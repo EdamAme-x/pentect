@@ -54,6 +54,10 @@ def _gen_bare_internal_host() -> str:
     names = [
         "billing-svc", "auth-gateway", "orders", "warehouse-api", "ledger",
         "payments-core", "kyc-service", "reporting", "inventory", "fulfillment",
+        "shipping-core", "tax-calc", "risk-engine", "coupon-svc", "pricing",
+        "cart-api", "session-store", "invoice-gen", "refund-core", "loyalty",
+        "kyc-v3", "audit-trail", "catalog", "search-core", "rec-engine",
+        "media-proxy", "cdn-origin", "doc-store", "batch-runner", "cron-svc",
     ]
     return random.choice(names)
 
@@ -132,6 +136,68 @@ _TEMPLATES: list = [
     (
         "{name} opened #{rid} against {host} about the 500s",
         [("name", "PII_NAME"), ("rid", "USER_ID"), ("host", "INTERNAL_URL")],
+    ),
+
+    # 11. INTERNAL_URL in terraform / infra-as-code fragments
+    (
+        "resource \"kubernetes_service\" \"{host}\" {{ cluster_ip = \"None\" }}",
+        [("host", "INTERNAL_URL")],
+    ),
+    (
+        "backend_service_upstream({host}, retries=3)",
+        [("host", "INTERNAL_URL")],
+    ),
+    (
+        "dial tcp {host}:9092: connection refused",
+        [("host", "INTERNAL_URL")],
+    ),
+
+    # 12. INTERNAL_URL in observability / metric names
+    (
+        "counter rpc_requests_total{{target=\"{host}\"}} 14820",
+        [("host", "INTERNAL_URL")],
+    ),
+    (
+        "span attribute upstream.service={host} attached to trace {rid}",
+        [("host", "INTERNAL_URL"), ("rid", "USER_ID")],
+    ),
+
+    # 13. INTERNAL_URL in SQL / query-like text
+    (
+        "SELECT * FROM service_health WHERE name = '{host}' AND status = 'degraded'",
+        [("host", "INTERNAL_URL")],
+    ),
+
+    # 14. INTERNAL_URL + host grouping (table-ish CSV row, not YAML)
+    (
+        "{host},prod,owner={name},last_deploy=2025-11-03",
+        [("host", "INTERNAL_URL"), ("name", "PII_NAME")],
+    ),
+
+    # 15. INTERNAL_URL in curl / shell one-liners
+    (
+        "curl -sSf http://{host}/healthz || echo 'down'",
+        [("host", "INTERNAL_URL")],
+    ),
+    (
+        "kubectl port-forward svc/{host} 8080:80 -n platform",
+        [("host", "INTERNAL_URL")],
+    ),
+
+    # 16. INTERNAL_URL + CREDENTIAL in dockerfile / env-file
+    (
+        "ENV UPSTREAM={host} API_TOKEN={tok}",
+        [("host", "INTERNAL_URL"), ("tok", "CREDENTIAL")],
+    ),
+
+    # 17. INTERNAL_URL in Japanese log without the hard_val vocabulary
+    (
+        "{host} へのリクエストが {rid} 回連続で失敗しました。担当 {name_ja} に共有済み。",
+        [("host", "INTERNAL_URL"), ("rid", "USER_ID"), ("name_ja", "PII_NAME")],
+    ),
+    (
+        "{name_ja} が {host} のレイテンシ悪化を調査中(token {opq} で再現)",
+        [("name_ja", "PII_NAME"), ("host", "INTERNAL_URL"), ("opq", "CREDENTIAL")],
     ),
 ]
 

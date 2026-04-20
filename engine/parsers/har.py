@@ -84,3 +84,67 @@ def parse_har(raw: str | dict[str, Any]) -> ParsedHar:
             fields.append(HarField(path=f"entries[{i}].response.content.text", text=str(res_text)))
 
     return ParsedHar(fields=fields, raw=data)
+
+
+@dataclass
+class HarEntryText:
+    """One HAR entry rendered as a compact inspectable text block.
+
+    Used by per-entry masking so each entry is a single in-distribution input
+    for the FT LLM (short, single-request sized), while shared values across
+    entries still collapse to the same placeholder via SHA-based hashing.
+    """
+    index: int
+    text: str
+
+
+_INTERESTING_HEADER_NAMES = {"authorization", "cookie", "x-api-key", "x-auth-token"}
+
+
+def iter_entry_texts(raw: str | dict[str, Any]) -> list[HarEntryText]:
+    """Render each HAR entry as a short inspectable text block.
+
+    Format per entry (mirrors demo/juice/identify_vulns.py for consistency):
+        METHOD URL
+          body: <first 400 chars>
+          Authorization: <first 300 chars>
+          -> <status> <statusText>
+          resp: <first 400 chars if looks interesting>
+    """
+    if isinstance(raw, str):
+        data = json.loads(raw)
+    else:
+        data = raw
+
+    entries = (data.get("log", {}) or {}).get("entries", []) or []
+    out: list[HarEntryText] = []
+    for i, entry in enumerate(entries):
+        req = entry.get("request", {}) or {}
+        res = entry.get("response", {}) or {}
+        url = req.get("url") or ""
+        method = req.get("method") or "GET"
+        lines: list[str] = [f"{method} {url}"]
+
+        body_text = (req.get("postData") or {}).get("text")
+        if body_text:
+            lines.append(f"  body: {body_text[:400]}")
+
+        for h in req.get("headers", []) or []:
+            n = str(h.get("name", "")).lower()
+            if n in _INTERESTING_HEADER_NAMES:
+                v = str(h.get("value", ""))[:300]
+                lines.append(f"  {h.get('name')}: {v}")
+
+        status = res.get("status")
+        st_txt = res.get("statusText", "")
+        if status:
+            lines.append(f"  -> {status} {st_txt}".rstrip())
+
+        res_body = (res.get("content") or {}).get("text") or ""
+        if res_body and len(res_body) < 800 and any(
+            k in res_body.lower() for k in ("error", "sqlite", "email", "admin", "token")
+        ):
+            lines.append(f"  resp: {res_body[:400]}")
+
+        out.append(HarEntryText(index=i, text="\n".join(lines)))
+    return out

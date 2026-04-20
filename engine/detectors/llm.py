@@ -30,18 +30,53 @@ INTERNAL_IP, PII_EMAIL, PII_NAME, USER_ID).
 """
 
 
+_OBJ_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+
 def _parse_output(raw: str) -> list[tuple[str, str]]:
-    m = re.search(r"\[.*?\]", raw, re.DOTALL)
-    if not m:
-        return []
-    try:
-        arr = _json.loads(m.group(0))
-    except Exception:  # noqa: BLE001
-        return []
+    # Cut at hallucinated continuation markers so we only consider the first block.
+    for marker in ("### Instruction", "### Input", "\n### "):
+        idx = raw.find(marker, 1)
+        if idx > 0:
+            raw = raw[:idx]
+            break
+
+    # Prefer the first balanced [...] block starting at the first '['.
+    start = raw.find("[")
+    candidate: str | None = None
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(raw)):
+            c = raw[i]
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw[start:i + 1]
+                    break
+        if candidate is None:
+            # truncated mid-array: salvage by harvesting any complete {...} objects
+            candidate = raw[start:] + "]"
+
+    items: list[dict] = []
+    if candidate:
+        try:
+            arr = _json.loads(candidate)
+            if isinstance(arr, list):
+                items = [x for x in arr if isinstance(x, dict)]
+        except Exception:  # noqa: BLE001
+            # Fall back to extracting any complete {"span":..., "category":...} objects
+            for m in _OBJ_RE.finditer(candidate):
+                try:
+                    obj = _json.loads(m.group(0))
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(obj, dict):
+                    items.append(obj)
+
     out: list[tuple[str, str]] = []
-    for item in arr:
-        if not isinstance(item, dict):
-            continue
+    for item in items:
         span = item.get("span")
         cat = item.get("category")
         if isinstance(span, str) and isinstance(cat, str):
@@ -64,7 +99,7 @@ class LLMDetector:
         model_id = os.environ.get("PENTECT_LLM_MODEL", "google/gemma-3-4b-it")
         adapter = os.environ.get("PENTECT_LLM_ADAPTER")
         use_4bit = os.environ.get("PENTECT_LLM_4BIT", "").lower() in {"1", "true"}
-        self._max_new_tokens = int(os.environ.get("PENTECT_LLM_MAX_TOK", "160"))
+        self._max_new_tokens = int(os.environ.get("PENTECT_LLM_MAX_TOK", "384"))
 
         self._tok = AutoTokenizer.from_pretrained(model_id)
         if self._tok.pad_token is None:

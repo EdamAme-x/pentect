@@ -1,0 +1,10 @@
+services:
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: juice-shop
+    hostname: juice-shop.local
+    ports:
+      - "3030:3000"
+    environment:
+      - NODE_ENV=unsafe
+    restart: unless-stopped

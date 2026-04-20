@@ -1,0 +1,49 @@
+You are a security reviewer. You will be given a compact HAR summary
+(a list of HTTP requests a pentester captured against a single target). List the
+specific vulnerabilities you can identify from this trace.
+
+For each finding, output:
+- title (short, e.g. "SQL injection in login")
+- evidence (the exact line or request that shows it)
+- severity (info/low/medium/high/critical)
+- brief explanation
+
+Use a numbered list. Only include findings you can actually point to in the
+trace. Do not speculate about things that are not in the trace.
+
+HAR summary (raw, unmasked):
+---
+GET http://juice-shop.local/rest/admin/application-version
+  -> 200 OK
+GET http://juice-shop.local/rest/admin/application-configuration
+GET http://juice-shop.local/api/Challenges/?name=Score%20Board
+GET http://juice-shop.local/rest/languages
+GET http://juice-shop.local/api/Quantitys/
+GET http://juice-shop.local/rest/products/search?q=
+GET http://juice-shop.local/rest/products/search?q=apple
+  cookie: language=en
+GET http://juice-shop.local/api/Products/1
+GET http://juice-shop.local/api/Products/2
+POST http://juice-shop.local/rest/user/login
+GET http://juice-shop.local/rest/user/whoami
+  Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJzdGF0dXMiOiJzdWNjZXNzIiwiZGF0YSI6eyJpZCI6MSwidXNlcm5hbWUiOiIiLCJlbWFpbCI6ImFkbWluQGp1aWNlLXNoLm9wIiwicGFzc3dvcmQiOiIwMTkyMDIzYTdiYmQ3MzI1MDUxNmYwNjlkZjE4YjUwMCIsInJvbGUiOiJhZG1pbiIsImRlbHV4ZVRva2VuIjoiIiwibGFzdExvZ2luSXAiOiIiLCJwcm9maWxlSW1hZ2UiOiJhc3Nl
+GET http://juice-shop.local/api/Baskets/1
+  -> 500 Internal Server Error
+GET http://juice-shop.local/rest/products/search?q=%27%29%29--
+GET http://juice-shop.local/api/Users/1
+  resp: {"status":"success","data":{"id":1,"username":"","email":"admin@juice-sh.op","role":"admin","deluxeToken":"","lastLoginIp":"","profileImage":"assets/public/images/uploads/defaultAdmin.png","isActive":true,"createdAt":"2026-04-20T13:01:18.439Z","updatedAt":"2026-04-20T13:01:18.439Z","deletedAt":null}}
+GET http://juice-shop.local/api/Users/2
+  resp: {"status":"success","data":{"id":2,"username":"","email":"jim@juice-sh.op","role":"customer","deluxeToken":"","lastLoginIp":"","profileImage":"assets/public/images/uploads/default.svg","isActive":true,"createdAt":"2026-04-20T13:01:18.439Z","updatedAt":"2026-04-20T13:01:18.439Z","deletedAt":null}}
+GET http://juice-shop.local/api/Users/3
+  resp: {"status":"success","data":{"id":3,"username":"","email":"bender@juice-sh.op","role":"customer","deluxeToken":"","lastLoginIp":"","profileImage":"assets/public/images/uploads/default.svg","isActive":true,"createdAt":"2026-04-20T13:01:18.439Z","updatedAt":"2026-04-20T13:01:18.439Z","deletedAt":null}}
+POST http://juice-shop.local/api/Feedbacks
+  -> 401 Unauthorized
+GET http://juice-shop.local/ftp/
+GET http://juice-shop.local/ftp/package.json.bak
+  -> 403 Forbidden
+POST http://juice-shop.local/api/BasketItems
+GET http://juice-shop.local/rest/basket/1
+GET http://juice-shop.local/rest/user/whoami?fields=id,email
+  Cookie: language=en
+GET http://juice-shop.local/rest/captcha/
+---

@@ -1,0 +1,143 @@
+{
+  "val_path": "training/data/hard_val.jsonl",
+  "adapter": "training/runs/gemma3_4b_lora",
+  "num_samples": 60,
+  "num_spans": 157,
+  "scoring": "strict one-directional: gold span must be substring of a detected hit",
+  "overall": {
+    "hit": 140,
+    "total": 157,
+    "recall": 0.8917
+  },
+  "per_category": {
+    "CREDENTIAL": {
+      "hit": 26,
+      "total": 29,
+      "recall": 0.897
+    },
+    "INTERNAL_IP": {
+      "hit": 9,
+      "total": 9,
+      "recall": 1.0
+    },
+    "INTERNAL_URL": {
+      "hit": 31,
+      "total": 41,
+      "recall": 0.756
+    },
+    "PII_NAME": {
+      "hit": 53,
+      "total": 57,
+      "recall": 0.93
+    },
+    "USER_ID": {
+      "hit": 21,
+      "total": 21,
+      "recall": 1.0
+    }
+  },
+  "misses": [
+    {
+      "idx": 2,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "As part of the retro, Hayashi Haruto summarised the timeline and flagged that the internal service scheduler-v2 lacked c"
+    },
+    {
+      "idx": 18,
+      "category": "INTERNAL_URL",
+      "value": "data-lake",
+      "input_preview": "## Findings\n\n- A long-lived token `PLAT:S7DR2-K4B6L-7N6W3F2H` was discovered in the build cache.\n- The related service `"
+    },
+    {
+      "idx": 18,
+      "category": "PII_NAME",
+      "value": "Ethan Martinez",
+      "input_preview": "## Findings\n\n- A long-lived token `PLAT:S7DR2-K4B6L-7N6W3F2H` was discovered in the build cache.\n- The related service `"
+    },
+    {
+      "idx": 21,
+      "category": "PII_NAME",
+      "value": "Nakamura Yui",
+      "input_preview": "[ops] Sophia Robinson escalated to Nakamura Yui at 03:12 — 内部ホスト event-bus returning 502s, token LGEkadblj4gLOmzGNOzMFdM"
+    },
+    {
+      "idx": 22,
+      "category": "INTERNAL_URL",
+      "value": "data-lake",
+      "input_preview": "deployment annotations include `owner: Nakamura Yui` and the sidecar is configured to push metrics to data-lake on port "
+    },
+    {
+      "idx": 33,
+      "category": "CREDENTIAL",
+      "value": "INFRA:8YOQ-NIZG7",
+      "input_preview": "Forgot to rotate: previous value was 34ZcWRO9diU6PsKUg, new one is INFRA:8YOQ-NIZG7 — please update your local .env"
+    },
+    {
+      "idx": 36,
+      "category": "CREDENTIAL",
+      "value": "DEV:FNVA-78CMI362-U6KD0QA",
+      "input_preview": "Forgot to rotate: previous value was b7nlgpYbfRmbLJGRg1Sc, new one is DEV:FNVA-78CMI362-U6KD0QA — please update your loc"
+    },
+    {
+      "idx": 38,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "As part of the retro, Hayashi Riku summarised the timeline and flagged that the internal service model-registry lacked c"
+    },
+    {
+      "idx": 41,
+      "category": "CREDENTIAL",
+      "value": "DEV:WVM9-YAAZ",
+      "input_preview": "インシデント報告: Yamada Kaitoさんが発見した通り、社内サービス scheduler-v2 に対して 短命トークン DEV:WVM9-YAAZ が認証なしで有効化されていました。"
+    },
+    {
+      "idx": 48,
+      "category": "INTERNAL_URL",
+      "value": "quota-svc",
+      "input_preview": "deployment annotations include `owner: Yamada Akari` and the sidecar is configured to push metrics to quota-svc on port "
+    },
+    {
+      "idx": 50,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "As part of the retro, Kobayashi Hina summarised the timeline and flagged that the internal service model-registry lacked"
+    },
+    {
+      "idx": 52,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "deployment annotations include `owner: Yamada Nanami` and the sidecar is configured to push metrics to scheduler-v2 on p"
+    },
+    {
+      "idx": 56,
+      "category": "INTERNAL_URL",
+      "value": "audit-log",
+      "input_preview": "## Findings\n\n- A long-lived token `INFRA:1XK9HU-R718E` was discovered in the build cache.\n- The related service `audit-l"
+    },
+    {
+      "idx": 56,
+      "category": "PII_NAME",
+      "value": "Liam Walker",
+      "input_preview": "## Findings\n\n- A long-lived token `INFRA:1XK9HU-R718E` was discovered in the build cache.\n- The related service `audit-l"
+    },
+    {
+      "idx": 57,
+      "category": "INTERNAL_URL",
+      "value": "notification-hub",
+      "input_preview": "deployment annotations include `owner: Nakamura Riku` and the sidecar is configured to push metrics to notification-hub "
+    },
+    {
+      "idx": 58,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "As part of the retro, Fujita Riku summarised the timeline and flagged that the internal service model-registry lacked ci"
+    },
+    {
+      "idx": 59,
+      "category": "PII_NAME",
+      "value": "Nakamura Hina",
+      "input_preview": "[ops] Isabella Robinson escalated to Nakamura Hina at 03:12 — 内部ホスト scheduler-v2 returning 502s, token RxwPGsPrsBgNTkGai"
+    }
+  ]
+}
