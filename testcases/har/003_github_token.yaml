@@ -1,0 +1,17 @@
+id: har-003-github-token
+category: har
+description: GitHub PAT 漏洩。外部ホスト(api.github.com)は保持されるべき
+input_file: ./003_github_token.har
+
+secrets:
+  - value: "ghp_1234567890abcdefghij1234567890ABCDEF"
+    expected_category: CREDENTIAL
+
+context_preservation:
+  - prompt: "このAPIは何をしている?"
+    expected_keywords: ["api.github.com", "/user/repos", "GET"]
+    min_match: 2
+
+must_not_mask:
+  - "api.github.com"
+  - "/user/repos"

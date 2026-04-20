@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pentect"
+version = "0.1.0"
+description = "Masking engine for sensitive data in pentest contexts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "EdamAme-x" }]
+
+dependencies = [
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+
+[project.optional-dependencies]
+# Presidio is used only as a baseline for evaluation (eval/baselines/presidio_only.py),
+# not as part of Pentect's detection pipeline.
+baselines = [
+    "presidio-analyzer>=2.2",
+    "presidio-anonymizer>=2.2",
+]
+llm = [
+    "transformers>=4.40",
+    "torch>=2.2",
+    "accelerate>=0.30",
+    "peft>=0.10",
+    "bitsandbytes>=0.43",
+    "datasets>=2.19",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+pentect = "engine.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["engine*", "eval*", "training*", "testcases*", "server*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

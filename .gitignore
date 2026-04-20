@@ -1,16 +1,46 @@
-# Reference files
+# Reference / scratch
 ref*.md
 sandbox/
 
-# Environment variables
+# Environment
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-.env.development
-.env.test
-.env.production
+.env.*
+!.env.example
 
-# Node modules
-node_modules
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node / Vite
+node_modules/
+ui/dist/
+ui/.vite/
+*.log
+
+# Training artifacts
+data/
+checkpoints/
+outputs/
+wandb/
+*.safetensors
+*.bin
+*.gguf
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

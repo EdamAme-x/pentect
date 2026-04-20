@@ -1,0 +1,32 @@
+id: text-001-curl-log
+category: text
+description: 生の curl -v ログ。HARではない生テキスト入力でも動くことの確認。
+input_text: |
+  * Trying 10.0.5.42:8080...
+  * Connected to gitlab.corp.internal (10.0.5.42) port 8080
+  > GET /api/v4/projects/42/issues HTTP/1.1
+  > Host: gitlab.corp.internal:8080
+  > Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZXYifQ.sig_deadbeef
+  > Cookie: _gitlab_session=abcd1234efgh5678ijkl
+  >
+  < HTTP/1.1 200 OK
+  < Set-Cookie: sid=XYZ987sessiontoken; Path=/
+  <
+  {"reporter": "alice@corp.example", "ip": "10.0.5.42"}
+
+secrets:
+  - value: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZXYifQ.sig_deadbeef"
+    expected_category: CREDENTIAL
+  - value: "gitlab.corp.internal"
+    expected_category: INTERNAL_URL
+  - value: "10.0.5.42"
+    expected_category: INTERNAL_IP
+  - value: "alice@corp.example"
+    expected_category: PII_EMAIL
+  - value: "XYZ987sessiontoken"
+    expected_category: CREDENTIAL
+
+context_preservation:
+  - prompt: "このログで観測された認証方式は?"
+    expected_keywords: ["Bearer", "Cookie", "session"]
+    min_match: 2

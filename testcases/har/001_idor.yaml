@@ -1,0 +1,23 @@
+id: har-001-idor
+category: har
+description: 内部JIRA風サービスでのIDOR推測ケース。パス末尾IDとホストをマスクし、パス構造は残す
+input_file: ./001_idor.har
+
+secrets:
+  - value: "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiYWxpY2UifQ.sig_ABCDEFGHIJKLMN"
+    expected_category: CREDENTIAL
+  - value: "jira.corp.internal"
+    expected_category: INTERNAL_URL
+  - value: "10.0.5.42"
+    expected_category: INTERNAL_IP
+  - value: "alice@example.com"
+    expected_category: PII_EMAIL
+
+context_preservation:
+  - prompt: "このHARから推測できる脆弱性は?"
+    expected_keywords: ["/api/issues/", "Bearer", "GET"]
+    min_match: 2
+
+must_not_mask:
+  - "/api/issues/"
+  - "application/json"

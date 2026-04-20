@@ -1,0 +1,45 @@
+{
+  "val_path": "training/data/train.val.jsonl",
+  "num_samples": 80,
+  "num_spans": 92,
+  "scoring": "strict: a gold span counts as recalled only if the full span value is a substring of at least one detected hit (one-directional). Presidio hits are filtered at score >= 0.5.",
+  "note": "This val set is the in-distribution validation split from the training data generator; FT recall of 1.000 here is expected. For an honest out-of-distribution measurement, see hard_val_recall.json.",
+  "engines": [
+    {
+      "label": "rule-only",
+      "overall": { "hit": 14, "total": 92 },
+      "overall_recall": 0.152,
+      "per_category": {
+        "CREDENTIAL":   { "hit": 9,  "total": 40 },
+        "INTERNAL_IP":  { "hit": 5,  "total": 5 },
+        "INTERNAL_URL": { "hit": 0,  "total": 16 },
+        "PII_NAME":     { "hit": 0,  "total": 23 },
+        "USER_ID":      { "hit": 0,  "total": 8 }
+      }
+    },
+    {
+      "label": "rule + Presidio (threshold=0.5)",
+      "overall": { "hit": 37, "total": 92 },
+      "overall_recall": 0.402,
+      "per_category": {
+        "CREDENTIAL":   { "hit": 10, "total": 40 },
+        "INTERNAL_IP":  { "hit": 5,  "total": 5 },
+        "INTERNAL_URL": { "hit": 0,  "total": 16 },
+        "PII_NAME":     { "hit": 22, "total": 23 },
+        "USER_ID":      { "hit": 0,  "total": 8 }
+      }
+    },
+    {
+      "label": "rule + FT Gemma 3 4B (LoRA)",
+      "overall": { "hit": 92, "total": 92 },
+      "overall_recall": 1.000,
+      "per_category": {
+        "CREDENTIAL":   { "hit": 40, "total": 40 },
+        "INTERNAL_IP":  { "hit": 5,  "total": 5 },
+        "INTERNAL_URL": { "hit": 16, "total": 16 },
+        "PII_NAME":     { "hit": 23, "total": 23 },
+        "USER_ID":      { "hit": 8,  "total": 8 }
+      }
+    }
+  ]
+}

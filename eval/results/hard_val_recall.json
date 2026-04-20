@@ -1,0 +1,58 @@
+{
+  "val_path": "training/data/hard_val.jsonl",
+  "num_samples": 60,
+  "num_spans": 157,
+  "scoring": "strict: a gold span counts as recalled only if the full span value is a substring of at least one detected hit (one-directional). Presidio hits are filtered at score >= 0.5.",
+  "engines": [
+    {
+      "label": "rule-only",
+      "overall": { "hit": 9, "total": 157 },
+      "overall_recall": 0.057,
+      "per_category": {
+        "CREDENTIAL":   { "hit": 0, "total": 29 },
+        "INTERNAL_IP":  { "hit": 9, "total": 9 },
+        "INTERNAL_URL": { "hit": 0, "total": 41 },
+        "PII_NAME":     { "hit": 0, "total": 57 },
+        "USER_ID":      { "hit": 0, "total": 21 }
+      }
+    },
+    {
+      "label": "rule + Presidio (threshold=0.5)",
+      "overall": { "hit": 64, "total": 157 },
+      "overall_recall": 0.408,
+      "per_category": {
+        "CREDENTIAL":   { "hit": 2,  "total": 29 },
+        "INTERNAL_IP":  { "hit": 9,  "total": 9 },
+        "INTERNAL_URL": { "hit": 0,  "total": 41 },
+        "PII_NAME":     { "hit": 52, "total": 57 },
+        "USER_ID":      { "hit": 1,  "total": 21 }
+      }
+    },
+    {
+      "label": "rule + vanilla Gemma 3 4B",
+      "overall": { "hit": 46, "total": 157 },
+      "overall_recall": 0.293,
+      "per_category": {
+        "CREDENTIAL":   { "hit": 27, "total": 29 },
+        "INTERNAL_IP":  { "hit": 7,  "total": 9 },
+        "INTERNAL_URL": { "hit": 8,  "total": 41 },
+        "PII_NAME":     { "hit": 0,  "total": 57 },
+        "USER_ID":      { "hit": 4,  "total": 21 }
+      },
+      "notes": "max_new_tokens=120, 4bit. PII_NAME 0% because vanilla Gemma typically masks only a fragment of a full name (first OR last), and strict scoring requires the FULL gold span to be covered."
+    },
+    {
+      "label": "rule + FT Gemma 3 4B (LoRA)",
+      "overall": { "hit": 132, "total": 157 },
+      "overall_recall": 0.841,
+      "per_category": {
+        "CREDENTIAL":   { "hit": 25, "total": 29 },
+        "INTERNAL_IP":  { "hit": 9,  "total": 9 },
+        "INTERNAL_URL": { "hit": 26, "total": 41 },
+        "PII_NAME":     { "hit": 53, "total": 57 },
+        "USER_ID":      { "hit": 19, "total": 21 }
+      },
+      "notes": "batch=8, max_new_tokens=160, 4bit. INTERNAL_URL 63.4% is the largest remaining gap."
+    }
+  ]
+}

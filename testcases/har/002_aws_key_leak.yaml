@@ -1,0 +1,23 @@
+id: har-002-aws-key-leak
+category: har
+description: AWSアクセスキーが postData に漏洩、スタックトレースに内部IPが露出
+input_file: ./002_aws_key_leak.har
+
+secrets:
+  - value: "AKIAIOSFODNN7EXAMPLE"
+    expected_category: CREDENTIAL
+  - value: "admin.corp.internal"
+    expected_category: INTERNAL_URL
+  - value: "192.168.10.5"
+    expected_category: INTERNAL_IP
+  - value: "s_GXyZTMPJKLNVWQRSTUVWXYZ12"
+    expected_category: CREDENTIAL
+
+context_preservation:
+  - prompt: "この通信で発生した問題は?"
+    expected_keywords: ["500", "Stacktrace", "deploy"]
+    min_match: 2
+
+must_not_mask:
+  - "/api/deploy"
+  - "application/json"

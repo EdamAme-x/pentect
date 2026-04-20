@@ -1,0 +1,35 @@
+id: text-002-env-file
+category: text
+description: .env 風の環境変数ファイル。クレデンシャル/内部エンドポイントが平文で並ぶ典型パターン。
+input_text: |
+  DATABASE_URL=postgres://admin:s3cr3t_p4ssw0rd@db.corp.internal:5432/prod
+  AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+  AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz
+  JWT_SECRET=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.sig_abcdefgh
+  ADMIN_EMAIL=ops@corp.example
+  INTERNAL_API=https://api.corp.internal/v1
+  REDIS_HOST=10.0.5.10
+
+secrets:
+  - value: "s3cr3t_p4ssw0rd"
+    expected_category: CREDENTIAL
+  - value: "AKIAIOSFODNN7EXAMPLE"
+    expected_category: CREDENTIAL
+  - value: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    expected_category: CREDENTIAL
+  - value: "ghp_1234567890abcdefghijklmnopqrstuvwxyz"
+    expected_category: CREDENTIAL
+  - value: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.sig_abcdefgh"
+    expected_category: CREDENTIAL
+  - value: "db.corp.internal"
+    expected_category: INTERNAL_URL
+  - value: "api.corp.internal"
+    expected_category: INTERNAL_URL
+  - value: "10.0.5.10"
+    expected_category: INTERNAL_IP
+
+context_preservation:
+  - prompt: "このenvに含まれるクラウドプロバイダは?"
+    expected_keywords: ["AWS", "GitHub"]
+    min_match: 1

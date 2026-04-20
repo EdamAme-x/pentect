@@ -1,0 +1,28 @@
+id: text-003-nmap-scan
+category: text
+description: nmap -sV の出力。内部IPとホスト名は隠しつつ、ポート/サービス構造は保持したい。
+input_text: |
+  # Nmap 7.94 scan initiated Mon Apr 20 10:00:00 2026
+  Nmap scan report for jira.corp.internal (10.0.5.42)
+  Host is up (0.00023s latency).
+  Other addresses for jira.corp.internal: 10.0.5.43
+  PORT     STATE SERVICE VERSION
+  22/tcp   open  ssh     OpenSSH 8.4p1 Debian 5+deb11u3 (protocol 2.0)
+  80/tcp   open  http    nginx 1.18.0
+  443/tcp  open  ssl/http nginx 1.18.0
+  Service Info: Host: gitlab.corp.internal; OS: Linux
+
+secrets:
+  - value: "jira.corp.internal"
+    expected_category: INTERNAL_URL
+  - value: "gitlab.corp.internal"
+    expected_category: INTERNAL_URL
+  - value: "10.0.5.42"
+    expected_category: INTERNAL_IP
+  - value: "10.0.5.43"
+    expected_category: INTERNAL_IP
+
+context_preservation:
+  - prompt: "このスキャン結果から推測できる攻撃面は?"
+    expected_keywords: ["ssh", "http", "port", "OpenSSH", "nginx"]
+    min_match: 2
