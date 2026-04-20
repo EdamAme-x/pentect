@@ -19,7 +19,8 @@ app.add_middleware(
 )
 
 _use_llm = os.environ.get("PENTECT_USE_LLM", "").lower() in {"1", "true"}
-_engine = PentectEngine(use_llm=_use_llm)
+_use_verifier = os.environ.get("PENTECT_USE_VERIFIER", "").lower() in {"1", "true"}
+_engine = PentectEngine(use_llm=_use_llm, use_verifier=_use_verifier)
 
 
 class MaskRequest(BaseModel):
@@ -31,6 +32,7 @@ class MaskResponse(BaseModel):
     masked_text: str
     map: dict
     summary: dict
+    verifier: dict | None = None
 
 
 @app.post("/api/mask", response_model=MaskResponse)
@@ -42,7 +44,12 @@ def mask(req: MaskRequest) -> MaskResponse:
             result = _engine.mask_text(req.text)
     else:
         result = _engine.mask_text(req.text)
-    return MaskResponse(masked_text=result.masked_text, map=result.map, summary=result.summary)
+    return MaskResponse(
+        masked_text=result.masked_text,
+        map=result.map,
+        summary=result.summary,
+        verifier=result.verifier,
+    )
 
 
 @app.get("/api/health")

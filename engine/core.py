@@ -22,13 +22,17 @@ class MaskResult:
     masked_text: str
     map: dict[str, dict[str, str]] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
+    verifier: dict[str, Any] | None = None  # set when a Verifier ran
 
     def to_json(self) -> str:
-        return json.dumps(
-            {"masked_text": self.masked_text, "map": self.map, "summary": self.summary},
-            ensure_ascii=False,
-            indent=2,
-        )
+        payload: dict[str, Any] = {
+            "masked_text": self.masked_text,
+            "map": self.map,
+            "summary": self.summary,
+        }
+        if self.verifier is not None:
+            payload["verifier"] = self.verifier
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 _PLACEHOLDER_RE = re.compile(r"<<([A-Z_]+)_([a-f0-9]{8})>>")
@@ -40,6 +44,7 @@ class PentectEngine:
         detectors: list[Detector] | None = None,
         *,
         use_llm: bool = False,
+        use_verifier: bool = False,
     ) -> None:
         if detectors is not None:
             self.detectors: list[Detector] = detectors
@@ -49,6 +54,12 @@ class PentectEngine:
                 from engine.detectors.llm import LLMDetector
 
                 self.detectors.append(LLMDetector())
+
+        self._verifier = None
+        if use_verifier:
+            from engine.verifier import QwenVerifier
+
+            self._verifier = QwenVerifier()
 
     def _detect_all(self, text: str) -> list[Span]:
         spans: list[Span] = []
@@ -60,7 +71,15 @@ class PentectEngine:
         spans = self._detect_all(text)
         replacements = apply_granularity(text, spans)
         masked = apply_replacements(text, replacements)
-        return _build_result(masked, replacements)
+        result = _build_result(masked, replacements)
+        if self._verifier is not None:
+            report = self._verifier.verify(masked)
+            result.verifier = {
+                "ok": report.ok,
+                "leaks": report.leaks,
+                "model": self._verifier.name,
+            }
+        return result
 
     def mask_har(self, har_raw: str | dict) -> MaskResult:
         """Accept a HAR JSON string or dict and mask it.

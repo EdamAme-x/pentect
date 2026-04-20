@@ -1,0 +1,574 @@
+{
+  "val_path": "training/data/hard_val.jsonl",
+  "totals": {
+    "total_spans": 157,
+    "ft_leaked": 22,
+    "verifier_rescued": 0,
+    "verifier_rescue_rate": 0.0,
+    "samples_flagged": 20,
+    "samples": 60,
+    "verifier_false_positives": 21
+  },
+  "details": [
+    {
+      "input": "deployment annotations include `owner: Yamada Riku` and the sidecar is configured to push metrics to notification-hub on port 9090",
+      "masked": "deployment annotations include `owner: <<PII_NAME_c773649c>>` and the sidecar is configured to push metrics to <<INTERNAL_URL_a82d4365>> on port 9090",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "values.yaml:\n  upstream:\n    host: data-lake\n    token: OPS:ZIUS5-K9EP1FR\n    audit_contact: Lucas Martinez",
+      "masked": "values.yaml:\n  upstream:\n    host: <<INTERNAL_URL_a83e3ec3>>\n    token: OPS:<<CREDENTIAL_e1efff29>>\n    audit_contact: <<PII_NAME_3e7d029c>>",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "OPS:<<CREDENTIAL_e1efff29>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "As part of the retro, Hayashi Haruto summarised the timeline and flagged that the internal service scheduler-v2 lacked circuit-breakers, which we'll address in Q3.",
+      "masked": "As part of the retro, <<PII_NAME_568e1811>> summarised the timeline and flagged that the internal service <<INTERNAL_URL_ba3297c6>> lacked circuit-breakers, which we'll address in Q3.",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "INTERNAL_URL_ba3297c6"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "nit: pls move h09CDfgvqZkb6GjHbG81RqwkVHWunY9 out of the repo and into our secret store before merging, otherwise anyone with read access sees it",
+      "masked": "nit: pls move <<CREDENTIAL_96c51d72>> out of the repo and into our secret store before merging, otherwise anyone with read access sees it",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "<<CREDENTIAL_96c51d72>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "Post-mortem: During the 02:14 incident, Noah King noticed that event-bus was returning 5xx. On-call rotated the pod and the upstream recovered within 8 minutes.",
+      "masked": "Post-mortem: During the 02:14 incident, <<PII_NAME_da84c32e>> noticed that <<INTERNAL_URL_c195d017>> was returning 5xx. On-call rotated the pod and the upstream recovered within 8 minutes.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "The bastion answered ping from 10.102.141.116 exactly once, then went silent; Isabella Hall will investigate.",
+      "masked": "The bastion answered ping from <<INTERNAL_IP_de8bd4df>> exactly once, then went silent; <<PII_NAME_faa047a7>> will investigate.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "[ops] Sophia Martinez escalated to Hayashi Hina at 03:12 — 内部ホスト search-api returning 502s, token 9ZkAFvmtSbIBbuMFd9W8g rotated immediately.",
+      "masked": "[ops] <<PII_NAME_72b1a74f>> escalated to <<PII_NAME_c5c93476>> at 03:12 — 内部ホスト <<INTERNAL_URL_dd8939c4>> returning 502s, token <<CREDENTIAL_60f53e5b>> rotated immediately.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "### Impact\n\nCustomer #7510347 was exposed because Liam Walker accidentally shared the dashboard link which embedded a signed cookie value 1CvI5qiGogkdmtsVrFlvbpaT.",
+      "masked": "### Impact\n\nCustomer #<<USER_ID_fb90aa72>> was exposed because <<PII_NAME_8eb82736>> accidentally shared the dashboard link which embedded a signed cookie value <<CREDENTIAL_85146f7c>>.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "### Impact\n\nCustomer #4777691 was exposed because Logan King accidentally shared the dashboard link which embedded a signed cookie value 8Hp7twaxDFmFaqfycbsoKGUOS2.",
+      "masked": "### Impact\n\nCustomer #<<USER_ID_2a2d06c8>> was exposed because <<PII_NAME_8cdb35c7>> accidentally shared the dashboard link which embedded a signed cookie value <<CREDENTIAL_2b0ce8ce>>.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "[ops] Ethan Anderson escalated to Inoue Kaito at 03:12 — 内部ホスト scheduler-v2 returning 502s, token peqTmT8ExDQVMNejpUsJadqPQPsGCCh rotated immediately.",
+      "masked": "[ops] <<PII_NAME_5c52c41e>> escalated to<<PII_NAME_b6bff90b>> at 03:12 — 内部ホスト <<INTERNAL_URL_ba3297c6>> returning 502s, token <<CREDENTIAL_0a3561b0>> rotated immediately.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "At 10:42 JST, Ethan King bumped ticket #6903523 from P3 to P1 after confirming the outage was user-visible and that scheduler-v2 hadn't recovered.",
+      "masked": "At 10:42 JST, <<PII_NAME_6658b18e>> bumped ticket #<<USER_ID_76066dfa>> from P3 to P1 after confirming the outage was user-visible and that <<INTERNAL_URL_ba3297c6>> hadn't recovered.",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "INTERNAL_URL_ba3297c6"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "ステージング環境 scheduler-v2 (10.110.47.70) でのみ再現したため、本番影響はなしと判断。担当: Yamada Akari、チケット #4178360。",
+      "masked": "ステージング環境 <<INTERNAL_URL_ba3297c6>> (<<INTERNAL_IP_e669554c>>) でのみ再現したため、本番影響はなしと判断。担当: <<PII_NAME_d5b0920f>>、チケット #<<USER_ID_49d0a364>>。",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "values.yaml:\n  upstream:\n    host: model-registry\n    token: PLAT:BZ6RV-C77T\n    audit_contact: Ethan Young",
+      "masked": "values.yaml:\n  upstream:\n    host: model-registry\n    token: <<CREDENTIAL_854e75c5>>\n    audit_contact: <<PII_NAME_8443f10e>>",
+      "ft_leaked": [
+        "model-registry"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "reviewer: this endpoint hits model-registry without a timeout — we had an incident in Q1 exactly because of this pattern, see #6362179",
+      "masked": "reviewer: this endpoint hits <<INTERNAL_URL_3d916499>> without a timeout — we had an incident in Q1 exactly because of this pattern, see #6362179",
+      "ft_leaked": [
+        "6362179"
+      ],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "<<INTERNAL_URL_3d916499>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "Sophia Walker: hey, did the deploy finish? the token BETA:KM8E-N1L2D expired 3h ago and our bot stopped posting",
+      "masked": "<<PII_NAME_13bbb161>>: hey, did the deploy finish? the token <<CREDENTIAL_95e9ddae>> expired 3h ago and our bot stopped posting",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "CREDENTIAL_95e9ddae"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "ステージング環境 quota-svc (10.62.150.76) でのみ再現したため、本番影響はなしと判断。担当: Shimizu Hina、チケット #4697502。",
+      "masked": "ステージング環境 <<INTERNAL_URL_10306f3d>> (<<INTERNAL_IP_81990b91>>) でのみ再現したため、本番影響はなしと判断。担当: <<PII_NAME_63a54449>>、チケット #<<USER_ID_97d0ebb4>>。",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "LGTM once the log line at line 42 stops printing 10.54.179.56; that's our bastion IP and shouldn't leak to observability",
+      "masked": "LGTM once the log line at line <<USER_ID_73475cb4>> stops printing <<INTERNAL_IP_b714aa76>>; that's our bastion IP and shouldn't leak to observability",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "<<INTERNAL_IP_b714aa76>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "nit: pls move zrt7tJwz19wmTma3AYz2CkaI out of the repo and into our secret store before merging, otherwise anyone with read access sees it",
+      "masked": "nit: pls move <<CREDENTIAL_fcbb56c9>> out of the repo and into our secret store before merging, otherwise anyone with read access sees it",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "<<CREDENTIAL_fcbb56c9>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "## Findings\n\n- A long-lived token `PLAT:S7DR2-K4B6L-7N6W3F2H` was discovered in the build cache.\n- The related service `data-lake` accepts it without IP allowlisting.\n- Reporter: Ethan Martinez.",
+      "masked": "## Findings\n\n- A long-lived token `<<CREDENTIAL_f5bab271>>` was discovered in the build cache.\n- The related service `data-lake` accepts it without IP allowlisting.\n- Reporter: Ethan Martinez.",
+      "ft_leaked": [
+        "data-lake",
+        "Ethan Martinez"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "The bastion answered ping from 10.129.81.83 exactly once, then went silent; Ethan Martinez will investigate.",
+      "masked": "The bastion answered ping from <<INTERNAL_IP_39e13cc3>> exactly once, then went silent; <<PII_NAME_86cadf3d>> will investigate.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "ステージング環境 quota-svc (10.23.11.14) でのみ再現したため、本番影響はなしと判断。担当: Inoue Yui、チケット #53880。",
+      "masked": "ステージング環境 <<INTERNAL_URL_10306f3d>> (<<INTERNAL_IP_ee582356>>) でのみ再現したため、本番影響はなしと判断。担当:<<PII_NAME_044d0a51>>、チケット #<<USER_ID_c4a873c6>>。",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "[ops] Sophia Robinson escalated to Nakamura Yui at 03:12 — 内部ホスト event-bus returning 502s, token LGEkadblj4gLOmzGNOzMFdM9SDHxB4 rotated immediately.",
+      "masked": "[ops] <<PII_NAME_2f6adf01>> escalated to <<PII_NAME_861e7d04>> at 03:12 — 内部ホスト <<INTERNAL_URL_c195d017>> returning 502s, token <<CREDENTIAL_af75a5c9>> rotated immediately.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "deployment annotations include `owner: Nakamura Yui` and the sidecar is configured to push metrics to data-lake on port 9090",
+      "masked": "deployment annotations include `owner: <<PII_NAME_861e7d04>>` and the sidecar is configured to push metrics to data-lake on port 9090",
+      "ft_leaked": [
+        "data-lake"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "values.yaml:\n  upstream:\n    host: event-bus\n    token: OPS:E2XK-PAJKZN-1VRK02\n    audit_contact: Lucas Thomas",
+      "masked": "values.yaml:\n  upstream:\n    host: event-bus\n    token: OPS:E2XK-PAJKZN-1VRK02\n    audit_contact: Lucas Thomas",
+      "ft_leaked": [
+        "event-bus",
+        "OPS:E2XK-PAJKZN-1VRK02",
+        "Lucas Thomas"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "At 10:42 JST, Liam Thomas bumped ticket #3301537 from P3 to P1 after confirming the outage was user-visible and that search-api hadn't recovered.",
+      "masked": "At 10:42 JST, <<PII_NAME_1075ce1c>> bumped ticket #3301537 from P3 to P1 after confirming the outage was user-visible and that search-api hadn't recovered.",
+      "ft_leaked": [
+        "3301537",
+        "search-api"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "### Impact\n\nCustomer #3362281 was exposed because Isabella Lewis accidentally shared the dashboard link which embedded a signed cookie value QNCtMgAWSNpACMzP5lOWyE8.",
+      "masked": "### Impact\n\nCustomer #<<USER_ID_bbac0e51>> was exposed because <<PII_NAME_c9e11c00>> accidentally shared the dashboard link which embedded a signed cookie value <<CREDENTIAL_e5f6c2b9>>.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "SRE memo: チケット #9208405 の root cause は audit-log の設定漏れ。assigned to Charlotte Martinez.",
+      "masked": "SRE memo: チケット #<<USER_ID_f28041ff>> の root cause は audit-log の設定漏れ。assigned to <<PII_NAME_6cba86b3>>.",
+      "ft_leaked": [
+        "audit-log"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "reviewer: this endpoint hits event-bus without a timeout — we had an incident in Q1 exactly because of this pattern, see #3585237",
+      "masked": "reviewer: this endpoint hits <<INTERNAL_URL_c195d017>> without a timeout — we had an incident in Q1 exactly because of this pattern, see #<<USER_ID_eb719429>>",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "<<INTERNAL_URL_c195d017>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "SRE memo: チケット #7096504 の root cause は notification-hub の設定漏れ。assigned to Sophia Young.",
+      "masked": "SRE memo: チケット #<<USER_ID_fe83609f>> の root cause は notification-hub の設定漏れ。assigned to <<PII_NAME_492dd2fa>>.",
+      "ft_leaked": [
+        "notification-hub"
+      ],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "fe83609f",
+        "492dd2fa"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "values.yaml:\n  upstream:\n    host: quota-svc\n    token: PLAT:OSJS9X2-GZE9D9-05TBKAG\n    audit_contact: Sophia Young",
+      "masked": "values.yaml:\n  upstream:\n    host: <<INTERNAL_URL_10306f3d>>\n    token: PLAT:<<CREDENTIAL_470fd71f>>\n    audit_contact: <<PII_NAME_492dd2fa>>",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "PLAT:<<CREDENTIAL_470fd71f>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "Mia Clark: ok i'll page Inoue Sora — they own metrics-collector this week and the latency is spiking",
+      "masked": "<<PII_NAME_846d3593>>: ok i'll page <<PII_NAME_fa4a08ea>> — they own metrics-collector this week and the latency is spiking",
+      "ft_leaked": [
+        "metrics-collector"
+      ],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "<<PII_NAME_fa4a08ea>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "ステージング環境 notification-hub (10.158.29.174) でのみ再現したため、本番影響はなしと判断。担当: Inoue Haruto、チケット #6645320。",
+      "masked": "ステージング環境 <<INTERNAL_URL_a82d4365>> (<<INTERNAL_IP_c471bbd1>>) でのみ再現したため、本番影響はなしと判断。担当:<<PII_NAME_1050b080>>、チケット #<<USER_ID_20a83573>>。",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "### Impact\n\nCustomer #6677209 was exposed because Liam Thomas accidentally shared the dashboard link which embedded a signed cookie value NWjLvGbc91EJqWA6VY7pcmlfdI1.",
+      "masked": "### Impact\n\nCustomer #<<USER_ID_3f7c1752>> was exposed because <<PII_NAME_1075ce1c>> accidentally shared the dashboard link which embedded a signed cookie value <<CREDENTIAL_31fb58b8>>.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "Forgot to rotate: previous value was 34ZcWRO9diU6PsKUg, new one is INFRA:8YOQ-NIZG7 — please update your local .env",
+      "masked": "Forgot to rotate: previous value was <<CREDENTIAL_77fcea5e>>, new one is <<INTERNAL_URL_2f44381e>> — please update your local .env",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "事後対応として、顧客ID 4812195 のアクセスログを Liam Clark に展開し、影響範囲の確認を依頼しました。",
+      "masked": "事後対応として、顧客ID <<USER_ID_1bfb131e>> のアクセスログを <<PII_NAME_cda6eb18>> に展開し、影響範囲の確認を依頼しました。",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "USER_ID_1bfb131e"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "インシデント報告: Matsumoto Soraさんが発見した通り、社内サービス model-registry に対して 短命トークン SEC:7DK6C-FXPSSP-KMBOJG4S が認証なしで有効化されていました。",
+      "masked": "インシデント報告: <<PII_NAME_8d0e2cb2>>さんが発見した通り、社内サービス <<INTERNAL_URL_3d916499>> に対して 短命トークン <<CREDENTIAL_78c82956>> が認証なしで有効化されていました。",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "Forgot to rotate: previous value was b7nlgpYbfRmbLJGRg1Sc, new one is DEV:FNVA-78CMI362-U6KD0QA — please update your local .env",
+      "masked": "Forgot to rotate: previous value was <<CREDENTIAL_39807f8c>>, new one is <<INTERNAL_URL_da79b19b>> — please update your local .env",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "### Impact\n\nCustomer #4468914 was exposed because Charlotte King accidentally shared the dashboard link which embedded a signed cookie value ZS0I9tyIujQv1PaglumPnAy.",
+      "masked": "### Impact\n\nCustomer #<<USER_ID_fadef512>> was exposed because <<PII_NAME_463218e2>> accidentally shared the dashboard link which embedded a signed cookie value <<CREDENTIAL_539e2875>>.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "As part of the retro, Hayashi Riku summarised the timeline and flagged that the internal service model-registry lacked circuit-breakers, which we'll address in Q3.",
+      "masked": "As part of the retro, <<PII_NAME_ca612ccc>> summarised the timeline and flagged that the internal service <<INTERNAL_URL_3d916499>> lacked circuit-breakers, which we'll address in Q3.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "## Findings\n\n- A long-lived token `DEV:W43S0-JWWZODO` was discovered in the build cache.\n- The related service `model-registry` accepts it without IP allowlisting.\n- Reporter: Noah Walker.",
+      "masked": "## Findings\n\n- A long-lived token `<<CREDENTIAL_9d9547b0>>` was discovered in the build cache.\n- The related service `<<INTERNAL_URL_3d916499>>` accepts it without IP allowlisting.\n- Reporter: <<PII_N",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "At 10:42 JST, Isabella Robinson bumped ticket #4874157 from P3 to P1 after confirming the outage was user-visible and that scheduler-v2 hadn't recovered.",
+      "masked": "At 10:42 JST, <<PII_NAME_d7a48c0a>> bumped ticket #<<USER_ID_96aa3a77>> from P3 to P1 after confirming the outage was user-visible and that <<INTERNAL_URL_ba3297c6>> hadn't recovered.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "インシデント報告: Yamada Kaitoさんが発見した通り、社内サービス scheduler-v2 に対して 短命トークン DEV:WVM9-YAAZ が認証なしで有効化されていました。",
+      "masked": "インシデント報告: <<PII_NAME_94844771>>さんが発見した通り、社内サービス <<INTERNAL_URL_ba3297c6>> に対して 短命トークン DEV:<<CREDENTIAL_67a1d04c>> が認証なしで有効化されていました。",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "DEV:<<CREDENTIAL_67a1d04c>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "The bastion answered ping from 10.3.148.102 exactly once, then went silent; Lucas Thomas will investigate.",
+      "masked": "The bastion answered ping from <<INTERNAL_IP_40c1eaf1>> exactly once, then went silent; <<PII_NAME_f1c1a52b>> will investigate.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "### Impact\n\nCustomer #9534106 was exposed because Noah Clark accidentally shared the dashboard link which embedded a signed cookie value jvSx7m6FoCiRq3KwpLn2hFH.",
+      "masked": "### Impact\n\nCustomer #<<USER_ID_4edd6599>> was exposed because <<PII_NAME_2b5a3333>> accidentally shared the dashboard link which embedded a signed cookie value <<CREDENTIAL_d067dca3>>.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "At 10:42 JST, Olivia Lewis bumped ticket #1875413 from P3 to P1 after confirming the outage was user-visible and that metrics-collector hadn't recovered.",
+      "masked": "At 10:42 JST, <<PII_NAME_02695292>> bumped ticket #<<USER_ID_a135f69c>> from <<INTERNAL_URL_9f9853b3>> to <<INTERNAL_URL_fbeae7c1>> after confirming the outage was user-visible and that <<INTERNAL_URL",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "INTERNAL_URL_9fd6a694"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "At 10:42 JST, Charlotte Martinez bumped ticket #2848893 from P3 to P1 after confirming the outage was user-visible and that quota-svc hadn't recovered.",
+      "masked": "At 10:42 JST, <<PII_NAME_6cba86b3>> bumped ticket #<<USER_ID_6c65f3ac>> from <<INTERNAL_URL_9f9853b3>> to <<INTERNAL_URL_fbeae7c1>> after confirming the outage was user-visible and that <<INTERNAL_URL",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "nit: pls move a9UfS8IgEAlHa5NM5 out of the repo and into our secret store before merging, otherwise anyone with read access sees it",
+      "masked": "nit: pls move <<CREDENTIAL_c96d6f8b>> out of the repo and into our secret store before merging, otherwise anyone with read access sees it",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "<<CREDENTIAL_c96d6f8b>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "Fujita Akari: can you rotate the shared secret 6EEjsKeQkB8fcBlSa ? someone committed it to the wiki on monday",
+      "masked": "<<PII_NAME_f5e20d64>>: can you rotate the shared secret <<CREDENTIAL_e4a690f2>> ? someone committed it to the wiki on monday",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "CREDENTIAL_e4a690f2"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "deployment annotations include `owner: Yamada Akari` and the sidecar is configured to push metrics to quota-svc on port 9090",
+      "masked": "deployment annotations include `owner: <<PII_NAME_d5b0920f>>` and the sidecar is configured to push metrics to quota-svc on port 9090",
+      "ft_leaked": [
+        "quota-svc"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "LGTM once the log line at line 42 stops printing 10.47.70.96; that's our bastion IP and shouldn't leak to observability",
+      "masked": "LGTM once the log line at line <<INTERNAL_URL_73475cb4>> stops printing <<INTERNAL_IP_13eee7ca>>; that's our bastion IP and shouldn't leak to observability",
+      "ft_leaked": [],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "<<INTERNAL_IP_13eee7ca>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "As part of the retro, Kobayashi Hina summarised the timeline and flagged that the internal service model-registry lacked circuit-breakers, which we'll address in Q3.",
+      "masked": "As part of the retro, <<PII_NAME_65528c88>> summarised the timeline and flagged that the internal service model-registry lacked circuit-breakers, which we'll address in Q3.",
+      "ft_leaked": [
+        "model-registry"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "Lucas Anderson: ok i'll page Shimizu Kaito — they own model-registry this week and the latency is spiking",
+      "masked": "<<PII_NAME_42225526>>: ok i'll page <<PII_NAME_306dd6cc>> — they own model-registry this week and the latency is spiking",
+      "ft_leaked": [
+        "model-registry"
+      ],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "306dd6cc"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "deployment annotations include `owner: Yamada Nanami` and the sidecar is configured to push metrics to scheduler-v2 on port 9090",
+      "masked": "deployment annotations include `owner: <<PII_NAME_49d19fd4>>` and the sidecar is configured to push metrics to scheduler-v2 on port 9090",
+      "ft_leaked": [
+        "scheduler-v2"
+      ],
+      "verifier_ok": false,
+      "verifier_leaks": [
+        "<<PII_NAME_49d19fd4>>"
+      ],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "## Findings\n\n- A long-lived token `BETA:9FH5Y-QUKGCKL` was discovered in the build cache.\n- The related service `notification-hub` accepts it without IP allowlisting.\n- Reporter: Liam Thomas.",
+      "masked": "## Findings\n\n- A long-lived token `<<CREDENTIAL_5db1c208>>` was discovered in the build cache.\n- The related service `<<INTERNAL_URL_a82d4365>>` accepts it without IP allowlisting.\n- Reporter: <<PII_N",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "Post-mortem: During the 02:14 incident, Charlotte Clark noticed that risk-engine was returning 5xx. On-call rotated the pod and the upstream recovered within 8 minutes.",
+      "masked": "Post-mortem: During the 02:14 incident, <<PII_NAME_a43032ad>> noticed that <<INTERNAL_URL_a8fbb5c7>> was returning 5xx. On-call rotated the pod and the upstream recovered within 8 minutes.",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "SRE memo: チケット #358382 の root cause は quota-svc の設定漏れ。assigned to Sophia Walker.",
+      "masked": "SRE memo: チケット #<<USER_ID_59c9ffaa>> の root cause は quota-svc の設定漏れ。assigned to <<PII_NAME_13bbb161>>.",
+      "ft_leaked": [
+        "quota-svc"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "## Findings\n\n- A long-lived token `INFRA:1XK9HU-R718E` was discovered in the build cache.\n- The related service `audit-log` accepts it without IP allowlisting.\n- Reporter: Liam Walker.",
+      "masked": "## Findings\n\n- A long-lived token `<<CREDENTIAL_57fdbf6b>>` was discovered in the build cache.\n- The related service `audit-log` accepts it without IP allowlisting.\n- Reporter: Liam Walker.",
+      "ft_leaked": [
+        "audit-log",
+        "Liam Walker"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "deployment annotations include `owner: Nakamura Riku` and the sidecar is configured to push metrics to notification-hub on port 9090",
+      "masked": "deployment annotations include `owner: <<PII_NAME_cf671783>>` and the sidecar is configured to push metrics to <<INTERNAL_URL_a82d4365>> on port 9090",
+      "ft_leaked": [],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "As part of the retro, Fujita Riku summarised the timeline and flagged that the internal service model-registry lacked circuit-breakers, which we'll address in Q3.",
+      "masked": "As part of the retro, <<PII_NAME_b618a416>> summarised the timeline and flagged that the internal service model-registry lacked circuit-breakers, which we'll address in Q3.",
+      "ft_leaked": [
+        "model-registry"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    },
+    {
+      "input": "[ops] Isabella Robinson escalated to Nakamura Hina at 03:12 — 内部ホスト scheduler-v2 returning 502s, token RxwPGsPrsBgNTkGaiEOM rotated immediately.",
+      "masked": "[ops] <<PII_NAME_d7a48c0a>> escalated to Nakamura Hina at 03:12 — 内部ホスト <<INTERNAL_URL_ba3297c6>> returning 502s, token <<CREDENTIAL_87a99b05>> rotated immediately.",
+      "ft_leaked": [
+        "Nakamura Hina"
+      ],
+      "verifier_ok": true,
+      "verifier_leaks": [],
+      "verifier_caught_of_ft_leak": []
+    }
+  ]
+}

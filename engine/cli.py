@@ -13,19 +13,18 @@ def main() -> None:
     ap.add_argument("input", nargs="?", help="Input file path. Reads stdin if omitted.")
     ap.add_argument("--text", action="store_true", help="Treat input as plain text (default: HAR).")
     ap.add_argument("--llm", action="store_true", help="Enable LLM detector.")
+    ap.add_argument("--verifier", action="store_true", help="Run Qwen verifier on the masked output.")
     args = ap.parse_args()
 
     raw = open(args.input, "r", encoding="utf-8").read() if args.input else sys.stdin.read()
 
-    engine = PentectEngine(use_llm=args.llm)
+    engine = PentectEngine(use_llm=args.llm, use_verifier=args.verifier)
     result = engine.mask_text(raw) if args.text else engine.mask_har(raw)
 
-    json.dump(
-        {"masked_text": result.masked_text, "map": result.map, "summary": result.summary},
-        sys.stdout,
-        ensure_ascii=False,
-        indent=2,
-    )
+    payload = {"masked_text": result.masked_text, "map": result.map, "summary": result.summary}
+    if result.verifier is not None:
+        payload["verifier"] = result.verifier
+    json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
 
 
