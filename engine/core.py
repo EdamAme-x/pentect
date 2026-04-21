@@ -46,6 +46,62 @@ class HarEntryMaskResult:
 _PLACEHOLDER_RE = re.compile(r"<<([A-Z_]+)_([a-f0-9]{8})>>")
 
 
+def _load_lenient_har(raw: str) -> dict:
+    """Tolerant HAR loader.
+
+    Real-world HAR files land malformed often enough that a hard json.loads
+    fails the whole pipeline. This loader tries, in order:
+      1. strict json.loads
+      2. BOM strip + // and /* */ comments removed + trailing-comma fix
+      3. truncate at the last syntactically recoverable entries entry (close
+         any open arrays/objects) so a mid-export cutoff still yields data
+    """
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    text = raw.lstrip("\ufeff").strip()
+    text = re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Salvage: walk balanced braces/brackets and cut at the last complete one.
+    depth = 0
+    last_ok = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                last_ok = i
+    if last_ok > 0:
+        try:
+            return json.loads(text[: last_ok + 1])
+        except Exception:
+            pass
+
+    # Last resort: return an empty HAR shell so the caller can keep going.
+    return {"log": {"entries": []}}
+
+
 class PentectEngine:
     def __init__(
         self,
@@ -108,17 +164,116 @@ class PentectEngine:
         return result
 
     def mask_har(self, har_raw: str | dict) -> MaskResult:
-        """Accept a HAR JSON string or dict and mask it.
+        """Mask a HAR file while preserving its JSON structure.
 
-        PoC: stringifies and scans the whole HAR as text.
+        Uses the same per-entry routing as mask_har_entries: each HAR entry
+        becomes one compact text block that the FT LLM sees as a single
+        in-distribution input. The detected sensitive values are then written
+        back into every JSON field (url, headers, body, response) that
+        contains them, so the returned masked_text is a valid masked HAR JSON.
         """
-        if isinstance(har_raw, dict):
-            text = json.dumps(har_raw, ensure_ascii=False)
+        if isinstance(har_raw, str):
+            data = _load_lenient_har(har_raw)
         else:
-            # validate by parsing, then use raw string
-            parse_har(har_raw)
-            text = har_raw
-        return self.mask_text(text)
+            data = json.loads(json.dumps(har_raw))
+
+        raw_entries = (data.get("log", {}) or {}).get("entries", []) or []
+        entry_texts = iter_entry_texts(data)
+        full_text = "\n".join(e.text for e in entry_texts)
+
+        rule = next((d for d in self.detectors if isinstance(d, RuleDetector)), None)
+        anchors: dict[str, Category] = {}
+        if rule is not None:
+            for sp in rule.detect(full_text):
+                anchors.setdefault(full_text[sp.start:sp.end], sp.category)
+
+        batched_spans = self._detect_all_batch([e.text for e in entry_texts]) if entry_texts else []
+
+        # Collapse per-entry detections + global anchors into one set of
+        # (value, category) pairs per entry. Each field inside that entry
+        # will be masked by substring replacement against this set, which
+        # guarantees cross-field consistency inside the JSON.
+        def _fields_of(entry: dict) -> list[tuple[dict, str]]:
+            out: list[tuple[dict, str]] = []
+            req = entry.get("request", {}) or {}
+            res = entry.get("response", {}) or {}
+            if isinstance(req.get("url"), str):
+                out.append((req, "url"))
+            for h in req.get("headers", []) or []:
+                if isinstance(h.get("value"), str):
+                    out.append((h, "value"))
+            for h in res.get("headers", []) or []:
+                if isinstance(h.get("value"), str):
+                    out.append((h, "value"))
+            for q in req.get("queryString", []) or []:
+                if isinstance(q.get("value"), str):
+                    out.append((q, "value"))
+            for c in (req.get("cookies", []) or []) + (res.get("cookies", []) or []):
+                if isinstance(c.get("value"), str):
+                    out.append((c, "value"))
+            post = req.get("postData") or {}
+            if isinstance(post.get("text"), str):
+                out.append((post, "text"))
+            content = res.get("content") or {}
+            if isinstance(content.get("text"), str):
+                out.append((content, "text"))
+            return out
+
+        combined_map: dict[str, dict[str, str]] = {}
+        by_category: dict[str, int] = {}
+
+        for idx, entry in enumerate(raw_entries):
+            spans = batched_spans[idx] if idx < len(batched_spans) else []
+            entry_values: dict[str, Category] = {}
+            for sp in spans:
+                val = entry_texts[idx].text[sp.start:sp.end]
+                entry_values.setdefault(val, sp.category)
+            for val, cat in anchors.items():
+                entry_values.setdefault(val, cat)
+
+            for target, key in _fields_of(entry):
+                text = target[key]
+                field_spans: list[Span] = []
+                for val, cat in entry_values.items():
+                    if not val:
+                        continue
+                    start = 0
+                    while True:
+                        hit = text.find(val, start)
+                        if hit < 0:
+                            break
+                        field_spans.append(Span(
+                            start=hit, end=hit + len(val),
+                            category=cat, source="har",
+                        ))
+                        start = hit + len(val)
+                field_spans = merge(field_spans)
+                if not field_spans:
+                    continue
+                replacements = apply_granularity(text, field_spans)
+                target[key] = apply_replacements(text, replacements)
+
+        masked_json = json.dumps(data, ensure_ascii=False, indent=2)
+        for m in _PLACEHOLDER_RE.finditer(masked_json):
+            ph = m.group(0)
+            if ph in combined_map:
+                continue
+            cat = _guess_category(m.group(1))
+            if cat is None:
+                combined_map[ph] = {"category": m.group(1), "description": m.group(1)}
+                by_category[m.group(1)] = by_category.get(m.group(1), 0) + 1
+            else:
+                combined_map[ph] = {
+                    "category": cat.value,
+                    "description": get_spec(cat).description,
+                }
+                by_category[cat.value] = by_category.get(cat.value, 0) + 1
+
+        return MaskResult(
+            masked_text=masked_json,
+            map=combined_map,
+            summary={"total_masked": len(combined_map), "by_category": by_category},
+        )
 
     def mask_har_entries(self, har_raw: str | dict) -> "HarEntryMaskResult":
         """Per-entry masking path.

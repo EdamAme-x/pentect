@@ -100,6 +100,7 @@ class LLMDetector:
         adapter = os.environ.get("PENTECT_LLM_ADAPTER")
         use_4bit = os.environ.get("PENTECT_LLM_4BIT", "").lower() in {"1", "true"}
         self._max_new_tokens = int(os.environ.get("PENTECT_LLM_MAX_TOK", "384"))
+        self._micro_batch = int(os.environ.get("PENTECT_LLM_MICROBATCH", "4"))
 
         self._tok = AutoTokenizer.from_pretrained(model_id)
         if self._tok.pad_token is None:
@@ -124,22 +125,47 @@ class LLMDetector:
         self._model.eval()
 
     def _generate(self, prompts: list[str]) -> list[str]:
+        """Generate with automatic micro-batching.
+
+        Large HARs produce dozens of prompts; running them as one padded
+        tensor OOMs 16GB cards. Split into PENTECT_LLM_MICROBATCH chunks.
+        If a single-prompt chunk still OOMs, raise — silently skipping would
+        let sensitive spans through as a masking fallback, which is exactly
+        the failure mode we refuse to have.
+        """
         import torch
 
         tok, model = self._tok, self._model
-        enc = tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(model.device)
-        with torch.inference_mode():
-            out = model.generate(
-                **enc,
-                max_new_tokens=self._max_new_tokens,
-                do_sample=False,
-                pad_token_id=tok.pad_token_id,
-                use_cache=True,
-            )
-        # strip input tokens (left-padded so input_ids are aligned at the right)
-        prompt_len = enc["input_ids"].shape[1]
-        gen_only = out[:, prompt_len:]
-        return tok.batch_decode(gen_only, skip_special_tokens=True)
+        results: list[str] = []
+        size = max(1, self._micro_batch)
+        i = 0
+        while i < len(prompts):
+            chunk = prompts[i : i + size]
+            try:
+                enc = tok(chunk, return_tensors="pt", padding=True,
+                          truncation=True, max_length=1024).to(model.device)
+                with torch.inference_mode():
+                    out = model.generate(
+                        **enc,
+                        max_new_tokens=self._max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=tok.pad_token_id,
+                        use_cache=True,
+                    )
+                prompt_len = enc["input_ids"].shape[1]
+                gen_only = out[:, prompt_len:]
+                results.extend(tok.batch_decode(gen_only, skip_special_tokens=True))
+                del enc, out, gen_only
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                i += size
+            except torch.cuda.OutOfMemoryError:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if size == 1:
+                    raise
+                size = max(1, size // 2)
+        return results
 
     def _to_spans(self, text: str, raw: str) -> list[Span]:
         spans: list[Span] = []
