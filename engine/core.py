@@ -179,13 +179,17 @@ class PentectEngine:
 
         raw_entries = (data.get("log", {}) or {}).get("entries", []) or []
         entry_texts = iter_entry_texts(data)
-        full_text = "\n".join(e.text for e in entry_texts)
 
+        # Rule anchors come from the full serialized HAR so values that live in
+        # response bodies / query strings / anywhere JSON are still caught even
+        # when the compact entry text (used only as the LLM's in-distribution
+        # input) wouldn't include them.
         rule = next((d for d in self.detectors if isinstance(d, RuleDetector)), None)
         anchors: dict[str, Category] = {}
         if rule is not None:
-            for sp in rule.detect(full_text):
-                anchors.setdefault(full_text[sp.start:sp.end], sp.category)
+            rule_source = json.dumps(data, ensure_ascii=False)
+            for sp in rule.detect(rule_source):
+                anchors.setdefault(rule_source[sp.start:sp.end], sp.category)
 
         batched_spans = self._detect_all_batch([e.text for e in entry_texts]) if entry_texts else []
 
