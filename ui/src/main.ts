@@ -5,6 +5,7 @@ const outputEl = document.getElementById("output") as HTMLPreElement;
 const runBtn = document.getElementById("run") as HTMLButtonElement;
 const sampleBtn = document.getElementById("sample") as HTMLButtonElement;
 const statusEl = document.getElementById("status") as HTMLSpanElement;
+const backendEl = document.getElementById("backend") as HTMLSelectElement;
 
 const PLACEHOLDER_RE = /<<[A-Z_]+_[0-9a-f]{8}>>/g;
 
@@ -63,6 +64,7 @@ type MaskResponse = {
   masked_text: string;
   map: Record<string, unknown>;
   summary: { total_masked?: number } & Record<string, unknown>;
+  backend?: string;
 };
 
 function clearNode(node: Node): void {
@@ -91,18 +93,20 @@ async function runMask(): Promise<void> {
     statusEl.textContent = "empty input";
     return;
   }
+  const backend = backendEl.value || undefined;
   runBtn.disabled = true;
-  statusEl.textContent = "masking...";
+  statusEl.textContent = `masking (${backend ?? "default"})...`;
   try {
     const res = await fetch("/api/mask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, backend }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data: MaskResponse = await res.json();
     renderMasked(data.masked_text);
-    statusEl.textContent = `masked ${data.summary.total_masked ?? 0}`;
+    const tag = data.backend ?? backend ?? "?";
+    statusEl.textContent = `[${tag}] masked ${data.summary.total_masked ?? 0}`;
   } catch (e) {
     statusEl.textContent = `error: ${(e as Error).message}`;
   } finally {

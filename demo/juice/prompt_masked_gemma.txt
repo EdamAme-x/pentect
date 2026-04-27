@@ -1,0 +1,174 @@
+You are a security reviewer. You will be given a compact HAR summary
+(a list of HTTP requests a pentester captured against a single target). List the
+specific vulnerabilities you can identify from this trace.
+
+For each finding, output:
+- title (short, e.g. "SQL injection in login")
+- evidence (the exact line or request that shows it)
+- severity (info/low/medium/high/critical)
+- brief explanation
+
+Use a numbered list. Only include findings you can actually point to in the
+trace. Do not speculate about things that are not in the trace.
+
+HAR summary (pentect-masked):
+---
+GET http://<<INTERNAL_URL_HOST_f4703816>>/
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/chunk-24EZLZ4I.js
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/chunk-T3PSKZ45.js
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/chunk-4MIYPPGW.js
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/chunk-LHKS7QUN.js
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/chunk-TWZW5B45.js
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/polyfills.js
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/main.js
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/scripts.js
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/styles.css
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/i18n/en.json
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/socket.io/?EIO=4&transport=polling&t=Psg_TQC
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_6d488933>>
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_e64d06d3>>
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Challenges/?name=Score%20Board
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/languages
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_6d488933>>
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_e64d06d3>>
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Challenges/?name=Score%20Board
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_e64d06d3>>
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_e64d06d3>>
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_e64d06d3>>
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Quantitys/
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/products/search?q=
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/JuiceShop_Logo.png
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/media/MaterialIcons-Regular-6R3D3MIQ.woff2
+  -> 200 OK
+POST http://<<INTERNAL_URL_HOST_f4703816>>/socket.io/?EIO=4&transport=polling&t=Psg_TRO&sid=Yp_crOiZaE3qykxGAAAE
+  body: 40
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/socket.io/?EIO=4&transport=polling&t=Psg_TRP&sid=Yp_crOiZaE3qykxGAAAE
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_e64d06d3>>
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/apple_juice.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/apple_pressings.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/banana_juice.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/artwork2.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/carrot_juice.jpeg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/eggfruit_juice.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/fruit_press.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/green_smoothie.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/permafrost.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/lemon_juice.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/melon_bike.jpeg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/assets/public/images/products/fan_facemask.jpg
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/products/search?q=apple
+  cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Products/<<USER_ID_6b86b273>>
+  cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Products/<<USER_ID_d4735e3a>>
+  cookie: language=en
+  -> 200 OK
+POST http://<<INTERNAL_URL_HOST_f4703816>>/rest/user/login
+  cookie: language=en
+  -> 200 OK
+  resp: {"authentication":{"token":"<<CREDENTIAL_2340d9af>>.eyJzdGF0dXMiOiJzdWNjZXNzIiwiZGF0YSI6eyJpZCI6MSwidXNlcm5hbWUiOiIiLCJlbWFpbCI6ImFkbWluQGp1aWNlLXNoLm9wIiwicGFzc3dvcmQiOiIwMTkyMDIzYTdiYmQ3MzI1MDUxNmYwNjlkZjE4YjUwMCIsInJvbGUiOiJhZG1pbiIsImRlbHV4ZVRva2VuIjoiIiwibGFzdExvZ2luSXAiOiIiLCJwcm9maWxlSW1hZ2UiOiJhc3NldHMvcHVibGljL2ltYWdlcy91cGxvYWRzL2RlZmF1bHRBZG1pbi5wbmciLCJ0b3RwU2VjcmV0IjoiIiw
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/user/whoami
+  Authorization: Bearer <<CREDENTIAL_99ed0ee3>>
+  cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Baskets/<<USER_ID_6b86b273>>
+  Authorization: Bearer <<CREDENTIAL_99ed0ee3>>
+  cookie: language=en
+  -> 500 Internal Server Error
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/products/search?q=%27%29%29--
+  cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Users/<<USER_ID_6b86b273>>
+  Authorization: Bearer <<CREDENTIAL_99ed0ee3>>
+  cookie: language=en
+  -> 200 OK
+  resp: {"status":"success","data":{"id":1,"username":"","email":"<<PII_EMAIL_LOCAL_8c6976e5>>@juice-sh.op","role":"admin","deluxeToken":"","lastLoginIp":"","profileImage":"assets/public/images/uploads/defaultAdmin.png","isActive":true,"createdAt":"2026-04-20T13:01:18.439Z","updatedAt":"2026-04-20T13:01:18.439Z","deletedAt":null}}
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Users/<<USER_ID_d4735e3a>>
+  Authorization: Bearer <<CREDENTIAL_99ed0ee3>>
+  cookie: language=en
+  -> 200 OK
+  resp: {"status":"success","data":{"id":2,"username":"","email":"<<PII_EMAIL_LOCAL_484ae24e>>@juice-sh.op","role":"customer","deluxeToken":"","lastLoginIp":"","profileImage":"assets/public/images/uploads/default.svg","isActive":true,"createdAt":"2026-04-20T13:01:18.439Z","updatedAt":"2026-04-20T13:01:18.439Z","deletedAt":null}}
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Users/<<USER_ID_4e074085>>
+  Authorization: Bearer <<CREDENTIAL_99ed0ee3>>
+  cookie: language=en
+  -> 200 OK
+  resp: {"status":"success","data":{"id":3,"username":"","email":"<<PII_EMAIL_LOCAL_47d140cb>>@juice-sh.op","role":"customer","deluxeToken":"","lastLoginIp":"","profileImage":"assets/public/images/uploads/default.svg","isActive":true,"createdAt":"2026-04-20T13:01:18.439Z","updatedAt":"2026-04-20T13:01:18.439Z","deletedAt":null}}
+POST http://<<INTERNAL_URL_HOST_f4703816>>/api/Feedbacks
+  Authorization: Bearer <<CREDENTIAL_99ed0ee3>>
+  cookie: language=en
+  -> 401 Unauthorized
+GET http://<<INTERNAL_URL_HOST_f4703816>>/ftp/
+  cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/ftp/package.json.bak
+  cookie: language=en
+  -> 403 Forbidden
+POST http://<<INTERNAL_URL_HOST_f4703816>>/api/BasketItems
+  Authorization: Bearer <<CREDENTIAL_99ed0ee3>>
+  cookie: language=en
+  -> 500 Internal Server Error
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/basket/<<USER_ID_6b86b273>>
+  Authorization: Bearer <<CREDENTIAL_99ed0ee3>>
+  cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/user/whoami?fields=id,email
+  Cookie: language=en
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/captcha/
+  Cookie: language=en
+  -> 200 OK
+---

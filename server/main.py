@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import os
+import threading
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -18,14 +19,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_use_llm = os.environ.get("PENTECT_USE_LLM", "").lower() in {"1", "true"}
+
+_VALID_BACKENDS = ("rule", "gemma", "opf_pf", "hybrid")
+
+
+def _default_backend() -> str:
+    env = os.environ.get("PENTECT_DETECTOR_BACKEND")
+    if env in _VALID_BACKENDS:
+        return env
+    if os.environ.get("PENTECT_USE_LLM", "").lower() in {"1", "true"}:
+        return "gemma"
+    return "rule"
+
+
 _use_verifier = os.environ.get("PENTECT_USE_VERIFIER", "").lower() in {"1", "true"}
-_engine = PentectEngine(use_llm=_use_llm, use_verifier=_use_verifier)
+
+# Lazy engine cache: each backend loads its own (potentially heavy) model only
+# the first time it's asked for. Multiple requests share the cached instance.
+_engine_cache: dict[str, PentectEngine] = {}
+_engine_lock = threading.Lock()
+
+
+def _get_engine(backend: str) -> PentectEngine:
+    with _engine_lock:
+        eng = _engine_cache.get(backend)
+        if eng is None:
+            eng = PentectEngine(use_verifier=_use_verifier, backend=backend)
+            _engine_cache[backend] = eng
+        return eng
+
+
+# Pre-warm the default backend so the first /api/mask isn't slow.
+_get_engine(_default_backend())
 
 
 class MaskRequest(BaseModel):
     text: str
     is_har: bool = True
+    backend: str | None = None  # one of _VALID_BACKENDS; defaults to env
 
 
 class MaskResponse(BaseModel):
@@ -33,25 +64,39 @@ class MaskResponse(BaseModel):
     map: dict
     summary: dict
     verifier: dict | None = None
+    backend: str
 
 
 @app.post("/api/mask", response_model=MaskResponse)
 def mask(req: MaskRequest) -> MaskResponse:
+    backend = req.backend or _default_backend()
+    if backend not in _VALID_BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}; valid: {_VALID_BACKENDS}")
+    engine = _get_engine(backend)
     if req.is_har:
         try:
-            result = _engine.mask_har(req.text)
+            result = engine.mask_har(req.text)
         except Exception:  # noqa: BLE001
-            result = _engine.mask_text(req.text)
+            result = engine.mask_text(req.text)
     else:
-        result = _engine.mask_text(req.text)
+        result = engine.mask_text(req.text)
     return MaskResponse(
         masked_text=result.masked_text,
         map=result.map,
         summary=result.summary,
         verifier=result.verifier,
+        backend=backend,
     )
 
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "detectors": [d.name for d in _engine.detectors]}
+    default = _default_backend()
+    eng = _engine_cache.get(default)
+    return {
+        "status": "ok",
+        "default_backend": default,
+        "loaded_backends": sorted(_engine_cache.keys()),
+        "available_backends": list(_VALID_BACKENDS),
+        "detectors": [d.name for d in eng.detectors] if eng else [],
+    }

@@ -36,10 +36,17 @@ from engine.core import PentectEngine
 
 HAR = Path(__file__).parent / "captured.har"
 OUT_RAW = Path(__file__).parent / "raw_summary.txt"
-OUT_MASKED = Path(__file__).parent / "masked_summary.txt"
 OUT_PROMPT_RAW = Path(__file__).parent / "prompt_raw.txt"
-OUT_PROMPT_MASKED = Path(__file__).parent / "prompt_masked.txt"
-OUT_COMPARE = Path(__file__).parent / "compare.md"
+
+
+def _masked_paths(backend: str) -> tuple[Path, Path, Path]:
+    suffix = f"_{backend}"
+    base = Path(__file__).parent
+    return (
+        base / f"masked_summary{suffix}.txt",
+        base / f"prompt_masked{suffix}.txt",
+        base / f"compare{suffix}.md",
+    )
 
 
 SYSTEM_PROMPT = """You are a security reviewer. You will be given a compact HAR summary
@@ -192,29 +199,50 @@ def _call_claude(prompt: str) -> str:
     return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
 
 
+def _build_engine(backend: str) -> PentectEngine:
+    if backend == "rule":
+        return PentectEngine(backend="rule")
+    if backend == "gemma":
+        os.environ.setdefault("PENTECT_LLM_ADAPTER", "training/runs/gemma3_4b_lora")
+        os.environ.setdefault("PENTECT_LLM_4BIT", "1")
+        return PentectEngine(backend="gemma")
+    if backend == "opf_pf":
+        os.environ.setdefault(
+            "PENTECT_PF_CHECKPOINT", "training/runs/opf_pentect_v4_e3"
+        )
+        return PentectEngine(backend="opf_pf")
+    if backend == "hybrid":
+        os.environ.setdefault(
+            "PENTECT_PF_CHECKPOINT", "training/runs/opf_pentect_v4_e3"
+        )
+        os.environ.setdefault("PENTECT_LLM_ADAPTER", "training/runs/gemma3_4b_lora")
+        os.environ.setdefault("PENTECT_LLM_4BIT", "1")
+        return PentectEngine(backend="hybrid")
+    raise ValueError(f"unknown backend {backend!r}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--api", action="store_true",
                     help="Actually call Claude (requires ANTHROPIC_API_KEY). "
                          "Default: write prompts to disk and stop.")
     ap.add_argument("--no-ft", action="store_true",
-                    help="Skip the FT Gemma LLM detector (use rule-only). "
-                         "Useful when the adapter is currently being retrained.")
+                    help="Legacy alias for --backend rule.")
+    ap.add_argument("--backend", default=None,
+                    choices=["rule", "gemma", "opf_pf", "hybrid"],
+                    help="Detector backend to use (default: gemma, or rule if --no-ft).")
     args = ap.parse_args()
+
+    backend = args.backend or ("rule" if args.no_ft else "gemma")
+    out_masked, out_prompt_masked, out_compare = _masked_paths(backend)
 
     print(f">>> extracting summary from {HAR.name}")
     raw_summary = _extract_summary(HAR)
     OUT_RAW.write_text(raw_summary, encoding="utf-8")
     print(f"    wrote {OUT_RAW}  ({len(raw_summary)} chars)")
 
-    if args.no_ft:
-        print(">>> masking summary with Pentect (RULE ONLY, --no-ft)")
-        engine = PentectEngine(use_llm=False)
-    else:
-        print(">>> masking summary with Pentect (rule + FT Gemma, per-entry)")
-        os.environ.setdefault("PENTECT_LLM_ADAPTER", "training/runs/gemma3_4b_lora")
-        os.environ.setdefault("PENTECT_LLM_4BIT", "1")
-        engine = PentectEngine(use_llm=True)
+    print(f">>> masking summary with Pentect (backend={backend}, per-entry)")
+    engine = _build_engine(backend)
     # Per-entry path: split the filtered summary into its individual request
     # blocks and mask each independently. Each block is short (in-distribution
     # for the FT model) and cross-block consistency is preserved via
@@ -222,24 +250,24 @@ def main() -> None:
     blocks = _split_summary_blocks(raw_summary)
     print(f">>> masking {len(blocks)} entry blocks in one batch")
     masked_text = _mask_blocks(engine, blocks)
-    OUT_MASKED.write_text(masked_text, encoding="utf-8")
+    out_masked.write_text(masked_text, encoding="utf-8")
     placeholder_count = len(set(re.findall(r"<<[A-Z_]+_[a-f0-9]{8}>>", masked_text)))
-    print(f"    wrote {OUT_MASKED}  ({len(masked_text)} chars, "
+    print(f"    wrote {out_masked}  ({len(masked_text)} chars, "
           f"{placeholder_count} unique placeholders)")
 
     prompt_raw = _build_prompt(raw_summary, "raw, unmasked")
-    prompt_masked = _build_prompt(masked_text, "pentect-masked")
+    prompt_masked = _build_prompt(masked_text, f"pentect-masked ({backend})")
     OUT_PROMPT_RAW.write_text(prompt_raw, encoding="utf-8")
-    OUT_PROMPT_MASKED.write_text(prompt_masked, encoding="utf-8")
+    out_prompt_masked.write_text(prompt_masked, encoding="utf-8")
     print(f"    wrote {OUT_PROMPT_RAW}")
-    print(f"    wrote {OUT_PROMPT_MASKED}")
+    print(f"    wrote {out_prompt_masked}")
 
     if not args.api:
         print("\n--- dry-run complete ---")
         print("To run both against Claude and compare:")
         print("  pip install anthropic")
         print("  export ANTHROPIC_API_KEY=...")
-        print("  python demo/juice/identify_vulns.py --api")
+        print(f"  python demo/juice/identify_vulns.py --backend {backend} --api")
         return
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -252,14 +280,15 @@ def main() -> None:
 
     report = (
         "# Pentect end-to-end demo: vulnerability identification\n\n"
+        f"Backend: `{backend}`  \n"
         f"Source HAR: `{HAR.name}`  ({placeholder_count} unique placeholders inserted)\n\n"
         "## Vulns found from RAW (unmasked) trace\n\n"
         f"{ans_raw}\n\n"
         "## Vulns found from PENTECT-MASKED trace\n\n"
         f"{ans_masked}\n"
     )
-    OUT_COMPARE.write_text(report, encoding="utf-8")
-    print(f"\nwrote {OUT_COMPARE}")
+    out_compare.write_text(report, encoding="utf-8")
+    print(f"\nwrote {out_compare}")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ Accepts HAR or plain text and runs: parse → detect → merge → granularity �
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -103,21 +104,52 @@ def _load_lenient_har(raw: str) -> dict:
 
 
 class PentectEngine:
+    """Pentect masking engine.
+
+    Backends (controlled by `backend=` or env `PENTECT_DETECTOR_BACKEND`):
+      - "rule"   : RuleDetector only (lightweight, no model loaded)
+      - "gemma"  : RuleDetector + Gemma 3 4B FT (the original LLMDetector)
+      - "opf_pf" : RuleDetector + Privacy Filter FT (fast, 1.5B MoE)
+      - "hybrid" : RuleDetector + Privacy Filter + Gemma "second opinion"
+
+    `use_llm=True` is a legacy alias for backend="gemma".
+    """
+
     def __init__(
         self,
         detectors: list[Detector] | None = None,
         *,
         use_llm: bool = False,
         use_verifier: bool = False,
+        backend: str | None = None,
     ) -> None:
         if detectors is not None:
             self.detectors: list[Detector] = detectors
+            self.backend = "custom"
         else:
+            chosen = backend or os.environ.get("PENTECT_DETECTOR_BACKEND")
+            if chosen is None:
+                chosen = "gemma" if use_llm else "rule"
+            self.backend = chosen
             self.detectors = [RuleDetector()]
-            if use_llm:
+            if chosen == "rule":
+                pass
+            elif chosen == "gemma":
                 from engine.detectors.llm import LLMDetector
 
                 self.detectors.append(LLMDetector())
+            elif chosen == "opf_pf":
+                from engine.detectors.opf_pf import PrivacyFilterDetector
+
+                self.detectors.append(PrivacyFilterDetector())
+            elif chosen == "hybrid":
+                from engine.detectors.hybrid import HybridDetector
+
+                self.detectors.append(HybridDetector())
+            else:
+                raise ValueError(
+                    f"unknown backend {chosen!r} (expected: rule|gemma|opf_pf|hybrid)"
+                )
 
         self._verifier = None
         if use_verifier:

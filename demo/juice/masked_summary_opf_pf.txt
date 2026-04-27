@@ -1,0 +1,33 @@
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_6d488933>>
+  -> 200 OK
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/admin/<<USER_ID_e64d06d3>>
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Challenges/?name=Score%20Board
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/languages
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Quantitys/
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/products/search?q=
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/products/search?q=apple
+  cookie: language=en
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Products/<<USER_ID_6b86b273>>
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Products/<<USER_ID_d4735e3a>>
+POST http://<<INTERNAL_URL_HOST_f4703816>>/rest/user/login
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/user/whoami
+  Authorization: Bearer <<CREDENTIAL_99ed0ee3>>
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Baskets/<<USER_ID_6b86b273>>
+  -> 500 Internal Server Error
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/products/search?q=%27%29%29--
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Users/<<USER_ID_6b86b273>>
+  resp: {"status":"success","data":{"id":1,"username":"","email":"<<INTERNAL_URL_6f907313>>","role":"admin","deluxeToken":"","lastLoginIp":"","profileImage":"assets<<INTERNAL_URL_36fa0e19>>/uploads<<INTERNAL_URL_45fc9906>>","isActive":true,"createdAt":"<<INTERNAL_IP_c0b54284>>:01:18.439Z","updatedAt":"2026-04-20T13:01:18.439Z","deletedAt":null}}
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Users/<<USER_ID_d4735e3a>>
+  resp: {"status":"success","data":{"id":2,"username":"","email":"<<CREDENTIAL_93f46120>>","role":"<<INTERNAL_URL_b6c45863>>","deluxeToken":"","lastLoginIp":"","profileImage":"assets/public/images/uploads<<INTERNAL_URL_4f323ba2>>","isActive":true,"createdAt":"<<INTERNAL_IP_c0b54284>>:01:18.439Z","updatedAt":"<<INTERNAL_IP_9fbcdbd1>>","deletedAt":null}}
+GET http://<<INTERNAL_URL_HOST_f4703816>>/api/Users/<<USER_ID_4e074085>>
+  resp: {"status":"success","data":{"id":3,"username":"","email":"<<INTERNAL_URL_495f3495>>","role":"<<INTERNAL_URL_b6c45863>>","deluxeToken":"","lastLoginIp":"","profileImage":"assets/public/images<<INTERNAL_URL_04fcab89>>","isActive":true,"createdAt":"2026-04-20T13:01:18.439Z","updatedAt":"<<INTERNAL_IP_ce6cb052>>T13:01:18.<<INTERNAL_URL_9baaddeb>>","deletedAt":null}}
+POST http://<<INTERNAL_URL_HOST_f4703816>>/api/Feedbacks
+  -> 401 Unauthorized
+GET http://<<INTERNAL_URL_HOST_f4703816>>/ftp/
+GET http://<<INTERNAL_URL_HOST_f4703816>>/ftp/package.json.bak
+  -> 403 Forbidden
+POST http://<<INTERNAL_URL_HOST_f4703816>>/api/BasketItems
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/basket/<<USER_ID_6b86b273>>
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/user/whoami?fields=id,email
+  Cookie: language=en
+GET http://<<INTERNAL_URL_HOST_f4703816>>/rest/captcha/

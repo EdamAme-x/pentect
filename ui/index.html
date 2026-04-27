@@ -93,6 +93,16 @@
       .status { color: var(--muted); font-size: 12px; margin-left: auto; }
       .ph { color: var(--ph); }
       .empty { color: var(--muted); }
+      select {
+        background: var(--panel);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 5px 8px;
+        font: inherit;
+        font-size: 12px;
+      }
+      .field { color: var(--muted); font-size: 12px; }
     </style>
   </head>
   <body>
@@ -106,6 +116,13 @@
         <div class="bar">
           <button id="run">Mask</button>
           <button id="sample" class="secondary">Sample</button>
+          <span class="field">backend</span>
+          <select id="backend">
+            <option value="rule">rule (no model)</option>
+            <option value="opf_pf">privacy filter FT</option>
+            <option value="gemma">gemma 4B FT</option>
+            <option value="hybrid">hybrid (PF + gemma audit)</option>
+          </select>
           <span class="status" id="status"></span>
         </div>
       </section>

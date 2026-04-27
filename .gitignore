@@ -47,3 +47,7 @@ Thumbs.db
 
 # Claude Code session state
 .claude/
+
+# Playwright MCP scratch dir + ad-hoc screenshots
+.playwright-mcp/
+pentect_demo_*.png
