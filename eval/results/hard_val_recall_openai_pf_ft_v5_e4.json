@@ -1,0 +1,448 @@
+{
+  "val_path": "training/data/hard_val.jsonl",
+  "model": "training/runs/opf_pentect_v5_e4",
+  "num_samples": 60,
+  "num_spans": 157,
+  "scoring": "strict one-directional: gold span must be substring of a detected hit",
+  "overall": {
+    "hit": 117,
+    "total": 157,
+    "recall": 0.7452
+  },
+  "per_category": {
+    "CREDENTIAL": {
+      "hit": 24,
+      "total": 29,
+      "recall": 0.828
+    },
+    "INTERNAL_IP": {
+      "hit": 7,
+      "total": 9,
+      "recall": 0.778
+    },
+    "INTERNAL_URL": {
+      "hit": 12,
+      "total": 41,
+      "recall": 0.293
+    },
+    "PII_NAME": {
+      "hit": 53,
+      "total": 57,
+      "recall": 0.93
+    },
+    "USER_ID": {
+      "hit": 21,
+      "total": 21,
+      "recall": 1.0
+    }
+  },
+  "misses": [
+    {
+      "idx": 0,
+      "category": "INTERNAL_URL",
+      "value": "notification-hub",
+      "input_preview": "deployment annotations include `owner: Yamada Riku` and the sidecar is configured to push metrics to notification-hub on",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 1,
+      "category": "INTERNAL_URL",
+      "value": "data-lake",
+      "input_preview": "values.yaml:\n  upstream:\n    host: data-lake\n    token: OPS:ZIUS5-K9EP1FR\n    audit_contact: Lucas Martinez",
+      "detected_labels": [
+        "secret",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 1,
+      "category": "CREDENTIAL",
+      "value": "OPS:ZIUS5-K9EP1FR",
+      "input_preview": "values.yaml:\n  upstream:\n    host: data-lake\n    token: OPS:ZIUS5-K9EP1FR\n    audit_contact: Lucas Martinez",
+      "detected_labels": [
+        "secret",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 2,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "As part of the retro, Hayashi Haruto summarised the timeline and flagged that the internal service scheduler-v2 lacked c",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 4,
+      "category": "INTERNAL_URL",
+      "value": "event-bus",
+      "input_preview": "Post-mortem: During the 02:14 incident, Noah King noticed that event-bus was returning 5xx. On-call rotated the pod and ",
+      "detected_labels": [
+        "internal_url",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 5,
+      "category": "INTERNAL_IP",
+      "value": "10.102.141.116",
+      "input_preview": "The bastion answered ping from 10.102.141.116 exactly once, then went silent; Isabella Hall will investigate.",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 6,
+      "category": "INTERNAL_URL",
+      "value": "search-api",
+      "input_preview": "[ops] Sophia Martinez escalated to Hayashi Hina at 03:12 — 内部ホスト search-api returning 502s, token 9ZkAFvmtSbIBbuMFd9W8g ",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "secret"
+      ]
+    },
+    {
+      "idx": 9,
+      "category": "PII_NAME",
+      "value": "Inoue Kaito",
+      "input_preview": "[ops] Ethan Anderson escalated to Inoue Kaito at 03:12 — 内部ホスト scheduler-v2 returning 502s, token peqTmT8ExDQVMNejpUsJad",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "internal_url",
+        "secret"
+      ]
+    },
+    {
+      "idx": 9,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "[ops] Ethan Anderson escalated to Inoue Kaito at 03:12 — 内部ホスト scheduler-v2 returning 502s, token peqTmT8ExDQVMNejpUsJad",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "internal_url",
+        "secret"
+      ]
+    },
+    {
+      "idx": 10,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "At 10:42 JST, Ethan King bumped ticket #6903523 from P3 to P1 after confirming the outage was user-visible and that sche",
+      "detected_labels": [
+        "private_person",
+        "account_number",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 12,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "values.yaml:\n  upstream:\n    host: model-registry\n    token: PLAT:BZ6RV-C77T\n    audit_contact: Ethan Young",
+      "detected_labels": [
+        "internal_url",
+        "secret",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 13,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "reviewer: this endpoint hits model-registry without a timeout — we had an incident in Q1 exactly because of this pattern",
+      "detected_labels": [
+        "internal_url",
+        "account_number"
+      ]
+    },
+    {
+      "idx": 14,
+      "category": "CREDENTIAL",
+      "value": "BETA:KM8E-N1L2D",
+      "input_preview": "Sophia Walker: hey, did the deploy finish? the token BETA:KM8E-N1L2D expired 3h ago and our bot stopped posting",
+      "detected_labels": [
+        "private_person",
+        "secret"
+      ]
+    },
+    {
+      "idx": 17,
+      "category": "CREDENTIAL",
+      "value": "zrt7tJwz19wmTma3AYz2CkaI",
+      "input_preview": "nit: pls move zrt7tJwz19wmTma3AYz2CkaI out of the repo and into our secret store before merging, otherwise anyone with r",
+      "detected_labels": [
+        "secret"
+      ]
+    },
+    {
+      "idx": 21,
+      "category": "INTERNAL_URL",
+      "value": "event-bus",
+      "input_preview": "[ops] Sophia Robinson escalated to Nakamura Yui at 03:12 — 内部ホスト event-bus returning 502s, token LGEkadblj4gLOmzGNOzMFdM",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "internal_url",
+        "secret"
+      ]
+    },
+    {
+      "idx": 22,
+      "category": "INTERNAL_URL",
+      "value": "data-lake",
+      "input_preview": "deployment annotations include `owner: Nakamura Yui` and the sidecar is configured to push metrics to data-lake on port ",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 23,
+      "category": "INTERNAL_URL",
+      "value": "event-bus",
+      "input_preview": "values.yaml:\n  upstream:\n    host: event-bus\n    token: OPS:E2XK-PAJKZN-1VRK02\n    audit_contact: Lucas Thomas",
+      "detected_labels": [
+        "internal_url",
+        "internal_url",
+        "secret",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 24,
+      "category": "PII_NAME",
+      "value": "Liam Thomas",
+      "input_preview": "At 10:42 JST, Liam Thomas bumped ticket #3301537 from P3 to P1 after confirming the outage was user-visible and that sea",
+      "detected_labels": [
+        "account_number"
+      ]
+    },
+    {
+      "idx": 24,
+      "category": "INTERNAL_URL",
+      "value": "search-api",
+      "input_preview": "At 10:42 JST, Liam Thomas bumped ticket #3301537 from P3 to P1 after confirming the outage was user-visible and that sea",
+      "detected_labels": [
+        "account_number"
+      ]
+    },
+    {
+      "idx": 28,
+      "category": "INTERNAL_URL",
+      "value": "notification-hub",
+      "input_preview": "SRE memo: チケット #7096504 の root cause は notification-hub の設定漏れ。assigned to Sophia Young.",
+      "detected_labels": [
+        "private_person",
+        "account_number",
+        "internal_url",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 29,
+      "category": "CREDENTIAL",
+      "value": "PLAT:OSJS9X2-GZE9D9-05TBKAG",
+      "input_preview": "values.yaml:\n  upstream:\n    host: quota-svc\n    token: PLAT:OSJS9X2-GZE9D9-05TBKAG\n    audit_contact: Sophia Young",
+      "detected_labels": [
+        "internal_url",
+        "internal_url",
+        "secret",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 30,
+      "category": "PII_NAME",
+      "value": "Inoue Sora",
+      "input_preview": "Mia Clark: ok i'll page Inoue Sora — they own metrics-collector this week and the latency is spiking",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 30,
+      "category": "INTERNAL_URL",
+      "value": "metrics-collector",
+      "input_preview": "Mia Clark: ok i'll page Inoue Sora — they own metrics-collector this week and the latency is spiking",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 35,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "インシデント報告: Matsumoto Soraさんが発見した通り、社内サービス model-registry に対して 短命トークン SEC:7DK6C-FXPSSP-KMBOJG4S が認証なしで有効化されていました。",
+      "detected_labels": [
+        "private_person",
+        "internal_url",
+        "secret"
+      ]
+    },
+    {
+      "idx": 38,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "As part of the retro, Hayashi Riku summarised the timeline and flagged that the internal service model-registry lacked c",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 39,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "## Findings\n\n- A long-lived token `DEV:W43S0-JWWZODO` was discovered in the build cache.\n- The related service `model-re",
+      "detected_labels": [
+        "secret",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 40,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "At 10:42 JST, Isabella Robinson bumped ticket #4874157 from P3 to P1 after confirming the outage was user-visible and th",
+      "detected_labels": [
+        "private_person",
+        "account_number",
+        "internal_url",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 42,
+      "category": "INTERNAL_IP",
+      "value": "10.3.148.102",
+      "input_preview": "The bastion answered ping from 10.3.148.102 exactly once, then went silent; Lucas Thomas will investigate.",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 44,
+      "category": "PII_NAME",
+      "value": "Olivia Lewis",
+      "input_preview": "At 10:42 JST, Olivia Lewis bumped ticket #1875413 from P3 to P1 after confirming the outage was user-visible and that me",
+      "detected_labels": [
+        "account_number",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 44,
+      "category": "INTERNAL_URL",
+      "value": "metrics-collector",
+      "input_preview": "At 10:42 JST, Olivia Lewis bumped ticket #1875413 from P3 to P1 after confirming the outage was user-visible and that me",
+      "detected_labels": [
+        "account_number",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 45,
+      "category": "INTERNAL_URL",
+      "value": "quota-svc",
+      "input_preview": "At 10:42 JST, Charlotte Martinez bumped ticket #2848893 from P3 to P1 after confirming the outage was user-visible and t",
+      "detected_labels": [
+        "private_person",
+        "account_number",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 46,
+      "category": "CREDENTIAL",
+      "value": "a9UfS8IgEAlHa5NM5",
+      "input_preview": "nit: pls move a9UfS8IgEAlHa5NM5 out of the repo and into our secret store before merging, otherwise anyone with read acc",
+      "detected_labels": [
+        "secret"
+      ]
+    },
+    {
+      "idx": 50,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "As part of the retro, Kobayashi Hina summarised the timeline and flagged that the internal service model-registry lacked",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 51,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "Lucas Anderson: ok i'll page Shimizu Kaito — they own model-registry this week and the latency is spiking",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 52,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "deployment annotations include `owner: Yamada Nanami` and the sidecar is configured to push metrics to scheduler-v2 on p",
+      "detected_labels": [
+        "private_person",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 54,
+      "category": "INTERNAL_URL",
+      "value": "risk-engine",
+      "input_preview": "Post-mortem: During the 02:14 incident, Charlotte Clark noticed that risk-engine was returning 5xx. On-call rotated the ",
+      "detected_labels": [
+        "internal_url",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 55,
+      "category": "INTERNAL_URL",
+      "value": "quota-svc",
+      "input_preview": "SRE memo: チケット #358382 の root cause は quota-svc の設定漏れ。assigned to Sophia Walker.",
+      "detected_labels": [
+        "private_person",
+        "account_number",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 57,
+      "category": "INTERNAL_URL",
+      "value": "notification-hub",
+      "input_preview": "deployment annotations include `owner: Nakamura Riku` and the sidecar is configured to push metrics to notification-hub ",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 58,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "As part of the retro, Fujita Riku summarised the timeline and flagged that the internal service model-registry lacked ci",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 59,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "[ops] Isabella Robinson escalated to Nakamura Hina at 03:12 — 内部ホスト scheduler-v2 returning 502s, token RxwPGsPrsBgNTkGai",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "secret"
+      ]
+    }
+  ]
+}
