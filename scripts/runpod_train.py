@@ -106,7 +106,10 @@ def _rsync_push(host: dict) -> None:
     ]
     excl = sum([["--exclude", e] for e in excludes], [])
     cmd = [
-        "rsync", "-az", "--delete", "-e", rsh,
+        # -rlptD = -a minus -go (the pod doesn't let us chown), --no-perms
+        # because some WSL files come over with mode bits the pod rejects.
+        "rsync", "-rltDz", "--no-owner", "--no-group", "--no-perms",
+        "--delete", "-e", rsh,
         *excl,
         f"{REPO}/", f"root@{host['ip']}:/workspace/pentect/",
     ]
@@ -124,7 +127,7 @@ def _rsync_pull(host: dict, run_name: str) -> Path:
         f"-p {host['port']}"
     )
     cmd = [
-        "rsync", "-az", "-e", rsh,
+        "rsync", "-rltDz", "--no-owner", "--no-group", "--no-perms", "-e", rsh,
         f"root@{host['ip']}:/workspace/pentect/training/runs/{run_name}/",
         f"{dst}/",
     ]
@@ -137,10 +140,11 @@ def _rsync_pull(host: dict, run_name: str) -> Path:
 def _build_remote_script(args: argparse.Namespace, run_name: str) -> str:
     """Compose the remote shell sequence: deps + training command."""
     if args.backend == "opf":
+        data_dir = args.data_dir or "training/data/opf"
         train_cmd = (
-            "opf train training/data/opf/train.jsonl "
-            "--validation-dataset training/data/opf/hard_val.jsonl "
-            "--label-space-json training/data/opf/label_space.json "
+            f"opf train {data_dir}/train.jsonl "
+            f"--validation-dataset {data_dir}/hard_val.jsonl "
+            f"--label-space-json {data_dir}/label_space.json "
             f"--output-dir training/runs/{run_name} "
             f"--device cuda --epochs {args.epochs} "
             f"--batch-size {args.batch_size} "
@@ -197,6 +201,9 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--run-name", default=None,
                     help="Output directory under training/runs/ (default: opf_pentect_runpod_<ts>)")
+    ap.add_argument("--data-dir", default=None,
+                    help="Override opf-format data dir (default: training/data/opf). "
+                         "Use e.g. training/data/opf_seed43 to train on a different synthetic split.")
     ap.add_argument("--keep", action="store_true",
                     help="Don't terminate the pod on success.")
     ap.add_argument("--cloud", default="SECURE", choices=["SECURE", "COMMUNITY", "ALL"],
