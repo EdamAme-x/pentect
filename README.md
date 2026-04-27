@@ -1,7 +1,5 @@
 # Pentect
 
-Rule Based + fine-tuned Gemma 3 4B
-
 ## Image
 ```
 # Input
