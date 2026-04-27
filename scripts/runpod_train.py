@@ -79,6 +79,19 @@ def _ssh_run(host: dict, remote_cmd: str, *, stream: bool = True) -> int:
     return subprocess.run(cmd, check=False).returncode
 
 
+def _bootstrap_pod(host: dict) -> None:
+    """Make sure tools we need (rsync) exist on the pod."""
+    print("[runpod] bootstrap: ensure rsync exists on pod")
+    rc = _ssh_run(
+        host,
+        "command -v rsync >/dev/null 2>&1 || "
+        "(apt-get update -qq && apt-get install -y -qq rsync >/dev/null) "
+        "&& rsync --version | head -1 && mkdir -p /workspace/pentect",
+    )
+    if rc != 0:
+        raise SystemExit(f"pod bootstrap failed: {rc}")
+
+
 def _rsync_push(host: dict) -> None:
     print("[runpod] rsync push: local repo -> pod:/workspace/pentect")
     rsh = (
@@ -154,16 +167,17 @@ def _build_remote_script(args: argparse.Namespace, run_name: str) -> str:
         raise ValueError(args.backend)
 
     hf = os.environ.get("HF_TOKEN", "")
-    parts = [
+    parts: list[str] = [
         "set -eu",
         "cd /workspace/pentect",
-        f"export HF_TOKEN={shlex.quote(hf)}" if hf else ":",
-        "export HUGGING_FACE_HUB_TOKEN=$HF_TOKEN",
-        # Faster pip
+    ]
+    if hf:
+        parts.append(f"export HF_TOKEN={shlex.quote(hf)}")
+        parts.append("export HUGGING_FACE_HUB_TOKEN=$HF_TOKEN")
+    parts += [
         "export PIP_DISABLE_PIP_VERSION_CHECK=1",
         install,
         train_cmd,
-        # Print final summary so it ends up in the streamed log
         f"ls -la training/runs/{run_name} || true",
     ]
     return " && ".join(parts)
@@ -216,6 +230,7 @@ def main() -> None:
         # Wait a few extra seconds for the ssh daemon to fully accept connections
         time.sleep(10)
 
+        _bootstrap_pod(host)
         _rsync_push(host)
         remote = _build_remote_script(args, run_name)
         rc = _ssh_run(host, f"bash -lc {shlex.quote(remote)}")
