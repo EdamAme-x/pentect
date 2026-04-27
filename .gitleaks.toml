@@ -1,0 +1,28 @@
+# gitleaks (トレーニングデータにenv値などが含まれているため、ignore必須)
+
+title = "Pentect gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic / fixture data and demo HARs. These are *intentionally* full of fake credentials, JWTs, API keys, and PII for testing the masking engine."
+paths = [
+    '''training/data/.*''',
+    '''training/runs/.*''',
+    '''testcases/.*''',
+    '''tests/.*''',
+    '''demo/juice/.*\.har''',
+    '''demo/juice/.*\.txt''',
+    '''demo/juice/.*\.md''',
+    '''eval/results/.*''',
+    '''ref.*\.md''',
+]
+
+# Custom: surface our own placeholders if they ever leak into commits without
+# being unmasked. Not a real secret pattern but helps catch broken pipelines.
+# (Disabled by default — re-enable if you start seeing accidental commits.)
+# [[rules]]
+# id = "pentect-placeholder-leak"
+# description = "Pentect placeholder string left in committed files"
+# regex = '''<<[A-Z_]+_[a-f0-9]{8}>>'''
