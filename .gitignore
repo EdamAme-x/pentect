@@ -44,3 +44,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Claude Code session state
+.claude/
