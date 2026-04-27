@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>recall</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      background: #ffffff;
+      color: #111;
+      font-family: ui-sans-serif, system-ui, "Helvetica Neue", "Hiragino Sans", "Yu Gothic UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    .card {
+      width: 1080px;
+      padding: 0 64px;
+      margin: 0 auto;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 460px 1fr 280px;
+      align-items: center;
+      gap: 36px;
+      padding: 28px 0;
+    }
+    .label {
+      font-size: 28px;
+      font-weight: 500;
+      color: #111;
+    }
+    .row.win .label {
+      font-weight: 700;
+    }
+    .bar {
+      position: relative;
+      height: 32px;
+      background: #ececec;
+      border-radius: 16px;
+      overflow: hidden;
+    }
+    .bar > .fill {
+      position: absolute;
+      top: 0; left: 0; bottom: 0;
+      border-radius: 16px;
+      background: #c8c8c8;
+    }
+    .row.win .fill {
+      background: #111;
+    }
+    .pct {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      font-size: 80px;
+      font-weight: 700;
+      letter-spacing: -0.04em;
+      color: #111;
+      line-height: 1;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="row">
+      <div class="label">Microsoft Presidio</div>
+      <div class="bar"><div class="fill" style="width: 40.8%"></div></div>
+      <div class="pct">40.8%</div>
+    </div>
+    <div class="row win">
+      <div class="label">Gemma 3 4B + LoRA FT</div>
+      <div class="bar"><div class="fill" style="width: 89.2%"></div></div>
+      <div class="pct">89.2%</div>
+    </div>
+    <div class="row win">
+      <div class="label">Privacy Filter + LoRA FT</div>
+      <div class="bar"><div class="fill" style="width: 86.0%"></div></div>
+      <div class="pct">86.0%</div>
+    </div>
+  </div>
+</body>
+</html>

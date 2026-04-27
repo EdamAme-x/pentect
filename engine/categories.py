@@ -46,8 +46,8 @@ CATEGORY_SPECS: dict[Category, CategorySpec] = {
     ),
     Category.PII_EMAIL: CategorySpec(
         Category.PII_EMAIL,
-        GranularityMode.EMAIL_LOCAL,
-        "Email local part (domain preserved)",
+        GranularityMode.FULL,
+        "Email address",
     ),
     Category.PII_NAME: CategorySpec(
         Category.PII_NAME,

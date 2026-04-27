@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>juice shop masked demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      background: #ffffff;
+      color: #111;
+      font-family: ui-sans-serif, system-ui, "Helvetica Neue", "Hiragino Sans", "Yu Gothic UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap {
+      width: 1700px;
+      padding: 32px 40px 40px;
+      margin: 0 auto;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 32px;
+    }
+    .col h2 {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      margin-bottom: 14px;
+      color: #555;
+    }
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      background: #fafafa;
+      border: 1px solid #ececec;
+      border-radius: 6px;
+      padding: 18px 22px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #222;
+    }
+    /* RAW: 機密値を控えめに強調 (太字のみ) */
+    .secret {
+      font-weight: 700;
+      color: #111;
+    }
+    /* MASKED: プレースホルダを控えめなアクセント (太字 + グレー寄りバッジ) */
+    .ph {
+      font-weight: 700;
+      color: #111;
+      background: #eef2f7;
+      padding: 0 4px;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="grid">
+      <section class="col left">
+        <h2>RAW</h2>
+<pre>GET http://<span class="secret">juice-shop.local</span>/rest/admin/application-version
+  -&gt; 200 OK
+GET http://<span class="secret">juice-shop.local</span>/rest/admin/application-configuration
+GET http://<span class="secret">juice-shop.local</span>/api/Products/<span class="secret">1</span>
+POST http://<span class="secret">juice-shop.local</span>/rest/user/login
+GET http://<span class="secret">juice-shop.local</span>/rest/user/whoami
+  Authorization: Bearer <span class="secret">eyJ0eXAiOiJKV1QiLCJhbGciOi…</span>
+GET http://<span class="secret">juice-shop.local</span>/api/Baskets/<span class="secret">1</span>
+  -&gt; 500 Internal Server Error
+GET http://<span class="secret">juice-shop.local</span>/rest/products/search?q=%27%29%29--
+GET http://<span class="secret">juice-shop.local</span>/api/Users/<span class="secret">1</span>
+  resp: {"id":<span class="secret">1</span>,"email":"<span class="secret">admin@juice-sh.op</span>","role":"admin", …}
+GET http://<span class="secret">juice-shop.local</span>/api/Users/<span class="secret">2</span>
+  resp: {"id":<span class="secret">2</span>,"email":"<span class="secret">jim@juice-sh.op</span>","role":"customer", …}
+GET http://<span class="secret">juice-shop.local</span>/api/Users/<span class="secret">3</span>
+  resp: {"id":<span class="secret">3</span>,"email":"<span class="secret">bender@juice-sh.op</span>","role":"customer", …}
+GET http://<span class="secret">juice-shop.local</span>/ftp/
+GET http://<span class="secret">juice-shop.local</span>/ftp/package.json.bak
+  -&gt; 403 Forbidden</pre>
+      </section>
+
+      <section class="col right">
+        <h2>MASKED</h2>
+<pre>GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/admin/application-version
+  -&gt; 200 OK
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/admin/application-configuration
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Products/<span class="ph">&lt;&lt;USER_ID_6b86b273&gt;&gt;</span>
+POST http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/user/login
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/user/whoami
+  Authorization: Bearer <span class="ph">&lt;&lt;CREDENTIAL_99ed0ee3&gt;&gt;</span>
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Baskets/<span class="ph">&lt;&lt;USER_ID_6b86b273&gt;&gt;</span>
+  -&gt; 500 Internal Server Error
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/products/search?q=%27%29%29--
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Users/<span class="ph">&lt;&lt;USER_ID_6b86b273&gt;&gt;</span>
+  resp: {"id":1,"email":"<span class="ph">&lt;&lt;PII_EMAIL_a9ea2216&gt;&gt;</span>","role":"admin", …}
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Users/<span class="ph">&lt;&lt;USER_ID_d4735e3a&gt;&gt;</span>
+  resp: {"id":2,"email":"<span class="ph">&lt;&lt;PII_EMAIL_4b1926fc&gt;&gt;</span>","role":"customer", …}
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Users/<span class="ph">&lt;&lt;USER_ID_4e074085&gt;&gt;</span>
+  resp: {"id":3,"email":"<span class="ph">&lt;&lt;PII_EMAIL_2c3a8e1f&gt;&gt;</span>","role":"customer", …}
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/ftp/
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/ftp/package.json.bak
+  -&gt; 403 Forbidden</pre>
+      </section>
+    </div>
+  </div>
+</body>
+</html>
