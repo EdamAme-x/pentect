@@ -38,6 +38,9 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.4",
 ]
+runpod = [
+    "runpod>=1.9",
+]
 
 [project.scripts]
 pentect = "engine.cli:main"
