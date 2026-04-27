@@ -13,7 +13,7 @@ GET http://<<HOST_47a126fb>>/api/issues/<<ID_fe675fe7>>
 Authorization: Bearer <<CREDENTIAL_8c6976e5>>
 ```
 
-placeholder by hash
+placeholder は、値のhashから (値が同一かどうかを保持)
 
 ---
 
