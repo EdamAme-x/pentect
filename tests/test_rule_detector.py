@@ -40,3 +40,37 @@ def test_detects_google_oauth_client_id():
     assert Category.CREDENTIAL in cats
     matched = [text[s.start:s.end] for s in spans if s.category is Category.CREDENTIAL]
     assert any("apps.googleusercontent.com" in m for m in matched)
+
+
+def test_detects_keybase_user_url():
+    text = "see https://keybase.io/bkimminich for the public key"
+    spans = RuleDetector().detect(text)
+    matched = [text[s.start:s.end] for s in spans if s.category is Category.CREDENTIAL]
+    assert any("keybase.io/bkimminich" in m for m in matched)
+
+
+def test_detects_github_owner_and_repo():
+    text = "see https://github.com/OWASP/juice-shop for the source"
+    spans = RuleDetector().detect(text)
+    matched = [text[s.start:s.end] for s in spans if s.category is Category.CREDENTIAL]
+    assert any("OWASP" in m for m in matched)
+
+
+def test_detects_twitter_handle_url():
+    text = "follow https://twitter.com/owasp_juiceshop for updates"
+    spans = RuleDetector().detect(text)
+    matched = [text[s.start:s.end] for s in spans if s.category is Category.CREDENTIAL]
+    assert any("owasp_juiceshop" in m for m in matched)
+
+
+def test_detects_concatenated_sha1_blob():
+    # Regression: Juice Shop's supportedFingerprints array concatenates
+    # multiple SHA1 hex strings back-to-back; a strict word-boundary regex
+    # missed every fingerprint after the first.
+    a = "0f933ab9fcaaa782d0279c300d73750e1311eae6"
+    b = "f4817631372dca68a25a18eb7a0b36d54f3dbcf7"
+    text = f'"fingerprints": "{a}{b}"'
+    spans = RuleDetector().detect(text)
+    matched = [text[s.start:s.end] for s in spans if s.category is Category.CREDENTIAL]
+    assert any(a in m for m in matched)
+    assert any(b in m for m in matched)

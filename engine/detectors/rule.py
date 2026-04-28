@@ -33,6 +33,25 @@ GOOGLE_API_RE = _compile(r"\bAIza[0-9A-Za-z_-]{35}\b")
 GOOGLE_OAUTH_CLIENT_ID_RE = _compile(
     r"\b[0-9]{6,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com\b"
 )
+# Keybase user URL: keybase.io/<username> -- identifies a person.
+KEYBASE_USER_RE = _compile(r"\bkeybase\.io/[A-Za-z0-9_]{2,32}\b")
+# GitHub owner / org / repo path: github.com/<owner>(/<repo>)? -- identifies
+# a project or a person. Mask the whole owner+repo segment, not just the host.
+GITHUB_OWNER_REPO_RE = _compile(
+    r"\bgithub\.com/[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:/[A-Za-z0-9._-]{1,100})?\b"
+)
+# Social handles in URL form: twitter.com/<user>, x.com/<user>, linkedin.com/in/<user>.
+# Skip well-known non-handle landing paths (twitter.com/intent etc).
+SOCIAL_HANDLE_URL_RE = _compile(
+    r"\b(?:twitter\.com|x\.com|linkedin\.com/(?:in|company))/(?!intent\b|share\b|home\b)"
+    r"[A-Za-z0-9._-]{2,40}\b"
+)
+# Long hex blobs: SHA1 (40) / SHA256 (64) fingerprints, git commits, API key
+# digests. Some sources concatenate fingerprints back-to-back (Juice Shop's
+# /rest/admin/application-configuration does this in the "supportedFingerprints"
+# array), so a strict lookbehind boundary misses runs of them. Instead we
+# capture any 40+ char hex run and mask each 40-char window in it.
+HEX_BLOB_RE = _compile(r"[A-Fa-f0-9]{40,}")
 # AWS Secret Access Key: 40 chars base64-ish, context-anchored to avoid false positives.
 AWS_SECRET_RE = _compile(
     r"(?i)(?:aws[_-]?secret(?:[_-]?access)?[_-]?key)\s*[:=]\s*[\"']?([A-Za-z0-9/+=]{40})[\"']?"
@@ -75,6 +94,9 @@ _CREDENTIAL_RULES: list[Rule] = [
     Rule(Category.CREDENTIAL, SLACK_TOKEN_RE, "slack_token"),
     Rule(Category.CREDENTIAL, GOOGLE_API_RE, "google_api_key"),
     Rule(Category.CREDENTIAL, GOOGLE_OAUTH_CLIENT_ID_RE, "google_oauth_client_id"),
+    Rule(Category.CREDENTIAL, KEYBASE_USER_RE, "keybase_user"),
+    Rule(Category.CREDENTIAL, GITHUB_OWNER_REPO_RE, "github_owner_repo"),
+    Rule(Category.CREDENTIAL, SOCIAL_HANDLE_URL_RE, "social_handle_url"),
 ]
 
 _CAPTURING_CREDENTIAL_RULES: list[Rule] = [
@@ -105,6 +127,26 @@ class RuleDetector:
 
     def detect(self, text: str) -> list[Span]:
         spans: list[Span] = []
+
+        # Hex blobs (concatenated SHA1/SHA256 fingerprints, git commits etc).
+        # Slice each run into 40-char windows so a "supportedFingerprints"
+        # array of back-to-back SHA1s gets every entry masked.
+        for m in HEX_BLOB_RE.finditer(text):
+            blob_start, blob_end = m.start(), m.end()
+            blob_len = blob_end - blob_start
+            window = 64 if blob_len >= 64 and blob_len % 64 == 0 else 40
+            for off in range(0, blob_len, window):
+                end = min(off + window, blob_len)
+                if end - off < 40:
+                    break
+                spans.append(
+                    Span(
+                        start=blob_start + off,
+                        end=blob_start + end,
+                        category=Category.CREDENTIAL,
+                        source=self.name,
+                    )
+                )
 
         for rule in _CREDENTIAL_RULES:
             for m in rule.pattern.finditer(text):
