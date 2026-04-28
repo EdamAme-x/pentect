@@ -160,15 +160,23 @@ class RuleDetector:
             )
 
         for m in IPV4_RE.finditer(text):
-            if _is_private_ip(m.group(0)):
-                spans.append(
-                    Span(
-                        start=m.start(),
-                        end=m.end(),
-                        category=Category.INTERNAL_IP,
-                        source=self.name,
-                    )
+            try:
+                ipaddress.ip_address(m.group(0))
+            except ValueError:
+                continue
+            cat = (
+                Category.INTERNAL_IP
+                if _is_private_ip(m.group(0))
+                else Category.EXTERNAL_IP
+            )
+            spans.append(
+                Span(
+                    start=m.start(),
+                    end=m.end(),
+                    category=cat,
+                    source=self.name,
                 )
+            )
 
         url_spans_ranges: list[tuple[int, int]] = []
         for m in URL_RE.finditer(text):

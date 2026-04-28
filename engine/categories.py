@@ -9,6 +9,7 @@ class Category(str, Enum):
     CREDENTIAL = "CREDENTIAL"
     INTERNAL_URL = "INTERNAL_URL"
     INTERNAL_IP = "INTERNAL_IP"
+    EXTERNAL_IP = "EXTERNAL_IP"
     PII_EMAIL = "PII_EMAIL"
     PII_NAME = "PII_NAME"
     USER_ID = "USER_ID"
@@ -44,7 +45,12 @@ CATEGORY_SPECS: dict[Category, CategorySpec] = {
     Category.INTERNAL_IP: CategorySpec(
         Category.INTERNAL_IP,
         GranularityMode.FULL,
-        "Internal IP address",
+        "Internal IP address (RFC 1918 / loopback / link-local)",
+    ),
+    Category.EXTERNAL_IP: CategorySpec(
+        Category.EXTERNAL_IP,
+        GranularityMode.FULL,
+        "External / public IP address",
     ),
     Category.PII_EMAIL: CategorySpec(
         Category.PII_EMAIL,

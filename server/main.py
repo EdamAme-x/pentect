@@ -67,13 +67,28 @@ class MaskResponse(BaseModel):
     backend: str
 
 
+def _looks_like_har(text: str) -> bool:
+    """Heuristic: does this body look like a HAR JSON?
+
+    The lenient HAR loader will happily turn any input into an empty
+    {"log": {"entries": []}}, which silently produces masked=0 for plain
+    text inputs. Detect HAR-ish shapes here so plain text falls through
+    to mask_text instead.
+    """
+    head = text.lstrip()[:1024]
+    if not head.startswith("{"):
+        return False
+    return '"log"' in head or '"entries"' in head or '"version"' in head
+
+
 @app.post("/api/mask", response_model=MaskResponse)
 def mask(req: MaskRequest) -> MaskResponse:
     backend = req.backend or _default_backend()
     if backend not in _VALID_BACKENDS:
         raise HTTPException(400, f"unknown backend {backend!r}; valid: {_VALID_BACKENDS}")
     engine = _get_engine(backend)
-    if req.is_har:
+    # Auto-route by content shape, not by an `is_har` flag the UI never sets.
+    if req.is_har and _looks_like_har(req.text):
         try:
             result = engine.mask_har(req.text)
         except Exception:  # noqa: BLE001
