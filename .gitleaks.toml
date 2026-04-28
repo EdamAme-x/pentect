@@ -15,6 +15,7 @@ paths = [
     '''demo/juice/.*\.har''',
     '''demo/juice/.*\.txt''',
     '''demo/juice/.*\.md''',
+    '''demo/pentect_shop/.*''',
     '''eval/results/.*''',
     '''ref.*\.md''',
 ]

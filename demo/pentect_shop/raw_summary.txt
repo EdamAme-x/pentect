@@ -1,0 +1,32 @@
+GET http://127.0.0.1:5057/api/products
+  -> 200 OK
+GET http://127.0.0.1:5057/api/products/search?q=Pentect
+GET http://127.0.0.1:5057/api/products/search?q=%27%29%20OR%201%3D1--
+  -> 500 INTERNAL SERVER ERROR
+  resp: {"error":"near \")\": syntax error","sql":"SELECT * FROM products WHERE name LIKE '%') OR 1=1--%'"}
+
+GET http://127.0.0.1:5057/api/products/search?q=%27%29%29--
+  resp: {"error":"near \")\": syntax error","sql":"SELECT * FROM products WHERE name LIKE '%'))--%'"}
+
+GET http://127.0.0.1:5057/api/users/1
+  resp: {"display_name":"Site Admin","email":"admin@pentect-shop.local","id":1,"password_hash":"5f4dcc3b5aa765d61d8327deb882cf99","role":"admin"}
+
+GET http://127.0.0.1:5057/api/users/2
+  resp: {"display_name":"Haruko Tanaka","email":"haruko@pentect-shop.local","id":2,"password_hash":"ab4f63f9ac65152575886860dde480a1","role":"customer"}
+
+GET http://127.0.0.1:5057/api/users/3
+  resp: {"display_name":"Ren Sato","email":"ren@pentect-shop.local","id":3,"password_hash":"098f6bcd4621d373cade4e832627b4f6","role":"admin"}
+
+GET http://127.0.0.1:5057/api/users/4
+  -> 404 NOT FOUND
+POST http://127.0.0.1:5057/api/login
+  resp: {"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEsImVtYWlsIjoiYWRtaW5AcGVudGVjdC1zaG9wLmxvY2FsIiwicm9sZSI6ImFkbWluIiwicGFzc3dvcmRfaGFzaCI6IjVmNGRjYzNiNWFhNzY1ZDYxZDgzMjdkZWI4ODJjZjk5IiwiaWF0IjoxNzc3MzQwMDY3fQ.cxStKwNoLTP-zAU4SHN8YM57MUpsotUEcp_5_GzJrEI","user":{"display_name":"Site Admin","email":"admin@pentect-shop.local","id":1,"password_hash":"5f4dcc3b5aa765d61d8327deb882cf99","role":"
+  Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEsImVtYWlsIjoiYWRtaW5AcGVudGVjdC1zaG9wLmxvY2FsIiwicm9sZSI6ImFkbWluIiwicGFzc3dvcmRfaGFzaCI6IjVmNGRjYzNiNWFhNzY1ZDYxZDgzMjdkZWI4ODJjZjk5IiwiaWF0IjoxNzc3MzQwMDY3fQ.cxStKwNoLTP-zAU4SHN8YM57MUpsotUEcp_5_GzJrEI
+PATCH http://127.0.0.1:5057/api/users/3
+GET http://127.0.0.1:5057/api/baskets/99999
+  resp: {"error":"basket lookup failed","trace":["  File 'app.py', line 1, in get_basket","  sqlite3.IntegrityError: missing basket id=99999"]}
+
+GET http://127.0.0.1:5057/api/admin/dump
+  resp: {"users":[{"display_name":"Site Admin","email":"admin@pentect-shop.local","id":1,"password_hash":"5f4dcc3b5aa765d61d8327deb882cf99","role":"admin"},{"display_name":"Haruko Tanaka","email":"haruko@pentect-shop.local","id":2,"password_hash":"ab4f63f9ac65152575886860dde480a1","role":"customer"},{"display_name":"Ren Sato","email":"ren@pentect-shop.local","id":3,"password_hash":"098f6bcd4621d373cade4e8
+GET http://127.0.0.1:5057/backup/
+GET http://127.0.0.1:5057/backup/db.sql.bak

@@ -51,3 +51,6 @@ Thumbs.db
 # Playwright MCP scratch dir + ad-hoc screenshots
 .playwright-mcp/
 pentect_demo_*.png
+
+# pentect-shop runtime artifacts (regenerated on app start)
+demo/pentect_shop/shop.db

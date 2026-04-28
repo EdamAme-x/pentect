@@ -1,0 +1,3 @@
+-- Pentect Shop snapshot
+INSERT INTO users VALUES (1,'admin@pentect-shop.local','5f4dcc3b5aa765d61d8327deb882cf99','admin','Site Admin');
+INSERT INTO users VALUES (2,'haruko@pentect-shop.local','ab4f63f9ac65152575886860dde480a1','customer','Haruko Tanaka');

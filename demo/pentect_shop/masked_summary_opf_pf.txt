@@ -1,0 +1,32 @@
+<<INTERNAL_URL_14e30cd1>> http://<<INTERNAL_IP_12ca17b4>>:5057<<INTERNAL_URL_3637094a>>
+  -> 200 OK
+<<INTERNAL_URL_14e30cd1>> http://<<INTERNAL_IP_12ca17b4>>:5057/api/products/search?q=<<INTERNAL_URL_6784a269>>
+GET http://<<INTERNAL_IP_12ca17b4>>:5057/api/products<<INTERNAL_URL_ebce8b22>>%29%20OR%<<INTERNAL_URL_607cc1ec>>--
+  -> 500 INTERNAL SERVER ERROR
+  resp: {"error":"near \")\": syntax error","sql":"SELECT * FROM products WHERE name LIKE '%') OR 1=1--%'"}
+
+GET http://<<INTERNAL_IP_12ca17b4>>:5057/api/products<<INTERNAL_URL_ebce8b22>>%29%29--
+  resp: {"error":"near \")\": <<INTERNAL_URL_08d1774d>>","sql":"SELECT * FROM products WHERE name LIKE '%'))--%'"}
+
+GET http://<<INTERNAL_IP_12ca17b4>>:5057/api/users/1
+  resp: {"display_name":"Site Admin","email":"admin@<<INTERNAL_URL_f5af35aa>>","id":1,"password_hash":"<<CREDENTIAL_3f2cd8e5>>","role":"admin"}
+
+<<INTERNAL_URL_14e30cd1>> http://<<INTERNAL_IP_12ca17b4>>:<<INTERNAL_URL_20383f2f>>
+  resp: {"display_name":"<<PII_NAME_b43e890a>>","email":"haruko@<<INTERNAL_URL_f5af35aa>>","id":2,"password_hash":"<<CREDENTIAL_68fcec57>>","role":"customer"}
+
+<<INTERNAL_URL_14e30cd1>> http://<<INTERNAL_IP_12ca17b4>>:5057/api/users/3
+  resp: {"display_name":"<<PII_NAME_1975b012>>","email":"ren@<<INTERNAL_URL_f5af35aa>>","id":3,"password_hash":"<<CREDENTIAL_52bbea75>>","role":"admin"}
+
+<<INTERNAL_URL_14e30cd1>> http://<<INTERNAL_IP_12ca17b4>>:5057/api/users/4
+  -> 404 NOT FOUND
+POST http://<<INTERNAL_IP_12ca17b4>>:5057/api/login
+  resp: {"token":"eyJ<<CREDENTIAL_39e24212>>","user":{"display_name":"Site Admin","email":"admin@<<INTERNAL_URL_f5af35aa>>","id":1,"password_hash":"5<<CREDENTIAL_2fa3e312>>","role":"
+  Authorization: Bearer eyJ<<CREDENTIAL_39e24212>>
+PATCH http://<<INTERNAL_IP_12ca17b4>>:<<USER_ID_f06436fb>>/api/users/3
+GET http://<<INTERNAL_IP_12ca17b4>>:5057/api/baskets/<<USER_ID_fd5f56b4>>
+  resp: {"error":"basket lookup failed","trace":["  File 'app.py', line 1, in get_b<<INTERNAL_URL_da1404a9>>","  <<INTERNAL_URL_bdabc871>>: missing basket id=<<USER_ID_fd5f56b4>>"]}
+
+GET http://<<INTERNAL_IP_12ca17b4>>:<<INTERNAL_URL_3b741f33>>
+  resp: {"users":[{"display_name":"Site Admin","email":"admin@<<INTERNAL_URL_f5af35aa>>","id":1,"password_hash":"<<CREDENTIAL_3f2cd8e5>>","role":"admin"},{"display_name":"<<PII_NAME_b43e890a>>","email":"haruko@<<INTERNAL_URL_f5af35aa>>","id":2,"password_hash":"<<CREDENTIAL_68fcec57>>","role":"customer"},{"display_name":"<<PII_NAME_1975b012>>","email":"ren@<<INTERNAL_URL_f5af35aa>>","id":3,"password_hash":"<<CREDENTIAL_aa059f07>>
+<<INTERNAL_URL_14e30cd1>> http://<<INTERNAL_IP_12ca17b4>>:5057/backup/
+<<INTERNAL_URL_14e30cd1>> http://<<INTERNAL_IP_12ca17b4>>:5057/backup/db.sql<<INTERNAL_URL_4406ca2a>>
