@@ -76,22 +76,42 @@ def test_detects_concatenated_sha1_blob():
     assert any(b in m for m in matched)
 
 
-def test_detects_json_numeric_id():
+def test_detects_json_resource_id():
     # The Sample HAR demo leaked the literal "1001" because the FT classifier
     # cannot yet flag numeric values under id-typed JSON keys. Until the
-    # synthetic dataset covers this, a regex catches it.
+    # synthetic dataset covers this, a regex catches it. Generic "id" goes to
+    # RESOURCE_ID since we don't know if the underlying record is a user or
+    # an issue / order / basket.
     text = '{"id": 1001, "page": 1, "per_page": 50, "total": 100}'
     spans = RuleDetector().detect(text)
-    user_id_spans = [text[s.start:s.end] for s in spans if s.category is Category.USER_ID]
-    assert "1001" in user_id_spans, f"missed numeric id, got: {user_id_spans}"
+    id_spans = [text[s.start:s.end] for s in spans
+                if s.category in (Category.USER_ID, Category.RESOURCE_ID)]
+    assert "1001" in id_spans, f"missed numeric id, got: {id_spans}"
     # Whitelist: page / per_page / total / count must NOT be masked.
-    assert "1" not in user_id_spans
-    assert "50" not in user_id_spans
+    assert "1" not in id_spans
+    assert "50" not in id_spans
+
+
+def test_user_id_keys_route_to_user_id_category():
+    # user_id / customer_id / account_id are person identifiers.
+    text = '{"user_id": 42, "customer_id": 7, "account_id": 99}'
+    spans = RuleDetector().detect(text)
+    user_id_vals = [text[s.start:s.end] for s in spans if s.category is Category.USER_ID]
+    assert set(user_id_vals) == {"42", "7", "99"}, user_id_vals
+
+
+def test_generic_id_keys_route_to_resource_id():
+    # "id" / "order_id" / "basket_id" / "product_id" are not person ids.
+    text = '{"id": 1001, "order_id": 7, "basket_id": 3, "product_id": 5}'
+    spans = RuleDetector().detect(text)
+    res_id_vals = [text[s.start:s.end] for s in spans if s.category is Category.RESOURCE_ID]
+    assert set(res_id_vals) == {"1001", "7", "3", "5"}, res_id_vals
 
 
 def test_does_not_mask_non_id_numeric_keys():
     # Negative-discrimination: qty / price / size / count are quantities, not ids.
     text = '{"qty": 3, "price": 1480, "size": 1024, "count": 50}'
     spans = RuleDetector().detect(text)
-    user_id_spans = [text[s.start:s.end] for s in spans if s.category is Category.USER_ID]
-    assert user_id_spans == [], f"over-masked, got: {user_id_spans}"
+    id_spans = [text[s.start:s.end] for s in spans
+                if s.category in (Category.USER_ID, Category.RESOURCE_ID)]
+    assert id_spans == [], f"over-masked, got: {id_spans}"

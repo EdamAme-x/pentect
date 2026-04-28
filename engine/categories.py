@@ -13,6 +13,7 @@ class Category(str, Enum):
     PII_EMAIL = "PII_EMAIL"
     PII_NAME = "PII_NAME"
     USER_ID = "USER_ID"
+    RESOURCE_ID = "RESOURCE_ID"
 
 
 class GranularityMode(str, Enum):
@@ -65,7 +66,12 @@ CATEGORY_SPECS: dict[Category, CategorySpec] = {
     Category.USER_ID: CategorySpec(
         Category.USER_ID,
         GranularityMode.HASH_ONLY,
-        "User / resource ID",
+        "User identifier (a person or account)",
+    ),
+    Category.RESOURCE_ID: CategorySpec(
+        Category.RESOURCE_ID,
+        GranularityMode.HASH_ONLY,
+        "Resource identifier (issue, order, basket, product, ...)",
     ),
 }
 

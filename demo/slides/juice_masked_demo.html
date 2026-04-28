@@ -86,19 +86,19 @@ GET http://<span class="secret">juice-shop.local</span>/ftp/package.json.bak
 <pre>GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/admin/application-version
   -&gt; 200 OK
 GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/admin/application-configuration
-GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Products/<span class="ph">&lt;&lt;USER_ID_6b86b273&gt;&gt;</span>
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Products/<span class="ph">&lt;&lt;RESOURCE_ID_6b86b273&gt;&gt;</span>
 POST http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/user/login
 GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/user/whoami
   Authorization: Bearer <span class="ph">&lt;&lt;CREDENTIAL_99ed0ee3&gt;&gt;</span>
-GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Baskets/<span class="ph">&lt;&lt;USER_ID_6b86b273&gt;&gt;</span>
+GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Baskets/<span class="ph">&lt;&lt;RESOURCE_ID_6b86b273&gt;&gt;</span>
   -&gt; 500 Internal Server Error
 GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/rest/products/search?q=%27%29%29--
 GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Users/<span class="ph">&lt;&lt;USER_ID_6b86b273&gt;&gt;</span>
-  resp: {"id":1,"email":"<span class="ph">&lt;&lt;PII_EMAIL_LOCAL_8c6976e5&gt;&gt;</span>@<span class="ph">&lt;&lt;PII_EMAIL_DOMAIN_08a174a6&gt;&gt;</span>","role":"admin", …}
+  resp: {"id":<span class="ph">&lt;&lt;RESOURCE_ID_6b86b273&gt;&gt;</span>,"email":"<span class="ph">&lt;&lt;PII_EMAIL_LOCAL_8c6976e5&gt;&gt;</span>@<span class="ph">&lt;&lt;PII_EMAIL_DOMAIN_08a174a6&gt;&gt;</span>","role":"admin", …}
 GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Users/<span class="ph">&lt;&lt;USER_ID_d4735e3a&gt;&gt;</span>
-  resp: {"id":2,"email":"<span class="ph">&lt;&lt;PII_EMAIL_LOCAL_484ae24e&gt;&gt;</span>@<span class="ph">&lt;&lt;PII_EMAIL_DOMAIN_08a174a6&gt;&gt;</span>","role":"customer", …}
+  resp: {"id":<span class="ph">&lt;&lt;RESOURCE_ID_d4735e3a&gt;&gt;</span>,"email":"<span class="ph">&lt;&lt;PII_EMAIL_LOCAL_484ae24e&gt;&gt;</span>@<span class="ph">&lt;&lt;PII_EMAIL_DOMAIN_08a174a6&gt;&gt;</span>","role":"customer", …}
 GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/api/Users/<span class="ph">&lt;&lt;USER_ID_4e074085&gt;&gt;</span>
-  resp: {"id":3,"email":"<span class="ph">&lt;&lt;PII_EMAIL_LOCAL_47d140cb&gt;&gt;</span>@<span class="ph">&lt;&lt;PII_EMAIL_DOMAIN_08a174a6&gt;&gt;</span>","role":"customer", …}
+  resp: {"id":<span class="ph">&lt;&lt;RESOURCE_ID_4e074085&gt;&gt;</span>,"email":"<span class="ph">&lt;&lt;PII_EMAIL_LOCAL_47d140cb&gt;&gt;</span>@<span class="ph">&lt;&lt;PII_EMAIL_DOMAIN_08a174a6&gt;&gt;</span>","role":"customer", …}
 GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/ftp/
 GET http://<span class="ph">&lt;&lt;INTERNAL_URL_HOST_f4703816&gt;&gt;</span>/ftp/package.json.bak
   -&gt; 403 Forbidden</pre>

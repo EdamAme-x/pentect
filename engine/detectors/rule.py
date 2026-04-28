@@ -191,14 +191,22 @@ class RuleDetector:
         _NON_ID_KEYS = {"page", "per_page", "perpage", "total", "count",
                         "qty", "quantity", "size", "limit", "offset",
                         "price", "amount", "score", "rating"}
+        # Keys whose value identifies a *person/account* go to USER_ID, the
+        # rest (issue id, order id, basket id, generic "id", ...) go to
+        # RESOURCE_ID. Both end up hashed identically; the separation is for
+        # readability of the masked output.
+        _USER_ID_KEYS = {"user_id", "userid", "customer_id", "customerid",
+                         "account_id", "accountid", "owner_id", "ownerid"}
         for m in JSON_ID_KEY_RE.finditer(text):
-            if m.group("key").lower() in _NON_ID_KEYS:
+            key_lower = m.group("key").lower()
+            if key_lower in _NON_ID_KEYS:
                 continue
+            cat = Category.USER_ID if key_lower in _USER_ID_KEYS else Category.RESOURCE_ID
             spans.append(
                 Span(
                     start=m.start("val"),
                     end=m.end("val"),
-                    category=Category.USER_ID,
+                    category=cat,
                     source=self.name,
                 )
             )

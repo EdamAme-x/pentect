@@ -21,6 +21,7 @@ _PENTEST_CATEGORIES = {
     Category.INTERNAL_IP,
     Category.EXTERNAL_IP,
     Category.USER_ID,
+    Category.RESOURCE_ID,
 }
 
 # Higher number = wins on conflict.

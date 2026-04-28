@@ -34,12 +34,20 @@ def _mask_internal_url(text: str, span: Span) -> list[Replacement]:
     path = parsed.path or ""
     query = f"?{parsed.query}" if parsed.query else ""
 
-    # mask trailing segment if it looks like a numeric or long alphanumeric ID
+    # Mask trailing segment if it looks like a numeric or long alphanumeric
+    # ID. Pick USER_ID vs RESOURCE_ID based on the *previous* segment so
+    # `/api/users/42` stays semantically a user identifier while
+    # `/api/issues/1001` or `/api/baskets/3` end up as resource ids.
     segments = path.split("/")
     if segments and segments[-1]:
         last = segments[-1]
         if re.fullmatch(r"\d+", last) or re.fullmatch(r"[A-Za-z0-9_\-]{16,}", last):
-            segments[-1] = make_placeholder(Category.USER_ID, last)
+            prev = segments[-2].lower() if len(segments) >= 2 else ""
+            user_collections = {"users", "user", "customers", "customer",
+                                "accounts", "account", "members", "owners"}
+            id_cat = (Category.USER_ID if prev in user_collections
+                      else Category.RESOURCE_ID)
+            segments[-1] = make_placeholder(id_cat, last)
     new_path = "/".join(segments)
 
     rebuilt = f"{parsed.scheme}://{host_ph}{new_path}{query}"
