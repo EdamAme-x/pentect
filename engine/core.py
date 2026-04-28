@@ -132,6 +132,19 @@ class PentectEngine:
                 chosen = "gemma" if use_llm else "rule"
             self.backend = chosen
             self.detectors = [RuleDetector()]
+            # Always run detect-secrets plugin regexes alongside our own
+            # rules. They add coverage for vendor token formats Pentect
+            # otherwise wouldn't know (Stripe / Twilio / SendGrid / Discord
+            # / private keys / Basic auth / Azure / npm / pypi / square /
+            # telegram). We skip it silently if the package isn't available
+            # so existing minimum installs still work.
+            try:
+                from engine.detectors.detect_secrets_plugins import (
+                    DetectSecretsPluginDetector,
+                )
+                self.detectors.append(DetectSecretsPluginDetector())
+            except RuntimeError:
+                pass
             if chosen == "rule":
                 pass
             elif chosen == "gemma":

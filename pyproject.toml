@@ -16,6 +16,10 @@ dependencies = [
     "pydantic>=2.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
+    # Curated vendor-secret regex bundle from Yelp; we use only its plugin
+    # regexes (no verification, no scanning pipeline). See
+    # engine/detectors/detect_secrets_plugins.py.
+    "detect-secrets>=1.5",
 ]
 
 [project.optional-dependencies]
