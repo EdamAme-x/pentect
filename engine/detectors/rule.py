@@ -79,7 +79,9 @@ RAW_COOKIE_RE = _compile(
 # samples to teach the classifier this pattern, we catch it with a rule and
 # whitelist a few common non-id numeric keys to avoid over-masking.
 JSON_ID_KEY_RE = _compile(
-    r'"(?P<key>[A-Za-z_][A-Za-z0-9_]*[Ii]d|id|userId|user_id|basket_id|order_id|account_id|customer_id|product_id)"\s*:\s*(?P<val>[0-9]+)'
+    # Allow zero/one backslash before the quotes so this still fires when the
+    # input is a HAR body (where the inner JSON is escaped: \"id\": 1001).
+    r'\\?"(?P<key>[A-Za-z_][A-Za-z0-9_]*[Ii]d|id|userId|user_id|basket_id|order_id|account_id|customer_id|product_id)\\?"\s*:\s*(?P<val>[0-9]+)'
 )
 
 # URL / host
