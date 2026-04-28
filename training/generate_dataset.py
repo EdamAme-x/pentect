@@ -77,6 +77,15 @@ def _gen_person_name_en() -> str:
     return f"{first} {last}"
 
 
+def _gen_email() -> str:
+    user = random.choice(["alice", "bob", "carol", "haruko", "ren", "kenji", "sakura"])
+    domain = random.choice([
+        "corp.local", "corp.example", "example.com", "internal.local",
+        "company.co.jp", "ops.local",
+    ])
+    return f"{user}@{domain}"
+
+
 def _gen_person_name_ja() -> str:
     # romanised Japanese-style names (kept ASCII to simplify tokenisation in PoC)
     firsts = ["Taro", "Hanako", "Yuki", "Ren", "Sakura", "Kenji", "Aoi"]
@@ -199,6 +208,35 @@ _TEMPLATES: list = [
         "{name_ja} が {host} のレイテンシ悪化を調査中(token {opq} で再現)",
         [("name_ja", "PII_NAME"), ("host", "INTERNAL_URL"), ("opq", "CREDENTIAL")],
     ),
+
+]
+
+
+# JSON-shaped templates kept in a separate list so we can dial the ratio.
+# These are the patterns that surfaced as leaks in the Sample HAR demo and
+# in JS bundle response bodies: numeric ID values under id-typed keys, plus
+# the email/ip variants used together in user-detail responses.
+_JSON_TEMPLATES: list = [
+    ('{{"id": {rid}, "status": "ok"}}', [("rid", "USER_ID")]),
+    ('{{"id": {rid}, "name": "{name}"}}', [("rid", "USER_ID"), ("name", "PII_NAME")]),
+    ('{{"user_id": {rid}, "role": "admin"}}', [("rid", "USER_ID")]),
+    ('{{"basket_id": {rid}, "items": []}}', [("rid", "USER_ID")]),
+    ('{{"order_id": {rid}, "qty": 3, "price": 1480}}', [("rid", "USER_ID")]),
+    (
+        '{{"id": {rid}, "reporter": "{email}", "ip": "{ip}"}}',
+        [("rid", "USER_ID"), ("email", "PII_EMAIL"), ("ip", "INTERNAL_IP")],
+    ),
+    (
+        '{{"user_id": {rid}, "email": "{email}", "host": "{host}"}}',
+        [("rid", "USER_ID"), ("email", "PII_EMAIL"), ("host", "INTERNAL_URL")],
+    ),
+    ('{{"token": "{tok}", "expires_in": 3600}}', [("tok", "CREDENTIAL")]),
+    ('{{"api_key": "{opq}", "scope": "read:metrics"}}', [("opq", "CREDENTIAL")]),
+    # Negative-discrimination: "page" / "per_page" / "total" / "qty" are NOT ids.
+    (
+        '{{"id": {rid}, "page": 1, "per_page": 50, "total": 4821}}',
+        [("rid", "USER_ID")],
+    ),
 ]
 
 
@@ -219,6 +257,7 @@ def _sample(template: tuple) -> Sample:
         "rid": _gen_resource_id(),
         "name": _gen_person_name_en(),
         "name_ja": _gen_person_name_ja(),
+        "email": _gen_email(),
     }
     text = tpl.format(**values)
 
@@ -228,9 +267,19 @@ def _sample(template: tuple) -> Sample:
     return Sample(input=text, spans=spans)
 
 
-def generate(n: int, seed: int = 42) -> list[Sample]:
+def generate(n: int, seed: int = 42, json_ratio: float = 0.3) -> list[Sample]:
+    """Generate n samples. ``json_ratio`` controls the share of JSON-shaped
+    templates so we can keep that distribution stable regardless of how many
+    other templates exist."""
     random.seed(seed)
-    return [_sample(random.choice(_TEMPLATES)) for _ in range(n)]
+    out: list[Sample] = []
+    for i in range(n):
+        if random.random() < json_ratio:
+            tpl = random.choice(_JSON_TEMPLATES)
+        else:
+            tpl = random.choice(_TEMPLATES)
+        out.append(_sample(tpl))
+    return out
 
 
 def main() -> None:

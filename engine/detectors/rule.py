@@ -73,6 +73,14 @@ HAR_COOKIE_VALUE_RE = _compile(
 RAW_COOKIE_RE = _compile(
     r"(?im)(?:^|[>\s])(?:Set-)?Cookie:\s*[^\r\n]*?\b(?:session|sess|sid|auth|token|access[_-]?token|refresh[_-]?token|jsessionid|phpsessid|csrftoken)=([^;\s]{8,})",
 )
+# TODO: replace with FT-side coverage. The opf checkpoint is fine on free-form
+# text but does not yet generalise to numeric IDs sitting under id-typed JSON
+# keys (e.g. {"id": 1001}). Until the synthetic dataset has enough JSON-shaped
+# samples to teach the classifier this pattern, we catch it with a rule and
+# whitelist a few common non-id numeric keys to avoid over-masking.
+JSON_ID_KEY_RE = _compile(
+    r'"(?P<key>[A-Za-z_][A-Za-z0-9_]*[Ii]d|id|userId|user_id|basket_id|order_id|account_id|customer_id|product_id)"\s*:\s*(?P<val>[0-9]+)'
+)
 
 # URL / host
 URL_RE = _compile(r"https?://([A-Za-z0-9\-._]+)(:[0-9]+)?(/[^\s\"'<>]*)?")
@@ -172,6 +180,23 @@ class RuleDetector:
                     start=m.start(1),
                     end=m.end(1),
                     category=Category.CREDENTIAL,
+                    source=self.name,
+                )
+            )
+
+        # TODO: drop this rule once the FT data covers JSON-shaped numeric IDs.
+        # See JSON_ID_KEY_RE definition above for context.
+        _NON_ID_KEYS = {"page", "per_page", "perpage", "total", "count",
+                        "qty", "quantity", "size", "limit", "offset",
+                        "price", "amount", "score", "rating"}
+        for m in JSON_ID_KEY_RE.finditer(text):
+            if m.group("key").lower() in _NON_ID_KEYS:
+                continue
+            spans.append(
+                Span(
+                    start=m.start("val"),
+                    end=m.end("val"),
+                    category=Category.USER_ID,
                     source=self.name,
                 )
             )

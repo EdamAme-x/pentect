@@ -74,3 +74,24 @@ def test_detects_concatenated_sha1_blob():
     matched = [text[s.start:s.end] for s in spans if s.category is Category.CREDENTIAL]
     assert any(a in m for m in matched)
     assert any(b in m for m in matched)
+
+
+def test_detects_json_numeric_id():
+    # The Sample HAR demo leaked the literal "1001" because the FT classifier
+    # cannot yet flag numeric values under id-typed JSON keys. Until the
+    # synthetic dataset covers this, a regex catches it.
+    text = '{"id": 1001, "page": 1, "per_page": 50, "total": 100}'
+    spans = RuleDetector().detect(text)
+    user_id_spans = [text[s.start:s.end] for s in spans if s.category is Category.USER_ID]
+    assert "1001" in user_id_spans, f"missed numeric id, got: {user_id_spans}"
+    # Whitelist: page / per_page / total / count must NOT be masked.
+    assert "1" not in user_id_spans
+    assert "50" not in user_id_spans
+
+
+def test_does_not_mask_non_id_numeric_keys():
+    # Negative-discrimination: qty / price / size / count are quantities, not ids.
+    text = '{"qty": 3, "price": 1480, "size": 1024, "count": 50}'
+    spans = RuleDetector().detect(text)
+    user_id_spans = [text[s.start:s.end] for s in spans if s.category is Category.USER_ID]
+    assert user_id_spans == [], f"over-masked, got: {user_id_spans}"
