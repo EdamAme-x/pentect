@@ -58,6 +58,72 @@ def _mask_email_local(text: str, span: Span) -> list[Replacement]:
     ]
 
 
+def _mask_email_split_hash(text: str, span: Span) -> list[Replacement]:
+    """Hash local part and domain independently.
+
+    Output shape:  <<PII_EMAIL_LOCAL_xxxx>>@<<PII_EMAIL_DOMAIN_yyyy>>
+
+    Same local string yields the same LOCAL placeholder, same domain yields
+    the same DOMAIN placeholder. This preserves cross-record relationships
+    (e.g., two users on the same internal domain, or one identity reused
+    across services) without leaking the actual values.
+    """
+    original = text[span.start:span.end]
+    if "@" not in original:
+        ph = make_placeholder(Category.PII_EMAIL, original)
+        return [Replacement(span.start, span.end, ph, Category.PII_EMAIL, original)]
+    local, domain = original.rsplit("@", 1)
+    local_ph = make_placeholder(Category.PII_EMAIL, local, suffix="LOCAL")
+    domain_ph = make_placeholder(Category.PII_EMAIL, domain, suffix="DOMAIN")
+    return [
+        Replacement(
+            span.start, span.end,
+            f"{local_ph}@{domain_ph}",
+            Category.PII_EMAIL, original,
+        )
+    ]
+
+
+# Known credential prefixes. When a CREDENTIAL span starts with one of these,
+# we keep the prefix readable so the analyst can tell which provider/scheme
+# the secret belongs to (Google vs OpenAI vs GitHub vs ...). Order matters:
+# longer prefixes first so "sk-proj-" wins over "sk-".
+_CRED_PREFIXES: tuple[str, ...] = (
+    "Bearer ",
+    "Basic ",
+    "github_pat_",
+    "sk-proj-",
+    "xoxb-", "xoxa-", "xoxp-",
+    "ghp_", "gho_", "ghs_",
+    "AKIA", "ASIA",
+    "AIza",
+    "sk_live_", "sk_test_", "pk_live_", "pk_test_",
+    "sk-",
+    "eyJ",  # JWT (header is base64-encoded {"alg":...} which always starts eyJ)
+)
+
+
+def _mask_credential_prefix(text: str, span: Span) -> list[Replacement]:
+    """Keep a well-known token prefix and mask the rest.
+
+    Input:  "AIza7h1515dummy..."  -> "AIza<<CREDENTIAL_xxxx>>"
+            "Bearer eyJ..."       -> "Bearer <<CREDENTIAL_xxxx>>"
+            "<unknown>"           -> "<<CREDENTIAL_xxxx>>" (full mask, fallback)
+    """
+    original = text[span.start:span.end]
+    for prefix in _CRED_PREFIXES:
+        if original.startswith(prefix):
+            secret = original[len(prefix):]
+            secret_ph = make_placeholder(Category.CREDENTIAL, secret)
+            return [Replacement(
+                span.start, span.end,
+                f"{prefix}{secret_ph}",
+                Category.CREDENTIAL, original,
+            )]
+    ph = make_placeholder(Category.CREDENTIAL, original)
+    return [Replacement(span.start, span.end, ph, Category.CREDENTIAL, original)]
+
+
 def _mask_full(text: str, span: Span) -> list[Replacement]:
     original = text[span.start:span.end]
     ph = make_placeholder(span.category, original)
@@ -80,6 +146,10 @@ def apply_granularity(text: str, spans: list[Span]) -> list[Replacement]:
             out.extend(_mask_internal_url(text, span))
         elif mode is GranularityMode.EMAIL_LOCAL:
             out.extend(_mask_email_local(text, span))
+        elif mode is GranularityMode.EMAIL_SPLIT_HASH:
+            out.extend(_mask_email_split_hash(text, span))
+        elif mode is GranularityMode.CREDENTIAL_PREFIX:
+            out.extend(_mask_credential_prefix(text, span))
         elif mode is GranularityMode.HASH_ONLY:
             out.extend(_mask_hash_only(text, span))
         else:

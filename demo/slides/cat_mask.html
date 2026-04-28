@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>cat mask</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      background: #ffffff;
+      color: #111;
+      font-family: ui-sans-serif, system-ui, "Helvetica Neue", "Hiragino Sans", "Yu Gothic UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap {
+      width: 1200px;
+      padding: 48px 56px 56px;
+      margin: 0 auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    td {
+      text-align: left;
+      vertical-align: middle;
+      padding: 22px 18px;
+      border-bottom: 1px solid #ececec;
+      font-size: 17px;
+      line-height: 1.6;
+    }
+    col.cat    { width: 30%; }
+    col.sample { width: 70%; }
+    .cat-name { font-weight: 700; color: #111; }
+    .sample {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 16px;
+      color: #444;
+    }
+    .keep {
+      background: #eaf5ee;
+      color: #1a6b3e;
+      padding: 2px 4px;
+      border-radius: 3px;
+    }
+    .mask {
+      color: #999;
+      text-decoration: line-through;
+      text-decoration-color: #aaa;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <table>
+      <colgroup>
+        <col class="cat" />
+        <col class="sample" />
+      </colgroup>
+      <tbody>
+        <tr>
+          <td class="cat-name">内部 URL + ID</td>
+          <td class="sample">http://<span class="mask">corp.local</span>/api/users/<span class="mask">1042</span></td>
+        </tr>
+        <tr>
+          <td class="cat-name">認証トークン</td>
+          <td class="sample">eyJ<span class="mask">hbGciOiJIUzI1NiJ9.eyJzdWIi...</span></td>
+        </tr>
+        <tr>
+          <td class="cat-name">メールアドレス</td>
+          <td class="sample"><span class="mask">admin</span>@<span class="mask">corp.com</span></td>
+        </tr>
+        <tr>
+          <td class="cat-name">Cookie</td>
+          <td class="sample">PHPSESSID=<span class="mask">a8f3e2c91d4b7e0f</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

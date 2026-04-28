@@ -17,8 +17,10 @@ class Category(str, Enum):
 class GranularityMode(str, Enum):
     FULL = "full"                      # replace entire value with one placeholder
     URL_STRUCTURED = "url_structured"  # mask host + trailing ID, keep path structure
-    EMAIL_LOCAL = "email_local"        # mask local part only
+    EMAIL_LOCAL = "email_local"        # mask local part only, keep domain readable
+    EMAIL_SPLIT_HASH = "email_split_hash"  # hash local and domain independently
     HASH_ONLY = "hash_only"            # replace with hash-based placeholder
+    CREDENTIAL_PREFIX = "credential_prefix"  # keep known token prefix (AIza, sk-, ...) and mask the rest
 
 
 @dataclass(frozen=True)
@@ -31,8 +33,8 @@ class CategorySpec:
 CATEGORY_SPECS: dict[Category, CategorySpec] = {
     Category.CREDENTIAL: CategorySpec(
         Category.CREDENTIAL,
-        GranularityMode.FULL,
-        "Credential value (token, key, password, cookie)",
+        GranularityMode.CREDENTIAL_PREFIX,
+        "Credential value (well-known prefix kept, secret part masked)",
     ),
     Category.INTERNAL_URL: CategorySpec(
         Category.INTERNAL_URL,
@@ -46,8 +48,8 @@ CATEGORY_SPECS: dict[Category, CategorySpec] = {
     ),
     Category.PII_EMAIL: CategorySpec(
         Category.PII_EMAIL,
-        GranularityMode.FULL,
-        "Email address",
+        GranularityMode.EMAIL_SPLIT_HASH,
+        "Email (local and domain hashed independently)",
     ),
     Category.PII_NAME: CategorySpec(
         Category.PII_NAME,
