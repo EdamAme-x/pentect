@@ -29,6 +29,10 @@ AWS_AKID_RE = _compile(r"\bAKIA[0-9A-Z]{16}\b")
 GITHUB_PAT_RE = _compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")
 SLACK_TOKEN_RE = _compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}\b")
 GOOGLE_API_RE = _compile(r"\bAIza[0-9A-Za-z_-]{35}\b")
+# Google OAuth Client ID format: <digits>-<32 lower-alnum>.apps.googleusercontent.com
+GOOGLE_OAUTH_CLIENT_ID_RE = _compile(
+    r"\b[0-9]{6,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com\b"
+)
 # AWS Secret Access Key: 40 chars base64-ish, context-anchored to avoid false positives.
 AWS_SECRET_RE = _compile(
     r"(?i)(?:aws[_-]?secret(?:[_-]?access)?[_-]?key)\s*[:=]\s*[\"']?([A-Za-z0-9/+=]{40})[\"']?"
@@ -70,6 +74,7 @@ _CREDENTIAL_RULES: list[Rule] = [
     Rule(Category.CREDENTIAL, GITHUB_PAT_RE, "github_pat"),
     Rule(Category.CREDENTIAL, SLACK_TOKEN_RE, "slack_token"),
     Rule(Category.CREDENTIAL, GOOGLE_API_RE, "google_api_key"),
+    Rule(Category.CREDENTIAL, GOOGLE_OAUTH_CLIENT_ID_RE, "google_oauth_client_id"),
 ]
 
 _CAPTURING_CREDENTIAL_RULES: list[Rule] = [
