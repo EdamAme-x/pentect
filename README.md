@@ -74,6 +74,11 @@ result = PentectEngine(use_llm=True).mask_text(raw_text)
 ./scripts/dev.sh   # http://localhost:5173
 ```
 
+## TODO
+- [ ] ルール追加 / マスク後の refill
+- [ ] テストケース拡充
+- [ ] 検出率 98%~ (テストケース拡充した上で)
+
 ## License
 
 MIT
