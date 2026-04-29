@@ -24,6 +24,11 @@ class MaskResult:
     map: dict[str, dict[str, str]] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
     verifier: dict[str, Any] | None = None  # set when a Verifier ran
+    # placeholder -> original value. Lives in process memory only; never
+    # serialized, never logged through repr. Used by .recover() so a local
+    # caller can pull the real value back when (and only when) it needs to
+    # show it to a human or hand it to a downstream tool that stays local.
+    _recovery_map: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
 
     def to_json(self) -> str:
         payload: dict[str, Any] = {
@@ -35,6 +40,30 @@ class MaskResult:
             payload["verifier"] = self.verifier
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
+    def recover(self, placeholder: str) -> str | None:
+        """Return the original value behind a single placeholder, or None.
+
+        Intended for local-only use: callers should not forward the result
+        to a remote service. The recovery map is kept out of to_json() and
+        out of repr() to make accidental leakage harder.
+        """
+        return self._recovery_map.get(placeholder)
+
+    def recover_all(self, text: str) -> str:
+        """Replace every known placeholder in `text` with its original value.
+
+        Same caveat as .recover(): never feed the output back to a remote
+        service. This is for ground-truth viewing on the local machine
+        (e.g., a final report displayed to the analyst).
+        """
+        if not self._recovery_map:
+            return text
+        # Replace longer placeholders first to avoid prefix collisions.
+        out = text
+        for ph in sorted(self._recovery_map, key=len, reverse=True):
+            out = out.replace(ph, self._recovery_map[ph])
+        return out
+
 
 @dataclass
 class HarEntryMaskResult:
@@ -42,6 +71,18 @@ class HarEntryMaskResult:
     map: dict[str, dict[str, str]] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
     entries: list[dict[str, Any]] = field(default_factory=list)  # per-entry masked
+    _recovery_map: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
+
+    def recover(self, placeholder: str) -> str | None:
+        return self._recovery_map.get(placeholder)
+
+    def recover_all(self, text: str) -> str:
+        if not self._recovery_map:
+            return text
+        out = text
+        for ph in sorted(self._recovery_map, key=len, reverse=True):
+            out = out.replace(ph, self._recovery_map[ph])
+        return out
 
 
 _PLACEHOLDER_RE = re.compile(r"<<([A-Z_]+)_([a-f0-9]{8})>>")
@@ -270,6 +311,7 @@ class PentectEngine:
 
         combined_map: dict[str, dict[str, str]] = {}
         by_category: dict[str, int] = {}
+        combined_recovery: dict[str, str] = {}
 
         for idx, entry in enumerate(raw_entries):
             spans = batched_spans[idx] if idx < len(batched_spans) else []
@@ -280,6 +322,7 @@ class PentectEngine:
             for val, cat in anchors.items():
                 entry_values.setdefault(val, cat)
 
+            all_replacements = []
             for target, key in _fields_of(entry):
                 text = target[key]
                 field_spans: list[Span] = []
@@ -301,6 +344,22 @@ class PentectEngine:
                     continue
                 replacements = apply_granularity(text, field_spans)
                 target[key] = apply_replacements(text, replacements)
+                all_replacements.extend(replacements)
+
+            # Build a per-entry recovery map by reusing the same logic the
+            # plain-text path uses. This stays inside the loop so we don't
+            # accumulate a giant combined map; cross-entry recoveries land
+            # in `combined_recovery` below.
+            entry_recovery: dict[str, str] = {}
+            for r in all_replacements:
+                # straight 1:1 replacement (entire span -> single placeholder)
+                if r.replacement.startswith("<<") and r.replacement.endswith(">>"):
+                    entry_recovery.setdefault(r.replacement, r.original)
+            _recover_split_url(all_replacements, entry_recovery)
+            _recover_split_email(all_replacements, entry_recovery)
+            _recover_credential_prefix(all_replacements, entry_recovery)
+            for ph, original in entry_recovery.items():
+                combined_recovery.setdefault(ph, original)
 
         masked_json = json.dumps(data, ensure_ascii=False, indent=2)
         for m in _PLACEHOLDER_RE.finditer(masked_json):
@@ -322,6 +381,7 @@ class PentectEngine:
             masked_text=masked_json,
             map=combined_map,
             summary={"total_masked": len(combined_map), "by_category": by_category},
+            _recovery_map=combined_recovery,
         )
 
     def mask_har_entries(self, har_raw: str | dict) -> "HarEntryMaskResult":
@@ -352,6 +412,7 @@ class PentectEngine:
 
         per_entry: list[dict[str, Any]] = []
         all_masked_chunks: list[str] = []
+        all_replacements = []
         for e, spans in zip(entries, batched_spans):
             for val, cat in anchors.items():
                 if not val:
@@ -371,20 +432,45 @@ class PentectEngine:
             masked = apply_replacements(e.text, replacements)
             per_entry.append({"index": e.index, "masked": masked})
             all_masked_chunks.append(masked)
+            all_replacements.extend(replacements)
 
         combined = "\n".join(all_masked_chunks)
-        result = _build_result(combined, [])
+        result = _build_result(combined, all_replacements)
         return HarEntryMaskResult(
             masked_text=combined,
             map=result.map,
             summary=result.summary,
             entries=per_entry,
+            _recovery_map=result._recovery_map,
         )
 
 
 def _build_result(masked_text: str, replacements) -> MaskResult:
     mapping: dict[str, dict[str, str]] = {}
     by_category: dict[str, int] = {}
+
+    # Collect placeholder -> original value pairs from the replacements that
+    # actually fired in this pass. Two replacements may produce the same
+    # placeholder (same value, same category) -- they collapse to one entry,
+    # which is what we want.
+    recovery_map: dict[str, str] = {}
+    for r in replacements or ():
+        for m in _PLACEHOLDER_RE.finditer(r.replacement):
+            ph = m.group(0)
+            # The granularity layer may emit a multi-part replacement like
+            # "<<HOST>>/api/users/<<USER_ID>>" -- in that case we can't pin
+            # a single original to a single placeholder, so fall through and
+            # let the per-mode helpers below set up the map for split cases.
+            if r.replacement == ph:
+                recovery_map.setdefault(ph, r.original)
+
+    # Plus, walk the (host, id) split URL replacements: their .replacement
+    # is a rebuilt URL string that contains multiple placeholders, but the
+    # granularity helper packs each placeholder's original into the parent
+    # span. We recover them by re-parsing the rebuilt URL.
+    _recover_split_url(replacements or (), recovery_map)
+    _recover_split_email(replacements or (), recovery_map)
+    _recover_credential_prefix(replacements or (), recovery_map)
 
     for m in _PLACEHOLDER_RE.finditer(masked_text):
         placeholder = m.group(0)
@@ -409,7 +495,82 @@ def _build_result(masked_text: str, replacements) -> MaskResult:
             "total_masked": len(mapping),
             "by_category": by_category,
         },
+        _recovery_map=recovery_map,
     )
+
+
+def _recover_split_url(replacements, recovery_map: dict[str, str]) -> None:
+    """Re-derive recovery entries for URL_STRUCTURED replacements.
+
+    The granularity helper rebuilds URLs as
+    "<scheme>://<<INTERNAL_URL_HOST_xxxx>>/<path>/<<USER_ID_yyyy>>?<query>"
+    so a single Replacement covers several placeholders. To recover them we
+    split both the masked URL and the original URL on the same path
+    structure.
+    """
+    from urllib.parse import urlparse
+
+    for r in replacements:
+        if r.replacement == r.original or "<<" not in r.replacement:
+            continue
+        # Only URLs are interesting here; emails are handled separately.
+        if "@" in r.replacement and "://" not in r.replacement:
+            continue
+        try:
+            masked_p = urlparse(r.replacement)
+            orig_p = urlparse(r.original)
+        except Exception:  # noqa: BLE001
+            continue
+        if not masked_p.netloc or not orig_p.netloc:
+            continue
+        # netloc placeholder
+        if masked_p.netloc.startswith("<<") and masked_p.netloc.endswith(">>"):
+            recovery_map.setdefault(masked_p.netloc, orig_p.netloc)
+        # trailing path id placeholder
+        masked_segments = (masked_p.path or "").split("/")
+        orig_segments = (orig_p.path or "").split("/")
+        if masked_segments and orig_segments and len(masked_segments) == len(orig_segments):
+            last_m, last_o = masked_segments[-1], orig_segments[-1]
+            if last_m.startswith("<<") and last_m.endswith(">>"):
+                recovery_map.setdefault(last_m, last_o)
+
+
+def _recover_split_email(replacements, recovery_map: dict[str, str]) -> None:
+    """Re-derive recovery entries for EMAIL_SPLIT_HASH replacements."""
+    for r in replacements:
+        if r.replacement == r.original or "@" not in r.replacement:
+            continue
+        if "://" in r.replacement:
+            continue  # URLs handled by _recover_split_url
+        masked_local, _, masked_domain = r.replacement.partition("@")
+        orig_local, _, orig_domain = r.original.partition("@")
+        if masked_local.startswith("<<") and masked_local.endswith(">>"):
+            recovery_map.setdefault(masked_local, orig_local)
+        if masked_domain.startswith("<<") and masked_domain.endswith(">>"):
+            recovery_map.setdefault(masked_domain, orig_domain)
+
+
+def _recover_credential_prefix(replacements, recovery_map: dict[str, str]) -> None:
+    """Re-derive recovery entries for CREDENTIAL_PREFIX replacements.
+
+    The granularity helper produces "<prefix><<CREDENTIAL_xxxx>>" -- we
+    pull the placeholder out and pair it with the secret tail of the
+    original (everything after the prefix).
+    """
+    for r in replacements:
+        if r.replacement == r.original:
+            continue
+        # Find the embedded placeholder. There must be exactly one for this
+        # to be a credential-prefix shape; multi-placeholder shapes are
+        # already handled by the URL/email helpers above.
+        matches = list(_PLACEHOLDER_RE.finditer(r.replacement))
+        if len(matches) != 1:
+            continue
+        m = matches[0]
+        ph = m.group(0)
+        prefix = r.replacement[: m.start()]
+        if prefix and r.original.startswith(prefix):
+            recovery_map.setdefault(ph, r.original[len(prefix):])
 
 
 def _guess_category(label: str) -> Category | None:

@@ -57,6 +57,10 @@ class MaskRequest(BaseModel):
     text: str
     is_har: bool = True
     backend: str | None = None  # one of _VALID_BACKENDS; defaults to env
+    # Opt-in: include the placeholder -> original-value recovery map in
+    # the response. False by default so the API stays safe when used as a
+    # demo, since the recovery map carries the values we just masked.
+    include_recovery: bool = False
 
 
 class MaskResponse(BaseModel):
@@ -65,6 +69,10 @@ class MaskResponse(BaseModel):
     summary: dict
     verifier: dict | None = None
     backend: str
+    # Only populated when MaskRequest.include_recovery is True. Lets a
+    # local caller round-trip the masked text (e.g. unmask a Claude
+    # response) by replacing each placeholder with its original value.
+    recovery: dict[str, str] | None = None
 
 
 def _looks_like_har(text: str) -> bool:
@@ -101,6 +109,7 @@ def mask(req: MaskRequest) -> MaskResponse:
         summary=result.summary,
         verifier=result.verifier,
         backend=backend,
+        recovery=dict(result._recovery_map) if req.include_recovery else None,
     )
 
 
