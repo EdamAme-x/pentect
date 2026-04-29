@@ -1,0 +1,238 @@
+{
+  "val_path": "training/data/hard_val.jsonl",
+  "model": "training/runs/opf_pentect_v10_5k_ts005917",
+  "num_samples": 60,
+  "num_spans": 157,
+  "scoring": "strict one-directional: gold span must be substring of a detected hit",
+  "overall": {
+    "hit": 139,
+    "total": 157,
+    "recall": 0.8854
+  },
+  "per_category": {
+    "CREDENTIAL": {
+      "hit": 25,
+      "total": 29,
+      "recall": 0.862
+    },
+    "INTERNAL_IP": {
+      "hit": 9,
+      "total": 9,
+      "recall": 1.0
+    },
+    "INTERNAL_URL": {
+      "hit": 28,
+      "total": 41,
+      "recall": 0.683
+    },
+    "PII_NAME": {
+      "hit": 57,
+      "total": 57,
+      "recall": 1.0
+    },
+    "USER_ID": {
+      "hit": 20,
+      "total": 21,
+      "recall": 0.952
+    }
+  },
+  "misses": [
+    {
+      "idx": 9,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "[ops] Ethan Anderson escalated to Inoue Kaito at 03:12 — 内部ホスト scheduler-v2 returning 502s, token peqTmT8ExDQVMNejpUsJad",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "internal_url",
+        "secret"
+      ]
+    },
+    {
+      "idx": 12,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "values.yaml:\n  upstream:\n    host: model-registry\n    token: PLAT:BZ6RV-C77T\n    audit_contact: Ethan Young",
+      "detected_labels": [
+        "internal_url",
+        "internal_url",
+        "secret",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 13,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "reviewer: this endpoint hits model-registry without a timeout — we had an incident in Q1 exactly because of this pattern",
+      "detected_labels": [
+        "internal_url",
+        "internal_url",
+        "account_number"
+      ]
+    },
+    {
+      "idx": 14,
+      "category": "CREDENTIAL",
+      "value": "BETA:KM8E-N1L2D",
+      "input_preview": "Sophia Walker: hey, did the deploy finish? the token BETA:KM8E-N1L2D expired 3h ago and our bot stopped posting",
+      "detected_labels": [
+        "private_person",
+        "internal_url",
+        "secret"
+      ]
+    },
+    {
+      "idx": 21,
+      "category": "INTERNAL_URL",
+      "value": "event-bus",
+      "input_preview": "[ops] Sophia Robinson escalated to Nakamura Yui at 03:12 — 内部ホスト event-bus returning 502s, token LGEkadblj4gLOmzGNOzMFdM",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "secret"
+      ]
+    },
+    {
+      "idx": 30,
+      "category": "INTERNAL_URL",
+      "value": "metrics-collector",
+      "input_preview": "Mia Clark: ok i'll page Inoue Sora — they own metrics-collector this week and the latency is spiking",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 31,
+      "category": "INTERNAL_URL",
+      "value": "notification-hub",
+      "input_preview": "ステージング環境 notification-hub (10.158.29.174) でのみ再現したため、本番影響はなしと判断。担当: Inoue Haruto、チケット #6645320。",
+      "detected_labels": [
+        "internal_url",
+        "internal_ip",
+        "private_person",
+        "account_number"
+      ]
+    },
+    {
+      "idx": 34,
+      "category": "USER_ID",
+      "value": "4812195",
+      "input_preview": "事後対応として、顧客ID 4812195 のアクセスログを Liam Clark に展開し、影響範囲の確認を依頼しました。",
+      "detected_labels": [
+        "account_number",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 35,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "インシデント報告: Matsumoto Soraさんが発見した通り、社内サービス model-registry に対して 短命トークン SEC:7DK6C-FXPSSP-KMBOJG4S が認証なしで有効化されていました。",
+      "detected_labels": [
+        "private_person",
+        "internal_url",
+        "secret"
+      ]
+    },
+    {
+      "idx": 35,
+      "category": "CREDENTIAL",
+      "value": "SEC:7DK6C-FXPSSP-KMBOJG4S",
+      "input_preview": "インシデント報告: Matsumoto Soraさんが発見した通り、社内サービス model-registry に対して 短命トークン SEC:7DK6C-FXPSSP-KMBOJG4S が認証なしで有効化されていました。",
+      "detected_labels": [
+        "private_person",
+        "internal_url",
+        "secret"
+      ]
+    },
+    {
+      "idx": 37,
+      "category": "CREDENTIAL",
+      "value": "ZS0I9tyIujQv1PaglumPnAy",
+      "input_preview": "### Impact\n\nCustomer #4468914 was exposed because Charlotte King accidentally shared the dashboard link which embedded a",
+      "detected_labels": [
+        "account_number",
+        "private_person",
+        "secret"
+      ]
+    },
+    {
+      "idx": 39,
+      "category": "CREDENTIAL",
+      "value": "DEV:W43S0-JWWZODO",
+      "input_preview": "## Findings\n\n- A long-lived token `DEV:W43S0-JWWZODO` was discovered in the build cache.\n- The related service `model-re",
+      "detected_labels": [
+        "internal_url",
+        "secret",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 39,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "## Findings\n\n- A long-lived token `DEV:W43S0-JWWZODO` was discovered in the build cache.\n- The related service `model-re",
+      "detected_labels": [
+        "internal_url",
+        "secret",
+        "private_person"
+      ]
+    },
+    {
+      "idx": 44,
+      "category": "INTERNAL_URL",
+      "value": "metrics-collector",
+      "input_preview": "At 10:42 JST, Olivia Lewis bumped ticket #1875413 from P3 to P1 after confirming the outage was user-visible and that me",
+      "detected_labels": [
+        "private_person",
+        "account_number",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 50,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "As part of the retro, Kobayashi Hina summarised the timeline and flagged that the internal service model-registry lacked",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 51,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "Lucas Anderson: ok i'll page Shimizu Kaito — they own model-registry this week and the latency is spiking",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "internal_url",
+        "internal_url"
+      ]
+    },
+    {
+      "idx": 58,
+      "category": "INTERNAL_URL",
+      "value": "model-registry",
+      "input_preview": "As part of the retro, Fujita Riku summarised the timeline and flagged that the internal service model-registry lacked ci",
+      "detected_labels": [
+        "private_person"
+      ]
+    },
+    {
+      "idx": 59,
+      "category": "INTERNAL_URL",
+      "value": "scheduler-v2",
+      "input_preview": "[ops] Isabella Robinson escalated to Nakamura Hina at 03:12 — 内部ホスト scheduler-v2 returning 502s, token RxwPGsPrsBgNTkGai",
+      "detected_labels": [
+        "private_person",
+        "private_person",
+        "secret"
+      ]
+    }
+  ]
+}

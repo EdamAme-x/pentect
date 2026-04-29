@@ -30,6 +30,7 @@ _SOURCE_PRIORITY = {
     "anchor": 3,    # rule-derived global anchors (engine.core)
     "har": 3,       # rule-derived HAR-field anchors (engine.core)
     "detect_secrets": 3,  # vendor regexes from the detect-secrets project
+    "spacy_ner": 3,  # spaCy NER for person/organization names
     "hybrid": 2,
     "opf_pf": 2,
     "llm": 2,

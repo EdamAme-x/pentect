@@ -78,6 +78,7 @@ result = PentectEngine(use_llm=True).mask_text(raw_text)
 - [ ] ルール追加 / マスク後の refill
 - [ ] テストケース拡充
 - [ ] 検出率 98%~ (テストケース拡充した上で)
+- [ ] 過マスクに関しての統計を後で取る！
 
 ## License
 

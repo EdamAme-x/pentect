@@ -20,6 +20,11 @@ dependencies = [
     # regexes (no verification, no scanning pipeline). See
     # engine/detectors/detect_secrets_plugins.py.
     "detect-secrets>=1.5",
+    # spaCy NER catches person / organization names in free-form prose
+    # that the FT classifier misses (long product descriptions, copyright
+    # lines, etc.). We default to en_core_web_sm; install it with:
+    #   python -m spacy download en_core_web_sm
+    "spacy>=3.7",
 ]
 
 [project.optional-dependencies]

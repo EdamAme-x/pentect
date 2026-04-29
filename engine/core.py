@@ -8,7 +8,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from engine.categories import Category, get_spec
 from engine.detectors.base import Detector, Span
@@ -186,6 +186,13 @@ class PentectEngine:
                 self.detectors.append(DetectSecretsPluginDetector())
             except RuntimeError:
                 pass
+            # spaCy NER catches person / organization names that the FT model
+            # misses (long-form descriptions, copyright lines, etc.).
+            try:
+                from engine.detectors.spacy_ner import SpacyNERDetector
+                self.detectors.append(SpacyNERDetector())
+            except RuntimeError:
+                pass
             if chosen == "rule":
                 pass
             elif chosen == "gemma":
@@ -266,16 +273,42 @@ class PentectEngine:
         raw_entries = (data.get("log", {}) or {}).get("entries", []) or []
         entry_texts = iter_entry_texts(data)
 
-        # Rule anchors come from the full serialized HAR so values that live in
+        # Anchors come from the full serialized HAR so values that live in
         # response bodies / query strings / anywhere JSON are still caught even
         # when the compact entry text (used only as the LLM's in-distribution
-        # input) wouldn't include them.
-        rule = next((d for d in self.detectors if isinstance(d, RuleDetector)), None)
+        # input) wouldn't include them. We run *every* lightweight detector
+        # (rule, detect-secrets, spaCy NER) on the full JSON so e.g. a person
+        # name buried inside a "description" field still becomes an anchor.
+        rule_source = json.dumps(data, ensure_ascii=False)
         anchors: dict[str, Category] = {}
-        if rule is not None:
-            rule_source = json.dumps(data, ensure_ascii=False)
-            for sp in rule.detect(rule_source):
-                anchors.setdefault(rule_source[sp.start:sp.end], sp.category)
+        # Plain-text values walked from the HAR: feeding spaCy raw rule_source
+        # mixes JSON escapes / minified JS / huge bundles together and the
+        # parser collapses to single-token false positives. Walking the leaf
+        # strings instead gives the NER a clean human-language context.
+        leaf_strings = list(_iter_leaf_strings(data))
+        for d in self.detectors:
+            # Skip the heavy LLM detectors here -- they are designed to run
+            # on a single per-entry text block, not on a multi-MB HAR.
+            cls = d.__class__.__name__
+            if cls in ("LLMDetector", "PrivacyFilterDetector", "HybridDetector"):
+                continue
+            if cls == "SpacyNERDetector":
+                try:
+                    for s in leaf_strings:
+                        for sp in d.detect(s):
+                            val = s[sp.start:sp.end]
+                            if val:
+                                anchors.setdefault(val, sp.category)
+                except Exception:  # noqa: BLE001
+                    continue
+                continue
+            try:
+                for sp in d.detect(rule_source):
+                    val = rule_source[sp.start:sp.end]
+                    if val:
+                        anchors.setdefault(val, sp.category)
+            except Exception:  # noqa: BLE001
+                continue
 
         batched_spans = self._detect_all_batch([e.text for e in entry_texts]) if entry_texts else []
 
@@ -443,6 +476,29 @@ class PentectEngine:
             entries=per_entry,
             _recovery_map=result._recovery_map,
         )
+
+
+def _iter_leaf_strings(obj: Any) -> "Iterable[str]":
+    """Yield every string value from a nested HAR-like data structure.
+
+    Used to feed spaCy NER one human-language field at a time instead of
+    the whole serialized HAR, since the parser otherwise drowns in JSON
+    escapes / minified JS and produces single-token noise.
+    """
+    if isinstance(obj, str):
+        # Only feed strings that have a chance of containing a name.
+        # Skip pure base64 / dataURIs / very short tokens.
+        if len(obj) < 6 or len(obj) > 50_000:
+            return
+        if obj.startswith("data:") or obj.startswith("blob:"):
+            return
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_leaf_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_leaf_strings(v)
 
 
 def _build_result(masked_text: str, replacements) -> MaskResult:

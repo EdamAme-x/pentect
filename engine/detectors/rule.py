@@ -83,6 +83,12 @@ JSON_ID_KEY_RE = _compile(
     # input is a HAR body (where the inner JSON is escaped: \"id\": 1001).
     r'\\?"(?P<key>[A-Za-z_][A-Za-z0-9_]*[Ii]d|id|userId|user_id|basket_id|order_id|account_id|customer_id|product_id)\\?"\s*:\s*(?P<val>[0-9]+)'
 )
+# Domain/host appears as a string value under host-shaped JSON keys.
+# Catches `"domain":"juice-sh.op"` / `"host":"corp.local"` and the HAR-escaped
+# variants (\"domain\":\"...\").
+JSON_HOST_KEY_RE = _compile(
+    r'\\?"(?P<key>domain|host|hostname|server|origin)\\?"\s*:\s*\\?"(?P<val>[A-Za-z0-9][A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,32})\\?"'
+)
 
 # URL / host
 URL_RE = _compile(r"https?://([A-Za-z0-9\-._]+)(:[0-9]+)?(/[^\s\"'<>]*)?")
@@ -207,6 +213,20 @@ class RuleDetector:
                     start=m.start("val"),
                     end=m.end("val"),
                     category=cat,
+                    source=self.name,
+                )
+            )
+
+        # Hostname / domain captured directly from JSON. This is what catches
+        # the `"application":{"domain":"juice-sh.op"}` shape that the FT
+        # classifier doesn't generalise to (only specific INTERNAL_HOST_HINT
+        # TLDs like .corp / .local trigger the URL-side path).
+        for m in JSON_HOST_KEY_RE.finditer(text):
+            spans.append(
+                Span(
+                    start=m.start("val"),
+                    end=m.end("val"),
+                    category=Category.INTERNAL_URL,
                     source=self.name,
                 )
             )
