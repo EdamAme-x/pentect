@@ -50,8 +50,37 @@ def _mask_internal_url(text: str, span: Span) -> list[Replacement]:
             segments[-1] = make_placeholder(id_cat, last)
     new_path = "/".join(segments)
 
-    rebuilt = f"{parsed.scheme}://{host_ph}{new_path}{query}"
+    # Re-scan the query string for credential-shaped values. The merger
+    # collapses the URL span and any sub-spans into the URL_STRUCTURED
+    # span (since it's the longest), so credentials hiding in a query
+    # parameter (e.g. `?sid=Yp_crOiZaE3qykxGAAAE`) would otherwise survive
+    # the host/path-only mask we just built.
+    new_query = query
+    if parsed.query:
+        new_query = "?" + _mask_query_secrets(parsed.query)
+
+    rebuilt = f"{parsed.scheme}://{host_ph}{new_path}{new_query}"
     return [Replacement(span.start, span.end, rebuilt, Category.INTERNAL_URL, original)]
+
+
+def _mask_query_secrets(query: str) -> str:
+    """Walk a `key=value&key=value` query string and mask credential-shaped
+    values using the entropy-based heuristic."""
+    from engine.detectors.entropy import _is_high_entropy_secret
+
+    parts = query.split("&")
+    out = []
+    for p in parts:
+        if "=" not in p:
+            out.append(p)
+            continue
+        k, _, v = p.partition("=")
+        if v and _is_high_entropy_secret(v):
+            ph = make_placeholder(Category.CREDENTIAL, v)
+            out.append(f"{k}={ph}")
+        else:
+            out.append(p)
+    return "&".join(out)
 
 
 def _mask_email_local(text: str, span: Span) -> list[Replacement]:

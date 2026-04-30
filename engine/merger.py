@@ -31,6 +31,7 @@ _SOURCE_PRIORITY = {
     "har": 3,       # rule-derived HAR-field anchors (engine.core)
     "detect_secrets": 3,  # vendor regexes from the detect-secrets project
     "spacy_ner": 3,  # spaCy NER for person/organization names
+    "entropy": 3,    # high-entropy values in query strings / cookies / JSON
     "hybrid": 2,
     "opf_pf": 2,
     "llm": 2,

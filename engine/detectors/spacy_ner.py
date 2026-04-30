@@ -16,10 +16,23 @@ not what Pentect masks.
 from __future__ import annotations
 
 import os
+import re
 from typing import Iterable
 
 from engine.categories import Category
 from engine.detectors.base import Span
+
+
+# Strip Pentect placeholders (`<<CATEGORY_xxxxxxxx>>`) before feeding text
+# to spaCy: in real HARs, copyright comments and product descriptions get
+# previous detector passes mixed into them, and spaCy's NER collapses on
+# adjacent placeholder noise. We blank them out with same-length spaces so
+# downstream offsets still line up with the original text.
+_PLACEHOLDER_RE = re.compile(r"<<[A-Z_]+_[a-f0-9]{8}>>")
+
+
+def _clean_for_ner(s: str) -> str:
+    return _PLACEHOLDER_RE.sub(lambda m: " " * len(m.group()), s)
 
 
 # Default to the small English model so the first install is light.
@@ -76,8 +89,9 @@ class SpacyNERDetector:
 
     def _detect_chunk(self, chunk: str, base_offset: int) -> list[Span]:
         out: list[Span] = []
+        cleaned = _clean_for_ner(chunk)
         try:
-            doc = self._nlp(chunk)
+            doc = self._nlp(cleaned)
         except Exception:  # noqa: BLE001
             return out
         for ent in doc.ents:

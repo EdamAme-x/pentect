@@ -13,7 +13,7 @@ from typing import Any, Iterable
 from engine.categories import Category, get_spec
 from engine.detectors.base import Detector, Span
 from engine.detectors.rule import RuleDetector
-from engine.granularity import apply_granularity, apply_replacements
+from engine.granularity import Replacement, apply_granularity, apply_replacements
 from engine.merger import merge
 from engine.parsers.har import HarEntryText, iter_entry_texts, parse_har
 
@@ -193,6 +193,11 @@ class PentectEngine:
                 self.detectors.append(SpacyNERDetector())
             except RuntimeError:
                 pass
+            # Entropy-based fallback for query / cookie / JSON-credential
+            # values whose shape isn't covered by any explicit pattern
+            # (Socket.IO sids, opaque session tokens, etc.).
+            from engine.detectors.entropy import EntropyDetector
+            self.detectors.append(EntropyDetector())
             if chosen == "rule":
                 pass
             elif chosen == "gemma":
@@ -292,9 +297,25 @@ class PentectEngine:
             cls = d.__class__.__name__
             if cls in ("LLMDetector", "PrivacyFilterDetector", "HybridDetector"):
                 continue
-            if cls == "SpacyNERDetector":
+            # spaCy NER and the entropy detector both blow up if you feed
+            # them a 4 MB blob mixing escaped JSON / minified JS / CSS:
+            # NER collapses to single-token false positives, and entropy
+            # mistakes minified-JS expressions like `?b:c)` for query
+            # parameters. Walking the HAR leaf-string by leaf-string keeps
+            # each detector inside a clean per-field context.
+            if cls in ("SpacyNERDetector", "EntropyDetector"):
+                # spaCy NER and entropy use different size budgets:
+                # - NER chunks internally and benefits from seeing full
+                #   HTML pages (where copyright comments live), so we
+                #   give it up to 200 KB per leaf.
+                # - Entropy is line-noise sensitive; very large minified
+                #   strings produce massive false positives, so cap it
+                #   tighter.
+                cap = 200_000 if cls == "SpacyNERDetector" else 20_000
                 try:
                     for s in leaf_strings:
+                        if len(s) > cap:
+                            continue
                         for sp in d.detect(s):
                             val = s[sp.start:sp.end]
                             if val:
@@ -394,6 +415,17 @@ class PentectEngine:
             for ph, original in entry_recovery.items():
                 combined_recovery.setdefault(ph, original)
 
+        # Final sweep: anchors that landed on HAR fields outside entries
+        # (e.g. log.pages[i].title) are not reached by the per-entry loop
+        # above. Walk every string in `data` and apply substring replacement
+        # for each anchor we have. This is O(N * anchors) where N is total
+        # string content; in practice anchors stays in the dozens.
+        if anchors:
+            tail_replacements = _apply_anchors_in_place(data, anchors)
+            for r in tail_replacements:
+                if r.replacement.startswith("<<") and r.replacement.endswith(">>"):
+                    combined_recovery.setdefault(r.replacement, r.original)
+
         masked_json = json.dumps(data, ensure_ascii=False, indent=2)
         for m in _PLACEHOLDER_RE.finditer(masked_json):
             ph = m.group(0)
@@ -478,6 +510,52 @@ class PentectEngine:
         )
 
 
+def _apply_anchors_in_place(obj: Any, anchors: dict[str, Category]):
+    """Walk a HAR-like structure and apply `anchors` to every string leaf.
+
+    Used after the per-entry pass to pick up strings that live outside
+    `log.entries[*]` (e.g. `log.pages[i].title`). Modifies the structure
+    in place where it can (for dict / list of strings) and returns the
+    list of Replacement objects produced so the caller can build a
+    recovery map.
+    """
+    out: list[Replacement] = []
+
+    def _walk(node: Any, parent: Any, key: Any) -> None:
+        if isinstance(node, str):
+            field_spans: list[Span] = []
+            for val, cat in anchors.items():
+                if not val:
+                    continue
+                start = 0
+                while True:
+                    hit = node.find(val, start)
+                    if hit < 0:
+                        break
+                    field_spans.append(Span(
+                        start=hit, end=hit + len(val),
+                        category=cat, source="har",
+                    ))
+                    start = hit + len(val)
+            if not field_spans:
+                return
+            field_spans = merge(field_spans)
+            replacements = apply_granularity(node, field_spans)
+            new_text = apply_replacements(node, replacements)
+            if new_text != node and parent is not None and key is not None:
+                parent[key] = new_text
+                out.extend(replacements)
+        elif isinstance(node, dict):
+            for k in list(node.keys()):
+                _walk(node[k], node, k)
+        elif isinstance(node, list):
+            for i in range(len(node)):
+                _walk(node[i], node, i)
+
+    _walk(obj, None, None)
+    return out
+
+
 def _iter_leaf_strings(obj: Any) -> "Iterable[str]":
     """Yield every string value from a nested HAR-like data structure.
 
@@ -488,7 +566,11 @@ def _iter_leaf_strings(obj: Any) -> "Iterable[str]":
     if isinstance(obj, str):
         # Only feed strings that have a chance of containing a name.
         # Skip pure base64 / dataURIs / very short tokens.
-        if len(obj) < 6 or len(obj) > 50_000:
+        # Upper bound: spaCy chunks internally to 80k, so 200k strings
+        # (full HTML responses w/ scripts) are fine; over that the entire
+        # body is almost certainly minified bundles or base64 binary --
+        # not human-language content NER would help with.
+        if len(obj) < 6 or len(obj) > 200_000:
             return
         if obj.startswith("data:") or obj.startswith("blob:"):
             return
