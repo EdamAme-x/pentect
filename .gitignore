@@ -30,7 +30,10 @@ ui/.vite/
 *.log
 
 # Training artifacts
-data/
+/data/
+# But the detector ships dictionaries (BIP39 wordlists) under
+# engine/detectors/data — keep those tracked.
+!engine/detectors/data/
 checkpoints/
 outputs/
 wandb/

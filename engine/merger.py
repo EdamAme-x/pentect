@@ -32,6 +32,9 @@ _SOURCE_PRIORITY = {
     "detect_secrets": 3,  # vendor regexes from the detect-secrets project
     "spacy_ner": 3,  # spaCy NER for person/organization names
     "entropy": 3,    # high-entropy values in query strings / cookies / JSON
+    "base64_unwrap": 3,  # base64 chunks whose decoded payload looks like a secret
+    "seed_phrase": 3,  # BIP39 mnemonic + PEM private key blocks
+    "crypto_address": 3,  # BTC / ETH / Solana / Cosmos wallet addresses
     "hybrid": 2,
     "opf_pf": 2,
     "llm": 2,

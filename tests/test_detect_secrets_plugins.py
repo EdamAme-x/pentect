@@ -57,10 +57,16 @@ def test_twilio_account_sid():
     assert any(m.startswith("AC") for m in matched), matched
 
 
-def test_private_key_header():
+def test_private_key_header_not_emitted_by_detect_secrets():
+    # detect-secrets ships a PrivateKeyDetector whose regex matches the
+    # `BEGIN RSA PRIVATE KEY` armor line. We deliberately drop that
+    # plugin (see engine/detectors/detect_secrets_plugins.py) because
+    # the armor lines are public format markers — masking them removes
+    # context without protecting any secret. Pentect's SeedPhraseDetector
+    # handles the b64 body separately.
     text = "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----"
     matched = _matches(text)
-    assert any("PRIVATE KEY" in m for m in matched), matched
+    assert matched == []
 
 
 def test_basic_auth_in_url():

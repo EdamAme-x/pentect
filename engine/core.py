@@ -16,6 +16,7 @@ from engine.detectors.rule import RuleDetector
 from engine.granularity import Replacement, apply_granularity, apply_replacements
 from engine.merger import merge
 from engine.parsers.har import HarEntryText, iter_entry_texts, parse_har
+from engine.placeholder import make_placeholder
 
 
 @dataclass
@@ -86,6 +87,162 @@ class HarEntryMaskResult:
 
 
 _PLACEHOLDER_RE = re.compile(r"<<([A-Z_]+)_([a-f0-9]{8})>>")
+
+
+# Static-asset shortcut. minified JS / CSS / images / fonts coming
+# from a public CDN are by far the bulk of a real HAR (often >90% of
+# bytes) and contain effectively no secrets — but walking them
+# through every detector is 70+ s of pure work. We pre-mask their
+# body with a single STATIC_ASSET placeholder and skip detection on
+# them entirely. The original bytes go into the recovery map so a
+# local caller can still get them back via MaskResult.recover().
+#
+# Detection is by URL suffix and by MIME type. We deliberately don't
+# look at body content sniffing: build artifacts can be large enough
+# that a heuristic scan dominates the cost we're trying to avoid.
+_STATIC_URL_SUFFIXES = (
+    ".js", ".mjs", ".cjs", ".js.map", ".css", ".css.map",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".svg",
+    ".mp4", ".mp3", ".webm", ".ogg", ".wav",
+    ".wasm", ".pdf",
+)
+_STATIC_MIME_PREFIXES = (
+    "image/",
+    "font/",
+    "audio/",
+    "video/",
+    "application/javascript",
+    "application/x-javascript",
+    "text/javascript",
+    "text/css",
+    "application/wasm",
+    "application/font-",
+    "application/x-font",
+)
+
+
+def _looks_like_static_asset(url: str, mime: str) -> bool:
+    """True iff this entry's response body should be treated as a
+    public-CDN asset and not walked by the detectors."""
+    if mime:
+        m = mime.lower().split(";", 1)[0].strip()
+        if m.startswith(_STATIC_MIME_PREFIXES):
+            return True
+    if url:
+        # strip query string before suffix match
+        u = url.split("?", 1)[0].split("#", 1)[0].lower()
+        if u.endswith(_STATIC_URL_SUFFIXES):
+            return True
+    return False
+
+# Minimum leaf length we'll pay spaCy NER inference cost on. Below
+# this we either won't have a multi-word entity to find, or the
+# string is a URL / token / short identifier that NER will hallucinate
+# on. 64 chars is roughly the smallest length where a real-world body
+# might contain a name (e.g. "© 2024 Acme Corp" is 18 chars but ones
+# we actually need to catch like "Bjoern Kimminich" appear inside
+# multi-line copyright headers or descriptions).
+_MIN_NER_LEAF_LEN = 64
+
+
+# Categories whose values are short handles / common words and must only
+# match on word boundaries when re-applied as anchors. Without this, an
+# anchor like `bootstrap` (from github.com/twbs/bootstrap) would also match
+# `getbootstrap.com` and replace just the middle of an unrelated host.
+_WORD_BOUNDED_ANCHOR_CATEGORIES = {Category.PII_HANDLE}
+
+
+def _anchor_iter_hits(text: str, value: str, category: Category):
+    """Yield (start, end) for every place `value` appears in `text` that we
+    should treat as an anchor hit.
+
+    For most categories that means every substring occurrence. For handle-
+    like categories we additionally require that the surrounding characters
+    are not part of an identifier, so `bootstrap` (handle) does not match
+    inside `getbootstrap.com`.
+    """
+    if not value:
+        return
+    word_bounded = category in _WORD_BOUNDED_ANCHOR_CATEGORIES
+    n = len(value)
+    start = 0
+    while True:
+        hit = text.find(value, start)
+        if hit < 0:
+            return
+        if word_bounded:
+            before = text[hit - 1] if hit > 0 else ""
+            after = text[hit + n] if hit + n < len(text) else ""
+            if (before and (before.isalnum() or before == "_")) or (
+                after and (after.isalnum() or after == "_")
+            ):
+                start = hit + 1
+                continue
+        yield hit, hit + n
+        start = hit + n
+
+
+def _build_anchor_matcher(anchor_items: list[tuple[str, Category]]):
+    """Compile the anchor set into a single regex that scans a target
+    string in one pass. Returns a callable
+    ``match(text) -> Iterable[tuple[int, int, Category]]``.
+
+    The naive implementation iterates each anchor against each target
+    field and calls ``str.find`` in a loop — that's O(F * A * T). With
+    a combined alternation, the regex engine walks the input once
+    while NFA-matching all alternatives, dropping the cost to
+    O((F + A) * T) which is what keeps the pipeline at k <= 1.2.
+
+    Two technical caveats:
+      - longer anchors are listed first so a substring anchor doesn't
+        win over a longer overlapping one (regex alternation is
+        leftmost-first, so order matters);
+      - PII_HANDLE-category anchors require word boundaries — we wrap
+        them with a lookbehind/lookahead via a per-anchor named
+        group so the same regex covers both regular and word-bounded
+        anchors.
+    """
+    if not anchor_items:
+        return None
+
+    # Sort anchors longest-first so alternation prefers the longer
+    # match. Empty anchors are skipped.
+    items = [(v, c) for v, c in anchor_items if v]
+    items.sort(key=lambda vc: -len(vc[0]))
+
+    parts: list[str] = []
+    cats: list[Category] = []
+    for value, category in items:
+        word_bounded = category in _WORD_BOUNDED_ANCHOR_CATEGORIES
+        body = re.escape(value)
+        if word_bounded:
+            body = rf"(?<![A-Za-z0-9_]){body}(?![A-Za-z0-9_])"
+        parts.append(f"(?:{body})")
+        cats.append(category)
+
+    # We use a single non-capturing alternation and look at the match
+    # text to decide which anchor fired. Using one named group per
+    # anchor would blow past Python's 100-group regex limit on
+    # realistic HARs. For very large anchor sets we fall back to the
+    # per-anchor loop.
+    if sum(len(p) for p in parts) > 800_000:
+        return None
+
+    pattern = re.compile("|".join(parts))
+    # Map original anchor value (already normalized to longest-first
+    # order) to its category for fast post-match lookup.
+    cat_by_value: dict[str, Category] = {v: c for v, c in items}
+
+    def matcher(text: str):
+        for m in pattern.finditer(text):
+            val = m.group(0)
+            cat = cat_by_value.get(val)
+            if cat is None:
+                continue
+            yield m.start(), m.end(), cat
+
+    return matcher
 
 
 def _load_lenient_har(raw: str) -> dict:
@@ -186,18 +343,42 @@ class PentectEngine:
                 self.detectors.append(DetectSecretsPluginDetector())
             except RuntimeError:
                 pass
-            # spaCy NER catches person / organization names that the FT model
-            # misses (long-form descriptions, copyright lines, etc.).
-            try:
-                from engine.detectors.spacy_ner import SpacyNERDetector
-                self.detectors.append(SpacyNERDetector())
-            except RuntimeError:
-                pass
+            # spaCy NER catches person / organization names that the
+            # FT model misses (long-form descriptions, copyright lines,
+            # etc.). On real HARs (3-4 MB, mostly minified bundles +
+            # JSON) NER costs 5-6x the rest of the pipeline combined
+            # while contributing roughly zero new leak-relevant masks
+            # — every name that mattered (Bjoern Kimminich, OWASP,
+            # davegandy, daneden, Dittmeyer) is already caught by the
+            # banner / @handle / detect-secrets rules. So NER is
+            # off-by-default and opted into via PENTECT_ENABLE_SPACY=1.
+            if os.environ.get("PENTECT_ENABLE_SPACY") in ("1", "true", "yes"):
+                try:
+                    from engine.detectors.spacy_ner import SpacyNERDetector
+                    self.detectors.append(SpacyNERDetector())
+                except RuntimeError:
+                    pass
             # Entropy-based fallback for query / cookie / JSON-credential
             # values whose shape isn't covered by any explicit pattern
             # (Socket.IO sids, opaque session tokens, etc.).
             from engine.detectors.entropy import EntropyDetector
             self.detectors.append(EntropyDetector())
+            # Base64-wrapped credentials: decode candidate chunks, check
+            # whether the plaintext contains a credential-shaped payload,
+            # mask the encoded blob if so.
+            from engine.detectors.base64_unwrap import Base64UnwrapDetector
+            self.detectors.append(Base64UnwrapDetector())
+            # BIP39 mnemonic phrases and PEM private key blocks. Neither
+            # shows up in the entropy path (lowercase prose is too low
+            # entropy; PEM b64 decodes to binary DER) so they get their
+            # own dictionary / regex pass.
+            from engine.detectors.seed_phrase import SeedPhraseDetector
+            self.detectors.append(SeedPhraseDetector())
+            # Cryptocurrency wallet addresses (BTC, ETH, Solana, ...).
+            # These are stable identifiers that link a person to their
+            # transaction history — same threat model as a username.
+            from engine.detectors.crypto_address import CryptoAddressDetector
+            self.detectors.append(CryptoAddressDetector())
             if chosen == "rule":
                 pass
             elif chosen == "gemma":
@@ -275,6 +456,15 @@ class PentectEngine:
         else:
             data = json.loads(json.dumps(har_raw))
 
+        # Pre-pass: collapse public CDN bodies (minified JS / CSS,
+        # images, fonts, ...) to a single STATIC_ASSET placeholder
+        # before the detectors ever see them. On real-world HARs this
+        # is by far the biggest wall-clock win: a Juice Shop /
+        # Angular bundle is ~1.4 MB of minified JS that would
+        # otherwise eat 70+ s of detector time for no leak gain.
+        static_recovery: dict[str, str] = {}
+        _collapse_static_assets(data, static_recovery)
+
         raw_entries = (data.get("log", {}) or {}).get("entries", []) or []
         entry_texts = iter_entry_texts(data)
 
@@ -312,14 +502,54 @@ class PentectEngine:
                 #   strings produce massive false positives, so cap it
                 #   tighter.
                 cap = 200_000 if cls == "SpacyNERDetector" else 20_000
+                if cls == "SpacyNERDetector":
+                    # Names live in human-language fields: HTML pages,
+                    # long copyright comments, JSON descriptions. URL
+                    # paths, header values, and short tokens almost
+                    # never carry a PERSON/ORG entity, but feeding them
+                    # to spaCy is by far the biggest wall-clock cost
+                    # in the pipeline. Filter by minimum length AND
+                    # by a quick "looks like prose" heuristic: must
+                    # contain at least one space character (entities
+                    # require multi-word tokens) and must include some
+                    # uppercase letters (proper nouns).
+                    # Also enforce a per-leaf upper bound smaller than
+                    # the chunk cap above: a multi-MB body is almost
+                    # always minified JS or base64, and even when it's
+                    # not the bulk of the runtime is spent on those
+                    # bytes for negligible recall gain. Keep this
+                    # tunable via env var so a user with very long
+                    # human-language documents can opt in to scanning
+                    # them.
+                    ner_cap = int(
+                        os.environ.get("PENTECT_NER_LEAF_CAP", "32000")
+                    )
+                    cand: list[str] = [
+                        s for s in leaf_strings
+                        if _MIN_NER_LEAF_LEN <= len(s) <= ner_cap
+                        and " " in s
+                        and any(c.isupper() for c in s)
+                    ]
+                else:
+                    cand = [s for s in leaf_strings if 0 < len(s) <= cap]
+                # Prefer batched inference where the detector exposes
+                # one — for spaCy NER this collapses hundreds of small
+                # forwards into one piped call (huge speedup).
+                batch_fn = getattr(d, "detect_batch", None)
                 try:
-                    for s in leaf_strings:
-                        if len(s) > cap:
-                            continue
-                        for sp in d.detect(s):
-                            val = s[sp.start:sp.end]
-                            if val:
-                                anchors.setdefault(val, sp.category)
+                    if callable(batch_fn):
+                        per = batch_fn(cand)
+                        for s, spans in zip(cand, per):
+                            for sp in spans:
+                                val = s[sp.start:sp.end]
+                                if val:
+                                    anchors.setdefault(val, sp.category)
+                    else:
+                        for s in cand:
+                            for sp in d.detect(s):
+                                val = s[sp.start:sp.end]
+                                if val:
+                                    anchors.setdefault(val, sp.category)
                 except Exception:  # noqa: BLE001
                     continue
                 continue
@@ -366,6 +596,10 @@ class PentectEngine:
         combined_map: dict[str, dict[str, str]] = {}
         by_category: dict[str, int] = {}
         combined_recovery: dict[str, str] = {}
+        # Carry over static-asset recovery entries built during the
+        # pre-pass so callers can recover() the original CDN bodies.
+        for ph, body in static_recovery.items():
+            combined_recovery.setdefault(ph, body)
 
         for idx, entry in enumerate(raw_entries):
             spans = batched_spans[idx] if idx < len(batched_spans) else []
@@ -376,23 +610,28 @@ class PentectEngine:
             for val, cat in anchors.items():
                 entry_values.setdefault(val, cat)
 
+            # Compile the per-entry anchor set once; reuse across
+            # every field of this entry so we walk each field text a
+            # single time instead of len(anchors) times.
+            entry_matcher = _build_anchor_matcher(list(entry_values.items()))
+
             all_replacements = []
             for target, key in _fields_of(entry):
                 text = target[key]
                 field_spans: list[Span] = []
-                for val, cat in entry_values.items():
-                    if not val:
-                        continue
-                    start = 0
-                    while True:
-                        hit = text.find(val, start)
-                        if hit < 0:
-                            break
+                if entry_matcher is not None:
+                    for s_, e_, cat in entry_matcher(text):
                         field_spans.append(Span(
-                            start=hit, end=hit + len(val),
+                            start=s_, end=e_,
                             category=cat, source="har",
                         ))
-                        start = hit + len(val)
+                else:
+                    for val, cat in entry_values.items():
+                        for s_, e_ in _anchor_iter_hits(text, val, cat):
+                            field_spans.append(Span(
+                                start=s_, end=e_,
+                                category=cat, source="har",
+                            ))
                 field_spans = merge(field_spans)
                 if not field_spans:
                     continue
@@ -480,18 +719,11 @@ class PentectEngine:
         all_replacements = []
         for e, spans in zip(entries, batched_spans):
             for val, cat in anchors.items():
-                if not val:
-                    continue
-                start = 0
-                while True:
-                    idx = e.text.find(val, start)
-                    if idx < 0:
-                        break
+                for s_, e_ in _anchor_iter_hits(e.text, val, cat):
                     spans.append(Span(
-                        start=idx, end=idx + len(val),
+                        start=s_, end=e_,
                         category=cat, source="anchor",
                     ))
-                    start = idx + len(val)
             spans = merge(spans)
             replacements = apply_granularity(e.text, spans)
             masked = apply_replacements(e.text, replacements)
@@ -510,6 +742,43 @@ class PentectEngine:
         )
 
 
+def _collapse_static_assets(data: Any, recovery: dict[str, str]) -> None:
+    """Replace static-asset response bodies in-place with a single
+    STATIC_ASSET placeholder. ``recovery`` is appended with the
+    placeholder -> original-body mapping so MaskResult.recover() can
+    return the bytes when a local caller asks.
+
+    We touch only ``log.entries[*].response.content.text``. URL is
+    read from ``log.entries[*].request.url`` and MIME from
+    ``response.content.mimeType``; either positive signal is enough
+    to mark the body as static.
+    """
+    log = data.get("log") if isinstance(data, dict) else None
+    if not isinstance(log, dict):
+        return
+    entries = log.get("entries") or []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        req = entry.get("request") or {}
+        res = entry.get("response") or {}
+        if not isinstance(req, dict) or not isinstance(res, dict):
+            continue
+        content = res.get("content") or {}
+        if not isinstance(content, dict):
+            continue
+        body = content.get("text")
+        if not isinstance(body, str) or not body:
+            continue
+        url = req.get("url") if isinstance(req.get("url"), str) else ""
+        mime = content.get("mimeType") if isinstance(content.get("mimeType"), str) else ""
+        if not _looks_like_static_asset(url, mime):
+            continue
+        ph = make_placeholder(Category.STATIC_ASSET, body)
+        recovery.setdefault(ph, body)
+        content["text"] = ph
+
+
 def _apply_anchors_in_place(obj: Any, anchors: dict[str, Category]):
     """Walk a HAR-like structure and apply `anchors` to every string leaf.
 
@@ -520,23 +789,24 @@ def _apply_anchors_in_place(obj: Any, anchors: dict[str, Category]):
     recovery map.
     """
     out: list[Replacement] = []
+    matcher = _build_anchor_matcher(list(anchors.items()))
 
     def _walk(node: Any, parent: Any, key: Any) -> None:
         if isinstance(node, str):
             field_spans: list[Span] = []
-            for val, cat in anchors.items():
-                if not val:
-                    continue
-                start = 0
-                while True:
-                    hit = node.find(val, start)
-                    if hit < 0:
-                        break
+            if matcher is not None:
+                for s_, e_, cat in matcher(node):
                     field_spans.append(Span(
-                        start=hit, end=hit + len(val),
+                        start=s_, end=e_,
                         category=cat, source="har",
                     ))
-                    start = hit + len(val)
+            else:
+                for val, cat in anchors.items():
+                    for s_, e_ in _anchor_iter_hits(node, val, cat):
+                        field_spans.append(Span(
+                            start=s_, end=e_,
+                            category=cat, source="har",
+                        ))
             if not field_spans:
                 return
             field_spans = merge(field_spans)

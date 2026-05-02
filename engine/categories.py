@@ -14,6 +14,40 @@ class Category(str, Enum):
     PII_NAME = "PII_NAME"
     USER_ID = "USER_ID"
     RESOURCE_ID = "RESOURCE_ID"
+    # Public account / project handle on a known platform (github, twitter,
+    # keybase, etc.). NOT a credential — the platform domain stays readable
+    # so "github.com/<<PII_HANDLE_xxx>>/<<PII_HANDLE_yyy>>" still tells the
+    # reader this is an OSS link.
+    PII_HANDLE = "PII_HANDLE"
+    # "Looks like X, can't fully confirm" buckets. Used by detectors
+    # that cast a wide net on shape/heuristics — the mask is reversible
+    # via MaskResult.recover() so over-masking is cheap. The category
+    # name carries our guess so the analyst can tell what kind of value
+    # was redacted without having to recover it.
+    #
+    # LIKELY_CRYPTO_ADDRESS — Base58 / Bech32 / hex shape that matches
+    #   a wallet-address pattern but lacks a strong protocol prefix
+    #   (e.g. an unanchored 32-44 char Base58 run that *could* be a
+    #   Solana / Cardano / NEAR address but is also valid as an opaque
+    #   token from some other system).
+    LIKELY_CRYPTO_ADDRESS = "LIKELY_CRYPTO_ADDRESS"
+    # LIKELY_HASH — high-entropy hex / base64 of a length matching a
+    #   well-known digest (md5, sha1, sha256, blake2). Could be a
+    #   commit hash, file checksum, password digest, ETag, etc. Not
+    #   confirmed to be a credential but identifies content / state.
+    LIKELY_HASH = "LIKELY_HASH"
+    # LIKELY_TOKEN — looks like a credential (length, charset, entropy)
+    #   but doesn't match any known vendor regex (Stripe / AWS / etc.)
+    #   and didn't appear under a credential-shaped key. Catch-all for
+    #   "random-looking string in a place we don't trust".
+    LIKELY_TOKEN = "LIKELY_TOKEN"
+    # Static asset body (minified JS / CSS, base64 image, webfont).
+    # The content is public-CDN material with effectively no leak risk
+    # but is the bulk of HAR size and dominates detector runtime if
+    # walked. We replace the whole body with one placeholder up front
+    # and skip detection on it. Recoverable via MaskResult.recover()
+    # like every other category.
+    STATIC_ASSET = "STATIC_ASSET"
 
 
 class GranularityMode(str, Enum):
@@ -72,6 +106,31 @@ CATEGORY_SPECS: dict[Category, CategorySpec] = {
         Category.RESOURCE_ID,
         GranularityMode.HASH_ONLY,
         "Resource identifier (issue, order, basket, product, ...)",
+    ),
+    Category.PII_HANDLE: CategorySpec(
+        Category.PII_HANDLE,
+        GranularityMode.HASH_ONLY,
+        "Public account / project handle on a known platform",
+    ),
+    Category.LIKELY_CRYPTO_ADDRESS: CategorySpec(
+        Category.LIKELY_CRYPTO_ADDRESS,
+        GranularityMode.HASH_ONLY,
+        "Looks like a wallet address (Base58 / Bech32 shape, unconfirmed)",
+    ),
+    Category.LIKELY_HASH: CategorySpec(
+        Category.LIKELY_HASH,
+        GranularityMode.HASH_ONLY,
+        "Looks like a digest / hash (entropy + length matching md5/sha1/sha256)",
+    ),
+    Category.LIKELY_TOKEN: CategorySpec(
+        Category.LIKELY_TOKEN,
+        GranularityMode.HASH_ONLY,
+        "Looks like a credential token; no specific vendor pattern matched",
+    ),
+    Category.STATIC_ASSET: CategorySpec(
+        Category.STATIC_ASSET,
+        GranularityMode.HASH_ONLY,
+        "Static asset body (minified JS / CSS / image / font)",
     ),
 }
 

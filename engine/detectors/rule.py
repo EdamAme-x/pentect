@@ -29,23 +29,88 @@ AWS_AKID_RE = _compile(r"\bAKIA[0-9A-Z]{16}\b")
 GITHUB_PAT_RE = _compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")
 SLACK_TOKEN_RE = _compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}\b")
 GOOGLE_API_RE = _compile(r"\bAIza[0-9A-Za-z_-]{35}\b")
+# OpenAI API keys: sk-... (legacy) and sk-proj-... / sk-svcacct-... (newer).
+# Length varies by key type but always >= 30 chars after the `sk-` prefix.
+OPENAI_KEY_RE = _compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{30,}\b")
 # Google OAuth Client ID format: <digits>-<32 lower-alnum>.apps.googleusercontent.com
 GOOGLE_OAUTH_CLIENT_ID_RE = _compile(
     r"\b[0-9]{6,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com\b"
 )
 # Keybase user URL: keybase.io/<username> -- identifies a person.
-KEYBASE_USER_RE = _compile(r"\bkeybase\.io/[A-Za-z0-9_]{2,32}\b")
+# We mask only the username segment so the keybase.io domain stays readable
+# (keybase.io itself is public, the leak is which person owns the account).
+KEYBASE_USER_RE = _compile(
+    r"\bkeybase\.io/(?P<handle>[A-Za-z0-9_]{2,32})\b"
+)
 # GitHub owner / org / repo path: github.com/<owner>(/<repo>)? -- identifies
-# a project or a person. Mask the whole owner+repo segment, not just the host.
+# a project or a person. Mask owner and repo as separate handles; the
+# github.com host stays readable so the masked output still tells the reader
+# this is a GitHub link.
 GITHUB_OWNER_REPO_RE = _compile(
-    r"\bgithub\.com/[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:/[A-Za-z0-9._-]{1,100})?\b"
+    r"\bgithub\.com/(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))"
+    r"(?:/(?P<repo>[A-Za-z0-9._-]{1,100}))?\b"
 )
 # Social handles in URL form: twitter.com/<user>, x.com/<user>, linkedin.com/in/<user>.
 # Skip well-known non-handle landing paths (twitter.com/intent etc).
 SOCIAL_HANDLE_URL_RE = _compile(
     r"\b(?:twitter\.com|x\.com|linkedin\.com/(?:in|company))/(?!intent\b|share\b|home\b)"
-    r"[A-Za-z0-9._-]{2,40}\b"
+    r"(?P<handle>[A-Za-z0-9._-]{2,40})\b"
 )
+# Bare "@handle" form -- common in OSS license headers / changelogs / social
+# attribution ("by @davegandy", "thanks @torvalds").
+# We require a leading whitespace or "by " so we don't fire on:
+#   - email local parts ("user@example.com" — char before @ is not space)
+#   - decorators ("@property" — leading char is `\n` but `property` is a
+#     reserved Python keyword which we exclude via length+stoplist below)
+#   - JSON keys ('"@type"' — preceded by a quote)
+SOCIAL_HANDLE_AT_RE = _compile(
+    r"(?:^|(?<=\s)|(?<=by\s))@(?P<handle>[A-Za-z][A-Za-z0-9_]{2,29})\b"
+)
+# OSS license / banner block: /*! ... */ — a CSS/JS convention that wraps
+# attribution headers. Hosts, project names, and emails in here can identify
+# the author or the project; we mask all of them indiscriminately. The
+# upstream caller can always undo a mask with MaskResult.recover(...) when
+# context is needed, so the policy is "if in doubt, mask" rather than
+# maintain an OSS allowlist.
+_LICENSE_BANNER_RE = _compile(r"/\*!.*?\*/", re.DOTALL)
+_BANNER_URL_HOST_RE = _compile(
+    r"https?://(?P<host>[A-Za-z0-9._-]+)(?:[/:][^\s]*)?",
+    re.IGNORECASE,
+)
+# Banner copyright holder: `(c) 2018 Twitter, Inc.`, `Copyright 2014 Foo Bar`.
+# Captures the entity name that follows a copyright marker + year. Stops at
+# end-of-line, period, comma, pipe, or another copyright clause.
+_BANNER_COPYRIGHT_RE = _compile(
+    r"(?:\(c\)|©|Copyright(?:\s+\(c\))?)\s*\d{4}(?:\s*[-–]\s*\d{4})?\s+"
+    r"(?P<holder>[A-Z][A-Za-z0-9.&]*(?:\s+[A-Z][A-Za-z0-9.&]*){0,5}?)"
+    r"(?=\s*(?:[,.|\n;:*]|$|Inc\b|LLC\b|Ltd\b|Foundation\b|Project\b))",
+    re.IGNORECASE,
+)
+# Banner project / product name: `Bootstrap`, `Animate.css`, `Font Awesome`,
+# `jQuery`. Captured at the start of a banner line (after the leading `/*!`,
+# `*`, or whitespace). Stops at version markers (`v3.1.1`), parentheses,
+# pipes, dashes, and version-y characters so we don't swallow the whole
+# header line.
+_BANNER_PROJECT_RE = _compile(
+    r"(?:^|\n)\s*(?:/\*!|\*)?\s*"
+    r"(?P<name>[A-Z][A-Za-z0-9]+(?:[. ][A-Za-z0-9]+){0,3})"
+    r"(?=\s+(?:v?\d|\(|\||-|by\b|version\b))",
+    re.IGNORECASE,
+)
+
+# Names that look like @handle but are language keywords / well-known
+# decorators / well-known npm-scope-like words. Filtered post-match so the
+# regex stays simple.
+_AT_HANDLE_STOPLIST: frozenset[str] = frozenset({
+    "property", "staticmethod", "classmethod", "abstractmethod",
+    "override", "deprecated", "param", "return", "returns", "throws",
+    "see", "since", "version", "author", "license", "private", "public",
+    "protected", "internal", "deprecated", "todo", "todos", "fixme",
+    "type", "typedef", "interface", "namespace", "module", "package",
+    "import", "export", "default", "this", "super", "self",
+    "media", "import", "supports", "keyframes", "font", "charset",
+    "Component", "Injectable", "NgModule", "Input", "Output",
+})
 # Long hex blobs: SHA1 (40) / SHA256 (64) fingerprints, git commits, API key
 # digests. Some sources concatenate fingerprints back-to-back (Juice Shop's
 # /rest/admin/application-configuration does this in the "supportedFingerprints"
@@ -58,7 +123,14 @@ AWS_SECRET_RE = _compile(
 )
 GENERIC_BEARER_RE = _compile(r"(?i)Bearer\s+([A-Za-z0-9._\-]{20,})")
 GENERIC_API_KEY_RE = _compile(
-    r"(?i)(?:api[_-]?key|apikey|secret|token|password|passwd|pwd)\s*[:=]\s*[\"']?([A-Za-z0-9_\-\.\/+=]{12,})[\"']?"
+    # Two alternations:
+    #   - api_key / apikey / secret / token  (>= 12 chars from charset)
+    #   - password / passwd / pwd            (>= 6 chars, broader symbol set)
+    # The optional [\"']? blocks bracketing the value let the same pattern
+    # cover plain `key=value`, JSON `"key":"value"`, and YAML `key: "value"`.
+    r"[\"']?(?:api[_-]?key|apikey|secret|token)[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_\-\.\/+=]{12,})[\"']?"
+    r"|[\"']?(?:password|passwd|pwd)[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_\-\.\/+=!@#$%^&*()]{6,})[\"']?",
+    re.IGNORECASE,
 )
 # Credentials embedded in connection URLs: scheme://user:password@host
 URL_CRED_RE = _compile(
@@ -90,6 +162,23 @@ JSON_HOST_KEY_RE = _compile(
     r'\\?"(?P<key>domain|host|hostname|server|origin)\\?"\s*:\s*\\?"(?P<val>[A-Za-z0-9][A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,32})\\?"'
 )
 
+# HTML form attributes that carry user input back into rendered HTML
+# (e.g. login form re-rendered with the typed password as `value="..."`).
+# Allow optional backslashes around the quotes so this still fires inside
+# HAR-escaped JSON content bodies. The "name" attribute tells us what kind
+# of credential it is.
+HTML_FORM_VALUE_RE = _compile(
+    r'name=\\?["\'](?P<key>username|user|email|password|passwd|pwd|matchingPassword|new_password|confirm_password|token|api_key|secret|csrf|csrf_token)\\?["\']\s*'
+    r'value=\\?["\'](?P<val>[^"\'\\<>]{3,256})\\?["\']',
+    re.IGNORECASE,
+)
+# Same shape but with attributes in the opposite order (value before name).
+HTML_FORM_VALUE_REV_RE = _compile(
+    r'value=\\?["\'](?P<val>[^"\'\\<>]{3,256})\\?["\']\s*'
+    r'name=\\?["\'](?P<key>username|user|email|password|passwd|pwd|matchingPassword|new_password|confirm_password|token|api_key|secret|csrf|csrf_token)\\?["\']',
+    re.IGNORECASE,
+)
+
 # URL / host
 URL_RE = _compile(r"https?://([A-Za-z0-9\-._]+)(:[0-9]+)?(/[^\s\"'<>]*)?")
 # heuristic: internal-looking hostnames (including RFC1918)
@@ -109,10 +198,18 @@ _CREDENTIAL_RULES: list[Rule] = [
     Rule(Category.CREDENTIAL, GITHUB_PAT_RE, "github_pat"),
     Rule(Category.CREDENTIAL, SLACK_TOKEN_RE, "slack_token"),
     Rule(Category.CREDENTIAL, GOOGLE_API_RE, "google_api_key"),
+    Rule(Category.CREDENTIAL, OPENAI_KEY_RE, "openai_key"),
     Rule(Category.CREDENTIAL, GOOGLE_OAUTH_CLIENT_ID_RE, "google_oauth_client_id"),
-    Rule(Category.CREDENTIAL, KEYBASE_USER_RE, "keybase_user"),
-    Rule(Category.CREDENTIAL, GITHUB_OWNER_REPO_RE, "github_owner_repo"),
-    Rule(Category.CREDENTIAL, SOCIAL_HANDLE_URL_RE, "social_handle_url"),
+]
+
+# Public-handle rules. Each pattern names one or more capture groups and we
+# emit one span per named group. The host portion stays unmasked (e.g.
+# "github.com/<<PII_HANDLE_xxx>>/<<PII_HANDLE_yyy>>") so the reader can still
+# tell the link goes to a known platform.
+_HANDLE_RULES: list[Rule] = [
+    Rule(Category.PII_HANDLE, KEYBASE_USER_RE, "keybase_user"),
+    Rule(Category.PII_HANDLE, GITHUB_OWNER_REPO_RE, "github_owner_repo"),
+    Rule(Category.PII_HANDLE, SOCIAL_HANDLE_URL_RE, "social_handle_url"),
 ]
 
 _CAPTURING_CREDENTIAL_RULES: list[Rule] = [
@@ -181,6 +278,78 @@ class RuleDetector:
                     )
                 )
 
+        # Public handles: emit one span per named group so a github.com/owner/repo
+        # path becomes "github.com/<<PII_HANDLE_xxx>>/<<PII_HANDLE_yyy>>".
+        for rule in _HANDLE_RULES:
+            for m in rule.pattern.finditer(text):
+                for name in m.groupdict():
+                    if m.group(name) is None:
+                        continue
+                    spans.append(
+                        Span(
+                            start=m.start(name),
+                            end=m.end(name),
+                            category=rule.category,
+                            source=self.name,
+                        )
+                    )
+
+        # OSS license banner: every URL host inside a /*! ... */ block is
+        # masked unconditionally; the project name on the header line is
+        # masked too. Pure-IP hosts are skipped here because the IPv4 rule
+        # above already handles them.
+        for banner in _LICENSE_BANNER_RE.finditer(text):
+            block = banner.group(0)
+            block_start = banner.start()
+            for um in _BANNER_URL_HOST_RE.finditer(block):
+                host = (um.group("host") or "").rstrip(".")
+                if not host:
+                    continue
+                if all(c.isdigit() or c == "." for c in host):
+                    continue
+                spans.append(
+                    Span(
+                        start=block_start + um.start("host"),
+                        end=block_start + um.end("host"),
+                        category=Category.PII_HANDLE,
+                        source=self.name,
+                    )
+                )
+            for pm in _BANNER_PROJECT_RE.finditer(block):
+                spans.append(
+                    Span(
+                        start=block_start + pm.start("name"),
+                        end=block_start + pm.end("name"),
+                        category=Category.PII_HANDLE,
+                        source=self.name,
+                    )
+                )
+            for cm in _BANNER_COPYRIGHT_RE.finditer(block):
+                spans.append(
+                    Span(
+                        start=block_start + cm.start("holder"),
+                        end=block_start + cm.end("holder"),
+                        category=Category.PII_HANDLE,
+                        source=self.name,
+                    )
+                )
+
+        # Bare "@handle" attribution form (CSS / JS / changelog headers).
+        for m in SOCIAL_HANDLE_AT_RE.finditer(text):
+            handle = m.group("handle")
+            if handle.lower() in _AT_HANDLE_STOPLIST:
+                continue
+            if handle in _AT_HANDLE_STOPLIST:
+                continue
+            spans.append(
+                Span(
+                    start=m.start("handle"),
+                    end=m.end("handle"),
+                    category=Category.PII_HANDLE,
+                    source=self.name,
+                )
+            )
+
         for m in GENERIC_BEARER_RE.finditer(text):
             # mask only the token value (group 1), not the "Bearer" keyword
             spans.append(
@@ -231,11 +400,31 @@ class RuleDetector:
                 )
             )
 
+        # HTML form values that re-render the user's typed credentials.
+        # WebGoat (Spring Boot) shows this on the login / registration page
+        # after a failed submission: `<input name="password" value="...">`.
+        _USER_KEYS = {"username", "user", "email"}
+        for re_obj in (HTML_FORM_VALUE_RE, HTML_FORM_VALUE_REV_RE):
+            for m in re_obj.finditer(text):
+                key = m.group("key").lower()
+                cat = Category.USER_ID if key in _USER_KEYS else Category.CREDENTIAL
+                spans.append(
+                    Span(
+                        start=m.start("val"),
+                        end=m.end("val"),
+                        category=cat,
+                        source=self.name,
+                    )
+                )
+
         for m in GENERIC_API_KEY_RE.finditer(text):
+            # The pattern has two alternations (api_key/token vs
+            # password/passwd/pwd) with separate capture groups.
+            grp = 1 if m.group(1) is not None else 2
             spans.append(
                 Span(
-                    start=m.start(1),
-                    end=m.end(1),
+                    start=m.start(grp),
+                    end=m.end(grp),
                     category=Category.CREDENTIAL,
                     source=self.name,
                 )

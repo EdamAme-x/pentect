@@ -1,7 +1,22 @@
 """spaCy-based NER detector for person and organization names.
 
-Why this exists
-===============
+DEPRECATED
+==========
+This detector is no longer enabled by default and is kept only for
+backward compatibility. Empirical measurement on the demo HARs
+(WebGoat 3.3 MB, Juice Shop 3.9 MB) showed that:
+
+  - NER adds 5-6x to the wall-clock cost of the rule pipeline.
+  - The set of NER-only placeholders on those HARs is **empty** —
+    every name that mattered (Bjoern Kimminich, OWASP, davegandy,
+    daneden, Dittmeyer, ...) is already caught by the banner-project /
+    @handle / copyright / detect-secrets rules.
+
+Set ``PENTECT_ENABLE_SPACY=1`` to opt in; otherwise the engine never
+constructs this detector.
+
+Original docstring (for the historical record)
+----------------------------------------------
 The Privacy Filter FT model is good on the names that look like English
 or Japanese personal names in our training distribution, but it misses
 unusual ones embedded in JSON product descriptions, HTML comments,
@@ -54,7 +69,16 @@ class SpacyNERDetector:
             ) from e
 
         try:
-            self._nlp = spacy.load(model or _DEFAULT_MODEL)
+            # Disable pipeline components we don't need for NER. The
+            # default English model includes a lemmatizer and an
+            # attribute_ruler that together account for ~10% of pipe
+            # time and produce information we never read. Keeping just
+            # tok2vec / tagger / parser / ner cuts the per-call cost
+            # noticeably on large HARs.
+            self._nlp = spacy.load(
+                model or _DEFAULT_MODEL,
+                disable=["lemmatizer", "attribute_ruler"],
+            )
         except OSError as e:  # pragma: no cover
             raise RuntimeError(
                 f"spaCy model {model or _DEFAULT_MODEL!r} not found. "
@@ -69,31 +93,47 @@ class SpacyNERDetector:
     _CHUNK_OVERLAP = 200
 
     def detect(self, text: str) -> list[Span]:
-        if len(text) <= self._CHUNK_SIZE:
-            return self._detect_chunk(text, 0)
+        # Single-input fast path; for large multi-input HARs the engine
+        # core funnels everything through `detect_batch` instead.
+        chunks = list(self._iter_chunks(text))
+        if not chunks:
+            return []
+        cleaned = [_clean_for_ner(c[0]) for c in chunks]
+        try:
+            docs = list(self._nlp.pipe(cleaned))
+        except Exception:  # noqa: BLE001
+            return []
         out: list[Span] = []
         seen: set[tuple[int, int]] = set()
-        offset = 0
-        while offset < len(text):
-            end = min(offset + self._CHUNK_SIZE, len(text))
-            for sp in self._detect_chunk(text[offset:end], offset):
+        for (chunk, base_offset), doc in zip(chunks, docs):
+            for sp in self._spans_from_doc(chunk, base_offset, doc):
                 key = (sp.start, sp.end)
                 if key in seen:
                     continue
                 seen.add(key)
                 out.append(sp)
-            if end == len(text):
-                break
-            offset = end - self._CHUNK_OVERLAP
         return out
 
-    def _detect_chunk(self, chunk: str, base_offset: int) -> list[Span]:
+    def _iter_chunks(self, text: str):
+        """Yield (chunk_text, base_offset_in_original) pairs covering
+        the whole input. Inputs shorter than _CHUNK_SIZE produce a
+        single chunk; larger inputs are sliced with overlap so a name
+        on the boundary is still seen by some chunk."""
+        if not text:
+            return
+        if len(text) <= self._CHUNK_SIZE:
+            yield text, 0
+            return
+        offset = 0
+        while offset < len(text):
+            end = min(offset + self._CHUNK_SIZE, len(text))
+            yield text[offset:end], offset
+            if end == len(text):
+                return
+            offset = end - self._CHUNK_OVERLAP
+
+    def _spans_from_doc(self, chunk: str, base_offset: int, doc) -> list[Span]:
         out: list[Span] = []
-        cleaned = _clean_for_ner(chunk)
-        try:
-            doc = self._nlp(cleaned)
-        except Exception:  # noqa: BLE001
-            return out
         for ent in doc.ents:
             if ent.label_ not in ("PERSON", "ORG"):
                 continue
@@ -110,6 +150,41 @@ class SpacyNERDetector:
                 )
             )
         return out
+
+    def detect_batch(self, texts: Iterable[str]) -> list[list[Span]]:
+        """Run NER on many inputs with a single `nlp.pipe()` call.
+
+        Building a Doc has a substantial fixed cost per call (vocab
+        lookup, pipeline setup); piping a batch lets spaCy share that
+        cost and the underlying matrix multiplications across inputs.
+        On a HAR with hundreds of leaf strings this is the difference
+        between ~10s and ~1s.
+        """
+        texts = list(texts)
+        # Track which (text_index, base_offset) each chunk corresponds
+        # to so we can stitch results back per input after one big pipe.
+        chunk_texts: list[str] = []
+        chunk_meta: list[tuple[int, str, int]] = []  # (text_idx, chunk, base_offset)
+        for i, t in enumerate(texts):
+            for chunk, base in self._iter_chunks(t):
+                chunk_texts.append(_clean_for_ner(chunk))
+                chunk_meta.append((i, chunk, base))
+        if not chunk_texts:
+            return [[] for _ in texts]
+        results: list[list[Span]] = [[] for _ in texts]
+        seen: list[set[tuple[int, int]]] = [set() for _ in texts]
+        try:
+            docs = self._nlp.pipe(chunk_texts)
+            for (i, chunk, base), doc in zip(chunk_meta, docs):
+                for sp in self._spans_from_doc(chunk, base, doc):
+                    key = (sp.start, sp.end)
+                    if key in seen[i]:
+                        continue
+                    seen[i].add(key)
+                    results[i].append(sp)
+        except Exception:  # noqa: BLE001
+            return [[] for _ in texts]
+        return results
 
 
 def _looks_like_real_name(s: str) -> bool:
@@ -138,6 +213,3 @@ def _looks_like_real_name(s: str) -> bool:
     if not all(p and p[0].isupper() for p in parts):
         return False
     return True
-
-    def detect_batch(self, texts: Iterable[str]) -> list[list[Span]]:
-        return [self.detect(t) for t in texts]

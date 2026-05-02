@@ -43,24 +43,30 @@ def test_detects_google_oauth_client_id():
 
 
 def test_detects_keybase_user_url():
+    # Public-platform handles are PII_HANDLE (the platform domain stays
+    # readable; only the username is masked).
     text = "see https://keybase.io/bkimminich for the public key"
     spans = RuleDetector().detect(text)
-    matched = [text[s.start:s.end] for s in spans if s.category is Category.CREDENTIAL]
-    assert any("keybase.io/bkimminich" in m for m in matched)
+    matched = [text[s.start:s.end] for s in spans if s.category is Category.PII_HANDLE]
+    assert "bkimminich" in matched
+    # The bare domain must not be tagged.
+    assert not any("keybase.io" == m for m in matched)
 
 
 def test_detects_github_owner_and_repo():
     text = "see https://github.com/OWASP/juice-shop for the source"
     spans = RuleDetector().detect(text)
-    matched = [text[s.start:s.end] for s in spans if s.category is Category.CREDENTIAL]
-    assert any("OWASP" in m for m in matched)
+    matched = [text[s.start:s.end] for s in spans if s.category is Category.PII_HANDLE]
+    assert "OWASP" in matched
+    assert "juice-shop" in matched
+    assert not any("github.com" in m for m in matched)
 
 
 def test_detects_twitter_handle_url():
     text = "follow https://twitter.com/owasp_juiceshop for updates"
     spans = RuleDetector().detect(text)
-    matched = [text[s.start:s.end] for s in spans if s.category is Category.CREDENTIAL]
-    assert any("owasp_juiceshop" in m for m in matched)
+    matched = [text[s.start:s.end] for s in spans if s.category is Category.PII_HANDLE]
+    assert "owasp_juiceshop" in matched
 
 
 def test_detects_concatenated_sha1_blob():

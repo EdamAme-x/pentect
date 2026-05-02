@@ -1,0 +1,11 @@
+services:
+  webgoat:
+    image: webgoat/webgoat:latest
+    container_name: pentect-webgoat
+    environment:
+      - TZ=Asia/Tokyo
+      - WEBGOAT_HOST=0.0.0.0
+      - WEBWOLF_HOST=0.0.0.0
+    ports:
+      - "8089:8080"
+      - "9099:9090"

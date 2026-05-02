@@ -40,7 +40,6 @@ def _build_plugin_regexes() -> list[tuple[str, "re.Pattern[str]"]]:
         from detect_secrets.plugins.sendgrid import SendGridDetector
         from detect_secrets.plugins.mailchimp import MailchimpDetector
         from detect_secrets.plugins.discord import DiscordBotTokenDetector
-        from detect_secrets.plugins.private_key import PrivateKeyDetector
         from detect_secrets.plugins.basic_auth import BasicAuthDetector
         from detect_secrets.plugins.azure_storage_key import AzureStorageKeyDetector
         from detect_secrets.plugins.npm import NpmDetector
@@ -62,7 +61,12 @@ def _build_plugin_regexes() -> list[tuple[str, "re.Pattern[str]"]]:
         SendGridDetector,
         MailchimpDetector,
         DiscordBotTokenDetector,
-        PrivateKeyDetector,
+        # PrivateKeyDetector intentionally omitted: it matches the
+        # `-----BEGIN ... PRIVATE KEY-----` armor line, which is a
+        # public format marker and contains no secret bytes. Pentect's
+        # SeedPhraseDetector masks the base64 *body* of the block
+        # instead, leaving the BEGIN/END lines readable so the masked
+        # output still says "this was a private key".
         BasicAuthDetector,
         AzureStorageKeyDetector,
         NpmDetector,

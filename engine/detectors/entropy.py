@@ -81,30 +81,108 @@ def _shannon_entropy(s: str) -> float:
     return entropy
 
 
-def _is_high_entropy_secret(val: str) -> bool:
+# Hex shape: only 0-9 a-f, length sane for SHA / MD5 / commit hash.
+_HEX_SHAPE_RE = re.compile(r"^[0-9a-f]{16,}$")
+# UUID 8-4-4-4-12 form, hex digits only.
+_UUID_SHAPE_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# Vowels we use to score "human prose"-ness. Only lowercase ASCII; tokens
+# with mixed case rarely have vowel alternation.
+_VOWELS = frozenset("aeiou")
+
+
+def _human_prose_score(s: str) -> float:
+    """Return the vowel/consonant alternation rate for the lowercase
+    letters in `s`, in [0, 1]. English prose averages ≈ 0.55; random
+    hex / base64 averages well below 0.30 because the hex alphabet has
+    only 2 of 6 vowel-class letters.
+
+    The score ignores non-letters so `configuration-management`
+    (separator stripped) keeps its high alternation rate, while hashes
+    (mostly consonants) score low.
+    """
+    letters = [c for c in s.lower() if c.isalpha()]
+    if len(letters) < 4:
+        return 0.0
+    transitions = 0
+    for a, b in zip(letters, letters[1:]):
+        if (a in _VOWELS) != (b in _VOWELS):
+            transitions += 1
+    return transitions / (len(letters) - 1)
+
+
+def _effective_alphabet_size(s: str) -> int:
+    """Number of distinct symbols in `s`. Used as the practical upper
+    bound on Shannon entropy (theoretical max = log2(alphabet))."""
+    return len(set(s))
+
+
+def _entropy_ratio(s: str) -> float:
+    """Shannon H normalized by the upper bound for the observed
+    alphabet. 1.0 means a perfectly uniform distribution over the
+    symbols actually present; ~0.95 is what genuinely random tokens
+    achieve in practice; English prose drops below ~0.85 because of
+    skewed letter frequencies."""
+    alphabet = _effective_alphabet_size(s)
+    if alphabet < 2:
+        return 0.0
+    return _shannon_entropy(s) / math.log2(alphabet)
+
+
+def _classify_high_entropy(val: str) -> Category | None:
+    """Decide whether `val` looks random enough to mask, and if so
+    return the most informative category for it.
+
+    Returns:
+      - Category.LIKELY_HASH  for hex / UUID shape that passes the
+        digest-style entropy threshold (md5 / sha1 / sha256 / uuid).
+      - Category.LIKELY_TOKEN for general high-entropy strings that
+        clear the ratio + prose checks.
+      - None                  if the value looks like prose, an ID,
+        a placeholder, a bundle artifact, etc.
+
+    The shape-aware split is necessary because a single Shannon
+    threshold can't separate hex hashes (alphabet=16, max H=4.0) from
+    base64 tokens (alphabet=64, max H=6) from human prose with
+    separators (alphabet ≈ 13, H ≈ 3.5).
+    """
     if len(val) < _MIN_LEN:
-        return False
-    # Skip Pentect placeholders and anything that contains them.
+        return None
     if "<<" in val or ">>" in val:
-        return False
-    # Strict char set; avoids JSON / HTML fragments leaking in.
+        return None
     if not _TOKEN_CHARSET.match(val):
-        return False
-    # File-extension shaped values (e.g. `Material-Icons-7Hx9bN.woff2`) are
-    # high-entropy bundle artifacts, not credentials. Real secrets very
-    # rarely show up as a query value with a known file extension.
+        return None
     if _FILE_EXT_RE.search(val):
-        return False
-    # Drop strings that look like human text (mostly lowercase + spaces, or
-    # a long readable word with vowels alternating with consonants). Our
-    # charset already excludes spaces, so we mostly care about run-of-letters
-    # checks.
-    if val.lower() == val and "-" not in val and "_" not in val and "." not in val:
-        # all-lowercase, no separators -> looks like a slug/word; skip unless
-        # entropy is unusually high.
-        if _shannon_entropy(val) < _MIN_ENTROPY + 0.5:
-            return False
-    return _shannon_entropy(val) >= _MIN_ENTROPY
+        return None
+    lower = val.lower()
+    # Pure-digit values are IDs, not credentials.
+    if val.isdigit():
+        return None
+    if _UUID_SHAPE_RE.match(val):
+        return Category.LIKELY_HASH
+    if _HEX_SHAPE_RE.match(lower):
+        if _effective_alphabet_size(val) < 6:
+            return None
+        if _entropy_ratio(val) < 0.80:
+            return None
+        return Category.LIKELY_HASH
+    # General token path.
+    if _entropy_ratio(val) < 0.85:
+        return None
+    if _shannon_entropy(val) < _MIN_ENTROPY:
+        return None
+    if _human_prose_score(val) >= 0.60:
+        return None
+    return Category.LIKELY_TOKEN
+
+
+def _is_high_entropy_secret(val: str) -> bool:
+    """Backward-compatible boolean predicate. Prefer
+    :func:`_classify_high_entropy` when the caller needs to know
+    whether the value looked like a hash vs an opaque token."""
+    return _classify_high_entropy(val) is not None
 
 
 # Common bundle / asset extensions. If a candidate value ends in one of

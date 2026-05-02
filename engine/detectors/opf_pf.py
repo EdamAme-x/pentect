@@ -76,6 +76,17 @@ class PrivacyFilterDetector:
             # Skip detections that land entirely inside a JSON key.
             if any(ks <= sp.start and sp.end <= ke for ks, ke in key_ranges):
                 continue
+            value = text[sp.start:sp.end]
+            # Drop CREDENTIAL detections that are clearly URL path fragments.
+            # The opf checkpoint occasionally tags `8089/WebGo` (mid-URL slice)
+            # as a secret; the resulting anchor then masks the same fragment
+            # everywhere, leaving the real path tail (`at/plugins`) exposed.
+            # Real credentials never contain slashes (JWT segments are dot-
+            # separated, base64url uses `-_`, Stripe/AWS/Slack tokens are
+            # alphanumeric+`_`+`-`); any `/` inside a CREDENTIAL span means
+            # we accidentally swallowed URL structure.
+            if cat is Category.CREDENTIAL and "/" in value:
+                continue
             out.append(Span(start=sp.start, end=sp.end, category=cat, source=self.name))
         return out
 
