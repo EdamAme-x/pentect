@@ -8,14 +8,12 @@ tells you exactly which behavioural contract regressed.
 from __future__ import annotations
 
 import json
-import os
 
 import pytest
 
 from engine.categories import Category
 from engine.core import PentectEngine, _looks_like_static_asset
 from engine.detectors.rule import RuleDetector
-from engine.detectors.spacy_ner import SpacyNERDetector  # noqa: F401  (import-only)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +133,31 @@ def test_spacy_off_by_default(monkeypatch):
     assert "SpacyNERDetector" not in names
 
 
+def _spacy_model_available() -> bool:
+    """Check whether the default spaCy English model is loadable.
+
+    CI runners install the package but not the model, so the
+    constructor raises RuntimeError on import. We skip the env-flag
+    test in that case rather than fail — the contract is "set the
+    flag and the detector tries to load"; whether the load succeeds
+    depends on whether the model is downloaded, which is outside
+    Pentect's responsibility.
+    """
+    try:
+        import spacy  # noqa: PLC0415
+    except ImportError:
+        return False
+    try:
+        spacy.load("en_core_web_sm")
+        return True
+    except (OSError, ImportError):
+        return False
+
+
+@pytest.mark.skipif(
+    not _spacy_model_available(),
+    reason="en_core_web_sm not installed; skip the loaded-detector check",
+)
 @pytest.mark.parametrize("flag", ["1", "true", "yes"])
 def test_spacy_on_with_env(monkeypatch, flag):
     monkeypatch.setenv("PENTECT_ENABLE_SPACY", flag)
