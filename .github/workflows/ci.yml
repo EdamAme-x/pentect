@@ -18,7 +18,10 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -e ".[dev]"
+      # Default suite first, then the scaling-contract sweeps (marked
+      # `slow`) so we catch performance regressions in CI too.
       - run: pytest tests/ -q
+      - run: pytest tests/ -q -m slow
 
   ui:
     runs-on: ubuntu-latest

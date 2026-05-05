@@ -60,6 +60,9 @@ include = ["engine*", "eval*", "training*", "testcases*", "server*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "slow: tests that take more than a few seconds (scaling sweeps, etc.); skipped from the default run via `-m 'not slow'`",
+]
 
 [tool.ruff]
 line-length = 100
