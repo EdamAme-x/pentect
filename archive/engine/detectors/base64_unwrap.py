@@ -66,37 +66,73 @@ def _default_peers() -> list[Detector]:
 
 
 class Base64UnwrapDetector:
+    """Peel base64 wrappers and hand the plaintext to peer detectors.
+
+    Unwraps as many times as it takes, with a *resource* budget rather
+    than a fixed depth limit. An attacker who wraps N times can be
+    countered by raising N — what we actually need to bound is total
+    work, not nesting count. We cap:
+      - total bytes decoded across all levels for a single chunk
+      - number of unwrap iterations (large to be effectively unlimited)
+    """
+
     name = "base64_unwrap"
+
+    # Resource budget. ``max_decoded_bytes`` is the most important: even
+    # 50 nestings of a small token expand at most ~ N * len(token), so
+    # 1 MB is plenty for legitimate inputs and is a hard ceiling against
+    # pathological inputs (e.g., 1000-line base64 wrapping a 1 MB blob).
+    _DEFAULT_MAX_DECODED_BYTES = 1_000_000
+    _DEFAULT_MAX_ITERATIONS = 64
 
     def __init__(
         self,
         peers: Iterable[Detector] | None = None,
-        max_depth: int = 3,
+        max_decoded_bytes: int = _DEFAULT_MAX_DECODED_BYTES,
+        max_iterations: int = _DEFAULT_MAX_ITERATIONS,
     ) -> None:
         self._peers: list[Detector] | None = (
             list(peers) if peers is not None else None
         )
-        self._max_depth = max_depth
+        self._max_decoded_bytes = max_decoded_bytes
+        self._max_iterations = max_iterations
 
     def _get_peers(self) -> list[Detector]:
         if self._peers is None:
             self._peers = _default_peers()
         return self._peers
 
-    def _peers_flag(self, plaintext: str, depth: int) -> bool:
-        for peer in self._get_peers():
-            try:
-                if peer.detect(plaintext):
-                    return True
-            except Exception:  # noqa: BLE001 -- never let a peer break us
-                continue
-        if depth >= self._max_depth:
-            return False
-        stripped = plaintext.strip()
-        if not _B64_CHUNK_RE.fullmatch(stripped):
-            return False
-        inner = _decode_to_text(stripped)
-        return inner is not None and self._peers_flag(inner, depth + 1)
+    def _peers_flag(self, plaintext: str) -> bool:
+        """Walk peer detectors on ``plaintext`` and on every base64
+        layer found inside it. Returns True as soon as any peer flags
+        anything at any level. Stops on resource exhaustion."""
+        seen: set[str] = set()
+        budget = self._max_decoded_bytes
+        for _ in range(self._max_iterations):
+            if plaintext in seen:
+                return False  # fixed point — won't decode further
+            seen.add(plaintext)
+
+            for peer in self._get_peers():
+                try:
+                    if peer.detect(plaintext):
+                        return True
+                except Exception:  # noqa: BLE001 -- never let a peer break us
+                    continue
+
+            # Try one more decode if the payload is itself a single
+            # tight base64 chunk.
+            stripped = plaintext.strip()
+            if not _B64_CHUNK_RE.fullmatch(stripped):
+                return False
+            inner = _decode_to_text(stripped)
+            if inner is None:
+                return False
+            budget -= len(inner)
+            if budget < 0:
+                return False
+            plaintext = inner
+        return False
 
     def _emit(self, start: int, end: int) -> Span:
         return Span(
@@ -125,7 +161,7 @@ class Base64UnwrapDetector:
             plaintext = _decode_to_text(m.group(0))
             if plaintext is None:
                 continue
-            if not self._peers_flag(plaintext, depth=0):
+            if not self._peers_flag(plaintext):
                 continue
             seen.add(key)
             out.append(self._emit(*key))

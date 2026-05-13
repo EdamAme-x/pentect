@@ -368,6 +368,10 @@ class PentectEngine:
             # mask the encoded blob if so.
             from engine.detectors.base64_unwrap import Base64UnwrapDetector
             self.detectors.append(Base64UnwrapDetector())
+            # Percent-encoded credentials: same idea, different alphabet.
+            # Catches `Authorization%3A%20Bearer%20eyJ...` style hiding.
+            from engine.detectors.encoding_peel import UrlEncodingPeeler
+            self.detectors.append(UrlEncodingPeeler())
             # BIP39 mnemonic phrases and PEM private key blocks. Neither
             # shows up in the entropy path (lowercase prose is too low
             # entropy; PEM b64 decodes to binary DER) so they get their
@@ -456,7 +460,15 @@ class PentectEngine:
         else:
             data = json.loads(json.dumps(har_raw))
 
-        # Pre-pass: collapse public CDN bodies (minified JS / CSS,
+        # Pre-pass 0: HAR spec lets bodies be stored as base64
+        # (content.encoding == "base64") when they're binary. We
+        # decode those in place so the detector chain sees plain
+        # text — otherwise every base64-stored body would look like
+        # a giant opaque blob and credentials inside it would be
+        # invisible to the rule / entropy / vendor regex passes.
+        _decode_har_body_base64(data)
+
+        # Pre-pass 1: collapse public CDN bodies (minified JS / CSS,
         # images, fonts, ...) to a single STATIC_ASSET placeholder
         # before the detectors ever see them. On real-world HARs this
         # is by far the biggest wall-clock win: a Juice Shop /
@@ -740,6 +752,49 @@ class PentectEngine:
             entries=per_entry,
             _recovery_map=result._recovery_map,
         )
+
+
+def _decode_har_body_base64(data: Any) -> None:
+    """Decode HAR bodies that are stored as base64.
+
+    Per the HAR 1.2 spec, `response.content.encoding == "base64"`
+    means the bytes in `response.content.text` are a base64 encoding
+    of the actual body (typically used for binary types). We flip
+    those back to text so detectors see the real content.
+
+    Mutates `data` in place. On decode error, leaves the body alone
+    (silent failure is fine — the worst case is we miss credentials
+    inside a malformed body, not that we crash).
+    """
+    import base64
+
+    log = data.get("log") if isinstance(data, dict) else None
+    if not isinstance(log, dict):
+        return
+    entries = log.get("entries") or []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        res = entry.get("response") or {}
+        if not isinstance(res, dict):
+            continue
+        content = res.get("content") or {}
+        if not isinstance(content, dict):
+            continue
+        if content.get("encoding") != "base64":
+            continue
+        body = content.get("text")
+        if not isinstance(body, str) or not body:
+            continue
+        try:
+            decoded = base64.b64decode(body, validate=False)
+            text = decoded.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            continue
+        content["text"] = text
+        # Clear the encoding marker so downstream consumers don't try
+        # to decode again.
+        content["encoding"] = ""
 
 
 def _collapse_static_assets(data: Any, recovery: dict[str, str]) -> None:

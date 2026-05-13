@@ -1,0 +1,120 @@
+{"input": "upstream host = refund-core  # k8s service dns", "spans": [{"start": 16, "end": 27, "value": "refund-core", "category": "INTERNAL_URL"}]}
+{"input": "Eve Wilson confirmed the rollback at 03:12 JST", "spans": [{"start": 0, "end": 10, "value": "Eve Wilson", "category": "PII_NAME"}]}
+{"input": "counter rpc_requests_total{target=\"auth-gateway\"} 14820", "spans": [{"start": 35, "end": 47, "value": "auth-gateway", "category": "INTERNAL_URL"}]}
+{"input": "Retrying request to search-core after timeout", "spans": [{"start": 20, "end": 31, "value": "search-core", "category": "INTERNAL_URL"}]}
+{"input": "SELECT * FROM service_health WHERE name = 'refund-core' AND status = 'degraded'", "spans": [{"start": 43, "end": 54, "value": "refund-core", "category": "INTERNAL_URL"}]}
+{"input": "x = \"FiveprBHs8YGPI5g2\"  # used by the billing worker", "spans": [{"start": 5, "end": 22, "value": "FiveprBHs8YGPI5g2", "category": "CREDENTIAL"}]}
+{"input": "issue 826622 was closed after the rollback", "spans": [{"start": 6, "end": 12, "value": "826622", "category": "USER_ID"}]}
+{"input": "kubectl port-forward svc/catalog 8080:80 -n platform", "spans": [{"start": 25, "end": 32, "value": "catalog", "category": "INTERNAL_URL"}]}
+{"input": "Bob Davis opened #262303 against media-proxy about the 500s", "spans": [{"start": 0, "end": 9, "value": "Bob Davis", "category": "PII_NAME"}, {"start": 18, "end": 24, "value": "262303", "category": "USER_ID"}, {"start": 33, "end": 44, "value": "media-proxy", "category": "INTERNAL_URL"}]}
+{"input": "curl -sSf http://risk-engine/healthz || echo 'down'", "spans": [{"start": 17, "end": 28, "value": "risk-engine", "category": "INTERNAL_URL"}]}
+{"input": "CORP_TOKEN_V2: TK-UAXEQBNH-M5K8P4-AT9MX2X", "spans": [{"start": 15, "end": 41, "value": "TK-UAXEQBNH-M5K8P4-AT9MX2X", "category": "CREDENTIAL"}]}
+{"input": "Reported by Eve Miller after escalation from on-call", "spans": [{"start": 12, "end": 22, "value": "Eve Miller", "category": "PII_NAME"}]}
+{"input": "See ticket #48726 for the stack trace", "spans": [{"start": 12, "end": 17, "value": "48726", "category": "USER_ID"}]}
+{"input": "Retrying request to payments-core after timeout", "spans": [{"start": 20, "end": 33, "value": "payments-core", "category": "INTERNAL_URL"}]}
+{"input": "counter rpc_requests_total{target=\"tax-calc\"} 14820", "spans": [{"start": 35, "end": 43, "value": "tax-calc", "category": "INTERNAL_URL"}]}
+{"input": "route add 172.20.228.138 via gw-01 metric 10", "spans": [{"start": 10, "end": 24, "value": "172.20.228.138", "category": "INTERNAL_IP"}]}
+{"input": "dial tcp shipping-core:9092: connection refused", "spans": [{"start": 9, "end": 22, "value": "shipping-core", "category": "INTERNAL_URL"}]}
+{"input": "Frank Johnson confirmed the rollback at 03:12 JST", "spans": [{"start": 0, "end": 13, "value": "Frank Johnson", "category": "PII_NAME"}]}
+{"input": "Tanaka Taro-san asked for access to the staging cluster", "spans": [{"start": 0, "end": 11, "value": "Tanaka Taro", "category": "PII_NAME"}]}
+{"input": "Reported by Eve Smith after escalation from on-call", "spans": [{"start": 12, "end": 21, "value": "Eve Smith", "category": "PII_NAME"}]}
+{"input": "span attribute upstream.service=ledger attached to trace 873176", "spans": [{"start": 32, "end": 38, "value": "ledger", "category": "INTERNAL_URL"}, {"start": 57, "end": 63, "value": "873176", "category": "USER_ID"}]}
+{"input": "backend_service_upstream(inventory, retries=3)", "spans": [{"start": 25, "end": 34, "value": "inventory", "category": "INTERNAL_URL"}]}
+{"input": "customer #317061 reported the incident", "spans": [{"start": 10, "end": 16, "value": "317061", "category": "USER_ID"}]}
+{"input": "the deploy used key TK-RPET-S43C5 issued by the platform ops for Carol Smith", "spans": [{"start": 20, "end": 33, "value": "TK-RPET-S43C5", "category": "CREDENTIAL"}, {"start": 65, "end": 76, "value": "Carol Smith", "category": "PII_NAME"}]}
+{"input": "upstream host = batch-runner  # k8s service dns", "spans": [{"start": 16, "end": 28, "value": "batch-runner", "category": "INTERNAL_URL"}]}
+{"input": "batch-runner,prod,owner=Carol Miller,last_deploy=2025-11-03", "spans": [{"start": 0, "end": 12, "value": "batch-runner", "category": "INTERNAL_URL"}, {"start": 24, "end": 36, "value": "Carol Miller", "category": "PII_NAME"}]}
+{"input": "const SERVICE_SECRET = 'CrxG7YXipN2Ig00rVq4jB';", "spans": [{"start": 24, "end": 45, "value": "CrxG7YXipN2Ig00rVq4jB", "category": "CREDENTIAL"}]}
+{"input": "tax-calc へのリクエストが 916754 回連続で失敗しました。担当 Watanabe Ren に共有済み。", "spans": [{"start": 0, "end": 8, "value": "tax-calc", "category": "INTERNAL_URL"}, {"start": 18, "end": 24, "value": "916754", "category": "USER_ID"}, {"start": 39, "end": 51, "value": "Watanabe Ren", "category": "PII_NAME"}]}
+{"input": "backend_service_upstream(media-proxy, retries=3)", "spans": [{"start": 25, "end": 36, "value": "media-proxy", "category": "INTERNAL_URL"}]}
+{"input": "customer #273933 reported the incident", "spans": [{"start": 10, "end": 16, "value": "273933", "category": "USER_ID"}]}
+{"input": "ENV UPSTREAM=pricing API_TOKEN=ZN-ECGZ-389Y", "spans": [{"start": 13, "end": 20, "value": "pricing", "category": "INTERNAL_URL"}, {"start": 31, "end": 43, "value": "ZN-ECGZ-389Y", "category": "CREDENTIAL"}]}
+{"input": "Takahashi Taro が kyc-v3 のレイテンシ悪化を調査中(token em7rMMfNKKkM3u5c1f6VqnJMb3H で再現)", "spans": [{"start": 0, "end": 14, "value": "Takahashi Taro", "category": "PII_NAME"}, {"start": 17, "end": 23, "value": "kyc-v3", "category": "INTERNAL_URL"}, {"start": 43, "end": 70, "value": "em7rMMfNKKkM3u5c1f6VqnJMb3H", "category": "CREDENTIAL"}]}
+{"input": "x = \"pgrxMp1juJtVEFEtb6F7n\"  # used by the billing worker", "spans": [{"start": 5, "end": 26, "value": "pgrxMp1juJtVEFEtb6F7n", "category": "CREDENTIAL"}]}
+{"input": "connected to tax-calc:5432 successfully", "spans": [{"start": 13, "end": 21, "value": "tax-calc", "category": "INTERNAL_URL"}]}
+{"input": "CORP_TOKEN_V2: ZN-JX8UIBR-WW4FYB8D-PPOH-1750CEHL", "spans": [{"start": 15, "end": 48, "value": "ZN-JX8UIBR-WW4FYB8D-PPOH-1750CEHL", "category": "CREDENTIAL"}]}
+{"input": "API_KEY: str = \"NdzSgVaI5z52Dm7tO\"  # loaded from vault", "spans": [{"start": 16, "end": 33, "value": "NdzSgVaI5z52Dm7tO", "category": "CREDENTIAL"}]}
+{"input": "customer #261096 reported the incident", "spans": [{"start": 10, "end": 16, "value": "261096", "category": "USER_ID"}]}
+{"input": "warehouse-api,prod,owner=Carol Johnson,last_deploy=2025-11-03", "spans": [{"start": 0, "end": 13, "value": "warehouse-api", "category": "INTERNAL_URL"}, {"start": 25, "end": 38, "value": "Carol Johnson", "category": "PII_NAME"}]}
+{"input": "Sato Kenji が invoice-gen のレイテンシ悪化を調査中(token vd95e5bzVV8OA9x14xQP で再現)", "spans": [{"start": 0, "end": 10, "value": "Sato Kenji", "category": "PII_NAME"}, {"start": 13, "end": 24, "value": "invoice-gen", "category": "INTERNAL_URL"}, {"start": 44, "end": 64, "value": "vd95e5bzVV8OA9x14xQP", "category": "CREDENTIAL"}]}
+{"input": "Carol Wilson confirmed the rollback at 03:12 JST", "spans": [{"start": 0, "end": 12, "value": "Carol Wilson", "category": "PII_NAME"}]}
+{"input": "span attribute upstream.service=search-core attached to trace 634760", "spans": [{"start": 32, "end": 43, "value": "search-core", "category": "INTERNAL_URL"}, {"start": 62, "end": 68, "value": "634760", "category": "USER_ID"}]}
+{"input": "the deploy used key HX-QXLM5Q2-1LHLB50-J7UP issued by the platform ops for Bob Wilson", "spans": [{"start": 20, "end": 43, "value": "HX-QXLM5Q2-1LHLB50-J7UP", "category": "CREDENTIAL"}, {"start": 75, "end": 85, "value": "Bob Wilson", "category": "PII_NAME"}]}
+{"input": "config.token = \"HX-4IZAS-CW76XA-TATJ9A3Y\"  # provisioned by platform team", "spans": [{"start": 16, "end": 40, "value": "HX-4IZAS-CW76XA-TATJ9A3Y", "category": "CREDENTIAL"}]}
+{"input": "config.token = \"CORP-C4XL9-67I6-RBC76UB7-AHF337\"  # provisioned by platform team", "spans": [{"start": 16, "end": 47, "value": "CORP-C4XL9-67I6-RBC76UB7-AHF337", "category": "CREDENTIAL"}]}
+{"input": "resource \"kubernetes_service\" \"ledger\" { cluster_ip = \"None\" }", "spans": [{"start": 31, "end": 37, "value": "ledger", "category": "INTERNAL_URL"}]}
+{"input": "val := 'mt78sREJpxYyhIKHQI7CRBsQY'  // injected at boot", "spans": [{"start": 8, "end": 33, "value": "mt78sREJpxYyhIKHQI7CRBsQY", "category": "CREDENTIAL"}]}
+{"input": "API_KEY: str = \"QnxCQQj9Ds5fZTvvWGvgSCe\"  # loaded from vault", "spans": [{"start": 16, "end": 39, "value": "QnxCQQj9Ds5fZTvvWGvgSCe", "category": "CREDENTIAL"}]}
+{"input": "Reported by Carol Miller after escalation from on-call", "spans": [{"start": 12, "end": 24, "value": "Carol Miller", "category": "PII_NAME"}]}
+{"input": "customer #366509 reported the incident", "spans": [{"start": 10, "end": 16, "value": "366509", "category": "USER_ID"}]}
+{"input": "Reported by Frank Smith after escalation from on-call", "spans": [{"start": 12, "end": 23, "value": "Frank Smith", "category": "PII_NAME"}]}
+{"input": "issue 386416 was closed after the rollback", "spans": [{"start": 6, "end": 12, "value": "386416", "category": "USER_ID"}]}
+{"input": "Retrying request to audit-trail after timeout", "spans": [{"start": 20, "end": 31, "value": "audit-trail", "category": "INTERNAL_URL"}]}
+{"input": "config.token = \"ZN-BC2SW-1POXTFDC-9FLV1\"  # provisioned by platform team", "spans": [{"start": 16, "end": 39, "value": "ZN-BC2SW-1POXTFDC-9FLV1", "category": "CREDENTIAL"}]}
+{"input": "Watanabe Yuki-san asked for access to the staging cluster", "spans": [{"start": 0, "end": 13, "value": "Watanabe Yuki", "category": "PII_NAME"}]}
+{"input": "connected to doc-store:5432 successfully", "spans": [{"start": 13, "end": 22, "value": "doc-store", "category": "INTERNAL_URL"}]}
+{"input": "headers['X-Corp-Auth'] = 'Z9-FZ8OBK-BOQ0I'", "spans": [{"start": 26, "end": 41, "value": "Z9-FZ8OBK-BOQ0I", "category": "CREDENTIAL"}]}
+{"input": "x = \"rim2GNXX9WwHE4F\"  # used by the billing worker", "spans": [{"start": 5, "end": 20, "value": "rim2GNXX9WwHE4F", "category": "CREDENTIAL"}]}
+{"input": "kubectl port-forward svc/audit-trail 8080:80 -n platform", "spans": [{"start": 25, "end": 36, "value": "audit-trail", "category": "INTERNAL_URL"}]}
+{"input": "SELECT * FROM service_health WHERE name = 'warehouse-api' AND status = 'degraded'", "spans": [{"start": 43, "end": 56, "value": "warehouse-api", "category": "INTERNAL_URL"}]}
+{"input": "tmp = \"fZMDgmN8DhWD3qNyxxlc\"; sendAuth(tmp)", "spans": [{"start": 7, "end": 27, "value": "fZMDgmN8DhWD3qNyxxlc", "category": "CREDENTIAL"}]}
+{"input": "connected to coupon-svc:5432 successfully", "spans": [{"start": 13, "end": 23, "value": "coupon-svc", "category": "INTERNAL_URL"}]}
+{"input": "val := 'grHvzxELcriLRc3uoU53bYsrER'  // injected at boot", "spans": [{"start": 8, "end": 34, "value": "grHvzxELcriLRc3uoU53bYsrER", "category": "CREDENTIAL"}]}
+{"input": "span attribute upstream.service=ledger attached to trace 265650", "spans": [{"start": 32, "end": 38, "value": "ledger", "category": "INTERNAL_URL"}, {"start": 57, "end": 63, "value": "265650", "category": "USER_ID"}]}
+{"input": "proxy -> audit-trail with x-internal-token OlGod1YztibEs4zTK9YvSQND6wsk (expires 60m)", "spans": [{"start": 9, "end": 20, "value": "audit-trail", "category": "INTERNAL_URL"}, {"start": 43, "end": 71, "value": "OlGod1YztibEs4zTK9YvSQND6wsk", "category": "CREDENTIAL"}]}
+{"input": "customer #392225 reported the incident", "spans": [{"start": 10, "end": 16, "value": "392225", "category": "USER_ID"}]}
+{"input": "CORP_TOKEN_V2: HX-WIYM-DSLCB-QSSPYE-MG87OI0", "spans": [{"start": 15, "end": 43, "value": "HX-WIYM-DSLCB-QSSPYE-MG87OI0", "category": "CREDENTIAL"}]}
+{"input": "config.token = \"ZN-XXJVE3D-EEDHHJSH-KBRH7LA\"  # provisioned by platform team", "spans": [{"start": 16, "end": 43, "value": "ZN-XXJVE3D-EEDHHJSH-KBRH7LA", "category": "CREDENTIAL"}]}
+{"input": "connected to doc-store:5432 successfully", "spans": [{"start": 13, "end": 22, "value": "doc-store", "category": "INTERNAL_URL"}]}
+{"input": "val := 'EkUturFIxYeBJfEt8UbzcIZX7N3'  // injected at boot", "spans": [{"start": 8, "end": 35, "value": "EkUturFIxYeBJfEt8UbzcIZX7N3", "category": "CREDENTIAL"}]}
+{"input": "curl -sSf http://search-core/healthz || echo 'down'", "spans": [{"start": 17, "end": 28, "value": "search-core", "category": "INTERNAL_URL"}]}
+{"input": "customer #400371 reported the incident", "spans": [{"start": 10, "end": 16, "value": "400371", "category": "USER_ID"}]}
+{"input": "See ticket #183237 for the stack trace", "spans": [{"start": 12, "end": 18, "value": "183237", "category": "USER_ID"}]}
+{"input": "proxy -> batch-runner with x-internal-token 2Pus6MDIUOhvoN4pc (expires 60m)", "spans": [{"start": 9, "end": 21, "value": "batch-runner", "category": "INTERNAL_URL"}, {"start": 44, "end": 61, "value": "2Pus6MDIUOhvoN4pc", "category": "CREDENTIAL"}]}
+{"input": "route add 172.24.36.148 via gw-01 metric 10", "spans": [{"start": 10, "end": 23, "value": "172.24.36.148", "category": "INTERNAL_IP"}]}
+{"input": "invoice-gen,prod,owner=Bob Brown,last_deploy=2025-11-03", "spans": [{"start": 0, "end": 11, "value": "invoice-gen", "category": "INTERNAL_URL"}, {"start": 23, "end": 32, "value": "Bob Brown", "category": "PII_NAME"}]}
+{"input": "ENV UPSTREAM=batch-runner API_TOKEN=CORP-EXDW6L-LXYFU38-AIH0P", "spans": [{"start": 13, "end": 25, "value": "batch-runner", "category": "INTERNAL_URL"}, {"start": 36, "end": 61, "value": "CORP-EXDW6L-LXYFU38-AIH0P", "category": "CREDENTIAL"}]}
+{"input": "Sato Hanako-san asked for access to the staging cluster", "spans": [{"start": 0, "end": 11, "value": "Sato Hanako", "category": "PII_NAME"}]}
+{"input": "const SERVICE_SECRET = '7LIbSPrfB91kZLXYlOqSvC';", "spans": [{"start": 24, "end": 46, "value": "7LIbSPrfB91kZLXYlOqSvC", "category": "CREDENTIAL"}]}
+{"input": "Suzuki Sakura が refund-core のレイテンシ悪化を調査中(token X4ZJApV4fLHpaUaGGxmXzgA で再現)", "spans": [{"start": 0, "end": 13, "value": "Suzuki Sakura", "category": "PII_NAME"}, {"start": 16, "end": 27, "value": "refund-core", "category": "INTERNAL_URL"}, {"start": 47, "end": 70, "value": "X4ZJApV4fLHpaUaGGxmXzgA", "category": "CREDENTIAL"}]}
+{"input": "proxy -> reporting with x-internal-token j5Adnecx9MGSL6YNBmOXrcLFokc (expires 60m)", "spans": [{"start": 9, "end": 18, "value": "reporting", "category": "INTERNAL_URL"}, {"start": 41, "end": 68, "value": "j5Adnecx9MGSL6YNBmOXrcLFokc", "category": "CREDENTIAL"}]}
+{"input": "counter rpc_requests_total{target=\"audit-trail\"} 14820", "spans": [{"start": 35, "end": 46, "value": "audit-trail", "category": "INTERNAL_URL"}]}
+{"input": "Sato Ren-san asked for access to the staging cluster", "spans": [{"start": 0, "end": 8, "value": "Sato Ren", "category": "PII_NAME"}]}
+{"input": "upstream host = kyc-service  # k8s service dns", "spans": [{"start": 16, "end": 27, "value": "kyc-service", "category": "INTERNAL_URL"}]}
+{"input": "Tanaka Taro-san asked for access to the staging cluster", "spans": [{"start": 0, "end": 11, "value": "Tanaka Taro", "category": "PII_NAME"}]}
+{"input": "kubectl port-forward svc/rec-engine 8080:80 -n platform", "spans": [{"start": 25, "end": 35, "value": "rec-engine", "category": "INTERNAL_URL"}]}
+{"input": "span attribute upstream.service=reporting attached to trace 772041", "spans": [{"start": 32, "end": 41, "value": "reporting", "category": "INTERNAL_URL"}, {"start": 60, "end": 66, "value": "772041", "category": "USER_ID"}]}
+{"input": "kubectl port-forward svc/auth-gateway 8080:80 -n platform", "spans": [{"start": 25, "end": 37, "value": "auth-gateway", "category": "INTERNAL_URL"}]}
+{"input": "resource \"kubernetes_service\" \"orders\" { cluster_ip = \"None\" }", "spans": [{"start": 31, "end": 37, "value": "orders", "category": "INTERNAL_URL"}]}
+{"input": "proxy -> inventory with x-internal-token t9uxVATLInV5p7ByT8KG9ssn1bYQ (expires 60m)", "spans": [{"start": 9, "end": 18, "value": "inventory", "category": "INTERNAL_URL"}, {"start": 41, "end": 69, "value": "t9uxVATLInV5p7ByT8KG9ssn1bYQ", "category": "CREDENTIAL"}]}
+{"input": "backend_service_upstream(ledger, retries=3)", "spans": [{"start": 25, "end": 31, "value": "ledger", "category": "INTERNAL_URL"}]}
+{"input": "See ticket #64029 for the stack trace", "spans": [{"start": 12, "end": 17, "value": "64029", "category": "USER_ID"}]}
+{"input": "proxy -> billing-svc with x-internal-token gt1GlFC5bpGuyjvvMo8FYM23Y (expires 60m)", "spans": [{"start": 9, "end": 20, "value": "billing-svc", "category": "INTERNAL_URL"}, {"start": 43, "end": 68, "value": "gt1GlFC5bpGuyjvvMo8FYM23Y", "category": "CREDENTIAL"}]}
+{"input": "dial tcp reporting:9092: connection refused", "spans": [{"start": 9, "end": 18, "value": "reporting", "category": "INTERNAL_URL"}]}
+{"input": "See ticket #868823 for the stack trace", "spans": [{"start": 12, "end": 18, "value": "868823", "category": "USER_ID"}]}
+{"input": "route add 172.19.67.246 via gw-01 metric 10", "spans": [{"start": 10, "end": 23, "value": "172.19.67.246", "category": "INTERNAL_IP"}]}
+{"input": "curl -sSf http://rec-engine/healthz || echo 'down'", "spans": [{"start": 17, "end": 27, "value": "rec-engine", "category": "INTERNAL_URL"}]}
+{"input": "proxy -> fulfillment with x-internal-token R8abMh0X9zuINamrW (expires 60m)", "spans": [{"start": 9, "end": 20, "value": "fulfillment", "category": "INTERNAL_URL"}, {"start": 43, "end": 60, "value": "R8abMh0X9zuINamrW", "category": "CREDENTIAL"}]}
+{"input": "counter rpc_requests_total{target=\"cart-api\"} 14820", "spans": [{"start": 35, "end": 43, "value": "cart-api", "category": "INTERNAL_URL"}]}
+{"input": "the deploy used key TK-37YE-QZSA issued by the platform ops for Carol Smith", "spans": [{"start": 20, "end": 32, "value": "TK-37YE-QZSA", "category": "CREDENTIAL"}, {"start": 64, "end": 75, "value": "Carol Smith", "category": "PII_NAME"}]}
+{"input": "Grace Miller opened #484367 against shipping-core about the 500s", "spans": [{"start": 0, "end": 12, "value": "Grace Miller", "category": "PII_NAME"}, {"start": 21, "end": 27, "value": "484367", "category": "USER_ID"}, {"start": 36, "end": 49, "value": "shipping-core", "category": "INTERNAL_URL"}]}
+{"input": "Reported by Dan Davis after escalation from on-call", "spans": [{"start": 12, "end": 21, "value": "Dan Davis", "category": "PII_NAME"}]}
+{"input": "counter rpc_requests_total{target=\"batch-runner\"} 14820", "spans": [{"start": 35, "end": 47, "value": "batch-runner", "category": "INTERNAL_URL"}]}
+{"input": "node loyalty (172.20.253.193) joined the pool", "spans": [{"start": 5, "end": 12, "value": "loyalty", "category": "INTERNAL_URL"}, {"start": 14, "end": 28, "value": "172.20.253.193", "category": "INTERNAL_IP"}]}
+{"input": "const SERVICE_SECRET = 'tG7gGv0LOqqXpKCPoPVGQ9ta';", "spans": [{"start": 24, "end": 48, "value": "tG7gGv0LOqqXpKCPoPVGQ9ta", "category": "CREDENTIAL"}]}
+{"input": "Bob Davis confirmed the rollback at 03:12 JST", "spans": [{"start": 0, "end": 9, "value": "Bob Davis", "category": "PII_NAME"}]}
+{"input": "connected to tax-calc:5432 successfully", "spans": [{"start": 13, "end": 21, "value": "tax-calc", "category": "INTERNAL_URL"}]}
+{"input": "Carol Wilson opened #712016 against warehouse-api about the 500s", "spans": [{"start": 0, "end": 12, "value": "Carol Wilson", "category": "PII_NAME"}, {"start": 21, "end": 27, "value": "712016", "category": "USER_ID"}, {"start": 36, "end": 49, "value": "warehouse-api", "category": "INTERNAL_URL"}]}
+{"input": "val := 'ZdYhKMdmuZTyhQHt'  // injected at boot", "spans": [{"start": 8, "end": 24, "value": "ZdYhKMdmuZTyhQHt", "category": "CREDENTIAL"}]}
+{"input": "API_KEY: str = \"hiqBokQKSLfZszIl98M19FCMm\"  # loaded from vault", "spans": [{"start": 16, "end": 41, "value": "hiqBokQKSLfZszIl98M19FCMm", "category": "CREDENTIAL"}]}
+{"input": "headers['X-Corp-Auth'] = 'TK-KPM21B-7G2R'", "spans": [{"start": 26, "end": 40, "value": "TK-KPM21B-7G2R", "category": "CREDENTIAL"}]}
+{"input": "Retrying request to auth-gateway after timeout", "spans": [{"start": 20, "end": 32, "value": "auth-gateway", "category": "INTERNAL_URL"}]}
+{"input": "tmp = \"6HXWf2Td6P3gwMwkIeRm8ohD6\"; sendAuth(tmp)", "spans": [{"start": 7, "end": 32, "value": "6HXWf2Td6P3gwMwkIeRm8ohD6", "category": "CREDENTIAL"}]}
+{"input": "proxy -> tax-calc with x-internal-token 3Ce3r7grRE2GMs8Hi (expires 60m)", "spans": [{"start": 9, "end": 17, "value": "tax-calc", "category": "INTERNAL_URL"}, {"start": 40, "end": 57, "value": "3Ce3r7grRE2GMs8Hi", "category": "CREDENTIAL"}]}
+{"input": "CORP_TOKEN_V2: CORP-XOMXLVZ4-QU6L2IN", "spans": [{"start": 15, "end": 36, "value": "CORP-XOMXLVZ4-QU6L2IN", "category": "CREDENTIAL"}]}
+{"input": "config.token = \"CORP-9LZRK79U-207ME-6FTLO4Q-LVHS\"  # provisioned by platform team", "spans": [{"start": 16, "end": 48, "value": "CORP-9LZRK79U-207ME-6FTLO4Q-LVHS", "category": "CREDENTIAL"}]}
+{"input": "span attribute upstream.service=cart-api attached to trace 504825", "spans": [{"start": 32, "end": 40, "value": "cart-api", "category": "INTERNAL_URL"}, {"start": 59, "end": 65, "value": "504825", "category": "USER_ID"}]}
+{"input": "kubectl port-forward svc/cdn-origin 8080:80 -n platform", "spans": [{"start": 25, "end": 35, "value": "cdn-origin", "category": "INTERNAL_URL"}]}
+{"input": "payments-core,prod,owner=Alice Miller,last_deploy=2025-11-03", "spans": [{"start": 0, "end": 13, "value": "payments-core", "category": "INTERNAL_URL"}, {"start": 25, "end": 37, "value": "Alice Miller", "category": "PII_NAME"}]}
+{"input": "See ticket #971237 for the stack trace", "spans": [{"start": 12, "end": 18, "value": "971237", "category": "USER_ID"}]}
+{"input": "Frank Miller opened #275375 against fulfillment about the 500s", "spans": [{"start": 0, "end": 12, "value": "Frank Miller", "category": "PII_NAME"}, {"start": 21, "end": 27, "value": "275375", "category": "USER_ID"}, {"start": 36, "end": 47, "value": "fulfillment", "category": "INTERNAL_URL"}]}

@@ -26,6 +26,27 @@ _JSON_KEY_RE = re.compile(r'"([^"\\]+)"\s*:')
 
 # Maps opf labels (8 default + 2 Pentect-specific) back to Pentect categories.
 # Mirrors training/convert_to_opf.py CATEGORY_TO_OPF in the reverse direction.
+# CJK detection helper. Currently no live caller — the post-filter
+# that used it was removed (see the long comment in
+# `_spans_from_result` for why). Kept around because the obvious
+# "fix" for opf misclassifying CJK nouns is to reclassify rather
+# than drop, and that future filter will need this same predicate.
+def _contains_cjk(s: str) -> bool:
+    for ch in s:
+        cp = ord(ch)
+        if 0x3040 <= cp <= 0x30FF:           # Hiragana + Katakana
+            return True
+        if 0xAC00 <= cp <= 0xD7AF:           # Hangul syllables
+            return True
+        if 0x4E00 <= cp <= 0x9FFF:           # CJK Unified Ideographs
+            return True
+        if 0x3400 <= cp <= 0x4DBF:           # CJK Extension A
+            return True
+        if 0xFF00 <= cp <= 0xFFEF:           # Halfwidth + Fullwidth Forms
+            return True
+    return False
+
+
 _OPF_TO_CATEGORY: dict[str, Category] = {
     "secret": Category.CREDENTIAL,
     "private_email": Category.PII_EMAIL,
@@ -87,6 +108,30 @@ class PrivacyFilterDetector:
             # we accidentally swallowed URL structure.
             if cat is Category.CREDENTIAL and "/" in value:
                 continue
+            # NOTE (kept disabled, do not re-enable lightly):
+            # We considered dropping short (<16 chars) CREDENTIAL spans
+            # whose value contains CJK — the FT model occasionally
+            # tags Japanese/Chinese/Korean nouns as secrets
+            # (e.g. "未踏JR" -> CREDENTIAL). The filter would have made
+            # the demo prettier on those inputs.
+            #
+            # Why it stays off:
+            #   1. Adversarial-masking policy says "if in doubt, mask".
+            #      Dropping a span lets the value pass through unmasked
+            #      because no other detector picks up short CJK strings
+            #      (rule / entropy / seed_phrase / crypto_address all
+            #      return zero spans on "未踏JR" today).
+            #   2. A real CJK-prefixed credential
+            #      (e.g. "Bearer 未踏JR_xxxxxxxx") right at the length
+            #      boundary would be silently dropped — false negatives
+            #      cost more than over-masking does.
+            #   3. The "len < 16" cutoff is a magic number with no firm
+            #      basis; the boundary is fragile.
+            #
+            # If we revisit this, the safer shape is to RECLASSIFY (e.g.
+            # PII_NAME) rather than DROP, so the value is still masked.
+            # if cat is Category.CREDENTIAL and len(value) < 16 and _contains_cjk(value):
+            #     continue
             out.append(Span(start=sp.start, end=sp.end, category=cat, source=self.name))
         return out
 

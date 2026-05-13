@@ -1,0 +1,59 @@
+# Reference / scratch
+ref*.md
+sandbox/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node / Vite
+node_modules/
+ui/dist/
+ui/.vite/
+*.log
+
+# Training artifacts
+/data/
+# But the detector ships dictionaries (BIP39 wordlists) under
+# engine/detectors/data — keep those tracked.
+!engine/detectors/data/
+checkpoints/
+outputs/
+wandb/
+*.safetensors
+*.bin
+*.gguf
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Claude Code session state
+.claude/
+
+# Playwright MCP scratch dir + ad-hoc screenshots
+.playwright-mcp/
+pentect_demo_*.png
+
+# pentect-shop runtime artifacts (regenerated on app start)
+demo/pentect_shop/shop.db

@@ -1,0 +1,1080 @@
+{"text": "headers['X-Corp-Auth'] = 'ZN-NLNQ-GX25-REZRD'", "spans": {"secret: ZN-NLNQ-GX25-REZRD": [[26, 44]]}, "info": {"id": "pentect_0", "source": "pentect"}}
+{"text": "Reported by Alice Brown after escalation from on-call", "spans": {"private_person: Alice Brown": [[12, 23]]}, "info": {"id": "pentect_1", "source": "pentect"}}
+{"text": "Eve Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Eve Johnson": [[0, 11]]}, "info": {"id": "pentect_2", "source": "pentect"}}
+{"text": "proxy -> tax-calc with x-internal-token hYuKyUoAik8BpKEx6tAQ726 (expires 60m)", "spans": {"internal_url: tax-calc": [[9, 17]], "secret: hYuKyUoAik8BpKEx6tAQ726": [[40, 63]]}, "info": {"id": "pentect_3", "source": "pentect"}}
+{"text": "x = \"1Z6Dz0S2YZRFvLYTCb\"  # used by the billing worker", "spans": {"secret: 1Z6Dz0S2YZRFvLYTCb": [[5, 23]]}, "info": {"id": "pentect_4", "source": "pentect"}}
+{"text": "node refund-core (172.19.7.184) joined the pool", "spans": {"internal_url: refund-core": [[5, 16]], "internal_ip: 172.19.7.184": [[18, 30]]}, "info": {"id": "pentect_5", "source": "pentect"}}
+{"text": "upstream host = auth-gateway  # k8s service dns", "spans": {"internal_url: auth-gateway": [[16, 28]]}, "info": {"id": "pentect_6", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'Z9-SN9YE6-UJS7'", "spans": {"secret: Z9-SN9YE6-UJS7": [[26, 40]]}, "info": {"id": "pentect_7", "source": "pentect"}}
+{"text": "billing-svc,prod,owner=Hank Davis,last_deploy=2025-11-03", "spans": {"internal_url: billing-svc": [[0, 11]], "private_person: Hank Davis": [[23, 33]]}, "info": {"id": "pentect_8", "source": "pentect"}}
+{"text": "config.token = \"TK-X8L0-E52K20TV-OG85\"  # provisioned by platform team", "spans": {"secret: TK-X8L0-E52K20TV-OG85": [[16, 37]]}, "info": {"id": "pentect_9", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'tax-calc' AND status = 'degraded'", "spans": {"internal_url: tax-calc": [[43, 51]]}, "info": {"id": "pentect_10", "source": "pentect"}}
+{"text": "curl -sSf http://kyc-service/healthz || echo 'down'", "spans": {"internal_url: kyc-service": [[17, 28]]}, "info": {"id": "pentect_11", "source": "pentect"}}
+{"text": "See ticket #680792 for the stack trace", "spans": {"account_number: 680792": [[12, 18]]}, "info": {"id": "pentect_12", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"batch-runner\" { cluster_ip = \"None\" }", "spans": {"internal_url: batch-runner": [[31, 43]]}, "info": {"id": "pentect_13", "source": "pentect"}}
+{"text": "Grace Brown confirmed the rollback at 03:12 JST", "spans": {"private_person: Grace Brown": [[0, 11]]}, "info": {"id": "pentect_14", "source": "pentect"}}
+{"text": "Reported by Carol Wilson after escalation from on-call", "spans": {"private_person: Carol Wilson": [[12, 24]]}, "info": {"id": "pentect_15", "source": "pentect"}}
+{"text": "issue 611658 was closed after the rollback", "spans": {"account_number: 611658": [[6, 12]]}, "info": {"id": "pentect_16", "source": "pentect"}}
+{"text": "API_KEY: str = \"zhJcjx9sEXiKd33nYEhv1zJJ3WD\"  # loaded from vault", "spans": {"secret: zhJcjx9sEXiKd33nYEhv1zJJ3WD": [[16, 43]]}, "info": {"id": "pentect_17", "source": "pentect"}}
+{"text": "API_KEY: str = \"GUFbOG7rmZ0JfHtKE5vlbGx\"  # loaded from vault", "spans": {"secret: GUFbOG7rmZ0JfHtKE5vlbGx": [[16, 39]]}, "info": {"id": "pentect_18", "source": "pentect"}}
+{"text": "tmp = \"mUKEUxhdCzEzo2\"; sendAuth(tmp)", "spans": {"secret: mUKEUxhdCzEzo2": [[7, 21]]}, "info": {"id": "pentect_19", "source": "pentect"}}
+{"text": "media-proxy,prod,owner=Hank Brown,last_deploy=2025-11-03", "spans": {"internal_url: media-proxy": [[0, 11]], "private_person: Hank Brown": [[23, 33]]}, "info": {"id": "pentect_20", "source": "pentect"}}
+{"text": "the deploy used key ZN-QVAYX-VAAG-6Z1T2XCB issued by the platform ops for Hank Wilson", "spans": {"secret: ZN-QVAYX-VAAG-6Z1T2XCB": [[20, 42]], "private_person: Hank Wilson": [[74, 85]]}, "info": {"id": "pentect_21", "source": "pentect"}}
+{"text": "issue 543383 was closed after the rollback", "spans": {"account_number: 543383": [[6, 12]]}, "info": {"id": "pentect_22", "source": "pentect"}}
+{"text": "proxy -> reporting with x-internal-token duX6WMVMJfdct0eh4BsMeQIsxfU (expires 60m)", "spans": {"internal_url: reporting": [[9, 18]], "secret: duX6WMVMJfdct0eh4BsMeQIsxfU": [[41, 68]]}, "info": {"id": "pentect_23", "source": "pentect"}}
+{"text": "Alice Wilson opened #965641 against pricing about the 500s", "spans": {"private_person: Alice Wilson": [[0, 12]], "account_number: 965641": [[21, 27]], "internal_url: pricing": [[36, 43]]}, "info": {"id": "pentect_24", "source": "pentect"}}
+{"text": "Grace Wilson confirmed the rollback at 03:12 JST", "spans": {"private_person: Grace Wilson": [[0, 12]]}, "info": {"id": "pentect_25", "source": "pentect"}}
+{"text": "API_KEY: str = \"pNrhFKETWXMky2UxGlS\"  # loaded from vault", "spans": {"secret: pNrhFKETWXMky2UxGlS": [[16, 35]]}, "info": {"id": "pentect_26", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'CORP-6QIHP-U7NTEDQ'", "spans": {"secret: CORP-6QIHP-U7NTEDQ": [[26, 44]]}, "info": {"id": "pentect_27", "source": "pentect"}}
+{"text": "See ticket #237444 for the stack trace", "spans": {"account_number: 237444": [[12, 18]]}, "info": {"id": "pentect_28", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"cdn-origin\"} 14820", "spans": {"internal_url: cdn-origin": [[35, 45]]}, "info": {"id": "pentect_29", "source": "pentect"}}
+{"text": "curl -sSf http://kyc-service/healthz || echo 'down'", "spans": {"internal_url: kyc-service": [[17, 28]]}, "info": {"id": "pentect_30", "source": "pentect"}}
+{"text": "connected to orders:5432 successfully", "spans": {"internal_url: orders": [[13, 19]]}, "info": {"id": "pentect_31", "source": "pentect"}}
+{"text": "val := 'oguaOannOrMc2zV'  // injected at boot", "spans": {"secret: oguaOannOrMc2zV": [[8, 23]]}, "info": {"id": "pentect_32", "source": "pentect"}}
+{"text": "Retrying request to billing-svc after timeout", "spans": {"internal_url: billing-svc": [[20, 31]]}, "info": {"id": "pentect_33", "source": "pentect"}}
+{"text": "Reported by Eve Davis after escalation from on-call", "spans": {"private_person: Eve Davis": [[12, 21]]}, "info": {"id": "pentect_34", "source": "pentect"}}
+{"text": "kubectl port-forward svc/audit-trail 8080:80 -n platform", "spans": {"internal_url: audit-trail": [[25, 36]]}, "info": {"id": "pentect_35", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '2KTU51gJXYqmURakEgVzzrAk';", "spans": {"secret: 2KTU51gJXYqmURakEgVzzrAk": [[24, 48]]}, "info": {"id": "pentect_36", "source": "pentect"}}
+{"text": "issue 857526 was closed after the rollback", "spans": {"account_number: 857526": [[6, 12]]}, "info": {"id": "pentect_37", "source": "pentect"}}
+{"text": "dial tcp pricing:9092: connection refused", "spans": {"internal_url: pricing": [[9, 16]]}, "info": {"id": "pentect_38", "source": "pentect"}}
+{"text": "Reported by Bob Brown after escalation from on-call", "spans": {"private_person: Bob Brown": [[12, 21]]}, "info": {"id": "pentect_39", "source": "pentect"}}
+{"text": "See ticket #411840 for the stack trace", "spans": {"account_number: 411840": [[12, 18]]}, "info": {"id": "pentect_40", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"kyc-v3\"} 14820", "spans": {"internal_url: kyc-v3": [[35, 41]]}, "info": {"id": "pentect_41", "source": "pentect"}}
+{"text": "Reported by Bob Johnson after escalation from on-call", "spans": {"private_person: Bob Johnson": [[12, 23]]}, "info": {"id": "pentect_42", "source": "pentect"}}
+{"text": "customer #268352 reported the incident", "spans": {"account_number: 268352": [[10, 16]]}, "info": {"id": "pentect_43", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"search-core\"} 14820", "spans": {"internal_url: search-core": [[35, 46]]}, "info": {"id": "pentect_44", "source": "pentect"}}
+{"text": "route add 172.20.245.128 via gw-01 metric 10", "spans": {"internal_ip: 172.20.245.128": [[10, 24]]}, "info": {"id": "pentect_45", "source": "pentect"}}
+{"text": "See ticket #372754 for the stack trace", "spans": {"account_number: 372754": [[12, 18]]}, "info": {"id": "pentect_46", "source": "pentect"}}
+{"text": "See ticket #788574 for the stack trace", "spans": {"account_number: 788574": [[12, 18]]}, "info": {"id": "pentect_47", "source": "pentect"}}
+{"text": "dial tcp inventory:9092: connection refused", "spans": {"internal_url: inventory": [[9, 18]]}, "info": {"id": "pentect_48", "source": "pentect"}}
+{"text": "span attribute upstream.service=shipping-core attached to trace 798953", "spans": {"internal_url: shipping-core": [[32, 45]], "account_number: 798953": [[64, 70]]}, "info": {"id": "pentect_49", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'IGT-PZ614-96QZ6CP7'", "spans": {"secret: IGT-PZ614-96QZ6CP7": [[26, 44]]}, "info": {"id": "pentect_50", "source": "pentect"}}
+{"text": "upstream host = inventory  # k8s service dns", "spans": {"internal_url: inventory": [[16, 25]]}, "info": {"id": "pentect_51", "source": "pentect"}}
+{"text": "dial tcp ledger:9092: connection refused", "spans": {"internal_url: ledger": [[9, 15]]}, "info": {"id": "pentect_52", "source": "pentect"}}
+{"text": "Bob Brown opened #918925 against audit-trail about the 500s", "spans": {"private_person: Bob Brown": [[0, 9]], "account_number: 918925": [[18, 24]], "internal_url: audit-trail": [[33, 44]]}, "info": {"id": "pentect_53", "source": "pentect"}}
+{"text": "backend_service_upstream(risk-engine, retries=3)", "spans": {"internal_url: risk-engine": [[25, 36]]}, "info": {"id": "pentect_54", "source": "pentect"}}
+{"text": "backend_service_upstream(loyalty, retries=3)", "spans": {"internal_url: loyalty": [[25, 32]]}, "info": {"id": "pentect_55", "source": "pentect"}}
+{"text": "config.token = \"HX-FG00ZKO-PXAECX-1SA3Y5T3-SZPF9S9E\"  # provisioned by platform team", "spans": {"secret: HX-FG00ZKO-PXAECX-1SA3Y5T3-SZPF9S9E": [[16, 51]]}, "info": {"id": "pentect_56", "source": "pentect"}}
+{"text": "See ticket #748385 for the stack trace", "spans": {"account_number: 748385": [[12, 18]]}, "info": {"id": "pentect_57", "source": "pentect"}}
+{"text": "val := 'JveSC98VB568EwrzMQ'  // injected at boot", "spans": {"secret: JveSC98VB568EwrzMQ": [[8, 26]]}, "info": {"id": "pentect_58", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'CORP-0I3A-KFOC-5YMQT3D-0771H'", "spans": {"secret: CORP-0I3A-KFOC-5YMQT3D-0771H": [[26, 54]]}, "info": {"id": "pentect_59", "source": "pentect"}}
+{"text": "proxy -> audit-trail with x-internal-token vQyaWLePMu96UTtjCj1h (expires 60m)", "spans": {"internal_url: audit-trail": [[9, 20]], "secret: vQyaWLePMu96UTtjCj1h": [[43, 63]]}, "info": {"id": "pentect_60", "source": "pentect"}}
+{"text": "warehouse-api,prod,owner=Alice Wilson,last_deploy=2025-11-03", "spans": {"internal_url: warehouse-api": [[0, 13]], "private_person: Alice Wilson": [[25, 37]]}, "info": {"id": "pentect_61", "source": "pentect"}}
+{"text": "span attribute upstream.service=coupon-svc attached to trace 647203", "spans": {"internal_url: coupon-svc": [[32, 42]], "account_number: 647203": [[61, 67]]}, "info": {"id": "pentect_62", "source": "pentect"}}
+{"text": "Retrying request to orders after timeout", "spans": {"internal_url: orders": [[20, 26]]}, "info": {"id": "pentect_63", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: CORP-RWHP-WQFK6X-4EMM9VAS", "spans": {"secret: CORP-RWHP-WQFK6X-4EMM9VAS": [[15, 40]]}, "info": {"id": "pentect_64", "source": "pentect"}}
+{"text": "proxy -> audit-trail with x-internal-token aQSnJtoernnIS6Y (expires 60m)", "spans": {"internal_url: audit-trail": [[9, 20]], "secret: aQSnJtoernnIS6Y": [[43, 58]]}, "info": {"id": "pentect_65", "source": "pentect"}}
+{"text": "See ticket #760282 for the stack trace", "spans": {"account_number: 760282": [[12, 18]]}, "info": {"id": "pentect_66", "source": "pentect"}}
+{"text": "x = \"VDfVSvZpO1ReEnPDxEv\"  # used by the billing worker", "spans": {"secret: VDfVSvZpO1ReEnPDxEv": [[5, 24]]}, "info": {"id": "pentect_67", "source": "pentect"}}
+{"text": "Dan Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Dan Smith": [[0, 9]]}, "info": {"id": "pentect_68", "source": "pentect"}}
+{"text": "proxy -> cart-api with x-internal-token rKTfFRDs4otel3iaDulqeQ0K (expires 60m)", "spans": {"internal_url: cart-api": [[9, 17]], "secret: rKTfFRDs4otel3iaDulqeQ0K": [[40, 64]]}, "info": {"id": "pentect_69", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: CORP-4SGFDK-Q09JRN-3KMS-RJSXFOH9", "spans": {"secret: CORP-4SGFDK-Q09JRN-3KMS-RJSXFOH9": [[15, 47]]}, "info": {"id": "pentect_70", "source": "pentect"}}
+{"text": "curl -sSf http://ledger/healthz || echo 'down'", "spans": {"internal_url: ledger": [[17, 23]]}, "info": {"id": "pentect_71", "source": "pentect"}}
+{"text": "curl -sSf http://kyc-v3/healthz || echo 'down'", "spans": {"internal_url: kyc-v3": [[17, 23]]}, "info": {"id": "pentect_72", "source": "pentect"}}
+{"text": "See ticket #289548 for the stack trace", "spans": {"account_number: 289548": [[12, 18]]}, "info": {"id": "pentect_73", "source": "pentect"}}
+{"text": "connected to doc-store:5432 successfully", "spans": {"internal_url: doc-store": [[13, 22]]}, "info": {"id": "pentect_74", "source": "pentect"}}
+{"text": "the deploy used key Z9-D50N9-CJB0 issued by the platform ops for Hank Johnson", "spans": {"secret: Z9-D50N9-CJB0": [[20, 33]], "private_person: Hank Johnson": [[65, 77]]}, "info": {"id": "pentect_75", "source": "pentect"}}
+{"text": "kubectl port-forward svc/loyalty 8080:80 -n platform", "spans": {"internal_url: loyalty": [[25, 32]]}, "info": {"id": "pentect_76", "source": "pentect"}}
+{"text": "tmp = \"hhM4vv4ofazUYHcX\"; sendAuth(tmp)", "spans": {"secret: hhM4vv4ofazUYHcX": [[7, 23]]}, "info": {"id": "pentect_77", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'ZN-V69EOX-C7HZ-64PKNT'", "spans": {"secret: ZN-V69EOX-C7HZ-64PKNT": [[26, 47]]}, "info": {"id": "pentect_78", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'TK-VK8C4N-5NBH-XTXB1'", "spans": {"secret: TK-VK8C4N-5NBH-XTXB1": [[26, 46]]}, "info": {"id": "pentect_79", "source": "pentect"}}
+{"text": "route add 172.27.22.154 via gw-01 metric 10", "spans": {"internal_ip: 172.27.22.154": [[10, 23]]}, "info": {"id": "pentect_80", "source": "pentect"}}
+{"text": "risk-engine,prod,owner=Dan Miller,last_deploy=2025-11-03", "spans": {"internal_url: risk-engine": [[0, 11]], "private_person: Dan Miller": [[23, 33]]}, "info": {"id": "pentect_81", "source": "pentect"}}
+{"text": "span attribute upstream.service=batch-runner attached to trace 175872", "spans": {"internal_url: batch-runner": [[32, 44]], "account_number: 175872": [[63, 69]]}, "info": {"id": "pentect_82", "source": "pentect"}}
+{"text": "kubectl port-forward svc/shipping-core 8080:80 -n platform", "spans": {"internal_url: shipping-core": [[25, 38]]}, "info": {"id": "pentect_83", "source": "pentect"}}
+{"text": "issue 165340 was closed after the rollback", "spans": {"account_number: 165340": [[6, 12]]}, "info": {"id": "pentect_84", "source": "pentect"}}
+{"text": "warehouse-api へのリクエストが 924685 回連続で失敗しました。担当 Takahashi Yuki に共有済み。", "spans": {"internal_url: warehouse-api": [[0, 13]], "account_number: 924685": [[23, 29]], "private_person: Takahashi Yuki": [[44, 58]]}, "info": {"id": "pentect_85", "source": "pentect"}}
+{"text": "Reported by Carol Brown after escalation from on-call", "spans": {"private_person: Carol Brown": [[12, 23]]}, "info": {"id": "pentect_86", "source": "pentect"}}
+{"text": "issue 606950 was closed after the rollback", "spans": {"account_number: 606950": [[6, 12]]}, "info": {"id": "pentect_87", "source": "pentect"}}
+{"text": "backend_service_upstream(payments-core, retries=3)", "spans": {"internal_url: payments-core": [[25, 38]]}, "info": {"id": "pentect_88", "source": "pentect"}}
+{"text": "Suzuki Aoi が invoice-gen のレイテンシ悪化を調査中(token pC65S0iGZazje8tlRHudDjv で再現)", "spans": {"private_person: Suzuki Aoi": [[0, 10]], "internal_url: invoice-gen": [[13, 24]], "secret: pC65S0iGZazje8tlRHudDjv": [[44, 67]]}, "info": {"id": "pentect_89", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'warehouse-api' AND status = 'degraded'", "spans": {"internal_url: warehouse-api": [[43, 56]]}, "info": {"id": "pentect_90", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'loyalty' AND status = 'degraded'", "spans": {"internal_url: loyalty": [[43, 50]]}, "info": {"id": "pentect_91", "source": "pentect"}}
+{"text": "upstream host = cron-svc  # k8s service dns", "spans": {"internal_url: cron-svc": [[16, 24]]}, "info": {"id": "pentect_92", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: ZN-HNC0-LY750", "spans": {"secret: ZN-HNC0-LY750": [[15, 28]]}, "info": {"id": "pentect_93", "source": "pentect"}}
+{"text": "issue 447582 was closed after the rollback", "spans": {"account_number: 447582": [[6, 12]]}, "info": {"id": "pentect_94", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: Z9-FKVZS8UF-2BD2FM", "spans": {"secret: Z9-FKVZS8UF-2BD2FM": [[15, 33]]}, "info": {"id": "pentect_95", "source": "pentect"}}
+{"text": "connected to billing-svc:5432 successfully", "spans": {"internal_url: billing-svc": [[13, 24]]}, "info": {"id": "pentect_96", "source": "pentect"}}
+{"text": "upstream host = coupon-svc  # k8s service dns", "spans": {"internal_url: coupon-svc": [[16, 26]]}, "info": {"id": "pentect_97", "source": "pentect"}}
+{"text": "curl -sSf http://rec-engine/healthz || echo 'down'", "spans": {"internal_url: rec-engine": [[17, 27]]}, "info": {"id": "pentect_98", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'ZN-6YJOAOE-Q2WDIZ-CKZ3V-LO7AMMPQ'", "spans": {"secret: ZN-6YJOAOE-Q2WDIZ-CKZ3V-LO7AMMPQ": [[26, 58]]}, "info": {"id": "pentect_99", "source": "pentect"}}
+{"text": "Retrying request to orders after timeout", "spans": {"internal_url: orders": [[20, 26]]}, "info": {"id": "pentect_100", "source": "pentect"}}
+{"text": "kubectl port-forward svc/batch-runner 8080:80 -n platform", "spans": {"internal_url: batch-runner": [[25, 37]]}, "info": {"id": "pentect_101", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'HX-ZSXPEFJ-1EGOM62H-LYQZ'", "spans": {"secret: HX-ZSXPEFJ-1EGOM62H-LYQZ": [[26, 50]]}, "info": {"id": "pentect_102", "source": "pentect"}}
+{"text": "orders へのリクエストが 218822 回連続で失敗しました。担当 Ito Aoi に共有済み。", "spans": {"internal_url: orders": [[0, 6]], "account_number: 218822": [[16, 22]], "private_person: Ito Aoi": [[37, 44]]}, "info": {"id": "pentect_103", "source": "pentect"}}
+{"text": "kubectl port-forward svc/payments-core 8080:80 -n platform", "spans": {"internal_url: payments-core": [[25, 38]]}, "info": {"id": "pentect_104", "source": "pentect"}}
+{"text": "customer #695214 reported the incident", "spans": {"account_number: 695214": [[10, 16]]}, "info": {"id": "pentect_105", "source": "pentect"}}
+{"text": "the deploy used key HX-LUHHS4D-F07V8-2O8Z issued by the platform ops for Eve Miller", "spans": {"secret: HX-LUHHS4D-F07V8-2O8Z": [[20, 41]], "private_person: Eve Miller": [[73, 83]]}, "info": {"id": "pentect_106", "source": "pentect"}}
+{"text": "route add 172.20.169.19 via gw-01 metric 10", "spans": {"internal_ip: 172.20.169.19": [[10, 23]]}, "info": {"id": "pentect_107", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'pricing' AND status = 'degraded'", "spans": {"internal_url: pricing": [[43, 50]]}, "info": {"id": "pentect_108", "source": "pentect"}}
+{"text": "dial tcp ledger:9092: connection refused", "spans": {"internal_url: ledger": [[9, 15]]}, "info": {"id": "pentect_109", "source": "pentect"}}
+{"text": "backend_service_upstream(ledger, retries=3)", "spans": {"internal_url: ledger": [[25, 31]]}, "info": {"id": "pentect_110", "source": "pentect"}}
+{"text": "See ticket #476207 for the stack trace", "spans": {"account_number: 476207": [[12, 18]]}, "info": {"id": "pentect_111", "source": "pentect"}}
+{"text": "proxy -> session-store with x-internal-token y69m0nbTvLj1GXwo (expires 60m)", "spans": {"internal_url: session-store": [[9, 22]], "secret: y69m0nbTvLj1GXwo": [[45, 61]]}, "info": {"id": "pentect_112", "source": "pentect"}}
+{"text": "Eve Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Eve Smith": [[0, 9]]}, "info": {"id": "pentect_113", "source": "pentect"}}
+{"text": "curl -sSf http://doc-store/healthz || echo 'down'", "spans": {"internal_url: doc-store": [[17, 26]]}, "info": {"id": "pentect_114", "source": "pentect"}}
+{"text": "Watanabe Yuki-san asked for access to the staging cluster", "spans": {"private_person: Watanabe Yuki": [[0, 13]]}, "info": {"id": "pentect_115", "source": "pentect"}}
+{"text": "connected to cron-svc:5432 successfully", "spans": {"internal_url: cron-svc": [[13, 21]]}, "info": {"id": "pentect_116", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"ledger\"} 14820", "spans": {"internal_url: ledger": [[35, 41]]}, "info": {"id": "pentect_117", "source": "pentect"}}
+{"text": "kubectl port-forward svc/invoice-gen 8080:80 -n platform", "spans": {"internal_url: invoice-gen": [[25, 36]]}, "info": {"id": "pentect_118", "source": "pentect"}}
+{"text": "upstream host = audit-trail  # k8s service dns", "spans": {"internal_url: audit-trail": [[16, 27]]}, "info": {"id": "pentect_119", "source": "pentect"}}
+{"text": "node pricing (172.19.33.87) joined the pool", "spans": {"internal_url: pricing": [[5, 12]], "internal_ip: 172.19.33.87": [[14, 26]]}, "info": {"id": "pentect_120", "source": "pentect"}}
+{"text": "ENV UPSTREAM=kyc-v3 API_TOKEN=IGT-BC9R4X1-DSXLSUTO", "spans": {"internal_url: kyc-v3": [[13, 19]], "secret: IGT-BC9R4X1-DSXLSUTO": [[30, 50]]}, "info": {"id": "pentect_121", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"inventory\" { cluster_ip = \"None\" }", "spans": {"internal_url: inventory": [[31, 40]]}, "info": {"id": "pentect_122", "source": "pentect"}}
+{"text": "See ticket #807487 for the stack trace", "spans": {"account_number: 807487": [[12, 18]]}, "info": {"id": "pentect_123", "source": "pentect"}}
+{"text": "See ticket #591045 for the stack trace", "spans": {"account_number: 591045": [[12, 18]]}, "info": {"id": "pentect_124", "source": "pentect"}}
+{"text": "Hank Brown confirmed the rollback at 03:12 JST", "spans": {"private_person: Hank Brown": [[0, 10]]}, "info": {"id": "pentect_125", "source": "pentect"}}
+{"text": "x = \"JXjtpTVELVGMcgeb51uf\"  # used by the billing worker", "spans": {"secret: JXjtpTVELVGMcgeb51uf": [[5, 25]]}, "info": {"id": "pentect_126", "source": "pentect"}}
+{"text": "the deploy used key CORP-RZKDU6F-E6OUWZK-9XFQ1-5RR1V issued by the platform ops for Alice Davis", "spans": {"secret: CORP-RZKDU6F-E6OUWZK-9XFQ1-5RR1V": [[20, 52]], "private_person: Alice Davis": [[84, 95]]}, "info": {"id": "pentect_127", "source": "pentect"}}
+{"text": "x = \"qlrfBPX413bhVpkeJofeSTv4e\"  # used by the billing worker", "spans": {"secret: qlrfBPX413bhVpkeJofeSTv4e": [[5, 30]]}, "info": {"id": "pentect_128", "source": "pentect"}}
+{"text": "Retrying request to fulfillment after timeout", "spans": {"internal_url: fulfillment": [[20, 31]]}, "info": {"id": "pentect_129", "source": "pentect"}}
+{"text": "config.token = \"HX-KFCR6C-C1ZA0DV-ZV8U0L-0RR1L9\"  # provisioned by platform team", "spans": {"secret: HX-KFCR6C-C1ZA0DV-ZV8U0L-0RR1L9": [[16, 47]]}, "info": {"id": "pentect_130", "source": "pentect"}}
+{"text": "customer #392490 reported the incident", "spans": {"account_number: 392490": [[10, 16]]}, "info": {"id": "pentect_131", "source": "pentect"}}
+{"text": "val := '8oKoYEDbFfUMfEL37qBWXri'  // injected at boot", "spans": {"secret: 8oKoYEDbFfUMfEL37qBWXri": [[8, 31]]}, "info": {"id": "pentect_132", "source": "pentect"}}
+{"text": "kubectl port-forward svc/billing-svc 8080:80 -n platform", "spans": {"internal_url: billing-svc": [[25, 36]]}, "info": {"id": "pentect_133", "source": "pentect"}}
+{"text": "dial tcp doc-store:9092: connection refused", "spans": {"internal_url: doc-store": [[9, 18]]}, "info": {"id": "pentect_134", "source": "pentect"}}
+{"text": "route add 172.24.111.131 via gw-01 metric 10", "spans": {"internal_ip: 172.24.111.131": [[10, 24]]}, "info": {"id": "pentect_135", "source": "pentect"}}
+{"text": "customer #668638 reported the incident", "spans": {"account_number: 668638": [[10, 16]]}, "info": {"id": "pentect_136", "source": "pentect"}}
+{"text": "upstream host = doc-store  # k8s service dns", "spans": {"internal_url: doc-store": [[16, 25]]}, "info": {"id": "pentect_137", "source": "pentect"}}
+{"text": "backend_service_upstream(session-store, retries=3)", "spans": {"internal_url: session-store": [[25, 38]]}, "info": {"id": "pentect_138", "source": "pentect"}}
+{"text": "Alice Davis opened #516200 against refund-core about the 500s", "spans": {"private_person: Alice Davis": [[0, 11]], "account_number: 516200": [[20, 26]], "internal_url: refund-core": [[35, 46]]}, "info": {"id": "pentect_139", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: HX-5NTDYWM-9N81DJD-0Z7Q0", "spans": {"secret: HX-5NTDYWM-9N81DJD-0Z7Q0": [[15, 39]]}, "info": {"id": "pentect_140", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'auth-gateway' AND status = 'degraded'", "spans": {"internal_url: auth-gateway": [[43, 55]]}, "info": {"id": "pentect_141", "source": "pentect"}}
+{"text": "Ito Taro-san asked for access to the staging cluster", "spans": {"private_person: Ito Taro": [[0, 8]]}, "info": {"id": "pentect_142", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'MX3OUjLrVAbef3jNwyCY4';", "spans": {"secret: MX3OUjLrVAbef3jNwyCY4": [[24, 45]]}, "info": {"id": "pentect_143", "source": "pentect"}}
+{"text": "Retrying request to kyc-service after timeout", "spans": {"internal_url: kyc-service": [[20, 31]]}, "info": {"id": "pentect_144", "source": "pentect"}}
+{"text": "kubectl port-forward svc/tax-calc 8080:80 -n platform", "spans": {"internal_url: tax-calc": [[25, 33]]}, "info": {"id": "pentect_145", "source": "pentect"}}
+{"text": "dial tcp loyalty:9092: connection refused", "spans": {"internal_url: loyalty": [[9, 16]]}, "info": {"id": "pentect_146", "source": "pentect"}}
+{"text": "dial tcp reporting:9092: connection refused", "spans": {"internal_url: reporting": [[9, 18]]}, "info": {"id": "pentect_147", "source": "pentect"}}
+{"text": "Watanabe Taro-san asked for access to the staging cluster", "spans": {"private_person: Watanabe Taro": [[0, 13]]}, "info": {"id": "pentect_148", "source": "pentect"}}
+{"text": "Reported by Grace Davis after escalation from on-call", "spans": {"private_person: Grace Davis": [[12, 23]]}, "info": {"id": "pentect_149", "source": "pentect"}}
+{"text": "backend_service_upstream(session-store, retries=3)", "spans": {"internal_url: session-store": [[25, 38]]}, "info": {"id": "pentect_150", "source": "pentect"}}
+{"text": "audit-trail へのリクエストが 702934 回連続で失敗しました。担当 Ito Kenji に共有済み。", "spans": {"internal_url: audit-trail": [[0, 11]], "account_number: 702934": [[21, 27]], "private_person: Ito Kenji": [[42, 51]]}, "info": {"id": "pentect_151", "source": "pentect"}}
+{"text": "backend_service_upstream(coupon-svc, retries=3)", "spans": {"internal_url: coupon-svc": [[25, 35]]}, "info": {"id": "pentect_152", "source": "pentect"}}
+{"text": "upstream host = billing-svc  # k8s service dns", "spans": {"internal_url: billing-svc": [[16, 27]]}, "info": {"id": "pentect_153", "source": "pentect"}}
+{"text": "route add 172.17.186.41 via gw-01 metric 10", "spans": {"internal_ip: 172.17.186.41": [[10, 23]]}, "info": {"id": "pentect_154", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'CORP-GRXOZLE-0ZX815-A28OR'", "spans": {"secret: CORP-GRXOZLE-0ZX815-A28OR": [[26, 51]]}, "info": {"id": "pentect_155", "source": "pentect"}}
+{"text": "See ticket #408923 for the stack trace", "spans": {"account_number: 408923": [[12, 18]]}, "info": {"id": "pentect_156", "source": "pentect"}}
+{"text": "See ticket #645209 for the stack trace", "spans": {"account_number: 645209": [[12, 18]]}, "info": {"id": "pentect_157", "source": "pentect"}}
+{"text": "tmp = \"YnlNVUe9oO4EVyNmcCaw95OzZ8\"; sendAuth(tmp)", "spans": {"secret: YnlNVUe9oO4EVyNmcCaw95OzZ8": [[7, 33]]}, "info": {"id": "pentect_158", "source": "pentect"}}
+{"text": "upstream host = fulfillment  # k8s service dns", "spans": {"internal_url: fulfillment": [[16, 27]]}, "info": {"id": "pentect_159", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'ZN-DL0ED8A-B3ODF76-CGXU5'", "spans": {"secret: ZN-DL0ED8A-B3ODF76-CGXU5": [[26, 50]]}, "info": {"id": "pentect_160", "source": "pentect"}}
+{"text": "See ticket #447853 for the stack trace", "spans": {"account_number: 447853": [[12, 18]]}, "info": {"id": "pentect_161", "source": "pentect"}}
+{"text": "curl -sSf http://session-store/healthz || echo 'down'", "spans": {"internal_url: session-store": [[17, 30]]}, "info": {"id": "pentect_162", "source": "pentect"}}
+{"text": "span attribute upstream.service=cron-svc attached to trace 845539", "spans": {"internal_url: cron-svc": [[32, 40]], "account_number: 845539": [[59, 65]]}, "info": {"id": "pentect_163", "source": "pentect"}}
+{"text": "Reported by Alice Smith after escalation from on-call", "spans": {"private_person: Alice Smith": [[12, 23]]}, "info": {"id": "pentect_164", "source": "pentect"}}
+{"text": "issue 610644 was closed after the rollback", "spans": {"account_number: 610644": [[6, 12]]}, "info": {"id": "pentect_165", "source": "pentect"}}
+{"text": "Frank Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Frank Smith": [[0, 11]]}, "info": {"id": "pentect_166", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: TK-9LY2S-1JD3VU-KS1F3KW-LQSQ", "spans": {"secret: TK-9LY2S-1JD3VU-KS1F3KW-LQSQ": [[15, 43]]}, "info": {"id": "pentect_167", "source": "pentect"}}
+{"text": "curl -sSf http://doc-store/healthz || echo 'down'", "spans": {"internal_url: doc-store": [[17, 26]]}, "info": {"id": "pentect_168", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'CORP-8WF8NK-G2ZN-YK86ADNO'", "spans": {"secret: CORP-8WF8NK-G2ZN-YK86ADNO": [[26, 51]]}, "info": {"id": "pentect_169", "source": "pentect"}}
+{"text": "API_KEY: str = \"mnzun20S74LFVuyCFzI13alY\"  # loaded from vault", "spans": {"secret: mnzun20S74LFVuyCFzI13alY": [[16, 40]]}, "info": {"id": "pentect_170", "source": "pentect"}}
+{"text": "Watanabe Taro が fulfillment のレイテンシ悪化を調査中(token dtehGVrHoyDZKUzkS6LFeBuzf5R1 で再現)", "spans": {"private_person: Watanabe Taro": [[0, 13]], "internal_url: fulfillment": [[16, 27]], "secret: dtehGVrHoyDZKUzkS6LFeBuzf5R1": [[47, 75]]}, "info": {"id": "pentect_171", "source": "pentect"}}
+{"text": "Eve Brown opened #550969 against invoice-gen about the 500s", "spans": {"private_person: Eve Brown": [[0, 9]], "account_number: 550969": [[18, 24]], "internal_url: invoice-gen": [[33, 44]]}, "info": {"id": "pentect_172", "source": "pentect"}}
+{"text": "upstream host = audit-trail  # k8s service dns", "spans": {"internal_url: audit-trail": [[16, 27]]}, "info": {"id": "pentect_173", "source": "pentect"}}
+{"text": "backend_service_upstream(cdn-origin, retries=3)", "spans": {"internal_url: cdn-origin": [[25, 35]]}, "info": {"id": "pentect_174", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'auth-gateway' AND status = 'degraded'", "spans": {"internal_url: auth-gateway": [[43, 55]]}, "info": {"id": "pentect_175", "source": "pentect"}}
+{"text": "Bob Wilson opened #21407 against coupon-svc about the 500s", "spans": {"private_person: Bob Wilson": [[0, 10]], "account_number: 21407": [[19, 24]], "internal_url: coupon-svc": [[33, 43]]}, "info": {"id": "pentect_176", "source": "pentect"}}
+{"text": "kubectl port-forward svc/pricing 8080:80 -n platform", "spans": {"internal_url: pricing": [[25, 32]]}, "info": {"id": "pentect_177", "source": "pentect"}}
+{"text": "route add 172.19.90.140 via gw-01 metric 10", "spans": {"internal_ip: 172.19.90.140": [[10, 23]]}, "info": {"id": "pentect_178", "source": "pentect"}}
+{"text": "Eve Miller confirmed the rollback at 03:12 JST", "spans": {"private_person: Eve Miller": [[0, 10]]}, "info": {"id": "pentect_179", "source": "pentect"}}
+{"text": "Retrying request to audit-trail after timeout", "spans": {"internal_url: audit-trail": [[20, 31]]}, "info": {"id": "pentect_180", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'batch-runner' AND status = 'degraded'", "spans": {"internal_url: batch-runner": [[43, 55]]}, "info": {"id": "pentect_181", "source": "pentect"}}
+{"text": "the deploy used key TK-107G8O8G-HZMVYD47 issued by the platform ops for Frank Miller", "spans": {"secret: TK-107G8O8G-HZMVYD47": [[20, 40]], "private_person: Frank Miller": [[72, 84]]}, "info": {"id": "pentect_182", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'Z9-HLLQLL-HGWH'", "spans": {"secret: Z9-HLLQLL-HGWH": [[26, 40]]}, "info": {"id": "pentect_183", "source": "pentect"}}
+{"text": "backend_service_upstream(shipping-core, retries=3)", "spans": {"internal_url: shipping-core": [[25, 38]]}, "info": {"id": "pentect_184", "source": "pentect"}}
+{"text": "node doc-store (172.21.188.74) joined the pool", "spans": {"internal_url: doc-store": [[5, 14]], "internal_ip: 172.21.188.74": [[16, 29]]}, "info": {"id": "pentect_185", "source": "pentect"}}
+{"text": "customer #492543 reported the incident", "spans": {"account_number: 492543": [[10, 16]]}, "info": {"id": "pentect_186", "source": "pentect"}}
+{"text": "issue 129090 was closed after the rollback", "spans": {"account_number: 129090": [[6, 12]]}, "info": {"id": "pentect_187", "source": "pentect"}}
+{"text": "ENV UPSTREAM=auth-gateway API_TOKEN=IGT-3K7UJ-U8RZE6", "spans": {"internal_url: auth-gateway": [[13, 25]], "secret: IGT-3K7UJ-U8RZE6": [[36, 52]]}, "info": {"id": "pentect_188", "source": "pentect"}}
+{"text": "curl -sSf http://loyalty/healthz || echo 'down'", "spans": {"internal_url: loyalty": [[17, 24]]}, "info": {"id": "pentect_189", "source": "pentect"}}
+{"text": "ENV UPSTREAM=kyc-v3 API_TOKEN=Z9-8FBFFHEY-O1FE1YE", "spans": {"internal_url: kyc-v3": [[13, 19]], "secret: Z9-8FBFFHEY-O1FE1YE": [[30, 49]]}, "info": {"id": "pentect_190", "source": "pentect"}}
+{"text": "route add 172.20.13.37 via gw-01 metric 10", "spans": {"internal_ip: 172.20.13.37": [[10, 22]]}, "info": {"id": "pentect_191", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '2NaR1cdbw47IVBAWMwKWvr06p0i';", "spans": {"secret: 2NaR1cdbw47IVBAWMwKWvr06p0i": [[24, 51]]}, "info": {"id": "pentect_192", "source": "pentect"}}
+{"text": "upstream host = coupon-svc  # k8s service dns", "spans": {"internal_url: coupon-svc": [[16, 26]]}, "info": {"id": "pentect_193", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'refund-core' AND status = 'degraded'", "spans": {"internal_url: refund-core": [[43, 54]]}, "info": {"id": "pentect_194", "source": "pentect"}}
+{"text": "Bob Davis confirmed the rollback at 03:12 JST", "spans": {"private_person: Bob Davis": [[0, 9]]}, "info": {"id": "pentect_195", "source": "pentect"}}
+{"text": "invoice-gen へのリクエストが 789693 回連続で失敗しました。担当 Watanabe Aoi に共有済み。", "spans": {"internal_url: invoice-gen": [[0, 11]], "account_number: 789693": [[21, 27]], "private_person: Watanabe Aoi": [[42, 54]]}, "info": {"id": "pentect_196", "source": "pentect"}}
+{"text": "kubectl port-forward svc/inventory 8080:80 -n platform", "spans": {"internal_url: inventory": [[25, 34]]}, "info": {"id": "pentect_197", "source": "pentect"}}
+{"text": "cart-api へのリクエストが 647216 回連続で失敗しました。担当 Suzuki Kenji に共有済み。", "spans": {"internal_url: cart-api": [[0, 8]], "account_number: 647216": [[18, 24]], "private_person: Suzuki Kenji": [[39, 51]]}, "info": {"id": "pentect_198", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'IGT-J2O4Q0-1EJT'", "spans": {"secret: IGT-J2O4Q0-1EJT": [[26, 41]]}, "info": {"id": "pentect_199", "source": "pentect"}}
+{"text": "tmp = \"yAp8OgJuLxabOJYs8pc59Qq31M\"; sendAuth(tmp)", "spans": {"secret: yAp8OgJuLxabOJYs8pc59Qq31M": [[7, 33]]}, "info": {"id": "pentect_200", "source": "pentect"}}
+{"text": "node warehouse-api (172.18.190.234) joined the pool", "spans": {"internal_url: warehouse-api": [[5, 18]], "internal_ip: 172.18.190.234": [[20, 34]]}, "info": {"id": "pentect_201", "source": "pentect"}}
+{"text": "dial tcp doc-store:9092: connection refused", "spans": {"internal_url: doc-store": [[9, 18]]}, "info": {"id": "pentect_202", "source": "pentect"}}
+{"text": "customer #33196 reported the incident", "spans": {"account_number: 33196": [[10, 15]]}, "info": {"id": "pentect_203", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'SFiMo02a11WTFSyDr40';", "spans": {"secret: SFiMo02a11WTFSyDr40": [[24, 43]]}, "info": {"id": "pentect_204", "source": "pentect"}}
+{"text": "x = \"j2Qd9tJiDrBixcfTLUxpq4ZOKk\"  # used by the billing worker", "spans": {"secret: j2Qd9tJiDrBixcfTLUxpq4ZOKk": [[5, 31]]}, "info": {"id": "pentect_205", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'XDxafsxXr4oI5ONfFcDAU1Nmt1KZ';", "spans": {"secret: XDxafsxXr4oI5ONfFcDAU1Nmt1KZ": [[24, 52]]}, "info": {"id": "pentect_206", "source": "pentect"}}
+{"text": "config.token = \"TK-78VPCA-P9YP-C6ON\"  # provisioned by platform team", "spans": {"secret: TK-78VPCA-P9YP-C6ON": [[16, 35]]}, "info": {"id": "pentect_207", "source": "pentect"}}
+{"text": "upstream host = orders  # k8s service dns", "spans": {"internal_url: orders": [[16, 22]]}, "info": {"id": "pentect_208", "source": "pentect"}}
+{"text": "customer #171870 reported the incident", "spans": {"account_number: 171870": [[10, 16]]}, "info": {"id": "pentect_209", "source": "pentect"}}
+{"text": "x = \"DdvIR6fJ8L02gY\"  # used by the billing worker", "spans": {"secret: DdvIR6fJ8L02gY": [[5, 19]]}, "info": {"id": "pentect_210", "source": "pentect"}}
+{"text": "cart-api,prod,owner=Bob Johnson,last_deploy=2025-11-03", "spans": {"internal_url: cart-api": [[0, 8]], "private_person: Bob Johnson": [[20, 31]]}, "info": {"id": "pentect_211", "source": "pentect"}}
+{"text": "val := 'BG2p2jGzqHcAmH9935F'  // injected at boot", "spans": {"secret: BG2p2jGzqHcAmH9935F": [[8, 27]]}, "info": {"id": "pentect_212", "source": "pentect"}}
+{"text": "node media-proxy (172.25.227.175) joined the pool", "spans": {"internal_url: media-proxy": [[5, 16]], "internal_ip: 172.25.227.175": [[18, 32]]}, "info": {"id": "pentect_213", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '27OQqNMbr7EVR0CI5RKwboUeay7M';", "spans": {"secret: 27OQqNMbr7EVR0CI5RKwboUeay7M": [[24, 52]]}, "info": {"id": "pentect_214", "source": "pentect"}}
+{"text": "Retrying request to pricing after timeout", "spans": {"internal_url: pricing": [[20, 27]]}, "info": {"id": "pentect_215", "source": "pentect"}}
+{"text": "Retrying request to invoice-gen after timeout", "spans": {"internal_url: invoice-gen": [[20, 31]]}, "info": {"id": "pentect_216", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"tax-calc\"} 14820", "spans": {"internal_url: tax-calc": [[35, 43]]}, "info": {"id": "pentect_217", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'fKtUQDRfIcd9voHYLnHx6F';", "spans": {"secret: fKtUQDRfIcd9voHYLnHx6F": [[24, 46]]}, "info": {"id": "pentect_218", "source": "pentect"}}
+{"text": "x = \"LmahMacmd6RniSE0h2pScWi\"  # used by the billing worker", "spans": {"secret: LmahMacmd6RniSE0h2pScWi": [[5, 28]]}, "info": {"id": "pentect_219", "source": "pentect"}}
+{"text": "config.token = \"HX-M2I3-QOVVI1Y-9DY39-QNV4\"  # provisioned by platform team", "spans": {"secret: HX-M2I3-QOVVI1Y-9DY39-QNV4": [[16, 42]]}, "info": {"id": "pentect_220", "source": "pentect"}}
+{"text": "audit-trail へのリクエストが 671532 回連続で失敗しました。担当 Suzuki Aoi に共有済み。", "spans": {"internal_url: audit-trail": [[0, 11]], "account_number: 671532": [[21, 27]], "private_person: Suzuki Aoi": [[42, 52]]}, "info": {"id": "pentect_221", "source": "pentect"}}
+{"text": "tmp = \"xSwCT4IquCK3Xq\"; sendAuth(tmp)", "spans": {"secret: xSwCT4IquCK3Xq": [[7, 21]]}, "info": {"id": "pentect_222", "source": "pentect"}}
+{"text": "proxy -> audit-trail with x-internal-token fvVKu6Jy0l0oC8iwS9qx5r (expires 60m)", "spans": {"internal_url: audit-trail": [[9, 20]], "secret: fvVKu6Jy0l0oC8iwS9qx5r": [[43, 65]]}, "info": {"id": "pentect_223", "source": "pentect"}}
+{"text": "the deploy used key TK-ZCUH1-D66BX-RTMG issued by the platform ops for Dan Wilson", "spans": {"secret: TK-ZCUH1-D66BX-RTMG": [[20, 39]], "private_person: Dan Wilson": [[71, 81]]}, "info": {"id": "pentect_224", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: CORP-OM0F6QEP-OHAKC3-337C7N-XBAF4GEL", "spans": {"secret: CORP-OM0F6QEP-OHAKC3-337C7N-XBAF4GEL": [[15, 51]]}, "info": {"id": "pentect_225", "source": "pentect"}}
+{"text": "backend_service_upstream(audit-trail, retries=3)", "spans": {"internal_url: audit-trail": [[25, 36]]}, "info": {"id": "pentect_226", "source": "pentect"}}
+{"text": "the deploy used key ZN-EH8HYF-7SW1K-M94UZ issued by the platform ops for Eve Smith", "spans": {"secret: ZN-EH8HYF-7SW1K-M94UZ": [[20, 41]], "private_person: Eve Smith": [[73, 82]]}, "info": {"id": "pentect_227", "source": "pentect"}}
+{"text": "the deploy used key ZN-5C1G-SKOU issued by the platform ops for Hank Miller", "spans": {"secret: ZN-5C1G-SKOU": [[20, 32]], "private_person: Hank Miller": [[64, 75]]}, "info": {"id": "pentect_228", "source": "pentect"}}
+{"text": "customer #632890 reported the incident", "spans": {"account_number: 632890": [[10, 16]]}, "info": {"id": "pentect_229", "source": "pentect"}}
+{"text": "node inventory (172.26.16.6) joined the pool", "spans": {"internal_url: inventory": [[5, 14]], "internal_ip: 172.26.16.6": [[16, 27]]}, "info": {"id": "pentect_230", "source": "pentect"}}
+{"text": "Eve Wilson confirmed the rollback at 03:12 JST", "spans": {"private_person: Eve Wilson": [[0, 10]]}, "info": {"id": "pentect_231", "source": "pentect"}}
+{"text": "Suzuki Kenji-san asked for access to the staging cluster", "spans": {"private_person: Suzuki Kenji": [[0, 12]]}, "info": {"id": "pentect_232", "source": "pentect"}}
+{"text": "span attribute upstream.service=invoice-gen attached to trace 215647", "spans": {"internal_url: invoice-gen": [[32, 43]], "account_number: 215647": [[62, 68]]}, "info": {"id": "pentect_233", "source": "pentect"}}
+{"text": "span attribute upstream.service=cdn-origin attached to trace 240474", "spans": {"internal_url: cdn-origin": [[32, 42]], "account_number: 240474": [[61, 67]]}, "info": {"id": "pentect_234", "source": "pentect"}}
+{"text": "proxy -> inventory with x-internal-token QPAC5a1iDLUt3drwd6koKVYkb (expires 60m)", "spans": {"internal_url: inventory": [[9, 18]], "secret: QPAC5a1iDLUt3drwd6koKVYkb": [[41, 66]]}, "info": {"id": "pentect_235", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: ZN-Z8XEBNP-6J5Q1D7", "spans": {"secret: ZN-Z8XEBNP-6J5Q1D7": [[15, 33]]}, "info": {"id": "pentect_236", "source": "pentect"}}
+{"text": "See ticket #772689 for the stack trace", "spans": {"account_number: 772689": [[12, 18]]}, "info": {"id": "pentect_237", "source": "pentect"}}
+{"text": "See ticket #634954 for the stack trace", "spans": {"account_number: 634954": [[12, 18]]}, "info": {"id": "pentect_238", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '7cxuqFOIgmgOVcqH0RjYf0fZWx';", "spans": {"secret: 7cxuqFOIgmgOVcqH0RjYf0fZWx": [[24, 50]]}, "info": {"id": "pentect_239", "source": "pentect"}}
+{"text": "ENV UPSTREAM=media-proxy API_TOKEN=ZN-6DUTJT-LLE4A2G-6RWR3S18", "spans": {"internal_url: media-proxy": [[13, 24]], "secret: ZN-6DUTJT-LLE4A2G-6RWR3S18": [[35, 61]]}, "info": {"id": "pentect_240", "source": "pentect"}}
+{"text": "rec-engine,prod,owner=Grace Johnson,last_deploy=2025-11-03", "spans": {"internal_url: rec-engine": [[0, 10]], "private_person: Grace Johnson": [[22, 35]]}, "info": {"id": "pentect_241", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'kyc-service' AND status = 'degraded'", "spans": {"internal_url: kyc-service": [[43, 54]]}, "info": {"id": "pentect_242", "source": "pentect"}}
+{"text": "val := '8z0NHsOlP9Yjyw7yxk1'  // injected at boot", "spans": {"secret: 8z0NHsOlP9Yjyw7yxk1": [[8, 27]]}, "info": {"id": "pentect_243", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'KtQpvMJzeFXX0gCrC6vyKYgxWH';", "spans": {"secret: KtQpvMJzeFXX0gCrC6vyKYgxWH": [[24, 50]]}, "info": {"id": "pentect_244", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"inventory\"} 14820", "spans": {"internal_url: inventory": [[35, 44]]}, "info": {"id": "pentect_245", "source": "pentect"}}
+{"text": "backend_service_upstream(billing-svc, retries=3)", "spans": {"internal_url: billing-svc": [[25, 36]]}, "info": {"id": "pentect_246", "source": "pentect"}}
+{"text": "route add 172.29.167.44 via gw-01 metric 10", "spans": {"internal_ip: 172.29.167.44": [[10, 23]]}, "info": {"id": "pentect_247", "source": "pentect"}}
+{"text": "config.token = \"Z9-8K0H-Z5VAI-X87CZ\"  # provisioned by platform team", "spans": {"secret: Z9-8K0H-Z5VAI-X87CZ": [[16, 35]]}, "info": {"id": "pentect_248", "source": "pentect"}}
+{"text": "backend_service_upstream(payments-core, retries=3)", "spans": {"internal_url: payments-core": [[25, 38]]}, "info": {"id": "pentect_249", "source": "pentect"}}
+{"text": "config.token = \"Z9-PLCGQLLX-0R3SDU-MYGK\"  # provisioned by platform team", "spans": {"secret: Z9-PLCGQLLX-0R3SDU-MYGK": [[16, 39]]}, "info": {"id": "pentect_250", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: ZN-3YMDD-OS6GKJ71-W74WQN-U536L", "spans": {"secret: ZN-3YMDD-OS6GKJ71-W74WQN-U536L": [[15, 45]]}, "info": {"id": "pentect_251", "source": "pentect"}}
+{"text": "ENV UPSTREAM=cdn-origin API_TOKEN=CORP-99DGHBTM-4ECI9RT", "spans": {"internal_url: cdn-origin": [[13, 23]], "secret: CORP-99DGHBTM-4ECI9RT": [[34, 55]]}, "info": {"id": "pentect_252", "source": "pentect"}}
+{"text": "upstream host = shipping-core  # k8s service dns", "spans": {"internal_url: shipping-core": [[16, 29]]}, "info": {"id": "pentect_253", "source": "pentect"}}
+{"text": "tmp = \"a4sGxpeRzcg9C6NmHY4z\"; sendAuth(tmp)", "spans": {"secret: a4sGxpeRzcg9C6NmHY4z": [[7, 27]]}, "info": {"id": "pentect_254", "source": "pentect"}}
+{"text": "config.token = \"IGT-9AFPP7S-JJJE\"  # provisioned by platform team", "spans": {"secret: IGT-9AFPP7S-JJJE": [[16, 32]]}, "info": {"id": "pentect_255", "source": "pentect"}}
+{"text": "Bob Wilson opened #275691 against inventory about the 500s", "spans": {"private_person: Bob Wilson": [[0, 10]], "account_number: 275691": [[19, 25]], "internal_url: inventory": [[34, 43]]}, "info": {"id": "pentect_256", "source": "pentect"}}
+{"text": "Bob Miller confirmed the rollback at 03:12 JST", "spans": {"private_person: Bob Miller": [[0, 10]]}, "info": {"id": "pentect_257", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'HX-NPYHRF-QXC72BM'", "spans": {"secret: HX-NPYHRF-QXC72BM": [[26, 43]]}, "info": {"id": "pentect_258", "source": "pentect"}}
+{"text": "dial tcp search-core:9092: connection refused", "spans": {"internal_url: search-core": [[9, 20]]}, "info": {"id": "pentect_259", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: CORP-PWLIE-CQ3ZA8E", "spans": {"secret: CORP-PWLIE-CQ3ZA8E": [[15, 33]]}, "info": {"id": "pentect_260", "source": "pentect"}}
+{"text": "Alice Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Alice Johnson": [[0, 13]]}, "info": {"id": "pentect_261", "source": "pentect"}}
+{"text": "x = \"pzaJ1fJTjoQmCZP\"  # used by the billing worker", "spans": {"secret: pzaJ1fJTjoQmCZP": [[5, 20]]}, "info": {"id": "pentect_262", "source": "pentect"}}
+{"text": "tmp = \"VrzBxJLr3qzBSfIqNai\"; sendAuth(tmp)", "spans": {"secret: VrzBxJLr3qzBSfIqNai": [[7, 26]]}, "info": {"id": "pentect_263", "source": "pentect"}}
+{"text": "route add 172.27.9.74 via gw-01 metric 10", "spans": {"internal_ip: 172.27.9.74": [[10, 21]]}, "info": {"id": "pentect_264", "source": "pentect"}}
+{"text": "curl -sSf http://search-core/healthz || echo 'down'", "spans": {"internal_url: search-core": [[17, 28]]}, "info": {"id": "pentect_265", "source": "pentect"}}
+{"text": "span attribute upstream.service=ledger attached to trace 907068", "spans": {"internal_url: ledger": [[32, 38]], "account_number: 907068": [[57, 63]]}, "info": {"id": "pentect_266", "source": "pentect"}}
+{"text": "node auth-gateway (172.21.46.42) joined the pool", "spans": {"internal_url: auth-gateway": [[5, 17]], "internal_ip: 172.21.46.42": [[19, 31]]}, "info": {"id": "pentect_267", "source": "pentect"}}
+{"text": "proxy -> cart-api with x-internal-token k9mKIKL7eYcas6YoU (expires 60m)", "spans": {"internal_url: cart-api": [[9, 17]], "secret: k9mKIKL7eYcas6YoU": [[40, 57]]}, "info": {"id": "pentect_268", "source": "pentect"}}
+{"text": "dial tcp catalog:9092: connection refused", "spans": {"internal_url: catalog": [[9, 16]]}, "info": {"id": "pentect_269", "source": "pentect"}}
+{"text": "cart-api へのリクエストが 464978 回連続で失敗しました。担当 Takahashi Sakura に共有済み。", "spans": {"internal_url: cart-api": [[0, 8]], "account_number: 464978": [[18, 24]], "private_person: Takahashi Sakura": [[39, 55]]}, "info": {"id": "pentect_270", "source": "pentect"}}
+{"text": "upstream host = tax-calc  # k8s service dns", "spans": {"internal_url: tax-calc": [[16, 24]]}, "info": {"id": "pentect_271", "source": "pentect"}}
+{"text": "route add 172.25.222.195 via gw-01 metric 10", "spans": {"internal_ip: 172.25.222.195": [[10, 24]]}, "info": {"id": "pentect_272", "source": "pentect"}}
+{"text": "curl -sSf http://cart-api/healthz || echo 'down'", "spans": {"internal_url: cart-api": [[17, 25]]}, "info": {"id": "pentect_273", "source": "pentect"}}
+{"text": "kubectl port-forward svc/catalog 8080:80 -n platform", "spans": {"internal_url: catalog": [[25, 32]]}, "info": {"id": "pentect_274", "source": "pentect"}}
+{"text": "issue 417830 was closed after the rollback", "spans": {"account_number: 417830": [[6, 12]]}, "info": {"id": "pentect_275", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'warehouse-api' AND status = 'degraded'", "spans": {"internal_url: warehouse-api": [[43, 56]]}, "info": {"id": "pentect_276", "source": "pentect"}}
+{"text": "tmp = \"KqUKbSFHsaU9U0bca\"; sendAuth(tmp)", "spans": {"secret: KqUKbSFHsaU9U0bca": [[7, 24]]}, "info": {"id": "pentect_277", "source": "pentect"}}
+{"text": "node refund-core (172.23.62.33) joined the pool", "spans": {"internal_url: refund-core": [[5, 16]], "internal_ip: 172.23.62.33": [[18, 30]]}, "info": {"id": "pentect_278", "source": "pentect"}}
+{"text": "x = \"J3v9giyeoDoy61q\"  # used by the billing worker", "spans": {"secret: J3v9giyeoDoy61q": [[5, 20]]}, "info": {"id": "pentect_279", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'orders' AND status = 'degraded'", "spans": {"internal_url: orders": [[43, 49]]}, "info": {"id": "pentect_280", "source": "pentect"}}
+{"text": "upstream host = doc-store  # k8s service dns", "spans": {"internal_url: doc-store": [[16, 25]]}, "info": {"id": "pentect_281", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"cart-api\"} 14820", "spans": {"internal_url: cart-api": [[35, 43]]}, "info": {"id": "pentect_282", "source": "pentect"}}
+{"text": "tmp = \"SvauCmABAjng82WhNXqS7s\"; sendAuth(tmp)", "spans": {"secret: SvauCmABAjng82WhNXqS7s": [[7, 29]]}, "info": {"id": "pentect_283", "source": "pentect"}}
+{"text": "curl -sSf http://refund-core/healthz || echo 'down'", "spans": {"internal_url: refund-core": [[17, 28]]}, "info": {"id": "pentect_284", "source": "pentect"}}
+{"text": "Hank Wilson confirmed the rollback at 03:12 JST", "spans": {"private_person: Hank Wilson": [[0, 11]]}, "info": {"id": "pentect_285", "source": "pentect"}}
+{"text": "Takahashi Sakura-san asked for access to the staging cluster", "spans": {"private_person: Takahashi Sakura": [[0, 16]]}, "info": {"id": "pentect_286", "source": "pentect"}}
+{"text": "proxy -> cdn-origin with x-internal-token kFM0U9b0XN00NJihCq1ARe1QBzm (expires 60m)", "spans": {"internal_url: cdn-origin": [[9, 19]], "secret: kFM0U9b0XN00NJihCq1ARe1QBzm": [[42, 69]]}, "info": {"id": "pentect_287", "source": "pentect"}}
+{"text": "kubectl port-forward svc/coupon-svc 8080:80 -n platform", "spans": {"internal_url: coupon-svc": [[25, 35]]}, "info": {"id": "pentect_288", "source": "pentect"}}
+{"text": "doc-store,prod,owner=Eve Miller,last_deploy=2025-11-03", "spans": {"internal_url: doc-store": [[0, 9]], "private_person: Eve Miller": [[21, 31]]}, "info": {"id": "pentect_289", "source": "pentect"}}
+{"text": "API_KEY: str = \"bjFJvJNCreHAKgL31kDyacibMCN\"  # loaded from vault", "spans": {"secret: bjFJvJNCreHAKgL31kDyacibMCN": [[16, 43]]}, "info": {"id": "pentect_290", "source": "pentect"}}
+{"text": "the deploy used key TK-WGJ9Y56-G0KX-KXNOA-7FIN issued by the platform ops for Grace Brown", "spans": {"secret: TK-WGJ9Y56-G0KX-KXNOA-7FIN": [[20, 46]], "private_person: Grace Brown": [[78, 89]]}, "info": {"id": "pentect_291", "source": "pentect"}}
+{"text": "tmp = \"kU6lGl7Ihxy76JzlvLK3LYKTXTpt\"; sendAuth(tmp)", "spans": {"secret: kU6lGl7Ihxy76JzlvLK3LYKTXTpt": [[7, 35]]}, "info": {"id": "pentect_292", "source": "pentect"}}
+{"text": "customer #621166 reported the incident", "spans": {"account_number: 621166": [[10, 16]]}, "info": {"id": "pentect_293", "source": "pentect"}}
+{"text": "dial tcp cart-api:9092: connection refused", "spans": {"internal_url: cart-api": [[9, 17]]}, "info": {"id": "pentect_294", "source": "pentect"}}
+{"text": "See ticket #337962 for the stack trace", "spans": {"account_number: 337962": [[12, 18]]}, "info": {"id": "pentect_295", "source": "pentect"}}
+{"text": "kubectl port-forward svc/invoice-gen 8080:80 -n platform", "spans": {"internal_url: invoice-gen": [[25, 36]]}, "info": {"id": "pentect_296", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: ZN-VOF70-S6TO8-XTAO-VM8NY", "spans": {"secret: ZN-VOF70-S6TO8-XTAO-VM8NY": [[15, 40]]}, "info": {"id": "pentect_297", "source": "pentect"}}
+{"text": "API_KEY: str = \"wrDRW1QQiNmBdyeMvp\"  # loaded from vault", "spans": {"secret: wrDRW1QQiNmBdyeMvp": [[16, 34]]}, "info": {"id": "pentect_298", "source": "pentect"}}
+{"text": "Reported by Alice Miller after escalation from on-call", "spans": {"private_person: Alice Miller": [[12, 24]]}, "info": {"id": "pentect_299", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'rruFhbISKvvn20Vyz1LQjEE';", "spans": {"secret: rruFhbISKvvn20Vyz1LQjEE": [[24, 47]]}, "info": {"id": "pentect_300", "source": "pentect"}}
+{"text": "Retrying request to refund-core after timeout", "spans": {"internal_url: refund-core": [[20, 31]]}, "info": {"id": "pentect_301", "source": "pentect"}}
+{"text": "Ito Aoi が reporting のレイテンシ悪化を調査中(token q1XglbwEn0iRRnQn9zqlIi で再現)", "spans": {"private_person: Ito Aoi": [[0, 7]], "internal_url: reporting": [[10, 19]], "secret: q1XglbwEn0iRRnQn9zqlIi": [[39, 61]]}, "info": {"id": "pentect_302", "source": "pentect"}}
+{"text": "customer #232879 reported the incident", "spans": {"account_number: 232879": [[10, 16]]}, "info": {"id": "pentect_303", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"search-core\"} 14820", "spans": {"internal_url: search-core": [[35, 46]]}, "info": {"id": "pentect_304", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'coupon-svc' AND status = 'degraded'", "spans": {"internal_url: coupon-svc": [[43, 53]]}, "info": {"id": "pentect_305", "source": "pentect"}}
+{"text": "Suzuki Kenji-san asked for access to the staging cluster", "spans": {"private_person: Suzuki Kenji": [[0, 12]]}, "info": {"id": "pentect_306", "source": "pentect"}}
+{"text": "route add 172.16.50.108 via gw-01 metric 10", "spans": {"internal_ip: 172.16.50.108": [[10, 23]]}, "info": {"id": "pentect_307", "source": "pentect"}}
+{"text": "doc-store へのリクエストが 21845 回連続で失敗しました。担当 Sato Taro に共有済み。", "spans": {"internal_url: doc-store": [[0, 9]], "account_number: 21845": [[19, 24]], "private_person: Sato Taro": [[39, 48]]}, "info": {"id": "pentect_308", "source": "pentect"}}
+{"text": "node billing-svc (172.26.255.164) joined the pool", "spans": {"internal_url: billing-svc": [[5, 16]], "internal_ip: 172.26.255.164": [[18, 32]]}, "info": {"id": "pentect_309", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: CORP-31BXPGWJ-28MT-LK4AG", "spans": {"secret: CORP-31BXPGWJ-28MT-LK4AG": [[15, 39]]}, "info": {"id": "pentect_310", "source": "pentect"}}
+{"text": "Watanabe Aoi が session-store のレイテンシ悪化を調査中(token KONQx8G3VDFsjxwvtMKbAjiSnDB で再現)", "spans": {"private_person: Watanabe Aoi": [[0, 12]], "internal_url: session-store": [[15, 28]], "secret: KONQx8G3VDFsjxwvtMKbAjiSnDB": [[48, 75]]}, "info": {"id": "pentect_311", "source": "pentect"}}
+{"text": "x = \"tmG92HMcCnFveEdKw9VMk\"  # used by the billing worker", "spans": {"secret: tmG92HMcCnFveEdKw9VMk": [[5, 26]]}, "info": {"id": "pentect_312", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: ZN-YOFV-G72V", "spans": {"secret: ZN-YOFV-G72V": [[15, 27]]}, "info": {"id": "pentect_313", "source": "pentect"}}
+{"text": "curl -sSf http://audit-trail/healthz || echo 'down'", "spans": {"internal_url: audit-trail": [[17, 28]]}, "info": {"id": "pentect_314", "source": "pentect"}}
+{"text": "backend_service_upstream(cart-api, retries=3)", "spans": {"internal_url: cart-api": [[25, 33]]}, "info": {"id": "pentect_315", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '4sX0RyTvNwrfMq55hdaak';", "spans": {"secret: 4sX0RyTvNwrfMq55hdaak": [[24, 45]]}, "info": {"id": "pentect_316", "source": "pentect"}}
+{"text": "Carol Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Carol Johnson": [[0, 13]]}, "info": {"id": "pentect_317", "source": "pentect"}}
+{"text": "Carol Wilson confirmed the rollback at 03:12 JST", "spans": {"private_person: Carol Wilson": [[0, 12]]}, "info": {"id": "pentect_318", "source": "pentect"}}
+{"text": "session-store,prod,owner=Carol Wilson,last_deploy=2025-11-03", "spans": {"internal_url: session-store": [[0, 13]], "private_person: Carol Wilson": [[25, 37]]}, "info": {"id": "pentect_319", "source": "pentect"}}
+{"text": "config.token = \"ZN-KPXPSB-2SC0T8DH-L7JP-OW8A2CQB\"  # provisioned by platform team", "spans": {"secret: ZN-KPXPSB-2SC0T8DH-L7JP-OW8A2CQB": [[16, 48]]}, "info": {"id": "pentect_320", "source": "pentect"}}
+{"text": "Grace Smith opened #543138 against reporting about the 500s", "spans": {"private_person: Grace Smith": [[0, 11]], "account_number: 543138": [[20, 26]], "internal_url: reporting": [[35, 44]]}, "info": {"id": "pentect_321", "source": "pentect"}}
+{"text": "Reported by Grace Davis after escalation from on-call", "spans": {"private_person: Grace Davis": [[12, 23]]}, "info": {"id": "pentect_322", "source": "pentect"}}
+{"text": "Dan Wilson confirmed the rollback at 03:12 JST", "spans": {"private_person: Dan Wilson": [[0, 10]]}, "info": {"id": "pentect_323", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: Z9-RHEC-117JW", "spans": {"secret: Z9-RHEC-117JW": [[15, 28]]}, "info": {"id": "pentect_324", "source": "pentect"}}
+{"text": "Retrying request to loyalty after timeout", "spans": {"internal_url: loyalty": [[20, 27]]}, "info": {"id": "pentect_325", "source": "pentect"}}
+{"text": "route add 172.30.2.42 via gw-01 metric 10", "spans": {"internal_ip: 172.30.2.42": [[10, 21]]}, "info": {"id": "pentect_326", "source": "pentect"}}
+{"text": "Retrying request to inventory after timeout", "spans": {"internal_url: inventory": [[20, 29]]}, "info": {"id": "pentect_327", "source": "pentect"}}
+{"text": "Hank Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Hank Smith": [[0, 10]]}, "info": {"id": "pentect_328", "source": "pentect"}}
+{"text": "span attribute upstream.service=billing-svc attached to trace 818646", "spans": {"internal_url: billing-svc": [[32, 43]], "account_number: 818646": [[62, 68]]}, "info": {"id": "pentect_329", "source": "pentect"}}
+{"text": "Suzuki Sakura が inventory のレイテンシ悪化を調査中(token OrIXr2hcfFILbnv8ISb9CKhjnOSS で再現)", "spans": {"private_person: Suzuki Sakura": [[0, 13]], "internal_url: inventory": [[16, 25]], "secret: OrIXr2hcfFILbnv8ISb9CKhjnOSS": [[45, 73]]}, "info": {"id": "pentect_330", "source": "pentect"}}
+{"text": "the deploy used key TK-2VL1TKU-4VPW-MFVTAC issued by the platform ops for Eve Davis", "spans": {"secret: TK-2VL1TKU-4VPW-MFVTAC": [[20, 42]], "private_person: Eve Davis": [[74, 83]]}, "info": {"id": "pentect_331", "source": "pentect"}}
+{"text": "customer #564945 reported the incident", "spans": {"account_number: 564945": [[10, 16]]}, "info": {"id": "pentect_332", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'Z9-6FPG-VPDKFEEK-Q7GEYV6'", "spans": {"secret: Z9-6FPG-VPDKFEEK-Q7GEYV6": [[26, 50]]}, "info": {"id": "pentect_333", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: ZN-XPNGMZYZ-SN8L", "spans": {"secret: ZN-XPNGMZYZ-SN8L": [[15, 31]]}, "info": {"id": "pentect_334", "source": "pentect"}}
+{"text": "connected to doc-store:5432 successfully", "spans": {"internal_url: doc-store": [[13, 22]]}, "info": {"id": "pentect_335", "source": "pentect"}}
+{"text": "span attribute upstream.service=billing-svc attached to trace 735348", "spans": {"internal_url: billing-svc": [[32, 43]], "account_number: 735348": [[62, 68]]}, "info": {"id": "pentect_336", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'cdn-origin' AND status = 'degraded'", "spans": {"internal_url: cdn-origin": [[43, 53]]}, "info": {"id": "pentect_337", "source": "pentect"}}
+{"text": "customer #753634 reported the incident", "spans": {"account_number: 753634": [[10, 16]]}, "info": {"id": "pentect_338", "source": "pentect"}}
+{"text": "audit-trail,prod,owner=Carol Smith,last_deploy=2025-11-03", "spans": {"internal_url: audit-trail": [[0, 11]], "private_person: Carol Smith": [[23, 34]]}, "info": {"id": "pentect_339", "source": "pentect"}}
+{"text": "span attribute upstream.service=session-store attached to trace 224951", "spans": {"internal_url: session-store": [[32, 45]], "account_number: 224951": [[64, 70]]}, "info": {"id": "pentect_340", "source": "pentect"}}
+{"text": "connected to cdn-origin:5432 successfully", "spans": {"internal_url: cdn-origin": [[13, 23]]}, "info": {"id": "pentect_341", "source": "pentect"}}
+{"text": "span attribute upstream.service=doc-store attached to trace 918474", "spans": {"internal_url: doc-store": [[32, 41]], "account_number: 918474": [[60, 66]]}, "info": {"id": "pentect_342", "source": "pentect"}}
+{"text": "cdn-origin へのリクエストが 203859 回連続で失敗しました。担当 Suzuki Ren に共有済み。", "spans": {"internal_url: cdn-origin": [[0, 10]], "account_number: 203859": [[20, 26]], "private_person: Suzuki Ren": [[41, 51]]}, "info": {"id": "pentect_343", "source": "pentect"}}
+{"text": "issue 655067 was closed after the rollback", "spans": {"account_number: 655067": [[6, 12]]}, "info": {"id": "pentect_344", "source": "pentect"}}
+{"text": "route add 172.18.95.28 via gw-01 metric 10", "spans": {"internal_ip: 172.18.95.28": [[10, 22]]}, "info": {"id": "pentect_345", "source": "pentect"}}
+{"text": "Tanaka Ren-san asked for access to the staging cluster", "spans": {"private_person: Tanaka Ren": [[0, 10]]}, "info": {"id": "pentect_346", "source": "pentect"}}
+{"text": "See ticket #667044 for the stack trace", "spans": {"account_number: 667044": [[12, 18]]}, "info": {"id": "pentect_347", "source": "pentect"}}
+{"text": "node risk-engine (172.20.110.105) joined the pool", "spans": {"internal_url: risk-engine": [[5, 16]], "internal_ip: 172.20.110.105": [[18, 32]]}, "info": {"id": "pentect_348", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"loyalty\" { cluster_ip = \"None\" }", "spans": {"internal_url: loyalty": [[31, 38]]}, "info": {"id": "pentect_349", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: IGT-777K-D8NRUU8-V8MO2", "spans": {"secret: IGT-777K-D8NRUU8-V8MO2": [[15, 37]]}, "info": {"id": "pentect_350", "source": "pentect"}}
+{"text": "val := 'RJwDXN9Ru2QYVs67wz'  // injected at boot", "spans": {"secret: RJwDXN9Ru2QYVs67wz": [[8, 26]]}, "info": {"id": "pentect_351", "source": "pentect"}}
+{"text": "issue 870396 was closed after the rollback", "spans": {"account_number: 870396": [[6, 12]]}, "info": {"id": "pentect_352", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'invoice-gen' AND status = 'degraded'", "spans": {"internal_url: invoice-gen": [[43, 54]]}, "info": {"id": "pentect_353", "source": "pentect"}}
+{"text": "Suzuki Yuki-san asked for access to the staging cluster", "spans": {"private_person: Suzuki Yuki": [[0, 11]]}, "info": {"id": "pentect_354", "source": "pentect"}}
+{"text": "Bob Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Bob Johnson": [[0, 11]]}, "info": {"id": "pentect_355", "source": "pentect"}}
+{"text": "Hank Miller confirmed the rollback at 03:12 JST", "spans": {"private_person: Hank Miller": [[0, 11]]}, "info": {"id": "pentect_356", "source": "pentect"}}
+{"text": "Grace Wilson opened #138292 against auth-gateway about the 500s", "spans": {"private_person: Grace Wilson": [[0, 12]], "account_number: 138292": [[21, 27]], "internal_url: auth-gateway": [[36, 48]]}, "info": {"id": "pentect_357", "source": "pentect"}}
+{"text": "ENV UPSTREAM=audit-trail API_TOKEN=Z9-BH7W5GLO-BXBA22J-YKCZF2T-B53X", "spans": {"internal_url: audit-trail": [[13, 24]], "secret: Z9-BH7W5GLO-BXBA22J-YKCZF2T-B53X": [[35, 67]]}, "info": {"id": "pentect_358", "source": "pentect"}}
+{"text": "config.token = \"ZN-UYD7RINA-VLRRBAEJ\"  # provisioned by platform team", "spans": {"secret: ZN-UYD7RINA-VLRRBAEJ": [[16, 36]]}, "info": {"id": "pentect_359", "source": "pentect"}}
+{"text": "span attribute upstream.service=warehouse-api attached to trace 704534", "spans": {"internal_url: warehouse-api": [[32, 45]], "account_number: 704534": [[64, 70]]}, "info": {"id": "pentect_360", "source": "pentect"}}
+{"text": "risk-engine へのリクエストが 570603 回連続で失敗しました。担当 Sato Sakura に共有済み。", "spans": {"internal_url: risk-engine": [[0, 11]], "account_number: 570603": [[21, 27]], "private_person: Sato Sakura": [[42, 53]]}, "info": {"id": "pentect_361", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'EgHzuzGfMP93aen';", "spans": {"secret: EgHzuzGfMP93aen": [[24, 39]]}, "info": {"id": "pentect_362", "source": "pentect"}}
+{"text": "connected to cdn-origin:5432 successfully", "spans": {"internal_url: cdn-origin": [[13, 23]]}, "info": {"id": "pentect_363", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'ZN-4IYV0N1S-Z63IVV-F49H'", "spans": {"secret: ZN-4IYV0N1S-Z63IVV-F49H": [[26, 49]]}, "info": {"id": "pentect_364", "source": "pentect"}}
+{"text": "See ticket #533909 for the stack trace", "spans": {"account_number: 533909": [[12, 18]]}, "info": {"id": "pentect_365", "source": "pentect"}}
+{"text": "kubectl port-forward svc/rec-engine 8080:80 -n platform", "spans": {"internal_url: rec-engine": [[25, 35]]}, "info": {"id": "pentect_366", "source": "pentect"}}
+{"text": "tmp = \"sufNd4l1PYeNttqU\"; sendAuth(tmp)", "spans": {"secret: sufNd4l1PYeNttqU": [[7, 23]]}, "info": {"id": "pentect_367", "source": "pentect"}}
+{"text": "dial tcp risk-engine:9092: connection refused", "spans": {"internal_url: risk-engine": [[9, 20]]}, "info": {"id": "pentect_368", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: IGT-F1U6SW-V5745I-3V8KHV4-OBQ2SA1", "spans": {"secret: IGT-F1U6SW-V5745I-3V8KHV4-OBQ2SA1": [[15, 48]]}, "info": {"id": "pentect_369", "source": "pentect"}}
+{"text": "tmp = \"OeTAbfEsISlrm7\"; sendAuth(tmp)", "spans": {"secret: OeTAbfEsISlrm7": [[7, 21]]}, "info": {"id": "pentect_370", "source": "pentect"}}
+{"text": "Dan Smith opened #846689 against invoice-gen about the 500s", "spans": {"private_person: Dan Smith": [[0, 9]], "account_number: 846689": [[18, 24]], "internal_url: invoice-gen": [[33, 44]]}, "info": {"id": "pentect_371", "source": "pentect"}}
+{"text": "session-store へのリクエストが 822618 回連続で失敗しました。担当 Ito Yuki に共有済み。", "spans": {"internal_url: session-store": [[0, 13]], "account_number: 822618": [[23, 29]], "private_person: Ito Yuki": [[44, 52]]}, "info": {"id": "pentect_372", "source": "pentect"}}
+{"text": "route add 172.26.125.135 via gw-01 metric 10", "spans": {"internal_ip: 172.26.125.135": [[10, 24]]}, "info": {"id": "pentect_373", "source": "pentect"}}
+{"text": "backend_service_upstream(pricing, retries=3)", "spans": {"internal_url: pricing": [[25, 32]]}, "info": {"id": "pentect_374", "source": "pentect"}}
+{"text": "config.token = \"ZN-0OY44TF-ANEO9VAX-JFII\"  # provisioned by platform team", "spans": {"secret: ZN-0OY44TF-ANEO9VAX-JFII": [[16, 40]]}, "info": {"id": "pentect_375", "source": "pentect"}}
+{"text": "tmp = \"R1z51DffmwFliFm38VHenMGH\"; sendAuth(tmp)", "spans": {"secret: R1z51DffmwFliFm38VHenMGH": [[7, 31]]}, "info": {"id": "pentect_376", "source": "pentect"}}
+{"text": "x = \"R8k4gLwC0800Tgdt\"  # used by the billing worker", "spans": {"secret: R8k4gLwC0800Tgdt": [[5, 21]]}, "info": {"id": "pentect_377", "source": "pentect"}}
+{"text": "See ticket #985360 for the stack trace", "spans": {"account_number: 985360": [[12, 18]]}, "info": {"id": "pentect_378", "source": "pentect"}}
+{"text": "span attribute upstream.service=kyc-v3 attached to trace 797984", "spans": {"internal_url: kyc-v3": [[32, 38]], "account_number: 797984": [[57, 63]]}, "info": {"id": "pentect_379", "source": "pentect"}}
+{"text": "x = \"546yXcIk5laW02q7y87cJpfFT\"  # used by the billing worker", "spans": {"secret: 546yXcIk5laW02q7y87cJpfFT": [[5, 30]]}, "info": {"id": "pentect_380", "source": "pentect"}}
+{"text": "dial tcp rec-engine:9092: connection refused", "spans": {"internal_url: rec-engine": [[9, 19]]}, "info": {"id": "pentect_381", "source": "pentect"}}
+{"text": "invoice-gen,prod,owner=Grace Wilson,last_deploy=2025-11-03", "spans": {"internal_url: invoice-gen": [[0, 11]], "private_person: Grace Wilson": [[23, 35]]}, "info": {"id": "pentect_382", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: HX-K2H90U3-MCMH7LM-VFSWJZ-DYZKSY", "spans": {"secret: HX-K2H90U3-MCMH7LM-VFSWJZ-DYZKSY": [[15, 47]]}, "info": {"id": "pentect_383", "source": "pentect"}}
+{"text": "See ticket #785073 for the stack trace", "spans": {"account_number: 785073": [[12, 18]]}, "info": {"id": "pentect_384", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"risk-engine\"} 14820", "spans": {"internal_url: risk-engine": [[35, 46]]}, "info": {"id": "pentect_385", "source": "pentect"}}
+{"text": "loyalty へのリクエストが 876922 回連続で失敗しました。担当 Takahashi Sakura に共有済み。", "spans": {"internal_url: loyalty": [[0, 7]], "account_number: 876922": [[17, 23]], "private_person: Takahashi Sakura": [[38, 54]]}, "info": {"id": "pentect_386", "source": "pentect"}}
+{"text": "kubectl port-forward svc/ledger 8080:80 -n platform", "spans": {"internal_url: ledger": [[25, 31]]}, "info": {"id": "pentect_387", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"tax-calc\" { cluster_ip = \"None\" }", "spans": {"internal_url: tax-calc": [[31, 39]]}, "info": {"id": "pentect_388", "source": "pentect"}}
+{"text": "curl -sSf http://audit-trail/healthz || echo 'down'", "spans": {"internal_url: audit-trail": [[17, 28]]}, "info": {"id": "pentect_389", "source": "pentect"}}
+{"text": "proxy -> kyc-v3 with x-internal-token Vy6gYP7XkqOtjx5KWHXjuMs8VBq (expires 60m)", "spans": {"internal_url: kyc-v3": [[9, 15]], "secret: Vy6gYP7XkqOtjx5KWHXjuMs8VBq": [[38, 65]]}, "info": {"id": "pentect_390", "source": "pentect"}}
+{"text": "the deploy used key IGT-7DD1T4-DNQSAM-H3XD issued by the platform ops for Carol Miller", "spans": {"secret: IGT-7DD1T4-DNQSAM-H3XD": [[20, 42]], "private_person: Carol Miller": [[74, 86]]}, "info": {"id": "pentect_391", "source": "pentect"}}
+{"text": "config.token = \"Z9-S5OK-BU9XRDT\"  # provisioned by platform team", "spans": {"secret: Z9-S5OK-BU9XRDT": [[16, 31]]}, "info": {"id": "pentect_392", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'ledger' AND status = 'degraded'", "spans": {"internal_url: ledger": [[43, 49]]}, "info": {"id": "pentect_393", "source": "pentect"}}
+{"text": "curl -sSf http://warehouse-api/healthz || echo 'down'", "spans": {"internal_url: warehouse-api": [[17, 30]]}, "info": {"id": "pentect_394", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'Z9-S66KE6Z-L8J3-VHQUEU1O'", "spans": {"secret: Z9-S66KE6Z-L8J3-VHQUEU1O": [[26, 50]]}, "info": {"id": "pentect_395", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'CORP-Z90HED-N44FBV-6MU62OED-8UO5NYM'", "spans": {"secret: CORP-Z90HED-N44FBV-6MU62OED-8UO5NYM": [[26, 61]]}, "info": {"id": "pentect_396", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'ZN-56PNBXU-FIQG01P-BPIM-TPG2O'", "spans": {"secret: ZN-56PNBXU-FIQG01P-BPIM-TPG2O": [[26, 55]]}, "info": {"id": "pentect_397", "source": "pentect"}}
+{"text": "x = \"w74GapBVsiubI8AG\"  # used by the billing worker", "spans": {"secret: w74GapBVsiubI8AG": [[5, 21]]}, "info": {"id": "pentect_398", "source": "pentect"}}
+{"text": "Retrying request to billing-svc after timeout", "spans": {"internal_url: billing-svc": [[20, 31]]}, "info": {"id": "pentect_399", "source": "pentect"}}
+{"text": "node billing-svc (172.27.252.37) joined the pool", "spans": {"internal_url: billing-svc": [[5, 16]], "internal_ip: 172.27.252.37": [[18, 31]]}, "info": {"id": "pentect_400", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"kyc-v3\"} 14820", "spans": {"internal_url: kyc-v3": [[35, 41]]}, "info": {"id": "pentect_401", "source": "pentect"}}
+{"text": "cart-api,prod,owner=Bob Brown,last_deploy=2025-11-03", "spans": {"internal_url: cart-api": [[0, 8]], "private_person: Bob Brown": [[20, 29]]}, "info": {"id": "pentect_402", "source": "pentect"}}
+{"text": "node kyc-v3 (172.17.51.174) joined the pool", "spans": {"internal_url: kyc-v3": [[5, 11]], "internal_ip: 172.17.51.174": [[13, 26]]}, "info": {"id": "pentect_403", "source": "pentect"}}
+{"text": "upstream host = billing-svc  # k8s service dns", "spans": {"internal_url: billing-svc": [[16, 27]]}, "info": {"id": "pentect_404", "source": "pentect"}}
+{"text": "node cdn-origin (172.19.113.64) joined the pool", "spans": {"internal_url: cdn-origin": [[5, 15]], "internal_ip: 172.19.113.64": [[17, 30]]}, "info": {"id": "pentect_405", "source": "pentect"}}
+{"text": "Reported by Frank Smith after escalation from on-call", "spans": {"private_person: Frank Smith": [[12, 23]]}, "info": {"id": "pentect_406", "source": "pentect"}}
+{"text": "Bob Brown confirmed the rollback at 03:12 JST", "spans": {"private_person: Bob Brown": [[0, 9]]}, "info": {"id": "pentect_407", "source": "pentect"}}
+{"text": "connected to billing-svc:5432 successfully", "spans": {"internal_url: billing-svc": [[13, 24]]}, "info": {"id": "pentect_408", "source": "pentect"}}
+{"text": "span attribute upstream.service=cron-svc attached to trace 657216", "spans": {"internal_url: cron-svc": [[32, 40]], "account_number: 657216": [[59, 65]]}, "info": {"id": "pentect_409", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: HX-ET8P-IQR2A-DRUD2-DKRF4FX", "spans": {"secret: HX-ET8P-IQR2A-DRUD2-DKRF4FX": [[15, 42]]}, "info": {"id": "pentect_410", "source": "pentect"}}
+{"text": "Grace Davis confirmed the rollback at 03:12 JST", "spans": {"private_person: Grace Davis": [[0, 11]]}, "info": {"id": "pentect_411", "source": "pentect"}}
+{"text": "upstream host = invoice-gen  # k8s service dns", "spans": {"internal_url: invoice-gen": [[16, 27]]}, "info": {"id": "pentect_412", "source": "pentect"}}
+{"text": "upstream host = warehouse-api  # k8s service dns", "spans": {"internal_url: warehouse-api": [[16, 29]]}, "info": {"id": "pentect_413", "source": "pentect"}}
+{"text": "span attribute upstream.service=loyalty attached to trace 112718", "spans": {"internal_url: loyalty": [[32, 39]], "account_number: 112718": [[58, 64]]}, "info": {"id": "pentect_414", "source": "pentect"}}
+{"text": "route add 172.24.129.133 via gw-01 metric 10", "spans": {"internal_ip: 172.24.129.133": [[10, 24]]}, "info": {"id": "pentect_415", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"media-proxy\"} 14820", "spans": {"internal_url: media-proxy": [[35, 46]]}, "info": {"id": "pentect_416", "source": "pentect"}}
+{"text": "Carol Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Carol Johnson": [[0, 13]]}, "info": {"id": "pentect_417", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"loyalty\" { cluster_ip = \"None\" }", "spans": {"internal_url: loyalty": [[31, 38]]}, "info": {"id": "pentect_418", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"auth-gateway\"} 14820", "spans": {"internal_url: auth-gateway": [[35, 47]]}, "info": {"id": "pentect_419", "source": "pentect"}}
+{"text": "Takahashi Sakura-san asked for access to the staging cluster", "spans": {"private_person: Takahashi Sakura": [[0, 16]]}, "info": {"id": "pentect_420", "source": "pentect"}}
+{"text": "Reported by Bob Wilson after escalation from on-call", "spans": {"private_person: Bob Wilson": [[12, 22]]}, "info": {"id": "pentect_421", "source": "pentect"}}
+{"text": "proxy -> kyc-service with x-internal-token VS8XmZ80tvINjSqfdP97C (expires 60m)", "spans": {"internal_url: kyc-service": [[9, 20]], "secret: VS8XmZ80tvINjSqfdP97C": [[43, 64]]}, "info": {"id": "pentect_422", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'billing-svc' AND status = 'degraded'", "spans": {"internal_url: billing-svc": [[43, 54]]}, "info": {"id": "pentect_423", "source": "pentect"}}
+{"text": "Tanaka Aoi-san asked for access to the staging cluster", "spans": {"private_person: Tanaka Aoi": [[0, 10]]}, "info": {"id": "pentect_424", "source": "pentect"}}
+{"text": "upstream host = rec-engine  # k8s service dns", "spans": {"internal_url: rec-engine": [[16, 26]]}, "info": {"id": "pentect_425", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'FAlBHHyn8rK8b4w33FR';", "spans": {"secret: FAlBHHyn8rK8b4w33FR": [[24, 43]]}, "info": {"id": "pentect_426", "source": "pentect"}}
+{"text": "Retrying request to auth-gateway after timeout", "spans": {"internal_url: auth-gateway": [[20, 32]]}, "info": {"id": "pentect_427", "source": "pentect"}}
+{"text": "issue 384249 was closed after the rollback", "spans": {"account_number: 384249": [[6, 12]]}, "info": {"id": "pentect_428", "source": "pentect"}}
+{"text": "Suzuki Sakura-san asked for access to the staging cluster", "spans": {"private_person: Suzuki Sakura": [[0, 13]]}, "info": {"id": "pentect_429", "source": "pentect"}}
+{"text": "batch-runner へのリクエストが 27781 回連続で失敗しました。担当 Ito Sakura に共有済み。", "spans": {"internal_url: batch-runner": [[0, 12]], "account_number: 27781": [[22, 27]], "private_person: Ito Sakura": [[42, 52]]}, "info": {"id": "pentect_430", "source": "pentect"}}
+{"text": "issue 432041 was closed after the rollback", "spans": {"account_number: 432041": [[6, 12]]}, "info": {"id": "pentect_431", "source": "pentect"}}
+{"text": "See ticket #678554 for the stack trace", "spans": {"account_number: 678554": [[12, 18]]}, "info": {"id": "pentect_432", "source": "pentect"}}
+{"text": "See ticket #250215 for the stack trace", "spans": {"account_number: 250215": [[12, 18]]}, "info": {"id": "pentect_433", "source": "pentect"}}
+{"text": "val := 'BkHjyjQGRU78k8I3qRwJi2EaJYYO'  // injected at boot", "spans": {"secret: BkHjyjQGRU78k8I3qRwJi2EaJYYO": [[8, 36]]}, "info": {"id": "pentect_434", "source": "pentect"}}
+{"text": "curl -sSf http://invoice-gen/healthz || echo 'down'", "spans": {"internal_url: invoice-gen": [[17, 28]]}, "info": {"id": "pentect_435", "source": "pentect"}}
+{"text": "backend_service_upstream(refund-core, retries=3)", "spans": {"internal_url: refund-core": [[25, 36]]}, "info": {"id": "pentect_436", "source": "pentect"}}
+{"text": "backend_service_upstream(search-core, retries=3)", "spans": {"internal_url: search-core": [[25, 36]]}, "info": {"id": "pentect_437", "source": "pentect"}}
+{"text": "curl -sSf http://cron-svc/healthz || echo 'down'", "spans": {"internal_url: cron-svc": [[17, 25]]}, "info": {"id": "pentect_438", "source": "pentect"}}
+{"text": "tax-calc へのリクエストが 468679 回連続で失敗しました。担当 Ito Sakura に共有済み。", "spans": {"internal_url: tax-calc": [[0, 8]], "account_number: 468679": [[18, 24]], "private_person: Ito Sakura": [[39, 49]]}, "info": {"id": "pentect_439", "source": "pentect"}}
+{"text": "curl -sSf http://ledger/healthz || echo 'down'", "spans": {"internal_url: ledger": [[17, 23]]}, "info": {"id": "pentect_440", "source": "pentect"}}
+{"text": "Eve Smith opened #874863 against tax-calc about the 500s", "spans": {"private_person: Eve Smith": [[0, 9]], "account_number: 874863": [[18, 24]], "internal_url: tax-calc": [[33, 41]]}, "info": {"id": "pentect_441", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'MI4fT1mjb16G8hB2DyAHPuDGT8S';", "spans": {"secret: MI4fT1mjb16G8hB2DyAHPuDGT8S": [[24, 51]]}, "info": {"id": "pentect_442", "source": "pentect"}}
+{"text": "config.token = \"Z9-XIHWM-RMPGX4-RZBJHTZ\"  # provisioned by platform team", "spans": {"secret: Z9-XIHWM-RMPGX4-RZBJHTZ": [[16, 39]]}, "info": {"id": "pentect_443", "source": "pentect"}}
+{"text": "route add 172.30.14.3 via gw-01 metric 10", "spans": {"internal_ip: 172.30.14.3": [[10, 21]]}, "info": {"id": "pentect_444", "source": "pentect"}}
+{"text": "Watanabe Sakura-san asked for access to the staging cluster", "spans": {"private_person: Watanabe Sakura": [[0, 15]]}, "info": {"id": "pentect_445", "source": "pentect"}}
+{"text": "route add 172.21.47.77 via gw-01 metric 10", "spans": {"internal_ip: 172.21.47.77": [[10, 22]]}, "info": {"id": "pentect_446", "source": "pentect"}}
+{"text": "route add 172.18.69.205 via gw-01 metric 10", "spans": {"internal_ip: 172.18.69.205": [[10, 23]]}, "info": {"id": "pentect_447", "source": "pentect"}}
+{"text": "span attribute upstream.service=reporting attached to trace 621823", "spans": {"internal_url: reporting": [[32, 41]], "account_number: 621823": [[60, 66]]}, "info": {"id": "pentect_448", "source": "pentect"}}
+{"text": "Suzuki Aoi が rec-engine のレイテンシ悪化を調査中(token SReEaOQ3fhFVst1gSWb3p7qwbEpG で再現)", "spans": {"private_person: Suzuki Aoi": [[0, 10]], "internal_url: rec-engine": [[13, 23]], "secret: SReEaOQ3fhFVst1gSWb3p7qwbEpG": [[43, 71]]}, "info": {"id": "pentect_449", "source": "pentect"}}
+{"text": "API_KEY: str = \"xVdyCaKr418yL1iVnCbgQGa\"  # loaded from vault", "spans": {"secret: xVdyCaKr418yL1iVnCbgQGa": [[16, 39]]}, "info": {"id": "pentect_450", "source": "pentect"}}
+{"text": "Reported by Carol Johnson after escalation from on-call", "spans": {"private_person: Carol Johnson": [[12, 25]]}, "info": {"id": "pentect_451", "source": "pentect"}}
+{"text": "issue 785875 was closed after the rollback", "spans": {"account_number: 785875": [[6, 12]]}, "info": {"id": "pentect_452", "source": "pentect"}}
+{"text": "proxy -> ledger with x-internal-token a90f7NiEjnGXDq (expires 60m)", "spans": {"internal_url: ledger": [[9, 15]], "secret: a90f7NiEjnGXDq": [[38, 52]]}, "info": {"id": "pentect_453", "source": "pentect"}}
+{"text": "backend_service_upstream(shipping-core, retries=3)", "spans": {"internal_url: shipping-core": [[25, 38]]}, "info": {"id": "pentect_454", "source": "pentect"}}
+{"text": "val := '7To12W6srR0kRN3pSVW2'  // injected at boot", "spans": {"secret: 7To12W6srR0kRN3pSVW2": [[8, 28]]}, "info": {"id": "pentect_455", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"cron-svc\"} 14820", "spans": {"internal_url: cron-svc": [[35, 43]]}, "info": {"id": "pentect_456", "source": "pentect"}}
+{"text": "ENV UPSTREAM=rec-engine API_TOKEN=IGT-CU5W-IMDDX1-TFFR", "spans": {"internal_url: rec-engine": [[13, 23]], "secret: IGT-CU5W-IMDDX1-TFFR": [[34, 54]]}, "info": {"id": "pentect_457", "source": "pentect"}}
+{"text": "kubectl port-forward svc/auth-gateway 8080:80 -n platform", "spans": {"internal_url: auth-gateway": [[25, 37]]}, "info": {"id": "pentect_458", "source": "pentect"}}
+{"text": "billing-svc,prod,owner=Eve Smith,last_deploy=2025-11-03", "spans": {"internal_url: billing-svc": [[0, 11]], "private_person: Eve Smith": [[23, 32]]}, "info": {"id": "pentect_459", "source": "pentect"}}
+{"text": "Eve Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Eve Johnson": [[0, 11]]}, "info": {"id": "pentect_460", "source": "pentect"}}
+{"text": "Suzuki Kenji-san asked for access to the staging cluster", "spans": {"private_person: Suzuki Kenji": [[0, 12]]}, "info": {"id": "pentect_461", "source": "pentect"}}
+{"text": "API_KEY: str = \"AGMq7GINJnC4D4P1QexofFU\"  # loaded from vault", "spans": {"secret: AGMq7GINJnC4D4P1QexofFU": [[16, 39]]}, "info": {"id": "pentect_462", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: Z9-AP50SW-OQ9R", "spans": {"secret: Z9-AP50SW-OQ9R": [[15, 29]]}, "info": {"id": "pentect_463", "source": "pentect"}}
+{"text": "route add 172.30.137.145 via gw-01 metric 10", "spans": {"internal_ip: 172.30.137.145": [[10, 24]]}, "info": {"id": "pentect_464", "source": "pentect"}}
+{"text": "config.token = \"IGT-EVKSO8AP-OK11U\"  # provisioned by platform team", "spans": {"secret: IGT-EVKSO8AP-OK11U": [[16, 34]]}, "info": {"id": "pentect_465", "source": "pentect"}}
+{"text": "issue 555056 was closed after the rollback", "spans": {"account_number: 555056": [[6, 12]]}, "info": {"id": "pentect_466", "source": "pentect"}}
+{"text": "upstream host = media-proxy  # k8s service dns", "spans": {"internal_url: media-proxy": [[16, 27]]}, "info": {"id": "pentect_467", "source": "pentect"}}
+{"text": "the deploy used key Z9-HHETZXA3-L01AV2R2-D5BG-34DT6U issued by the platform ops for Frank Smith", "spans": {"secret: Z9-HHETZXA3-L01AV2R2-D5BG-34DT6U": [[20, 52]], "private_person: Frank Smith": [[84, 95]]}, "info": {"id": "pentect_468", "source": "pentect"}}
+{"text": "connected to tax-calc:5432 successfully", "spans": {"internal_url: tax-calc": [[13, 21]]}, "info": {"id": "pentect_469", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'risk-engine' AND status = 'degraded'", "spans": {"internal_url: risk-engine": [[43, 54]]}, "info": {"id": "pentect_470", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"pricing\" { cluster_ip = \"None\" }", "spans": {"internal_url: pricing": [[31, 38]]}, "info": {"id": "pentect_471", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"risk-engine\" { cluster_ip = \"None\" }", "spans": {"internal_url: risk-engine": [[31, 42]]}, "info": {"id": "pentect_472", "source": "pentect"}}
+{"text": "See ticket #964161 for the stack trace", "spans": {"account_number: 964161": [[12, 18]]}, "info": {"id": "pentect_473", "source": "pentect"}}
+{"text": "Grace Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Grace Johnson": [[0, 13]]}, "info": {"id": "pentect_474", "source": "pentect"}}
+{"text": "span attribute upstream.service=cart-api attached to trace 731120", "spans": {"internal_url: cart-api": [[32, 40]], "account_number: 731120": [[59, 65]]}, "info": {"id": "pentect_475", "source": "pentect"}}
+{"text": "Retrying request to media-proxy after timeout", "spans": {"internal_url: media-proxy": [[20, 31]]}, "info": {"id": "pentect_476", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'nh3Kc5njl1tI5Brmht6T3nyCCSEa';", "spans": {"secret: nh3Kc5njl1tI5Brmht6T3nyCCSEa": [[24, 52]]}, "info": {"id": "pentect_477", "source": "pentect"}}
+{"text": "warehouse-api,prod,owner=Alice Davis,last_deploy=2025-11-03", "spans": {"internal_url: warehouse-api": [[0, 13]], "private_person: Alice Davis": [[25, 36]]}, "info": {"id": "pentect_478", "source": "pentect"}}
+{"text": "curl -sSf http://billing-svc/healthz || echo 'down'", "spans": {"internal_url: billing-svc": [[17, 28]]}, "info": {"id": "pentect_479", "source": "pentect"}}
+{"text": "tmp = \"6g5W4pCLtMXL7v4nPbC6xP\"; sendAuth(tmp)", "spans": {"secret: 6g5W4pCLtMXL7v4nPbC6xP": [[7, 29]]}, "info": {"id": "pentect_480", "source": "pentect"}}
+{"text": "customer #579630 reported the incident", "spans": {"account_number: 579630": [[10, 16]]}, "info": {"id": "pentect_481", "source": "pentect"}}
+{"text": "Watanabe Yuki が reporting のレイテンシ悪化を調査中(token y2quBTxqKqBevMTrBptcNpW で再現)", "spans": {"private_person: Watanabe Yuki": [[0, 13]], "internal_url: reporting": [[16, 25]], "secret: y2quBTxqKqBevMTrBptcNpW": [[45, 68]]}, "info": {"id": "pentect_482", "source": "pentect"}}
+{"text": "Takahashi Yuki が pricing のレイテンシ悪化を調査中(token CdXrvSxk9pbgX2zG1 で再現)", "spans": {"private_person: Takahashi Yuki": [[0, 14]], "internal_url: pricing": [[17, 24]], "secret: CdXrvSxk9pbgX2zG1": [[44, 61]]}, "info": {"id": "pentect_483", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'cart-api' AND status = 'degraded'", "spans": {"internal_url: cart-api": [[43, 51]]}, "info": {"id": "pentect_484", "source": "pentect"}}
+{"text": "customer #38552 reported the incident", "spans": {"account_number: 38552": [[10, 15]]}, "info": {"id": "pentect_485", "source": "pentect"}}
+{"text": "node search-core (172.22.12.52) joined the pool", "spans": {"internal_url: search-core": [[5, 16]], "internal_ip: 172.22.12.52": [[18, 30]]}, "info": {"id": "pentect_486", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'audit-trail' AND status = 'degraded'", "spans": {"internal_url: audit-trail": [[43, 54]]}, "info": {"id": "pentect_487", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"orders\" { cluster_ip = \"None\" }", "spans": {"internal_url: orders": [[31, 37]]}, "info": {"id": "pentect_488", "source": "pentect"}}
+{"text": "proxy -> tax-calc with x-internal-token ZusTCgXaRsIKhSubJOrSc4b5z5v (expires 60m)", "spans": {"internal_url: tax-calc": [[9, 17]], "secret: ZusTCgXaRsIKhSubJOrSc4b5z5v": [[40, 67]]}, "info": {"id": "pentect_489", "source": "pentect"}}
+{"text": "Retrying request to media-proxy after timeout", "spans": {"internal_url: media-proxy": [[20, 31]]}, "info": {"id": "pentect_490", "source": "pentect"}}
+{"text": "kubectl port-forward svc/audit-trail 8080:80 -n platform", "spans": {"internal_url: audit-trail": [[25, 36]]}, "info": {"id": "pentect_491", "source": "pentect"}}
+{"text": "curl -sSf http://reporting/healthz || echo 'down'", "spans": {"internal_url: reporting": [[17, 26]]}, "info": {"id": "pentect_492", "source": "pentect"}}
+{"text": "tmp = \"YzBWufQDZsLkyBf5pYnXMuf\"; sendAuth(tmp)", "spans": {"secret: YzBWufQDZsLkyBf5pYnXMuf": [[7, 30]]}, "info": {"id": "pentect_493", "source": "pentect"}}
+{"text": "config.token = \"HX-2VATUN1-NP9S8E9G\"  # provisioned by platform team", "spans": {"secret: HX-2VATUN1-NP9S8E9G": [[16, 35]]}, "info": {"id": "pentect_494", "source": "pentect"}}
+{"text": "dial tcp cron-svc:9092: connection refused", "spans": {"internal_url: cron-svc": [[9, 17]]}, "info": {"id": "pentect_495", "source": "pentect"}}
+{"text": "issue 941415 was closed after the rollback", "spans": {"account_number: 941415": [[6, 12]]}, "info": {"id": "pentect_496", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'auth-gateway' AND status = 'degraded'", "spans": {"internal_url: auth-gateway": [[43, 55]]}, "info": {"id": "pentect_497", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'batch-runner' AND status = 'degraded'", "spans": {"internal_url: batch-runner": [[43, 55]]}, "info": {"id": "pentect_498", "source": "pentect"}}
+{"text": "Hank Davis confirmed the rollback at 03:12 JST", "spans": {"private_person: Hank Davis": [[0, 10]]}, "info": {"id": "pentect_499", "source": "pentect"}}
+{"text": "backend_service_upstream(catalog, retries=3)", "spans": {"internal_url: catalog": [[25, 32]]}, "info": {"id": "pentect_500", "source": "pentect"}}
+{"text": "backend_service_upstream(reporting, retries=3)", "spans": {"internal_url: reporting": [[25, 34]]}, "info": {"id": "pentect_501", "source": "pentect"}}
+{"text": "config.token = \"Z9-XB59-YYSM4YY-QRRBJVE-S5DUPX0\"  # provisioned by platform team", "spans": {"secret: Z9-XB59-YYSM4YY-QRRBJVE-S5DUPX0": [[16, 47]]}, "info": {"id": "pentect_502", "source": "pentect"}}
+{"text": "ENV UPSTREAM=auth-gateway API_TOKEN=CORP-P050-XGTT0RR-Q9RVN97Y", "spans": {"internal_url: auth-gateway": [[13, 25]], "secret: CORP-P050-XGTT0RR-Q9RVN97Y": [[36, 62]]}, "info": {"id": "pentect_503", "source": "pentect"}}
+{"text": "the deploy used key HX-TS02NI4-PGEY1-JSEUO4V-0EI92E issued by the platform ops for Bob Davis", "spans": {"secret: HX-TS02NI4-PGEY1-JSEUO4V-0EI92E": [[20, 51]], "private_person: Bob Davis": [[83, 92]]}, "info": {"id": "pentect_504", "source": "pentect"}}
+{"text": "val := 'cWxRxN9lLmJzxZCaGtbJqV'  // injected at boot", "spans": {"secret: cWxRxN9lLmJzxZCaGtbJqV": [[8, 30]]}, "info": {"id": "pentect_505", "source": "pentect"}}
+{"text": "node cdn-origin (172.29.146.216) joined the pool", "spans": {"internal_url: cdn-origin": [[5, 15]], "internal_ip: 172.29.146.216": [[17, 31]]}, "info": {"id": "pentect_506", "source": "pentect"}}
+{"text": "Bob Miller opened #871319 against shipping-core about the 500s", "spans": {"private_person: Bob Miller": [[0, 10]], "account_number: 871319": [[19, 25]], "internal_url: shipping-core": [[34, 47]]}, "info": {"id": "pentect_507", "source": "pentect"}}
+{"text": "proxy -> catalog with x-internal-token LPTIJRlXKkY1NgrJ4qggafY7 (expires 60m)", "spans": {"internal_url: catalog": [[9, 16]], "secret: LPTIJRlXKkY1NgrJ4qggafY7": [[39, 63]]}, "info": {"id": "pentect_508", "source": "pentect"}}
+{"text": "API_KEY: str = \"MF7ywseHC6Lpx2uLgz7R\"  # loaded from vault", "spans": {"secret: MF7ywseHC6Lpx2uLgz7R": [[16, 36]]}, "info": {"id": "pentect_509", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: CORP-GS5H-O515IG", "spans": {"secret: CORP-GS5H-O515IG": [[15, 31]]}, "info": {"id": "pentect_510", "source": "pentect"}}
+{"text": "ENV UPSTREAM=invoice-gen API_TOKEN=HX-CQM24-A3Z5-4AY2V5", "spans": {"internal_url: invoice-gen": [[13, 24]], "secret: HX-CQM24-A3Z5-4AY2V5": [[35, 55]]}, "info": {"id": "pentect_511", "source": "pentect"}}
+{"text": "kyc-service へのリクエストが 530078 回連続で失敗しました。担当 Takahashi Hanako に共有済み。", "spans": {"internal_url: kyc-service": [[0, 11]], "account_number: 530078": [[21, 27]], "private_person: Takahashi Hanako": [[42, 58]]}, "info": {"id": "pentect_512", "source": "pentect"}}
+{"text": "val := 'cuesKmQgU5gKEvP8YAywL6ube'  // injected at boot", "spans": {"secret: cuesKmQgU5gKEvP8YAywL6ube": [[8, 33]]}, "info": {"id": "pentect_513", "source": "pentect"}}
+{"text": "ENV UPSTREAM=billing-svc API_TOKEN=IGT-589H8YH-ESP553XU-M4Y04-58E6PL", "spans": {"internal_url: billing-svc": [[13, 24]], "secret: IGT-589H8YH-ESP553XU-M4Y04-58E6PL": [[35, 68]]}, "info": {"id": "pentect_514", "source": "pentect"}}
+{"text": "span attribute upstream.service=shipping-core attached to trace 782397", "spans": {"internal_url: shipping-core": [[32, 45]], "account_number: 782397": [[64, 70]]}, "info": {"id": "pentect_515", "source": "pentect"}}
+{"text": "x = \"HJMNXcFnrhpvF5Y\"  # used by the billing worker", "spans": {"secret: HJMNXcFnrhpvF5Y": [[5, 20]]}, "info": {"id": "pentect_516", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"audit-trail\"} 14820", "spans": {"internal_url: audit-trail": [[35, 46]]}, "info": {"id": "pentect_517", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"batch-runner\" { cluster_ip = \"None\" }", "spans": {"internal_url: batch-runner": [[31, 43]]}, "info": {"id": "pentect_518", "source": "pentect"}}
+{"text": "span attribute upstream.service=cron-svc attached to trace 883356", "spans": {"internal_url: cron-svc": [[32, 40]], "account_number: 883356": [[59, 65]]}, "info": {"id": "pentect_519", "source": "pentect"}}
+{"text": "route add 172.22.27.201 via gw-01 metric 10", "spans": {"internal_ip: 172.22.27.201": [[10, 23]]}, "info": {"id": "pentect_520", "source": "pentect"}}
+{"text": "node catalog (172.22.170.225) joined the pool", "spans": {"internal_url: catalog": [[5, 12]], "internal_ip: 172.22.170.225": [[14, 28]]}, "info": {"id": "pentect_521", "source": "pentect"}}
+{"text": "Dan Miller opened #623531 against media-proxy about the 500s", "spans": {"private_person: Dan Miller": [[0, 10]], "account_number: 623531": [[19, 25]], "internal_url: media-proxy": [[34, 45]]}, "info": {"id": "pentect_522", "source": "pentect"}}
+{"text": "route add 172.23.218.24 via gw-01 metric 10", "spans": {"internal_ip: 172.23.218.24": [[10, 23]]}, "info": {"id": "pentect_523", "source": "pentect"}}
+{"text": "span attribute upstream.service=invoice-gen attached to trace 813588", "spans": {"internal_url: invoice-gen": [[32, 43]], "account_number: 813588": [[62, 68]]}, "info": {"id": "pentect_524", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"inventory\" { cluster_ip = \"None\" }", "spans": {"internal_url: inventory": [[31, 40]]}, "info": {"id": "pentect_525", "source": "pentect"}}
+{"text": "backend_service_upstream(loyalty, retries=3)", "spans": {"internal_url: loyalty": [[25, 32]]}, "info": {"id": "pentect_526", "source": "pentect"}}
+{"text": "kubectl port-forward svc/doc-store 8080:80 -n platform", "spans": {"internal_url: doc-store": [[25, 34]]}, "info": {"id": "pentect_527", "source": "pentect"}}
+{"text": "proxy -> cron-svc with x-internal-token JgusZB3yMPhlAvHhVit (expires 60m)", "spans": {"internal_url: cron-svc": [[9, 17]], "secret: JgusZB3yMPhlAvHhVit": [[40, 59]]}, "info": {"id": "pentect_528", "source": "pentect"}}
+{"text": "Watanabe Kenji-san asked for access to the staging cluster", "spans": {"private_person: Watanabe Kenji": [[0, 14]]}, "info": {"id": "pentect_529", "source": "pentect"}}
+{"text": "Tanaka Yuki が billing-svc のレイテンシ悪化を調査中(token 33id8W7P6j77Whw399jp で再現)", "spans": {"private_person: Tanaka Yuki": [[0, 11]], "internal_url: billing-svc": [[14, 25]], "secret: 33id8W7P6j77Whw399jp": [[45, 65]]}, "info": {"id": "pentect_530", "source": "pentect"}}
+{"text": "Grace Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Grace Smith": [[0, 11]]}, "info": {"id": "pentect_531", "source": "pentect"}}
+{"text": "Reported by Hank Johnson after escalation from on-call", "spans": {"private_person: Hank Johnson": [[12, 24]]}, "info": {"id": "pentect_532", "source": "pentect"}}
+{"text": "Suzuki Hanako-san asked for access to the staging cluster", "spans": {"private_person: Suzuki Hanako": [[0, 13]]}, "info": {"id": "pentect_533", "source": "pentect"}}
+{"text": "config.token = \"Z9-4FPLLG-NKWSTVS-QKJFP-NB6G3QYX\"  # provisioned by platform team", "spans": {"secret: Z9-4FPLLG-NKWSTVS-QKJFP-NB6G3QYX": [[16, 48]]}, "info": {"id": "pentect_534", "source": "pentect"}}
+{"text": "route add 172.29.66.68 via gw-01 metric 10", "spans": {"internal_ip: 172.29.66.68": [[10, 22]]}, "info": {"id": "pentect_535", "source": "pentect"}}
+{"text": "kubectl port-forward svc/risk-engine 8080:80 -n platform", "spans": {"internal_url: risk-engine": [[25, 36]]}, "info": {"id": "pentect_536", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"loyalty\" { cluster_ip = \"None\" }", "spans": {"internal_url: loyalty": [[31, 38]]}, "info": {"id": "pentect_537", "source": "pentect"}}
+{"text": "Reported by Bob Johnson after escalation from on-call", "spans": {"private_person: Bob Johnson": [[12, 23]]}, "info": {"id": "pentect_538", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'TK-7YD9MIZ-LYDKG2'", "spans": {"secret: TK-7YD9MIZ-LYDKG2": [[26, 43]]}, "info": {"id": "pentect_539", "source": "pentect"}}
+{"text": "API_KEY: str = \"aK3Pn8vTA752rw\"  # loaded from vault", "spans": {"secret: aK3Pn8vTA752rw": [[16, 30]]}, "info": {"id": "pentect_540", "source": "pentect"}}
+{"text": "Reported by Carol Smith after escalation from on-call", "spans": {"private_person: Carol Smith": [[12, 23]]}, "info": {"id": "pentect_541", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'iAnl0ceWjKibWwUt8l';", "spans": {"secret: iAnl0ceWjKibWwUt8l": [[24, 42]]}, "info": {"id": "pentect_542", "source": "pentect"}}
+{"text": "Sato Yuki-san asked for access to the staging cluster", "spans": {"private_person: Sato Yuki": [[0, 9]]}, "info": {"id": "pentect_543", "source": "pentect"}}
+{"text": "inventory,prod,owner=Frank Smith,last_deploy=2025-11-03", "spans": {"internal_url: inventory": [[0, 9]], "private_person: Frank Smith": [[21, 32]]}, "info": {"id": "pentect_544", "source": "pentect"}}
+{"text": "the deploy used key HX-IKBU-IX5TTEUG-PCE37RR issued by the platform ops for Alice Johnson", "spans": {"secret: HX-IKBU-IX5TTEUG-PCE37RR": [[20, 44]], "private_person: Alice Johnson": [[76, 89]]}, "info": {"id": "pentect_545", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'orders' AND status = 'degraded'", "spans": {"internal_url: orders": [[43, 49]]}, "info": {"id": "pentect_546", "source": "pentect"}}
+{"text": "upstream host = catalog  # k8s service dns", "spans": {"internal_url: catalog": [[16, 23]]}, "info": {"id": "pentect_547", "source": "pentect"}}
+{"text": "tmp = \"hA5XUziLlflypkB\"; sendAuth(tmp)", "spans": {"secret: hA5XUziLlflypkB": [[7, 22]]}, "info": {"id": "pentect_548", "source": "pentect"}}
+{"text": "Alice Smith opened #344590 against auth-gateway about the 500s", "spans": {"private_person: Alice Smith": [[0, 11]], "account_number: 344590": [[20, 26]], "internal_url: auth-gateway": [[35, 47]]}, "info": {"id": "pentect_549", "source": "pentect"}}
+{"text": "media-proxy,prod,owner=Alice Brown,last_deploy=2025-11-03", "spans": {"internal_url: media-proxy": [[0, 11]], "private_person: Alice Brown": [[23, 34]]}, "info": {"id": "pentect_550", "source": "pentect"}}
+{"text": "tmp = \"qybEJWBse31CXhjm\"; sendAuth(tmp)", "spans": {"secret: qybEJWBse31CXhjm": [[7, 23]]}, "info": {"id": "pentect_551", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'QaRp3LJyASXtxHqPpItVXvSLIIPz';", "spans": {"secret: QaRp3LJyASXtxHqPpItVXvSLIIPz": [[24, 52]]}, "info": {"id": "pentect_552", "source": "pentect"}}
+{"text": "dial tcp orders:9092: connection refused", "spans": {"internal_url: orders": [[9, 15]]}, "info": {"id": "pentect_553", "source": "pentect"}}
+{"text": "upstream host = risk-engine  # k8s service dns", "spans": {"internal_url: risk-engine": [[16, 27]]}, "info": {"id": "pentect_554", "source": "pentect"}}
+{"text": "x = \"Kg3ti9fc4Vl8k5Mz917\"  # used by the billing worker", "spans": {"secret: Kg3ti9fc4Vl8k5Mz917": [[5, 24]]}, "info": {"id": "pentect_555", "source": "pentect"}}
+{"text": "Tanaka Hanako-san asked for access to the staging cluster", "spans": {"private_person: Tanaka Hanako": [[0, 13]]}, "info": {"id": "pentect_556", "source": "pentect"}}
+{"text": "Hank Wilson opened #811426 against payments-core about the 500s", "spans": {"private_person: Hank Wilson": [[0, 11]], "account_number: 811426": [[20, 26]], "internal_url: payments-core": [[35, 48]]}, "info": {"id": "pentect_557", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'HX-771L6R4-32M7FCGL-3P24BX21'", "spans": {"secret: HX-771L6R4-32M7FCGL-3P24BX21": [[26, 54]]}, "info": {"id": "pentect_558", "source": "pentect"}}
+{"text": "Bob Miller opened #296039 against reporting about the 500s", "spans": {"private_person: Bob Miller": [[0, 10]], "account_number: 296039": [[19, 25]], "internal_url: reporting": [[34, 43]]}, "info": {"id": "pentect_559", "source": "pentect"}}
+{"text": "Reported by Dan Wilson after escalation from on-call", "spans": {"private_person: Dan Wilson": [[12, 22]]}, "info": {"id": "pentect_560", "source": "pentect"}}
+{"text": "backend_service_upstream(invoice-gen, retries=3)", "spans": {"internal_url: invoice-gen": [[25, 36]]}, "info": {"id": "pentect_561", "source": "pentect"}}
+{"text": "Bob Davis opened #261246 against catalog about the 500s", "spans": {"private_person: Bob Davis": [[0, 9]], "account_number: 261246": [[18, 24]], "internal_url: catalog": [[33, 40]]}, "info": {"id": "pentect_562", "source": "pentect"}}
+{"text": "node inventory (172.29.7.88) joined the pool", "spans": {"internal_url: inventory": [[5, 14]], "internal_ip: 172.29.7.88": [[16, 27]]}, "info": {"id": "pentect_563", "source": "pentect"}}
+{"text": "span attribute upstream.service=session-store attached to trace 600422", "spans": {"internal_url: session-store": [[32, 45]], "account_number: 600422": [[64, 70]]}, "info": {"id": "pentect_564", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'EmgLJFACQbGPoyA';", "spans": {"secret: EmgLJFACQbGPoyA": [[24, 39]]}, "info": {"id": "pentect_565", "source": "pentect"}}
+{"text": "issue 71367 was closed after the rollback", "spans": {"account_number: 71367": [[6, 11]]}, "info": {"id": "pentect_566", "source": "pentect"}}
+{"text": "val := 'Pr9ZEnNmUOjpv0BQzZKvYZTd'  // injected at boot", "spans": {"secret: Pr9ZEnNmUOjpv0BQzZKvYZTd": [[8, 32]]}, "info": {"id": "pentect_567", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"ledger\"} 14820", "spans": {"internal_url: ledger": [[35, 41]]}, "info": {"id": "pentect_568", "source": "pentect"}}
+{"text": "Ito Sakura-san asked for access to the staging cluster", "spans": {"private_person: Ito Sakura": [[0, 10]]}, "info": {"id": "pentect_569", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'invoice-gen' AND status = 'degraded'", "spans": {"internal_url: invoice-gen": [[43, 54]]}, "info": {"id": "pentect_570", "source": "pentect"}}
+{"text": "customer #661874 reported the incident", "spans": {"account_number: 661874": [[10, 16]]}, "info": {"id": "pentect_571", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'ZN-V4AKXK-LQW3B'", "spans": {"secret: ZN-V4AKXK-LQW3B": [[26, 41]]}, "info": {"id": "pentect_572", "source": "pentect"}}
+{"text": "curl -sSf http://loyalty/healthz || echo 'down'", "spans": {"internal_url: loyalty": [[17, 24]]}, "info": {"id": "pentect_573", "source": "pentect"}}
+{"text": "the deploy used key IGT-BS1GYA-APTD5G1-XGL1QGO issued by the platform ops for Dan Johnson", "spans": {"secret: IGT-BS1GYA-APTD5G1-XGL1QGO": [[20, 46]], "private_person: Dan Johnson": [[78, 89]]}, "info": {"id": "pentect_574", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"doc-store\" { cluster_ip = \"None\" }", "spans": {"internal_url: doc-store": [[31, 40]]}, "info": {"id": "pentect_575", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'IOrIB1lGJ14XjS6fX75RiUa6';", "spans": {"secret: IOrIB1lGJ14XjS6fX75RiUa6": [[24, 48]]}, "info": {"id": "pentect_576", "source": "pentect"}}
+{"text": "backend_service_upstream(invoice-gen, retries=3)", "spans": {"internal_url: invoice-gen": [[25, 36]]}, "info": {"id": "pentect_577", "source": "pentect"}}
+{"text": "x = \"Zr2EJNA9pOn9c6d6gzVA98\"  # used by the billing worker", "spans": {"secret: Zr2EJNA9pOn9c6d6gzVA98": [[5, 27]]}, "info": {"id": "pentect_578", "source": "pentect"}}
+{"text": "config.token = \"IGT-Q64NFU-1DAL-CN9OBXC-6KVWPWM\"  # provisioned by platform team", "spans": {"secret: IGT-Q64NFU-1DAL-CN9OBXC-6KVWPWM": [[16, 47]]}, "info": {"id": "pentect_579", "source": "pentect"}}
+{"text": "curl -sSf http://payments-core/healthz || echo 'down'", "spans": {"internal_url: payments-core": [[17, 30]]}, "info": {"id": "pentect_580", "source": "pentect"}}
+{"text": "upstream host = reporting  # k8s service dns", "spans": {"internal_url: reporting": [[16, 25]]}, "info": {"id": "pentect_581", "source": "pentect"}}
+{"text": "proxy -> session-store with x-internal-token P1OubtI4CkddppJogeh60ampyQFr (expires 60m)", "spans": {"internal_url: session-store": [[9, 22]], "secret: P1OubtI4CkddppJogeh60ampyQFr": [[45, 73]]}, "info": {"id": "pentect_582", "source": "pentect"}}
+{"text": "proxy -> billing-svc with x-internal-token RDBi4zrIdPgmDetqOeuE2jZ6oM (expires 60m)", "spans": {"internal_url: billing-svc": [[9, 20]], "secret: RDBi4zrIdPgmDetqOeuE2jZ6oM": [[43, 69]]}, "info": {"id": "pentect_583", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"cart-api\"} 14820", "spans": {"internal_url: cart-api": [[35, 43]]}, "info": {"id": "pentect_584", "source": "pentect"}}
+{"text": "Suzuki Sakura-san asked for access to the staging cluster", "spans": {"private_person: Suzuki Sakura": [[0, 13]]}, "info": {"id": "pentect_585", "source": "pentect"}}
+{"text": "Frank Brown opened #131001 against kyc-service about the 500s", "spans": {"private_person: Frank Brown": [[0, 11]], "account_number: 131001": [[20, 26]], "internal_url: kyc-service": [[35, 46]]}, "info": {"id": "pentect_586", "source": "pentect"}}
+{"text": "ENV UPSTREAM=cron-svc API_TOKEN=HX-3PWJT7D-AC0BQO", "spans": {"internal_url: cron-svc": [[13, 21]], "secret: HX-3PWJT7D-AC0BQO": [[32, 49]]}, "info": {"id": "pentect_587", "source": "pentect"}}
+{"text": "API_KEY: str = \"RlKRvSdAYCImyVgrnbd5v7dsmgQ\"  # loaded from vault", "spans": {"secret: RlKRvSdAYCImyVgrnbd5v7dsmgQ": [[16, 43]]}, "info": {"id": "pentect_588", "source": "pentect"}}
+{"text": "API_KEY: str = \"10BivpeN9JttA2hzZxC3jOQBbRgS\"  # loaded from vault", "spans": {"secret: 10BivpeN9JttA2hzZxC3jOQBbRgS": [[16, 44]]}, "info": {"id": "pentect_589", "source": "pentect"}}
+{"text": "Takahashi Taro-san asked for access to the staging cluster", "spans": {"private_person: Takahashi Taro": [[0, 14]]}, "info": {"id": "pentect_590", "source": "pentect"}}
+{"text": "the deploy used key CORP-P9MN-A8F8BOR issued by the platform ops for Hank Miller", "spans": {"secret: CORP-P9MN-A8F8BOR": [[20, 37]], "private_person: Hank Miller": [[69, 80]]}, "info": {"id": "pentect_591", "source": "pentect"}}
+{"text": "backend_service_upstream(rec-engine, retries=3)", "spans": {"internal_url: rec-engine": [[25, 35]]}, "info": {"id": "pentect_592", "source": "pentect"}}
+{"text": "Takahashi Kenji が shipping-core のレイテンシ悪化を調査中(token GbFXLa04FHqlr0 で再現)", "spans": {"private_person: Takahashi Kenji": [[0, 15]], "internal_url: shipping-core": [[18, 31]], "secret: GbFXLa04FHqlr0": [[51, 65]]}, "info": {"id": "pentect_593", "source": "pentect"}}
+{"text": "Bob Davis confirmed the rollback at 03:12 JST", "spans": {"private_person: Bob Davis": [[0, 9]]}, "info": {"id": "pentect_594", "source": "pentect"}}
+{"text": "ENV UPSTREAM=kyc-v3 API_TOKEN=ZN-HKUM-K7U1-XOMTF0-5G514A99", "spans": {"internal_url: kyc-v3": [[13, 19]], "secret: ZN-HKUM-K7U1-XOMTF0-5G514A99": [[30, 58]]}, "info": {"id": "pentect_595", "source": "pentect"}}
+{"text": "tax-calc へのリクエストが 406352 回連続で失敗しました。担当 Takahashi Hanako に共有済み。", "spans": {"internal_url: tax-calc": [[0, 8]], "account_number: 406352": [[18, 24]], "private_person: Takahashi Hanako": [[39, 55]]}, "info": {"id": "pentect_596", "source": "pentect"}}
+{"text": "backend_service_upstream(refund-core, retries=3)", "spans": {"internal_url: refund-core": [[25, 36]]}, "info": {"id": "pentect_597", "source": "pentect"}}
+{"text": "fulfillment,prod,owner=Grace Miller,last_deploy=2025-11-03", "spans": {"internal_url: fulfillment": [[0, 11]], "private_person: Grace Miller": [[23, 35]]}, "info": {"id": "pentect_598", "source": "pentect"}}
+{"text": "Reported by Hank Wilson after escalation from on-call", "spans": {"private_person: Hank Wilson": [[12, 23]]}, "info": {"id": "pentect_599", "source": "pentect"}}
+{"text": "tmp = \"PXPaSNvR3qODPN2SKyvOMYmc9h\"; sendAuth(tmp)", "spans": {"secret: PXPaSNvR3qODPN2SKyvOMYmc9h": [[7, 33]]}, "info": {"id": "pentect_600", "source": "pentect"}}
+{"text": "Takahashi Aoi-san asked for access to the staging cluster", "spans": {"private_person: Takahashi Aoi": [[0, 13]]}, "info": {"id": "pentect_601", "source": "pentect"}}
+{"text": "proxy -> search-core with x-internal-token S2uBTxmTDIfdEGnKY0q (expires 60m)", "spans": {"internal_url: search-core": [[9, 20]], "secret: S2uBTxmTDIfdEGnKY0q": [[43, 62]]}, "info": {"id": "pentect_602", "source": "pentect"}}
+{"text": "issue 436804 was closed after the rollback", "spans": {"account_number: 436804": [[6, 12]]}, "info": {"id": "pentect_603", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'DqbdAHHeEfiLeqROd';", "spans": {"secret: DqbdAHHeEfiLeqROd": [[24, 41]]}, "info": {"id": "pentect_604", "source": "pentect"}}
+{"text": "Frank Miller opened #27803 against search-core about the 500s", "spans": {"private_person: Frank Miller": [[0, 12]], "account_number: 27803": [[21, 26]], "internal_url: search-core": [[35, 46]]}, "info": {"id": "pentect_605", "source": "pentect"}}
+{"text": "config.token = \"CORP-AA6UYPV2-JPVQ30-N32K1IH\"  # provisioned by platform team", "spans": {"secret: CORP-AA6UYPV2-JPVQ30-N32K1IH": [[16, 44]]}, "info": {"id": "pentect_606", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'orders' AND status = 'degraded'", "spans": {"internal_url: orders": [[43, 49]]}, "info": {"id": "pentect_607", "source": "pentect"}}
+{"text": "Sato Hanako-san asked for access to the staging cluster", "spans": {"private_person: Sato Hanako": [[0, 11]]}, "info": {"id": "pentect_608", "source": "pentect"}}
+{"text": "Grace Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Grace Smith": [[0, 11]]}, "info": {"id": "pentect_609", "source": "pentect"}}
+{"text": "ENV UPSTREAM=pricing API_TOKEN=CORP-7921YK-XPFO86-YAPI-YFMQF", "spans": {"internal_url: pricing": [[13, 20]], "secret: CORP-7921YK-XPFO86-YAPI-YFMQF": [[31, 60]]}, "info": {"id": "pentect_610", "source": "pentect"}}
+{"text": "See ticket #274473 for the stack trace", "spans": {"account_number: 274473": [[12, 18]]}, "info": {"id": "pentect_611", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'search-core' AND status = 'degraded'", "spans": {"internal_url: search-core": [[43, 54]]}, "info": {"id": "pentect_612", "source": "pentect"}}
+{"text": "upstream host = ledger  # k8s service dns", "spans": {"internal_url: ledger": [[16, 22]]}, "info": {"id": "pentect_613", "source": "pentect"}}
+{"text": "Bob Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Bob Johnson": [[0, 11]]}, "info": {"id": "pentect_614", "source": "pentect"}}
+{"text": "route add 172.28.42.68 via gw-01 metric 10", "spans": {"internal_ip: 172.28.42.68": [[10, 22]]}, "info": {"id": "pentect_615", "source": "pentect"}}
+{"text": "Grace Wilson opened #179632 against batch-runner about the 500s", "spans": {"private_person: Grace Wilson": [[0, 12]], "account_number: 179632": [[21, 27]], "internal_url: batch-runner": [[36, 48]]}, "info": {"id": "pentect_616", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"session-store\" { cluster_ip = \"None\" }", "spans": {"internal_url: session-store": [[31, 44]]}, "info": {"id": "pentect_617", "source": "pentect"}}
+{"text": "See ticket #669159 for the stack trace", "spans": {"account_number: 669159": [[12, 18]]}, "info": {"id": "pentect_618", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"reporting\"} 14820", "spans": {"internal_url: reporting": [[35, 44]]}, "info": {"id": "pentect_619", "source": "pentect"}}
+{"text": "the deploy used key HX-ANPS-INCO8-6X3L8TV-78D29 issued by the platform ops for Bob Davis", "spans": {"secret: HX-ANPS-INCO8-6X3L8TV-78D29": [[20, 47]], "private_person: Bob Davis": [[79, 88]]}, "info": {"id": "pentect_620", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '3j4vXPkXDN96EFuOMS0Mdko';", "spans": {"secret: 3j4vXPkXDN96EFuOMS0Mdko": [[24, 47]]}, "info": {"id": "pentect_621", "source": "pentect"}}
+{"text": "curl -sSf http://rec-engine/healthz || echo 'down'", "spans": {"internal_url: rec-engine": [[17, 27]]}, "info": {"id": "pentect_622", "source": "pentect"}}
+{"text": "backend_service_upstream(tax-calc, retries=3)", "spans": {"internal_url: tax-calc": [[25, 33]]}, "info": {"id": "pentect_623", "source": "pentect"}}
+{"text": "Takahashi Taro-san asked for access to the staging cluster", "spans": {"private_person: Takahashi Taro": [[0, 14]]}, "info": {"id": "pentect_624", "source": "pentect"}}
+{"text": "the deploy used key ZN-CFJF-LNKOH67P issued by the platform ops for Alice Smith", "spans": {"secret: ZN-CFJF-LNKOH67P": [[20, 36]], "private_person: Alice Smith": [[68, 79]]}, "info": {"id": "pentect_625", "source": "pentect"}}
+{"text": "Retrying request to cdn-origin after timeout", "spans": {"internal_url: cdn-origin": [[20, 30]]}, "info": {"id": "pentect_626", "source": "pentect"}}
+{"text": "tmp = \"tAWOrf2D9O5NsA2pgQ6H0cDAZU\"; sendAuth(tmp)", "spans": {"secret: tAWOrf2D9O5NsA2pgQ6H0cDAZU": [[7, 33]]}, "info": {"id": "pentect_627", "source": "pentect"}}
+{"text": "the deploy used key CORP-WR4IJI-QPVBXSM4-4C3Z2L-92HA6E issued by the platform ops for Bob Smith", "spans": {"secret: CORP-WR4IJI-QPVBXSM4-4C3Z2L-92HA6E": [[20, 54]], "private_person: Bob Smith": [[86, 95]]}, "info": {"id": "pentect_628", "source": "pentect"}}
+{"text": "proxy -> kyc-v3 with x-internal-token h6uiIW2m7lyEvZRn063hkCh7frk (expires 60m)", "spans": {"internal_url: kyc-v3": [[9, 15]], "secret: h6uiIW2m7lyEvZRn063hkCh7frk": [[38, 65]]}, "info": {"id": "pentect_629", "source": "pentect"}}
+{"text": "ENV UPSTREAM=audit-trail API_TOKEN=HX-6D60A-GPIREX-CZKM9X9", "spans": {"internal_url: audit-trail": [[13, 24]], "secret: HX-6D60A-GPIREX-CZKM9X9": [[35, 58]]}, "info": {"id": "pentect_630", "source": "pentect"}}
+{"text": "connected to loyalty:5432 successfully", "spans": {"internal_url: loyalty": [[13, 20]]}, "info": {"id": "pentect_631", "source": "pentect"}}
+{"text": "coupon-svc,prod,owner=Dan Johnson,last_deploy=2025-11-03", "spans": {"internal_url: coupon-svc": [[0, 10]], "private_person: Dan Johnson": [[22, 33]]}, "info": {"id": "pentect_632", "source": "pentect"}}
+{"text": "tax-calc,prod,owner=Bob Davis,last_deploy=2025-11-03", "spans": {"internal_url: tax-calc": [[0, 8]], "private_person: Bob Davis": [[20, 29]]}, "info": {"id": "pentect_633", "source": "pentect"}}
+{"text": "proxy -> doc-store with x-internal-token 4UcvIPL0t8t5HJUW (expires 60m)", "spans": {"internal_url: doc-store": [[9, 18]], "secret: 4UcvIPL0t8t5HJUW": [[41, 57]]}, "info": {"id": "pentect_634", "source": "pentect"}}
+{"text": "tmp = \"MscTHyDJ0WqAtp8a3csz0pCGnTH\"; sendAuth(tmp)", "spans": {"secret: MscTHyDJ0WqAtp8a3csz0pCGnTH": [[7, 34]]}, "info": {"id": "pentect_635", "source": "pentect"}}
+{"text": "API_KEY: str = \"g6BZ0WpNQDX18P2YZ\"  # loaded from vault", "spans": {"secret: g6BZ0WpNQDX18P2YZ": [[16, 33]]}, "info": {"id": "pentect_636", "source": "pentect"}}
+{"text": "curl -sSf http://media-proxy/healthz || echo 'down'", "spans": {"internal_url: media-proxy": [[17, 28]]}, "info": {"id": "pentect_637", "source": "pentect"}}
+{"text": "kubectl port-forward svc/doc-store 8080:80 -n platform", "spans": {"internal_url: doc-store": [[25, 34]]}, "info": {"id": "pentect_638", "source": "pentect"}}
+{"text": "upstream host = pricing  # k8s service dns", "spans": {"internal_url: pricing": [[16, 23]]}, "info": {"id": "pentect_639", "source": "pentect"}}
+{"text": "proxy -> kyc-v3 with x-internal-token WDJP2E6I901TNAyo5YHWlCQsH (expires 60m)", "spans": {"internal_url: kyc-v3": [[9, 15]], "secret: WDJP2E6I901TNAyo5YHWlCQsH": [[38, 63]]}, "info": {"id": "pentect_640", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"doc-store\"} 14820", "spans": {"internal_url: doc-store": [[35, 44]]}, "info": {"id": "pentect_641", "source": "pentect"}}
+{"text": "dial tcp kyc-v3:9092: connection refused", "spans": {"internal_url: kyc-v3": [[9, 15]]}, "info": {"id": "pentect_642", "source": "pentect"}}
+{"text": "doc-store,prod,owner=Grace Brown,last_deploy=2025-11-03", "spans": {"internal_url: doc-store": [[0, 9]], "private_person: Grace Brown": [[21, 32]]}, "info": {"id": "pentect_643", "source": "pentect"}}
+{"text": "route add 172.26.154.95 via gw-01 metric 10", "spans": {"internal_ip: 172.26.154.95": [[10, 23]]}, "info": {"id": "pentect_644", "source": "pentect"}}
+{"text": "Grace Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Grace Smith": [[0, 11]]}, "info": {"id": "pentect_645", "source": "pentect"}}
+{"text": "dial tcp rec-engine:9092: connection refused", "spans": {"internal_url: rec-engine": [[9, 19]]}, "info": {"id": "pentect_646", "source": "pentect"}}
+{"text": "loyalty へのリクエストが 425048 回連続で失敗しました。担当 Tanaka Sakura に共有済み。", "spans": {"internal_url: loyalty": [[0, 7]], "account_number: 425048": [[17, 23]], "private_person: Tanaka Sakura": [[38, 51]]}, "info": {"id": "pentect_647", "source": "pentect"}}
+{"text": "x = \"AeqAJj5KOCzgcp\"  # used by the billing worker", "spans": {"secret: AeqAJj5KOCzgcp": [[5, 19]]}, "info": {"id": "pentect_648", "source": "pentect"}}
+{"text": "tmp = \"aNXgj7UMHm7C8WdGJ\"; sendAuth(tmp)", "spans": {"secret: aNXgj7UMHm7C8WdGJ": [[7, 24]]}, "info": {"id": "pentect_649", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"kyc-service\"} 14820", "spans": {"internal_url: kyc-service": [[35, 46]]}, "info": {"id": "pentect_650", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'HX-NJWU-3365RD4-WKECB-PLKK'", "spans": {"secret: HX-NJWU-3365RD4-WKECB-PLKK": [[26, 52]]}, "info": {"id": "pentect_651", "source": "pentect"}}
+{"text": "Takahashi Sakura が kyc-service のレイテンシ悪化を調査中(token xFFWBvnaQ7wtwd で再現)", "spans": {"private_person: Takahashi Sakura": [[0, 16]], "internal_url: kyc-service": [[19, 30]], "secret: xFFWBvnaQ7wtwd": [[50, 64]]}, "info": {"id": "pentect_652", "source": "pentect"}}
+{"text": "loyalty へのリクエストが 982124 回連続で失敗しました。担当 Suzuki Hanako に共有済み。", "spans": {"internal_url: loyalty": [[0, 7]], "account_number: 982124": [[17, 23]], "private_person: Suzuki Hanako": [[38, 51]]}, "info": {"id": "pentect_653", "source": "pentect"}}
+{"text": "issue 431808 was closed after the rollback", "spans": {"account_number: 431808": [[6, 12]]}, "info": {"id": "pentect_654", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'ZN-AF3IH-S1DUAFA0'", "spans": {"secret: ZN-AF3IH-S1DUAFA0": [[26, 43]]}, "info": {"id": "pentect_655", "source": "pentect"}}
+{"text": "See ticket #141681 for the stack trace", "spans": {"account_number: 141681": [[12, 18]]}, "info": {"id": "pentect_656", "source": "pentect"}}
+{"text": "curl -sSf http://pricing/healthz || echo 'down'", "spans": {"internal_url: pricing": [[17, 24]]}, "info": {"id": "pentect_657", "source": "pentect"}}
+{"text": "Hank Miller opened #645307 against risk-engine about the 500s", "spans": {"private_person: Hank Miller": [[0, 11]], "account_number: 645307": [[20, 26]], "internal_url: risk-engine": [[35, 46]]}, "info": {"id": "pentect_658", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'session-store' AND status = 'degraded'", "spans": {"internal_url: session-store": [[43, 56]]}, "info": {"id": "pentect_659", "source": "pentect"}}
+{"text": "backend_service_upstream(kyc-v3, retries=3)", "spans": {"internal_url: kyc-v3": [[25, 31]]}, "info": {"id": "pentect_660", "source": "pentect"}}
+{"text": "Carol Smith opened #978266 against kyc-v3 about the 500s", "spans": {"private_person: Carol Smith": [[0, 11]], "account_number: 978266": [[20, 26]], "internal_url: kyc-v3": [[35, 41]]}, "info": {"id": "pentect_661", "source": "pentect"}}
+{"text": "val := 'vCA4ENrRs1DCqNyqMj'  // injected at boot", "spans": {"secret: vCA4ENrRs1DCqNyqMj": [[8, 26]]}, "info": {"id": "pentect_662", "source": "pentect"}}
+{"text": "val := '7DW71lFevwIJw0Gqq93'  // injected at boot", "spans": {"secret: 7DW71lFevwIJw0Gqq93": [[8, 27]]}, "info": {"id": "pentect_663", "source": "pentect"}}
+{"text": "x = \"fOepV8FnC8dd1BM6\"  # used by the billing worker", "spans": {"secret: fOepV8FnC8dd1BM6": [[5, 21]]}, "info": {"id": "pentect_664", "source": "pentect"}}
+{"text": "refund-core,prod,owner=Carol Wilson,last_deploy=2025-11-03", "spans": {"internal_url: refund-core": [[0, 11]], "private_person: Carol Wilson": [[23, 35]]}, "info": {"id": "pentect_665", "source": "pentect"}}
+{"text": "connected to media-proxy:5432 successfully", "spans": {"internal_url: media-proxy": [[13, 24]]}, "info": {"id": "pentect_666", "source": "pentect"}}
+{"text": "dial tcp reporting:9092: connection refused", "spans": {"internal_url: reporting": [[9, 18]]}, "info": {"id": "pentect_667", "source": "pentect"}}
+{"text": "upstream host = search-core  # k8s service dns", "spans": {"internal_url: search-core": [[16, 27]]}, "info": {"id": "pentect_668", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'risk-engine' AND status = 'degraded'", "spans": {"internal_url: risk-engine": [[43, 54]]}, "info": {"id": "pentect_669", "source": "pentect"}}
+{"text": "Frank Miller opened #512838 against pricing about the 500s", "spans": {"private_person: Frank Miller": [[0, 12]], "account_number: 512838": [[21, 27]], "internal_url: pricing": [[36, 43]]}, "info": {"id": "pentect_670", "source": "pentect"}}
+{"text": "upstream host = search-core  # k8s service dns", "spans": {"internal_url: search-core": [[16, 27]]}, "info": {"id": "pentect_671", "source": "pentect"}}
+{"text": "x = \"bF97dA5e7s1AN2\"  # used by the billing worker", "spans": {"secret: bF97dA5e7s1AN2": [[5, 19]]}, "info": {"id": "pentect_672", "source": "pentect"}}
+{"text": "proxy -> loyalty with x-internal-token DSKRRk9cdfdW1fvIAVQLNDq7 (expires 60m)", "spans": {"internal_url: loyalty": [[9, 16]], "secret: DSKRRk9cdfdW1fvIAVQLNDq7": [[39, 63]]}, "info": {"id": "pentect_673", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'ZN-E5OH-49P1ZRTU'", "spans": {"secret: ZN-E5OH-49P1ZRTU": [[26, 42]]}, "info": {"id": "pentect_674", "source": "pentect"}}
+{"text": "backend_service_upstream(refund-core, retries=3)", "spans": {"internal_url: refund-core": [[25, 36]]}, "info": {"id": "pentect_675", "source": "pentect"}}
+{"text": "backend_service_upstream(loyalty, retries=3)", "spans": {"internal_url: loyalty": [[25, 32]]}, "info": {"id": "pentect_676", "source": "pentect"}}
+{"text": "dial tcp media-proxy:9092: connection refused", "spans": {"internal_url: media-proxy": [[9, 20]]}, "info": {"id": "pentect_677", "source": "pentect"}}
+{"text": "dial tcp refund-core:9092: connection refused", "spans": {"internal_url: refund-core": [[9, 20]]}, "info": {"id": "pentect_678", "source": "pentect"}}
+{"text": "Reported by Bob Smith after escalation from on-call", "spans": {"private_person: Bob Smith": [[12, 21]]}, "info": {"id": "pentect_679", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '0UdyNjHbnBbbJ33fKa1Uyy1o';", "spans": {"secret: 0UdyNjHbnBbbJ33fKa1Uyy1o": [[24, 48]]}, "info": {"id": "pentect_680", "source": "pentect"}}
+{"text": "route add 172.22.28.222 via gw-01 metric 10", "spans": {"internal_ip: 172.22.28.222": [[10, 23]]}, "info": {"id": "pentect_681", "source": "pentect"}}
+{"text": "node inventory (172.27.184.131) joined the pool", "spans": {"internal_url: inventory": [[5, 14]], "internal_ip: 172.27.184.131": [[16, 30]]}, "info": {"id": "pentect_682", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'zaK0Vc8h8JkYCN';", "spans": {"secret: zaK0Vc8h8JkYCN": [[24, 38]]}, "info": {"id": "pentect_683", "source": "pentect"}}
+{"text": "API_KEY: str = \"KBsn1wwaIdiMbAKsmt4pYQKmNcWb\"  # loaded from vault", "spans": {"secret: KBsn1wwaIdiMbAKsmt4pYQKmNcWb": [[16, 44]]}, "info": {"id": "pentect_684", "source": "pentect"}}
+{"text": "node cron-svc (172.21.216.167) joined the pool", "spans": {"internal_url: cron-svc": [[5, 13]], "internal_ip: 172.21.216.167": [[15, 29]]}, "info": {"id": "pentect_685", "source": "pentect"}}
+{"text": "x = \"Jw22JkAaGMVgoPjQip6PSVu\"  # used by the billing worker", "spans": {"secret: Jw22JkAaGMVgoPjQip6PSVu": [[5, 28]]}, "info": {"id": "pentect_686", "source": "pentect"}}
+{"text": "issue 446236 was closed after the rollback", "spans": {"account_number: 446236": [[6, 12]]}, "info": {"id": "pentect_687", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'BG1jJFxRfNA5YMKDaQloUBTnpcne';", "spans": {"secret: BG1jJFxRfNA5YMKDaQloUBTnpcne": [[24, 52]]}, "info": {"id": "pentect_688", "source": "pentect"}}
+{"text": "upstream host = audit-trail  # k8s service dns", "spans": {"internal_url: audit-trail": [[16, 27]]}, "info": {"id": "pentect_689", "source": "pentect"}}
+{"text": "route add 172.31.67.228 via gw-01 metric 10", "spans": {"internal_ip: 172.31.67.228": [[10, 23]]}, "info": {"id": "pentect_690", "source": "pentect"}}
+{"text": "connected to rec-engine:5432 successfully", "spans": {"internal_url: rec-engine": [[13, 23]]}, "info": {"id": "pentect_691", "source": "pentect"}}
+{"text": "connected to doc-store:5432 successfully", "spans": {"internal_url: doc-store": [[13, 22]]}, "info": {"id": "pentect_692", "source": "pentect"}}
+{"text": "session-store,prod,owner=Eve Brown,last_deploy=2025-11-03", "spans": {"internal_url: session-store": [[0, 13]], "private_person: Eve Brown": [[25, 34]]}, "info": {"id": "pentect_693", "source": "pentect"}}
+{"text": "span attribute upstream.service=search-core attached to trace 756780", "spans": {"internal_url: search-core": [[32, 43]], "account_number: 756780": [[62, 68]]}, "info": {"id": "pentect_694", "source": "pentect"}}
+{"text": "route add 172.21.183.231 via gw-01 metric 10", "spans": {"internal_ip: 172.21.183.231": [[10, 24]]}, "info": {"id": "pentect_695", "source": "pentect"}}
+{"text": "backend_service_upstream(fulfillment, retries=3)", "spans": {"internal_url: fulfillment": [[25, 36]]}, "info": {"id": "pentect_696", "source": "pentect"}}
+{"text": "issue 687769 was closed after the rollback", "spans": {"account_number: 687769": [[6, 12]]}, "info": {"id": "pentect_697", "source": "pentect"}}
+{"text": "route add 172.24.196.123 via gw-01 metric 10", "spans": {"internal_ip: 172.24.196.123": [[10, 24]]}, "info": {"id": "pentect_698", "source": "pentect"}}
+{"text": "kubectl port-forward svc/reporting 8080:80 -n platform", "spans": {"internal_url: reporting": [[25, 34]]}, "info": {"id": "pentect_699", "source": "pentect"}}
+{"text": "route add 172.30.0.229 via gw-01 metric 10", "spans": {"internal_ip: 172.30.0.229": [[10, 22]]}, "info": {"id": "pentect_700", "source": "pentect"}}
+{"text": "See ticket #591501 for the stack trace", "spans": {"account_number: 591501": [[12, 18]]}, "info": {"id": "pentect_701", "source": "pentect"}}
+{"text": "connected to billing-svc:5432 successfully", "spans": {"internal_url: billing-svc": [[13, 24]]}, "info": {"id": "pentect_702", "source": "pentect"}}
+{"text": "tmp = \"R3rUhOdVHTzPBsd26UM\"; sendAuth(tmp)", "spans": {"secret: R3rUhOdVHTzPBsd26UM": [[7, 26]]}, "info": {"id": "pentect_703", "source": "pentect"}}
+{"text": "Sato Taro-san asked for access to the staging cluster", "spans": {"private_person: Sato Taro": [[0, 9]]}, "info": {"id": "pentect_704", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"cron-svc\"} 14820", "spans": {"internal_url: cron-svc": [[35, 43]]}, "info": {"id": "pentect_705", "source": "pentect"}}
+{"text": "dial tcp rec-engine:9092: connection refused", "spans": {"internal_url: rec-engine": [[9, 19]]}, "info": {"id": "pentect_706", "source": "pentect"}}
+{"text": "dial tcp rec-engine:9092: connection refused", "spans": {"internal_url: rec-engine": [[9, 19]]}, "info": {"id": "pentect_707", "source": "pentect"}}
+{"text": "Tanaka Sakura-san asked for access to the staging cluster", "spans": {"private_person: Tanaka Sakura": [[0, 13]]}, "info": {"id": "pentect_708", "source": "pentect"}}
+{"text": "dial tcp cart-api:9092: connection refused", "spans": {"internal_url: cart-api": [[9, 17]]}, "info": {"id": "pentect_709", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"inventory\"} 14820", "spans": {"internal_url: inventory": [[35, 44]]}, "info": {"id": "pentect_710", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'warehouse-api' AND status = 'degraded'", "spans": {"internal_url: warehouse-api": [[43, 56]]}, "info": {"id": "pentect_711", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'refund-core' AND status = 'degraded'", "spans": {"internal_url: refund-core": [[43, 54]]}, "info": {"id": "pentect_712", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '8vQ1oWVfhUQJ83blTFtRzdZ';", "spans": {"secret: 8vQ1oWVfhUQJ83blTFtRzdZ": [[24, 47]]}, "info": {"id": "pentect_713", "source": "pentect"}}
+{"text": "Sato Taro が session-store のレイテンシ悪化を調査中(token AyfHUoMrsLmyosDL6k0gPIKIv で再現)", "spans": {"private_person: Sato Taro": [[0, 9]], "internal_url: session-store": [[12, 25]], "secret: AyfHUoMrsLmyosDL6k0gPIKIv": [[45, 70]]}, "info": {"id": "pentect_714", "source": "pentect"}}
+{"text": "customer #479294 reported the incident", "spans": {"account_number: 479294": [[10, 16]]}, "info": {"id": "pentect_715", "source": "pentect"}}
+{"text": "Reported by Alice Wilson after escalation from on-call", "spans": {"private_person: Alice Wilson": [[12, 24]]}, "info": {"id": "pentect_716", "source": "pentect"}}
+{"text": "curl -sSf http://shipping-core/healthz || echo 'down'", "spans": {"internal_url: shipping-core": [[17, 30]]}, "info": {"id": "pentect_717", "source": "pentect"}}
+{"text": "the deploy used key TK-XT8S7I5-P9BAAU issued by the platform ops for Dan Wilson", "spans": {"secret: TK-XT8S7I5-P9BAAU": [[20, 37]], "private_person: Dan Wilson": [[69, 79]]}, "info": {"id": "pentect_718", "source": "pentect"}}
+{"text": "dial tcp session-store:9092: connection refused", "spans": {"internal_url: session-store": [[9, 22]]}, "info": {"id": "pentect_719", "source": "pentect"}}
+{"text": "issue 23446 was closed after the rollback", "spans": {"account_number: 23446": [[6, 11]]}, "info": {"id": "pentect_720", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: ZN-2C6KH1X-QYXWL9-5PAYJ3", "spans": {"secret: ZN-2C6KH1X-QYXWL9-5PAYJ3": [[15, 39]]}, "info": {"id": "pentect_721", "source": "pentect"}}
+{"text": "Retrying request to rec-engine after timeout", "spans": {"internal_url: rec-engine": [[20, 30]]}, "info": {"id": "pentect_722", "source": "pentect"}}
+{"text": "backend_service_upstream(refund-core, retries=3)", "spans": {"internal_url: refund-core": [[25, 36]]}, "info": {"id": "pentect_723", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"auth-gateway\" { cluster_ip = \"None\" }", "spans": {"internal_url: auth-gateway": [[31, 43]]}, "info": {"id": "pentect_724", "source": "pentect"}}
+{"text": "val := 'BnWRoKtkoUqKkkwG7'  // injected at boot", "spans": {"secret: BnWRoKtkoUqKkkwG7": [[8, 25]]}, "info": {"id": "pentect_725", "source": "pentect"}}
+{"text": "dial tcp reporting:9092: connection refused", "spans": {"internal_url: reporting": [[9, 18]]}, "info": {"id": "pentect_726", "source": "pentect"}}
+{"text": "ENV UPSTREAM=session-store API_TOKEN=Z9-LDZ5J-84DEH", "spans": {"internal_url: session-store": [[13, 26]], "secret: Z9-LDZ5J-84DEH": [[37, 51]]}, "info": {"id": "pentect_727", "source": "pentect"}}
+{"text": "coupon-svc へのリクエストが 339943 回連続で失敗しました。担当 Takahashi Yuki に共有済み。", "spans": {"internal_url: coupon-svc": [[0, 10]], "account_number: 339943": [[20, 26]], "private_person: Takahashi Yuki": [[41, 55]]}, "info": {"id": "pentect_728", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"warehouse-api\"} 14820", "spans": {"internal_url: warehouse-api": [[35, 48]]}, "info": {"id": "pentect_729", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'dVU3KCJwx4alNcdp5x';", "spans": {"secret: dVU3KCJwx4alNcdp5x": [[24, 42]]}, "info": {"id": "pentect_730", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'k960mSfF5kku9xEb';", "spans": {"secret: k960mSfF5kku9xEb": [[24, 40]]}, "info": {"id": "pentect_731", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'Qm7rvmvYT5oSBNKWe45bpcN';", "spans": {"secret: Qm7rvmvYT5oSBNKWe45bpcN": [[24, 47]]}, "info": {"id": "pentect_732", "source": "pentect"}}
+{"text": "customer #319013 reported the incident", "spans": {"account_number: 319013": [[10, 16]]}, "info": {"id": "pentect_733", "source": "pentect"}}
+{"text": "span attribute upstream.service=orders attached to trace 260478", "spans": {"internal_url: orders": [[32, 38]], "account_number: 260478": [[57, 63]]}, "info": {"id": "pentect_734", "source": "pentect"}}
+{"text": "Reported by Dan Wilson after escalation from on-call", "spans": {"private_person: Dan Wilson": [[12, 22]]}, "info": {"id": "pentect_735", "source": "pentect"}}
+{"text": "route add 172.19.60.21 via gw-01 metric 10", "spans": {"internal_ip: 172.19.60.21": [[10, 22]]}, "info": {"id": "pentect_736", "source": "pentect"}}
+{"text": "connected to reporting:5432 successfully", "spans": {"internal_url: reporting": [[13, 22]]}, "info": {"id": "pentect_737", "source": "pentect"}}
+{"text": "Reported by Carol Davis after escalation from on-call", "spans": {"private_person: Carol Davis": [[12, 23]]}, "info": {"id": "pentect_738", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'coupon-svc' AND status = 'degraded'", "spans": {"internal_url: coupon-svc": [[43, 53]]}, "info": {"id": "pentect_739", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: HX-GX8R6HO1-I2HUXMO-XRAZMSA-M7YB", "spans": {"secret: HX-GX8R6HO1-I2HUXMO-XRAZMSA-M7YB": [[15, 47]]}, "info": {"id": "pentect_740", "source": "pentect"}}
+{"text": "backend_service_upstream(doc-store, retries=3)", "spans": {"internal_url: doc-store": [[25, 34]]}, "info": {"id": "pentect_741", "source": "pentect"}}
+{"text": "Retrying request to orders after timeout", "spans": {"internal_url: orders": [[20, 26]]}, "info": {"id": "pentect_742", "source": "pentect"}}
+{"text": "Reported by Grace Brown after escalation from on-call", "spans": {"private_person: Grace Brown": [[12, 23]]}, "info": {"id": "pentect_743", "source": "pentect"}}
+{"text": "issue 854808 was closed after the rollback", "spans": {"account_number: 854808": [[6, 12]]}, "info": {"id": "pentect_744", "source": "pentect"}}
+{"text": "config.token = \"HX-ODN65SWS-ZENPT-H3JWBXZW-Y5TG\"  # provisioned by platform team", "spans": {"secret: HX-ODN65SWS-ZENPT-H3JWBXZW-Y5TG": [[16, 47]]}, "info": {"id": "pentect_745", "source": "pentect"}}
+{"text": "orders へのリクエストが 646733 回連続で失敗しました。担当 Takahashi Kenji に共有済み。", "spans": {"internal_url: orders": [[0, 6]], "account_number: 646733": [[16, 22]], "private_person: Takahashi Kenji": [[37, 52]]}, "info": {"id": "pentect_746", "source": "pentect"}}
+{"text": "val := 'uPW4P5OAhGM7DDua'  // injected at boot", "spans": {"secret: uPW4P5OAhGM7DDua": [[8, 24]]}, "info": {"id": "pentect_747", "source": "pentect"}}
+{"text": "catalog,prod,owner=Hank Davis,last_deploy=2025-11-03", "spans": {"internal_url: catalog": [[0, 7]], "private_person: Hank Davis": [[19, 29]]}, "info": {"id": "pentect_748", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'It2krj3VYHaRFxSMS';", "spans": {"secret: It2krj3VYHaRFxSMS": [[24, 41]]}, "info": {"id": "pentect_749", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'eQhA1SAtPySGJTD5kTFlC8NhEO3I';", "spans": {"secret: eQhA1SAtPySGJTD5kTFlC8NhEO3I": [[24, 52]]}, "info": {"id": "pentect_750", "source": "pentect"}}
+{"text": "Tanaka Taro が reporting のレイテンシ悪化を調査中(token fLaZADAPm1mXy1tIl3kta で再現)", "spans": {"private_person: Tanaka Taro": [[0, 11]], "internal_url: reporting": [[14, 23]], "secret: fLaZADAPm1mXy1tIl3kta": [[43, 64]]}, "info": {"id": "pentect_751", "source": "pentect"}}
+{"text": "connected to coupon-svc:5432 successfully", "spans": {"internal_url: coupon-svc": [[13, 23]]}, "info": {"id": "pentect_752", "source": "pentect"}}
+{"text": "node coupon-svc (172.17.198.132) joined the pool", "spans": {"internal_url: coupon-svc": [[5, 15]], "internal_ip: 172.17.198.132": [[17, 31]]}, "info": {"id": "pentect_753", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: CORP-YZ5SCZ-E5J7O", "spans": {"secret: CORP-YZ5SCZ-E5J7O": [[15, 32]]}, "info": {"id": "pentect_754", "source": "pentect"}}
+{"text": "Retrying request to tax-calc after timeout", "spans": {"internal_url: tax-calc": [[20, 28]]}, "info": {"id": "pentect_755", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'IGT-J5LM9YU-FK46W-1Y2D6UN'", "spans": {"secret: IGT-J5LM9YU-FK46W-1Y2D6UN": [[26, 51]]}, "info": {"id": "pentect_756", "source": "pentect"}}
+{"text": "config.token = \"Z9-YT9L6TWR-V3TGA\"  # provisioned by platform team", "spans": {"secret: Z9-YT9L6TWR-V3TGA": [[16, 33]]}, "info": {"id": "pentect_757", "source": "pentect"}}
+{"text": "config.token = \"IGT-SM0D48-YXSD5\"  # provisioned by platform team", "spans": {"secret: IGT-SM0D48-YXSD5": [[16, 32]]}, "info": {"id": "pentect_758", "source": "pentect"}}
+{"text": "ENV UPSTREAM=fulfillment API_TOKEN=Z9-D5L8-JZV07-7OCE3", "spans": {"internal_url: fulfillment": [[13, 24]], "secret: Z9-D5L8-JZV07-7OCE3": [[35, 54]]}, "info": {"id": "pentect_759", "source": "pentect"}}
+{"text": "ENV UPSTREAM=catalog API_TOKEN=TK-XLHY4UXM-NW60JSCT-F8RDZRQ", "spans": {"internal_url: catalog": [[13, 20]], "secret: TK-XLHY4UXM-NW60JSCT-F8RDZRQ": [[31, 59]]}, "info": {"id": "pentect_760", "source": "pentect"}}
+{"text": "Retrying request to reporting after timeout", "spans": {"internal_url: reporting": [[20, 29]]}, "info": {"id": "pentect_761", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: TK-ECP3-DIXS5", "spans": {"secret: TK-ECP3-DIXS5": [[15, 28]]}, "info": {"id": "pentect_762", "source": "pentect"}}
+{"text": "issue 137553 was closed after the rollback", "spans": {"account_number: 137553": [[6, 12]]}, "info": {"id": "pentect_763", "source": "pentect"}}
+{"text": "node kyc-v3 (172.23.151.211) joined the pool", "spans": {"internal_url: kyc-v3": [[5, 11]], "internal_ip: 172.23.151.211": [[13, 27]]}, "info": {"id": "pentect_764", "source": "pentect"}}
+{"text": "tax-calc,prod,owner=Frank Davis,last_deploy=2025-11-03", "spans": {"internal_url: tax-calc": [[0, 8]], "private_person: Frank Davis": [[20, 31]]}, "info": {"id": "pentect_765", "source": "pentect"}}
+{"text": "Retrying request to coupon-svc after timeout", "spans": {"internal_url: coupon-svc": [[20, 30]]}, "info": {"id": "pentect_766", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'IGT-IFEUO4W2-NA0B'", "spans": {"secret: IGT-IFEUO4W2-NA0B": [[26, 43]]}, "info": {"id": "pentect_767", "source": "pentect"}}
+{"text": "connected to cart-api:5432 successfully", "spans": {"internal_url: cart-api": [[13, 21]]}, "info": {"id": "pentect_768", "source": "pentect"}}
+{"text": "Tanaka Hanako が search-core のレイテンシ悪化を調査中(token GbONqILIzrg5kgSwNiKmKDi3sx で再現)", "spans": {"private_person: Tanaka Hanako": [[0, 13]], "internal_url: search-core": [[16, 27]], "secret: GbONqILIzrg5kgSwNiKmKDi3sx": [[47, 73]]}, "info": {"id": "pentect_769", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'warehouse-api' AND status = 'degraded'", "spans": {"internal_url: warehouse-api": [[43, 56]]}, "info": {"id": "pentect_770", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'AEIoPcmYmFyNvNlyGxGH';", "spans": {"secret: AEIoPcmYmFyNvNlyGxGH": [[24, 44]]}, "info": {"id": "pentect_771", "source": "pentect"}}
+{"text": "customer #713031 reported the incident", "spans": {"account_number: 713031": [[10, 16]]}, "info": {"id": "pentect_772", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"fulfillment\" { cluster_ip = \"None\" }", "spans": {"internal_url: fulfillment": [[31, 42]]}, "info": {"id": "pentect_773", "source": "pentect"}}
+{"text": "Dan Davis opened #304370 against refund-core about the 500s", "spans": {"private_person: Dan Davis": [[0, 9]], "account_number: 304370": [[18, 24]], "internal_url: refund-core": [[33, 44]]}, "info": {"id": "pentect_774", "source": "pentect"}}
+{"text": "proxy -> shipping-core with x-internal-token gSKD8fTXJ4pmCgPKwoIaToDb (expires 60m)", "spans": {"internal_url: shipping-core": [[9, 22]], "secret: gSKD8fTXJ4pmCgPKwoIaToDb": [[45, 69]]}, "info": {"id": "pentect_775", "source": "pentect"}}
+{"text": "See ticket #635437 for the stack trace", "spans": {"account_number: 635437": [[12, 18]]}, "info": {"id": "pentect_776", "source": "pentect"}}
+{"text": "Reported by Hank Miller after escalation from on-call", "spans": {"private_person: Hank Miller": [[12, 23]]}, "info": {"id": "pentect_777", "source": "pentect"}}
+{"text": "the deploy used key Z9-NJ8A2E3W-IE9LAO-PKI4-BVQ4RK issued by the platform ops for Eve Johnson", "spans": {"secret: Z9-NJ8A2E3W-IE9LAO-PKI4-BVQ4RK": [[20, 50]], "private_person: Eve Johnson": [[82, 93]]}, "info": {"id": "pentect_778", "source": "pentect"}}
+{"text": "backend_service_upstream(tax-calc, retries=3)", "spans": {"internal_url: tax-calc": [[25, 33]]}, "info": {"id": "pentect_779", "source": "pentect"}}
+{"text": "dial tcp loyalty:9092: connection refused", "spans": {"internal_url: loyalty": [[9, 16]]}, "info": {"id": "pentect_780", "source": "pentect"}}
+{"text": "backend_service_upstream(batch-runner, retries=3)", "spans": {"internal_url: batch-runner": [[25, 37]]}, "info": {"id": "pentect_781", "source": "pentect"}}
+{"text": "See ticket #173975 for the stack trace", "spans": {"account_number: 173975": [[12, 18]]}, "info": {"id": "pentect_782", "source": "pentect"}}
+{"text": "curl -sSf http://reporting/healthz || echo 'down'", "spans": {"internal_url: reporting": [[17, 26]]}, "info": {"id": "pentect_783", "source": "pentect"}}
+{"text": "kubectl port-forward svc/cart-api 8080:80 -n platform", "spans": {"internal_url: cart-api": [[25, 33]]}, "info": {"id": "pentect_784", "source": "pentect"}}
+{"text": "curl -sSf http://warehouse-api/healthz || echo 'down'", "spans": {"internal_url: warehouse-api": [[17, 30]]}, "info": {"id": "pentect_785", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'tax-calc' AND status = 'degraded'", "spans": {"internal_url: tax-calc": [[43, 51]]}, "info": {"id": "pentect_786", "source": "pentect"}}
+{"text": "ENV UPSTREAM=auth-gateway API_TOKEN=CORP-V6LR0LU-7BQ0U7-CNXLE9", "spans": {"internal_url: auth-gateway": [[13, 25]], "secret: CORP-V6LR0LU-7BQ0U7-CNXLE9": [[36, 62]]}, "info": {"id": "pentect_787", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '7f2Fq0NtgP6rUIo9t39';", "spans": {"secret: 7f2Fq0NtgP6rUIo9t39": [[24, 43]]}, "info": {"id": "pentect_788", "source": "pentect"}}
+{"text": "Eve Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Eve Johnson": [[0, 11]]}, "info": {"id": "pentect_789", "source": "pentect"}}
+{"text": "payments-core へのリクエストが 65580 回連続で失敗しました。担当 Ito Aoi に共有済み。", "spans": {"internal_url: payments-core": [[0, 13]], "account_number: 65580": [[23, 28]], "private_person: Ito Aoi": [[43, 50]]}, "info": {"id": "pentect_790", "source": "pentect"}}
+{"text": "Retrying request to session-store after timeout", "spans": {"internal_url: session-store": [[20, 33]]}, "info": {"id": "pentect_791", "source": "pentect"}}
+{"text": "tmp = \"2ViFVzpFVMcFePkTZ6ldr\"; sendAuth(tmp)", "spans": {"secret: 2ViFVzpFVMcFePkTZ6ldr": [[7, 28]]}, "info": {"id": "pentect_792", "source": "pentect"}}
+{"text": "span attribute upstream.service=cron-svc attached to trace 386894", "spans": {"internal_url: cron-svc": [[32, 40]], "account_number: 386894": [[59, 65]]}, "info": {"id": "pentect_793", "source": "pentect"}}
+{"text": "tmp = \"0gq5x482JbiI0GFKKwPSrKis\"; sendAuth(tmp)", "spans": {"secret: 0gq5x482JbiI0GFKKwPSrKis": [[7, 31]]}, "info": {"id": "pentect_794", "source": "pentect"}}
+{"text": "connected to loyalty:5432 successfully", "spans": {"internal_url: loyalty": [[13, 20]]}, "info": {"id": "pentect_795", "source": "pentect"}}
+{"text": "upstream host = media-proxy  # k8s service dns", "spans": {"internal_url: media-proxy": [[16, 27]]}, "info": {"id": "pentect_796", "source": "pentect"}}
+{"text": "proxy -> kyc-v3 with x-internal-token zlOKO8vYmrPSVB (expires 60m)", "spans": {"internal_url: kyc-v3": [[9, 15]], "secret: zlOKO8vYmrPSVB": [[38, 52]]}, "info": {"id": "pentect_797", "source": "pentect"}}
+{"text": "proxy -> cdn-origin with x-internal-token VkpF0T5hi4kEY6ALej0JF (expires 60m)", "spans": {"internal_url: cdn-origin": [[9, 19]], "secret: VkpF0T5hi4kEY6ALej0JF": [[42, 63]]}, "info": {"id": "pentect_798", "source": "pentect"}}
+{"text": "backend_service_upstream(risk-engine, retries=3)", "spans": {"internal_url: risk-engine": [[25, 36]]}, "info": {"id": "pentect_799", "source": "pentect"}}
+{"text": "kubectl port-forward svc/tax-calc 8080:80 -n platform", "spans": {"internal_url: tax-calc": [[25, 33]]}, "info": {"id": "pentect_800", "source": "pentect"}}
+{"text": "route add 172.25.248.234 via gw-01 metric 10", "spans": {"internal_ip: 172.25.248.234": [[10, 24]]}, "info": {"id": "pentect_801", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'HX-NM5UN7-1X8L'", "spans": {"secret: HX-NM5UN7-1X8L": [[26, 40]]}, "info": {"id": "pentect_802", "source": "pentect"}}
+{"text": "kubectl port-forward svc/batch-runner 8080:80 -n platform", "spans": {"internal_url: batch-runner": [[25, 37]]}, "info": {"id": "pentect_803", "source": "pentect"}}
+{"text": "backend_service_upstream(catalog, retries=3)", "spans": {"internal_url: catalog": [[25, 32]]}, "info": {"id": "pentect_804", "source": "pentect"}}
+{"text": "curl -sSf http://cron-svc/healthz || echo 'down'", "spans": {"internal_url: cron-svc": [[17, 25]]}, "info": {"id": "pentect_805", "source": "pentect"}}
+{"text": "upstream host = doc-store  # k8s service dns", "spans": {"internal_url: doc-store": [[16, 25]]}, "info": {"id": "pentect_806", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'rB607jjyQMNagGBZWCt';", "spans": {"secret: rB607jjyQMNagGBZWCt": [[24, 43]]}, "info": {"id": "pentect_807", "source": "pentect"}}
+{"text": "See ticket #226422 for the stack trace", "spans": {"account_number: 226422": [[12, 18]]}, "info": {"id": "pentect_808", "source": "pentect"}}
+{"text": "dial tcp search-core:9092: connection refused", "spans": {"internal_url: search-core": [[9, 20]]}, "info": {"id": "pentect_809", "source": "pentect"}}
+{"text": "API_KEY: str = \"VgxjepqIhH25uJdmL2wwBUUVh\"  # loaded from vault", "spans": {"secret: VgxjepqIhH25uJdmL2wwBUUVh": [[16, 41]]}, "info": {"id": "pentect_810", "source": "pentect"}}
+{"text": "Ito Kenji-san asked for access to the staging cluster", "spans": {"private_person: Ito Kenji": [[0, 9]]}, "info": {"id": "pentect_811", "source": "pentect"}}
+{"text": "See ticket #135273 for the stack trace", "spans": {"account_number: 135273": [[12, 18]]}, "info": {"id": "pentect_812", "source": "pentect"}}
+{"text": "issue 91747 was closed after the rollback", "spans": {"account_number: 91747": [[6, 11]]}, "info": {"id": "pentect_813", "source": "pentect"}}
+{"text": "node shipping-core (172.19.161.57) joined the pool", "spans": {"internal_url: shipping-core": [[5, 18]], "internal_ip: 172.19.161.57": [[20, 33]]}, "info": {"id": "pentect_814", "source": "pentect"}}
+{"text": "doc-store,prod,owner=Eve Brown,last_deploy=2025-11-03", "spans": {"internal_url: doc-store": [[0, 9]], "private_person: Eve Brown": [[21, 30]]}, "info": {"id": "pentect_815", "source": "pentect"}}
+{"text": "tax-calc,prod,owner=Eve Davis,last_deploy=2025-11-03", "spans": {"internal_url: tax-calc": [[0, 8]], "private_person: Eve Davis": [[20, 29]]}, "info": {"id": "pentect_816", "source": "pentect"}}
+{"text": "connected to media-proxy:5432 successfully", "spans": {"internal_url: media-proxy": [[13, 24]]}, "info": {"id": "pentect_817", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"session-store\"} 14820", "spans": {"internal_url: session-store": [[35, 48]]}, "info": {"id": "pentect_818", "source": "pentect"}}
+{"text": "node ledger (172.30.215.215) joined the pool", "spans": {"internal_url: ledger": [[5, 11]], "internal_ip: 172.30.215.215": [[13, 27]]}, "info": {"id": "pentect_819", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'ZN-W56I9PY-J4B09UH-601S9BA'", "spans": {"secret: ZN-W56I9PY-J4B09UH-601S9BA": [[26, 52]]}, "info": {"id": "pentect_820", "source": "pentect"}}
+{"text": "curl -sSf http://shipping-core/healthz || echo 'down'", "spans": {"internal_url: shipping-core": [[17, 30]]}, "info": {"id": "pentect_821", "source": "pentect"}}
+{"text": "span attribute upstream.service=payments-core attached to trace 711312", "spans": {"internal_url: payments-core": [[32, 45]], "account_number: 711312": [[64, 70]]}, "info": {"id": "pentect_822", "source": "pentect"}}
+{"text": "Tanaka Kenji-san asked for access to the staging cluster", "spans": {"private_person: Tanaka Kenji": [[0, 12]]}, "info": {"id": "pentect_823", "source": "pentect"}}
+{"text": "proxy -> kyc-v3 with x-internal-token 2WESDPUEahOJAjruB9rmRaLE (expires 60m)", "spans": {"internal_url: kyc-v3": [[9, 15]], "secret: 2WESDPUEahOJAjruB9rmRaLE": [[38, 62]]}, "info": {"id": "pentect_824", "source": "pentect"}}
+{"text": "node reporting (172.19.146.198) joined the pool", "spans": {"internal_url: reporting": [[5, 14]], "internal_ip: 172.19.146.198": [[16, 30]]}, "info": {"id": "pentect_825", "source": "pentect"}}
+{"text": "customer #129723 reported the incident", "spans": {"account_number: 129723": [[10, 16]]}, "info": {"id": "pentect_826", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'refund-core' AND status = 'degraded'", "spans": {"internal_url: refund-core": [[43, 54]]}, "info": {"id": "pentect_827", "source": "pentect"}}
+{"text": "issue 721122 was closed after the rollback", "spans": {"account_number: 721122": [[6, 12]]}, "info": {"id": "pentect_828", "source": "pentect"}}
+{"text": "the deploy used key CORP-7CJB-10MVNIK2-94WOZ-R7VQFFZ issued by the platform ops for Bob Johnson", "spans": {"secret: CORP-7CJB-10MVNIK2-94WOZ-R7VQFFZ": [[20, 52]], "private_person: Bob Johnson": [[84, 95]]}, "info": {"id": "pentect_829", "source": "pentect"}}
+{"text": "Grace Miller opened #469944 against refund-core about the 500s", "spans": {"private_person: Grace Miller": [[0, 12]], "account_number: 469944": [[21, 27]], "internal_url: refund-core": [[36, 47]]}, "info": {"id": "pentect_830", "source": "pentect"}}
+{"text": "issue 557130 was closed after the rollback", "spans": {"account_number: 557130": [[6, 12]]}, "info": {"id": "pentect_831", "source": "pentect"}}
+{"text": "Retrying request to fulfillment after timeout", "spans": {"internal_url: fulfillment": [[20, 31]]}, "info": {"id": "pentect_832", "source": "pentect"}}
+{"text": "x = \"9w9MZ0NRAE3nXJ7K5tqC20cl1fX\"  # used by the billing worker", "spans": {"secret: 9w9MZ0NRAE3nXJ7K5tqC20cl1fX": [[5, 32]]}, "info": {"id": "pentect_833", "source": "pentect"}}
+{"text": "proxy -> pricing with x-internal-token L8p9wkE5XmxXTl (expires 60m)", "spans": {"internal_url: pricing": [[9, 16]], "secret: L8p9wkE5XmxXTl": [[39, 53]]}, "info": {"id": "pentect_834", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"loyalty\"} 14820", "spans": {"internal_url: loyalty": [[35, 42]]}, "info": {"id": "pentect_835", "source": "pentect"}}
+{"text": "span attribute upstream.service=auth-gateway attached to trace 91914", "spans": {"internal_url: auth-gateway": [[32, 44]], "account_number: 91914": [[63, 68]]}, "info": {"id": "pentect_836", "source": "pentect"}}
+{"text": "val := 'Gv695qmnRtQEaBBbCLj'  // injected at boot", "spans": {"secret: Gv695qmnRtQEaBBbCLj": [[8, 27]]}, "info": {"id": "pentect_837", "source": "pentect"}}
+{"text": "ENV UPSTREAM=orders API_TOKEN=CORP-3CE60JLD-VJLV-KNE8I-JCP1YB3Y", "spans": {"internal_url: orders": [[13, 19]], "secret: CORP-3CE60JLD-VJLV-KNE8I-JCP1YB3Y": [[30, 63]]}, "info": {"id": "pentect_838", "source": "pentect"}}
+{"text": "config.token = \"ZN-URD8-DUDUYM-1T4NB5GO\"  # provisioned by platform team", "spans": {"secret: ZN-URD8-DUDUYM-1T4NB5GO": [[16, 39]]}, "info": {"id": "pentect_839", "source": "pentect"}}
+{"text": "config.token = \"Z9-XNAM-YWS4\"  # provisioned by platform team", "spans": {"secret: Z9-XNAM-YWS4": [[16, 28]]}, "info": {"id": "pentect_840", "source": "pentect"}}
+{"text": "issue 386023 was closed after the rollback", "spans": {"account_number: 386023": [[6, 12]]}, "info": {"id": "pentect_841", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = '3P9mlEAVdeakMpN57EWNQqer';", "spans": {"secret: 3P9mlEAVdeakMpN57EWNQqer": [[24, 48]]}, "info": {"id": "pentect_842", "source": "pentect"}}
+{"text": "session-store へのリクエストが 161738 回連続で失敗しました。担当 Tanaka Yuki に共有済み。", "spans": {"internal_url: session-store": [[0, 13]], "account_number: 161738": [[23, 29]], "private_person: Tanaka Yuki": [[44, 55]]}, "info": {"id": "pentect_843", "source": "pentect"}}
+{"text": "Retrying request to orders after timeout", "spans": {"internal_url: orders": [[20, 26]]}, "info": {"id": "pentect_844", "source": "pentect"}}
+{"text": "connected to risk-engine:5432 successfully", "spans": {"internal_url: risk-engine": [[13, 24]]}, "info": {"id": "pentect_845", "source": "pentect"}}
+{"text": "config.token = \"HX-KNE4L-667HHFR\"  # provisioned by platform team", "spans": {"secret: HX-KNE4L-667HHFR": [[16, 32]]}, "info": {"id": "pentect_846", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: HX-PCBHBX-QUB7T-1TVV95KJ", "spans": {"secret: HX-PCBHBX-QUB7T-1TVV95KJ": [[15, 39]]}, "info": {"id": "pentect_847", "source": "pentect"}}
+{"text": "config.token = \"HX-UACI-RJFVOH-J6GOQLJ\"  # provisioned by platform team", "spans": {"secret: HX-UACI-RJFVOH-J6GOQLJ": [[16, 38]]}, "info": {"id": "pentect_848", "source": "pentect"}}
+{"text": "dial tcp orders:9092: connection refused", "spans": {"internal_url: orders": [[9, 15]]}, "info": {"id": "pentect_849", "source": "pentect"}}
+{"text": "Frank Davis confirmed the rollback at 03:12 JST", "spans": {"private_person: Frank Davis": [[0, 11]]}, "info": {"id": "pentect_850", "source": "pentect"}}
+{"text": "See ticket #993523 for the stack trace", "spans": {"account_number: 993523": [[12, 18]]}, "info": {"id": "pentect_851", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"kyc-v3\"} 14820", "spans": {"internal_url: kyc-v3": [[35, 41]]}, "info": {"id": "pentect_852", "source": "pentect"}}
+{"text": "tmp = \"yYFljFJSeWUJxe6M\"; sendAuth(tmp)", "spans": {"secret: yYFljFJSeWUJxe6M": [[7, 23]]}, "info": {"id": "pentect_853", "source": "pentect"}}
+{"text": "reporting へのリクエストが 236204 回連続で失敗しました。担当 Tanaka Kenji に共有済み。", "spans": {"internal_url: reporting": [[0, 9]], "account_number: 236204": [[19, 25]], "private_person: Tanaka Kenji": [[40, 52]]}, "info": {"id": "pentect_854", "source": "pentect"}}
+{"text": "upstream host = audit-trail  # k8s service dns", "spans": {"internal_url: audit-trail": [[16, 27]]}, "info": {"id": "pentect_855", "source": "pentect"}}
+{"text": "cron-svc へのリクエストが 707921 回連続で失敗しました。担当 Sato Kenji に共有済み。", "spans": {"internal_url: cron-svc": [[0, 8]], "account_number: 707921": [[18, 24]], "private_person: Sato Kenji": [[39, 49]]}, "info": {"id": "pentect_856", "source": "pentect"}}
+{"text": "span attribute upstream.service=warehouse-api attached to trace 815056", "spans": {"internal_url: warehouse-api": [[32, 45]], "account_number: 815056": [[64, 70]]}, "info": {"id": "pentect_857", "source": "pentect"}}
+{"text": "catalog へのリクエストが 239871 回連続で失敗しました。担当 Takahashi Aoi に共有済み。", "spans": {"internal_url: catalog": [[0, 7]], "account_number: 239871": [[17, 23]], "private_person: Takahashi Aoi": [[38, 51]]}, "info": {"id": "pentect_858", "source": "pentect"}}
+{"text": "dial tcp reporting:9092: connection refused", "spans": {"internal_url: reporting": [[9, 18]]}, "info": {"id": "pentect_859", "source": "pentect"}}
+{"text": "Watanabe Ren が pricing のレイテンシ悪化を調査中(token GV42FHJLor3dwi5E で再現)", "spans": {"private_person: Watanabe Ren": [[0, 12]], "internal_url: pricing": [[15, 22]], "secret: GV42FHJLor3dwi5E": [[42, 58]]}, "info": {"id": "pentect_860", "source": "pentect"}}
+{"text": "API_KEY: str = \"9GxYiRXWJ0FpSUdXDW5R\"  # loaded from vault", "spans": {"secret: 9GxYiRXWJ0FpSUdXDW5R": [[16, 36]]}, "info": {"id": "pentect_861", "source": "pentect"}}
+{"text": "connected to ledger:5432 successfully", "spans": {"internal_url: ledger": [[13, 19]]}, "info": {"id": "pentect_862", "source": "pentect"}}
+{"text": "config.token = \"ZN-HUUHU-AI75ML\"  # provisioned by platform team", "spans": {"secret: ZN-HUUHU-AI75ML": [[16, 31]]}, "info": {"id": "pentect_863", "source": "pentect"}}
+{"text": "span attribute upstream.service=invoice-gen attached to trace 542689", "spans": {"internal_url: invoice-gen": [[32, 43]], "account_number: 542689": [[62, 68]]}, "info": {"id": "pentect_864", "source": "pentect"}}
+{"text": "upstream host = catalog  # k8s service dns", "spans": {"internal_url: catalog": [[16, 23]]}, "info": {"id": "pentect_865", "source": "pentect"}}
+{"text": "val := 'pqv0Zxo6xBjxj21bhtJYIIbmbU'  // injected at boot", "spans": {"secret: pqv0Zxo6xBjxj21bhtJYIIbmbU": [[8, 34]]}, "info": {"id": "pentect_866", "source": "pentect"}}
+{"text": "config.token = \"TK-F0SV3-IQ76P-WJN5L3J-SFXUST\"  # provisioned by platform team", "spans": {"secret: TK-F0SV3-IQ76P-WJN5L3J-SFXUST": [[16, 45]]}, "info": {"id": "pentect_867", "source": "pentect"}}
+{"text": "val := 'FGxPWTkaQbYuHskZzqzfS1'  // injected at boot", "spans": {"secret: FGxPWTkaQbYuHskZzqzfS1": [[8, 30]]}, "info": {"id": "pentect_868", "source": "pentect"}}
+{"text": "Hank Johnson confirmed the rollback at 03:12 JST", "spans": {"private_person: Hank Johnson": [[0, 12]]}, "info": {"id": "pentect_869", "source": "pentect"}}
+{"text": "issue 419625 was closed after the rollback", "spans": {"account_number: 419625": [[6, 12]]}, "info": {"id": "pentect_870", "source": "pentect"}}
+{"text": "Suzuki Taro が warehouse-api のレイテンシ悪化を調査中(token 48fTQXQc6CKQZKfeilUv で再現)", "spans": {"private_person: Suzuki Taro": [[0, 11]], "internal_url: warehouse-api": [[14, 27]], "secret: 48fTQXQc6CKQZKfeilUv": [[47, 67]]}, "info": {"id": "pentect_871", "source": "pentect"}}
+{"text": "the deploy used key Z9-ZYFI-AT6R-CBBG8P issued by the platform ops for Grace Davis", "spans": {"secret: Z9-ZYFI-AT6R-CBBG8P": [[20, 39]], "private_person: Grace Davis": [[71, 82]]}, "info": {"id": "pentect_872", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"session-store\" { cluster_ip = \"None\" }", "spans": {"internal_url: session-store": [[31, 44]]}, "info": {"id": "pentect_873", "source": "pentect"}}
+{"text": "dial tcp kyc-v3:9092: connection refused", "spans": {"internal_url: kyc-v3": [[9, 15]]}, "info": {"id": "pentect_874", "source": "pentect"}}
+{"text": "config.token = \"TK-UOWJ-MFU2G-559Q-8B5G\"  # provisioned by platform team", "spans": {"secret: TK-UOWJ-MFU2G-559Q-8B5G": [[16, 39]]}, "info": {"id": "pentect_875", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"risk-engine\"} 14820", "spans": {"internal_url: risk-engine": [[35, 46]]}, "info": {"id": "pentect_876", "source": "pentect"}}
+{"text": "upstream host = doc-store  # k8s service dns", "spans": {"internal_url: doc-store": [[16, 25]]}, "info": {"id": "pentect_877", "source": "pentect"}}
+{"text": "Reported by Eve Johnson after escalation from on-call", "spans": {"private_person: Eve Johnson": [[12, 23]]}, "info": {"id": "pentect_878", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'JecjyODt05LRUAbhAYa8x';", "spans": {"secret: JecjyODt05LRUAbhAYa8x": [[24, 45]]}, "info": {"id": "pentect_879", "source": "pentect"}}
+{"text": "tmp = \"trKxrQkzZJVPuvVdmZHPRWwM7prg\"; sendAuth(tmp)", "spans": {"secret: trKxrQkzZJVPuvVdmZHPRWwM7prg": [[7, 35]]}, "info": {"id": "pentect_880", "source": "pentect"}}
+{"text": "tmp = \"tC9gMeqGbdU2foZQkhZKp\"; sendAuth(tmp)", "spans": {"secret: tC9gMeqGbdU2foZQkhZKp": [[7, 28]]}, "info": {"id": "pentect_881", "source": "pentect"}}
+{"text": "connected to coupon-svc:5432 successfully", "spans": {"internal_url: coupon-svc": [[13, 23]]}, "info": {"id": "pentect_882", "source": "pentect"}}
+{"text": "dial tcp coupon-svc:9092: connection refused", "spans": {"internal_url: coupon-svc": [[9, 19]]}, "info": {"id": "pentect_883", "source": "pentect"}}
+{"text": "backend_service_upstream(loyalty, retries=3)", "spans": {"internal_url: loyalty": [[25, 32]]}, "info": {"id": "pentect_884", "source": "pentect"}}
+{"text": "route add 172.19.203.9 via gw-01 metric 10", "spans": {"internal_ip: 172.19.203.9": [[10, 22]]}, "info": {"id": "pentect_885", "source": "pentect"}}
+{"text": "connected to coupon-svc:5432 successfully", "spans": {"internal_url: coupon-svc": [[13, 23]]}, "info": {"id": "pentect_886", "source": "pentect"}}
+{"text": "node batch-runner (172.24.120.248) joined the pool", "spans": {"internal_url: batch-runner": [[5, 17]], "internal_ip: 172.24.120.248": [[19, 33]]}, "info": {"id": "pentect_887", "source": "pentect"}}
+{"text": "connected to cron-svc:5432 successfully", "spans": {"internal_url: cron-svc": [[13, 21]]}, "info": {"id": "pentect_888", "source": "pentect"}}
+{"text": "issue 898662 was closed after the rollback", "spans": {"account_number: 898662": [[6, 12]]}, "info": {"id": "pentect_889", "source": "pentect"}}
+{"text": "issue 450629 was closed after the rollback", "spans": {"account_number: 450629": [[6, 12]]}, "info": {"id": "pentect_890", "source": "pentect"}}
+{"text": "See ticket #24855 for the stack trace", "spans": {"account_number: 24855": [[12, 17]]}, "info": {"id": "pentect_891", "source": "pentect"}}
+{"text": "kubectl port-forward svc/catalog 8080:80 -n platform", "spans": {"internal_url: catalog": [[25, 32]]}, "info": {"id": "pentect_892", "source": "pentect"}}
+{"text": "x = \"QqoiIQB5AEu891YTJVvM3V\"  # used by the billing worker", "spans": {"secret: QqoiIQB5AEu891YTJVvM3V": [[5, 27]]}, "info": {"id": "pentect_893", "source": "pentect"}}
+{"text": "ENV UPSTREAM=warehouse-api API_TOKEN=CORP-QD30-IGOI", "spans": {"internal_url: warehouse-api": [[13, 26]], "secret: CORP-QD30-IGOI": [[37, 51]]}, "info": {"id": "pentect_894", "source": "pentect"}}
+{"text": "dial tcp fulfillment:9092: connection refused", "spans": {"internal_url: fulfillment": [[9, 20]]}, "info": {"id": "pentect_895", "source": "pentect"}}
+{"text": "backend_service_upstream(refund-core, retries=3)", "spans": {"internal_url: refund-core": [[25, 36]]}, "info": {"id": "pentect_896", "source": "pentect"}}
+{"text": "the deploy used key ZN-3ANHR-JYZHGS50-0L58JQS-1OT0A issued by the platform ops for Eve Brown", "spans": {"secret: ZN-3ANHR-JYZHGS50-0L58JQS-1OT0A": [[20, 51]], "private_person: Eve Brown": [[83, 92]]}, "info": {"id": "pentect_897", "source": "pentect"}}
+{"text": "dial tcp risk-engine:9092: connection refused", "spans": {"internal_url: risk-engine": [[9, 20]]}, "info": {"id": "pentect_898", "source": "pentect"}}
+{"text": "customer #353080 reported the incident", "spans": {"account_number: 353080": [[10, 16]]}, "info": {"id": "pentect_899", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'media-proxy' AND status = 'degraded'", "spans": {"internal_url: media-proxy": [[43, 54]]}, "info": {"id": "pentect_900", "source": "pentect"}}
+{"text": "pricing へのリクエストが 164517 回連続で失敗しました。担当 Suzuki Yuki に共有済み。", "spans": {"internal_url: pricing": [[0, 7]], "account_number: 164517": [[17, 23]], "private_person: Suzuki Yuki": [[38, 49]]}, "info": {"id": "pentect_901", "source": "pentect"}}
+{"text": "ENV UPSTREAM=cart-api API_TOKEN=CORP-681D-TG5H-4CUC", "spans": {"internal_url: cart-api": [[13, 21]], "secret: CORP-681D-TG5H-4CUC": [[32, 51]]}, "info": {"id": "pentect_902", "source": "pentect"}}
+{"text": "customer #811652 reported the incident", "spans": {"account_number: 811652": [[10, 16]]}, "info": {"id": "pentect_903", "source": "pentect"}}
+{"text": "Reported by Frank Miller after escalation from on-call", "spans": {"private_person: Frank Miller": [[12, 24]]}, "info": {"id": "pentect_904", "source": "pentect"}}
+{"text": "connected to ledger:5432 successfully", "spans": {"internal_url: ledger": [[13, 19]]}, "info": {"id": "pentect_905", "source": "pentect"}}
+{"text": "proxy -> invoice-gen with x-internal-token mk7ZXB1n67Cb0LnyydD86IYfON7 (expires 60m)", "spans": {"internal_url: invoice-gen": [[9, 20]], "secret: mk7ZXB1n67Cb0LnyydD86IYfON7": [[43, 70]]}, "info": {"id": "pentect_906", "source": "pentect"}}
+{"text": "shipping-core,prod,owner=Eve Davis,last_deploy=2025-11-03", "spans": {"internal_url: shipping-core": [[0, 13]], "private_person: Eve Davis": [[25, 34]]}, "info": {"id": "pentect_907", "source": "pentect"}}
+{"text": "Reported by Frank Miller after escalation from on-call", "spans": {"private_person: Frank Miller": [[12, 24]]}, "info": {"id": "pentect_908", "source": "pentect"}}
+{"text": "upstream host = cart-api  # k8s service dns", "spans": {"internal_url: cart-api": [[16, 24]]}, "info": {"id": "pentect_909", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'myCjIrJm7jTG8TS2FGgyQ63SGrt';", "spans": {"secret: myCjIrJm7jTG8TS2FGgyQ63SGrt": [[24, 51]]}, "info": {"id": "pentect_910", "source": "pentect"}}
+{"text": "Suzuki Aoi-san asked for access to the staging cluster", "spans": {"private_person: Suzuki Aoi": [[0, 10]]}, "info": {"id": "pentect_911", "source": "pentect"}}
+{"text": "Tanaka Yuki-san asked for access to the staging cluster", "spans": {"private_person: Tanaka Yuki": [[0, 11]]}, "info": {"id": "pentect_912", "source": "pentect"}}
+{"text": "customer #321344 reported the incident", "spans": {"account_number: 321344": [[10, 16]]}, "info": {"id": "pentect_913", "source": "pentect"}}
+{"text": "tmp = \"qlRkrPQdkMgtXszLi1DRJ\"; sendAuth(tmp)", "spans": {"secret: qlRkrPQdkMgtXszLi1DRJ": [[7, 28]]}, "info": {"id": "pentect_914", "source": "pentect"}}
+{"text": "Reported by Eve Brown after escalation from on-call", "spans": {"private_person: Eve Brown": [[12, 21]]}, "info": {"id": "pentect_915", "source": "pentect"}}
+{"text": "tmp = \"DXiqttajlkhHybXtHn8k3oEn\"; sendAuth(tmp)", "spans": {"secret: DXiqttajlkhHybXtHn8k3oEn": [[7, 31]]}, "info": {"id": "pentect_916", "source": "pentect"}}
+{"text": "Tanaka Hanako が cron-svc のレイテンシ悪化を調査中(token SQlWvwsBjbdqFLQMEqp で再現)", "spans": {"private_person: Tanaka Hanako": [[0, 13]], "internal_url: cron-svc": [[16, 24]], "secret: SQlWvwsBjbdqFLQMEqp": [[44, 63]]}, "info": {"id": "pentect_917", "source": "pentect"}}
+{"text": "ENV UPSTREAM=invoice-gen API_TOKEN=Z9-4NBH944F-159O-32IX", "spans": {"internal_url: invoice-gen": [[13, 24]], "secret: Z9-4NBH944F-159O-32IX": [[35, 56]]}, "info": {"id": "pentect_918", "source": "pentect"}}
+{"text": "connected to session-store:5432 successfully", "spans": {"internal_url: session-store": [[13, 26]]}, "info": {"id": "pentect_919", "source": "pentect"}}
+{"text": "Ito Hanako が refund-core のレイテンシ悪化を調査中(token mZpTg5JXbWIF14HVHR で再現)", "spans": {"private_person: Ito Hanako": [[0, 10]], "internal_url: refund-core": [[13, 24]], "secret: mZpTg5JXbWIF14HVHR": [[44, 62]]}, "info": {"id": "pentect_920", "source": "pentect"}}
+{"text": "kubectl port-forward svc/payments-core 8080:80 -n platform", "spans": {"internal_url: payments-core": [[25, 38]]}, "info": {"id": "pentect_921", "source": "pentect"}}
+{"text": "backend_service_upstream(rec-engine, retries=3)", "spans": {"internal_url: rec-engine": [[25, 35]]}, "info": {"id": "pentect_922", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'fulfillment' AND status = 'degraded'", "spans": {"internal_url: fulfillment": [[43, 54]]}, "info": {"id": "pentect_923", "source": "pentect"}}
+{"text": "Sato Sakura-san asked for access to the staging cluster", "spans": {"private_person: Sato Sakura": [[0, 11]]}, "info": {"id": "pentect_924", "source": "pentect"}}
+{"text": "Ito Kenji-san asked for access to the staging cluster", "spans": {"private_person: Ito Kenji": [[0, 9]]}, "info": {"id": "pentect_925", "source": "pentect"}}
+{"text": "dial tcp batch-runner:9092: connection refused", "spans": {"internal_url: batch-runner": [[9, 21]]}, "info": {"id": "pentect_926", "source": "pentect"}}
+{"text": "shipping-core,prod,owner=Eve Miller,last_deploy=2025-11-03", "spans": {"internal_url: shipping-core": [[0, 13]], "private_person: Eve Miller": [[25, 35]]}, "info": {"id": "pentect_927", "source": "pentect"}}
+{"text": "Retrying request to coupon-svc after timeout", "spans": {"internal_url: coupon-svc": [[20, 30]]}, "info": {"id": "pentect_928", "source": "pentect"}}
+{"text": "the deploy used key IGT-VX974PP-WLDT issued by the platform ops for Dan Johnson", "spans": {"secret: IGT-VX974PP-WLDT": [[20, 36]], "private_person: Dan Johnson": [[68, 79]]}, "info": {"id": "pentect_929", "source": "pentect"}}
+{"text": "backend_service_upstream(kyc-v3, retries=3)", "spans": {"internal_url: kyc-v3": [[25, 31]]}, "info": {"id": "pentect_930", "source": "pentect"}}
+{"text": "batch-runner へのリクエストが 622115 回連続で失敗しました。担当 Watanabe Ren に共有済み。", "spans": {"internal_url: batch-runner": [[0, 12]], "account_number: 622115": [[22, 28]], "private_person: Watanabe Ren": [[43, 55]]}, "info": {"id": "pentect_931", "source": "pentect"}}
+{"text": "upstream host = inventory  # k8s service dns", "spans": {"internal_url: inventory": [[16, 25]]}, "info": {"id": "pentect_932", "source": "pentect"}}
+{"text": "curl -sSf http://ledger/healthz || echo 'down'", "spans": {"internal_url: ledger": [[17, 23]]}, "info": {"id": "pentect_933", "source": "pentect"}}
+{"text": "kubectl port-forward svc/doc-store 8080:80 -n platform", "spans": {"internal_url: doc-store": [[25, 34]]}, "info": {"id": "pentect_934", "source": "pentect"}}
+{"text": "span attribute upstream.service=reporting attached to trace 310477", "spans": {"internal_url: reporting": [[32, 41]], "account_number: 310477": [[60, 66]]}, "info": {"id": "pentect_935", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'HYKXYcJzbT52zsGxGsklCyv';", "spans": {"secret: HYKXYcJzbT52zsGxGsklCyv": [[24, 47]]}, "info": {"id": "pentect_936", "source": "pentect"}}
+{"text": "customer #369274 reported the incident", "spans": {"account_number: 369274": [[10, 16]]}, "info": {"id": "pentect_937", "source": "pentect"}}
+{"text": "See ticket #391309 for the stack trace", "spans": {"account_number: 391309": [[12, 18]]}, "info": {"id": "pentect_938", "source": "pentect"}}
+{"text": "audit-trail へのリクエストが 741582 回連続で失敗しました。担当 Watanabe Ren に共有済み。", "spans": {"internal_url: audit-trail": [[0, 11]], "account_number: 741582": [[21, 27]], "private_person: Watanabe Ren": [[42, 54]]}, "info": {"id": "pentect_939", "source": "pentect"}}
+{"text": "Reported by Bob Miller after escalation from on-call", "spans": {"private_person: Bob Miller": [[12, 22]]}, "info": {"id": "pentect_940", "source": "pentect"}}
+{"text": "connected to invoice-gen:5432 successfully", "spans": {"internal_url: invoice-gen": [[13, 24]]}, "info": {"id": "pentect_941", "source": "pentect"}}
+{"text": "x = \"3v6SKzENeZ07lzSsZE\"  # used by the billing worker", "spans": {"secret: 3v6SKzENeZ07lzSsZE": [[5, 23]]}, "info": {"id": "pentect_942", "source": "pentect"}}
+{"text": "Eve Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Eve Smith": [[0, 9]]}, "info": {"id": "pentect_943", "source": "pentect"}}
+{"text": "issue 679766 was closed after the rollback", "spans": {"account_number: 679766": [[6, 12]]}, "info": {"id": "pentect_944", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"reporting\"} 14820", "spans": {"internal_url: reporting": [[35, 44]]}, "info": {"id": "pentect_945", "source": "pentect"}}
+{"text": "the deploy used key CORP-DYFZ54-3KOMPO0N-DJ6YI7J issued by the platform ops for Grace Davis", "spans": {"secret: CORP-DYFZ54-3KOMPO0N-DJ6YI7J": [[20, 48]], "private_person: Grace Davis": [[80, 91]]}, "info": {"id": "pentect_946", "source": "pentect"}}
+{"text": "Ito Kenji-san asked for access to the staging cluster", "spans": {"private_person: Ito Kenji": [[0, 9]]}, "info": {"id": "pentect_947", "source": "pentect"}}
+{"text": "issue 654256 was closed after the rollback", "spans": {"account_number: 654256": [[6, 12]]}, "info": {"id": "pentect_948", "source": "pentect"}}
+{"text": "span attribute upstream.service=coupon-svc attached to trace 963587", "spans": {"internal_url: coupon-svc": [[32, 42]], "account_number: 963587": [[61, 67]]}, "info": {"id": "pentect_949", "source": "pentect"}}
+{"text": "Alice Brown opened #154708 against fulfillment about the 500s", "spans": {"private_person: Alice Brown": [[0, 11]], "account_number: 154708": [[20, 26]], "internal_url: fulfillment": [[35, 46]]}, "info": {"id": "pentect_950", "source": "pentect"}}
+{"text": "node catalog (172.27.3.21) joined the pool", "spans": {"internal_url: catalog": [[5, 12]], "internal_ip: 172.27.3.21": [[14, 25]]}, "info": {"id": "pentect_951", "source": "pentect"}}
+{"text": "Retrying request to invoice-gen after timeout", "spans": {"internal_url: invoice-gen": [[20, 31]]}, "info": {"id": "pentect_952", "source": "pentect"}}
+{"text": "route add 172.26.134.122 via gw-01 metric 10", "spans": {"internal_ip: 172.26.134.122": [[10, 24]]}, "info": {"id": "pentect_953", "source": "pentect"}}
+{"text": "Retrying request to refund-core after timeout", "spans": {"internal_url: refund-core": [[20, 31]]}, "info": {"id": "pentect_954", "source": "pentect"}}
+{"text": "node billing-svc (172.24.64.207) joined the pool", "spans": {"internal_url: billing-svc": [[5, 16]], "internal_ip: 172.24.64.207": [[18, 31]]}, "info": {"id": "pentect_955", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: TK-U3LEIF0-KIYLX5-CRRB-3LFL4", "spans": {"secret: TK-U3LEIF0-KIYLX5-CRRB-3LFL4": [[15, 43]]}, "info": {"id": "pentect_956", "source": "pentect"}}
+{"text": "route add 172.27.97.140 via gw-01 metric 10", "spans": {"internal_ip: 172.27.97.140": [[10, 23]]}, "info": {"id": "pentect_957", "source": "pentect"}}
+{"text": "API_KEY: str = \"NgbSTW0BoZTAkwnV0W1t\"  # loaded from vault", "spans": {"secret: NgbSTW0BoZTAkwnV0W1t": [[16, 36]]}, "info": {"id": "pentect_958", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'qiofIPRjAlNK2Rsyo3rrDKlNz';", "spans": {"secret: qiofIPRjAlNK2Rsyo3rrDKlNz": [[24, 49]]}, "info": {"id": "pentect_959", "source": "pentect"}}
+{"text": "curl -sSf http://tax-calc/healthz || echo 'down'", "spans": {"internal_url: tax-calc": [[17, 25]]}, "info": {"id": "pentect_960", "source": "pentect"}}
+{"text": "span attribute upstream.service=invoice-gen attached to trace 220445", "spans": {"internal_url: invoice-gen": [[32, 43]], "account_number: 220445": [[62, 68]]}, "info": {"id": "pentect_961", "source": "pentect"}}
+{"text": "API_KEY: str = \"hFFOSTYUWpOGknNZ4\"  # loaded from vault", "spans": {"secret: hFFOSTYUWpOGknNZ4": [[16, 33]]}, "info": {"id": "pentect_962", "source": "pentect"}}
+{"text": "API_KEY: str = \"lNhq0OCCgIU4JiP52MAw\"  # loaded from vault", "spans": {"secret: lNhq0OCCgIU4JiP52MAw": [[16, 36]]}, "info": {"id": "pentect_963", "source": "pentect"}}
+{"text": "customer #717160 reported the incident", "spans": {"account_number: 717160": [[10, 16]]}, "info": {"id": "pentect_964", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"cron-svc\"} 14820", "spans": {"internal_url: cron-svc": [[35, 43]]}, "info": {"id": "pentect_965", "source": "pentect"}}
+{"text": "tmp = \"gACjYpz4UncCG6mnVTKeFUP\"; sendAuth(tmp)", "spans": {"secret: gACjYpz4UncCG6mnVTKeFUP": [[7, 30]]}, "info": {"id": "pentect_966", "source": "pentect"}}
+{"text": "connected to risk-engine:5432 successfully", "spans": {"internal_url: risk-engine": [[13, 24]]}, "info": {"id": "pentect_967", "source": "pentect"}}
+{"text": "catalog,prod,owner=Carol Davis,last_deploy=2025-11-03", "spans": {"internal_url: catalog": [[0, 7]], "private_person: Carol Davis": [[19, 30]]}, "info": {"id": "pentect_968", "source": "pentect"}}
+{"text": "x = \"Q3CS5sjUiq2QYKzSY3gL6Rzc\"  # used by the billing worker", "spans": {"secret: Q3CS5sjUiq2QYKzSY3gL6Rzc": [[5, 29]]}, "info": {"id": "pentect_969", "source": "pentect"}}
+{"text": "kubectl port-forward svc/reporting 8080:80 -n platform", "spans": {"internal_url: reporting": [[25, 34]]}, "info": {"id": "pentect_970", "source": "pentect"}}
+{"text": "customer #330373 reported the incident", "spans": {"account_number: 330373": [[10, 16]]}, "info": {"id": "pentect_971", "source": "pentect"}}
+{"text": "API_KEY: str = \"7mO3QTNLtsWYV6Y5c81IxHk4\"  # loaded from vault", "spans": {"secret: 7mO3QTNLtsWYV6Y5c81IxHk4": [[16, 40]]}, "info": {"id": "pentect_972", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'frjTC7pDRyhqoNmcV4Gq1jndJ4Y';", "spans": {"secret: frjTC7pDRyhqoNmcV4Gq1jndJ4Y": [[24, 51]]}, "info": {"id": "pentect_973", "source": "pentect"}}
+{"text": "config.token = \"CORP-2476-81EWHVF1-5BY2B-OAFKBFQ1\"  # provisioned by platform team", "spans": {"secret: CORP-2476-81EWHVF1-5BY2B-OAFKBFQ1": [[16, 49]]}, "info": {"id": "pentect_974", "source": "pentect"}}
+{"text": "span attribute upstream.service=tax-calc attached to trace 846202", "spans": {"internal_url: tax-calc": [[32, 40]], "account_number: 846202": [[59, 65]]}, "info": {"id": "pentect_975", "source": "pentect"}}
+{"text": "Sato Yuki が pricing のレイテンシ悪化を調査中(token NKdQi8GMlaVCmH32ub8nmy4 で再現)", "spans": {"private_person: Sato Yuki": [[0, 9]], "internal_url: pricing": [[12, 19]], "secret: NKdQi8GMlaVCmH32ub8nmy4": [[39, 62]]}, "info": {"id": "pentect_976", "source": "pentect"}}
+{"text": "Frank Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Frank Smith": [[0, 11]]}, "info": {"id": "pentect_977", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"pricing\"} 14820", "spans": {"internal_url: pricing": [[35, 42]]}, "info": {"id": "pentect_978", "source": "pentect"}}
+{"text": "API_KEY: str = \"hF2dMkRoMqyHosQyjVFG\"  # loaded from vault", "spans": {"secret: hF2dMkRoMqyHosQyjVFG": [[16, 36]]}, "info": {"id": "pentect_979", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'rec-engine' AND status = 'degraded'", "spans": {"internal_url: rec-engine": [[43, 53]]}, "info": {"id": "pentect_980", "source": "pentect"}}
+{"text": "cart-api,prod,owner=Carol Brown,last_deploy=2025-11-03", "spans": {"internal_url: cart-api": [[0, 8]], "private_person: Carol Brown": [[20, 31]]}, "info": {"id": "pentect_981", "source": "pentect"}}
+{"text": "orders へのリクエストが 168474 回連続で失敗しました。担当 Tanaka Ren に共有済み。", "spans": {"internal_url: orders": [[0, 6]], "account_number: 168474": [[16, 22]], "private_person: Tanaka Ren": [[37, 47]]}, "info": {"id": "pentect_982", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"ledger\" { cluster_ip = \"None\" }", "spans": {"internal_url: ledger": [[31, 37]]}, "info": {"id": "pentect_983", "source": "pentect"}}
+{"text": "the deploy used key IGT-0X1A-SUUXHXXD issued by the platform ops for Frank Brown", "spans": {"secret: IGT-0X1A-SUUXHXXD": [[20, 37]], "private_person: Frank Brown": [[69, 80]]}, "info": {"id": "pentect_984", "source": "pentect"}}
+{"text": "See ticket #659874 for the stack trace", "spans": {"account_number: 659874": [[12, 18]]}, "info": {"id": "pentect_985", "source": "pentect"}}
+{"text": "route add 172.18.96.167 via gw-01 metric 10", "spans": {"internal_ip: 172.18.96.167": [[10, 23]]}, "info": {"id": "pentect_986", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'NBNvfEznXYddhK2Y1Az75kWWFZ8n';", "spans": {"secret: NBNvfEznXYddhK2Y1Az75kWWFZ8n": [[24, 52]]}, "info": {"id": "pentect_987", "source": "pentect"}}
+{"text": "span attribute upstream.service=ledger attached to trace 404561", "spans": {"internal_url: ledger": [[32, 38]], "account_number: 404561": [[57, 63]]}, "info": {"id": "pentect_988", "source": "pentect"}}
+{"text": "kubectl port-forward svc/coupon-svc 8080:80 -n platform", "spans": {"internal_url: coupon-svc": [[25, 35]]}, "info": {"id": "pentect_989", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'JEmsHRyU9IqBaTJ15trg8Zx';", "spans": {"secret: JEmsHRyU9IqBaTJ15trg8Zx": [[24, 47]]}, "info": {"id": "pentect_990", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'jPQ2uehnGnQLqMfPDl1Lp';", "spans": {"secret: jPQ2uehnGnQLqMfPDl1Lp": [[24, 45]]}, "info": {"id": "pentect_991", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"inventory\" { cluster_ip = \"None\" }", "spans": {"internal_url: inventory": [[31, 40]]}, "info": {"id": "pentect_992", "source": "pentect"}}
+{"text": "upstream host = batch-runner  # k8s service dns", "spans": {"internal_url: batch-runner": [[16, 28]]}, "info": {"id": "pentect_993", "source": "pentect"}}
+{"text": "x = \"amlV7JsohJHZpeu09\"  # used by the billing worker", "spans": {"secret: amlV7JsohJHZpeu09": [[5, 22]]}, "info": {"id": "pentect_994", "source": "pentect"}}
+{"text": "curl -sSf http://rec-engine/healthz || echo 'down'", "spans": {"internal_url: rec-engine": [[17, 27]]}, "info": {"id": "pentect_995", "source": "pentect"}}
+{"text": "upstream host = cron-svc  # k8s service dns", "spans": {"internal_url: cron-svc": [[16, 24]]}, "info": {"id": "pentect_996", "source": "pentect"}}
+{"text": "See ticket #209430 for the stack trace", "spans": {"account_number: 209430": [[12, 18]]}, "info": {"id": "pentect_997", "source": "pentect"}}
+{"text": "See ticket #117541 for the stack trace", "spans": {"account_number: 117541": [[12, 18]]}, "info": {"id": "pentect_998", "source": "pentect"}}
+{"text": "the deploy used key IGT-7MHV9S-57R7-KNJ4AO8 issued by the platform ops for Alice Smith", "spans": {"secret: IGT-7MHV9S-57R7-KNJ4AO8": [[20, 43]], "private_person: Alice Smith": [[75, 86]]}, "info": {"id": "pentect_999", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'batch-runner' AND status = 'degraded'", "spans": {"internal_url: batch-runner": [[43, 55]]}, "info": {"id": "pentect_1000", "source": "pentect"}}
+{"text": "customer #132851 reported the incident", "spans": {"account_number: 132851": [[10, 16]]}, "info": {"id": "pentect_1001", "source": "pentect"}}
+{"text": "config.token = \"TK-EMBX-DRXDNOPI\"  # provisioned by platform team", "spans": {"secret: TK-EMBX-DRXDNOPI": [[16, 32]]}, "info": {"id": "pentect_1002", "source": "pentect"}}
+{"text": "API_KEY: str = \"apIqq14U4Z7wA2epb8Uu\"  # loaded from vault", "spans": {"secret: apIqq14U4Z7wA2epb8Uu": [[16, 36]]}, "info": {"id": "pentect_1003", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'tax-calc' AND status = 'degraded'", "spans": {"internal_url: tax-calc": [[43, 51]]}, "info": {"id": "pentect_1004", "source": "pentect"}}
+{"text": "Carol Miller opened #337196 against inventory about the 500s", "spans": {"private_person: Carol Miller": [[0, 12]], "account_number: 337196": [[21, 27]], "internal_url: inventory": [[36, 45]]}, "info": {"id": "pentect_1005", "source": "pentect"}}
+{"text": "Reported by Frank Johnson after escalation from on-call", "spans": {"private_person: Frank Johnson": [[12, 25]]}, "info": {"id": "pentect_1006", "source": "pentect"}}
+{"text": "issue 468811 was closed after the rollback", "spans": {"account_number: 468811": [[6, 12]]}, "info": {"id": "pentect_1007", "source": "pentect"}}
+{"text": "Suzuki Sakura が cron-svc のレイテンシ悪化を調査中(token lisUg4ds9oxMLqOFrKY1lwGf で再現)", "spans": {"private_person: Suzuki Sakura": [[0, 13]], "internal_url: cron-svc": [[16, 24]], "secret: lisUg4ds9oxMLqOFrKY1lwGf": [[44, 68]]}, "info": {"id": "pentect_1008", "source": "pentect"}}
+{"text": "span attribute upstream.service=orders attached to trace 830776", "spans": {"internal_url: orders": [[32, 38]], "account_number: 830776": [[57, 63]]}, "info": {"id": "pentect_1009", "source": "pentect"}}
+{"text": "Alice Smith confirmed the rollback at 03:12 JST", "spans": {"private_person: Alice Smith": [[0, 11]]}, "info": {"id": "pentect_1010", "source": "pentect"}}
+{"text": "Takahashi Ren-san asked for access to the staging cluster", "spans": {"private_person: Takahashi Ren": [[0, 13]]}, "info": {"id": "pentect_1011", "source": "pentect"}}
+{"text": "upstream host = ledger  # k8s service dns", "spans": {"internal_url: ledger": [[16, 22]]}, "info": {"id": "pentect_1012", "source": "pentect"}}
+{"text": "proxy -> audit-trail with x-internal-token 6HkA8IzcO8ooxeOukuq (expires 60m)", "spans": {"internal_url: audit-trail": [[9, 20]], "secret: 6HkA8IzcO8ooxeOukuq": [[43, 62]]}, "info": {"id": "pentect_1013", "source": "pentect"}}
+{"text": "connected to inventory:5432 successfully", "spans": {"internal_url: inventory": [[13, 22]]}, "info": {"id": "pentect_1014", "source": "pentect"}}
+{"text": "val := 'rmgzXfrsZHau1bunTXPLVb8CMQ'  // injected at boot", "spans": {"secret: rmgzXfrsZHau1bunTXPLVb8CMQ": [[8, 34]]}, "info": {"id": "pentect_1015", "source": "pentect"}}
+{"text": "tmp = \"2AdJ3AYHuTIb79ZjFDsd\"; sendAuth(tmp)", "spans": {"secret: 2AdJ3AYHuTIb79ZjFDsd": [[7, 27]]}, "info": {"id": "pentect_1016", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"invoice-gen\"} 14820", "spans": {"internal_url: invoice-gen": [[35, 46]]}, "info": {"id": "pentect_1017", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"catalog\"} 14820", "spans": {"internal_url: catalog": [[35, 42]]}, "info": {"id": "pentect_1018", "source": "pentect"}}
+{"text": "upstream host = batch-runner  # k8s service dns", "spans": {"internal_url: batch-runner": [[16, 28]]}, "info": {"id": "pentect_1019", "source": "pentect"}}
+{"text": "Retrying request to payments-core after timeout", "spans": {"internal_url: payments-core": [[20, 33]]}, "info": {"id": "pentect_1020", "source": "pentect"}}
+{"text": "Bob Davis opened #190948 against kyc-v3 about the 500s", "spans": {"private_person: Bob Davis": [[0, 9]], "account_number: 190948": [[18, 24]], "internal_url: kyc-v3": [[33, 39]]}, "info": {"id": "pentect_1021", "source": "pentect"}}
+{"text": "kubectl port-forward svc/ledger 8080:80 -n platform", "spans": {"internal_url: ledger": [[25, 31]]}, "info": {"id": "pentect_1022", "source": "pentect"}}
+{"text": "val := 'C0nqsdPsPiZtBYgS'  // injected at boot", "spans": {"secret: C0nqsdPsPiZtBYgS": [[8, 24]]}, "info": {"id": "pentect_1023", "source": "pentect"}}
+{"text": "proxy -> session-store with x-internal-token mv6wJSMLtzwrOEyBpJfs (expires 60m)", "spans": {"internal_url: session-store": [[9, 22]], "secret: mv6wJSMLtzwrOEyBpJfs": [[45, 65]]}, "info": {"id": "pentect_1024", "source": "pentect"}}
+{"text": "node kyc-service (172.24.46.5) joined the pool", "spans": {"internal_url: kyc-service": [[5, 16]], "internal_ip: 172.24.46.5": [[18, 29]]}, "info": {"id": "pentect_1025", "source": "pentect"}}
+{"text": "Alice Johnson opened #494244 against warehouse-api about the 500s", "spans": {"private_person: Alice Johnson": [[0, 13]], "account_number: 494244": [[22, 28]], "internal_url: warehouse-api": [[37, 50]]}, "info": {"id": "pentect_1026", "source": "pentect"}}
+{"text": "headers['X-Corp-Auth'] = 'Z9-FMTO5-9ZWQFC-ML4T5D8-6ORGER'", "spans": {"secret: Z9-FMTO5-9ZWQFC-ML4T5D8-6ORGER": [[26, 56]]}, "info": {"id": "pentect_1027", "source": "pentect"}}
+{"text": "dial tcp session-store:9092: connection refused", "spans": {"internal_url: session-store": [[9, 22]]}, "info": {"id": "pentect_1028", "source": "pentect"}}
+{"text": "x = \"efmSLXlMJjBkZV4HFV2wMYad\"  # used by the billing worker", "spans": {"secret: efmSLXlMJjBkZV4HFV2wMYad": [[5, 29]]}, "info": {"id": "pentect_1029", "source": "pentect"}}
+{"text": "tmp = \"HtUpXPYXyyiAHjMLKDRF\"; sendAuth(tmp)", "spans": {"secret: HtUpXPYXyyiAHjMLKDRF": [[7, 27]]}, "info": {"id": "pentect_1030", "source": "pentect"}}
+{"text": "config.token = \"HX-X4TS-MGVVLS3\"  # provisioned by platform team", "spans": {"secret: HX-X4TS-MGVVLS3": [[16, 31]]}, "info": {"id": "pentect_1031", "source": "pentect"}}
+{"text": "config.token = \"IGT-8DVNQ-M4EXJ-6GPE34-MWDGT7\"  # provisioned by platform team", "spans": {"secret: IGT-8DVNQ-M4EXJ-6GPE34-MWDGT7": [[16, 45]]}, "info": {"id": "pentect_1032", "source": "pentect"}}
+{"text": "backend_service_upstream(ledger, retries=3)", "spans": {"internal_url: ledger": [[25, 31]]}, "info": {"id": "pentect_1033", "source": "pentect"}}
+{"text": "route add 172.27.216.163 via gw-01 metric 10", "spans": {"internal_ip: 172.27.216.163": [[10, 24]]}, "info": {"id": "pentect_1034", "source": "pentect"}}
+{"text": "dial tcp billing-svc:9092: connection refused", "spans": {"internal_url: billing-svc": [[9, 20]]}, "info": {"id": "pentect_1035", "source": "pentect"}}
+{"text": "tmp = \"rzg0uuZqbiBYTdwdobFOovgVNu\"; sendAuth(tmp)", "spans": {"secret: rzg0uuZqbiBYTdwdobFOovgVNu": [[7, 33]]}, "info": {"id": "pentect_1036", "source": "pentect"}}
+{"text": "x = \"cMq493Ytgljsg3wjOe\"  # used by the billing worker", "spans": {"secret: cMq493Ytgljsg3wjOe": [[5, 23]]}, "info": {"id": "pentect_1037", "source": "pentect"}}
+{"text": "Retrying request to rec-engine after timeout", "spans": {"internal_url: rec-engine": [[20, 30]]}, "info": {"id": "pentect_1038", "source": "pentect"}}
+{"text": "dial tcp media-proxy:9092: connection refused", "spans": {"internal_url: media-proxy": [[9, 20]]}, "info": {"id": "pentect_1039", "source": "pentect"}}
+{"text": "backend_service_upstream(loyalty, retries=3)", "spans": {"internal_url: loyalty": [[25, 32]]}, "info": {"id": "pentect_1040", "source": "pentect"}}
+{"text": "config.token = \"ZN-YGQX4U-LTE9Y\"  # provisioned by platform team", "spans": {"secret: ZN-YGQX4U-LTE9Y": [[16, 31]]}, "info": {"id": "pentect_1041", "source": "pentect"}}
+{"text": "backend_service_upstream(kyc-v3, retries=3)", "spans": {"internal_url: kyc-v3": [[25, 31]]}, "info": {"id": "pentect_1042", "source": "pentect"}}
+{"text": "val := 'SSUVrfddnKpZBXhUcXPb'  // injected at boot", "spans": {"secret: SSUVrfddnKpZBXhUcXPb": [[8, 28]]}, "info": {"id": "pentect_1043", "source": "pentect"}}
+{"text": "connected to coupon-svc:5432 successfully", "spans": {"internal_url: coupon-svc": [[13, 23]]}, "info": {"id": "pentect_1044", "source": "pentect"}}
+{"text": "Retrying request to catalog after timeout", "spans": {"internal_url: catalog": [[20, 27]]}, "info": {"id": "pentect_1045", "source": "pentect"}}
+{"text": "resource \"kubernetes_service\" \"media-proxy\" { cluster_ip = \"None\" }", "spans": {"internal_url: media-proxy": [[31, 42]]}, "info": {"id": "pentect_1046", "source": "pentect"}}
+{"text": "dial tcp loyalty:9092: connection refused", "spans": {"internal_url: loyalty": [[9, 16]]}, "info": {"id": "pentect_1047", "source": "pentect"}}
+{"text": "Reported by Bob Wilson after escalation from on-call", "spans": {"private_person: Bob Wilson": [[12, 22]]}, "info": {"id": "pentect_1048", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'inventory' AND status = 'degraded'", "spans": {"internal_url: inventory": [[43, 52]]}, "info": {"id": "pentect_1049", "source": "pentect"}}
+{"text": "Takahashi Taro が cron-svc のレイテンシ悪化を調査中(token 3yVxPSgdpq037uAJ2lU で再現)", "spans": {"private_person: Takahashi Taro": [[0, 14]], "internal_url: cron-svc": [[17, 25]], "secret: 3yVxPSgdpq037uAJ2lU": [[45, 64]]}, "info": {"id": "pentect_1050", "source": "pentect"}}
+{"text": "rec-engine へのリクエストが 299027 回連続で失敗しました。担当 Watanabe Yuki に共有済み。", "spans": {"internal_url: rec-engine": [[0, 10]], "account_number: 299027": [[20, 26]], "private_person: Watanabe Yuki": [[41, 54]]}, "info": {"id": "pentect_1051", "source": "pentect"}}
+{"text": "cart-api,prod,owner=Grace Wilson,last_deploy=2025-11-03", "spans": {"internal_url: cart-api": [[0, 8]], "private_person: Grace Wilson": [[20, 32]]}, "info": {"id": "pentect_1052", "source": "pentect"}}
+{"text": "invoice-gen へのリクエストが 84440 回連続で失敗しました。担当 Tanaka Aoi に共有済み。", "spans": {"internal_url: invoice-gen": [[0, 11]], "account_number: 84440": [[21, 26]], "private_person: Tanaka Aoi": [[41, 51]]}, "info": {"id": "pentect_1053", "source": "pentect"}}
+{"text": "See ticket #113684 for the stack trace", "spans": {"account_number: 113684": [[12, 18]]}, "info": {"id": "pentect_1054", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'I28yhFCU6SFcajX8WLE';", "spans": {"secret: I28yhFCU6SFcajX8WLE": [[24, 43]]}, "info": {"id": "pentect_1055", "source": "pentect"}}
+{"text": "counter rpc_requests_total{target=\"inventory\"} 14820", "spans": {"internal_url: inventory": [[35, 44]]}, "info": {"id": "pentect_1056", "source": "pentect"}}
+{"text": "customer #286785 reported the incident", "spans": {"account_number: 286785": [[10, 16]]}, "info": {"id": "pentect_1057", "source": "pentect"}}
+{"text": "route add 172.27.167.94 via gw-01 metric 10", "spans": {"internal_ip: 172.27.167.94": [[10, 23]]}, "info": {"id": "pentect_1058", "source": "pentect"}}
+{"text": "customer #921715 reported the incident", "spans": {"account_number: 921715": [[10, 16]]}, "info": {"id": "pentect_1059", "source": "pentect"}}
+{"text": "Retrying request to inventory after timeout", "spans": {"internal_url: inventory": [[20, 29]]}, "info": {"id": "pentect_1060", "source": "pentect"}}
+{"text": "route add 172.18.72.119 via gw-01 metric 10", "spans": {"internal_ip: 172.18.72.119": [[10, 23]]}, "info": {"id": "pentect_1061", "source": "pentect"}}
+{"text": "connected to shipping-core:5432 successfully", "spans": {"internal_url: shipping-core": [[13, 26]]}, "info": {"id": "pentect_1062", "source": "pentect"}}
+{"text": "const SERVICE_SECRET = 'q9nHYbNzCFmh8kVdv';", "spans": {"secret: q9nHYbNzCFmh8kVdv": [[24, 41]]}, "info": {"id": "pentect_1063", "source": "pentect"}}
+{"text": "See ticket #231215 for the stack trace", "spans": {"account_number: 231215": [[12, 18]]}, "info": {"id": "pentect_1064", "source": "pentect"}}
+{"text": "the deploy used key CORP-A859TY-CPT3S7-99ZU-MFE6V issued by the platform ops for Frank Brown", "spans": {"secret: CORP-A859TY-CPT3S7-99ZU-MFE6V": [[20, 49]], "private_person: Frank Brown": [[81, 92]]}, "info": {"id": "pentect_1065", "source": "pentect"}}
+{"text": "route add 172.29.79.59 via gw-01 metric 10", "spans": {"internal_ip: 172.29.79.59": [[10, 22]]}, "info": {"id": "pentect_1066", "source": "pentect"}}
+{"text": "customer #297856 reported the incident", "spans": {"account_number: 297856": [[10, 16]]}, "info": {"id": "pentect_1067", "source": "pentect"}}
+{"text": "customer #960397 reported the incident", "spans": {"account_number: 960397": [[10, 16]]}, "info": {"id": "pentect_1068", "source": "pentect"}}
+{"text": "customer #569889 reported the incident", "spans": {"account_number: 569889": [[10, 16]]}, "info": {"id": "pentect_1069", "source": "pentect"}}
+{"text": "issue 295940 was closed after the rollback", "spans": {"account_number: 295940": [[6, 12]]}, "info": {"id": "pentect_1070", "source": "pentect"}}
+{"text": "CORP_TOKEN_V2: Z9-6HCE0LO-Z2QS3N-PPBDSDH", "spans": {"secret: Z9-6HCE0LO-Z2QS3N-PPBDSDH": [[15, 40]]}, "info": {"id": "pentect_1071", "source": "pentect"}}
+{"text": "Reported by Hank Smith after escalation from on-call", "spans": {"private_person: Hank Smith": [[12, 22]]}, "info": {"id": "pentect_1072", "source": "pentect"}}
+{"text": "upstream host = session-store  # k8s service dns", "spans": {"internal_url: session-store": [[16, 29]]}, "info": {"id": "pentect_1073", "source": "pentect"}}
+{"text": "dial tcp media-proxy:9092: connection refused", "spans": {"internal_url: media-proxy": [[9, 20]]}, "info": {"id": "pentect_1074", "source": "pentect"}}
+{"text": "SELECT * FROM service_health WHERE name = 'billing-svc' AND status = 'degraded'", "spans": {"internal_url: billing-svc": [[43, 54]]}, "info": {"id": "pentect_1075", "source": "pentect"}}
+{"text": "tmp = \"Xe50xTdgEICt6Phuz2\"; sendAuth(tmp)", "spans": {"secret: Xe50xTdgEICt6Phuz2": [[7, 25]]}, "info": {"id": "pentect_1076", "source": "pentect"}}
+{"text": "ENV UPSTREAM=media-proxy API_TOKEN=Z9-MIRNO6P-HFDW-JUC5R-84KJZTMV", "spans": {"internal_url: media-proxy": [[13, 24]], "secret: Z9-MIRNO6P-HFDW-JUC5R-84KJZTMV": [[35, 65]]}, "info": {"id": "pentect_1077", "source": "pentect"}}
+{"text": "connected to batch-runner:5432 successfully", "spans": {"internal_url: batch-runner": [[13, 25]]}, "info": {"id": "pentect_1078", "source": "pentect"}}
+{"text": "issue 835921 was closed after the rollback", "spans": {"account_number: 835921": [[6, 12]]}, "info": {"id": "pentect_1079", "source": "pentect"}}

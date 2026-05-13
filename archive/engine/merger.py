@@ -33,6 +33,7 @@ _SOURCE_PRIORITY = {
     "spacy_ner": 3,  # spaCy NER for person/organization names
     "entropy": 3,    # high-entropy values in query strings / cookies / JSON
     "base64_unwrap": 3,  # base64 chunks whose decoded payload looks like a secret
+    "url_encoding_peel": 3,  # percent-encoded runs whose decoded form looks sensitive
     "seed_phrase": 3,  # BIP39 mnemonic + PEM private key blocks
     "crypto_address": 3,  # BTC / ETH / Solana / Cosmos wallet addresses
     "hybrid": 2,
