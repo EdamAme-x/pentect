@@ -74,6 +74,36 @@ result = PentectEngine(use_llm=True).mask_text(raw_text)
 ./scripts/dev.sh   # http://localhost:5173
 ```
 
+## Public demo
+
+匿名公開するデモは `opf_pf` と `presidio` の比較だけに絞る。
+
+```bash
+cd ui
+pnpm install
+pnpm build
+cd ..
+
+set PENTECT_ALLOWED_BACKENDS=opf_pf,presidio
+set PENTECT_PF_DEVICE=cpu
+set PENTECT_MAX_INPUT_CHARS=50000
+set PENTECT_RATE_LIMIT_REQUESTS=30
+set PENTECT_RATE_LIMIT_WINDOW_SECONDS=60
+set PENTECT_ALLOW_RECOVERY=0
+python -m uvicorn server.main:app --host 127.0.0.1 --port 8000
+```
+
+Open `http://127.0.0.1:8000/`.
+
+Docker:
+
+```bash
+docker build -t pentect-demo .
+docker run --rm -p 8000:8000 pentect-demo
+```
+
+See `PUBLIC_DEMO.md`.
+
 ## TODO
 - [ ] ルール追加 / マスク後の refill
 - [ ] テストケース拡充

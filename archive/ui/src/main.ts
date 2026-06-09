@@ -7,7 +7,8 @@ const sampleBtn = document.getElementById("sample") as HTMLButtonElement;
 const statusEl = document.getElementById("status") as HTMLSpanElement;
 const backendEl = document.getElementById("backend") as HTMLSelectElement;
 
-const PLACEHOLDER_RE = /<<[A-Z_]+_[0-9a-f]{8}>>/g;
+const PLACEHOLDER_RE = /<<[A-Z_]+_[0-9a-f]{8}>>|<PRESIDIO_MASKED>/g;
+const MAX_INPUT_CHARS = 50_000;
 
 const SAMPLE_HAR = JSON.stringify(
   {
@@ -67,6 +68,10 @@ type MaskResponse = {
   backend?: string;
 };
 
+function selectedBackendLabel(): string {
+  return backendEl.selectedOptions[0]?.textContent?.trim() || backendEl.value || "default";
+}
+
 function clearNode(node: Node): void {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
@@ -93,20 +98,33 @@ async function runMask(): Promise<void> {
     statusEl.textContent = "empty input";
     return;
   }
+  if (text.length > MAX_INPUT_CHARS) {
+    statusEl.textContent = `input too large (${text.length}/${MAX_INPUT_CHARS})`;
+    return;
+  }
   const backend = backendEl.value || undefined;
+  const backendLabel = selectedBackendLabel();
   runBtn.disabled = true;
-  statusEl.textContent = `masking (${backend ?? "default"})...`;
+  statusEl.textContent = `masking (${backendLabel})...`;
   try {
     const res = await fetch("/api/mask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, backend }),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const errorBody = await res.json() as { detail?: string };
+        if (errorBody.detail) detail = errorBody.detail;
+      } catch {
+        // Keep the status fallback.
+      }
+      throw new Error(detail);
+    }
     const data: MaskResponse = await res.json();
     renderMasked(data.masked_text);
-    const tag = data.backend ?? backend ?? "?";
-    statusEl.textContent = `[${tag}] masked ${data.summary.total_masked ?? 0}`;
+    statusEl.textContent = `[${backendLabel}] masked ${data.summary.total_masked ?? 0}`;
   } catch (e) {
     statusEl.textContent = `error: ${(e as Error).message}`;
   } finally {

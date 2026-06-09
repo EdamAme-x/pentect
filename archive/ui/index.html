@@ -4,15 +4,19 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Pentect</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230d1117'/%3E%3Cpath d='M18 34h28M18 24h28M18 44h18' stroke='%2358a6ff' stroke-width='6' stroke-linecap='round'/%3E%3C/svg%3E" />
     <style>
       :root {
         color-scheme: dark;
         --bg: #0d1117;
         --panel: #161b22;
+        --panel-2: #0f141b;
         --border: #30363d;
         --fg: #e6edf3;
         --muted: #8b949e;
         --accent: #58a6ff;
+        --control: #21262d;
+        --control-hover: #2a313a;
         --ph: #ff7b72;
       }
       * { box-sizing: border-box; }
@@ -32,7 +36,6 @@
         gap: 12px;
       }
       .topbar h1 { margin: 0; font-size: 16px; font-weight: 600; }
-      .topbar .tag { color: var(--muted); font-size: 12px; }
       main {
         flex: 1;
         display: grid;
@@ -68,60 +71,161 @@
       }
       .bar {
         display: flex;
-        gap: 8px;
-        padding: 8px;
+        gap: 12px;
+        padding: 10px 12px;
         border-top: 1px solid var(--border);
+        align-items: center;
+        background: var(--panel-2);
+        min-height: 52px;
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
         align-items: center;
       }
       button {
-        background: var(--accent);
-        color: #0d1117;
-        border: 0;
-        padding: 6px 14px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        height: 32px;
+        min-width: 72px;
+        padding: 0 14px;
         border-radius: 5px;
+        color: #0d1117;
+        border: 1px solid var(--accent);
+        background: var(--accent);
         font: inherit;
         font-size: 13px;
         font-weight: 600;
         cursor: pointer;
+        transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 80ms ease;
       }
       button.secondary {
         background: transparent;
         color: var(--fg);
-        border: 1px solid var(--border);
+        border-color: var(--border);
       }
+      button:hover:not(:disabled) {
+        background: #79c0ff;
+        border-color: #79c0ff;
+      }
+      button.secondary:hover:not(:disabled) {
+        background: var(--control);
+        color: var(--fg);
+        border-color: var(--border);
+      }
+      button:focus-visible, select:focus-visible {
+        outline: 2px solid rgba(121, 192, 255, 0.9);
+        outline-offset: 2px;
+      }
+      button:active:not(:disabled) { transform: translateY(1px); }
       button:disabled { opacity: 0.5; cursor: not-allowed; }
-      .status { color: var(--muted); font-size: 12px; margin-left: auto; }
+      .status {
+        color: var(--muted);
+        font-size: 12px;
+        margin-left: 0;
+        margin-inline-start: auto;
+        min-height: 18px;
+        max-width: 42%;
+        overflow: hidden;
+        text-align: right;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       .ph { color: var(--ph); }
       .empty { color: var(--muted); }
+      .backend-control {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
       select {
-        background: var(--panel);
+        height: 34px;
+        min-width: 136px;
+        background: var(--control);
         color: var(--fg);
         border: 1px solid var(--border);
-        border-radius: 5px;
-        padding: 5px 8px;
+        border-radius: 6px;
+        padding: 0 10px;
         font: inherit;
         font-size: 12px;
+        cursor: pointer;
+        transition: background 120ms ease, border-color 120ms ease;
       }
+      select:hover { background: var(--control-hover); border-color: #484f58; }
       .field { color: var(--muted); font-size: 12px; }
+      .mobile-block { display: none; }
+      @media (max-width: 1100px) {
+        main {
+          grid-template-columns: 1fr;
+          grid-template-rows: minmax(300px, 1fr) minmax(260px, 1fr);
+        }
+        .status {
+          max-width: none;
+          width: 100%;
+          margin-inline-start: 0;
+          text-align: left;
+        }
+        .bar { flex-wrap: wrap; }
+      }
+      @media (max-width: 860px) {
+        main { padding: 10px; }
+        .bar {
+          align-items: stretch;
+          flex-direction: column;
+        }
+        .actions { width: 100%; }
+        button { flex: 1; }
+        .backend-control {
+          justify-content: space-between;
+          width: 100%;
+        }
+        select {
+          min-width: 0;
+          width: min(220px, 58%);
+        }
+      }
+      .mobile-device .topbar {
+        justify-content: center;
+        padding: 16px;
+      }
+      .mobile-device main { display: none; }
+      .mobile-device .mobile-block {
+        flex: 1;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        text-align: center;
+      }
+      .mobile-device .mobile-block h2 {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 600;
+      }
     </style>
   </head>
   <body>
     <div class="topbar">
-      <h1>Pentect</h1>
+      <h1>Pentect PoC</h1>
+    </div>
+    <div class="mobile-block" role="status">
+      <h2>PCで開いてください</h2>
     </div>
     <main>
       <section class="pane">
         <textarea id="input" placeholder="Paste text or HAR here..." spellcheck="false"></textarea>
         <div class="bar">
-          <button id="run">Mask</button>
-          <button id="sample" class="secondary">Sample</button>
-          <span class="field">backend</span>
-          <select id="backend">
-            <option value="rule">rule (no model)</option>
-            <option value="opf_pf">privacy filter FT</option>
-            <option value="gemma">gemma 4B FT</option>
-            <option value="hybrid">hybrid (PF + gemma audit)</option>
-          </select>
+          <div class="actions">
+            <button id="run">Mask</button>
+            <button id="sample" class="secondary">Sample</button>
+          </div>
+          <label class="backend-control">
+            <span class="field">backend</span>
+            <select id="backend">
+              <option value="opf_pf">Pentect PoC</option>
+              <option value="presidio">presidio</option>
+            </select>
+          </label>
           <span class="status" id="status"></span>
         </div>
       </section>
@@ -129,6 +233,14 @@
         <pre id="output" class="empty">Output</pre>
       </section>
     </main>
+    <script>
+      (() => {
+        const ua = navigator.userAgent || "";
+        const mobileUA = /Android|iPhone|iPad|iPod|Windows Phone/i.test(ua);
+        const smallScreen = Math.min(screen.width, screen.height) <= 760;
+        if (mobileUA && smallScreen) document.documentElement.classList.add("mobile-device");
+      })();
+    </script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

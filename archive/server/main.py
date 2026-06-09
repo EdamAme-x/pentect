@@ -1,35 +1,65 @@
-"""FastAPI server exposing /api/mask"""
+"""FastAPI server exposing /api/mask and the public demo UI."""
 from __future__ import annotations
 
+from collections import deque
 import os
+from pathlib import Path
 import threading
+import time
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from engine.core import PentectEngine
+from engine.core import MaskResult, PentectEngine
 
 
 app = FastAPI(title="Pentect PoC")
+
+
+def _csv_env(name: str, default: str) -> tuple[str, ...]:
+    raw = os.environ.get(name, default)
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+_VALID_BACKENDS = ("opf_pf", "presidio", "rule", "gemma", "hybrid")
+_PENTECT_ENGINE_BACKENDS = {"opf_pf", "rule", "gemma", "hybrid"}
+_ALLOWED_BACKENDS = _csv_env("PENTECT_ALLOWED_BACKENDS", "opf_pf,presidio")
+_CORS_ORIGINS = _csv_env(
+    "PENTECT_CORS_ORIGINS",
+    "http://127.0.0.1:5173,http://127.0.0.1:5175,http://localhost:5173,http://localhost:5175",
+)
+_MAX_INPUT_CHARS = int(os.environ.get("PENTECT_MAX_INPUT_CHARS", "50000"))
+_RATE_LIMIT_REQUESTS = int(os.environ.get("PENTECT_RATE_LIMIT_REQUESTS", "30"))
+_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("PENTECT_RATE_LIMIT_WINDOW_SECONDS", "60"))
+_TRUST_PROXY = os.environ.get("PENTECT_TRUST_PROXY", "").lower() in {"1", "true"}
+_ALLOW_RECOVERY = os.environ.get("PENTECT_ALLOW_RECOVERY", "").lower() in {"1", "true"}
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(_CORS_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-_VALID_BACKENDS = ("rule", "gemma", "opf_pf", "hybrid")
+_rate_lock = threading.Lock()
+_rate_windows: dict[str, deque[float]] = {}
 
 
 def _default_backend() -> str:
     env = os.environ.get("PENTECT_DETECTOR_BACKEND")
-    if env in _VALID_BACKENDS:
+    if env in _VALID_BACKENDS and env in _ALLOWED_BACKENDS:
         return env
-    if os.environ.get("PENTECT_USE_LLM", "").lower() in {"1", "true"}:
+    if os.environ.get("PENTECT_USE_LLM", "").lower() in {"1", "true"} and "gemma" in _ALLOWED_BACKENDS:
         return "gemma"
-    return "rule"
+    if "opf_pf" in _ALLOWED_BACKENDS:
+        return "opf_pf"
+    if "rule" in _ALLOWED_BACKENDS:
+        return "rule"
+    return _ALLOWED_BACKENDS[0] if _ALLOWED_BACKENDS else "rule"
 
 
 _use_verifier = os.environ.get("PENTECT_USE_VERIFIER", "").lower() in {"1", "true"}
@@ -38,9 +68,15 @@ _use_verifier = os.environ.get("PENTECT_USE_VERIFIER", "").lower() in {"1", "tru
 # the first time it's asked for. Multiple requests share the cached instance.
 _engine_cache: dict[str, PentectEngine] = {}
 _engine_lock = threading.Lock()
+_presidio_lock = threading.Lock()
+_presidio_analyzer = None
+_presidio_anonymizer = None
+_presidio_operator = None
 
 
 def _get_engine(backend: str) -> PentectEngine:
+    if backend not in _PENTECT_ENGINE_BACKENDS:
+        raise HTTPException(400, f"backend {backend!r} is not a Pentect engine backend")
     with _engine_lock:
         eng = _engine_cache.get(backend)
         if eng is None:
@@ -49,8 +85,100 @@ def _get_engine(backend: str) -> PentectEngine:
         return eng
 
 
-# Pre-warm the default backend so the first /api/mask isn't slow.
-_get_engine(_default_backend())
+def _get_presidio_components():
+    global _presidio_analyzer, _presidio_anonymizer, _presidio_operator
+
+    with _presidio_lock:
+        if _presidio_analyzer is None:
+            from presidio_analyzer import AnalyzerEngine
+            from presidio_anonymizer import AnonymizerEngine
+            from presidio_anonymizer.entities import OperatorConfig
+
+            _presidio_analyzer = AnalyzerEngine()
+            _presidio_anonymizer = AnonymizerEngine()
+            _presidio_operator = OperatorConfig("replace", {"new_value": "<PRESIDIO_MASKED>"})
+        return _presidio_analyzer, _presidio_anonymizer, _presidio_operator
+
+
+def _mask_with_presidio(text: str) -> MaskResult:
+    analyzer, anonymizer, operator = _get_presidio_components()
+    results = analyzer.analyze(text=text, language="en")
+    anon = anonymizer.anonymize(
+        text=text,
+        analyzer_results=results,
+        operators={"DEFAULT": operator},
+    )
+    by_category: dict[str, int] = {}
+    for result in results:
+        by_category[result.entity_type] = by_category.get(result.entity_type, 0) + 1
+
+    return MaskResult(
+        masked_text=anon.text,
+        map={
+            "<PRESIDIO_MASKED>": {
+                "category": "PRESIDIO",
+                "description": "Span anonymized by Microsoft Presidio",
+            }
+        } if results else {},
+        summary={"total_masked": len(results), "by_category": by_category},
+    )
+
+
+def _client_ip(request: Request) -> str:
+    if _TRUST_PROXY:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _enforce_rate_limit(request: Request) -> None:
+    if _RATE_LIMIT_REQUESTS <= 0 or _RATE_LIMIT_WINDOW_SECONDS <= 0:
+        return
+
+    now = time.monotonic()
+    cutoff = now - _RATE_LIMIT_WINDOW_SECONDS
+    key = _client_ip(request)
+
+    with _rate_lock:
+        window = _rate_windows.setdefault(key, deque())
+        while window and window[0] < cutoff:
+            window.popleft()
+        if len(window) >= _RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"rate limit exceeded: {_RATE_LIMIT_REQUESTS} requests/{_RATE_LIMIT_WINDOW_SECONDS}s",
+            )
+        window.append(now)
+
+
+def _validate_backend(backend: str) -> None:
+    if backend not in _VALID_BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}; valid: {_VALID_BACKENDS}")
+    if backend not in _ALLOWED_BACKENDS:
+        raise HTTPException(400, f"backend {backend!r} is disabled for this demo")
+
+
+def _validate_input(text: str) -> None:
+    if len(text) > _MAX_INPUT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"input too large: max {_MAX_INPUT_CHARS} characters",
+        )
+
+
+def _warm_allowed_backends() -> None:
+    for backend in _ALLOWED_BACKENDS:
+        _validate_backend(backend)
+        if backend == "presidio":
+            _get_presidio_components()
+        else:
+            _get_engine(backend)
+
+
+# Public demo dependencies are required. If opf/presidio is missing, fail at startup.
+_validate_backend(_default_backend())
+_warm_allowed_backends()
 
 
 class MaskRequest(BaseModel):
@@ -90,10 +218,22 @@ def _looks_like_har(text: str) -> bool:
 
 
 @app.post("/api/mask", response_model=MaskResponse)
-def mask(req: MaskRequest) -> MaskResponse:
+def mask(req: MaskRequest, request: Request) -> MaskResponse:
+    _enforce_rate_limit(request)
+    _validate_input(req.text)
     backend = req.backend or _default_backend()
-    if backend not in _VALID_BACKENDS:
-        raise HTTPException(400, f"unknown backend {backend!r}; valid: {_VALID_BACKENDS}")
+    _validate_backend(backend)
+    if backend == "presidio":
+        result = _mask_with_presidio(req.text)
+        return MaskResponse(
+            masked_text=result.masked_text,
+            map=result.map,
+            summary=result.summary,
+            verifier=None,
+            backend=backend,
+            recovery=None,
+        )
+
     engine = _get_engine(backend)
     # Auto-route by content shape, not by an `is_har` flag the UI never sets.
     if req.is_har and _looks_like_har(req.text):
@@ -109,7 +249,7 @@ def mask(req: MaskRequest) -> MaskResponse:
         summary=result.summary,
         verifier=result.verifier,
         backend=backend,
-        recovery=dict(result._recovery_map) if req.include_recovery else None,
+        recovery=dict(result._recovery_map) if (_ALLOW_RECOVERY and req.include_recovery) else None,
     )
 
 
@@ -121,6 +261,21 @@ def health() -> dict:
         "status": "ok",
         "default_backend": default,
         "loaded_backends": sorted(_engine_cache.keys()),
-        "available_backends": list(_VALID_BACKENDS),
+        "available_backends": [backend for backend in _VALID_BACKENDS if backend in _ALLOWED_BACKENDS],
+        "max_input_chars": _MAX_INPUT_CHARS,
+        "rate_limit_requests": _RATE_LIMIT_REQUESTS,
+        "rate_limit_window_seconds": _RATE_LIMIT_WINDOW_SECONDS,
+        "recovery_enabled": _ALLOW_RECOVERY,
         "detectors": [d.name for d in eng.detectors] if eng else [],
     }
+
+
+_DIST_DIR = Path(__file__).resolve().parents[1] / "ui" / "dist"
+if _DIST_DIR.exists():
+    assets_dir = _DIST_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    def index() -> FileResponse:
+        return FileResponse(_DIST_DIR / "index.html")

@@ -5,7 +5,7 @@ Wraps a finetuned `opf` checkpoint as a Pentect Detector.
 Env vars:
   PENTECT_PF_CHECKPOINT  Path to a finetuned opf checkpoint dir.
                          Defaults to training/runs/opf_pentect_v4_e3.
-  PENTECT_PF_DEVICE      cuda | cpu (default: cuda)
+  PENTECT_PF_DEVICE      cuda | cpu (default: cpu)
 """
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class PrivacyFilterDetector:
             "PENTECT_PF_CHECKPOINT",
             "training/runs/opf_pentect_v4_e3",
         )
-        device = os.environ.get("PENTECT_PF_DEVICE", "cuda")
+        device = os.environ.get("PENTECT_PF_DEVICE", "cpu")
         # Use the absolute path so the OPF loader doesn't get confused by cwd.
         if ckpt and not os.path.isabs(ckpt) and os.path.isdir(ckpt):
             ckpt = os.path.abspath(ckpt)

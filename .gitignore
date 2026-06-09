@@ -11,3 +11,10 @@ node_modules/
 .env
 .env.*
 .DS_Store
+SPEC.md
+STRATEGY.md
+CASES.md
+ARCHITECTURE.md
+
+# Scratch space — slides, drafts, experiments
+sandbox/
