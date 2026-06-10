@@ -45,6 +45,27 @@ impl Recovery {
         // Always valid UTF-8: we only ever sealed &str bytes and XOR is exact.
         String::from_utf8(bytes).ok()
     }
+
+    /// Re-mask: replace any sealed original value that reappears in `text` (e.g.
+    /// a tool echoed it after a resolve) with its placeholder. The other half of
+    /// `restore`, for the resolve-at-exec loop: resolve placeholders just before
+    /// running a command, then re-mask the command's output so a revealed secret
+    /// does not leak back to the model. Longest value first, so a value that
+    /// contains a shorter one is replaced as a whole.
+    pub fn remask(&self, text: &str) -> String {
+        let mut pairs: Vec<(String, &str)> = self
+            .map
+            .keys()
+            .filter_map(|ph| self.reveal(ph).map(|v| (v, ph.as_str())))
+            .filter(|(v, _)| !v.is_empty())
+            .collect();
+        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let mut out = text.to_string();
+        for (value, ph) in pairs {
+            out = out.replace(&value, ph);
+        }
+        out
+    }
 }
 
 /// Uninhabited: `restore` cannot fail today. Reserved so a future versioned,
@@ -168,6 +189,24 @@ mod tests {
         // but the stored bytes are not the plaintext secret.
         let stored = rec.map.get("<<AWS_AKID_0011223344556677>>").unwrap();
         assert_ne!(stored.as_slice(), secret.as_bytes());
+    }
+
+    #[test]
+    fn remask_rehides_echoed_values_and_pairs_with_restore() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let ph = "<<AWS_AKID_0011223344556677>>";
+        let rec = Recovery::seal(
+            HashMap::from([(ph.to_string(), secret.to_string())]),
+            &[5u8; 32],
+        );
+        // A tool echoed the resolved secret; remask hides it again.
+        assert_eq!(
+            rec.remask(&format!("ran with {secret} ok")),
+            format!("ran with {ph} ok")
+        );
+        // restore then remask is the identity on masked text.
+        let masked = format!("use {ph}");
+        assert_eq!(rec.remask(&restore(&masked, &rec).unwrap()), masked);
     }
 
     proptest::proptest! {
