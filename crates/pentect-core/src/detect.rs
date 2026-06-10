@@ -102,6 +102,14 @@ impl Default for EntropyDetector {
     }
 }
 
+impl EntropyDetector {
+    /// `min_len` is clamped to the placeholder hash width so a lowered threshold
+    /// can never re-fire on a rendered placeholder hash.
+    pub fn with(min_len: usize, threshold: f64) -> Self {
+        Self { min_len: min_len.max(crate::placeholder::HASH_HEX_WIDTH), threshold }
+    }
+}
+
 impl Detector for EntropyDetector {
     fn id(&self) -> &str {
         "entropy"
@@ -167,11 +175,15 @@ pub struct DecodeDetector {
     codecs: Vec<Box<dyn Codec>>,
     identify: Vec<Box<dyn Detector>>,
     max_depth: u8,
+    /// When set, a run that decodes to binary-looking bytes but yields no inner
+    /// secret is still masked as an opaque blob ("looks encrypted").
+    mask_unknown: bool,
+    min_unknown_run: usize,
 }
 
 impl DecodeDetector {
     pub fn new(codecs: Vec<Box<dyn Codec>>, identify: Vec<Box<dyn Detector>>, max_depth: u8) -> Self {
-        Self { codecs, identify, max_depth }
+        Self { codecs, identify, max_depth, mask_unknown: false, min_unknown_run: MIN_DECODE_RUN }
     }
 
     pub fn builtin() -> Self {
@@ -185,6 +197,18 @@ impl DecodeDetector {
             vec![Box::new(RuleDetector::builtin())],
             3,
         )
+    }
+
+    pub fn with_opaque(mut self, mask_unknown: bool, min_run: usize) -> Self {
+        self.mask_unknown = mask_unknown;
+        self.min_unknown_run = min_run.max(MIN_DECODE_RUN);
+        self
+    }
+
+    /// True if some codec decodes the run into binary-looking bytes (a strong
+    /// "this is ciphertext" signal, distinct from raw entropy).
+    fn decodes_to_binary(&self, run: &str) -> bool {
+        self.codecs.iter().any(|c| c.decode(run).is_some_and(|b| looks_binary(&b)))
     }
 
     fn probe(&self, run: &str, depth: u8) -> Option<(Category, String, Confidence)> {
@@ -260,7 +284,8 @@ impl Detector for DecodeDetector {
                 i += 1;
             }
             if i - start >= MIN_DECODE_RUN {
-                if let Some((cat, label, conf)) = self.probe(&s[start..i], self.max_depth) {
+                let run = &s[start..i];
+                if let Some((cat, label, conf)) = self.probe(run, self.max_depth) {
                     out.push(Span {
                         range: view.to_raw(ByteRange::new(start, i)),
                         category: cat,
@@ -268,11 +293,38 @@ impl Detector for DecodeDetector {
                         confidence: conf,
                         source: "decode".to_string(),
                     });
+                } else if self.mask_unknown
+                    && i - start >= self.min_unknown_run
+                    && self.decodes_to_binary(run)
+                {
+                    out.push(Span {
+                        range: view.to_raw(ByteRange::new(start, i)),
+                        category: Category::Secret,
+                        label: "OPAQUE_BLOB".to_string(),
+                        confidence: Confidence::Low,
+                        source: "decode_opaque".to_string(),
+                    });
                 }
             }
         }
         out
     }
+}
+
+/// Decoded bytes look like ciphertext: not valid UTF-8, or a high fraction of
+/// non-printable bytes.
+fn looks_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    if std::str::from_utf8(bytes).is_err() {
+        return true;
+    }
+    let nonprint = bytes
+        .iter()
+        .filter(|&&b| b < 0x09 || (0x0e..0x20).contains(&b) || b >= 0x7f)
+        .count();
+    nonprint * 10 > bytes.len() * 3
 }
 
 fn token_runs(s: &str) -> Vec<&str> {
@@ -389,5 +441,36 @@ mod tests {
         assert_eq!(key_tokens("apiKey"), ["api", "key"]);
         assert_eq!(key_tokens("X-Auth-Token"), ["x", "auth", "token"]);
         assert_eq!(key_tokens("tokenizer"), ["tokenizer"]);
+    }
+
+    fn plain(raw: &str) -> Region {
+        Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: Context { path: None, key: None, kind: RegionKind::PlainText, format: Kind::Text },
+        }
+    }
+
+    // Token runs are ASCII-only, so CJK prose never forms an entropy run even at
+    // a lowered threshold.
+    #[test]
+    fn cjk_prose_not_flagged_as_entropy() {
+        let raw = "これは日本語の散文でありパスワードではありません";
+        let r = plain(raw);
+        let v = NormalizedView::build(&r, raw);
+        let det = EntropyDetector::with(16, 2.0);
+        assert!(det.detect(&v).is_empty());
+    }
+
+    #[test]
+    fn opaque_blob_only_when_mask_unknown() {
+        // base64 of binary-looking bytes; no inner secret to identify.
+        let enc = data_encoding::BASE64
+            .encode(&[0x00, 0xff, 0x1a, 0x2c, 0x9b, 0x4e, 0xd1, 0x77, 0x88, 0x33, 0xaa, 0x55, 0xc0, 0x0d]);
+        let raw = format!("x {enc} y");
+        let r = plain(&raw);
+        let v = NormalizedView::build(&r, &raw);
+        assert!(DecodeDetector::builtin().detect(&v).is_empty(), "off by default");
+        let spans = DecodeDetector::builtin().with_opaque(true, 16).detect(&v);
+        assert!(spans.iter().any(|s| s.label == "OPAQUE_BLOB"), "{:?}", spans);
     }
 }
