@@ -23,7 +23,7 @@ pub use detect::{
 };
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
 pub use parse::{EnvParser, JsonParser, Parser, TextParser};
-pub use pipeline::{Config, Engine, EngineBuilder, MaskResult, ResidualNote, Summary};
+pub use pipeline::{Config, Engine, EngineBuilder, MaskResult, MaskedItem, ResidualNote, Summary};
 pub use policy::guard::{OverMaskGuard, ShapeGuard};
 pub use policy::{Action, MaskAll, OpaqueStance, Policy, Profile, ProfilePolicy};
 pub use recovery::{restore, Recovery, RestoreError};

@@ -53,11 +53,24 @@ impl Config {
     }
 }
 
-/// A span surfaced to the user without masking (value-free).
+/// Something flagged but left unmasked (value-free). Reports *what* was warned
+/// about, not *where*: this is part of the serializable Summary, so it carries no
+/// raw byte offset (which would disclose the position and exact length of the
+/// flagged content).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResidualNote {
-    pub range: ByteRange,
     pub category: Category,
+    pub source: DetectorId,
+}
+
+/// One masked value, for reporting. Carries *what* was masked (label/category/
+/// detector), never *where*: a raw input offset would not map to `masked` anyway
+/// and would disclose each secret's position.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MaskedItem {
+    pub category: Category,
+    pub label: Label,
+    pub confidence: Confidence,
     pub source: DetectorId,
 }
 
@@ -82,7 +95,8 @@ pub struct Summary {
 pub struct MaskResult {
     pub masked: String,
     pub recovery: Recovery,
-    pub spans: Vec<Span>,
+    /// What was masked (no raw offsets); see `MaskedItem`.
+    pub items: Vec<MaskedItem>,
     pub summary: Summary,
 }
 
@@ -157,7 +171,6 @@ impl Engine {
             match self.policy.classify(&s) {
                 Action::Mask => to_mask.push(s),
                 Action::Warn => residual.push(ResidualNote {
-                    range: s.range,
                     category: s.category,
                     source: s.source,
                 }),
@@ -176,10 +189,19 @@ impl Engine {
             collisions: rendered.collisions,
             parser_fallback: false,
         };
+        let items = swept
+            .into_iter()
+            .map(|s| MaskedItem {
+                category: s.category,
+                label: s.label,
+                confidence: s.confidence,
+                source: s.source,
+            })
+            .collect();
         MaskResult {
             masked: rendered.masked,
             recovery: Recovery { map: rendered.map },
-            spans: swept,
+            items,
             summary,
         }
     }
@@ -466,6 +488,15 @@ mod tests {
         assert!(o["user"].as_str().unwrap().starts_with("<<"));
         assert_eq!(o["note"].as_str().unwrap(), "hello world");
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn report_names_what_was_masked_without_offsets() {
+        let r = m("key AKIAIOSFODNN7EXAMPLE here");
+        // The report carries the label/category but no raw position, so a
+        // consumer learns what was masked, not where the secret sat.
+        assert!(r.items.iter().any(|i| i.label == "AWS_AKID"));
+        assert_eq!(r.items.len(), r.summary.masked_count);
     }
 
     #[test]
