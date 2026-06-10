@@ -6,10 +6,14 @@ use crate::model::*;
 ///
 /// Only string values become regions, so keys and structural bytes are never
 /// masked and the output re-parses as valid JSON.
+/// Bound recursion so pathological nesting returns None (graceful plaintext
+/// fallback) instead of overflowing the stack, which would abort the process.
+const MAX_DEPTH: usize = 128;
+
 pub fn parse_json_regions(raw: &str) -> Option<Vec<Region>> {
     let mut p = Parser { b: raw.as_bytes(), i: 0, out: Vec::new() };
     p.skip_ws();
-    p.value(None)?;
+    p.value(None, 0)?;
     p.skip_ws();
     if p.i != p.b.len() {
         return None;
@@ -34,11 +38,14 @@ impl Parser<'_> {
         }
     }
 
-    fn value(&mut self, key: Option<String>) -> Option<()> {
+    fn value(&mut self, key: Option<String>, depth: usize) -> Option<()> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
         self.skip_ws();
         match self.peek()? {
-            b'{' => self.object(),
-            b'[' => self.array(key),
+            b'{' => self.object(depth + 1),
+            b'[' => self.array(key, depth + 1),
             b'"' => {
                 let (range, _) = self.string()?;
                 self.out.push(Region {
@@ -59,7 +66,7 @@ impl Parser<'_> {
         }
     }
 
-    fn object(&mut self) -> Option<()> {
+    fn object(&mut self, depth: usize) -> Option<()> {
         self.i += 1; // '{'
         self.skip_ws();
         if self.peek() == Some(b'}') {
@@ -77,7 +84,7 @@ impl Parser<'_> {
                 return None;
             }
             self.i += 1;
-            self.value(Some(key))?;
+            self.value(Some(key), depth)?;
             self.skip_ws();
             match self.peek()? {
                 b',' => self.i += 1,
@@ -90,7 +97,7 @@ impl Parser<'_> {
         }
     }
 
-    fn array(&mut self, key: Option<String>) -> Option<()> {
+    fn array(&mut self, key: Option<String>, depth: usize) -> Option<()> {
         self.i += 1; // '['
         self.skip_ws();
         if self.peek() == Some(b']') {
@@ -99,7 +106,7 @@ impl Parser<'_> {
         }
         loop {
             // Array elements inherit the array's key as their context.
-            self.value(key.clone())?;
+            self.value(key.clone(), depth)?;
             self.skip_ws();
             match self.peek()? {
                 b',' => self.i += 1,
@@ -182,5 +189,11 @@ mod tests {
     #[test]
     fn rejects_non_json() {
         assert!(parse_json_regions("{bad").is_none());
+    }
+
+    #[test]
+    fn deep_nesting_returns_none_not_abort() {
+        let deep = format!("{}true{}", "[".repeat(50_000), "]".repeat(50_000));
+        assert!(parse_json_regions(&deep).is_none());
     }
 }
