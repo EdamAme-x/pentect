@@ -4,6 +4,7 @@
 //! Invariants are property-tested in tests/invariants.rs.
 
 pub mod detect;
+pub mod json;
 pub mod merge;
 pub mod model;
 pub mod normalize;

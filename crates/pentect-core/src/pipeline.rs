@@ -1,4 +1,5 @@
 use crate::detect::DetectorSet;
+use crate::json;
 use crate::merge::merge;
 use crate::model::*;
 use crate::policy::{Action, Policy};
@@ -59,7 +60,7 @@ pub fn mask_ir(ir: Ir, config: &Config) -> MaskResult {
     spans.retain(|s| matches!(policy.classify(s), Action::Mask(_)));
 
     let merged = merge(spans, &ir.protected);
-    let swept = identity_sweep(&ir.raw, merged, &ir.protected);
+    let swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
     let rendered = render(&ir.raw, &config.key, swept.clone());
 
     let summary = Summary { masked_count: rendered.map.len() };
@@ -72,20 +73,28 @@ pub fn mask_ir(ir: Ir, config: &Config) -> MaskResult {
 }
 
 fn parse(input: Input) -> Ir {
-    // slice 1: the whole input is a single plaintext region.
-    let raw = input.data;
+    let Input { kind, data: raw } = input;
     let protected = scan_placeholders(&raw);
-    let ctx = Context {
-        path: None,
-        key: None,
-        kind: RegionKind::PlainText,
-        format: input.kind,
+    // JSON yields one region per string value (keys/structure stay unmasked);
+    // anything else is a single plaintext region.
+    let regions = match &kind {
+        Kind::Json => json::parse_json_regions(&raw)
+            .unwrap_or_else(|| vec![plaintext_region(raw.len(), Kind::Json)]),
+        other => vec![plaintext_region(raw.len(), other.clone())],
     };
-    let regions = vec![Region {
-        span: ByteRange::new(0, raw.len()),
-        ctx,
-    }];
     Ir { raw, regions, protected }
+}
+
+fn plaintext_region(len: usize, format: Kind) -> Region {
+    Region {
+        span: ByteRange::new(0, len),
+        ctx: Context {
+            path: None,
+            key: None,
+            kind: RegionKind::PlainText,
+            format,
+        },
+    }
 }
 
 /// Freeze existing `<<LABEL_hash>>` placeholders so re-masking is a no-op.
@@ -94,4 +103,68 @@ fn scan_placeholders(raw: &str) -> Vec<ByteRange> {
     re.find_iter(raw)
         .map(|m| ByteRange::new(m.start(), m.end()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recovery::restore;
+    use proptest::prelude::*;
+
+    fn m(s: &str) -> MaskResult {
+        mask(Input { kind: Kind::Text, data: s.to_string() }, &Config::insecure_testing())
+    }
+    fn mj(s: &str) -> MaskResult {
+        mask(Input { kind: Kind::Json, data: s.to_string() }, &Config::insecure_testing())
+    }
+
+    #[test]
+    fn reversible_idempotent_deterministic() {
+        for x in ["", "hi there", "key sk-ABCDEFGHIJKLMNOPQRSTUVWX end", "a@b.com x a@b.com"] {
+            let r = m(x);
+            assert_eq!(restore(&r.masked, &r.recovery).unwrap(), x);
+            assert_eq!(m(&r.masked).masked, r.masked);
+            assert_eq!(m(x).masked, r.masked);
+        }
+    }
+
+    #[test]
+    fn global_identity_no_survivor() {
+        let r = m("a@b.com mid a@b.com");
+        assert!(!r.masked.contains("a@b.com"), "{}", r.masked);
+        assert_eq!(r.recovery.map.len(), 1);
+    }
+
+    #[test]
+    fn distinct_values_distinct_placeholders() {
+        let r = m("AKIAIOSFODNN7EXAMPLE AKIA0000000000000000");
+        assert_eq!(r.recovery.map.len(), 2, "{}", r.masked);
+    }
+
+    #[test]
+    fn json_structure_preserved() {
+        let input = r#"{"user":"alice@example.com","db_password":"hunter2pass","note":"hello world"}"#;
+        let r = mj(input);
+        let v: serde_json::Value = serde_json::from_str(&r.masked).expect("masked output is valid JSON");
+        let o = v.as_object().unwrap();
+        assert!(o["db_password"].as_str().unwrap().starts_with("<<")); // suspicious key
+        assert!(o["user"].as_str().unwrap().starts_with("<<")); // email rule
+        assert_eq!(o["note"].as_str().unwrap(), "hello world"); // benign, untouched
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    proptest! {
+        // Charset excludes `<` and `>` to avoid injecting placeholder syntax.
+        #[test]
+        fn prop_reversible(s in "[a-zA-Z0-9 @._:/-]{0,160}") {
+            let r = m(&s);
+            prop_assert_eq!(restore(&r.masked, &r.recovery).unwrap(), s);
+        }
+
+        #[test]
+        fn prop_idempotent(s in "[a-zA-Z0-9 @._:/-]{0,160}") {
+            let once = m(&s).masked;
+            prop_assert_eq!(m(&once).masked, once);
+        }
+    }
 }
