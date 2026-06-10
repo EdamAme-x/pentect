@@ -3,6 +3,13 @@ use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
 
+/// Default minimum run length before a token is entropy-eligible. Long enough to
+/// skip short benign tokens (UUID segments, short ids) while catching real keys.
+pub const DEFAULT_ENTROPY_MIN_LEN: usize = 24;
+/// Default Shannon bits/char above which a run is opaque. base64 ciphertext sits
+/// ~5-6, hex digests ~3.9; 3.2 catches those while sparing ordinary identifiers.
+pub const DEFAULT_ENTROPY_THRESHOLD: f64 = 3.2;
+
 /// Flags long, high-entropy codec-alphabet runs as likely opaque secrets.
 pub struct EntropyDetector {
     min_len: usize,
@@ -11,10 +18,7 @@ pub struct EntropyDetector {
 
 impl Default for EntropyDetector {
     fn default() -> Self {
-        Self {
-            min_len: 24,
-            threshold: 3.2,
-        }
+        Self::with(DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD)
     }
 }
 

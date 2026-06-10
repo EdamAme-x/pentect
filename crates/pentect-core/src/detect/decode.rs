@@ -6,8 +6,21 @@ use crate::normalize::NormalizedView;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use std::io::Read;
 
+/// Shortest run worth attempting to decode (below this it's rarely an encoded
+/// secret and the codec false-positive rate climbs).
 const MIN_DECODE_RUN: usize = 16;
+/// Default nesting limit for decode/decompress recursion (e.g. base64(gzip(..))).
+/// Deep enough for real multi-wrap payloads, bounded so crafted nesting can't fan
+/// out unboundedly.
+pub const DEFAULT_DECODE_DEPTH: u8 = 3;
+/// Default minimum run length for the opaque-blob ("looks encrypted") path; kept
+/// above MIN_DECODE_RUN so short decodable strings don't get masked as ciphertext.
+pub const DEFAULT_MIN_OPAQUE_RUN: usize = 24;
+/// Cap on decompression output so a zip bomb can't exhaust memory; we only need
+/// enough to detect a secret, not the full payload.
 const MAX_INFLATE: u64 = 8 * 1024 * 1024;
+/// Fraction of C0 control bytes above which decoded text is treated as binary.
+const BINARY_NONPRINT_RATIO: f64 = 0.3;
 
 /// Tries injected codecs on each encoded-looking run; if the decoded content
 /// (possibly nested) is identified by an injected detector, masks the whole
@@ -47,7 +60,7 @@ impl DecodeDetector {
                 Box::new(HexCodec),
             ],
             vec![Box::new(RuleDetector::builtin())],
-            3,
+            DEFAULT_DECODE_DEPTH,
         )
     }
 
@@ -167,8 +180,9 @@ impl Detector for DecodeDetector {
     }
 }
 
-/// Decoded bytes look like ciphertext: not valid UTF-8, or a high fraction of
-/// non-printable bytes.
+/// Decoded bytes look like ciphertext: not valid UTF-8, or more than
+/// BINARY_NONPRINT_RATIO C0 control bytes (TAB/LF/VT/FF/CR excepted). High bytes
+/// are not counted here — in valid UTF-8 they are legitimate multibyte text.
 fn looks_binary(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
@@ -178,9 +192,9 @@ fn looks_binary(bytes: &[u8]) -> bool {
     }
     let nonprint = bytes
         .iter()
-        .filter(|&&b| b < 0x09 || (0x0e..0x20).contains(&b) || b >= 0x7f)
+        .filter(|&&b| b < 0x09 || (0x0e..0x20).contains(&b))
         .count();
-    nonprint * 10 > bytes.len() * 3
+    nonprint as f64 > bytes.len() as f64 * BINARY_NONPRINT_RATIO
 }
 
 fn token_runs(s: &str) -> Vec<&str> {
@@ -237,5 +251,18 @@ mod tests {
         );
         let spans = DecodeDetector::builtin().with_opaque(true, 16).detect(&v);
         assert!(spans.iter().any(|s| s.label == "OPAQUE_BLOB"), "{spans:?}");
+    }
+
+    #[test]
+    fn looks_binary_ratio_boundary() {
+        // Valid UTF-8 with C0 control bytes either side of the 30% threshold.
+        let below: Vec<u8> = std::iter::repeat_n(0x01, 7)
+            .chain(std::iter::repeat_n(b'a', 17))
+            .collect(); // 7/24 = 29%
+        let above: Vec<u8> = std::iter::repeat_n(0x01, 8)
+            .chain(std::iter::repeat_n(b'a', 16))
+            .collect(); // 8/24 = 33%
+        assert!(!looks_binary(&below));
+        assert!(looks_binary(&above));
     }
 }

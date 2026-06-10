@@ -1,3 +1,4 @@
+use crate::detect::{DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD, DEFAULT_MIN_OPAQUE_RUN};
 use crate::model::{DetectorId, Span};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -79,35 +80,42 @@ pub enum Profile {
 }
 
 impl Profile {
+    /// Profiles share the detector defaults and move monotonically: Strict and
+    /// Balanced use the defaults (differing only in the context-free stance);
+    /// Dev relaxes (higher thresholds + keeps context-free); Paranoid tightens
+    /// (lower thresholds + masks opaque blobs). The numeric offsets are local to
+    /// each profile and intentionally hand-tuned.
     pub fn knobs(self) -> ProfileKnobs {
         match self {
             Profile::Strict => ProfileKnobs {
                 context_free: OpaqueStance::Mask,
-                entropy_min_len: 24,
-                entropy_threshold: 3.2,
+                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN,
+                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD,
                 mask_unknown_codec: false,
-                min_opaque_run: 24,
+                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
             },
             Profile::Balanced => ProfileKnobs {
                 context_free: OpaqueStance::Warn,
-                entropy_min_len: 24,
-                entropy_threshold: 3.2,
+                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN,
+                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD,
                 mask_unknown_codec: false,
-                min_opaque_run: 24,
+                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
             },
+            // Relaxed: raise thresholds so kept context-free runs are quieter.
             Profile::Dev => ProfileKnobs {
                 context_free: OpaqueStance::Keep,
-                entropy_min_len: 28,
-                entropy_threshold: 3.6,
+                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN + 4,
+                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD + 0.4,
                 mask_unknown_codec: false,
-                min_opaque_run: 28,
+                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN + 4,
             },
+            // Tightened: lower thresholds and mask decodable opaque blobs.
             Profile::Paranoid => ProfileKnobs {
                 context_free: OpaqueStance::Mask,
-                entropy_min_len: 20,
-                entropy_threshold: 2.8,
+                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN - 4,
+                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD - 0.4,
                 mask_unknown_codec: true,
-                min_opaque_run: 20,
+                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN - 4,
             },
         }
     }
