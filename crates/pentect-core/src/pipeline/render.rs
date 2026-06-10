@@ -201,7 +201,8 @@ mod tests {
         assert_eq!(r.masked.matches("<<IDENTITY_").count(), 2, "{}", r.masked);
         assert!(r.masked.contains(">>@<<"), "{}", r.masked);
         assert_eq!(
-            crate::recovery::restore(&r.masked, &crate::recovery::Recovery { map: r.map }).unwrap(),
+            crate::recovery::restore(&r.masked, &crate::recovery::Recovery::seal(r.map, &key))
+                .unwrap(),
             raw
         );
     }

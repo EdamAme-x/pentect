@@ -1,10 +1,50 @@
-use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-/// Local-only mapping; never serialized into a MaskResult summary.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+const PAD_DOMAIN: &[u8] = b"pentect-recovery-pad-v1";
+
+/// Local-only placeholder -> original mapping. Values are stored XOR-obfuscated,
+/// not as cleartext: this is lightweight in-memory obfuscation, NOT encryption.
+/// The pad is derived from the masking key and lives in the same process, so an
+/// attacker with memory access still recovers the values; the point is only that
+/// secrets don't sit as plaintext in a memory dump or trip a naive secret-scan.
+/// Deliberately not serializable — persisting it to disk is a separate, gated
+/// decision (a versioned, integrity-checked header), not a casual derive.
+#[derive(Clone, Debug, Default)]
 pub struct Recovery {
-    pub map: HashMap<String, String>,
+    pad: [u8; 32],
+    map: HashMap<String, Vec<u8>>,
+}
+
+impl Recovery {
+    /// Obfuscate a plaintext placeholder->value map for in-memory storage.
+    pub fn seal(plaintext: HashMap<String, String>, key: &[u8; 32]) -> Self {
+        let pad = derive_pad(key);
+        let map = plaintext
+            .into_iter()
+            .map(|(ph, val)| {
+                let obf = xor_keystream(&pad, ph.as_bytes(), val.as_bytes());
+                (ph, obf)
+            })
+            .collect();
+        Self { pad, map }
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Deobfuscate the original value for `placeholder`, if present.
+    fn reveal(&self, placeholder: &str) -> Option<String> {
+        let obf = self.map.get(placeholder)?;
+        let bytes = xor_keystream(&self.pad, placeholder.as_bytes(), obf);
+        // Always valid UTF-8: we only ever sealed &str bytes and XOR is exact.
+        String::from_utf8(bytes).ok()
+    }
 }
 
 /// Uninhabited: `restore` cannot fail today. Reserved so a future versioned,
@@ -23,8 +63,8 @@ pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
         if bytes[i] == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
             if let Some(close) = find_from(bytes, i + 2, b">>") {
                 let token = &text[i..close + 2];
-                match rec.map.get(token) {
-                    Some(v) => out.push_str(v),
+                match rec.reveal(token) {
+                    Some(v) => out.push_str(&v),
                     None => out.push_str(token),
                 }
                 i = close + 2;
@@ -36,6 +76,39 @@ pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
         i += len;
     }
     Ok(out)
+}
+
+/// Domain-separated pad derived from the masking key (so it isn't reused verbatim
+/// for placeholder hashing).
+fn derive_pad(key: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(PAD_DOMAIN);
+    h.update(key);
+    h.finalize().into()
+}
+
+/// XOR `data` with a per-entry keystream: block i is SHA256(pad || nonce || i).
+/// `nonce` is the placeholder, unique per entry, so values never share a stream.
+/// Reversible — calling it again on the output restores the input.
+fn xor_keystream(pad: &[u8; 32], nonce: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut block = [0u8; 32];
+    let mut bi = block.len();
+    let mut counter: u64 = 0;
+    for &b in data {
+        if bi == block.len() {
+            let mut h = Sha256::new();
+            h.update(pad);
+            h.update(nonce);
+            h.update(counter.to_le_bytes());
+            block = h.finalize().into();
+            counter += 1;
+            bi = 0;
+        }
+        out.push(b ^ block[bi]);
+        bi += 1;
+    }
+    out
 }
 
 fn find_from(hay: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
@@ -77,6 +150,26 @@ mod tests {
         assert_eq!(out, "a <<X_unknown>> b");
     }
 
+    #[test]
+    fn seal_reveal_round_trips_without_storing_cleartext() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let rec = Recovery::seal(
+            HashMap::from([(
+                "<<AWS_AKID_0011223344556677>>".to_string(),
+                secret.to_string(),
+            )]),
+            &[7u8; 32],
+        );
+        // restore deobfuscates exactly,
+        assert_eq!(
+            restore("use <<AWS_AKID_0011223344556677>>", &rec).unwrap(),
+            format!("use {secret}")
+        );
+        // but the stored bytes are not the plaintext secret.
+        let stored = rec.map.get("<<AWS_AKID_0011223344556677>>").unwrap();
+        assert_ne!(stored.as_slice(), secret.as_bytes());
+    }
+
     proptest::proptest! {
         // restore must never panic on arbitrary input, with or without entries.
         #[test]
@@ -85,8 +178,7 @@ mod tests {
             k in "[A-Z_]{0,8}",
             v in ".{0,16}",
         ) {
-            let mut rec = Recovery::default();
-            rec.map.insert(format!("<<{k}_aa>>"), v);
+            let rec = Recovery::seal(HashMap::from([(format!("<<{k}_aa>>"), v)]), &[0u8; 32]);
             let _ = restore(&text, &rec).unwrap();
         }
 

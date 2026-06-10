@@ -203,7 +203,7 @@ impl Engine {
             .collect();
         MaskResult {
             masked: rendered.masked,
-            recovery: Recovery { map: rendered.map },
+            recovery: Recovery::seal(rendered.map, &config.key),
             segments: rendered.segments,
             items,
             summary,
@@ -374,13 +374,13 @@ mod tests {
         assert!(!r.masked.contains("a@b.com"), "{}", r.masked);
         // Email splits into local + domain, so both occurrences share two
         // mappings (not one): the point is no plaintext address survives.
-        assert_eq!(r.recovery.map.len(), 2);
+        assert_eq!(r.recovery.len(), 2);
     }
 
     #[test]
     fn distinct_values_distinct_placeholders() {
         let r = m("AKIAIOSFODNN7EXAMPLE AKIA0000000000000000");
-        assert_eq!(r.recovery.map.len(), 2, "{}", r.masked);
+        assert_eq!(r.recovery.len(), 2, "{}", r.masked);
     }
 
     #[test]
