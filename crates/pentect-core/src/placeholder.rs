@@ -20,8 +20,8 @@ pub fn identity_hash(key: &[u8; 32], n_id_value: &str) -> String {
     s
 }
 
-/// Length buckets for opt-in disclosure (REF.md §11.6). Three fixed floors so
-/// only three values are ever emitted and the exact length is never revealed.
+/// Length buckets for opt-in disclosure. Three fixed floors so only three values
+/// are ever emitted and the exact length is never revealed.
 const BUCKET_MED: usize = 24;
 const BUCKET_LONG: usize = 64;
 const BUCKET_XLONG: usize = 512;
@@ -39,8 +39,8 @@ pub fn render_placeholder(label: &str, hash: &str, bucket: Option<u32>) -> Strin
 /// Coarse length bucket for opaque blobs, opt-in. Returns the floor of one of
 /// three buckets (24/64/512), so the value reads as "at least N chars" but the
 /// exact length never leaks (only three possible outputs). Below BUCKET_MED
-/// nothing is disclosed. Deviates from REF.md §11.6 only in spelling: emits the
-/// legible floor instead of ~med/~long/~xlong so a model understands it.
+/// nothing is disclosed. Emits the legible floor (not ~med/~long) so a model
+/// understands it.
 pub fn approx_length(char_len: usize) -> Option<u32> {
     match char_len {
         n if n >= BUCKET_XLONG => Some(BUCKET_XLONG as u32),

@@ -12,12 +12,12 @@ pub struct Rendered {
     pub collisions: Vec<String>,
 }
 
-// Render granularity is shape-driven (REF §7.8/C20, §10.3): a value that parses
-// as an email splits its local part and domain into separate hashes joined by a
-// literal `@`, so same-domain addresses still aggregate (a model can tell two
-// users share an org without seeing the addresses) — regardless of category.
-// Everything else is one opaque placeholder: we never keep value prefixes
-// (§10.2), so FULL and HASH_ONLY coincide. URL_STRUCTURED awaits a URL detector.
+// Render granularity is shape-driven: a value that parses as an email splits its
+// local part and domain into separate hashes joined by a literal `@`, so
+// same-domain addresses still aggregate (a model can tell two users share an org
+// without seeing the addresses) — regardless of category. Everything else is one
+// opaque placeholder; we never keep value prefixes, so there is no separate
+// "whole vs hash-only" mode. Structured URL masking awaits a URL detector.
 
 /// Split an email into (local, domain), or None unless it is a single-`@` address
 /// with a dotted, alphabetic-TLD domain — so a value that merely contains `@`
