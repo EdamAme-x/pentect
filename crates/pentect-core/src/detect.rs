@@ -1,5 +1,7 @@
 use crate::model::*;
 use crate::normalize::NormalizedView;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+use base64::Engine;
 use regex::Regex;
 
 /// Side-effect-free and deterministic. Runs on a region's normalized view and
@@ -19,6 +21,7 @@ impl DetectorSet {
             detectors: vec![
                 Box::new(RuleDetector::builtin()),
                 Box::new(EntropyDetector::default()),
+                Box::new(Base64Detector::builtin()),
                 Box::new(SuspiciousKeyDetector),
             ],
         }
@@ -87,6 +90,15 @@ impl RuleDetector {
         ];
         Self { rules }
     }
+
+    /// First matching rule in a plain string, ignoring coordinates. Used by the
+    /// base64 detector to identify what a decoded blob contains.
+    fn probe(&self, s: &str) -> Option<(Category, &'static str, Confidence)> {
+        self.rules
+            .iter()
+            .find(|rule| rule.re.is_match(s))
+            .map(|rule| (rule.category, rule.label, rule.confidence))
+    }
 }
 
 impl Detector for RuleDetector {
@@ -129,17 +141,15 @@ impl Detector for EntropyDetector {
     }
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let bytes = view.text().as_bytes();
-        let is_tok =
-            |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-');
         let mut out = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
-            if !is_tok(bytes[i]) {
+            if !is_token_byte(bytes[i]) {
                 i += 1;
                 continue;
             }
             let start = i;
-            while i < bytes.len() && is_tok(bytes[i]) {
+            while i < bytes.len() && is_token_byte(bytes[i]) {
                 i += 1;
             }
             let run = &bytes[start..i];
@@ -155,6 +165,10 @@ impl Detector for EntropyDetector {
         }
         out
     }
+}
+
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-')
 }
 
 fn shannon(bytes: &[u8]) -> f64 {
@@ -174,6 +188,93 @@ fn shannon(bytes: &[u8]) -> f64 {
         }
     }
     h
+}
+
+const MIN_B64_RUN: usize = 16;
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    STANDARD
+        .decode(s)
+        .ok()
+        .or_else(|| URL_SAFE.decode(s).ok())
+        .or_else(|| STANDARD_NO_PAD.decode(s).ok())
+        .or_else(|| URL_SAFE_NO_PAD.decode(s).ok())
+}
+
+/// Decodes base64-ish runs and, if the decoded content (possibly nested) matches
+/// a known rule, masks the whole encoded blob under that label. The blob is
+/// masked whole because a partial replacement could not be re-encoded.
+pub struct Base64Detector {
+    rules: RuleDetector,
+    max_depth: u8,
+}
+
+impl Base64Detector {
+    pub fn builtin() -> Self {
+        Self { rules: RuleDetector::builtin(), max_depth: 3 }
+    }
+
+    fn probe(&self, run: &str, depth: u8) -> Option<(Category, String, Confidence)> {
+        let decoded = b64_decode(run)?;
+        let text = std::str::from_utf8(&decoded).ok()?;
+        if let Some((cat, label, conf)) = self.rules.probe(text) {
+            return Some((cat, label.to_string(), conf));
+        }
+        if depth > 0 {
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if !is_token_byte(bytes[i]) {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < bytes.len() && is_token_byte(bytes[i]) {
+                    i += 1;
+                }
+                if i - start >= MIN_B64_RUN {
+                    if let Some(hit) = self.probe(&text[start..i], depth - 1) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+impl Detector for Base64Detector {
+    fn id(&self) -> &str {
+        "base64_unwrap"
+    }
+    fn detect(&self, view: &NormalizedView) -> Vec<Span> {
+        let s = view.text();
+        let bytes = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !is_token_byte(bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && is_token_byte(bytes[i]) {
+                i += 1;
+            }
+            if i - start >= MIN_B64_RUN {
+                if let Some((cat, label, conf)) = self.probe(&s[start..i], self.max_depth) {
+                    out.push(Span {
+                        range: view.to_raw(ByteRange::new(start, i)),
+                        category: cat,
+                        label,
+                        confidence: conf,
+                        source: "base64_unwrap".to_string(),
+                    });
+                }
+            }
+        }
+        out
+    }
 }
 
 const SENSITIVE_KEY_TOKENS: &[&str] = &[

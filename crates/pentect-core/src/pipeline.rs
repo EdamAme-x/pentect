@@ -103,7 +103,7 @@ fn plaintext_region(len: usize, format: Kind) -> Region {
 
 /// Freeze existing `<<LABEL_hash>>` placeholders so re-masking is a no-op.
 fn scan_placeholders(raw: &str) -> Vec<ByteRange> {
-    let re = Regex::new(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}(?:_~[a-z]+)?>>")
+    let re = Regex::new(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}(?:_len[0-9]+)?>>")
         .expect("placeholder regex compiles");
     re.find_iter(raw)
         .map(|m| ByteRange::new(m.start(), m.end()))
@@ -147,17 +147,17 @@ mod tests {
     }
 
     #[test]
-    fn opt_in_length_bucket_for_opaque_only() {
+    fn opt_in_length_for_opaque_only() {
         let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh"; // ~29 chars, high entropy
         let input = format!("blob {blob} end");
         let on = Config { disclose_length: true, ..Config::insecure_testing() };
         let r = mask(Input { kind: Kind::Text, data: input.clone() }, &on);
-        assert!(r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_~med>>"), "{}", r.masked);
+        assert!(r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_len"), "{}", r.masked);
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
 
-        // Off by default: no bucket suffix.
+        // Off by default: no length suffix.
         let r2 = mask(Input { kind: Kind::Text, data: input.clone() }, &Config::insecure_testing());
-        assert!(!r2.masked.contains('~'), "{}", r2.masked);
+        assert!(!r2.masked.contains("_len"), "{}", r2.masked);
     }
 
     #[test]
@@ -165,6 +165,20 @@ mod tests {
         let r = m("key AKIA\u{200b}IOSFODNN7EXAMPLE end");
         assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
         assert!(!r.masked.contains('\u{200b}'), "{}", r.masked);
+    }
+
+    #[test]
+    fn base64_wrapped_secret_gets_specific_label() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let once = STANDARD.encode("AKIAIOSFODNN7EXAMPLE");
+        let twice = STANDARD.encode(once.as_bytes());
+        for enc in [once, twice] {
+            let input = format!("payload {enc} tail");
+            let r = m(&input);
+            assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
+            assert!(!r.masked.contains(&enc), "{}", r.masked);
+            assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+        }
     }
 
     #[test]

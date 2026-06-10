@@ -20,21 +20,23 @@ pub fn identity_hash(key: &[u8; 32], n_id_value: &str) -> String {
     s
 }
 
-/// `<<LABEL_HASH>>`, or `<<LABEL_HASH_~BUCKET>>` when a length bucket is given.
-pub fn render_placeholder(label: &str, hash: &str, length_bucket: Option<&str>) -> String {
-    match length_bucket {
-        Some(b) => format!("<<{label}_{hash}_~{b}>>"),
+/// `<<LABEL_HASH>>`, or `<<LABEL_HASH_lenN>>` when an approximate length is given.
+/// `lenN` is self-describing so a model reads it as "about N characters".
+pub fn render_placeholder(label: &str, hash: &str, approx_len: Option<u32>) -> String {
+    match approx_len {
+        Some(n) => format!("<<{label}_{hash}_len{n}>>"),
         None => format!("<<{label}_{hash}>>"),
     }
 }
 
-/// Coarse, opt-in length bucket for opaque blobs. Nothing is disclosed below the
-/// floor, and exact length is never revealed.
-pub fn length_bucket(char_len: usize) -> Option<&'static str> {
-    match char_len {
-        0..=23 => None,
-        24..=63 => Some("med"),
-        64..=511 => Some("long"),
-        _ => Some("xlong"),
+/// Approximate character length for opaque blobs, opt-in. Rounded to a coarse
+/// step so it reads naturally but never reveals the exact length; below the
+/// floor nothing is disclosed.
+pub fn approx_length(char_len: usize) -> Option<u32> {
+    const FLOOR: usize = 24;
+    const STEP: usize = 8;
+    if char_len < FLOOR {
+        return None;
     }
+    Some(((char_len + STEP / 2) / STEP * STEP) as u32)
 }

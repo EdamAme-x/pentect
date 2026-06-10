@@ -1,6 +1,6 @@
 use crate::model::*;
 use crate::normalize::n_id;
-use crate::placeholder::{identity_hash, length_bucket, render_placeholder};
+use crate::placeholder::{approx_length, identity_hash, render_placeholder};
 use std::collections::HashMap;
 
 pub struct Rendered {
@@ -26,12 +26,12 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         masked.push_str(&raw[cursor..s.range.start]);
         let val = &raw[s.range.start..s.range.end];
         let hash = identity_hash(key, &n_id(val));
-        let bucket = if disclose_length && s.label == "LIKELY_SECRET" {
-            length_bucket(val.chars().count())
+        let len = if disclose_length && s.label == "LIKELY_SECRET" {
+            approx_length(val.chars().count())
         } else {
             None
         };
-        let ph = render_placeholder(&s.label, &hash, bucket);
+        let ph = render_placeholder(&s.label, &hash, len);
         masked.push_str(&ph);
         map.entry(ph).or_insert_with(|| val.to_string());
         cursor = s.range.end;
