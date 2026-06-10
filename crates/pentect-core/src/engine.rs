@@ -1,5 +1,5 @@
 use crate::detect::{
-    DecodeDetector, Detector, EntropyDetector, RuleDetector, SuspiciousKeyDetector,
+    DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, SuspiciousKeyDetector,
 };
 use crate::guard::{OverMaskGuard, ShapeGuard};
 use crate::merge::merge;
@@ -104,6 +104,7 @@ impl Engine {
             .parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
             .detector(Box::new(RuleDetector::builtin()))
+            .detector(Box::new(PemDetector::default()))
             .detector(Box::new(EntropyDetector::with(
                 k.entropy_min_len,
                 k.entropy_threshold,
@@ -208,6 +209,7 @@ impl Default for Engine {
             .parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
             .detector(Box::new(RuleDetector::builtin()))
+            .detector(Box::new(PemDetector::default()))
             .detector(Box::new(EntropyDetector::default()))
             .detector(Box::new(DecodeDetector::builtin()))
             .detector(Box::new(SuspiciousKeyDetector))
@@ -596,6 +598,23 @@ mod tests {
                 prop_assert!(!r.masked.contains(secret), "{p:?} left a survivor: {}", r.masked);
             }
         }
+    }
+
+    #[test]
+    fn pem_private_key_masked_under_default_profile() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBVAIBADANBgkqh\nkiG9w0BAQEFAASCAT\n-----END RSA PRIVATE KEY-----";
+        let input = format!("here is the key:\n{pem}\nthanks");
+        let r = Engine::with_profile(Profile::Balanced)
+            .mask(Input::text(&input), &Config::insecure_testing());
+        assert!(r.masked.contains("<<PRIVATE_KEY_"), "{}", r.masked);
+        assert!(!r.masked.contains("MIIBVAIBADANBgkqh"), "{}", r.masked);
+        // Armor preserved so the model knows what was masked.
+        assert!(
+            r.masked.contains("-----BEGIN RSA PRIVATE KEY-----"),
+            "{}",
+            r.masked
+        );
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
     }
 
     #[test]

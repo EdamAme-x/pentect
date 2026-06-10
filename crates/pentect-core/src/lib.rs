@@ -21,7 +21,9 @@ pub mod render;
 pub mod sweep;
 
 pub use codec::Codec;
-pub use detect::{DecodeDetector, Detector, EntropyDetector, RuleDetector, SuspiciousKeyDetector};
+pub use detect::{
+    DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, SuspiciousKeyDetector,
+};
 pub use engine::{Config, Engine, EngineBuilder, MaskResult, ResidualNote, Summary};
 pub use guard::{NoGuard, OverMaskGuard, ShapeGuard};
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
