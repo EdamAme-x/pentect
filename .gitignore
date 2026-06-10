@@ -21,3 +21,10 @@ archive/
 
 # Scratch space — slides, drafts, experiments
 sandbox/
+
+# Rust build output
+/target/
+**/target/
+
+# Local recovery maps (never commit — local-only secret mapping, REF.md §12.5)
+.pentect/
