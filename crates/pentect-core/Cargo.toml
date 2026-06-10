@@ -15,6 +15,7 @@ hmac = { workspace = true }
 unicode-normalization = { workspace = true }
 data-encoding = { workspace = true }
 bs58 = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

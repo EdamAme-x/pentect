@@ -244,6 +244,25 @@ mod tests {
     }
 
     #[test]
+    fn masks_through_percent_encoding() {
+        let r = m("key sk%2DABCDEFGHIJKLMNOPQRSTUVWX end");
+        assert!(r.masked.contains("<<OPENAI_API_KEY_"), "{}", r.masked);
+        assert!(!r.masked.contains("%2D"), "{}", r.masked);
+    }
+
+    #[test]
+    fn unwraps_base64_gzip() {
+        use data_encoding::BASE64;
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(b"secret AKIAIOSFODNN7EXAMPLE here").unwrap();
+        let enc = BASE64.encode(&e.finish().unwrap());
+        let r = m(&format!("body {enc} end"));
+        assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
+    }
+
+    #[test]
     fn json_structure_preserved() {
         let input = r#"{"user":"alice@example.com","db_password":"hunter2pass","note":"hello world"}"#;
         let r = mj(input);

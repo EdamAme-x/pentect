@@ -1,7 +1,9 @@
 use crate::codec::{Base32Codec, Base58Codec, Base64Codec, Codec, HexCodec};
 use crate::model::*;
 use crate::normalize::NormalizedView;
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use regex::Regex;
+use std::io::Read;
 
 /// Side-effect-free and deterministic. Runs on a region's normalized view and
 /// returns spans in absolute raw coordinates.
@@ -187,18 +189,36 @@ impl DecodeDetector {
 
     fn probe(&self, run: &str, depth: u8) -> Option<(Category, String, Confidence)> {
         for codec in &self.codecs {
-            let Some(bytes) = codec.decode(run) else { continue };
-            let Ok(text) = std::str::from_utf8(&bytes) else { continue };
-            if let Some(hit) = self.identify(text) {
-                return Some(hit);
+            if let Some(bytes) = codec.decode(run) {
+                if let Some(hit) = self.scan_bytes(&bytes, depth) {
+                    return Some(hit);
+                }
             }
-            if depth > 0 {
-                for sub in token_runs(text) {
-                    if let Some(hit) = self.probe(sub, depth - 1) {
-                        return Some(hit);
+        }
+        None
+    }
+
+    fn scan_bytes(&self, bytes: &[u8], depth: u8) -> Option<(Category, String, Confidence)> {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                if let Some(hit) = self.identify(text) {
+                    return Some(hit);
+                }
+                if depth > 0 {
+                    for sub in token_runs(text) {
+                        if let Some(hit) = self.probe(sub, depth - 1) {
+                            return Some(hit);
+                        }
                     }
                 }
             }
+            // Binary bytes might be compressed (e.g. SAML's base64(deflate(..))).
+            Err(_) if depth > 0 => {
+                if let Some(inflated) = decompress(bytes) {
+                    return self.scan_bytes(&inflated, depth - 1);
+                }
+            }
+            Err(_) => {}
         }
         None
     }
@@ -278,6 +298,22 @@ fn token_runs(s: &str) -> Vec<&str> {
 fn is_stronger(a: &Span, b: &Span) -> bool {
     a.confidence > b.confidence
         || (a.confidence == b.confidence && a.category.priority() > b.category.priority())
+}
+
+const MAX_INFLATE: u64 = 8 * 1024 * 1024;
+
+/// Try gzip, zlib, then raw deflate. Output is capped to bound decompression
+/// bombs; we only need enough to detect a secret, not the full payload.
+fn decompress(data: &[u8]) -> Option<Vec<u8>> {
+    inflate(GzDecoder::new(data))
+        .or_else(|| inflate(ZlibDecoder::new(data)))
+        .or_else(|| inflate(DeflateDecoder::new(data)))
+}
+
+fn inflate<R: Read>(reader: R) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    reader.take(MAX_INFLATE).read_to_end(&mut out).ok()?;
+    (!out.is_empty()).then_some(out)
 }
 
 const SENSITIVE_KEY_TOKENS: &[&str] = &[

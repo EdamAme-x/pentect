@@ -16,10 +16,19 @@ fn is_bidi(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
-/// A region's text after aggressive normalization for detection (NFKC plus
-/// zero-width/bidi stripping), with a map back to raw byte ranges. Detectors run
-/// on the normalized text so zero-width/full-width tricks can't break a match;
-/// the resulting spans are always reported in raw coordinates.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// A region's text after aggressive normalization for detection (NFKC, zero-width
+/// /bidi stripping, and percent-decoding of `%XX` ASCII), with a map back to raw
+/// byte ranges. Detectors run on the normalized text so these tricks can't break
+/// a match; the resulting spans are always reported in raw coordinates.
 pub struct NormalizedView<'a> {
     pub region: &'a Region,
     norm: String,
@@ -35,17 +44,36 @@ struct Seg {
 impl<'a> NormalizedView<'a> {
     /// Normalization is per-character, so cross-character composition (e.g. a
     /// base letter plus a combining mark) is not folded. That is enough for the
-    /// zero-width / bidi / full-width cases we target.
+    /// zero-width / bidi / full-width / percent cases we target.
     pub fn build(region: &'a Region, raw: &str) -> Self {
+        let base = region.span.start;
         let slice = &raw[region.span.start..region.span.end];
+        let bytes = slice.as_bytes();
         let mut norm = String::new();
         let mut segs = Vec::new();
-        for (off, ch) in slice.char_indices() {
+        let mut i = 0;
+        while i < bytes.len() {
+            // Percent-encoded ASCII byte (%XX) -> one normalized char.
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    let byte = (hi << 4) | lo;
+                    if byte.is_ascii() {
+                        let raw = ByteRange::new(base + i, base + i + 3);
+                        let norm_start = norm.len();
+                        norm.push(byte as char);
+                        segs.push(Seg { norm: ByteRange::new(norm_start, norm.len()), raw });
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+
+            let ch = slice[i..].chars().next().expect("char boundary");
+            let raw = ByteRange::new(base + i, base + i + ch.len_utf8());
+            i += ch.len_utf8();
             if is_zero_width(ch) || is_bidi(ch) {
                 continue; // dropped; recovered later by outward snapping
             }
-            let raw_start = region.span.start + off;
-            let raw = ByteRange::new(raw_start, raw_start + ch.len_utf8());
             let norm_start = norm.len();
             for nc in ch.to_string().nfkc() {
                 norm.push(nc);
@@ -108,8 +136,8 @@ mod tests {
         let r = region(raw);
         let v = NormalizedView::build(&r, raw);
         assert_eq!(v.text(), "ABCD");
-        assert_eq!(v.to_raw(ByteRange::new(0, 4)), ByteRange::new(0, raw.len())); // covers the zwsp
-        assert_eq!(v.to_raw(ByteRange::new(2, 4)), ByteRange::new(5, 7)); // "CD" after the zwsp
+        assert_eq!(v.to_raw(ByteRange::new(0, 4)), ByteRange::new(0, raw.len()));
+        assert_eq!(v.to_raw(ByteRange::new(2, 4)), ByteRange::new(5, 7));
     }
 
     #[test]
@@ -119,5 +147,14 @@ mod tests {
         let v = NormalizedView::build(&r, raw);
         assert_eq!(v.text(), "A");
         assert_eq!(v.to_raw(ByteRange::new(0, 1)), ByteRange::new(0, raw.len()));
+    }
+
+    #[test]
+    fn decodes_percent_encoded_ascii() {
+        let raw = "a%2Db"; // %2D = '-'
+        let r = region(raw);
+        let v = NormalizedView::build(&r, raw);
+        assert_eq!(v.text(), "a-b");
+        assert_eq!(v.to_raw(ByteRange::new(1, 2)), ByteRange::new(1, 4));
     }
 }
