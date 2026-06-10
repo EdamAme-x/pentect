@@ -1,3 +1,4 @@
+use crate::detect::is_token_byte;
 use crate::model::*;
 use crate::normalize::n_id;
 use std::collections::BTreeMap;
@@ -73,12 +74,11 @@ pub fn identity_sweep(
 }
 
 /// True if the byte at `i` is part of the same token (would make a match a mere
-/// substring of a longer identifier/codec run). `.`/`@`/whitespace are NOT
-/// continuations, so emails and IPs are still swept at their real boundaries.
+/// substring of a longer identifier/codec run). Shares the detector scan alphabet
+/// (`is_token_byte`), so `.`/`@`/whitespace are NOT continuations and emails/IPs
+/// are still swept at their real boundaries.
 fn continues_token(bytes: &[u8], i: usize) -> bool {
-    bytes.get(i).is_some_and(|&b| {
-        b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-')
-    })
+    bytes.get(i).is_some_and(|&b| is_token_byte(b))
 }
 
 #[cfg(test)]

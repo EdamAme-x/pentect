@@ -14,6 +14,8 @@ pub use pem::PemDetector;
 pub use rule::RuleDetector;
 pub use suspicious_key::SuspiciousKeyDetector;
 
+pub(crate) use util::is_token_byte;
+
 #[cfg(test)]
 pub(crate) use util::region;
 

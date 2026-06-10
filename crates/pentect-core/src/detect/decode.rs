@@ -1,4 +1,4 @@
-use super::util::is_token_byte;
+use super::util::token_runs;
 use super::{Detector, RuleDetector};
 use crate::codec::{Base32Codec, Base58Codec, Base64Codec, Codec, HexCodec};
 use crate::model::*;
@@ -96,9 +96,11 @@ impl DecodeDetector {
                     return Some(hit);
                 }
                 if depth > 0 {
-                    for sub in token_runs(text) {
-                        if let Some(hit) = self.probe(sub, depth - 1) {
-                            return Some(hit);
+                    for (a, b) in token_runs(text) {
+                        if b - a >= MIN_DECODE_RUN {
+                            if let Some(hit) = self.probe(&text[a..b], depth - 1) {
+                                return Some(hit);
+                            }
                         }
                     }
                 }
@@ -140,40 +142,31 @@ impl DecodeDetector {
 impl Detector for DecodeDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let s = view.text();
-        let bytes = s.as_bytes();
         let mut out = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if !is_token_byte(bytes[i]) {
-                i += 1;
+        for (start, end) in token_runs(s) {
+            if end - start < MIN_DECODE_RUN {
                 continue;
             }
-            let start = i;
-            while i < bytes.len() && is_token_byte(bytes[i]) {
-                i += 1;
-            }
-            if i - start >= MIN_DECODE_RUN {
-                let run = &s[start..i];
-                if let Some((cat, label, conf)) = self.probe(run, self.max_depth) {
-                    out.push(Span {
-                        range: view.to_raw(ByteRange::new(start, i)),
-                        category: cat,
-                        label,
-                        confidence: conf,
-                        source: DetectorId::Decode,
-                    });
-                } else if self.mask_unknown
-                    && i - start >= self.min_unknown_run
-                    && self.decodes_to_binary(run)
-                {
-                    out.push(Span {
-                        range: view.to_raw(ByteRange::new(start, i)),
-                        category: Category::Secret,
-                        label: "OPAQUE_BLOB".to_string(),
-                        confidence: Confidence::Low,
-                        source: DetectorId::DecodeOpaque,
-                    });
-                }
+            let run = &s[start..end];
+            if let Some((cat, label, conf)) = self.probe(run, self.max_depth) {
+                out.push(Span {
+                    range: view.to_raw(ByteRange::new(start, end)),
+                    category: cat,
+                    label,
+                    confidence: conf,
+                    source: DetectorId::Decode,
+                });
+            } else if self.mask_unknown
+                && end - start >= self.min_unknown_run
+                && self.decodes_to_binary(run)
+            {
+                out.push(Span {
+                    range: view.to_raw(ByteRange::new(start, end)),
+                    category: Category::Secret,
+                    label: "OPAQUE_BLOB".to_string(),
+                    confidence: Confidence::Low,
+                    source: DetectorId::DecodeOpaque,
+                });
             }
         }
         out
@@ -195,26 +188,6 @@ fn looks_binary(bytes: &[u8]) -> bool {
         .filter(|&&b| b < 0x09 || (0x0e..0x20).contains(&b))
         .count();
     nonprint as f64 > bytes.len() as f64 * BINARY_NONPRINT_RATIO
-}
-
-fn token_runs(s: &str) -> Vec<&str> {
-    let bytes = s.as_bytes();
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if !is_token_byte(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && is_token_byte(bytes[i]) {
-            i += 1;
-        }
-        if i - start >= MIN_DECODE_RUN {
-            runs.push(&s[start..i]);
-        }
-    }
-    runs
 }
 
 /// Try gzip, zlib, then raw deflate. Output is capped to bound decompression

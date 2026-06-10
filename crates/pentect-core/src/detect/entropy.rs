@@ -1,4 +1,4 @@
-use super::util::is_token_byte;
+use super::util::token_runs;
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -35,22 +35,13 @@ impl EntropyDetector {
 
 impl Detector for EntropyDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
-        let bytes = view.text().as_bytes();
+        let text = view.text();
         let mut out = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if !is_token_byte(bytes[i]) {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < bytes.len() && is_token_byte(bytes[i]) {
-                i += 1;
-            }
-            let run = &bytes[start..i];
+        for (start, end) in token_runs(text) {
+            let run = &text.as_bytes()[start..end];
             if run.len() >= self.min_len && shannon(run) >= self.threshold {
                 out.push(Span {
-                    range: view.to_raw(ByteRange::new(start, i)),
+                    range: view.to_raw(ByteRange::new(start, end)),
                     category: Category::Secret,
                     label: "LIKELY_SECRET".to_string(),
                     confidence: Confidence::Low,
