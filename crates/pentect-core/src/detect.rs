@@ -1,10 +1,12 @@
 use crate::model::*;
+use crate::normalize::NormalizedView;
 use regex::Regex;
 
-/// Side-effect-free and deterministic. Returns spans in absolute raw coordinates.
+/// Side-effect-free and deterministic. Runs on a region's normalized view and
+/// returns spans in absolute raw coordinates.
 pub trait Detector {
     fn id(&self) -> &str;
-    fn detect(&self, region: &Region, raw: &str) -> Vec<Span>;
+    fn detect(&self, view: &NormalizedView) -> Vec<Span>;
 }
 
 pub struct DetectorSet {
@@ -22,10 +24,10 @@ impl DetectorSet {
         }
     }
 
-    pub fn run(&self, region: &Region, raw: &str) -> Vec<Span> {
+    pub fn run(&self, view: &NormalizedView) -> Vec<Span> {
         let mut out = Vec::new();
         for d in &self.detectors {
-            out.extend(d.detect(region, raw));
+            out.extend(d.detect(view));
         }
         out
     }
@@ -91,14 +93,13 @@ impl Detector for RuleDetector {
     fn id(&self) -> &str {
         "rule"
     }
-    fn detect(&self, region: &Region, raw: &str) -> Vec<Span> {
-        let base = region.span.start;
-        let s = &raw[region.span.start..region.span.end];
+    fn detect(&self, view: &NormalizedView) -> Vec<Span> {
+        let s = view.text();
         let mut out = Vec::new();
         for rule in &self.rules {
             for m in rule.re.find_iter(s) {
                 out.push(Span {
-                    range: ByteRange::new(base + m.start(), base + m.end()),
+                    range: view.to_raw(ByteRange::new(m.start(), m.end())),
                     category: rule.category,
                     label: rule.label.to_string(),
                     confidence: rule.confidence,
@@ -126,10 +127,8 @@ impl Detector for EntropyDetector {
     fn id(&self) -> &str {
         "entropy"
     }
-    fn detect(&self, region: &Region, raw: &str) -> Vec<Span> {
-        let base = region.span.start;
-        let s = &raw[region.span.start..region.span.end];
-        let bytes = s.as_bytes();
+    fn detect(&self, view: &NormalizedView) -> Vec<Span> {
+        let bytes = view.text().as_bytes();
         let is_tok =
             |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-');
         let mut out = Vec::new();
@@ -146,7 +145,7 @@ impl Detector for EntropyDetector {
             let run = &bytes[start..i];
             if run.len() >= self.min_len && shannon(run) >= self.threshold {
                 out.push(Span {
-                    range: ByteRange::new(base + start, base + i),
+                    range: view.to_raw(ByteRange::new(start, i)),
                     category: Category::Secret,
                     label: "LIKELY_SECRET".to_string(),
                     confidence: Confidence::Low,
@@ -191,7 +190,8 @@ impl Detector for SuspiciousKeyDetector {
     fn id(&self) -> &str {
         "suspicious_key"
     }
-    fn detect(&self, region: &Region, _raw: &str) -> Vec<Span> {
+    fn detect(&self, view: &NormalizedView) -> Vec<Span> {
+        let region = view.region;
         let Some(k) = &region.ctx.key else { return vec![] };
         if region.span.is_empty() {
             return vec![];

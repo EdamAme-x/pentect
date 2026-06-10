@@ -2,6 +2,7 @@ use crate::detect::DetectorSet;
 use crate::json;
 use crate::merge::merge;
 use crate::model::*;
+use crate::normalize::NormalizedView;
 use crate::policy::{Action, Policy};
 use crate::recovery::Recovery;
 use crate::render::render;
@@ -52,7 +53,8 @@ pub fn mask_ir(ir: Ir, config: &Config) -> MaskResult {
 
     let mut spans = Vec::new();
     for region in &ir.regions {
-        spans.extend(detectors.run(region, &ir.raw));
+        let view = NormalizedView::build(region, &ir.raw);
+        spans.extend(detectors.run(&view));
     }
 
     // Classify before merge so an allowlist can retract false candidates before
@@ -139,6 +141,13 @@ mod tests {
     fn distinct_values_distinct_placeholders() {
         let r = m("AKIAIOSFODNN7EXAMPLE AKIA0000000000000000");
         assert_eq!(r.recovery.map.len(), 2, "{}", r.masked);
+    }
+
+    #[test]
+    fn masks_through_zero_width() {
+        let r = m("key AKIA\u{200b}IOSFODNN7EXAMPLE end");
+        assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
+        assert!(!r.masked.contains('\u{200b}'), "{}", r.masked);
     }
 
     #[test]
