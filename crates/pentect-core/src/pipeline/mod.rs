@@ -276,7 +276,7 @@ impl EngineBuilder {
                 DecodeDetector::builtin()
                     .with_opaque(knobs.mask_unknown_codec, knobs.min_opaque_run),
             ))
-            .detector(Box::new(SuspiciousKeyDetector))
+            .detector(Box::new(SuspiciousKeyDetector::builtin()))
     }
     pub fn parser(mut self, kind: Kind, parser: Box<dyn Parser>) -> Self {
         self.parsers.push((kind, parser));

@@ -2,8 +2,14 @@ use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
 
-/// Unambiguous secret-bearing key tokens: presence alone masks the value (High).
-const STRONG_KEY_TOKENS: &[&str] = &[
+/// The shipped default vocabulary. A baseline has to exist — every scanner has
+/// one — but it is *data*, not detector logic: `with_tokens` (and a TOML pack)
+/// replaces it, and locale-aware / semantic key classification is a future
+/// ML-sidecar concern, not core's. STRONG tokens are unambiguous secret names;
+/// WEAK ones (e.g. `key`, which appears in `public_key`) are a weaker signal, so
+/// the confidence tier carries the ambiguity rather than a denylist of benign
+/// modifiers.
+const DEFAULT_STRONG: &[&str] = &[
     "password",
     "passwd",
     "pwd",
@@ -19,17 +25,32 @@ const STRONG_KEY_TOKENS: &[&str] = &[
     "jwt",
     "signature",
 ];
-
-/// Sensitive but ambiguous tokens: the name alone is a weaker signal (e.g.
-/// `public_key` is not a secret), so these mask at Medium rather than High. We
-/// deliberately do NOT keep a denylist of benign modifiers ("public", "primary",
-/// ...) to subtract: that list is unbounded and over-masking is the safe
-/// direction. The lower confidence is the honest way to encode the ambiguity.
-const WEAK_KEY_TOKENS: &[&str] = &["key", "auth", "session", "sid", "pin", "nonce"];
+const DEFAULT_WEAK: &[&str] = &["key", "auth", "session", "sid", "pin", "nonce"];
 
 /// Masks a value when its key looks sensitive, regardless of the value's shape.
-/// Relies only on `Context.key`, so it works without NER even in WASM builds.
-pub struct SuspiciousKeyDetector;
+/// Relies only on `Context.key`, so it works without NER even in WASM builds. The
+/// detector is a pure mechanism; the sensitive-key vocabulary is injected data.
+pub struct SuspiciousKeyDetector {
+    strong: Vec<String>,
+    weak: Vec<String>,
+}
+
+impl SuspiciousKeyDetector {
+    /// The shipped default vocabulary.
+    pub fn builtin() -> Self {
+        Self::with_tokens(owned(DEFAULT_STRONG), owned(DEFAULT_WEAK))
+    }
+
+    /// A caller-supplied vocabulary (e.g. a rule pack or a locale-specific set).
+    /// `strong` tokens mask at High, `weak` at Medium.
+    pub fn with_tokens(strong: Vec<String>, weak: Vec<String>) -> Self {
+        Self { strong, weak }
+    }
+}
+
+fn owned(tokens: &[&str]) -> Vec<String> {
+    tokens.iter().map(|t| t.to_string()).collect()
+}
 
 impl Detector for SuspiciousKeyDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
@@ -41,8 +62,8 @@ impl Detector for SuspiciousKeyDetector {
             return vec![];
         }
         let toks = key_tokens(k);
-        let strong = toks.iter().any(|t| STRONG_KEY_TOKENS.contains(&t.as_str()));
-        let any_hit = strong || toks.iter().any(|t| WEAK_KEY_TOKENS.contains(&t.as_str()));
+        let strong = toks.iter().any(|t| self.strong.contains(t));
+        let any_hit = strong || toks.iter().any(|t| self.weak.contains(t));
         if !any_hit {
             return vec![];
         }
@@ -121,7 +142,7 @@ mod tests {
             },
         };
         let view = NormalizedView::build(&region, &raw);
-        SuspiciousKeyDetector
+        SuspiciousKeyDetector::builtin()
             .detect(&view)
             .first()
             .map(|s| s.confidence)
@@ -156,5 +177,26 @@ mod tests {
         assert_eq!(fires("password", ""), None);
         assert_eq!(fires("password", "null"), None);
         assert_eq!(fires("api_token", "<<SECRET_0123456789abcdef>>"), None);
+    }
+
+    #[test]
+    fn vocabulary_is_injected_not_hardcoded() {
+        // A custom set (here a non-English token) is honored, and a default token
+        // outside it no longer fires — the knowledge is data, not detector logic.
+        let det = SuspiciousKeyDetector::with_tokens(vec!["パスワード".into()], vec![]);
+        let fire = |key: &str, raw: &str| {
+            let region = Region {
+                span: ByteRange::new(0, raw.len()),
+                ctx: Context {
+                    path: None,
+                    key: Some(key.to_string()),
+                    kind: RegionKind::JsonValue,
+                    format: Kind::Json,
+                },
+            };
+            !det.detect(&NormalizedView::build(&region, raw)).is_empty()
+        };
+        assert!(fire("パスワード", "hunter2"));
+        assert!(!fire("password", "hunter2"));
     }
 }

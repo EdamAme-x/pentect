@@ -1,34 +1,22 @@
-use crate::detect::{RuleDetector, RuleSpec};
+use crate::detect::{RuleDetector, RuleSpec, SuspiciousKeyDetector};
 use crate::model::{Category, Confidence};
 use serde::Deserialize;
 
-/// A Layer-1 rule pack: pure data, no code. v1 supports SAFE-ADDITIVE detector
-/// entries (one linear-time regex each). when-conditions, deny/allow, granularity
-/// overrides, and sidecars are later layers; entries without a `pattern` are
-/// skipped so a pack that mixes layers still contributes its Layer-1 rules.
-#[derive(Debug, Deserialize)]
-struct PackFile {
-    #[serde(default)]
-    detector: Vec<DetectorEntry>,
+/// A loaded Layer-1 rule pack: pure data, no code. Carries the vendor-style regex
+/// rules and, optionally, a sensitive-key vocabulary that replaces the built-in
+/// default (so the key set is data, locale-able, not hardcoded logic).
+pub struct Pack {
+    pub rules: RuleDetector,
+    pub suspicious_keys: Option<SuspiciousKeyDetector>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DetectorEntry {
-    pattern: Option<String>,
-    category: Option<String>,
-    label: Option<String>,
-    #[serde(default = "default_confidence")]
-    confidence: String,
-}
-
-fn default_confidence() -> String {
-    "high".to_string()
-}
-
-/// Parse a TOML rule pack into a detector built from its `[[detector]]` regex
-/// entries. Errors on malformed TOML, an unknown category/confidence, an invalid
-/// regex, or a regex entry missing its category/label.
-pub fn load_rule_detector(toml_src: &str) -> Result<RuleDetector, String> {
+/// Parse a TOML rule pack. v1 supports SAFE-ADDITIVE detector entries (one
+/// linear-time regex each) and a `[suspicious_keys]` token set. when-conditions,
+/// deny/allow, granularity overrides, and sidecars are later layers; detector
+/// entries without a `pattern` are skipped so a mixed pack still loads its
+/// Layer-1 rules. Errors on malformed TOML, an unknown category/confidence, an
+/// invalid regex, or a regex entry missing its category/label.
+pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
     let pack: PackFile = toml::from_str(toml_src).map_err(|e| e.to_string())?;
     let mut specs = Vec::new();
     for d in pack.detector {
@@ -46,7 +34,42 @@ pub fn load_rule_detector(toml_src: &str) -> Result<RuleDetector, String> {
             confidence: parse_confidence(&d.confidence)?,
         });
     }
-    RuleDetector::from_specs(specs)
+    let suspicious_keys = pack
+        .suspicious_keys
+        .map(|sk| SuspiciousKeyDetector::with_tokens(sk.strong, sk.weak));
+    Ok(Pack {
+        rules: RuleDetector::from_specs(specs)?,
+        suspicious_keys,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct PackFile {
+    #[serde(default)]
+    detector: Vec<DetectorEntry>,
+    #[serde(default)]
+    suspicious_keys: Option<SuspiciousKeysEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetectorEntry {
+    pattern: Option<String>,
+    category: Option<String>,
+    label: Option<String>,
+    #[serde(default = "default_confidence")]
+    confidence: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuspiciousKeysEntry {
+    #[serde(default)]
+    strong: Vec<String>,
+    #[serde(default)]
+    weak: Vec<String>,
+}
+
+fn default_confidence() -> String {
+    "high".to_string()
 }
 
 fn parse_category(s: &str) -> Result<Category, String> {
@@ -86,13 +109,16 @@ mod tests {
         category = "Identifier"
         label = "ACME_ACCOUNT"
         confidence = "high"
+        [suspicious_keys]
+        strong = ["geheim"]
+        weak = ["kennung"]
     "#;
 
     #[test]
     fn loaded_rule_matches() {
-        let det = load_rule_detector(ACME).unwrap();
+        let pack = load_pack(ACME).unwrap();
         let raw = "id ACC-0123456789 end";
-        let spans = det.detect(&NormalizedView::build(&region(raw), raw));
+        let spans = pack.rules.detect(&NormalizedView::build(&region(raw), raw));
         assert!(
             spans
                 .iter()
@@ -102,10 +128,27 @@ mod tests {
     }
 
     #[test]
+    fn loaded_suspicious_keys_override_default() {
+        let det = load_pack(ACME).unwrap().suspicious_keys.unwrap();
+        let region = Region {
+            span: ByteRange::new(0, 5),
+            ctx: Context {
+                path: None,
+                key: Some("geheim".into()),
+                kind: RegionKind::JsonValue,
+                format: Kind::Json,
+            },
+        };
+        assert!(!det
+            .detect(&NormalizedView::build(&region, "abcde"))
+            .is_empty());
+    }
+
+    #[test]
     fn engine_masks_with_loaded_pack() {
-        let det = load_rule_detector(ACME).unwrap();
+        let pack = load_pack(ACME).unwrap();
         let engine = Engine::builder()
-            .detector(Box::new(det))
+            .detector(Box::new(pack.rules))
             .policy(Box::new(MaskAll))
             .build();
         let r = engine.mask(
@@ -124,23 +167,23 @@ mod tests {
             kind = "sidecar"
             cmd = "python"
         "#;
-        let det = load_rule_detector(pack).unwrap();
+        let rules = load_pack(pack).unwrap().rules;
         let raw = "AKIAIOSFODNN7EXAMPLE";
-        assert!(det
+        assert!(rules
             .detect(&NormalizedView::build(&region(raw), raw))
             .is_empty());
     }
 
     #[test]
     fn invalid_regex_and_unknown_category_error() {
-        assert!(load_rule_detector(
+        assert!(load_pack(
             r#"[[detector]]
                pattern = "("
                category = "secret"
                label = "BAD""#
         )
         .is_err());
-        assert!(load_rule_detector(
+        assert!(load_pack(
             r#"[[detector]]
                pattern = "x"
                category = "nope"

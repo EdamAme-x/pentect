@@ -24,7 +24,7 @@ pub use detect::{
     SuspiciousKeyDetector,
 };
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
-pub use pack::load_rule_detector;
+pub use pack::{load_pack, Pack};
 pub use parse::{EnvParser, HarParser, JsonParser, Parser, TextParser};
 pub use pipeline::{
     Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote, Summary,
