@@ -115,7 +115,7 @@ impl DecodeDetector {
         let mut best: Option<Span> = None;
         for d in &self.identify {
             for span in d.detect(&view) {
-                if best.as_ref().is_none_or(|b| is_stronger(&span, b)) {
+                if best.as_ref().is_none_or(|b| span.cmp_strength(b).is_gt()) {
                     best = Some(span);
                 }
             }
@@ -201,11 +201,6 @@ fn token_runs(s: &str) -> Vec<&str> {
         }
     }
     runs
-}
-
-fn is_stronger(a: &Span, b: &Span) -> bool {
-    a.confidence > b.confidence
-        || (a.confidence == b.confidence && a.category.priority() > b.category.priority())
 }
 
 /// Try gzip, zlib, then raw deflate. Output is capped to bound decompression

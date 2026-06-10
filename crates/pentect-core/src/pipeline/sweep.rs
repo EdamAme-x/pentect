@@ -13,16 +13,15 @@ pub fn identity_sweep(
     protected: &[ByteRange],
     regions: &[Region],
 ) -> Vec<Span> {
-    // One representative per identity: highest category priority, then
-    // confidence, then earliest start. The representative's label is what all
-    // swept occurrences inherit, so a specific AWS_AKID is not overwritten by an
-    // earlier generic LIKELY_SECRET.
+    // One representative per identity, chosen by the canonical Span::cmp_strength,
+    // so the strongest detection's label is what all occurrences inherit (a
+    // specific High AWS_AKID is not overwritten by a generic Low LIKELY_SECRET).
     let mut rep: BTreeMap<String, Span> = BTreeMap::new();
     for s in &accepted {
         let id = n_id(&raw[s.range.start..s.range.end]);
         rep.entry(id)
             .and_modify(|e| {
-                if stronger_rep(s, e) {
+                if s.cmp_strength(e).is_gt() {
                     *e = s.clone();
                 }
             })
@@ -71,14 +70,6 @@ pub fn identity_sweep(
 
     all.sort_by_key(|s| s.range.start);
     all
-}
-
-fn stronger_rep(a: &Span, b: &Span) -> bool {
-    (a.category.priority(), a.confidence as u8).cmp(&(b.category.priority(), b.confidence as u8))
-        == std::cmp::Ordering::Greater
-        || (a.category.priority() == b.category.priority()
-            && a.confidence == b.confidence
-            && a.range.start < b.range.start)
 }
 
 /// True if the byte at `i` is part of the same token (would make a match a mere

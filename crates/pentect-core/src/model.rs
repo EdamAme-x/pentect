@@ -118,6 +118,42 @@ pub struct Ir {
     pub protected: Vec<ByteRange>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(len: usize, cat: Category, conf: Confidence, src: DetectorId) -> Span {
+        Span {
+            range: ByteRange::new(0, len),
+            category: cat,
+            label: "X".into(),
+            confidence: conf,
+            source: src,
+        }
+    }
+
+    #[test]
+    fn confidence_dominates_then_length_then_category() {
+        let high = span(6, Category::Secret, Confidence::High, DetectorId::Rule);
+        let low = span(20, Category::Secret, Confidence::Low, DetectorId::Entropy);
+        // High wins despite being shorter (confidence dominates).
+        assert!(high.cmp_strength(&low).is_gt());
+
+        let small = span(4, Category::Secret, Confidence::Medium, DetectorId::Rule);
+        let large = span(10, Category::Secret, Confidence::Medium, DetectorId::Rule);
+        // Equal confidence -> larger span wins (never leak a prefix).
+        assert!(large.cmp_strength(&small).is_gt());
+    }
+
+    #[test]
+    fn strength_is_a_total_order() {
+        let a = span(10, Category::Secret, Confidence::High, DetectorId::Rule);
+        let b = span(10, Category::Secret, Confidence::High, DetectorId::Rule);
+        assert!(a.cmp_strength(&b).is_eq()); // identical spans tie
+        assert_eq!(a.cmp_strength(&b), b.cmp_strength(&a).reverse());
+    }
+}
+
 /// Which detector produced a span. Typed (not a free-form string) so policy and
 /// render branch on the variant and a rename can't silently change behaviour.
 /// Declaration order is a *specificity rank* (most-specific/anchored first): on
@@ -158,4 +194,22 @@ pub struct Span {
     pub label: Label,
     pub confidence: Confidence,
     pub source: DetectorId,
+}
+
+impl Span {
+    /// Canonical "which span wins" ordering — the single source of truth for
+    /// merge, the identity sweep, and decode's inner-hit selection. `Greater`
+    /// means `self` is the stronger span. Higher confidence first (a High
+    /// anchored hit beats a Low guess), then larger span (cover the whole secret,
+    /// never leak a prefix), then higher category; ties broken deterministically
+    /// by more-specific source then earliest position.
+    pub fn cmp_strength(&self, other: &Self) -> core::cmp::Ordering {
+        self.confidence
+            .cmp(&other.confidence)
+            .then(self.range.len().cmp(&other.range.len()))
+            .then(self.category.priority().cmp(&other.category.priority()))
+            .then(other.source.cmp(&self.source))
+            .then(other.range.start.cmp(&self.range.start))
+            .then(other.range.end.cmp(&self.range.end))
+    }
 }
