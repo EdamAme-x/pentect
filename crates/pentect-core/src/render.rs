@@ -43,7 +43,11 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
     }
     masked.push_str(&raw[cursor..]);
 
-    Rendered { masked, map, collisions }
+    Rendered {
+        masked,
+        map,
+        collisions,
+    }
 }
 
 /// Insert a placeholder->value mapping. Returns true on collision: the
@@ -78,8 +82,20 @@ mod tests {
         let key = [9u8; 32];
         let raw = "a@b.com x a@b.com";
         let spans = vec![
-            Span { range: ByteRange::new(0, 7), category: Category::Pii, label: "IDENTITY".into(), confidence: Confidence::Medium, source: "rule".into() },
-            Span { range: ByteRange::new(10, 17), category: Category::Pii, label: "IDENTITY".into(), confidence: Confidence::Medium, source: "rule".into() },
+            Span {
+                range: ByteRange::new(0, 7),
+                category: Category::Pii,
+                label: "IDENTITY".into(),
+                confidence: Confidence::Medium,
+                source: "rule".into(),
+            },
+            Span {
+                range: ByteRange::new(10, 17),
+                category: Category::Pii,
+                label: "IDENTITY".into(),
+                confidence: Confidence::Medium,
+                source: "rule".into(),
+            },
         ];
         let r = render(raw, &key, spans, false);
         assert_eq!(r.map.len(), 1);

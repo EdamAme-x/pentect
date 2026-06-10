@@ -55,12 +55,18 @@ mod tests {
 
     #[test]
     fn hash_depends_on_key() {
-        assert_ne!(identity_hash(&[1u8; 32], "x"), identity_hash(&[2u8; 32], "x"));
+        assert_ne!(
+            identity_hash(&[1u8; 32], "x"),
+            identity_hash(&[2u8; 32], "x")
+        );
     }
 
     #[test]
     fn placeholder_format() {
-        assert_eq!(render_placeholder("AWS_AKID", "abc", None), "<<AWS_AKID_abc>>");
+        assert_eq!(
+            render_placeholder("AWS_AKID", "abc", None),
+            "<<AWS_AKID_abc>>"
+        );
         assert_eq!(render_placeholder("X", "abc", Some(32)), "<<X_abc_len32>>");
     }
 

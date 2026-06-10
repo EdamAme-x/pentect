@@ -2,8 +2,8 @@
 //! written to disk.
 
 use pentect_core::{
-    Config, Engine, EntropyDetector, Input, Kind, NoGuard, Profile, ProfilePolicy,
-    RuleDetector, SuspiciousKeyDetector, DecodeDetector, JsonParser,
+    Config, DecodeDetector, Engine, EntropyDetector, Input, JsonParser, Kind, NoGuard, Profile,
+    ProfilePolicy, RuleDetector, SuspiciousKeyDetector,
 };
 use std::io::{Read, Write};
 
@@ -39,7 +39,9 @@ fn read_stdin_capped() -> Result<String, String> {
         .read_to_end(&mut buf)
         .map_err(|e| format!("could not read stdin: {e}"))?;
     if buf.len() > MAX_INPUT_BYTES {
-        return Err(format!("input exceeds {MAX_INPUT_BYTES} bytes; refusing to mask partially"));
+        return Err(format!(
+            "input exceeds {MAX_INPUT_BYTES} bytes; refusing to mask partially"
+        ));
     }
     String::from_utf8(buf).map_err(|_| "input is not UTF-8 text (binary not supported)".to_string())
 }
@@ -70,7 +72,10 @@ fn cmd_mask(args: &[String]) {
     // reproducible key isn't needed (restore is unavailable by design).
     let kind_label = format!("{kind:?}");
     let engine = build_engine(profile, aggressive);
-    let cfg = Config { disclose_length, ..Config::generate() };
+    let cfg = Config {
+        disclose_length,
+        ..Config::generate()
+    };
     let result = engine.mask(Input { kind, data }, &cfg);
 
     print!("{}", result.masked);
@@ -102,8 +107,13 @@ fn build_engine(profile: Profile, aggressive: bool) -> Engine {
     Engine::builder()
         .parser(Kind::Json, Box::new(JsonParser))
         .detector(Box::new(RuleDetector::builtin()))
-        .detector(Box::new(EntropyDetector::with(k.entropy_min_len, k.entropy_threshold)))
-        .detector(Box::new(DecodeDetector::builtin().with_opaque(k.mask_unknown_codec, k.min_opaque_run)))
+        .detector(Box::new(EntropyDetector::with(
+            k.entropy_min_len,
+            k.entropy_threshold,
+        )))
+        .detector(Box::new(
+            DecodeDetector::builtin().with_opaque(k.mask_unknown_codec, k.min_opaque_run),
+        ))
         .detector(Box::new(SuspiciousKeyDetector))
         .policy(Box::new(ProfilePolicy::new(profile)))
         .guard(Box::new(NoGuard))
@@ -115,5 +125,8 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }

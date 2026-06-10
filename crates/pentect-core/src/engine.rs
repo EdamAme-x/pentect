@@ -1,4 +1,6 @@
-use crate::detect::{DecodeDetector, Detector, EntropyDetector, RuleDetector, SuspiciousKeyDetector};
+use crate::detect::{
+    DecodeDetector, Detector, EntropyDetector, RuleDetector, SuspiciousKeyDetector,
+};
 use crate::guard::{OverMaskGuard, ShapeGuard};
 use crate::merge::merge;
 use crate::model::*;
@@ -24,7 +26,11 @@ pub struct Config {
 
 impl Config {
     pub fn new(key: [u8; 32]) -> Self {
-        Self { key, locale: "en".into(), disclose_length: false }
+        Self {
+            key,
+            locale: "en".into(),
+            disclose_length: false,
+        }
     }
     /// Fixed key for tests and demos only.
     pub fn insecure_testing() -> Self {
@@ -97,7 +103,10 @@ impl Engine {
         Engine::builder()
             .parser(Kind::Json, Box::new(JsonParser))
             .detector(Box::new(RuleDetector::builtin()))
-            .detector(Box::new(EntropyDetector::with(k.entropy_min_len, k.entropy_threshold)))
+            .detector(Box::new(EntropyDetector::with(
+                k.entropy_min_len,
+                k.entropy_threshold,
+            )))
             .detector(Box::new(
                 DecodeDetector::builtin().with_opaque(k.mask_unknown_codec, k.min_opaque_run),
             ))
@@ -181,7 +190,14 @@ impl Engine {
             },
             None => (self.fallback.parse(&raw).unwrap_or_default(), false),
         };
-        (Ir { raw, regions, protected }, fell_back)
+        (
+            Ir {
+                raw,
+                regions,
+                protected,
+            },
+            fell_back,
+        )
     }
 }
 
@@ -207,7 +223,12 @@ pub struct EngineBuilder {
 
 impl EngineBuilder {
     pub fn new() -> Self {
-        Self { parsers: Vec::new(), detectors: Vec::new(), policy: None, guard: None }
+        Self {
+            parsers: Vec::new(),
+            detectors: Vec::new(),
+            policy: None,
+            guard: None,
+        }
     }
     pub fn parser(mut self, kind: Kind, parser: Box<dyn Parser>) -> Self {
         self.parsers.push((kind, parser));
@@ -262,15 +283,32 @@ mod tests {
     use proptest::prelude::*;
 
     fn m(s: &str) -> MaskResult {
-        Engine::default().mask(Input { kind: Kind::Text, data: s.to_string() }, &Config::insecure_testing())
+        Engine::default().mask(
+            Input {
+                kind: Kind::Text,
+                data: s.to_string(),
+            },
+            &Config::insecure_testing(),
+        )
     }
     fn mj(s: &str) -> MaskResult {
-        Engine::default().mask(Input { kind: Kind::Json, data: s.to_string() }, &Config::insecure_testing())
+        Engine::default().mask(
+            Input {
+                kind: Kind::Json,
+                data: s.to_string(),
+            },
+            &Config::insecure_testing(),
+        )
     }
 
     #[test]
     fn reversible_idempotent_deterministic() {
-        for x in ["", "hi there", "key sk-ABCDEFGHIJKLMNOPQRSTUVWX end", "a@b.com x a@b.com"] {
+        for x in [
+            "",
+            "hi there",
+            "key sk-ABCDEFGHIJKLMNOPQRSTUVWX end",
+            "a@b.com x a@b.com",
+        ] {
             let r = m(x);
             assert_eq!(restore(&r.masked, &r.recovery).unwrap(), x);
             assert_eq!(m(&r.masked).masked, r.masked);
@@ -295,9 +333,22 @@ mod tests {
     fn opt_in_length_for_opaque_only() {
         let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh"; // ~29 chars, high entropy
         let input = format!("blob {blob} end");
-        let on = Config { disclose_length: true, ..Config::insecure_testing() };
-        let r = Engine::default().mask(Input { kind: Kind::Text, data: input.clone() }, &on);
-        assert!(r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_len"), "{}", r.masked);
+        let on = Config {
+            disclose_length: true,
+            ..Config::insecure_testing()
+        };
+        let r = Engine::default().mask(
+            Input {
+                kind: Kind::Text,
+                data: input.clone(),
+            },
+            &on,
+        );
+        assert!(
+            r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_len"),
+            "{}",
+            r.masked
+        );
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
 
         let r2 = m(&input);
@@ -331,7 +382,11 @@ mod tests {
         let secret = b"AKIAIOSFODNN7EXAMPLE";
         for enc in [HEXLOWER.encode(secret), BASE32.encode(secret)] {
             let r = m(&format!("blob {enc} end"));
-            assert!(r.masked.contains("<<AWS_AKID_"), "codec failed for {enc}: {}", r.masked);
+            assert!(
+                r.masked.contains("<<AWS_AKID_"),
+                "codec failed for {enc}: {}",
+                r.masked
+            );
         }
     }
 
@@ -356,9 +411,11 @@ mod tests {
 
     #[test]
     fn json_structure_preserved() {
-        let input = r#"{"user":"alice@example.com","db_password":"hunter2pass","note":"hello world"}"#;
+        let input =
+            r#"{"user":"alice@example.com","db_password":"hunter2pass","note":"hello world"}"#;
         let r = mj(input);
-        let v: serde_json::Value = serde_json::from_str(&r.masked).expect("masked output is valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(&r.masked).expect("masked output is valid JSON");
         let o = v.as_object().unwrap();
         assert!(o["db_password"].as_str().unwrap().starts_with("<<"));
         assert!(o["user"].as_str().unwrap().starts_with("<<"));
@@ -370,7 +427,10 @@ mod tests {
     fn custom_engine_can_drop_detectors() {
         // DI: an engine with no detectors masks nothing.
         let engine = Engine::builder().policy(Box::new(MaskAll)).build();
-        let r = engine.mask(Input::text("token sk-ABCDEFGHIJKLMNOPQRSTUVWX"), &Config::insecure_testing());
+        let r = engine.mask(
+            Input::text("token sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+            &Config::insecure_testing(),
+        );
         assert_eq!(r.summary.masked_count, 0, "{}", r.masked);
     }
 
@@ -392,7 +452,12 @@ mod tests {
 
     #[test]
     fn anchored_secret_masks_under_every_profile() {
-        for p in [Profile::Strict, Profile::Balanced, Profile::Dev, Profile::Paranoid] {
+        for p in [
+            Profile::Strict,
+            Profile::Balanced,
+            Profile::Dev,
+            Profile::Paranoid,
+        ] {
             let r = mp(p, "key AKIAIOSFODNN7EXAMPLE end");
             assert!(r.masked.contains("<<AWS_AKID_"), "{p:?}: {}", r.masked);
         }
@@ -402,22 +467,33 @@ mod tests {
     fn guard_spares_uuid_unless_anchored() {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         // Bare UUID survives even Paranoid (benign shape).
-        assert!(mp(Profile::Paranoid, &format!("id {uuid} x")).masked.contains(uuid));
+        assert!(mp(Profile::Paranoid, &format!("id {uuid} x"))
+            .masked
+            .contains(uuid));
         // Under a sensitive key it is anchored, so it masks.
         let j = format!("{{\"session_token\":\"{uuid}\"}}");
-        let r = Engine::with_profile(Profile::Balanced)
-            .mask(Input { kind: Kind::Json, data: j }, &Config::insecure_testing());
+        let r = Engine::with_profile(Profile::Balanced).mask(
+            Input {
+                kind: Kind::Json,
+                data: j,
+            },
+            &Config::insecure_testing(),
+        );
         assert!(!r.masked.contains(uuid), "{}", r.masked);
     }
 
     #[test]
     fn paranoid_masks_opaque_blob() {
         use data_encoding::BASE64;
-        let bytes: Vec<u8> = (0u8..24).map(|n| n.wrapping_mul(37).wrapping_add(11)).collect();
+        let bytes: Vec<u8> = (0u8..24)
+            .map(|n| n.wrapping_mul(37).wrapping_add(11))
+            .collect();
         let enc = BASE64.encode(&bytes);
         let input = format!("payload {enc} end");
         assert!(mp(Profile::Balanced, &input).masked.contains(&enc)); // untouched
-        assert!(mp(Profile::Paranoid, &input).masked.contains("<<OPAQUE_BLOB_"));
+        assert!(mp(Profile::Paranoid, &input)
+            .masked
+            .contains("<<OPAQUE_BLOB_"));
     }
 
     #[test]
@@ -429,7 +505,10 @@ mod tests {
             .policy(Box::new(ProfilePolicy::new(Profile::Paranoid)))
             .guard(Box::new(crate::guard::NoGuard))
             .build();
-        let r = engine.mask(Input::text(&format!("id {uuid} x")), &Config::insecure_testing());
+        let r = engine.mask(
+            Input::text(format!("id {uuid} x")),
+            &Config::insecure_testing(),
+        );
         assert!(!r.masked.contains(uuid), "{}", r.masked);
     }
 
@@ -445,12 +524,18 @@ mod tests {
     #[test]
     fn malformed_json_flags_parser_fallback() {
         let ok = Engine::default().mask(
-            Input { kind: Kind::Json, data: "{\"a\":\"x\"}".into() },
+            Input {
+                kind: Kind::Json,
+                data: "{\"a\":\"x\"}".into(),
+            },
             &Config::insecure_testing(),
         );
         assert!(!ok.summary.parser_fallback);
         let bad = Engine::default().mask(
-            Input { kind: Kind::Json, data: "{not valid json".into() },
+            Input {
+                kind: Kind::Json,
+                data: "{not valid json".into(),
+            },
             &Config::insecure_testing(),
         );
         assert!(bad.summary.parser_fallback);
@@ -462,7 +547,12 @@ mod tests {
     #[test]
     fn reversible_under_all_profiles() {
         let input = "key AKIAIOSFODNN7EXAMPLE and a@b.com and Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
-        for p in [Profile::Strict, Profile::Balanced, Profile::Dev, Profile::Paranoid] {
+        for p in [
+            Profile::Strict,
+            Profile::Balanced,
+            Profile::Dev,
+            Profile::Paranoid,
+        ] {
             let r = mp(p, input);
             assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input, "{p:?}");
         }
@@ -510,8 +600,13 @@ mod tests {
     fn no_survivor_in_json_values() {
         let secret = "AKIAIOSFODNN7EXAMPLE";
         let input = format!("{{\"a\":\"{secret}\",\"b\":\"see {secret} here\"}}");
-        let r = Engine::with_profile(Profile::Balanced)
-            .mask(Input { kind: Kind::Json, data: input }, &Config::insecure_testing());
+        let r = Engine::with_profile(Profile::Balanced).mask(
+            Input {
+                kind: Kind::Json,
+                data: input,
+            },
+            &Config::insecure_testing(),
+        );
         assert!(!r.masked.contains(secret), "{}", r.masked);
     }
 }

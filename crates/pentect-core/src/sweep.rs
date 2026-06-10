@@ -97,7 +97,12 @@ mod tests {
     fn region(raw: &str) -> Region {
         Region {
             span: ByteRange::new(0, raw.len()),
-            ctx: Context { path: None, key: None, kind: RegionKind::PlainText, format: Kind::Text },
+            ctx: Context {
+                path: None,
+                key: None,
+                kind: RegionKind::PlainText,
+                format: Kind::Text,
+            },
         }
     }
 
@@ -124,7 +129,13 @@ mod tests {
     #[test]
     fn sweeps_real_repeat_but_not_substring_of_longer_token() {
         let raw = "to a@b.com cc a@b.com see a@b.commerce.io";
-        let first = span(raw, "a@b.com", "IDENTITY", Category::Pii, Confidence::Medium);
+        let first = span(
+            raw,
+            "a@b.com",
+            "IDENTITY",
+            Category::Pii,
+            Confidence::Medium,
+        );
         let swept = swept_ranges(raw, vec![first]);
         // The second standalone a@b.com is swept; the prefix inside
         // a@b.commerce.io is NOT (next byte 'm' continues the token).
@@ -137,15 +148,30 @@ mod tests {
     #[test]
     fn does_not_carve_hex_prefix_out_of_longer_run() {
         let raw = "x abc123 y abc1234567";
-        let first = span(raw, "abc123", "LIKELY_SECRET", Category::Secret, Confidence::Low);
+        let first = span(
+            raw,
+            "abc123",
+            "LIKELY_SECRET",
+            Category::Secret,
+            Confidence::Low,
+        );
         let swept = swept_ranges(raw, vec![first]);
-        assert!(swept.is_empty(), "abc123 must not be carved from abc1234567: {swept:?}");
+        assert!(
+            swept.is_empty(),
+            "abc123 must not be carved from abc1234567: {swept:?}"
+        );
     }
 
     #[test]
     fn swept_occurrence_inherits_highest_priority_label() {
         let raw = "AKIAIOSFODNN7EXAMPLE here AKIAIOSFODNN7EXAMPLE then AKIAIOSFODNN7EXAMPLE";
-        let weak = span(raw, "AKIAIOSFODNN7EXAMPLE", "LIKELY_SECRET", Category::Secret, Confidence::Low);
+        let weak = span(
+            raw,
+            "AKIAIOSFODNN7EXAMPLE",
+            "LIKELY_SECRET",
+            Category::Secret,
+            Confidence::Low,
+        );
         // A stronger hit on the same value at a later position.
         let second_at = raw.match_indices("AKIAIOSFODNN7EXAMPLE").nth(1).unwrap().0;
         let strong = Span {
@@ -158,6 +184,9 @@ mod tests {
         let out = identity_sweep(raw, vec![weak, strong], &[], &[region(raw)]);
         let swept: Vec<_> = out.iter().filter(|s| s.source == "sweep").collect();
         assert_eq!(swept.len(), 1, "third occurrence swept: {swept:?}");
-        assert_eq!(swept[0].label, "AWS_AKID", "must inherit the stronger label");
+        assert_eq!(
+            swept[0].label, "AWS_AKID",
+            "must inherit the stronger label"
+        );
     }
 }

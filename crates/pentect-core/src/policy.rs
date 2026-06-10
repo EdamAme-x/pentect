@@ -130,7 +130,9 @@ pub struct ProfilePolicy {
 
 impl ProfilePolicy {
     pub fn new(profile: Profile) -> Self {
-        Self { stance: profile.knobs().context_free }
+        Self {
+            stance: profile.knobs().context_free,
+        }
     }
 }
 

@@ -46,7 +46,10 @@ pub struct Input {
 
 impl Input {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { kind: Kind::Text, data: s.into() }
+        Self {
+            kind: Kind::Text,
+            data: s.into(),
+        }
     }
 }
 

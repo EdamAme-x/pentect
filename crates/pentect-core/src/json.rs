@@ -11,7 +11,11 @@ use crate::model::*;
 const MAX_DEPTH: usize = 128;
 
 pub fn parse_json_regions(raw: &str) -> Option<Vec<Region>> {
-    let mut p = Parser { b: raw.as_bytes(), i: 0, out: Vec::new() };
+    let mut p = Parser {
+        b: raw.as_bytes(),
+        i: 0,
+        out: Vec::new(),
+    };
     p.skip_ws();
     p.value(None, 0)?;
     p.skip_ws();
@@ -183,7 +187,10 @@ mod tests {
             .iter()
             .map(|r| (r.ctx.key.as_deref(), &raw[r.span.start..r.span.end]))
             .collect();
-        assert_eq!(got, [(Some("a"), "x"), (Some("b"), "y"), (Some("arr"), "z")]);
+        assert_eq!(
+            got,
+            [(Some("a"), "x"), (Some("b"), "y"), (Some("arr"), "z")]
+        );
     }
 
     #[test]

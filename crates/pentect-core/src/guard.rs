@@ -18,9 +18,13 @@ impl ShapeGuard {
     pub fn builtin() -> Self {
         let r = |p: &str| Regex::new(p).expect("guard regex compiles");
         Self {
-            uuid: r("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+            uuid: r(
+                "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            ),
             // md5/sha1/sha256/sha512 digest lengths.
-            hex_digest: r("^(?i)[0-9a-f]{32}$|^(?i)[0-9a-f]{40}$|^(?i)[0-9a-f]{64}$|^(?i)[0-9a-f]{128}$"),
+            hex_digest: r(
+                "^(?i)[0-9a-f]{32}$|^(?i)[0-9a-f]{40}$|^(?i)[0-9a-f]{64}$|^(?i)[0-9a-f]{128}$",
+            ),
             git_sha: r("^[0-9a-f]{7,40}$"),
         }
     }

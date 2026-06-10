@@ -98,7 +98,10 @@ pub struct EntropyDetector {
 
 impl Default for EntropyDetector {
     fn default() -> Self {
-        Self { min_len: 24, threshold: 3.2 }
+        Self {
+            min_len: 24,
+            threshold: 3.2,
+        }
     }
 }
 
@@ -106,7 +109,10 @@ impl EntropyDetector {
     /// `min_len` is clamped to the placeholder hash width so a lowered threshold
     /// can never re-fire on a rendered placeholder hash.
     pub fn with(min_len: usize, threshold: f64) -> Self {
-        Self { min_len: min_len.max(crate::placeholder::HASH_HEX_WIDTH), threshold }
+        Self {
+            min_len: min_len.max(crate::placeholder::HASH_HEX_WIDTH),
+            threshold,
+        }
     }
 }
 
@@ -182,8 +188,18 @@ pub struct DecodeDetector {
 }
 
 impl DecodeDetector {
-    pub fn new(codecs: Vec<Box<dyn Codec>>, identify: Vec<Box<dyn Detector>>, max_depth: u8) -> Self {
-        Self { codecs, identify, max_depth, mask_unknown: false, min_unknown_run: MIN_DECODE_RUN }
+    pub fn new(
+        codecs: Vec<Box<dyn Codec>>,
+        identify: Vec<Box<dyn Detector>>,
+        max_depth: u8,
+    ) -> Self {
+        Self {
+            codecs,
+            identify,
+            max_depth,
+            mask_unknown: false,
+            min_unknown_run: MIN_DECODE_RUN,
+        }
     }
 
     pub fn builtin() -> Self {
@@ -208,7 +224,9 @@ impl DecodeDetector {
     /// True if some codec decodes the run into binary-looking bytes (a strong
     /// "this is ciphertext" signal, distinct from raw entropy).
     fn decodes_to_binary(&self, run: &str) -> bool {
-        self.codecs.iter().any(|c| c.decode(run).is_some_and(|b| looks_binary(&b)))
+        self.codecs
+            .iter()
+            .any(|c| c.decode(run).is_some_and(|b| looks_binary(&b)))
     }
 
     fn probe(&self, run: &str, depth: u8) -> Option<(Category, String, Confidence)> {
@@ -250,13 +268,18 @@ impl DecodeDetector {
     fn identify(&self, text: &str) -> Option<(Category, String, Confidence)> {
         let region = Region {
             span: ByteRange::new(0, text.len()),
-            ctx: Context { path: None, key: None, kind: RegionKind::PlainText, format: Kind::Text },
+            ctx: Context {
+                path: None,
+                key: None,
+                kind: RegionKind::PlainText,
+                format: Kind::Text,
+            },
         };
         let view = NormalizedView::build(&region, text);
         let mut best: Option<Span> = None;
         for d in &self.identify {
             for span in d.detect(&view) {
-                if best.as_ref().map_or(true, |b| is_stronger(&span, b)) {
+                if best.as_ref().is_none_or(|b| is_stronger(&span, b)) {
                     best = Some(span);
                 }
             }
@@ -369,9 +392,26 @@ fn inflate<R: Read>(reader: R) -> Option<Vec<u8>> {
 }
 
 const SENSITIVE_KEY_TOKENS: &[&str] = &[
-    "password", "passwd", "pwd", "secret", "token", "auth", "authorization",
-    "credential", "cred", "key", "apikey", "session", "sid", "signature", "nonce",
-    "bearer", "passphrase", "otp", "pin", "jwt",
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "auth",
+    "authorization",
+    "credential",
+    "cred",
+    "key",
+    "apikey",
+    "session",
+    "sid",
+    "signature",
+    "nonce",
+    "bearer",
+    "passphrase",
+    "otp",
+    "pin",
+    "jwt",
 ];
 
 /// Masks a value when its key looks sensitive, regardless of the value's shape.
@@ -384,7 +424,9 @@ impl Detector for SuspiciousKeyDetector {
     }
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let region = view.region;
-        let Some(k) = &region.ctx.key else { return vec![] };
+        let Some(k) = &region.ctx.key else {
+            return vec![];
+        };
         if region.span.is_empty() {
             return vec![];
         }
@@ -446,7 +488,12 @@ mod tests {
     fn plain(raw: &str) -> Region {
         Region {
             span: ByteRange::new(0, raw.len()),
-            ctx: Context { path: None, key: None, kind: RegionKind::PlainText, format: Kind::Text },
+            ctx: Context {
+                path: None,
+                key: None,
+                kind: RegionKind::PlainText,
+                format: Kind::Text,
+            },
         }
     }
 
@@ -464,13 +511,21 @@ mod tests {
     #[test]
     fn opaque_blob_only_when_mask_unknown() {
         // base64 of binary-looking bytes; no inner secret to identify.
-        let enc = data_encoding::BASE64
-            .encode(&[0x00, 0xff, 0x1a, 0x2c, 0x9b, 0x4e, 0xd1, 0x77, 0x88, 0x33, 0xaa, 0x55, 0xc0, 0x0d]);
+        let enc = data_encoding::BASE64.encode(&[
+            0x00, 0xff, 0x1a, 0x2c, 0x9b, 0x4e, 0xd1, 0x77, 0x88, 0x33, 0xaa, 0x55, 0xc0, 0x0d,
+        ]);
         let raw = format!("x {enc} y");
         let r = plain(&raw);
         let v = NormalizedView::build(&r, &raw);
-        assert!(DecodeDetector::builtin().detect(&v).is_empty(), "off by default");
+        assert!(
+            DecodeDetector::builtin().detect(&v).is_empty(),
+            "off by default"
+        );
         let spans = DecodeDetector::builtin().with_opaque(true, 16).detect(&v);
-        assert!(spans.iter().any(|s| s.label == "OPAQUE_BLOB"), "{:?}", spans);
+        assert!(
+            spans.iter().any(|s| s.label == "OPAQUE_BLOB"),
+            "{:?}",
+            spans
+        );
     }
 }

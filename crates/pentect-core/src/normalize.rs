@@ -5,7 +5,9 @@ use unicode_normalization::UnicodeNormalization;
 /// stripping. Conservative so distinct values are never merged (full-width vs
 /// ASCII digits stay distinct). Used for placeholder hashing and the sweep.
 pub fn n_id(s: &str) -> String {
-    s.nfc().filter(|c| !is_zero_width(*c) && !is_bidi(*c)).collect()
+    s.nfc()
+        .filter(|c| !is_zero_width(*c) && !is_bidi(*c))
+        .collect()
 }
 
 fn is_zero_width(c: char) -> bool {
@@ -61,7 +63,10 @@ impl<'a> NormalizedView<'a> {
                         let raw = ByteRange::new(base + i, base + i + 3);
                         let norm_start = norm.len();
                         norm.push(byte as char);
-                        segs.push(Seg { norm: ByteRange::new(norm_start, norm.len()), raw });
+                        segs.push(Seg {
+                            norm: ByteRange::new(norm_start, norm.len()),
+                            raw,
+                        });
                         i += 3;
                         continue;
                     }
@@ -79,7 +84,10 @@ impl<'a> NormalizedView<'a> {
                 norm.push(nc);
             }
             if norm.len() > norm_start {
-                segs.push(Seg { norm: ByteRange::new(norm_start, norm.len()), raw });
+                segs.push(Seg {
+                    norm: ByteRange::new(norm_start, norm.len()),
+                    raw,
+                });
             }
         }
         NormalizedView { region, norm, segs }
@@ -126,7 +134,12 @@ mod tests {
     fn region(raw: &str) -> Region {
         Region {
             span: ByteRange::new(0, raw.len()),
-            ctx: Context { path: None, key: None, kind: RegionKind::PlainText, format: Kind::Text },
+            ctx: Context {
+                path: None,
+                key: None,
+                kind: RegionKind::PlainText,
+                format: Kind::Text,
+            },
         }
     }
 

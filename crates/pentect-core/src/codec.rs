@@ -1,4 +1,6 @@
-use data_encoding::{BASE32, BASE32_NOPAD, BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD, HEXLOWER_PERMISSIVE};
+use data_encoding::{
+    BASE32, BASE32_NOPAD, BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD, HEXLOWER_PERMISSIVE,
+};
 
 /// Decodes a contiguous encoded blob to bytes, or None if the run isn't valid in
 /// this encoding. Injected into the decode detector so new encodings are added
@@ -33,7 +35,10 @@ impl Codec for Base32Codec {
     }
     fn decode(&self, run: &str) -> Option<Vec<u8>> {
         let b = run.as_bytes();
-        BASE32.decode(b).ok().or_else(|| BASE32_NOPAD.decode(b).ok())
+        BASE32
+            .decode(b)
+            .ok()
+            .or_else(|| BASE32_NOPAD.decode(b).ok())
     }
 }
 
@@ -68,7 +73,10 @@ mod tests {
         let v = b"AKIAIOSFODNN7EXAMPLE".to_vec();
         assert_eq!(Base64Codec.decode(&BASE64.encode(&v)), Some(v.clone()));
         assert_eq!(Base32Codec.decode(&BASE32.encode(&v)), Some(v.clone()));
-        assert_eq!(HexCodec.decode(&HEXLOWER_PERMISSIVE.encode(&v)), Some(v.clone()));
+        assert_eq!(
+            HexCodec.decode(&HEXLOWER_PERMISSIVE.encode(&v)),
+            Some(v.clone())
+        );
         assert_eq!(Base58Codec.decode(&bs58::encode(&v).into_string()), Some(v));
     }
 }
