@@ -1,9 +1,10 @@
 use crate::detect::{DecodeDetector, Detector, EntropyDetector, RuleDetector, SuspiciousKeyDetector};
+use crate::guard::{OverMaskGuard, ShapeGuard};
 use crate::merge::merge;
 use crate::model::*;
 use crate::normalize::NormalizedView;
 use crate::parse::{JsonParser, Parser, TextParser};
-use crate::policy::{Action, MaskAll, Policy};
+use crate::policy::{is_context_free, Action, MaskAll, Policy, Profile, ProfilePolicy};
 use crate::recovery::Recovery;
 use crate::render::render;
 use crate::sweep::identity_sweep;
@@ -30,9 +31,20 @@ impl Config {
     }
 }
 
+/// A span surfaced to the user without masking (value-free).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResidualNote {
+    pub range: ByteRange,
+    pub category: Category,
+    pub source: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Summary {
     pub masked_count: usize,
+    /// Opaque candidates that were warned about rather than masked (no value).
+    #[serde(default)]
+    pub residual: Vec<ResidualNote>,
 }
 
 /// Carries the local-only recovery map, so it is intentionally not serializable.
@@ -50,11 +62,30 @@ pub struct Engine {
     fallback: Box<dyn Parser>,
     detectors: Vec<Box<dyn Detector>>,
     policy: Box<dyn Policy>,
+    /// Spares benign shapes from context-free over-masking (see ShapeGuard).
+    guard: Option<Box<dyn OverMaskGuard>>,
 }
 
 impl Engine {
     pub fn builder() -> EngineBuilder {
         EngineBuilder::new()
+    }
+
+    /// Standard stack tuned for a profile. Power users can still build a fully
+    /// custom Engine via `builder()`.
+    pub fn with_profile(profile: Profile) -> Self {
+        let k = profile.knobs();
+        Engine::builder()
+            .parser(Kind::Json, Box::new(JsonParser))
+            .detector(Box::new(RuleDetector::builtin()))
+            .detector(Box::new(EntropyDetector::with(k.entropy_min_len, k.entropy_threshold)))
+            .detector(Box::new(
+                DecodeDetector::builtin().with_opaque(k.mask_unknown_codec, k.min_opaque_run),
+            ))
+            .detector(Box::new(SuspiciousKeyDetector))
+            .policy(Box::new(ProfilePolicy::new(profile)))
+            .guard(Box::new(ShapeGuard::builtin()))
+            .build()
     }
 
     pub fn mask(&self, input: Input, config: &Config) -> MaskResult {
@@ -72,15 +103,36 @@ impl Engine {
             }
         }
 
-        // Classify before merge so an allowlist can retract false candidates
-        // before overlaps are resolved (the default policy only emits Mask).
-        spans.retain(|s| matches!(self.policy.classify(s), Action::Mask(_)));
+        // Classify per span. The guard may retract a context-free candidate
+        // (benign shape), but never an anchored one, so an anchored Mask
+        // overlapping a benign-shaped value is never suppressed before merge.
+        let mut to_mask = Vec::new();
+        let mut residual = Vec::new();
+        for s in spans {
+            let ctx_free = is_context_free(&s);
+            if ctx_free {
+                if let Some(g) = &self.guard {
+                    if g.benign(&ir.raw[s.range.start..s.range.end]) {
+                        continue;
+                    }
+                }
+            }
+            match self.policy.classify(&s) {
+                Action::Mask(_) => to_mask.push(s),
+                Action::Warn => residual.push(ResidualNote {
+                    range: s.range,
+                    category: s.category,
+                    source: s.source,
+                }),
+                Action::Keep | Action::Drop => {}
+            }
+        }
 
-        let merged = merge(spans, &ir.protected);
+        let merged = merge(to_mask, &ir.protected);
         let swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
         let rendered = render(&ir.raw, &config.key, swept.clone(), config.disclose_length);
 
-        let summary = Summary { masked_count: rendered.map.len() };
+        let summary = Summary { masked_count: rendered.map.len(), residual };
         MaskResult {
             masked: rendered.masked,
             recovery: Recovery { map: rendered.map },
@@ -120,11 +172,12 @@ pub struct EngineBuilder {
     parsers: Vec<(Kind, Box<dyn Parser>)>,
     detectors: Vec<Box<dyn Detector>>,
     policy: Option<Box<dyn Policy>>,
+    guard: Option<Box<dyn OverMaskGuard>>,
 }
 
 impl EngineBuilder {
     pub fn new() -> Self {
-        Self { parsers: Vec::new(), detectors: Vec::new(), policy: None }
+        Self { parsers: Vec::new(), detectors: Vec::new(), policy: None, guard: None }
     }
     pub fn parser(mut self, kind: Kind, parser: Box<dyn Parser>) -> Self {
         self.parsers.push((kind, parser));
@@ -138,12 +191,17 @@ impl EngineBuilder {
         self.policy = Some(policy);
         self
     }
+    pub fn guard(mut self, guard: Box<dyn OverMaskGuard>) -> Self {
+        self.guard = Some(guard);
+        self
+    }
     pub fn build(self) -> Engine {
         Engine {
             parsers: self.parsers,
             fallback: Box::new(TextParser),
             detectors: self.detectors,
             policy: self.policy.unwrap_or_else(|| Box::new(MaskAll)),
+            guard: self.guard,
         }
     }
 }
@@ -280,6 +338,74 @@ mod tests {
         let engine = Engine::builder().policy(Box::new(MaskAll)).build();
         let r = engine.mask(Input::text("token sk-ABCDEFGHIJKLMNOPQRSTUVWX"), &Config::insecure_testing());
         assert_eq!(r.summary.masked_count, 0, "{}", r.masked);
+    }
+
+    fn mp(profile: Profile, s: &str) -> MaskResult {
+        Engine::with_profile(profile).mask(Input::text(s), &Config::insecure_testing())
+    }
+
+    #[test]
+    fn context_free_entropy_follows_profile() {
+        let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh"; // high entropy, no anchor
+        let input = format!("blob {blob} end");
+        // Strict masks it; Balanced warns (kept in output, surfaced in residual).
+        assert!(!mp(Profile::Strict, &input).masked.contains(blob));
+        let bal = mp(Profile::Balanced, &input);
+        assert!(bal.masked.contains(blob), "{}", bal.masked);
+        assert_eq!(bal.summary.residual.len(), 1);
+        assert!(mp(Profile::Dev, &input).masked.contains(blob)); // kept
+    }
+
+    #[test]
+    fn anchored_secret_masks_under_every_profile() {
+        for p in [Profile::Strict, Profile::Balanced, Profile::Dev, Profile::Paranoid] {
+            let r = mp(p, "key AKIAIOSFODNN7EXAMPLE end");
+            assert!(r.masked.contains("<<AWS_AKID_"), "{p:?}: {}", r.masked);
+        }
+    }
+
+    #[test]
+    fn guard_spares_uuid_unless_anchored() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        // Bare UUID survives even Paranoid (benign shape).
+        assert!(mp(Profile::Paranoid, &format!("id {uuid} x")).masked.contains(uuid));
+        // Under a sensitive key it is anchored, so it masks.
+        let j = format!("{{\"session_token\":\"{uuid}\"}}");
+        let r = Engine::with_profile(Profile::Balanced)
+            .mask(Input { kind: Kind::Json, data: j }, &Config::insecure_testing());
+        assert!(!r.masked.contains(uuid), "{}", r.masked);
+    }
+
+    #[test]
+    fn paranoid_masks_opaque_blob() {
+        use data_encoding::BASE64;
+        let bytes: Vec<u8> = (0u8..24).map(|n| n.wrapping_mul(37).wrapping_add(11)).collect();
+        let enc = BASE64.encode(&bytes);
+        let input = format!("payload {enc} end");
+        assert!(mp(Profile::Balanced, &input).masked.contains(&enc)); // untouched
+        assert!(mp(Profile::Paranoid, &input).masked.contains("<<OPAQUE_BLOB_"));
+    }
+
+    #[test]
+    fn aggressive_engine_masks_uuid() {
+        // --aggressive == ProfilePolicy(Paranoid) + NoGuard.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let engine = Engine::builder()
+            .detector(Box::new(EntropyDetector::with(20, 2.8)))
+            .policy(Box::new(ProfilePolicy::new(Profile::Paranoid)))
+            .guard(Box::new(crate::guard::NoGuard))
+            .build();
+        let r = engine.mask(Input::text(&format!("id {uuid} x")), &Config::insecure_testing());
+        assert!(!r.masked.contains(uuid), "{}", r.masked);
+    }
+
+    #[test]
+    fn reversible_under_all_profiles() {
+        let input = "key AKIAIOSFODNN7EXAMPLE and a@b.com and Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
+        for p in [Profile::Strict, Profile::Balanced, Profile::Dev, Profile::Paranoid] {
+            let r = mp(p, input);
+            assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input, "{p:?}");
+        }
     }
 
     proptest! {

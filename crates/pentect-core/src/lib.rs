@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod detect;
 pub mod engine;
+pub mod guard;
 pub mod json;
 pub mod merge;
 pub mod model;
@@ -20,11 +21,12 @@ pub mod render;
 pub mod sweep;
 
 pub use codec::Codec;
-pub use detect::Detector;
-pub use engine::{Config, Engine, EngineBuilder, MaskResult, Summary};
+pub use detect::{DecodeDetector, Detector, EntropyDetector, RuleDetector, SuspiciousKeyDetector};
+pub use engine::{Config, Engine, EngineBuilder, MaskResult, ResidualNote, Summary};
+pub use guard::{NoGuard, OverMaskGuard, ShapeGuard};
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
 pub use parse::{JsonParser, Parser, TextParser};
-pub use policy::{Action, Granularity, MaskAll, Policy};
+pub use policy::{Action, Granularity, MaskAll, OpaqueStance, Policy, Profile, ProfilePolicy};
 pub use recovery::{restore, Recovery, RestoreError};
 
 /// Mask with the default engine. Build an `Engine` once for repeated calls.
