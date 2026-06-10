@@ -25,7 +25,7 @@ pub use detect::{
 };
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
 pub use pack::load_rule_detector;
-pub use parse::{EnvParser, JsonParser, Parser, TextParser};
+pub use parse::{EnvParser, HarParser, JsonParser, Parser, TextParser};
 pub use pipeline::{
     Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote, Summary,
 };

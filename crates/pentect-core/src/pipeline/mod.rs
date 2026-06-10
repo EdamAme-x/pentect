@@ -7,7 +7,7 @@ use crate::detect::{
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
-use crate::parse::{EnvParser, JsonParser, Parser, TextParser};
+use crate::parse::{EnvParser, HarParser, JsonParser, Parser, TextParser};
 use crate::policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
 use crate::policy::{
     is_context_free, Action, MaskAll, Policy, Profile, ProfileKnobs, ProfilePolicy,
@@ -265,6 +265,7 @@ impl EngineBuilder {
     pub fn standard_stack(self, knobs: ProfileKnobs) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
+            .parser(Kind::Har, Box::new(HarParser))
             .detector(Box::new(RuleDetector::builtin()))
             .detector(Box::new(PemDetector::default()))
             .detector(Box::new(EntropyDetector::with(

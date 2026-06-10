@@ -1,5 +1,6 @@
 use crate::model::*;
 
+mod har;
 mod json;
 
 /// Turns raw input into value regions. Injected per `Kind`; the engine falls
@@ -29,6 +30,18 @@ pub struct JsonParser;
 impl Parser for JsonParser {
     fn parse(&self, raw: &str) -> Option<Vec<Region>> {
         json::parse_json_regions(raw)
+    }
+}
+
+/// Parses a HAR (HTTP Archive, which is JSON) into value regions, tagging
+/// header/cookie/query-string values with their field name so key-anchored
+/// detection fires on Authorization/Cookie/etc. Masks only string values, so the
+/// output re-parses as valid HAR.
+pub struct HarParser;
+
+impl Parser for HarParser {
+    fn parse(&self, raw: &str) -> Option<Vec<Region>> {
+        har::parse_har_regions(raw)
     }
 }
 
