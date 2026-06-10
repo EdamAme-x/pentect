@@ -196,4 +196,19 @@ mod tests {
         let deep = format!("{}true{}", "[".repeat(50_000), "]".repeat(50_000));
         assert!(parse_json_regions(&deep).is_none());
     }
+
+    proptest::proptest! {
+        // Arbitrary input must never panic, and any region must stay in bounds
+        // on char boundaries.
+        #[test]
+        fn parse_never_panics_and_in_bounds(s in proptest::prelude::any::<String>()) {
+            if let Some(regions) = parse_json_regions(&s) {
+                for r in regions {
+                    proptest::prop_assert!(r.span.end <= s.len());
+                    proptest::prop_assert!(s.is_char_boundary(r.span.start));
+                    proptest::prop_assert!(s.is_char_boundary(r.span.end));
+                }
+            }
+        }
+    }
 }

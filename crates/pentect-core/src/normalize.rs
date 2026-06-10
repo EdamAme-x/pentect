@@ -157,4 +157,20 @@ mod tests {
         assert_eq!(v.text(), "a-b");
         assert_eq!(v.to_raw(ByteRange::new(1, 2)), ByteRange::new(1, 4));
     }
+
+    proptest::proptest! {
+        // Building a view and mapping any normalized range back must never panic
+        // and must stay inside the region on char boundaries.
+        #[test]
+        fn build_and_to_raw_never_panic(s in proptest::prelude::any::<String>()) {
+            let r = region(&s);
+            let v = NormalizedView::build(&r, &s);
+            let n = v.text().len();
+            let raw = v.to_raw(ByteRange::new(0, n));
+            proptest::prop_assert!(raw.start <= raw.end);
+            proptest::prop_assert!(raw.end <= s.len());
+            proptest::prop_assert!(s.is_char_boundary(raw.start));
+            proptest::prop_assert!(s.is_char_boundary(raw.end));
+        }
+    }
 }

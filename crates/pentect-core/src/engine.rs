@@ -481,5 +481,37 @@ mod tests {
             let once = m(&s).masked;
             prop_assert_eq!(m(&once).masked, once);
         }
+
+        // mask() must never panic on arbitrary input, and stay reversible.
+        #[test]
+        fn prop_arbitrary_never_panics_and_reversible(s in any::<String>()) {
+            let r = m(&s);
+            prop_assert_eq!(restore(&r.masked, &r.recovery).unwrap(), s);
+        }
+
+        // No-survivor: a known secret placed at token boundaries never appears
+        // verbatim in the masked output, under any profile.
+        #[test]
+        fn prop_no_survivor_all_profiles(
+            pre in "[a-z ]{0,20}",
+            mid in "[a-z ]{1,20}",
+            post in "[a-z ]{0,20}",
+        ) {
+            let secret = "AKIAIOSFODNN7EXAMPLE";
+            let input = format!("{pre} {secret} {mid} {secret} {post}");
+            for p in [Profile::Strict, Profile::Balanced, Profile::Dev, Profile::Paranoid] {
+                let r = Engine::with_profile(p).mask(Input::text(&input), &Config::insecure_testing());
+                prop_assert!(!r.masked.contains(secret), "{p:?} left a survivor: {}", r.masked);
+            }
+        }
+    }
+
+    #[test]
+    fn no_survivor_in_json_values() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let input = format!("{{\"a\":\"{secret}\",\"b\":\"see {secret} here\"}}");
+        let r = Engine::with_profile(Profile::Balanced)
+            .mask(Input { kind: Kind::Json, data: input }, &Config::insecure_testing());
+        assert!(!r.masked.contains(secret), "{}", r.masked);
     }
 }

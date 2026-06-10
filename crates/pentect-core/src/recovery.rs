@@ -63,3 +63,29 @@ fn utf8_len(b: u8) -> usize {
         1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_placeholders_pass_through() {
+        let rec = Recovery::default();
+        let out = restore("a <<X_unknown>> b", &rec).unwrap();
+        assert_eq!(out, "a <<X_unknown>> b");
+    }
+
+    proptest::proptest! {
+        // restore must never panic on arbitrary input, with or without entries.
+        #[test]
+        fn restore_never_panics(
+            text in proptest::prelude::any::<String>(),
+            k in "[A-Z_]{0,8}",
+            v in ".{0,16}",
+        ) {
+            let mut rec = Recovery::default();
+            rec.map.insert(format!("<<{k}_aa>>"), v);
+            let _ = restore(&text, &rec).unwrap();
+        }
+    }
+}
