@@ -8,8 +8,10 @@ use crate::detect::{
 use crate::model::*;
 use crate::normalize::NormalizedView;
 use crate::parse::{EnvParser, JsonParser, Parser, TextParser};
-use crate::policy::guard::{OverMaskGuard, ShapeGuard};
-use crate::policy::{is_context_free, Action, MaskAll, Policy, Profile, ProfilePolicy};
+use crate::policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
+use crate::policy::{
+    is_context_free, Action, MaskAll, Policy, Profile, ProfileKnobs, ProfilePolicy,
+};
 use crate::recovery::Recovery;
 use merge::merge;
 use regex::Regex;
@@ -103,22 +105,21 @@ impl Engine {
     /// Standard stack tuned for a profile. Power users can still build a fully
     /// custom Engine via `builder()`.
     pub fn with_profile(profile: Profile) -> Self {
-        let k = profile.knobs();
         Engine::builder()
-            .parser(Kind::Json, Box::new(JsonParser))
-            .parser(Kind::Env, Box::new(EnvParser))
-            .detector(Box::new(RuleDetector::builtin()))
-            .detector(Box::new(PemDetector::default()))
-            .detector(Box::new(EntropyDetector::with(
-                k.entropy_min_len,
-                k.entropy_threshold,
-            )))
-            .detector(Box::new(
-                DecodeDetector::builtin().with_opaque(k.mask_unknown_codec, k.min_opaque_run),
-            ))
-            .detector(Box::new(SuspiciousKeyDetector))
+            .standard_stack(profile.knobs())
             .policy(Box::new(ProfilePolicy::new(profile)))
             .guard(Box::new(ShapeGuard::builtin()))
+            .build()
+    }
+
+    /// Like `with_profile` but with the benign-shape guard disabled — the
+    /// "mask everything, even UUIDs/hashes" escape hatch (`--aggressive`). Output
+    /// is then mostly unusable for reasoning, but every mask stays reversible.
+    pub fn with_profile_unguarded(profile: Profile) -> Self {
+        Engine::builder()
+            .standard_stack(profile.knobs())
+            .policy(Box::new(ProfilePolicy::new(profile)))
+            .guard(Box::new(NoGuard))
             .build()
     }
 
@@ -210,13 +211,7 @@ impl Engine {
 impl Default for Engine {
     fn default() -> Self {
         Engine::builder()
-            .parser(Kind::Json, Box::new(JsonParser))
-            .parser(Kind::Env, Box::new(EnvParser))
-            .detector(Box::new(RuleDetector::builtin()))
-            .detector(Box::new(PemDetector::default()))
-            .detector(Box::new(EntropyDetector::default()))
-            .detector(Box::new(DecodeDetector::builtin()))
-            .detector(Box::new(SuspiciousKeyDetector))
+            .standard_stack(Profile::Strict.knobs())
             .policy(Box::new(MaskAll))
             .build()
     }
@@ -237,6 +232,24 @@ impl EngineBuilder {
             policy: None,
             guard: None,
         }
+    }
+    /// Register the canonical parser + detector set tuned for `knobs`. The single
+    /// definition of the standard stack, so no path (profile, default, aggressive)
+    /// can silently miss a parser or detector.
+    pub fn standard_stack(self, knobs: ProfileKnobs) -> Self {
+        self.parser(Kind::Json, Box::new(JsonParser))
+            .parser(Kind::Env, Box::new(EnvParser))
+            .detector(Box::new(RuleDetector::builtin()))
+            .detector(Box::new(PemDetector::default()))
+            .detector(Box::new(EntropyDetector::with(
+                knobs.entropy_min_len,
+                knobs.entropy_threshold,
+            )))
+            .detector(Box::new(
+                DecodeDetector::builtin()
+                    .with_opaque(knobs.mask_unknown_codec, knobs.min_opaque_run),
+            ))
+            .detector(Box::new(SuspiciousKeyDetector))
     }
     pub fn parser(mut self, kind: Kind, parser: Box<dyn Parser>) -> Self {
         self.parsers.push((kind, parser));
@@ -619,6 +632,32 @@ mod tests {
             r.masked
         );
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn unguarded_keeps_full_stack_parsers_and_detectors() {
+        // Regression: the --aggressive path must not drop EnvParser or PemDetector.
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBVAIBADANBgkqh\nkiG9w0BAQEFAASCAT\n-----END RSA PRIVATE KEY-----";
+        let r = Engine::with_profile_unguarded(Profile::Paranoid)
+            .mask(Input::text(pem), &Config::insecure_testing());
+        assert!(
+            r.masked.contains("<<PRIVATE_KEY_"),
+            "pem still masked: {}",
+            r.masked
+        );
+
+        let env = Engine::with_profile_unguarded(Profile::Paranoid).mask(
+            Input {
+                kind: Kind::Env,
+                data: "DB_PASSWORD=hunter2\n".into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(
+            !env.masked.contains("hunter2"),
+            "env still masked: {}",
+            env.masked
+        );
     }
 
     #[test]

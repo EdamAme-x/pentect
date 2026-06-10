@@ -1,10 +1,7 @@
 //! Pentect CLI: mask secrets from stdin to stdout. One-way for now; nothing is
 //! written to disk.
 
-use pentect_core::{
-    Config, DecodeDetector, Engine, EntropyDetector, Input, JsonParser, Kind, NoGuard, Profile,
-    ProfilePolicy, RuleDetector, SuspiciousKeyDetector,
-};
+use pentect_core::{Config, Engine, Input, Kind, Profile};
 use std::io::{Read, Write};
 
 /// Refuse oversized input rather than emit partially-masked output (a masked
@@ -97,28 +94,15 @@ fn cmd_mask(args: &[String]) {
     }
 }
 
-/// `--aggressive` swaps the benign-shape guard for one that spares nothing, so
-/// even UUIDs/hashes get masked. Output is then mostly unusable for reasoning.
+/// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
+/// masked. Output is then mostly unusable for reasoning, but still reversible.
 fn build_engine(profile: Profile, aggressive: bool) -> Engine {
-    if !aggressive {
-        return Engine::with_profile(profile);
+    if aggressive {
+        eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
+        Engine::with_profile_unguarded(profile)
+    } else {
+        Engine::with_profile(profile)
     }
-    eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
-    let k = profile.knobs();
-    Engine::builder()
-        .parser(Kind::Json, Box::new(JsonParser))
-        .detector(Box::new(RuleDetector::builtin()))
-        .detector(Box::new(EntropyDetector::with(
-            k.entropy_min_len,
-            k.entropy_threshold,
-        )))
-        .detector(Box::new(
-            DecodeDetector::builtin().with_opaque(k.mask_unknown_codec, k.min_opaque_run),
-        ))
-        .detector(Box::new(SuspiciousKeyDetector))
-        .policy(Box::new(ProfilePolicy::new(profile)))
-        .guard(Box::new(NoGuard))
-        .build()
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {
