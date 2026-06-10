@@ -13,7 +13,7 @@ fn main() {
 }
 
 fn usage() {
-    eprintln!("pentect mask [--kind text|json]   mask secrets from stdin to stdout");
+    eprintln!("pentect mask [--kind text|json] [--length]   mask secrets from stdin to stdout");
 }
 
 fn read_stdin() -> String {
@@ -28,10 +28,12 @@ fn cmd_mask(args: &[String]) {
         _ => Kind::Text,
     };
     let data = read_stdin();
+    let disclose_length = args.iter().any(|a| a == "--length");
 
     // Fixed dev key for now; a real CSPRNG key + keyfile is an adapter concern.
     eprintln!("[pentect] WARNING: using a fixed insecure dev key (no keyfile yet).");
-    let result = mask(Input { kind, data }, &Config::insecure_testing());
+    let cfg = Config { disclose_length, ..Config::insecure_testing() };
+    let result = mask(Input { kind, data }, &cfg);
 
     print!("{}", result.masked);
     let _ = std::io::stdout().flush();

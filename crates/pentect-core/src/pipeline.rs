@@ -16,11 +16,13 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub key: [u8; 32],
     pub locale: String,
+    /// Opt-in coarse length disclosure for opaque blobs (off by default).
+    pub disclose_length: bool,
 }
 
 impl Config {
     pub fn new(key: [u8; 32]) -> Self {
-        Self { key, locale: "en".into() }
+        Self { key, locale: "en".into(), disclose_length: false }
     }
     /// Fixed key for tests and demos only.
     pub fn insecure_testing() -> Self {
@@ -63,7 +65,7 @@ pub fn mask_ir(ir: Ir, config: &Config) -> MaskResult {
 
     let merged = merge(spans, &ir.protected);
     let swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
-    let rendered = render(&ir.raw, &config.key, swept.clone());
+    let rendered = render(&ir.raw, &config.key, swept.clone(), config.disclose_length);
 
     let summary = Summary { masked_count: rendered.map.len() };
     MaskResult {
@@ -101,7 +103,8 @@ fn plaintext_region(len: usize, format: Kind) -> Region {
 
 /// Freeze existing `<<LABEL_hash>>` placeholders so re-masking is a no-op.
 fn scan_placeholders(raw: &str) -> Vec<ByteRange> {
-    let re = Regex::new(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>").expect("placeholder regex compiles");
+    let re = Regex::new(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}(?:_~[a-z]+)?>>")
+        .expect("placeholder regex compiles");
     re.find_iter(raw)
         .map(|m| ByteRange::new(m.start(), m.end()))
         .collect()
@@ -141,6 +144,20 @@ mod tests {
     fn distinct_values_distinct_placeholders() {
         let r = m("AKIAIOSFODNN7EXAMPLE AKIA0000000000000000");
         assert_eq!(r.recovery.map.len(), 2, "{}", r.masked);
+    }
+
+    #[test]
+    fn opt_in_length_bucket_for_opaque_only() {
+        let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh"; // ~29 chars, high entropy
+        let input = format!("blob {blob} end");
+        let on = Config { disclose_length: true, ..Config::insecure_testing() };
+        let r = mask(Input { kind: Kind::Text, data: input.clone() }, &on);
+        assert!(r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_~med>>"), "{}", r.masked);
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+
+        // Off by default: no bucket suffix.
+        let r2 = mask(Input { kind: Kind::Text, data: input.clone() }, &Config::insecure_testing());
+        assert!(!r2.masked.contains('~'), "{}", r2.masked);
     }
 
     #[test]

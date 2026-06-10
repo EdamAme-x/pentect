@@ -20,6 +20,21 @@ pub fn identity_hash(key: &[u8; 32], n_id_value: &str) -> String {
     s
 }
 
-pub fn render_placeholder(label: &str, hash: &str) -> String {
-    format!("<<{}_{}>>", label, hash)
+/// `<<LABEL_HASH>>`, or `<<LABEL_HASH_~BUCKET>>` when a length bucket is given.
+pub fn render_placeholder(label: &str, hash: &str, length_bucket: Option<&str>) -> String {
+    match length_bucket {
+        Some(b) => format!("<<{label}_{hash}_~{b}>>"),
+        None => format!("<<{label}_{hash}>>"),
+    }
+}
+
+/// Coarse, opt-in length bucket for opaque blobs. Nothing is disclosed below the
+/// floor, and exact length is never revealed.
+pub fn length_bucket(char_len: usize) -> Option<&'static str> {
+    match char_len {
+        0..=23 => None,
+        24..=63 => Some("med"),
+        64..=511 => Some("long"),
+        _ => Some("xlong"),
+    }
 }
