@@ -10,6 +10,7 @@ use crate::render::render;
 use crate::sweep::identity_sweep;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 /// Per-call parameters (not behaviour). `key` is the HMAC key for identity
 /// hashing; the adapter generates and persists it.
@@ -241,11 +242,15 @@ impl Default for EngineBuilder {
     }
 }
 
+static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}(?:_len[0-9]+)?>>")
+        .expect("placeholder regex compiles")
+});
+
 /// Freeze existing `<<LABEL_hash>>` placeholders so re-masking is a no-op.
 fn scan_placeholders(raw: &str) -> Vec<ByteRange> {
-    let re = Regex::new(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}(?:_len[0-9]+)?>>")
-        .expect("placeholder regex compiles");
-    re.find_iter(raw)
+    PLACEHOLDER_RE
+        .find_iter(raw)
         .map(|m| ByteRange::new(m.start(), m.end()))
         .collect()
 }
