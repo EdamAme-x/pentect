@@ -59,6 +59,10 @@ pub struct Summary {
     /// instead of silently corrupting reversibility.
     #[serde(default)]
     pub collisions: Vec<String>,
+    /// The requested format parser failed and we fell back to plaintext, so key
+    /// context is lost and structure is not guaranteed. Not set for Text input.
+    #[serde(default)]
+    pub parser_fallback: bool,
 }
 
 /// Carries the local-only recovery map, so it is intentionally not serializable.
@@ -103,8 +107,10 @@ impl Engine {
     }
 
     pub fn mask(&self, input: Input, config: &Config) -> MaskResult {
-        let ir = self.parse(input);
-        self.mask_ir(ir, config)
+        let (ir, fell_back) = self.parse(input);
+        let mut result = self.mask_ir(ir, config);
+        result.summary.parser_fallback = fell_back;
+        result
     }
 
     /// An adapter can build the same `Ir` and call this directly.
@@ -146,8 +152,13 @@ impl Engine {
         let swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
         let rendered = render(&ir.raw, &config.key, swept.clone(), config.disclose_length);
 
-        let summary =
-            Summary { masked_count: rendered.map.len(), residual, collisions: rendered.collisions };
+        // parser_fallback is set by mask(); mask_ir takes a ready-made Ir.
+        let summary = Summary {
+            masked_count: rendered.map.len(),
+            residual,
+            collisions: rendered.collisions,
+            parser_fallback: false,
+        };
         MaskResult {
             masked: rendered.masked,
             recovery: Recovery { map: rendered.map },
@@ -156,17 +167,20 @@ impl Engine {
         }
     }
 
-    fn parse(&self, input: Input) -> Ir {
+    /// Returns the Ir and whether a *requested* format parser failed (so we fell
+    /// back to plaintext). Text input has no registered parser, so it is never a
+    /// fallback.
+    fn parse(&self, input: Input) -> (Ir, bool) {
         let Input { kind, data: raw } = input;
         let protected = scan_placeholders(&raw);
-        let regions = self
-            .parsers
-            .iter()
-            .find(|(k, _)| *k == kind)
-            .and_then(|(_, p)| p.parse(&raw))
-            .or_else(|| self.fallback.parse(&raw))
-            .unwrap_or_default();
-        Ir { raw, regions, protected }
+        let (regions, fell_back) = match self.parsers.iter().find(|(k, _)| *k == kind) {
+            Some((_, p)) => match p.parse(&raw) {
+                Some(regions) => (regions, false),
+                None => (self.fallback.parse(&raw).unwrap_or_default(), true),
+            },
+            None => (self.fallback.parse(&raw).unwrap_or_default(), false),
+        };
+        (Ir { raw, regions, protected }, fell_back)
     }
 }
 
@@ -421,6 +435,23 @@ mod tests {
         let b = Config::generate().key;
         assert_ne!(a, b);
         assert_ne!(a, [0u8; 32]);
+    }
+
+    #[test]
+    fn malformed_json_flags_parser_fallback() {
+        let ok = Engine::default().mask(
+            Input { kind: Kind::Json, data: "{\"a\":\"x\"}".into() },
+            &Config::insecure_testing(),
+        );
+        assert!(!ok.summary.parser_fallback);
+        let bad = Engine::default().mask(
+            Input { kind: Kind::Json, data: "{not valid json".into() },
+            &Config::insecure_testing(),
+        );
+        assert!(bad.summary.parser_fallback);
+        // Text input is never a "fallback".
+        let txt = Engine::default().mask(Input::text("hi"), &Config::insecure_testing());
+        assert!(!txt.summary.parser_fallback);
     }
 
     #[test]

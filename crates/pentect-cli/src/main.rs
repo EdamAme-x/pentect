@@ -7,6 +7,10 @@ use pentect_core::{
 };
 use std::io::{Read, Write};
 
+/// Refuse oversized input rather than emit partially-masked output (a masked
+/// head plus a raw tail would leak the tail).
+const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -22,10 +26,22 @@ fn usage() {
     );
 }
 
-fn read_stdin() -> String {
-    let mut s = String::new();
-    std::io::stdin().read_to_string(&mut s).expect("read stdin");
-    s
+fn die(msg: &str) -> ! {
+    eprintln!("[pentect] {msg}");
+    std::process::exit(2);
+}
+
+/// Read stdin as bytes (no panic on binary), cap the size, and require UTF-8.
+fn read_stdin_capped() -> Result<String, String> {
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .take((MAX_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("could not read stdin: {e}"))?;
+    if buf.len() > MAX_INPUT_BYTES {
+        return Err(format!("input exceeds {MAX_INPUT_BYTES} bytes; refusing to mask partially"));
+    }
+    String::from_utf8(buf).map_err(|_| "input is not UTF-8 text (binary not supported)".to_string())
 }
 
 fn cmd_mask(args: &[String]) {
@@ -45,10 +61,14 @@ fn cmd_mask(args: &[String]) {
     };
     let disclose_length = has_flag(args, "--length");
     let aggressive = has_flag(args, "--aggressive");
-    let data = read_stdin();
+    let data = match read_stdin_capped() {
+        Ok(s) => s,
+        Err(e) => die(&e),
+    };
 
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (restore is unavailable by design).
+    let kind_label = format!("{kind:?}");
     let engine = build_engine(profile, aggressive);
     let cfg = Config { disclose_length, ..Config::generate() };
     let result = engine.mask(Input { kind, data }, &cfg);
@@ -60,6 +80,9 @@ fn cmd_mask(args: &[String]) {
         result.summary.masked_count,
         result.summary.residual.len()
     );
+    if result.summary.parser_fallback {
+        eprintln!("[pentect] note: --kind {kind_label} failed to parse; masked as plaintext (key context lost, structure not guaranteed).");
+    }
     if !result.summary.collisions.is_empty() {
         eprintln!(
             "[pentect] WARNING: {} placeholder collision(s) — restore may be wrong for the colliding value(s).",
