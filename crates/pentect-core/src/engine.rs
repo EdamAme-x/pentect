@@ -45,6 +45,11 @@ pub struct Summary {
     /// Opaque candidates that were warned about rather than masked (no value).
     #[serde(default)]
     pub residual: Vec<ResidualNote>,
+    /// Placeholders that two distinct values collided on (restore would be wrong
+    /// for the second). Practically never with a 64-bit keyed hash, but surfaced
+    /// instead of silently corrupting reversibility.
+    #[serde(default)]
+    pub collisions: Vec<String>,
 }
 
 /// Carries the local-only recovery map, so it is intentionally not serializable.
@@ -132,7 +137,8 @@ impl Engine {
         let swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
         let rendered = render(&ir.raw, &config.key, swept.clone(), config.disclose_length);
 
-        let summary = Summary { masked_count: rendered.map.len(), residual };
+        let summary =
+            Summary { masked_count: rendered.map.len(), residual, collisions: rendered.collisions };
         MaskResult {
             masked: rendered.masked,
             recovery: Recovery { map: rendered.map },

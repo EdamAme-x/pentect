@@ -60,6 +60,12 @@ fn cmd_mask(args: &[String]) {
         result.summary.masked_count,
         result.summary.residual.len()
     );
+    if !result.summary.collisions.is_empty() {
+        eprintln!(
+            "[pentect] WARNING: {} placeholder collision(s) — restore may be wrong for the colliding value(s).",
+            result.summary.collisions.len()
+        );
+    }
 }
 
 /// `--aggressive` swaps the benign-shape guard for one that spares nothing, so

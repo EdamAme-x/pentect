@@ -40,3 +40,33 @@ pub fn approx_length(char_len: usize) -> Option<u32> {
     }
     Some(((char_len + STEP / 2) / STEP * STEP) as u32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_is_deterministic_and_value_dependent() {
+        let key = [3u8; 32];
+        assert_eq!(identity_hash(&key, "alice"), identity_hash(&key, "alice"));
+        assert_ne!(identity_hash(&key, "alice"), identity_hash(&key, "bob"));
+        assert_eq!(identity_hash(&key, "alice").len(), HASH_HEX_WIDTH);
+    }
+
+    #[test]
+    fn hash_depends_on_key() {
+        assert_ne!(identity_hash(&[1u8; 32], "x"), identity_hash(&[2u8; 32], "x"));
+    }
+
+    #[test]
+    fn placeholder_format() {
+        assert_eq!(render_placeholder("AWS_AKID", "abc", None), "<<AWS_AKID_abc>>");
+        assert_eq!(render_placeholder("X", "abc", Some(32)), "<<X_abc_len32>>");
+    }
+
+    #[test]
+    fn approx_length_floor_and_rounding() {
+        assert_eq!(approx_length(20), None); // below floor
+        assert_eq!(approx_length(29), Some(32)); // rounded to step
+    }
+}

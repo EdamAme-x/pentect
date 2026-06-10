@@ -27,3 +27,54 @@ pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
     accepted.sort_by_key(|s| s.range.start);
     accepted
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(start: usize, end: usize, conf: Confidence, src: &str) -> Span {
+        Span {
+            range: ByteRange::new(start, end),
+            category: Category::Secret,
+            label: "X".into(),
+            confidence: conf,
+            source: src.into(),
+        }
+    }
+
+    #[test]
+    fn higher_confidence_wins_overlap() {
+        let out = merge(
+            vec![span(0, 10, Confidence::Low, "entropy"), span(2, 8, Confidence::High, "rule")],
+            &[],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].confidence, Confidence::High);
+    }
+
+    #[test]
+    fn equal_confidence_prefers_larger_span() {
+        let out = merge(
+            vec![span(2, 6, Confidence::Medium, "a"), span(0, 10, Confidence::Medium, "b")],
+            &[],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].range, ByteRange::new(0, 10));
+    }
+
+    #[test]
+    fn protected_and_empty_dropped() {
+        let out = merge(vec![span(0, 5, Confidence::High, "r"), span(7, 7, Confidence::High, "e")], &[ByteRange::new(0, 5)]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn disjoint_spans_all_kept_sorted() {
+        let out = merge(
+            vec![span(10, 12, Confidence::Low, "a"), span(0, 3, Confidence::Low, "b")],
+            &[],
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out[0].range.start < out[1].range.start);
+    }
+}
