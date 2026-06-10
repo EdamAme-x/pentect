@@ -22,6 +22,7 @@ data-encoding = { workspace = true }
 bs58 = { workspace = true }
 flate2 = { workspace = true }
 getrandom = { workspace = true, optional = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

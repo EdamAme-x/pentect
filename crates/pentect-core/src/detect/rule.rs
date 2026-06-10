@@ -6,19 +6,45 @@ use regex::Regex;
 struct Rule {
     re: Regex,
     category: Category,
-    label: &'static str,
+    label: String,
     confidence: Confidence,
 }
 
+/// A data-form rule (e.g. a TOML pack entry) before its pattern is compiled.
+pub struct RuleSpec {
+    pub pattern: String,
+    pub category: Category,
+    pub label: String,
+    pub confidence: Confidence,
+}
+
 /// Anchored vendor-token rules. High confidence and linear-time (no ReDoS), so
-/// these bypass the entropy/profile uncertainty.
+/// these bypass the entropy/profile uncertainty. The built-in set is just the
+/// default pack — `from_specs` builds the same detector from loaded data.
 pub struct RuleDetector {
     rules: Vec<Rule>,
 }
 
 impl RuleDetector {
+    /// Compile data-form rules into a detector; errors if any pattern is invalid.
+    pub fn from_specs(specs: Vec<RuleSpec>) -> Result<Self, String> {
+        let rules = specs
+            .into_iter()
+            .map(|s| {
+                Ok(Rule {
+                    re: Regex::new(&s.pattern).map_err(|e| format!("rule {}: {e}", s.label))?,
+                    category: s.category,
+                    label: s.label,
+                    confidence: s.confidence,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self { rules })
+    }
+
     pub fn builtin() -> Self {
-        let r = |p: &str| Regex::new(p).expect("builtin regex compiles");
+        use Category::{Identifier, Pii, Secret};
+        use Confidence::{High, Medium};
         // Conventions, so new rules stay consistent:
         // - charset order is upper, lower, digits, then extras `_-`, with `-`
         //   written last and unescaped: `[A-Za-z0-9_-]`. Hex is `[0-9a-fA-F]`.
@@ -26,111 +52,79 @@ impl RuleDetector {
         //   High = a unique prefix/structure makes a match almost certainly the
         //   secret; Medium = a short prefix plus generic hex/charset that a
         //   non-secret could plausibly hit (e.g. Twilio's `AC`+32hex).
-        // - labels are UPPER_SNAKE (asserted in tests) so they render cleanly
-        //   into `<<LABEL_hash>>` placeholders.
-        let rules = vec![
-            Rule {
-                re: r(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*"),
-                category: Category::Secret,
-                label: "JWT_SECRET",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"AKIA[A-Z0-9]{16}"),
-                category: Category::Secret,
-                label: "AWS_AKID",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"sk-[A-Za-z0-9_-]{20,}"),
-                category: Category::Secret,
-                label: "OPENAI_API_KEY",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
-                category: Category::Secret,
-                label: "SLACK_TOKEN",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+"),
-                category: Category::Secret,
-                label: "SLACK_WEBHOOK",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"(sk|rk)_(live|test)_[A-Za-z0-9]{10,}"),
-                category: Category::Secret,
-                label: "STRIPE_SECRET_KEY",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"AIza[A-Za-z0-9_-]{35}"),
-                category: Category::Secret,
-                label: "GOOGLE_API_KEY",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"GOCSPX-[A-Za-z0-9_-]{28}"),
-                category: Category::Secret,
-                label: "GOOGLE_OAUTH_SECRET",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"ya29\.[A-Za-z0-9_-]{20,}"),
-                category: Category::Secret,
-                label: "GOOGLE_OAUTH_TOKEN",
-                confidence: Confidence::High,
-            },
+        // - labels are UPPER_SNAKE (asserted in tests) so they render cleanly.
+        let table: &[(&str, Category, &str, Confidence)] = &[
+            (
+                r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*",
+                Secret,
+                "JWT_SECRET",
+                High,
+            ),
+            (r"AKIA[A-Z0-9]{16}", Secret, "AWS_AKID", High),
+            (r"sk-[A-Za-z0-9_-]{20,}", Secret, "OPENAI_API_KEY", High),
+            (r"xox[baprs]-[A-Za-z0-9-]{10,}", Secret, "SLACK_TOKEN", High),
+            (
+                r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",
+                Secret,
+                "SLACK_WEBHOOK",
+                High,
+            ),
+            (
+                r"(sk|rk)_(live|test)_[A-Za-z0-9]{10,}",
+                Secret,
+                "STRIPE_SECRET_KEY",
+                High,
+            ),
+            (r"AIza[A-Za-z0-9_-]{35}", Secret, "GOOGLE_API_KEY", High),
+            (
+                r"GOCSPX-[A-Za-z0-9_-]{28}",
+                Secret,
+                "GOOGLE_OAUTH_SECRET",
+                High,
+            ),
+            (
+                r"ya29\.[A-Za-z0-9_-]{20,}",
+                Secret,
+                "GOOGLE_OAUTH_TOKEN",
+                High,
+            ),
             // Fine-grained PAT; distinct format from the classic gh*_ family.
-            Rule {
-                re: r(r"github_pat_[A-Za-z0-9_]{22,}"),
-                category: Category::Secret,
-                label: "GITHUB_PAT",
-                confidence: Confidence::High,
-            },
+            (r"github_pat_[A-Za-z0-9_]{22,}", Secret, "GITHUB_PAT", High),
             // Classic GitHub token family (p/o/u/s/r) is one format, so one rule.
-            Rule {
-                re: r(r"gh[oprsu]_[A-Za-z0-9]{36}"),
-                category: Category::Secret,
-                label: "GITHUB_TOKEN",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"SK[0-9a-fA-F]{32}"),
-                category: Category::Secret,
-                label: "TWILIO_API_KEY",
-                confidence: Confidence::Medium,
-            },
-            Rule {
-                re: r(r"AC[0-9a-fA-F]{32}"),
-                category: Category::Identifier,
-                label: "TWILIO_ACCOUNT_SID",
-                confidence: Confidence::Medium,
-            },
-            Rule {
-                re: r(r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}"),
-                category: Category::Secret,
-                label: "SENDGRID_KEY",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"npm_[A-Za-z0-9]{36}"),
-                category: Category::Secret,
-                label: "NPM_TOKEN",
-                confidence: Confidence::High,
-            },
+            (r"gh[oprsu]_[A-Za-z0-9]{36}", Secret, "GITHUB_TOKEN", High),
+            (r"SK[0-9a-fA-F]{32}", Secret, "TWILIO_API_KEY", Medium),
+            (
+                r"AC[0-9a-fA-F]{32}",
+                Identifier,
+                "TWILIO_ACCOUNT_SID",
+                Medium,
+            ),
+            (
+                r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}",
+                Secret,
+                "SENDGRID_KEY",
+                High,
+            ),
+            (r"npm_[A-Za-z0-9]{36}", Secret, "NPM_TOKEN", High),
             // Domain is label(.label)*.tld, so consecutive/trailing dots and a
             // leading-dot domain don't match. TLD capped to bound the match.
-            Rule {
-                re: r(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,24}"),
-                category: Category::Pii,
-                label: "IDENTITY",
-                confidence: Confidence::Medium,
-            },
+            (
+                r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,24}",
+                Pii,
+                "IDENTITY",
+                Medium,
+            ),
         ];
-        Self { rules }
+        let specs = table
+            .iter()
+            .map(|&(pattern, category, label, confidence)| RuleSpec {
+                pattern: pattern.to_string(),
+                category,
+                label: label.to_string(),
+                confidence,
+            })
+            .collect();
+        Self::from_specs(specs).expect("builtin regexes compile")
     }
 }
 
@@ -143,7 +137,7 @@ impl Detector for RuleDetector {
                 out.push(Span {
                     range: view.to_raw(ByteRange::new(m.start(), m.end())),
                     category: rule.category,
-                    label: rule.label.to_string(),
+                    label: rule.label.clone(),
                     confidence: rule.confidence,
                     source: DetectorId::Rule,
                 });
@@ -237,7 +231,7 @@ mod tests {
     fn rule_labels_are_upper_snake() {
         let label_re = Regex::new(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$").unwrap();
         for rule in &RuleDetector::builtin().rules {
-            assert!(label_re.is_match(rule.label), "bad label: {}", rule.label);
+            assert!(label_re.is_match(&rule.label), "bad label: {}", rule.label);
         }
     }
 

@@ -11,7 +11,7 @@ mod util;
 pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
 pub use pem::PemDetector;
-pub use rule::RuleDetector;
+pub use rule::{RuleDetector, RuleSpec};
 pub use suspicious_key::SuspiciousKeyDetector;
 
 pub(crate) use util::is_token_byte;

@@ -11,6 +11,7 @@ pub mod codec;
 pub mod detect;
 pub mod model;
 pub mod normalize;
+pub mod pack;
 pub mod parse;
 pub mod pipeline;
 pub mod placeholder;
@@ -19,9 +20,11 @@ pub mod recovery;
 
 pub use codec::Codec;
 pub use detect::{
-    DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, SuspiciousKeyDetector,
+    DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, RuleSpec,
+    SuspiciousKeyDetector,
 };
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
+pub use pack::load_rule_detector;
 pub use parse::{EnvParser, JsonParser, Parser, TextParser};
 pub use pipeline::{
     Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote, Summary,
