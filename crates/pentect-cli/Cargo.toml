@@ -1,7 +1,7 @@
 [package]
 name = "pentect-cli"
 version = "0.0.1"
-description = "Pentect CLI: mask | restore | resolve (stdin -> stdout)."
+description = "Pentect CLI"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

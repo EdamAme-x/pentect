@@ -11,31 +11,6 @@ pub trait Detector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span>;
 }
 
-pub struct DetectorSet {
-    detectors: Vec<Box<dyn Detector>>,
-}
-
-impl DetectorSet {
-    pub fn builtin() -> Self {
-        Self {
-            detectors: vec![
-                Box::new(RuleDetector::builtin()),
-                Box::new(EntropyDetector::default()),
-                Box::new(Base64Detector::builtin()),
-                Box::new(SuspiciousKeyDetector),
-            ],
-        }
-    }
-
-    pub fn run(&self, view: &NormalizedView) -> Vec<Span> {
-        let mut out = Vec::new();
-        for d in &self.detectors {
-            out.extend(d.detect(view));
-        }
-        out
-    }
-}
-
 struct Rule {
     re: Regex,
     category: Category,
