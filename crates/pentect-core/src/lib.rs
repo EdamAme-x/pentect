@@ -24,8 +24,8 @@ pub use detect::{
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
 pub use parse::{EnvParser, JsonParser, Parser, TextParser};
 pub use pipeline::{Config, Engine, EngineBuilder, MaskResult, ResidualNote, Summary};
-pub use policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
-pub use policy::{Action, Granularity, MaskAll, OpaqueStance, Policy, Profile, ProfilePolicy};
+pub use policy::guard::{OverMaskGuard, ShapeGuard};
+pub use policy::{Action, MaskAll, OpaqueStance, Policy, Profile, ProfilePolicy};
 pub use recovery::{restore, Recovery, RestoreError};
 
 /// Mask with the default engine. Build an `Engine` once for repeated calls.

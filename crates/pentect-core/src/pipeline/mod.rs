@@ -155,7 +155,7 @@ impl Engine {
                 }
             }
             match self.policy.classify(&s) {
-                Action::Mask(_) => to_mask.push(s),
+                Action::Mask => to_mask.push(s),
                 Action::Warn => residual.push(ResidualNote {
                     range: s.range,
                     category: s.category,

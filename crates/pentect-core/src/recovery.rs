@@ -7,7 +7,9 @@ pub struct Recovery {
     pub map: HashMap<String, String>,
 }
 
-/// No failure modes yet; version/header mismatches will fail closed later.
+/// Uninhabited: `restore` cannot fail today. Reserved so a future versioned,
+/// integrity-checked recovery header can fail closed without a breaking change to
+/// `restore`'s signature.
 #[derive(Clone, Debug)]
 pub enum RestoreError {}
 
@@ -86,6 +88,19 @@ mod tests {
             let mut rec = Recovery::default();
             rec.map.insert(format!("<<{k}_aa>>"), v);
             let _ = restore(&text, &rec).unwrap();
+        }
+
+        // A well-formed placeholder with no mapping (e.g. an LLM hallucination)
+        // restores byte-for-byte: nothing is invented, nothing leaks.
+        #[test]
+        fn unmapped_placeholder_is_byte_identical(
+            label in "[A-Z][A-Z0-9_]{0,15}",
+            hash in "[0-9a-f]{16}",
+        ) {
+            let token = format!("<<{label}_{hash}>>");
+            let text = format!("before {token} after");
+            let out = restore(&text, &Recovery::default()).unwrap();
+            proptest::prop_assert_eq!(out, text);
         }
     }
 }

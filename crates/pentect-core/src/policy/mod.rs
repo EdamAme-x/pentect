@@ -5,15 +5,9 @@ use std::str::FromStr;
 
 pub mod guard;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Granularity {
-    Full,
-    HashOnly,
-}
-
 #[derive(Clone, Debug)]
 pub enum Action {
-    Mask(Option<Granularity>),
+    Mask,
     Keep,
     Warn,
     Drop,
@@ -30,7 +24,7 @@ pub struct MaskAll;
 
 impl Policy for MaskAll {
     fn classify(&self, _span: &Span) -> Action {
-        Action::Mask(None)
+        Action::Mask
     }
 }
 
@@ -152,12 +146,12 @@ impl Policy for ProfilePolicy {
     fn classify(&self, s: &Span) -> Action {
         if is_context_free(s) {
             match self.stance {
-                OpaqueStance::Mask => Action::Mask(None),
+                OpaqueStance::Mask => Action::Mask,
                 OpaqueStance::Warn => Action::Warn,
                 OpaqueStance::Keep => Action::Keep,
             }
         } else {
-            Action::Mask(None)
+            Action::Mask
         }
     }
 }
