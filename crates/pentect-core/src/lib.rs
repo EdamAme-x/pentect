@@ -25,7 +25,7 @@ pub use detect::{DecodeDetector, Detector, EntropyDetector, RuleDetector, Suspic
 pub use engine::{Config, Engine, EngineBuilder, MaskResult, ResidualNote, Summary};
 pub use guard::{NoGuard, OverMaskGuard, ShapeGuard};
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
-pub use parse::{JsonParser, Parser, TextParser};
+pub use parse::{EnvParser, JsonParser, Parser, TextParser};
 pub use policy::{Action, Granularity, MaskAll, OpaqueStance, Policy, Profile, ProfilePolicy};
 pub use recovery::{restore, Recovery, RestoreError};
 

@@ -27,11 +27,12 @@ impl ByteRange {
     }
 }
 
-/// Provenance tag for the input; only Text/Json have a built-in parser so far.
+/// Provenance tag for the input; only Text/Json/Env have a built-in parser so far.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     Text,
     Json,
+    Env,
     Har,
     Curl,
     Markdown,

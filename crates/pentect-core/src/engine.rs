@@ -5,7 +5,7 @@ use crate::guard::{OverMaskGuard, ShapeGuard};
 use crate::merge::merge;
 use crate::model::*;
 use crate::normalize::NormalizedView;
-use crate::parse::{JsonParser, Parser, TextParser};
+use crate::parse::{EnvParser, JsonParser, Parser, TextParser};
 use crate::policy::{is_context_free, Action, MaskAll, Policy, Profile, ProfilePolicy};
 use crate::recovery::Recovery;
 use crate::render::render;
@@ -102,6 +102,7 @@ impl Engine {
         let k = profile.knobs();
         Engine::builder()
             .parser(Kind::Json, Box::new(JsonParser))
+            .parser(Kind::Env, Box::new(EnvParser))
             .detector(Box::new(RuleDetector::builtin()))
             .detector(Box::new(EntropyDetector::with(
                 k.entropy_min_len,
@@ -205,6 +206,7 @@ impl Default for Engine {
     fn default() -> Self {
         Engine::builder()
             .parser(Kind::Json, Box::new(JsonParser))
+            .parser(Kind::Env, Box::new(EnvParser))
             .detector(Box::new(RuleDetector::builtin()))
             .detector(Box::new(EntropyDetector::default()))
             .detector(Box::new(DecodeDetector::builtin()))
@@ -594,6 +596,23 @@ mod tests {
                 prop_assert!(!r.masked.contains(secret), "{p:?} left a survivor: {}", r.masked);
             }
         }
+    }
+
+    #[test]
+    fn env_key_anchor_masks_short_low_entropy_value() {
+        let raw = "export DB_PASSWORD=hunter2\nNOTE=hello world\n";
+        let r = Engine::with_profile(Profile::Balanced).mask(
+            Input {
+                kind: Kind::Env,
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        // Short value masked because its key is sensitive; benign key untouched.
+        assert!(!r.masked.contains("hunter2"), "{}", r.masked);
+        assert!(r.masked.contains("NOTE=hello world"), "{}", r.masked);
+        // Structure preserved: key, =, newlines intact.
+        assert!(r.masked.contains("export DB_PASSWORD=<<"), "{}", r.masked);
     }
 
     #[test]

@@ -21,7 +21,7 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect mask [--kind text|json] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive]\n\
+        "pentect mask [--kind text|json|env] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive]\n\
          \x20 mask secrets from stdin to stdout"
     );
 }
@@ -49,6 +49,7 @@ fn read_stdin_capped() -> Result<String, String> {
 fn cmd_mask(args: &[String]) {
     let kind = match arg_value(args, "--kind").as_deref() {
         Some("json") => Kind::Json,
+        Some("env") => Kind::Env,
         _ => Kind::Text,
     };
     let profile: Profile = match arg_value(args, "--profile").as_deref() {
