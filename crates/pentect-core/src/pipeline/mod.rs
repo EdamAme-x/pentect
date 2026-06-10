@@ -1,18 +1,22 @@
+mod merge;
+mod render;
+mod sweep;
+
 use crate::detect::{
     DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, SuspiciousKeyDetector,
 };
-use crate::guard::{OverMaskGuard, ShapeGuard};
-use crate::merge::merge;
 use crate::model::*;
 use crate::normalize::NormalizedView;
 use crate::parse::{EnvParser, JsonParser, Parser, TextParser};
+use crate::policy::guard::{OverMaskGuard, ShapeGuard};
 use crate::policy::{is_context_free, Action, MaskAll, Policy, Profile, ProfilePolicy};
 use crate::recovery::Recovery;
-use crate::render::render;
-use crate::sweep::identity_sweep;
+use merge::merge;
 use regex::Regex;
+use render::render;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
+use sweep::identity_sweep;
 
 /// Per-call parameters (not behaviour). `key` is the HMAC key for identity
 /// hashing; the adapter generates and persists it.
@@ -507,7 +511,7 @@ mod tests {
         let engine = Engine::builder()
             .detector(Box::new(EntropyDetector::with(20, 2.8)))
             .policy(Box::new(ProfilePolicy::new(Profile::Paranoid)))
-            .guard(Box::new(crate::guard::NoGuard))
+            .guard(Box::new(crate::policy::guard::NoGuard))
             .build();
         let r = engine.mask(
             Input::text(format!("id {uuid} x")),

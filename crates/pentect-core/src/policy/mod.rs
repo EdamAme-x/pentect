@@ -2,6 +2,8 @@ use crate::model::{Confidence, Span};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+pub mod guard;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Granularity {
     Full,

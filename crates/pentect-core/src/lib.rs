@@ -1,33 +1,30 @@
 //! pentect-core: translate secrets in text into reversible placeholders, locally.
 //!
-//! Roles are ports (traits) wired at a composition root (`Engine`): `Parser`,
-//! `Detector`, `Policy`. The merge -> sweep -> render core is fixed because it
-//! carries the invariants (reversible, idempotent, deterministic, global
-//! identity, collision-free), which are property-tested in `engine`.
+//! Layers: `model` (domain), the pluggable adapter layers `detect` / `codec` /
+//! `parse` / `policy` (each with its port trait), and `pipeline` (the Engine
+//! composition root plus the fixed merge -> sweep -> render core that carries the
+//! invariants: reversible, idempotent, deterministic, global-identity,
+//! collision-free). `normalize` / `placeholder` / `recovery` are shared
+//! primitives.
 
 pub mod codec;
 pub mod detect;
-pub mod engine;
-pub mod guard;
-pub mod json;
-pub mod merge;
 pub mod model;
 pub mod normalize;
 pub mod parse;
+pub mod pipeline;
 pub mod placeholder;
 pub mod policy;
 pub mod recovery;
-pub mod render;
-pub mod sweep;
 
 pub use codec::Codec;
 pub use detect::{
     DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, SuspiciousKeyDetector,
 };
-pub use engine::{Config, Engine, EngineBuilder, MaskResult, ResidualNote, Summary};
-pub use guard::{NoGuard, OverMaskGuard, ShapeGuard};
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
 pub use parse::{EnvParser, JsonParser, Parser, TextParser};
+pub use pipeline::{Config, Engine, EngineBuilder, MaskResult, ResidualNote, Summary};
+pub use policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
 pub use policy::{Action, Granularity, MaskAll, OpaqueStance, Policy, Profile, ProfilePolicy};
 pub use recovery::{restore, Recovery, RestoreError};
 
