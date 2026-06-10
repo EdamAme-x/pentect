@@ -49,7 +49,7 @@ impl Detector for SuspiciousKeyDetector {
         vec![Span {
             range: region.span,
             category: Category::Secret,
-            label: "SECRET".to_string(),
+            label: labels::SECRET.to_string(),
             confidence: if strong {
                 Confidence::High
             } else {

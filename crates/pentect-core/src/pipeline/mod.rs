@@ -285,8 +285,13 @@ impl Default for EngineBuilder {
 }
 
 static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}(?:_len[0-9]+)?>>")
-        .expect("placeholder regex compiles")
+    // Hash width comes from the renderer so the freeze pattern can't drift from
+    // what we emit.
+    let w = crate::placeholder::HASH_HEX_WIDTH;
+    Regex::new(&format!(
+        r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{{{w}}}(?:_len[0-9]+)?>>"
+    ))
+    .expect("placeholder regex compiles")
 });
 
 /// Freeze existing `<<LABEL_hash>>` placeholders so re-masking is a no-op.

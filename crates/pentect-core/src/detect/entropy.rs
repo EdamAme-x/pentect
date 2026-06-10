@@ -23,8 +23,11 @@ impl Default for EntropyDetector {
 }
 
 impl EntropyDetector {
-    /// `min_len` is clamped to the placeholder hash width so a lowered threshold
-    /// can never re-fire on a rendered placeholder hash.
+    /// `min_len` is floored at the placeholder hash width: a run shorter than the
+    /// hash we would emit isn't worth masking (the placeholder would be longer
+    /// than the original and just as opaque), and Shannon needs that many symbols
+    /// to mean much. Idempotency on already-rendered placeholders comes from
+    /// placeholder protection, not from this floor.
     pub fn with(min_len: usize, threshold: f64) -> Self {
         Self {
             min_len: min_len.max(crate::placeholder::HASH_HEX_WIDTH),
@@ -43,7 +46,7 @@ impl Detector for EntropyDetector {
                 out.push(Span {
                     range: view.to_raw(ByteRange::new(start, end)),
                     category: Category::Secret,
-                    label: "LIKELY_SECRET".to_string(),
+                    label: labels::LIKELY_SECRET.to_string(),
                     confidence: Confidence::Low,
                     source: DetectorId::Entropy,
                 });
@@ -85,5 +88,15 @@ mod tests {
         let reg = region(raw);
         let v = NormalizedView::build(&reg, raw);
         assert!(EntropyDetector::with(16, 2.0).detect(&v).is_empty());
+    }
+
+    // A high-entropy run shorter than the hash width is not flagged even when
+    // min_len is set below it: the floor wins.
+    #[test]
+    fn min_len_floored_at_hash_width() {
+        let raw = "x aB3xZ9qW2pL5 y"; // 12-char token, < HASH_HEX_WIDTH
+        let reg = region(raw);
+        let v = NormalizedView::build(&reg, raw);
+        assert!(EntropyDetector::with(8, 1.0).detect(&v).is_empty());
     }
 }

@@ -47,7 +47,7 @@ pub enum OpaqueStance {
 
 /// Behaviour recipe derived from a Profile. Pure data, not a runtime field of
 /// the engine.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProfileKnobs {
     pub context_free: OpaqueStance,
     pub entropy_min_len: usize,
@@ -167,12 +167,49 @@ mod tests {
         assert!("".parse::<Profile>().is_err());
     }
 
+    // Pin every field of every profile, so any knob change is a deliberate,
+    // visible edit here rather than a silent behaviour shift.
     #[test]
     fn knobs_table_pinned() {
-        assert!(!Profile::Balanced.knobs().mask_unknown_codec);
-        assert!(Profile::Paranoid.knobs().mask_unknown_codec);
-        assert_eq!(Profile::Paranoid.knobs().context_free, OpaqueStance::Mask);
-        assert_eq!(Profile::Balanced.knobs().context_free, OpaqueStance::Warn);
-        assert_eq!(Profile::Dev.knobs().context_free, OpaqueStance::Keep);
+        assert_eq!(
+            Profile::Strict.knobs(),
+            ProfileKnobs {
+                context_free: OpaqueStance::Mask,
+                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN,
+                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD,
+                mask_unknown_codec: false,
+                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
+            }
+        );
+        assert_eq!(
+            Profile::Balanced.knobs(),
+            ProfileKnobs {
+                context_free: OpaqueStance::Warn,
+                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN,
+                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD,
+                mask_unknown_codec: false,
+                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
+            }
+        );
+        assert_eq!(
+            Profile::Dev.knobs(),
+            ProfileKnobs {
+                context_free: OpaqueStance::Keep,
+                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN + 4,
+                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD + 0.4,
+                mask_unknown_codec: false,
+                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN + 4,
+            }
+        );
+        assert_eq!(
+            Profile::Paranoid.knobs(),
+            ProfileKnobs {
+                context_free: OpaqueStance::Mask,
+                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN - 4,
+                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD - 0.4,
+                mask_unknown_codec: true,
+                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN - 4,
+            }
+        );
     }
 }

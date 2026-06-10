@@ -2,6 +2,22 @@ use serde::{Deserialize, Serialize};
 
 pub type Label = String;
 
+/// The synthetic labels the core detectors emit. Vendor-token labels live inline
+/// in the rule table instead, since that layer is meant to become data-driven.
+/// All labels are UPPER_SNAKE so they render into well-formed `<<LABEL_hash>>`
+/// placeholders; keeping the shared ones here stops the same string being
+/// retyped (and drifting) across detectors.
+pub mod labels {
+    /// High-entropy run with no anchoring context (entropy detector).
+    pub const LIKELY_SECRET: &str = "LIKELY_SECRET";
+    /// Decodes to binary-looking bytes ("looks encrypted") with no inner secret.
+    pub const OPAQUE_BLOB: &str = "OPAQUE_BLOB";
+    /// Value masked because its key name looks sensitive.
+    pub const SECRET: &str = "SECRET";
+    /// Body of a PEM private-key block.
+    pub const PRIVATE_KEY: &str = "PRIVATE_KEY";
+}
+
 /// Half-open byte range into the raw input, aligned to UTF-8 char boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ByteRange {

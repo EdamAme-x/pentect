@@ -1,3 +1,12 @@
+//! Two deliberately opposite normalizations live here, and conflating them is a
+//! bug:
+//! - `n_id` (identity): conservative NFC, so distinct values never merge. Used
+//!   for placeholder hashing and the identity sweep — folding here would make two
+//!   different secrets share one placeholder.
+//! - `NormalizedView` (detection): aggressive NFKC + percent-decode, so spoofing
+//!   tricks can't hide a secret from a detector. It keeps a map back to raw, so
+//!   spans are always reported in raw coordinates.
+
 use crate::model::{ByteRange, Region};
 use unicode_normalization::UnicodeNormalization;
 

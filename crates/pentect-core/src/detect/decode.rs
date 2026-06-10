@@ -163,7 +163,7 @@ impl Detector for DecodeDetector {
                 out.push(Span {
                     range: view.to_raw(ByteRange::new(start, end)),
                     category: Category::Secret,
-                    label: "OPAQUE_BLOB".to_string(),
+                    label: labels::OPAQUE_BLOB.to_string(),
                     confidence: Confidence::Low,
                     source: DetectorId::DecodeOpaque,
                 });

@@ -31,7 +31,7 @@ impl Detector for PemDetector {
             .map(|m| Span {
                 range: view.to_raw(ByteRange::new(m.start(), m.end())),
                 category: Category::Secret,
-                label: "PRIVATE_KEY".to_string(),
+                label: labels::PRIVATE_KEY.to_string(),
                 confidence: Confidence::High,
                 source: DetectorId::Pem,
             })

@@ -6,16 +6,12 @@ use data_encoding::{
 /// this encoding. Injected into the decode detector so new encodings are added
 /// without touching the detector.
 pub trait Codec {
-    fn name(&self) -> &str;
     fn decode(&self, run: &str) -> Option<Vec<u8>>;
 }
 
 pub struct Base64Codec;
 
 impl Codec for Base64Codec {
-    fn name(&self) -> &str {
-        "base64"
-    }
     fn decode(&self, run: &str) -> Option<Vec<u8>> {
         let b = run.as_bytes();
         BASE64
@@ -30,9 +26,6 @@ impl Codec for Base64Codec {
 pub struct Base32Codec;
 
 impl Codec for Base32Codec {
-    fn name(&self) -> &str {
-        "base32"
-    }
     fn decode(&self, run: &str) -> Option<Vec<u8>> {
         let b = run.as_bytes();
         BASE32
@@ -45,9 +38,6 @@ impl Codec for Base32Codec {
 pub struct HexCodec;
 
 impl Codec for HexCodec {
-    fn name(&self) -> &str {
-        "hex"
-    }
     fn decode(&self, run: &str) -> Option<Vec<u8>> {
         HEXLOWER_PERMISSIVE.decode(run.as_bytes()).ok()
     }
@@ -56,9 +46,6 @@ impl Codec for HexCodec {
 pub struct Base58Codec;
 
 impl Codec for Base58Codec {
-    fn name(&self) -> &str {
-        "base58"
-    }
     fn decode(&self, run: &str) -> Option<Vec<u8>> {
         bs58::decode(run).into_vec().ok()
     }
