@@ -16,6 +16,7 @@ use crate::recovery::Recovery;
 use merge::merge;
 use regex::Regex;
 use render::render;
+pub use render::RenderSegment;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use sweep::identity_sweep;
@@ -95,6 +96,8 @@ pub struct Summary {
 pub struct MaskResult {
     pub masked: String,
     pub recovery: Recovery,
+    /// Literal/masked pieces of `masked`, in order, for index-free visualization.
+    pub segments: Vec<RenderSegment>,
     /// What was masked (no raw offsets); see `MaskedItem`.
     pub items: Vec<MaskedItem>,
     pub summary: Summary,
@@ -201,6 +204,7 @@ impl Engine {
         MaskResult {
             masked: rendered.masked,
             recovery: Recovery { map: rendered.map },
+            segments: rendered.segments,
             items,
             summary,
         }

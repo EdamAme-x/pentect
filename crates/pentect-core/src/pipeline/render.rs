@@ -2,10 +2,38 @@ use crate::model::*;
 use crate::normalize::n_id;
 use crate::placeholder::{approx_length, identity_hash, render_placeholder};
 use crate::policy::is_context_free;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// A piece of the rendered output: literal source text, or a masked placeholder
+/// with its metadata. Walking these lets a UI colour-code without byte-offset
+/// math, so emoji/CJK can't misalign a highlight. The segment texts concatenate
+/// back to `masked` exactly (property-tested).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RenderSegment {
+    Literal {
+        text: String,
+    },
+    Masked {
+        text: String,
+        label: Label,
+        category: Category,
+        confidence: Confidence,
+    },
+}
+
+impl RenderSegment {
+    pub fn text(&self) -> &str {
+        match self {
+            RenderSegment::Literal { text } | RenderSegment::Masked { text, .. } => text,
+        }
+    }
+}
 
 pub struct Rendered {
     pub masked: String,
+    /// Literal/masked pieces in order; `masked` is their concatenation.
+    pub segments: Vec<RenderSegment>,
     /// placeholder -> first-seen original bytes.
     pub map: HashMap<String, String>,
     /// Placeholders that two distinct values hashed to (would mis-restore).
@@ -43,33 +71,32 @@ fn split_email(v: &str) -> Option<(&str, &str)> {
 /// OPAQUE_BLOB) — never for typed credentials, whose length is sensitive.
 pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: bool) -> Rendered {
     spans.sort_by_key(|s| s.range.start);
-    let mut masked = String::with_capacity(raw.len());
+    let mut segments: Vec<RenderSegment> = Vec::new();
     let mut map: HashMap<String, String> = HashMap::new();
     let mut collisions = Vec::new();
     let mut cursor = 0usize;
+
+    let literal = |seg: &mut Vec<RenderSegment>, text: &str| {
+        if !text.is_empty() {
+            seg.push(RenderSegment::Literal { text: text.into() });
+        }
+    };
 
     for s in &spans {
         // Spans are already non-overlapping; this is just defensive.
         if s.range.start < cursor {
             continue;
         }
-        masked.push_str(&raw[cursor..s.range.start]);
+        literal(&mut segments, &raw[cursor..s.range.start]);
         let val = &raw[s.range.start..s.range.end];
 
         match split_email(val) {
             // Mask each side under the same label; the `@` stays literal so
             // restore reconstructs the address from the two mappings.
             Some((local, domain)) => {
-                masked.push_str(&emit(key, &s.label, local, None, &mut map, &mut collisions));
-                masked.push('@');
-                masked.push_str(&emit(
-                    key,
-                    &s.label,
-                    domain,
-                    None,
-                    &mut map,
-                    &mut collisions,
-                ));
+                segments.push(masked_seg(key, s, local, None, &mut map, &mut collisions));
+                literal(&mut segments, "@");
+                segments.push(masked_seg(key, s, domain, None, &mut map, &mut collisions));
             }
             None => {
                 let len = if disclose_length && is_context_free(s) {
@@ -77,36 +104,43 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                 } else {
                     None
                 };
-                masked.push_str(&emit(key, &s.label, val, len, &mut map, &mut collisions));
+                segments.push(masked_seg(key, s, val, len, &mut map, &mut collisions));
             }
         }
         cursor = s.range.end;
     }
-    masked.push_str(&raw[cursor..]);
+    literal(&mut segments, &raw[cursor..]);
 
+    let masked = segments.iter().map(RenderSegment::text).collect();
     Rendered {
         masked,
+        segments,
         map,
         collisions,
     }
 }
 
-/// Render one `<<LABEL_hash>>` placeholder for `val`, recording its mapping and
-/// noting a collision if a different value already claimed it.
-fn emit(
+/// Build a masked segment for `val`, recording its mapping and noting a collision
+/// if a different value already claimed the placeholder.
+fn masked_seg(
     key: &[u8; 32],
-    label: &str,
+    span: &Span,
     val: &str,
     len: Option<u32>,
     map: &mut HashMap<String, String>,
     collisions: &mut Vec<String>,
-) -> String {
+) -> RenderSegment {
     let hash = identity_hash(key, &n_id(val));
-    let ph = render_placeholder(label, &hash, len);
+    let ph = render_placeholder(&span.label, &hash, len);
     if record(map, &ph, val) {
         collisions.push(ph.clone());
     }
-    ph
+    RenderSegment::Masked {
+        text: ph,
+        label: span.label.clone(),
+        category: span.category,
+        confidence: span.confidence,
+    }
 }
 
 /// Insert a placeholder->value mapping. Returns true on collision: the
@@ -208,5 +242,35 @@ mod tests {
             let r = render(raw, &key, vec![span], false);
             assert_eq!(r.masked.matches("<<").count(), 1, "{}", r.masked);
         }
+    }
+
+    #[test]
+    fn segments_concatenate_to_masked() {
+        let key = [5u8; 32];
+        let raw = "to alice@example.com now";
+        let r = render(raw, &key, vec![email_span(3, 20)], false);
+        let joined: String = r.segments.iter().map(RenderSegment::text).collect();
+        assert_eq!(joined, r.masked);
+    }
+
+    #[test]
+    fn email_renders_as_literal_masked_literal_masked_literal() {
+        let key = [6u8; 32];
+        let raw = "to alice@example.com now";
+        let r = render(raw, &key, vec![email_span(3, 20)], false);
+        let kinds: Vec<&str> = r
+            .segments
+            .iter()
+            .map(|s| match s {
+                RenderSegment::Literal { .. } => "lit",
+                RenderSegment::Masked { .. } => "mask",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["lit", "mask", "lit", "mask", "lit"],
+            "{:?}",
+            r.segments
+        );
     }
 }
