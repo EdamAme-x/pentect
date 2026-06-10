@@ -29,6 +29,15 @@ impl Config {
     pub fn insecure_testing() -> Self {
         Self::new([7u8; 32])
     }
+    /// Fresh key from the OS CSPRNG. For one-way (mask-only) use a per-run key is
+    /// fine: the cloud side cannot recompute the hash. Reproducing a mask across
+    /// runs requires persisting this key (an adapter concern).
+    #[cfg(feature = "rand-key")]
+    pub fn generate() -> Self {
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).expect("OS CSPRNG unavailable");
+        Self::new(key)
+    }
 }
 
 /// A span surfaced to the user without masking (value-free).
@@ -403,6 +412,15 @@ mod tests {
             .build();
         let r = engine.mask(Input::text(&format!("id {uuid} x")), &Config::insecure_testing());
         assert!(!r.masked.contains(uuid), "{}", r.masked);
+    }
+
+    #[cfg(feature = "rand-key")]
+    #[test]
+    fn generated_keys_differ_and_are_nonzero() {
+        let a = Config::generate().key;
+        let b = Config::generate().key;
+        assert_ne!(a, b);
+        assert_ne!(a, [0u8; 32]);
     }
 
     #[test]

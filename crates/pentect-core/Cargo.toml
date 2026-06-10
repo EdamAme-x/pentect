@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["rand-key"]
+# CSPRNG key generation; disable for WASM/rules-only builds that supply the key.
+rand-key = ["dep:getrandom"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,6 +21,7 @@ unicode-normalization = { workspace = true }
 data-encoding = { workspace = true }
 bs58 = { workspace = true }
 flate2 = { workspace = true }
+getrandom = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1"

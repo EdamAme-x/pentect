@@ -47,10 +47,10 @@ fn cmd_mask(args: &[String]) {
     let aggressive = has_flag(args, "--aggressive");
     let data = read_stdin();
 
-    // Fixed dev key for now; a real CSPRNG key + keyfile is an adapter concern.
-    eprintln!("[pentect] WARNING: using a fixed insecure dev key (no keyfile yet).");
+    // Fresh per-run key: mask-only, so the recovery map is not retained and a
+    // reproducible key isn't needed (restore is unavailable by design).
     let engine = build_engine(profile, aggressive);
-    let cfg = Config { disclose_length, ..Config::insecure_testing() };
+    let cfg = Config { disclose_length, ..Config::generate() };
     let result = engine.mask(Input { kind, data }, &cfg);
 
     print!("{}", result.masked);
