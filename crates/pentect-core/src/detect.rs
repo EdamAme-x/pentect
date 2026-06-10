@@ -1,14 +1,9 @@
-//! Detector 契約と組込み検出器（REF.md §7）。
-//! slice 1 = `rule`（高信頼ベンダ規則）+ `entropy`（不透明 blob）。
-//! 検出は raw region 上で直接（正規化検出ビュー/OffsetMap は slice 2）。
-
 use crate::model::*;
 use regex::Regex;
 
-/// 境界 B（REF.md §7.1）。副作用なし・決定的。
+/// Side-effect-free and deterministic. Returns spans in absolute raw coordinates.
 pub trait Detector {
     fn id(&self) -> &str;
-    /// `region` の値範囲を `raw` から切り出して走査し、絶対 raw 範囲の span を返す。
     fn detect(&self, region: &Region, raw: &str) -> Vec<Span>;
 }
 
@@ -34,8 +29,6 @@ impl DetectorSet {
         out
     }
 }
-
-// --- rule detector -----------------------------------------------------------
 
 struct Rule {
     re: Regex,
@@ -82,7 +75,6 @@ impl RuleDetector {
                 label: "SLACK_TOKEN",
                 confidence: Confidence::High,
             },
-            // email は broad ラベル `IDENTITY`（specific 化は High+anchored 限定, REF.md §11.5）。
             Rule {
                 re: r(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
                 category: Category::Pii,
@@ -117,10 +109,7 @@ impl Detector for RuleDetector {
     }
 }
 
-// --- entropy detector --------------------------------------------------------
-
-/// 高エントロピーな codec-alphabet run を `LIKELY_SECRET`（Secret/Low）に。
-/// slice 1 は ASCII run の byte エントロピーで近似（per-script 化は REF.md §7.7 で後続）。
+/// Flags long, high-entropy codec-alphabet runs as likely opaque secrets.
 pub struct EntropyDetector {
     min_len: usize,
     threshold: f64,

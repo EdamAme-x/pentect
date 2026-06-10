@@ -1,5 +1,5 @@
-//! Pentect CLI（REF.md §15.4, first surface）。slice 1 = `mask` / `restore`（stdin→stdout）。
-//! recovery map は `./.pentect/recovery.json`（ephemeral 既定の素朴版, REF.md §12.5）。
+//! Pentect CLI: `mask` and `restore` over stdin/stdout. The recovery map is
+//! written to ./.pentect/recovery.json (gitignored).
 
 use pentect_core::{mask, restore, Config, Input, Kind, Recovery};
 use std::io::{Read, Write};
@@ -11,7 +11,7 @@ fn main() {
         Some("mask") => cmd_mask(&args),
         Some("restore") => cmd_restore(),
         Some("resolve") => {
-            eprintln!("resolve: not yet implemented (REF.md §12.2, slice 2+).");
+            eprintln!("resolve: not yet implemented.");
             std::process::exit(2);
         }
         _ => usage(),
@@ -46,9 +46,8 @@ fn cmd_mask(args: &[String]) {
     };
     let data = read_stdin();
 
-    eprintln!(
-        "[pentect] WARNING: slice 1 uses a fixed insecure dev key (no CSPRNG/keyfile yet, REF.md §11.2)."
-    );
+    // Fixed dev key for now; a real CSPRNG key + keyfile is an adapter concern.
+    eprintln!("[pentect] WARNING: using a fixed insecure dev key (no keyfile yet).");
     let cfg = Config::insecure_testing();
     let result = mask(Input { kind, data }, &cfg);
 

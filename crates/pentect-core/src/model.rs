@@ -1,11 +1,8 @@
-//! 中核データモデル（REF.md §4）。slice 1 は契約を最小実装。
-
 use serde::{Deserialize, Serialize};
 
-/// 型ラベル（将来 SmolStr）。`^[A-Z][A-Z0-9_]*$` を想定（render が保証）。
 pub type Label = String;
 
-/// raw 内の byte 範囲（char 境界整列）。
+/// Half-open byte range into the raw input, aligned to UTF-8 char boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ByteRange {
     pub start: usize,
@@ -22,7 +19,6 @@ impl ByteRange {
     pub fn is_empty(&self) -> bool {
         self.end <= self.start
     }
-    /// 半開区間の重なり判定。
     pub fn overlaps(&self, o: &ByteRange) -> bool {
         self.start < o.end && o.start < self.end
     }
@@ -31,7 +27,7 @@ impl ByteRange {
     }
 }
 
-/// provenance タグ（REF.md §4.1）。slice 1 の builtin parser は Text/Json のみ。
+/// Provenance tag for the input; only Text/Json have a built-in parser so far.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     Text,
@@ -54,7 +50,6 @@ impl Input {
     }
 }
 
-/// 4 軸 + catch-all（REF.md §4.3, §17.1）。細かい型は `Span.label` に押し込む。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Category {
     Secret,
@@ -65,7 +60,7 @@ pub enum Category {
 }
 
 impl Category {
-    /// Merge 優先度（REF.md §8.2 P3.3）: Secret > Pii > Identifier > Endpoint > Other。
+    /// Tie-break weight when overlapping spans have equal confidence; higher wins.
     pub fn priority(self) -> u8 {
         match self {
             Category::Secret => 4,
@@ -77,7 +72,7 @@ impl Category {
     }
 }
 
-/// 宣言順で Low < Medium < High（Ord 派生）。
+/// Ordered Low < Medium < High.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Confidence {
     Low,
@@ -95,7 +90,7 @@ pub enum RegionKind {
     Body,
 }
 
-/// 検出・Policy が読む read-only 文脈（REF.md §4.2）。
+/// Read-only context a detector or policy reads about a region.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Context {
     pub path: Option<String>,
@@ -104,23 +99,21 @@ pub struct Context {
     pub format: Kind,
 }
 
-/// 「値（content）」の範囲 + 文脈。構造文字は含まない。
+/// A value range plus its context. Structural characters are excluded.
 #[derive(Clone, Debug)]
 pub struct Region {
     pub span: ByteRange,
     pub ctx: Context,
 }
 
-/// IR = raw + regions + protected（REF.md §4.2）。
 #[derive(Clone, Debug)]
 pub struct Ir {
     pub raw: String,
     pub regions: Vec<Region>,
-    /// 既存 placeholder の不可侵範囲（冪等性、REF.md §18.5）。
+    /// Existing placeholders, frozen so re-masking is idempotent.
     pub protected: Vec<ByteRange>,
 }
 
-/// Detector の出力単位（REF.md §4.2）。range は常に raw の絶対 byte 範囲。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Span {
     pub range: ByteRange,

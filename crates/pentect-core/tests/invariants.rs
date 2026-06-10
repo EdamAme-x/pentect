@@ -1,5 +1,3 @@
-//! REF.md §14 不変条件の property / example テスト（slice 1 が満たす範囲）。
-
 use pentect_core::{mask, restore, Config, Input, Kind, Recovery};
 use proptest::prelude::*;
 
@@ -20,7 +18,6 @@ const CORPUS: &[&str] = &[
     "日本語のテキスト no secret",
 ];
 
-// §14-1 可逆
 #[test]
 fn reversible() {
     for &x in CORPUS {
@@ -30,7 +27,6 @@ fn reversible() {
     }
 }
 
-// §14-2 冪等
 #[test]
 fn idempotent() {
     let cfg = Config::insecure_testing();
@@ -41,7 +37,6 @@ fn idempotent() {
     }
 }
 
-// §14-3 決定的
 #[test]
 fn deterministic() {
     for &x in CORPUS {
@@ -51,19 +46,16 @@ fn deterministic() {
     }
 }
 
-// §14-6 全域同一性（survivor ゼロ + 同値→同 placeholder）
+// Same value masks to one placeholder, and no plaintext occurrence survives.
 #[test]
 fn global_identity_no_survivor() {
     let x = "id alice@example.com mid alice@example.com end";
     let (masked, rec) = mask_text(x);
-    assert!(
-        !masked.contains("alice@example.com"),
-        "survivor remained: {masked}"
-    );
+    assert!(!masked.contains("alice@example.com"), "survivor remained: {masked}");
     assert_eq!(rec.map.len(), 1, "same value must map to one placeholder: {masked}");
 }
 
-// §14-8 collision ゼロ（異なる値 → 異なる placeholder）
+// Distinct values map to distinct placeholders.
 #[test]
 fn distinct_values_distinct_placeholders() {
     let x = "a AKIAIOSFODNN7EXAMPLE b AKIA0000000000000000 c";
@@ -71,7 +63,7 @@ fn distinct_values_distinct_placeholders() {
     assert_eq!(rec.map.len(), 2, "two distinct AKIDs -> two placeholders: {masked}");
 }
 
-// §14-4（部分）構造非破壊: マスクは値範囲のみ。非マスク byte は不変。
+// Bytes outside a masked value are left untouched.
 #[test]
 fn non_masked_bytes_unchanged() {
     let x = "prefix sk-ABCDEFGHIJKLMNOPQRSTUVWX suffix";
@@ -81,7 +73,7 @@ fn non_masked_bytes_unchanged() {
 }
 
 proptest! {
-    // §14-1 可逆（charset から `<` `>` を除外し placeholder 注入を回避）
+    // Charset excludes `<` and `>` to avoid injecting placeholder syntax.
     #[test]
     fn prop_reversible(s in "[a-zA-Z0-9 @._:/-]{0,200}") {
         let (masked, rec) = mask_text(&s);
@@ -89,7 +81,6 @@ proptest! {
         prop_assert_eq!(back, s);
     }
 
-    // §14-3 決定的
     #[test]
     fn prop_deterministic(s in "[a-zA-Z0-9 @._:/-]{0,200}") {
         let (a, _) = mask_text(&s);
@@ -97,7 +88,6 @@ proptest! {
         prop_assert_eq!(a, b);
     }
 
-    // §14-2 冪等
     #[test]
     fn prop_idempotent(s in "[a-zA-Z0-9 @._:/-]{0,200}") {
         let (m1, _) = mask_text(&s);

@@ -1,20 +1,18 @@
-//! Recovery & restore（REF.md §12）。core の primitive は `restore` 1つ（string→string）。
-//! recovery map は **local-only**（summary/to_json に載せない, REF.md §14-5）。
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Local-only mapping; never serialized into a MaskResult summary.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Recovery {
     pub map: HashMap<String, String>,
 }
 
-/// slice 1 では失敗系を返さない。version/header mismatch の fail-closed（REF.md §12.1）は slice 2。
+/// No failure modes yet; version/header mismatches will fail closed later.
 #[derive(Clone, Debug)]
 pub enum RestoreError {}
 
-/// `<<...>>` トークンを原値へ置換。未知 placeholder は **そのまま残す**
-/// （原値が無い＝広がらない＝安全側, REF.md §12.1）。
+/// Replace known `<<...>>` tokens with their originals; leave unknown tokens
+/// unchanged (a hallucinated placeholder has no mapping, so nothing can leak).
 pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());

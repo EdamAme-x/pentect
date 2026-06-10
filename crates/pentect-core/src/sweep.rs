@@ -1,15 +1,11 @@
-//! グローバル同一性スイープ（REF.md §13）: 最適化ではなく **correctness**。
-//! 「ある値を1箇所で隠したが別箇所に生で残る」= 部分漏洩を閉じる（不変条件 §14-6）。
-//!
-//! slice 1 は prong (b)（代表の raw bytes を全域リテラル検索）。prong (a)（各 region の
-//! N_id ビュー上のマッチ）は検出ビュー/OffsetMap と共に slice 2。
-
 use crate::model::*;
 use crate::normalize::n_id;
 use std::collections::BTreeMap;
 
+/// Mask every other occurrence of an already-masked value across the whole input.
+/// This is correctness, not optimization: a value left in plaintext anywhere leaks.
 pub fn identity_sweep(raw: &str, accepted: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
-    // identity = n_id(value) ごとに代表（最小 offset）を選ぶ。
+    // Earliest occurrence of each identity is the representative.
     let mut rep: BTreeMap<String, Span> = BTreeMap::new();
     for s in &accepted {
         let val = &raw[s.range.start..s.range.end];
@@ -23,6 +19,8 @@ pub fn identity_sweep(raw: &str, accepted: Vec<Span>, protected: &[ByteRange]) -
             .or_insert_with(|| s.clone());
     }
 
+    // Add every literal occurrence that doesn't clash with an existing span or a
+    // frozen placeholder.
     let mut all = accepted.clone();
     for r in rep.values() {
         let needle = &raw[r.range.start..r.range.end];

@@ -1,6 +1,3 @@
-//! Renderer（REF.md §10/§11）: 値範囲を placeholder へ。
-//! 同 identity → 同 placeholder（全域一貫の ID）。slice 1 は whole-value 粒度のみ。
-
 use crate::model::*;
 use crate::normalize::n_id;
 use crate::placeholder::{identity_hash, render_placeholder};
@@ -8,10 +5,12 @@ use std::collections::HashMap;
 
 pub struct Rendered {
     pub masked: String,
-    /// placeholder -> 原値（first-seen の raw bytes）。recovery map の元。
+    /// placeholder -> first-seen original bytes.
     pub map: HashMap<String, String>,
 }
 
+/// Replace each span with a placeholder. Same identity yields the same
+/// placeholder, keeping the whole document consistent.
 pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>) -> Rendered {
     spans.sort_by_key(|s| s.range.start);
     let mut masked = String::with_capacity(raw.len());
@@ -19,7 +18,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>) -> Rendered {
     let mut cursor = 0usize;
 
     for s in &spans {
-        // 念のための非重複ガード（Merge/Sweep で保証済みだが防御的に）。
+        // Spans are already non-overlapping; this is just defensive.
         if s.range.start < cursor {
             continue;
         }

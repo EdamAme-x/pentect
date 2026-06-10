@@ -1,12 +1,9 @@
-//! Policy（REF.md §9）。slice 1 は既定の per-span 分類のみ（deny/allow/when は slice 2+）。
-
 use crate::model::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Granularity {
     Full,
     HashOnly,
-    // URL_STRUCTURED / EMAIL_SPLIT は slice 2。
 }
 
 #[derive(Clone, Debug)]
@@ -21,8 +18,7 @@ pub enum Action {
 pub struct Policy {}
 
 impl Policy {
-    /// REF.md §17.2 core 既定 = Mask（strict; 迷ったら隠す）。
-    /// per-span・他 span を見ない（順序非依存, REF.md §9.1）。
+    /// Default policy: mask every candidate. Per-span and order-independent.
     pub fn classify(&self, _span: &Span) -> Action {
         Action::Mask(None)
     }

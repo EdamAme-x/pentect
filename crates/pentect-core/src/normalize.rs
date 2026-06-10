@@ -1,11 +1,8 @@
-//! 正規化（REF.md §6）。slice 1 は identity 正規化 `n_id` のみ実装。
-//! 検出ビュー（NFKC + percent/entity decode）と OffsetMap は slice 2。
-
 use unicode_normalization::UnicodeNormalization;
 
-/// identity 正規化（conservative, REF.md §6.1）:
-/// `NFC + zero-width/bidi strip`。**NFKC ではない**（全角/半角/homoglyph は畳まず、
-/// 異なる値を誤って統合しない）。placeholder の同一性ハッシュと sweep のキーに使う。
+/// Identity normalization: NFC (deliberately not NFKC) plus zero-width/bidi
+/// stripping. Conservative so distinct values are never merged (full-width vs
+/// ASCII digits stay distinct). Used for placeholder hashing and the sweep.
 pub fn n_id(s: &str) -> String {
     s.nfc().filter(|c| !is_zero_width(*c) && !is_bidi(*c)).collect()
 }

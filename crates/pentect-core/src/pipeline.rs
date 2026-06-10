@@ -1,5 +1,3 @@
-//! パイプライン編成（REF.md §5）と公開 API（境界 A, §15）。
-
 use crate::detect::DetectorSet;
 use crate::merge::merge;
 use crate::model::*;
@@ -10,8 +8,8 @@ use crate::sweep::identity_sweep;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-/// マスク設定（REF.md §15.1）。`key` は同一性ハッシュの HMAC 鍵（§11.2）。
-/// 鍵生成・keyfile I/O は adapter 責務（core は明示フィールドで受けるだけ）。
+/// `key` is the HMAC key for identity hashing; the adapter generates and
+/// persists it.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub key: [u8; 32],
@@ -22,19 +20,18 @@ impl Config {
     pub fn new(key: [u8; 32]) -> Self {
         Self { key, locale: "en".into() }
     }
-    /// テスト/デモ用の固定鍵。**本番不可**（adapter が CSPRNG 鍵を供給, REF.md §11.2）。
+    /// Fixed key for tests and demos only.
     pub fn insecure_testing() -> Self {
         Self::new([7u8; 32])
     }
 }
 
-/// 原値を含まない要約（REF.md §14-5）。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Summary {
     pub masked_count: usize,
 }
 
-/// `recovery` は local-only。`MaskResult` 自体は serde 派生しない（§14-5）。
+/// Carries the local-only recovery map, so it is intentionally not serializable.
 pub struct MaskResult {
     pub masked: String,
     pub recovery: Recovery,
@@ -47,21 +44,20 @@ pub fn mask(input: Input, config: &Config) -> MaskResult {
     mask_ir(ir, config)
 }
 
-/// core primitive（REF.md §15.1, §17.5）。adapter は同じ IR を作って渡せる。
+/// Core primitive: an adapter can build the same Ir and call this directly.
 pub fn mask_ir(ir: Ir, config: &Config) -> MaskResult {
     let detectors = DetectorSet::builtin();
     let policy = Policy::default();
 
-    // Detect
     let mut spans = Vec::new();
     for region in &ir.regions {
         spans.extend(detectors.run(region, &ir.raw));
     }
 
-    // Policy.classify（slice 1 は Mask のみ残す）
+    // Classify before merge so an allowlist can retract false candidates before
+    // overlaps are resolved (slice 1 only emits Mask).
     spans.retain(|s| matches!(policy.classify(s), Action::Mask(_)));
 
-    // Merge → 同一性 sweep → Render
     let merged = merge(spans, &ir.protected);
     let swept = identity_sweep(&ir.raw, merged, &ir.protected);
     let rendered = render(&ir.raw, &config.key, swept.clone());
@@ -75,8 +71,8 @@ pub fn mask_ir(ir: Ir, config: &Config) -> MaskResult {
     }
 }
 
-/// slice 1 parser: Text/Json を単一 PlainText region に。既存 placeholder を protected に。
 fn parse(input: Input) -> Ir {
+    // slice 1: the whole input is a single plaintext region.
     let raw = input.data;
     let protected = scan_placeholders(&raw);
     let ctx = Context {
@@ -92,7 +88,7 @@ fn parse(input: Input) -> Ir {
     Ir { raw, regions, protected }
 }
 
-/// render が出す厳密形 `<<LABEL_hhhhhhhhhhhhhhhh>>`（16 lowercase hex）を冪等性のため凍結。
+/// Freeze existing `<<LABEL_hash>>` placeholders so re-masking is a no-op.
 fn scan_placeholders(raw: &str) -> Vec<ByteRange> {
     let re = Regex::new(r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{16}>>").expect("placeholder regex compiles");
     re.find_iter(raw)
