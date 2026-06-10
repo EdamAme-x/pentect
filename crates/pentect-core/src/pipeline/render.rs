@@ -12,30 +12,26 @@ pub struct Rendered {
     pub collisions: Vec<String>,
 }
 
-/// Renderer granularity (REF §10.1/10.3). FULL and HASH_ONLY both render as one
-/// opaque placeholder here — we never keep value prefixes (§10.2), so they
-/// collapse to `Whole`. Pii emails use `EmailSplit` so the local part and domain
-/// hash separately and same-domain addresses still aggregate (a model can tell
-/// two users share an org without seeing the addresses). URL_STRUCTURED awaits an
-/// Endpoint/URL detector, so it is not a variant yet.
-#[derive(Clone, Copy, PartialEq)]
-enum Granularity {
-    Whole,
-    EmailSplit,
-}
+// Render granularity is shape-driven (REF §7.8/C20, §10.3): a value that parses
+// as an email splits its local part and domain into separate hashes joined by a
+// literal `@`, so same-domain addresses still aggregate (a model can tell two
+// users share an org without seeing the addresses) — regardless of category.
+// Everything else is one opaque placeholder: we never keep value prefixes
+// (§10.2), so FULL and HASH_ONLY coincide. URL_STRUCTURED awaits a URL detector.
 
-fn granularity(category: Category) -> Granularity {
-    match category {
-        Category::Pii => Granularity::EmailSplit, // only email-shaped values actually split
-        _ => Granularity::Whole,
-    }
-}
-
-/// Split an email into (local, domain), or None if it isn't a single-`@` address.
+/// Split an email into (local, domain), or None unless it is a single-`@` address
+/// with a dotted, alphabetic-TLD domain — so a value that merely contains `@`
+/// (e.g. a password `p@ssw0rd`) is not split.
 fn split_email(v: &str) -> Option<(&str, &str)> {
     let at = v.find('@')?;
     let (local, domain) = (&v[..at], &v[at + 1..]);
-    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+    let tld = domain.rsplit('.').next().unwrap_or("");
+    if local.is_empty()
+        || domain.contains('@')
+        || !domain.contains('.')
+        || tld.len() < 2
+        || !tld.bytes().all(|b| b.is_ascii_alphabetic())
+    {
         return None;
     }
     Some((local, domain))
@@ -60,10 +56,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         masked.push_str(&raw[cursor..s.range.start]);
         let val = &raw[s.range.start..s.range.end];
 
-        let split = (granularity(s.category) == Granularity::EmailSplit)
-            .then(|| split_email(val))
-            .flatten();
-        match split {
+        match split_email(val) {
             // Mask each side under the same label; the `@` stays literal so
             // restore reconstructs the address from the two mappings.
             Some((local, domain)) => {
@@ -201,17 +194,19 @@ mod tests {
     }
 
     #[test]
-    fn non_email_pii_is_not_split() {
+    fn non_email_values_are_not_split() {
         let key = [3u8; 32];
-        let raw = "4111111111111111"; // card-shaped Pii, no '@'
-        let span = Span {
-            range: ByteRange::new(0, raw.len()),
-            category: Category::Pii,
-            label: "CARD".into(),
-            confidence: Confidence::High,
-            source: DetectorId::Rule,
-        };
-        let r = render(raw, &key, vec![span], false);
-        assert_eq!(r.masked.matches("<<").count(), 1, "{}", r.masked);
+        // No '@', and '@' without a dotted domain (a password) — neither splits.
+        for raw in ["4111111111111111", "p@ssw0rd"] {
+            let span = Span {
+                range: ByteRange::new(0, raw.len()),
+                category: Category::Secret,
+                label: "SECRET".into(),
+                confidence: Confidence::High,
+                source: DetectorId::Rule,
+            };
+            let r = render(raw, &key, vec![span], false);
+            assert_eq!(r.masked.matches("<<").count(), 1, "{}", r.masked);
+        }
     }
 }
