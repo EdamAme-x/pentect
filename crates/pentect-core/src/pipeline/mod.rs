@@ -56,7 +56,7 @@ impl Config {
 pub struct ResidualNote {
     pub range: ByteRange,
     pub category: Category,
-    pub source: String,
+    pub source: DetectorId,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

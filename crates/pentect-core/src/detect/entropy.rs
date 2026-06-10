@@ -30,9 +30,6 @@ impl EntropyDetector {
 }
 
 impl Detector for EntropyDetector {
-    fn id(&self) -> &str {
-        "entropy"
-    }
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let bytes = view.text().as_bytes();
         let mut out = Vec::new();
@@ -53,7 +50,7 @@ impl Detector for EntropyDetector {
                     category: Category::Secret,
                     label: "LIKELY_SECRET".to_string(),
                     confidence: Confidence::Low,
-                    source: "entropy".to_string(),
+                    source: DetectorId::Entropy,
                 });
             }
         }

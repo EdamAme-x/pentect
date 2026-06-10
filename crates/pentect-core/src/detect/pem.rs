@@ -23,9 +23,6 @@ impl Default for PemDetector {
 }
 
 impl Detector for PemDetector {
-    fn id(&self) -> &str {
-        "pem"
-    }
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let s = view.text();
         self.re
@@ -36,7 +33,7 @@ impl Detector for PemDetector {
                 category: Category::Secret,
                 label: "PRIVATE_KEY".to_string(),
                 confidence: Confidence::High,
-                source: "pem".to_string(),
+                source: DetectorId::Pem,
             })
             .collect()
     }

@@ -30,9 +30,6 @@ const SENSITIVE_KEY_TOKENS: &[&str] = &[
 pub struct SuspiciousKeyDetector;
 
 impl Detector for SuspiciousKeyDetector {
-    fn id(&self) -> &str {
-        "suspicious_key"
-    }
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let region = view.region;
         let Some(k) = &region.ctx.key else {
@@ -50,7 +47,7 @@ impl Detector for SuspiciousKeyDetector {
                 category: Category::Secret,
                 label: "SECRET".to_string(),
                 confidence: Confidence::Medium,
-                source: "suspicious_key".to_string(),
+                source: DetectorId::SuspiciousKey,
             }]
         } else {
             vec![]

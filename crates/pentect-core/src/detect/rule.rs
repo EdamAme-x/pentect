@@ -128,9 +128,6 @@ impl RuleDetector {
 }
 
 impl Detector for RuleDetector {
-    fn id(&self) -> &str {
-        "rule"
-    }
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let s = view.text();
         let mut out = Vec::new();
@@ -141,7 +138,7 @@ impl Detector for RuleDetector {
                     category: rule.category,
                     label: rule.label.to_string(),
                     confidence: rule.confidence,
-                    source: format!("rule:{}", rule.label),
+                    source: DetectorId::Rule,
                 });
             }
         }

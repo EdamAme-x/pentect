@@ -63,7 +63,7 @@ pub fn identity_sweep(
                     category: r.category,
                     label: r.label.clone(),
                     confidence: r.confidence,
-                    source: "sweep".to_string(),
+                    source: DetectorId::Sweep,
                 });
             }
         }
@@ -113,7 +113,7 @@ mod tests {
             category: cat,
             label: label.into(),
             confidence: conf,
-            source: "rule".into(),
+            source: DetectorId::Rule,
         }
     }
 
@@ -121,7 +121,7 @@ mod tests {
         let regions = vec![region(raw)];
         identity_sweep(raw, accepted, &[], &regions)
             .into_iter()
-            .filter(|s| s.source == "sweep")
+            .filter(|s| s.source == DetectorId::Sweep)
             .map(|s| s.range)
             .collect()
     }
@@ -179,10 +179,13 @@ mod tests {
             category: Category::Secret,
             label: "AWS_AKID".into(),
             confidence: Confidence::High,
-            source: "rule".into(),
+            source: DetectorId::Rule,
         };
         let out = identity_sweep(raw, vec![weak, strong], &[], &[region(raw)]);
-        let swept: Vec<_> = out.iter().filter(|s| s.source == "sweep").collect();
+        let swept: Vec<_> = out
+            .iter()
+            .filter(|s| s.source == DetectorId::Sweep)
+            .collect();
         assert_eq!(swept.len(), 1, "third occurrence swept: {swept:?}");
         assert_eq!(
             swept[0].label, "AWS_AKID",

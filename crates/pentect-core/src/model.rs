@@ -118,11 +118,44 @@ pub struct Ir {
     pub protected: Vec<ByteRange>,
 }
 
+/// Which detector produced a span. Typed (not a free-form string) so policy and
+/// render branch on the variant and a rename can't silently change behaviour.
+/// Declaration order is a *specificity rank* (most-specific/anchored first): on
+/// an otherwise-tied overlap the lower variant wins, so the more informative
+/// label is kept (e.g. OPAQUE_BLOB over a generic LIKELY_SECRET).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum DetectorId {
+    Rule,
+    Pem,
+    /// A codec-decoded blob whose decoded content was identified as a secret.
+    Decode,
+    SuspiciousKey,
+    /// A codec-decoded blob that only "looks encrypted" (no inner secret found).
+    DecodeOpaque,
+    Entropy,
+    /// Added by the global identity sweep, not a real detector.
+    Sweep,
+}
+
+impl DetectorId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DetectorId::Rule => "rule",
+            DetectorId::Entropy => "entropy",
+            DetectorId::Decode => "decode",
+            DetectorId::DecodeOpaque => "decode_opaque",
+            DetectorId::Pem => "pem",
+            DetectorId::SuspiciousKey => "suspicious_key",
+            DetectorId::Sweep => "sweep",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Span {
     pub range: ByteRange,
     pub category: Category,
     pub label: Label,
     pub confidence: Confidence,
-    pub source: String,
+    pub source: DetectorId,
 }

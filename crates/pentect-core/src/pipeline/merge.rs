@@ -32,23 +32,20 @@ pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
 mod tests {
     use super::*;
 
-    fn span(start: usize, end: usize, conf: Confidence, src: &str) -> Span {
+    fn span(start: usize, end: usize, conf: Confidence) -> Span {
         Span {
             range: ByteRange::new(start, end),
             category: Category::Secret,
             label: "X".into(),
             confidence: conf,
-            source: src.into(),
+            source: DetectorId::Rule,
         }
     }
 
     #[test]
     fn higher_confidence_wins_overlap() {
         let out = merge(
-            vec![
-                span(0, 10, Confidence::Low, "entropy"),
-                span(2, 8, Confidence::High, "rule"),
-            ],
+            vec![span(0, 10, Confidence::Low), span(2, 8, Confidence::High)],
             &[],
         );
         assert_eq!(out.len(), 1);
@@ -59,8 +56,8 @@ mod tests {
     fn equal_confidence_prefers_larger_span() {
         let out = merge(
             vec![
-                span(2, 6, Confidence::Medium, "a"),
-                span(0, 10, Confidence::Medium, "b"),
+                span(2, 6, Confidence::Medium),
+                span(0, 10, Confidence::Medium),
             ],
             &[],
         );
@@ -71,10 +68,7 @@ mod tests {
     #[test]
     fn protected_and_empty_dropped() {
         let out = merge(
-            vec![
-                span(0, 5, Confidence::High, "r"),
-                span(7, 7, Confidence::High, "e"),
-            ],
+            vec![span(0, 5, Confidence::High), span(7, 7, Confidence::High)],
             &[ByteRange::new(0, 5)],
         );
         assert!(out.is_empty());
@@ -83,10 +77,7 @@ mod tests {
     #[test]
     fn disjoint_spans_all_kept_sorted() {
         let out = merge(
-            vec![
-                span(10, 12, Confidence::Low, "a"),
-                span(0, 3, Confidence::Low, "b"),
-            ],
+            vec![span(10, 12, Confidence::Low), span(0, 3, Confidence::Low)],
             &[],
         );
         assert_eq!(out.len(), 2);

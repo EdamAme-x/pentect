@@ -18,8 +18,7 @@ pub use suspicious_key::SuspiciousKeyDetector;
 pub(crate) use util::region;
 
 /// Side-effect-free and deterministic. Runs on a region's normalized view and
-/// returns spans in absolute raw coordinates.
+/// returns spans in absolute raw coordinates (each tagged with its `DetectorId`).
 pub trait Detector {
-    fn id(&self) -> &str;
     fn detect(&self, view: &NormalizedView) -> Vec<Span>;
 }

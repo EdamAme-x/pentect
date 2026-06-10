@@ -87,14 +87,14 @@ mod tests {
                 category: Category::Pii,
                 label: "IDENTITY".into(),
                 confidence: Confidence::Medium,
-                source: "rule".into(),
+                source: DetectorId::Rule,
             },
             Span {
                 range: ByteRange::new(10, 17),
                 category: Category::Pii,
                 label: "IDENTITY".into(),
                 confidence: Confidence::Medium,
-                source: "rule".into(),
+                source: DetectorId::Rule,
             },
         ];
         let r = render(raw, &key, spans, false);

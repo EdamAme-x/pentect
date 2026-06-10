@@ -125,9 +125,6 @@ impl DecodeDetector {
 }
 
 impl Detector for DecodeDetector {
-    fn id(&self) -> &str {
-        "decode"
-    }
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let s = view.text();
         let bytes = s.as_bytes();
@@ -150,7 +147,7 @@ impl Detector for DecodeDetector {
                         category: cat,
                         label,
                         confidence: conf,
-                        source: "decode".to_string(),
+                        source: DetectorId::Decode,
                     });
                 } else if self.mask_unknown
                     && i - start >= self.min_unknown_run
@@ -161,7 +158,7 @@ impl Detector for DecodeDetector {
                         category: Category::Secret,
                         label: "OPAQUE_BLOB".to_string(),
                         confidence: Confidence::Low,
-                        source: "decode_opaque".to_string(),
+                        source: DetectorId::DecodeOpaque,
                     });
                 }
             }

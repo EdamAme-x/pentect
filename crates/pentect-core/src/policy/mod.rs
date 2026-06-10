@@ -1,4 +1,4 @@
-use crate::model::{Confidence, Span};
+use crate::model::{DetectorId, Span};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -37,7 +37,9 @@ impl Policy for MaskAll {
 /// raw entropy or an opaque decodable blob put it here. These are the
 /// "when in doubt" candidates the aggressiveness setting governs.
 pub fn is_context_free(s: &Span) -> bool {
-    (s.source == "entropy" || s.source == "decode_opaque") && s.confidence == Confidence::Low
+    // Entropy and DecodeOpaque are the only sources that emit unanchored guesses
+    // (always Low confidence), so the variant alone identifies a context-free span.
+    matches!(s.source, DetectorId::Entropy | DetectorId::DecodeOpaque)
 }
 
 /// What to do with a context-free opaque/entropy span.
