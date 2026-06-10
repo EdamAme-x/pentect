@@ -20,25 +20,34 @@ pub fn identity_hash(key: &[u8; 32], n_id_value: &str) -> String {
     s
 }
 
-/// `<<LABEL_HASH>>`, or `<<LABEL_HASH_lenN>>` when an approximate length is given.
-/// `lenN` is self-describing so a model reads it as "about N characters".
-pub fn render_placeholder(label: &str, hash: &str, approx_len: Option<u32>) -> String {
-    match approx_len {
+/// Length buckets for opt-in disclosure (REF.md §11.6). Three fixed floors so
+/// only three values are ever emitted and the exact length is never revealed.
+const BUCKET_MED: usize = 24;
+const BUCKET_LONG: usize = 64;
+const BUCKET_XLONG: usize = 512;
+
+/// `<<LABEL_HASH>>`, or `<<LABEL_HASH_lenN>>` when a length bucket is given.
+/// `lenN` is the bucket floor — self-describing ("at least N chars") so a model
+/// reads it, unlike an opaque `~med`, while staying coarse.
+pub fn render_placeholder(label: &str, hash: &str, bucket: Option<u32>) -> String {
+    match bucket {
         Some(n) => format!("<<{label}_{hash}_len{n}>>"),
         None => format!("<<{label}_{hash}>>"),
     }
 }
 
-/// Approximate character length for opaque blobs, opt-in. Rounded to a coarse
-/// step so it reads naturally but never reveals the exact length; below the
-/// floor nothing is disclosed.
+/// Coarse length bucket for opaque blobs, opt-in. Returns the floor of one of
+/// three buckets (24/64/512), so the value reads as "at least N chars" but the
+/// exact length never leaks (only three possible outputs). Below BUCKET_MED
+/// nothing is disclosed. Deviates from REF.md §11.6 only in spelling: emits the
+/// legible floor instead of ~med/~long/~xlong so a model understands it.
 pub fn approx_length(char_len: usize) -> Option<u32> {
-    const FLOOR: usize = 24;
-    const STEP: usize = 8;
-    if char_len < FLOOR {
-        return None;
+    match char_len {
+        n if n >= BUCKET_XLONG => Some(BUCKET_XLONG as u32),
+        n if n >= BUCKET_LONG => Some(BUCKET_LONG as u32),
+        n if n >= BUCKET_MED => Some(BUCKET_MED as u32),
+        _ => None,
     }
-    Some(((char_len + STEP / 2) / STEP * STEP) as u32)
 }
 
 #[cfg(test)]
@@ -67,12 +76,16 @@ mod tests {
             render_placeholder("AWS_AKID", "abc", None),
             "<<AWS_AKID_abc>>"
         );
-        assert_eq!(render_placeholder("X", "abc", Some(32)), "<<X_abc_len32>>");
+        assert_eq!(render_placeholder("X", "abc", Some(24)), "<<X_abc_len24>>");
     }
 
     #[test]
-    fn approx_length_floor_and_rounding() {
-        assert_eq!(approx_length(20), None); // below floor
-        assert_eq!(approx_length(29), Some(32)); // rounded to step
+    fn approx_length_is_three_coarse_buckets() {
+        assert_eq!(approx_length(23), None);
+        assert_eq!(approx_length(24), Some(24));
+        assert_eq!(approx_length(63), Some(24));
+        assert_eq!(approx_length(64), Some(64));
+        assert_eq!(approx_length(511), Some(64));
+        assert_eq!(approx_length(512), Some(512));
     }
 }

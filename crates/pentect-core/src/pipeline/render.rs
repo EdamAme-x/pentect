@@ -1,6 +1,7 @@
 use crate::model::*;
 use crate::normalize::n_id;
 use crate::placeholder::{approx_length, identity_hash, render_placeholder};
+use crate::policy::is_context_free;
 use std::collections::HashMap;
 
 pub struct Rendered {
@@ -13,7 +14,8 @@ pub struct Rendered {
 
 /// Replace each span with a placeholder. Same identity yields the same
 /// placeholder, keeping the whole document consistent. Length is disclosed only
-/// when opted in, and only for opaque entropy-flagged blobs.
+/// when opted in, and only for context-free opaque blobs (LIKELY_SECRET /
+/// OPAQUE_BLOB) — never for typed credentials, whose length is sensitive.
 pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: bool) -> Rendered {
     spans.sort_by_key(|s| s.range.start);
     let mut masked = String::with_capacity(raw.len());
@@ -29,7 +31,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         masked.push_str(&raw[cursor..s.range.start]);
         let val = &raw[s.range.start..s.range.end];
         let hash = identity_hash(key, &n_id(val));
-        let len = if disclose_length && s.label == "LIKELY_SECRET" {
+        let len = if disclose_length && is_context_free(s) {
             approx_length(val.chars().count())
         } else {
             None

@@ -377,6 +377,25 @@ mod tests {
     }
 
     #[test]
+    fn length_disclosed_for_opaque_blob_too() {
+        use data_encoding::BASE64;
+        let bytes: Vec<u8> = (0u8..24)
+            .map(|n| n.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let input = format!("payload {} end", BASE64.encode(&bytes));
+        let on = Config {
+            disclose_length: true,
+            ..Config::insecure_testing()
+        };
+        let r = Engine::with_profile(Profile::Paranoid).mask(Input::text(&input), &on);
+        assert!(
+            r.masked.contains("<<OPAQUE_BLOB_") && r.masked.contains("_len"),
+            "{}",
+            r.masked
+        );
+    }
+
+    #[test]
     fn masks_through_zero_width() {
         let r = m("key AKIA\u{200b}IOSFODNN7EXAMPLE end");
         assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
