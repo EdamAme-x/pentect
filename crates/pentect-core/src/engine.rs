@@ -1,4 +1,4 @@
-use crate::detect::{Base64Detector, Detector, EntropyDetector, RuleDetector, SuspiciousKeyDetector};
+use crate::detect::{DecodeDetector, Detector, EntropyDetector, RuleDetector, SuspiciousKeyDetector};
 use crate::merge::merge;
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -109,7 +109,7 @@ impl Default for Engine {
             .parser(Kind::Json, Box::new(JsonParser))
             .detector(Box::new(RuleDetector::builtin()))
             .detector(Box::new(EntropyDetector::default()))
-            .detector(Box::new(Base64Detector::builtin()))
+            .detector(Box::new(DecodeDetector::builtin()))
             .detector(Box::new(SuspiciousKeyDetector))
             .policy(Box::new(MaskAll))
             .build()
@@ -221,15 +221,25 @@ mod tests {
 
     #[test]
     fn base64_wrapped_secret_gets_specific_label() {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let once = STANDARD.encode("AKIAIOSFODNN7EXAMPLE");
-        let twice = STANDARD.encode(once.as_bytes());
+        use data_encoding::BASE64;
+        let once = BASE64.encode(b"AKIAIOSFODNN7EXAMPLE");
+        let twice = BASE64.encode(once.as_bytes());
         for enc in [once, twice] {
             let input = format!("payload {enc} tail");
             let r = m(&input);
             assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
             assert!(!r.masked.contains(&enc), "{}", r.masked);
             assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn decode_unwrap_handles_multiple_codecs() {
+        use data_encoding::{BASE32, HEXLOWER};
+        let secret = b"AKIAIOSFODNN7EXAMPLE";
+        for enc in [HEXLOWER.encode(secret), BASE32.encode(secret)] {
+            let r = m(&format!("blob {enc} end"));
+            assert!(r.masked.contains("<<AWS_AKID_"), "codec failed for {enc}: {}", r.masked);
         }
     }
 

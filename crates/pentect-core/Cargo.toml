@@ -13,7 +13,8 @@ regex = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 unicode-normalization = { workspace = true }
-base64 = { workspace = true }
+data-encoding = { workspace = true }
+bs58 = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

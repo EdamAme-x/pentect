@@ -1,7 +1,6 @@
+use crate::codec::{Base32Codec, Base58Codec, Base64Codec, Codec, HexCodec};
 use crate::model::*;
 use crate::normalize::NormalizedView;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-use base64::Engine;
 use regex::Regex;
 
 /// Side-effect-free and deterministic. Runs on a region's normalized view and
@@ -64,15 +63,6 @@ impl RuleDetector {
             },
         ];
         Self { rules }
-    }
-
-    /// First matching rule in a plain string, ignoring coordinates. Used by the
-    /// base64 detector to identify what a decoded blob contains.
-    fn probe(&self, s: &str) -> Option<(Category, &'static str, Confidence)> {
-        self.rules
-            .iter()
-            .find(|rule| rule.re.is_match(s))
-            .map(|rule| (rule.category, rule.label, rule.confidence))
     }
 }
 
@@ -165,50 +155,46 @@ fn shannon(bytes: &[u8]) -> f64 {
     h
 }
 
-const MIN_B64_RUN: usize = 16;
+const MIN_DECODE_RUN: usize = 16;
 
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    STANDARD
-        .decode(s)
-        .ok()
-        .or_else(|| URL_SAFE.decode(s).ok())
-        .or_else(|| STANDARD_NO_PAD.decode(s).ok())
-        .or_else(|| URL_SAFE_NO_PAD.decode(s).ok())
-}
-
-/// Decodes base64-ish runs and, if the decoded content (possibly nested) matches
-/// a known rule, masks the whole encoded blob under that label. The blob is
-/// masked whole because a partial replacement could not be re-encoded.
-pub struct Base64Detector {
-    rules: RuleDetector,
+/// Tries injected codecs on each encoded-looking run; if the decoded content
+/// (possibly nested) is identified by an injected detector, masks the whole
+/// encoded blob under that label. The blob is masked whole because a partial
+/// replacement could not be re-encoded. Codec- and detector-agnostic via DI.
+pub struct DecodeDetector {
+    codecs: Vec<Box<dyn Codec>>,
+    identify: Vec<Box<dyn Detector>>,
     max_depth: u8,
 }
 
-impl Base64Detector {
+impl DecodeDetector {
+    pub fn new(codecs: Vec<Box<dyn Codec>>, identify: Vec<Box<dyn Detector>>, max_depth: u8) -> Self {
+        Self { codecs, identify, max_depth }
+    }
+
     pub fn builtin() -> Self {
-        Self { rules: RuleDetector::builtin(), max_depth: 3 }
+        Self::new(
+            vec![
+                Box::new(Base64Codec),
+                Box::new(Base32Codec),
+                Box::new(Base58Codec),
+                Box::new(HexCodec),
+            ],
+            vec![Box::new(RuleDetector::builtin())],
+            3,
+        )
     }
 
     fn probe(&self, run: &str, depth: u8) -> Option<(Category, String, Confidence)> {
-        let decoded = b64_decode(run)?;
-        let text = std::str::from_utf8(&decoded).ok()?;
-        if let Some((cat, label, conf)) = self.rules.probe(text) {
-            return Some((cat, label.to_string(), conf));
-        }
-        if depth > 0 {
-            let bytes = text.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                if !is_token_byte(bytes[i]) {
-                    i += 1;
-                    continue;
-                }
-                let start = i;
-                while i < bytes.len() && is_token_byte(bytes[i]) {
-                    i += 1;
-                }
-                if i - start >= MIN_B64_RUN {
-                    if let Some(hit) = self.probe(&text[start..i], depth - 1) {
+        for codec in &self.codecs {
+            let Some(bytes) = codec.decode(run) else { continue };
+            let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+            if let Some(hit) = self.identify(text) {
+                return Some(hit);
+            }
+            if depth > 0 {
+                for sub in token_runs(text) {
+                    if let Some(hit) = self.probe(sub, depth - 1) {
                         return Some(hit);
                     }
                 }
@@ -216,11 +202,28 @@ impl Base64Detector {
         }
         None
     }
+
+    fn identify(&self, text: &str) -> Option<(Category, String, Confidence)> {
+        let region = Region {
+            span: ByteRange::new(0, text.len()),
+            ctx: Context { path: None, key: None, kind: RegionKind::PlainText, format: Kind::Text },
+        };
+        let view = NormalizedView::build(&region, text);
+        let mut best: Option<Span> = None;
+        for d in &self.identify {
+            for span in d.detect(&view) {
+                if best.as_ref().map_or(true, |b| is_stronger(&span, b)) {
+                    best = Some(span);
+                }
+            }
+        }
+        best.map(|s| (s.category, s.label, s.confidence))
+    }
 }
 
-impl Detector for Base64Detector {
+impl Detector for DecodeDetector {
     fn id(&self) -> &str {
-        "base64_unwrap"
+        "decode"
     }
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let s = view.text();
@@ -236,20 +239,45 @@ impl Detector for Base64Detector {
             while i < bytes.len() && is_token_byte(bytes[i]) {
                 i += 1;
             }
-            if i - start >= MIN_B64_RUN {
+            if i - start >= MIN_DECODE_RUN {
                 if let Some((cat, label, conf)) = self.probe(&s[start..i], self.max_depth) {
                     out.push(Span {
                         range: view.to_raw(ByteRange::new(start, i)),
                         category: cat,
                         label,
                         confidence: conf,
-                        source: "base64_unwrap".to_string(),
+                        source: "decode".to_string(),
                     });
                 }
             }
         }
         out
     }
+}
+
+fn token_runs(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_token_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_token_byte(bytes[i]) {
+            i += 1;
+        }
+        if i - start >= MIN_DECODE_RUN {
+            runs.push(&s[start..i]);
+        }
+    }
+    runs
+}
+
+fn is_stronger(a: &Span, b: &Span) -> bool {
+    a.confidence > b.confidence
+        || (a.confidence == b.confidence && a.category.priority() > b.category.priority())
 }
 
 const SENSITIVE_KEY_TOKENS: &[&str] = &[

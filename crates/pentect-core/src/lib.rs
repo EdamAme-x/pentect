@@ -5,6 +5,7 @@
 //! carries the invariants (reversible, idempotent, deterministic, global
 //! identity, collision-free), which are property-tested in `engine`.
 
+pub mod codec;
 pub mod detect;
 pub mod engine;
 pub mod json;
@@ -18,6 +19,7 @@ pub mod recovery;
 pub mod render;
 pub mod sweep;
 
+pub use codec::Codec;
 pub use detect::Detector;
 pub use engine::{Config, Engine, EngineBuilder, MaskResult, Summary};
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
