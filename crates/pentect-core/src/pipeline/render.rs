@@ -12,6 +12,35 @@ pub struct Rendered {
     pub collisions: Vec<String>,
 }
 
+/// Renderer granularity (REF §10.1/10.3). FULL and HASH_ONLY both render as one
+/// opaque placeholder here — we never keep value prefixes (§10.2), so they
+/// collapse to `Whole`. Pii emails use `EmailSplit` so the local part and domain
+/// hash separately and same-domain addresses still aggregate (a model can tell
+/// two users share an org without seeing the addresses). URL_STRUCTURED awaits an
+/// Endpoint/URL detector, so it is not a variant yet.
+#[derive(Clone, Copy, PartialEq)]
+enum Granularity {
+    Whole,
+    EmailSplit,
+}
+
+fn granularity(category: Category) -> Granularity {
+    match category {
+        Category::Pii => Granularity::EmailSplit, // only email-shaped values actually split
+        _ => Granularity::Whole,
+    }
+}
+
+/// Split an email into (local, domain), or None if it isn't a single-`@` address.
+fn split_email(v: &str) -> Option<(&str, &str)> {
+    let at = v.find('@')?;
+    let (local, domain) = (&v[..at], &v[at + 1..]);
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return None;
+    }
+    Some((local, domain))
+}
+
 /// Replace each span with a placeholder. Same identity yields the same
 /// placeholder, keeping the whole document consistent. Length is disclosed only
 /// when opted in, and only for context-free opaque blobs (LIKELY_SECRET /
@@ -30,17 +59,34 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         }
         masked.push_str(&raw[cursor..s.range.start]);
         let val = &raw[s.range.start..s.range.end];
-        let hash = identity_hash(key, &n_id(val));
-        let len = if disclose_length && is_context_free(s) {
-            approx_length(val.chars().count())
-        } else {
-            None
-        };
-        let ph = render_placeholder(&s.label, &hash, len);
-        if record(&mut map, &ph, val) {
-            collisions.push(ph.clone());
+
+        let split = (granularity(s.category) == Granularity::EmailSplit)
+            .then(|| split_email(val))
+            .flatten();
+        match split {
+            // Mask each side under the same label; the `@` stays literal so
+            // restore reconstructs the address from the two mappings.
+            Some((local, domain)) => {
+                masked.push_str(&emit(key, &s.label, local, None, &mut map, &mut collisions));
+                masked.push('@');
+                masked.push_str(&emit(
+                    key,
+                    &s.label,
+                    domain,
+                    None,
+                    &mut map,
+                    &mut collisions,
+                ));
+            }
+            None => {
+                let len = if disclose_length && is_context_free(s) {
+                    approx_length(val.chars().count())
+                } else {
+                    None
+                };
+                masked.push_str(&emit(key, &s.label, val, len, &mut map, &mut collisions));
+            }
         }
-        masked.push_str(&ph);
         cursor = s.range.end;
     }
     masked.push_str(&raw[cursor..]);
@@ -50,6 +96,24 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         map,
         collisions,
     }
+}
+
+/// Render one `<<LABEL_hash>>` placeholder for `val`, recording its mapping and
+/// noting a collision if a different value already claimed it.
+fn emit(
+    key: &[u8; 32],
+    label: &str,
+    val: &str,
+    len: Option<u32>,
+    map: &mut HashMap<String, String>,
+    collisions: &mut Vec<String>,
+) -> String {
+    let hash = identity_hash(key, &n_id(val));
+    let ph = render_placeholder(label, &hash, len);
+    if record(map, &ph, val) {
+        collisions.push(ph.clone());
+    }
+    ph
 }
 
 /// Insert a placeholder->value mapping. Returns true on collision: the
@@ -79,28 +143,75 @@ mod tests {
         assert_eq!(map["<<X_aa>>"], "alice"); // first mapping kept
     }
 
+    fn email_span(start: usize, end: usize) -> Span {
+        Span {
+            range: ByteRange::new(start, end),
+            category: Category::Pii,
+            label: "IDENTITY".into(),
+            confidence: Confidence::Medium,
+            source: DetectorId::Rule,
+        }
+    }
+
     #[test]
-    fn same_value_twice_is_one_mapping_no_collision() {
+    fn same_value_twice_is_no_collision() {
         let key = [9u8; 32];
         let raw = "a@b.com x a@b.com";
-        let spans = vec![
-            Span {
-                range: ByteRange::new(0, 7),
-                category: Category::Pii,
-                label: "IDENTITY".into(),
-                confidence: Confidence::Medium,
-                source: DetectorId::Rule,
-            },
-            Span {
-                range: ByteRange::new(10, 17),
-                category: Category::Pii,
-                label: "IDENTITY".into(),
-                confidence: Confidence::Medium,
-                source: DetectorId::Rule,
-            },
-        ];
+        let spans = vec![email_span(0, 7), email_span(10, 17)];
         let r = render(raw, &key, spans, false);
-        assert_eq!(r.map.len(), 1);
+        // Email splits into local + domain, so two distinct mappings; the
+        // repeat is the identity case, not a collision.
+        assert_eq!(r.map.len(), 2);
         assert!(r.collisions.is_empty());
+    }
+
+    #[test]
+    fn email_split_masks_local_and_domain_separately() {
+        let key = [1u8; 32];
+        let raw = "alice@example.com";
+        let r = render(raw, &key, vec![email_span(0, raw.len())], false);
+        // Two placeholders joined by a literal '@'.
+        assert_eq!(r.masked.matches("<<IDENTITY_").count(), 2, "{}", r.masked);
+        assert!(r.masked.contains(">>@<<"), "{}", r.masked);
+        assert_eq!(
+            crate::recovery::restore(&r.masked, &crate::recovery::Recovery { map: r.map }).unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn same_domain_aggregates_across_addresses() {
+        let key = [2u8; 32];
+        let raw = "alice@corp.com bob@corp.com";
+        let spans = vec![email_span(0, 14), email_span(15, 27)];
+        let r = render(raw, &key, spans, false);
+        // Distinct local placeholders, one shared domain placeholder.
+        let domain_phs: std::collections::HashSet<_> = r
+            .masked
+            .split('@')
+            .skip(1)
+            .map(|s| s.split(">>").next().unwrap())
+            .collect();
+        assert_eq!(
+            domain_phs.len(),
+            1,
+            "same domain must share a placeholder: {}",
+            r.masked
+        );
+    }
+
+    #[test]
+    fn non_email_pii_is_not_split() {
+        let key = [3u8; 32];
+        let raw = "4111111111111111"; // card-shaped Pii, no '@'
+        let span = Span {
+            range: ByteRange::new(0, raw.len()),
+            category: Category::Pii,
+            label: "CARD".into(),
+            confidence: Confidence::High,
+            source: DetectorId::Rule,
+        };
+        let r = render(raw, &key, vec![span], false);
+        assert_eq!(r.masked.matches("<<").count(), 1, "{}", r.masked);
     }
 }

@@ -368,7 +368,9 @@ mod tests {
     fn global_identity_no_survivor() {
         let r = m("a@b.com mid a@b.com");
         assert!(!r.masked.contains("a@b.com"), "{}", r.masked);
-        assert_eq!(r.recovery.map.len(), 1);
+        // Email splits into local + domain, so both occurrences share two
+        // mappings (not one): the point is no plaintext address survives.
+        assert_eq!(r.recovery.map.len(), 2);
     }
 
     #[test]
