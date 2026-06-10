@@ -19,6 +19,15 @@ pub struct RuleDetector {
 impl RuleDetector {
     pub fn builtin() -> Self {
         let r = |p: &str| Regex::new(p).expect("builtin regex compiles");
+        // Conventions, so new rules stay consistent:
+        // - charset order is upper, lower, digits, then extras `_-`, with `-`
+        //   written last and unescaped: `[A-Za-z0-9_-]`. Hex is `[0-9a-fA-F]`.
+        // - confidence is the pattern's collision-resistance, not vendor fame:
+        //   High = a unique prefix/structure makes a match almost certainly the
+        //   secret; Medium = a short prefix plus generic hex/charset that a
+        //   non-secret could plausibly hit (e.g. Twilio's `AC`+32hex).
+        // - labels are UPPER_SNAKE (asserted in tests) so they render cleanly
+        //   into `<<LABEL_hash>>` placeholders.
         let rules = vec![
             Rule {
                 re: r(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*"),
@@ -27,7 +36,7 @@ impl RuleDetector {
                 confidence: Confidence::High,
             },
             Rule {
-                re: r(r"AKIA[0-9A-Z]{16}"),
+                re: r(r"AKIA[A-Z0-9]{16}"),
                 category: Category::Secret,
                 label: "AWS_AKID",
                 confidence: Confidence::High,
@@ -36,12 +45,6 @@ impl RuleDetector {
                 re: r(r"sk-[A-Za-z0-9_-]{20,}"),
                 category: Category::Secret,
                 label: "OPENAI_API_KEY",
-                confidence: Confidence::High,
-            },
-            Rule {
-                re: r(r"ghp_[A-Za-z0-9]{36}"),
-                category: Category::Secret,
-                label: "GITHUB_PAT",
                 confidence: Confidence::High,
             },
             Rule {
@@ -57,37 +60,39 @@ impl RuleDetector {
                 confidence: Confidence::High,
             },
             Rule {
-                re: r(r"(sk|rk)_(live|test)_[0-9a-zA-Z]{10,}"),
+                re: r(r"(sk|rk)_(live|test)_[A-Za-z0-9]{10,}"),
                 category: Category::Secret,
                 label: "STRIPE_SECRET_KEY",
                 confidence: Confidence::High,
             },
             Rule {
-                re: r(r"AIza[0-9A-Za-z_\-]{35}"),
+                re: r(r"AIza[A-Za-z0-9_-]{35}"),
                 category: Category::Secret,
                 label: "GOOGLE_API_KEY",
                 confidence: Confidence::High,
             },
             Rule {
-                re: r(r"GOCSPX-[0-9A-Za-z_\-]{28}"),
+                re: r(r"GOCSPX-[A-Za-z0-9_-]{28}"),
                 category: Category::Secret,
                 label: "GOOGLE_OAUTH_SECRET",
                 confidence: Confidence::High,
             },
             Rule {
-                re: r(r"ya29\.[0-9A-Za-z_\-]{20,}"),
+                re: r(r"ya29\.[A-Za-z0-9_-]{20,}"),
                 category: Category::Secret,
                 label: "GOOGLE_OAUTH_TOKEN",
                 confidence: Confidence::High,
             },
+            // Fine-grained PAT; distinct format from the classic gh*_ family.
             Rule {
-                re: r(r"github_pat_[0-9a-zA-Z_]{22,}"),
+                re: r(r"github_pat_[A-Za-z0-9_]{22,}"),
                 category: Category::Secret,
                 label: "GITHUB_PAT",
                 confidence: Confidence::High,
             },
+            // Classic GitHub token family (p/o/u/s/r) is one format, so one rule.
             Rule {
-                re: r(r"gh[ousr]_[0-9a-zA-Z]{36}"),
+                re: r(r"gh[oprsu]_[A-Za-z0-9]{36}"),
                 category: Category::Secret,
                 label: "GITHUB_TOKEN",
                 confidence: Confidence::High,
@@ -96,16 +101,16 @@ impl RuleDetector {
                 re: r(r"SK[0-9a-fA-F]{32}"),
                 category: Category::Secret,
                 label: "TWILIO_API_KEY",
-                confidence: Confidence::High,
+                confidence: Confidence::Medium,
             },
             Rule {
                 re: r(r"AC[0-9a-fA-F]{32}"),
                 category: Category::Identifier,
                 label: "TWILIO_ACCOUNT_SID",
-                confidence: Confidence::High,
+                confidence: Confidence::Medium,
             },
             Rule {
-                re: r(r"SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}"),
+                re: r(r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}"),
                 category: Category::Secret,
                 label: "SENDGRID_KEY",
                 confidence: Confidence::High,
@@ -116,8 +121,10 @@ impl RuleDetector {
                 label: "NPM_TOKEN",
                 confidence: Confidence::High,
             },
+            // Domain is label(.label)*.tld, so consecutive/trailing dots and a
+            // leading-dot domain don't match. TLD capped to bound the match.
             Rule {
-                re: r(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
+                re: r(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,24}"),
                 category: Category::Pii,
                 label: "IDENTITY",
                 confidence: Confidence::Medium,
@@ -162,7 +169,7 @@ mod tests {
             (concat!("sk", "-ABCDEFGHIJKLMNOPQRSTUVWX"), "OPENAI_API_KEY"),
             (
                 concat!("ghp", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
-                "GITHUB_PAT",
+                "GITHUB_TOKEN",
             ),
             (
                 concat!("github", "_pat_11ABCDEFG0aBcDeFgHiJkLmNoPqRsTuVwXyZ"),
@@ -222,5 +229,31 @@ mod tests {
                 spans.iter().map(|s| &s.label).collect::<Vec<_>>()
             );
         }
+    }
+
+    // Every label must be UPPER_SNAKE so it renders into a well-formed
+    // `<<LABEL_hash>>` placeholder; a new rule can't smuggle in a bad label.
+    #[test]
+    fn rule_labels_are_upper_snake() {
+        let label_re = Regex::new(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$").unwrap();
+        for rule in &RuleDetector::builtin().rules {
+            assert!(label_re.is_match(rule.label), "bad label: {}", rule.label);
+        }
+    }
+
+    // The tightened email rule must reject malformed domains while still
+    // matching ordinary addresses.
+    #[test]
+    fn email_rule_rejects_malformed_domains() {
+        let det = RuleDetector::builtin();
+        let hits = |s: &str| {
+            let reg = region(s);
+            let v = NormalizedView::build(&reg, s);
+            det.detect(&v).iter().any(|sp| sp.label == "IDENTITY")
+        };
+        assert!(hits("alice@example.com"));
+        assert!(hits("a@b.co.uk"));
+        assert!(!hits("alice@.com"));
+        assert!(!hits("alice@example."));
     }
 }
