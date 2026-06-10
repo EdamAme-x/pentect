@@ -59,7 +59,7 @@ impl Recovery {
             .filter_map(|ph| self.reveal(ph).map(|v| (v, ph.as_str())))
             .filter(|(v, _)| !v.is_empty())
             .collect();
-        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
         let mut out = text.to_string();
         for (value, ph) in pairs {
             out = out.replace(&value, ph);
