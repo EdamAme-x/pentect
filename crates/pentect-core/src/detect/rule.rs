@@ -55,7 +55,7 @@ impl RuleDetector {
 
     pub fn builtin() -> Self {
         use Category::{Endpoint, Identifier, Pii, Secret};
-        use Confidence::{High, Medium};
+        use Confidence::{High, Low, Medium};
         // Conventions, so new rules stay consistent:
         // - charset order is upper, lower, digits, then extras `_-`, with `-`
         //   written last and unescaped: `[A-Za-z0-9_-]`. Hex is `[0-9a-fA-F]`.
@@ -176,6 +176,65 @@ impl RuleDetector {
                 "IP_ADDRESS_V4",
                 High,
             ),
+            // Structural national IDs (no public checksum) — the regex encodes the
+            // grammar; confidence reflects how distinctive it is. Higher false-
+            // positive risk than the checksummed ones, kept lower-confidence.
+            (
+                r"\b9[0-9]{2}[- ]?(?:5[0-9]|6[0-5]|7[0-9]|8[0-8]|9[0-24-9])[- ]?[0-9]{4}\b",
+                Identifier,
+                "US_ITIN",
+                Medium,
+            ),
+            (
+                r"\b[0-9][ACDEFGHJKMNPQRTUVWXY][0-9ACDEFGHJKMNPQRTUVWXY][0-9][- ]?[ACDEFGHJKMNPQRTUVWXY][0-9ACDEFGHJKMNPQRTUVWXY][0-9][- ]?[ACDEFGHJKMNPQRTUVWXY][ACDEFGHJKMNPQRTUVWXY][0-9][0-9]\b",
+                Pii,
+                "US_MBI",
+                Medium,
+            ),
+            (r"\b[A-Z][0-9]{8}\b", Identifier, "US_PASSPORT", Low),
+            (
+                r"(?i)\b[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z][ -]?[0-9]{2}[ -]?[0-9]{2}[ -]?[0-9]{2}[ -]?[A-D]\b",
+                Identifier,
+                "UK_NINO",
+                Medium,
+            ),
+            (
+                r"\b[A-Za-z]{3}[AaBbCcFfGgHhJjLlPpTt][A-Za-z][0-9]{4}[A-Za-z]\b",
+                Identifier,
+                "IN_PAN",
+                Medium,
+            ),
+            (
+                r"\b[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b",
+                Identifier,
+                "SWIFT_BIC",
+                Medium,
+            ),
+            (
+                r"(?i)\b(?:AT|BE|BG|CY|CZ|DE|DK|EE|EL|ES|FI|FR|GB|HR|HU|IE|IT|LT|LU|LV|MT|NL|PL|PT|RO|SE|SI|SK|XI)[ ]?[0-9A-Z][0-9A-Z .-]{6,12}[0-9A-Z]\b",
+                Identifier,
+                "EU_VAT",
+                Low,
+            ),
+            // Context-gated cloud secrets (the literal vendor word near the value).
+            (
+                r#"(?i)(?:datadog|dd[_-]?(?:api|app|application)[_-]?key|dd_client_token)[a-z0-9 ._\-"'=:>|?,]{0,30}\b(?:[a-f0-9]{32}|[a-f0-9]{40})\b"#,
+                Secret,
+                "DATADOG_API_KEY",
+                Medium,
+            ),
+            (
+                r#"(?i)postmark[a-z0-9 ._\-"'=:>|?,]{0,40}\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"#,
+                Secret,
+                "POSTMARK_SERVER_TOKEN",
+                Medium,
+            ),
+            (
+                r#"(?i)heroku[a-z0-9 ._\-"'=:>|?,]{0,40}\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"#,
+                Secret,
+                "HEROKU_API_KEY",
+                Medium,
+            ),
         ];
         use Validator as V;
         // Checksum-gated detectors: a permissive pattern finds candidates, the
@@ -208,6 +267,7 @@ impl RuleDetector {
             (r"\b[LM3][a-km-zA-HJ-NP-Z1-9]{25,34}\b", Identifier, "LTC_ADDRESS", High, V::LtcAddress),
             (r"\br[rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz]{24,34}\b", Identifier, "XRP_ADDRESS", High, V::XrpAddress),
             (r"\b[5KL][a-km-zA-HJ-NP-Z1-9]{50,51}\b", Secret, "CRYPTO_PRIVATE_KEY_WIF", High, V::Wif),
+            (r"\b[0-8][0-9]{2}[- ]?[0-9]{2}[- ]?[0-9]{4}\b", Pii, "US_SSN", Medium, V::UsSsn),
         ];
         let specs = table
             .iter()

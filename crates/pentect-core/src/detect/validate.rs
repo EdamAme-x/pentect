@@ -432,6 +432,18 @@ pub fn de_tax_id(s: &str) -> bool {
     check == d[10] as i64
 }
 
+/// US SSN: structural — reject area 000/666/900-999, group 00, serial 0000.
+pub fn us_ssn(s: &str) -> bool {
+    let d = digits(s);
+    if d.len() != 9 {
+        return false;
+    }
+    let area = d[0] * 100 + d[1] * 10 + d[2];
+    let group = d[3] * 10 + d[4];
+    let serial = d[5] * 1000 + d[6] * 100 + d[7] * 10 + d[8];
+    area != 0 && area != 666 && area < 900 && group != 0 && serial != 0
+}
+
 /// Verhoeff (India Aadhaar): dihedral D5 check == 0.
 pub fn verhoeff(s: &str) -> bool {
     const D: [[usize; 10]; 10] = [
@@ -532,6 +544,7 @@ pub enum Validator {
     LtcAddress,
     XrpAddress,
     Wif,
+    UsSsn,
 }
 
 impl Validator {
@@ -563,6 +576,7 @@ impl Validator {
             Validator::LtcAddress => ltc_address(s),
             Validator::XrpAddress => xrp_address(s),
             Validator::Wif => wif(s),
+            Validator::UsSsn => us_ssn(s),
         }
     }
 }
@@ -604,6 +618,7 @@ mod tests {
         vectors!(es_nie, "X1234567L" => true, "X1234567A" => false);
         vectors!(de_tax_id, "86095742719" => true, "79569910383" => true, "12345678903" => false, "02345678901" => false);
         vectors!(verhoeff, "234567890124" => true, "234567890121" => false, "345678901238" => true, "111111111111" => false);
+        vectors!(us_ssn, "219099998" => true, "000099998" => false, "666099998" => false, "219009998" => false, "219090000" => false);
     }
 
     #[test]
