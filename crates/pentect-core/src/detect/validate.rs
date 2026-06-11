@@ -590,6 +590,39 @@ pub fn eth_address(s: &str) -> bool {
     true
 }
 
+static BIP39_ENGLISH: &str = include_str!("bip39_english.txt");
+
+/// BIP-39 mnemonic seed phrase: 12/15/18/21/24 words from the English wordlist
+/// with a valid SHA-256 checksum. Wordlist membership + checksum make false
+/// positives negligible (a random word sequence almost never validates).
+pub fn bip39_mnemonic(s: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let words: Vec<String> = s.split_whitespace().map(|w| w.to_ascii_lowercase()).collect();
+    if !matches!(words.len(), 12 | 15 | 18 | 21 | 24) {
+        return false;
+    }
+    let total_bits = words.len() * 11;
+    let cs_bits = total_bits / 33;
+    let ent_bits = total_bits - cs_bits;
+    let mut bits = Vec::with_capacity(total_bits);
+    for w in &words {
+        let Some(idx) = BIP39_ENGLISH.lines().position(|x| x == w) else {
+            return false;
+        };
+        for b in (0..11).rev() {
+            bits.push(((idx >> b) & 1) as u8);
+        }
+    }
+    let mut ent = vec![0u8; ent_bits / 8];
+    for (i, &bit) in bits.iter().take(ent_bits).enumerate() {
+        if bit == 1 {
+            ent[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    let hash = Sha256::digest(&ent);
+    (0..cs_bits).all(|i| (hash[i / 8] >> (7 - (i % 8))) & 1 == bits[ent_bits + i])
+}
+
 /// A checksum gate applied to a regex match before it becomes a span.
 #[derive(Clone, Copy, Debug)]
 pub enum Validator {
@@ -622,6 +655,7 @@ pub enum Validator {
     UsSsn,
     BtcBech32,
     EthAddress,
+    Bip39,
 }
 
 impl Validator {
@@ -659,6 +693,7 @@ impl Validator {
             "us_ssn" => Validator::UsSsn,
             "btc_bech32" => Validator::BtcBech32,
             "eth_address" => Validator::EthAddress,
+            "bip39" => Validator::Bip39,
             _ => return None,
         })
     }
@@ -694,6 +729,7 @@ impl Validator {
             Validator::UsSsn => us_ssn(s),
             Validator::BtcBech32 => btc_bech32(s),
             Validator::EthAddress => eth_address(s),
+            Validator::Bip39 => bip39_mnemonic(s),
         }
     }
 }
@@ -774,5 +810,24 @@ mod tests {
         assert!(eth_address("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"));
         assert!(!eth_address("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1Beaed")); // case flip
         assert!(!eth_address("0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d35")); // 39 hex
+    }
+
+    #[test]
+    fn bip39_mnemonic_validator() {
+        assert!(bip39_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        ));
+        assert!(bip39_mnemonic(
+            "legal winner thank year wave sausage worth useful legal winner thank yellow"
+        ));
+        // Right length & wordlist but wrong checksum (last word swapped).
+        assert!(!bip39_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon zoo"
+        ));
+        // A non-wordlist token.
+        assert!(!bip39_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon xyzzy"
+        ));
+        assert!(!bip39_mnemonic("just three words here")); // wrong count
     }
 }

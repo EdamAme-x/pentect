@@ -590,6 +590,10 @@ mod tests {
         ("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "btc_bech32"),
         ("0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "eth_address"),
         ("219-09-9998", "us_ssn"),
+        (
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "bip39_mnemonic",
+        ),
     ];
     const SIDECAR_GAP: &[(&str, &str)] = &[
         ("John Smith", "person_name"),

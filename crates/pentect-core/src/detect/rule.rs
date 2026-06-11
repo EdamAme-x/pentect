@@ -270,6 +270,7 @@ impl RuleDetector {
             (r"\b[0-8][0-9]{2}[- ]?[0-9]{2}[- ]?[0-9]{4}\b", Pii, "US_SSN", Medium, V::UsSsn),
             (r"\bbc1[02-9ac-hj-np-z]{6,87}\b", Identifier, "BTC_ADDRESS_BECH32", High, V::BtcBech32),
             (r"\b0x[0-9a-fA-F]{40}\b", Identifier, "ETH_ADDRESS", High, V::EthAddress),
+            (r"\b(?:[a-z]{3,8} ){11,23}[a-z]{3,8}\b", Secret, "BIP39_MNEMONIC", High, V::Bip39),
         ];
         let specs = table
             .iter()
