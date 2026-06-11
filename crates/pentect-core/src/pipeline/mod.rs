@@ -664,11 +664,11 @@ mod tests {
     // entity-by-entity. Each entry is classified:
     //   Core    — deterministic (pattern/checksum); core MUST catch it (asserted).
     //   Ner     — semantic (person, location, org, nationality, address, age,
-    //             person-type): no closed pattern, so these need a model — that
-    //             is Pentect's NER layer (ai4privacy DeBERTa / OpenAI Privacy
-    //             Filter), which outperforms Presidio's spaCy. Not yet wired
-    //             here, so the deterministic core alone doesn't catch them; this
-    //             is a not-yet-integrated layer, not a lost matchup. Recorded.
+    //             person-type): no closed pattern, so these need a model. That
+    //             layer exists — the `ner` feature's sidecar (spaCy-class, or
+    //             swap to ai4privacy/DeBERTa to beat spaCy). This default-build
+    //             benchmark runs the deterministic core only, so it records
+    //             these rather than asserting them. Recorded, not asserted.
     //   Todo    — deterministic but not implemented yet; the remaining gap to
     //             close for full deterministic parity. Recorded, not asserted.
     // "Surpassed" on the deterministic axis = every Core caught AND we add
