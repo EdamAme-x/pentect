@@ -54,7 +54,7 @@ impl RuleDetector {
     }
 
     pub fn builtin() -> Self {
-        use Category::{Identifier, Pii, Secret};
+        use Category::{Endpoint, Identifier, Pii, Secret};
         use Confidence::{High, Medium};
         // Conventions, so new rules stay consistent:
         // - charset order is upper, lower, digits, then extras `_-`, with `-`
@@ -124,6 +124,57 @@ impl RuleDetector {
                 Pii,
                 "IDENTITY",
                 Medium,
+            ),
+            // Cloud / DB secrets and network identifiers (pattern-only). The
+            // prefix-anchored ones are near-zero false-positive; the connection
+            // string masks the whole `scheme://user:pass@host` (credential incl).
+            (
+                r"do[opr]_v1_[a-f0-9]{64}",
+                Secret,
+                "DIGITALOCEAN_TOKEN",
+                High,
+            ),
+            (
+                r"shp(at|ca|pa|ss)_[a-fA-F0-9]{32}",
+                Secret,
+                "SHOPIFY_TOKEN",
+                High,
+            ),
+            (
+                r"(?:EAAA|sq0atp-|sq0csp-)[A-Za-z0-9_-]{22,60}",
+                Secret,
+                "SQUARE_TOKEN",
+                Medium,
+            ),
+            (
+                r"(?:key|pubkey)-[a-f0-9]{32}",
+                Secret,
+                "MAILGUN_API_KEY",
+                Medium,
+            ),
+            (
+                r#""private_key_id"[ \t]*:[ \t]*"[0-9a-f]{40}""#,
+                Secret,
+                "GCP_PRIVATE_KEY_ID",
+                Medium,
+            ),
+            (
+                r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?)://[^\s:/@]+:[^\s:/@]+@[^\s/?#]+",
+                Secret,
+                "DB_CONNECTION_STRING",
+                High,
+            ),
+            (
+                r"\b[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}\b",
+                Identifier,
+                "MAC_ADDRESS",
+                Medium,
+            ),
+            (
+                r"\b(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}(?:/(?:3[0-2]|[12][0-9]|[0-9]))?\b",
+                Endpoint,
+                "IP_ADDRESS_V4",
+                High,
             ),
         ];
         use Validator as V;
@@ -266,6 +317,23 @@ mod tests {
                 ),
                 "SLACK_WEBHOOK",
             ),
+            (
+                concat!(
+                    "dop",
+                    "_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ),
+                "DIGITALOCEAN_TOKEN",
+            ),
+            (
+                concat!("shp", "at_0123456789abcdef0123456789abcdef"),
+                "SHOPIFY_TOKEN",
+            ),
+            (
+                "postgresql://admin:s3cr3t@db.host:5432/sales",
+                "DB_CONNECTION_STRING",
+            ),
+            ("00:1A:2B:3C:4D:5E", "MAC_ADDRESS"),
+            ("192.168.1.1", "IP_ADDRESS_V4"),
         ];
         let det = RuleDetector::builtin();
         for (sample, label) in cases {
