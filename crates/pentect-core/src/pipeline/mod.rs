@@ -760,7 +760,7 @@ mod tests {
         ("USBankAccountNumber", "account number 1234567890", Core),
         ("ItalyFiscalCode", "RSSMRA85T10A562S", Core),
         ("URL", "https://example.com/x", Core),
-        ("FrenchINSEE", "180047509112556", Todo),
+        ("FrenchINSEE", "180047509112541", Core),
         ("DateTime", "2025-06-11", Todo),
         ("Age", "35 years old", Ner),
         (
@@ -808,7 +808,7 @@ mod tests {
 
             let det_total = core.len() + todo.len();
             eprintln!(
-                "vs {name}: deterministic {}/{} covered; NER {} (awaiting NER layer, beats spaCy); remaining deterministic gap: {:?}",
+                "vs {name}: deterministic {}/{} covered; NER {} (via --features ner sidecar); remaining deterministic gap: {:?}",
                 core.len(),
                 det_total,
                 ner.len(),

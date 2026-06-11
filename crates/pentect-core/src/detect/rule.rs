@@ -313,6 +313,7 @@ impl RuleDetector {
             (r"(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[0-9A-Za-z]+)?(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?", Endpoint, "IP_ADDRESS_V6", High, V::Ipv6),
             (r"\b[0-9]{6}[-+A-Y][0-9]{3}[0-9A-Y]\b", Identifier, "FI_HETU", High, V::FiHetu),
             (r"(?i)\b[A-Z]{6}[0-9A-Z]{2}[A-Z][0-9A-Z]{2}[A-Z][0-9A-Z]{3}[A-Z]\b", Identifier, "IT_FISCAL_CODE", High, V::ItFiscalCode),
+            (r"\b[12][0-9]{4}(?:[0-9]{2}|2[AB])[0-9]{8}\b", Identifier, "FR_NIR_INSEE", High, V::FrNir),
         ];
         let specs = table
             .iter()

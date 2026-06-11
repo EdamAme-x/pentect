@@ -499,6 +499,31 @@ pub fn it_codice_fiscale(s: &str) -> bool {
     b'A' + (sum % 26) as u8 == b[15]
 }
 
+/// France NIR (INSEE): 13-digit body + 2-digit key, key = 97 - (body mod 97).
+/// Corsica dept 2A/2B (chars 6-7) substitutes to 19/18 before the mod.
+pub fn fr_nir(s: &str) -> bool {
+    let t: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if t.len() != 15 || !t.as_bytes()[13..15].iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let body = match &t[5..7] {
+        "2A" => format!("{}19{}", &t[..5], &t[7..13]),
+        "2B" => format!("{}18{}", &t[..5], &t[7..13]),
+        _ => t[..13].to_string(),
+    };
+    if body.len() != 13 || !body.bytes().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    match (body.parse::<u64>(), t[13..15].parse::<u64>()) {
+        (Ok(n), Ok(given)) => given == 97 - (n % 97),
+        _ => false,
+    }
+}
+
 /// Verhoeff (India Aadhaar): dihedral D5 check == 0.
 pub fn verhoeff(s: &str) -> bool {
     const D: [[usize; 10]; 10] = [
@@ -764,6 +789,7 @@ pub enum Validator {
     Ipv6,
     FiHetu,
     ItFiscalCode,
+    FrNir,
 }
 
 impl Validator {
@@ -805,6 +831,7 @@ impl Validator {
             "ipv6" => Validator::Ipv6,
             "fi_hetu" => Validator::FiHetu,
             "it_codice_fiscale" => Validator::ItFiscalCode,
+            "fr_nir" => Validator::FrNir,
             _ => return None,
         })
     }
@@ -844,6 +871,7 @@ impl Validator {
             Validator::Ipv6 => ipv6(s),
             Validator::FiHetu => fi_hetu(s),
             Validator::ItFiscalCode => it_codice_fiscale(s),
+            Validator::FrNir => fr_nir(s),
         }
     }
 }
@@ -888,6 +916,7 @@ mod tests {
         vectors!(us_ssn, "219099998" => true, "000099998" => false, "666099998" => false, "219009998" => false, "219090000" => false);
         vectors!(fi_hetu, "131052-308T" => true, "131052X308T" => true, "131052-308U" => false, "131052G308T" => false);
         vectors!(it_codice_fiscale, "RSSMRA85T10A562S" => true, "RSSMRA85M01H501Q" => true, "RSSMRA85T10A562A" => false);
+        vectors!(fr_nir, "180047509112541" => true, "180047509112556" => false);
     }
 
     #[test]
