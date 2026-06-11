@@ -598,21 +598,21 @@ mod tests {
     // where we match/exceed Presidio). Each sample passes its real checksum.
     const CHECKSUM_FLOOR: &[(&str, &str)] = &[
         ("1234567893", "us_npi"),
-        ("00123456782", "it_vat"),
-        ("130458623", "ca_sin"),
+        ("IT00123456782", "it_vat"),
+        ("social insurance 130458623", "ca_sin"),
         ("021000021", "us_aba_routing"),
         ("AB1234563", "us_dea"),
         ("GB82WEST12345698765432", "iban"),
-        ("9434767016", "uk_nhs"),
-        ("44051401359", "pl_pesel"),
-        ("123456782", "au_tfn"),
+        ("NHS 9434767016", "uk_nhs"),
+        ("PESEL 44051401359", "pl_pesel"),
+        ("TFN 123456782", "au_tfn"),
         ("9001011123459", "kr_rrn"),
         ("12345678Z", "es_nif"),
         ("X1234567L", "es_nie"),
         ("86095742719", "de_tax_id"),
         ("S1234567D", "sg_nric_fin"),
         ("51824753556", "au_abn"),
-        ("2951234577", "au_medicare"),
+        ("medicare 2951234577", "au_medicare"),
         ("234567890124", "in_aadhaar"),
         ("123456789018", "jp_my_number"),
         ("11144477735", "br_cpf"),
@@ -697,16 +697,16 @@ mod tests {
         ("US_NPI", "1234567893", Core),
         ("US_PASSPORT", "passport C12345678", Core),
         ("MEDICAL_LICENSE(DEA)", "AB1234563", Core),
-        ("UK_NHS", "9434767016", Core),
+        ("UK_NHS", "NHS 9434767016", Core),
         ("UK_NINO", "AB123456C", Core),
         ("ES_NIF", "12345678Z", Core),
         ("ES_NIE", "X1234567L", Core),
-        ("IT_VAT_CODE", "00123456782", Core),
-        ("PL_PESEL", "44051401359", Core),
+        ("IT_VAT_CODE", "IT00123456782", Core),
+        ("PL_PESEL", "PESEL 44051401359", Core),
         ("SG_NRIC_FIN", "S1234567D", Core),
         ("AU_ABN", "51824753556", Core),
-        ("AU_TFN", "123456782", Core),
-        ("AU_MEDICARE", "2951234577", Core),
+        ("AU_TFN", "TFN 123456782", Core),
+        ("AU_MEDICARE", "medicare 2951234577", Core),
         ("IN_PAN", "ABCPK1234L", Core),
         ("IN_AADHAAR", "234567890124", Core),
         ("FI_HETU", "131052-308T", Core),
@@ -738,15 +738,15 @@ mod tests {
         ("USDEANumber", "AB1234563", Core),
         ("USPassportNumber", "passport C12345678", Core),
         ("UKNationalInsuranceNumber", "AB123456C", Core),
-        ("UKNHSNumber", "9434767016", Core),
+        ("UKNHSNumber", "NHS 9434767016", Core),
         ("SpainDNI", "12345678Z", Core),
         ("SpainNIE", "X1234567L", Core),
-        ("ItalyVAT", "00123456782", Core),
-        ("PolandPESEL", "44051401359", Core),
+        ("ItalyVAT", "IT00123456782", Core),
+        ("PolandPESEL", "PESEL 44051401359", Core),
         ("GermanyTaxId", "86095742719", Core),
-        ("NetherlandsBSN", "111222333", Core),
+        ("NetherlandsBSN", "BSN 111222333", Core),
         ("SingaporeNRIC", "S1234567D", Core),
-        ("AustraliaTFN", "123456782", Core),
+        ("AustraliaTFN", "TFN 123456782", Core),
         ("AustraliaABN", "51824753556", Core),
         ("IndiaPAN", "ABCPK1234L", Core),
         ("IndiaAadhaar", "234567890124", Core),
@@ -754,7 +754,7 @@ mod tests {
         ("KoreaRRN", "9001011123459", Core),
         ("BrazilCPF", "11144477735", Core),
         ("BrazilCNPJ", "11222333000181", Core),
-        ("CanadaSIN", "130458623", Core),
+        ("CanadaSIN", "social insurance 130458623", Core),
         ("EUVAT", "DE136695976", Core),
         ("USDriversLicense", "driver's license D1234567", Core),
         ("USBankAccountNumber", "account number 1234567890", Core),
@@ -837,20 +837,29 @@ mod tests {
     // that is all `<<X>> <<Y>>`). This is the precision metric, and it ratchets
     // down: lower the ceiling as detectors are tightened, never raise it.
     const NEGATIVES: &[&str] = &[
-        "request_id=183920475 user=42 order=100482931 retries=0 status=200 bytes=10485760",
-        "{\"sku\":\"WIDGETCO\",\"batch\":\"X12345678\",\"warehouse\":\"ABCDEFGH\",\"port\":5432}",
-        "const MASK: u32 = 0x1ff_ffff; let big = 123456789012345; let n = 219099998;",
-        "The quick brown fox jumps over the lazy dog while the team reviews the budget plan.",
-        "version 2.10.0 build 4194304 commit 8da1fcd elapsed 143 ms region us-east-1",
-        "Please ship invoice INV90070183 to the front desk by Friday afternoon.",
+        "2026-06-11T13:42:01Z INFO request_id=183920475 user=42 order=100482931 retries=0 status=200 bytes=10485760 dur_ms=143",
+        "2026-06-11T13:42:02Z WARN cache_miss key=session count=900700123 backlog=123456789 worker=3 queue=8",
+        "{\"user_id\":42,\"order_id\":100482931,\"sku\":\"WIDGETCO-2024\",\"qty\":11223344556,\"warehouse\":\"ABCDEFGH\",\"batch\":\"X12345678\"}",
+        "{\"total_cents\":1999,\"tax_cents\":175,\"items\":64,\"ref\":\"44051401359\"}",
+        "const PORT: u16 = 5432; const MAX_CHUNK: u32 = 4194304; let mask = 0x1ff_ffff; let widths = [10, 9, 8, 7];",
+        "enum Region { UsEast1, EuWest2, ApNortheast1 } let big = 123456789012345; let ssn_like = 219099998;",
+        "id,name,amount\n100482931,Widget,1999\n100482932,Gadget,2999\n900700123,Gizmo,3499",
+        "thread 'main' panicked at src/lib.rs:4821: index 100482931 out of bounds for len 64",
+        "RETRY_LIMIT=5\nMAX_CONN=128\nTIMEOUT_MS=30000\nACCOUNT_TYPE=premium\nVAT_RATE=20",
+        "Released version 2.10.0 (build 4194304) on 2026-06-11; commits 8da1fcd, 2c755b0, 01bb317.",
+        "The quick brown fox jumps over the lazy dog while the project team reviews the budget plan for the next quarter and the season ahead.",
+        "Please ship invoice INV90070183 to the front desk by Friday and notify the warehouse team in advance.",
+        "matrix dims 183920475 x 100482931, checksum 11223344556, lot ABCDEFGH, seed 219099998",
+        "warehouse codes ABCDEFGH, WIDGETCO, ZZTOPXYZ; ticket JIRA-100482; PR 4821; SKU X12345678",
     ];
 
     #[test]
     fn precision_no_overmasking_on_benign_text() {
-        // Ceiling, not zero: the weak-checksum bare-number IDs (AU_TFN, and on
-        // other inputs PL_PESEL/IT_VAT) still fire by chance until they too are
-        // context-gated. Tightening lowers this; it must never rise.
-        const CEILING: usize = 1;
+        // Zero false positives on secret-free text. Over-masking is the real
+        // failure mode (you cannot reason about output that is all `<<X>>`), and
+        // the recall benchmark is blind to it. Raising this is a regression to
+        // justify, not a knob to turn.
+        const CEILING: usize = 0;
         let mut total = 0usize;
         let mut hits: Vec<String> = Vec::new();
         for s in NEGATIVES {
@@ -863,8 +872,8 @@ mod tests {
         eprintln!(
             "precision: {total} false mask(s) on benign corpus (ceiling {CEILING}): {hits:?}"
         );
-        assert!(
-            total <= CEILING,
+        assert_eq!(
+            total, CEILING,
             "over-masking regressed: {total} false masks (ceiling {CEILING}): {hits:?}"
         );
     }
