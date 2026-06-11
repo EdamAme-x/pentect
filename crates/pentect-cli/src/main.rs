@@ -22,6 +22,7 @@ fn usage() {
          \x20 mask secrets from stdin to stdout\n\
          \x20 --pack FILE      load extra rules from a TOML pack (repeatable)\n\
          \x20 --disable LABEL  turn off a built-in detector by label (repeatable)\n\
+         \x20 --enable LABEL   turn on an off-by-default built-in (e.g. DATE_TIME)\n\
          \x20 --ner            also mask person/location/org via the NER sidecar (needs --features ner)"
     );
 }
@@ -151,12 +152,14 @@ fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
         let pack = load_pack(&src).map_err(|e| format!("pack '{path}' is invalid: {e}"))?;
         packs.push(pack);
     }
-    // --disable LABEL is a pack with no rules, only suppressions.
+    // --disable / --enable are a pack with no rules, only toggles.
     let disable = arg_values(args, "--disable");
-    if !disable.is_empty() {
+    let enable = arg_values(args, "--enable");
+    if !disable.is_empty() || !enable.is_empty() {
         packs.push(Pack {
             rules: RuleDetector::from_specs(Vec::new())?,
             disable,
+            enable,
         });
     }
     Ok(packs)

@@ -166,6 +166,11 @@ impl Engine {
     ) -> Self {
         let mut builder = Engine::builder().standard_stack(profile.knobs());
         for pack in packs {
+            for name in &pack.enable {
+                if let Some(d) = crate::detect::enable_builtin(name) {
+                    builder = builder.detector(d);
+                }
+            }
             builder = builder
                 .detector(Box::new(pack.rules))
                 .disable_labels(pack.disable);
@@ -715,8 +720,10 @@ mod tests {
         ("US_DRIVER_LICENSE", "driver's license D1234567", Core),
         ("US_BANK_NUMBER", "account number 1234567890", Core),
         ("URL", "https://example.com/x", Core),
-        // Deterministic (Presidio uses a regex), but deferred: masking every date
-        // floods. A real deterministic gap, not an NER concern — hence Todo.
+        // Capability exists (date_detector / `enable = ["DATE_TIME"]`) but ships
+        // OFF: masking every date floods the paste-to-LLM use case. So the
+        // default engine here doesn't catch it — Todo means "off by default", not
+        // "can't do it".
         ("DATE_TIME", "January 5, 1990", Todo),
         ("PERSON", "John Smith", Ner),
         ("LOCATION", "Mountain View", Ner),
