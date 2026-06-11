@@ -1,6 +1,7 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use zeroize::Zeroize;
 
 const PAD_DOMAIN: &[u8] = b"pentect-recovery-pad-v1";
 const MAC_DOMAIN: &[u8] = b"pentect-recovery-mac-v1";
@@ -69,8 +70,9 @@ impl Recovery {
             .collect();
         pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
         let mut out = text.to_string();
-        for (value, ph) in pairs {
+        for (mut value, ph) in pairs {
             out = out.replace(&value, ph);
+            value.zeroize(); // don't leave the revealed plaintext on the heap
         }
         out
     }
@@ -138,6 +140,17 @@ impl Recovery {
             pad: derive_pad(key),
             map,
         })
+    }
+}
+
+impl Drop for Recovery {
+    fn drop(&mut self) {
+        // Wipe the deobfuscation pad and the (obfuscated) values so a dropped map
+        // leaves no recovery material in freed memory. Placeholders are public.
+        self.pad.zeroize();
+        for v in self.map.values_mut() {
+            v.zeroize();
+        }
     }
 }
 
