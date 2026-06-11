@@ -518,7 +518,13 @@ pub fn wif(s: &str) -> bool {
 const BECH32_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 fn bech32_polymod(values: &[u8]) -> u32 {
-    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    const GEN: [u32; 5] = [
+        0x3b6a_57b2,
+        0x2650_8e6d,
+        0x1ea1_19fa,
+        0x3d42_33dd,
+        0x2a14_62b3,
+    ];
     let mut chk = 1u32;
     for &v in values {
         let top = chk >> 25;
@@ -852,7 +858,7 @@ mod tests {
         assert!(btc_bech32("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"));
         assert!(!btc_bech32("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5")); // bad checksum
         assert!(!btc_bech32("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kg3llr")); // wrong HRP
-        // EIP-55 reference addresses.
+                                                                           // EIP-55 reference addresses.
         assert!(eth_address("0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"));
         assert!(eth_address("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"));
         assert!(!eth_address("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1Beaed")); // case flip
