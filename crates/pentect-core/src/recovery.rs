@@ -1,7 +1,15 @@
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 const PAD_DOMAIN: &[u8] = b"pentect-recovery-pad-v1";
+const MAC_DOMAIN: &[u8] = b"pentect-recovery-mac-v1";
+/// Serialized recovery blob: `MAGIC | VERSION | HMAC(32) | body`. The body is
+/// the already-obfuscated map (no plaintext), the HMAC is keyed by a
+/// key-derived MAC key over `MAGIC | VERSION | body`, so a wrong key, a version
+/// bump, or any tampering fails closed on load.
+const MAGIC: &[u8; 4] = b"PNR1";
+const FORMAT_VERSION: u8 = 1;
 
 /// Local-only placeholder -> original mapping. Values are stored XOR-obfuscated,
 /// not as cleartext: this is lightweight in-memory obfuscation, NOT encryption.
@@ -66,13 +74,142 @@ impl Recovery {
         }
         out
     }
+
+    /// Serialize for persistence: `MAGIC | VERSION | HMAC | body`. The body is
+    /// the obfuscated map (no plaintext); the HMAC binds it to `key`. This is a
+    /// FORMAT, not storage — an adapter writes the bytes to disk, and should
+    /// wrap them in an AEAD at rest. The pad is not stored (re-derived from the
+    /// key on `load`).
+    pub fn serialize(&self, key: &[u8; 32]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(self.map.len() as u32).to_le_bytes());
+        for (ph, val) in &self.map {
+            body.extend_from_slice(&(ph.len() as u32).to_le_bytes());
+            body.extend_from_slice(ph.as_bytes());
+            body.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            body.extend_from_slice(val);
+        }
+        let mut out = Vec::with_capacity(4 + 1 + 32 + body.len());
+        out.extend_from_slice(MAGIC);
+        out.push(FORMAT_VERSION);
+        out.extend_from_slice(&mac(key, &out, &body));
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Load a serialized blob, failing closed on a bad magic, an unsupported
+    /// version, a wrong key / tampering (HMAC mismatch), or a malformed body.
+    /// A corrupt or foreign blob never yields a partial or wrong mapping.
+    pub fn load(bytes: &[u8], key: &[u8; 32]) -> Result<Self, RecoveryError> {
+        if bytes.len() < 4 + 1 + 32 {
+            return Err(RecoveryError::Malformed);
+        }
+        if &bytes[..4] != MAGIC {
+            return Err(RecoveryError::BadMagic);
+        }
+        let version = bytes[4];
+        if version != FORMAT_VERSION {
+            return Err(RecoveryError::UnsupportedVersion(version));
+        }
+        let tag = &bytes[5..37];
+        let body = &bytes[37..];
+        // Constant-time HMAC verify over MAGIC | VERSION | body.
+        let mut m = Hmac::<Sha256>::new_from_slice(&derive_mac_key(key)).expect("hmac key");
+        m.update(&bytes[..5]);
+        m.update(body);
+        m.verify_slice(tag)
+            .map_err(|_| RecoveryError::IntegrityFailure)?;
+
+        let mut map = HashMap::new();
+        let mut r = Reader { buf: body, pos: 0 };
+        let count = r.u32()?;
+        for _ in 0..count {
+            let ph_len = r.u32()? as usize;
+            let ph = String::from_utf8(r.take(ph_len)?.to_vec())
+                .map_err(|_| RecoveryError::Malformed)?;
+            let val_len = r.u32()? as usize;
+            let val = r.take(val_len)?.to_vec();
+            map.insert(ph, val);
+        }
+        if r.pos != body.len() {
+            return Err(RecoveryError::Malformed); // trailing garbage
+        }
+        Ok(Self {
+            pad: derive_pad(key),
+            map,
+        })
+    }
 }
 
-/// Uninhabited: `restore` cannot fail today. Reserved so a future versioned,
-/// integrity-checked recovery header can fail closed without a breaking change to
-/// `restore`'s signature.
+/// HMAC-SHA256 over `header || body`, keyed by a key-derived MAC key.
+fn mac(key: &[u8; 32], header: &[u8], body: &[u8]) -> [u8; 32] {
+    let mut m = Hmac::<Sha256>::new_from_slice(&derive_mac_key(key)).expect("hmac key");
+    m.update(header);
+    m.update(body);
+    m.finalize().into_bytes().into()
+}
+
+fn derive_mac_key(key: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(MAC_DOMAIN);
+    h.update(key);
+    h.finalize().into()
+}
+
+/// Length-prefix reader that fails closed (no panic) on truncation.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl Reader<'_> {
+    fn u32(&mut self) -> Result<u32, RecoveryError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn take(&mut self, n: usize) -> Result<&[u8], RecoveryError> {
+        let end = self.pos.checked_add(n).ok_or(RecoveryError::Malformed)?;
+        if end > self.buf.len() {
+            return Err(RecoveryError::Malformed);
+        }
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+}
+
+/// Uninhabited: `restore` from a valid in-memory map cannot fail — it reveals
+/// known tokens and passes unknown ones through. The fail-closed path is `load`
+/// (validating an untrusted/persisted blob), which returns `RecoveryError`.
 #[derive(Clone, Debug)]
 pub enum RestoreError {}
+
+/// Why loading a serialized recovery blob failed. Every variant means the blob
+/// is rejected whole — `load` never returns a partial or wrong mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryError {
+    /// Not a pentect recovery blob (magic mismatch).
+    BadMagic,
+    /// A newer/older format this build does not understand.
+    UnsupportedVersion(u8),
+    /// HMAC mismatch: wrong key, or the bytes were tampered/corrupted.
+    IntegrityFailure,
+    /// Truncated or structurally invalid body.
+    Malformed,
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecoveryError::BadMagic => write!(f, "not a pentect recovery blob"),
+            RecoveryError::UnsupportedVersion(v) => write!(f, "unsupported recovery version {v}"),
+            RecoveryError::IntegrityFailure => write!(f, "recovery integrity check failed"),
+            RecoveryError::Malformed => write!(f, "malformed recovery blob"),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryError {}
 
 /// Replace known `<<...>>` tokens with their originals; leave unknown tokens
 /// unchanged (a hallucinated placeholder has no mapping, so nothing can leak).
@@ -209,7 +346,78 @@ mod tests {
         assert_eq!(rec.remask(&restore(&masked, &rec).unwrap()), masked);
     }
 
+    fn sample_recovery(key: &[u8; 32]) -> Recovery {
+        Recovery::seal(
+            HashMap::from([
+                (
+                    "<<AWS_AKID_0011223344556677>>".into(),
+                    "AKIAIOSFODNN7EXAMPLE".into(),
+                ),
+                (
+                    "<<IDENTITY_8899aabbccddeeff>>".into(),
+                    "alice@example.com".into(),
+                ),
+            ]),
+            key,
+        )
+    }
+
+    #[test]
+    fn serialize_load_round_trips_and_restores() {
+        let key = [9u8; 32];
+        let rec = sample_recovery(&key);
+        let blob = rec.serialize(&key);
+        let loaded = Recovery::load(&blob, &key).unwrap();
+        assert_eq!(
+            restore("id <<AWS_AKID_0011223344556677>>", &loaded).unwrap(),
+            "id AKIAIOSFODNN7EXAMPLE"
+        );
+        // No plaintext secret sits in the serialized bytes.
+        assert!(!contains(&blob, b"AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn load_fails_closed() {
+        let key = [9u8; 32];
+        let blob = sample_recovery(&key).serialize(&key);
+
+        let err = |b: &[u8], k: &[u8; 32]| Recovery::load(b, k).err();
+        // Wrong key -> integrity failure (not a wrong/partial mapping).
+        assert_eq!(
+            err(&blob, &[1u8; 32]),
+            Some(RecoveryError::IntegrityFailure)
+        );
+        // Tampered body byte -> integrity failure.
+        let mut t = blob.clone();
+        *t.last_mut().unwrap() ^= 0x01;
+        assert_eq!(err(&t, &key), Some(RecoveryError::IntegrityFailure));
+        // Bad magic.
+        let mut bad = blob.clone();
+        bad[0] ^= 0xff;
+        assert_eq!(err(&bad, &key), Some(RecoveryError::BadMagic));
+        // Unsupported version.
+        let mut ver = blob.clone();
+        ver[4] = 99;
+        assert_eq!(err(&ver, &key), Some(RecoveryError::UnsupportedVersion(99)));
+        // Truncated body -> integrity failure; too-short -> malformed.
+        assert_eq!(
+            err(&blob[..40], &key),
+            Some(RecoveryError::IntegrityFailure)
+        );
+        assert_eq!(err(b"short", &key), Some(RecoveryError::Malformed));
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
     proptest::proptest! {
+        // load must never panic on arbitrary bytes; it returns Err, never a map.
+        #[test]
+        fn load_never_panics(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+            let _ = Recovery::load(&bytes, &[3u8; 32]);
+        }
+
         // restore must never panic on arbitrary input, with or without entries.
         #[test]
         fn restore_never_panics(

@@ -33,7 +33,7 @@ pub use pipeline::{
 };
 pub use policy::guard::{OverMaskGuard, ShapeGuard};
 pub use policy::{Action, MaskAll, OpaqueStance, Policy, Profile, ProfilePolicy};
-pub use recovery::{restore, Recovery, RestoreError};
+pub use recovery::{restore, Recovery, RecoveryError, RestoreError};
 
 /// Mask with the default engine. Build an `Engine` once for repeated calls.
 pub fn mask(input: Input, config: &Config) -> MaskResult {
