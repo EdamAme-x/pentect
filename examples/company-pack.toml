@@ -1,0 +1,36 @@
+# Pentect rule pack — extra things to mask, on top of the built-in detectors.
+# Load it with:  pentect mask --pack company-pack.toml < input.txt
+#
+# You do NOT need to know regular expressions. The simplest rule is just a list
+# of words/phrases to hide. Copy a block, change the list, done.
+
+# 1) The easy way: list literal words or phrases. Anything in this list gets
+#    masked wherever it appears (case-insensitive). No other fields required.
+[[detector]]
+keywords = [
+  "Project Titan",          # internal codename
+  "vault.acme.internal",    # internal hostname
+  "acme-prod-db",           # internal system name
+]
+
+# 2) Optional: give matches a nicer name and say what kind of thing it is.
+#    category = secret | pii | identifier | endpoint   (default: secret)
+#    A friendly label is tidied up automatically (e.g. "internal host").
+[[detector]]
+keywords = ["10.4.", "bastion.acme.internal"]
+category = "endpoint"
+label = "internal host"
+
+# 3) For people who DO know regex: provide a 'pattern' instead of 'keywords',
+#    and optionally a checksum 'validator' to cut false positives. Validator
+#    names include: luhn, iban_mod97, verhoeff, us_ssn, btc_address, ...
+[[detector]]
+pattern = '\bEMP-[0-9]{6}\b'
+category = "identifier"
+label = "EMPLOYEE_ID"
+
+[[detector]]
+pattern = '\b[0-9]{16}\b'
+category = "pii"
+label = "LOYALTY_CARD"
+validator = "luhn"          # only flag numbers that pass the Luhn checksum

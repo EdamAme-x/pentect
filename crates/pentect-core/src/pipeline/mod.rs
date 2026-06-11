@@ -141,6 +141,29 @@ impl Engine {
             .build()
     }
 
+    /// Standard profile stack plus user rule packs (loaded from TOML). Each
+    /// pack's rules run as additional detectors on top of the built-ins;
+    /// `aggressive` disables the benign-shape guard.
+    pub fn with_profile_and_packs(
+        profile: Profile,
+        packs: Vec<crate::pack::Pack>,
+        aggressive: bool,
+    ) -> Self {
+        let mut builder = Engine::builder().standard_stack(profile.knobs());
+        for pack in packs {
+            builder = builder.detector(Box::new(pack.rules));
+        }
+        let guard: Box<dyn OverMaskGuard> = if aggressive {
+            Box::new(NoGuard)
+        } else {
+            Box::new(ShapeGuard::builtin())
+        };
+        builder
+            .policy(Box::new(ProfilePolicy::new(profile)))
+            .guard(guard)
+            .build()
+    }
+
     pub fn mask(&self, input: Input, config: &Config) -> MaskResult {
         let (ir, fell_back) = self.parse(input);
         let mut result = self.mask_ir(ir, config);

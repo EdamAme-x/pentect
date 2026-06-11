@@ -1,7 +1,7 @@
 //! Pentect CLI: mask secrets from stdin to stdout. One-way for now; nothing is
 //! written to disk.
 
-use pentect_core::{Config, Engine, Input, Kind, Profile};
+use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile};
 use std::io::{Read, Write};
 
 /// Refuse oversized input rather than emit partially-masked output (a masked
@@ -18,8 +18,9 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect mask [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive]\n\
-         \x20 mask secrets from stdin to stdout"
+        "pentect mask [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]...\n\
+         \x20 mask secrets from stdin to stdout\n\
+         \x20 --pack FILE   load extra rules from a TOML pack (repeatable)"
     );
 }
 
@@ -62,6 +63,10 @@ fn cmd_mask(args: &[String]) {
     };
     let disclose_length = has_flag(args, "--length");
     let aggressive = has_flag(args, "--aggressive");
+    let packs = match load_packs(args) {
+        Ok(p) => p,
+        Err(e) => die(&e),
+    };
     let data = match read_stdin_capped() {
         Ok(s) => s,
         Err(e) => die(&e),
@@ -70,7 +75,7 @@ fn cmd_mask(args: &[String]) {
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (restore is unavailable by design).
     let kind_label = format!("{kind:?}");
-    let engine = build_engine(profile, aggressive);
+    let engine = build_engine(profile, aggressive, packs);
     let cfg = Config {
         disclose_length,
         ..Config::generate()
@@ -97,17 +102,38 @@ fn cmd_mask(args: &[String]) {
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
 /// masked. Output is then mostly unusable for reasoning, but still reversible.
-fn build_engine(profile: Profile, aggressive: bool) -> Engine {
+fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Engine {
     if aggressive {
         eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
-        Engine::with_profile_unguarded(profile)
-    } else {
-        Engine::with_profile(profile)
     }
+    Engine::with_profile_and_packs(profile, packs, aggressive)
+}
+
+/// Load each `--pack FILE` as a TOML rule pack. Reading a config file is input,
+/// not secret persistence. Errors are reported with the file name so a pack
+/// author can see exactly what to fix.
+fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
+    let mut packs = Vec::new();
+    for path in arg_values(args, "--pack") {
+        let src = std::fs::read_to_string(&path)
+            .map_err(|e| format!("could not read pack '{path}': {e}"))?;
+        let pack = load_pack(&src).map_err(|e| format!("pack '{path}' is invalid: {e}"))?;
+        packs.push(pack);
+    }
+    Ok(packs)
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
+}
+
+/// All values following each occurrence of `flag` (so `--pack` can repeat).
+fn arg_values(args: &[String], flag: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == flag)
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect()
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
