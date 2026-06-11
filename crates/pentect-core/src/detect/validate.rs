@@ -467,6 +467,42 @@ pub fn verhoeff(s: &str) -> bool {
     c == 0
 }
 
+/// Base58Check decode (chain alphabet) verifying the trailing 4-byte
+/// double-SHA256 checksum; returns the version+payload (no checksum) on success.
+fn base58check(s: &str, alphabet: &'static bs58::Alphabet) -> Option<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    let raw = bs58::decode(s).with_alphabet(alphabet).into_vec().ok()?;
+    if raw.len() < 5 {
+        return None;
+    }
+    let (payload, checksum) = raw.split_at(raw.len() - 4);
+    let digest = Sha256::digest(Sha256::digest(payload));
+    (&digest[..4] == checksum).then(|| payload.to_vec())
+}
+
+/// Bitcoin address: base58check, P2PKH (0x00, '1') or P2SH (0x05, '3').
+pub fn btc_address(s: &str) -> bool {
+    base58check(s, bs58::Alphabet::BITCOIN).is_some_and(|d| d.len() == 21 && matches!(d[0], 0 | 5))
+}
+
+/// Litecoin address: base58check, version 0x30 ('L'), 0x32 ('M'), or 0x05 ('3').
+pub fn ltc_address(s: &str) -> bool {
+    base58check(s, bs58::Alphabet::BITCOIN)
+        .is_some_and(|d| d.len() == 21 && matches!(d[0], 0x30 | 0x32 | 5))
+}
+
+/// XRP classic address: base58check over the Ripple alphabet, version 0x00.
+pub fn xrp_address(s: &str) -> bool {
+    base58check(s, bs58::Alphabet::RIPPLE).is_some_and(|d| d.len() == 21 && d[0] == 0)
+}
+
+/// Bitcoin WIF private key: base58check, version 0x80; 33 bytes (uncompressed)
+/// or 34 with a trailing 0x01 (compressed).
+pub fn wif(s: &str) -> bool {
+    base58check(s, bs58::Alphabet::BITCOIN)
+        .is_some_and(|d| d[0] == 0x80 && (d.len() == 33 || (d.len() == 34 && d[33] == 1)))
+}
+
 /// A checksum gate applied to a regex match before it becomes a span.
 #[derive(Clone, Copy, Debug)]
 pub enum Validator {
@@ -492,6 +528,10 @@ pub enum Validator {
     EsNie,
     DeTaxId,
     Verhoeff,
+    BtcAddress,
+    LtcAddress,
+    XrpAddress,
+    Wif,
 }
 
 impl Validator {
@@ -519,6 +559,10 @@ impl Validator {
             Validator::EsNie => es_nie(s),
             Validator::DeTaxId => de_tax_id(s),
             Validator::Verhoeff => verhoeff(s),
+            Validator::BtcAddress => btc_address(s),
+            Validator::LtcAddress => ltc_address(s),
+            Validator::XrpAddress => xrp_address(s),
+            Validator::Wif => wif(s),
         }
     }
 }
@@ -560,5 +604,30 @@ mod tests {
         vectors!(es_nie, "X1234567L" => true, "X1234567A" => false);
         vectors!(de_tax_id, "86095742719" => true, "79569910383" => true, "12345678903" => false, "02345678901" => false);
         vectors!(verhoeff, "234567890124" => true, "234567890121" => false, "345678901238" => true, "111111111111" => false);
+    }
+
+    #[test]
+    fn base58check_crypto_validators() {
+        use sha2::{Digest, Sha256};
+        // Build a valid base58check string for a version+20-byte payload, so no
+        // real address/key literal is needed in source.
+        let make = |ver: u8, body: &[u8], alpha: &'static bs58::Alphabet| {
+            let mut p = vec![ver];
+            p.extend_from_slice(body);
+            let cs = Sha256::digest(Sha256::digest(&p));
+            p.extend_from_slice(&cs[..4]);
+            bs58::encode(&p).with_alphabet(alpha).into_string()
+        };
+        let b = [0x11u8; 20];
+        assert!(btc_address(&make(0x00, &b, bs58::Alphabet::BITCOIN)));
+        assert!(ltc_address(&make(0x30, &b, bs58::Alphabet::BITCOIN)));
+        assert!(xrp_address(&make(0x00, &b, bs58::Alphabet::RIPPLE)));
+        // Bitcoin genesis address (public) and a tampered copy.
+        assert!(btc_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"));
+        assert!(!btc_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb"));
+        // WIF: version 0x80 + 32-byte key.
+        let wif_str = make(0x80, &[0x22u8; 32], bs58::Alphabet::BITCOIN);
+        assert!(wif(&wif_str));
+        assert!(!wif("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")); // valid base58check, wrong version
     }
 }

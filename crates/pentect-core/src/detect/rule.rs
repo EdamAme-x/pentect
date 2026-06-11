@@ -204,6 +204,10 @@ impl RuleDetector {
             (r"\b[0-9]{4}[ -]?[0-9]{4}[ -]?[0-9]{4}\b", Pii, "JP_MY_NUMBER", High, V::JpMyNumber),
             (r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", Pii, "BR_CPF", High, V::BrCpf),
             (r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b", Identifier, "BR_CNPJ", High, V::BrCnpj),
+            (r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b", Identifier, "BTC_ADDRESS", High, V::BtcAddress),
+            (r"\b[LM3][a-km-zA-HJ-NP-Z1-9]{25,34}\b", Identifier, "LTC_ADDRESS", High, V::LtcAddress),
+            (r"\br[rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz]{24,34}\b", Identifier, "XRP_ADDRESS", High, V::XrpAddress),
+            (r"\b[5KL][a-km-zA-HJ-NP-Z1-9]{50,51}\b", Secret, "CRYPTO_PRIVATE_KEY_WIF", High, V::Wif),
         ];
         let specs = table
             .iter()

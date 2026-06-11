@@ -563,6 +563,7 @@ mod tests {
         ("123456789018", "jp_my_number"),
         ("11144477735", "br_cpf"),
         ("11222333000181", "br_cnpj"),
+        ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "btc_address"),
     ];
     const SIDECAR_GAP: &[(&str, &str)] = &[
         ("John Smith", "person_name"),
