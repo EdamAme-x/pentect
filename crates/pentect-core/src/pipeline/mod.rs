@@ -649,9 +649,11 @@ mod tests {
     // The two standing goals: surpass Presidio and surpass Azure. We measure it
     // entity-by-entity. Each entry is classified:
     //   Core    — deterministic (pattern/checksum); core MUST catch it (asserted).
-    //   Sidecar — semantic / NER (person, org, address, age, free-form date);
-    //             out of scope for a deterministic core, that's the ML sidecar's
-    //             job. Recorded, not asserted.
+    //   Sidecar — semantic / NER (person, location, org, nationality, address,
+    //             age, person-type): no closed pattern exists, so a deterministic
+    //             core genuinely cannot reach these — Presidio's spaCy NER does,
+    //             and on these it beats us until the ML sidecar lands. Honest
+    //             concession, not a free pass. Recorded, not asserted.
     //   Todo    — deterministic but not implemented yet; the remaining gap to
     //             close for full deterministic parity. Recorded, not asserted.
     // "Surpassed" on the deterministic axis = every Core caught AND we add
@@ -696,7 +698,9 @@ mod tests {
         ("US_DRIVER_LICENSE", "driver's license D1234567", Core),
         ("US_BANK_NUMBER", "account number 1234567890", Core),
         ("URL", "https://example.com/x", Core),
-        ("DATE_TIME", "January 5, 1990", Sidecar),
+        // Deterministic (Presidio uses a regex), but deferred: masking every date
+        // floods. A real gap, not a sidecar concession — hence Todo, not Sidecar.
+        ("DATE_TIME", "January 5, 1990", Todo),
         ("PERSON", "John Smith", Sidecar),
         ("LOCATION", "Mountain View", Sidecar),
         ("NRP", "British", Sidecar),
@@ -741,7 +745,7 @@ mod tests {
         ("ItalyFiscalCode", "RSSMRA85T10A562S", Core),
         ("URL", "https://example.com/x", Core),
         ("FrenchINSEE", "180047509112556", Todo),
-        ("DateTime", "2025-06-11", Sidecar),
+        ("DateTime", "2025-06-11", Todo),
         ("Age", "35 years old", Sidecar),
         (
             "Address",
