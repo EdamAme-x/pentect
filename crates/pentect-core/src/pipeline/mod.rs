@@ -3,8 +3,8 @@ mod render;
 mod sweep;
 
 use crate::detect::{
-    CardDetector, DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector,
-    StructuralDetector,
+    CardDetector, DecodeDetector, Detector, EntropyDetector, PemDetector, PhoneDetector,
+    RuleDetector, StructuralDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -327,6 +327,7 @@ impl EngineBuilder {
                     .with_opaque(knobs.mask_unknown_codec, knobs.min_opaque_run),
             ))
             .detector(Box::new(StructuralDetector))
+            .detector(Box::new(PhoneDetector))
     }
     pub fn parser(mut self, kind: Kind, parser: Box<dyn Parser>) -> Self {
         self.parsers.push((kind, parser));

@@ -247,15 +247,10 @@ impl RuleDetector {
                 Medium,
             ),
             // Phone: no checksum, so only the distinctive forms are enabled — an
-            // E.164 `+CC...` number, and a NANP number with real separators (so a
-            // bare 10-digit order number is not masked). Other regions (DE/FR/JP/
-            // IN/CN bare-digit forms) are left out as too noisy without context.
-            (
-                r"\+[1-9][0-9]{0,2}[0-9 ().-]{4,17}[0-9]",
-                Pii,
-                "PHONE_E164",
-                Medium,
-            ),
+            // International `+CC...` numbers are handled by PhoneDetector (the
+            // libphonenumber crate, validated). This rule covers a NANP number
+            // with real separators (so a bare 10-digit order number is not
+            // masked) for the common no-country-code US case.
             (
                 r"(?:\+?1[ .-])?\(?[2-9][0-9]{2}\)?[ .-][2-9][0-9]{2}[ .-][0-9]{4}",
                 Pii,
@@ -453,7 +448,6 @@ mod tests {
             ),
             ("00:1A:2B:3C:4D:5E", "MAC_ADDRESS"),
             ("192.168.1.1", "IP_ADDRESS_V4"),
-            ("+14155550132", "PHONE_E164"),
             ("(415) 555-0132", "PHONE_NANP"),
         ];
         let det = RuleDetector::builtin();

@@ -7,6 +7,7 @@ mod entropy;
 #[cfg(feature = "ner")]
 mod ner;
 mod pem;
+mod phone;
 mod rule;
 mod structural;
 mod util;
@@ -18,6 +19,7 @@ pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRE
 #[cfg(feature = "ner")]
 pub use ner::NerDetector;
 pub use pem::PemDetector;
+pub use phone::PhoneDetector;
 pub use rule::{RuleDetector, RuleSpec};
 pub use structural::StructuralDetector;
 pub use validate::Validator;
