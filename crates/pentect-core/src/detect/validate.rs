@@ -444,6 +444,61 @@ pub fn us_ssn(s: &str) -> bool {
     area != 0 && area != 666 && area < 900 && group != 0 && serial != 0
 }
 
+/// Finland HETU (henkilötunnus): ddmmyy + century sign + 3-digit individual +
+/// mod-31 control character.
+pub fn fi_hetu(s: &str) -> bool {
+    const CTRL: &[u8] = b"0123456789ABCDEFHJKLMNPRSTUVWXY";
+    let t = s.trim().as_bytes();
+    if t.len() != 11 {
+        return false;
+    }
+    if !t[0..6].iter().all(u8::is_ascii_digit) || !t[7..10].iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    if !b"+-YXWVUABCDEF".contains(&t[6].to_ascii_uppercase()) {
+        return false;
+    }
+    let mut n: u64 = 0;
+    for &b in t[0..6].iter().chain(&t[7..10]) {
+        n = n * 10 + u64::from(b - b'0');
+    }
+    CTRL[(n % 31) as usize] == t[10].to_ascii_uppercase()
+}
+
+/// Italy Codice Fiscale: 16 chars, odd/even table mod-26 control character.
+pub fn it_codice_fiscale(s: &str) -> bool {
+    #[rustfmt::skip]
+    const ODD: [u32; 36] = [
+        1, 0, 5, 7, 9, 13, 15, 17, 19, 21,
+        1, 0, 5, 7, 9, 13, 15, 17, 19, 21, 2, 4, 18, 20, 11, 3, 6, 8, 12, 14, 16, 10, 22, 25, 24, 23,
+    ];
+    let t = s.trim().to_ascii_uppercase();
+    let b = t.as_bytes();
+    if b.len() != 16 || !b.iter().all(u8::is_ascii_alphanumeric) {
+        return false;
+    }
+    let idx = |c: u8| -> usize {
+        if c.is_ascii_digit() {
+            (c - b'0') as usize
+        } else {
+            (c - b'A') as usize + 10
+        }
+    };
+    let mut sum = 0u32;
+    for (i, &c) in b[..15].iter().enumerate() {
+        let j = idx(c);
+        // 1st/3rd/... characters (0-indexed even) use the odd table.
+        sum += if i % 2 == 0 {
+            ODD[j]
+        } else if j < 10 {
+            j as u32
+        } else {
+            (j - 10) as u32
+        };
+    }
+    b'A' + (sum % 26) as u8 == b[15]
+}
+
 /// Verhoeff (India Aadhaar): dihedral D5 check == 0.
 pub fn verhoeff(s: &str) -> bool {
     const D: [[usize; 10]; 10] = [
@@ -707,6 +762,8 @@ pub enum Validator {
     EthAddress,
     Bip39,
     Ipv6,
+    FiHetu,
+    ItFiscalCode,
 }
 
 impl Validator {
@@ -746,6 +803,8 @@ impl Validator {
             "eth_address" => Validator::EthAddress,
             "bip39" => Validator::Bip39,
             "ipv6" => Validator::Ipv6,
+            "fi_hetu" => Validator::FiHetu,
+            "it_codice_fiscale" => Validator::ItFiscalCode,
             _ => return None,
         })
     }
@@ -783,6 +842,8 @@ impl Validator {
             Validator::EthAddress => eth_address(s),
             Validator::Bip39 => bip39_mnemonic(s),
             Validator::Ipv6 => ipv6(s),
+            Validator::FiHetu => fi_hetu(s),
+            Validator::ItFiscalCode => it_codice_fiscale(s),
         }
     }
 }
@@ -825,6 +886,8 @@ mod tests {
         vectors!(de_tax_id, "86095742719" => true, "79569910383" => true, "12345678903" => false, "02345678901" => false);
         vectors!(verhoeff, "234567890124" => true, "234567890121" => false, "345678901238" => true, "111111111111" => false);
         vectors!(us_ssn, "219099998" => true, "000099998" => false, "666099998" => false, "219009998" => false, "219090000" => false);
+        vectors!(fi_hetu, "131052-308T" => true, "131052X308T" => true, "131052-308U" => false, "131052G308T" => false);
+        vectors!(it_codice_fiscale, "RSSMRA85T10A562S" => true, "RSSMRA85M01H501Q" => true, "RSSMRA85T10A562A" => false);
     }
 
     #[test]

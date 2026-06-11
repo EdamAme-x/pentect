@@ -253,6 +253,27 @@ impl RuleDetector {
                 "PHONE_NANP",
                 Medium,
             ),
+            // URL (scheme required, so it doesn't match bare hostnames).
+            (
+                r#"(?i)\b(?:https?|ftp|ftps|wss?)://[^\s"'<>()]+"#,
+                Endpoint,
+                "URL",
+                Medium,
+            ),
+            // Context-gated like Presidio: a bare number/ID only fires next to its
+            // keyword, so these don't flood. The match includes the keyword.
+            (
+                r"(?i)\bacc(?:ount|t)\b[^\n]{0,15}?\b[0-9]{8,17}\b",
+                Identifier,
+                "US_BANK_ACCOUNT",
+                Low,
+            ),
+            (
+                r"(?i)(?:driver'?s?\s*licen[sc]e|\bDLN?\b)[^\n]{0,15}?\b[A-Z0-9]{5,13}\b",
+                Identifier,
+                "US_DRIVER_LICENSE",
+                Low,
+            ),
         ];
         use Validator as V;
         // Checksum-gated detectors: a permissive pattern finds candidates, the
@@ -290,6 +311,8 @@ impl RuleDetector {
             (r"\b0x[0-9a-fA-F]{40}\b", Identifier, "ETH_ADDRESS", High, V::EthAddress),
             (r"\b(?:[a-z]{3,8} ){11,23}[a-z]{3,8}\b", Secret, "BIP39_MNEMONIC", High, V::Bip39),
             (r"(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[0-9A-Za-z]+)?(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?", Endpoint, "IP_ADDRESS_V6", High, V::Ipv6),
+            (r"\b[0-9]{6}[-+A-Y][0-9]{3}[0-9A-Y]\b", Identifier, "FI_HETU", High, V::FiHetu),
+            (r"(?i)\b[A-Z]{6}[0-9A-Z]{2}[A-Z][0-9A-Z]{2}[A-Z][0-9A-Z]{3}[A-Z]\b", Identifier, "IT_FISCAL_CODE", High, V::ItFiscalCode),
         ];
         let specs = table
             .iter()
