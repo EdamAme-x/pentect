@@ -510,6 +510,73 @@ mod tests {
         assert_eq!(r.items.len(), r.summary.masked_count);
     }
 
+    // Categorized recall corpus. CORE_FLOOR = what the deterministic core must
+    // catch by value/structure (hard-asserted, so recall can't silently
+    // regress). SIDECAR_GAP = categories that need the semantic ML layer (names,
+    // addresses, weak/keyed values, multilingual, locale IDs); recorded, not
+    // asserted — that is the honest boundary, not a core failure. Secret-shaped
+    // samples are split with concat! so no contiguous secret literal exists.
+    const CORE_FLOOR: &[(&str, &str)] = &[
+        ("AKIAIOSFODNN7EXAMPLE", "aws_access_key"),
+        (concat!("sk", "-ABCDEFGHIJKLMNOPQRSTUVWX"), "openai_api_key"),
+        (
+            concat!("ghp", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+            "github_token",
+        ),
+        (concat!("sk", "_live_ABCDEFGHIJ1234567890"), "stripe_key"),
+        (
+            concat!("AIza", "SyA1234567890abcdefghijklmnopqrstuv0"),
+            "google_api_key",
+        ),
+        (
+            concat!("npm", "_abcdefghijklmnopqrstuvwxyz0123456789"),
+            "npm_token",
+        ),
+        ("4242424242424242", "credit_card_luhn"),
+        ("alice@example.com", "email"),
+        ("Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh", "high_entropy_token"),
+        (
+            "-----BEGIN PRIVATE KEY-----\nMIIBVAIBADANBgkqhkiG9w0BAQEF\n-----END PRIVATE KEY-----",
+            "private_key_pem",
+        ),
+    ];
+    const SIDECAR_GAP: &[(&str, &str)] = &[
+        ("John Smith", "person_name"),
+        ("山田太郎", "person_name_ja"),
+        (
+            "1600 Amphitheatre Parkway, Mountain View CA",
+            "street_address",
+        ),
+        ("+1 202-555-0173", "phone_number"),
+        ("123-45-6789", "us_ssn"),
+        ("123456789012", "jp_my_number"),
+        ("GB82WEST12345698765432", "iban"),
+        ("192.168.1.100", "ip_address"),
+        ("hunter2", "weak_password_value"),
+    ];
+
+    #[test]
+    fn recall_corpus_core_floor_holds() {
+        for (sample, label) in CORE_FLOOR {
+            assert!(
+                !m(sample).items.is_empty(),
+                "core recall floor regressed on {label}: {sample:?}"
+            );
+        }
+        // Sanity: the corpus exercises both the floor and the known sidecar gap.
+        assert!(CORE_FLOOR.len() >= 10 && SIDECAR_GAP.len() >= 8);
+        let gap_hit: Vec<&str> = SIDECAR_GAP
+            .iter()
+            .filter(|(s, _)| !m(s).items.is_empty())
+            .map(|(_, l)| *l)
+            .collect();
+        eprintln!(
+            "recall corpus: core_floor {}/{} caught; sidecar_gap incidentally caught: {gap_hit:?}",
+            CORE_FLOOR.len(),
+            CORE_FLOOR.len()
+        );
+    }
+
     #[test]
     fn custom_engine_can_drop_detectors() {
         // DI: an engine with no detectors masks nothing.
