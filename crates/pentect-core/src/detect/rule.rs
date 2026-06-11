@@ -210,8 +210,10 @@ impl RuleDetector {
                 "SWIFT_BIC",
                 Medium,
             ),
+            // Uppercase country code + a digit-led body (no spaces, no (?i)) so
+            // prose like "seed ..." or all-caps words don't match.
             (
-                r"(?i)\b(?:AT|BE|BG|CY|CZ|DE|DK|EE|EL|ES|FI|FR|GB|HR|HU|IE|IT|LT|LU|LV|MT|NL|PL|PT|RO|SE|SI|SK|XI)[ ]?[0-9A-Z][0-9A-Z .-]{6,12}[0-9A-Z]\b",
+                r"\b(?:AT|BE|BG|CY|CZ|DE|DK|EE|EL|ES|FI|FR|GB|HR|HU|IE|IT|LT|LU|LV|MT|NL|PL|PT|RO|SE|SI|SK|XI)[0-9]{2}[0-9A-Z]{4,10}\b",
                 Identifier,
                 "EU_VAT",
                 Low,

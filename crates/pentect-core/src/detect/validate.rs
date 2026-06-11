@@ -621,21 +621,36 @@ pub fn ipv6(s: &str) -> bool {
 
 static BIP39_ENGLISH: &str = include_str!("bip39_english.txt");
 
-/// BIP-39 mnemonic seed phrase: 12/15/18/21/24 words from the English wordlist
-/// with a valid SHA-256 checksum. Wordlist membership + checksum make false
-/// positives negligible (a random word sequence almost never validates).
+/// BIP-39 mnemonic seed phrase: a contiguous run of 12/15/18/21/24 words from
+/// the English wordlist with a valid SHA-256 checksum. Wordlist membership +
+/// checksum make false positives negligible (a random word sequence almost never
+/// validates). The match may include a few adjacent words, so we scan windows
+/// of each valid length — a hit masks the whole region (over-masking an adjacent
+/// word is safe; leaking a seed phrase is not).
 pub fn bip39_mnemonic(s: &str) -> bool {
-    use sha2::{Digest, Sha256};
-    let words: Vec<String> = s.split_whitespace().map(|w| w.to_ascii_lowercase()).collect();
-    if !matches!(words.len(), 12 | 15 | 18 | 21 | 24) {
-        return false;
+    let words: Vec<&str> = s.split_whitespace().collect();
+    for &len in &[24usize, 21, 18, 15, 12] {
+        if words.len() < len {
+            continue;
+        }
+        for w in words.windows(len) {
+            if bip39_window_valid(w) {
+                return true;
+            }
+        }
     }
+    false
+}
+
+fn bip39_window_valid(words: &[&str]) -> bool {
+    use sha2::{Digest, Sha256};
     let total_bits = words.len() * 11;
     let cs_bits = total_bits / 33;
     let ent_bits = total_bits - cs_bits;
     let mut bits = Vec::with_capacity(total_bits);
-    for w in &words {
-        let Some(idx) = BIP39_ENGLISH.lines().position(|x| x == w) else {
+    for w in words {
+        let lw = w.to_ascii_lowercase();
+        let Some(idx) = BIP39_ENGLISH.lines().position(|x| x == lw) else {
             return false;
         };
         for b in (0..11).rev() {
