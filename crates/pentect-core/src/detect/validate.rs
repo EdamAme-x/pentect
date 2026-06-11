@@ -548,6 +548,42 @@ pub enum Validator {
 }
 
 impl Validator {
+    /// Resolve a validator by its snake_case name (for TOML rule packs), so a
+    /// user can add a checksum-gated detector from data. Unknown names are an
+    /// error at the call site.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "none" => Validator::None,
+            "luhn" => Validator::Luhn,
+            "us_npi" => Validator::UsNpi,
+            "ca_sin" => Validator::CaSin,
+            "aba_routing" => Validator::AbaRouting,
+            "iban_mod97" => Validator::IbanMod97,
+            "uk_nhs" => Validator::UkNhs,
+            "pl_pesel" => Validator::PlPesel,
+            "au_tfn" => Validator::AuTfn,
+            "kr_rrn" => Validator::KrRrn,
+            "nl_bsn" => Validator::NlBsn,
+            "jp_my_number" => Validator::JpMyNumber,
+            "au_abn" => Validator::AuAbn,
+            "au_medicare" => Validator::AuMedicare,
+            "br_cpf" => Validator::BrCpf,
+            "br_cnpj" => Validator::BrCnpj,
+            "sg_nric_fin" => Validator::SgNricFin,
+            "us_dea" => Validator::UsDea,
+            "es_nif" => Validator::EsNif,
+            "es_nie" => Validator::EsNie,
+            "de_tax_id" => Validator::DeTaxId,
+            "verhoeff" => Validator::Verhoeff,
+            "btc_address" => Validator::BtcAddress,
+            "ltc_address" => Validator::LtcAddress,
+            "xrp_address" => Validator::XrpAddress,
+            "wif" => Validator::Wif,
+            "us_ssn" => Validator::UsSsn,
+            _ => return None,
+        })
+    }
+
     pub fn accepts(self, s: &str) -> bool {
         match self {
             Validator::None => true,

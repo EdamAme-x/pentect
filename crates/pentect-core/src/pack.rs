@@ -9,31 +9,41 @@ pub struct Pack {
     pub rules: RuleDetector,
 }
 
-/// Parse a TOML rule pack. v1 supports SAFE-ADDITIVE detector entries (one
-/// linear-time regex each). when-conditions, deny/allow, granularity overrides,
-/// and sidecars are later layers; detector entries without a `pattern` are
-/// skipped so a mixed pack still loads its Layer-1 rules. Errors on malformed
-/// TOML, an unknown category/confidence, an invalid regex, or a regex entry
-/// missing its category/label.
+/// Parse a TOML rule pack. Each `[[detector]]` is a linear-time regex plus an
+/// optional `validator` (a checksum gate by name, e.g. `validator = "luhn"`), so
+/// a user can add a precision-gated detector from data with no code. when-
+/// conditions, deny/allow, granularity overrides, and sidecars are later layers;
+/// detector entries without a `pattern` are skipped so a mixed pack still loads
+/// its Layer-1 rules. Errors on malformed TOML, an unknown category / confidence
+/// / validator, an invalid regex, or a regex entry missing its category/label.
 pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
     let pack: PackFile = toml::from_str(toml_src).map_err(|e| e.to_string())?;
     let mut specs = Vec::new();
     for d in pack.detector {
-        let Some(pattern) = d.pattern else {
-            continue; // not a Layer-1 regex rule (e.g. a sidecar/keyword entry)
+        // `pattern` (regex, for power users) OR `keywords` (plain literal strings,
+        // for anyone): a non-expert just lists company terms / internal hosts.
+        let pattern = match (d.pattern, d.keywords) {
+            (Some(p), _) => p,
+            (None, Some(kw)) if !kw.is_empty() => keyword_regex(&kw),
+            _ => continue, // higher-layer entry (e.g. sidecar) — ignored here
         };
-        let category = d
-            .category
-            .ok_or("detector with a pattern needs a category")?;
-        let label = d.label.ok_or("detector with a pattern needs a label")?;
+        // Sensible defaults so the minimal entry is just a keyword list: mask
+        // (Secret) under a CUSTOM label.
+        let category = parse_category(d.category.as_deref().unwrap_or("secret"))?;
+        let label = d
+            .label
+            .map_or_else(|| "CUSTOM".to_string(), |l| safe_label(&l));
+        let validator = match d.validator.as_deref() {
+            None => crate::detect::Validator::None,
+            Some(name) => crate::detect::Validator::from_name(name)
+                .ok_or_else(|| format!("unknown validator: {name}"))?,
+        };
         specs.push(RuleSpec {
             pattern,
-            category: parse_category(&category)?,
+            category,
             label,
             confidence: parse_confidence(&d.confidence)?,
-            // Pack rules are pattern-only for now; checksum validators are a
-            // built-in concern (not yet expressible in a pack).
-            validator: crate::detect::Validator::None,
+            validator,
         });
     }
     Ok(Pack {
@@ -49,15 +59,49 @@ struct PackFile {
 
 #[derive(Debug, Deserialize)]
 struct DetectorEntry {
+    /// Regex (power users). Mutually exclusive-ish with `keywords`.
     pattern: Option<String>,
+    /// Plain literal strings to mask — no regex knowledge needed. Matched
+    /// case-insensitively as exact substrings.
+    keywords: Option<Vec<String>>,
     category: Option<String>,
     label: Option<String>,
     #[serde(default = "default_confidence")]
     confidence: String,
+    /// Optional checksum gate by name (e.g. "luhn", "iban_mod97", "verhoeff"),
+    /// so a pack can add a precision-gated detector, not just a bare regex.
+    validator: Option<String>,
 }
 
 fn default_confidence() -> String {
     "high".to_string()
+}
+
+/// Build a case-insensitive alternation of escaped literals (no regex knowledge
+/// required from the pack author).
+fn keyword_regex(keywords: &[String]) -> String {
+    let alts: Vec<String> = keywords.iter().map(|k| regex::escape(k)).collect();
+    format!("(?i)(?:{})", alts.join("|"))
+}
+
+/// Coerce a user label into a well-formed UPPER_SNAKE placeholder label, so a
+/// casual `label = "internal host"` still renders as `<<INTERNAL_HOST_...>>`.
+fn safe_label(s: &str) -> String {
+    let up: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = up.trim_matches('_');
+    match trimmed.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => trimmed.replace("__", "_"),
+        _ => "CUSTOM".to_string(),
+    }
 }
 
 fn parse_category(s: &str) -> Result<Category, String> {
@@ -110,6 +154,68 @@ mod tests {
                 .any(|s| s.label == "ACME_ACCOUNT" && s.category == Category::Identifier),
             "{spans:?}"
         );
+    }
+
+    #[test]
+    fn pack_validator_gates_matches() {
+        // A pack can add a checksum-gated detector from data: only a Luhn-valid
+        // number is flagged.
+        let pack = load_pack(
+            r#"[[detector]]
+               pattern = '\b[0-9]{16}\b'
+               category = "Pii"
+               label = "MY_CARD"
+               validator = "luhn""#,
+        )
+        .unwrap();
+        let hit = |raw: &str| {
+            pack.rules
+                .detect(&NormalizedView::build(&region(raw), raw))
+                .iter()
+                .any(|s| s.label == "MY_CARD")
+        };
+        assert!(hit("4242424242424242")); // valid Luhn
+        assert!(!hit("4242424242424243")); // fails Luhn
+        assert!(load_pack(
+            r#"[[detector]]
+               pattern = "x"
+               category = "secret"
+               label = "X"
+               validator = "nope""#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn minimal_keyword_pack_needs_no_regex_knowledge() {
+        // The simplest thing a non-expert can write: just a list of company terms.
+        let pack = load_pack(
+            r#"[[detector]]
+               keywords = ["Project Titan", "vault.acme.internal"]"#,
+        )
+        .unwrap();
+        let hit = |raw: &str, label: &str| {
+            pack.rules
+                .detect(&NormalizedView::build(&region(raw), raw))
+                .iter()
+                .any(|s| s.label == label)
+        };
+        assert!(hit("notes about Project Titan here", "CUSTOM"));
+        assert!(hit("connect to VAULT.ACME.INTERNAL", "CUSTOM")); // case-insensitive
+        assert!(!hit("nothing sensitive", "CUSTOM"));
+
+        // A casual label is coerced into a valid placeholder label.
+        let p2 = load_pack(
+            r#"[[detector]]
+               keywords = ["acme"]
+               label = "internal host""#,
+        )
+        .unwrap();
+        assert!(p2
+            .rules
+            .detect(&NormalizedView::build(&region("acme"), "acme"))
+            .iter()
+            .any(|s| s.label == "INTERNAL_HOST"));
     }
 
     #[test]
