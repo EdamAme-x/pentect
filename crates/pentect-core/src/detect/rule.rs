@@ -318,6 +318,8 @@ impl RuleDetector {
             (r"\b[0-9]{6}[-+A-Y][0-9]{3}[0-9A-Y]\b", Identifier, "FI_HETU", High, V::FiHetu),
             (r"(?i)\b[A-Z]{6}[0-9A-Z]{2}[A-Z][0-9A-Z]{2}[A-Z][0-9A-Z]{3}[A-Z]\b", Identifier, "IT_FISCAL_CODE", High, V::ItFiscalCode),
             (r"\b[12][0-9]{4}(?:[0-9]{2}|2[AB])[0-9]{8}\b", Identifier, "FR_NIR_INSEE", High, V::FrNir),
+            (r"(?i)(?:acn|company number)[^\n]{0,12}?\b\d{3}[ ]?\d{3}[ ]?\d{3}\b", Identifier, "AU_ACN", High, V::AuAcn),
+            (r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b", Identifier, "IN_GSTIN", High, V::InGstin),
         ];
         let specs = table
             .iter()

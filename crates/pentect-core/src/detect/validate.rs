@@ -524,6 +524,36 @@ pub fn fr_nir(s: &str) -> bool {
     }
 }
 
+/// Australia ACN (company number): 9 digits, weighted (8..1) mod-10 complement.
+pub fn au_acn(s: &str) -> bool {
+    let d = digits(s);
+    if d.len() != 9 {
+        return false;
+    }
+    let w: [u32; 8] = [8, 7, 6, 5, 4, 3, 2, 1];
+    let sum: u32 = d[..8].iter().zip(w).map(|(a, b)| a * b).sum();
+    (10 - sum % 10) % 10 == d[8]
+}
+
+/// India GSTIN: 15 chars, base-36 Luhn check character over the first 14.
+pub fn in_gstin(s: &str) -> bool {
+    const CH: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let t = s.trim().to_ascii_uppercase();
+    let b = t.as_bytes();
+    if b.len() != 15 || !b.iter().all(u8::is_ascii_alphanumeric) {
+        return false;
+    }
+    let val = |c: u8| CH.iter().position(|&x| x == c).unwrap_or(0) as u32;
+    let mut total = 0u32;
+    let mut factor = 2u32;
+    for &c in b[..14].iter().rev() {
+        let p = val(c) * factor;
+        total += p / 36 + p % 36;
+        factor = if factor == 2 { 1 } else { 2 };
+    }
+    CH[((36 - total % 36) % 36) as usize] == b[14]
+}
+
 /// Verhoeff (India Aadhaar): dihedral D5 check == 0.
 pub fn verhoeff(s: &str) -> bool {
     const D: [[usize; 10]; 10] = [
@@ -790,6 +820,8 @@ pub enum Validator {
     FiHetu,
     ItFiscalCode,
     FrNir,
+    AuAcn,
+    InGstin,
 }
 
 impl Validator {
@@ -832,6 +864,8 @@ impl Validator {
             "fi_hetu" => Validator::FiHetu,
             "it_codice_fiscale" => Validator::ItFiscalCode,
             "fr_nir" => Validator::FrNir,
+            "au_acn" => Validator::AuAcn,
+            "in_gstin" => Validator::InGstin,
             _ => return None,
         })
     }
@@ -872,6 +906,8 @@ impl Validator {
             Validator::FiHetu => fi_hetu(s),
             Validator::ItFiscalCode => it_codice_fiscale(s),
             Validator::FrNir => fr_nir(s),
+            Validator::AuAcn => au_acn(s),
+            Validator::InGstin => in_gstin(s),
         }
     }
 }
@@ -917,6 +953,8 @@ mod tests {
         vectors!(fi_hetu, "131052-308T" => true, "131052X308T" => true, "131052-308U" => false, "131052G308T" => false);
         vectors!(it_codice_fiscale, "RSSMRA85T10A562S" => true, "RSSMRA85M01H501Q" => true, "RSSMRA85T10A562A" => false);
         vectors!(fr_nir, "180047509112541" => true, "180047509112556" => false);
+        vectors!(au_acn, "004085616" => true, "004085617" => false);
+        vectors!(in_gstin, "27AAPFU0939F1ZV" => true, "27AAPFU0939F1ZX" => false);
     }
 
     #[test]

@@ -632,6 +632,8 @@ mod tests {
             "bip39_mnemonic",
         ),
         ("2001:db8::8a2e:370:7334", "ipv6"),
+        ("27AAPFU0939F1ZV", "in_gstin"),
+        ("ACN 004085616", "au_acn"),
     ];
     const SIDECAR_GAP: &[(&str, &str)] = &[
         ("John Smith", "person_name"),
@@ -715,6 +717,8 @@ mod tests {
         ("AU_MEDICARE", "medicare 2951234577", Core),
         ("IN_PAN", "ABCPK1234L", Core),
         ("IN_AADHAAR", "234567890124", Core),
+        ("IN_GSTIN", "27AAPFU0939F1ZV", Core),
+        ("AU_ACN", "ACN 004085616", Core),
         ("FI_HETU", "131052-308T", Core),
         ("IT_FISCAL_CODE", "RSSMRA85T10A562S", Core),
         ("US_DRIVER_LICENSE", "driver's license D1234567", Core),
@@ -758,6 +762,8 @@ mod tests {
         ("AustraliaABN", "51824753556", Core),
         ("IndiaPAN", "ABCPK1234L", Core),
         ("IndiaAadhaar", "234567890124", Core),
+        ("IndiaGSTIN", "27AAPFU0939F1ZV", Core),
+        ("AustraliaACN", "ACN 004085616", Core),
         ("JapanMyNumber", "123456789018", Core),
         ("KoreaRRN", "9001011123459", Core),
         ("BrazilCPF", "11144477735", Core),
