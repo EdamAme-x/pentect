@@ -16,6 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 sha2 = { workspace = true }
+sha3 = { workspace = true }
 hmac = { workspace = true }
 unicode-normalization = { workspace = true }
 data-encoding = { workspace = true }

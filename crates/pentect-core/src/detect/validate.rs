@@ -515,6 +515,81 @@ pub fn wif(s: &str) -> bool {
         .is_some_and(|d| d[0] == 0x80 && (d.len() == 33 || (d.len() == 34 && d[33] == 1)))
 }
 
+const BECH32_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+fn bech32_polymod(values: &[u8]) -> u32 {
+    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    let mut chk = 1u32;
+    for &v in values {
+        let top = chk >> 25;
+        chk = ((chk & 0x1ff_ffff) << 5) ^ u32::from(v);
+        for (i, g) in GEN.iter().enumerate() {
+            if (top >> i) & 1 == 1 {
+                chk ^= g;
+            }
+        }
+    }
+    chk
+}
+
+/// Bitcoin SegWit (bech32 / bech32m) address with HRP "bc".
+pub fn btc_bech32(s: &str) -> bool {
+    let has_upper = s.bytes().any(|b| b.is_ascii_uppercase());
+    let has_lower = s.bytes().any(|b| b.is_ascii_lowercase());
+    if has_upper && has_lower {
+        return false; // mixed case is invalid by spec
+    }
+    let s = s.to_ascii_lowercase();
+    if !(8..=90).contains(&s.len()) || !s.starts_with("bc1") {
+        return false;
+    }
+    let mut data = Vec::with_capacity(s.len() - 3);
+    for c in s[3..].bytes() {
+        match BECH32_CHARSET.iter().position(|&x| x == c) {
+            Some(v) => data.push(v as u8),
+            None => return false,
+        }
+    }
+    if data.len() < 6 {
+        return false;
+    }
+    // hrp_expand("bc") = high bits, separator 0, low bits, then the data.
+    let mut values: Vec<u8> = b"bc".iter().map(|c| c >> 5).collect();
+    values.push(0);
+    values.extend(b"bc".iter().map(|c| c & 31));
+    values.extend_from_slice(&data);
+    let expected = if data[0] == 0 { 1 } else { 0x2bc8_30a3 }; // bech32 (v0) vs bech32m (v1+)
+    bech32_polymod(&values) == expected
+}
+
+/// Ethereum address: 40 hex after 0x; if mixed-case, enforce the EIP-55
+/// keccak-256 checksum (all-lower / all-upper carry no checksum, accepted).
+pub fn eth_address(s: &str) -> bool {
+    use sha3::{Digest, Keccak256};
+    let body = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(b) => b,
+        None => return false,
+    };
+    if body.len() != 40 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let has_upper = body.bytes().any(|b| b.is_ascii_uppercase());
+    let has_lower = body.bytes().any(|b| b.is_ascii_lowercase());
+    if !(has_upper && has_lower) {
+        return true; // no case information to verify
+    }
+    let hash = Keccak256::digest(body.to_ascii_lowercase().as_bytes());
+    for (i, c) in body.bytes().enumerate() {
+        if c.is_ascii_alphabetic() {
+            let nibble = (hash[i / 2] >> (if i % 2 == 0 { 4 } else { 0 })) & 0xf;
+            if (nibble >= 8) != c.is_ascii_uppercase() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// A checksum gate applied to a regex match before it becomes a span.
 #[derive(Clone, Copy, Debug)]
 pub enum Validator {
@@ -545,6 +620,8 @@ pub enum Validator {
     XrpAddress,
     Wif,
     UsSsn,
+    BtcBech32,
+    EthAddress,
 }
 
 impl Validator {
@@ -580,6 +657,8 @@ impl Validator {
             "xrp_address" => Validator::XrpAddress,
             "wif" => Validator::Wif,
             "us_ssn" => Validator::UsSsn,
+            "btc_bech32" => Validator::BtcBech32,
+            "eth_address" => Validator::EthAddress,
             _ => return None,
         })
     }
@@ -613,6 +692,8 @@ impl Validator {
             Validator::XrpAddress => xrp_address(s),
             Validator::Wif => wif(s),
             Validator::UsSsn => us_ssn(s),
+            Validator::BtcBech32 => btc_bech32(s),
+            Validator::EthAddress => eth_address(s),
         }
     }
 }
@@ -680,5 +761,18 @@ mod tests {
         let wif_str = make(0x80, &[0x22u8; 32], bs58::Alphabet::BITCOIN);
         assert!(wif(&wif_str));
         assert!(!wif("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")); // valid base58check, wrong version
+    }
+
+    #[test]
+    fn bech32_and_eip55_validators() {
+        // BIP-173 reference v0 address.
+        assert!(btc_bech32("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"));
+        assert!(!btc_bech32("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5")); // bad checksum
+        assert!(!btc_bech32("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kg3llr")); // wrong HRP
+        // EIP-55 reference addresses.
+        assert!(eth_address("0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"));
+        assert!(eth_address("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"));
+        assert!(!eth_address("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1Beaed")); // case flip
+        assert!(!eth_address("0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d35")); // 39 hex
     }
 }

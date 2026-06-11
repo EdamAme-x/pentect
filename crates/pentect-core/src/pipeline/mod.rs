@@ -587,6 +587,9 @@ mod tests {
         ("11144477735", "br_cpf"),
         ("11222333000181", "br_cnpj"),
         ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "btc_address"),
+        ("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "btc_bech32"),
+        ("0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "eth_address"),
+        ("219-09-9998", "us_ssn"),
     ];
     const SIDECAR_GAP: &[(&str, &str)] = &[
         ("John Smith", "person_name"),
@@ -595,7 +598,6 @@ mod tests {
             "1600 Amphitheatre Parkway, Mountain View CA",
             "street_address",
         ),
-        ("123-45-6789", "us_ssn"),
         ("hunter2", "weak_password_value"),
     ];
 
