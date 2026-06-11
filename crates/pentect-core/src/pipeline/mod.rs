@@ -113,6 +113,10 @@ pub struct Engine {
     policy: Box<dyn Policy>,
     /// Spares benign shapes from context-free over-masking (see ShapeGuard).
     guard: Option<Box<dyn OverMaskGuard>>,
+    /// Labels to suppress (a deployment turning a built-in detector off, e.g.
+    /// "don't mask IPs here"). Filtered before classify, so it overrides any
+    /// detector regardless of which one produced the span.
+    disabled: std::collections::HashSet<String>,
 }
 
 impl Engine {
@@ -151,7 +155,9 @@ impl Engine {
     ) -> Self {
         let mut builder = Engine::builder().standard_stack(profile.knobs());
         for pack in packs {
-            builder = builder.detector(Box::new(pack.rules));
+            builder = builder
+                .detector(Box::new(pack.rules))
+                .disable_labels(pack.disable);
         }
         let guard: Box<dyn OverMaskGuard> = if aggressive {
             Box::new(NoGuard)
@@ -179,6 +185,9 @@ impl Engine {
             for d in &self.detectors {
                 spans.extend(d.detect(&view));
             }
+        }
+        if !self.disabled.is_empty() {
+            spans.retain(|s| !self.disabled.contains(&s.label));
         }
 
         // Classify per span. The guard may retract a context-free candidate
@@ -272,6 +281,7 @@ pub struct EngineBuilder {
     detectors: Vec<Box<dyn Detector>>,
     policy: Option<Box<dyn Policy>>,
     guard: Option<Box<dyn OverMaskGuard>>,
+    disabled: std::collections::HashSet<String>,
 }
 
 impl EngineBuilder {
@@ -281,6 +291,7 @@ impl EngineBuilder {
             detectors: Vec::new(),
             policy: None,
             guard: None,
+            disabled: std::collections::HashSet::new(),
         }
     }
     /// Register the canonical parser + detector set tuned for `knobs`. The single
@@ -319,6 +330,11 @@ impl EngineBuilder {
         self.guard = Some(guard);
         self
     }
+    /// Suppress these labels (turn off built-in or pack detectors by name).
+    pub fn disable_labels(mut self, labels: impl IntoIterator<Item = String>) -> Self {
+        self.disabled.extend(labels);
+        self
+    }
     pub fn build(self) -> Engine {
         Engine {
             parsers: self.parsers,
@@ -326,6 +342,7 @@ impl EngineBuilder {
             detectors: self.detectors,
             policy: self.policy.unwrap_or_else(|| Box::new(MaskAll)),
             guard: self.guard,
+            disabled: self.disabled,
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Pentect CLI: mask secrets from stdin to stdout. One-way for now; nothing is
 //! written to disk.
 
-use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile};
+use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, RuleDetector};
 use std::io::{Read, Write};
 
 /// Refuse oversized input rather than emit partially-masked output (a masked
@@ -18,9 +18,10 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect mask [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]...\n\
+        "pentect mask [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--disable LABEL]...\n\
          \x20 mask secrets from stdin to stdout\n\
-         \x20 --pack FILE   load extra rules from a TOML pack (repeatable)"
+         \x20 --pack FILE      load extra rules from a TOML pack (repeatable)\n\
+         \x20 --disable LABEL  turn off a built-in detector by label (repeatable)"
     );
 }
 
@@ -119,6 +120,14 @@ fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
             .map_err(|e| format!("could not read pack '{path}': {e}"))?;
         let pack = load_pack(&src).map_err(|e| format!("pack '{path}' is invalid: {e}"))?;
         packs.push(pack);
+    }
+    // --disable LABEL is a pack with no rules, only suppressions.
+    let disable = arg_values(args, "--disable");
+    if !disable.is_empty() {
+        packs.push(Pack {
+            rules: RuleDetector::from_specs(Vec::new())?,
+            disable,
+        });
     }
     Ok(packs)
 }

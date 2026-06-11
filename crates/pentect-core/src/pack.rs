@@ -2,20 +2,21 @@ use crate::detect::{RuleDetector, RuleSpec};
 use crate::model::{Category, Confidence};
 use serde::Deserialize;
 
-/// A loaded Layer-1 rule pack: pure data, no code. Carries vendor-style regex
-/// rules. (No key-name vocabulary — open-vocabulary key sensitivity is a model's
-/// job, not a hardcoded list's.)
+/// A loaded Layer-1 rule pack: pure data, no code. Carries extra regex/keyword
+/// rules and a list of built-in labels to turn off. (No key-name vocabulary —
+/// open-vocabulary key sensitivity is a model's job, not a hardcoded list's.)
 pub struct Pack {
     pub rules: RuleDetector,
+    /// Built-in (or other) labels this pack suppresses, e.g. `IP_ADDRESS_V4`.
+    pub disable: Vec<String>,
 }
 
-/// Parse a TOML rule pack. Each `[[detector]]` is a linear-time regex plus an
-/// optional `validator` (a checksum gate by name, e.g. `validator = "luhn"`), so
-/// a user can add a precision-gated detector from data with no code. when-
-/// conditions, deny/allow, granularity overrides, and sidecars are later layers;
-/// detector entries without a `pattern` are skipped so a mixed pack still loads
-/// its Layer-1 rules. Errors on malformed TOML, an unknown category / confidence
-/// / validator, an invalid regex, or a regex entry missing its category/label.
+/// Parse a TOML rule pack. Two knobs cover the real demand: add your own rules
+/// (`[[detector]]` with `keywords = [...]` literals, or a regex `pattern` plus an
+/// optional checksum `validator`), and turn built-ins off (`disable = ["LABEL"]`).
+/// Detector entries without a `pattern`/`keywords` are skipped so a mixed pack
+/// still loads its Layer-1 rules. Errors on malformed TOML, an unknown category /
+/// confidence / validator, or an invalid regex.
 pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
     let pack: PackFile = toml::from_str(toml_src).map_err(|e| e.to_string())?;
     let mut specs = Vec::new();
@@ -48,6 +49,7 @@ pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
     }
     Ok(Pack {
         rules: RuleDetector::from_specs(specs)?,
+        disable: pack.disable,
     })
 }
 
@@ -55,6 +57,9 @@ pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
 struct PackFile {
     #[serde(default)]
     detector: Vec<DetectorEntry>,
+    /// Built-in detector labels to turn off (e.g. `disable = ["IP_ADDRESS_V4"]`).
+    #[serde(default)]
+    disable: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,7 +135,7 @@ mod tests {
     use crate::detect::{region, Detector};
     use crate::model::*;
     use crate::normalize::NormalizedView;
-    use crate::{Config, Engine, Input, MaskAll};
+    use crate::{Config, Engine, Input, MaskAll, Profile};
 
     const ACME: &str = r#"
         schema_version = 1
@@ -216,6 +221,24 @@ mod tests {
             .detect(&NormalizedView::build(&region("acme"), "acme"))
             .iter()
             .any(|s| s.label == "INTERNAL_HOST"));
+    }
+
+    #[test]
+    fn pack_disables_a_builtin_label() {
+        let off = load_pack(r#"disable = ["IP_ADDRESS_V4"]"#).unwrap();
+        assert_eq!(off.disable, ["IP_ADDRESS_V4"]);
+        let input = || Input::text("ping 192.168.1.1 then card 4242424242424242");
+        let cfg = Config::insecure_testing();
+
+        // Control: by default the IP is masked.
+        let base = Engine::with_profile_and_packs(Profile::Balanced, vec![], false);
+        assert!(!base.mask(input(), &cfg).masked.contains("192.168.1.1"));
+
+        // With the pack, the IP passes through but the card is still masked.
+        let tuned = Engine::with_profile_and_packs(Profile::Balanced, vec![off], false);
+        let out = tuned.mask(input(), &cfg).masked;
+        assert!(out.contains("192.168.1.1"), "{out}");
+        assert!(out.contains("<<CARD_"), "{out}");
     }
 
     #[test]
