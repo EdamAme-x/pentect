@@ -179,8 +179,9 @@ impl RuleDetector {
             // Structural national IDs (no public checksum) — the regex encodes the
             // grammar; confidence reflects how distinctive it is. Higher false-
             // positive risk than the checksummed ones, kept lower-confidence.
+            // Separators required: a bare 9-digit run is any number, not an ITIN.
             (
-                r"\b9[0-9]{2}[- ]?(?:5[0-9]|6[0-5]|7[0-9]|8[0-8]|9[0-24-9])[- ]?[0-9]{4}\b",
+                r"\b9[0-9]{2}[- ](?:5[0-9]|6[0-5]|7[0-9]|8[0-8]|9[0-24-9])[- ][0-9]{4}\b",
                 Identifier,
                 "US_ITIN",
                 Medium,
@@ -191,7 +192,13 @@ impl RuleDetector {
                 "US_MBI",
                 Medium,
             ),
-            (r"\b[A-Z][0-9]{8}\b", Identifier, "US_PASSPORT", Low),
+            // No checksum, so context-gated: a bare letter+8-digits is any SKU.
+            (
+                r"(?i)passport[^\n]{0,12}?\b[A-Z][0-9]{8}\b",
+                Identifier,
+                "US_PASSPORT",
+                Low,
+            ),
             (
                 r"(?i)\b[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z][ -]?[0-9]{2}[ -]?[0-9]{2}[ -]?[0-9]{2}[ -]?[A-D]\b",
                 Identifier,
@@ -204,8 +211,10 @@ impl RuleDetector {
                 "IN_PAN",
                 Medium,
             ),
+            // No checksum (SWIFT has none), so context-gated: otherwise any 8-
+            // letter uppercase word (WIDGETCO, ABCDEFGH) masks as a BIC.
             (
-                r"\b[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b",
+                r"(?i)(?:swift|bic)[^\n]{0,10}?\b[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b",
                 Identifier,
                 "SWIFT_BIC",
                 Medium,
@@ -306,7 +315,7 @@ impl RuleDetector {
             (r"\b[LM3][a-km-zA-HJ-NP-Z1-9]{25,34}\b", Identifier, "LTC_ADDRESS", High, V::LtcAddress),
             (r"\br[rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz]{24,34}\b", Identifier, "XRP_ADDRESS", High, V::XrpAddress),
             (r"\b[5KL][a-km-zA-HJ-NP-Z1-9]{50,51}\b", Secret, "CRYPTO_PRIVATE_KEY_WIF", High, V::Wif),
-            (r"\b[0-8][0-9]{2}[- ]?[0-9]{2}[- ]?[0-9]{4}\b", Pii, "US_SSN", Medium, V::UsSsn),
+            (r"\b[0-8][0-9]{2}[- ][0-9]{2}[- ][0-9]{4}\b", Pii, "US_SSN", Medium, V::UsSsn),
             (r"\bbc1[02-9ac-hj-np-z]{6,87}\b", Identifier, "BTC_ADDRESS_BECH32", High, V::BtcBech32),
             (r"\b0x[0-9a-fA-F]{40}\b", Identifier, "ETH_ADDRESS", High, V::EthAddress),
             (r"\b(?:[a-z]{3,8} ){11,23}[a-z]{3,8}\b", Secret, "BIP39_MNEMONIC", High, V::Bip39),

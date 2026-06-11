@@ -695,7 +695,7 @@ mod tests {
         ("US_SSN", "219-09-9998", Core),
         ("US_ITIN", "900-70-1234", Core),
         ("US_NPI", "1234567893", Core),
-        ("US_PASSPORT", "C12345678", Core),
+        ("US_PASSPORT", "passport C12345678", Core),
         ("MEDICAL_LICENSE(DEA)", "AB1234563", Core),
         ("UK_NHS", "9434767016", Core),
         ("UK_NINO", "AB123456C", Core),
@@ -728,7 +728,7 @@ mod tests {
     const AZURE: &[(&str, &str, Cov)] = &[
         ("CreditCardNumber", "4242424242424242", Core),
         ("ABARoutingNumber", "021000021", Core),
-        ("SWIFTCode", "DEUTDEFF", Core),
+        ("SWIFTCode", "SWIFT DEUTDEFF", Core),
         ("IBAN", "GB82WEST12345698765432", Core),
         ("Email", "alice@example.com", Core),
         ("IPAddress", "192.168.1.1", Core),
@@ -736,7 +736,7 @@ mod tests {
         ("USSocialSecurityNumber", "219-09-9998", Core),
         ("USITIN", "900-70-1234", Core),
         ("USDEANumber", "AB1234563", Core),
-        ("USPassportNumber", "C12345678", Core),
+        ("USPassportNumber", "passport C12345678", Core),
         ("UKNationalInsuranceNumber", "AB123456C", Core),
         ("UKNHSNumber", "9434767016", Core),
         ("SpainDNI", "12345678Z", Core),
@@ -829,6 +829,44 @@ mod tests {
 
     fn caught_exclusive(s: &str) -> bool {
         !m(s).items.is_empty()
+    }
+
+    // Precision corpus: realistic text with NO secrets (logs, JSON, code, prose).
+    // Every mask here is a FALSE POSITIVE. The recall benchmark is blind to these,
+    // yet over-masking is the real failure mode (you can't reason about output
+    // that is all `<<X>> <<Y>>`). This is the precision metric, and it ratchets
+    // down: lower the ceiling as detectors are tightened, never raise it.
+    const NEGATIVES: &[&str] = &[
+        "request_id=183920475 user=42 order=100482931 retries=0 status=200 bytes=10485760",
+        "{\"sku\":\"WIDGETCO\",\"batch\":\"X12345678\",\"warehouse\":\"ABCDEFGH\",\"port\":5432}",
+        "const MASK: u32 = 0x1ff_ffff; let big = 123456789012345; let n = 219099998;",
+        "The quick brown fox jumps over the lazy dog while the team reviews the budget plan.",
+        "version 2.10.0 build 4194304 commit 8da1fcd elapsed 143 ms region us-east-1",
+        "Please ship invoice INV90070183 to the front desk by Friday afternoon.",
+    ];
+
+    #[test]
+    fn precision_no_overmasking_on_benign_text() {
+        // Ceiling, not zero: the weak-checksum bare-number IDs (AU_TFN, and on
+        // other inputs PL_PESEL/IT_VAT) still fire by chance until they too are
+        // context-gated. Tightening lowers this; it must never rise.
+        const CEILING: usize = 1;
+        let mut total = 0usize;
+        let mut hits: Vec<String> = Vec::new();
+        for s in NEGATIVES {
+            for item in m(s).items {
+                total += 1;
+                hits.push(item.label);
+            }
+        }
+        hits.sort();
+        eprintln!(
+            "precision: {total} false mask(s) on benign corpus (ceiling {CEILING}): {hits:?}"
+        );
+        assert!(
+            total <= CEILING,
+            "over-masking regressed: {total} false masks (ceiling {CEILING}): {hits:?}"
+        );
     }
 
     #[test]
