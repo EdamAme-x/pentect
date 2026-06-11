@@ -8,6 +8,7 @@ mod pem;
 mod rule;
 mod structural;
 mod util;
+mod validate;
 
 pub use card::CardDetector;
 pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
@@ -15,6 +16,7 @@ pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRE
 pub use pem::PemDetector;
 pub use rule::{RuleDetector, RuleSpec};
 pub use structural::StructuralDetector;
+pub use validate::Validator;
 
 pub(crate) use util::is_token_byte;
 

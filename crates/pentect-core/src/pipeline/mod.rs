@@ -540,6 +540,30 @@ mod tests {
             "private_key_pem",
         ),
     ];
+    // Checksum-validated national / financial IDs (deterministic core; this is
+    // where we match/exceed Presidio). Each sample passes its real checksum.
+    const CHECKSUM_FLOOR: &[(&str, &str)] = &[
+        ("1234567893", "us_npi"),
+        ("00123456782", "it_vat"),
+        ("130458623", "ca_sin"),
+        ("021000021", "us_aba_routing"),
+        ("AB1234563", "us_dea"),
+        ("GB82WEST12345698765432", "iban"),
+        ("9434767016", "uk_nhs"),
+        ("44051401359", "pl_pesel"),
+        ("123456782", "au_tfn"),
+        ("9001011123459", "kr_rrn"),
+        ("12345678Z", "es_nif"),
+        ("X1234567L", "es_nie"),
+        ("86095742719", "de_tax_id"),
+        ("S1234567D", "sg_nric_fin"),
+        ("51824753556", "au_abn"),
+        ("2951234577", "au_medicare"),
+        ("234567890124", "in_aadhaar"),
+        ("123456789018", "jp_my_number"),
+        ("11144477735", "br_cpf"),
+        ("11222333000181", "br_cnpj"),
+    ];
     const SIDECAR_GAP: &[(&str, &str)] = &[
         ("John Smith", "person_name"),
         ("山田太郎", "person_name_ja"),
@@ -547,33 +571,29 @@ mod tests {
             "1600 Amphitheatre Parkway, Mountain View CA",
             "street_address",
         ),
-        ("+1 202-555-0173", "phone_number"),
         ("123-45-6789", "us_ssn"),
-        ("123456789012", "jp_my_number"),
-        ("GB82WEST12345698765432", "iban"),
-        ("192.168.1.100", "ip_address"),
         ("hunter2", "weak_password_value"),
     ];
 
     #[test]
     fn recall_corpus_core_floor_holds() {
-        for (sample, label) in CORE_FLOOR {
+        for (sample, label) in CORE_FLOOR.iter().chain(CHECKSUM_FLOOR) {
             assert!(
                 !m(sample).items.is_empty(),
                 "core recall floor regressed on {label}: {sample:?}"
             );
         }
-        // Sanity: the corpus exercises both the floor and the known sidecar gap.
-        assert!(CORE_FLOOR.len() >= 10 && SIDECAR_GAP.len() >= 8);
+        // Sanity: the corpus exercises the floor and the known sidecar gap.
+        assert!(CORE_FLOOR.len() + CHECKSUM_FLOOR.len() >= 30 && SIDECAR_GAP.len() >= 4);
         let gap_hit: Vec<&str> = SIDECAR_GAP
             .iter()
             .filter(|(s, _)| !m(s).items.is_empty())
             .map(|(_, l)| *l)
             .collect();
         eprintln!(
-            "recall corpus: core_floor {}/{} caught; sidecar_gap incidentally caught: {gap_hit:?}",
-            CORE_FLOOR.len(),
-            CORE_FLOOR.len()
+            "recall corpus: floor {}/{} caught; sidecar_gap incidentally caught: {gap_hit:?}",
+            CORE_FLOOR.len() + CHECKSUM_FLOOR.len(),
+            CORE_FLOOR.len() + CHECKSUM_FLOOR.len()
         );
     }
 

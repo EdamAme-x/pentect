@@ -1,13 +1,17 @@
+use super::validate::Validator;
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 
 struct Rule {
     re: Regex,
     category: Category,
     label: String,
     confidence: Confidence,
+    /// Checksum gate applied to each match before it becomes a span (the
+    /// precision lever that lets a permissive pattern avoid false positives).
+    validator: Validator,
 }
 
 /// A data-form rule (e.g. a TOML pack entry) before its pattern is compiled.
@@ -16,6 +20,7 @@ pub struct RuleSpec {
     pub category: Category,
     pub label: String,
     pub confidence: Confidence,
+    pub validator: Validator,
 }
 
 /// Anchored vendor-token rules. High confidence and linear-time (no ReDoS), so
@@ -23,11 +28,16 @@ pub struct RuleSpec {
 /// default pack — `from_specs` builds the same detector from loaded data.
 pub struct RuleDetector {
     rules: Vec<Rule>,
+    /// All patterns in one DFA: one pass says which rules match anywhere, so we
+    /// only run per-rule `find_iter` for those (cheap on secret-free regions).
+    set: RegexSet,
 }
 
 impl RuleDetector {
     /// Compile data-form rules into a detector; errors if any pattern is invalid.
     pub fn from_specs(specs: Vec<RuleSpec>) -> Result<Self, String> {
+        let set = RegexSet::new(specs.iter().map(|s| s.pattern.as_str()))
+            .map_err(|e| format!("rule set: {e}"))?;
         let rules = specs
             .into_iter()
             .map(|s| {
@@ -36,10 +46,11 @@ impl RuleDetector {
                     category: s.category,
                     label: s.label,
                     confidence: s.confidence,
+                    validator: s.validator,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(Self { rules })
+        Ok(Self { rules, set })
     }
 
     pub fn builtin() -> Self {
@@ -115,6 +126,34 @@ impl RuleDetector {
                 Medium,
             ),
         ];
+        use Validator as V;
+        // Checksum-gated detectors: a permissive pattern finds candidates, the
+        // validator (Luhn, mod-97, Verhoeff, weighted mod-N, ...) confirms them.
+        // This is how we match/exceed Presidio's recognizers deterministically.
+        #[rustfmt::skip]
+        let checked: &[(&str, Category, &str, Confidence, Validator)] = &[
+            (r"\b[12][0-9]{3}[- ]?[0-9]{3}[- ]?[0-9]{3}\b", Identifier, "US_NPI", High, V::UsNpi),
+            (r"(?i)\b(?:IT)?([0-9]{11})\b", Identifier, "IT_VAT_CODE", High, V::Luhn),
+            (r"\b[1-79]\d{2}[ -]?\d{3}[ -]?\d{3}\b", Pii, "CA_SIN", High, V::CaSin),
+            (r"\b[0123678][0-9]{8}\b", Identifier, "US_ABA_ROUTING", High, V::AbaRouting),
+            (r"\b[ABCDEFGHJKLMPRSTUX][A-Z9][0-9]{7}\b", Identifier, "US_DEA_NUMBER", High, V::UsDea),
+            (r"(?i)\b[A-Z]{2}[0-9]{2}[ ]?[A-Z0-9]{4}(?:[ ]?[A-Z0-9]{4}){1,6}[ ]?[A-Z0-9]{0,3}\b", Identifier, "IBAN_CODE", High, V::IbanMod97),
+            (r"\b[0-9]{3}[ -]?[0-9]{3}[ -]?[0-9]{4}\b", Identifier, "UK_NHS", High, V::UkNhs),
+            (r"\b[0-9]{2}[0-3][0-9][0-3][0-9][0-9]{5}\b", Identifier, "PL_PESEL", High, V::PlPesel),
+            (r"\b\d{3}[ -]?\d{3}[ -]?\d{3}\b", Pii, "AU_TFN", High, V::AuTfn),
+            (r"\b\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])[ -]?[1-8]\d{6}\b", Pii, "KR_RRN", High, V::KrRrn),
+            (r"(?i)\b[0-9]{8}[ -]?[A-Z]\b", Identifier, "ES_DNI_NIF", High, V::EsNif),
+            (r"(?i)\b[XYZ][ -]?[0-9]{7}[ -]?[A-Z]\b", Identifier, "ES_NIE", High, V::EsNie),
+            (r"\b[0-9]{2}[ ]?[0-9]{3}[ ]?[0-9]{3}[ ]?[0-9]{3}\b", Identifier, "DE_TAX_ID", High, V::DeTaxId),
+            (r"\b[0-9]{8,9}\b", Identifier, "NL_BSN", Medium, V::NlBsn),
+            (r"(?i)\b[STFGM][0-9]{7}[A-Z]\b", Pii, "SG_NRIC_FIN", High, V::SgNricFin),
+            (r"\b\d{2}[ ]?\d{3}[ ]?\d{3}[ ]?\d{3}\b", Identifier, "AU_ABN", High, V::AuAbn),
+            (r"\b[2-6]\d{3}[ ]?\d{5}[ ]?\d\b", Pii, "AU_MEDICARE", High, V::AuMedicare),
+            (r"\b[2-9][0-9]{3}[ -]?[0-9]{4}[ -]?[0-9]{4}\b", Pii, "IN_AADHAAR", High, V::Verhoeff),
+            (r"\b[0-9]{4}[ -]?[0-9]{4}[ -]?[0-9]{4}\b", Pii, "JP_MY_NUMBER", High, V::JpMyNumber),
+            (r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", Pii, "BR_CPF", High, V::BrCpf),
+            (r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b", Identifier, "BR_CNPJ", High, V::BrCnpj),
+        ];
         let specs = table
             .iter()
             .map(|&(pattern, category, label, confidence)| RuleSpec {
@@ -122,7 +161,19 @@ impl RuleDetector {
                 category,
                 label: label.to_string(),
                 confidence,
+                validator: V::None,
             })
+            .chain(
+                checked.iter().map(
+                    |&(pattern, category, label, confidence, validator)| RuleSpec {
+                        pattern: pattern.to_string(),
+                        category,
+                        label: label.to_string(),
+                        confidence,
+                        validator,
+                    },
+                ),
+            )
             .collect();
         Self::from_specs(specs).expect("builtin regexes compile")
     }
@@ -132,8 +183,12 @@ impl Detector for RuleDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let s = view.text();
         let mut out = Vec::new();
-        for rule in &self.rules {
+        for i in self.set.matches(s) {
+            let rule = &self.rules[i];
             for m in rule.re.find_iter(s) {
+                if !rule.validator.accepts(m.as_str()) {
+                    continue;
+                }
                 out.push(Span {
                     range: view.to_raw(ByteRange::new(m.start(), m.end())),
                     category: rule.category,

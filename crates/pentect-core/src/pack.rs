@@ -31,6 +31,9 @@ pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
             category: parse_category(&category)?,
             label,
             confidence: parse_confidence(&d.confidence)?,
+            // Pack rules are pattern-only for now; checksum validators are a
+            // built-in concern (not yet expressible in a pack).
+            validator: crate::detect::Validator::None,
         });
     }
     Ok(Pack {
