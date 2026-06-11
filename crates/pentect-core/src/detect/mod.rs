@@ -1,6 +1,7 @@
 use crate::model::Span;
 use crate::normalize::NormalizedView;
 
+mod card;
 mod decode;
 mod entropy;
 mod pem;
@@ -8,6 +9,7 @@ mod rule;
 mod structural;
 mod util;
 
+pub use card::CardDetector;
 pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
 pub use pem::PemDetector;

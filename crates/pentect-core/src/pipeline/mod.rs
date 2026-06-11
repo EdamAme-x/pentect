@@ -3,7 +3,8 @@ mod render;
 mod sweep;
 
 use crate::detect::{
-    DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, StructuralDetector,
+    CardDetector, DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector,
+    StructuralDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -267,6 +268,7 @@ impl EngineBuilder {
             .parser(Kind::Env, Box::new(EnvParser))
             .parser(Kind::Har, Box::new(HarParser))
             .detector(Box::new(RuleDetector::builtin()))
+            .detector(Box::new(CardDetector))
             .detector(Box::new(PemDetector::default()))
             .detector(Box::new(EntropyDetector::with(
                 knobs.entropy_min_len,
