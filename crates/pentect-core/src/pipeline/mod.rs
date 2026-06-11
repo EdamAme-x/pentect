@@ -3,7 +3,7 @@ mod render;
 mod sweep;
 
 use crate::detect::{
-    DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, SuspiciousKeyDetector,
+    DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, StructuralDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -276,7 +276,7 @@ impl EngineBuilder {
                 DecodeDetector::builtin()
                     .with_opaque(knobs.mask_unknown_codec, knobs.min_opaque_run),
             ))
-            .detector(Box::new(SuspiciousKeyDetector::builtin()))
+            .detector(Box::new(StructuralDetector))
     }
     pub fn parser(mut self, kind: Kind, parser: Box<dyn Parser>) -> Self {
         self.parsers.push((kind, parser));
@@ -485,13 +485,15 @@ mod tests {
 
     #[test]
     fn json_structure_preserved() {
+        // Detectable-by-value secrets (core no longer guesses arbitrary keys); a
+        // benign string stays untouched and the output re-parses as JSON.
         let input =
-            r#"{"user":"alice@example.com","db_password":"hunter2pass","note":"hello world"}"#;
+            r#"{"user":"alice@example.com","api_key":"AKIAIOSFODNN7EXAMPLE","note":"hello world"}"#;
         let r = mj(input);
         let v: serde_json::Value =
             serde_json::from_str(&r.masked).expect("masked output is valid JSON");
         let o = v.as_object().unwrap();
-        assert!(o["db_password"].as_str().unwrap().starts_with("<<"));
+        assert!(o["api_key"].as_str().unwrap().starts_with("<<"));
         assert!(o["user"].as_str().unwrap().starts_with("<<"));
         assert_eq!(o["note"].as_str().unwrap(), "hello world");
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
@@ -553,12 +555,15 @@ mod tests {
         assert!(mp(Profile::Paranoid, &format!("id {uuid} x"))
             .masked
             .contains(uuid));
-        // Under a sensitive key it is anchored, so it masks.
-        let j = format!("{{\"session_token\":\"{uuid}\"}}");
+        // As a cookie value it is anchored by structure, so it masks despite the
+        // benign shape (the guard only retracts context-free guesses).
+        let har = format!(
+            r#"{{"log":{{"entries":[{{"request":{{"cookies":[{{"name":"sid","value":"{uuid}"}}]}}}}]}}}}"#
+        );
         let r = Engine::with_profile(Profile::Balanced).mask(
             Input {
-                kind: Kind::Json,
-                data: j,
+                kind: Kind::Har,
+                data: har,
             },
             &Config::insecure_testing(),
         );
@@ -711,20 +716,20 @@ mod tests {
         let env = Engine::with_profile_unguarded(Profile::Paranoid).mask(
             Input {
                 kind: Kind::Env,
-                data: "DB_PASSWORD=hunter2\n".into(),
+                data: "DB_KEY=AKIAIOSFODNN7EXAMPLE\n".into(),
             },
             &Config::insecure_testing(),
         );
         assert!(
-            !env.masked.contains("hunter2"),
-            "env still masked: {}",
+            !env.masked.contains("AKIAIOSFODNN7EXAMPLE"),
+            "env value still masked: {}",
             env.masked
         );
     }
 
     #[test]
-    fn env_key_anchor_masks_short_low_entropy_value() {
-        let raw = "export DB_PASSWORD=hunter2\nNOTE=hello world\n";
+    fn env_value_masked_by_value_structure_preserved() {
+        let raw = "export DB_KEY=AKIAIOSFODNN7EXAMPLE\nNOTE=hello world\n";
         let r = Engine::with_profile(Profile::Balanced).mask(
             Input {
                 kind: Kind::Env,
@@ -732,11 +737,12 @@ mod tests {
             },
             &Config::insecure_testing(),
         );
-        // Short value masked because its key is sensitive; benign key untouched.
-        assert!(!r.masked.contains("hunter2"), "{}", r.masked);
+        // The value is masked because it *looks* like a secret (vendor shape),
+        // not because of its key; a benign value is untouched.
+        assert!(!r.masked.contains("AKIAIOSFODNN7EXAMPLE"), "{}", r.masked);
         assert!(r.masked.contains("NOTE=hello world"), "{}", r.masked);
         // Structure preserved: key, =, newlines intact.
-        assert!(r.masked.contains("export DB_PASSWORD=<<"), "{}", r.masked);
+        assert!(r.masked.contains("export DB_KEY=<<"), "{}", r.masked);
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub mod recovery;
 pub use codec::Codec;
 pub use detect::{
     DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, RuleSpec,
-    SuspiciousKeyDetector,
+    StructuralDetector,
 };
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
 pub use pack::{load_pack, Pack};

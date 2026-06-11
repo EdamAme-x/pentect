@@ -181,7 +181,8 @@ pub enum DetectorId {
     Pem,
     /// A codec-decoded blob whose decoded content was identified as a secret.
     Decode,
-    SuspiciousKey,
+    /// A value sensitive by structural position (cookie value, auth header).
+    Structural,
     /// A codec-decoded blob that only "looks encrypted" (no inner secret found).
     DecodeOpaque,
     Entropy,
@@ -197,7 +198,7 @@ impl DetectorId {
             DetectorId::Decode => "decode",
             DetectorId::DecodeOpaque => "decode_opaque",
             DetectorId::Pem => "pem",
-            DetectorId::SuspiciousKey => "suspicious_key",
+            DetectorId::Structural => "structural",
             DetectorId::Sweep => "sweep",
         }
     }
