@@ -4,6 +4,8 @@ use crate::normalize::NormalizedView;
 mod card;
 mod decode;
 mod entropy;
+#[cfg(feature = "ner")]
+mod ner;
 mod pem;
 mod rule;
 mod structural;
@@ -13,6 +15,8 @@ mod validate;
 pub use card::CardDetector;
 pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
+#[cfg(feature = "ner")]
+pub use ner::NerDetector;
 pub use pem::PemDetector;
 pub use rule::{RuleDetector, RuleSpec};
 pub use structural::StructuralDetector;

@@ -153,11 +153,25 @@ impl Engine {
         packs: Vec<crate::pack::Pack>,
         aggressive: bool,
     ) -> Self {
+        Self::with_profile_packs_detectors(profile, packs, Vec::new(), aggressive)
+    }
+
+    /// Like `with_profile_and_packs`, plus extra detectors (e.g. the NER
+    /// sidecar) appended after the built-ins and pack rules.
+    pub fn with_profile_packs_detectors(
+        profile: Profile,
+        packs: Vec<crate::pack::Pack>,
+        extra: Vec<Box<dyn Detector>>,
+        aggressive: bool,
+    ) -> Self {
         let mut builder = Engine::builder().standard_stack(profile.knobs());
         for pack in packs {
             builder = builder
                 .detector(Box::new(pack.rules))
                 .disable_labels(pack.disable);
+        }
+        for d in extra {
+            builder = builder.detector(d);
         }
         let guard: Box<dyn OverMaskGuard> = if aggressive {
             Box::new(NoGuard)

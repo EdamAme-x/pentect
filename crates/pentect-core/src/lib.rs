@@ -19,6 +19,8 @@ pub mod policy;
 pub mod recovery;
 
 pub use codec::Codec;
+#[cfg(feature = "ner")]
+pub use detect::NerDetector;
 pub use detect::{
     CardDetector, DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, RuleSpec,
     StructuralDetector,

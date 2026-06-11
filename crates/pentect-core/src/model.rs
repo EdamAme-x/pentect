@@ -186,6 +186,8 @@ pub enum DetectorId {
     /// A codec-decoded blob that only "looks encrypted" (no inner secret found).
     DecodeOpaque,
     Entropy,
+    /// Semantic NER (person/location/org/nationality) from the ML sidecar.
+    Ner,
     /// Added by the global identity sweep, not a real detector.
     Sweep,
 }
@@ -199,6 +201,7 @@ impl DetectorId {
             DetectorId::DecodeOpaque => "decode_opaque",
             DetectorId::Pem => "pem",
             DetectorId::Structural => "structural",
+            DetectorId::Ner => "ner",
             DetectorId::Sweep => "sweep",
         }
     }

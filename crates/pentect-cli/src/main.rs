@@ -21,7 +21,8 @@ fn usage() {
         "pentect mask [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--disable LABEL]...\n\
          \x20 mask secrets from stdin to stdout\n\
          \x20 --pack FILE      load extra rules from a TOML pack (repeatable)\n\
-         \x20 --disable LABEL  turn off a built-in detector by label (repeatable)"
+         \x20 --disable LABEL  turn off a built-in detector by label (repeatable)\n\
+         \x20 --ner            also mask person/location/org via the NER sidecar (needs --features ner)"
     );
 }
 
@@ -76,7 +77,7 @@ fn cmd_mask(args: &[String]) {
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (restore is unavailable by design).
     let kind_label = format!("{kind:?}");
-    let engine = build_engine(profile, aggressive, packs);
+    let engine = build_engine(profile, aggressive, packs, args);
     let cfg = Config {
         disclose_length,
         ..Config::generate()
@@ -103,11 +104,40 @@ fn cmd_mask(args: &[String]) {
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
 /// masked. Output is then mostly unusable for reasoning, but still reversible.
-fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Engine {
+fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>, args: &[String]) -> Engine {
     if aggressive {
         eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
     }
-    Engine::with_profile_and_packs(profile, packs, aggressive)
+    Engine::with_profile_packs_detectors(profile, packs, ner_detectors(args), aggressive)
+}
+
+/// `--ner` adds the semantic NER sidecar (person/location/org/nationality).
+/// Built only with `--features ner`; the script defaults to PENTECT_NER_SCRIPT
+/// or tools/ner_sidecar.py.
+#[cfg(feature = "ner")]
+fn ner_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
+    if !has_flag(args, "--ner") {
+        return Vec::new();
+    }
+    let script =
+        std::env::var("PENTECT_NER_SCRIPT").unwrap_or_else(|_| "tools/ner_sidecar.py".into());
+    match pentect_core::NerDetector::spawn(&script) {
+        Ok(d) => vec![Box::new(d)],
+        Err(e) => {
+            eprintln!(
+                "[pentect] --ner: could not start NER sidecar ({e}); continuing without NER."
+            );
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(not(feature = "ner"))]
+fn ner_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
+    if has_flag(args, "--ner") {
+        eprintln!("[pentect] --ner requires a build with `--features ner`; ignoring.");
+    }
+    Vec::new()
 }
 
 /// Load each `--pack FILE` as a TOML rule pack. Reading a config file is input,

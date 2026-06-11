@@ -10,6 +10,10 @@ repository.workspace = true
 default = ["rand-key"]
 # CSPRNG key generation; disable for WASM/rules-only builds that supply the key.
 rand-key = ["dep:getrandom"]
+# Semantic NER via a persistent Python sidecar (spaCy / ai4privacy). No extra
+# Rust deps — just std::process. Off by default (the deterministic core needs
+# no model); opt in for person/location/org/nationality coverage.
+ner = []
 
 [dependencies]
 serde = { workspace = true }

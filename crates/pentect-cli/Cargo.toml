@@ -10,5 +10,9 @@ repository.workspace = true
 name = "pentect"
 path = "src/main.rs"
 
+[features]
+# Enable the semantic NER sidecar (--ner). Requires Python + spaCy at runtime.
+ner = ["pentect-core/ner"]
+
 [dependencies]
 pentect-core = { path = "../pentect-core" }
