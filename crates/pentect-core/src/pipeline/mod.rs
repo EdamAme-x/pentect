@@ -645,6 +645,172 @@ mod tests {
         );
     }
 
+    // === Benchmark vs Presidio and Azure AI Language PII ===
+    // The two standing goals: surpass Presidio and surpass Azure. We measure it
+    // entity-by-entity. Each entry is classified:
+    //   Core    — deterministic (pattern/checksum); core MUST catch it (asserted).
+    //   Sidecar — semantic / NER (person, org, address, age, free-form date);
+    //             out of scope for a deterministic core, that's the ML sidecar's
+    //             job. Recorded, not asserted.
+    //   Todo    — deterministic but not implemented yet; the remaining gap to
+    //             close for full deterministic parity. Recorded, not asserted.
+    // "Surpassed" on the deterministic axis = every Core caught AND we add
+    // entities neither vendor has (see EXCLUSIVE). Todo count is the honest
+    // distance to zero-gap; Sidecar is conceded to the sidecar by design.
+    #[derive(PartialEq, Clone, Copy)]
+    enum Cov {
+        Core,
+        Sidecar,
+        Todo,
+    }
+    use Cov::{Core, Sidecar, Todo};
+
+    // Microsoft Presidio predefined recognizers (entity, sample, classification).
+    const PRESIDIO: &[(&str, &str, Cov)] = &[
+        ("CREDIT_CARD", "4242424242424242", Core),
+        ("CRYPTO", "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", Core),
+        ("IBAN_CODE", "GB82WEST12345698765432", Core),
+        ("IP_ADDRESS(v4)", "192.168.1.1", Core),
+        ("IP_ADDRESS(v6)", "2001:db8::8a2e:370:7334", Core),
+        ("EMAIL_ADDRESS", "alice@example.com", Core),
+        ("PHONE_NUMBER", "(415) 555-0132", Core),
+        ("US_SSN", "219-09-9998", Core),
+        ("US_ITIN", "900-70-1234", Core),
+        ("US_NPI", "1234567893", Core),
+        ("US_PASSPORT", "C12345678", Core),
+        ("MEDICAL_LICENSE(DEA)", "AB1234563", Core),
+        ("UK_NHS", "9434767016", Core),
+        ("UK_NINO", "AB123456C", Core),
+        ("ES_NIF", "12345678Z", Core),
+        ("ES_NIE", "X1234567L", Core),
+        ("IT_VAT_CODE", "00123456782", Core),
+        ("PL_PESEL", "44051401359", Core),
+        ("SG_NRIC_FIN", "S1234567D", Core),
+        ("AU_ABN", "51824753556", Core),
+        ("AU_TFN", "123456782", Core),
+        ("AU_MEDICARE", "2951234577", Core),
+        ("IN_PAN", "ABCPK1234L", Core),
+        ("IN_AADHAAR", "234567890124", Core),
+        ("FI_HETU", "131052-308T", Todo),
+        ("IT_FISCAL_CODE", "RSSMRA85T10A562S", Todo),
+        ("US_DRIVER_LICENSE", "D1234567", Todo),
+        ("US_BANK_NUMBER", "1234567890", Todo),
+        ("URL", "https://example.com/x", Todo),
+        ("DATE_TIME", "January 5, 1990", Sidecar),
+        ("PERSON", "John Smith", Sidecar),
+        ("LOCATION", "Mountain View", Sidecar),
+        ("NRP", "British", Sidecar),
+        ("ORGANIZATION", "Acme Corporation", Sidecar),
+    ];
+
+    // Azure AI Language PII entity categories (representative; ~200 total, the
+    // bulk being per-country ID variants of the patterns covered below).
+    const AZURE: &[(&str, &str, Cov)] = &[
+        ("CreditCardNumber", "4242424242424242", Core),
+        ("ABARoutingNumber", "021000021", Core),
+        ("SWIFTCode", "DEUTDEFF", Core),
+        ("IBAN", "GB82WEST12345698765432", Core),
+        ("Email", "alice@example.com", Core),
+        ("IPAddress", "192.168.1.1", Core),
+        ("PhoneNumber", "(415) 555-0132", Core),
+        ("USSocialSecurityNumber", "219-09-9998", Core),
+        ("USITIN", "900-70-1234", Core),
+        ("USDEANumber", "AB1234563", Core),
+        ("USPassportNumber", "C12345678", Core),
+        ("UKNationalInsuranceNumber", "AB123456C", Core),
+        ("UKNHSNumber", "9434767016", Core),
+        ("SpainDNI", "12345678Z", Core),
+        ("SpainNIE", "X1234567L", Core),
+        ("ItalyVAT", "00123456782", Core),
+        ("PolandPESEL", "44051401359", Core),
+        ("GermanyTaxId", "86095742719", Core),
+        ("NetherlandsBSN", "111222333", Core),
+        ("SingaporeNRIC", "S1234567D", Core),
+        ("AustraliaTFN", "123456782", Core),
+        ("AustraliaABN", "51824753556", Core),
+        ("IndiaPAN", "ABCPK1234L", Core),
+        ("IndiaAadhaar", "234567890124", Core),
+        ("JapanMyNumber", "123456789018", Core),
+        ("KoreaRRN", "9001011123459", Core),
+        ("BrazilCPF", "11144477735", Core),
+        ("BrazilCNPJ", "11222333000181", Core),
+        ("CanadaSIN", "130458623", Core),
+        ("EUVAT", "DE136695976", Core),
+        ("USDriversLicense", "D1234567", Todo),
+        ("USBankAccountNumber", "1234567890", Todo),
+        ("FrenchINSEE", "180047509112556", Todo),
+        ("ItalyFiscalCode", "RSSMRA85T10A562S", Todo),
+        ("URL", "https://example.com/x", Todo),
+        ("DateTime", "2025-06-11", Sidecar),
+        ("Age", "35 years old", Sidecar),
+        (
+            "Address",
+            "1600 Amphitheatre Parkway, Mountain View CA",
+            Sidecar,
+        ),
+        ("Person", "John Smith", Sidecar),
+        ("PersonType", "doctor", Sidecar),
+        ("Organization", "Microsoft", Sidecar),
+    ];
+
+    // Deterministic entities Pentect catches that NEITHER Presidio nor Azure has
+    // a recognizer for — where we strictly exceed both. (Samples are public
+    // addresses / non-secret shapes; vendor API keys are covered in rule.rs.)
+    const EXCLUSIVE: &[(&str, &str)] = &[
+        ("ETH_ADDRESS", "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"),
+        ("BTC_BECH32", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
+        (
+            "BIP39_MNEMONIC",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        ),
+        ("MAC_ADDRESS", "00:1A:2B:3C:4D:5E"),
+        ("DB_CONNECTION_STRING", "postgresql://admin:s3cr3t@db.host:5432/sales"),
+    ];
+
+    #[test]
+    fn surpass_benchmark_presidio_and_azure() {
+        for (name, table) in [("Presidio", PRESIDIO), ("Azure", AZURE)] {
+            let caught = |s: &str| !m(s).items.is_empty();
+            let core: Vec<_> = table.iter().filter(|(_, _, c)| *c == Core).collect();
+            let todo: Vec<_> = table.iter().filter(|(_, _, c)| *c == Todo).collect();
+            let sidecar: Vec<_> = table.iter().filter(|(_, _, c)| *c == Sidecar).collect();
+
+            // The goal, asserted: every deterministic entity is caught.
+            let core_missed: Vec<&str> = core
+                .iter()
+                .filter(|(_, s, _)| !caught(s))
+                .map(|(e, _, _)| *e)
+                .collect();
+            assert!(
+                core_missed.is_empty(),
+                "{name}: deterministic recognizer(s) not caught (regression): {core_missed:?}"
+            );
+
+            let det_total = core.len() + todo.len();
+            eprintln!(
+                "vs {name}: deterministic {}/{} covered; sidecar/NER {} (out of core scope); remaining deterministic gap: {:?}",
+                core.len(),
+                det_total,
+                sidecar.len(),
+                todo.iter().map(|(e, _, _)| *e).collect::<Vec<_>>(),
+            );
+        }
+        for (label, sample) in EXCLUSIVE {
+            assert!(
+                caught_exclusive(sample),
+                "exclusive entity regressed: {label}"
+            );
+        }
+        eprintln!(
+            "Pentect-exclusive (beyond both vendors): {:?}",
+            EXCLUSIVE.iter().map(|(l, _)| *l).collect::<Vec<_>>()
+        );
+    }
+
+    fn caught_exclusive(s: &str) -> bool {
+        !m(s).items.is_empty()
+    }
+
     #[test]
     fn custom_engine_can_drop_detectors() {
         // DI: an engine with no detectors masks nothing.
