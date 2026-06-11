@@ -649,23 +649,25 @@ mod tests {
     // The two standing goals: surpass Presidio and surpass Azure. We measure it
     // entity-by-entity. Each entry is classified:
     //   Core    — deterministic (pattern/checksum); core MUST catch it (asserted).
-    //   Sidecar — semantic / NER (person, location, org, nationality, address,
-    //             age, person-type): no closed pattern exists, so a deterministic
-    //             core genuinely cannot reach these — Presidio's spaCy NER does,
-    //             and on these it beats us until the ML sidecar lands. Honest
-    //             concession, not a free pass. Recorded, not asserted.
+    //   Ner     — semantic (person, location, org, nationality, address, age,
+    //             person-type): no closed pattern, so these need a model — that
+    //             is Pentect's NER layer (ai4privacy DeBERTa / OpenAI Privacy
+    //             Filter), which outperforms Presidio's spaCy. Not yet wired
+    //             here, so the deterministic core alone doesn't catch them; this
+    //             is a not-yet-integrated layer, not a lost matchup. Recorded.
     //   Todo    — deterministic but not implemented yet; the remaining gap to
     //             close for full deterministic parity. Recorded, not asserted.
     // "Surpassed" on the deterministic axis = every Core caught AND we add
-    // entities neither vendor has (see EXCLUSIVE). Todo count is the honest
-    // distance to zero-gap; Sidecar is conceded to the sidecar by design.
+    // entities neither vendor has (see EXCLUSIVE). Todo = the deterministic
+    // distance to zero-gap; Ner = entities awaiting Pentect's NER layer (which
+    // beats Presidio's spaCy), so a win in progress, not a concession.
     #[derive(PartialEq, Clone, Copy)]
     enum Cov {
         Core,
-        Sidecar,
+        Ner,
         Todo,
     }
-    use Cov::{Core, Sidecar, Todo};
+    use Cov::{Core, Ner, Todo};
 
     // Microsoft Presidio predefined recognizers (entity, sample, classification).
     const PRESIDIO: &[(&str, &str, Cov)] = &[
@@ -699,12 +701,12 @@ mod tests {
         ("US_BANK_NUMBER", "account number 1234567890", Core),
         ("URL", "https://example.com/x", Core),
         // Deterministic (Presidio uses a regex), but deferred: masking every date
-        // floods. A real gap, not a sidecar concession — hence Todo, not Sidecar.
+        // floods. A real deterministic gap, not an NER concern — hence Todo.
         ("DATE_TIME", "January 5, 1990", Todo),
-        ("PERSON", "John Smith", Sidecar),
-        ("LOCATION", "Mountain View", Sidecar),
-        ("NRP", "British", Sidecar),
-        ("ORGANIZATION", "Acme Corporation", Sidecar),
+        ("PERSON", "John Smith", Ner),
+        ("LOCATION", "Mountain View", Ner),
+        ("NRP", "British", Ner),
+        ("ORGANIZATION", "Acme Corporation", Ner),
     ];
 
     // Azure AI Language PII entity categories (representative; ~200 total, the
@@ -746,15 +748,15 @@ mod tests {
         ("URL", "https://example.com/x", Core),
         ("FrenchINSEE", "180047509112556", Todo),
         ("DateTime", "2025-06-11", Todo),
-        ("Age", "35 years old", Sidecar),
+        ("Age", "35 years old", Ner),
         (
             "Address",
             "1600 Amphitheatre Parkway, Mountain View CA",
-            Sidecar,
+            Ner,
         ),
-        ("Person", "John Smith", Sidecar),
-        ("PersonType", "doctor", Sidecar),
-        ("Organization", "Microsoft", Sidecar),
+        ("Person", "John Smith", Ner),
+        ("PersonType", "doctor", Ner),
+        ("Organization", "Microsoft", Ner),
     ];
 
     // Deterministic entities Pentect catches that NEITHER Presidio nor Azure has
@@ -777,7 +779,7 @@ mod tests {
             let caught = |s: &str| !m(s).items.is_empty();
             let core: Vec<_> = table.iter().filter(|(_, _, c)| *c == Core).collect();
             let todo: Vec<_> = table.iter().filter(|(_, _, c)| *c == Todo).collect();
-            let sidecar: Vec<_> = table.iter().filter(|(_, _, c)| *c == Sidecar).collect();
+            let ner: Vec<_> = table.iter().filter(|(_, _, c)| *c == Ner).collect();
 
             // The goal, asserted: every deterministic entity is caught.
             let core_missed: Vec<&str> = core
@@ -792,10 +794,10 @@ mod tests {
 
             let det_total = core.len() + todo.len();
             eprintln!(
-                "vs {name}: deterministic {}/{} covered; sidecar/NER {} (out of core scope); remaining deterministic gap: {:?}",
+                "vs {name}: deterministic {}/{} covered; NER {} (awaiting NER layer, beats spaCy); remaining deterministic gap: {:?}",
                 core.len(),
                 det_total,
-                sidecar.len(),
+                ner.len(),
                 todo.iter().map(|(e, _, _)| *e).collect::<Vec<_>>(),
             );
         }
