@@ -590,6 +590,35 @@ pub fn eth_address(s: &str) -> bool {
     true
 }
 
+/// IPv6 address (structural): one `::` at most, 1-4 hex per group, correct group
+/// count, optional %zone and /prefix stripped first.
+pub fn ipv6(s: &str) -> bool {
+    let s = s.split('%').next().unwrap_or(s);
+    let s = s.split('/').next().unwrap_or(s);
+    if !s.contains(':') || s.contains(":::") {
+        return false;
+    }
+    if s == "::" {
+        return true;
+    }
+    let compressed = s.matches("::").count();
+    if compressed > 1 {
+        return false;
+    }
+    let groups: Vec<&str> = s.split(':').collect();
+    for g in &groups {
+        if !g.is_empty() && (g.len() > 4 || !g.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return false;
+        }
+    }
+    let nonempty = groups.iter().filter(|g| !g.is_empty()).count();
+    if compressed == 0 {
+        nonempty == 8 && groups.iter().all(|g| !g.is_empty())
+    } else {
+        nonempty <= 7
+    }
+}
+
 static BIP39_ENGLISH: &str = include_str!("bip39_english.txt");
 
 /// BIP-39 mnemonic seed phrase: 12/15/18/21/24 words from the English wordlist
@@ -656,6 +685,7 @@ pub enum Validator {
     BtcBech32,
     EthAddress,
     Bip39,
+    Ipv6,
 }
 
 impl Validator {
@@ -694,6 +724,7 @@ impl Validator {
             "btc_bech32" => Validator::BtcBech32,
             "eth_address" => Validator::EthAddress,
             "bip39" => Validator::Bip39,
+            "ipv6" => Validator::Ipv6,
             _ => return None,
         })
     }
@@ -730,6 +761,7 @@ impl Validator {
             Validator::BtcBech32 => btc_bech32(s),
             Validator::EthAddress => eth_address(s),
             Validator::Bip39 => bip39_mnemonic(s),
+            Validator::Ipv6 => ipv6(s),
         }
     }
 }
@@ -829,5 +861,17 @@ mod tests {
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon xyzzy"
         ));
         assert!(!bip39_mnemonic("just three words here")); // wrong count
+    }
+
+    #[test]
+    fn ipv6_structural_validator() {
+        assert!(ipv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334"));
+        assert!(ipv6("2001:db8::8a2e:370:7334"));
+        assert!(ipv6("::1"));
+        assert!(ipv6("fe80::1%eth0"));
+        assert!(!ipv6("2001:db8::8a2e::7334")); // two ::
+        assert!(!ipv6("2001:db8:85a3:0:0:8a2e:370:7334:9999")); // 9 groups
+        assert!(!ipv6("00:1A:2B:3C:4D:5E")); // MAC, not 8 groups
+        assert!(!ipv6("12:34:56")); // not IPv6
     }
 }

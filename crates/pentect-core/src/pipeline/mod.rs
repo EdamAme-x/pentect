@@ -594,6 +594,7 @@ mod tests {
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
             "bip39_mnemonic",
         ),
+        ("2001:db8::8a2e:370:7334", "ipv6"),
     ];
     const SIDECAR_GAP: &[(&str, &str)] = &[
         ("John Smith", "person_name"),
