@@ -704,6 +704,10 @@ mod tests {
         "38520000023237",
         "3530111333300000",
         "3566002020360505",
+        // Separator-formatted (very common): grouped Visa / MC / Amex.
+        "4242 4242 4242 4242",
+        "5555-5555-5555-4444",
+        "3782 822463 10005",
     ];
     const PHONE_VALID: &[&str] = &[
         "+14155552671",
@@ -723,6 +727,17 @@ mod tests {
         "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
         "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
     ];
+    // Real-world formatting (grouping/separators) — exercises the regexes'
+    // separator handling, where values usually appear with punctuation.
+    const FORMATTED_VALID: &[&str] = &[
+        "DE15 8043 1937 1058 2946 17", // IBAN grouped
+        "111.444.777-35",              // BR CPF
+        "11.222.333/0001-81",          // BR CNPJ
+        "2345 6789 0124",              // IN Aadhaar grouped
+        "219-09-9998",                 // US SSN
+        "+1 415-555-2671",             // phone formatted
+        "(415) 555-0132",              // NANP
+    ];
 
     #[test]
     fn recall_many_valid_samples_caught() {
@@ -730,7 +745,8 @@ mod tests {
             .iter()
             .chain(CARD_VALID)
             .chain(PHONE_VALID)
-            .chain(CRYPTO_VALID);
+            .chain(CRYPTO_VALID)
+            .chain(FORMATTED_VALID);
         let mut n = 0;
         for s in all {
             assert!(!m(s).items.is_empty(), "recall miss on {s:?}");

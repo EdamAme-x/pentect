@@ -349,6 +349,11 @@ impl RuleDetector {
         // This is how we match/exceed Presidio's recognizers deterministically.
         #[rustfmt::skip]
         let checked: &[(&str, Category, &str, Confidence, Validator)] = &[
+            // Separator-formatted cards (CardDetector handles contiguous digits;
+            // these handle the common "4242 4242 4242 4242" grouping). Luhn-gated.
+            (r"\b\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4}\b", Pii, "CARD", High, V::Luhn),
+            (r"\b\d{4}[ -]\d{6}[ -]\d{5}\b", Pii, "CARD", High, V::Luhn),
+            (r"\b\d{4}[ -]\d{6}[ -]\d{4}\b", Pii, "CARD", High, V::Luhn),
             (r"\b[12][0-9]{3}[- ]?[0-9]{3}[- ]?[0-9]{3}\b", Identifier, "US_NPI", High, V::UsNpi),
             (r"\bIT[0-9]{11}\b", Identifier, "IT_VAT_CODE", High, V::Luhn),
             (r"(?i)social insurance[^\n]{0,15}?\b[1-79]\d{2}[ -]?\d{3}[ -]?\d{3}\b", Pii, "CA_SIN", High, V::CaSin),
