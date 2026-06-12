@@ -726,6 +726,10 @@ mod tests {
         "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
         "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
         "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+        "LXmteg8PyzybHdrywScarTEfieHWJbpAHy", // LTC
+        "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", // XRP
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
     ];
     // Real-world formatting (grouping/separators) — exercises the regexes'
     // separator handling, where values usually appear with punctuation.
