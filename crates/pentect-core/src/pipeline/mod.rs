@@ -742,6 +742,17 @@ mod tests {
         "+1 415-555-2671",             // phone formatted
         "(415) 555-0132",              // NANP
     ];
+    // Several distinct valid values per checksummed detector (computed), so a
+    // checksum/regex change that drops a subset is caught.
+    const NATIONAL_ID_VALID: &[&str] = &[
+        "52998224725",
+        "39053344705",    // BR CPF
+        "11444777000161", // BR CNPJ
+        "00000023T",
+        "99999999R", // ES NIF
+        "1000000004",
+        "1987654328", // US NPI
+    ];
 
     #[test]
     fn recall_many_valid_samples_caught() {
@@ -750,7 +761,8 @@ mod tests {
             .chain(CARD_VALID)
             .chain(PHONE_VALID)
             .chain(CRYPTO_VALID)
-            .chain(FORMATTED_VALID);
+            .chain(FORMATTED_VALID)
+            .chain(NATIONAL_ID_VALID);
         let mut n = 0;
         for s in all {
             assert!(!m(s).items.is_empty(), "recall miss on {s:?}");
