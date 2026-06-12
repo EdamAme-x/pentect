@@ -753,6 +753,21 @@ mod tests {
         "1000000004",
         "1987654328", // US NPI
     ];
+    // Values embedded in realistic surrounding text (JSON, logs, sentences,
+    // markup) — exercises the word-boundary handling against quotes/punctuation,
+    // not just bare values.
+    const EMBEDDED_VALID: &[&str] = &[
+        r#"{"iban":"DE15804319371058294617","amount":100}"#,
+        "paid with card 4111111111111111 on file",
+        "Please wire to GB94804319371058294617 by EOD.",
+        r#"contact: "+442071838750" (london office)"#,
+        "wallet=1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa;balance=0",
+        "ssn:219-09-9998,name:redacted",
+        "aadhaar [2345 6789 0124] verified",
+        "eth(0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359)",
+        "cpf=111.444.777-35&uf=SP",
+        "<email>alice@example.com</email>",
+    ];
 
     #[test]
     fn recall_many_valid_samples_caught() {
@@ -762,7 +777,8 @@ mod tests {
             .chain(PHONE_VALID)
             .chain(CRYPTO_VALID)
             .chain(FORMATTED_VALID)
-            .chain(NATIONAL_ID_VALID);
+            .chain(NATIONAL_ID_VALID)
+            .chain(EMBEDDED_VALID);
         let mut n = 0;
         for s in all {
             assert!(!m(s).items.is_empty(), "recall miss on {s:?}");
