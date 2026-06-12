@@ -192,9 +192,10 @@ impl RuleDetector {
                 "US_MBI",
                 Medium,
             ),
-            // No checksum, so context-gated: a bare letter+8-digits is any SKU.
+            // No checksum, so context-gated (multilingual keyword): a bare
+            // letter+8-digits is any SKU.
             (
-                r"(?i)passport[^\n]{0,12}?\b[A-Z][0-9]{8}\b",
+                r"(?i)(?:passport|pasaporte|passeport|passaporto|reisepass|パスポート|旅券)[^\n]{0,12}?\b[A-Z][0-9]{8}\b",
                 Identifier,
                 "US_PASSPORT",
                 Low,
@@ -267,13 +268,13 @@ impl RuleDetector {
             // Context-gated like Presidio: a bare number/ID only fires next to its
             // keyword, so these don't flood. The match includes the keyword.
             (
-                r"(?i)\bacc(?:ount|t)\b[^\n]{0,15}?\b[0-9]{8,17}\b",
+                r"(?i)(?:\bacc(?:ount|t)\b|konto|compte|cuenta|口座)[^\n]{0,15}?\b[0-9]{8,17}\b",
                 Identifier,
                 "US_BANK_ACCOUNT",
                 Low,
             ),
             (
-                r"(?i)(?:driver'?s?\s*licen[sc]e|\bDLN?\b)[^\n]{0,15}?\b[A-Z0-9]{5,13}\b",
+                r"(?i)(?:driver'?s?\s*licen[sc]e|\bDLN?\b|führerschein|permis de conduire|運転免許)[^\n]{0,15}?\b[A-Z0-9]{5,13}\b",
                 Identifier,
                 "US_DRIVER_LICENSE",
                 Low,
@@ -300,19 +301,19 @@ impl RuleDetector {
                 Low,
             ),
             (
-                r"(?i)passport[^\n]{0,15}?\b[0-9]{9}\b",
+                r"(?i)(?:passport|pasaporte|passeport|passaporto|reisepass|パスポート|旅券)[^\n]{0,15}?\b[0-9]{9}\b",
                 Identifier,
                 "UK_PASSPORT",
                 Low,
             ),
             (
-                r"(?i)(?:passport|pasaporte)[^\n]{0,15}?\b[A-Z]{3}[0-9]{6}[A-Z]?\b",
+                r"(?i)(?:passport|pasaporte|passeport|passaporto|reisepass|パスポート|旅券)[^\n]{0,15}?\b[A-Z]{3}[0-9]{6}[A-Z]?\b",
                 Identifier,
                 "ES_PASSPORT",
                 Low,
             ),
             (
-                r"(?i)(?:passport|passaporto)[^\n]{0,15}?\b[A-Z]{2}[0-9]{7}\b",
+                r"(?i)(?:passport|pasaporte|passeport|passaporto|reisepass|パスポート|旅券)[^\n]{0,15}?\b[A-Z]{2}[0-9]{7}\b",
                 Identifier,
                 "IT_PASSPORT",
                 Low,
@@ -324,7 +325,7 @@ impl RuleDetector {
                 Low,
             ),
             (
-                r"(?i)passport[^\n]{0,15}?\b[A-Z][0-9]{7}\b",
+                r"(?i)(?:passport|pasaporte|passeport|passaporto|reisepass|パスポート|旅券)[^\n]{0,15}?\b[A-Z][0-9]{7}\b",
                 Identifier,
                 "IN_PASSPORT",
                 Low,
@@ -514,6 +515,9 @@ mod tests {
             ("00:1A:2B:3C:4D:5E", "MAC_ADDRESS"),
             ("192.168.1.1", "IP_ADDRESS_V4"),
             ("(415) 555-0132", "PHONE_NANP"),
+            // Multilingual context keywords (Presidio supports multiple languages).
+            ("パスポート C12345678", "US_PASSPORT"),
+            ("Konto 12345678 prüfen", "US_BANK_ACCOUNT"),
         ];
         let det = RuleDetector::builtin();
         for (sample, label) in cases {
