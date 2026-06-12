@@ -667,6 +667,103 @@ mod tests {
         );
     }
 
+    // Broad recall: many VALID samples per detector, so a regex/validator change
+    // that silently drops a real value is caught. Test data must be VARIED — an
+    // all-same-digit run is correctly retracted as a benign shape, which would
+    // mask a recall regression. (IBANs computed across countries; cards span all
+    // networks; phones span regions; crypto is public addresses.)
+    const IBAN_VALID: &[&str] = &[
+        "DE15804319371058294617",
+        "GB94804319371058294617",
+        "FR7980431937105829461730528",
+        "ES8280431937105829461730",
+        "IT4680431937105829461730528",
+        "NL3280431937105829",
+        "CH1480431937105829461",
+        "BE92804319371058",
+        "AT678043193710582946",
+        "IE67804319371058294617",
+        "PT39804319371058294617305",
+        "PL34804319371058294617305280",
+        "NO1980431937105",
+        "SE9580431937105829461730",
+        "FI1680431937105829",
+    ];
+    const CARD_VALID: &[&str] = &[
+        "4242424242424242",
+        "4012888888881881",
+        "4111111111111111",
+        "5555555555554444",
+        "5105105105105100",
+        "2223003122003222",
+        "378282246310005",
+        "371449635398431",
+        "6011111111111117",
+        "6011000990139424",
+        "30569309025904",
+        "38520000023237",
+        "3530111333300000",
+        "3566002020360505",
+    ];
+    const PHONE_VALID: &[&str] = &[
+        "+14155552671",
+        "+442071838750",
+        "+81363849000",
+        "+4930901820",
+        "+33142685300",
+        "+390612345678",
+        "+34911234567",
+        "+919876543210",
+        "+85228765432",
+        "+6531234567",
+    ];
+    const CRYPTO_VALID: &[&str] = &[
+        "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+        "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+    ];
+
+    #[test]
+    fn recall_many_valid_samples_caught() {
+        let all = IBAN_VALID
+            .iter()
+            .chain(CARD_VALID)
+            .chain(PHONE_VALID)
+            .chain(CRYPTO_VALID);
+        let mut n = 0;
+        for s in all {
+            assert!(!m(s).items.is_empty(), "recall miss on {s:?}");
+            n += 1;
+        }
+        assert!(n >= 40);
+    }
+
+    // Right shape, wrong checksum: the gated label must NOT appear (the checksum
+    // is the precision lever). Other detectors may still fire on substrings, so
+    // we assert the specific label is absent, not that nothing masks.
+    const NEAR_MISS: &[(&str, &str)] = &[
+        ("DE15804319371058294618", "IBAN_CODE"),
+        ("4242424242424241", "CARD"),
+        ("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1Beaed", "ETH_ADDRESS"),
+        (
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5",
+            "BTC_ADDRESS_BECH32",
+        ),
+        ("234567890121", "IN_AADHAAR"),
+        ("27AAPFU0939F1ZX", "IN_GSTIN"),
+    ];
+
+    #[test]
+    fn near_miss_bad_checksums_not_caught_under_their_label() {
+        for (s, label) in NEAR_MISS {
+            assert!(
+                !m(s).items.iter().any(|i| i.label == *label),
+                "bad-checksum {s:?} wrongly masked as {label}"
+            );
+        }
+    }
+
     // === Benchmark vs Presidio and Azure AI Language PII ===
     // The two standing goals: surpass Presidio and surpass Azure. We measure it
     // entity-by-entity. Each entry is classified:
