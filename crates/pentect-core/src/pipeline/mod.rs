@@ -1014,6 +1014,19 @@ mod tests {
         assert!(overmasks.is_empty(), "over-masking: {overmasks:?}");
     }
 
+    #[test]
+    fn entity_level_recall_all_mentions_masked() {
+        // TAB's entity-level metric: an identifier is concealed only if ALL its
+        // mentions are masked. The same value masks to one stable placeholder
+        // everywhere (so it stays consistent and restorable).
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let out = m(&format!("a {secret} b {secret} c {secret} d")).masked;
+        assert!(!out.contains(secret), "leaked a mention: {out}");
+        let start = out.find("<<").unwrap();
+        let ph = &out[start..out[start..].find(">>").unwrap() + start + 2];
+        assert_eq!(out.matches(ph).count(), 3, "unstable placeholder: {out}");
+    }
+
     // === Benchmark vs Presidio and Azure AI Language PII ===
     // The two standing goals: surpass Presidio and surpass Azure. We measure it
     // entity-by-entity. Each entry is classified:
