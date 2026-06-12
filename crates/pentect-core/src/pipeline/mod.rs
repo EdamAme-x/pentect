@@ -198,11 +198,48 @@ impl Engine {
 
     /// An adapter can build the same `Ir` and call this directly.
     pub fn mask_ir(&self, ir: Ir, config: &Config) -> MaskResult {
-        let mut spans = Vec::new();
-        for region in &ir.regions {
-            let view = NormalizedView::build(region, &ir.raw);
-            for d in &self.detectors {
-                spans.extend(d.detect(&view));
+        // Detect to a bounded fixpoint. When a found span sits against an
+        // alphanumeric neighbour (two distinct secrets concatenated with no
+        // separator, e.g. a card directly followed by an IBAN), the trailing
+        // one's regex word boundary fails; so we blank found spans (same-length
+        // ASCII spaces — offsets preserved, UTF-8 stays valid) and re-detect.
+        // The common case (separated secrets) finds nothing adjacent and stops
+        // after one pass.
+        let mut spans: Vec<Span> = Vec::new();
+        let mut work = ir.raw.clone();
+        for _ in 0..4 {
+            let mut found = Vec::new();
+            for region in &ir.regions {
+                let view = NormalizedView::build(region, &work);
+                for d in &self.detectors {
+                    found.extend(d.detect(&view));
+                }
+            }
+            found.retain(|s| !spans.iter().any(|e| e.range == s.range));
+            if found.is_empty() {
+                break;
+            }
+            let b = work.as_bytes();
+            let more = found.iter().any(|s| {
+                let before = s
+                    .range
+                    .start
+                    .checked_sub(1)
+                    .is_some_and(|i| b[i].is_ascii_alphanumeric());
+                let after = b.get(s.range.end).is_some_and(u8::is_ascii_alphanumeric);
+                before || after
+            });
+            if more {
+                // SAFETY: writing ASCII spaces over any byte range keeps the
+                // string valid UTF-8, and same length keeps span offsets correct.
+                let bytes = unsafe { work.as_bytes_mut() };
+                for s in &found {
+                    bytes[s.range.start..s.range.end].fill(b' ');
+                }
+            }
+            spans.extend(found);
+            if !more {
+                break;
             }
         }
         if !self.disabled.is_empty() {
@@ -810,6 +847,67 @@ mod tests {
                 "bad-checksum {s:?} wrongly masked as {label}"
             );
         }
+    }
+
+    // Deliberately nasty inputs: degenerate, placeholder-confusing, adjacency,
+    // Unicode/multibyte, fake placeholders. The invariants must hold for ALL of
+    // them — never panic, mask->restore is the identity, and masking is
+    // idempotent (re-masking masked text changes nothing).
+    const ADVERSARIAL: &[&str] = &[
+        "",
+        " ",
+        "::",
+        "+",
+        "<<",
+        ">>",
+        "<<>>",
+        "<<X_",
+        "x>>y<<z",
+        "<<AWS_AKID_0011223344556677>>", // fake placeholder, unmapped
+        "<<<<AKIAIOSFODNN7EXAMPLE>>>>",  // real key wrapped in angle brackets
+        "4242424242424242DE15804319371058294617", // adjacent card + IBAN, no sep
+        "💳4242424242424242 paid 🤑",    // emoji adjacent (multibyte offsets)
+        "café AKIAIOSFODNN7EXAMPLE déjà", // combining/accented around a secret
+        "line1 AKIAIOSFODNN7EXAMPLE\nline2 alice@example.com\n",
+        "key=AKIAIOSFODNN7EXAMPLE&card=4242424242424242",
+        "secret>>AKIAIOSFODNN7EXAMPLE<<end",
+        "４２４２４２４２４２４２４２４２", // fullwidth digits (normalization)
+        "\u{200b}4242424242424242\u{200b}", // zero-width spaces around a card
+    ];
+
+    #[test]
+    fn adversarial_inputs_never_panic_and_reversible() {
+        let cfg = Config::insecure_testing();
+        let eng = Engine::default();
+        for s in ADVERSARIAL {
+            // Reaching here at all proves no panic. mask -> restore is identity.
+            let r = eng.mask(Input::text(*s), &cfg);
+            assert_eq!(
+                crate::recovery::restore(&r.masked, &r.recovery).unwrap(),
+                *s,
+                "not reversible: {s:?} masked to {:?}",
+                r.masked
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_masking_is_idempotent() {
+        let cfg = Config::insecure_testing();
+        let eng = Engine::default();
+        for s in ADVERSARIAL {
+            let r = eng.mask(Input::text(*s), &cfg);
+            let r2 = eng.mask(Input::text(r.masked.clone()), &cfg);
+            assert_eq!(r2.masked, r.masked, "not idempotent on {s:?}");
+        }
+    }
+
+    #[test]
+    fn concatenated_secrets_both_masked() {
+        // The fixpoint catches a card directly followed by an IBAN (no separator).
+        let out = m("4242424242424242DE15804319371058294617").masked;
+        assert!(out.contains("<<CARD_"), "{out}");
+        assert!(out.contains("<<IBAN_CODE_"), "{out}");
     }
 
     // === Benchmark vs Presidio and Azure AI Language PII ===
