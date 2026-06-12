@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 761baef3fc2ab96717afe2cbef9223f00711c2da06ccae807ea923825e707501 # shrinks to s = "_@0.aA0/a0_A/aa00_aabAbc/BC_DE"
+cc dd447064ca7f0a433363e988f12a3bd353c348ab519449db89bb75da57c6b505 # shrinks to s = "<::"

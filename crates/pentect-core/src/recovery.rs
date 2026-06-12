@@ -234,12 +234,14 @@ pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
         if bytes[i] == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
             if let Some(close) = find_from(bytes, i + 2, b">>") {
                 let token = &text[i..close + 2];
-                match rec.reveal(token) {
-                    Some(v) => out.push_str(&v),
-                    None => out.push_str(token),
+                if let Some(v) = rec.reveal(token) {
+                    out.push_str(&v);
+                    i = close + 2;
+                    continue;
                 }
-                i = close + 2;
-                continue;
+                // Unknown token: don't consume it whole. A stray '<' before a
+                // real placeholder (masked output "<" + "<<X>>" = "<<<X>>") must
+                // still resolve the inner one — fall through and copy one char.
             }
         }
         let len = utf8_len(bytes[i]);
@@ -373,6 +375,20 @@ mod tests {
             ]),
             key,
         )
+    }
+
+    #[test]
+    fn stray_angle_before_placeholder_still_restores() {
+        let ph = "<<X_aabbccdd00112233>>";
+        let rec = Recovery::seal(
+            HashMap::from([(ph.to_string(), "secret".to_string())]),
+            &[1u8; 32],
+        );
+        // Masked output where a literal '<' precedes the placeholder ("<<<X_..>>").
+        assert_eq!(restore(&format!("<{ph}"), &rec).unwrap(), "<secret");
+        // An unknown "<<<..>>" still passes through byte-for-byte (nothing leaks).
+        let unknown = "<<<UNKNOWN_0000000000000000>>";
+        assert_eq!(restore(unknown, &Recovery::default()).unwrap(), unknown);
     }
 
     #[test]
