@@ -910,6 +910,110 @@ mod tests {
         assert!(out.contains("<<IBAN_CODE_"), "{out}");
     }
 
+    // Research-style evaluation (precision/recall/F1/F2 + utility) on realistic
+    // text where secrets and benign look-alikes share the same sentence — the
+    // metric framing the Text Anonymization Benchmark / Presidio-evaluator use,
+    // measured against the REAL default profile (Balanced). Each sample lists the
+    // values that must be masked and the benign values that must be preserved;
+    // the corpus is the skeleton that real TAB / SecretBench data plugs into.
+    // Person/location names are NER-scope (off by default) and excluded here.
+    type Labeled = (
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+    );
+    const LABELED: &[Labeled] = &[
+        (
+            "Ticket 100482931 from sarah.chen@acme.com: card 4242424242424242 declined.",
+            &["sarah.chen@acme.com", "4242424242424242"],
+            &["100482931"],
+        ),
+        (
+            "Wire to GB94804319371058294617 ref INV90070183 amount 5000 by Friday.",
+            &["GB94804319371058294617"],
+            &["INV90070183", "5000"],
+        ),
+        (
+            "export AWS_KEY=AKIAIOSFODNN7EXAMPLE; port=8080; workers=3",
+            &["AKIAIOSFODNN7EXAMPLE"],
+            &["8080", "3"],
+        ),
+        (
+            "CPF 111.444.777-35 do pedido 219099998 no valor de 99 reais.",
+            &["111.444.777-35"],
+            &["219099998", "99"],
+        ),
+        (
+            "aadhaar 234567890124 issued; sku ABCDEFGH; release v2.10.0 build 4194304.",
+            &["234567890124"],
+            &["ABCDEFGH", "2.10.0", "4194304"],
+        ),
+        (
+            "btc 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa moved 4194304 sat at block 100482931.",
+            &["1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"],
+            &["4194304", "100482931"],
+        ),
+        (
+            "Contact +442071838750 or paste token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 once.",
+            &["+442071838750", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"],
+            &["once"],
+        ),
+        (
+            r#"{"eth":"0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359","nonce":4194304,"id":42}"#,
+            &["0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"],
+            &["4194304", "42"],
+        ),
+        (
+            "ssn 219-09-9998 on file; ticket JIRA-100482; retries 3; status 200.",
+            &["219-09-9998"],
+            &["100482", "3", "200"],
+        ),
+        (
+            "db postgres://admin:s3cr3t@db.internal:5432/sales pool=20 timeout=30",
+            &["postgres://admin:s3cr3t@db.internal:5432/sales"],
+            &["20", "30"],
+        ),
+    ];
+
+    #[test]
+    fn research_metrics_precision_recall_f2_utility() {
+        let (mut tp, mut fp, mut fn_, mut tn) = (0u32, 0u32, 0u32, 0u32);
+        let mut leaks = Vec::new();
+        let mut overmasks = Vec::new();
+        for (text, should_mask, should_not) in LABELED {
+            let out = mp(Profile::Balanced, text).masked;
+            for v in *should_mask {
+                if out.contains(v) {
+                    fn_ += 1;
+                    leaks.push(*v);
+                } else {
+                    tp += 1;
+                }
+            }
+            for v in *should_not {
+                if out.contains(v) {
+                    tn += 1;
+                } else {
+                    fp += 1;
+                    overmasks.push(*v);
+                }
+            }
+        }
+        let prec = tp as f64 / (tp + fp).max(1) as f64;
+        let rec = tp as f64 / (tp + fn_).max(1) as f64;
+        let f1 = 2.0 * prec * rec / (prec + rec).max(f64::MIN_POSITIVE);
+        let f2 = 5.0 * prec * rec / (4.0 * prec + rec).max(f64::MIN_POSITIVE);
+        let utility = tn as f64 / (tn + fp).max(1) as f64;
+        eprintln!(
+            "research metrics (Balanced, {} samples): P={prec:.3} R={rec:.3} F1={f1:.3} F2={f2:.3} utility={utility:.3} (TP={tp} FP={fp} FN={fn_} TN={tn})\n  leaks={leaks:?} overmasks={overmasks:?}",
+            LABELED.len()
+        );
+        // No leaks (recall 1.0) and no over-masking (precision/utility 1.0) on the
+        // realistic mixed corpus.
+        assert!(leaks.is_empty(), "recall leak: {leaks:?}");
+        assert!(overmasks.is_empty(), "over-masking: {overmasks:?}");
+    }
+
     // === Benchmark vs Presidio and Azure AI Language PII ===
     // The two standing goals: surpass Presidio and surpass Azure. We measure it
     // entity-by-entity. Each entry is classified:
