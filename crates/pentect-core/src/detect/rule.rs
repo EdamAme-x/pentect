@@ -278,6 +278,69 @@ impl RuleDetector {
                 "US_DRIVER_LICENSE",
                 Low,
             ),
+            // Country long-tail (Presidio parity). Distinctive formats run
+            // context-free; ambiguous shapes (passports, plates, voter/UEN) are
+            // context-gated so a bare token doesn't mask.
+            (
+                r"(?i)\b[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}\b",
+                Pii,
+                "UK_POSTCODE",
+                Medium,
+            ),
+            (
+                r"\b[A-Z9]{5}[0-9]{6}[A-Z9]{2}[0-9][A-Z]{2}\b",
+                Identifier,
+                "UK_DRIVING_LICENCE",
+                Medium,
+            ),
+            (
+                r"(?i)(?:reg|plate|vehicle)[^\n]{0,15}?\b[A-Z]{2}[0-9]{2} ?[A-Z]{3}\b",
+                Identifier,
+                "UK_VEHICLE_REGISTRATION",
+                Low,
+            ),
+            (
+                r"(?i)passport[^\n]{0,15}?\b[0-9]{9}\b",
+                Identifier,
+                "UK_PASSPORT",
+                Low,
+            ),
+            (
+                r"(?i)(?:passport|pasaporte)[^\n]{0,15}?\b[A-Z]{3}[0-9]{6}[A-Z]?\b",
+                Identifier,
+                "ES_PASSPORT",
+                Low,
+            ),
+            (
+                r"(?i)(?:passport|passaporto)[^\n]{0,15}?\b[A-Z]{2}[0-9]{7}\b",
+                Identifier,
+                "IT_PASSPORT",
+                Low,
+            ),
+            (
+                r"(?i)(?:voter|epic)[^\n]{0,15}?\b[A-Z]{3}[0-9]{7}\b",
+                Identifier,
+                "IN_VOTER",
+                Low,
+            ),
+            (
+                r"(?i)passport[^\n]{0,15}?\b[A-Z][0-9]{7}\b",
+                Identifier,
+                "IN_PASSPORT",
+                Low,
+            ),
+            (
+                r"(?i)(?:vehicle|registration|reg)[^\n]{0,15}?\b[A-Z]{2}[ -]?[0-9]{1,2}[ -]?[A-Z]{1,3}[ -]?[0-9]{4}\b",
+                Identifier,
+                "IN_VEHICLE_REGISTRATION",
+                Low,
+            ),
+            (
+                r"(?i)uen[^\n]{0,12}?\b(?:[0-9]{8,9}[A-Z]|[STR][0-9]{2}[A-Z]{2}[0-9]{4}[A-Z])\b",
+                Identifier,
+                "SG_UEN",
+                Low,
+            ),
         ];
         use Validator as V;
         // Checksum-gated detectors: a permissive pattern finds candidates, the

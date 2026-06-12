@@ -724,6 +724,16 @@ mod tests {
         ("US_DRIVER_LICENSE", "driver's license D1234567", Core),
         ("US_BANK_NUMBER", "account number 1234567890", Core),
         ("URL", "https://example.com/x", Core),
+        ("UK_POSTCODE", "SW1A 1AA", Core),
+        ("UK_DRIVING_LICENCE", "MORGA657054SM9IJ", Core),
+        ("UK_VEHICLE_REGISTRATION", "reg AB12 CDE", Core),
+        ("UK_PASSPORT", "passport 123456789", Core),
+        ("ES_PASSPORT", "pasaporte ABC123456", Core),
+        ("IT_PASSPORT", "passaporto AB1234567", Core),
+        ("IN_VOTER", "voter ABC1234567", Core),
+        ("IN_PASSPORT", "passport A1234567", Core),
+        ("IN_VEHICLE_REGISTRATION", "vehicle KA01AB1234", Core),
+        ("SG_UEN", "uen 53312345A", Core),
         // Capability exists (date_detector / `enable = ["DATE_TIME"]`) but ships
         // OFF: masking every date floods the paste-to-LLM use case. So the
         // default engine here doesn't catch it — Todo means "off by default", not
