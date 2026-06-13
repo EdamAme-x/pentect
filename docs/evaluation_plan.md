@@ -39,21 +39,32 @@ recall, F1, false-positive rate, and failures by SecretBench category/comment.
 It does not contain a hand-authored corpus, so the result cannot be made 100%
 by adjusting local fixtures.
 
-### SecretBench public regex pack
+### External regex packs
 
-SecretBench also publishes the regular-expression workbook used to collect
-candidate repositories. This is public and separate from the gated dataset rows.
-It can be used before dataset access arrives, but it is not a benchmark result:
-without the labeled rows, it cannot produce SecretBench precision or recall.
+External regex sources can be used as broad-recall detector packs without
+locking Pentect to a specific benchmark. SecretBench's public regular-expression
+workbook is one useful source, but the same builder also accepts CSV, TSV, XLSX,
+JSON, and JSONL inputs with explicit column mappings.
 
-Generate chunked Pentect packs from the public workbook:
+Generate chunked Pentect packs from the SecretBench public workbook:
 
 ```sh
-python tools/import_secretbench_regex.py --out-dir target/secretbench-public-regex
+python tools/build_regex_pack.py --source secretbench-public --out-dir target/secretbench-public-regex
 ```
 
-Then pass the generated TOML files as repeated `--pack` arguments. The generator
-skips workbook entries that are templates, malformed, or not supported by the
+Generate packs from another source by mapping its columns:
+
+```sh
+python tools/build_regex_pack.py rules.csv \
+  --pattern-col regex \
+  --label-col type \
+  --id-col id \
+  --origin-col source \
+  --label-prefix EXT \
+  --out-dir target/external-regex
+```
+
+The builder skips entries that are templates, malformed, or not supported by the
 Rust regex engine, and writes a `*-skipped.tsv` report.
 
 The CLI can load the whole generated directory directly:
@@ -62,9 +73,9 @@ The CLI can load the whole generated directory directly:
 pentect mask --pack-dir target/secretbench-public-regex
 ```
 
-Use this as a temporary broad-recall detector pack. Keep reporting it separately
-from the curated core rules because many public SecretBench regexes are
-context-heavy and can overmask surrounding text.
+Use generated regex packs as temporary broad-recall detector packs. Keep them
+reported separately from the curated core rules because third-party regexes are
+often context-heavy and can overmask surrounding text.
 
 ### ai4privacy export
 
