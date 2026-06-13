@@ -3,11 +3,15 @@
 ## One-line definition
 
 Pentect is a local, reversible masking layer that lets AI agents work with
-sensitive technical data without seeing the original secrets.
+sensitive technical values without seeing the original data.
 
 日本語では、次の定義に固定する。
 
 > Pentect は、AI エージェントに機密値を見せずに、技術データを読ませ・使わせるためのローカル可逆マスキングエンジン。
+
+短い対外説明では **AI 時代のローカル可逆 DLP kernel** と言ってよい。
+ただし、企業向け DLP 製品全体ではなく、AI agent と tool-use の手前に置く
+core/kernel だと必ず補足する。
 
 ## Primary user
 
@@ -38,6 +42,8 @@ Pentect はこの間に入り、機密値をローカルで可逆 placeholder �
 
 - 人名、住所、組織名、自由文の地名は optional NER sidecar / audit / policy pack の責務にする。
 - 判例・契約書・社内文書の完全匿名化は v1 の主目的にしない。
+
+詳細な境界は [PII boundary](pii_boundary.md) に固定する。
 
 ## Non-goals for now
 

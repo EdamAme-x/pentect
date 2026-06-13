@@ -36,6 +36,34 @@ recall, F1, false-positive rate, and failures by SecretBench category/comment.
 It does not contain a hand-authored corpus, so the result cannot be made 100%
 by adjusting local fixtures.
 
+### ai4privacy export
+
+This is the external benchmark path for structured PII and the boundary between
+structured PII and semantic PII.
+
+Use it from an external Hugging Face export. Do not copy the dataset rows into
+this repository.
+
+```sh
+python tools/eval_ai4privacy.py path/to/ai4privacy.jsonl --bin target/release/pentect
+python tools/eval_ai4privacy.py path/to/ai4privacy.jsonl --preset core-structured --bin target/release/pentect
+python tools/eval_ai4privacy.py path/to/ai4privacy.jsonl --preset semantic --extra-arg --ner --bin target/release/pentect
+```
+
+The runner consumes `source_text`, `privacy_mask`, and `span_labels` style rows.
+It reports detection-only recall by label: a labeled value counts as concealed
+when the raw value is absent from Pentect's masked output. It does not report
+type accuracy, because Pentect placeholders use Pentect labels rather than the
+ai4privacy label taxonomy.
+
+Use the presets deliberately:
+
+- `core-structured`: email, phone, card, IBAN, passport, tax/social numbers,
+  account numbers, usernames, IP-like and URL-like identifiers.
+- `semantic`: names, addresses, organizations, locations, titles, dates, and
+  time-like prose labels. This should be used to measure optional NER/date
+  layers, not to judge the deterministic core.
+
 ### Technical corpus
 
 This is the primary corpus.
@@ -69,6 +97,11 @@ The ceiling for false positive masking in this corpus should remain zero unless 
 This is secondary.
 
 TAB/ECHR and similar prose anonymization datasets are useful only for measuring optional semantic PII layers such as NER or date detection. They should not be used as the headline score for the deterministic core.
+
+ai4privacy is more useful than TAB for Pentect because it contains many
+structured identifiers mixed into natural text. Still, the headline Pentect
+score should separate `core-structured` from `semantic`; combining them into one
+PII number hides the actual product boundary.
 
 ## Why TAB is not the primary benchmark
 
