@@ -56,6 +56,12 @@ Then pass the generated TOML files as repeated `--pack` arguments. The generator
 skips workbook entries that are templates, malformed, or not supported by the
 Rust regex engine, and writes a `*-skipped.tsv` report.
 
+The CLI can load the whole generated directory directly:
+
+```sh
+pentect mask --pack-dir target/secretbench-public-regex
+```
+
 Use this as a temporary broad-recall detector pack. Keep reporting it separately
 from the curated core rules because many public SecretBench regexes are
 context-heavy and can overmask surrounding text.

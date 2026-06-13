@@ -3,6 +3,7 @@
 
 use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, RuleDetector};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 /// Refuse oversized input rather than emit partially-masked output (a masked
 /// head plus a raw tail would leak the tail).
@@ -18,9 +19,10 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect mask [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--disable LABEL]...\n\
+        "pentect mask [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
          \x20 mask secrets from stdin to stdout\n\
          \x20 --pack FILE      load extra rules from a TOML pack (repeatable)\n\
+         \x20 --pack-dir DIR   load every *.toml pack in a directory (repeatable)\n\
          \x20 --disable LABEL  turn off a built-in detector by label (repeatable)\n\
          \x20 --enable LABEL   turn on an off-by-default built-in (e.g. DATE_TIME)\n\
          \x20 --ner            also mask person/location/org via the NER sidecar (needs --features ner)"
@@ -146,10 +148,11 @@ fn ner_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
 /// author can see exactly what to fix.
 fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
     let mut packs = Vec::new();
-    for path in arg_values(args, "--pack") {
+    for path in pack_paths(args)? {
+        let display = path.display();
         let src = std::fs::read_to_string(&path)
-            .map_err(|e| format!("could not read pack '{path}': {e}"))?;
-        let pack = load_pack(&src).map_err(|e| format!("pack '{path}' is invalid: {e}"))?;
+            .map_err(|e| format!("could not read pack '{display}': {e}"))?;
+        let pack = load_pack(&src).map_err(|e| format!("pack '{display}' is invalid: {e}"))?;
         packs.push(pack);
     }
     // --disable / --enable are a pack with no rules, only toggles.
@@ -163,6 +166,33 @@ fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
         });
     }
     Ok(packs)
+}
+
+fn pack_paths(args: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut paths: Vec<PathBuf> = arg_values(args, "--pack")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    for dir in arg_values(args, "--pack-dir") {
+        paths.extend(toml_files_in_dir(Path::new(&dir))?);
+    }
+    Ok(paths)
+}
+
+fn toml_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| format!("could not read pack directory '{}': {e}", dir.display()))?
+    {
+        let path = entry
+            .map_err(|e| format!("could not read pack directory '{}': {e}", dir.display()))?
+            .path();
+        if path.extension().is_some_and(|ext| ext == "toml") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {
@@ -183,4 +213,35 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_dir_expands_toml_files_in_stable_order() {
+        let root =
+            std::env::temp_dir().join(format!("pentect-pack-dir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("b.toml"), "").unwrap();
+        std::fs::write(root.join("a.toml"), "").unwrap();
+        std::fs::write(root.join("skip.txt"), "").unwrap();
+
+        let args = vec![
+            "pentect".to_string(),
+            "mask".to_string(),
+            "--pack-dir".to_string(),
+            root.display().to_string(),
+        ];
+        let paths = pack_paths(&args).unwrap();
+        assert_eq!(
+            paths,
+            vec![root.join("a.toml"), root.join("b.toml")],
+            "{paths:?}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
