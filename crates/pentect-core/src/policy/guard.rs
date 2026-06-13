@@ -28,7 +28,7 @@ impl ShapeGuard {
             ),
             git_sha: r("^[0-9a-f]{7,40}$"),
             local_path: r(
-                r#"(?i)^(?:[A-Z]:[\\/]|/(?:home|Users|mnt/[A-Z]|[A-Z]/Users)/)[^\r\n]+$"#,
+                r#"(?i)^(?:[A-Z]:[\\/]|/(?:home|Users|var/home|export/home|mnt/[A-Z]|[A-Z]/Users)/|~[^/\s\r\n"']+/)[^\r\n]+$"#,
             ),
         }
     }
@@ -65,6 +65,8 @@ mod tests {
         assert!(g.benign("5f4dcc3b5aa765d61d8327deb882cf99")); // md5
         assert!(g.benign(r"C:\Users\Public\Downloads\file.txt")); // local path
         assert!(g.benign("/Users/Shared/cache/file.txt")); // local path
+        assert!(g.benign("/var/home/alice/.config/app.toml")); // local path
+        assert!(g.benign("~alice/src/main.rs")); // local path
         assert!(!g.benign("AKIAIOSFODNN7EXAMPLE")); // real secret shape
         assert!(!NoGuard.benign("550e8400-e29b-41d4-a716-446655440000"));
     }

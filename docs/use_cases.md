@@ -17,7 +17,7 @@
 - DB connection strings and credential-bearing URLs
 - Authorization headers, cookies, session IDs
 - Structured PII such as email, phone, card, IBAN, national IDs
-- Local account names leaked through Windows/macOS/Linux home paths
+- Local account names leaked through Windows/macOS/Unix home paths
 
 ### What Pentect should preserve
 

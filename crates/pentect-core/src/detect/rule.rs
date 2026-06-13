@@ -461,7 +461,8 @@ impl RuleDetector {
             // Preserve path structure for debugging, but hide the local account
             // segment that frequently leaks in stack traces and tool output.
             (r#"(?i)\b[A-Z]:[\\/]+Users[\\/]+([^\\/\s:\r\n"<>|?*]{1,64})(?:[\\/]|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
-            (r#"(?i)(?:^|[\s"'=(:])/(?:home|Users)/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
+            (r#"(?i)(?:^|[\s"'=(:])/(?:home|Users|var/home|export/home)/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
+            (r#"(?i)(?:^|[\s"'=(:])~([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])/[a-z]/Users/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])/mnt/[a-z]/Users/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
         ];
@@ -696,6 +697,9 @@ mod tests {
             (r#"C:/Users/alice/project/main.rs"#, "alice"),
             ("/home/bob/project/main.rs", "bob"),
             ("/Users/carol/Library/Logs/app.log", "carol"),
+            ("/var/home/frank/.config/app.toml", "frank"),
+            ("/export/home/grace/work/app.log", "grace"),
+            ("~heidi/src/main.rs", "heidi"),
             ("/mnt/c/Users/dave/code/app.log", "dave"),
             ("/c/Users/erin/code/app.log", "erin"),
         ];
