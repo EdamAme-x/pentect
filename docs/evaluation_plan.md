@@ -39,6 +39,27 @@ recall, F1, false-positive rate, and failures by SecretBench category/comment.
 It does not contain a hand-authored corpus, so the result cannot be made 100%
 by adjusting local fixtures.
 
+### SecretBench public regex pack
+
+SecretBench also publishes the regular-expression workbook used to collect
+candidate repositories. This is public and separate from the gated dataset rows.
+It can be used before dataset access arrives, but it is not a benchmark result:
+without the labeled rows, it cannot produce SecretBench precision or recall.
+
+Generate chunked Pentect packs from the public workbook:
+
+```sh
+python tools/import_secretbench_regex.py --out-dir target/secretbench-public-regex
+```
+
+Then pass the generated TOML files as repeated `--pack` arguments. The generator
+skips workbook entries that are templates, malformed, or not supported by the
+Rust regex engine, and writes a `*-skipped.tsv` report.
+
+Use this as a temporary broad-recall detector pack. Keep reporting it separately
+from the curated core rules because many public SecretBench regexes are
+context-heavy and can overmask surrounding text.
+
 ### ai4privacy export
 
 This is the external benchmark path for structured PII and the boundary between
