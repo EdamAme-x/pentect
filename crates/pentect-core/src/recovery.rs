@@ -55,9 +55,19 @@ impl Recovery {
         String::from_utf8(bytes).ok()
     }
 
+    /// Resolve known placeholders into their original values.
+    ///
+    /// This is the local-only half of the agent boundary loop: an adapter can
+    /// let the model work with masked commands, then call `resolve` immediately
+    /// before executing them. Unknown placeholders pass through unchanged, so a
+    /// hallucinated token never invents a value.
+    pub fn resolve(&self, text: &str) -> String {
+        resolve_text(text, self)
+    }
+
     /// Re-mask: replace any sealed original value that reappears in `text` (e.g.
     /// a tool echoed it after a resolve) with its placeholder. The other half of
-    /// `restore`, for the resolve-at-exec loop: resolve placeholders just before
+    /// `resolve`, for the resolve-at-exec loop: resolve placeholders just before
     /// running a command, then re-mask the command's output so a revealed secret
     /// does not leak back to the model. Longest value first, so a value that
     /// contains a shorter one is replaced as a whole.
@@ -191,7 +201,7 @@ impl Reader<'_> {
     }
 }
 
-/// Uninhabited: `restore` from a valid in-memory map cannot fail — it reveals
+/// Uninhabited: resolving from a valid in-memory map cannot fail — it reveals
 /// known tokens and passes unknown ones through. The fail-closed path is `load`
 /// (validating an untrusted/persisted blob), which returns `RecoveryError`.
 #[derive(Clone, Debug)]
@@ -224,9 +234,15 @@ impl std::fmt::Display for RecoveryError {
 
 impl std::error::Error for RecoveryError {}
 
+/// Compatibility wrapper for resolving known placeholders into originals.
+/// Prefer `Recovery::resolve` in agent-boundary code.
+pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
+    Ok(rec.resolve(text))
+}
+
 /// Replace known `<<...>>` tokens with their originals; leave unknown tokens
 /// unchanged (a hallucinated placeholder has no mapping, so nothing can leak).
-pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
+fn resolve_text(text: &str, rec: &Recovery) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
@@ -234,8 +250,9 @@ pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
         if bytes[i] == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
             if let Some(close) = find_from(bytes, i + 2, b">>") {
                 let token = &text[i..close + 2];
-                if let Some(v) = rec.reveal(token) {
+                if let Some(mut v) = rec.reveal(token) {
                     out.push_str(&v);
+                    v.zeroize();
                     i = close + 2;
                     continue;
                 }
@@ -248,7 +265,7 @@ pub fn restore(text: &str, rec: &Recovery) -> Result<String, RestoreError> {
         out.push_str(&text[i..i + len]);
         i += len;
     }
-    Ok(out)
+    out
 }
 
 /// Domain-separated pad derived from the masking key (so it isn't reused verbatim
@@ -344,6 +361,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_method_restores_known_placeholders() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let ph = "<<AWS_AKID_0011223344556677>>";
+        let rec = Recovery::seal(
+            HashMap::from([(ph.to_string(), secret.to_string())]),
+            &[7u8; 32],
+        );
+        assert_eq!(rec.resolve(&format!("use {ph}")), format!("use {secret}"));
+        assert_eq!(
+            restore(&format!("use {ph}"), &rec).unwrap(),
+            rec.resolve(&format!("use {ph}"))
+        );
+    }
+
+    #[test]
+    fn resolve_leaves_unknown_placeholders_byte_identical() {
+        let rec = Recovery::default();
+        let text = "run <<UNKNOWN_0011223344556677>> now";
+        assert_eq!(rec.resolve(text), text);
+    }
+
+    #[test]
     fn remask_rehides_echoed_values_and_pairs_with_restore() {
         let secret = "AKIAIOSFODNN7EXAMPLE";
         let ph = "<<AWS_AKID_0011223344556677>>";
@@ -386,9 +425,11 @@ mod tests {
         );
         // Masked output where a literal '<' precedes the placeholder ("<<<X_..>>").
         assert_eq!(restore(&format!("<{ph}"), &rec).unwrap(), "<secret");
+        assert_eq!(rec.resolve(&format!("<{ph}")), "<secret");
         // An unknown "<<<..>>" still passes through byte-for-byte (nothing leaks).
         let unknown = "<<<UNKNOWN_0000000000000000>>";
         assert_eq!(restore(unknown, &Recovery::default()).unwrap(), unknown);
+        assert_eq!(Recovery::default().resolve(unknown), unknown);
     }
 
     #[test]

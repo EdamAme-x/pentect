@@ -76,7 +76,7 @@ fn cmd_mask(args: &[String]) {
     };
 
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
-    // reproducible key isn't needed (restore is unavailable by design).
+    // reproducible key isn't needed (resolve/restore is unavailable by design).
     let kind_label = format!("{kind:?}");
     let engine = build_engine(profile, aggressive, packs, args);
     let cfg = Config {
@@ -97,7 +97,7 @@ fn cmd_mask(args: &[String]) {
     }
     if !result.summary.collisions.is_empty() {
         eprintln!(
-            "[pentect] WARNING: {} placeholder collision(s) — restore may be wrong for the colliding value(s).",
+            "[pentect] WARNING: {} placeholder collision(s) — resolve/restore may be wrong for the colliding value(s).",
             result.summary.collisions.len()
         );
     }

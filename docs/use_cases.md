@@ -44,7 +44,7 @@ AI agent reads masked project data and proposes commands. The agent sees placeho
 
 - Stable placeholders for repeated values
 - A recovery map held locally
-- A restore operation before execution
+- A resolve operation before execution
 - A remask operation on stdout/stderr/tool results
 
 ### Success condition

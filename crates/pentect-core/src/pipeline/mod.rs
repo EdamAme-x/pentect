@@ -469,6 +469,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_loop_resolve_before_exec_and_remask_output() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let input = format!("curl -H 'X-Api-Key: {secret}' https://api.example.test");
+        let r = Engine::with_profile(Profile::Balanced)
+            .mask(Input::text(&input), &Config::insecure_testing());
+
+        assert!(!r.masked.contains(secret), "{}", r.masked);
+        assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
+
+        let ai_command = r.masked.replace("curl", "curl -s");
+        let resolved = r.recovery.resolve(&ai_command);
+        assert!(resolved.contains(secret), "{resolved}");
+        assert!(resolved.starts_with("curl -s"), "{resolved}");
+
+        let tool_output = format!("request succeeded; debug echoed {secret}");
+        let safe_output = r.recovery.remask(&tool_output);
+        assert!(!safe_output.contains(secret), "{safe_output}");
+        assert!(safe_output.contains("<<AWS_AKID_"), "{safe_output}");
+    }
+
+    #[test]
     fn global_identity_no_survivor() {
         let r = m("a@b.com mid a@b.com");
         assert!(!r.masked.contains("a@b.com"), "{}", r.masked);

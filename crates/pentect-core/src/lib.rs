@@ -1,4 +1,4 @@
-//! pentect-core: translate secrets in text into reversible placeholders, locally.
+//! pentect-core: a local bidirectional masking kernel for AI boundaries.
 //!
 //! Layers: `model` (domain), the pluggable adapter layers `detect` / `codec` /
 //! `parse` / `policy` (each with its port trait), and `pipeline` (the Engine
@@ -6,6 +6,18 @@
 //! invariants: reversible, idempotent, deterministic, global-identity,
 //! collision-free). `normalize` / `placeholder` / `recovery` are shared
 //! primitives.
+//!
+//! The core loop is pure text transformation:
+//!
+//! 1. `Engine::mask` turns local plaintext into placeholders safe for a model.
+//! 2. `Recovery::resolve` expands known placeholders immediately before a local
+//!    adapter executes a command or tool call.
+//! 3. `Recovery::remask` hides any echoed values before output returns to the
+//!    model.
+//!
+//! Hook integration, command execution, key storage, session persistence, network
+//! policy, and UI are adapter responsibilities; this crate does not perform
+//! those side effects.
 
 pub mod codec;
 pub mod detect;

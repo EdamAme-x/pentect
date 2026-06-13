@@ -14,7 +14,7 @@ The main question is not "does Pentect anonymize all prose PII?" The main questi
 - `overmask_count`: benign values masked when they should remain visible. Target: 0 for the precision ratchet corpus.
 - `utility`: whether the masked prompt still preserves enough structure for the task.
 - `task_success`: whether the AI can complete the intended debugging, review, or security reasoning task.
-- `restore_correctness`: masked text restores byte-for-byte through the local recovery map.
+- `resolve_correctness`: masked text resolves byte-for-byte through the local recovery map.
 - `remask_correctness`: resolved secrets echoed by tools are hidden again before returning to the AI.
 
 ## Corpora
@@ -76,7 +76,7 @@ Accept when:
 - all secrets are masked
 - repeated values use stable placeholders
 - benign debugging context remains readable
-- restore returns the exact original input
+- resolve returns the exact original input
 
 ### Agent execution scenario
 
@@ -84,7 +84,7 @@ Input: masked command containing placeholders.
 
 Accept when:
 
-- restore before execution yields the real command locally
+- resolve before execution yields the real command locally
 - tool output is remasked before it is shown to the AI
 - unknown or hallucinated placeholders do not reveal anything
 
@@ -107,7 +107,7 @@ Recommended reporting table:
 - scenario
 - leak count
 - overmask count
-- restore pass/fail
+- resolve pass/fail
 - remask pass/fail
 - task success
 - notes on utility loss
