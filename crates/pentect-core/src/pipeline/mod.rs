@@ -1,3 +1,4 @@
+mod interval;
 mod merge;
 mod render;
 mod sweep;

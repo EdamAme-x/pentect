@@ -1,17 +1,23 @@
 use crate::model::*;
 use crate::policy::is_context_free;
 
+use super::interval::RangeIndex;
+
 /// Resolve overlapping candidates into a non-overlapping set.
 pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
+    let protected_index = RangeIndex::new(protected.to_vec());
+
     // Drop empties and anything touching a frozen placeholder.
-    spans.retain(|s| !s.range.is_empty() && !protected.iter().any(|p| p.overlaps(&s.range)));
+    spans.retain(|s| !s.range.is_empty() && !protected_index.overlaps(&s.range));
 
     // Strongest first (Span::cmp_strength is the one canonical ordering).
     spans.sort_by(|a, b| b.cmp_strength(a));
 
     let mut accepted: Vec<Span> = Vec::new();
+    let mut accepted_index = RangeIndex::default();
     for s in spans {
-        if accepted.iter().all(|a| !a.range.overlaps(&s.range)) {
+        if !accepted_index.overlaps(&s.range) {
+            accepted_index.insert(s.range);
             accepted.push(s);
             continue;
         }
@@ -23,14 +29,12 @@ pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
         // split into fragments.
         if is_context_free(&s) {
             let mut pieces = vec![s.range];
-            for a in &accepted {
-                pieces = pieces
-                    .into_iter()
-                    .flat_map(|p| subtract(p, &a.range))
-                    .collect();
+            for a in accepted_index.overlapping(&s.range) {
+                pieces = pieces.into_iter().flat_map(|p| subtract(p, &a)).collect();
             }
             for range in pieces {
-                if !range.is_empty() {
+                if !range.is_empty() && !accepted_index.overlaps(&range) {
+                    accepted_index.insert(range);
                     accepted.push(Span { range, ..s.clone() });
                 }
             }

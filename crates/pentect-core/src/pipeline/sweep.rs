@@ -1,7 +1,11 @@
+use aho_corasick::{AhoCorasickBuilder, MatchKind};
+
 use crate::detect::is_token_byte;
 use crate::model::*;
 use crate::normalize::n_id;
 use std::collections::BTreeMap;
+
+use super::interval::RangeIndex;
 
 /// Mask every other occurrence of an already-masked value across the input.
 /// This is correctness, not optimization: a value left in plaintext anywhere
@@ -38,35 +42,59 @@ pub fn identity_sweep(
             .then(a.range.start.cmp(&b.range.start))
     });
 
+    let needles: Vec<&str> = reps
+        .iter()
+        .map(|r| &raw[r.range.start..r.range.end])
+        .filter(|needle| !needle.is_empty())
+        .collect();
+    if needles.is_empty() {
+        return accepted;
+    }
+
+    let ac = AhoCorasickBuilder::new()
+        .match_kind(MatchKind::Standard)
+        .build(&needles)
+        .expect("non-empty patterns");
+    let mut occupied = RangeIndex::new(
+        accepted
+            .iter()
+            .map(|s| s.range)
+            .chain(protected.iter().copied())
+            .collect(),
+    );
+    let mut candidates: Vec<(usize, ByteRange)> = Vec::new();
     let bytes = raw.as_bytes();
+    for m in ac.find_overlapping_iter(raw) {
+        let range = ByteRange::new(m.start(), m.end());
+        let on_boundary = !continues_token(bytes, range.start.wrapping_sub(1))
+            && !continues_token(bytes, range.end);
+        let in_region = regions.iter().any(|rg| rg.span.contains(&range));
+        if on_boundary && in_region && !occupied.overlaps(&range) {
+            candidates.push((m.pattern().as_usize(), range));
+        }
+    }
+
+    candidates.sort_by(|(ai, a), (bi, b)| {
+        b.len()
+            .cmp(&a.len())
+            .then(a.start.cmp(&b.start))
+            .then(ai.cmp(bi))
+    });
+
     let mut all = accepted.clone();
-    for r in reps {
-        let needle = &raw[r.range.start..r.range.end];
-        if needle.is_empty() {
+    for (pattern, range) in candidates {
+        if occupied.overlaps(&range) {
             continue;
         }
-        let mut from = 0usize;
-        while let Some(pos) = raw[from..].find(needle) {
-            let abs = from + pos;
-            let end = abs + needle.len();
-            let range = ByteRange::new(abs, end);
-            from = end;
-
-            let on_boundary =
-                !continues_token(bytes, abs.wrapping_sub(1)) && !continues_token(bytes, end);
-            let in_region = regions.iter().any(|rg| rg.span.contains(&range));
-            let clash = all.iter().any(|a| a.range.overlaps(&range))
-                || protected.iter().any(|p| p.overlaps(&range));
-            if on_boundary && in_region && !clash {
-                all.push(Span {
-                    range,
-                    category: r.category,
-                    label: r.label.clone(),
-                    confidence: r.confidence,
-                    source: DetectorId::Sweep,
-                });
-            }
-        }
+        let r = reps[pattern];
+        occupied.insert(range);
+        all.push(Span {
+            range,
+            category: r.category,
+            label: r.label.clone(),
+            confidence: r.confidence,
+            source: DetectorId::Sweep,
+        });
     }
 
     all.sort_by_key(|s| s.range.start);

@@ -455,6 +455,7 @@ dependencies = [
 name = "pentect-core"
 version = "0.0.1"
 dependencies = [
+ "aho-corasick",
  "bs58",
  "data-encoding",
  "flate2",
