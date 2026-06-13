@@ -36,6 +36,7 @@ Pentect はこの間に入り、機密値をローカルで可逆 placeholder �
 - API key, token, credential, private key
 - `.env`, config, logs, stack traces, code snippets
 - HAR, curl, headers, cookies, query parameters
+- local filesystem paths that reveal account names
 - email, phone, card, IBAN, national ID などの構造化 PII
 
 自由文 PII は捨てないが、core の主戦場にしない。

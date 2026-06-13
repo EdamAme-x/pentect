@@ -456,6 +456,15 @@ impl RuleDetector {
             (r"(?i)(?:acn|company number)[^\n]{0,12}?\b\d{3}[ ]?\d{3}[ ]?\d{3}\b", Identifier, "AU_ACN", High, V::AuAcn),
             (r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b", Identifier, "IN_GSTIN", High, V::InGstin),
         ];
+        #[rustfmt::skip]
+        let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
+            // Preserve path structure for debugging, but hide the local account
+            // segment that frequently leaks in stack traces and tool output.
+            (r#"(?i)\b[A-Z]:[\\/]+Users[\\/]+([^\\/\s:\r\n"<>|?*]{1,64})(?:[\\/]|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
+            (r#"(?i)(?:^|[\s"'=(:])/(?:home|Users)/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
+            (r#"(?i)(?:^|[\s"'=(:])/[a-z]/Users/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
+            (r#"(?i)(?:^|[\s"'=(:])/mnt/[a-z]/Users/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
+        ];
         let specs = table
             .iter()
             .map(|&(pattern, category, label, confidence)| RuleSpec {
@@ -480,6 +489,17 @@ impl RuleDetector {
                     },
                 ),
             )
+            .chain(captured.iter().map(
+                |&(pattern, category, label, confidence, capture, validator)| RuleSpec {
+                    pattern: pattern.to_string(),
+                    category,
+                    label: label.to_string(),
+                    confidence,
+                    validator,
+                    capture,
+                    prefilter: Vec::new(),
+                },
+            ))
             .collect();
         Self::from_specs(specs).expect("builtin regexes compile")
     }
@@ -666,6 +686,42 @@ mod tests {
         assert!(hits("a@b.co.uk"));
         assert!(!hits("alice@.com"));
         assert!(!hits("alice@example."));
+    }
+
+    #[test]
+    fn home_paths_mask_only_local_username_segment() {
+        let det = RuleDetector::builtin();
+        let cases = [
+            (r#"C:\Users\alice\project\main.rs"#, "alice"),
+            (r#"C:/Users/alice/project/main.rs"#, "alice"),
+            ("/home/bob/project/main.rs", "bob"),
+            ("/Users/carol/Library/Logs/app.log", "carol"),
+            ("/mnt/c/Users/dave/code/app.log", "dave"),
+            ("/c/Users/erin/code/app.log", "erin"),
+        ];
+        for (raw, username) in cases {
+            let spans = det.detect(&NormalizedView::build(&region(raw), raw));
+            let Some(span) = spans.iter().find(|s| s.label == "LOCAL_USERNAME") else {
+                panic!("{raw} should detect LOCAL_USERNAME, got {spans:?}");
+            };
+            assert_eq!(&raw[span.range.start..span.range.end], username);
+        }
+    }
+
+    #[test]
+    fn shared_home_directories_are_not_local_usernames() {
+        let det = RuleDetector::builtin();
+        for raw in [
+            r#"C:\Users\Public\Downloads\file.txt"#,
+            "/Users/Shared/cache/file.txt",
+            "/home/../project",
+        ] {
+            let spans = det.detect(&NormalizedView::build(&region(raw), raw));
+            assert!(
+                spans.iter().all(|s| s.label != "LOCAL_USERNAME"),
+                "{raw} should not mask a shared/system directory: {spans:?}"
+            );
+        }
     }
 
     #[test]

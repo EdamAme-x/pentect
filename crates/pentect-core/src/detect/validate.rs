@@ -783,6 +783,31 @@ fn bip39_window_valid(words: &[&str]) -> bool {
     (0..cs_bits).all(|i| (hash[i / 8] >> (7 - (i % 8))) & 1 == bits[ent_bits + i])
 }
 
+/// Local account names captured from home-directory paths. This is not a
+/// checksum; it filters obvious shared/system pseudo-users so path masking does
+/// not erase useful public directory context.
+pub fn local_username(s: &str) -> bool {
+    let name = s.trim();
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    if name == "." || name == ".." {
+        return false;
+    }
+    if name.chars().all(|c| c == '.' || c.is_whitespace()) {
+        return false;
+    }
+    if name.chars().any(|c| {
+        c.is_control() || matches!(c, '\\' | '/' | ':' | '"' | '<' | '>' | '|' | '?' | '*')
+    }) {
+        return false;
+    }
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "all users" | "default" | "default user" | "public" | "shared"
+    )
+}
+
 /// A checksum gate applied to a regex match before it becomes a span.
 #[derive(Clone, Copy, Debug)]
 pub enum Validator {
@@ -822,6 +847,7 @@ pub enum Validator {
     FrNir,
     AuAcn,
     InGstin,
+    LocalUsername,
 }
 
 impl Validator {
@@ -866,6 +892,7 @@ impl Validator {
             "fr_nir" => Validator::FrNir,
             "au_acn" => Validator::AuAcn,
             "in_gstin" => Validator::InGstin,
+            "local_username" => Validator::LocalUsername,
             _ => return None,
         })
     }
@@ -908,6 +935,7 @@ impl Validator {
             Validator::FrNir => fr_nir(s),
             Validator::AuAcn => au_acn(s),
             Validator::InGstin => in_gstin(s),
+            Validator::LocalUsername => local_username(s),
         }
     }
 }
@@ -955,6 +983,19 @@ mod tests {
         vectors!(fr_nir, "180047509112541" => true, "180047509112556" => false);
         vectors!(au_acn, "004085616" => true, "004085617" => false);
         vectors!(in_gstin, "27AAPFU0939F1ZV" => true, "27AAPFU0939F1ZX" => false);
+    }
+
+    #[test]
+    fn local_username_filters_shared_home_directories() {
+        vectors!(local_username,
+            "alice" => true,
+            "Alice Smith" => true,
+            "山田太郎" => true,
+            "Public" => false,
+            "Shared" => false,
+            "Default User" => false,
+            ".." => false,
+            "alice/project" => false);
     }
 
     #[test]

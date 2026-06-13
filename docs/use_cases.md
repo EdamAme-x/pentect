@@ -17,11 +17,13 @@
 - DB connection strings and credential-bearing URLs
 - Authorization headers, cookies, session IDs
 - Structured PII such as email, phone, card, IBAN, national IDs
+- Local account names leaked through Windows/macOS/Linux home paths
 
 ### What Pentect should preserve
 
 - File structure and syntax
 - Error messages
+- Path structure, while hiding local account names
 - Status codes, HTTP methods, endpoint shape
 - Non-secret variable names and configuration keys
 - Enough stable identity to let the AI correlate repeated values

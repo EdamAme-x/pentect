@@ -12,6 +12,7 @@ pub struct ShapeGuard {
     uuid: Regex,
     hex_digest: Regex,
     git_sha: Regex,
+    local_path: Regex,
 }
 
 impl ShapeGuard {
@@ -26,13 +27,19 @@ impl ShapeGuard {
                 "^(?i)[0-9a-f]{32}$|^(?i)[0-9a-f]{40}$|^(?i)[0-9a-f]{64}$|^(?i)[0-9a-f]{128}$",
             ),
             git_sha: r("^[0-9a-f]{7,40}$"),
+            local_path: r(
+                r#"(?i)^(?:[A-Z]:[\\/]|/(?:home|Users|mnt/[A-Z]|[A-Z]/Users)/)[^\r\n]+$"#,
+            ),
         }
     }
 }
 
 impl OverMaskGuard for ShapeGuard {
     fn benign(&self, value: &str) -> bool {
-        self.uuid.is_match(value) || self.hex_digest.is_match(value) || self.git_sha.is_match(value)
+        self.uuid.is_match(value)
+            || self.hex_digest.is_match(value)
+            || self.git_sha.is_match(value)
+            || self.local_path.is_match(value)
     }
 }
 
@@ -56,6 +63,8 @@ mod tests {
         assert!(g.benign("550e8400-e29b-41d4-a716-446655440000")); // uuid
         assert!(g.benign("356a192b7913b04c54574d18c28d46e6395428ab")); // sha1
         assert!(g.benign("5f4dcc3b5aa765d61d8327deb882cf99")); // md5
+        assert!(g.benign(r"C:\Users\Public\Downloads\file.txt")); // local path
+        assert!(g.benign("/Users/Shared/cache/file.txt")); // local path
         assert!(!g.benign("AKIAIOSFODNN7EXAMPLE")); // real secret shape
         assert!(!NoGuard.benign("550e8400-e29b-41d4-a716-446655440000"));
     }
