@@ -19,6 +19,23 @@ The main question is not "does Pentect anonymize all prose PII?" The main questi
 
 ## Corpora
 
+### SecretBench export
+
+This is the primary external benchmark for deterministic secret detection.
+
+SecretBench is gated and must be requested from its authors. Do not copy its
+rows into this repository. After access is granted, export the BigQuery table to
+CSV, JSON, or JSONL, then run:
+
+```sh
+python tools/eval_secretbench.py path/to/secretbench_export.jsonl --bin target/release/pentect
+```
+
+The runner consumes external labeled rows and reports candidate-level precision,
+recall, F1, false-positive rate, and failures by SecretBench category/comment.
+It does not contain a hand-authored corpus, so the result cannot be made 100%
+by adjusting local fixtures.
+
 ### Technical corpus
 
 This is the primary corpus.
