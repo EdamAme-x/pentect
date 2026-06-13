@@ -28,6 +28,7 @@ pub fn date_detector() -> RuleDetector {
             label: "DATE_TIME".to_string(),
             confidence: Confidence::Medium,
             validator: Validator::None,
+            capture: 0,
         })
         .collect();
     RuleDetector::from_specs(specs).expect("date regexes compile")

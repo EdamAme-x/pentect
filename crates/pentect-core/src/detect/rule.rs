@@ -12,6 +12,8 @@ struct Rule {
     /// Checksum gate applied to each match before it becomes a span (the
     /// precision lever that lets a permissive pattern avoid false positives).
     validator: Validator,
+    /// 0 masks the full regex match; N masks capture group N.
+    capture: usize,
 }
 
 /// A data-form rule (e.g. a TOML pack entry) before its pattern is compiled.
@@ -21,6 +23,7 @@ pub struct RuleSpec {
     pub label: String,
     pub confidence: Confidence,
     pub validator: Validator,
+    pub capture: usize,
 }
 
 /// Anchored vendor-token rules. High confidence and linear-time (no ReDoS), so
@@ -36,20 +39,28 @@ pub struct RuleDetector {
 impl RuleDetector {
     /// Compile data-form rules into a detector; errors if any pattern is invalid.
     pub fn from_specs(specs: Vec<RuleSpec>) -> Result<Self, String> {
-        let set = RegexSet::new(specs.iter().map(|s| s.pattern.as_str()))
-            .map_err(|e| format!("rule set: {e}"))?;
         let rules = specs
             .into_iter()
             .map(|s| {
+                let re = Regex::new(&s.pattern).map_err(|e| format!("rule {}: {e}", s.label))?;
+                if s.capture >= re.captures_len() {
+                    return Err(format!(
+                        "rule {}: capture {} does not exist",
+                        s.label, s.capture
+                    ));
+                }
                 Ok(Rule {
-                    re: Regex::new(&s.pattern).map_err(|e| format!("rule {}: {e}", s.label))?,
+                    re,
                     category: s.category,
                     label: s.label,
                     confidence: s.confidence,
                     validator: s.validator,
+                    capture: s.capture,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let set = RegexSet::new(rules.iter().map(|r| r.re.as_str()))
+            .map_err(|e| format!("rule set: {e}"))?;
         Ok(Self { rules, set })
     }
 
@@ -398,6 +409,7 @@ impl RuleDetector {
                 label: label.to_string(),
                 confidence,
                 validator: V::None,
+                capture: 0,
             })
             .chain(
                 checked.iter().map(
@@ -407,6 +419,7 @@ impl RuleDetector {
                         label: label.to_string(),
                         confidence,
                         validator,
+                        capture: 0,
                     },
                 ),
             )
@@ -421,21 +434,40 @@ impl Detector for RuleDetector {
         let mut out = Vec::new();
         for i in self.set.matches(s) {
             let rule = &self.rules[i];
-            for m in rule.re.find_iter(s) {
-                if !rule.validator.accepts(m.as_str()) {
-                    continue;
+            if rule.capture == 0 {
+                for m in rule.re.find_iter(s) {
+                    push_match(view, rule, m.start(), m.end(), m.as_str(), &mut out);
                 }
-                out.push(Span {
-                    range: view.to_raw(ByteRange::new(m.start(), m.end())),
-                    category: rule.category,
-                    label: rule.label.clone(),
-                    confidence: rule.confidence,
-                    source: DetectorId::Rule,
-                });
+            } else {
+                for captures in rule.re.captures_iter(s) {
+                    if let Some(m) = captures.get(rule.capture) {
+                        push_match(view, rule, m.start(), m.end(), m.as_str(), &mut out);
+                    }
+                }
             }
         }
         out
     }
+}
+
+fn push_match(
+    view: &NormalizedView,
+    rule: &Rule,
+    start: usize,
+    end: usize,
+    value: &str,
+    out: &mut Vec<Span>,
+) {
+    if value.is_empty() || !rule.validator.accepts(value) {
+        return;
+    }
+    out.push(Span {
+        range: view.to_raw(ByteRange::new(start, end)),
+        category: rule.category,
+        label: rule.label.clone(),
+        confidence: rule.confidence,
+        source: DetectorId::Rule,
+    });
 }
 
 #[cfg(test)]
@@ -561,5 +593,38 @@ mod tests {
         assert!(hits("a@b.co.uk"));
         assert!(!hits("alice@.com"));
         assert!(!hits("alice@example."));
+    }
+
+    #[test]
+    fn capture_masks_only_the_selected_group() {
+        let det = RuleDetector::from_specs(vec![RuleSpec {
+            pattern: r"(?i)api[_-]?key\s*=\s*([A-Za-z0-9]{12})".into(),
+            category: Category::Secret,
+            label: "API_KEY".into(),
+            confidence: Confidence::High,
+            validator: Validator::None,
+            capture: 1,
+        }])
+        .unwrap();
+        let raw = "api_key = ABCDEFGH1234";
+        let spans = det.detect(&NormalizedView::build(&region(raw), raw));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            &raw[spans[0].range.start..spans[0].range.end],
+            "ABCDEFGH1234"
+        );
+    }
+
+    #[test]
+    fn missing_capture_is_rejected() {
+        assert!(RuleDetector::from_specs(vec![RuleSpec {
+            pattern: r"API-[A-Z0-9]+".into(),
+            category: Category::Secret,
+            label: "API_KEY".into(),
+            confidence: Confidence::High,
+            validator: Validator::None,
+            capture: 1,
+        }])
+        .is_err());
     }
 }

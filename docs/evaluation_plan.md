@@ -60,12 +60,20 @@ python tools/build_regex_pack.py rules.csv \
   --label-col type \
   --id-col id \
   --origin-col source \
+  --capture-col capture \
   --label-prefix EXT \
   --out-dir target/external-regex
 ```
 
 The builder skips entries that are templates, malformed, or not supported by the
 Rust regex engine, and writes a `*-skipped.tsv` report.
+
+Generated packs can set `capture = N` per detector. `capture = 0` masks the full
+regex match; `capture = 1` masks only the first capture group. This matters for
+third-party rules shaped like `keyword ... (actual_secret)`, where masking the
+whole match would erase useful context. The SecretBench public preset enables a
+conservative capture inference pass for common context-window and delimiter
+patterns.
 
 The CLI can load the whole generated directory directly:
 

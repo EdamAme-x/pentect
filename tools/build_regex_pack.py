@@ -37,6 +37,7 @@ class RegexRule:
     label_source: str
     pattern: str
     origin: str
+    capture: int
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label-col", default="label")
     p.add_argument("--id-col", default="")
     p.add_argument("--origin-col", default="")
+    p.add_argument("--capture-col", default="")
+    p.add_argument("--capture", type=int, default=0)
+    p.add_argument("--infer-capture", action="store_true")
     p.add_argument("--label-prefix", default="REGEX")
     p.add_argument("--out-dir", type=Path, default=Path("target/regex-packs"))
     p.add_argument("--prefix", default="regex-pack")
@@ -103,6 +107,7 @@ def configure_preset(args: argparse.Namespace) -> None:
     args.origin_col = "Source"
     args.label_prefix = "SB"
     args.prefix = "secretbench-public-regex"
+    args.infer_capture = True
     if args.out_dir == Path("target/regex-packs"):
         args.out_dir = Path("target/secretbench-public-regex")
 
@@ -124,12 +129,16 @@ def read_rules(path: Path, args: argparse.Namespace) -> list[RegexRule]:
         pattern = text(row.get(args.pattern_col, ""))
         if not pattern:
             continue
+        capture = capture_value(row, args)
+        if args.infer_capture:
+            capture = infer_capture(pattern, capture)
         out.append(
             RegexRule(
                 rule_id=text(row.get(args.id_col, "")) if args.id_col else str(index),
                 label_source=text(row.get(args.label_col, "")) if args.label_col else "CUSTOM",
                 pattern=pattern,
                 origin=text(row.get(args.origin_col, "")) if args.origin_col else "",
+                capture=capture,
             )
         )
     return out
@@ -255,6 +264,8 @@ def write_pack(path: Path, rules: list[RegexRule], args: argparse.Namespace) -> 
             f.write(f"category = {toml_string(args.category)}\n")
             f.write(f"confidence = {toml_string(args.confidence)}\n")
             f.write(f"# rule_id = {rule.rule_id}; origin = {rule.origin}\n")
+            if rule.capture:
+                f.write(f"capture = {rule.capture}\n")
             f.write(f"pattern = {toml_string(rule.pattern)}\n\n")
 
 
@@ -279,6 +290,131 @@ def chunked(items: list[RegexRule], size: int) -> list[list[RegexRule]]:
     if size <= 0:
         raise SystemExit("--chunk-size must be positive")
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def capture_value(row: dict[str, Any], args: argparse.Namespace) -> int:
+    if not args.capture_col:
+        return args.capture
+    value = text(row.get(args.capture_col, ""))
+    if not value:
+        return args.capture
+    try:
+        capture = int(value)
+    except ValueError as e:
+        raise SystemExit(f"invalid capture value {value!r}") from e
+    if capture < 0:
+        raise SystemExit("capture must be >= 0")
+    return capture
+
+
+def infer_capture(pattern: str, default: int) -> int:
+    if default:
+        return default
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        try:
+            compiled = re.compile(pattern)
+        except re.error:
+            return default
+    if compiled.groups != 1:
+        return default
+    group = first_capturing_group_span(pattern)
+    if group is None:
+        return default
+    start, end = group
+    before = pattern[:start]
+    after = pattern[end + 1 :]
+    if has_context_window(before) or (
+        looks_like_delimiter_prefix(before) and looks_like_delimiter_suffix(after)
+    ):
+        return 1
+    return default
+
+
+def has_context_window(prefix: str) -> bool:
+    return any(
+        token in prefix
+        for token in (
+            "{0,20}",
+            "{0,30}",
+            "{0,40}",
+            "(?:.|[\\n\\r])",
+            "[^\\n]{0,",
+        )
+    )
+
+
+def looks_like_delimiter_suffix(suffix: str) -> bool:
+    suffix = suffix.strip()
+    if not suffix:
+        return True
+    token_re = re.compile(
+        r"^(?:"
+        r"\\b|\\s|\\r|\\n|\\t|\$|\^|"
+        r"\[[^\]]+\]|"
+        r"\(\?:\\s\|\$\)|"
+        r"[?+*]|"
+        r"\{[0-9,]+\}"
+        r")+$"
+    )
+    return token_re.fullmatch(suffix) is not None
+
+
+def looks_like_delimiter_prefix(prefix: str) -> bool:
+    prefix = prefix.strip()
+    if not prefix:
+        return True
+    token_re = re.compile(
+        r"^(?:"
+        r"\(\?[A-Za-z-]+\)|"
+        r"\\b|\\s|\\r|\\n|\\t|\$|\^|"
+        r"\[[^\]]+\]|"
+        r"[?+*]|"
+        r"\{[0-9,]+\}"
+        r")+$"
+    )
+    return token_re.fullmatch(prefix) is not None
+
+
+def first_capturing_group_span(pattern: str) -> tuple[int, int] | None:
+    in_class = False
+    escaped = False
+    stack: list[tuple[int, bool]] = []
+    for i, ch in enumerate(pattern):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if in_class:
+            if ch == "]":
+                in_class = False
+            continue
+        if ch == "[":
+            in_class = True
+            continue
+        if ch == "(":
+            capturing = is_capturing_group(pattern, i)
+            stack.append((i, capturing))
+            continue
+        if ch == ")" and stack:
+            start, capturing = stack.pop()
+            if capturing:
+                return (start, i)
+    return None
+
+
+def is_capturing_group(pattern: str, index: int) -> bool:
+    if index + 1 >= len(pattern) or pattern[index + 1] != "?":
+        return True
+    if index + 2 >= len(pattern):
+        return False
+    marker = pattern[index + 2]
+    if marker in ":=!<":
+        return False
+    # Inline flags such as (?i) or (?im-s:...) are not captures.
+    return False
 
 
 def safe_label(value: str) -> str:
