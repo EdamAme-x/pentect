@@ -15,11 +15,11 @@ pub struct Pack {
 
 /// Parse a TOML rule pack. Two knobs cover the real demand: add your own rules
 /// (`[[detector]]` with `keywords = [...]` literals, or a regex `pattern` plus an
-/// optional checksum `validator` / `capture` group), and turn built-ins off
-/// (`disable = ["LABEL"]`). Detector entries without a `pattern`/`keywords` are
-/// skipped so a mixed pack still loads its Layer-1 rules. Errors on malformed
-/// TOML, an unknown category / confidence / validator, an invalid regex, or a
-/// missing capture group.
+/// optional checksum `validator`, `capture` group, or `prefilter` literals), and
+/// turn built-ins off (`disable = ["LABEL"]`). Detector entries without a
+/// `pattern`/`keywords` are skipped so a mixed pack still loads its Layer-1
+/// rules. Errors on malformed TOML, an unknown category / confidence /
+/// validator, an invalid regex, or a missing capture group.
 pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
     let pack: PackFile = toml::from_str(toml_src).map_err(|e| e.to_string())?;
     let mut specs = Vec::new();
@@ -49,6 +49,7 @@ pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
             confidence: parse_confidence(&d.confidence)?,
             validator,
             capture: d.capture.unwrap_or(0),
+            prefilter: d.prefilter.unwrap_or_default(),
         });
     }
     Ok(Pack {
@@ -86,6 +87,8 @@ struct DetectorEntry {
     validator: Option<String>,
     /// 0 or absent masks the full match; N masks capture group N.
     capture: Option<usize>,
+    /// Optional literals that must be present before this regex is run.
+    prefilter: Option<Vec<String>>,
 }
 
 fn default_confidence() -> String {
@@ -224,6 +227,26 @@ mod tests {
         assert!(out.contains("api_key = "), "{out}");
         assert!(!out.contains("ABCDEFGH1234"), "{out}");
         assert!(out.contains("<<API_KEY_"), "{out}");
+    }
+
+    #[test]
+    fn pack_prefilter_runs_rule_only_when_literal_is_present() {
+        let pack = load_pack(
+            r#"[[detector]]
+               pattern = '(?i)acme.{0,20}([A-Za-z0-9]{12})'
+               label = "ACME_TOKEN"
+               capture = 1
+               prefilter = ["acme"]"#,
+        )
+        .unwrap();
+        let hit = |raw: &str| {
+            pack.rules
+                .detect(&NormalizedView::build(&region(raw), raw))
+                .iter()
+                .any(|s| s.label == "ACME_TOKEN")
+        };
+        assert!(!hit("token ABCDEFGH1234"));
+        assert!(hit("acme token ABCDEFGH1234"));
     }
 
     #[test]

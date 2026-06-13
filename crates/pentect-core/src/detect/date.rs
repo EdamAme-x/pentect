@@ -29,6 +29,7 @@ pub fn date_detector() -> RuleDetector {
             confidence: Confidence::Medium,
             validator: Validator::None,
             capture: 0,
+            prefilter: Vec::new(),
         })
         .collect();
     RuleDetector::from_specs(specs).expect("date regexes compile")

@@ -61,6 +61,7 @@ python tools/build_regex_pack.py rules.csv \
   --id-col id \
   --origin-col source \
   --capture-col capture \
+  --prefilter-col vendor \
   --label-prefix EXT \
   --out-dir target/external-regex
 ```
@@ -74,6 +75,12 @@ third-party rules shaped like `keyword ... (actual_secret)`, where masking the
 whole match would erase useful context. The SecretBench public preset enables a
 conservative capture inference pass for common context-window and delimiter
 patterns.
+
+Generated packs can also set `prefilter = ["literal", ...]`. Prefilter literals
+are scanned with Aho-Corasick first, and the regex runs only if one of its
+literals appears. The SecretBench public preset infers vendor-keyword prefilters
+for common `vendor ... (actual_secret)` rules, which keeps the broad pack usable
+on large inputs.
 
 The CLI can load the whole generated directory directly:
 

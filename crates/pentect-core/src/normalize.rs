@@ -115,23 +115,19 @@ impl<'a> NormalizedView<'a> {
     }
 
     fn raw_start_at(&self, pos: usize) -> usize {
+        let idx = self.segs.partition_point(|s| s.norm.end <= pos);
         self.segs
-            .iter()
-            .find(|s| pos < s.norm.end)
+            .get(idx)
             .map(|s| s.raw.start)
             .unwrap_or(self.region.span.end)
     }
 
     fn raw_end_at(&self, pos: usize) -> usize {
-        let mut end = self.region.span.start;
-        for s in &self.segs {
-            if s.norm.start < pos {
-                end = s.raw.end;
-            } else {
-                break;
-            }
-        }
-        end
+        let idx = self.segs.partition_point(|s| s.norm.start < pos);
+        idx.checked_sub(1)
+            .and_then(|i| self.segs.get(i))
+            .map(|s| s.raw.end)
+            .unwrap_or(self.region.span.start)
     }
 }
 

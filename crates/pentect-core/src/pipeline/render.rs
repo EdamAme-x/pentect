@@ -73,6 +73,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
     spans.sort_by_key(|s| s.range.start);
     let mut segments: Vec<RenderSegment> = Vec::new();
     let mut map: HashMap<String, String> = HashMap::new();
+    let mut placeholder_cache: HashMap<(String, String, Option<u32>), String> = HashMap::new();
     let mut collisions = Vec::new();
     let mut cursor = 0usize;
 
@@ -94,9 +95,25 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
             // Mask each side under the same label; the `@` stays literal so
             // restore reconstructs the address from the two mappings.
             Some((local, domain)) => {
-                segments.push(masked_seg(key, s, local, None, &mut map, &mut collisions));
+                segments.push(masked_seg(
+                    key,
+                    s,
+                    local,
+                    None,
+                    &mut map,
+                    &mut placeholder_cache,
+                    &mut collisions,
+                ));
                 literal(&mut segments, "@");
-                segments.push(masked_seg(key, s, domain, None, &mut map, &mut collisions));
+                segments.push(masked_seg(
+                    key,
+                    s,
+                    domain,
+                    None,
+                    &mut map,
+                    &mut placeholder_cache,
+                    &mut collisions,
+                ));
             }
             None => {
                 let len = if disclose_length && is_context_free(s) {
@@ -104,7 +121,15 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                 } else {
                     None
                 };
-                segments.push(masked_seg(key, s, val, len, &mut map, &mut collisions));
+                segments.push(masked_seg(
+                    key,
+                    s,
+                    val,
+                    len,
+                    &mut map,
+                    &mut placeholder_cache,
+                    &mut collisions,
+                ));
             }
         }
         cursor = s.range.end;
@@ -128,13 +153,22 @@ fn masked_seg(
     val: &str,
     len: Option<u32>,
     map: &mut HashMap<String, String>,
+    placeholder_cache: &mut HashMap<(String, String, Option<u32>), String>,
     collisions: &mut Vec<String>,
 ) -> RenderSegment {
-    let hash = identity_hash(key, &n_id(val));
-    let ph = render_placeholder(&span.label, &hash, len);
-    if record(map, &ph, val) {
-        collisions.push(ph.clone());
-    }
+    let cache_key = (span.label.clone(), val.to_string(), len);
+    let ph = match placeholder_cache.get(&cache_key) {
+        Some(ph) => ph.clone(),
+        None => {
+            let hash = identity_hash(key, &n_id(val));
+            let ph = render_placeholder(&span.label, &hash, len);
+            if record(map, &ph, val) {
+                collisions.push(ph.clone());
+            }
+            placeholder_cache.insert(cache_key, ph.clone());
+            ph
+        }
+    };
     RenderSegment::Masked {
         text: ph,
         label: span.label.clone(),

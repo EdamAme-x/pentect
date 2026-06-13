@@ -1,3 +1,5 @@
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+
 use super::validate::Validator;
 use super::Detector;
 use crate::model::*;
@@ -24,6 +26,7 @@ pub struct RuleSpec {
     pub confidence: Confidence,
     pub validator: Validator,
     pub capture: usize,
+    pub prefilter: Vec<String>,
 }
 
 /// Anchored vendor-token rules. High confidence and linear-time (no ReDoS), so
@@ -31,37 +34,89 @@ pub struct RuleSpec {
 /// default pack — `from_specs` builds the same detector from loaded data.
 pub struct RuleDetector {
     rules: Vec<Rule>,
-    /// All patterns in one DFA: one pass says which rules match anywhere, so we
-    /// only run per-rule `find_iter` for those (cheap on secret-free regions).
+    /// Unprefiltered rules share one RegexSet, so we do a merged candidate scan
+    /// instead of trying every regex blindly. Each matching rule is then scanned
+    /// exactly to preserve overlaps, captures, and validators.
+    exact: Option<ExactGroup>,
+    prefiltered: Option<PrefilterGroup>,
+}
+
+struct ExactGroup {
     set: RegexSet,
+    rules: Vec<usize>,
+}
+
+struct PrefilterGroup {
+    ac: AhoCorasick,
+    rules_by_pattern: Vec<Vec<usize>>,
 }
 
 impl RuleDetector {
     /// Compile data-form rules into a detector; errors if any pattern is invalid.
     pub fn from_specs(specs: Vec<RuleSpec>) -> Result<Self, String> {
-        let rules = specs
-            .into_iter()
-            .map(|s| {
-                let re = Regex::new(&s.pattern).map_err(|e| format!("rule {}: {e}", s.label))?;
-                if s.capture >= re.captures_len() {
-                    return Err(format!(
-                        "rule {}: capture {} does not exist",
-                        s.label, s.capture
-                    ));
+        let mut rules = Vec::with_capacity(specs.len());
+        let mut exact_patterns = Vec::new();
+        let mut exact_rules = Vec::new();
+        let mut prefilter_literals = Vec::new();
+        let mut rules_by_pattern: Vec<Vec<usize>> = Vec::new();
+
+        for s in specs {
+            let re = Regex::new(&s.pattern).map_err(|e| format!("rule {}: {e}", s.label))?;
+            if s.capture >= re.captures_len() {
+                return Err(format!(
+                    "rule {}: capture {} does not exist",
+                    s.label, s.capture
+                ));
+            }
+            let rule_index = rules.len();
+            if s.prefilter.is_empty() {
+                exact_patterns.push(s.pattern);
+                exact_rules.push(rule_index);
+            } else {
+                for literal in &s.prefilter {
+                    if literal.is_empty() {
+                        continue;
+                    }
+                    prefilter_literals.push(literal.clone());
+                    rules_by_pattern.push(vec![rule_index]);
                 }
-                Ok(Rule {
-                    re,
-                    category: s.category,
-                    label: s.label,
-                    confidence: s.confidence,
-                    validator: s.validator,
-                    capture: s.capture,
-                })
+            }
+            rules.push(Rule {
+                re,
+                category: s.category,
+                label: s.label,
+                confidence: s.confidence,
+                validator: s.validator,
+                capture: s.capture,
+            });
+        }
+
+        let exact = if exact_patterns.is_empty() {
+            None
+        } else {
+            Some(ExactGroup {
+                set: RegexSet::new(exact_patterns.iter().map(|s| s.as_str()))
+                    .map_err(|e| format!("rule set: {e}"))?,
+                rules: exact_rules,
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        let set = RegexSet::new(rules.iter().map(|r| r.re.as_str()))
-            .map_err(|e| format!("rule set: {e}"))?;
-        Ok(Self { rules, set })
+        };
+        let prefiltered = if prefilter_literals.is_empty() {
+            None
+        } else {
+            Some(PrefilterGroup {
+                ac: AhoCorasickBuilder::new()
+                    .ascii_case_insensitive(true)
+                    .build(&prefilter_literals)
+                    .map_err(|e| format!("prefilter set: {e}"))?,
+                rules_by_pattern,
+            })
+        };
+
+        Ok(Self {
+            rules,
+            exact,
+            prefiltered,
+        })
     }
 
     pub fn builtin() -> Self {
@@ -410,6 +465,7 @@ impl RuleDetector {
                 confidence,
                 validator: V::None,
                 capture: 0,
+                prefilter: Vec::new(),
             })
             .chain(
                 checked.iter().map(
@@ -420,6 +476,7 @@ impl RuleDetector {
                         confidence,
                         validator,
                         capture: 0,
+                        prefilter: Vec::new(),
                     },
                 ),
             )
@@ -432,13 +489,29 @@ impl Detector for RuleDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let s = view.text();
         let mut out = Vec::new();
-        for i in self.set.matches(s) {
-            let rule = &self.rules[i];
-            if rule.capture == 0 {
-                for m in rule.re.find_iter(s) {
-                    push_match(view, rule, m.start(), m.end(), m.as_str(), &mut out);
+        if let Some(exact) = &self.exact {
+            for i in exact.set.matches(s) {
+                let rule = &self.rules[exact.rules[i]];
+                for captures in rule.re.captures_iter(s) {
+                    if let Some(m) = captures.get(rule.capture) {
+                        push_match(view, rule, m.start(), m.end(), m.as_str(), &mut out);
+                    }
                 }
-            } else {
+            }
+        }
+        if let Some(prefiltered) = &self.prefiltered {
+            let mut seen = vec![false; self.rules.len()];
+            let mut candidates = Vec::new();
+            for m in prefiltered.ac.find_overlapping_iter(s) {
+                for &rule_index in &prefiltered.rules_by_pattern[m.pattern().as_usize()] {
+                    if !seen[rule_index] {
+                        seen[rule_index] = true;
+                        candidates.push(rule_index);
+                    }
+                }
+            }
+            for rule_index in candidates {
+                let rule = &self.rules[rule_index];
                 for captures in rule.re.captures_iter(s) {
                     if let Some(m) = captures.get(rule.capture) {
                         push_match(view, rule, m.start(), m.end(), m.as_str(), &mut out);
@@ -604,6 +677,7 @@ mod tests {
             confidence: Confidence::High,
             validator: Validator::None,
             capture: 1,
+            prefilter: Vec::new(),
         }])
         .unwrap();
         let raw = "api_key = ABCDEFGH1234";
@@ -624,7 +698,98 @@ mod tests {
             confidence: Confidence::High,
             validator: Validator::None,
             capture: 1,
+            prefilter: Vec::new(),
         }])
         .is_err());
+    }
+
+    #[test]
+    fn prefilter_skips_absent_literal_and_keeps_capture() {
+        let det = RuleDetector::from_specs(vec![RuleSpec {
+            pattern: r"(?i)acme.{0,20}([A-Z0-9]{12})".into(),
+            category: Category::Secret,
+            label: "ACME_TOKEN".into(),
+            confidence: Confidence::High,
+            validator: Validator::None,
+            capture: 1,
+            prefilter: vec!["acme".into()],
+        }])
+        .unwrap();
+        let miss = "token ABCDEFGH1234";
+        assert!(det
+            .detect(&NormalizedView::build(&region(miss), miss))
+            .is_empty());
+        let hit = "acme token ABCDEFGH1234";
+        let spans = det.detect(&NormalizedView::build(&region(hit), hit));
+        assert_eq!(
+            &hit[spans[0].range.start..spans[0].range.end],
+            "ABCDEFGH1234"
+        );
+    }
+
+    #[test]
+    fn merged_candidate_scan_preserves_overlapping_rules() {
+        let det = RuleDetector::from_specs(vec![
+            RuleSpec {
+                pattern: r"https://[^\s]+".into(),
+                category: Category::Endpoint,
+                label: "URL".into(),
+                confidence: Confidence::Medium,
+                validator: Validator::None,
+                capture: 0,
+                prefilter: Vec::new(),
+            },
+            RuleSpec {
+                pattern: r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+".into(),
+                category: Category::Secret,
+                label: "SLACK_WEBHOOK".into(),
+                confidence: Confidence::High,
+                validator: Validator::None,
+                capture: 0,
+                prefilter: Vec::new(),
+            },
+        ])
+        .unwrap();
+        let raw = "https://hooks.slack.com/services/T000/B000/abcd";
+        let labels: Vec<_> = det
+            .detect(&NormalizedView::build(&region(raw), raw))
+            .into_iter()
+            .map(|s| s.label)
+            .collect();
+        assert!(labels.contains(&"URL".to_string()), "{labels:?}");
+        assert!(labels.contains(&"SLACK_WEBHOOK".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn prefilter_collects_overlapping_literals() {
+        let det = RuleDetector::from_specs(vec![
+            RuleSpec {
+                pattern: r"abc[a-z0-9]{3}".into(),
+                category: Category::Secret,
+                label: "SHORT_PREFIX".into(),
+                confidence: Confidence::Medium,
+                validator: Validator::None,
+                capture: 0,
+                prefilter: vec!["abc".into()],
+            },
+            RuleSpec {
+                pattern: r"abcd[0-9]{2}".into(),
+                category: Category::Secret,
+                label: "LONG_PREFIX".into(),
+                confidence: Confidence::High,
+                validator: Validator::None,
+                capture: 0,
+                prefilter: vec!["abcd".into()],
+            },
+        ])
+        .unwrap();
+        let raw = "abcd12";
+        let labels: Vec<_> = det
+            .detect(&NormalizedView::build(&region(raw), raw))
+            .into_iter()
+            .map(|s| s.label)
+            .collect();
+        assert!(labels.contains(&"SHORT_PREFIX".to_string()), "{labels:?}");
+        assert!(labels.contains(&"LONG_PREFIX".to_string()), "{labels:?}");
     }
 }

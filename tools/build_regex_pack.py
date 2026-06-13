@@ -38,6 +38,7 @@ class RegexRule:
     pattern: str
     origin: str
     capture: int
+    prefilter: list[str]
 
 
 @dataclass(frozen=True)
@@ -86,8 +87,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--id-col", default="")
     p.add_argument("--origin-col", default="")
     p.add_argument("--capture-col", default="")
+    p.add_argument("--prefilter-col", default="")
     p.add_argument("--capture", type=int, default=0)
     p.add_argument("--infer-capture", action="store_true")
+    p.add_argument("--infer-prefilter", action="store_true")
     p.add_argument("--label-prefix", default="REGEX")
     p.add_argument("--out-dir", type=Path, default=Path("target/regex-packs"))
     p.add_argument("--prefix", default="regex-pack")
@@ -108,6 +111,7 @@ def configure_preset(args: argparse.Namespace) -> None:
     args.label_prefix = "SB"
     args.prefix = "secretbench-public-regex"
     args.infer_capture = True
+    args.infer_prefilter = True
     if args.out_dir == Path("target/regex-packs"):
         args.out_dir = Path("target/secretbench-public-regex")
 
@@ -117,6 +121,8 @@ def resolve_source(args: argparse.Namespace) -> Path:
         return args.input
     if args.source == "secretbench-public":
         path = Path(tempfile.gettempdir()) / "secretbench-secret-regular-expression.xlsx"
+        if path.exists():
+            return path
         urllib.request.urlretrieve(SECRETBENCH_PUBLIC_WORKBOOK_URL, path)
         return path
     raise SystemExit("input file is required unless --source secretbench-public is used")
@@ -132,6 +138,10 @@ def read_rules(path: Path, args: argparse.Namespace) -> list[RegexRule]:
         capture = capture_value(row, args)
         if args.infer_capture:
             capture = infer_capture(pattern, capture)
+        prefilter = prefilter_value(row, args)
+        if args.infer_prefilter:
+            prefilter = [*prefilter, *infer_prefilter(pattern)]
+        prefilter = sorted(set(p for p in prefilter if len(p) >= 3))
         out.append(
             RegexRule(
                 rule_id=text(row.get(args.id_col, "")) if args.id_col else str(index),
@@ -139,6 +149,7 @@ def read_rules(path: Path, args: argparse.Namespace) -> list[RegexRule]:
                 pattern=pattern,
                 origin=text(row.get(args.origin_col, "")) if args.origin_col else "",
                 capture=capture,
+                prefilter=prefilter,
             )
         )
     return out
@@ -266,6 +277,8 @@ def write_pack(path: Path, rules: list[RegexRule], args: argparse.Namespace) -> 
             f.write(f"# rule_id = {rule.rule_id}; origin = {rule.origin}\n")
             if rule.capture:
                 f.write(f"capture = {rule.capture}\n")
+            if rule.prefilter:
+                f.write(f"prefilter = {toml_string_list(rule.prefilter)}\n")
             f.write(f"pattern = {toml_string(rule.pattern)}\n\n")
 
 
@@ -307,6 +320,15 @@ def capture_value(row: dict[str, Any], args: argparse.Namespace) -> int:
     return capture
 
 
+def prefilter_value(row: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    if not args.prefilter_col:
+        return []
+    value = text(row.get(args.prefilter_col, ""))
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
 def infer_capture(pattern: str, default: int) -> int:
     if default:
         return default
@@ -329,6 +351,31 @@ def infer_capture(pattern: str, default: int) -> int:
     ):
         return 1
     return default
+
+
+def infer_prefilter(pattern: str) -> list[str]:
+    for regex in (
+        r"^\(\?i\)\(\?:(?P<alts>[^)]+)\)\(\?:\.\|\[\\n\\r\]\)\{0,\d+\}",
+        r"^\(\?i\)\(\?:(?P<alts>[^)]+)\)\[[^\]]+\]\{0,\d+\}",
+        r"^\(\?i\)(?P<alts>[A-Za-z][A-Za-z0-9_.-]{2,})\[[^\]]+\]\{0,\d+\}",
+    ):
+        m = re.match(regex, pattern)
+        if not m:
+            continue
+        return [
+            literal
+            for literal in (clean_prefilter_literal(alt) for alt in m.group("alts").split("|"))
+            if literal
+        ]
+    return []
+
+
+def clean_prefilter_literal(value: str) -> str:
+    value = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.\\ -]{3,40}", value):
+        return ""
+    value = value.replace(r"\.", ".").replace(r"\-", "-").replace(r"\_", "_")
+    return value if re.search(r"[A-Za-z]", value) else ""
 
 
 def has_context_window(prefix: str) -> bool:
@@ -426,6 +473,10 @@ def safe_label(value: str) -> str:
 
 def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def toml_string_list(values: list[str]) -> str:
+    return "[" + ", ".join(toml_string(v) for v in values) + "]"
 
 
 def text(value: Any) -> str:
