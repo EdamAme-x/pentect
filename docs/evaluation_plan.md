@@ -27,6 +27,9 @@ SecretBench is gated and must be requested from its authors. Do not copy its
 rows into this repository. After access is granted, export the BigQuery table to
 CSV, JSON, or JSONL, then run:
 
+Access status: request sent to the authors; wait for their reply and any data
+protection agreement instructions before exporting or running the dataset.
+
 ```sh
 python tools/eval_secretbench.py path/to/secretbench_export.jsonl --bin target/release/pentect
 ```
