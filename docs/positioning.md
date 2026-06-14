@@ -13,6 +13,15 @@ sensitive technical values without seeing the original data.
 ただし、企業向け DLP 製品全体ではなく、AI agent と tool-use の手前に置く
 core/kernel だと必ず補足する。
 
+## Like-but framing
+
+迷ったときは `not X` ではなく `X-like, but ...` で説明する。
+
+- 1Password-like, but for messy AI-bound context that was never put in a vault.
+- DLP-like, but local, reversible, and workflow-preserving.
+- Secret-scanner-like, but it masks, resolves, and remasks instead of only alerting.
+- Pentest-proxy-like, but also useful for debugging, logs, configs, and agents.
+
 ## Primary user
 
 最初の主ユーザーは **AI を使う技術者**。
