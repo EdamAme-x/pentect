@@ -438,7 +438,6 @@ impl RuleDetector {
             (r"\b\d{2}[ ]?\d{3}[ ]?\d{3}[ ]?\d{3}\b", Identifier, "AU_ABN", High, V::AuAbn),
             (r"(?i)medicare[^\n]{0,15}?\b[2-6]\d{3}[ ]?\d{5}[ ]?\d\b", Pii, "AU_MEDICARE", High, V::AuMedicare),
             (r"\b[2-9][0-9]{3}[ -]?[0-9]{4}[ -]?[0-9]{4}\b", Pii, "IN_AADHAAR", High, V::Verhoeff),
-            (r"\b[0-9]{4}[ -]?[0-9]{4}[ -]?[0-9]{4}\b", Pii, "JP_MY_NUMBER", High, V::JpMyNumber),
             (r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", Pii, "BR_CPF", High, V::BrCpf),
             (r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b", Identifier, "BR_CNPJ", High, V::BrCnpj),
             (r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b", Identifier, "BTC_ADDRESS", High, V::BtcAddress),
@@ -465,6 +464,10 @@ impl RuleDetector {
             (r#"(?i)(?:^|[\s"'=(:])~([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])/[a-z]/Users/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])/mnt/[a-z]/Users/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
+            // Avoid slicing the 12-digit tail out of UUIDs / hashes while still
+            // masking a standalone My Number. Rust regex has no look-around, so
+            // capture only the candidate and keep the separators outside.
+            (r#"(?i)(?:^|[\s"'=:(,;])([0-9]{4}[ -]?[0-9]{4}[ -]?[0-9]{4})(?:$|[\s"',;.)\]])"#, Pii, "JP_MY_NUMBER", High, 1, V::JpMyNumber),
         ];
         let specs = table
             .iter()
@@ -726,6 +729,24 @@ mod tests {
                 "{raw} should not mask a shared/system directory: {spans:?}"
             );
         }
+    }
+
+    #[test]
+    fn my_number_does_not_mask_uuid_tail() {
+        let det = RuleDetector::builtin();
+        let uuidish = "request_id=550e8400-e29b-41d4-a716-000000000019";
+        let uuid_spans = det.detect(&NormalizedView::build(&region(uuidish), uuidish));
+        assert!(
+            uuid_spans.iter().all(|s| s.label != "JP_MY_NUMBER"),
+            "uuid tail should not mask as My Number: {uuid_spans:?}"
+        );
+
+        let raw = "my_number=123456789018, ok";
+        let spans = det.detect(&NormalizedView::build(&region(raw), raw));
+        let Some(span) = spans.iter().find(|s| s.label == "JP_MY_NUMBER") else {
+            panic!("standalone My Number should still detect: {spans:?}");
+        };
+        assert_eq!(&raw[span.range.start..span.range.end], "123456789018");
     }
 
     #[test]

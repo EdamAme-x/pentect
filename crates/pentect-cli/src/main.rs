@@ -1,6 +1,9 @@
 //! Pentect CLI: mask secrets from stdin to stdout. One-way for now; nothing is
 //! written to disk.
 
+mod input;
+
+use input::{InputAdapter, TextInput};
 use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, RuleDetector};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,8 +22,9 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect mask [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
+        "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
          \x20 mask secrets from stdin to stdout\n\
+         \x20 --input text|pdf read stdin as UTF-8 text or extract text from a PDF first\n\
          \x20 --pack FILE      load extra rules from a TOML pack (repeatable)\n\
          \x20 --pack-dir DIR   load every *.toml pack in a directory (repeatable)\n\
          \x20 --disable LABEL  turn off a built-in detector by label (repeatable)\n\
@@ -34,8 +38,9 @@ fn die(msg: &str) -> ! {
     std::process::exit(2);
 }
 
-/// Read stdin as bytes (no panic on binary), cap the size, and require UTF-8.
-fn read_stdin_capped() -> Result<String, String> {
+/// Read stdin as bytes (no panic on binary), cap the size, then delegate
+/// interpretation to the injected input adapter.
+fn read_stdin_capped(reader: &dyn InputAdapter) -> Result<String, String> {
     let mut buf = Vec::new();
     std::io::stdin()
         .take((MAX_INPUT_BYTES + 1) as u64)
@@ -46,7 +51,7 @@ fn read_stdin_capped() -> Result<String, String> {
             "input exceeds {MAX_INPUT_BYTES} bytes; refusing to mask partially"
         ));
     }
-    String::from_utf8(buf).map_err(|_| "input is not UTF-8 text (binary not supported)".to_string())
+    reader.read(buf)
 }
 
 fn cmd_mask(args: &[String]) {
@@ -72,7 +77,11 @@ fn cmd_mask(args: &[String]) {
         Ok(p) => p,
         Err(e) => die(&e),
     };
-    let data = match read_stdin_capped() {
+    let reader = match input_adapter(args) {
+        Ok(r) => r,
+        Err(e) => die(&e),
+    };
+    let data = match read_stdin_capped(reader.as_ref()) {
         Ok(s) => s,
         Err(e) => die(&e),
     };
@@ -103,6 +112,24 @@ fn cmd_mask(args: &[String]) {
             result.summary.collisions.len()
         );
     }
+}
+
+fn input_adapter(args: &[String]) -> Result<Box<dyn InputAdapter>, String> {
+    match arg_value(args, "--input").as_deref() {
+        Some("pdf") => pdf_input_adapter(),
+        Some("text") | None => Ok(Box::new(TextInput)),
+        Some(other) => Err(format!("unknown --input: {other}")),
+    }
+}
+
+#[cfg(feature = "pdf")]
+fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
+    Ok(Box::new(input::PdfTextInput))
+}
+
+#[cfg(not(feature = "pdf"))]
+fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
+    Err("PDF input requires a build with `--features pdf`".to_string())
 }
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get

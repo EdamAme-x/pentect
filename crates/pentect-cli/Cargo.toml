@@ -11,8 +11,13 @@ name = "pentect"
 path = "src/main.rs"
 
 [features]
+default = ["pdf"]
+# PDF input is an adapter concern: extract text locally, then feed the normal
+# masking kernel. Disable default features for a slimmer text-only CLI.
+pdf = ["dep:pdf-extract"]
 # Enable the semantic NER sidecar (--ner). Requires Python + spaCy at runtime.
 ner = ["pentect-core/ner"]
 
 [dependencies]
 pentect-core = { path = "../pentect-core" }
+pdf-extract = { workspace = true, optional = true }

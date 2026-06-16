@@ -434,24 +434,56 @@ mod tests {
     use super::*;
     use crate::recovery::restore;
     use proptest::prelude::*;
+    use std::cell::OnceCell;
+
+    thread_local! {
+        static DEFAULT_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
+        static STRICT_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
+        static BALANCED_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
+        static DEV_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
+        static PARANOID_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
+    }
+
+    fn with_default_engine<R>(f: impl FnOnce(&Engine) -> R) -> R {
+        DEFAULT_ENGINE.with(|engine| f(engine.get_or_init(Engine::default)))
+    }
+
+    fn with_profile_engine<R>(profile: Profile, f: impl FnOnce(&Engine) -> R) -> R {
+        match profile {
+            Profile::Strict => {
+                STRICT_ENGINE.with(|engine| f(engine.get_or_init(|| Engine::with_profile(profile))))
+            }
+            Profile::Balanced => BALANCED_ENGINE
+                .with(|engine| f(engine.get_or_init(|| Engine::with_profile(profile)))),
+            Profile::Dev => {
+                DEV_ENGINE.with(|engine| f(engine.get_or_init(|| Engine::with_profile(profile))))
+            }
+            Profile::Paranoid => PARANOID_ENGINE
+                .with(|engine| f(engine.get_or_init(|| Engine::with_profile(profile)))),
+        }
+    }
 
     fn m(s: &str) -> MaskResult {
-        Engine::default().mask(
-            Input {
-                kind: Kind::Text,
-                data: s.to_string(),
-            },
-            &Config::insecure_testing(),
-        )
+        with_default_engine(|engine| {
+            engine.mask(
+                Input {
+                    kind: Kind::Text,
+                    data: s.to_string(),
+                },
+                &Config::insecure_testing(),
+            )
+        })
     }
     fn mj(s: &str) -> MaskResult {
-        Engine::default().mask(
-            Input {
-                kind: Kind::Json,
-                data: s.to_string(),
-            },
-            &Config::insecure_testing(),
-        )
+        with_default_engine(|engine| {
+            engine.mask(
+                Input {
+                    kind: Kind::Json,
+                    data: s.to_string(),
+                },
+                &Config::insecure_testing(),
+            )
+        })
     }
 
     #[test]
@@ -1296,7 +1328,9 @@ mod tests {
     }
 
     fn mp(profile: Profile, s: &str) -> MaskResult {
-        Engine::with_profile(profile).mask(Input::text(s), &Config::insecure_testing())
+        with_profile_engine(profile, |engine| {
+            engine.mask(Input::text(s), &Config::insecure_testing())
+        })
     }
 
     #[test]
@@ -1454,7 +1488,7 @@ mod tests {
             let secret = "AKIAIOSFODNN7EXAMPLE";
             let input = format!("{pre} {secret} {mid} {secret} {post}");
             for p in [Profile::Strict, Profile::Balanced, Profile::Dev, Profile::Paranoid] {
-                let r = Engine::with_profile(p).mask(Input::text(&input), &Config::insecure_testing());
+                let r = mp(p, &input);
                 prop_assert!(!r.masked.contains(secret), "{p:?} left a survivor: {}", r.masked);
             }
         }
