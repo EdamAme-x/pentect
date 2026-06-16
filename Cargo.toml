@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pentect-core", "crates/pentect-cli"]
+members = ["crates/pentect-core", "crates/pentect-cli", "crates/pentect-agent"]
 
 [workspace.package]
 edition = "2021"

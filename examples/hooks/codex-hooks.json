@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc '\"$(git rev-parse --show-toplevel)/target/release/pentect-agent\" hook codex --session default'",
+            "commandWindows": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path (git rev-parse --show-toplevel) 'target\\release\\pentect-agent.exe') hook codex --session default\"",
+            "timeout": 30,
+            "statusMessage": "Pentect resolving masked tool input"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -lc '\"$(git rev-parse --show-toplevel)/target/release/pentect-agent\" hook codex --session default'",
+            "commandWindows": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& (Join-Path (git rev-parse --show-toplevel) 'target\\release\\pentect-agent.exe') hook codex --session default\"",
+            "timeout": 30,
+            "statusMessage": "Pentect masking tool output"
+          }
+        ]
+      }
+    ]
+  }
+}

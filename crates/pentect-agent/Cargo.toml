@@ -1,24 +1,21 @@
 [package]
-name = "pentect-cli"
+name = "pentect-agent"
 version = "0.0.1"
-description = "Pentect CLI"
+description = "Pentect agent tool-boundary adapter"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "pentect"
+name = "pentect-agent"
 path = "src/main.rs"
 
 [features]
 default = ["pdf"]
-# PDF input is an adapter concern: extract text locally, then feed the normal
-# masking kernel. Disable default features for a slimmer text-only CLI.
 pdf = ["dep:pdf-extract"]
-# Enable the semantic NER sidecar (--ner). Requires Python + spaCy at runtime.
-ner = ["pentect-core/ner"]
 
 [dependencies]
 pentect-core = { path = "../pentect-core" }
+data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 serde_json = { workspace = true }

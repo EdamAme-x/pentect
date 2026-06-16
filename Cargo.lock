@@ -617,11 +617,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pentect-agent"
+version = "0.0.1"
+dependencies = [
+ "data-encoding",
+ "pdf-extract",
+ "pentect-core",
+ "serde_json",
+]
+
+[[package]]
 name = "pentect-cli"
 version = "0.0.1"
 dependencies = [
  "pdf-extract",
  "pentect-core",
+ "serde_json",
 ]
 
 [[package]]

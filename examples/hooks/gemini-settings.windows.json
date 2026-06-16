@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "pentect-resolve-tool-input",
+            "type": "command",
+            "command": "target\\release\\pentect-agent.exe hook gemini --session default",
+            "timeout": 30000
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "pentect-mask-tool-output",
+            "type": "command",
+            "command": "target\\release\\pentect-agent.exe hook gemini --session default",
+            "timeout": 30000
+          }
+        ]
+      }
+    ]
+  }
+}

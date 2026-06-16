@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "& \"$env:CLAUDE_PROJECT_DIR\\target\\release\\pentect-agent.exe\" hook claude --session default",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "& \"$env:CLAUDE_PROJECT_DIR\\target\\release\\pentect-agent.exe\" hook claude --session default",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

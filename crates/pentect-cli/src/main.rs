@@ -5,8 +5,10 @@ mod input;
 
 use input::{InputAdapter, TextInput};
 use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, RuleDetector};
+use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Refuse oversized input rather than emit partially-masked output (a masked
 /// head plus a raw tail would leak the tail).
@@ -16,6 +18,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("mask") => cmd_mask(&args),
+        Some("codex") => cmd_agent_tool(AgentTool::Codex, &args),
+        Some("claude") => cmd_agent_tool(AgentTool::Claude, &args),
+        Some("gemini") => cmd_agent_tool(AgentTool::Gemini, &args),
         _ => usage(),
     }
 }
@@ -23,7 +28,11 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
+         pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
          \x20 mask secrets from stdin to stdout\n\
+         \x20 codex|claude|gemini starts that agent with temporary Pentect hook config\n\
+         \x20 --allow-unverified-hooks bypasses fail-closed checks for agent CLIs whose hook path was not verified\n\
+         \x20 prompt masking is TODO; this wrapper protects tool boundaries via hooks\n\
          \x20 --input text|pdf read stdin as UTF-8 text or extract text from a PDF first\n\
          \x20 --pack FILE      load extra rules from a TOML pack (repeatable)\n\
          \x20 --pack-dir DIR   load every *.toml pack in a directory (repeatable)\n\
@@ -36,6 +45,26 @@ fn usage() {
 fn die(msg: &str) -> ! {
     eprintln!("[pentect] {msg}");
     std::process::exit(2);
+}
+
+fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
+    let opts = match AgentToolOpts::parse(tool, args) {
+        Ok(o) => o,
+        Err(e) => die(&e),
+    };
+    let agent = opts.agent.clone().unwrap_or_else(default_agent_path);
+    if !agent.exists() && agent.components().count() > 1 {
+        die(&format!(
+            "pentect-agent not found at '{}'; run `cargo build -p pentect-agent --release` or pass --agent PATH",
+            agent.display()
+        ));
+    }
+    let status = match tool {
+        AgentTool::Codex => run_codex(&opts, &agent),
+        AgentTool::Claude => run_claude(&opts, &agent),
+        AgentTool::Gemini => run_gemini(&opts, &agent),
+    };
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Read stdin as bytes (no panic on binary), cap the size, then delegate
@@ -112,6 +141,561 @@ fn cmd_mask(args: &[String]) {
             result.summary.collisions.len()
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentTool {
+    Codex,
+    Claude,
+    Gemini,
+}
+
+impl AgentTool {
+    fn name(self) -> &'static str {
+        match self {
+            AgentTool::Codex => "codex",
+            AgentTool::Claude => "claude",
+            AgentTool::Gemini => "gemini",
+        }
+    }
+
+    fn env_var(self) -> &'static str {
+        match self {
+            AgentTool::Codex => "PENTECT_CODEX",
+            AgentTool::Claude => "PENTECT_CLAUDE",
+            AgentTool::Gemini => "PENTECT_GEMINI",
+        }
+    }
+
+    fn default_command(self) -> &'static str {
+        match self {
+            AgentTool::Gemini if cfg!(windows) => "gemini.cmd",
+            _ => self.name(),
+        }
+    }
+
+    fn path_flag(self) -> &'static str {
+        match self {
+            AgentTool::Codex => "--codex",
+            AgentTool::Claude => "--claude",
+            AgentTool::Gemini => "--gemini",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentToolOpts {
+    session: String,
+    agent: Option<PathBuf>,
+    command: PathBuf,
+    dry_run: bool,
+    allow_unverified_hooks: bool,
+    tool_args: Vec<String>,
+}
+
+impl AgentToolOpts {
+    fn parse(tool: AgentTool, args: &[String]) -> Result<Self, String> {
+        let mut session = "default".to_string();
+        let mut agent = None;
+        let mut command = std::env::var_os(tool.env_var())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(tool.default_command()));
+        let mut dry_run = false;
+        let mut allow_unverified_hooks = false;
+        let mut tool_args = Vec::new();
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--" => {
+                    tool_args.extend(args[i + 1..].iter().cloned());
+                    break;
+                }
+                "--session" => {
+                    session =
+                        checked_agent_session_name(&required_value(args, &mut i, "--session")?)?;
+                }
+                "--agent" => {
+                    agent = Some(PathBuf::from(required_value(args, &mut i, "--agent")?));
+                }
+                "--tool" => {
+                    command = PathBuf::from(required_value(args, &mut i, "--tool")?);
+                }
+                flag if flag == tool.path_flag() => {
+                    command = PathBuf::from(required_value(args, &mut i, flag)?);
+                }
+                "--dry-run" => {
+                    dry_run = true;
+                    i += 1;
+                }
+                "--allow-unverified-hooks" => {
+                    allow_unverified_hooks = true;
+                    i += 1;
+                }
+                "--prompt-proxy" | "--no-prompt-proxy" => {
+                    return Err(
+                        "prompt proxy is currently disabled/TODO; Pentect now protects tool boundaries via agent hooks only"
+                            .to_string(),
+                    );
+                }
+                _ => {
+                    tool_args.extend(args[i..].iter().cloned());
+                    break;
+                }
+            }
+        }
+        Ok(Self {
+            session,
+            agent: agent.or_else(|| std::env::var_os("PENTECT_AGENT").map(PathBuf::from)),
+            command,
+            dry_run,
+            allow_unverified_hooks,
+            tool_args,
+        })
+    }
+}
+
+fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
+    let configs = codex_hook_config_args(agent, &opts.session);
+    if opts.dry_run {
+        if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
+            eprintln!(
+                "[pentect] note: Codex headless hook execution was not verified for this invocation; non-dry runs fail closed for this subcommand."
+            );
+        }
+        print_dry_run(&opts.command, &codex_args(&configs, &opts.tool_args));
+        return success_status();
+    }
+    if codex_uses_unverified_headless_hook_path(&opts.tool_args) && !opts.allow_unverified_hooks {
+        die("refusing to start Codex headless subcommand with Pentect hooks: local probes showed `codex exec` runs shell commands without dispatching PreToolUse/PostToolUse hooks, even under a TTY. Use interactive `pentect codex`, `pentect claude`, `pentect-agent exec`, or pass --allow-unverified-hooks only for debugging.");
+    }
+    let mut cmd = Command::new(&opts.command);
+    for config in configs {
+        cmd.arg("--config").arg(config);
+    }
+    cmd.args(&opts.tool_args);
+    run_command(cmd, &opts.command)
+}
+
+fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
+    let settings = claude_settings_json(agent, &opts.session);
+    let args = claude_args(&settings, &opts.tool_args);
+    if opts.dry_run {
+        print_dry_run(&opts.command, &args);
+        return success_status();
+    }
+    let mut cmd = Command::new(&opts.command);
+    cmd.args(&args);
+    run_command(cmd, &opts.command)
+}
+
+fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
+    let settings_path = PathBuf::from(".gemini").join("settings.json");
+    if opts.dry_run {
+        eprintln!(
+            "[pentect] would temporarily merge Pentect hooks into {}",
+            settings_path.display()
+        );
+        print_dry_run(&opts.command, &opts.tool_args);
+        return success_status();
+    }
+    if !opts.allow_unverified_hooks && !gemini_cli_mentions_hooks(&opts.command) {
+        die("refusing to start Gemini with Pentect hooks: this Gemini CLI does not advertise hook support, so temporary settings may be ignored and raw tool output could leak. Upgrade Gemini CLI or pass --allow-unverified-hooks only for debugging.");
+    }
+    let original = match install_gemini_hooks(&settings_path, agent, &opts.session) {
+        Ok(o) => o,
+        Err(e) => die(&e),
+    };
+    let status = {
+        let mut cmd = Command::new(&opts.command);
+        cmd.args(&opts.tool_args);
+        run_command(cmd, &opts.command)
+    };
+    if let Err(e) = restore_gemini_settings(&settings_path, original) {
+        eprintln!("[pentect] WARNING: {e}");
+    }
+    status
+}
+
+fn run_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
+    cmd.status()
+        .unwrap_or_else(|e| die(&format!("could not start '{}': {e}", display.display())))
+}
+
+fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(configs.len() * 2 + tool_args.len());
+    for config in configs {
+        args.push("--config".to_string());
+        args.push(config.clone());
+    }
+    args.extend(tool_args.iter().cloned());
+    args
+}
+
+fn claude_args(settings: &str, tool_args: &[String]) -> Vec<String> {
+    let mut args = vec!["--settings".to_string(), settings.to_string()];
+    args.extend(tool_args.iter().cloned());
+    args
+}
+
+fn codex_hook_config_args(agent: &Path, session: &str) -> Vec<String> {
+    let agent = agent_command_path(agent);
+    let unix = hook_command_unix(&agent, "codex", session);
+    let windows = hook_command_windows(&agent, "codex", session);
+    vec![
+        "features.hooks=true".to_string(),
+        format!(
+            "hooks.PreToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30,statusMessage=\"Pentect resolving masked tool input\"}}]}}]",
+            toml_string(&unix),
+            toml_string(&windows)
+        ),
+        format!(
+            "hooks.PostToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30,statusMessage=\"Pentect masking tool output\"}}]}}]",
+            toml_string(&unix),
+            toml_string(&windows)
+        ),
+    ]
+}
+
+fn codex_uses_unverified_headless_hook_path(tool_args: &[String]) -> bool {
+    if tool_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
+    {
+        return false;
+    }
+    matches!(
+        codex_first_positional(tool_args),
+        Some("exec" | "e" | "review")
+    )
+}
+
+fn codex_first_positional(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            return args.get(i + 1).map(String::as_str);
+        }
+        if arg.starts_with("--") {
+            i += if codex_long_option_takes_value(arg) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
+            i += if codex_short_option_takes_value(arg) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        return Some(arg);
+    }
+    None
+}
+
+fn codex_long_option_takes_value(arg: &str) -> bool {
+    if arg.contains('=') {
+        return false;
+    }
+    matches!(
+        arg,
+        "--model"
+            | "--config"
+            | "--profile"
+            | "--sandbox"
+            | "--ask-for-approval"
+            | "--cd"
+            | "--add-dir"
+            | "--enable"
+            | "--disable"
+            | "--remote"
+            | "--remote-auth-token-env"
+            | "--image"
+            | "--local-provider"
+            | "--output-last-message"
+            | "--color"
+    )
+}
+
+fn codex_short_option_takes_value(arg: &str) -> bool {
+    matches!(arg, "-m" | "-c" | "-p" | "-s" | "-C" | "-o")
+}
+
+fn gemini_cli_mentions_hooks(command: &Path) -> bool {
+    let Ok(output) = Command::new(command).arg("--help").output() else {
+        return false;
+    };
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text.to_ascii_lowercase().contains("hook")
+}
+
+fn claude_settings_json(agent: &Path, session: &str) -> String {
+    let agent = agent_command_path(agent);
+    let command = agent.to_string_lossy();
+    json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": command,
+                    "args": ["hook", "claude", "--session", session],
+                    "timeout": 30
+                }]
+            }],
+            "PostToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": command,
+                    "args": ["hook", "claude", "--session", session],
+                    "timeout": 30
+                }]
+            }]
+        }
+    })
+    .to_string()
+}
+
+fn gemini_hook_settings(agent: &Path, session: &str) -> Value {
+    let agent = agent_command_path(agent);
+    let command = if cfg!(windows) {
+        hook_command_windows(&agent, "gemini", session)
+    } else {
+        hook_command_unix(&agent, "gemini", session)
+    };
+    json!({
+        "hooks": {
+            "BeforeTool": [{
+                "matcher": "*",
+                "hooks": [{
+                    "name": "pentect-resolve-tool-input",
+                    "type": "command",
+                    "command": command,
+                    "timeout": 30000
+                }]
+            }],
+            "AfterTool": [{
+                "matcher": "*",
+                "hooks": [{
+                    "name": "pentect-mask-tool-output",
+                    "type": "command",
+                    "command": command,
+                    "timeout": 30000
+                }]
+            }]
+        }
+    })
+}
+
+fn install_gemini_hooks(
+    settings_path: &Path,
+    agent: &Path,
+    session: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let original = if settings_path.exists() {
+        Some(
+            std::fs::read(settings_path)
+                .map_err(|e| format!("could not read '{}': {e}", settings_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let mut settings = match &original {
+        Some(bytes) => serde_json::from_slice(bytes).map_err(|e| {
+            format!(
+                "Gemini settings '{}' is not valid JSON: {e}",
+                settings_path.display()
+            )
+        })?,
+        None => json!({}),
+    };
+    merge_hooks(&mut settings, &gemini_hook_settings(agent, session))?;
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(&settings)
+        .map_err(|e| format!("could not serialize Gemini settings: {e}"))?;
+    std::fs::write(settings_path, bytes)
+        .map_err(|e| format!("could not write '{}': {e}", settings_path.display()))?;
+    Ok(original)
+}
+
+fn restore_gemini_settings(settings_path: &Path, original: Option<Vec<u8>>) -> Result<(), String> {
+    match original {
+        Some(bytes) => std::fs::write(settings_path, bytes)
+            .map_err(|e| format!("could not restore '{}': {e}", settings_path.display())),
+        None => {
+            if settings_path.exists() {
+                std::fs::remove_file(settings_path)
+                    .map_err(|e| format!("could not remove '{}': {e}", settings_path.display()))?;
+            }
+            if let Some(parent) = settings_path.parent() {
+                match std::fs::remove_dir(parent) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(e) => return Err(format!("could not remove '{}': {e}", parent.display())),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn merge_hooks(settings: &mut Value, extra: &Value) -> Result<(), String> {
+    let Some(settings_object) = settings.as_object_mut() else {
+        return Err("Gemini settings root must be a JSON object".to_string());
+    };
+    let hooks = settings_object.entry("hooks").or_insert_with(|| json!({}));
+    let Some(hooks_object) = hooks.as_object_mut() else {
+        return Err("Gemini settings `hooks` must be a JSON object".to_string());
+    };
+    let Some(extra_hooks) = extra.get("hooks").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for (event, additions) in extra_hooks {
+        let target = hooks_object
+            .entry(event.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(target_array) = target.as_array_mut() else {
+            return Err(format!("Gemini settings `hooks.{event}` must be an array"));
+        };
+        let Some(additions) = additions.as_array() else {
+            return Err(format!("Pentect internal `hooks.{event}` must be an array"));
+        };
+        target_array.extend(additions.iter().cloned());
+    }
+    Ok(())
+}
+
+fn hook_command_unix(agent: &Path, provider: &str, session: &str) -> String {
+    format!(
+        "{} hook {} --session {}",
+        shell_quote_unix(&agent.to_string_lossy()),
+        shell_quote_unix(provider),
+        shell_quote_unix(session)
+    )
+}
+
+fn hook_command_windows(agent: &Path, provider: &str, session: &str) -> String {
+    format!(
+        "& {} hook {} --session {}",
+        powershell_quote(&agent.to_string_lossy()),
+        powershell_quote(provider),
+        powershell_quote(session)
+    )
+}
+
+fn agent_command_path(agent: &Path) -> PathBuf {
+    if agent.is_absolute() {
+        return agent.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(agent))
+        .unwrap_or_else(|_| agent.to_path_buf())
+}
+
+fn default_agent_path() -> PathBuf {
+    let exe_name = if cfg!(windows) {
+        "pentect-agent.exe"
+    } else {
+        "pentect-agent"
+    };
+    let mut candidates = Vec::new();
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(dir) = current.parent() {
+            candidates.push(dir.join(exe_name));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("target").join("debug").join(exe_name));
+        candidates.push(cwd.join("target").join("release").join(exe_name));
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from(exe_name))
+}
+
+fn print_dry_run(command: &Path, args: &[String]) {
+    print!("{}", shell_quote_display(&command.to_string_lossy()));
+    for arg in args {
+        print!(" {}", shell_quote_display(arg));
+    }
+    println!();
+}
+
+fn success_status() -> std::process::ExitStatus {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+}
+
+fn shell_quote_display(value: &str) -> String {
+    if cfg!(windows) {
+        shell_quote_windows(value)
+    } else {
+        shell_quote_unix(value)
+    }
+}
+
+fn shell_quote_unix(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn shell_quote_windows(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn checked_agent_session_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("session name must not be empty".to_string());
+    }
+    if name.chars().any(|c| {
+        c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return Err("session name must be a simple file-name segment".to_string());
+    }
+    Ok(name.to_string())
 }
 
 fn input_adapter(args: &[String]) -> Result<Box<dyn InputAdapter>, String> {
@@ -242,6 +826,14 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
+    let Some(value) = args.get(*i + 1) else {
+        return Err(format!("{flag} requires a value"));
+    };
+    *i += 2;
+    Ok(value.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +862,84 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_tool_parse_accepts_unverified_hook_escape_hatch() {
+        let args = vec![
+            "pentect".to_string(),
+            "codex".to_string(),
+            "--allow-unverified-hooks".to_string(),
+            "--".to_string(),
+            "exec".to_string(),
+            "do something".to_string(),
+        ];
+        let opts = AgentToolOpts::parse(AgentTool::Codex, &args).unwrap();
+        assert!(opts.allow_unverified_hooks);
+        assert_eq!(opts.tool_args, vec!["exec", "do something"]);
+    }
+
+    #[test]
+    fn agent_tool_parse_rejects_prompt_proxy_for_all_agents() {
+        for tool in [AgentTool::Codex, AgentTool::Claude, AgentTool::Gemini] {
+            let args = vec![
+                "pentect".to_string(),
+                tool.name().to_string(),
+                "--prompt-proxy".to_string(),
+            ];
+            let err = AgentToolOpts::parse(tool, &args).unwrap_err();
+            assert!(err.contains("disabled/TODO"), "{tool:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn codex_metadata_commands_do_not_need_verified_hooks() {
+        assert!(!codex_uses_unverified_headless_hook_path(&[
+            "--version".to_string()
+        ]));
+        assert!(!codex_uses_unverified_headless_hook_path(&[
+            "--help".to_string()
+        ]));
+        assert!(!codex_uses_unverified_headless_hook_path(&[
+            "help".to_string()
+        ]));
+    }
+
+    #[test]
+    fn codex_interactive_invocations_do_not_need_headless_hook_guard() {
+        assert!(!codex_uses_unverified_headless_hook_path(&Vec::new()));
+        assert!(!codex_uses_unverified_headless_hook_path(&[
+            "review this".to_string()
+        ]));
+        assert!(!codex_uses_unverified_headless_hook_path(&[
+            "--model".to_string(),
+            "gpt-5.5".to_string(),
+            "Run a command".to_string()
+        ]));
+    }
+
+    #[test]
+    fn codex_headless_commands_need_verified_hooks() {
+        assert!(codex_uses_unverified_headless_hook_path(&[
+            "exec".to_string()
+        ]));
+        assert!(codex_uses_unverified_headless_hook_path(&["e".to_string()]));
+        assert!(codex_uses_unverified_headless_hook_path(&[
+            "review".to_string()
+        ]));
+        assert!(codex_uses_unverified_headless_hook_path(&[
+            "--model".to_string(),
+            "gpt-5.5".to_string(),
+            "exec".to_string()
+        ]));
+        assert!(codex_uses_unverified_headless_hook_path(&[
+            "--".to_string(),
+            "exec".to_string()
+        ]));
+        assert!(codex_uses_unverified_headless_hook_path(&[
+            "--enable".to_string(),
+            "foo".to_string(),
+            "exec".to_string()
+        ]));
     }
 }

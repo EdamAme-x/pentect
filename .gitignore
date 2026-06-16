@@ -25,6 +25,9 @@ sandbox/
 # Local planning / positioning notes
 docs/
 
+# Local agent recovery/session state
+.pentect-agent/
+
 # Rust build output
 /target/
 **/target/

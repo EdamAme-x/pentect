@@ -77,13 +77,20 @@ impl Parser for EnvParser {
 /// comment, or keyless lines.
 fn parse_env_line(raw: &str, start: usize, end: usize) -> Option<(String, ByteRange)> {
     let line = raw[start..end].trim_end_matches('\r');
-    let lead = line.len() - line.trim_start().len();
-    let body = &line[lead..];
+    let bom = if start == 0 && line.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let after_bom = &line[bom..];
+    let lead = after_bom.len() - after_bom.trim_start().len();
+    let body = &after_bom[lead..];
     if body.is_empty() || body.starts_with('#') {
         return None;
     }
     // Optional `export ` prefix.
-    let body_off = lead
+    let body_off = bom
+        + lead
         + body
             .strip_prefix("export ")
             .map_or(0, |rest| body.len() - rest.len());
@@ -155,5 +162,17 @@ mod tests {
         let r = EnvParser.parse(raw).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(&raw[r[0].span.start..r[0].span.end], "abc"); // no quotes
+    }
+
+    #[test]
+    fn utf8_bom_does_not_hide_first_env_key() {
+        let raw = "\u{feff}AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
+        assert_eq!(
+            parsed(raw),
+            [(
+                Some("AWS_ACCESS_KEY_ID".into()),
+                "AKIAIOSFODNN7EXAMPLE".into()
+            )]
+        );
     }
 }
