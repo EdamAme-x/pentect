@@ -22,6 +22,9 @@ archive/
 # Scratch space — slides, drafts, experiments
 sandbox/
 
+# Local planning / positioning notes
+docs/
+
 # Rust build output
 /target/
 **/target/
