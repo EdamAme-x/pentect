@@ -139,6 +139,7 @@ impl RuleDetector {
             ),
             (r"AKIA[A-Z0-9]{16}", Secret, "AWS_AKID", High),
             (r"sk-[A-Za-z0-9_-]{20,}", Secret, "OPENAI_API_KEY", High),
+            (r"rpa_[A-Za-z0-9]{24,}", Secret, "RUNPOD_API_KEY", High),
             (r"xox[baprs]-[A-Za-z0-9-]{10,}", Secret, "SLACK_TOKEN", High),
             (
                 r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",
@@ -581,6 +582,10 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             ("AKIAIOSFODNN7EXAMPLE", "AWS_AKID"),
             (concat!("sk", "-ABCDEFGHIJKLMNOPQRSTUVWX"), "OPENAI_API_KEY"),
+            (
+                concat!("rpa", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+                "RUNPOD_API_KEY",
+            ),
             (
                 concat!("ghp", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
                 "GITHUB_TOKEN",

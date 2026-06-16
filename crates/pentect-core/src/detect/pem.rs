@@ -38,3 +38,27 @@ impl Detector for PemDetector {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::region;
+
+    #[test]
+    fn detects_openssh_private_key_body() {
+        let raw = concat!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAA\n",
+            "-----END OPENSSH PRIVATE KEY-----"
+        );
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        let spans = PemDetector::default().detect(&view);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].label, labels::PRIVATE_KEY);
+        assert_eq!(
+            &raw[spans[0].range.start..spans[0].range.end],
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAA"
+        );
+    }
+}

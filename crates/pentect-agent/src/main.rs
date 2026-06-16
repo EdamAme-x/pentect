@@ -133,11 +133,11 @@ fn cmd_exec(args: &[String]) -> i32 {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let safe_stdout = match session.remask_all(&stdout) {
+    let safe_stdout = match mask_hook_text(&session, &stdout) {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let safe_stderr = match session.remask_all(&stderr) {
+    let safe_stderr = match mask_hook_text(&session, &stderr) {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
@@ -223,16 +223,52 @@ fn run_resolved_command(
                 .iter()
                 .map(|arg| session.resolve_all(arg))
                 .collect();
+            let resolved_args = resolved_args?;
+            guard_program_invocation(&program, &resolved_args)?;
             Command::new(program)
-                .args(resolved_args?)
+                .args(resolved_args)
                 .output()
                 .map_err(|e| format!("could not execute command: {e}"))
         }
         ExecMode::Shell(command) => {
             let resolved = session.resolve_all(command)?;
+            guard_shell_script(&resolved)?;
             run_shell_script(&resolved)
         }
     }
+}
+
+fn guard_program_invocation(program: &str, args: &[String]) -> Result<(), String> {
+    let mut text = String::from(program);
+    for arg in args {
+        text.push(' ');
+        text.push_str(arg);
+    }
+    guard_sensitive_source_access(&text)
+}
+
+fn guard_shell_script(script: &str) -> Result<(), String> {
+    guard_sensitive_source_access(script)
+}
+
+fn guard_sensitive_source_access(text: &str) -> Result<(), String> {
+    if allows_single_pentect_read(text) {
+        return Ok(());
+    }
+    let normalized = normalize_policy_text(text);
+    if contains_sensitive_file_reference(&normalized) {
+        return Err(
+            "Pentect blocked direct access to a likely secret file; use `pentect-agent read` so the AI only sees masked content."
+                .to_string(),
+        );
+    }
+    if contains_env_read_reference(&normalized) {
+        return Err(
+            "Pentect blocked direct environment-variable access; pass approved values through Pentect placeholders instead."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn run_shell_script(script: &str) -> Result<std::process::Output, String> {
@@ -314,7 +350,7 @@ impl ReadOpts {
         let mut session = DEFAULT_SESSION.to_string();
         let mut input_format = InputFormat::Text;
         let mut kind = None;
-        let mut profile = Profile::Balanced;
+        let mut profile = Profile::Strict;
         let mut disclose_length = false;
         let mut path = None;
         let mut i = 2;
@@ -638,10 +674,6 @@ fn before_tool_updated_input(
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
-        let resolved = session.resolve_all(command)?;
-        if resolved == command {
-            return Ok((tool_input.clone(), false));
-        }
         let mut updated = tool_input.clone();
         if let Some(object) = updated.as_object_mut() {
             object.insert(
@@ -659,24 +691,46 @@ fn wrap_shell_command(
     session_name: &str,
     masked_command: &str,
 ) -> Result<String, String> {
+    let encoded = BASE64URL_NOPAD.encode(masked_command.as_bytes());
+    let mut words = agent_exec_words()?;
+    words.extend([
+        "--session".to_string(),
+        session_name.to_string(),
+        "--shell-b64".to_string(),
+        encoded,
+    ]);
+    if cfg!(windows) {
+        Ok(powershell_command(&words))
+    } else {
+        Ok(shell_command(&words))
+    }
+}
+
+fn agent_exec_words() -> Result<Vec<String>, String> {
+    if pentect_agent_passthrough_available() {
+        return Ok(vec![
+            "pentect".to_string(),
+            "agent".to_string(),
+            "exec".to_string(),
+        ]);
+    }
+    if command_available("pentect-agent") {
+        return Ok(vec!["pentect-agent".to_string(), "exec".to_string()]);
+    }
     let agent = std::env::current_exe()
         .map_err(|e| format!("could not resolve pentect-agent executable: {e}"))?;
-    let encoded = BASE64URL_NOPAD.encode(masked_command.as_bytes());
-    if cfg!(windows) {
-        Ok(format!(
-            "& {} exec --session {} --shell-b64 {}",
-            powershell_quote(&agent.to_string_lossy()),
-            powershell_quote(session_name),
-            powershell_quote(&encoded)
-        ))
-    } else {
-        Ok(format!(
-            "{} exec --session {} --shell-b64 {}",
-            shell_quote_unix(&agent.to_string_lossy()),
-            shell_quote_unix(session_name),
-            shell_quote_unix(&encoded)
-        ))
-    }
+    Ok(vec![
+        agent.to_string_lossy().into_owned(),
+        "exec".to_string(),
+    ])
+}
+
+fn pentect_agent_passthrough_available() -> bool {
+    let Ok(output) = Command::new("pentect").arg("agent").arg("--probe").output() else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).trim() == "pentect-agent-passthrough"
 }
 
 fn decode_shell_b64(encoded: &str) -> Result<String, String> {
@@ -790,7 +844,7 @@ where
 
 fn mask_hook_text(session: &Session, text: &str) -> Result<String, String> {
     let remasked = session.remask_all(text)?;
-    let result = Engine::with_profile(Profile::Balanced).mask(
+    let result = Engine::with_profile(Profile::Strict).mask(
         Input {
             kind: Kind::Text,
             data: remasked,
@@ -930,18 +984,256 @@ fn read_stdin_text() -> Result<String, String> {
     Ok(text)
 }
 
+fn command_available(command: &str) -> bool {
+    let status = if cfg!(windows) {
+        Command::new("where.exe")
+            .arg(command)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg("command -v \"$1\" >/dev/null 2>&1")
+            .arg("sh")
+            .arg(command)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    };
+    status.is_ok_and(|s| s.success())
+}
+
+fn shell_command(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| shell_quote_unix(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn powershell_command(words: &[String]) -> String {
+    let mut out = String::from("& ");
+    out.push_str(
+        &words
+            .iter()
+            .map(|word| powershell_word(word))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    out
+}
+
 fn shell_quote_unix(value: &str) -> String {
+    if is_simple_shell_word(value) {
+        return value.to_string();
+    }
     if value.is_empty() {
         return "''".to_string();
     }
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn powershell_word(value: &str) -> String {
+    if is_simple_shell_word(value) {
+        value.to_string()
+    } else {
+        powershell_quote(value)
+    }
+}
+
 fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn is_simple_shell_word(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn normalize_policy_text(text: &str) -> String {
+    text.to_ascii_lowercase().replace('\\', "/")
+}
+
+fn contains_sensitive_file_reference(normalized: &str) -> bool {
+    [
+        ".env",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".pgpass",
+        ".pem",
+        ".pfx",
+        ".p12",
+        ".aws/credentials",
+        ".ssh/id_rsa",
+        ".ssh/id_ed25519",
+        ".ssh/id_ecdsa",
+        ".ssh/id_dsa",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn contains_env_read_reference(normalized: &str) -> bool {
+    normalized.contains("$env:")
+        || normalized.contains(" env:")
+        || normalized.starts_with("env:")
+        || normalized.contains("[environment]::getenvironmentvariable")
+        || normalized.contains("[environment]::getenvironmentvariables")
+        || ascii_word_present(normalized, "printenv")
+        || references_sensitive_env_name(normalized)
+}
+
+fn references_sensitive_env_name(normalized: &str) -> bool {
+    let bytes = normalized.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let marker = bytes[i] as char;
+        if marker == '$' || marker == '%' {
+            if let Some((name, next)) = env_name_after_marker(normalized, i + 1, marker) {
+                if is_sensitive_env_name(name) {
+                    return true;
+                }
+                i = next;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn env_name_after_marker(text: &str, start: usize, marker: char) -> Option<(&str, usize)> {
+    let bytes = text.as_bytes();
+    if start >= bytes.len() {
+        return None;
+    }
+
+    if marker == '$' && bytes[start] == b'{' {
+        let name_start = start + 1;
+        let mut end = name_start;
+        while end < bytes.len() && is_env_name_byte(bytes[end]) {
+            end += 1;
+        }
+        if end > name_start && end < bytes.len() && bytes[end] == b'}' {
+            return Some((&text[name_start..end], end + 1));
+        }
+        return None;
+    }
+
+    let mut end = start;
+    while end < bytes.len() && is_env_name_byte(bytes[end]) {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    if marker == '%' && (end >= bytes.len() || bytes[end] != b'%') {
+        return None;
+    }
+    let next = if marker == '%' { end + 1 } else { end };
+    Some((&text[start..end], next))
+}
+
+fn is_env_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_sensitive_env_name(name: &str) -> bool {
+    if name == "auth" || name.contains("auth_") || name.contains("_auth") {
+        return true;
+    }
+    [
+        "api_key",
+        "apikey",
+        "access_key",
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "private",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
+}
+
+fn allows_single_pentect_read(text: &str) -> bool {
+    let normalized = normalize_policy_text(text);
+    let mut body = normalized.trim();
+    if let Some(rest) = body.strip_prefix('&') {
+        body = rest.trim_start();
+    }
+    if body.contains('\n')
+        || body.contains(';')
+        || body.contains('|')
+        || body.contains('>')
+        || body.contains('<')
+        || body.contains("&&")
+        || body.contains("||")
+    {
+        return false;
+    }
+    let simplified = body.replace(['\'', '"'], "");
+    let tokens: Vec<&str> = simplified.split_whitespace().collect();
+    matches!(
+        tokens.as_slice(),
+        [command, "read", rest @ ..] if is_pentect_agent_command(command) && safe_read_profile(rest)
+    ) || matches!(
+        tokens.as_slice(),
+        ["pentect", "agent", "read", rest @ ..] if safe_read_profile(rest)
+    )
+}
+
+fn is_pentect_agent_command(command: &str) -> bool {
+    let command = command.trim_start_matches("./");
+    command == "pentect-agent"
+        || command == "pentect-agent.exe"
+        || command.ends_with("/pentect-agent")
+        || command.ends_with("/pentect-agent.exe")
+}
+
+fn safe_read_profile(args: &[&str]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if let Some(profile) = arg.strip_prefix("--profile=") {
+            return matches!(profile, "strict" | "paranoid");
+        }
+        if arg == "--profile" {
+            let Some(profile) = args.get(i + 1) else {
+                return false;
+            };
+            return matches!(*profile, "strict" | "paranoid");
+        }
+        i += 1;
+    }
+    true
+}
+
+fn ascii_word_present(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(idx, _)| {
+        let before = haystack[..idx].chars().next_back();
+        let after = haystack[idx + needle.len()..].chars().next();
+        !is_ascii_word_char(before) && !is_ascii_word_char(after)
+    })
+}
+
+fn is_ascii_word_char(ch: Option<char>) -> bool {
+    ch.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
 fn infer_kind(path: &Path) -> Kind {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(".env"))
+    {
+        return Kind::Env;
+    }
     match path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -1065,6 +1357,128 @@ mod tests {
     }
 
     #[test]
+    fn read_defaults_to_strict_and_infers_dotenv() {
+        let args = strings(["pentect-agent", "read", r".\.env"]);
+        let opts = ReadOpts::parse(&args).unwrap();
+        assert_eq!(opts.profile, Profile::Strict);
+        assert_eq!(infer_kind(&opts.path), Kind::Env);
+    }
+
+    #[test]
+    fn exec_policy_blocks_direct_env_file_reads() {
+        let err = guard_shell_script(r"Get-Content .\.env").unwrap_err();
+        assert!(err.contains("blocked direct access"), "{err}");
+
+        let err = guard_shell_script("cat .env | Select-String RUNPOD").unwrap_err();
+        assert!(err.contains("blocked direct access"), "{err}");
+
+        let err = guard_shell_script(r#"python -c "open('.env').read()" # pentect-agent read"#)
+            .unwrap_err();
+        assert!(err.contains("blocked direct access"), "{err}");
+    }
+
+    #[test]
+    fn exec_policy_allows_single_pentect_read() {
+        guard_shell_script(r"& 'C:\Users\me\.cargo\bin\pentect-agent.exe' read --kind env .\.env")
+            .unwrap();
+        guard_shell_script(r"pentect agent read --kind env .\.env").unwrap();
+        guard_shell_script(r"pentect agent read --profile strict .\.env").unwrap();
+        guard_shell_script(r"pentect agent read --profile paranoid .\.env").unwrap();
+    }
+
+    #[test]
+    fn exec_policy_blocks_weakened_pentect_read_profiles() {
+        let err = guard_shell_script(r"pentect agent read --profile balanced .\.env").unwrap_err();
+        assert!(err.contains("blocked direct access"), "{err}");
+
+        let err = guard_shell_script(r"pentect-agent read --profile dev .\.env").unwrap_err();
+        assert!(err.contains("blocked direct access"), "{err}");
+    }
+
+    #[test]
+    fn exec_policy_blocks_environment_reads() {
+        let err = guard_shell_script("Get-ChildItem Env:").unwrap_err();
+        assert!(err.contains("environment-variable"), "{err}");
+
+        let err = guard_shell_script("printenv RUNPOD_API_KEY").unwrap_err();
+        assert!(err.contains("environment-variable"), "{err}");
+
+        let err = guard_shell_script("echo $RUNPOD_API_KEY").unwrap_err();
+        assert!(err.contains("environment-variable"), "{err}");
+
+        let err = guard_shell_script("Write-Output %RUNPOD_API_KEY%").unwrap_err();
+        assert!(err.contains("environment-variable"), "{err}");
+    }
+
+    #[test]
+    fn exec_policy_does_not_block_regular_shell_state_changes() {
+        guard_shell_script("export PATH=/tmp:$PATH").unwrap();
+        guard_shell_script("Set-Content note.txt hello").unwrap();
+        guard_shell_script("echo $AUTHOR").unwrap();
+        guard_shell_script("Write-Output %USERNAME%").unwrap();
+    }
+
+    #[test]
+    fn claude_pretool_wraps_plain_shell_command() {
+        let (root, session) = empty_session("hook-pre-plain");
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": r"Get-Content .\.env"
+            }
+        });
+        let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+        let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains("exec"), "{command}");
+        assert!(command.contains("--shell-b64"), "{command}");
+        assert!(!command.contains(".env"), "{command}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pretool_wraps_plain_shell_commands_for_every_provider() {
+        for provider in [
+            HookProvider::Codex,
+            HookProvider::Claude,
+            HookProvider::Gemini,
+        ] {
+            let (root, session) = empty_session("hook-pre-provider");
+            let input = match provider {
+                HookProvider::Gemini => json!({
+                    "event_name": "BeforeTool",
+                    "tool_name": "run_shell_command",
+                    "tool_input": {
+                        "command": "echo hello"
+                    }
+                }),
+                _ => json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "echo hello"
+                    }
+                }),
+            };
+            let output = handle_hook(provider, "t", &session, input).unwrap();
+            let command = match provider {
+                HookProvider::Gemini => output["hookSpecificOutput"]["tool_input"]["command"]
+                    .as_str()
+                    .unwrap(),
+                _ => output["hookSpecificOutput"]["updatedInput"]["command"]
+                    .as_str()
+                    .unwrap(),
+            };
+            assert!(command.contains("exec"), "{command}");
+            assert!(command.contains("--shell-b64"), "{command}");
+            assert!(!command.contains("echo hello"), "{command}");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn claude_pretool_wraps_masked_shell_command() {
         let (root, session, masked) = masked_session("hook-pre");
         let input = json!({
@@ -1111,6 +1525,17 @@ mod tests {
             session.resolve_all(content).unwrap(),
             "token=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hook_text_masks_runpod_token_as_plain_text() {
+        let (root, session) = empty_session("hook-runpod-text");
+        let raw = concat!("RUNPOD=", "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
+        let masked = mask_hook_text(&session, raw).unwrap();
+        assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
+        assert!(masked.contains("<<RUNPOD_API_KEY_"), "{masked}");
+        assert_eq!(session.resolve_all(&masked).unwrap(), raw);
         let _ = std::fs::remove_dir_all(root);
     }
 

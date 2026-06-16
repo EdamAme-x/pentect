@@ -1556,6 +1556,26 @@ mod tests {
     }
 
     #[test]
+    fn text_masks_runpod_token_without_key_context() {
+        let raw = concat!("RUNPOD=", "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
+        let r = Engine::with_profile(Profile::Balanced)
+            .mask(Input::text(raw), &Config::insecure_testing());
+        assert!(!r
+            .masked
+            .contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
+        assert!(r.masked.contains("<<RUNPOD_API_KEY_"), "{}", r.masked);
+    }
+
+    #[test]
+    fn strict_text_masks_unknown_entropy_token() {
+        let raw = "RUNPOD=Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
+        let r = Engine::with_profile(Profile::Strict)
+            .mask(Input::text(raw), &Config::insecure_testing());
+        assert!(!r.masked.contains("Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh"));
+        assert!(r.masked.contains("<<LIKELY_SECRET_"), "{}", r.masked);
+    }
+
+    #[test]
     fn no_survivor_in_json_values() {
         let secret = "AKIAIOSFODNN7EXAMPLE";
         let input = format!("{{\"a\":\"{secret}\",\"b\":\"see {secret} here\"}}");

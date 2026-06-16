@@ -18,6 +18,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("mask") => cmd_mask(&args),
+        Some("agent") => cmd_agent_passthrough(&args),
         Some("codex") => cmd_agent_tool(AgentTool::Codex, &args),
         Some("claude") => cmd_agent_tool(AgentTool::Claude, &args),
         Some("gemini") => cmd_agent_tool(AgentTool::Gemini, &args),
@@ -29,8 +30,10 @@ fn usage() {
     eprintln!(
         "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
          pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
+         pentect agent read|write|exec|hook|resolve|remask ...\n\
          \x20 mask secrets from stdin to stdout\n\
          \x20 codex|claude|gemini starts that agent with temporary Pentect hook config\n\
+         \x20 agent forwards to pentect-agent, used by hook-rewritten tool commands\n\
          \x20 --allow-unverified-hooks bypasses fail-closed checks for agent CLIs whose hook path was not verified\n\
          \x20 prompt masking is TODO; this wrapper protects tool boundaries via hooks\n\
          \x20 --input text|pdf read stdin as UTF-8 text or extract text from a PDF first\n\
@@ -45,6 +48,20 @@ fn usage() {
 fn die(msg: &str) -> ! {
     eprintln!("[pentect] {msg}");
     std::process::exit(2);
+}
+
+fn cmd_agent_passthrough(args: &[String]) {
+    if matches!(args.get(2).map(String::as_str), Some("--probe")) {
+        println!("pentect-agent-passthrough");
+        return;
+    }
+    let agent = std::env::var_os("PENTECT_AGENT")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_agent_path);
+    let mut cmd = Command::new(&agent);
+    cmd.args(&args[2..]);
+    let status = run_command(cmd, &agent);
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
@@ -338,9 +355,8 @@ fn claude_args(settings: &str, tool_args: &[String]) -> Vec<String> {
 }
 
 fn codex_hook_config_args(agent: &Path, session: &str) -> Vec<String> {
-    let agent = agent_command_path(agent);
-    let unix = hook_command_unix(&agent, "codex", session);
-    let windows = hook_command_windows(&agent, "codex", session);
+    let unix = hook_command_unix(agent, "codex", session);
+    let windows = hook_command_windows(agent, "codex", session);
     vec![
         "features.hooks=true".to_string(),
         format!(
@@ -436,16 +452,17 @@ fn gemini_cli_mentions_hooks(command: &Path) -> bool {
 }
 
 fn claude_settings_json(agent: &Path, session: &str) -> String {
-    let agent = agent_command_path(agent);
-    let command = agent.to_string_lossy();
+    let words = hook_words(agent, "claude", session);
+    let command = words[0].clone();
+    let args = words[1..].to_vec();
     json!({
         "hooks": {
             "PreToolUse": [{
                 "matcher": "*",
                 "hooks": [{
                     "type": "command",
-                    "command": command,
-                    "args": ["hook", "claude", "--session", session],
+                    "command": command.clone(),
+                    "args": args.clone(),
                     "timeout": 30
                 }]
             }],
@@ -453,8 +470,8 @@ fn claude_settings_json(agent: &Path, session: &str) -> String {
                 "matcher": "*",
                 "hooks": [{
                     "type": "command",
-                    "command": command,
-                    "args": ["hook", "claude", "--session", session],
+                    "command": command.clone(),
+                    "args": args.clone(),
                     "timeout": 30
                 }]
             }]
@@ -464,11 +481,10 @@ fn claude_settings_json(agent: &Path, session: &str) -> String {
 }
 
 fn gemini_hook_settings(agent: &Path, session: &str) -> Value {
-    let agent = agent_command_path(agent);
     let command = if cfg!(windows) {
-        hook_command_windows(&agent, "gemini", session)
+        hook_command_windows(agent, "gemini", session)
     } else {
-        hook_command_unix(&agent, "gemini", session)
+        hook_command_unix(agent, "gemini", session)
     };
     json!({
         "hooks": {
@@ -577,21 +593,52 @@ fn merge_hooks(settings: &mut Value, extra: &Value) -> Result<(), String> {
 }
 
 fn hook_command_unix(agent: &Path, provider: &str, session: &str) -> String {
-    format!(
-        "{} hook {} --session {}",
-        shell_quote_unix(&agent.to_string_lossy()),
-        shell_quote_unix(provider),
-        shell_quote_unix(session)
-    )
+    hook_words(agent, provider, session)
+        .iter()
+        .map(|word| shell_quote_unix(word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn hook_command_windows(agent: &Path, provider: &str, session: &str) -> String {
-    format!(
-        "& {} hook {} --session {}",
-        powershell_quote(&agent.to_string_lossy()),
-        powershell_quote(provider),
-        powershell_quote(session)
-    )
+    let mut out = String::from("& ");
+    out.push_str(
+        &hook_words(agent, provider, session)
+            .iter()
+            .map(|word| powershell_quote(word))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    out
+}
+
+fn hook_words(agent: &Path, provider: &str, session: &str) -> Vec<String> {
+    if pentect_agent_passthrough_available() {
+        return vec![
+            "pentect".to_string(),
+            "agent".to_string(),
+            "hook".to_string(),
+            provider.to_string(),
+            "--session".to_string(),
+            session.to_string(),
+        ];
+    }
+    let agent = agent_command_path(agent);
+    vec![
+        agent.to_string_lossy().into_owned(),
+        "hook".to_string(),
+        provider.to_string(),
+        "--session".to_string(),
+        session.to_string(),
+    ]
+}
+
+fn pentect_agent_passthrough_available() -> bool {
+    let Ok(output) = Command::new("pentect").arg("agent").arg("--probe").output() else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).trim() == "pentect-agent-passthrough"
 }
 
 fn agent_command_path(agent: &Path) -> PathBuf {
@@ -655,6 +702,9 @@ fn shell_quote_display(value: &str) -> String {
 }
 
 fn shell_quote_unix(value: &str) -> String {
+    if is_simple_shell_word(value) {
+        return value.to_string();
+    }
     if value.is_empty() {
         return "''".to_string();
     }
@@ -666,7 +716,17 @@ fn shell_quote_windows(value: &str) -> String {
 }
 
 fn powershell_quote(value: &str) -> String {
+    if is_simple_shell_word(value) {
+        return value.to_string();
+    }
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn is_simple_shell_word(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
 fn toml_string(value: &str) -> String {
