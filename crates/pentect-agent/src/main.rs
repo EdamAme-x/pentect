@@ -1,16 +1,15 @@
 //! pentect-agent: a minimal tool-boundary adapter.
 //!
 //! It demonstrates the product loop:
-//! read tool output -> mask before the AI sees it;
+//! shell tool input -> force execution through `pentect exec`;
 //! write/exec tool input -> resolve placeholders locally;
 //! command output -> remask before it returns to the AI.
 
-use data_encoding::BASE64URL_NOPAD;
 use pentect_core::{Config, Engine, Input, Kind, Profile, Recovery};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,16 +39,16 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect read [--session NAME] [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
-         pentect write PATH < masked-text\n\
-         pentect exec [--session NAME] COMMAND\n\
+        "pentect exec [--session NAME] COMMAND\n\
          pentect exec [--session NAME] -- PROGRAM [ARG...]\n\
+         pentect write PATH < masked-text\n\
+         pentect read [--session NAME] [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
          pentect hook codex|claude|gemini < hook-json\n\
          pentect resolve < masked-text\n\
          pentect remask < command-output\n\
          \n\
-         read stores local recovery state; write/exec resolve placeholders using that state;\n\
-         exec remasks stdout/stderr before printing them back."
+         agent hooks force shell tools through exec and block direct read tools;\n\
+         read is a human masked-preview helper."
     );
 }
 
@@ -122,18 +121,17 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let run = match run_resolved_command(&session, &opts.mode) {
+    let output = match run_resolved_command(&session, &opts.mode) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
-    let output = run.output;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let safe_stdout = match mask_text(&session, &stdout, run.output_kind.clone()) {
+    let safe_stdout = match mask_tool_output(&session, &stdout) {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let safe_stderr = match mask_text(&session, &stderr, run.output_kind) {
+    let safe_stderr = match mask_tool_output(&session, &stderr) {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
@@ -205,12 +203,10 @@ fn cmd_filter(args: &[String], mode: FilterMode) -> i32 {
     }
 }
 
-struct ExecRun {
-    output: Output,
-    output_kind: Kind,
-}
-
-fn run_resolved_command(session: &Session, mode: &ExecMode) -> Result<ExecRun, String> {
+fn run_resolved_command(
+    session: &Session,
+    mode: &ExecMode,
+) -> Result<std::process::Output, String> {
     match mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
@@ -223,43 +219,16 @@ fn run_resolved_command(session: &Session, mode: &ExecMode) -> Result<ExecRun, S
                 .collect();
             let resolved_args = resolved_args?;
             guard_program_invocation(&program, &resolved_args)?;
-            let output_kind = infer_exec_output_kind(&program, &resolved_args);
-            let output = Command::new(program)
+            Command::new(program)
                 .args(resolved_args)
                 .output()
-                .map_err(|e| format!("could not execute command: {e}"))?;
-            Ok(ExecRun {
-                output,
-                output_kind,
-            })
+                .map_err(|e| format!("could not execute command: {e}"))
         }
         ExecMode::Shell(command) => {
             let resolved = session.resolve_all(command)?;
             guard_shell_script(&resolved)?;
-            let output_kind = infer_shell_output_kind(&resolved);
-            let output = run_shell_script(&resolved)?;
-            Ok(ExecRun {
-                output,
-                output_kind,
-            })
+            run_shell_script(&resolved)
         }
-    }
-}
-
-fn infer_exec_output_kind(program: &str, args: &[String]) -> Kind {
-    let mut text = program.to_string();
-    for arg in args {
-        text.push(' ');
-        text.push_str(arg);
-    }
-    infer_shell_output_kind(&text)
-}
-
-fn infer_shell_output_kind(command: &str) -> Kind {
-    if references_env_file(&normalize_policy_text(command)) {
-        Kind::Env
-    } else {
-        Kind::Text
     }
 }
 
@@ -519,16 +488,6 @@ impl ExecOpts {
                         mode: ExecMode::Shell(command),
                     });
                 }
-                "--shell-b64" => {
-                    let encoded = value(args, &mut i, "--shell-b64")?;
-                    if i != args.len() {
-                        return Err("--shell-b64 must be the final exec option".to_string());
-                    }
-                    return Ok(Self {
-                        session: checked_session_name(&session)?,
-                        mode: ExecMode::Shell(decode_shell_b64(&encoded)?),
-                    });
-                }
                 "--" => {
                     let command = args[i + 1..].to_vec();
                     if command.is_empty() {
@@ -580,8 +539,9 @@ impl Session {
 
     fn open_existing(name: &str) -> Result<Self, String> {
         let root = session_root(name)?;
-        let key = read_key(&root.join(KEY_FILE))
-            .map_err(|_| format!("session '{name}' does not exist; run `pentect read` first"))?;
+        let key = read_key(&root.join(KEY_FILE)).map_err(|_| {
+            format!("session '{name}' does not exist; run `pentect exec \"...\"` first")
+        })?;
         Ok(Self { root, key })
     }
 
@@ -666,8 +626,19 @@ fn handle_hook(
             let Some(tool_input) = hook_field(&input, &["tool_input"]) else {
                 return Ok(json!({}));
             };
-            let (updated, changed) =
-                before_tool_updated_input(provider, session_name, session, tool_input)?;
+            let tool_name = hook_field(&input, &["tool_name"])
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (updated, changed) = match before_tool_updated_input(
+                provider,
+                session_name,
+                session,
+                tool_name,
+                tool_input,
+            ) {
+                Ok(result) => result,
+                Err(reason) => return Ok(before_tool_block_output(provider, &reason)),
+            };
             if changed {
                 Ok(before_tool_output(provider, updated))
             } else {
@@ -697,9 +668,22 @@ fn before_tool_updated_input(
     provider: HookProvider,
     session_name: &str,
     session: &Session,
+    tool_name: &str,
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
+    if is_read_like_tool_name(tool_name) {
+        return Err(read_tool_block_reason(tool_name));
+    }
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
+        if is_pentect_read_command(command) {
+            return Err(
+                "use `pentect exec \"Get-Content ...\"` instead of `pentect read` from AI hooks"
+                    .to_string(),
+            );
+        }
+        if is_pentect_exec_command(command) {
+            return Ok((tool_input.clone(), false));
+        }
         let mut updated = tool_input.clone();
         if let Some(object) = updated.as_object_mut() {
             object.insert(
@@ -710,6 +694,78 @@ fn before_tool_updated_input(
         }
     }
     transform_json_strings(tool_input, &mut |text| session.resolve_all(text))
+}
+
+fn is_read_like_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "read" | "read_file" | "read_many_files" | "multiread" | "notebookread" | "notebook_read"
+    )
+}
+
+fn is_pentect_exec_command(command: &str) -> bool {
+    let tokens = shell_like_words(command);
+    let tokens = strip_leading_invocation_marker(&tokens);
+    matches!(
+        tokens,
+        [command, subcommand, ..]
+            if is_pentect_command(command) && subcommand.eq_ignore_ascii_case("exec")
+    ) || matches!(
+        tokens,
+        [command, agent, subcommand, ..]
+            if is_pentect_command(command)
+                && agent.eq_ignore_ascii_case("agent")
+                && subcommand.eq_ignore_ascii_case("exec")
+    )
+}
+
+fn is_pentect_read_command(command: &str) -> bool {
+    let tokens = shell_like_words(command);
+    let tokens = strip_leading_invocation_marker(&tokens);
+    matches!(
+        tokens,
+        [command, subcommand, ..]
+            if is_pentect_command(command) && subcommand.eq_ignore_ascii_case("read")
+    ) || matches!(
+        tokens,
+        [command, agent, subcommand, ..]
+            if is_pentect_command(command)
+                && agent.eq_ignore_ascii_case("agent")
+                && subcommand.eq_ignore_ascii_case("read")
+    )
+}
+
+fn read_tool_block_reason(tool_name: &str) -> String {
+    format!(
+        "{tool_name} is human-only; use `pentect exec \"Get-Content ...\"` from AI hooks instead."
+    )
+}
+
+fn shell_like_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|ch| matches!(ch, '"' | '\'')))
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn strip_leading_invocation_marker(tokens: &[String]) -> &[String] {
+    match tokens {
+        [marker, rest @ ..] if marker == "&" => rest,
+        _ => tokens,
+    }
+}
+
+fn is_pentect_command(command: &str) -> bool {
+    let command = command.trim_start_matches("./");
+    command == "pentect"
+        || command == "pentect.exe"
+        || command == "pentect-agent"
+        || command == "pentect-agent.exe"
+        || command.ends_with("/pentect")
+        || command.ends_with("/pentect.exe")
+        || command.ends_with("/pentect-agent")
+        || command.ends_with("/pentect-agent.exe")
 }
 
 fn wrap_shell_command(
@@ -761,13 +817,6 @@ fn pentect_agent_passthrough_available() -> bool {
         && String::from_utf8_lossy(&output.stdout).trim() == "pentect-agent-passthrough"
 }
 
-fn decode_shell_b64(encoded: &str) -> Result<String, String> {
-    let bytes = BASE64URL_NOPAD
-        .decode(encoded.as_bytes())
-        .map_err(|e| format!("--shell-b64 is not valid base64url: {e}"))?;
-    String::from_utf8(bytes).map_err(|_| "--shell-b64 command is not UTF-8".to_string())
-}
-
 fn hook_phase(provider: HookProvider, input: &Value) -> HookPhase {
     let event = hook_event_name(input).unwrap_or_default();
     match provider {
@@ -806,6 +855,22 @@ fn before_tool_output(provider: HookProvider, updated_input: Value) -> Value {
             "hookSpecificOutput": {
                 "tool_input": updated_input
             }
+        }),
+    }
+}
+
+fn before_tool_block_output(provider: HookProvider, reason: &str) -> Value {
+    match provider {
+        HookProvider::Codex | HookProvider::Claude => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason
+            }
+        }),
+        HookProvider::Gemini => json!({
+            "decision": "deny",
+            "reason": reason
         }),
     }
 }
@@ -871,7 +936,16 @@ where
 }
 
 fn mask_hook_text(session: &Session, text: &str) -> Result<String, String> {
-    mask_text(session, text, Kind::Text)
+    mask_tool_output(session, text)
+}
+
+fn mask_tool_output(session: &Session, text: &str) -> Result<String, String> {
+    let kind = if looks_like_sensitive_env_output(text) || looks_like_env_output(text) {
+        Kind::Env
+    } else {
+        Kind::Text
+    };
+    mask_text(session, text, kind)
 }
 
 fn mask_text(session: &Session, text: &str, kind: Kind) -> Result<String, String> {
@@ -887,6 +961,57 @@ fn mask_text(session: &Session, text: &str, kind: Kind) -> Result<String, String
         session.save_recovery(&result.recovery)?;
     }
     Ok(result.masked)
+}
+
+fn looks_like_env_output(text: &str) -> bool {
+    let mut env_lines = 0usize;
+    let mut non_empty_lines = 0usize;
+    for line in text.lines().take(256) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        non_empty_lines += 1;
+        if is_env_assignment_line(trimmed) {
+            env_lines += 1;
+        }
+    }
+    env_lines >= 2 && env_lines == non_empty_lines
+}
+
+fn looks_like_sensitive_env_output(text: &str) -> bool {
+    for line in text.lines().take(256) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(key) = env_assignment_key(trimmed) {
+            if is_sensitive_env_name(&key.to_ascii_lowercase()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_env_assignment_line(line: &str) -> bool {
+    env_assignment_key(line).is_some()
+}
+
+fn env_assignment_key(line: &str) -> Option<&str> {
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let (key, value) = line.split_once('=')?;
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    if key
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+    {
+        Some(key)
+    } else {
+        None
+    }
 }
 
 fn stringify_tool_output(value: &Value) -> String {
@@ -1029,6 +1154,22 @@ fn shell_command(words: &[String]) -> String {
 }
 
 fn powershell_command(words: &[String]) -> String {
+    if let Some((first, rest)) = words.split_first() {
+        if is_simple_shell_word(first) {
+            let mut out = powershell_word(first);
+            if !rest.is_empty() {
+                out.push(' ');
+                out.push_str(
+                    &rest
+                        .iter()
+                        .map(|word| powershell_word(word))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+            return out;
+        }
+    }
     let mut out = String::from("& ");
     out.push_str(
         &words
@@ -1071,20 +1212,6 @@ fn is_simple_shell_word(value: &str) -> bool {
 
 fn normalize_policy_text(text: &str) -> String {
     text.to_ascii_lowercase().replace('\\', "/")
-}
-
-fn references_env_file(normalized: &str) -> bool {
-    normalized
-        .split(|ch: char| {
-            ch.is_whitespace() || matches!(ch, '\'' | '"' | '`' | '(' | ')' | ';' | '|')
-        })
-        .any(is_env_file_token)
-}
-
-fn is_env_file_token(token: &str) -> bool {
-    let token = token.trim_matches(|ch| matches!(ch, ',' | ':' | '[' | ']' | '{' | '}'));
-    let file = token.rsplit('/').next().unwrap_or(token);
-    file == ".env" || file.starts_with(".env.")
 }
 
 fn contains_env_read_reference(normalized: &str) -> bool {
@@ -1335,6 +1462,49 @@ mod tests {
     }
 
     #[test]
+    fn read_dotenv_masks_all_values() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-agent-test-{}-{}-read-dotenv",
+            std::process::id(),
+            unix_millis()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".env");
+        std::fs::write(
+            &path,
+            "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n",
+        )
+        .unwrap();
+
+        let session = Session::open_at(&root.join("agent-home"), "t").unwrap();
+        let data = read_input(&path, InputFormat::Text).unwrap();
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: infer_kind(&path),
+                data,
+            },
+            &Config::new(session.key),
+        );
+
+        assert!(!result
+            .masked
+            .contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
+        assert!(!result.masked.contains("114514810"), "{}", result.masked);
+        assert!(!result.masked.contains("hello world"), "{}", result.masked);
+        assert!(
+            result.masked.contains("TEST_SECRET=<<SECRET_"),
+            "{}",
+            result.masked
+        );
+        assert!(
+            result.masked.contains("NOTE=<<SECRET_"),
+            "{}",
+            result.masked
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn exec_allows_secret_file_reads_because_output_is_remasked() {
         guard_shell_script(r"Get-Content .\.env").unwrap();
         guard_shell_script("cat .env | Select-String RUNPOD").unwrap();
@@ -1365,20 +1535,36 @@ mod tests {
     }
 
     #[test]
-    fn exec_output_from_dotenv_command_masks_all_env_values() {
+    fn env_like_tool_output_masks_all_env_values() {
         let (root, session) = empty_session("exec-dotenv-output");
         let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
-        let masked = mask_text(
-            &session,
-            output,
-            infer_shell_output_kind(r"Get-Content .\.env"),
-        )
-        .unwrap();
+        let masked = mask_tool_output(&session, output).unwrap();
         assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
         assert!(!masked.contains("114514810"), "{masked}");
         assert!(!masked.contains("hello world"), "{masked}");
         assert!(masked.contains("TEST_SECRET=<<SECRET_"), "{masked}");
         assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn single_assignment_output_stays_text() {
+        let (root, session) = empty_session("exec-single-assignment");
+        let masked = mask_tool_output(&session, "NOTE=hello world\n").unwrap();
+        assert_eq!(masked, "NOTE=hello world\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn single_sensitive_assignment_output_is_masked_as_env() {
+        let (root, session) = empty_session("exec-single-sensitive-assignment");
+        let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n";
+        let masked = mask_tool_output(&session, output).unwrap();
+        assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
+        assert!(
+            masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+            "{masked}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1401,6 +1587,60 @@ mod tests {
         assert!(command.contains("Get-Content"), "{command}");
         assert!(command.contains(".\\.env"), "{command}");
         assert!(!command.contains("--shell-b64"), "{command}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pretool_blocks_pentect_read_from_ai_hooks() {
+        let (root, session) = empty_session("hook-pre-read");
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": r"pentect read .\.env"
+            }
+        });
+        let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+        let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(reason.contains("pentect exec"), "{reason}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pretool_blocks_direct_read_tools() {
+        let (root, session) = empty_session("hook-pre-direct-read");
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {
+                "file_path": r".\.env"
+            }
+        });
+        let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+        let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains("human-only"), "{reason}");
+        assert!(reason.contains("pentect exec"), "{reason}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pretool_does_not_double_wrap_pentect_exec() {
+        let (root, session) = empty_session("hook-pre-exec");
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": r#"pentect exec "Get-Content .\.env""#
+            }
+        });
+        let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+        assert_eq!(output, json!({}));
         let _ = std::fs::remove_dir_all(root);
     }
 

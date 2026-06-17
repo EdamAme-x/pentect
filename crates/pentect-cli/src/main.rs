@@ -4,21 +4,29 @@
 mod input;
 
 use input::{InputAdapter, TextInput};
-use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, RuleDetector};
+use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, Recovery, RuleDetector};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Refuse oversized input rather than emit partially-masked output (a masked
 /// head plus a raw tail would leak the tail).
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_SESSION: &str = "default";
+const KEY_FILE: &str = "key.bin";
+const RECOVERY_DIR: &str = "recoveries";
+
+static RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("mask") => cmd_mask(&args),
-        Some("read" | "write" | "exec" | "hook" | "resolve" | "remask") => {
+        Some("read") => cmd_read(&args),
+        Some("write" | "exec" | "hook" | "resolve" | "remask") => {
             cmd_agent_passthrough_from(1, &args)
         }
         Some("agent") => cmd_agent_passthrough(&args),
@@ -169,11 +177,154 @@ fn cmd_mask(args: &[String]) {
     }
 }
 
+fn cmd_read(args: &[String]) {
+    let opts = match ReadOpts::parse(args) {
+        Ok(o) => o,
+        Err(e) => die(&e),
+    };
+    let session = match Session::open(&opts.session) {
+        Ok(s) => s,
+        Err(e) => die(&e),
+    };
+    let data = match read_input(&opts.path, opts.input_format) {
+        Ok(s) => s,
+        Err(e) => die(&e),
+    };
+    let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
+    let engine = Engine::with_profile(opts.profile);
+    let cfg = Config {
+        disclose_length: opts.disclose_length,
+        ..Config::new(session.key)
+    };
+    let result = engine.mask(Input { kind, data }, &cfg);
+    if !result.recovery.is_empty() {
+        if let Err(e) = session.save_recovery(&result.recovery) {
+            die(&e);
+        }
+    }
+    print!("{}", result.masked);
+    let _ = std::io::stdout().flush();
+    if opts.emit_meta {
+        eprintln!(
+            "[pentect] masked={}, warned={}",
+            result.summary.masked_count,
+            result.summary.residual.len()
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentTool {
     Codex,
     Claude,
     Gemini,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadInputFormat {
+    Text,
+    Pdf,
+}
+
+struct ReadOpts {
+    session: String,
+    input_format: ReadInputFormat,
+    kind: Option<Kind>,
+    profile: Profile,
+    disclose_length: bool,
+    emit_meta: bool,
+    path: PathBuf,
+}
+
+impl ReadOpts {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut session = DEFAULT_SESSION.to_string();
+        let mut input_format = ReadInputFormat::Text;
+        let mut kind = None;
+        let mut profile = Profile::Strict;
+        let mut disclose_length = false;
+        let mut emit_meta = false;
+        let mut path = None;
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--session" => {
+                    session = checked_session_name(&required_value(args, &mut i, "--session")?)?;
+                }
+                "--input" => {
+                    input_format =
+                        parse_read_input_format(&required_value(args, &mut i, "--input")?)?;
+                }
+                "--kind" => {
+                    kind = Some(parse_kind(&required_value(args, &mut i, "--kind")?)?);
+                }
+                "--profile" => {
+                    profile = required_value(args, &mut i, "--profile")?.parse()?;
+                }
+                "--length" => {
+                    disclose_length = true;
+                    i += 1;
+                }
+                "--meta" => {
+                    emit_meta = true;
+                    i += 1;
+                }
+                flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
+                p => {
+                    if path.is_some() {
+                        return Err("read accepts exactly one PATH".to_string());
+                    }
+                    path = Some(PathBuf::from(p));
+                    i += 1;
+                }
+            }
+        }
+        Ok(Self {
+            session,
+            input_format,
+            kind,
+            profile,
+            disclose_length,
+            emit_meta,
+            path: path.ok_or_else(|| "read requires PATH".to_string())?,
+        })
+    }
+}
+
+struct Session {
+    root: PathBuf,
+    key: [u8; 32],
+}
+
+impl Session {
+    fn open(name: &str) -> Result<Self, String> {
+        let root = session_root(name)?;
+        std::fs::create_dir_all(root.join(RECOVERY_DIR))
+            .map_err(|e| format!("could not create session '{}': {e}", root.display()))?;
+        let key_path = root.join(KEY_FILE);
+        let key = if key_path.exists() {
+            read_key(&key_path)?
+        } else {
+            let key = Config::generate().key;
+            write_key(&key_path, &key)?;
+            key
+        };
+        Ok(Self { root, key })
+    }
+
+    fn save_recovery(&self, recovery: &Recovery) -> Result<(), String> {
+        let dir = self.root.join(RECOVERY_DIR);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create recovery dir '{}': {e}", dir.display()))?;
+        let path = dir.join(format!(
+            "recovery-{}-{}-{}.pnr",
+            unix_millis(),
+            std::process::id(),
+            RECOVERY_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, recovery.serialize(&self.key))
+            .map_err(|e| format!("could not write recovery '{}': {e}", path.display()))
+    }
 }
 
 impl AgentTool {
@@ -718,7 +869,8 @@ fn maybe_print_first_run_agent_hint(session: &str) {
         return;
     }
     eprintln!("[pentect] tool-boundary masking is active for this directory.");
-    eprintln!("[pentect] first use: `pentect read .env`, then use masked placeholders in commands through `pentect exec \"...\"`.");
+    eprintln!("[pentect] AI tools should call `pentect exec \"<command>\"`.");
+    eprintln!("[pentect] `pentect read` is a human masked-preview helper.");
     let _ = std::fs::write(marker, b"shown\n");
 }
 
@@ -727,6 +879,42 @@ fn agent_session_root(session: &str) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".pentect-agent"));
     base.join(session)
+}
+
+fn session_root(name: &str) -> Result<PathBuf, String> {
+    let name = checked_session_name(name)?;
+    Ok(agent_session_root(&name))
+}
+
+fn checked_session_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("session name must not be empty".to_string());
+    }
+    if name.chars().any(|c| {
+        c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return Err("session name must be a simple file-name segment".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn read_key(path: &Path) -> Result<[u8; 32], String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("could not read key '{}': {e}", path.display()))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("key '{}' must be exactly 32 bytes", path.display()))
+}
+
+fn write_key(path: &Path, key: &[u8; 32]) -> Result<(), String> {
+    std::fs::write(path, key).map_err(|e| format!("could not write key '{}': {e}", path.display()))
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn shell_quote_display(value: &str) -> String {
@@ -799,6 +987,94 @@ fn input_adapter(args: &[String]) -> Result<Box<dyn InputAdapter>, String> {
         Some("pdf") => pdf_input_adapter(),
         Some("text") | None => Ok(Box::new(TextInput)),
         Some(other) => Err(format!("unknown --input: {other}")),
+    }
+}
+
+fn parse_read_input_format(value: &str) -> Result<ReadInputFormat, String> {
+    match value {
+        "text" => Ok(ReadInputFormat::Text),
+        "pdf" => Ok(ReadInputFormat::Pdf),
+        other => Err(format!("unknown --input: {other}")),
+    }
+}
+
+fn parse_kind(value: &str) -> Result<Kind, String> {
+    match value {
+        "text" => Ok(Kind::Text),
+        "json" => Ok(Kind::Json),
+        "env" => Ok(Kind::Env),
+        "har" => Ok(Kind::Har),
+        other => Err(format!("unknown kind: {other}")),
+    }
+}
+
+fn read_input(path: &Path, format: ReadInputFormat) -> Result<String, String> {
+    let bytes = read_bytes(path)?;
+    match format {
+        ReadInputFormat::Text => String::from_utf8(bytes)
+            .map_err(|_| format!("input '{}' is not UTF-8 text", path.display())),
+        ReadInputFormat::Pdf => pdf_text(&bytes),
+    }
+}
+
+fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    if path == Path::new("-") {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .take((MAX_INPUT_BYTES + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("could not read stdin: {e}"))?;
+        if buf.len() > MAX_INPUT_BYTES {
+            return Err(format!("input exceeds {MAX_INPUT_BYTES} bytes"));
+        }
+        return Ok(buf);
+    }
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("could not stat '{}': {e}", path.display()))?;
+    if metadata.len() > MAX_INPUT_BYTES as u64 {
+        return Err(format!(
+            "input '{}' exceeds {MAX_INPUT_BYTES} bytes",
+            path.display()
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))
+}
+
+#[cfg(feature = "pdf")]
+fn pdf_text(bytes: &[u8]) -> Result<String, String> {
+    let text = pdf_extract::extract_text_from_mem(bytes)
+        .map_err(|e| format!("could not extract PDF text: {e}"))?;
+    if text.trim().is_empty() {
+        return Err(
+            "PDF contains no extractable text; scanned/image-only PDFs need OCR".to_string(),
+        );
+    }
+    Ok(text)
+}
+
+#[cfg(not(feature = "pdf"))]
+fn pdf_text(_bytes: &[u8]) -> Result<String, String> {
+    Err("PDF input requires a build with `--features pdf`".to_string())
+}
+
+fn infer_kind(path: &Path) -> Kind {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(".env"))
+    {
+        return Kind::Env;
+    }
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("json") => Kind::Json,
+        Some("env") => Kind::Env,
+        Some("har") => Kind::Har,
+        _ => Kind::Text,
     }
 }
 
@@ -933,6 +1209,58 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_parse_infers_dotenv_and_defaults_to_strict() {
+        let args = vec!["pentect".into(), "read".into(), r".\.env".into()];
+        let opts = ReadOpts::parse(&args).unwrap();
+        assert_eq!(opts.profile, Profile::Strict);
+        assert_eq!(infer_kind(&opts.path), Kind::Env);
+        assert!(!opts.emit_meta);
+
+        let args = vec![
+            "pentect".into(),
+            "read".into(),
+            "--meta".into(),
+            "--kind".into(),
+            "env".into(),
+            r".\.env".into(),
+        ];
+        let opts = ReadOpts::parse(&args).unwrap();
+        assert_eq!(opts.kind, Some(Kind::Env));
+        assert!(opts.emit_meta);
+    }
+
+    #[test]
+    fn cli_session_saves_recovery_in_agent_compatible_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-cli-session-test-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        let previous = std::env::var_os("PENTECT_AGENT_HOME");
+        std::env::set_var("PENTECT_AGENT_HOME", &root);
+
+        let session = Session::open("t").unwrap();
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Env,
+                data: "TEST_SECRET=114514810\nNOTE=hello world\n".into(),
+            },
+            &Config::new(session.key),
+        );
+        session.save_recovery(&result.recovery).unwrap();
+
+        assert!(root.join("t").join("key.bin").exists());
+        let recoveries = root.join("t").join("recoveries");
+        assert!(std::fs::read_dir(&recoveries).unwrap().count() > 0);
+
+        match previous {
+            Some(value) => std::env::set_var("PENTECT_AGENT_HOME", value),
+            None => std::env::remove_var("PENTECT_AGENT_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn pack_dir_expands_toml_files_in_stable_order() {
