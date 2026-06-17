@@ -4,8 +4,8 @@ mod render;
 mod sweep;
 
 use crate::detect::{
-    CardDetector, DecodeDetector, Detector, EntropyDetector, PemDetector, PhoneDetector,
-    RuleDetector, StructuralDetector,
+    CardDetector, DecodeDetector, Detector, EntropyDetector, EnvValueDetector, PemDetector,
+    PhoneDetector, RuleDetector, StructuralDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -369,6 +369,7 @@ impl EngineBuilder {
                 DecodeDetector::builtin()
                     .with_opaque(knobs.mask_unknown_codec, knobs.min_opaque_run),
             ))
+            .detector(Box::new(EnvValueDetector))
             .detector(Box::new(StructuralDetector))
             .detector(Box::new(PhoneDetector))
     }
@@ -1538,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn env_value_masked_by_value_structure_preserved() {
+    fn env_values_masked_wholesale_structure_preserved() {
         let raw = "export DB_KEY=AKIAIOSFODNN7EXAMPLE\nNOTE=hello world\n";
         let r = Engine::with_profile(Profile::Balanced).mask(
             Input {
@@ -1547,12 +1548,29 @@ mod tests {
             },
             &Config::insecure_testing(),
         );
-        // The value is masked because it *looks* like a secret (vendor shape),
-        // not because of its key; a benign value is untouched.
+        // `.env` files are a secret-bearing boundary, so every parsed value is
+        // masked even when the value itself has a benign shape.
         assert!(!r.masked.contains("AKIAIOSFODNN7EXAMPLE"), "{}", r.masked);
-        assert!(r.masked.contains("NOTE=hello world"), "{}", r.masked);
+        assert!(!r.masked.contains("hello world"), "{}", r.masked);
         // Structure preserved: key, =, newlines intact.
         assert!(r.masked.contains("export DB_KEY=<<"), "{}", r.masked);
+        assert!(r.masked.contains("NOTE=<<"), "{}", r.masked);
+    }
+
+    #[test]
+    fn env_numeric_values_masked_even_when_low_entropy() {
+        let raw = "TEST_SECRET=114514810\nFEATURE_FLAG=false\n";
+        let r = Engine::with_profile(Profile::Balanced).mask(
+            Input {
+                kind: Kind::Env,
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(!r.masked.contains("114514810"), "{}", r.masked);
+        assert!(!r.masked.contains("false"), "{}", r.masked);
+        assert!(r.masked.contains("TEST_SECRET=<<SECRET_"), "{}", r.masked);
+        assert!(r.masked.contains("FEATURE_FLAG=<<SECRET_"), "{}", r.masked);
     }
 
     #[test]

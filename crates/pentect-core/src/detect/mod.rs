@@ -22,7 +22,7 @@ pub use ner::NerDetector;
 pub use pem::PemDetector;
 pub use phone::PhoneDetector;
 pub use rule::{RuleDetector, RuleSpec};
-pub use structural::StructuralDetector;
+pub use structural::{EnvValueDetector, StructuralDetector};
 pub use validate::Validator;
 
 pub(crate) use util::is_token_byte;

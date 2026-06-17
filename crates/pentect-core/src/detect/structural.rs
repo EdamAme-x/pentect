@@ -18,6 +18,11 @@ const SENSITIVE_HEADERS: &[&str] = &[
 /// model's job (ML sidecar), not core's — core does not enumerate key names.
 pub struct StructuralDetector;
 
+/// `.env` value regions are masked wholesale. The parser already strips the
+/// structural shell, so the core can treat every non-placeholder value as
+/// secret without key-name guessing.
+pub struct EnvValueDetector;
+
 impl Detector for StructuralDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let region = view.region;
@@ -48,20 +53,41 @@ impl Detector for StructuralDetector {
     }
 }
 
+impl Detector for EnvValueDetector {
+    fn detect(&self, view: &NormalizedView) -> Vec<Span> {
+        let region = view.region;
+        if region.span.is_empty()
+            || region.ctx.format != Kind::Env
+            || is_rendered_placeholder(view.text())
+        {
+            return vec![];
+        }
+        vec![Span {
+            range: region.span,
+            category: Category::Secret,
+            label: labels::SECRET.to_string(),
+            confidence: Confidence::High,
+            source: DetectorId::Structural,
+        }]
+    }
+}
+
 /// Values that are never secrets even in a sensitive position: empty, JSON
 /// literals, or an already-rendered placeholder (idempotency).
 fn is_benign_value(v: &str) -> bool {
     let t = v.trim();
-    t.is_empty()
-        || matches!(t, "true" | "false" | "null")
-        || (t.starts_with("<<") && t.ends_with(">>"))
+    t.is_empty() || matches!(t, "true" | "false" | "null") || is_rendered_placeholder(t)
+}
+
+fn is_rendered_placeholder(v: &str) -> bool {
+    v.starts_with("<<") && v.ends_with(">>")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fires(kind: RegionKind, key: Option<&str>, value: &str) -> bool {
+    fn fires(kind: RegionKind, format: Kind, key: Option<&str>, value: &str) -> bool {
         let raw = value.to_string();
         let region = Region {
             span: ByteRange::new(0, raw.len()),
@@ -69,7 +95,7 @@ mod tests {
                 path: None,
                 key: key.map(str::to_string),
                 kind,
-                format: Kind::Har,
+                format,
             },
         };
         !StructuralDetector
@@ -77,36 +103,82 @@ mod tests {
             .is_empty()
     }
 
+    fn env_fires(key: Option<&str>, value: &str) -> bool {
+        let raw = value.to_string();
+        let region = Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: Context {
+                path: None,
+                key: key.map(str::to_string),
+                kind: RegionKind::Body,
+                format: Kind::Env,
+            },
+        };
+        !EnvValueDetector
+            .detect(&NormalizedView::build(&region, &raw))
+            .is_empty()
+    }
+
     #[test]
     fn cookie_values_fire_by_structure() {
-        assert!(fires(RegionKind::Cookie, Some("anyname"), "sessabc123"));
-        assert!(fires(RegionKind::Cookie, None, "x"));
+        assert!(fires(
+            RegionKind::Cookie,
+            Kind::Har,
+            Some("anyname"),
+            "sessabc123"
+        ));
+        assert!(fires(RegionKind::Cookie, Kind::Har, None, "x"));
     }
 
     #[test]
     fn sensitive_headers_fire_benign_headers_do_not() {
-        assert!(fires(RegionKind::Header, Some("Authorization"), "Bearer x"));
-        assert!(fires(RegionKind::Header, Some("cookie"), "a=b"));
+        assert!(fires(
+            RegionKind::Header,
+            Kind::Har,
+            Some("Authorization"),
+            "Bearer x"
+        ));
+        assert!(fires(RegionKind::Header, Kind::Har, Some("cookie"), "a=b"));
         assert!(!fires(
             RegionKind::Header,
+            Kind::Har,
             Some("Content-Type"),
             "application/json"
         ));
-        assert!(!fires(RegionKind::Header, Some("Accept"), "*/*"));
+        assert!(!fires(RegionKind::Header, Kind::Har, Some("Accept"), "*/*"));
     }
 
     #[test]
     fn arbitrary_keys_are_not_guessed() {
         // The whole point: open-vocabulary key names are NOT enumerated here.
-        assert!(!fires(RegionKind::JsonValue, Some("password"), "hunter2"));
-        assert!(!fires(RegionKind::Body, Some("db_password"), "hunter2"));
+        assert!(!fires(
+            RegionKind::JsonValue,
+            Kind::Har,
+            Some("password"),
+            "hunter2"
+        ));
+        assert!(!fires(
+            RegionKind::Body,
+            Kind::Har,
+            Some("db_password"),
+            "hunter2"
+        ));
+    }
+
+    #[test]
+    fn env_values_fire_wholesale() {
+        assert!(env_fires(Some("TEST_SECRET"), "114514810"));
+        assert!(env_fires(Some("USERNAME"), "alice"));
+        assert!(env_fires(Some("FLAG"), "false"));
+        assert!(!env_fires(Some("USERNAME"), "<<SECRET_0123456789abcdef>>"));
     }
 
     #[test]
     fn benign_values_skipped() {
-        assert!(!fires(RegionKind::Cookie, None, ""));
+        assert!(!fires(RegionKind::Cookie, Kind::Har, None, ""));
         assert!(!fires(
             RegionKind::Cookie,
+            Kind::Har,
             None,
             "<<SECRET_0123456789abcdef>>"
         ));
