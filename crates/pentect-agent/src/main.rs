@@ -507,7 +507,7 @@ impl ExecOpts {
                 }
             }
         }
-        Err("exec requires COMMAND, `-- PROGRAM...`, or `--shell COMMAND`".to_string())
+        Err("exec requires COMMAND or `-- PROGRAM...`".to_string())
     }
 }
 
@@ -870,14 +870,12 @@ fn agent_exec_words(session_name: &str, masked_command: &str) -> Result<Vec<Stri
     if pentect_agent_passthrough_available() {
         let mut words = vec!["pentect".to_string(), "exec".to_string()];
         add_non_default_session(&mut words, session_name);
-        words.push("--shell".to_string());
         words.push(masked_command.to_string());
         return Ok(words);
     }
     if command_available("pentect-agent") {
         let mut words = vec!["pentect-agent".to_string(), "exec".to_string()];
         add_non_default_session(&mut words, session_name);
-        words.push("--shell".to_string());
         words.push(masked_command.to_string());
         return Ok(words);
     }
@@ -885,7 +883,6 @@ fn agent_exec_words(session_name: &str, masked_command: &str) -> Result<Vec<Stri
         .map_err(|e| format!("could not resolve pentect-agent executable: {e}"))?;
     let mut words = vec![agent.to_string_lossy().into_owned(), "exec".to_string()];
     add_non_default_session(&mut words, session_name);
-    words.push("--shell".to_string());
     words.push(masked_command.to_string());
     Ok(words)
 }
@@ -1736,10 +1733,9 @@ mod tests {
             .unwrap();
         assert!(command.contains("pentect"), "{command}");
         assert!(command.contains("exec"), "{command}");
-        assert!(command.contains("--shell"), "{command}");
+        assert!(!command.contains("--shell"), "{command}");
         assert!(command.contains("Get-Content"), "{command}");
         assert_eq!(command.matches(" exec ").count(), 1, "{command}");
-        assert_eq!(command.matches(" --shell ").count(), 1, "{command}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1759,7 +1755,7 @@ mod tests {
             .unwrap();
         assert!(command.contains("pentect"), "{command}");
         assert!(command.contains("exec"), "{command}");
-        assert!(command.contains("--shell"), "{command}");
+        assert!(!command.contains("--shell"), "{command}");
         assert!(command.contains("Test-Path"), "{command}");
         assert!(command.contains("missing"), "{command}");
         let _ = std::fs::remove_dir_all(root);
