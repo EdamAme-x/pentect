@@ -1738,7 +1738,8 @@ mod tests {
         assert!(command.contains("exec"), "{command}");
         assert!(command.contains("--shell"), "{command}");
         assert!(command.contains("Get-Content"), "{command}");
-        assert_eq!(command.matches("pentect").count(), 1, "{command}");
+        assert_eq!(command.matches(" exec ").count(), 1, "{command}");
+        assert_eq!(command.matches(" --shell ").count(), 1, "{command}");
         let _ = std::fs::remove_dir_all(root);
     }
 
