@@ -3,10 +3,11 @@ memo: ui / approve / shell result / prompt
 
 MVP: secret-aware tool boundary for AI agents.
 
-- Rewrite shell tools to `pentect agent exec` from hooks.
+- Rewrite shell tools to `pentect exec "<command>"` from hooks.
 - Mask read/shell output before it returns to the agent.
 - Resolve placeholders only inside local tool execution.
-- Block direct reads of likely secret sources; use `pentect agent read`.
+- Block direct reads of likely secret sources; use `pentect read`.
+- Sessions are directory-local by default via `.pentect-agent/default`.
 - Prompt/TUI masking and external UI logs are out of scope for this MVP.
 
 - Hooks

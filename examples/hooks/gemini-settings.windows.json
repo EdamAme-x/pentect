@@ -7,7 +7,7 @@
           {
             "name": "pentect-resolve-tool-input",
             "type": "command",
-            "command": "target\\release\\pentect-agent.exe hook gemini --session default",
+            "command": "pentect hook gemini",
             "timeout": 30000
           }
         ]
@@ -20,7 +20,7 @@
           {
             "name": "pentect-mask-tool-output",
             "type": "command",
-            "command": "target\\release\\pentect-agent.exe hook gemini --session default",
+            "command": "pentect hook gemini",
             "timeout": 30000
           }
         ]

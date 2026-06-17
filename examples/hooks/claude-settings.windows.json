@@ -7,7 +7,7 @@
           {
             "type": "command",
             "shell": "powershell",
-            "command": "& \"$env:CLAUDE_PROJECT_DIR\\target\\release\\pentect-agent.exe\" hook claude --session default",
+            "command": "& pentect hook claude",
             "timeout": 30
           }
         ]
@@ -20,7 +20,7 @@
           {
             "type": "command",
             "shell": "powershell",
-            "command": "& \"$env:CLAUDE_PROJECT_DIR\\target\\release\\pentect-agent.exe\" hook claude --session default",
+            "command": "& pentect hook claude",
             "timeout": 30
           }
         ]

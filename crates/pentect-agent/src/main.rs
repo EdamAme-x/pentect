@@ -40,14 +40,13 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect-agent read [--session NAME] [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] PATH\n\
-         pentect-agent write [--session NAME] PATH < masked-text\n\
-         pentect-agent exec [--session NAME] -- PROGRAM [ARG...]\n\
-         pentect-agent exec [--session NAME] --shell COMMAND\n\
-         pentect-agent exec [--session NAME] --shell-b64 BASE64URL_COMMAND\n\
-         pentect-agent hook codex|claude|gemini [--session NAME] < hook-json\n\
-         pentect-agent resolve [--session NAME] < masked-text\n\
-         pentect-agent remask [--session NAME] < command-output\n\
+        "pentect read [--session NAME] [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
+         pentect write PATH < masked-text\n\
+         pentect exec [--session NAME] COMMAND\n\
+         pentect exec [--session NAME] -- PROGRAM [ARG...]\n\
+         pentect hook codex|claude|gemini < hook-json\n\
+         pentect resolve < masked-text\n\
+         pentect remask < command-output\n\
          \n\
          read stores local recovery state; write/exec resolve placeholders using that state;\n\
          exec remasks stdout/stderr before printing them back."
@@ -81,12 +80,13 @@ fn cmd_read(args: &[String]) -> i32 {
     }
     print!("{}", result.masked);
     let _ = std::io::stdout().flush();
-    eprintln!(
-        "[pentect-agent] session={} masked {} value(s), {} warned.",
-        opts.session,
-        result.summary.masked_count,
-        result.summary.residual.len()
-    );
+    if opts.emit_meta {
+        eprintln!(
+            "[pentect] masked={}, warned={}",
+            result.summary.masked_count,
+            result.summary.residual.len()
+        );
+    }
     0
 }
 
@@ -110,11 +110,6 @@ fn cmd_write(args: &[String]) -> i32 {
     if let Err(e) = std::fs::write(&opts.path, resolved) {
         return die(&format!("could not write '{}': {e}", opts.path.display()));
     }
-    eprintln!(
-        "[pentect-agent] session={} wrote resolved content to {}",
-        opts.session,
-        opts.path.display()
-    );
     0
 }
 
@@ -258,7 +253,7 @@ fn guard_sensitive_source_access(text: &str) -> Result<(), String> {
     let normalized = normalize_policy_text(text);
     if contains_sensitive_file_reference(&normalized) {
         return Err(
-            "Pentect blocked direct access to a likely secret file; use `pentect-agent read` so the AI only sees masked content."
+            "Pentect blocked direct access to a likely secret file; use `pentect read` so the AI only sees masked content."
                 .to_string(),
         );
     }
@@ -342,6 +337,7 @@ struct ReadOpts {
     kind: Option<Kind>,
     profile: Profile,
     disclose_length: bool,
+    emit_meta: bool,
     path: PathBuf,
 }
 
@@ -352,6 +348,7 @@ impl ReadOpts {
         let mut kind = None;
         let mut profile = Profile::Strict;
         let mut disclose_length = false;
+        let mut emit_meta = false;
         let mut path = None;
         let mut i = 2;
         while i < args.len() {
@@ -372,6 +369,10 @@ impl ReadOpts {
                     disclose_length = true;
                     i += 1;
                 }
+                "--meta" => {
+                    emit_meta = true;
+                    i += 1;
+                }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 p => {
                     if path.is_some() {
@@ -388,6 +389,7 @@ impl ReadOpts {
             kind,
             profile,
             disclose_length,
+            emit_meta,
             path: path.ok_or_else(|| "read requires PATH".to_string())?,
         })
     }
@@ -462,12 +464,8 @@ impl HookOpts {
         if let Ok(session) = std::env::var("PENTECT_AGENT_SESSION") {
             return checked_session_name(&session);
         }
-        let from_hook = input
-            .get("session_id")
-            .and_then(Value::as_str)
-            .and_then(sanitize_session_name)
-            .unwrap_or_else(|| DEFAULT_SESSION.to_string());
-        checked_session_name(&from_hook)
+        let _ = input;
+        Ok(DEFAULT_SESSION.to_string())
     }
 }
 
@@ -521,12 +519,20 @@ impl ExecOpts {
                     });
                 }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
-                _ => {
-                    return Err("exec command must follow `--` or use `--shell COMMAND`".to_string())
+                command => {
+                    if i + 1 != args.len() {
+                        return Err(
+                            "exec accepts one shell command, or use `-- PROGRAM...`".to_string()
+                        );
+                    }
+                    return Ok(Self {
+                        session: checked_session_name(&session)?,
+                        mode: ExecMode::Shell(command.to_string()),
+                    });
                 }
             }
         }
-        Err("exec requires `-- PROGRAM...` or `--shell COMMAND`".to_string())
+        Err("exec requires COMMAND, `-- PROGRAM...`, or `--shell COMMAND`".to_string())
     }
 }
 
@@ -553,9 +559,8 @@ impl Session {
 
     fn open_existing(name: &str) -> Result<Self, String> {
         let root = session_root(name)?;
-        let key = read_key(&root.join(KEY_FILE)).map_err(|_| {
-            format!("session '{name}' does not exist; run `pentect-agent read` first")
-        })?;
+        let key = read_key(&root.join(KEY_FILE))
+            .map_err(|_| format!("session '{name}' does not exist; run `pentect read` first"))?;
         Ok(Self { root, key })
     }
 
@@ -691,14 +696,11 @@ fn wrap_shell_command(
     session_name: &str,
     masked_command: &str,
 ) -> Result<String, String> {
-    let encoded = BASE64URL_NOPAD.encode(masked_command.as_bytes());
-    let mut words = agent_exec_words()?;
-    words.extend([
-        "--session".to_string(),
-        session_name.to_string(),
-        "--shell-b64".to_string(),
-        encoded,
-    ]);
+    let words = if let Some(path) = direct_sensitive_read_path(masked_command) {
+        agent_read_words(session_name, &path)
+    } else {
+        agent_exec_words(session_name, masked_command)?
+    };
     if cfg!(windows) {
         Ok(powershell_command(&words))
     } else {
@@ -706,23 +708,48 @@ fn wrap_shell_command(
     }
 }
 
-fn agent_exec_words() -> Result<Vec<String>, String> {
+fn agent_exec_words(session_name: &str, masked_command: &str) -> Result<Vec<String>, String> {
     if pentect_agent_passthrough_available() {
-        return Ok(vec![
-            "pentect".to_string(),
-            "agent".to_string(),
-            "exec".to_string(),
-        ]);
+        let mut words = vec!["pentect".to_string(), "exec".to_string()];
+        add_non_default_session(&mut words, session_name);
+        words.push(masked_command.to_string());
+        return Ok(words);
     }
     if command_available("pentect-agent") {
-        return Ok(vec!["pentect-agent".to_string(), "exec".to_string()]);
+        let mut words = vec!["pentect-agent".to_string(), "exec".to_string()];
+        add_non_default_session(&mut words, session_name);
+        words.push(masked_command.to_string());
+        return Ok(words);
     }
     let agent = std::env::current_exe()
         .map_err(|e| format!("could not resolve pentect-agent executable: {e}"))?;
-    Ok(vec![
-        agent.to_string_lossy().into_owned(),
-        "exec".to_string(),
-    ])
+    let mut words = vec![agent.to_string_lossy().into_owned(), "exec".to_string()];
+    add_non_default_session(&mut words, session_name);
+    words.push(masked_command.to_string());
+    Ok(words)
+}
+
+fn agent_read_words(session_name: &str, path: &str) -> Vec<String> {
+    let mut words = if pentect_agent_passthrough_available() {
+        vec!["pentect".to_string(), "read".to_string()]
+    } else if command_available("pentect-agent") {
+        vec!["pentect-agent".to_string(), "read".to_string()]
+    } else {
+        let agent = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "pentect-agent".to_string());
+        vec![agent, "read".to_string()]
+    };
+    add_non_default_session(&mut words, session_name);
+    words.push(path.to_string());
+    words
+}
+
+fn add_non_default_session(words: &mut Vec<String>, session_name: &str) {
+    if session_name != DEFAULT_SESSION {
+        words.push("--session".to_string());
+        words.push(session_name.to_string());
+    }
 }
 
 fn pentect_agent_passthrough_available() -> bool {
@@ -731,6 +758,81 @@ fn pentect_agent_passthrough_available() -> bool {
     };
     output.status.success()
         && String::from_utf8_lossy(&output.stdout).trim() == "pentect-agent-passthrough"
+}
+
+fn direct_sensitive_read_path(command: &str) -> Option<String> {
+    direct_sensitive_read_command_path(command)
+}
+
+fn direct_sensitive_read_command_path(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let normalized = normalize_policy_text(trimmed);
+    if !(normalized.contains(".env")
+        || normalized.contains(".npmrc")
+        || normalized.contains(".pypirc")
+        || normalized.contains(".netrc")
+        || normalized.contains(".pgpass")
+        || normalized.contains(".pem")
+        || normalized.contains(".ssh/"))
+    {
+        return None;
+    }
+    if has_shell_control_operator(trimmed) {
+        return None;
+    }
+    let tokens = shell_like_words(trimmed);
+    let tokens = strip_leading_invocation_marker(&tokens);
+    let (command, rest) = tokens.split_first()?;
+    if !is_plain_read_command(command) {
+        return None;
+    }
+    let path = match rest {
+        [path] => path.as_str(),
+        [flag, path] if is_path_flag(flag) => path.as_str(),
+        _ => return None,
+    };
+    let normalized_path = normalize_policy_text(path);
+    if contains_sensitive_file_reference(&normalized_path) {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
+fn has_shell_control_operator(command: &str) -> bool {
+    command.contains('\n')
+        || command.contains(';')
+        || command.contains('|')
+        || command.contains('>')
+        || command.contains('<')
+        || command.contains("&&")
+        || command.contains("||")
+}
+
+fn shell_like_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|ch| matches!(ch, '"' | '\'')))
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn strip_leading_invocation_marker(tokens: &[String]) -> &[String] {
+    match tokens {
+        [marker, rest @ ..] if marker == "&" => rest,
+        _ => tokens,
+    }
+}
+
+fn is_plain_read_command(command: &str) -> bool {
+    matches!(
+        command.to_ascii_lowercase().as_str(),
+        "cat" | "type" | "get-content" | "gc"
+    )
+}
+
+fn is_path_flag(flag: &str) -> bool {
+    matches!(flag.to_ascii_lowercase().as_str(), "-literalpath" | "-path")
 }
 
 fn decode_shell_b64(encoded: &str) -> Result<String, String> {
@@ -882,22 +984,6 @@ fn checked_session_name(name: &str) -> Result<String, String> {
         return Err("session name must be a simple file-name segment".to_string());
     }
     Ok(name.to_string())
-}
-
-fn sanitize_session_name(value: &str) -> Option<String> {
-    let mut out = String::with_capacity(value.len().min(96));
-    for ch in value.chars().take(96) {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
 }
 
 fn read_key(path: &Path) -> Result<[u8; 32], String> {
@@ -1181,17 +1267,21 @@ fn allows_single_pentect_read(text: &str) -> bool {
     let tokens: Vec<&str> = simplified.split_whitespace().collect();
     matches!(
         tokens.as_slice(),
-        [command, "read", rest @ ..] if is_pentect_agent_command(command) && safe_read_profile(rest)
+        [command, "read", rest @ ..] if is_pentect_command(command) && safe_read_profile(rest)
     ) || matches!(
         tokens.as_slice(),
         ["pentect", "agent", "read", rest @ ..] if safe_read_profile(rest)
     )
 }
 
-fn is_pentect_agent_command(command: &str) -> bool {
+fn is_pentect_command(command: &str) -> bool {
     let command = command.trim_start_matches("./");
-    command == "pentect-agent"
+    command == "pentect"
+        || command == "pentect.exe"
+        || command == "pentect-agent"
         || command == "pentect-agent.exe"
+        || command.ends_with("/pentect")
+        || command.ends_with("/pentect.exe")
         || command.ends_with("/pentect-agent")
         || command.ends_with("/pentect-agent.exe")
 }
@@ -1300,7 +1390,7 @@ fn value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
 }
 
 fn die(msg: &str) -> i32 {
-    eprintln!("[pentect-agent] {msg}");
+    eprintln!("[pentect] {msg}");
     2
 }
 
@@ -1346,9 +1436,18 @@ mod tests {
     }
 
     #[test]
-    fn exec_parse_requires_separator() {
+    fn exec_parse_rejects_split_shell_command() {
         let args = strings(["pentect-agent", "exec", "echo", "hi"]);
         assert!(ExecOpts::parse(&args).is_err());
+        let args = strings(["pentect-agent", "exec", "echo hi"]);
+        assert!(matches!(
+            ExecOpts::parse(&args).unwrap().mode,
+            ExecMode::Shell(command) if command == "echo hi"
+        ));
+    }
+
+    #[test]
+    fn exec_parse_accepts_program_after_separator() {
         let args = strings(["pentect-agent", "exec", "--", "echo", "hi"]);
         assert!(matches!(
             ExecOpts::parse(&args).unwrap().mode,
@@ -1361,7 +1460,11 @@ mod tests {
         let args = strings(["pentect-agent", "read", r".\.env"]);
         let opts = ReadOpts::parse(&args).unwrap();
         assert_eq!(opts.profile, Profile::Strict);
+        assert!(!opts.emit_meta);
         assert_eq!(infer_kind(&opts.path), Kind::Env);
+
+        let args = strings(["pentect-agent", "read", "--meta", r".\.env"]);
+        assert!(ReadOpts::parse(&args).unwrap().emit_meta);
     }
 
     #[test]
@@ -1381,6 +1484,8 @@ mod tests {
     fn exec_policy_allows_single_pentect_read() {
         guard_shell_script(r"& 'C:\Users\me\.cargo\bin\pentect-agent.exe' read --kind env .\.env")
             .unwrap();
+        guard_shell_script(r"pentect read --kind env .\.env").unwrap();
+        guard_shell_script(r"pentect read --profile strict .\.env").unwrap();
         guard_shell_script(r"pentect agent read --kind env .\.env").unwrap();
         guard_shell_script(r"pentect agent read --profile strict .\.env").unwrap();
         guard_shell_script(r"pentect agent read --profile paranoid .\.env").unwrap();
@@ -1388,6 +1493,9 @@ mod tests {
 
     #[test]
     fn exec_policy_blocks_weakened_pentect_read_profiles() {
+        let err = guard_shell_script(r"pentect read --profile balanced .\.env").unwrap_err();
+        assert!(err.contains("blocked direct access"), "{err}");
+
         let err = guard_shell_script(r"pentect agent read --profile balanced .\.env").unwrap_err();
         assert!(err.contains("blocked direct access"), "{err}");
 
@@ -1428,13 +1536,15 @@ mod tests {
                 "command": r"Get-Content .\.env"
             }
         });
-        let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+        let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
         let command = output["hookSpecificOutput"]["updatedInput"]["command"]
             .as_str()
             .unwrap();
-        assert!(command.contains("exec"), "{command}");
-        assert!(command.contains("--shell-b64"), "{command}");
-        assert!(!command.contains(".env"), "{command}");
+        assert!(command.contains("pentect"), "{command}");
+        assert!(command.contains("read"), "{command}");
+        assert!(command.contains(r".\.env"), "{command}");
+        assert!(!command.contains("exec"), "{command}");
+        assert!(!command.contains("--shell-b64"), "{command}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1462,7 +1572,7 @@ mod tests {
                     }
                 }),
             };
-            let output = handle_hook(provider, "t", &session, input).unwrap();
+            let output = handle_hook(provider, DEFAULT_SESSION, &session, input).unwrap();
             let command = match provider {
                 HookProvider::Gemini => output["hookSpecificOutput"]["tool_input"]["command"]
                     .as_str()
@@ -1472,10 +1582,31 @@ mod tests {
                     .unwrap(),
             };
             assert!(command.contains("exec"), "{command}");
-            assert!(command.contains("--shell-b64"), "{command}");
-            assert!(!command.contains("echo hello"), "{command}");
+            assert!(command.contains("echo hello"), "{command}");
+            assert!(!command.contains("--shell-b64"), "{command}");
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn pretool_non_default_session_is_inserted_before_command() {
+        let (root, session) = empty_session("hook-pre-session");
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "echo hello"
+            }
+        });
+        let output = handle_hook(HookProvider::Claude, "project-a", &session, input).unwrap();
+        let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains("--session"), "{command}");
+        assert!(command.contains("project-a"), "{command}");
+        assert!(command.contains("echo hello"), "{command}");
+        assert!(!command.contains("--shell-b64"), "{command}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1488,17 +1619,17 @@ mod tests {
                 "command": format!("echo {masked}")
             }
         });
-        let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+        let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
         let command = output["hookSpecificOutput"]["updatedInput"]["command"]
             .as_str()
             .unwrap();
         assert!(command.contains("exec"), "{command}");
-        assert!(command.contains("--shell-b64"), "{command}");
+        assert!(!command.contains("--shell-b64"), "{command}");
         assert!(
             !command.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
             "{command}"
         );
-        assert!(!command.contains("<<OPENAI_API_KEY_"), "{command}");
+        assert!(command.contains("<<OPENAI_API_KEY_"), "{command}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1565,19 +1696,36 @@ mod tests {
                 "command": format!("echo {masked}")
             }
         });
-        let output = handle_hook(HookProvider::Gemini, "t", &session, input).unwrap();
+        let output = handle_hook(HookProvider::Gemini, DEFAULT_SESSION, &session, input).unwrap();
         assert_eq!(output["decision"], "allow");
         let command = output["hookSpecificOutput"]["tool_input"]["command"]
             .as_str()
             .unwrap();
         assert!(command.contains("exec"), "{command}");
-        assert!(command.contains("--shell-b64"), "{command}");
+        assert!(!command.contains("--shell-b64"), "{command}");
         assert!(
             !command.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
             "{command}"
         );
-        assert!(!command.contains("<<OPENAI_API_KEY_"), "{command}");
+        assert!(command.contains("<<OPENAI_API_KEY_"), "{command}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_sensitive_read_path_recognizes_common_shell_reads() {
+        assert_eq!(
+            direct_sensitive_read_path(r"Get-Content -LiteralPath .\.env").as_deref(),
+            Some(r".\.env")
+        );
+        assert_eq!(
+            direct_sensitive_read_path("cat '.npmrc'").as_deref(),
+            Some(".npmrc")
+        );
+        assert_eq!(
+            direct_sensitive_read_path(r#"type "C:\Users\me\.ssh\id_ed25519""#).as_deref(),
+            Some(r"C:\Users\me\.ssh\id_ed25519")
+        );
+        assert_eq!(direct_sensitive_read_path("cat .env | sort"), None);
     }
 
     fn masked_session(name: &str) -> (PathBuf, Session, String) {

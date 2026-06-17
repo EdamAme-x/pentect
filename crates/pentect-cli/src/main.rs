@@ -18,6 +18,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("mask") => cmd_mask(&args),
+        Some("read" | "write" | "exec" | "hook" | "resolve" | "remask") => {
+            cmd_agent_passthrough_from(1, &args)
+        }
         Some("agent") => cmd_agent_passthrough(&args),
         Some("codex") => cmd_agent_tool(AgentTool::Codex, &args),
         Some("claude") => cmd_agent_tool(AgentTool::Claude, &args),
@@ -29,11 +32,10 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
+         pentect read|write|exec|hook|resolve|remask ...\n\
          pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
-         pentect agent read|write|exec|hook|resolve|remask ...\n\
          \x20 mask secrets from stdin to stdout\n\
          \x20 codex|claude|gemini starts that agent with temporary Pentect hook config\n\
-         \x20 agent forwards to pentect-agent, used by hook-rewritten tool commands\n\
          \x20 --allow-unverified-hooks bypasses fail-closed checks for agent CLIs whose hook path was not verified\n\
          \x20 prompt masking is TODO; this wrapper protects tool boundaries via hooks\n\
          \x20 --input text|pdf read stdin as UTF-8 text or extract text from a PDF first\n\
@@ -55,11 +57,15 @@ fn cmd_agent_passthrough(args: &[String]) {
         println!("pentect-agent-passthrough");
         return;
     }
+    cmd_agent_passthrough_from(2, args)
+}
+
+fn cmd_agent_passthrough_from(start: usize, args: &[String]) {
     let agent = std::env::var_os("PENTECT_AGENT")
         .map(PathBuf::from)
         .unwrap_or_else(default_agent_path);
     let mut cmd = Command::new(&agent);
-    cmd.args(&args[2..]);
+    cmd.args(&args[start..]);
     let status = run_command(cmd, &agent);
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -75,6 +81,9 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
             "pentect-agent not found at '{}'; run `cargo build -p pentect-agent --release` or pass --agent PATH",
             agent.display()
         ));
+    }
+    if !opts.dry_run {
+        maybe_print_first_run_agent_hint(&opts.session);
     }
     let status = match tool {
         AgentTool::Codex => run_codex(&opts, &agent),
@@ -283,7 +292,7 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
         return success_status();
     }
     if codex_uses_unverified_headless_hook_path(&opts.tool_args) && !opts.allow_unverified_hooks {
-        die("refusing to start Codex headless subcommand with Pentect hooks: local probes showed `codex exec` runs shell commands without dispatching PreToolUse/PostToolUse hooks, even under a TTY. Use interactive `pentect codex`, `pentect claude`, `pentect-agent exec`, or pass --allow-unverified-hooks only for debugging.");
+        die("refusing to start Codex headless subcommand with Pentect hooks: local probes showed `codex exec` runs shell commands without dispatching PreToolUse/PostToolUse hooks, even under a TTY. Use interactive `pentect codex`, `pentect claude`, `pentect exec`, or pass --allow-unverified-hooks only for debugging.");
     }
     let mut cmd = Command::new(&opts.command);
     for config in configs {
@@ -614,23 +623,29 @@ fn hook_command_windows(agent: &Path, provider: &str, session: &str) -> String {
 
 fn hook_words(agent: &Path, provider: &str, session: &str) -> Vec<String> {
     if pentect_agent_passthrough_available() {
-        return vec![
+        let mut words = vec![
             "pentect".to_string(),
-            "agent".to_string(),
             "hook".to_string(),
             provider.to_string(),
-            "--session".to_string(),
-            session.to_string(),
         ];
+        add_non_default_session(&mut words, session);
+        return words;
     }
     let agent = agent_command_path(agent);
-    vec![
+    let mut words = vec![
         agent.to_string_lossy().into_owned(),
         "hook".to_string(),
         provider.to_string(),
-        "--session".to_string(),
-        session.to_string(),
-    ]
+    ];
+    add_non_default_session(&mut words, session);
+    words
+}
+
+fn add_non_default_session(words: &mut Vec<String>, session: &str) {
+    if session != "default" {
+        words.push("--session".to_string());
+        words.push(session.to_string());
+    }
 }
 
 fn pentect_agent_passthrough_available() -> bool {
@@ -691,6 +706,27 @@ fn success_status() -> std::process::ExitStatus {
         use std::os::unix::process::ExitStatusExt;
         std::process::ExitStatus::from_raw(0)
     }
+}
+
+fn maybe_print_first_run_agent_hint(session: &str) {
+    let root = agent_session_root(session);
+    let marker = root.join("first-run-hint-shown");
+    if marker.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(&root).is_err() {
+        return;
+    }
+    eprintln!("[pentect] tool-boundary masking is active for this directory.");
+    eprintln!("[pentect] first use: `pentect read .env`, then use masked placeholders in commands through `pentect exec \"...\"`.");
+    let _ = std::fs::write(marker, b"shown\n");
+}
+
+fn agent_session_root(session: &str) -> PathBuf {
+    let base = std::env::var_os("PENTECT_AGENT_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".pentect-agent"));
+    base.join(session)
 }
 
 fn shell_quote_display(value: &str) -> String {
