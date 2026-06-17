@@ -499,15 +499,10 @@ impl ExecOpts {
                     });
                 }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
-                command => {
-                    if i + 1 != args.len() {
-                        return Err(
-                            "exec accepts one shell command, or use `-- PROGRAM...`".to_string()
-                        );
-                    }
+                _ => {
                     return Ok(Self {
                         session: checked_session_name(&session)?,
-                        mode: ExecMode::Shell(command.to_string()),
+                        mode: ExecMode::Shell(args[i..].join(" ")),
                     });
                 }
             }
@@ -681,14 +676,15 @@ fn before_tool_updated_input(
                     .to_string(),
             );
         }
-        if is_pentect_exec_command(command) {
+        if is_pentect_exec_program_command(command) {
             return Ok((tool_input.clone(), false));
         }
+        let command = extract_pentect_exec_shell_payload(command).unwrap_or_else(|| command.into());
         let mut updated = tool_input.clone();
         if let Some(object) = updated.as_object_mut() {
             object.insert(
                 "command".to_string(),
-                Value::String(wrap_shell_command(provider, session_name, command)?),
+                Value::String(wrap_shell_command(provider, session_name, &command)?),
             );
             return Ok((updated, true));
         }
@@ -703,35 +699,45 @@ fn is_read_like_tool_name(tool_name: &str) -> bool {
     )
 }
 
-fn is_pentect_exec_command(command: &str) -> bool {
-    let tokens = shell_like_words(command);
-    let tokens = strip_leading_invocation_marker(&tokens);
+fn is_pentect_exec_program_command(command: &str) -> bool {
     matches!(
-        tokens,
-        [command, subcommand, ..]
-            if is_pentect_command(command) && subcommand.eq_ignore_ascii_case("exec")
-    ) || matches!(
-        tokens,
-        [command, agent, subcommand, ..]
-            if is_pentect_command(command)
-                && agent.eq_ignore_ascii_case("agent")
-                && subcommand.eq_ignore_ascii_case("exec")
+        parse_pentect_subcommand(command),
+        Some(PentectInvocation {
+            subcommand: PentectSubcommand::Exec,
+            rest
+        }) if rest.trim_start().starts_with("-- ")
     )
 }
 
+fn extract_pentect_exec_shell_payload(command: &str) -> Option<String> {
+    let PentectInvocation { subcommand, rest } = parse_pentect_subcommand(command)?;
+    if subcommand != PentectSubcommand::Exec {
+        return None;
+    }
+    let mut rest = rest.trim_start();
+    loop {
+        let (word, _, word_end) = next_shell_word(rest, 0)?;
+        match word.as_str() {
+            "--session" => {
+                let (_, _, value_end) = next_shell_word(rest, word_end)?;
+                rest = rest[value_end..].trim_start();
+            }
+            "--shell" => {
+                return Some(unquote_wrapped_shell_arg(rest[word_end..].trim_start()));
+            }
+            "--" => return None,
+            _ => return Some(unquote_wrapped_shell_arg(rest)),
+        }
+    }
+}
+
 fn is_pentect_read_command(command: &str) -> bool {
-    let tokens = shell_like_words(command);
-    let tokens = strip_leading_invocation_marker(&tokens);
     matches!(
-        tokens,
-        [command, subcommand, ..]
-            if is_pentect_command(command) && subcommand.eq_ignore_ascii_case("read")
-    ) || matches!(
-        tokens,
-        [command, agent, subcommand, ..]
-            if is_pentect_command(command)
-                && agent.eq_ignore_ascii_case("agent")
-                && subcommand.eq_ignore_ascii_case("read")
+        parse_pentect_subcommand(command),
+        Some(PentectInvocation {
+            subcommand: PentectSubcommand::Read,
+            ..
+        })
     )
 }
 
@@ -741,23 +747,88 @@ fn read_tool_block_reason(tool_name: &str) -> String {
     )
 }
 
-fn shell_like_words(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .map(|word| word.trim_matches(|ch| matches!(ch, '"' | '\'')))
-        .filter(|word| !word.is_empty())
-        .map(str::to_string)
-        .collect()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PentectSubcommand {
+    Exec,
+    Read,
 }
 
-fn strip_leading_invocation_marker(tokens: &[String]) -> &[String] {
-    match tokens {
-        [marker, rest @ ..] if marker == "&" => rest,
-        _ => tokens,
+struct PentectInvocation<'a> {
+    subcommand: PentectSubcommand,
+    rest: &'a str,
+}
+
+fn parse_pentect_subcommand(command: &str) -> Option<PentectInvocation<'_>> {
+    let mut cursor = 0usize;
+    let (first, _, first_end) = next_shell_word(command, cursor)?;
+    cursor = first_end;
+    let first = if first == "&" {
+        let (word, _, end) = next_shell_word(command, cursor)?;
+        cursor = end;
+        word
+    } else {
+        first
+    };
+    if !is_pentect_command(&first) {
+        return None;
     }
+    let (mut subcommand, _, mut end) = next_shell_word(command, cursor)?;
+    if subcommand.eq_ignore_ascii_case("agent") {
+        let (word, _, word_end) = next_shell_word(command, end)?;
+        subcommand = word;
+        end = word_end;
+    }
+    let subcommand = match subcommand.to_ascii_lowercase().as_str() {
+        "exec" => PentectSubcommand::Exec,
+        "read" => PentectSubcommand::Read,
+        _ => return None,
+    };
+    Some(PentectInvocation {
+        subcommand,
+        rest: &command[end..],
+    })
+}
+
+fn next_shell_word(text: &str, start: usize) -> Option<(String, usize, usize)> {
+    let mut word_start = start;
+    while word_start < text.len() {
+        let ch = text[word_start..].chars().next()?;
+        if !ch.is_whitespace() {
+            break;
+        }
+        word_start += ch.len_utf8();
+    }
+    if word_start >= text.len() {
+        return None;
+    }
+    let first = text[word_start..].chars().next()?;
+    if matches!(first, '\'' | '"') {
+        let mut end = word_start + first.len_utf8();
+        let mut word = String::new();
+        while end < text.len() {
+            let ch = text[end..].chars().next()?;
+            end += ch.len_utf8();
+            if ch == first {
+                return Some((word, word_start, end));
+            }
+            word.push(ch);
+        }
+        return Some((word, word_start, end));
+    }
+    let mut end = word_start;
+    while end < text.len() {
+        let ch = text[end..].chars().next()?;
+        if ch.is_whitespace() {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    Some((text[word_start..end].to_string(), word_start, end))
 }
 
 fn is_pentect_command(command: &str) -> bool {
-    let command = command.trim_start_matches("./");
+    let normalized = command.replace('\\', "/");
+    let command = normalized.trim_start_matches("./");
     command == "pentect"
         || command == "pentect.exe"
         || command == "pentect-agent"
@@ -766,6 +837,20 @@ fn is_pentect_command(command: &str) -> bool {
         || command.ends_with("/pentect.exe")
         || command.ends_with("/pentect-agent")
         || command.ends_with("/pentect-agent.exe")
+}
+
+fn unquote_wrapped_shell_arg(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'' {
+            return value[1..value.len() - 1].replace("''", "'");
+        }
+        if bytes[0] == b'"' && bytes[value.len() - 1] == b'"' {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
 }
 
 fn wrap_shell_command(
@@ -785,12 +870,14 @@ fn agent_exec_words(session_name: &str, masked_command: &str) -> Result<Vec<Stri
     if pentect_agent_passthrough_available() {
         let mut words = vec!["pentect".to_string(), "exec".to_string()];
         add_non_default_session(&mut words, session_name);
+        words.push("--shell".to_string());
         words.push(masked_command.to_string());
         return Ok(words);
     }
     if command_available("pentect-agent") {
         let mut words = vec!["pentect-agent".to_string(), "exec".to_string()];
         add_non_default_session(&mut words, session_name);
+        words.push("--shell".to_string());
         words.push(masked_command.to_string());
         return Ok(words);
     }
@@ -798,6 +885,7 @@ fn agent_exec_words(session_name: &str, masked_command: &str) -> Result<Vec<Stri
         .map_err(|e| format!("could not resolve pentect-agent executable: {e}"))?;
     let mut words = vec![agent.to_string_lossy().into_owned(), "exec".to_string()];
     add_non_default_session(&mut words, session_name);
+    words.push("--shell".to_string());
     words.push(masked_command.to_string());
     Ok(words)
 }
@@ -1430,9 +1518,12 @@ mod tests {
     }
 
     #[test]
-    fn exec_parse_rejects_split_shell_command() {
+    fn exec_parse_accepts_split_shell_command_as_shell_text() {
         let args = strings(["pentect-agent", "exec", "echo", "hi"]);
-        assert!(ExecOpts::parse(&args).is_err());
+        assert!(matches!(
+            ExecOpts::parse(&args).unwrap().mode,
+            ExecMode::Shell(command) if command == "echo hi"
+        ));
         let args = strings(["pentect-agent", "exec", "echo hi"]);
         assert!(matches!(
             ExecOpts::parse(&args).unwrap().mode,
@@ -1630,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn pretool_does_not_double_wrap_pentect_exec() {
+    fn pretool_canonicalizes_quoted_pentect_exec_shell_command() {
         let (root, session) = empty_session("hook-pre-exec");
         let input = json!({
             "hook_event_name": "PreToolUse",
@@ -1640,7 +1731,36 @@ mod tests {
             }
         });
         let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-        assert_eq!(output, json!({}));
+        let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains("pentect"), "{command}");
+        assert!(command.contains("exec"), "{command}");
+        assert!(command.contains("--shell"), "{command}");
+        assert!(command.contains("Get-Content"), "{command}");
+        assert_eq!(command.matches("pentect").count(), 1, "{command}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pretool_canonicalizes_pentect_exec_shell_commands() {
+        let (root, session) = empty_session("hook-pre-canonical");
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "pentect exec if (!(Test-Path -LiteralPath $path)) { Write-Output \"missing\"; exit 0 }"
+            }
+        });
+        let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+        let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains("pentect"), "{command}");
+        assert!(command.contains("exec"), "{command}");
+        assert!(command.contains("--shell"), "{command}");
+        assert!(command.contains("Test-Path"), "{command}");
+        assert!(command.contains("missing"), "{command}");
         let _ = std::fs::remove_dir_all(root);
     }
 

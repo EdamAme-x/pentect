@@ -869,7 +869,7 @@ fn maybe_print_first_run_agent_hint(session: &str) {
         return;
     }
     eprintln!("[pentect] tool-boundary masking is active for this directory.");
-    eprintln!("[pentect] AI tools should call `pentect exec \"<command>\"`.");
+    eprintln!("[pentect] AI tools should call `pentect exec --shell \"<command>\"`.");
     eprintln!("[pentect] `pentect read` is a human masked-preview helper.");
     let _ = std::fs::write(marker, b"shown\n");
 }
