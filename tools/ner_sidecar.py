@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Persistent NER sidecar for Pentect.
+"""Persistent semantic PII sidecar for Pentect.
 
-Loads a spaCy model once, then serves requests over stdin/stdout (one JSON
-request and one JSON response per line). Pentect's Rust `NerDetector` (the
-`ner` feature) spawns this and pipes region text through it.
+Loads a provider once, then serves requests over stdin/stdout (one JSON request
+and one JSON response per line). Pentect's Rust `SemanticDetector` spawns this
+and pipes region text through it.
 
 Protocol (newline-delimited JSON, so text with newlines is escaped):
   request:  a JSON string  ->  "John Smith at Acme Corp"
   response: a JSON array   ->  [[0,10,"PERSON"],[14,23,"ORGANIZATION"]]
 Offsets are BYTE offsets into the UTF-8 text, matching Rust's span ranges.
 
-Model: PENTECT_SPACY_MODEL (default en_core_web_lg — same family Presidio
-uses). Swap to ai4privacy/DeBERTa later for a strict win over spaCy.
+Provider: PENTECT_SEMANTIC_PROVIDER (spacy, gliner, presidio). spaCy is the
+default because it is lightweight and already installed in many Python stacks;
+GLiNER/Presidio are optional adapters when their packages are available.
 """
 import json
 import os
+import re
 import sys
 
-# spaCy entity label -> Pentect NER label. Only identity-bearing types.
-LABELS = {
+SPACY_LABELS = {
     "PERSON": "PERSON",
     "ORG": "ORGANIZATION",
     "GPE": "LOCATION",
@@ -27,14 +28,212 @@ LABELS = {
     "NORP": "NRP",
 }
 
+PRESIDIO_LABELS = {
+    "PERSON": "PERSON",
+    "LOCATION": "LOCATION",
+    "ORGANIZATION": "ORGANIZATION",
+    "NRP": "NRP",
+    "ADDRESS": "LOCATION",
+}
 
-def main() -> None:
+GLINER_LABELS = {
+    "person": "PERSON",
+    "full name": "PERSON",
+    "organization": "ORGANIZATION",
+    "company": "ORGANIZATION",
+    "location": "LOCATION",
+    "address": "LOCATION",
+    "street address": "LOCATION",
+    "nationality": "NRP",
+    "religion": "NRP",
+    "political group": "NRP",
+}
+
+TECH_INDEX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*\[\d+\]?$")
+TECH_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-\[\]]{7,}$")
+
+ADDRESS_PATTERNS = [
+    # 1600 Amphitheatre Parkway, Mountain View CA
+    # 221B Baker Street, London
+    re.compile(
+        r"""
+        \b\d{1,6}[A-Za-z]?(?:[-/]\d{1,6}[A-Za-z]?){0,2}
+        \s+
+        (?:[A-Z][\w.'-]*\s+|[a-z][\w.'-]*\s+){0,6}
+        (?:Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Boulevard|Blvd\.?|
+           Drive|Dr\.?|Lane|Ln\.?|Parkway|Pkwy\.?|Way|Court|Ct\.?|
+           Place|Pl\.?|Square|Sq\.?|Terrace|Trail|Circle|Cir\.?)
+        \b
+        (?:,\s*[A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*){0,4}(?:\s+[A-Z]{2})?)?
+        """,
+        re.VERBOSE,
+    ),
+    # 1-1-2 Otemachi, Chiyoda-ku, Tokyo
+    re.compile(
+        r"""
+        \b\d{1,4}(?:-\d{1,4}){1,3}
+        \s+[A-Z][\w.'-]*
+        (?:,\s*[A-Z][\w.'-]*(?:-[a-z]+)?){1,4}
+        """,
+        re.VERBOSE,
+    ),
+    # Japanese address-like runs. This is deliberately structural, not a list
+    # of benchmark strings.
+    re.compile(
+        r"[\u3040-\u30ff\u3400-\u9fff]{2,}(?:都|道|府|県)"
+        r"[\u3040-\u30ff\u3400-\u9fff0-9０-９\-ー丁目番地号区市町村郡]+"
+    ),
+]
+
+
+def is_probably_technical_entity(value: str) -> bool:
+    s = value.strip(" \t\r\n'\"`.,;:()")
+    if not s:
+        return True
+    # Multi-line or assignment-shaped spans are almost always log/config blobs,
+    # not a single semantic person/org/location entity.
+    if "\n" in s or "\r" in s or "=" in s:
+        return True
+    # Filesystem paths and URLs are structured data. Core rules handle the
+    # sensitive path segment; NER should not mask the whole debug path as ORG.
+    if "\\" in s or "/" in s:
+        return True
+    # deploy[42], worker-7, client-16, trace IDs, invalid IBAN-like fixtures.
+    if TECH_INDEX_RE.fullmatch(s):
+        return True
+    if len(s) >= 8 and any(ch.isdigit() for ch in s) and TECH_TOKEN_RE.fullmatch(s):
+        return True
+    return False
+
+
+def byte_offsets(text: str, start: int, end: int) -> tuple[int, int]:
+    return (
+        len(text[:start].encode("utf-8")),
+        len(text[:end].encode("utf-8")),
+    )
+
+
+def collect_address_entities(text: str) -> list[tuple[int, int, str]]:
+    out = []
+    for pattern in ADDRESS_PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            value = text[start:end].strip()
+            if value and not is_probably_technical_entity(value):
+                out.append((start, end, "LOCATION"))
+    return out
+
+
+def normalize_provider_name(raw: str) -> str:
+    name = raw.strip().lower().replace("_", "-")
+    aliases = {
+        "ner": "spacy",
+        "spacy-ner": "spacy",
+        "gliner2": "gliner",
+        "gliner2-pii": "gliner",
+        "opf": "presidio",
+        "presidio-analyzer": "presidio",
+    }
+    return aliases.get(name, name)
+
+
+def load_spacy_detector():
     import spacy
 
     model = os.environ.get("PENTECT_SPACY_MODEL", "en_core_web_lg")
     nlp = spacy.load(model, disable=["lemmatizer", "tagger", "parser", "attribute_ruler"])
+
+    def detect(text: str) -> list[tuple[int, int, str]]:
+        out = []
+        doc = nlp(text)
+        for ent in doc.ents:
+            label = SPACY_LABELS.get(ent.label_)
+            if label is not None and not is_probably_technical_entity(ent.text):
+                out.append((ent.start_char, ent.end_char, label))
+        return out
+
+    return detect
+
+
+def load_gliner_detector():
+    from gliner import GLiNER
+
+    model_name = os.environ.get(
+        "PENTECT_GLINER_MODEL",
+        "fastino/gliner2-privacy-filter-PII-multi",
+    )
+    threshold = float(os.environ.get("PENTECT_GLINER_THRESHOLD", "0.45"))
+    model = GLiNER.from_pretrained(model_name)
+    labels = list(GLINER_LABELS)
+
+    def detect(text: str) -> list[tuple[int, int, str]]:
+        out = []
+        for ent in model.predict_entities(text, labels, threshold=threshold):
+            raw_label = str(ent.get("label", "")).lower()
+            label = GLINER_LABELS.get(raw_label)
+            start = ent.get("start")
+            end = ent.get("end")
+            if label is None or not isinstance(start, int) or not isinstance(end, int):
+                continue
+            if not is_probably_technical_entity(text[start:end]):
+                out.append((start, end, label))
+        return out
+
+    return detect
+
+
+def load_presidio_detector():
+    from presidio_analyzer import AnalyzerEngine
+
+    analyzer = AnalyzerEngine()
+    language = os.environ.get("PENTECT_PRESIDIO_LANGUAGE", "en")
+
+    def detect(text: str) -> list[tuple[int, int, str]]:
+        out = []
+        for ent in analyzer.analyze(text=text, language=language):
+            label = PRESIDIO_LABELS.get(ent.entity_type)
+            if label is not None and not is_probably_technical_entity(text[ent.start : ent.end]):
+                out.append((ent.start, ent.end, label))
+        return out
+
+    return detect
+
+
+def load_detector(provider: str):
+    if provider == "spacy":
+        return load_spacy_detector()
+    if provider == "gliner":
+        return load_gliner_detector()
+    if provider == "presidio":
+        return load_presidio_detector()
+    raise RuntimeError(f"unknown semantic provider: {provider}")
+
+
+def encode_response(text: str, spans: list[tuple[int, int, str]]) -> list[list[object]]:
+    response = []
+    seen = set()
+    for start, end, label in sorted(spans):
+        if not (0 <= start < end <= len(text)):
+            continue
+        key = (start, end, label)
+        if key in seen:
+            continue
+        seen.add(key)
+        b_start, b_end = byte_offsets(text, start, end)
+        response.append([b_start, b_end, label])
+    return response
+
+
+def main() -> None:
+    provider = normalize_provider_name(
+        os.environ.get(
+            "PENTECT_SEMANTIC_PROVIDER",
+            os.environ.get("PENTECT_NER_PROVIDER", "spacy"),
+        )
+    )
+    detect = load_detector(provider)
     # Signal readiness so the parent can block until the (slow) model load is done.
-    sys.stdout.write("READY\n")
+    sys.stdout.write(f"READY {provider}\n")
     sys.stdout.flush()
 
     for line in sys.stdin:
@@ -43,17 +242,9 @@ def main() -> None:
             continue
         try:
             text = json.loads(line)
-            doc = nlp(text)
-            out = []
-            for ent in doc.ents:
-                label = LABELS.get(ent.label_)
-                if label is None:
-                    continue
-                # char offsets -> byte offsets into the UTF-8 text
-                b_start = len(text[: ent.start_char].encode("utf-8"))
-                b_end = len(text[: ent.end_char].encode("utf-8"))
-                out.append([b_start, b_end, label])
-            sys.stdout.write(json.dumps(out) + "\n")
+            out = detect(text)
+            out.extend(collect_address_entities(text))
+            sys.stdout.write(json.dumps(encode_response(text, out)) + "\n")
         except Exception:  # never crash the loop on one bad request
             sys.stdout.write("[]\n")
         sys.stdout.flush()

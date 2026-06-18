@@ -51,7 +51,10 @@ fn usage() {
          \x20 --pack-dir DIR   load every *.toml pack in a directory (repeatable)\n\
          \x20 --disable LABEL  turn off a built-in detector by label (repeatable)\n\
          \x20 --enable LABEL   turn on an off-by-default built-in (e.g. DATE_TIME)\n\
-         \x20 --ner            also mask person/location/org via the NER sidecar (needs --features ner)"
+         \x20 --semantic       also mask person/location/org/address via a semantic sidecar\n\
+         \x20 --semantic-provider spacy|gliner|presidio  choose the semantic provider\n\
+         \x20 --semantic-script FILE  choose the semantic sidecar script\n\
+         \x20 --ner            legacy alias for --semantic --semantic-provider spacy"
     );
 }
 
@@ -1094,24 +1097,50 @@ fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>, args: &[St
     if aggressive {
         eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
     }
-    Engine::with_profile_packs_detectors(profile, packs, ner_detectors(args), aggressive)
+    Engine::with_profile_packs_detectors(profile, packs, semantic_detectors(args), aggressive)
 }
 
-/// `--ner` adds the semantic NER sidecar (person/location/org/nationality).
-/// Built only with `--features ner`; the script defaults to PENTECT_NER_SCRIPT
-/// or tools/ner_sidecar.py.
-#[cfg(feature = "ner")]
-fn ner_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
-    if !has_flag(args, "--ner") {
-        return Vec::new();
+#[derive(Debug, PartialEq, Eq)]
+struct SemanticOpts {
+    provider: String,
+    script: String,
+}
+
+fn semantic_requested(args: &[String]) -> bool {
+    has_flag(args, "--semantic")
+        || has_flag(args, "--ner")
+        || arg_value(args, "--semantic-provider").is_some()
+        || arg_value(args, "--semantic-script").is_some()
+}
+
+fn semantic_opts(args: &[String]) -> Option<SemanticOpts> {
+    if !semantic_requested(args) {
+        return None;
     }
-    let script =
-        std::env::var("PENTECT_NER_SCRIPT").unwrap_or_else(|_| "tools/ner_sidecar.py".into());
-    match pentect_core::NerDetector::spawn(&script) {
+    let provider = arg_value(args, "--semantic-provider")
+        .or_else(|| std::env::var("PENTECT_SEMANTIC_PROVIDER").ok())
+        .unwrap_or_else(|| "spacy".into());
+    let script = arg_value(args, "--semantic-script")
+        .or_else(|| std::env::var("PENTECT_SEMANTIC_SCRIPT").ok())
+        .or_else(|| std::env::var("PENTECT_NER_SCRIPT").ok())
+        .unwrap_or_else(|| "tools/ner_sidecar.py".into());
+    Some(SemanticOpts { provider, script })
+}
+
+/// `--semantic` adds the semantic sidecar (person/location/org/address).
+/// Built only with `--features semantic`/`ner`; the script defaults to
+/// PENTECT_SEMANTIC_SCRIPT, PENTECT_NER_SCRIPT, or tools/ner_sidecar.py.
+#[cfg(feature = "ner")]
+fn semantic_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
+    let Some(opts) = semantic_opts(args) else {
+        return Vec::new();
+    };
+    match pentect_core::SemanticDetector::spawn_with_provider(&opts.script, &opts.provider) {
         Ok(d) => vec![Box::new(d)],
         Err(e) => {
             eprintln!(
-                "[pentect] --ner: could not start NER sidecar ({e}); continuing without NER."
+                "[pentect] --semantic provider='{}': could not start semantic sidecar ({e}); continuing without semantic detection.",
+                opts.provider
             );
             Vec::new()
         }
@@ -1119,9 +1148,9 @@ fn ner_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
 }
 
 #[cfg(not(feature = "ner"))]
-fn ner_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
-    if has_flag(args, "--ner") {
-        eprintln!("[pentect] --ner requires a build with `--features ner`; ignoring.");
+fn semantic_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
+    if semantic_requested(args) {
+        eprintln!("[pentect] --semantic requires a build with `--features semantic`; ignoring.");
     }
     Vec::new()
 }
@@ -1229,6 +1258,32 @@ mod tests {
         let opts = ReadOpts::parse(&args).unwrap();
         assert_eq!(opts.kind, Some(Kind::Env));
         assert!(opts.emit_meta);
+    }
+
+    #[test]
+    fn semantic_provider_flag_implies_semantic_sidecar() {
+        let args = vec![
+            "pentect".into(),
+            "mask".into(),
+            "--semantic-provider".into(),
+            "gliner".into(),
+            "--semantic-script".into(),
+            "tools/custom_sidecar.py".into(),
+        ];
+        assert!(semantic_requested(&args));
+        assert_eq!(
+            semantic_opts(&args),
+            Some(SemanticOpts {
+                provider: "gliner".into(),
+                script: "tools/custom_sidecar.py".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_ner_flag_requests_semantic_sidecar() {
+        let args = vec!["pentect".into(), "mask".into(), "--ner".into()];
+        assert!(semantic_requested(&args));
     }
 
     #[test]

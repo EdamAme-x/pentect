@@ -10,13 +10,11 @@
 use crate::model::{ByteRange, Region};
 use unicode_normalization::UnicodeNormalization;
 
-/// Identity normalization: NFC (deliberately not NFKC) plus zero-width/bidi
-/// stripping. Conservative so distinct values are never merged (full-width vs
-/// ASCII digits stay distinct). Used for placeholder hashing and the sweep.
+/// Identity normalization: NFC only (deliberately not NFKC, and deliberately
+/// not dropping zero-width/bidi controls). Used for placeholder hashing and the
+/// sweep, where merging distinct source bytes would make restore ambiguous.
 pub fn n_id(s: &str) -> String {
-    s.nfc()
-        .filter(|c| !is_zero_width(*c) && !is_bidi(*c))
-        .collect()
+    s.nfc().collect()
 }
 
 fn is_zero_width(c: char) -> bool {
@@ -36,10 +34,20 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+fn push_ascii_escape(norm: &mut String, segs: &mut Vec<Seg>, byte: u8, raw: ByteRange) {
+    let norm_start = norm.len();
+    norm.push(byte as char);
+    segs.push(Seg {
+        norm: ByteRange::new(norm_start, norm.len()),
+        raw,
+    });
+}
+
 /// A region's text after aggressive normalization for detection (NFKC, zero-width
-/// /bidi stripping, and percent-decoding of `%XX` ASCII), with a map back to raw
-/// byte ranges. Detectors run on the normalized text so these tricks can't break
-/// a match; the resulting spans are always reported in raw coordinates.
+/// /bidi stripping, percent-decoding of `%XX` ASCII, and source-literal decoding
+/// of ASCII `\u00XX` / `\xXX` escapes), with a map back to raw byte ranges.
+/// Detectors run on the normalized text so these tricks can't break a match; the
+/// resulting spans are always reported in raw coordinates.
 pub struct NormalizedView<'a> {
     pub region: &'a Region,
     norm: String,
@@ -70,14 +78,39 @@ impl<'a> NormalizedView<'a> {
                     let byte = (hi << 4) | lo;
                     if byte.is_ascii() {
                         let raw = ByteRange::new(base + i, base + i + 3);
-                        let norm_start = norm.len();
-                        norm.push(byte as char);
-                        segs.push(Seg {
-                            norm: ByteRange::new(norm_start, norm.len()),
-                            raw,
-                        });
+                        push_ascii_escape(&mut norm, &mut segs, byte, raw);
                         i += 3;
                         continue;
+                    }
+                }
+            }
+            // Source-code / JSON-style ASCII escapes (`\u002d`, `\x2d`) are a
+            // common way for logs and tool output to split a recognizable token.
+            if bytes[i] == b'\\' {
+                if i + 5 < bytes.len()
+                    && bytes[i + 1] == b'u'
+                    && bytes[i + 2] == b'0'
+                    && bytes[i + 3] == b'0'
+                {
+                    if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 4]), hex_val(bytes[i + 5])) {
+                        let byte = (hi << 4) | lo;
+                        if byte.is_ascii() {
+                            let raw = ByteRange::new(base + i, base + i + 6);
+                            push_ascii_escape(&mut norm, &mut segs, byte, raw);
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+                if i + 3 < bytes.len() && matches!(bytes[i + 1], b'x' | b'X') {
+                    if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 2]), hex_val(bytes[i + 3])) {
+                        let byte = (hi << 4) | lo;
+                        if byte.is_ascii() {
+                            let raw = ByteRange::new(base + i, base + i + 4);
+                            push_ascii_escape(&mut norm, &mut segs, byte, raw);
+                            i += 4;
+                            continue;
+                        }
                     }
                 }
             }
@@ -174,6 +207,25 @@ mod tests {
         let v = NormalizedView::build(&r, raw);
         assert_eq!(v.text(), "a-b");
         assert_eq!(v.to_raw(ByteRange::new(1, 2)), ByteRange::new(1, 4));
+    }
+
+    #[test]
+    fn decodes_ascii_source_escapes() {
+        let raw = r"a\u002db\x2ec";
+        let r = region(raw);
+        let v = NormalizedView::build(&r, raw);
+        assert_eq!(v.text(), "a-b.c");
+        assert_eq!(v.to_raw(ByteRange::new(1, 2)), ByteRange::new(1, 7));
+        assert_eq!(v.to_raw(ByteRange::new(3, 4)), ByteRange::new(8, 12));
+    }
+
+    #[test]
+    fn identity_keeps_controls_that_detection_drops() {
+        assert_ne!(
+            n_id("AKIAIOSFODNN7EXAMPLE"),
+            n_id("AKIA\u{200b}IOSFODNN7EXAMPLE")
+        );
+        assert_ne!(n_id("abc"), n_id("a\u{202e}bc"));
     }
 
     proptest::proptest! {

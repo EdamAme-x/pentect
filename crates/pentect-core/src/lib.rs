@@ -31,12 +31,12 @@ pub mod policy;
 pub mod recovery;
 
 pub use codec::Codec;
-#[cfg(feature = "ner")]
-pub use detect::NerDetector;
 pub use detect::{
     CardDetector, DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, RuleSpec,
     StructuralDetector,
 };
+#[cfg(feature = "ner")]
+pub use detect::{NerDetector, SemanticDetector};
 pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
 pub use pack::{load_pack, Pack};
 pub use parse::{EnvParser, HarParser, JsonParser, Parser, TextParser};
