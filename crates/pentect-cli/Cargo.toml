@@ -15,7 +15,10 @@ default = ["pdf"]
 # PDF input is an adapter concern: extract text locally, then feed the normal
 # masking kernel. Disable default features for a slimmer text-only CLI.
 pdf = ["dep:pdf-extract"]
-# Enable the semantic NER sidecar (--ner). Requires Python + spaCy at runtime.
+# Enable the semantic sidecar (--semantic). Requires Python and a provider
+# runtime such as spaCy, GLiNER, or Presidio.
+semantic = ["ner"]
+# Backward-compatible feature name. Prefer `semantic` in user-facing docs.
 ner = ["pentect-core/ner"]
 
 [dependencies]

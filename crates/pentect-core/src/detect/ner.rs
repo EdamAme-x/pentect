@@ -1,7 +1,7 @@
-//! Semantic NER via a persistent Python sidecar (see tools/ner_sidecar.py).
+//! Semantic PII via a persistent Python sidecar (see tools/ner_sidecar.py).
 //! Catches the entities a deterministic core cannot — person, location,
-//! organization, nationality — by talking to a model loaded once in a child
-//! process. Off unless built with the `ner` feature.
+//! organization, address — by talking to a provider loaded once in a child
+//! process. Off unless built with the `semantic`/`ner` feature.
 
 use super::Detector;
 use crate::model::*;
@@ -10,9 +10,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
 
-pub struct NerDetector {
+pub struct SemanticDetector {
     proc: Mutex<NerProc>,
 }
+
+/// Backward-compatible name for older callers. Prefer `SemanticDetector`.
+pub type NerDetector = SemanticDetector;
 
 struct NerProc {
     child: Child,
@@ -20,14 +23,20 @@ struct NerProc {
     stdout: BufReader<ChildStdout>,
 }
 
-impl NerDetector {
-    /// Spawn the sidecar (`<python> <script>`) and block until its model is
+impl SemanticDetector {
+    /// Spawn the default spaCy sidecar provider.
+    pub fn spawn(script: &str) -> std::io::Result<Self> {
+        Self::spawn_with_provider(script, "spacy")
+    }
+
+    /// Spawn the sidecar (`<python> <script>`) and block until its provider is
     /// loaded (it prints `READY`). `python` defaults to PENTECT_PYTHON or
     /// "python". Errors if the process can't start or never signals ready.
-    pub fn spawn(script: &str) -> std::io::Result<Self> {
+    pub fn spawn_with_provider(script: &str, provider: &str) -> std::io::Result<Self> {
         let python = std::env::var("PENTECT_PYTHON").unwrap_or_else(|_| "python".into());
         let mut child = Command::new(python)
             .arg(script)
+            .env("PENTECT_SEMANTIC_PROVIDER", provider)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -36,8 +45,11 @@ impl NerDetector {
         let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let mut ready = String::new();
         stdout.read_line(&mut ready)?;
-        if ready.trim() != "READY" {
-            return Err(std::io::Error::other("ner sidecar did not signal READY"));
+        let ready = ready.trim();
+        if ready != "READY" && !ready.starts_with("READY ") {
+            return Err(std::io::Error::other(
+                "semantic sidecar did not signal READY",
+            ));
         }
         Ok(Self {
             proc: Mutex::new(NerProc {
@@ -49,7 +61,7 @@ impl NerDetector {
     }
 }
 
-impl Drop for NerDetector {
+impl Drop for SemanticDetector {
     fn drop(&mut self) {
         if let Ok(mut p) = self.proc.lock() {
             let _ = p.child.kill();
@@ -57,7 +69,7 @@ impl Drop for NerDetector {
     }
 }
 
-impl Detector for NerDetector {
+impl Detector for SemanticDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let text = view.text();
         let Ok(req) = serde_json::to_string(text) else {
@@ -86,7 +98,7 @@ impl Detector for NerDetector {
                 category: Category::Pii,
                 label,
                 // Probabilistic, so Medium: a vendor rule on the same span keeps
-                // its label, but NER still beats nothing.
+                // its label, but semantic detection still beats nothing.
                 confidence: Confidence::Medium,
                 source: DetectorId::Ner,
             })
@@ -100,9 +112,9 @@ mod tests {
     use crate::detect::region;
 
     #[test]
-    fn ner_detects_person_org_location() {
+    fn semantic_detects_person_org_location() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/ner_sidecar.py");
-        let det = match NerDetector::spawn(script) {
+        let det = match SemanticDetector::spawn_with_provider(script, "spacy") {
             Ok(d) => d,
             Err(_) => return, // python/spaCy unavailable here — skip, don't fail
         };

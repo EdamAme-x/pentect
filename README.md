@@ -18,3 +18,26 @@ MVP: secret-aware tool boundary for AI agents.
   - https://geminicli.com/docs/hooks/reference
 
 Prompt/TUI masking is TODO.
+
+Hostile gap corpus:
+
+```powershell
+cargo build -p pentect-cli --release
+python tools/eval_hostile_realworld.py --bin target\release\pentect.exe
+```
+
+This corpus is intentionally mean: encoded/fractured secrets, low-entropy keyed
+values, semantic PII, real-looking logs, and benign near misses. It is for gap
+tracking, not a CI pass/fail gate.
+
+For the semantic layer:
+
+```powershell
+cargo build -p pentect-cli --release --features semantic
+python tools/eval_hostile_realworld.py --bin target\release\pentect.exe --pentect-arg=--semantic
+```
+
+Semantic detection is provider-backed and optional. The default provider is
+spaCy; use `--semantic-provider gliner` or `--semantic-provider presidio` when
+those Python packages/models are installed. `--ner` remains as a legacy alias for
+`--semantic --semantic-provider spacy`.

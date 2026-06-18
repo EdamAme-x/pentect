@@ -18,7 +18,7 @@ pub use card::CardDetector;
 pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
 #[cfg(feature = "ner")]
-pub use ner::NerDetector;
+pub use ner::{NerDetector, SemanticDetector};
 pub use pem::PemDetector;
 pub use phone::PhoneDetector;
 pub use rule::{RuleDetector, RuleSpec};

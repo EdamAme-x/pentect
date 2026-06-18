@@ -139,6 +139,15 @@ impl RuleDetector {
             ),
             (r"AKIA[A-Z0-9]{16}", Secret, "AWS_AKID", High),
             (r"sk-[A-Za-z0-9_-]{20,}", Secret, "OPENAI_API_KEY", High),
+            // Copy/paste, log wrapping, and markdown often insert whitespace
+            // around the vendor delimiter. Keep this specific to the distinctive
+            // OpenAI prefix rather than deleting arbitrary whitespace in tokens.
+            (
+                r"sk[ \t]+-[ \t]*[A-Za-z0-9_-]{20,}",
+                Secret,
+                "OPENAI_API_KEY",
+                High,
+            ),
             (r"rpa_[A-Za-z0-9]{24,}", Secret, "RUNPOD_API_KEY", High),
             (r"xox[baprs]-[A-Za-z0-9-]{10,}", Secret, "SLACK_TOKEN", High),
             (
@@ -458,6 +467,21 @@ impl RuleDetector {
         ];
         #[rustfmt::skip]
         let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
+            // Context-keyed values in free text / shell logs. This is deliberately
+            // not a raw "any key=value" detector: it fires only on a closed set of
+            // credential-bearing nouns, and captures the value rather than the
+            // surrounding sentence. That catches low-entropy secrets ("password
+            // is summer-2026!") without masking ports, counters, or status codes.
+            (r#"(?i)\b(?:password|passwd|pwd|passphrase|secret|shared[-_ ]?secret|client[-_ ]?secret|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|auth[-_ ]?token|otp|recovery[-_ ]?phrase)\b[^\r\n]{0,24}?(?:=|:|=>|\bis\b)?[ \t'"]{0,3}([A-Za-z0-9][A-Za-z0-9._~+/=!@#$%^&*()-]{3,160})(?:$|[\s"',;)])"#, Secret, "KEYED_SECRET", Medium, 1, V::None),
+            // Session/JWT-like values need context. A bare aaa.bbb.ccc is common
+            // test/noise; a long three-segment token after session/jwt/cookie is
+            // credential-bearing even if the header is opaque or not JSON.
+            (r#"(?i)\b(?:session|sid|jwt|cookie|auth[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token)\b[^\r\n]{0,16}?(?:=|:)[ \t'"]{0,3}([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})(?:$|[\s"',;)])"#, Secret, "SESSION_TOKEN", Medium, 1, V::None),
+            // Support/health/customer case IDs are sensitive when keyed by
+            // patient/case/customer language. This does not mask ordinary JIRA
+            // stories or invoice numbers because the year-like middle segment is
+            // required and the keyword is required.
+            (r#"(?i)\b(?:case|patient|customer|member|mrn|medical record|health record)[^\r\n]{0,16}?\b([A-Z]{2,6}-[0-9]{4}-[0-9]{6,})\b"#, Identifier, "CASE_IDENTIFIER", Medium, 1, V::None),
             // Preserve path structure for debugging, but hide the local account
             // segment that frequently leaks in stack traces and tool output.
             (r#"(?i)\b[A-Z]:[\\/]+Users[\\/]+([^\\/\s:\r\n"<>|?*]{1,64})(?:[\\/]|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
@@ -583,6 +607,10 @@ mod tests {
             ("AKIAIOSFODNN7EXAMPLE", "AWS_AKID"),
             (concat!("sk", "-ABCDEFGHIJKLMNOPQRSTUVWX"), "OPENAI_API_KEY"),
             (
+                concat!("sk", " -ABCDEFGHIJKLMNOPQRSTUVWX"),
+                "OPENAI_API_KEY",
+            ),
+            (
                 concat!("rpa", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
                 "RUNPOD_API_KEY",
             ),
@@ -695,6 +723,38 @@ mod tests {
         assert!(hits("a@b.co.uk"));
         assert!(!hits("alice@.com"));
         assert!(!hits("alice@example."));
+    }
+
+    #[test]
+    fn keyed_value_context_masks_low_entropy_values_without_masking_counters() {
+        let det = RuleDetector::builtin();
+        let labels = |s: &str| {
+            let reg = region(s);
+            let v = NormalizedView::build(&reg, s);
+            det.detect(&v)
+                .iter()
+                .map(|sp| sp.label.clone())
+                .collect::<Vec<_>>()
+        };
+        let has = |text: &str, label: &str| labels(text).iter().any(|got| got == label);
+        assert!(has("password is summer-2026! for the demo", "KEYED_SECRET"));
+        assert!(has("client_secret: tenant-7-trial", "KEYED_SECRET"));
+        assert!(has("otp=100482 expires soon", "KEYED_SECRET"));
+        assert!(has(
+            "k8s secret data api-key: abcDEF123456+/==",
+            "KEYED_SECRET"
+        ));
+        assert!(has(
+            "cookie session=abcdefghijkl.mnopqrstuvwxyz.ABCDEFGHIJKLMN",
+            "SESSION_TOKEN"
+        ));
+        assert!(has("Case PT-2026-100482 follows up", "CASE_IDENTIFIER"));
+        assert!(!has(
+            "port=5432 workers=4 timeout_ms=30000 status=200",
+            "KEYED_SECRET"
+        ));
+        assert!(!has("jwt_like=aaa.bbb.ccc css=#aabbcc", "SESSION_TOKEN"));
+        assert!(!has("story=SEC-100482 estimate=8", "CASE_IDENTIFIER"));
     }
 
     #[test]
