@@ -39,8 +39,8 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect exec [--session NAME] COMMAND\n\
-         pentect exec [--session NAME] -- PROGRAM [ARG...]\n\
+        "pentect exec [--session NAME] [--env NAME=VALUE]... COMMAND\n\
+         pentect exec [--session NAME] [--env NAME=VALUE]... -- PROGRAM [ARG...]\n\
          pentect write PATH < masked-text\n\
          pentect read [--session NAME] [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
          pentect hook codex|claude|gemini < hook-json\n\
@@ -121,7 +121,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let output = match run_resolved_command(&session, &opts.mode) {
+    let output = match run_resolved_command(&session, &opts) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
@@ -205,9 +205,14 @@ fn cmd_filter(args: &[String], mode: FilterMode) -> i32 {
 
 fn run_resolved_command(
     session: &Session,
-    mode: &ExecMode,
+    opts: &ExecOpts,
 ) -> Result<std::process::Output, String> {
-    match mode {
+    let env = resolve_env_bindings(session, &opts.env)?;
+    let allowed_env_names = env
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
@@ -218,36 +223,60 @@ fn run_resolved_command(
                 .map(|arg| session.resolve_all(arg))
                 .collect();
             let resolved_args = resolved_args?;
-            guard_program_invocation(&program, &resolved_args)?;
-            Command::new(program)
-                .args(resolved_args)
+            guard_program_invocation_with_env(&program, &resolved_args, &allowed_env_names)?;
+            let mut command = Command::new(program);
+            command.args(resolved_args);
+            apply_env_bindings(&mut command, &env);
+            command
                 .output()
                 .map_err(|e| format!("could not execute command: {e}"))
         }
         ExecMode::Shell(command) => {
             let resolved = session.resolve_all(command)?;
-            guard_shell_script(&resolved)?;
-            run_shell_script(&resolved)
+            guard_shell_script_with_env(&resolved, &allowed_env_names)?;
+            run_shell_script(&resolved, &env)
         }
     }
 }
 
-fn guard_program_invocation(program: &str, args: &[String]) -> Result<(), String> {
+fn resolve_env_bindings(
+    session: &Session,
+    env: &[EnvBinding],
+) -> Result<Vec<(String, String)>, String> {
+    env.iter()
+        .map(|binding| Ok((binding.name.clone(), session.resolve_all(&binding.value)?)))
+        .collect()
+}
+
+fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
+    for (name, value) in env {
+        command.env(name, value);
+    }
+}
+
+fn guard_program_invocation_with_env(
+    program: &str,
+    args: &[String],
+    allowed_env_names: &[String],
+) -> Result<(), String> {
     let mut text = String::from(program);
     for arg in args {
         text.push(' ');
         text.push_str(arg);
     }
-    guard_sensitive_source_access(&text)
+    guard_sensitive_source_access_with_env(&text, allowed_env_names)
 }
 
-fn guard_shell_script(script: &str) -> Result<(), String> {
-    guard_sensitive_source_access(script)
+fn guard_shell_script_with_env(script: &str, allowed_env_names: &[String]) -> Result<(), String> {
+    guard_sensitive_source_access_with_env(script, allowed_env_names)
 }
 
-fn guard_sensitive_source_access(text: &str) -> Result<(), String> {
+fn guard_sensitive_source_access_with_env(
+    text: &str,
+    allowed_env_names: &[String],
+) -> Result<(), String> {
     let normalized = normalize_policy_text(text);
-    if contains_env_read_reference(&normalized) {
+    if contains_env_read_reference(&normalized, allowed_env_names) {
         return Err(
             "Pentect blocked direct environment-variable access; pass approved values through Pentect placeholders instead."
                 .to_string(),
@@ -256,8 +285,13 @@ fn guard_sensitive_source_access(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_shell_script(script: &str) -> Result<std::process::Output, String> {
-    let mut child = shell_script_command()
+fn run_shell_script(
+    script: &str,
+    env: &[(String, String)],
+) -> Result<std::process::Output, String> {
+    let mut command = shell_script_command();
+    apply_env_bindings(&mut command, env);
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -461,7 +495,13 @@ impl HookOpts {
 
 struct ExecOpts {
     session: String,
+    env: Vec<EnvBinding>,
     mode: ExecMode,
+}
+
+struct EnvBinding {
+    name: String,
+    value: String,
 }
 
 enum ExecMode {
@@ -472,21 +512,20 @@ enum ExecMode {
 impl ExecOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut session = DEFAULT_SESSION.to_string();
+        let mut env = Vec::new();
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
                 "--session" => {
                     session = value(args, &mut i, "--session")?;
                 }
+                "--env" => {
+                    env.push(parse_env_binding(&value(args, &mut i, "--env")?)?);
+                }
                 "--shell" => {
-                    let command = value(args, &mut i, "--shell")?;
-                    if i != args.len() {
-                        return Err("--shell must be the final exec option".to_string());
-                    }
-                    return Ok(Self {
-                        session: checked_session_name(&session)?,
-                        mode: ExecMode::Shell(command),
-                    });
+                    return Err(
+                        "`--shell` was removed; use `pentect exec \"<command>\"`".to_string()
+                    );
                 }
                 "--" => {
                     let command = args[i + 1..].to_vec();
@@ -495,6 +534,7 @@ impl ExecOpts {
                     }
                     return Ok(Self {
                         session: checked_session_name(&session)?,
+                        env,
                         mode: ExecMode::Program(command),
                     });
                 }
@@ -502,6 +542,7 @@ impl ExecOpts {
                 _ => {
                     return Ok(Self {
                         session: checked_session_name(&session)?,
+                        env,
                         mode: ExecMode::Shell(args[i..].join(" ")),
                     });
                 }
@@ -509,6 +550,26 @@ impl ExecOpts {
         }
         Err("exec requires COMMAND or `-- PROGRAM...`".to_string())
     }
+}
+
+fn parse_env_binding(raw: &str) -> Result<EnvBinding, String> {
+    let Some((name, value)) = raw.split_once('=') else {
+        return Err("--env requires NAME=VALUE".to_string());
+    };
+    Ok(EnvBinding {
+        name: checked_env_name(name)?,
+        value: value.to_string(),
+    })
+}
+
+fn checked_env_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("--env name must not be empty".to_string());
+    }
+    if name.as_bytes()[0].is_ascii_digit() || !name.bytes().all(is_env_name_byte) {
+        return Err("--env name must be a shell-style environment variable name".to_string());
+    }
+    Ok(name.to_string())
 }
 
 struct Session {
@@ -1299,24 +1360,44 @@ fn normalize_policy_text(text: &str) -> String {
     text.to_ascii_lowercase().replace('\\', "/")
 }
 
-fn contains_env_read_reference(normalized: &str) -> bool {
-    normalized.contains("$env:")
+fn contains_env_read_reference(normalized: &str, allowed_env_names: &[String]) -> bool {
+    has_disallowed_powershell_env_ref(normalized, allowed_env_names)
         || normalized.contains(" env:")
         || normalized.starts_with("env:")
         || normalized.contains("[environment]::getenvironmentvariable")
         || normalized.contains("[environment]::getenvironmentvariables")
         || ascii_word_present(normalized, "printenv")
-        || references_sensitive_env_name(normalized)
+        || references_sensitive_env_name(normalized, allowed_env_names)
 }
 
-fn references_sensitive_env_name(normalized: &str) -> bool {
+fn has_disallowed_powershell_env_ref(normalized: &str, allowed_env_names: &[String]) -> bool {
+    let mut offset = 0usize;
+    while let Some(index) = normalized[offset..].find("$env:") {
+        let name_start = offset + index + "$env:".len();
+        let mut name_end = name_start;
+        let bytes = normalized.as_bytes();
+        while name_end < bytes.len() && is_env_name_byte(bytes[name_end]) {
+            name_end += 1;
+        }
+        if name_end == name_start {
+            return true;
+        }
+        if !is_allowed_env_name(&normalized[name_start..name_end], allowed_env_names) {
+            return true;
+        }
+        offset = name_end;
+    }
+    false
+}
+
+fn references_sensitive_env_name(normalized: &str, allowed_env_names: &[String]) -> bool {
     let bytes = normalized.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let marker = bytes[i] as char;
         if marker == '$' || marker == '%' {
             if let Some((name, next)) = env_name_after_marker(normalized, i + 1, marker) {
-                if is_sensitive_env_name(name) {
+                if is_sensitive_env_name(name) && !is_allowed_env_name(name, allowed_env_names) {
                     return true;
                 }
                 i = next;
@@ -1326,6 +1407,12 @@ fn references_sensitive_env_name(normalized: &str) -> bool {
         i += 1;
     }
     false
+}
+
+fn is_allowed_env_name(name: &str, allowed_env_names: &[String]) -> bool {
+    allowed_env_names
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
 }
 
 fn env_name_after_marker(text: &str, start: usize, marker: char) -> Option<(&str, usize)> {
@@ -1529,6 +1616,36 @@ mod tests {
     }
 
     #[test]
+    fn exec_parse_accepts_env_bindings() {
+        let args = strings([
+            "pentect-agent",
+            "exec",
+            "--env",
+            "RUNPOD_API_KEY=<<RUNPOD_API_KEY_abc>>",
+            "echo",
+            "hi",
+        ]);
+        let opts = ExecOpts::parse(&args).unwrap();
+        assert_eq!(opts.env.len(), 1);
+        assert_eq!(opts.env[0].name, "RUNPOD_API_KEY");
+        assert_eq!(opts.env[0].value, "<<RUNPOD_API_KEY_abc>>");
+        assert!(matches!(
+            opts.mode,
+            ExecMode::Shell(command) if command == "echo hi"
+        ));
+    }
+
+    #[test]
+    fn exec_parse_rejects_shell_flag() {
+        let args = strings(["pentect-agent", "exec", "--shell", "echo hi"]);
+        let err = match ExecOpts::parse(&args) {
+            Ok(_) => panic!("expected --shell to be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("removed"), "{err}");
+    }
+
+    #[test]
     fn exec_parse_accepts_program_after_separator() {
         let args = strings(["pentect-agent", "exec", "--", "echo", "hi"]);
         assert!(matches!(
@@ -1594,32 +1711,65 @@ mod tests {
 
     #[test]
     fn exec_allows_secret_file_reads_because_output_is_remasked() {
-        guard_shell_script(r"Get-Content .\.env").unwrap();
-        guard_shell_script("cat .env | Select-String RUNPOD").unwrap();
-        guard_shell_script(r#"python -c "open('.env').read()" # pentect-agent read"#).unwrap();
+        guard_shell_script_with_env(r"Get-Content .\.env", &[]).unwrap();
+        guard_shell_script_with_env("cat .env | Select-String RUNPOD", &[]).unwrap();
+        guard_shell_script_with_env(
+            r#"python -c "open('.env').read()" # pentect-agent read"#,
+            &[],
+        )
+        .unwrap();
     }
 
     #[test]
     fn exec_policy_blocks_environment_reads() {
-        let err = guard_shell_script("Get-ChildItem Env:").unwrap_err();
+        let err = guard_shell_script_with_env("Get-ChildItem Env:", &[]).unwrap_err();
         assert!(err.contains("environment-variable"), "{err}");
 
-        let err = guard_shell_script("printenv RUNPOD_API_KEY").unwrap_err();
+        let err = guard_shell_script_with_env("printenv RUNPOD_API_KEY", &[]).unwrap_err();
         assert!(err.contains("environment-variable"), "{err}");
 
-        let err = guard_shell_script("echo $RUNPOD_API_KEY").unwrap_err();
+        let err = guard_shell_script_with_env("echo $RUNPOD_API_KEY", &[]).unwrap_err();
         assert!(err.contains("environment-variable"), "{err}");
 
-        let err = guard_shell_script("Write-Output %RUNPOD_API_KEY%").unwrap_err();
+        let err = guard_shell_script_with_env("Write-Output %RUNPOD_API_KEY%", &[]).unwrap_err();
         assert!(err.contains("environment-variable"), "{err}");
     }
 
     #[test]
     fn exec_policy_does_not_block_regular_shell_state_changes() {
-        guard_shell_script("export PATH=/tmp:$PATH").unwrap();
-        guard_shell_script("Set-Content note.txt hello").unwrap();
-        guard_shell_script("echo $AUTHOR").unwrap();
-        guard_shell_script("Write-Output %USERNAME%").unwrap();
+        guard_shell_script_with_env("export PATH=/tmp:$PATH", &[]).unwrap();
+        guard_shell_script_with_env("Set-Content note.txt hello", &[]).unwrap();
+        guard_shell_script_with_env("echo $AUTHOR", &[]).unwrap();
+        guard_shell_script_with_env("Write-Output %USERNAME%", &[]).unwrap();
+    }
+
+    #[test]
+    fn exec_env_binding_resolves_placeholder_for_child_process() {
+        let (root, session) = empty_session("exec-env-binding");
+        let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let masked = mask_text(&session, raw, Kind::Text).unwrap();
+        let command = if cfg!(windows) {
+            "Write-Output $env:OPENAI_API_KEY".to_string()
+        } else {
+            "printf '%s' \"$OPENAI_API_KEY\"".to_string()
+        };
+        let opts = ExecOpts {
+            session: DEFAULT_SESSION.to_string(),
+            env: vec![EnvBinding {
+                name: "OPENAI_API_KEY".to_string(),
+                value: masked,
+            }],
+            mode: ExecMode::Shell(command),
+        };
+
+        let output = run_resolved_command(&session, &opts).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(raw), "{stdout}");
+
+        let safe = mask_tool_output(&session, &stdout).unwrap();
+        assert!(!safe.contains(raw), "{safe}");
+        assert!(safe.contains("<<OPENAI_API_KEY_"), "{safe}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
