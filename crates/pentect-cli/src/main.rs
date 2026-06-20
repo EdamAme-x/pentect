@@ -39,7 +39,7 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
+        "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--semantic [provider]] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
          pentect read|write|exec|hook|resolve|remask ...\n\
          pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
          \x20 mask secrets from stdin to stdout\n\
@@ -51,10 +51,8 @@ fn usage() {
          \x20 --pack-dir DIR   load every *.toml pack in a directory (repeatable)\n\
          \x20 --disable LABEL  turn off a built-in detector by label (repeatable)\n\
          \x20 --enable LABEL   turn on an off-by-default built-in (e.g. DATE_TIME)\n\
-         \x20 --semantic       also mask person/location/org/address via a semantic sidecar\n\
-         \x20 --semantic-provider spacy|gliner|presidio  choose the semantic provider\n\
-         \x20 --semantic-script FILE  choose the semantic sidecar script\n\
-         \x20 --ner            legacy alias for --semantic --semantic-provider spacy"
+         \x20 --semantic [spacy|gliner|presidio]\n\
+         \x20                  also mask person/location/org/address via a semantic sidecar"
     );
 }
 
@@ -1106,8 +1104,28 @@ struct SemanticOpts {
     script: String,
 }
 
+fn semantic_inline_provider(args: &[String]) -> Option<String> {
+    for (i, arg) in args.iter().enumerate() {
+        if let Some(provider) = arg.strip_prefix("--semantic=") {
+            return Some(provider.to_string());
+        }
+        if arg == "--semantic" {
+            let next = args.get(i + 1)?;
+            if !next.starts_with("--") {
+                return Some(next.clone());
+            }
+        }
+    }
+    None
+}
+
+fn has_semantic_flag(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--semantic" || a.starts_with("--semantic="))
+}
+
 fn semantic_requested(args: &[String]) -> bool {
-    has_flag(args, "--semantic")
+    has_semantic_flag(args)
         || has_flag(args, "--ner")
         || arg_value(args, "--semantic-provider").is_some()
         || arg_value(args, "--semantic-script").is_some()
@@ -1117,7 +1135,8 @@ fn semantic_opts(args: &[String]) -> Option<SemanticOpts> {
     if !semantic_requested(args) {
         return None;
     }
-    let provider = arg_value(args, "--semantic-provider")
+    let provider = semantic_inline_provider(args)
+        .or_else(|| arg_value(args, "--semantic-provider"))
         .or_else(|| std::env::var("PENTECT_SEMANTIC_PROVIDER").ok())
         .unwrap_or_else(|| "spacy".into());
     let script = arg_value(args, "--semantic-script")
@@ -1261,7 +1280,38 @@ mod tests {
     }
 
     #[test]
-    fn semantic_provider_flag_implies_semantic_sidecar() {
+    fn semantic_inline_provider_implies_semantic_sidecar() {
+        let args = vec![
+            "pentect".into(),
+            "mask".into(),
+            "--semantic".into(),
+            "gliner".into(),
+        ];
+        assert!(semantic_requested(&args));
+        assert_eq!(
+            semantic_opts(&args),
+            Some(SemanticOpts {
+                provider: "gliner".into(),
+                script: "tools/ner_sidecar.py".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_equals_provider_is_accepted() {
+        let args = vec![
+            "pentect".into(),
+            "mask".into(),
+            "--semantic=presidio".into(),
+        ];
+        assert_eq!(
+            semantic_opts(&args).map(|o| o.provider),
+            Some("presidio".into())
+        );
+    }
+
+    #[test]
+    fn legacy_semantic_provider_flag_still_works() {
         let args = vec![
             "pentect".into(),
             "mask".into(),
@@ -1270,7 +1320,6 @@ mod tests {
             "--semantic-script".into(),
             "tools/custom_sidecar.py".into(),
         ];
-        assert!(semantic_requested(&args));
         assert_eq!(
             semantic_opts(&args),
             Some(SemanticOpts {

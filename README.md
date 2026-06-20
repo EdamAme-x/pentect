@@ -38,6 +38,5 @@ python tools/eval_hostile_realworld.py --bin target\release\pentect.exe --pentec
 ```
 
 Semantic detection is provider-backed and optional. The default provider is
-spaCy; use `--semantic-provider gliner` or `--semantic-provider presidio` when
-those Python packages/models are installed. `--ner` remains as a legacy alias for
-`--semantic --semantic-provider spacy`.
+spaCy; use `--semantic gliner` or `--semantic presidio` when those Python
+packages/models are installed. `--ner` remains as a legacy alias.
