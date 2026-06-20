@@ -36,7 +36,20 @@ PRESIDIO_LABELS = {
     "ADDRESS": "LOCATION",
 }
 
+GLINER_REQUEST_LABELS = [
+    "PERSON",
+    "ORGANIZATION",
+    "LOCATION",
+    "ADDRESS",
+    "NRP",
+]
+
 GLINER_LABELS = {
+    "PERSON": "PERSON",
+    "ORGANIZATION": "ORGANIZATION",
+    "LOCATION": "LOCATION",
+    "ADDRESS": "LOCATION",
+    "NRP": "NRP",
     "person": "PERSON",
     "full name": "PERSON",
     "organization": "ORGANIZATION",
@@ -85,6 +98,12 @@ ADDRESS_PATTERNS = [
     ),
 ]
 
+CJK_PERSON_CONTEXT_RE = re.compile(
+    r"(?i)(?:^|[\s,;])(?:owner|name|person|caller|manager|担当|氏名|名前|所有者)"
+    r"[ \t:=：]{1,8}"
+    r"([\u3040-\u30ff\u3400-\u9fff]{2,8})"
+)
+
 
 def is_probably_technical_entity(value: str) -> bool:
     s = value.strip(" \t\r\n'\"`.,;:()")
@@ -124,6 +143,46 @@ def collect_address_entities(text: str) -> list[tuple[int, int, str]]:
     return out
 
 
+def collect_contextual_person_entities(text: str) -> list[tuple[int, int, str]]:
+    out = []
+    for match in CJK_PERSON_CONTEXT_RE.finditer(text):
+        start, end = match.span(1)
+        value = text[start:end].strip()
+        if value and not is_probably_technical_entity(value):
+            out.append((start, end, "PERSON"))
+    return out
+
+
+def iter_text_chunks(text: str, max_chars: int) -> list[tuple[int, str]]:
+    chunks = []
+    start = 0
+    current = []
+    current_start = 0
+    current_len = 0
+    for line in text.splitlines(keepends=True):
+        line_start = start
+        start += len(line)
+        if current and current_len + len(line) > max_chars:
+            chunks.append((current_start, "".join(current)))
+            current = []
+            current_len = 0
+        if not current:
+            current_start = line_start
+        if len(line) <= max_chars:
+            current.append(line)
+            current_len += len(line)
+            continue
+        if current:
+            chunks.append((current_start, "".join(current)))
+            current = []
+            current_len = 0
+        for off in range(0, len(line), max_chars):
+            chunks.append((line_start + off, line[off : off + max_chars]))
+    if current:
+        chunks.append((current_start, "".join(current)))
+    return chunks
+
+
 def normalize_provider_name(raw: str) -> str:
     name = raw.strip().lower().replace("_", "-")
     aliases = {
@@ -160,23 +219,29 @@ def load_gliner_detector():
 
     model_name = os.environ.get(
         "PENTECT_GLINER_MODEL",
-        "fastino/gliner2-privacy-filter-PII-multi",
+        "nvidia/gliner-PII",
     )
     threshold = float(os.environ.get("PENTECT_GLINER_THRESHOLD", "0.45"))
+    max_chars = int(os.environ.get("PENTECT_GLINER_CHUNK_CHARS", "6000"))
     model = GLiNER.from_pretrained(model_name)
-    labels = list(GLINER_LABELS)
+    labels = os.environ.get("PENTECT_GLINER_LABELS")
+    if labels:
+        labels = [item.strip() for item in labels.split(",") if item.strip()]
+    else:
+        labels = GLINER_REQUEST_LABELS
 
     def detect(text: str) -> list[tuple[int, int, str]]:
         out = []
-        for ent in model.predict_entities(text, labels, threshold=threshold):
-            raw_label = str(ent.get("label", "")).lower()
-            label = GLINER_LABELS.get(raw_label)
-            start = ent.get("start")
-            end = ent.get("end")
-            if label is None or not isinstance(start, int) or not isinstance(end, int):
-                continue
-            if not is_probably_technical_entity(text[start:end]):
-                out.append((start, end, label))
+        for base, chunk in iter_text_chunks(text, max_chars):
+            for ent in model.predict_entities(chunk, labels, threshold=threshold):
+                raw_label = str(ent.get("label", ""))
+                label = GLINER_LABELS.get(raw_label) or GLINER_LABELS.get(raw_label.lower())
+                start = ent.get("start")
+                end = ent.get("end")
+                if label is None or not isinstance(start, int) or not isinstance(end, int):
+                    continue
+                if not is_probably_technical_entity(chunk[start:end]):
+                    out.append((base + start, base + end, label))
         return out
 
     return detect
@@ -244,6 +309,7 @@ def main() -> None:
             text = json.loads(line)
             out = detect(text)
             out.extend(collect_address_entities(text))
+            out.extend(collect_contextual_person_entities(text))
             sys.stdout.write(json.dumps(encode_response(text, out)) + "\n")
         except Exception:  # never crash the loop on one bad request
             sys.stdout.write("[]\n")
