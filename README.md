@@ -37,6 +37,7 @@ cargo build -p pentect-cli --release --features semantic
 python tools/eval_hostile_realworld.py --bin target\release\pentect.exe --pentect-arg=--semantic
 ```
 
-Semantic detection is provider-backed and optional. The default provider is
-spaCy; use `--semantic gliner` or `--semantic presidio` when those Python
-packages/models are installed. `--ner` remains as a legacy alias.
+Semantic detection is optional and intentionally outside the deterministic core.
+The default provider is spaCy. `--semantic gliner` and `--semantic presidio` are
+adapter experiments for comparing external PII engines; keep the AI tool
+boundary and reversible masking path as the main Pentect surface.

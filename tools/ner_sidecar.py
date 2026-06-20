@@ -12,7 +12,8 @@ Offsets are BYTE offsets into the UTF-8 text, matching Rust's span ranges.
 
 Provider: PENTECT_SEMANTIC_PROVIDER (spacy, gliner, presidio). spaCy is the
 default because it is lightweight and already installed in many Python stacks;
-GLiNER/Presidio are optional adapters when their packages are available.
+GLiNER/Presidio are optional comparison adapters when their packages are
+available. They are not required for Pentect's core AI tool-boundary flow.
 """
 import json
 import os
@@ -217,6 +218,8 @@ def load_spacy_detector():
 def load_gliner_detector():
     from gliner import GLiNER
 
+    # This model uses GLiNER's native artifact layout. GLiNER2 PII checkpoints
+    # may need a different runtime even when they are useful for research.
     model_name = os.environ.get(
         "PENTECT_GLINER_MODEL",
         "nvidia/gliner-PII",
