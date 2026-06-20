@@ -38,6 +38,5 @@ python tools/eval_hostile_realworld.py --bin target\release\pentect.exe --pentec
 ```
 
 Semantic detection is optional and intentionally outside the deterministic core.
-The default provider is spaCy. `--semantic gliner` and `--semantic presidio` are
-adapter experiments for comparing external PII engines; keep the AI tool
-boundary and reversible masking path as the main Pentect surface.
+It uses the local spaCy sidecar when enabled; keep the AI tool boundary and
+reversible masking path as the main Pentect surface.

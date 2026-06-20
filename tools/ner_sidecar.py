@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """Persistent semantic PII sidecar for Pentect.
 
-Loads a provider once, then serves requests over stdin/stdout (one JSON request
-and one JSON response per line). Pentect's Rust `SemanticDetector` spawns this
-and pipes region text through it.
+Loads a spaCy model once, then serves requests over stdin/stdout (one JSON
+request and one JSON response per line). Pentect's Rust `SemanticDetector`
+spawns this and pipes region text through it.
 
 Protocol (newline-delimited JSON, so text with newlines is escaped):
   request:  a JSON string  ->  "John Smith at Acme Corp"
   response: a JSON array   ->  [[0,10,"PERSON"],[14,23,"ORGANIZATION"]]
 Offsets are BYTE offsets into the UTF-8 text, matching Rust's span ranges.
 
-Provider: PENTECT_SEMANTIC_PROVIDER (spacy, gliner, presidio). spaCy is the
-default because it is lightweight and already installed in many Python stacks;
-GLiNER/Presidio are optional comparison adapters when their packages are
-available. They are not required for Pentect's core AI tool-boundary flow.
+Provider: spaCy. Semantic detection is optional and not part of Pentect's
+deterministic AI tool-boundary core.
 """
 import json
 import os
@@ -27,40 +25,6 @@ SPACY_LABELS = {
     "LOC": "LOCATION",
     "FAC": "LOCATION",
     "NORP": "NRP",
-}
-
-PRESIDIO_LABELS = {
-    "PERSON": "PERSON",
-    "LOCATION": "LOCATION",
-    "ORGANIZATION": "ORGANIZATION",
-    "NRP": "NRP",
-    "ADDRESS": "LOCATION",
-}
-
-GLINER_REQUEST_LABELS = [
-    "PERSON",
-    "ORGANIZATION",
-    "LOCATION",
-    "ADDRESS",
-    "NRP",
-]
-
-GLINER_LABELS = {
-    "PERSON": "PERSON",
-    "ORGANIZATION": "ORGANIZATION",
-    "LOCATION": "LOCATION",
-    "ADDRESS": "LOCATION",
-    "NRP": "NRP",
-    "person": "PERSON",
-    "full name": "PERSON",
-    "organization": "ORGANIZATION",
-    "company": "ORGANIZATION",
-    "location": "LOCATION",
-    "address": "LOCATION",
-    "street address": "LOCATION",
-    "nationality": "NRP",
-    "religion": "NRP",
-    "political group": "NRP",
 }
 
 TECH_INDEX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*\[\d+\]?$")
@@ -154,49 +118,6 @@ def collect_contextual_person_entities(text: str) -> list[tuple[int, int, str]]:
     return out
 
 
-def iter_text_chunks(text: str, max_chars: int) -> list[tuple[int, str]]:
-    chunks = []
-    start = 0
-    current = []
-    current_start = 0
-    current_len = 0
-    for line in text.splitlines(keepends=True):
-        line_start = start
-        start += len(line)
-        if current and current_len + len(line) > max_chars:
-            chunks.append((current_start, "".join(current)))
-            current = []
-            current_len = 0
-        if not current:
-            current_start = line_start
-        if len(line) <= max_chars:
-            current.append(line)
-            current_len += len(line)
-            continue
-        if current:
-            chunks.append((current_start, "".join(current)))
-            current = []
-            current_len = 0
-        for off in range(0, len(line), max_chars):
-            chunks.append((line_start + off, line[off : off + max_chars]))
-    if current:
-        chunks.append((current_start, "".join(current)))
-    return chunks
-
-
-def normalize_provider_name(raw: str) -> str:
-    name = raw.strip().lower().replace("_", "-")
-    aliases = {
-        "ner": "spacy",
-        "spacy-ner": "spacy",
-        "gliner2": "gliner",
-        "gliner2-pii": "gliner",
-        "opf": "presidio",
-        "presidio-analyzer": "presidio",
-    }
-    return aliases.get(name, name)
-
-
 def load_spacy_detector():
     import spacy
 
@@ -215,68 +136,6 @@ def load_spacy_detector():
     return detect
 
 
-def load_gliner_detector():
-    from gliner import GLiNER
-
-    # This model uses GLiNER's native artifact layout. GLiNER2 PII checkpoints
-    # may need a different runtime even when they are useful for research.
-    model_name = os.environ.get(
-        "PENTECT_GLINER_MODEL",
-        "nvidia/gliner-PII",
-    )
-    threshold = float(os.environ.get("PENTECT_GLINER_THRESHOLD", "0.45"))
-    max_chars = int(os.environ.get("PENTECT_GLINER_CHUNK_CHARS", "6000"))
-    model = GLiNER.from_pretrained(model_name)
-    labels = os.environ.get("PENTECT_GLINER_LABELS")
-    if labels:
-        labels = [item.strip() for item in labels.split(",") if item.strip()]
-    else:
-        labels = GLINER_REQUEST_LABELS
-
-    def detect(text: str) -> list[tuple[int, int, str]]:
-        out = []
-        for base, chunk in iter_text_chunks(text, max_chars):
-            for ent in model.predict_entities(chunk, labels, threshold=threshold):
-                raw_label = str(ent.get("label", ""))
-                label = GLINER_LABELS.get(raw_label) or GLINER_LABELS.get(raw_label.lower())
-                start = ent.get("start")
-                end = ent.get("end")
-                if label is None or not isinstance(start, int) or not isinstance(end, int):
-                    continue
-                if not is_probably_technical_entity(chunk[start:end]):
-                    out.append((base + start, base + end, label))
-        return out
-
-    return detect
-
-
-def load_presidio_detector():
-    from presidio_analyzer import AnalyzerEngine
-
-    analyzer = AnalyzerEngine()
-    language = os.environ.get("PENTECT_PRESIDIO_LANGUAGE", "en")
-
-    def detect(text: str) -> list[tuple[int, int, str]]:
-        out = []
-        for ent in analyzer.analyze(text=text, language=language):
-            label = PRESIDIO_LABELS.get(ent.entity_type)
-            if label is not None and not is_probably_technical_entity(text[ent.start : ent.end]):
-                out.append((ent.start, ent.end, label))
-        return out
-
-    return detect
-
-
-def load_detector(provider: str):
-    if provider == "spacy":
-        return load_spacy_detector()
-    if provider == "gliner":
-        return load_gliner_detector()
-    if provider == "presidio":
-        return load_presidio_detector()
-    raise RuntimeError(f"unknown semantic provider: {provider}")
-
-
 def encode_response(text: str, spans: list[tuple[int, int, str]]) -> list[list[object]]:
     response = []
     seen = set()
@@ -293,15 +152,9 @@ def encode_response(text: str, spans: list[tuple[int, int, str]]) -> list[list[o
 
 
 def main() -> None:
-    provider = normalize_provider_name(
-        os.environ.get(
-            "PENTECT_SEMANTIC_PROVIDER",
-            os.environ.get("PENTECT_NER_PROVIDER", "spacy"),
-        )
-    )
-    detect = load_detector(provider)
+    detect = load_spacy_detector()
     # Signal readiness so the parent can block until the (slow) model load is done.
-    sys.stdout.write(f"READY {provider}\n")
+    sys.stdout.write("READY\n")
     sys.stdout.flush()
 
     for line in sys.stdin:

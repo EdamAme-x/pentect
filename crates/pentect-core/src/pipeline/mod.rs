@@ -1088,7 +1088,7 @@ mod tests {
     //   Core    — deterministic (pattern/checksum); core MUST catch it (asserted).
     //   Ner     — semantic (person, location, org, nationality, address, age,
     //             person-type): no closed pattern, so these need a model. That
-    //             layer exists — the `ner` feature's sidecar (spaCy-class, or
+    //             layer exists — the `semantic` feature's sidecar (spaCy-class, or
     //             swap to ai4privacy/DeBERTa to beat spaCy). This default-build
     //             benchmark runs the deterministic core only, so it records
     //             these rather than asserting them. Recorded, not asserted.
@@ -1247,7 +1247,7 @@ mod tests {
 
             let det_total = core.len() + todo.len();
             eprintln!(
-                "vs {name}: deterministic {}/{} covered; NER {} (via --features ner sidecar); remaining deterministic gap: {:?}",
+                "vs {name}: deterministic {}/{} covered; NER {} (via --features semantic sidecar); remaining deterministic gap: {:?}",
                 core.len(),
                 det_total,
                 ner.len(),

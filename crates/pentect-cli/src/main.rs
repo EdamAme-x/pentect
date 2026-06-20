@@ -39,7 +39,7 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--semantic [provider]] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
+        "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--semantic] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
          pentect read|write|exec|hook|resolve|remask ...\n\
          pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
          \x20 mask secrets from stdin to stdout\n\
@@ -51,8 +51,7 @@ fn usage() {
          \x20 --pack-dir DIR   load every *.toml pack in a directory (repeatable)\n\
          \x20 --disable LABEL  turn off a built-in detector by label (repeatable)\n\
          \x20 --enable LABEL   turn on an off-by-default built-in (e.g. DATE_TIME)\n\
-         \x20 --semantic [spacy|gliner|presidio]\n\
-         \x20                  also mask person/location/org/address via a semantic sidecar"
+         \x20 --semantic       also mask person/location/org/address via a spaCy sidecar"
     );
 }
 
@@ -119,11 +118,15 @@ fn read_stdin_capped(reader: &dyn InputAdapter) -> Result<String, String> {
 }
 
 fn cmd_mask(args: &[String]) {
+    if let Err(e) = validate_mask_args(args) {
+        die(&e);
+    }
     let kind = match arg_value(args, "--kind").as_deref() {
-        Some("json") => Kind::Json,
-        Some("env") => Kind::Env,
-        Some("har") => Kind::Har,
-        _ => Kind::Text,
+        Some(name) => match parse_kind(name) {
+            Ok(k) => k,
+            Err(e) => die(&e),
+        },
+        None => Kind::Text,
     };
     let profile: Profile = match arg_value(args, "--profile").as_deref() {
         Some(name) => match name.parse() {
@@ -176,6 +179,54 @@ fn cmd_mask(args: &[String]) {
             result.summary.collisions.len()
         );
     }
+}
+
+fn validate_mask_args(args: &[String]) -> Result<(), String> {
+    let mut i = 2usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kind" | "--profile" | "--input" | "--pack" | "--pack-dir" | "--disable"
+            | "--enable" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err(format!("{} requires a value", args[i]));
+                };
+                if value.starts_with("--") {
+                    return Err(format!("{} requires a value", args[i]));
+                }
+                if args[i] == "--kind" {
+                    parse_kind(value)?;
+                }
+                if args[i] == "--profile" {
+                    value.parse::<Profile>()?;
+                }
+                i += 2;
+            }
+            "--length" | "--aggressive" | "--semantic" => {
+                i += 1;
+            }
+            "--ner" => {
+                return Err("--ner was removed; use --semantic".to_string());
+            }
+            "--semantic-provider" | "--semantic-script" => {
+                return Err(format!(
+                    "{} was removed; use --semantic with the default sidecar",
+                    args[i]
+                ));
+            }
+            flag if flag.starts_with("--semantic=") => {
+                return Err("--semantic no longer accepts a provider; use --semantic".to_string());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(format!("unknown option: {flag}"));
+            }
+            value => {
+                return Err(format!(
+                    "unexpected argument for mask: {value}; --semantic takes no provider"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_read(args: &[String]) {
@@ -1098,75 +1149,32 @@ fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>, args: &[St
     Engine::with_profile_packs_detectors(profile, packs, semantic_detectors(args), aggressive)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct SemanticOpts {
-    provider: String,
-    script: String,
-}
-
-fn semantic_inline_provider(args: &[String]) -> Option<String> {
-    for (i, arg) in args.iter().enumerate() {
-        if let Some(provider) = arg.strip_prefix("--semantic=") {
-            return Some(provider.to_string());
-        }
-        if arg == "--semantic" {
-            let next = args.get(i + 1)?;
-            if !next.starts_with("--") {
-                return Some(next.clone());
-            }
-        }
-    }
-    None
-}
-
-fn has_semantic_flag(args: &[String]) -> bool {
-    args.iter()
-        .any(|a| a == "--semantic" || a.starts_with("--semantic="))
-}
-
 fn semantic_requested(args: &[String]) -> bool {
-    has_semantic_flag(args)
-        || has_flag(args, "--ner")
-        || arg_value(args, "--semantic-provider").is_some()
-        || arg_value(args, "--semantic-script").is_some()
-}
-
-fn semantic_opts(args: &[String]) -> Option<SemanticOpts> {
-    if !semantic_requested(args) {
-        return None;
-    }
-    let provider = semantic_inline_provider(args)
-        .or_else(|| arg_value(args, "--semantic-provider"))
-        .or_else(|| std::env::var("PENTECT_SEMANTIC_PROVIDER").ok())
-        .unwrap_or_else(|| "spacy".into());
-    let script = arg_value(args, "--semantic-script")
-        .or_else(|| std::env::var("PENTECT_SEMANTIC_SCRIPT").ok())
-        .or_else(|| std::env::var("PENTECT_NER_SCRIPT").ok())
-        .unwrap_or_else(|| "tools/ner_sidecar.py".into());
-    Some(SemanticOpts { provider, script })
+    has_flag(args, "--semantic")
 }
 
 /// `--semantic` adds the semantic sidecar (person/location/org/address).
-/// Built only with `--features semantic`/`ner`; the script defaults to
-/// PENTECT_SEMANTIC_SCRIPT, PENTECT_NER_SCRIPT, or tools/ner_sidecar.py.
-#[cfg(feature = "ner")]
+/// Built only with `--features semantic`; the script defaults to
+/// PENTECT_SEMANTIC_SCRIPT or tools/ner_sidecar.py.
+#[cfg(feature = "semantic")]
 fn semantic_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
-    let Some(opts) = semantic_opts(args) else {
+    if !semantic_requested(args) {
         return Vec::new();
-    };
-    match pentect_core::SemanticDetector::spawn_with_provider(&opts.script, &opts.provider) {
+    }
+    let script =
+        std::env::var("PENTECT_SEMANTIC_SCRIPT").unwrap_or_else(|_| "tools/ner_sidecar.py".into());
+    match pentect_core::SemanticDetector::spawn(&script) {
         Ok(d) => vec![Box::new(d)],
         Err(e) => {
             eprintln!(
-                "[pentect] --semantic provider='{}': could not start semantic sidecar ({e}); continuing without semantic detection.",
-                opts.provider
+                "[pentect] --semantic: could not start semantic sidecar ({e}); continuing without semantic detection."
             );
             Vec::new()
         }
     }
 }
 
-#[cfg(not(feature = "ner"))]
+#[cfg(not(feature = "semantic"))]
 fn semantic_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
     if semantic_requested(args) {
         eprintln!("[pentect] --semantic requires a build with `--features semantic`; ignoring.");
@@ -1280,38 +1288,60 @@ mod tests {
     }
 
     #[test]
-    fn semantic_inline_provider_implies_semantic_sidecar() {
+    fn semantic_flag_requests_semantic_sidecar() {
+        let args = vec!["pentect".into(), "mask".into(), "--semantic".into()];
+        assert!(semantic_requested(&args));
+        assert!(validate_mask_args(&args).is_ok());
+    }
+
+    #[test]
+    fn semantic_provider_argument_is_rejected() {
         let args = vec![
             "pentect".into(),
             "mask".into(),
             "--semantic".into(),
             "gliner".into(),
         ];
-        assert!(semantic_requested(&args));
-        assert_eq!(
-            semantic_opts(&args),
-            Some(SemanticOpts {
-                provider: "gliner".into(),
-                script: "tools/ner_sidecar.py".into(),
-            })
-        );
+        assert!(validate_mask_args(&args)
+            .unwrap_err()
+            .contains("no provider"));
     }
 
     #[test]
-    fn semantic_equals_provider_is_accepted() {
+    fn mask_rejects_unknown_kind_and_missing_values() {
+        let args = vec![
+            "pentect".into(),
+            "mask".into(),
+            "--kind".into(),
+            "yaml".into(),
+        ];
+        assert!(validate_mask_args(&args)
+            .unwrap_err()
+            .contains("unknown kind"));
+
+        let args = vec![
+            "pentect".into(),
+            "mask".into(),
+            "--profile".into(),
+            "--semantic".into(),
+        ];
+        assert!(validate_mask_args(&args)
+            .unwrap_err()
+            .contains("requires a value"));
+    }
+
+    #[test]
+    fn semantic_equals_provider_is_rejected() {
         let args = vec![
             "pentect".into(),
             "mask".into(),
             "--semantic=presidio".into(),
         ];
-        assert_eq!(
-            semantic_opts(&args).map(|o| o.provider),
-            Some("presidio".into())
-        );
+        assert!(validate_mask_args(&args).unwrap_err().contains("no longer"));
     }
 
     #[test]
-    fn legacy_semantic_provider_flag_still_works() {
+    fn removed_semantic_provider_flags_are_rejected() {
         let args = vec![
             "pentect".into(),
             "mask".into(),
@@ -1320,19 +1350,13 @@ mod tests {
             "--semantic-script".into(),
             "tools/custom_sidecar.py".into(),
         ];
-        assert_eq!(
-            semantic_opts(&args),
-            Some(SemanticOpts {
-                provider: "gliner".into(),
-                script: "tools/custom_sidecar.py".into(),
-            })
-        );
+        assert!(validate_mask_args(&args).unwrap_err().contains("removed"));
     }
 
     #[test]
-    fn legacy_ner_flag_requests_semantic_sidecar() {
+    fn legacy_ner_flag_is_rejected() {
         let args = vec!["pentect".into(), "mask".into(), "--ner".into()];
-        assert!(semantic_requested(&args));
+        assert!(validate_mask_args(&args).unwrap_err().contains("removed"));
     }
 
     #[test]

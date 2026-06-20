@@ -10,12 +10,10 @@ repository.workspace = true
 default = ["rand-key"]
 # CSPRNG key generation; disable for WASM/rules-only builds that supply the key.
 rand-key = ["dep:getrandom"]
-# Semantic PII via a persistent Python sidecar (spaCy / GLiNER / Presidio). No
-# extra Rust deps — just std::process. Off by default (the deterministic core
-# needs no model); opt in for person/location/org/address coverage.
-semantic = ["ner"]
-# Backward-compatible feature name. Prefer `semantic` in user-facing docs.
-ner = []
+# Semantic PII via a persistent Python sidecar. No extra Rust deps — just
+# std::process. Off by default (the deterministic core needs no model); opt in
+# for person/location/org/address coverage.
+semantic = []
 
 [dependencies]
 aho-corasick = { workspace = true }

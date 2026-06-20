@@ -1,7 +1,7 @@
 //! Semantic PII via a persistent Python sidecar (see tools/ner_sidecar.py).
 //! Catches the entities a deterministic core cannot — person, location,
-//! organization, address — by talking to a provider loaded once in a child
-//! process. Off unless built with the `semantic`/`ner` feature.
+//! organization, address — by talking to a spaCy sidecar loaded once in a child
+//! process. Off unless built with the `semantic` feature.
 
 use super::Detector;
 use crate::model::*;
@@ -14,9 +14,6 @@ pub struct SemanticDetector {
     proc: Mutex<NerProc>,
 }
 
-/// Backward-compatible name for older callers. Prefer `SemanticDetector`.
-pub type NerDetector = SemanticDetector;
-
 struct NerProc {
     child: Child,
     stdin: ChildStdin,
@@ -24,19 +21,13 @@ struct NerProc {
 }
 
 impl SemanticDetector {
-    /// Spawn the default spaCy sidecar provider.
-    pub fn spawn(script: &str) -> std::io::Result<Self> {
-        Self::spawn_with_provider(script, "spacy")
-    }
-
-    /// Spawn the sidecar (`<python> <script>`) and block until its provider is
+    /// Spawn the sidecar (`<python> <script>`) and block until its model is
     /// loaded (it prints `READY`). `python` defaults to PENTECT_PYTHON or
     /// "python". Errors if the process can't start or never signals ready.
-    pub fn spawn_with_provider(script: &str, provider: &str) -> std::io::Result<Self> {
+    pub fn spawn(script: &str) -> std::io::Result<Self> {
         let python = std::env::var("PENTECT_PYTHON").unwrap_or_else(|_| "python".into());
         let mut child = Command::new(python)
             .arg(script)
-            .env("PENTECT_SEMANTIC_PROVIDER", provider)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -46,7 +37,7 @@ impl SemanticDetector {
         let mut ready = String::new();
         stdout.read_line(&mut ready)?;
         let ready = ready.trim();
-        if ready != "READY" && !ready.starts_with("READY ") {
+        if ready != "READY" {
             return Err(std::io::Error::other(
                 "semantic sidecar did not signal READY",
             ));
@@ -114,7 +105,7 @@ mod tests {
     #[test]
     fn semantic_detects_person_org_location() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/ner_sidecar.py");
-        let det = match SemanticDetector::spawn_with_provider(script, "spacy") {
+        let det = match SemanticDetector::spawn(script) {
             Ok(d) => d,
             Err(_) => return, // python/spaCy unavailable here — skip, don't fail
         };
