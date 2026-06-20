@@ -7,6 +7,8 @@ MVP: secret-aware tool boundary for AI agents.
 - Mask read/shell output before it returns to the agent.
 - Resolve placeholders only inside local tool execution.
 - Pass placeholders to child processes as env with `pentect exec --env NAME=<<...>> "<command>"`.
+- Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.
+- Gate direct environment-variable reads with `--allow-env NAME` / `--deny-env NAME`.
 - Block direct AI Read tools; use `pentect exec "<command>"` at the tool boundary.
 - Keep `pentect read` as a human masked-preview helper, not the AI path.
 - Sessions are directory-local by default via `.pentect-agent/default`.
