@@ -11,12 +11,15 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
 const KEY_FILE: &str = "key.bin";
 const RECOVERY_DIR: &str = "recoveries";
+const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
+const LIVE_MASK_CHUNK_LINES: usize = 2048;
 
 static RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -121,24 +124,29 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
+    let store = match RecoveryStore::load(&session) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
     if opts.live {
-        let status = match run_resolved_command_live(&session, &opts) {
+        let status = match run_resolved_command_live(&store, &opts) {
             Ok(s) => s,
             Err(e) => return die(&e),
         };
         return exit_code(status);
     }
-    let output = match run_resolved_command(&session, &opts) {
+    let output = match run_resolved_command(&store, &opts) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let safe_stdout = match mask_tool_output(&session, &stdout) {
+    let mut masker = OutputMasker::new_shared(store);
+    let safe_stdout = match masker.mask_tool_output(&stdout) {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let safe_stderr = match mask_tool_output(&session, &stderr) {
+    let safe_stderr = match masker.mask_tool_output(&stderr) {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
@@ -211,21 +219,19 @@ fn cmd_filter(args: &[String], mode: FilterMode) -> i32 {
 }
 
 fn run_resolved_command(
-    session: &Session,
+    store: &RecoveryStore,
     opts: &ExecOpts,
 ) -> Result<std::process::Output, String> {
-    let env = resolve_env_bindings(session, &opts.env)?;
+    let env = resolve_env_bindings(store, &opts.env)?;
     let env_policy = exec_env_policy(&env, opts)?;
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
-            let program = session.resolve_all(&args[0])?;
-            let resolved_args: Result<Vec<String>, String> = args[1..]
-                .iter()
-                .map(|arg| session.resolve_all(arg))
-                .collect();
+            let program = store.resolve_all(&args[0])?;
+            let resolved_args: Result<Vec<String>, String> =
+                args[1..].iter().map(|arg| store.resolve_all(arg)).collect();
             let resolved_args = resolved_args?;
             guard_program_invocation_with_env(&program, &resolved_args, &env_policy)?;
             let mut command = Command::new(program);
@@ -236,49 +242,47 @@ fn run_resolved_command(
                 .map_err(|e| format!("could not execute command: {e}"))
         }
         ExecMode::Shell(command) => {
-            let resolved = session.resolve_all(command)?;
+            let resolved = store.resolve_all(command)?;
             guard_shell_script_with_env(&resolved, &env_policy)?;
             run_shell_script(&resolved, &env)
         }
     }
 }
 
-fn run_resolved_command_live(session: &Session, opts: &ExecOpts) -> Result<ExitStatus, String> {
-    let env = resolve_env_bindings(session, &opts.env)?;
+fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExitStatus, String> {
+    let env = resolve_env_bindings(store, &opts.env)?;
     let env_policy = exec_env_policy(&env, opts)?;
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
-            let program = session.resolve_all(&args[0])?;
-            let resolved_args: Result<Vec<String>, String> = args[1..]
-                .iter()
-                .map(|arg| session.resolve_all(arg))
-                .collect();
+            let program = store.resolve_all(&args[0])?;
+            let resolved_args: Result<Vec<String>, String> =
+                args[1..].iter().map(|arg| store.resolve_all(arg)).collect();
             let resolved_args = resolved_args?;
             guard_program_invocation_with_env(&program, &resolved_args, &env_policy)?;
             let mut command = Command::new(program);
             command.args(resolved_args);
             apply_env_bindings(&mut command, &env);
-            run_live_command(command, None, session)
+            run_live_command(command, None, store.clone())
         }
         ExecMode::Shell(command) => {
-            let resolved = session.resolve_all(command)?;
+            let resolved = store.resolve_all(command)?;
             guard_shell_script_with_env(&resolved, &env_policy)?;
             let mut command = shell_script_command();
             apply_env_bindings(&mut command, &env);
-            run_live_command(command, Some(&resolved), session)
+            run_live_command(command, Some(&resolved), store.clone())
         }
     }
 }
 
 fn resolve_env_bindings(
-    session: &Session,
+    store: &RecoveryStore,
     env: &[EnvBinding],
 ) -> Result<Vec<(String, String)>, String> {
     env.iter()
-        .map(|binding| Ok((binding.name.clone(), session.resolve_all(&binding.value)?)))
+        .map(|binding| Ok((binding.name.clone(), store.resolve_all(&binding.value)?)))
         .collect()
 }
 
@@ -409,7 +413,7 @@ enum StreamTarget {
 fn run_live_command(
     mut command: Command,
     stdin_script: Option<&str>,
-    session: &Session,
+    store: RecoveryStore,
 ) -> Result<ExitStatus, String> {
     live_status("streaming masked command output");
     if stdin_script.is_some() {
@@ -438,13 +442,17 @@ fn run_live_command(
         .stderr
         .take()
         .ok_or_else(|| "could not capture command stderr".to_string())?;
-    let stdout_session = session.clone();
-    let stderr_session = session.clone();
+    let stdout_store = store.clone();
+    let stderr_store = store;
     let stdout_thread = std::thread::spawn(move || {
-        stream_masked_reader(stdout_session, stdout, StreamTarget::Stdout)
+        let mut masker = OutputMasker::new_deferred(stdout_store)?;
+        stream_masked_reader(&mut masker, stdout, StreamTarget::Stdout)?;
+        masker.flush()
     });
     let stderr_thread = std::thread::spawn(move || {
-        stream_masked_reader(stderr_session, stderr, StreamTarget::Stderr)
+        let mut masker = OutputMasker::new_deferred(stderr_store)?;
+        stream_masked_reader(&mut masker, stderr, StreamTarget::Stderr)?;
+        masker.flush()
     });
     let status = child
         .wait()
@@ -455,12 +463,15 @@ fn run_live_command(
 }
 
 fn stream_masked_reader<R: Read>(
-    session: Session,
+    masker: &mut OutputMasker,
     reader: R,
     target: StreamTarget,
 ) -> Result<(), String> {
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_kind: Option<Kind> = None;
+    let mut chunk_lines = 0usize;
     loop {
         buf.clear();
         let n = reader
@@ -470,20 +481,48 @@ fn stream_masked_reader<R: Read>(
             break;
         }
         let text = String::from_utf8_lossy(&buf);
-        let masked = mask_live_output(&session, &text)?;
-        match target {
-            StreamTarget::Stdout => {
-                print!("{masked}");
-                std::io::stdout()
-                    .flush()
-                    .map_err(|e| format!("could not flush stdout: {e}"))?;
-            }
-            StreamTarget::Stderr => {
-                eprint!("{masked}");
-                std::io::stderr()
-                    .flush()
-                    .map_err(|e| format!("could not flush stderr: {e}"))?;
-            }
+        let line_kind = live_output_kind(&text);
+        if !chunk.is_empty() && chunk_kind.as_ref() != Some(&line_kind) {
+            flush_masked_chunk(masker, target, &mut chunk, chunk_kind.take().unwrap())?;
+            chunk_lines = 0;
+        }
+        chunk_kind = Some(line_kind);
+        chunk.push_str(&text);
+        chunk_lines += 1;
+        if chunk.len() >= LIVE_MASK_CHUNK_BYTES || chunk_lines >= LIVE_MASK_CHUNK_LINES {
+            flush_masked_chunk(masker, target, &mut chunk, chunk_kind.take().unwrap())?;
+            chunk_lines = 0;
+        }
+    }
+    if let Some(kind) = chunk_kind {
+        flush_masked_chunk(masker, target, &mut chunk, kind)?;
+    }
+    Ok(())
+}
+
+fn flush_masked_chunk(
+    masker: &mut OutputMasker,
+    target: StreamTarget,
+    chunk: &mut String,
+    kind: Kind,
+) -> Result<(), String> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let masked = masker.mask_text(chunk, kind)?;
+    chunk.clear();
+    match target {
+        StreamTarget::Stdout => {
+            print!("{masked}");
+            std::io::stdout()
+                .flush()
+                .map_err(|e| format!("could not flush stdout: {e}"))?;
+        }
+        StreamTarget::Stderr => {
+            eprint!("{masked}");
+            std::io::stderr()
+                .flush()
+                .map_err(|e| format!("could not flush stderr: {e}"))?;
         }
     }
     Ok(())
@@ -880,6 +919,141 @@ impl Session {
                     .map_err(|e| format!("could not load recovery '{}': {e}", path.display()))
             })
             .collect()
+    }
+}
+
+#[derive(Clone)]
+struct RecoveryStore {
+    session: Session,
+    recoveries: Arc<Mutex<Vec<Recovery>>>,
+}
+
+impl RecoveryStore {
+    fn load(session: &Session) -> Result<Self, String> {
+        Ok(Self {
+            session: session.clone(),
+            recoveries: Arc::new(Mutex::new(session.recoveries()?)),
+        })
+    }
+
+    fn resolve_all(&self, text: &str) -> Result<String, String> {
+        let recoveries = self.lock()?;
+        let mut out = text.to_string();
+        for rec in recoveries.iter() {
+            out = rec.resolve(&out);
+        }
+        Ok(out)
+    }
+
+    fn remask_all(&self, text: &str) -> Result<String, String> {
+        let recoveries = self.lock()?;
+        let mut out = text.to_string();
+        for rec in recoveries.iter() {
+            out = rec.remask(&out);
+        }
+        Ok(out)
+    }
+
+    fn snapshot(&self) -> Result<Vec<Recovery>, String> {
+        Ok(self.lock()?.clone())
+    }
+
+    fn save_recovery(&self, recovery: Recovery) -> Result<(), String> {
+        if recovery.is_empty() {
+            return Ok(());
+        }
+        self.session.save_recovery(&recovery)?;
+        self.lock()?.push(recovery);
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Vec<Recovery>>, String> {
+        self.recoveries
+            .lock()
+            .map_err(|_| "recovery cache lock poisoned".to_string())
+    }
+}
+
+struct OutputMasker {
+    store: RecoveryStore,
+    engine: Engine,
+    mode: OutputMaskerMode,
+    pending: Recovery,
+}
+
+enum OutputMaskerMode {
+    Shared,
+    Deferred { remask_recoveries: Vec<Recovery> },
+}
+
+impl OutputMasker {
+    fn new_shared(store: RecoveryStore) -> Self {
+        let key = store.session.key;
+        Self {
+            store,
+            engine: Engine::with_profile(Profile::Strict),
+            mode: OutputMaskerMode::Shared,
+            pending: Recovery::empty_for_key(&key),
+        }
+    }
+
+    fn new_deferred(store: RecoveryStore) -> Result<Self, String> {
+        let key = store.session.key;
+        let remask_recoveries = store.snapshot()?;
+        Ok(Self {
+            store,
+            engine: Engine::with_profile(Profile::Strict),
+            mode: OutputMaskerMode::Deferred { remask_recoveries },
+            pending: Recovery::empty_for_key(&key),
+        })
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let next = Recovery::empty_for_key(&self.store.session.key);
+        let pending = std::mem::replace(&mut self.pending, next);
+        self.store.save_recovery(pending)
+    }
+
+    fn mask_tool_output(&mut self, text: &str) -> Result<String, String> {
+        let kind = if looks_like_sensitive_env_output(text) || looks_like_env_output(text) {
+            Kind::Env
+        } else {
+            Kind::Text
+        };
+        self.mask_text(text, kind)
+    }
+
+    fn mask_text(&mut self, text: &str, kind: Kind) -> Result<String, String> {
+        let remasked = self.remask_all(text)?;
+        let result = self.engine.mask(
+            Input {
+                kind,
+                data: remasked,
+            },
+            &Config::new(self.store.session.key),
+        );
+        let masked = result.masked;
+        match &mut self.mode {
+            OutputMaskerMode::Shared => self.store.save_recovery(result.recovery)?,
+            OutputMaskerMode::Deferred { .. } => self.pending.extend_same_key(result.recovery),
+        }
+        Ok(masked)
+    }
+
+    fn remask_all(&self, text: &str) -> Result<String, String> {
+        match &self.mode {
+            OutputMaskerMode::Shared => self.store.remask_all(text),
+            OutputMaskerMode::Deferred { remask_recoveries } => {
+                let mut out = text.to_string();
+                for rec in remask_recoveries {
+                    out = rec.remask(&out);
+                }
+                Ok(out)
+            }
+        }
     }
 }
 
@@ -1306,16 +1480,20 @@ fn mask_tool_output(session: &Session, text: &str) -> Result<String, String> {
     mask_text(session, text, kind)
 }
 
+#[cfg(test)]
 fn mask_live_output(session: &Session, text: &str) -> Result<String, String> {
-    let kind = if looks_like_sensitive_env_output(text)
+    mask_text(session, text, live_output_kind(text))
+}
+
+fn live_output_kind(text: &str) -> Kind {
+    if looks_like_sensitive_env_output(text)
         || looks_like_env_output(text)
         || text.lines().any(|line| is_env_assignment_line(line.trim()))
     {
         Kind::Env
     } else {
         Kind::Text
-    };
-    mask_text(session, text, kind)
+    }
 }
 
 fn mask_text(session: &Session, text: &str, kind: Kind) -> Result<String, String> {
@@ -2056,7 +2234,8 @@ mod tests {
             mode: ExecMode::Shell(command),
         };
 
-        let output = run_resolved_command(&session, &opts).unwrap();
+        let store = RecoveryStore::load(&session).unwrap();
+        let output = run_resolved_command(&store, &opts).unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains(raw), "{stdout}");
 

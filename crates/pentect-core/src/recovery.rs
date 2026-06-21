@@ -26,6 +26,16 @@ pub struct Recovery {
 }
 
 impl Recovery {
+    /// Create an empty recovery map using the same in-memory obfuscation pad as
+    /// maps sealed with `key`. This is useful for adapters that batch multiple
+    /// mask results into one persisted recovery file.
+    pub fn empty_for_key(key: &[u8; 32]) -> Self {
+        Self {
+            pad: derive_pad(key),
+            map: HashMap::new(),
+        }
+    }
+
     /// Obfuscate a plaintext placeholder->value map for in-memory storage.
     pub fn seal(plaintext: HashMap<String, String>, key: &[u8; 32]) -> Self {
         let pad = derive_pad(key);
@@ -45,6 +55,14 @@ impl Recovery {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// Merge another recovery produced with the same key into this one.
+    ///
+    /// Placeholders are deterministic for a given key/value/label pair, so
+    /// duplicate entries are harmless and overwrite with the same original.
+    pub fn extend_same_key(&mut self, mut other: Self) {
+        self.map.extend(std::mem::take(&mut other.map));
     }
 
     /// Deobfuscate the original value for `placeholder`, if present.
@@ -398,6 +416,26 @@ mod tests {
         // restore then remask is the identity on masked text.
         let masked = format!("use {ph}");
         assert_eq!(rec.remask(&restore(&masked, &rec).unwrap()), masked);
+    }
+
+    #[test]
+    fn empty_for_key_extends_and_persists_batch() {
+        let key = [8u8; 32];
+        let mut batch = Recovery::empty_for_key(&key);
+        batch.extend_same_key(Recovery::seal(
+            HashMap::from([("<<A_0011223344556677>>".into(), "alpha".into())]),
+            &key,
+        ));
+        batch.extend_same_key(Recovery::seal(
+            HashMap::from([("<<B_0011223344556677>>".into(), "bravo".into())]),
+            &key,
+        ));
+
+        let loaded = Recovery::load(&batch.serialize(&key), &key).unwrap();
+        assert_eq!(
+            loaded.resolve("x=<<A_0011223344556677>> y=<<B_0011223344556677>>"),
+            "x=alpha y=bravo"
+        );
     }
 
     fn sample_recovery(key: &[u8; 32]) -> Recovery {
