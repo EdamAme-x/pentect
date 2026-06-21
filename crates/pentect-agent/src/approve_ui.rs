@@ -6,7 +6,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Style, Stylize},
     text::{Line, Span},
     widgets::{Clear, Paragraph, Wrap},
     Frame, Terminal,
@@ -20,18 +20,15 @@ pub enum ApprovalDecision {
 }
 
 pub struct ApprovalRequest {
-    pub title: String,
+    pub prompt: String,
     pub body: String,
-    pub note: String,
     pub approve_label: String,
     pub deny_label: String,
-    pub footer_note: String,
     pub warnings: Vec<String>,
 }
 
 struct App<'a> {
     request: &'a ApprovalRequest,
-    selected: ApprovalDecision,
     scroll: u16,
 }
 
@@ -62,11 +59,7 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     request: &ApprovalRequest,
 ) -> Result<ApprovalDecision, String> {
-    let mut app = App {
-        request,
-        selected: ApprovalDecision::Approve,
-        scroll: 0,
-    };
+    let mut app = App { request, scroll: 0 };
     loop {
         terminal
             .draw(|frame| draw(frame, &app))
@@ -81,13 +74,7 @@ fn run_loop(
                 KeyCode::Char('n') | KeyCode::Char('d') | KeyCode::Esc => {
                     return Ok(ApprovalDecision::Deny);
                 }
-                KeyCode::Enter => return Ok(app.selected),
-                KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
-                    app.selected = match app.selected {
-                        ApprovalDecision::Approve => ApprovalDecision::Deny,
-                        ApprovalDecision::Deny => ApprovalDecision::Approve,
-                    };
-                }
+                KeyCode::Enter => return Ok(ApprovalDecision::Approve),
                 KeyCode::Up => app.scroll = app.scroll.saturating_sub(1),
                 KeyCode::Down => app.scroll = app.scroll.saturating_add(1),
                 KeyCode::Char('q') => return Ok(ApprovalDecision::Deny),
@@ -107,7 +94,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
-    let area = centered(frame.area(), 82, 18);
+    let area = centered(frame.area(), 72, 12);
     frame.render_widget(Clear, area);
     let inner = area.inner(Margin {
         horizontal: 1,
@@ -116,10 +103,10 @@ fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(4),
             Constraint::Length(2),
-            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -131,20 +118,14 @@ fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
     let request = app.request;
-    let text = vec![
-        Line::from(vec![
-            Span::styled(
-                "pentect",
-                Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
-            ),
-            Span::raw("  "),
-            Span::styled(&request.title, Style::default().fg(Color::White).bold()),
-        ]),
-        Line::from(Span::styled(
-            request.note.as_str(),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
+    let text = vec![Line::from(vec![
+        Span::styled(
+            "pentect",
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+        ),
+        Span::raw("  "),
+        Span::styled(&request.prompt, Style::default().fg(Color::White).bold()),
+    ])];
     frame.render_widget(Paragraph::new(text), area);
 }
 
@@ -169,43 +150,29 @@ fn draw_warning(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let approve_style = selected_style(app.selected == ApprovalDecision::Approve, Color::Green);
-    let deny_style = selected_style(app.selected == ApprovalDecision::Deny, Color::Red);
-    let text = vec![
-        Line::from(vec![
-            Span::styled(format!("  {}  ", app.request.approve_label), approve_style),
-            Span::raw("  "),
-            Span::styled(format!("  {}  ", app.request.deny_label), deny_style),
-            Span::raw("   "),
-            Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
-            Span::raw("/"),
-            Span::styled("Y", Style::default().fg(Color::Cyan).bold()),
-            Span::raw(" approve   "),
-            Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
-            Span::raw("/"),
-            Span::styled("N", Style::default().fg(Color::Cyan).bold()),
-            Span::raw(" deny"),
-        ]),
-        Line::from(Span::styled(
-            app.request.footer_note.as_str(),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
+    let text = vec![Line::from(vec![
+        Span::styled("y", Style::default().fg(Color::Green).bold()),
+        Span::raw(" "),
+        Span::styled(
+            app.request.approve_label.as_str(),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("    "),
+        Span::styled("n", Style::default().fg(Color::Red).bold()),
+        Span::raw(" "),
+        Span::styled(
+            app.request.deny_label.as_str(),
+            Style::default().fg(Color::Red),
+        ),
+        Span::raw("    "),
+        Span::styled("esc", Style::default().fg(Color::DarkGray)),
+    ])];
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), area);
 }
 
-fn selected_style(selected: bool, color: Color) -> Style {
-    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-    if selected {
-        style.bg(Color::DarkGray)
-    } else {
-        style
-    }
-}
-
 fn centered(area: Rect, max_width: u16, max_height: u16) -> Rect {
-    let width = bounded_size(area.width, 44, max_width);
-    let height = bounded_size(area.height, 12, max_height);
+    let width = bounded_size(area.width, 36, max_width);
+    let height = bounded_size(area.height, 8, max_height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect {
@@ -232,25 +199,26 @@ mod tests {
     #[test]
     fn approval_screen_explains_the_execution_contract() {
         let request = ApprovalRequest {
-            title: "Approve command execution".to_string(),
+            prompt: "Run?".to_string(),
             body: "Get-Content -Raw -LiteralPath .env".to_string(),
-            note: "Run locally. Mask output before the AI sees it.".to_string(),
-            approve_label: "APPROVE & RUN".to_string(),
-            deny_label: "DENY".to_string(),
-            footer_note: "Enter approve. Esc deny. Up/Down scroll.".to_string(),
+            approve_label: "run".to_string(),
+            deny_label: "cancel".to_string(),
             warnings: vec!["review direct env usage".to_string()],
         };
         let rendered = render_request(&request, 100, 34);
 
         assert!(rendered.contains("pentect"));
+        assert!(rendered.contains("Run?"));
         assert!(rendered.contains("Get-Content"));
         assert!(rendered.contains("Warning:"));
-        assert!(rendered.contains("APPROVE & RUN"));
+        assert!(rendered.contains("y run"));
+        assert!(rendered.contains("n cancel"));
         assert!(!rendered.contains("resolves placeholders"));
         assert!(!rendered.contains("what happens"));
         assert!(!rendered.contains("environment policy"));
         assert!(!rendered.contains("Secrets:"));
         assert!(!rendered.contains("Env:"));
+        assert!(!rendered.contains("scope:"));
     }
 
     #[test]
@@ -265,11 +233,7 @@ mod tests {
     fn render_request(request: &ApprovalRequest, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
-        let app = App {
-            request,
-            selected: ApprovalDecision::Approve,
-            scroll: 0,
-        };
+        let app = App { request, scroll: 0 };
         terminal.draw(|frame| draw(frame, &app)).expect("draws UI");
         buffer_to_string(terminal.backend().buffer())
     }

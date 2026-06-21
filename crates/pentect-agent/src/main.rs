@@ -89,22 +89,21 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
         Some(path) => format!("active ({})", path.display()),
         None => "not created yet".to_string(),
     };
-    let command = format!(
-        "Directory  {}\nSession    {session}\nVault      {vault_line}",
-        cwd.display()
-    );
+    let body = if session == DEFAULT_SESSION {
+        format!("{}\nvault: {vault_line}", cwd.display())
+    } else {
+        format!("{}\nsession: {session}\nvault: {vault_line}", cwd.display())
+    };
     let warnings = if vault.is_some() {
         vec!["Capability vault is active for this scope.".to_string()]
     } else {
         Vec::new()
     };
     Ok(ApprovalRequest {
-        title: "Pentect control".to_string(),
-        body: command,
-        note: "Current scope.".to_string(),
-        approve_label: "OK".to_string(),
-        deny_label: "CLOSE".to_string(),
-        footer_note: "Enter/Esc close. Use --dir and --session for another scope.".to_string(),
+        prompt: "Status".to_string(),
+        body,
+        approve_label: "close".to_string(),
+        deny_label: "close".to_string(),
         warnings,
     })
 }
@@ -238,12 +237,14 @@ fn request_approval(
 ) -> Result<ApprovalDecision, String> {
     let command = display_exec_mode(&opts.mode);
     let request = ApprovalRequest {
-        title: title.to_string(),
+        prompt: if title.contains("Preview") {
+            "Preview".to_string()
+        } else {
+            "Run?".to_string()
+        },
         body: command.clone(),
-        note: "Run locally. Mask output before the AI sees it.".to_string(),
-        approve_label: "APPROVE & RUN".to_string(),
-        deny_label: "DENY".to_string(),
-        footer_note: "Enter approve. Esc deny. Up/Down scroll.".to_string(),
+        approve_label: "run".to_string(),
+        deny_label: "cancel".to_string(),
         warnings: approval_warnings(store, opts, &command)?,
     };
     approve_ui::run(&request)
