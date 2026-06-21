@@ -494,6 +494,7 @@ mod tests {
             "hi there",
             "key sk-ABCDEFGHIJKLMNOPQRSTUVWX end",
             "a@b.com x a@b.com",
+            "::aG00aA ",
         ] {
             let r = m(x);
             assert_eq!(restore(&r.masked, &r.recovery).unwrap(), x);

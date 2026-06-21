@@ -2,8 +2,9 @@
 //!
 //! It demonstrates the product loop:
 //! shell tool input -> force execution through `pentect exec`;
-//! write/exec tool input -> resolve placeholders locally;
-//! command output -> remask before it returns to the AI.
+//! command output -> mask before it returns to the AI.
+//! No recovery state is persisted by default; placeholders are one-way outside
+//! the current process.
 
 mod approve_ui;
 
@@ -13,29 +14,22 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
-const KEY_FILE: &str = "key.bin";
-const RECOVERY_DIR: &str = "recoveries";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
-
-static RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
         Some("read") => cmd_read(&args),
-        Some("write") => cmd_write(&args),
         Some("exec") => cmd_exec(&args),
         Some("approve") => cmd_approve(&args),
         Some("hook") => cmd_hook(&args),
-        Some("resolve") => cmd_filter(&args, FilterMode::Resolve),
-        Some("remask") => cmd_filter(&args, FilterMode::Remask),
+        Some("purge") => cmd_purge(&args),
         _ => {
             usage();
             2
@@ -49,24 +43,18 @@ fn usage() {
         "pentect exec [--session NAME] [--approve] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
          pentect exec [--session NAME] [--approve] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... -- PROGRAM [ARG...]\n\
          pentect approve [--session NAME] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
-         pentect write PATH < masked-text\n\
-         pentect read [--session NAME] [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
+         pentect read [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
          pentect hook codex|claude|gemini < hook-json\n\
-         pentect resolve < masked-text\n\
-         pentect remask < command-output\n\
+         pentect purge [--session NAME]\n\
          \n\
          agent hooks force shell tools through exec and block direct read tools;\n\
-         read is a human masked-preview helper."
+         read is a one-way human masked-preview helper."
     );
 }
 
 fn cmd_read(args: &[String]) -> i32 {
     let opts = match ReadOpts::parse(args) {
         Ok(o) => o,
-        Err(e) => return die(&e),
-    };
-    let session = match Session::open(&opts.session) {
-        Ok(s) => s,
         Err(e) => return die(&e),
     };
     let data = match read_input(&opts.path, opts.input_format) {
@@ -77,14 +65,9 @@ fn cmd_read(args: &[String]) -> i32 {
     let engine = Engine::with_profile(opts.profile);
     let cfg = Config {
         disclose_length: opts.disclose_length,
-        ..Config::new(session.key)
+        ..Config::generate()
     };
     let result = engine.mask(Input { kind, data }, &cfg);
-    if !result.recovery.is_empty() {
-        if let Err(e) = session.save_recovery(&result.recovery) {
-            return die(&e);
-        }
-    }
     print!("{}", result.masked);
     let _ = std::io::stdout().flush();
     if opts.emit_meta {
@@ -93,29 +76,6 @@ fn cmd_read(args: &[String]) -> i32 {
             result.summary.masked_count,
             result.summary.residual.len()
         );
-    }
-    0
-}
-
-fn cmd_write(args: &[String]) -> i32 {
-    let opts = match WriteOpts::parse(args) {
-        Ok(o) => o,
-        Err(e) => return die(&e),
-    };
-    let session = match Session::open(&opts.session) {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
-    let masked = match read_stdin_text() {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
-    let resolved = match session.resolve_all(&masked) {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
-    if let Err(e) = std::fs::write(&opts.path, resolved) {
-        return die(&format!("could not write '{}': {e}", opts.path.display()));
     }
     0
 }
@@ -192,6 +152,28 @@ fn cmd_approve(args: &[String]) -> i32 {
     }
 }
 
+fn cmd_purge(args: &[String]) -> i32 {
+    let opts = match PurgeOpts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return die(&e),
+    };
+    let root = match session_root(&opts.session) {
+        Ok(root) => root,
+        Err(e) => return die(&e),
+    };
+    if !root.exists() {
+        return 0;
+    }
+    if let Err(e) = std::fs::remove_dir_all(&root) {
+        return die(&format!(
+            "could not purge session '{}': {e}",
+            root.display()
+        ));
+    }
+    eprintln!("[pentect] purged session state: {}", root.display());
+    0
+}
+
 fn request_approval(
     store: &RecoveryStore,
     opts: &ExecOpts,
@@ -241,7 +223,7 @@ fn approval_env_rows(opts: &ExecOpts) -> Vec<EnvReview> {
 }
 
 fn approval_warnings(
-    store: &RecoveryStore,
+    _store: &RecoveryStore,
     opts: &ExecOpts,
     display_command: &str,
 ) -> Result<Vec<String>, String> {
@@ -252,13 +234,12 @@ fn approval_warnings(
         .map(|binding| (binding.name.clone(), String::new()))
         .collect::<Vec<_>>();
     let policy = exec_env_policy(&env, opts)?;
-    let resolved_for_policy = store.resolve_all(display_command)?;
     let guard = match &opts.mode {
         ExecMode::Program(args) => {
             let program = args.first().map(String::as_str).unwrap_or_default();
             guard_program_invocation_with_env(program, &args[1..], &policy)
         }
-        ExecMode::Shell(_) => guard_shell_script_with_env(&resolved_for_policy, &policy),
+        ExecMode::Shell(_) => guard_shell_script_with_env(display_command, &policy),
     };
     if let Err(reason) = guard {
         warnings.push(reason);
@@ -333,33 +314,6 @@ fn cmd_hook(args: &[String]) -> i32 {
     }
 }
 
-fn cmd_filter(args: &[String], mode: FilterMode) -> i32 {
-    let opts = match FilterOpts::parse(args) {
-        Ok(o) => o,
-        Err(e) => return die(&e),
-    };
-    let session = match Session::open_existing(&opts.session) {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
-    let input = match read_stdin_text() {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
-    let out = match mode {
-        FilterMode::Resolve => session.resolve_all(&input),
-        FilterMode::Remask => session.remask_all(&input),
-    };
-    match out {
-        Ok(s) => {
-            print!("{s}");
-            let _ = std::io::stdout().flush();
-            0
-        }
-        Err(e) => die(&e),
-    }
-}
-
 fn run_resolved_command(
     store: &RecoveryStore,
     opts: &ExecOpts,
@@ -371,22 +325,19 @@ fn run_resolved_command(
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
-            let program = store.resolve_all(&args[0])?;
-            let resolved_args: Result<Vec<String>, String> =
-                args[1..].iter().map(|arg| store.resolve_all(arg)).collect();
-            let resolved_args = resolved_args?;
-            guard_program_invocation_with_env(&program, &resolved_args, &env_policy)?;
+            let program = &args[0];
+            let command_args = &args[1..];
+            guard_program_invocation_with_env(program, command_args, &env_policy)?;
             let mut command = Command::new(program);
-            command.args(resolved_args);
+            command.args(command_args);
             apply_env_bindings(&mut command, &env);
             command
                 .output()
                 .map_err(|e| format!("could not execute command: {e}"))
         }
         ExecMode::Shell(command) => {
-            let resolved = store.resolve_all(command)?;
-            guard_shell_script_with_env(&resolved, &env_policy)?;
-            run_shell_script(&resolved, &env)
+            guard_shell_script_with_env(command, &env_policy)?;
+            run_shell_script(command, &env)
         }
     }
 }
@@ -399,33 +350,31 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
-            let program = store.resolve_all(&args[0])?;
-            let resolved_args: Result<Vec<String>, String> =
-                args[1..].iter().map(|arg| store.resolve_all(arg)).collect();
-            let resolved_args = resolved_args?;
-            guard_program_invocation_with_env(&program, &resolved_args, &env_policy)?;
+            let program = &args[0];
+            let command_args = &args[1..];
+            guard_program_invocation_with_env(program, command_args, &env_policy)?;
             let mut command = Command::new(program);
-            command.args(resolved_args);
+            command.args(command_args);
             apply_env_bindings(&mut command, &env);
             run_live_command(command, None, store.clone())
         }
         ExecMode::Shell(command) => {
-            let resolved = store.resolve_all(command)?;
-            guard_shell_script_with_env(&resolved, &env_policy)?;
-            let mut command = shell_script_command();
-            apply_env_bindings(&mut command, &env);
-            run_live_command(command, Some(&resolved), store.clone())
+            guard_shell_script_with_env(command, &env_policy)?;
+            let mut shell = shell_script_command();
+            apply_env_bindings(&mut shell, &env);
+            run_live_command(shell, Some(command), store.clone())
         }
     }
 }
 
 fn resolve_env_bindings(
-    store: &RecoveryStore,
+    _store: &RecoveryStore,
     env: &[EnvBinding],
 ) -> Result<Vec<(String, String)>, String> {
-    env.iter()
-        .map(|binding| Ok((binding.name.clone(), store.resolve_all(&binding.value)?)))
-        .collect()
+    Ok(env
+        .iter()
+        .map(|binding| (binding.name.clone(), binding.value.clone()))
+        .collect())
 }
 
 fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
@@ -699,12 +648,6 @@ fn exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
-#[derive(Clone, Copy)]
-enum FilterMode {
-    Resolve,
-    Remask,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HookProvider {
     Codex,
@@ -726,7 +669,6 @@ enum InputFormat {
 }
 
 struct ReadOpts {
-    session: String,
     input_format: InputFormat,
     kind: Option<Kind>,
     profile: Profile,
@@ -737,7 +679,6 @@ struct ReadOpts {
 
 impl ReadOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
-        let mut session = DEFAULT_SESSION.to_string();
         let mut input_format = InputFormat::Text;
         let mut kind = None;
         let mut profile = Profile::Strict;
@@ -747,9 +688,6 @@ impl ReadOpts {
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
-                "--session" => {
-                    session = value(args, &mut i, "--session")?;
-                }
                 "--input" => {
                     input_format = parse_input_format(&value(args, &mut i, "--input")?)?;
                 }
@@ -778,7 +716,6 @@ impl ReadOpts {
             }
         }
         Ok(Self {
-            session: checked_session_name(&session)?,
             input_format,
             kind,
             profile,
@@ -789,33 +726,15 @@ impl ReadOpts {
     }
 }
 
-struct WriteOpts {
-    session: String,
-    path: PathBuf,
-}
-
-impl WriteOpts {
-    fn parse(args: &[String]) -> Result<Self, String> {
-        let (session, rest) = parse_session_and_rest(args, 2)?;
-        if rest.len() != 1 {
-            return Err("write requires exactly one PATH".to_string());
-        }
-        Ok(Self {
-            session,
-            path: PathBuf::from(&rest[0]),
-        })
-    }
-}
-
-struct FilterOpts {
+struct PurgeOpts {
     session: String,
 }
 
-impl FilterOpts {
+impl PurgeOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let (session, rest) = parse_session_and_rest(args, 2)?;
         if !rest.is_empty() {
-            return Err("resolve/remask read from stdin and accept no positional args".to_string());
+            return Err("purge accepts no positional args".to_string());
         }
         Ok(Self { session })
     }
@@ -974,59 +893,38 @@ fn checked_env_name(name: &str) -> Result<String, String> {
 
 #[derive(Clone)]
 struct Session {
-    root: PathBuf,
     key: [u8; 32],
+    recoveries: Arc<Mutex<Vec<Recovery>>>,
 }
 
 impl Session {
     fn open(name: &str) -> Result<Self, String> {
-        let root = session_root(name)?;
-        std::fs::create_dir_all(root.join(RECOVERY_DIR))
-            .map_err(|e| format!("could not create session '{}': {e}", root.display()))?;
-        let key_path = root.join(KEY_FILE);
-        let key = if key_path.exists() {
-            read_key(&key_path)?
-        } else {
-            let key = Config::generate().key;
-            write_key(&key_path, &key)?;
-            key
-        };
-        Ok(Self { root, key })
-    }
-
-    fn open_existing(name: &str) -> Result<Self, String> {
-        let root = session_root(name)?;
-        let key = read_key(&root.join(KEY_FILE)).map_err(|_| {
-            format!("session '{name}' does not exist; run `pentect exec \"...\"` first")
-        })?;
-        Ok(Self { root, key })
+        let _ = checked_session_name(name)?;
+        Ok(Self {
+            key: Config::generate().key,
+            recoveries: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     #[cfg(test)]
     fn open_at(base: &Path, name: &str) -> Result<Self, String> {
-        let name = checked_session_name(name)?;
-        let root = base.join(name);
-        std::fs::create_dir_all(root.join(RECOVERY_DIR))
-            .map_err(|e| format!("could not create session '{}': {e}", root.display()))?;
-        let key = Config::generate().key;
-        write_key(&root.join(KEY_FILE), &key)?;
-        Ok(Self { root, key })
+        let _ = base;
+        Self::open(name)
     }
 
+    #[cfg(test)]
     fn save_recovery(&self, recovery: &Recovery) -> Result<(), String> {
-        let dir = self.root.join(RECOVERY_DIR);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("could not create recovery dir '{}': {e}", dir.display()))?;
-        let path = dir.join(format!(
-            "recovery-{}-{}-{}.pnr",
-            unix_millis(),
-            std::process::id(),
-            RECOVERY_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, recovery.serialize(&self.key))
-            .map_err(|e| format!("could not write recovery '{}': {e}", path.display()))
+        if recovery.is_empty() {
+            return Ok(());
+        }
+        self.recoveries
+            .lock()
+            .map_err(|_| "recovery cache lock poisoned".to_string())?
+            .push(recovery.clone());
+        Ok(())
     }
 
+    #[cfg(test)]
     fn resolve_all(&self, text: &str) -> Result<String, String> {
         let mut out = text.to_string();
         for rec in self.recoveries()? {
@@ -1035,6 +933,7 @@ impl Session {
         Ok(out)
     }
 
+    #[cfg(test)]
     fn remask_all(&self, text: &str) -> Result<String, String> {
         let mut out = text.to_string();
         for rec in self.recoveries()? {
@@ -1043,32 +942,19 @@ impl Session {
         Ok(out)
     }
 
+    #[cfg(test)]
     fn recoveries(&self) -> Result<Vec<Recovery>, String> {
-        let dir = self.root.join(RECOVERY_DIR);
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut paths = Vec::new();
-        for entry in std::fs::read_dir(&dir)
-            .map_err(|e| format!("could not read recovery dir '{}': {e}", dir.display()))?
-        {
-            let path = entry
-                .map_err(|e| format!("could not read recovery dir '{}': {e}", dir.display()))?
-                .path();
-            if path.extension().is_some_and(|ext| ext == "pnr") {
-                paths.push(path);
-            }
-        }
-        paths.sort();
-        paths
-            .into_iter()
-            .map(|path| {
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| format!("could not read recovery '{}': {e}", path.display()))?;
-                Recovery::load(&bytes, &self.key)
-                    .map_err(|e| format!("could not load recovery '{}': {e}", path.display()))
-            })
-            .collect()
+        Ok(self
+            .recoveries
+            .lock()
+            .map_err(|_| "recovery cache lock poisoned".to_string())?
+            .clone())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.key.zeroize();
     }
 }
 
@@ -1082,10 +968,11 @@ impl RecoveryStore {
     fn load(session: &Session) -> Result<Self, String> {
         Ok(Self {
             session: session.clone(),
-            recoveries: Arc::new(Mutex::new(session.recoveries()?)),
+            recoveries: session.recoveries.clone(),
         })
     }
 
+    #[cfg(test)]
     fn resolve_all(&self, text: &str) -> Result<String, String> {
         let recoveries = self.lock()?;
         let mut out = text.to_string();
@@ -1108,11 +995,10 @@ impl RecoveryStore {
         Ok(self.lock()?.clone())
     }
 
-    fn save_recovery(&self, recovery: Recovery) -> Result<(), String> {
+    fn add_recovery(&self, recovery: Recovery) -> Result<(), String> {
         if recovery.is_empty() {
             return Ok(());
         }
-        self.session.save_recovery(&recovery)?;
         self.lock()?.push(recovery);
         Ok(())
     }
@@ -1164,7 +1050,7 @@ impl OutputMasker {
         }
         let next = Recovery::empty_for_key(&self.store.session.key);
         let pending = std::mem::replace(&mut self.pending, next);
-        self.store.save_recovery(pending)
+        self.store.add_recovery(pending)
     }
 
     fn mask_tool_output(&mut self, text: &str) -> Result<String, String> {
@@ -1187,7 +1073,7 @@ impl OutputMasker {
         );
         let masked = result.masked;
         match &mut self.mode {
-            OutputMaskerMode::Shared => self.store.save_recovery(result.recovery)?,
+            OutputMaskerMode::Shared => self.store.add_recovery(result.recovery)?,
             OutputMaskerMode::Deferred { .. } => self.pending.extend_same_key(result.recovery),
         }
         Ok(masked)
@@ -1244,8 +1130,10 @@ fn handle_hook(
             ) else {
                 return Ok(json!({}));
             };
+            let store = RecoveryStore::load(session)?;
+            let mut masker = OutputMasker::new_shared(store);
             let (updated, changed) =
-                transform_json_strings(tool_response, &mut |text| mask_hook_text(session, text))?;
+                transform_json_strings(tool_response, &mut |text| masker.mask_tool_output(text))?;
             if changed {
                 Ok(after_tool_output(provider, updated))
             } else {
@@ -1259,7 +1147,7 @@ fn handle_hook(
 fn before_tool_updated_input(
     provider: HookProvider,
     session_name: &str,
-    session: &Session,
+    _session: &Session,
     tool_name: &str,
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
@@ -1286,7 +1174,7 @@ fn before_tool_updated_input(
             return Ok((updated, true));
         }
     }
-    transform_json_strings(tool_input, &mut |text| session.resolve_all(text))
+    Ok((tool_input.clone(), false))
 }
 
 fn is_read_like_tool_name(tool_name: &str) -> bool {
@@ -1617,22 +1505,16 @@ where
     }
 }
 
-fn mask_hook_text(session: &Session, text: &str) -> Result<String, String> {
-    mask_tool_output(session, text)
-}
-
+#[cfg(test)]
 fn mask_tool_output(session: &Session, text: &str) -> Result<String, String> {
-    let kind = if looks_like_sensitive_env_output(text) || looks_like_env_output(text) {
-        Kind::Env
-    } else {
-        Kind::Text
-    };
-    mask_text(session, text, kind)
+    let store = RecoveryStore::load(session)?;
+    OutputMasker::new_shared(store).mask_tool_output(text)
 }
 
 #[cfg(test)]
 fn mask_live_output(session: &Session, text: &str) -> Result<String, String> {
-    mask_text(session, text, live_output_kind(text))
+    let store = RecoveryStore::load(session)?;
+    OutputMasker::new_shared(store).mask_text(text, live_output_kind(text))
 }
 
 fn live_output_kind(text: &str) -> Kind {
@@ -1644,21 +1526,6 @@ fn live_output_kind(text: &str) -> Kind {
     } else {
         Kind::Text
     }
-}
-
-fn mask_text(session: &Session, text: &str, kind: Kind) -> Result<String, String> {
-    let remasked = session.remask_all(text)?;
-    let result = Engine::with_profile(Profile::Strict).mask(
-        Input {
-            kind,
-            data: remasked,
-        },
-        &Config::new(session.key),
-    );
-    if !result.recovery.is_empty() {
-        session.save_recovery(&result.recovery)?;
-    }
-    Ok(result.masked)
 }
 
 fn looks_like_env_output(text: &str) -> bool {
@@ -1739,21 +1606,10 @@ fn checked_session_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-fn read_key(path: &Path) -> Result<[u8; 32], String> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("could not read key '{}': {e}", path.display()))?;
-    bytes
-        .try_into()
-        .map_err(|_| format!("key '{}' must be exactly 32 bytes", path.display()))
-}
-
-fn write_key(path: &Path, key: &[u8; 32]) -> Result<(), String> {
-    std::fs::write(path, key).map_err(|e| format!("could not write key '{}': {e}", path.display()))
-}
-
+#[cfg(test)]
 fn unix_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
 }
@@ -2143,7 +1999,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_round_trips_mask_resolve_remask() {
+    fn session_recovery_is_process_local() {
         let root = std::env::temp_dir().join(format!(
             "pentect-agent-test-{}-{}",
             std::process::id(),
@@ -2168,6 +2024,7 @@ mod tests {
             .unwrap();
         assert!(remasked.contains("<<OPENAI_API_KEY_"), "{remasked}");
         assert!(!remasked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        assert!(!root.exists(), "{}", root.display());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2270,6 +2127,44 @@ mod tests {
     }
 
     #[test]
+    fn recovery_store_is_process_local_only() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-agent-test-{}-{}-process-local",
+            std::process::id(),
+            unix_millis()
+        ));
+        let session = Session::open_at(&root, "t").unwrap();
+        let store = RecoveryStore::load(&session).unwrap();
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input::text("OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+            &Config::new(session.key),
+        );
+
+        let masked = result.masked.clone();
+        store.add_recovery(result.recovery).unwrap();
+
+        assert_eq!(
+            store.resolve_all(&masked).unwrap(),
+            "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+        );
+        assert!(!root.exists(), "{}", root.display());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_does_not_create_key_or_recovery_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-agent-test-{}-{}-session",
+            std::process::id(),
+            unix_millis()
+        ));
+
+        let _session = Session::open_at(&root, "t").unwrap();
+        assert!(!root.exists(), "{}", root.display());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn read_dotenv_masks_all_values() {
         let root = std::env::temp_dir().join(format!(
             "pentect-agent-test-{}-{}-read-dotenv",
@@ -2365,10 +2260,9 @@ mod tests {
     }
 
     #[test]
-    fn exec_env_binding_resolves_placeholder_for_child_process() {
+    fn exec_env_binding_injects_literal_and_masks_output() {
         let (root, session) = empty_session("exec-env-binding");
         let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-        let masked = mask_text(&session, raw, Kind::Text).unwrap();
         let command = if cfg!(windows) {
             "Write-Output $env:OPENAI_API_KEY".to_string()
         } else {
@@ -2378,7 +2272,7 @@ mod tests {
             session: DEFAULT_SESSION.to_string(),
             env: vec![EnvBinding {
                 name: "OPENAI_API_KEY".to_string(),
-                value: masked,
+                value: raw.to_string(),
             }],
             allow_env: Vec::new(),
             deny_env: Vec::new(),
@@ -2650,10 +2544,6 @@ mod tests {
             !content.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
             "{content}"
         );
-        assert_eq!(
-            session.resolve_all(content).unwrap(),
-            "token=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
-        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2661,10 +2551,9 @@ mod tests {
     fn hook_text_masks_runpod_token_as_plain_text() {
         let (root, session) = empty_session("hook-runpod-text");
         let raw = concat!("RUNPOD=", "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
-        let masked = mask_hook_text(&session, raw).unwrap();
+        let masked = mask_tool_output(&session, raw).unwrap();
         assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
         assert!(masked.contains("<<RUNPOD_API_KEY_"), "{masked}");
-        assert_eq!(session.resolve_all(&masked).unwrap(), raw);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2718,7 +2607,6 @@ mod tests {
             },
             &Config::new(session.key),
         );
-        session.save_recovery(&result.recovery).unwrap();
         (root, session, result.masked)
     }
 

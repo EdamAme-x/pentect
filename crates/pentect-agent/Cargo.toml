@@ -22,3 +22,4 @@ serde_json = { workspace = true }
 anstream = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+zeroize = { workspace = true }

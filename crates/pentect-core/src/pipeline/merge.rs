@@ -7,8 +7,14 @@ use super::interval::RangeIndex;
 pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
     let protected_index = RangeIndex::new(protected.to_vec());
 
-    // Drop empties and anything touching a frozen placeholder.
-    spans.retain(|s| !s.range.is_empty() && !protected_index.overlaps(&s.range));
+    // Drop empties and anything overlapping or directly touching a frozen
+    // placeholder. Placeholder delimiters are punctuation, so a second pass can
+    // otherwise create a new synthetic word boundary and mask a harmless tail.
+    spans.retain(|s| {
+        !s.range.is_empty()
+            && !protected_index.overlaps(&s.range)
+            && !touches_protected(&s.range, protected)
+    });
 
     // Strongest first (Span::cmp_strength is the one canonical ordering).
     spans.sort_by(|a, b| b.cmp_strength(a));
@@ -59,6 +65,12 @@ fn subtract(p: ByteRange, a: &ByteRange) -> Vec<ByteRange> {
     out
 }
 
+fn touches_protected(range: &ByteRange, protected: &[ByteRange]) -> bool {
+    protected
+        .iter()
+        .any(|p| range.start == p.end || range.end == p.start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +115,18 @@ mod tests {
             &[ByteRange::new(0, 5)],
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn placeholder_adjacent_spans_are_dropped() {
+        let out = merge(
+            vec![
+                span(5, 10, Confidence::High),
+                span(11, 16, Confidence::High),
+            ],
+            &[ByteRange::new(0, 5), ByteRange::new(16, 20)],
+        );
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]

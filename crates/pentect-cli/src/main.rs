@@ -4,31 +4,22 @@
 mod input;
 
 use input::{InputAdapter, TextInput};
-use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, Recovery, RuleDetector};
+use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, RuleDetector};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Refuse oversized input rather than emit partially-masked output (a masked
 /// head plus a raw tail would leak the tail).
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
-const DEFAULT_SESSION: &str = "default";
-const KEY_FILE: &str = "key.bin";
-const RECOVERY_DIR: &str = "recoveries";
-
-static RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
-        Some("write" | "exec" | "approve" | "hook" | "resolve" | "remask") => {
-            cmd_agent_passthrough_from(1, &args)
-        }
+        Some("exec" | "approve" | "hook" | "purge") => cmd_agent_passthrough_from(1, &args),
         Some("agent") => cmd_agent_passthrough(&args),
         Some("codex") => cmd_agent_tool(AgentTool::Codex, &args),
         Some("claude") => cmd_agent_tool(AgentTool::Claude, &args),
@@ -40,7 +31,7 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--semantic] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
-         pentect read|write|exec|approve|hook|resolve|remask ...\n\
+         pentect read|exec|approve|hook|purge ...\n\
          pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
          \x20 mask secrets from stdin to stdout\n\
          \x20 codex|claude|gemini starts that agent with temporary Pentect hook config\n\
@@ -234,10 +225,6 @@ fn cmd_read(args: &[String]) {
         Ok(o) => o,
         Err(e) => die(&e),
     };
-    let session = match Session::open(&opts.session) {
-        Ok(s) => s,
-        Err(e) => die(&e),
-    };
     let data = match read_input(&opts.path, opts.input_format) {
         Ok(s) => s,
         Err(e) => die(&e),
@@ -246,14 +233,9 @@ fn cmd_read(args: &[String]) {
     let engine = Engine::with_profile(opts.profile);
     let cfg = Config {
         disclose_length: opts.disclose_length,
-        ..Config::new(session.key)
+        ..Config::generate()
     };
     let result = engine.mask(Input { kind, data }, &cfg);
-    if !result.recovery.is_empty() {
-        if let Err(e) = session.save_recovery(&result.recovery) {
-            die(&e);
-        }
-    }
     print!("{}", result.masked);
     let _ = std::io::stdout().flush();
     if opts.emit_meta {
@@ -279,7 +261,6 @@ enum ReadInputFormat {
 }
 
 struct ReadOpts {
-    session: String,
     input_format: ReadInputFormat,
     kind: Option<Kind>,
     profile: Profile,
@@ -290,7 +271,6 @@ struct ReadOpts {
 
 impl ReadOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
-        let mut session = DEFAULT_SESSION.to_string();
         let mut input_format = ReadInputFormat::Text;
         let mut kind = None;
         let mut profile = Profile::Strict;
@@ -300,9 +280,6 @@ impl ReadOpts {
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
-                "--session" => {
-                    session = checked_session_name(&required_value(args, &mut i, "--session")?)?;
-                }
                 "--input" => {
                     input_format =
                         parse_read_input_format(&required_value(args, &mut i, "--input")?)?;
@@ -332,7 +309,6 @@ impl ReadOpts {
             }
         }
         Ok(Self {
-            session,
             input_format,
             kind,
             profile,
@@ -340,42 +316,6 @@ impl ReadOpts {
             emit_meta,
             path: path.ok_or_else(|| "read requires PATH".to_string())?,
         })
-    }
-}
-
-struct Session {
-    root: PathBuf,
-    key: [u8; 32],
-}
-
-impl Session {
-    fn open(name: &str) -> Result<Self, String> {
-        let root = session_root(name)?;
-        std::fs::create_dir_all(root.join(RECOVERY_DIR))
-            .map_err(|e| format!("could not create session '{}': {e}", root.display()))?;
-        let key_path = root.join(KEY_FILE);
-        let key = if key_path.exists() {
-            read_key(&key_path)?
-        } else {
-            let key = Config::generate().key;
-            write_key(&key_path, &key)?;
-            key
-        };
-        Ok(Self { root, key })
-    }
-
-    fn save_recovery(&self, recovery: &Recovery) -> Result<(), String> {
-        let dir = self.root.join(RECOVERY_DIR);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("could not create recovery dir '{}': {e}", dir.display()))?;
-        let path = dir.join(format!(
-            "recovery-{}-{}-{}.pnr",
-            unix_millis(),
-            std::process::id(),
-            RECOVERY_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, recovery.serialize(&self.key))
-            .map_err(|e| format!("could not write recovery '{}': {e}", path.display()))
     }
 }
 
@@ -703,7 +643,7 @@ fn gemini_hook_settings(agent: &Path, session: &str) -> Value {
             "BeforeTool": [{
                 "matcher": "*",
                 "hooks": [{
-                    "name": "pentect-resolve-tool-input",
+                    "name": "pentect-wrap-tool-input",
                     "type": "command",
                     "command": command,
                     "timeout": 30000
@@ -922,7 +862,8 @@ fn maybe_print_first_run_agent_hint(session: &str) {
     }
     eprintln!("[pentect] tool-boundary masking is active for this directory.");
     eprintln!("[pentect] AI tools should call `pentect exec \"<command>\"`.");
-    eprintln!("[pentect] `pentect read` is a human masked-preview helper.");
+    eprintln!("[pentect] output masking is one-way by default; no recovery state is saved.");
+    eprintln!("[pentect] use `pentect purge` to delete old saved recovery state.");
     let _ = std::fs::write(marker, b"shown\n");
 }
 
@@ -931,42 +872,6 @@ fn agent_session_root(session: &str) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".pentect-agent"));
     base.join(session)
-}
-
-fn session_root(name: &str) -> Result<PathBuf, String> {
-    let name = checked_session_name(name)?;
-    Ok(agent_session_root(&name))
-}
-
-fn checked_session_name(name: &str) -> Result<String, String> {
-    if name.is_empty() {
-        return Err("session name must not be empty".to_string());
-    }
-    if name.chars().any(|c| {
-        c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
-    }) {
-        return Err("session name must be a simple file-name segment".to_string());
-    }
-    Ok(name.to_string())
-}
-
-fn read_key(path: &Path) -> Result<[u8; 32], String> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("could not read key '{}': {e}", path.display()))?;
-    bytes
-        .try_into()
-        .map_err(|_| format!("key '{}' must be exactly 32 bytes", path.display()))
-}
-
-fn write_key(path: &Path, key: &[u8; 32]) -> Result<(), String> {
-    std::fs::write(path, key).map_err(|e| format!("could not write key '{}': {e}", path.display()))
-}
-
-fn unix_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 fn shell_quote_display(value: &str) -> String {
@@ -1285,6 +1190,18 @@ mod tests {
         let opts = ReadOpts::parse(&args).unwrap();
         assert_eq!(opts.kind, Some(Kind::Env));
         assert!(opts.emit_meta);
+
+        let args = vec![
+            "pentect".into(),
+            "read".into(),
+            "--persist".into(),
+            r".\.env".into(),
+        ];
+        let err = match ReadOpts::parse(&args) {
+            Ok(_) => panic!("expected --persist to be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unknown option"), "{err}");
     }
 
     #[test]
@@ -1357,37 +1274,6 @@ mod tests {
     fn legacy_ner_flag_is_rejected() {
         let args = vec!["pentect".into(), "mask".into(), "--ner".into()];
         assert!(validate_mask_args(&args).unwrap_err().contains("removed"));
-    }
-
-    #[test]
-    fn cli_session_saves_recovery_in_agent_compatible_layout() {
-        let root = std::env::temp_dir().join(format!(
-            "pentect-cli-session-test-{}-{}",
-            std::process::id(),
-            unix_millis()
-        ));
-        let previous = std::env::var_os("PENTECT_AGENT_HOME");
-        std::env::set_var("PENTECT_AGENT_HOME", &root);
-
-        let session = Session::open("t").unwrap();
-        let result = Engine::with_profile(Profile::Strict).mask(
-            Input {
-                kind: Kind::Env,
-                data: "TEST_SECRET=114514810\nNOTE=hello world\n".into(),
-            },
-            &Config::new(session.key),
-        );
-        session.save_recovery(&result.recovery).unwrap();
-
-        assert!(root.join("t").join("key.bin").exists());
-        let recoveries = root.join("t").join("recoveries");
-        assert!(std::fs::read_dir(&recoveries).unwrap().count() > 0);
-
-        match previous {
-            Some(value) => std::env::set_var("PENTECT_AGENT_HOME", value),
-            None => std::env::remove_var("PENTECT_AGENT_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -884,6 +884,7 @@ dependencies = [
  "pentect-core",
  "ratatui",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
