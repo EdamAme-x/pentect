@@ -26,7 +26,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
-        Some("write" | "exec" | "hook" | "resolve" | "remask") => {
+        Some("write" | "exec" | "approve" | "hook" | "resolve" | "remask") => {
             cmd_agent_passthrough_from(1, &args)
         }
         Some("agent") => cmd_agent_passthrough(&args),
@@ -40,7 +40,7 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--semantic] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
-         pentect read|write|exec|hook|resolve|remask ...\n\
+         pentect read|write|exec|approve|hook|resolve|remask ...\n\
          pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
          \x20 mask secrets from stdin to stdout\n\
          \x20 codex|claude|gemini starts that agent with temporary Pentect hook config\n\

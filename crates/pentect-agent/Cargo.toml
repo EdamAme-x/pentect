@@ -20,3 +20,5 @@ data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 serde_json = { workspace = true }
 anstream = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }

@@ -5,6 +5,9 @@
 //! write/exec tool input -> resolve placeholders locally;
 //! command output -> remask before it returns to the AI.
 
+mod approve_ui;
+
+use approve_ui::{ApprovalDecision, ApprovalRequest, EnvAction, EnvReview};
 use pentect_core::{Config, Engine, Input, Kind, Profile, Recovery};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -29,6 +32,7 @@ fn main() {
         Some("read") => cmd_read(&args),
         Some("write") => cmd_write(&args),
         Some("exec") => cmd_exec(&args),
+        Some("approve") => cmd_approve(&args),
         Some("hook") => cmd_hook(&args),
         Some("resolve") => cmd_filter(&args, FilterMode::Resolve),
         Some("remask") => cmd_filter(&args, FilterMode::Remask),
@@ -42,8 +46,9 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect exec [--session NAME] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
-         pentect exec [--session NAME] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... -- PROGRAM [ARG...]\n\
+        "pentect exec [--session NAME] [--approve] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
+         pentect exec [--session NAME] [--approve] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... -- PROGRAM [ARG...]\n\
+         pentect approve [--session NAME] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
          pentect write PATH < masked-text\n\
          pentect read [--session NAME] [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
          pentect hook codex|claude|gemini < hook-json\n\
@@ -128,6 +133,16 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
+    if opts.approve {
+        match request_approval(&store, &opts, "Approve command execution") {
+            Ok(ApprovalDecision::Approve) => {}
+            Ok(ApprovalDecision::Deny) => {
+                eprintln!("[pentect] command denied");
+                return 1;
+            }
+            Err(e) => return die(&e),
+        }
+    }
     if opts.live {
         let status = match run_resolved_command_live(&store, &opts) {
             Ok(s) => s,
@@ -155,6 +170,133 @@ fn cmd_exec(args: &[String]) -> i32 {
     eprint!("{safe_stderr}");
     let _ = std::io::stderr().flush();
     exit_code(output.status)
+}
+
+fn cmd_approve(args: &[String]) -> i32 {
+    let opts = match ExecOpts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return die(&e),
+    };
+    let session = match Session::open(&opts.session) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
+    let store = match RecoveryStore::load(&session) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
+    match request_approval(&store, &opts, "Preview Pentect approval") {
+        Ok(ApprovalDecision::Approve) => 0,
+        Ok(ApprovalDecision::Deny) => 1,
+        Err(e) => die(&e),
+    }
+}
+
+fn request_approval(
+    store: &RecoveryStore,
+    opts: &ExecOpts,
+    title: &str,
+) -> Result<ApprovalDecision, String> {
+    let command = display_exec_mode(&opts.mode);
+    let request = ApprovalRequest {
+        title: title.to_string(),
+        command: command.clone(),
+        session: opts.session.clone(),
+        mode: exec_mode_label(&opts.mode).to_string(),
+        env: approval_env_rows(opts),
+        warnings: approval_warnings(store, opts, &command)?,
+    };
+    approve_ui::run(&request)
+}
+
+fn approval_env_rows(opts: &ExecOpts) -> Vec<EnvReview> {
+    let mut rows = Vec::new();
+    for binding in &opts.env {
+        let detail = if binding.value.contains("<<") {
+            "placeholder resolves only inside child process".to_string()
+        } else {
+            "literal value is hidden from this review".to_string()
+        };
+        rows.push(EnvReview {
+            name: binding.name.clone(),
+            action: EnvAction::Inject,
+            detail,
+        });
+    }
+    for name in &opts.allow_env {
+        rows.push(EnvReview {
+            name: name.clone(),
+            action: EnvAction::Allow,
+            detail: "direct env references for this name pass policy".to_string(),
+        });
+    }
+    for name in &opts.deny_env {
+        rows.push(EnvReview {
+            name: name.clone(),
+            action: EnvAction::Deny,
+            detail: "direct env references for this name are blocked".to_string(),
+        });
+    }
+    rows
+}
+
+fn approval_warnings(
+    store: &RecoveryStore,
+    opts: &ExecOpts,
+    display_command: &str,
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    let env = opts
+        .env
+        .iter()
+        .map(|binding| (binding.name.clone(), String::new()))
+        .collect::<Vec<_>>();
+    let policy = exec_env_policy(&env, opts)?;
+    let resolved_for_policy = store.resolve_all(display_command)?;
+    let guard = match &opts.mode {
+        ExecMode::Program(args) => {
+            let program = args.first().map(String::as_str).unwrap_or_default();
+            guard_program_invocation_with_env(program, &args[1..], &policy)
+        }
+        ExecMode::Shell(_) => guard_shell_script_with_env(&resolved_for_policy, &policy),
+    };
+    if let Err(reason) = guard {
+        warnings.push(reason);
+    }
+    if opts.env.is_empty() && opts.allow_env.is_empty() && opts.deny_env.is_empty() {
+        warnings.push("ambient environment is inherited by the child process today; explicit env policy is still recommended".to_string());
+    }
+    if opts.live {
+        warnings.push(
+            "live output is masked in chunks; very long partial lines flush at chunk boundaries"
+                .to_string(),
+        );
+    }
+    Ok(warnings)
+}
+
+fn display_exec_mode(mode: &ExecMode) -> String {
+    match mode {
+        ExecMode::Shell(command) => command.clone(),
+        ExecMode::Program(args) => args
+            .iter()
+            .map(|arg| {
+                if cfg!(windows) {
+                    powershell_word(arg)
+                } else {
+                    shell_quote_unix(arg)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn exec_mode_label(mode: &ExecMode) -> &'static str {
+    match mode {
+        ExecMode::Shell(_) => "shell",
+        ExecMode::Program(_) => "program",
+    }
 }
 
 fn cmd_hook(args: &[String]) -> i32 {
@@ -727,6 +869,7 @@ struct ExecOpts {
     allow_env: Vec<String>,
     deny_env: Vec<String>,
     live: bool,
+    approve: bool,
     mode: ExecMode,
 }
 
@@ -747,6 +890,7 @@ impl ExecOpts {
         let mut allow_env = Vec::new();
         let mut deny_env = Vec::new();
         let mut live = false;
+        let mut approve = false;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
@@ -755,6 +899,10 @@ impl ExecOpts {
                 }
                 "--live" => {
                     live = true;
+                    i += 1;
+                }
+                "--approve" => {
+                    approve = true;
                     i += 1;
                 }
                 "--env" => {
@@ -782,6 +930,7 @@ impl ExecOpts {
                         allow_env,
                         deny_env,
                         live,
+                        approve,
                         mode: ExecMode::Program(command),
                     });
                 }
@@ -793,6 +942,7 @@ impl ExecOpts {
                         allow_env,
                         deny_env,
                         live,
+                        approve,
                         mode: ExecMode::Shell(args[i..].join(" ")),
                     });
                 }
@@ -2069,6 +2219,7 @@ mod tests {
             "pentect-agent",
             "exec",
             "--live",
+            "--approve",
             "--allow-env",
             "RUNPOD_API_KEY",
             "--deny-env",
@@ -2078,6 +2229,7 @@ mod tests {
         ]);
         let opts = ExecOpts::parse(&args).unwrap();
         assert!(opts.live);
+        assert!(opts.approve);
         assert_eq!(opts.allow_env, ["RUNPOD_API_KEY"]);
         assert_eq!(opts.deny_env, ["AWS_SECRET_ACCESS_KEY"]);
         assert!(matches!(
@@ -2231,6 +2383,7 @@ mod tests {
             allow_env: Vec::new(),
             deny_env: Vec::new(),
             live: false,
+            approve: false,
             mode: ExecMode::Shell(command),
         };
 
