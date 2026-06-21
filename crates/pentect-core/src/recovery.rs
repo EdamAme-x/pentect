@@ -94,7 +94,7 @@ impl Recovery {
             .map
             .keys()
             .filter_map(|ph| self.reveal(ph).map(|v| (v, ph.as_str())))
-            .filter(|(v, _)| !v.is_empty())
+            .filter(|(v, _)| is_remaskable_echo(v))
             .collect();
         pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
         let mut out = text.to_string();
@@ -169,6 +169,11 @@ impl Recovery {
             map,
         })
     }
+}
+
+fn is_remaskable_echo(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.len() >= 6 && !matches!(trimmed, "true" | "false" | "null")
 }
 
 impl Drop for Recovery {
@@ -416,6 +421,19 @@ mod tests {
         // restore then remask is the identity on masked text.
         let masked = format!("use {ph}");
         assert_eq!(rec.remask(&restore(&masked, &rec).unwrap()), masked);
+    }
+
+    #[test]
+    fn remask_ignores_short_metadata_values() {
+        let rec = Recovery::seal(
+            HashMap::from([("<<COUNT_0011223344556677>>".to_string(), "3".to_string())]),
+            &[5u8; 32],
+        );
+        assert_eq!(rec.resolve("n=<<COUNT_0011223344556677>>"), "n=3");
+        assert_eq!(
+            rec.remask("AKIA3EXAMPLE has a digit"),
+            "AKIA3EXAMPLE has a digit"
+        );
     }
 
     #[test]

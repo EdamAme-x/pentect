@@ -1232,7 +1232,9 @@ impl OutputMasker {
     }
 
     fn mask_text(&mut self, text: &str, kind: Kind) -> Result<String, String> {
-        let remasked = self.remask_all(text)?;
+        let redacted = redact_env_derivative_lines(text);
+        let remasked = self.remask_all(&redacted)?;
+        let needs_text_pass = kind != Kind::Text;
         let result = self.engine.mask(
             Input {
                 kind,
@@ -1240,10 +1242,22 @@ impl OutputMasker {
             },
             &Config::new(self.store.session.key),
         );
-        let masked = result.masked;
+        let mut masked = result.masked;
+        let mut recovery = result.recovery;
+        if needs_text_pass {
+            let text_result = self.engine.mask(
+                Input {
+                    kind: Kind::Text,
+                    data: masked,
+                },
+                &Config::new(self.store.session.key),
+            );
+            masked = text_result.masked;
+            recovery.extend_same_key(text_result.recovery);
+        }
         match &mut self.mode {
-            OutputMaskerMode::Shared => self.store.add_recovery(result.recovery)?,
-            OutputMaskerMode::Deferred { .. } => self.pending.extend_same_key(result.recovery),
+            OutputMaskerMode::Shared => self.store.add_recovery(recovery)?,
+            OutputMaskerMode::Deferred { .. } => self.pending.extend_same_key(recovery),
         }
         Ok(masked)
     }
@@ -1798,17 +1812,19 @@ fn live_output_kind(text: &str) -> Kind {
 fn looks_like_env_output(text: &str) -> bool {
     let mut env_lines = 0usize;
     let mut non_empty_lines = 0usize;
+    let mut strong_key = false;
     for line in text.lines().take(256) {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         non_empty_lines += 1;
-        if is_env_assignment_line(trimmed) {
+        if let Some(key) = env_assignment_key(trimmed) {
             env_lines += 1;
+            strong_key |= is_strong_env_output_key(key);
         }
     }
-    env_lines >= 2 && env_lines == non_empty_lines
+    env_lines >= 2 && env_lines == non_empty_lines && strong_key
 }
 
 fn looks_like_sensitive_env_output(text: &str) -> bool {
@@ -1818,12 +1834,157 @@ fn looks_like_sensitive_env_output(text: &str) -> bool {
             continue;
         }
         if let Some(key) = env_assignment_key(trimmed) {
-            if is_sensitive_env_name(&key.to_ascii_lowercase()) {
+            if is_sensitive_env_output_name(&key.to_ascii_lowercase()) {
                 return true;
             }
         }
     }
     false
+}
+
+fn redact_env_derivative_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    for segment in text.split_inclusive('\n') {
+        let (body, ending) = split_line_ending(segment);
+        if let Some(key) =
+            env_derivative_assignment_key(body).or_else(|| env_derivative_summary_key(body))
+        {
+            let indent_len = body.len() - body.trim_start().len();
+            out.push_str(&body[..indent_len]);
+            out.push_str(key);
+            out.push_str("=<<REDACTED_DERIVED>>");
+            out.push_str(ending);
+            changed = true;
+        } else {
+            out.push_str(segment);
+        }
+    }
+    if changed {
+        out
+    } else {
+        text.to_string()
+    }
+}
+
+fn split_line_ending(line: &str) -> (&str, &'static str) {
+    let mut body = line;
+    let mut ending = "";
+    if let Some(stripped) = body.strip_suffix('\n') {
+        body = stripped;
+        ending = "\n";
+    }
+    if let Some(stripped) = body.strip_suffix('\r') {
+        body = stripped;
+        ending = if ending.is_empty() { "\r" } else { "\r\n" };
+    }
+    (body, ending)
+}
+
+fn env_derivative_assignment_key(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let (key, value) = trimmed.split_once('=')?;
+    if key.is_empty() || value.is_empty() || !key.chars().all(is_env_summary_key_char) {
+        return None;
+    }
+    is_derived_output_key(key).then_some(key)
+}
+
+fn env_derivative_summary_key(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let key_end = trimmed
+        .char_indices()
+        .find(|(_, ch)| !is_env_summary_key_char(*ch))
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    if key_end == 0 || key_end == trimmed.len() {
+        return None;
+    }
+    let key = &trimmed[..key_end];
+    if !looks_like_env_summary_key(key) {
+        return None;
+    }
+    let rest = &trimmed[key_end..];
+    if rest.starts_with('=') {
+        return None;
+    }
+    (contains_secret_derivative_marker(rest) || looks_like_tabular_derivative(rest)).then_some(key)
+}
+
+fn is_env_summary_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-')
+}
+
+fn looks_like_env_summary_key(key: &str) -> bool {
+    if key.is_empty() || key.as_bytes()[0].is_ascii_digit() {
+        return false;
+    }
+    let lower = key.to_ascii_lowercase();
+    is_sensitive_env_output_name(&lower)
+        || key.contains('_')
+        || key.contains('.')
+        || key.contains('-')
+        || key.chars().any(|ch| ch.is_ascii_uppercase())
+}
+
+fn is_sensitive_env_output_name(name: &str) -> bool {
+    name == "key" || is_sensitive_env_name(name)
+}
+
+fn is_derived_output_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    [
+        "prefix", "suffix", "length", "len", "base64", "b64", "hex", "encoded", "hash", "digest",
+        "sha1", "sha256",
+    ]
+    .iter()
+    .any(|marker| lower == *marker || lower.contains(&format!("{marker}_")))
+}
+
+fn contains_secret_derivative_marker(rest: &str) -> bool {
+    let lower = rest.to_ascii_lowercase();
+    [
+        "masked",
+        "preview",
+        "prefix",
+        "suffix",
+        "first",
+        "last",
+        "length",
+        "len=",
+        "hex",
+        "base64",
+        "b64",
+        "encoded",
+        "hash",
+        "digest",
+        "sha1",
+        "sha256",
+        "starts_with",
+        "ends_with",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn looks_like_tabular_derivative(rest: &str) -> bool {
+    let mut words = rest.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if first.chars().all(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+    matches!(first.to_ascii_lowercase().as_str(), "length" | "len")
+        && words.any(|word| word.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn is_strong_env_output_key(key: &str) -> bool {
+    is_sensitive_env_output_name(&key.to_ascii_lowercase())
+        || key.chars().any(|ch| ch.is_ascii_uppercase())
 }
 
 fn is_env_assignment_line(line: &str) -> bool {
@@ -2524,6 +2685,8 @@ mod tests {
         guard_shell_script_with_env("Set-Content note.txt hello", &EnvPolicy::default()).unwrap();
         guard_shell_script_with_env("echo $AUTHOR", &EnvPolicy::default()).unwrap();
         guard_shell_script_with_env("Write-Output %USERNAME%", &EnvPolicy::default()).unwrap();
+        guard_shell_script_with_env("$key = 'name'; Write-Output $key", &EnvPolicy::default())
+            .unwrap();
     }
 
     #[test]
@@ -2665,6 +2828,26 @@ mod tests {
     }
 
     #[test]
+    fn metadata_assignment_output_does_not_pollute_recovery() {
+        let (root, session) = empty_session("exec-metadata-assignment");
+        let metadata = "exists=true\ntotal_lines=3\nassignment_lines=3\n";
+        let first = mask_tool_output(&session, metadata).unwrap();
+        assert_eq!(first, metadata);
+
+        let output = "RUNPOD_API_KEY=rpa_FAKEPENTECTJAILBREAK1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
+        let masked = mask_tool_output(&session, output).unwrap();
+        assert!(!masked.contains("rpa_FAKEPENTECTJAILBREAK"), "{masked}");
+        assert!(!masked.contains("4567890abcdef"), "{masked}");
+        assert!(
+            masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+            "{masked}"
+        );
+        assert!(masked.contains("TEST_SECRET=<<SECRET_"), "{masked}");
+        assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn live_single_assignment_output_masks_value() {
         let (root, session) = empty_session("exec-live-single-assignment");
         let masked = mask_live_output(&session, "NOTE=hello world\n").unwrap();
@@ -2683,6 +2866,101 @@ mod tests {
             masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
             "{masked}"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn derived_env_summary_output_does_not_leak_prefix_suffix_or_length() {
+        let (root, session) = empty_session("exec-derived-env-summary");
+        let output = "RUNPOD_API_KEY length=46 masked=rpa_...cdef\nTEST_SECRET length=9 masked=1145...4810\nNOTE length=11 masked=hell...orld\nKEY length=5 masked=abc...xyz\nkey length=5 masked=abc...xyz\nRUNPOD_API_KEY     40\nTEST_SECRET        9\nNOTE               11\nPREFIX_32=rpa_FAKEPENTECTJAILBREAK\nSUFFIX_32=ET=114514810\nBASE64=77u/UlVOUE9E\n";
+        let masked = mask_tool_output(&session, output).unwrap();
+
+        for leaked in [
+            "length=46",
+            "length=9",
+            "length=11",
+            "     40",
+            "        9",
+            "               11",
+            "rpa_",
+            "cdef",
+            "1145",
+            "4810",
+            "hell",
+            "orld",
+            "rpa_FAKE",
+            "ET=114514810",
+            "77u/",
+            "abc",
+            "xyz",
+        ] {
+            assert!(!masked.contains(leaked), "{masked}");
+        }
+        assert!(
+            masked.contains("RUNPOD_API_KEY=<<REDACTED_DERIVED>>"),
+            "{masked}"
+        );
+        assert!(
+            masked.contains("TEST_SECRET=<<REDACTED_DERIVED>>"),
+            "{masked}"
+        );
+        assert!(masked.contains("NOTE=<<REDACTED_DERIVED>>"), "{masked}");
+        assert!(masked.contains("KEY=<<REDACTED_DERIVED>>"), "{masked}");
+        assert!(masked.contains("key=<<REDACTED_DERIVED>>"), "{masked}");
+        assert!(
+            masked.contains("PREFIX_32=<<REDACTED_DERIVED>>"),
+            "{masked}"
+        );
+        assert!(
+            masked.contains("SUFFIX_32=<<REDACTED_DERIVED>>"),
+            "{masked}"
+        );
+        assert!(masked.contains("BASE64=<<REDACTED_DERIVED>>"), "{masked}");
+        assert_eq!(
+            masked
+                .matches("RUNPOD_API_KEY=<<REDACTED_DERIVED>>")
+                .count(),
+            2,
+            "{masked}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn encoded_env_derivatives_do_not_leak() {
+        let (root, session) = empty_session("exec-encoded-env-derivatives");
+        let dotenv = "RUNPOD_API_KEY=rpa_FAKEPENTECTJAILBREAK1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
+        let b64 = data_encoding::BASE64.encode(dotenv.as_bytes());
+        let output = format!(
+            "B64_FILE:\n{b64}\nHEX_VALUES:\nRUNPOD_API_KEY hex=7270615f46414b4550454e544543544a41494c425245414b31323334353637383930616263646566\nNOTE hex=68656c6c6f20776f726c64\n"
+        );
+        let masked = mask_tool_output(&session, &output).unwrap();
+        assert!(!masked.contains(&b64), "{masked}");
+        assert!(!masked.contains("7270615f46414b"), "{masked}");
+        assert!(!masked.contains("68656c6c6f20776f726c64"), "{masked}");
+        assert!(masked.contains("<<SECRET_"), "{masked}");
+        assert!(
+            masked.contains("RUNPOD_API_KEY=<<REDACTED_DERIVED>>"),
+            "{masked}"
+        );
+        assert!(masked.contains("NOTE=<<REDACTED_DERIVED>>"), "{masked}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mixed_env_output_still_masks_encoded_non_env_lines() {
+        let (root, session) = empty_session("exec-mixed-env-encoded");
+        let dotenv = "RUNPOD_API_KEY=rpa_FAKEPENTECTJAILBREAK1234567890abcdef\r\nTEST_SECRET=114514810\r\nNOTE=hello world\r\n";
+        let b64 = data_encoding::BASE64.encode(dotenv.as_bytes());
+        let output = format!("{dotenv}B64_FILE:\n{b64}\n");
+        let masked = mask_tool_output(&session, &output).unwrap();
+        assert!(!masked.contains("rpa_FAKEPENTECTJAILBREAK"), "{masked}");
+        assert!(!masked.contains(&b64), "{masked}");
+        assert!(
+            masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+            "{masked}"
+        );
+        assert!(masked.contains("B64_FILE:\n<<SECRET_"), "{masked}");
         let _ = std::fs::remove_dir_all(root);
     }
 

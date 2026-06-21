@@ -117,6 +117,13 @@ impl DecodeDetector {
     }
 
     fn identify(&self, text: &str) -> Option<(Category, String, Confidence)> {
+        if looks_like_env_secret_text(text) {
+            return Some((
+                Category::Secret,
+                labels::SECRET.to_string(),
+                Confidence::High,
+            ));
+        }
         let region = Region {
             span: ByteRange::new(0, text.len()),
             ctx: Context {
@@ -139,6 +146,42 @@ impl DecodeDetector {
     }
 }
 
+fn looks_like_env_secret_text(text: &str) -> bool {
+    let mut assignments = 0usize;
+    let mut strong_key = false;
+    for line in text.lines().take(256) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed
+            .strip_prefix("export ")
+            .unwrap_or(trimmed)
+            .split_once('=')
+        else {
+            continue;
+        };
+        if key.is_empty()
+            || value.is_empty()
+            || !key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            continue;
+        }
+        assignments += 1;
+        let lower = key.to_ascii_lowercase();
+        strong_key |= key.chars().any(|ch| ch.is_ascii_uppercase())
+            || lower.contains("secret")
+            || lower.contains("token")
+            || lower.contains("password")
+            || lower.contains("api_key")
+            || lower.contains("apikey")
+            || lower == "key";
+    }
+    assignments >= 2 && strong_key
+}
+
 impl Detector for DecodeDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let s = view.text();
@@ -148,6 +191,7 @@ impl Detector for DecodeDetector {
                 continue;
             }
             let run = &s[start..end];
+            let mut pushed = false;
             if let Some((cat, label, conf)) = self.probe(run, self.max_depth) {
                 out.push(Span {
                     range: view.to_raw(ByteRange::new(start, end)),
@@ -156,7 +200,28 @@ impl Detector for DecodeDetector {
                     confidence: conf,
                     source: DetectorId::Decode,
                 });
-            } else if self.mask_unknown
+                pushed = true;
+            }
+            if !pushed {
+                if let Some(eq) = run.find('=') {
+                    let value_start = eq + 1;
+                    let value = &run[value_start..];
+                    if value.len() >= MIN_DECODE_RUN {
+                        if let Some((cat, label, conf)) = self.probe(value, self.max_depth) {
+                            out.push(Span {
+                                range: view.to_raw(ByteRange::new(start + value_start, end)),
+                                category: cat,
+                                label,
+                                confidence: conf,
+                                source: DetectorId::Decode,
+                            });
+                            pushed = true;
+                        }
+                    }
+                }
+            }
+            if !pushed
+                && self.mask_unknown
                 && end - start >= self.min_unknown_run
                 && self.decodes_to_binary(run)
             {
@@ -237,5 +302,18 @@ mod tests {
             .collect(); // 8/24 = 33%
         assert!(!looks_binary(&below));
         assert!(looks_binary(&above));
+    }
+
+    #[test]
+    fn encoded_dotenv_blob_is_identified() {
+        let raw = "RUNPOD_API_KEY=rpa_FAKEPENTECTJAILBREAK1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
+        let enc = data_encoding::BASE64.encode(raw.as_bytes());
+        let sample = format!("blob={enc}");
+        let spans =
+            DecodeDetector::builtin().detect(&NormalizedView::build(&region(&sample), &sample));
+        assert!(
+            spans.iter().any(|span| span.label == labels::SECRET),
+            "{spans:?}"
+        );
     }
 }
