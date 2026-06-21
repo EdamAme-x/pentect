@@ -195,9 +195,9 @@ fn approval_env_rows(opts: &ExecOpts) -> Vec<EnvReview> {
     let mut rows = Vec::new();
     for binding in &opts.env {
         let detail = if binding.value.contains("<<") {
-            "placeholder resolves only inside child process".to_string()
+            "masked token is passed as text; no secret restore".to_string()
         } else {
-            "literal value is hidden from this review".to_string()
+            "value is hidden here; child receives it; output is masked".to_string()
         };
         rows.push(EnvReview {
             name: binding.name.clone(),
@@ -209,7 +209,7 @@ fn approval_env_rows(opts: &ExecOpts) -> Vec<EnvReview> {
         rows.push(EnvReview {
             name: name.clone(),
             action: EnvAction::Allow,
-            detail: "direct env references for this name pass policy".to_string(),
+            detail: "direct reads of this env name are allowed".to_string(),
         });
     }
     for name in &opts.deny_env {
@@ -245,7 +245,7 @@ fn approval_warnings(
         warnings.push(reason);
     }
     if opts.env.is_empty() && opts.allow_env.is_empty() && opts.deny_env.is_empty() {
-        warnings.push("ambient environment is inherited by the child process today; explicit env policy is still recommended".to_string());
+        warnings.push("no explicit env policy: child inherits ambient env; output masking still applies, but prefer --env for approved values".to_string());
     }
     if opts.live {
         warnings.push(
@@ -462,7 +462,7 @@ fn guard_sensitive_source_access_with_env(
     let normalized = normalize_policy_text(text);
     if contains_env_read_reference(&normalized, env_policy) {
         return Err(
-            "Pentect blocked direct environment-variable access; pass approved values through Pentect placeholders instead."
+            "Pentect blocked direct environment-variable access; pass approved values with `--env NAME=VALUE` instead."
                 .to_string(),
         );
     }
