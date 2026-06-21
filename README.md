@@ -4,15 +4,17 @@ memo: ui / approve / shell result / prompt
 MVP: secret-aware tool boundary for AI agents.
 
 - Rewrite shell tools to `pentect exec "<command>"` from hooks.
-- Mask read/shell output before it returns to the agent.
-- Do not persist recovery state by default; placeholders are one-way outside the current process.
-- Pass literal environment values to child processes with `pentect exec --env NAME=VALUE "<command>"`; stdout/stderr are masked before returning to the agent.
+- Mask read/shell/MCP-like tool output before it returns to the agent.
+- Plain `mask` / `read` stay one-way. Agent hooks use a local per-directory capability vault so masked handles can be reused without showing plaintext to the AI.
+- Pass environment values or known handles to child processes with `pentect exec --env NAME=VALUE "<command>"`; stdout/stderr are masked before returning to the agent.
+- Materialize known handles into `.env` writes: when a Write-like tool tries to write `KEY=<<HANDLE>>`, Pentect writes the resolved local `.env` itself and blocks the original Write tool so plaintext is not returned in hook JSON.
 - Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.
 - Gate direct environment-variable reads with `--allow-env NAME` / `--deny-env NAME`.
-- Show the terminal approval screen with `pentect approve "<command>"` or gate execution with `pentect exec --approve "<command>"`.
+- Open the terminal control screen with `pentect`; inspect another scope with `pentect dashboard --dir PATH --session NAME`.
+- Show the command approval screen with `pentect approve "<command>"` or gate execution with `pentect exec --approve "<command>"`.
 - Block direct AI Read tools; use `pentect exec "<command>"` at the tool boundary.
 - Keep `pentect read` as a one-way human masked-preview helper, not the AI path.
-- Delete old saved recovery state with `pentect purge`.
+- Delete local capability state with `pentect purge`.
 - Prompt/TUI masking and external UI logs are out of scope for this MVP.
 
 - Hooks

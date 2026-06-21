@@ -24,6 +24,10 @@ pub struct ApprovalRequest {
     pub command: String,
     pub session: String,
     pub mode: String,
+    pub header_note: String,
+    pub approve_label: String,
+    pub deny_label: String,
+    pub footer_note: String,
     pub env: Vec<EnvReview>,
     pub warnings: Vec<String>,
 }
@@ -176,7 +180,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
             ),
         ]),
         Line::from(Span::styled(
-            "Approve one local execution. Pentect masks stdout/stderr before output returns to the AI.",
+            request.header_note.as_str(),
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -332,9 +336,9 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
     let deny_style = selected_style(app.selected == ApprovalDecision::Deny, Color::Red);
     let text = vec![
         Line::from(vec![
-            Span::styled("  APPROVE & RUN  ", approve_style),
+            Span::styled(format!("  {}  ", app.request.approve_label), approve_style),
             Span::raw("  "),
-            Span::styled("  DENY  ", deny_style),
+            Span::styled(format!("  {}  ", app.request.deny_label), deny_style),
             Span::raw("   "),
             Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
             Span::raw(" select   "),
@@ -346,7 +350,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
             Span::raw(" deny"),
         ]),
         Line::from(Span::styled(
-            "Use Up/Down to scroll long commands. Masked tokens are not restored by default.",
+            app.request.footer_note.as_str(),
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -395,6 +399,14 @@ mod tests {
             command: "Get-Content -Raw -LiteralPath .env".to_string(),
             session: "project".to_string(),
             mode: "shell".to_string(),
+            header_note:
+                "Approve one local execution. Pentect masks stdout/stderr before output returns to the AI."
+                    .to_string(),
+            approve_label: "APPROVE & RUN".to_string(),
+            deny_label: "DENY".to_string(),
+            footer_note:
+                "Use Up/Down to scroll long commands. Masked tokens are not restored by default."
+                    .to_string(),
             env: vec![EnvReview {
                 name: "RUNPOD_API_KEY".to_string(),
                 action: EnvAction::Inject,

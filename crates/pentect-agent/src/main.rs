@@ -21,10 +21,16 @@ const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
+const VAULT_FILE: &str = "capability-vault.pnt";
+const VAULT_MAGIC: &[u8; 4] = b"PNV1";
+const VAULT_VERSION: u8 = 1;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
+        None => cmd_dashboard(&args),
+        Some("dashboard") => cmd_dashboard(&args),
+        Some("--dir" | "--session") => cmd_dashboard(&args),
         Some("read") => cmd_read(&args),
         Some("exec") => cmd_exec(&args),
         Some("approve") => cmd_approve(&args),
@@ -40,16 +46,84 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect exec [--session NAME] [--approve] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
+        "pentect [dashboard] [--session NAME] [--dir PATH]\n\
+         pentect exec [--session NAME] [--approve] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
          pentect exec [--session NAME] [--approve] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... -- PROGRAM [ARG...]\n\
          pentect approve [--session NAME] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
          pentect read [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
-         pentect hook codex|claude|gemini < hook-json\n\
+         pentect hook [--capability] codex|claude|gemini < hook-json\n\
          pentect purge [--session NAME]\n\
          \n\
          agent hooks force shell tools through exec and block direct read tools;\n\
          read is a one-way human masked-preview helper."
     );
+}
+
+fn cmd_dashboard(args: &[String]) -> i32 {
+    let opts = match DashboardOpts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return die(&e),
+    };
+    if let Some(dir) = &opts.dir {
+        if let Err(e) = std::env::set_current_dir(dir) {
+            return die(&format!(
+                "could not open directory '{}': {e}",
+                dir.display()
+            ));
+        }
+    }
+    let request = match dashboard_request(&opts.session) {
+        Ok(request) => request,
+        Err(e) => return die(&e),
+    };
+    match approve_ui::run(&request) {
+        Ok(ApprovalDecision::Approve) | Ok(ApprovalDecision::Deny) => 0,
+        Err(e) => die(&e),
+    }
+}
+
+fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?;
+    let vault = Session::vault_status(session)?;
+    let vault_line = match &vault {
+        Some(path) => format!("active ({})", path.display()),
+        None => "not created yet".to_string(),
+    };
+    let command = format!(
+        "directory: {}\nsession: {session}\ncapability vault: {vault_line}\n\nUse `pentect codex`, `pentect claude`, or `pentect gemini` to start an AI agent with tool-boundary hooks.\nWhen capability vault is active, masked placeholders can be materialized into local .env writes without showing plaintext to the AI.",
+        cwd.display()
+    );
+    let env = vec![EnvReview {
+        name: "capability vault".to_string(),
+        action: if vault.is_some() {
+            EnvAction::Allow
+        } else {
+            EnvAction::Deny
+        },
+        detail: if vault.is_some() {
+            "known placeholders may be used by approved local adapters".to_string()
+        } else {
+            "not active until hooks create it for this directory/session".to_string()
+        },
+    }];
+    let warnings = if vault.is_some() {
+        vec!["capability mode is not ZDR: local adapters can materialize known handles into approved files or child processes".to_string()]
+    } else {
+        Vec::new()
+    };
+    Ok(ApprovalRequest {
+        title: "Pentect control".to_string(),
+        command,
+        session: session.to_string(),
+        mode: "dashboard".to_string(),
+        header_note: "Review the active Pentect scope for this directory/session.".to_string(),
+        approve_label: "OK".to_string(),
+        deny_label: "CLOSE".to_string(),
+        footer_note: "Use `pentect dashboard --dir PATH --session NAME` to inspect another scope."
+            .to_string(),
+        env,
+        warnings,
+    })
 }
 
 fn cmd_read(args: &[String]) -> i32 {
@@ -185,6 +259,14 @@ fn request_approval(
         command: command.clone(),
         session: opts.session.clone(),
         mode: exec_mode_label(&opts.mode).to_string(),
+        header_note:
+            "Approve one local execution. Pentect masks stdout/stderr before output returns to the AI."
+                .to_string(),
+        approve_label: "APPROVE & RUN".to_string(),
+        deny_label: "DENY".to_string(),
+        footer_note:
+            "Use Up/Down to scroll long commands. Masked tokens restore only when a capability vault is active."
+                .to_string(),
         env: approval_env_rows(opts),
         warnings: approval_warnings(store, opts, &command)?,
     };
@@ -297,7 +379,11 @@ fn cmd_hook(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let session = match Session::open(&session_name) {
+    let session = match if opts.capability {
+        Session::open_capability(&session_name)
+    } else {
+        Session::open(&session_name)
+    } {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
@@ -368,13 +454,12 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
 }
 
 fn resolve_env_bindings(
-    _store: &RecoveryStore,
+    store: &RecoveryStore,
     env: &[EnvBinding],
 ) -> Result<Vec<(String, String)>, String> {
-    Ok(env
-        .iter()
-        .map(|binding| (binding.name.clone(), binding.value.clone()))
-        .collect())
+    env.iter()
+        .map(|binding| Ok((binding.name.clone(), store.resolve_all(&binding.value)?)))
+        .collect()
 }
 
 fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
@@ -740,18 +825,53 @@ impl PurgeOpts {
     }
 }
 
+struct DashboardOpts {
+    session: String,
+    dir: Option<PathBuf>,
+}
+
+impl DashboardOpts {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut session = DEFAULT_SESSION.to_string();
+        let mut dir = None;
+        let mut i = if matches!(args.get(1).map(String::as_str), Some("dashboard")) {
+            2
+        } else {
+            1
+        };
+        while i < args.len() {
+            match args[i].as_str() {
+                "--session" => session = value(args, &mut i, "--session")?,
+                "--dir" => dir = Some(PathBuf::from(value(args, &mut i, "--dir")?)),
+                flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
+                arg => return Err(format!("unexpected dashboard argument: {arg}")),
+            }
+        }
+        Ok(Self {
+            session: checked_session_name(&session)?,
+            dir,
+        })
+    }
+}
+
 struct HookOpts {
     provider: HookProvider,
     session: Option<String>,
+    capability: bool,
 }
 
 impl HookOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut provider = None;
         let mut session = None;
+        let mut capability = false;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
+                "--capability" => {
+                    capability = true;
+                    i += 1;
+                }
                 "--session" => {
                     session = Some(checked_session_name(&value(args, &mut i, "--session")?)?);
                 }
@@ -767,6 +887,7 @@ impl HookOpts {
             provider: provider
                 .ok_or_else(|| "hook requires provider: codex, claude, or gemini".to_string())?,
             session,
+            capability,
         })
     }
 
@@ -895,21 +1016,41 @@ fn checked_env_name(name: &str) -> Result<String, String> {
 struct Session {
     key: [u8; 32],
     recoveries: Arc<Mutex<Vec<Recovery>>>,
+    vault_path: Option<PathBuf>,
 }
 
 impl Session {
     fn open(name: &str) -> Result<Self, String> {
-        let _ = checked_session_name(name)?;
-        Ok(Self {
+        let root = session_root(name)?;
+        let vault_path = root.join(VAULT_FILE);
+        if vault_path.exists() {
+            return Self::load_vault(vault_path);
+        }
+        Ok(Self::in_memory())
+    }
+
+    fn open_capability(name: &str) -> Result<Self, String> {
+        let root = session_root(name)?;
+        Self::open_capability_root(root)
+    }
+
+    fn in_memory() -> Self {
+        Self {
             key: Config::generate().key,
             recoveries: Arc::new(Mutex::new(Vec::new())),
-        })
+            vault_path: None,
+        }
     }
 
     #[cfg(test)]
     fn open_at(base: &Path, name: &str) -> Result<Self, String> {
         let _ = base;
         Self::open(name)
+    }
+
+    #[cfg(test)]
+    fn open_capability_at(base: &Path, name: &str) -> Result<Self, String> {
+        Self::open_capability_root(base.join(checked_session_name(name)?))
     }
 
     #[cfg(test)]
@@ -942,13 +1083,64 @@ impl Session {
         Ok(out)
     }
 
-    #[cfg(test)]
     fn recoveries(&self) -> Result<Vec<Recovery>, String> {
         Ok(self
             .recoveries
             .lock()
             .map_err(|_| "recovery cache lock poisoned".to_string())?
             .clone())
+    }
+
+    fn open_capability_root(root: PathBuf) -> Result<Self, String> {
+        let vault_path = root.join(VAULT_FILE);
+        if vault_path.exists() {
+            return Self::load_vault(vault_path);
+        }
+        std::fs::create_dir_all(&root)
+            .map_err(|e| format!("could not create '{}': {e}", root.display()))?;
+        let session = Self {
+            key: Config::generate().key,
+            recoveries: Arc::new(Mutex::new(Vec::new())),
+            vault_path: Some(vault_path),
+        };
+        session.persist_recoveries()?;
+        Ok(session)
+    }
+
+    fn load_vault(path: PathBuf) -> Result<Self, String> {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+        let (key, recovery) = decode_vault(&bytes)?;
+        Ok(Self {
+            key,
+            recoveries: Arc::new(Mutex::new(if recovery.is_empty() {
+                Vec::new()
+            } else {
+                vec![recovery]
+            })),
+            vault_path: Some(path),
+        })
+    }
+
+    fn persist_recoveries(&self) -> Result<(), String> {
+        let Some(path) = &self.vault_path else {
+            return Ok(());
+        };
+        let mut batch = Recovery::empty_for_key(&self.key);
+        for recovery in self.recoveries()? {
+            batch.extend_same_key(recovery);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
+        }
+        std::fs::write(path, encode_vault(&self.key, &batch))
+            .map_err(|e| format!("could not write '{}': {e}", path.display()))
+    }
+
+    fn vault_status(name: &str) -> Result<Option<PathBuf>, String> {
+        let path = session_root(name)?.join(VAULT_FILE);
+        Ok(path.exists().then_some(path))
     }
 }
 
@@ -972,7 +1164,6 @@ impl RecoveryStore {
         })
     }
 
-    #[cfg(test)]
     fn resolve_all(&self, text: &str) -> Result<String, String> {
         let recoveries = self.lock()?;
         let mut out = text.to_string();
@@ -999,7 +1190,10 @@ impl RecoveryStore {
         if recovery.is_empty() {
             return Ok(());
         }
-        self.lock()?.push(recovery);
+        {
+            self.lock()?.push(recovery);
+        }
+        self.session.persist_recoveries()?;
         Ok(())
     }
 
@@ -1008,6 +1202,48 @@ impl RecoveryStore {
             .lock()
             .map_err(|_| "recovery cache lock poisoned".to_string())
     }
+}
+
+fn encode_vault(key: &[u8; 32], recovery: &Recovery) -> Vec<u8> {
+    let recovery_blob = recovery.serialize(key);
+    let mut out = Vec::with_capacity(4 + 1 + 32 + 4 + recovery_blob.len());
+    out.extend_from_slice(VAULT_MAGIC);
+    out.push(VAULT_VERSION);
+    out.extend_from_slice(key);
+    out.extend_from_slice(&(recovery_blob.len() as u32).to_le_bytes());
+    out.extend_from_slice(&recovery_blob);
+    out
+}
+
+fn decode_vault(bytes: &[u8]) -> Result<([u8; 32], Recovery), String> {
+    if bytes.len() < 4 + 1 + 32 + 4 {
+        return Err("capability vault is malformed".to_string());
+    }
+    if &bytes[..4] != VAULT_MAGIC {
+        return Err("capability vault has unknown magic".to_string());
+    }
+    if bytes[4] != VAULT_VERSION {
+        return Err(format!(
+            "unsupported capability vault version: {}",
+            bytes[4]
+        ));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes[5..37]);
+    let len = u32::from_le_bytes(
+        bytes[37..41]
+            .try_into()
+            .map_err(|_| "capability vault is malformed".to_string())?,
+    ) as usize;
+    let end = 41usize
+        .checked_add(len)
+        .ok_or_else(|| "capability vault is too large".to_string())?;
+    if end != bytes.len() {
+        return Err("capability vault has trailing or truncated data".to_string());
+    }
+    let recovery = Recovery::load(&bytes[41..end], &key)
+        .map_err(|e| format!("could not load capability vault recovery: {e}"))?;
+    Ok((key, recovery))
 }
 
 struct OutputMasker {
@@ -1124,10 +1360,7 @@ fn handle_hook(
             }
         }
         HookPhase::AfterTool => {
-            let Some(tool_response) = hook_field(
-                &input,
-                &["tool_response", "tool_output", "response", "output"],
-            ) else {
+            let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
             let store = RecoveryStore::load(session)?;
@@ -1147,12 +1380,15 @@ fn handle_hook(
 fn before_tool_updated_input(
     provider: HookProvider,
     session_name: &str,
-    _session: &Session,
+    session: &Session,
     tool_name: &str,
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
     if is_read_like_tool_name(tool_name) {
         return Err(read_tool_block_reason(tool_name));
+    }
+    if let Some(reason) = maybe_materialize_dotenv_write(session, tool_name, tool_input)? {
+        return Err(reason);
     }
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
         if is_pentect_read_command(command) {
@@ -1175,6 +1411,85 @@ fn before_tool_updated_input(
         }
     }
     Ok((tool_input.clone(), false))
+}
+
+fn maybe_materialize_dotenv_write(
+    session: &Session,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Result<Option<String>, String> {
+    if !is_write_like_tool_name(tool_name) {
+        return Ok(None);
+    }
+    let Some((path, content)) = write_path_and_content(tool_input) else {
+        return Ok(None);
+    };
+    if !is_dotenv_materialization_path(path) || !content.contains("<<") {
+        return Ok(None);
+    }
+    let store = RecoveryStore::load(session)?;
+    let resolved = store.resolve_all(content)?;
+    if resolved == content {
+        return Ok(None);
+    }
+    materialize_file(Path::new(path), &resolved)?;
+    Ok(Some(format!(
+        "Pentect materialized masked .env content into '{}' and blocked the original Write tool so plaintext never returns to the AI.",
+        path
+    )))
+}
+
+fn is_write_like_tool_name(tool_name: &str) -> bool {
+    let normalized = tool_name.to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "write" | "writefile" | "write_file" | "create_file"
+    ) || normalized.ends_with("__write_file")
+        || normalized.ends_with("_write_file")
+}
+
+fn write_path_and_content(value: &Value) -> Option<(&str, &str)> {
+    for candidate in write_input_candidates(value) {
+        if let (Some(path), Some(content)) = (
+            string_field(candidate, &["file_path", "filepath", "path", "filename"]),
+            string_field(candidate, &["content", "file_content", "text", "data"]),
+        ) {
+            return Some((path, content));
+        }
+    }
+    None
+}
+
+fn write_input_candidates(value: &Value) -> Vec<&Value> {
+    let mut out = vec![value];
+    for key in ["arguments", "input", "tool_input"] {
+        if let Some(candidate) = value.get(key) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| value.get(*name)?.as_str())
+}
+
+fn is_dotenv_materialization_path(path: &str) -> bool {
+    let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == ".env" || lower.starts_with(".env.")
+}
+
+fn materialize_file(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, content).map_err(|e| format!("could not write '{}': {e}", path.display()))
 }
 
 fn is_read_like_tool_name(tool_name: &str) -> bool {
@@ -1409,6 +1724,25 @@ fn hook_event_name(input: &Value) -> Option<&str> {
 
 fn hook_field<'a>(input: &'a Value, names: &[&str]) -> Option<&'a Value> {
     names.iter().find_map(|name| input.get(*name))
+}
+
+fn hook_tool_result(input: &Value) -> Option<&Value> {
+    hook_field(
+        input,
+        &[
+            "tool_response",
+            "tool_output",
+            "tool_result",
+            "call_tool_result",
+            "mcp_result",
+            "mcp_tool_result",
+            "response",
+            "result",
+            "output",
+            "content",
+            "structuredContent",
+        ],
+    )
 }
 
 fn before_tool_output(provider: HookProvider, updated_input: Value) -> Value {
@@ -2293,6 +2627,90 @@ mod tests {
     }
 
     #[test]
+    fn capability_vault_restores_env_binding_across_sessions() {
+        let root = temp_root("capability-env-binding");
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+        assert!(masked.contains("<<OPENAI_API_KEY_"), "{masked}");
+
+        let placeholder = masked.split_once('=').unwrap().1.trim().to_string();
+        drop(session);
+
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let store = RecoveryStore::load(&session).unwrap();
+        let env = resolve_env_bindings(
+            &store,
+            &[EnvBinding {
+                name: "OPENAI_API_KEY".to_string(),
+                value: placeholder,
+            }],
+        )
+        .unwrap();
+        assert_eq!(env, vec![("OPENAI_API_KEY".to_string(), raw.to_string())]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_tool_materializes_dotenv_without_returning_plaintext() {
+        let root = temp_root("capability-write-dotenv");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+        let masked = mask_tool_output(&session, &format!("RUNPOD_API_KEY={raw}\n")).unwrap();
+        drop(session);
+
+        let session = Session::open_capability_at(&root, "t").unwrap();
+        let dotenv = project.join(".env");
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": dotenv.to_string_lossy(),
+                "content": masked
+            }
+        });
+        let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+        let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains("materialized masked .env"), "{reason}");
+        assert!(!reason.contains(raw), "{reason}");
+
+        let written = std::fs::read_to_string(&dotenv).unwrap();
+        assert_eq!(written, format!("RUNPOD_API_KEY={raw}\n"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_style_tool_result_masks_content_and_structured_content() {
+        let (root, session) = empty_session("hook-post-mcp");
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "mcp__browser__create_api_key",
+            "tool_response": {
+                "content": [{
+                    "type": "text",
+                    "text": "created RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"
+                }],
+                "structuredContent": {
+                    "apiKey": "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+                }
+            }
+        });
+        let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+        let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
+        let rendered = serde_json::to_string(updated).unwrap();
+        assert!(rendered.contains("<<RUNPOD_API_KEY_"), "{rendered}");
+        assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+        assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
+        assert!(!rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn env_like_tool_output_masks_all_env_values() {
         let (root, session) = empty_session("exec-dotenv-output");
         let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
@@ -2611,13 +3029,17 @@ mod tests {
     }
 
     fn empty_session(name: &str) -> (PathBuf, Session) {
-        let root = std::env::temp_dir().join(format!(
+        let root = temp_root(name);
+        let session = Session::open_at(&root, "t").unwrap();
+        (root, session)
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
             "pentect-agent-test-{}-{}-{name}",
             std::process::id(),
             unix_millis()
-        ));
-        let session = Session::open_at(&root, "t").unwrap();
-        (root, session)
+        ))
     }
 
     fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {

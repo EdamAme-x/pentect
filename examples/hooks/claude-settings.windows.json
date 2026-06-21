@@ -7,7 +7,7 @@
           {
             "type": "command",
             "shell": "powershell",
-            "command": "& pentect hook claude",
+            "command": "& pentect hook --capability claude",
             "timeout": 30
           }
         ]
@@ -20,7 +20,7 @@
           {
             "type": "command",
             "shell": "powershell",
-            "command": "& pentect hook claude",
+            "command": "& pentect hook --capability claude",
             "timeout": 30
           }
         ]

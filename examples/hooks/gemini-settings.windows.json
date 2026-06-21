@@ -7,7 +7,7 @@
           {
             "name": "pentect-resolve-tool-input",
             "type": "command",
-            "command": "pentect hook gemini",
+            "command": "pentect hook --capability gemini",
             "timeout": 30000
           }
         ]
@@ -20,7 +20,7 @@
           {
             "name": "pentect-mask-tool-output",
             "type": "command",
-            "command": "pentect hook gemini",
+            "command": "pentect hook --capability gemini",
             "timeout": 30000
           }
         ]

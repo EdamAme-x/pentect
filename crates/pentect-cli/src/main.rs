@@ -17,6 +17,9 @@ const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        None => cmd_agent_passthrough_from(1, &args),
+        Some("dashboard") => cmd_agent_passthrough_from(1, &args),
+        Some("--dir" | "--session") => cmd_agent_passthrough_from(1, &args),
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("exec" | "approve" | "hook" | "purge") => cmd_agent_passthrough_from(1, &args),
@@ -31,6 +34,7 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--semantic] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
+         pentect [dashboard] [--session NAME] [--dir PATH]\n\
          pentect read|exec|approve|hook|purge ...\n\
          pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
          \x20 mask secrets from stdin to stdout\n\
@@ -769,6 +773,7 @@ fn hook_words(agent: &Path, provider: &str, session: &str) -> Vec<String> {
         let mut words = vec![
             "pentect".to_string(),
             "hook".to_string(),
+            "--capability".to_string(),
             provider.to_string(),
         ];
         add_non_default_session(&mut words, session);
@@ -778,6 +783,7 @@ fn hook_words(agent: &Path, provider: &str, session: &str) -> Vec<String> {
     let mut words = vec![
         agent.to_string_lossy().into_owned(),
         "hook".to_string(),
+        "--capability".to_string(),
         provider.to_string(),
     ];
     add_non_default_session(&mut words, session);
@@ -862,8 +868,8 @@ fn maybe_print_first_run_agent_hint(session: &str) {
     }
     eprintln!("[pentect] tool-boundary masking is active for this directory.");
     eprintln!("[pentect] AI tools should call `pentect exec \"<command>\"`.");
-    eprintln!("[pentect] output masking is one-way by default; no recovery state is saved.");
-    eprintln!("[pentect] use `pentect purge` to delete old saved recovery state.");
+    eprintln!("[pentect] hook mode keeps a local capability vault so masked handles can be used without showing plaintext to the AI.");
+    eprintln!("[pentect] use `pentect` to inspect this directory/session; use `pentect purge` to delete local capability state.");
     let _ = std::fs::write(marker, b"shown\n");
 }
 

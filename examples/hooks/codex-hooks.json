@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pentect hook codex",
-            "commandWindows": "& pentect hook codex",
+            "command": "pentect hook --capability codex",
+            "commandWindows": "& pentect hook --capability codex",
             "timeout": 30,
             "statusMessage": "Pentect resolving masked tool input"
           }
@@ -20,8 +20,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pentect hook codex",
-            "commandWindows": "& pentect hook codex",
+            "command": "pentect hook --capability codex",
+            "commandWindows": "& pentect hook --capability codex",
             "timeout": 30,
             "statusMessage": "Pentect masking tool output"
           }
