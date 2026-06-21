@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io::{self, IsTerminal};
@@ -21,27 +21,12 @@ pub enum ApprovalDecision {
 
 pub struct ApprovalRequest {
     pub title: String,
-    pub command: String,
-    pub session: String,
-    pub mode: String,
-    pub header_note: String,
+    pub body: String,
+    pub note: String,
     pub approve_label: String,
     pub deny_label: String,
     pub footer_note: String,
-    pub env: Vec<EnvReview>,
     pub warnings: Vec<String>,
-}
-
-pub struct EnvReview {
-    pub name: String,
-    pub action: EnvAction,
-}
-
-#[derive(Clone, Copy)]
-pub enum EnvAction {
-    Inject,
-    Allow,
-    Deny,
 }
 
 struct App<'a> {
@@ -122,39 +107,25 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
-    let area = centered(frame.area(), 88, 24);
+    let area = centered(frame.area(), 82, 18);
     frame.render_widget(Clear, area);
-    let outer = Block::default()
-        .title(Line::from(vec![
-            Span::styled(
-                " pentect ",
-                Style::default().fg(Color::Black).bg(Color::Cyan),
-            ),
-            Span::styled(" approval ", Style::default().fg(Color::Cyan)),
-        ]))
-        .title_alignment(Alignment::Left)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
-    frame.render_widget(outer, area);
-
     let inner = area.inner(Margin {
-        horizontal: 2,
-        vertical: 1,
+        horizontal: 1,
+        vertical: 0,
     });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(6),
-            Constraint::Length(5),
+            Constraint::Min(4),
+            Constraint::Length(2),
             Constraint::Length(3),
         ])
         .split(inner);
 
     draw_header(frame, chunks[0], app);
-    draw_main(frame, chunks[1], app);
-    draw_status(frame, chunks[2], app);
+    draw_body(frame, chunks[1], app);
+    draw_warning(frame, chunks[2], app);
     draw_footer(frame, chunks[3], app);
 }
 
@@ -162,111 +133,39 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
     let request = app.request;
     let text = vec![
         Line::from(vec![
+            Span::styled(
+                "pentect",
+                Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+            ),
+            Span::raw("  "),
             Span::styled(&request.title, Style::default().fg(Color::White).bold()),
-            Span::raw("  "),
-            Span::styled(
-                format!("scope: {}", request.session),
-                Style::default().fg(Color::Gray),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("mode: {}", request.mode),
-                Style::default().fg(Color::Gray),
-            ),
         ]),
         Line::from(Span::styled(
-            request.header_note.as_str(),
+            request.note.as_str(),
             Style::default().fg(Color::DarkGray),
         )),
     ];
     frame.render_widget(Paragraph::new(text), area);
 }
 
-fn draw_main(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let title = if app.request.mode == "dashboard" {
-        " status "
-    } else {
-        " command "
-    };
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Blue));
-    let text = Paragraph::new(app.request.command.as_str())
-        .block(block)
+fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
+    let text = Paragraph::new(app.request.body.as_str())
         .wrap(Wrap { trim: false })
         .scroll((app.scroll, 0))
         .style(Style::default().fg(Color::White));
     frame.render_widget(text, area);
 }
 
-fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let mut lines = Vec::new();
-    if let Some(warning) = app.request.warnings.first() {
-        lines.push(Line::from(vec![
+fn draw_warning(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
+    let line = if let Some(warning) = app.request.warnings.first() {
+        Line::from(vec![
             Span::styled("Warning: ", Style::default().fg(Color::Yellow).bold()),
             Span::styled(warning, Style::default().fg(Color::Yellow)),
-        ]));
+        ])
     } else {
-        lines.push(Line::from(vec![
-            Span::styled("Output: ", Style::default().fg(Color::Green).bold()),
-            Span::raw("masked before the AI sees it."),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        Span::styled("Secrets: ", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(secret_status(app.request)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Env: ", Style::default().fg(Color::Magenta).bold()),
-        Span::raw(env_status(app.request)),
-    ]));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(" safety ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn secret_status(request: &ApprovalRequest) -> &'static str {
-    if request.mode == "dashboard" {
-        "local capability scope only."
-    } else {
-        "handles restore only inside local Pentect adapters."
-    }
-}
-
-fn env_status(request: &ApprovalRequest) -> String {
-    if request.env.is_empty() {
-        return "no explicit env rule.".to_string();
-    }
-    let names = request
-        .env
-        .iter()
-        .take(3)
-        .map(|item| {
-            let action = match item.action {
-                EnvAction::Inject => "inject",
-                EnvAction::Allow => "allow",
-                EnvAction::Deny => "deny",
-            };
-            format!("{action} {}", item.name)
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    if request.env.len() > 3 {
-        format!("{names}, +{} more", request.env.len() - 3)
-    } else {
-        names
-    }
+        Line::from(Span::raw(""))
+    };
+    frame.render_widget(Paragraph::new(vec![line]).wrap(Wrap { trim: false }), area);
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
@@ -279,12 +178,12 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
             Span::styled(format!("  {}  ", app.request.deny_label), deny_style),
             Span::raw("   "),
             Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
-            Span::raw(" select   "),
-            Span::styled("Tab", Style::default().fg(Color::Cyan).bold()),
-            Span::raw(" switch   "),
-            Span::styled("Y/N", Style::default().fg(Color::Cyan).bold()),
-            Span::raw(" direct   "),
+            Span::raw("/"),
+            Span::styled("Y", Style::default().fg(Color::Cyan).bold()),
+            Span::raw(" approve   "),
             Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+            Span::raw("/"),
+            Span::styled("N", Style::default().fg(Color::Cyan).bold()),
             Span::raw(" deny"),
         ]),
         Line::from(Span::styled(
@@ -305,8 +204,8 @@ fn selected_style(selected: bool, color: Color) -> Style {
 }
 
 fn centered(area: Rect, max_width: u16, max_height: u16) -> Rect {
-    let width = bounded_size(area.width, 50, max_width);
-    let height = bounded_size(area.height, 16, max_height);
+    let width = bounded_size(area.width, 44, max_width);
+    let height = bounded_size(area.height, 12, max_height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect {
@@ -334,29 +233,24 @@ mod tests {
     fn approval_screen_explains_the_execution_contract() {
         let request = ApprovalRequest {
             title: "Approve command execution".to_string(),
-            command: "Get-Content -Raw -LiteralPath .env".to_string(),
-            session: "project".to_string(),
-            mode: "shell".to_string(),
-            header_note: "Run locally. Mask output before the AI sees it.".to_string(),
+            body: "Get-Content -Raw -LiteralPath .env".to_string(),
+            note: "Run locally. Mask output before the AI sees it.".to_string(),
             approve_label: "APPROVE & RUN".to_string(),
             deny_label: "DENY".to_string(),
             footer_note: "Enter approve. Esc deny. Up/Down scroll.".to_string(),
-            env: vec![EnvReview {
-                name: "RUNPOD_API_KEY".to_string(),
-                action: EnvAction::Inject,
-            }],
             warnings: vec!["review direct env usage".to_string()],
         };
         let rendered = render_request(&request, 100, 34);
 
-        assert!(rendered.contains("command"));
-        assert!(rendered.contains("safety"));
+        assert!(rendered.contains("pentect"));
+        assert!(rendered.contains("Get-Content"));
         assert!(rendered.contains("Warning:"));
-        assert!(rendered.contains("Secrets:"));
         assert!(rendered.contains("APPROVE & RUN"));
         assert!(!rendered.contains("resolves placeholders"));
         assert!(!rendered.contains("what happens"));
         assert!(!rendered.contains("environment policy"));
+        assert!(!rendered.contains("Secrets:"));
+        assert!(!rendered.contains("Env:"));
     }
 
     #[test]

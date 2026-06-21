@@ -8,7 +8,7 @@
 
 mod approve_ui;
 
-use approve_ui::{ApprovalDecision, ApprovalRequest, EnvAction, EnvReview};
+use approve_ui::{ApprovalDecision, ApprovalRequest};
 use pentect_core::{Config, Engine, Input, Kind, Profile, Recovery};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -93,29 +93,18 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
         "Directory  {}\nSession    {session}\nVault      {vault_line}",
         cwd.display()
     );
-    let env = vec![EnvReview {
-        name: "capability vault".to_string(),
-        action: if vault.is_some() {
-            EnvAction::Allow
-        } else {
-            EnvAction::Deny
-        },
-    }];
     let warnings = if vault.is_some() {
-        vec!["capability mode is not ZDR: local adapters can materialize known handles into approved files or child processes".to_string()]
+        vec!["Capability vault is active for this scope.".to_string()]
     } else {
         Vec::new()
     };
     Ok(ApprovalRequest {
         title: "Pentect control".to_string(),
-        command,
-        session: session.to_string(),
-        mode: "dashboard".to_string(),
-        header_note: "Current Pentect scope.".to_string(),
+        body: command,
+        note: "Current scope.".to_string(),
         approve_label: "OK".to_string(),
         deny_label: "CLOSE".to_string(),
         footer_note: "Enter/Esc close. Use --dir and --session for another scope.".to_string(),
-        env,
         warnings,
     })
 }
@@ -250,40 +239,14 @@ fn request_approval(
     let command = display_exec_mode(&opts.mode);
     let request = ApprovalRequest {
         title: title.to_string(),
-        command: command.clone(),
-        session: opts.session.clone(),
-        mode: exec_mode_label(&opts.mode).to_string(),
-        header_note: "Run locally. Mask output before the AI sees it.".to_string(),
+        body: command.clone(),
+        note: "Run locally. Mask output before the AI sees it.".to_string(),
         approve_label: "APPROVE & RUN".to_string(),
         deny_label: "DENY".to_string(),
         footer_note: "Enter approve. Esc deny. Up/Down scroll.".to_string(),
-        env: approval_env_rows(opts),
         warnings: approval_warnings(store, opts, &command)?,
     };
     approve_ui::run(&request)
-}
-
-fn approval_env_rows(opts: &ExecOpts) -> Vec<EnvReview> {
-    let mut rows = Vec::new();
-    for binding in &opts.env {
-        rows.push(EnvReview {
-            name: binding.name.clone(),
-            action: EnvAction::Inject,
-        });
-    }
-    for name in &opts.allow_env {
-        rows.push(EnvReview {
-            name: name.clone(),
-            action: EnvAction::Allow,
-        });
-    }
-    for name in &opts.deny_env {
-        rows.push(EnvReview {
-            name: name.clone(),
-            action: EnvAction::Deny,
-        });
-    }
-    rows
 }
 
 fn approval_warnings(
@@ -308,14 +271,8 @@ fn approval_warnings(
     if let Err(reason) = guard {
         warnings.push(reason);
     }
-    if opts.env.is_empty() && opts.allow_env.is_empty() && opts.deny_env.is_empty() {
-        warnings.push("no explicit env policy: child inherits ambient env; output masking still applies, but prefer --env for approved values".to_string());
-    }
     if opts.live {
-        warnings.push(
-            "live output is masked in chunks; very long partial lines flush at chunk boundaries"
-                .to_string(),
-        );
+        warnings.push("live output is masked in chunks".to_string());
     }
     Ok(warnings)
 }
@@ -334,13 +291,6 @@ fn display_exec_mode(mode: &ExecMode) -> String {
             })
             .collect::<Vec<_>>()
             .join(" "),
-    }
-}
-
-fn exec_mode_label(mode: &ExecMode) -> &'static str {
-    match mode {
-        ExecMode::Shell(_) => "shell",
-        ExecMode::Program(_) => "program",
     }
 }
 
