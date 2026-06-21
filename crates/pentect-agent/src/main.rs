@@ -90,7 +90,7 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
         None => "not created yet".to_string(),
     };
     let command = format!(
-        "directory: {}\nsession: {session}\ncapability vault: {vault_line}\n\nUse `pentect codex`, `pentect claude`, or `pentect gemini` to start an AI agent with tool-boundary hooks.\nWhen capability vault is active, masked placeholders can be materialized into local .env writes without showing plaintext to the AI.",
+        "Directory  {}\nSession    {session}\nVault      {vault_line}",
         cwd.display()
     );
     let env = vec![EnvReview {
@@ -99,11 +99,6 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
             EnvAction::Allow
         } else {
             EnvAction::Deny
-        },
-        detail: if vault.is_some() {
-            "known placeholders may be used by approved local adapters".to_string()
-        } else {
-            "not active until hooks create it for this directory/session".to_string()
         },
     }];
     let warnings = if vault.is_some() {
@@ -116,11 +111,10 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
         command,
         session: session.to_string(),
         mode: "dashboard".to_string(),
-        header_note: "Review the active Pentect scope for this directory/session.".to_string(),
+        header_note: "Current Pentect scope.".to_string(),
         approve_label: "OK".to_string(),
         deny_label: "CLOSE".to_string(),
-        footer_note: "Use `pentect dashboard --dir PATH --session NAME` to inspect another scope."
-            .to_string(),
+        footer_note: "Enter/Esc close. Use --dir and --session for another scope.".to_string(),
         env,
         warnings,
     })
@@ -259,14 +253,10 @@ fn request_approval(
         command: command.clone(),
         session: opts.session.clone(),
         mode: exec_mode_label(&opts.mode).to_string(),
-        header_note:
-            "Approve one local execution. Pentect masks stdout/stderr before output returns to the AI."
-                .to_string(),
+        header_note: "Run locally. Mask output before the AI sees it.".to_string(),
         approve_label: "APPROVE & RUN".to_string(),
         deny_label: "DENY".to_string(),
-        footer_note:
-            "Use Up/Down to scroll long commands. Masked tokens restore only when a capability vault is active."
-                .to_string(),
+        footer_note: "Enter approve. Esc deny. Up/Down scroll.".to_string(),
         env: approval_env_rows(opts),
         warnings: approval_warnings(store, opts, &command)?,
     };
@@ -276,29 +266,21 @@ fn request_approval(
 fn approval_env_rows(opts: &ExecOpts) -> Vec<EnvReview> {
     let mut rows = Vec::new();
     for binding in &opts.env {
-        let detail = if binding.value.contains("<<") {
-            "masked token is passed as text; no secret restore".to_string()
-        } else {
-            "value is hidden here; child receives it; output is masked".to_string()
-        };
         rows.push(EnvReview {
             name: binding.name.clone(),
             action: EnvAction::Inject,
-            detail,
         });
     }
     for name in &opts.allow_env {
         rows.push(EnvReview {
             name: name.clone(),
             action: EnvAction::Allow,
-            detail: "direct reads of this env name are allowed".to_string(),
         });
     }
     for name in &opts.deny_env {
         rows.push(EnvReview {
             name: name.clone(),
             action: EnvAction::Deny,
-            detail: "direct env references for this name are blocked".to_string(),
         });
     }
     rows

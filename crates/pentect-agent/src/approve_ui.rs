@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io::{self, IsTerminal};
@@ -35,7 +35,6 @@ pub struct ApprovalRequest {
 pub struct EnvReview {
     pub name: String,
     pub action: EnvAction,
-    pub detail: String,
 }
 
 #[derive(Clone, Copy)]
@@ -123,7 +122,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
-    let area = centered(frame.area(), 100, 34);
+    let area = centered(frame.area(), 88, 24);
     frame.render_widget(Clear, area);
     let outer = Block::default()
         .title(Line::from(vec![
@@ -147,20 +146,16 @@ fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(5),
             Constraint::Min(6),
-            Constraint::Length(7),
             Constraint::Length(5),
             Constraint::Length(3),
         ])
         .split(inner);
 
     draw_header(frame, chunks[0], app);
-    draw_summary(frame, chunks[1], app);
-    draw_command(frame, chunks[2], app);
-    draw_env(frame, chunks[3], app);
-    draw_warnings(frame, chunks[4], app);
-    draw_footer(frame, chunks[5], app);
+    draw_main(frame, chunks[1], app);
+    draw_status(frame, chunks[2], app);
+    draw_footer(frame, chunks[3], app);
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
@@ -187,55 +182,14 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
     frame.render_widget(Paragraph::new(text), area);
 }
 
-fn draw_summary(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let warning_style = if app.request.warnings.is_empty() {
-        Style::default().fg(Color::Green)
+fn draw_main(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
+    let title = if app.request.mode == "dashboard" {
+        " status "
     } else {
-        Style::default().fg(Color::Yellow).bold()
+        " command "
     };
-    let env_text = if app.request.env.is_empty() {
-        "No explicit env rules; inherited env may exist.".to_string()
-    } else {
-        format!("{} env rule(s); values hidden.", app.request.env.len())
-    };
-    let warning_text = if app.request.warnings.is_empty() {
-        "No warnings.".to_string()
-    } else {
-        format!("{} warning(s). Review first.", app.request.warnings.len())
-    };
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("RUN  ", Style::default().fg(Color::Cyan).bold()),
-            Span::raw("Local child process only; no recovery state is saved."),
-        ]),
-        Line::from(vec![
-            Span::styled("MASK ", Style::default().fg(Color::Cyan).bold()),
-            Span::raw("stdout/stderr are scanned and masked before the AI sees them."),
-        ]),
-        Line::from(vec![
-            Span::styled("ENV  ", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(env_text, Style::default().fg(Color::Gray)),
-            Span::raw("  "),
-            Span::styled(warning_text, warning_style),
-        ]),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(" what happens ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn draw_command(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
     let block = Block::default()
-        .title(" command to run ")
+        .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Blue));
@@ -247,88 +201,72 @@ fn draw_command(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
     frame.render_widget(text, area);
 }
 
-fn draw_env(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let rows = if app.request.env.is_empty() {
-        vec![Row::new(vec![
-            Cell::from("default").style(Style::default().fg(Color::DarkGray)),
-            Cell::from("ambient env").style(Style::default().fg(Color::DarkGray)),
-            Cell::from("child inherits env; direct sensitive reads are guarded")
-                .style(Style::default().fg(Color::DarkGray)),
-        ])]
+fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
+    let mut lines = Vec::new();
+    if let Some(warning) = app.request.warnings.first() {
+        lines.push(Line::from(vec![
+            Span::styled("Warning: ", Style::default().fg(Color::Yellow).bold()),
+            Span::styled(warning, Style::default().fg(Color::Yellow)),
+        ]));
     } else {
-        app.request
-            .env
-            .iter()
-            .map(|item| {
-                let (label, color) = match item.action {
-                    EnvAction::Inject => ("inject", Color::Green),
-                    EnvAction::Allow => ("allow", Color::Yellow),
-                    EnvAction::Deny => ("deny", Color::Red),
-                };
-                Row::new(vec![
-                    Cell::from(label).style(Style::default().fg(color).bold()),
-                    Cell::from(item.name.clone()),
-                    Cell::from(item.detail.clone()).style(Style::default().fg(Color::Gray)),
-                ])
-            })
-            .collect()
-    };
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(10),
-            Constraint::Length(28),
-            Constraint::Min(20),
-        ],
-    )
-    .header(
-        Row::new(vec!["policy", "name", "detail"]).style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .block(
-        Block::default()
-            .title(" environment policy ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Magenta)),
-    )
-    .row_highlight_style(Style::default().bg(Color::DarkGray));
-    frame.render_widget(table, area);
-}
-
-fn draw_warnings(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let lines = if app.request.warnings.is_empty() {
-        vec![Line::from(Span::styled(
-            "No policy warnings for this request.",
-            Style::default().fg(Color::Green),
-        ))]
-    } else {
-        app.request
-            .warnings
-            .iter()
-            .map(|warning| {
-                Line::from(vec![
-                    Span::styled("! ", Style::default().fg(Color::Yellow).bold()),
-                    Span::styled(warning, Style::default().fg(Color::Yellow)),
-                ])
-            })
-            .collect()
-    };
+        lines.push(Line::from(vec![
+            Span::styled("Output: ", Style::default().fg(Color::Green).bold()),
+            Span::raw("masked before the AI sees it."),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("Secrets: ", Style::default().fg(Color::Cyan).bold()),
+        Span::raw(secret_status(app.request)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Env: ", Style::default().fg(Color::Magenta).bold()),
+        Span::raw(env_status(app.request)),
+    ]));
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(" safety notes ")
+                    .title(" safety ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(Style::default().fg(Color::Cyan)),
             )
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn secret_status(request: &ApprovalRequest) -> &'static str {
+    if request.mode == "dashboard" {
+        "local capability scope only."
+    } else {
+        "handles restore only inside local Pentect adapters."
+    }
+}
+
+fn env_status(request: &ApprovalRequest) -> String {
+    if request.env.is_empty() {
+        return "no explicit env rule.".to_string();
+    }
+    let names = request
+        .env
+        .iter()
+        .take(3)
+        .map(|item| {
+            let action = match item.action {
+                EnvAction::Inject => "inject",
+                EnvAction::Allow => "allow",
+                EnvAction::Deny => "deny",
+            };
+            format!("{action} {}", item.name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if request.env.len() > 3 {
+        format!("{names}, +{} more", request.env.len() - 3)
+    } else {
+        names
+    }
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
@@ -367,8 +305,8 @@ fn selected_style(selected: bool, color: Color) -> Style {
 }
 
 fn centered(area: Rect, max_width: u16, max_height: u16) -> Rect {
-    let width = bounded_size(area.width, 54, max_width);
-    let height = bounded_size(area.height, 22, max_height);
+    let width = bounded_size(area.width, 50, max_width);
+    let height = bounded_size(area.height, 16, max_height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect {
@@ -399,29 +337,26 @@ mod tests {
             command: "Get-Content -Raw -LiteralPath .env".to_string(),
             session: "project".to_string(),
             mode: "shell".to_string(),
-            header_note:
-                "Approve one local execution. Pentect masks stdout/stderr before output returns to the AI."
-                    .to_string(),
+            header_note: "Run locally. Mask output before the AI sees it.".to_string(),
             approve_label: "APPROVE & RUN".to_string(),
             deny_label: "DENY".to_string(),
-            footer_note:
-                "Use Up/Down to scroll long commands. Masked tokens are not restored by default."
-                    .to_string(),
+            footer_note: "Enter approve. Esc deny. Up/Down scroll.".to_string(),
             env: vec![EnvReview {
                 name: "RUNPOD_API_KEY".to_string(),
                 action: EnvAction::Inject,
-                detail: "value is hidden here; child receives it; output is masked".to_string(),
             }],
             warnings: vec!["review direct env usage".to_string()],
         };
         let rendered = render_request(&request, 100, 34);
 
-        assert!(rendered.contains("what happens"));
-        assert!(rendered.contains("no recovery state is saved"));
-        assert!(rendered.contains("stdout/stderr are scanned and masked"));
-        assert!(rendered.contains("environment policy"));
+        assert!(rendered.contains("command"));
+        assert!(rendered.contains("safety"));
+        assert!(rendered.contains("Warning:"));
+        assert!(rendered.contains("Secrets:"));
         assert!(rendered.contains("APPROVE & RUN"));
         assert!(!rendered.contains("resolves placeholders"));
+        assert!(!rendered.contains("what happens"));
+        assert!(!rendered.contains("environment policy"));
     }
 
     #[test]
