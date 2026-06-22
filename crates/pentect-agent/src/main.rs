@@ -13,11 +13,11 @@ mod shell;
 
 use approve_ui::{ApprovalDecision, ApprovalRequest};
 use masking::{
-    contains_unresolved_masked_handle, first_reusable_env_name, is_ascii_word_char,
-    is_env_name_byte, is_sensitive_env_name, live_output_kind, OutputMasker,
+    contains_unresolved_masked_handle, is_ascii_word_char, is_env_name_byte, is_sensitive_env_name,
+    live_output_kind, OutputMasker,
 };
 #[cfg(test)]
-use masking::{mask_live_output, mask_tool_output};
+use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
 use pentect_core::{Config, Engine, Input, Kind, Profile};
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
@@ -56,9 +56,9 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect [dashboard] [--session NAME] [--dir PATH]\n\
-         pentect exec [--session NAME] [--approve] [--live] [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
-         pentect exec [--session NAME] [--approve] [--live] [--allow-env NAME]... [--deny-env NAME]... -- PROGRAM [ARG...]\n\
-         pentect approve [--session NAME] [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
+         pentect exec [--session NAME] [--approve] [--live] COMMAND\n\
+         pentect exec [--session NAME] [--approve] [--live] -- PROGRAM [ARG...]\n\
+         pentect approve [--session NAME] COMMAND\n\
          pentect read [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
          pentect hook [--capability] codex|claude|gemini < hook-json\n\
          pentect purge [--session NAME]\n\
@@ -146,6 +146,13 @@ fn cmd_read(args: &[String]) -> i32 {
 }
 
 fn cmd_exec(args: &[String]) -> i32 {
+    if matches!(
+        args.get(2).map(String::as_str),
+        Some("--help" | "-h" | "help")
+    ) {
+        exec_help();
+        return 0;
+    }
     let opts = match ExecOpts::parse(args) {
         Ok(o) => o,
         Err(e) => return die(&e),
@@ -190,17 +197,23 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let env_name =
-        first_reusable_env_name(&safe_stdout).or_else(|| first_reusable_env_name(&safe_stderr));
     print!("{safe_stdout}");
     let _ = std::io::stdout().flush();
     eprint!("{safe_stderr}");
-    if !safe_stderr.is_empty() && !safe_stderr.ends_with('\n') {
-        eprintln!();
-    }
-    eprintln!("{}", exec_usage_hint(env_name.as_deref()));
     let _ = std::io::stderr().flush();
     exit_code(output.status)
+}
+
+fn exec_help() {
+    print!(
+        "{}",
+        concat!(
+            "pentect exec \"<command>\"\n",
+            "pentect exec --live \"<command>\"\n\n",
+            "Runs a command and prints normal stdout/stderr with secrets masked.\n",
+            "Masked handles and env values from prior output resolve locally in later `pentect exec` commands.\n",
+        )
+    );
 }
 
 fn cmd_approve(args: &[String]) -> i32 {
@@ -953,15 +966,6 @@ fn checked_env_name(name: &str) -> Result<String, String> {
         );
     }
     Ok(name.to_string())
-}
-
-fn exec_usage_hint(env_name: Option<&str>) -> String {
-    match env_name {
-        Some(name) => format!(
-            "# pentect: env ready: `$env:{name}` on PowerShell / `${name}` on Unix. Help: `pentect help`."
-        ),
-        None => "# pentect: help: `pentect help`.".to_string(),
-    }
 }
 
 fn handle_hook(

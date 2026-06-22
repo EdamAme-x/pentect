@@ -165,6 +165,7 @@ fn looks_like_sensitive_env_output(text: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 pub(crate) fn first_reusable_env_name(masked: &str) -> Option<String> {
     reusable_env_handles(masked)
         .into_iter()

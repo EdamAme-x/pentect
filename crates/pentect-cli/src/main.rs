@@ -58,15 +58,16 @@ fn cmd_help() {
 }
 
 fn help_text() -> &'static str {
-    "pentect protects AI tool boundaries by running shell commands through `pentect exec`.\n\
-\n\
-Agent workflow:\n\
-  pentect codex|claude|gemini\n\
-  pentect exec \"<command>\"\n\
-\n\
-Masked handles resolve locally inside later `pentect exec` commands.\n\
-Masked env lines become env vars: `$env:KEY` on PowerShell, `$KEY` on Unix.\n\
-Use `pentect purge` to delete local capability state for this directory/session.\n"
+    concat!(
+        "pentect protects AI tool boundaries.\n\n",
+        "Use:\n",
+        "  pentect codex|claude|gemini\n",
+        "  pentect exec \"<command>\"\n\n",
+        "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
+        "Masked handles resolve locally in later `pentect exec` commands.\n",
+        "Masked env lines become env vars: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
+        "Use `pentect purge` to clear local capability state.\n",
+    )
 }
 
 fn die(msg: &str) -> ! {
@@ -893,11 +894,8 @@ fn maybe_print_first_run_agent_hint(session: &str) {
     if std::fs::create_dir_all(&root).is_err() {
         return;
     }
-    eprintln!("[pentect] tool-boundary masking is active for this directory.");
-    eprintln!("[pentect] AI tools should call `pentect exec \"<command>\"`.");
-    eprintln!("[pentect] masked env keys become normal env vars in later `pentect exec`; use `$env:KEY` on PowerShell or `$KEY` on Unix.");
-    eprintln!("[pentect] exec/hook mode keeps a local capability vault so masked handles can be used without showing plaintext to the AI.");
-    eprintln!("[pentect] use `pentect` to inspect this directory/session; use `pentect purge` to delete local capability state.");
+    eprintln!("[pentect] active: use `pentect exec \"<command>\"`; stdout/stderr are masked.");
+    eprintln!("[pentect] handles/env from masked output resolve locally in later `pentect exec`; details: `pentect help`.");
     let _ = std::fs::write(marker, b"shown\n");
 }
 
