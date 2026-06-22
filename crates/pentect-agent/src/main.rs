@@ -3,8 +3,8 @@
 //! It demonstrates the product loop:
 //! shell tool input -> force execution through `pentect exec`;
 //! command output -> mask before it returns to the AI.
-//! No recovery state is persisted by default; placeholders are one-way outside
-//! the current process.
+//! `read` is a one-way human preview. `exec` and hooks use a local capability
+//! vault so masked handles can be passed back into later tool-boundary commands.
 
 mod approve_ui;
 
@@ -141,7 +141,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
-    let session = match Session::open(&opts.session) {
+    let session = match Session::open_capability(&opts.session) {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
@@ -181,9 +181,16 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
+    let handle_hint = env_handle_hint(&safe_stdout).or_else(|| env_handle_hint(&safe_stderr));
     print!("{safe_stdout}");
     let _ = std::io::stdout().flush();
     eprint!("{safe_stderr}");
+    if let Some(hint) = handle_hint {
+        if !safe_stderr.is_empty() && !safe_stderr.ends_with('\n') {
+            eprintln!();
+        }
+        eprintln!("{hint}");
+    }
     let _ = std::io::stderr().flush();
     exit_code(output.status)
 }
@@ -193,7 +200,7 @@ fn cmd_approve(args: &[String]) -> i32 {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
-    let session = match Session::open(&opts.session) {
+    let session = match Session::open_capability(&opts.session) {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
@@ -391,7 +398,16 @@ fn resolve_env_bindings(
     env: &[EnvBinding],
 ) -> Result<Vec<(String, String)>, String> {
     env.iter()
-        .map(|binding| Ok((binding.name.clone(), store.resolve_all(&binding.value)?)))
+        .map(|binding| {
+            let resolved = store.resolve_all(&binding.value)?;
+            if resolved == binding.value && is_reusable_placeholder(binding.value.trim()) {
+                return Err(format!(
+                    "unknown masked env handle for {}; run from the same Pentect directory/session or re-read it with `pentect exec`",
+                    binding.name
+                ));
+            }
+            Ok((binding.name.clone(), resolved))
+        })
         .collect()
 }
 
@@ -1842,6 +1858,52 @@ fn looks_like_sensitive_env_output(text: &str) -> bool {
     false
 }
 
+fn env_handle_hint(masked: &str) -> Option<String> {
+    let (name, handle) = first_reusable_env_handle(masked)?;
+    if masked.contains("# pentect: pass masked env handles with") {
+        return None;
+    }
+    Some(format!(
+        "# pentect: pass masked env handles with `pentect exec --env \"{name}={handle}\" \"<command>\"`"
+    ))
+}
+
+fn first_reusable_env_handle(text: &str) -> Option<(&str, &str)> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed
+            .strip_prefix("export ")
+            .unwrap_or(trimmed)
+            .split_once('=')
+        else {
+            continue;
+        };
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            continue;
+        }
+        let handle = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim_end_matches(';');
+        if is_reusable_placeholder(handle) {
+            return Some((key, handle));
+        }
+    }
+    None
+}
+
+fn is_reusable_placeholder(value: &str) -> bool {
+    value.starts_with("<<")
+        && value.ends_with(">>")
+        && value.contains('_')
+        && !value.contains("REDACTED_DERIVED")
+}
+
 fn redact_env_derivative_lines(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut changed = false;
@@ -2748,6 +2810,23 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_masked_env_handle_is_rejected() {
+        let (root, session) = empty_session("unresolved-env-handle");
+        let store = RecoveryStore::load(&session).unwrap();
+        let err = resolve_env_bindings(
+            &store,
+            &[EnvBinding {
+                name: "RUNPOD_API_KEY".to_string(),
+                value: "<<RUNPOD_API_KEY_missing>>".to_string(),
+            }],
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown masked env handle"), "{err}");
+        assert!(err.contains("RUNPOD_API_KEY"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn write_tool_materializes_dotenv_without_returning_plaintext() {
         let root = temp_root("capability-write-dotenv");
         let project = root.join("project");
@@ -2816,6 +2895,29 @@ mod tests {
         assert!(!masked.contains("hello world"), "{masked}");
         assert!(masked.contains("TEST_SECRET=<<SECRET_"), "{masked}");
         assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn env_handle_output_teaches_ai_how_to_use_it() {
+        let (root, session) = empty_session("exec-dotenv-handle-hint");
+        let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n";
+        let masked = mask_tool_output(&session, output).unwrap();
+        let hint = env_handle_hint(&masked).unwrap();
+        assert!(
+            hint.contains("# pentect: pass masked env handles with `pentect exec --env \"RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+            "{hint}"
+        );
+        assert!(hint.contains("\" \"<command>\"`"), "{hint}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn derived_redactions_do_not_claim_to_be_reusable_handles() {
+        let (root, session) = empty_session("exec-derived-no-hint");
+        let masked = mask_tool_output(&session, "PREFIX_32=rpa_FAKE\n").unwrap();
+        assert_eq!(masked, "PREFIX_32=<<REDACTED_DERIVED>>\n");
+        assert!(env_handle_hint(&masked).is_none(), "{masked}");
         let _ = std::fs::remove_dir_all(root);
     }
 

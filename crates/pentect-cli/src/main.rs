@@ -868,7 +868,8 @@ fn maybe_print_first_run_agent_hint(session: &str) {
     }
     eprintln!("[pentect] tool-boundary masking is active for this directory.");
     eprintln!("[pentect] AI tools should call `pentect exec \"<command>\"`.");
-    eprintln!("[pentect] hook mode keeps a local capability vault so masked handles can be used without showing plaintext to the AI.");
+    eprintln!("[pentect] masked env handles like `KEY=<<...>>` can be used with `pentect exec --env \"KEY=<<...>>\" \"<command>\"`.");
+    eprintln!("[pentect] exec/hook mode keeps a local capability vault so masked handles can be used without showing plaintext to the AI.");
     eprintln!("[pentect] use `pentect` to inspect this directory/session; use `pentect purge` to delete local capability state.");
     let _ = std::fs::write(marker, b"shown\n");
 }
