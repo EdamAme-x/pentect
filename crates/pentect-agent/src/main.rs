@@ -255,9 +255,12 @@ fn exec_help() {
             "pentect exec \"<command>\"\n",
             "pentect exec --live \"<command>\"\n\n",
             "Runs a command and prints normal stdout/stderr with secrets masked.\n",
-            "Masked handles and env values from prior output resolve locally in later `pentect exec` commands.\n",
-            "Use `pentect resolve <path>` to rewrite a local file containing handles.\n",
-            "Pipe a handle into `pentect resolve` when a child script needs the real value.\n",
+            "Every prior `<<LABEL_hash>>` handle becomes a PENTECT_LABEL_hash env var in later execs.\n",
+            "If prior output showed `KEY=<<...>>`, later `pentect exec` commands also get KEY as an env var.\n",
+            "Print source output through `pentect exec` to register it; suppressing output does not register it.\n",
+            "For .env, use a normal read command and let Pentect return masked handles.\n",
+            "Use `$env:KEY` on PowerShell or `$KEY` on Unix; stdout/stderr stays masked.\n",
+            "Masked handles in command text also resolve locally before execution.\n",
         )
     );
 }
@@ -331,7 +334,7 @@ fn approval_warnings(
 ) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
     let env = store.auto_env_bindings()?;
-    let policy = exec_env_policy(&env, opts)?;
+    let policy = exec_env_policy(&env);
     let guard = match &opts.mode {
         ExecMode::Program(args) => {
             let resolved_args = resolve_command_args(store, args)?;
@@ -415,7 +418,7 @@ fn run_resolved_command(
     opts: &ExecOpts,
 ) -> Result<std::process::Output, String> {
     let env = store.auto_env_bindings()?;
-    let env_policy = exec_env_policy(&env, opts)?;
+    let env_policy = exec_env_policy(&env);
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
@@ -443,7 +446,7 @@ fn run_resolved_command(
 
 fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExitStatus, String> {
     let env = store.auto_env_bindings()?;
-    let env_policy = exec_env_policy(&env, opts)?;
+    let env_policy = exec_env_policy(&env);
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
@@ -513,49 +516,29 @@ fn apply_pentect_session(command: &mut Command, session: &str) {
 #[derive(Debug, Default)]
 struct EnvPolicy {
     allowed: Vec<String>,
-    denied: Vec<String>,
 }
 
 impl EnvPolicy {
     fn allows_direct_read(&self, name: &str) -> bool {
-        !self.is_denied(name) && self.is_allowed(name)
+        self.is_allowed(name)
     }
 
     fn blocks_shell_var_read(&self, name: &str) -> bool {
-        self.is_denied(name) || (is_sensitive_env_name(name) && !self.is_allowed(name))
+        is_sensitive_env_name(name) && !self.is_allowed(name)
     }
 
     fn is_allowed(&self, name: &str) -> bool {
         let normalized = name.to_ascii_lowercase();
         self.allowed.iter().any(|allowed| allowed == &normalized)
     }
-
-    fn is_denied(&self, name: &str) -> bool {
-        let normalized = name.to_ascii_lowercase();
-        self.denied.iter().any(|denied| denied == &normalized)
-    }
 }
 
-fn exec_env_policy(env: &[(String, String)], opts: &ExecOpts) -> Result<EnvPolicy, String> {
+fn exec_env_policy(env: &[(String, String)]) -> EnvPolicy {
     let mut allowed = Vec::new();
     for (name, _) in env {
         push_unique_env_name(&mut allowed, name);
     }
-    for name in &opts.allow_env {
-        push_unique_env_name(&mut allowed, name);
-    }
-    let mut denied = Vec::new();
-    for name in &opts.deny_env {
-        push_unique_env_name(&mut denied, name);
-    }
-    for name in &denied {
-        if allowed.iter().any(|allowed| allowed == name) {
-            return Err(format!(
-                "environment variable is both allowed and denied: {name}"
-            ));
-        }
-    }
-    Ok(EnvPolicy { allowed, denied })
+    EnvPolicy { allowed }
 }
 
 fn push_unique_env_name(names: &mut Vec<String>, name: &str) {
@@ -587,13 +570,44 @@ fn guard_sensitive_source_access_with_env(
     env_policy: &EnvPolicy,
 ) -> Result<(), String> {
     let normalized = normalize_policy_text(text);
+    if contains_dotenv_source_reference(&normalized) {
+        return Err(
+            "Pentect does not carry shell state across tool calls. Do not source .env files; print them through `pentect exec` instead (`Get-Content .env` or `cat .env`) so masked `KEY=<<...>>` output registers env capabilities."
+                .to_string(),
+        );
+    }
     if contains_env_read_reference(&normalized, env_policy) {
         return Err(
-            "Pentect blocked direct environment-variable access; first read it through `pentect exec`, then use `$env:KEY` on PowerShell or `$KEY` on Unix in later `pentect exec` commands."
+            "Pentect only exposes environment variables that came from prior masked output. Run the source command through `pentect exec`; if it prints `KEY=<<...>>`, use `$env:KEY` on PowerShell or `$KEY` on Unix in later `pentect exec` commands."
                 .to_string(),
         );
     }
     Ok(())
+}
+
+fn contains_dotenv_source_reference(normalized: &str) -> bool {
+    let mut cursor = 0usize;
+    while let Some((word, _, next)) = next_shell_word(normalized, cursor) {
+        if (word == "source" || word == ".")
+            && next_shell_word(normalized, next)
+                .is_some_and(|(path, _, _)| is_dotenv_source_path(&path))
+        {
+            return true;
+        }
+        cursor = next;
+    }
+    false
+}
+
+fn is_dotenv_source_path(path: &str) -> bool {
+    let name = path
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_start_matches("./")
+        .rsplit('/')
+        .next()
+        .unwrap_or(path);
+    name == ".env" || name.starts_with(".env.")
 }
 
 fn run_shell_script(
@@ -948,8 +962,6 @@ impl HookOpts {
 
 struct ExecOpts {
     session: String,
-    allow_env: Vec<String>,
-    deny_env: Vec<String>,
     live: bool,
     approve: bool,
     mode: ExecMode,
@@ -1001,8 +1013,6 @@ impl ResolveOpts {
 impl ExecOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut session = default_session_name()?;
-        let mut allow_env = Vec::new();
-        let mut deny_env = Vec::new();
         let mut live = false;
         let mut approve = false;
         let mut i = 2;
@@ -1019,12 +1029,6 @@ impl ExecOpts {
                     approve = true;
                     i += 1;
                 }
-                "--allow-env" => {
-                    allow_env.push(checked_env_name(&value(args, &mut i, "--allow-env")?)?);
-                }
-                "--deny-env" => {
-                    deny_env.push(checked_env_name(&value(args, &mut i, "--deny-env")?)?);
-                }
                 "--shell" => {
                     return Err(
                         "`--shell` was removed; use `pentect exec \"<command>\"`".to_string()
@@ -1037,8 +1041,6 @@ impl ExecOpts {
                     }
                     return Ok(Self {
                         session: checked_session_name(&session)?,
-                        allow_env,
-                        deny_env,
                         live,
                         approve,
                         mode: ExecMode::Program(command),
@@ -1048,8 +1050,6 @@ impl ExecOpts {
                 _ => {
                     return Ok(Self {
                         session: checked_session_name(&session)?,
-                        allow_env,
-                        deny_env,
                         live,
                         approve,
                         mode: ExecMode::Shell(args[i..].join(" ")),
@@ -1079,18 +1079,6 @@ fn default_directory_session_name() -> Result<String, String> {
         "dir_{}",
         data_encoding::HEXLOWER.encode(&digest[..8])
     ))
-}
-
-fn checked_env_name(name: &str) -> Result<String, String> {
-    if name.is_empty() {
-        return Err("environment variable name must not be empty".to_string());
-    }
-    if name.as_bytes()[0].is_ascii_digit() || !name.bytes().all(is_env_name_byte) {
-        return Err(
-            "environment variable name must be a shell-style environment variable name".to_string(),
-        );
-    }
-    Ok(name.to_string())
 }
 
 fn handle_hook(

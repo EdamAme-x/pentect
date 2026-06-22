@@ -167,14 +167,14 @@ fn looks_like_sensitive_env_output(text: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn first_reusable_env_name(masked: &str) -> Option<String> {
-    reusable_env_handles(masked)
+    reusable_env_aliases(masked)
         .into_iter()
         .next()
         .map(|(name, _)| name)
 }
 
 fn env_alias_recovery(masked: &str, key: &[u8; 32]) -> Recovery {
-    let aliases = reusable_env_handles(masked);
+    let aliases = reusable_env_aliases(masked);
     if aliases.is_empty() {
         return Recovery::empty_for_key(key);
     }
@@ -190,7 +190,13 @@ fn env_alias_recovery(masked: &str, key: &[u8; 32]) -> Recovery {
     Recovery::seal(map, key)
 }
 
-fn reusable_env_handles(text: &str) -> Vec<(String, String)> {
+fn reusable_env_aliases(text: &str) -> Vec<(String, String)> {
+    let mut out = reusable_assignment_env_aliases(text);
+    out.extend(reusable_handle_env_aliases(text));
+    out
+}
+
+fn reusable_assignment_env_aliases(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -214,6 +220,41 @@ fn reusable_env_handles(text: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+fn reusable_handle_env_aliases(text: &str) -> Vec<(String, String)> {
+    reusable_placeholders(text)
+        .into_iter()
+        .filter_map(|handle| {
+            let name = env_name_for_handle(&handle)?;
+            Some((name, handle))
+        })
+        .collect()
+}
+
+fn reusable_placeholders(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'<' {
+            if let Some(close) = find_from(bytes, i + 2, b">>") {
+                let handle = &text[i..close + 2];
+                if is_reusable_placeholder(handle) {
+                    out.push(handle.to_string());
+                }
+                i = close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn env_name_for_handle(handle: &str) -> Option<String> {
+    let core = placeholder_core(handle)?;
+    Some(format!("PENTECT_{core}"))
 }
 
 fn env_alias_placeholder(key: &[u8; 32], name: &str, handle: &str) -> String {
@@ -279,7 +320,7 @@ fn is_reusable_placeholder(value: &str) -> bool {
         && placeholder_label(value) != Some(ENV_ALIAS_LABEL)
 }
 
-fn placeholder_label(value: &str) -> Option<&str> {
+fn placeholder_core(value: &str) -> Option<&str> {
     let inner = value.strip_prefix("<<")?.strip_suffix(">>")?;
     let inner = match inner.rsplit_once("_length_at_least_") {
         Some((prefix, suffix))
@@ -295,6 +336,18 @@ fn placeholder_label(value: &str) -> Option<&str> {
         Some((prefix, suffix)) if suffix.bytes().all(|b| b.is_ascii_digit()) => prefix,
         _ => inner,
     };
+    if inner
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
+fn placeholder_label(value: &str) -> Option<&str> {
+    let inner = placeholder_core(value)?;
     let (label, hash) = inner.rsplit_once('_')?;
     if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         Some(label)

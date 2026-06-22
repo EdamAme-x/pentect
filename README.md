@@ -9,9 +9,11 @@ MVP: secret-aware tool boundary for AI agents.
 - Inject a model-visible agent contract invisibly for supported agents: Codex uses temporary `developer_instructions`, Claude uses `--append-system-prompt`.
 - Do not print wrapper hints during normal agent startup; explicit `pentect help` is for humans.
 - Canonicalize nested wrappers so `pentect exec "pentect exec ..."` becomes one protected boundary, while `pentect read` remains blocked from AI hooks.
-- Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be reused without showing plaintext to the AI.
-- Masked env values become normal env vars inside later shell commands; after seeing `KEY=<<...>>`, the agent should use `$env:KEY` on PowerShell or `$KEY` on Unix instead of re-reading the original source or parsing prior assignments.
-- `pentect resolve <path>` rewrites a local file containing masked handles with real values without printing the secrets; with no path it resolves stdin, so scripts running under `pentect exec` can turn a handle into a usable local value.
+- Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be used without showing plaintext to the AI.
+- Every masked handle becomes a normal env var inside later shell commands: `<<LABEL_hash>>` is available as `$env:PENTECT_LABEL_hash` on PowerShell or `$PENTECT_LABEL_hash` on Unix. If the output was `KEY=<<...>>`, `KEY` is also available.
+- Printing masked output through `pentect exec` is the registration step; suppressing output means no capability gets registered. For `.env`, use a normal read command and let Pentect return masked handles.
+- Do not rely on shell state, `source`, `export`, or `$env:KEY=...` assignments carrying between tool calls.
+- `pentect resolve <path>` is only for the file-materialization case; the agent path should prefer env vars inside `pentect exec`.
 - Large opaque masked values carry readable coarse metadata such as `_length_at_least_512_chars`; exact length is not disclosed.
 - Resolve known handles into `.env` writes: when a Write-like tool tries to write `KEY=<<HANDLE>>`, Pentect writes the resolved local `.env` itself and blocks the original Write tool so plaintext is not returned in hook JSON.
 - Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.

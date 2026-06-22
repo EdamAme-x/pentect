@@ -17,10 +17,14 @@ const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
     "- Run the shell command you actually intend to run. The hook layer routes shell tools through `pentect exec`; do not add nested Pentect wrappers.\n",
-    "- Masked handles like `<<NAME_hash>>` are local capabilities. Later `pentect exec` commands resolve them locally and mask stdout/stderr again.\n",
-    "- If output contains `KEY=<<KEY_hash>>`, treat KEY as available in later commands as `$env:KEY` on PowerShell or `$KEY` on Unix.\n",
-    "- If a file should contain real values, run `pentect resolve <path>`. If a child script needs a handle's real value, pipe the handle into `pentect resolve`; it inherits the same Pentect session.\n",
-    "- Do not re-read the original source, grep prior output, split assignment lines, or echo the masked handle when the task is to use the value.\n",
+    "- Common .env flow: run the native file-read command (`Get-Content .env` on PowerShell, `cat .env` on Unix) and let masked `KEY=<<...>>` lines appear; then use `$env:KEY` on PowerShell or `$KEY` on Unix in later commands.\n",
+    "- Masked handles like `<<NAME_hash>>` are local capabilities. Later `pentect exec` commands resolve them locally before execution and mask stdout/stderr again.\n",
+    "- Every masked handle is also available in later `pentect exec` commands as a `PENTECT_...` env var: `<<LABEL_hash>>` becomes `$env:PENTECT_LABEL_hash` on PowerShell or `$PENTECT_LABEL_hash` on Unix.\n",
+    "- If output contains `KEY=<<KEY_hash>>`, KEY is also available as `$env:KEY` on PowerShell or `$KEY` on Unix.\n",
+    "- To register a secret from a file, API, browser, or MCP result, run the source command so it prints through the protected tool boundary and returns masked output. Masked output such as `KEY=<<...>>` is safe to show and is required for registration.\n",
+    "- For files like `.env`, use the simple read command (`Get-Content .env` or `cat .env`) and let Pentect mask it. Do not suppress output, hand-roll parsers, or build encoded scripts just to avoid showing masked handles.\n",
+    "- Shell state does not persist across tool calls. Do not source files, export variables, assign `$env:KEY`, or load secrets into shell state yourself.\n",
+    "- When the task is to use a secret, use the env var. Do not echo the handle, parse the source file again, grep prior output, switch shells, run `pentect help`/`pentect --help`, or add flags.\n",
     "- Do not bypass masking by transforming a secret into base64, hex, chunks, prefixes, suffixes, screenshots, or alternate encodings. Use the secret as a capability and report only non-secret outcomes.\n",
     "- Masked command output is expected. Answer from success/failure, status codes, non-secret response fields, and masked handles; do not claim a secret was unusable merely because the returned value stayed masked.\n",
 );
@@ -70,9 +74,11 @@ fn help_text() -> &'static str {
         "  pentect exec \"<command>\"\n\n",
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
         "Masked handles resolve locally in later `pentect exec` commands.\n",
-        "Masked env lines become env vars: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
-        "`pentect resolve <path>` rewrites a local placeholder file with real values.\n",
-        "Child scripts can pipe a handle into `pentect resolve` to use the real value locally.\n",
+        "Every handle also becomes a `PENTECT_...` env var for later execs.\n",
+        "Masked env lines become env vars in later execs: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
+        "Printing masked output through `pentect exec` registers the capability; suppressing output does not.\n",
+        "For .env, use a normal read command and let Pentect return masked handles.\n",
+        "Use `pentect resolve <path>` only when a local file must be materialized with real values.\n",
     )
 }
 
@@ -1379,6 +1385,7 @@ mod tests {
         assert!(help.contains("pentect exec"), "{help}");
         assert!(help.contains("$env:KEY"), "{help}");
         assert!(help.contains("$KEY"), "{help}");
+        assert!(help.contains("PENTECT_"), "{help}");
         assert!(help.contains("pentect resolve"), "{help}");
         assert!(!help.contains("pentect materialize"), "{help}");
         assert!(!help.contains("pentect purge"), "{help}");
@@ -1396,12 +1403,21 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("$env:KEY"), "{rendered}");
-        assert!(rendered.contains("treat KEY as available"), "{rendered}");
-        assert!(rendered.contains("pentect resolve"), "{rendered}");
-        assert!(!rendered.contains("pentect materialize"), "{rendered}");
-        assert!(rendered.contains("same Pentect session"), "{rendered}");
+        assert!(rendered.contains("Common .env flow"), "{rendered}");
+        assert!(rendered.contains("Get-Content .env"), "{rendered}");
+        assert!(rendered.contains("PENTECT_"), "{rendered}");
+        assert!(rendered.contains("KEY is also available"), "{rendered}");
         assert!(
-            rendered.contains("Do not re-read the original source"),
+            rendered.contains("Shell state does not persist"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("required for registration"), "{rendered}");
+        assert!(rendered.contains("Do not suppress output"), "{rendered}");
+        assert!(rendered.contains("pentect --help"), "{rendered}");
+        assert!(!rendered.contains("pentect resolve"), "{rendered}");
+        assert!(!rendered.contains("pentect materialize"), "{rendered}");
+        assert!(
+            rendered.contains("parse the source file again"),
             "{rendered}"
         );
         assert!(rendered.contains("Do not bypass masking"), "{rendered}");
@@ -1422,13 +1438,22 @@ mod tests {
         let rendered = args.join("\n");
         assert!(rendered.contains("--append-system-prompt"), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
-        assert!(rendered.contains("treat KEY as available"), "{rendered}");
+        assert!(rendered.contains("KEY is also available"), "{rendered}");
         assert!(rendered.contains("$env:KEY"), "{rendered}");
-        assert!(rendered.contains("pentect resolve"), "{rendered}");
-        assert!(!rendered.contains("pentect materialize"), "{rendered}");
-        assert!(rendered.contains("same Pentect session"), "{rendered}");
+        assert!(rendered.contains("Common .env flow"), "{rendered}");
+        assert!(rendered.contains("Get-Content .env"), "{rendered}");
+        assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(
-            rendered.contains("Do not re-read the original source"),
+            rendered.contains("Shell state does not persist"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("required for registration"), "{rendered}");
+        assert!(rendered.contains("Do not suppress output"), "{rendered}");
+        assert!(rendered.contains("pentect --help"), "{rendered}");
+        assert!(!rendered.contains("pentect resolve"), "{rendered}");
+        assert!(!rendered.contains("pentect materialize"), "{rendered}");
+        assert!(
+            rendered.contains("parse the source file again"),
             "{rendered}"
         );
         assert!(rendered.contains("Do not bypass masking"), "{rendered}");

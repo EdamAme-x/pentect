@@ -53,28 +53,32 @@ fn exec_parse_accepts_split_shell_command_as_shell_text() {
 }
 
 #[test]
-fn exec_parse_accepts_live_and_env_policy() {
-    let args = strings([
-        "pentect-agent",
-        "exec",
-        "--live",
-        "--approve",
-        "--allow-env",
-        "RUNPOD_API_KEY",
-        "--deny-env",
-        "AWS_SECRET_ACCESS_KEY",
-        "echo",
-        "hi",
-    ]);
+fn exec_parse_accepts_live_and_approve_without_env_flags() {
+    let args = strings(["pentect-agent", "exec", "--live", "--approve", "echo", "hi"]);
     let opts = ExecOpts::parse(&args).unwrap();
     assert!(opts.live);
     assert!(opts.approve);
-    assert_eq!(opts.allow_env, ["RUNPOD_API_KEY"]);
-    assert_eq!(opts.deny_env, ["AWS_SECRET_ACCESS_KEY"]);
     assert!(matches!(
         opts.mode,
         ExecMode::Shell(command) if command == "echo hi"
     ));
+}
+
+#[test]
+fn exec_parse_rejects_manual_env_policy_flags() {
+    let args = strings([
+        "pentect-agent",
+        "exec",
+        "--allow-env",
+        "RUNPOD_API_KEY",
+        "echo",
+        "hi",
+    ]);
+    let err = match ExecOpts::parse(&args) {
+        Ok(_) => panic!("expected --allow-env to be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("unknown option"), "{err}");
 }
 
 #[test]
@@ -219,33 +223,44 @@ fn exec_allows_secret_file_reads_because_output_is_remasked() {
 }
 
 #[test]
-fn exec_policy_blocks_environment_reads() {
-    let err = guard_shell_script_with_env("Get-ChildItem Env:", &EnvPolicy::default()).unwrap_err();
-    assert!(err.contains("environment-variable"), "{err}");
-
-    let err =
-        guard_shell_script_with_env("printenv RUNPOD_API_KEY", &EnvPolicy::default()).unwrap_err();
-    assert!(err.contains("environment-variable"), "{err}");
-
-    let err =
-        guard_shell_script_with_env("echo $RUNPOD_API_KEY", &EnvPolicy::default()).unwrap_err();
-    assert!(err.contains("environment-variable"), "{err}");
-
-    let err = guard_shell_script_with_env("Write-Output %RUNPOD_API_KEY%", &EnvPolicy::default())
+fn exec_blocks_dotenv_sourcing_because_it_does_not_register_capabilities() {
+    let err = guard_shell_script_with_env("set -a; . ./.env >/dev/null", &EnvPolicy::default())
         .unwrap_err();
-    assert!(err.contains("environment-variable"), "{err}");
+    assert!(err.contains("Do not source .env"), "{err}");
+    assert!(err.contains("KEY=<<...>>"), "{err}");
+
+    let err = guard_shell_script_with_env("source .env.local", &EnvPolicy::default()).unwrap_err();
+    assert!(err.contains("Do not source .env"), "{err}");
 }
 
 #[test]
-fn exec_policy_allows_and_denies_named_environment_reads() {
-    let allowed = env_policy(&["RUNPOD_API_KEY"], &[]);
+fn exec_policy_blocks_environment_reads() {
+    let err = guard_shell_script_with_env("Get-ChildItem Env:", &EnvPolicy::default()).unwrap_err();
+    assert!(err.contains("environment variables"), "{err}");
+
+    let err =
+        guard_shell_script_with_env("printenv RUNPOD_API_KEY", &EnvPolicy::default()).unwrap_err();
+    assert!(err.contains("environment variables"), "{err}");
+
+    let err =
+        guard_shell_script_with_env("echo $RUNPOD_API_KEY", &EnvPolicy::default()).unwrap_err();
+    assert!(err.contains("environment variables"), "{err}");
+
+    let err = guard_shell_script_with_env("Write-Output %RUNPOD_API_KEY%", &EnvPolicy::default())
+        .unwrap_err();
+    assert!(err.contains("environment variables"), "{err}");
+}
+
+#[test]
+fn exec_policy_allows_auto_bound_environment_reads_only() {
+    let allowed = env_policy(&["RUNPOD_API_KEY"]);
     guard_shell_script_with_env("printenv RUNPOD_API_KEY", &allowed).unwrap();
     guard_shell_script_with_env("echo $RUNPOD_API_KEY", &allowed).unwrap();
     guard_shell_script_with_env("Write-Output $env:RUNPOD_API_KEY", &allowed).unwrap();
 
-    let denied = env_policy(&["RUNPOD_API_KEY"], &["USERNAME"]);
-    let err = guard_shell_script_with_env("Write-Output %USERNAME%", &denied).unwrap_err();
-    assert!(err.contains("environment-variable"), "{err}");
+    let err = guard_shell_script_with_env("Write-Output $env:AWS_SECRET_ACCESS_KEY", &allowed)
+        .unwrap_err();
+    assert!(err.contains("environment variables"), "{err}");
 }
 
 #[test]
@@ -274,8 +289,6 @@ fn exec_resolves_masked_handle_in_command_text() {
     };
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
-        allow_env: Vec::new(),
-        deny_env: Vec::new(),
         live: false,
         approve: false,
         mode: ExecMode::Shell(command),
@@ -304,6 +317,8 @@ fn exec_auto_binds_masked_env_output_across_sessions() {
     );
     assert!(masked.contains("TEST_SECRET=<<SECRET_"), "{masked}");
     assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
+    let runpod_handle = masked_handle_from_assignment(&masked, "RUNPOD_API_KEY");
+    let runpod_pentect_env = pentect_env_name_for_handle(&runpod_handle);
     drop(session);
 
     let session = Session::open_capability_at(&root, "t").unwrap();
@@ -324,6 +339,11 @@ fn exec_auto_binds_masked_env_output_across_sessions() {
             .any(|(name, value)| name == "NOTE" && value == "hello world"),
         "{env:?}"
     );
+    assert!(
+        env.iter().any(|(name, value)| name == &runpod_pentect_env
+            && value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+        "{env:?}"
+    );
 
     let command = if cfg!(windows) {
         "Write-Output $env:RUNPOD_API_KEY; Write-Output $env:TEST_SECRET; Write-Output $env:NOTE"
@@ -333,8 +353,6 @@ fn exec_auto_binds_masked_env_output_across_sessions() {
     };
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
-        allow_env: Vec::new(),
-        deny_env: Vec::new(),
         live: false,
         approve: false,
         mode: ExecMode::Shell(command),
@@ -379,6 +397,47 @@ fn resolve_path_rewrites_known_handles_without_printing_secret() {
     let written = std::fs::read_to_string(&path).unwrap();
     assert_eq!(written, raw);
     assert!(!written.contains("<<OPENAI_API_KEY_"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
+    let root = temp_root("capability-generic-pentect-env");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_tool_output(&session, &format!("created token: {raw}\n")).unwrap();
+    assert!(!masked.contains(raw), "{masked}");
+    let handle = first_masked_handle(&masked);
+    let env_name = pentect_env_name_for_handle(&handle);
+    drop(session);
+
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+    let env = store.auto_env_bindings().unwrap();
+    assert!(
+        env.iter()
+            .any(|(name, value)| name == &env_name && value == raw),
+        "{env:?}"
+    );
+
+    let command = if cfg!(windows) {
+        format!("Write-Output $env:{env_name}")
+    } else {
+        format!("printf '%s' \"${env_name}\"")
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        approve: false,
+        mode: ExecMode::Shell(command),
+    };
+    let output = run_resolved_command(&store, &opts).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(raw), "{stdout}");
+
+    let safe = mask_tool_output(&session, &stdout).unwrap();
+    assert!(!safe.contains(raw), "{safe}");
+    assert!(safe.contains("<<OPENAI_API_KEY_"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1026,15 +1085,53 @@ fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {
     items.into_iter().map(str::to_string).collect()
 }
 
-fn env_policy(allowed: &[&str], denied: &[&str]) -> EnvPolicy {
+fn env_policy(allowed: &[&str]) -> EnvPolicy {
     EnvPolicy {
         allowed: allowed
             .iter()
             .map(|name| name.to_ascii_lowercase())
             .collect(),
-        denied: denied
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect(),
     }
+}
+
+fn masked_handle_from_assignment(masked: &str, key: &str) -> String {
+    let prefix = format!("{key}=");
+    let line = masked
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("missing {key}= line in {masked}"));
+    line[prefix.len()..].trim().to_string()
+}
+
+fn first_masked_handle(masked: &str) -> String {
+    let start = masked
+        .find("<<")
+        .unwrap_or_else(|| panic!("missing handle in {masked}"));
+    let end = masked[start..]
+        .find(">>")
+        .map(|offset| start + offset + 2)
+        .unwrap_or_else(|| panic!("unterminated handle in {masked}"));
+    masked[start..end].to_string()
+}
+
+fn pentect_env_name_for_handle(handle: &str) -> String {
+    let inner = handle
+        .strip_prefix("<<")
+        .and_then(|value| value.strip_suffix(">>"))
+        .unwrap_or_else(|| panic!("not a handle: {handle}"));
+    let core = match inner.rsplit_once("_length_at_least_") {
+        Some((prefix, suffix))
+            if suffix
+                .strip_suffix("_chars")
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            prefix
+        }
+        _ => inner,
+    };
+    let core = match core.rsplit_once("_len") {
+        Some((prefix, suffix)) if suffix.bytes().all(|b| b.is_ascii_digit()) => prefix,
+        _ => core,
+    };
+    format!("PENTECT_{core}")
 }
