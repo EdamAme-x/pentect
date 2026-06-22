@@ -26,12 +26,13 @@ const BUCKET_MED: usize = 24;
 const BUCKET_LONG: usize = 64;
 const BUCKET_XLONG: usize = 512;
 
-/// `<<LABEL_HASH>>`, or `<<LABEL_HASH_lenN>>` when a length bucket is given.
-/// `lenN` is the bucket floor — self-describing ("at least N chars") so a model
-/// reads it, unlike an opaque `~med`, while staying coarse.
+/// `<<LABEL_HASH>>`, or `<<LABEL_HASH_length_at_least_N_chars>>` when a length
+/// bucket is given. The suffix is deliberately verbose: it is still made of
+/// shell/env-safe identifier characters, but an AI can read the meaning without
+/// learning a project-specific abbreviation.
 pub fn render_placeholder(label: &str, hash: &str, bucket: Option<u32>) -> String {
     match bucket {
-        Some(n) => format!("<<{label}_{hash}_len{n}>>"),
+        Some(n) => format!("<<{label}_{hash}_length_at_least_{n}_chars>>"),
         None => format!("<<{label}_{hash}>>"),
     }
 }
@@ -76,7 +77,10 @@ mod tests {
             render_placeholder("AWS_AKID", "abc", None),
             "<<AWS_AKID_abc>>"
         );
-        assert_eq!(render_placeholder("X", "abc", Some(24)), "<<X_abc_len24>>");
+        assert_eq!(
+            render_placeholder("X", "abc", Some(24)),
+            "<<X_abc_length_at_least_24_chars>>"
+        );
     }
 
     #[test]

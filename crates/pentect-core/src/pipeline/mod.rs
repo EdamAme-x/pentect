@@ -417,7 +417,7 @@ static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
     // what we emit.
     let w = crate::placeholder::HASH_HEX_WIDTH;
     Regex::new(&format!(
-        r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{{{w}}}(?:_len[0-9]+)?>>"
+        r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{{{w}}}(?:_(?:len[0-9]+|length_at_least_[0-9]+_chars))?>>"
     ))
     .expect("placeholder regex compiles")
 });
@@ -555,14 +555,14 @@ mod tests {
             &on,
         );
         assert!(
-            r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_len"),
+            r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_length_at_least_24_chars"),
             "{}",
             r.masked
         );
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
 
         let r2 = m(&input);
-        assert!(!r2.masked.contains("_len"), "{}", r2.masked);
+        assert!(!r2.masked.contains("_length_at_least_"), "{}", r2.masked);
     }
 
     #[test]
@@ -578,7 +578,7 @@ mod tests {
         };
         let r = Engine::with_profile(Profile::Paranoid).mask(Input::text(&input), &on);
         assert!(
-            r.masked.contains("<<OPAQUE_BLOB_") && r.masked.contains("_len"),
+            r.masked.contains("<<OPAQUE_BLOB_") && r.masked.contains("_length_at_least_24_chars"),
             "{}",
             r.masked
         );
