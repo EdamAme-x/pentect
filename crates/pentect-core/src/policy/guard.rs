@@ -1,5 +1,3 @@
-use regex::Regex;
-
 /// Spares structured-but-benign values (UUIDs, hash digests, git SHAs) from
 /// context-free over-masking. It only ever retracts a candidate, and the engine
 /// only applies it to context-free spans, so it can never suppress an anchored
@@ -8,39 +6,120 @@ pub trait OverMaskGuard {
     fn benign(&self, value: &str) -> bool;
 }
 
-pub struct ShapeGuard {
-    uuid: Regex,
-    hex_digest: Regex,
-    git_sha: Regex,
-    local_path: Regex,
-}
+pub struct ShapeGuard;
 
 impl ShapeGuard {
     pub fn builtin() -> Self {
-        let r = |p: &str| Regex::new(p).expect("guard regex compiles");
-        Self {
-            uuid: r(
-                "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
-            ),
-            // md5/sha1/sha256/sha512 digest lengths.
-            hex_digest: r(
-                "^(?i)[0-9a-f]{32}$|^(?i)[0-9a-f]{40}$|^(?i)[0-9a-f]{64}$|^(?i)[0-9a-f]{128}$",
-            ),
-            git_sha: r("^[0-9a-f]{7,40}$"),
-            local_path: r(
-                r#"(?i)^(?:[A-Z]:[\\/]|/(?:home|Users|var/home|export/home|mnt/[A-Z]|[A-Z]/Users)/|~[^/\s\r\n"']+/)[^\r\n]+$"#,
-            ),
-        }
+        Self
     }
 }
 
 impl OverMaskGuard for ShapeGuard {
     fn benign(&self, value: &str) -> bool {
-        self.uuid.is_match(value)
-            || self.hex_digest.is_match(value)
-            || self.git_sha.is_match(value)
-            || self.local_path.is_match(value)
+        is_uuid(value) || is_hex_digest(value) || is_git_sha(value) || is_local_path(value)
     }
+}
+
+fn is_uuid(value: &str) -> bool {
+    let b = value.as_bytes();
+    b.len() == 36
+        && b[8] == b'-'
+        && b[13] == b'-'
+        && b[18] == b'-'
+        && b[23] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+}
+
+fn is_hex_digest(value: &str) -> bool {
+    matches!(value.len(), 32 | 40 | 64 | 128) && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+fn is_git_sha(value: &str) -> bool {
+    (7..=40).contains(&value.len())
+        && value
+            .as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
+fn is_local_path(value: &str) -> bool {
+    let b = value.as_bytes();
+    if b.iter().any(|&c| matches!(c, b'\r' | b'\n')) {
+        return false;
+    }
+    if b.len() >= 4 && b[0].is_ascii_alphabetic() && b[1] == b':' && is_sep(b[2]) {
+        return true;
+    }
+    if b.starts_with(b"~") {
+        return has_tilde_home_prefix(b);
+    }
+    if !b.starts_with(b"/") {
+        return false;
+    }
+    path_prefix_rest(b, &[b"home", b"users", b"var/home", b"export/home"])
+        .is_some_and(|rest| !rest.is_empty())
+        || mnt_drive_prefix_rest(b).is_some_and(|rest| !rest.is_empty())
+        || slash_drive_users_prefix_rest(b).is_some_and(|rest| !rest.is_empty())
+}
+
+fn has_tilde_home_prefix(b: &[u8]) -> bool {
+    if b.len() < 4 || b[0] != b'~' {
+        return false;
+    }
+    let Some(sep) = b[1..].iter().position(|&c| c == b'/') else {
+        return false;
+    };
+    let name = &b[1..1 + sep];
+    !name.is_empty()
+        && !name.iter().any(|&c| {
+            matches!(c, b'/' | b'\\' | b'\r' | b'\n' | b'"' | b'\'') || c.is_ascii_whitespace()
+        })
+        && b.get(1 + sep + 1).is_some()
+}
+
+fn path_prefix_rest<'a>(b: &'a [u8], prefixes: &[&[u8]]) -> Option<&'a [u8]> {
+    for prefix in prefixes {
+        if b.len() > prefix.len() + 2
+            && b[0] == b'/'
+            && eq_ascii_ci(&b[1..1 + prefix.len()], prefix)
+        {
+            let sep = 1 + prefix.len();
+            if b[sep] == b'/' {
+                return Some(&b[sep + 1..]);
+            }
+        }
+    }
+    None
+}
+
+fn mnt_drive_prefix_rest(b: &[u8]) -> Option<&[u8]> {
+    if b.len() > 7 && eq_ascii_ci(&b[..5], b"/mnt/") && b[5].is_ascii_alphabetic() && b[6] == b'/' {
+        return Some(&b[7..]);
+    }
+    None
+}
+
+fn slash_drive_users_prefix_rest(b: &[u8]) -> Option<&[u8]> {
+    if b.len() > 9
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b'/'
+        && eq_ascii_ci(&b[3..8], b"users")
+        && b[8] == b'/'
+    {
+        return Some(&b[9..]);
+    }
+    None
+}
+
+fn is_sep(b: u8) -> bool {
+    matches!(b, b'/' | b'\\')
+}
+
+fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.eq_ignore_ascii_case(b)
 }
 
 /// Guard that spares nothing: the `--aggressive` escape hatch. Internal — callers

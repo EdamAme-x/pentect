@@ -8,6 +8,7 @@
 //!   spans are always reported in raw coordinates.
 
 use crate::model::{ByteRange, Region};
+use std::borrow::Cow;
 use unicode_normalization::UnicodeNormalization;
 
 /// Identity normalization: NFC only (deliberately not NFKC, and deliberately
@@ -50,8 +51,9 @@ fn push_ascii_escape(norm: &mut String, segs: &mut Vec<Seg>, byte: u8, raw: Byte
 /// resulting spans are always reported in raw coordinates.
 pub struct NormalizedView<'a> {
     pub region: &'a Region,
-    norm: String,
+    norm: Cow<'a, str>,
     segs: Vec<Seg>,
+    identity: bool,
 }
 
 /// One normalized run and the raw bytes it came from.
@@ -64,11 +66,19 @@ impl<'a> NormalizedView<'a> {
     /// Normalization is per-character, so cross-character composition (e.g. a
     /// base letter plus a combining mark) is not folded. That is enough for the
     /// zero-width / bidi / full-width / percent cases we target.
-    pub fn build(region: &'a Region, raw: &str) -> Self {
+    pub fn build(region: &'a Region, raw: &'a str) -> Self {
         let base = region.span.start;
         let slice = &raw[region.span.start..region.span.end];
+        if is_identity_detection_slice(slice) {
+            return NormalizedView {
+                region,
+                norm: Cow::Borrowed(slice),
+                segs: Vec::new(),
+                identity: true,
+            };
+        }
         let bytes = slice.as_bytes();
-        let mut norm = String::new();
+        let mut norm = String::with_capacity(slice.len());
         let mut segs = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
@@ -132,7 +142,12 @@ impl<'a> NormalizedView<'a> {
                 });
             }
         }
-        NormalizedView { region, norm, segs }
+        NormalizedView {
+            region,
+            norm: Cow::Owned(norm),
+            segs,
+            identity: false,
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -142,6 +157,11 @@ impl<'a> NormalizedView<'a> {
     /// Map a normalized byte range to a raw range, snapping outward to whole
     /// source characters so we never under-cover (under-covering would leak).
     pub fn to_raw(&self, norm: ByteRange) -> ByteRange {
+        if self.identity {
+            let start = self.region.span.start + norm.start;
+            let end = self.region.span.start + norm.end;
+            return ByteRange::new(start, end.max(start).min(self.region.span.end));
+        }
         let start = self.raw_start_at(norm.start);
         let end = self.raw_end_at(norm.end);
         ByteRange::new(start, end.max(start))
@@ -162,6 +182,43 @@ impl<'a> NormalizedView<'a> {
             .map(|s| s.raw.end)
             .unwrap_or(self.region.span.start)
     }
+}
+
+fn is_identity_detection_slice(slice: &str) -> bool {
+    let bytes = slice.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii() {
+            return false;
+        }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && hex_val(bytes[i + 1]).is_some()
+            && hex_val(bytes[i + 2]).is_some()
+        {
+            return false;
+        }
+        if bytes[i] == b'\\' {
+            if i + 5 < bytes.len()
+                && bytes[i + 1] == b'u'
+                && bytes[i + 2] == b'0'
+                && bytes[i + 3] == b'0'
+                && hex_val(bytes[i + 4]).is_some()
+                && hex_val(bytes[i + 5]).is_some()
+            {
+                return false;
+            }
+            if i + 3 < bytes.len()
+                && matches!(bytes[i + 1], b'x' | b'X')
+                && hex_val(bytes[i + 2]).is_some()
+                && hex_val(bytes[i + 3]).is_some()
+            {
+                return false;
+            }
+        }
+        i += 1;
+    }
+    true
 }
 
 #[cfg(test)]

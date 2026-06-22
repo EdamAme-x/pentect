@@ -1,3 +1,4 @@
+use aho_corasick::{AhoCorasickBuilder, MatchKind};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -104,10 +105,29 @@ impl Recovery {
             .filter_map(|ph| self.reveal(ph).map(|v| (v, ph.as_str())))
             .filter(|(v, _)| is_remaskable_echo(v))
             .collect();
-        pairs.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
-        let mut out = text.to_string();
-        for (mut value, ph) in pairs {
-            out = out.replace(&value, ph);
+        if pairs.is_empty() {
+            return text.to_string();
+        }
+        if pairs.len() == 1 {
+            let (mut value, ph) = pairs.pop().expect("checked len");
+            let out = text.replace(&value, ph);
+            value.zeroize();
+            return out;
+        }
+        let patterns: Vec<&str> = pairs.iter().map(|(value, _)| value.as_str()).collect();
+        let ac = AhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(patterns)
+            .expect("non-empty remask patterns");
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for m in ac.find_iter(text) {
+            out.push_str(&text[cursor..m.start()]);
+            out.push_str(pairs[m.pattern().as_usize()].1);
+            cursor = m.end();
+        }
+        out.push_str(&text[cursor..]);
+        for (value, _) in &mut pairs {
             value.zeroize(); // don't leave the revealed plaintext on the heap
         }
         out

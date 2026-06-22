@@ -71,31 +71,29 @@ fn split_email(v: &str) -> Option<(&str, &str)> {
 /// OPAQUE_BLOB) — never for typed credentials, whose length is sensitive.
 pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: bool) -> Rendered {
     spans.sort_by_key(|s| s.range.start);
-    let mut segments: Vec<RenderSegment> = Vec::new();
+    let mut segments: Vec<RenderSegment> =
+        Vec::with_capacity(spans.len().saturating_mul(2).saturating_add(1));
+    let mut masked = String::with_capacity(raw.len());
     let mut map: HashMap<String, String> = HashMap::new();
     let mut placeholder_cache: HashMap<(String, String, Option<u32>), String> = HashMap::new();
     let mut collisions = Vec::new();
     let mut cursor = 0usize;
-
-    let literal = |seg: &mut Vec<RenderSegment>, text: &str| {
-        if !text.is_empty() {
-            seg.push(RenderSegment::Literal { text: text.into() });
-        }
-    };
 
     for s in &spans {
         // Spans are already non-overlapping; this is just defensive.
         if s.range.start < cursor {
             continue;
         }
-        literal(&mut segments, &raw[cursor..s.range.start]);
+        push_literal(&mut segments, &mut masked, &raw[cursor..s.range.start]);
         let val = &raw[s.range.start..s.range.end];
 
         match split_email(val) {
             // Mask each side under the same label; the `@` stays literal so
             // restore reconstructs the address from the two mappings.
             Some((local, domain)) => {
-                segments.push(masked_seg(
+                push_masked(
+                    &mut segments,
+                    &mut masked,
                     key,
                     s,
                     local,
@@ -103,9 +101,11 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                     &mut map,
                     &mut placeholder_cache,
                     &mut collisions,
-                ));
-                literal(&mut segments, "@");
-                segments.push(masked_seg(
+                );
+                push_literal(&mut segments, &mut masked, "@");
+                push_masked(
+                    &mut segments,
+                    &mut masked,
                     key,
                     s,
                     domain,
@@ -113,7 +113,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                     &mut map,
                     &mut placeholder_cache,
                     &mut collisions,
-                ));
+                );
             }
             None => {
                 let len = if disclose_length && is_context_free(s) {
@@ -121,7 +121,9 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                 } else {
                     None
                 };
-                segments.push(masked_seg(
+                push_masked(
+                    &mut segments,
+                    &mut masked,
                     key,
                     s,
                     val,
@@ -129,20 +131,44 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                     &mut map,
                     &mut placeholder_cache,
                     &mut collisions,
-                ));
+                );
             }
         }
         cursor = s.range.end;
     }
-    literal(&mut segments, &raw[cursor..]);
+    push_literal(&mut segments, &mut masked, &raw[cursor..]);
 
-    let masked = segments.iter().map(RenderSegment::text).collect();
     Rendered {
         masked,
         segments,
         map,
         collisions,
     }
+}
+
+fn push_literal(segments: &mut Vec<RenderSegment>, masked: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    masked.push_str(text);
+    segments.push(RenderSegment::Literal { text: text.into() });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_masked(
+    segments: &mut Vec<RenderSegment>,
+    masked: &mut String,
+    key: &[u8; 32],
+    span: &Span,
+    val: &str,
+    len: Option<u32>,
+    map: &mut HashMap<String, String>,
+    placeholder_cache: &mut HashMap<(String, String, Option<u32>), String>,
+    collisions: &mut Vec<String>,
+) {
+    let segment = masked_seg(key, span, val, len, map, placeholder_cache, collisions);
+    masked.push_str(segment.text());
+    segments.push(segment);
 }
 
 /// Build a masked segment for `val`, recording its mapping and noting a collision

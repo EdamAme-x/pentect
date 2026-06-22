@@ -1,4 +1,5 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use std::sync::LazyLock;
 
 use super::validate::Validator;
 use super::Detector;
@@ -6,6 +7,7 @@ use crate::model::*;
 use crate::normalize::NormalizedView;
 use regex::{Regex, RegexSet};
 
+#[derive(Clone)]
 struct Rule {
     re: Regex,
     category: Category,
@@ -41,15 +43,29 @@ pub struct RuleDetector {
     prefiltered: Option<PrefilterGroup>,
 }
 
+#[derive(Clone)]
 struct ExactGroup {
     set: RegexSet,
     rules: Vec<usize>,
 }
 
+#[derive(Clone)]
 struct PrefilterGroup {
     ac: AhoCorasick,
     rules_by_pattern: Vec<Vec<usize>>,
 }
+
+impl Clone for RuleDetector {
+    fn clone(&self) -> Self {
+        Self {
+            rules: self.rules.clone(),
+            exact: self.exact.clone(),
+            prefiltered: self.prefiltered.clone(),
+        }
+    }
+}
+
+static BUILTIN_RULE_DETECTOR: LazyLock<RuleDetector> = LazyLock::new(RuleDetector::build_builtin);
 
 impl RuleDetector {
     /// Compile data-form rules into a detector; errors if any pattern is invalid.
@@ -120,6 +136,10 @@ impl RuleDetector {
     }
 
     pub fn builtin() -> Self {
+        BUILTIN_RULE_DETECTOR.clone()
+    }
+
+    fn build_builtin() -> Self {
         use Category::{Endpoint, Identifier, Pii, Secret};
         use Confidence::{High, Low, Medium};
         // Conventions, so new rules stay consistent:

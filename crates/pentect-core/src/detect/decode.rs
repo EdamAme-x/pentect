@@ -54,10 +54,10 @@ impl DecodeDetector {
     pub fn builtin() -> Self {
         Self::new(
             vec![
-                Box::new(Base64Codec),
-                Box::new(Base32Codec),
-                Box::new(Base58Codec),
                 Box::new(HexCodec),
+                Box::new(Base32Codec),
+                Box::new(Base64Codec),
+                Box::new(Base58Codec),
             ],
             vec![Box::new(RuleDetector::builtin())],
             DEFAULT_DECODE_DEPTH,
@@ -258,9 +258,27 @@ fn looks_binary(bytes: &[u8]) -> bool {
 /// Try gzip, zlib, then raw deflate. Output is capped to bound decompression
 /// bombs; we only need enough to detect a secret, not the full payload.
 fn decompress(data: &[u8]) -> Option<Vec<u8>> {
-    inflate(GzDecoder::new(data))
-        .or_else(|| inflate(ZlibDecoder::new(data)))
-        .or_else(|| inflate(DeflateDecoder::new(data)))
+    if data.starts_with(&[0x1f, 0x8b]) {
+        return inflate(GzDecoder::new(data));
+    }
+    if looks_like_zlib(data) {
+        return inflate(ZlibDecoder::new(data));
+    }
+    // Raw DEFLATE has no reliable magic bytes. Trying it on every random decoded
+    // hash is expensive, so only keep it as a fallback for payload-sized blobs.
+    if data.len() >= 32 {
+        return inflate(DeflateDecoder::new(data));
+    }
+    None
+}
+
+fn looks_like_zlib(data: &[u8]) -> bool {
+    let Some((&cmf, &flg)) = data.first().zip(data.get(1)) else {
+        return false;
+    };
+    // RFC 1950: compression method must be deflate (8), window <= 32K, and the
+    // two-byte header is divisible by 31.
+    cmf & 0x0f == 8 && (cmf >> 4) <= 7 && u16::from_be_bytes([cmf, flg]).is_multiple_of(31)
 }
 
 fn inflate<R: Read>(reader: R) -> Option<Vec<u8>> {
