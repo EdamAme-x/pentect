@@ -23,3 +23,7 @@ semantic = ["pentect-core/semantic"]
 pentect-core = { path = "../pentect-core" }
 pdf-extract = { workspace = true, optional = true }
 serde_json = { workspace = true }
+crossterm = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }

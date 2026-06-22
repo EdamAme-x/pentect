@@ -2,6 +2,7 @@
 //! written to disk.
 
 mod input;
+mod terminal;
 
 use input::{InputAdapter, TextInput};
 use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, RuleDetector};
@@ -86,6 +87,7 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
         ));
     }
     if !opts.dry_run {
+        terminal::restore_after_tui();
         maybe_print_first_run_agent_hint(&opts.session);
     }
     let status = match tool {
@@ -446,7 +448,7 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
         cmd.arg("--config").arg(config);
     }
     cmd.args(&opts.tool_args);
-    run_command(cmd, &opts.command)
+    run_interactive_command(cmd, &opts.command)
 }
 
 fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
@@ -458,7 +460,7 @@ fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     }
     let mut cmd = Command::new(&opts.command);
     cmd.args(&args);
-    run_command(cmd, &opts.command)
+    run_interactive_command(cmd, &opts.command)
 }
 
 fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
@@ -481,7 +483,7 @@ fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     let status = {
         let mut cmd = Command::new(&opts.command);
         cmd.args(&opts.tool_args);
-        run_command(cmd, &opts.command)
+        run_interactive_command(cmd, &opts.command)
     };
     if let Err(e) = restore_gemini_settings(&settings_path, original) {
         eprintln!("[pentect] WARNING: {e}");
@@ -492,6 +494,13 @@ fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
 fn run_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
     cmd.status()
         .unwrap_or_else(|e| die(&format!("could not start '{}': {e}", display.display())))
+}
+
+fn run_interactive_command(cmd: Command, display: &Path) -> std::process::ExitStatus {
+    terminal::restore_after_tui();
+    let status = run_command(cmd, display);
+    terminal::restore_after_tui();
+    status
 }
 
 fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {

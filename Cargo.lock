@@ -891,9 +891,11 @@ dependencies = [
 name = "pentect-cli"
 version = "0.0.1"
 dependencies = [
+ "crossterm",
  "pdf-extract",
  "pentect-core",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
