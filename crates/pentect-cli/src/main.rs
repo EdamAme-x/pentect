@@ -19,6 +19,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         None => cmd_agent_passthrough_from(1, &args),
+        Some("help" | "--help" | "-h") => cmd_help(),
         Some("dashboard") => cmd_agent_passthrough_from(1, &args),
         Some("--dir" | "--session") => cmd_agent_passthrough_from(1, &args),
         Some("mask") => cmd_mask(&args),
@@ -35,6 +36,7 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--semantic] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
+         pentect help\n\
          pentect [dashboard] [--session NAME] [--dir PATH]\n\
          pentect read|exec|approve|hook|purge ...\n\
          pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
@@ -49,6 +51,22 @@ fn usage() {
          \x20 --enable LABEL   turn on an off-by-default built-in (e.g. DATE_TIME)\n\
          \x20 --semantic       also mask person/location/org/address via a spaCy sidecar"
     );
+}
+
+fn cmd_help() {
+    print!("{}", help_text());
+}
+
+fn help_text() -> &'static str {
+    "pentect protects AI tool boundaries by running shell commands through `pentect exec`.\n\
+\n\
+Agent workflow:\n\
+  pentect codex|claude|gemini\n\
+  pentect exec \"<command>\"\n\
+\n\
+Masked handles resolve locally inside later `pentect exec` commands.\n\
+Masked env lines become env vars: `$env:KEY` on PowerShell, `$KEY` on Unix.\n\
+Use `pentect purge` to delete local capability state for this directory/session.\n"
 }
 
 fn die(msg: &str) -> ! {
@@ -1357,6 +1375,15 @@ mod tests {
         assert!(!codex_uses_unverified_headless_hook_path(&[
             "help".to_string()
         ]));
+    }
+
+    #[test]
+    fn help_text_explains_agent_handle_reuse() {
+        let help = help_text();
+        assert!(help.contains("pentect exec"), "{help}");
+        assert!(help.contains("$env:KEY"), "{help}");
+        assert!(help.contains("$KEY"), "{help}");
+        assert!(help.contains("pentect purge"), "{help}");
     }
 
     #[test]

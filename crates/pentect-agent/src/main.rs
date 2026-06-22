@@ -958,9 +958,9 @@ fn checked_env_name(name: &str) -> Result<String, String> {
 fn exec_usage_hint(env_name: Option<&str>) -> String {
     match env_name {
         Some(name) => format!(
-            "# pentect: usage: use `pentect exec \"<command>\"`; known `<<...>>` handles resolve locally before execution; `{name}` is available as `$env:{name}` on PowerShell or `${name}` on Unix; opaque blobs may show `_length_at_least_N_chars`."
+            "# pentect: env ready: `$env:{name}` on PowerShell / `${name}` on Unix. Help: `pentect help`."
         ),
-        None => "# pentect: usage: use `pentect exec \"<command>\"`; known `<<...>>` handles resolve locally before execution; masked env keys become `$env:KEY` on PowerShell or `$KEY` on Unix; opaque blobs may show `_length_at_least_N_chars`.".to_string(),
+        None => "# pentect: help: `pentect help`.".to_string(),
     }
 }
 

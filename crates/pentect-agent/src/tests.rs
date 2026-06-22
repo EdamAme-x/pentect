@@ -149,16 +149,15 @@ fn session_does_not_create_key_or_recovery_dir() {
 #[test]
 fn exec_usage_hint_explains_agent_contract() {
     let hint = exec_usage_hint(None);
-    assert!(hint.contains("pentect exec"), "{hint}");
-    assert!(hint.contains("handles resolve locally"), "{hint}");
-    assert!(hint.contains("$env:KEY"), "{hint}");
-    assert!(hint.contains("$KEY"), "{hint}");
-    assert!(hint.contains("_length_at_least_N_chars"), "{hint}");
+    assert!(hint.contains("pentect help"), "{hint}");
+    assert!(!hint.contains("length_at_least"), "{hint}");
+    assert!(!hint.contains("<<"), "{hint}");
 
     let concrete = exec_usage_hint(Some("RUNPOD_API_KEY"));
     assert!(concrete.contains("$env:RUNPOD_API_KEY"), "{concrete}");
     assert!(concrete.contains("$RUNPOD_API_KEY"), "{concrete}");
-    assert!(concrete.contains("handles resolve locally"), "{concrete}");
+    assert!(concrete.contains("pentect help"), "{concrete}");
+    assert!(!concrete.contains("length_at_least"), "{concrete}");
 }
 
 #[test]
@@ -444,9 +443,38 @@ fn env_handle_output_says_keys_are_auto_bound() {
     let masked = mask_tool_output(&session, output).unwrap();
     let env_name = first_reusable_env_name(&masked).unwrap();
     let hint = exec_usage_hint(Some(&env_name));
-    assert!(hint.contains("handles resolve locally"), "{hint}");
     assert!(hint.contains("$env:RUNPOD_API_KEY"), "{hint}");
     assert!(hint.contains("$RUNPOD_API_KEY"), "{hint}");
+    assert!(hint.contains("pentect help"), "{hint}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_usage_hint_is_not_remasked_by_posttool() {
+    let (root, session) = empty_session("exec-hint-stable");
+    let hint = exec_usage_hint(Some("RUNPOD_API_KEY"));
+    let masked = mask_tool_output(&session, &hint).unwrap();
+    assert_eq!(masked, hint);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn codex_posttool_does_not_block_already_masked_exec_output() {
+    let (root, session) = empty_session("hook-post-codex-already-masked");
+    let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
+    let masked = mask_tool_output(&session, output).unwrap();
+    let env_name = first_reusable_env_name(&masked).unwrap();
+    let tool_response = format!("{}{}\n", masked, exec_usage_hint(Some(&env_name)));
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "pentect exec 'Get-Content -LiteralPath .\\.env'"
+        },
+        "tool_response": tool_response
+    });
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    assert_eq!(output, json!({}));
     let _ = std::fs::remove_dir_all(root);
 }
 
