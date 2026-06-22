@@ -479,6 +479,22 @@ fn codex_posttool_does_not_block_already_masked_exec_output() {
 }
 
 #[test]
+fn codex_posttool_does_not_block_legacy_exec_footer() {
+    let (root, session) = empty_session("hook-post-codex-legacy-footer");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "pentect exec 'Get-Content -LiteralPath .\\.env'"
+        },
+        "tool_response": "RUNPOD_API_KEY=<<RUNPOD_API_KEY_f6a375b6c449645f>>\nTEST_SECRET=<<SECRET_ea193cc4740362de>>\nNOTE=<<SECRET_36da7f6aab3d75f1>>\n# pentect: usage: use `pentect exec \"<command>\"`; known `<<...>>` handles resolve locally before execution; `RUNPOD_API_KEY` is available as `$env:RUNPOD_API_KEY` on PowerShell or `$RUNPOD_API_KEY` on Unix; opaque blobs may show `_length_at_least_N_chars`."
+    });
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn exec_tool_output_discloses_readable_coarse_opaque_length() {
     let (root, session) = empty_session("exec-readable-length");
     let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";

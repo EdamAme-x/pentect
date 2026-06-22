@@ -995,6 +995,9 @@ fn handle_hook(
             }
         }
         HookPhase::AfterTool => {
+            if posttool_came_from_pentect_exec(&input) {
+                return Ok(json!({}));
+            }
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
@@ -1046,6 +1049,13 @@ fn before_tool_updated_input(
         }
     }
     Ok((tool_input.clone(), false))
+}
+
+fn posttool_came_from_pentect_exec(input: &Value) -> bool {
+    hook_field(input, &["tool_input"])
+        .and_then(|tool_input| tool_input.get("command"))
+        .and_then(Value::as_str)
+        .is_some_and(is_pentect_exec_command)
 }
 
 fn maybe_materialize_dotenv_write(
@@ -1131,6 +1141,16 @@ fn is_read_like_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name.to_ascii_lowercase().as_str(),
         "read" | "read_file" | "read_many_files" | "multiread" | "notebookread" | "notebook_read"
+    )
+}
+
+fn is_pentect_exec_command(command: &str) -> bool {
+    matches!(
+        parse_pentect_subcommand(command),
+        Some(PentectInvocation {
+            subcommand: PentectSubcommand::Exec,
+            ..
+        })
     )
 }
 
