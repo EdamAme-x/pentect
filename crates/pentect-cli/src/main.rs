@@ -15,9 +15,10 @@ use std::process::Command;
 /// head plus a raw tail would leak the tail).
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
-    "Pentect protects this agent's tool boundary. Shell tools are automatically routed through `pentect exec`; do not nest Pentect wrappers around each other.\n",
+    "Pentect protects this agent's tool boundary. Shell tools are automatically routed through `pentect exec`; prefer writing the intended shell command directly, and do not nest Pentect wrappers around each other.\n",
     "When you see masked handles like `<<NAME_hash>>`, you may reuse them in later shell commands. Pentect resolves them locally before execution and masks stdout/stderr again before returning output.\n",
-    "Masked env assignment output such as `KEY=<<KEY_hash>>` also becomes a local env var for later `pentect exec` commands: use `$env:KEY` on PowerShell or `$KEY` on Unix. Do not try to reveal the plaintext value; use the handle or env var to call downstream tools.\n",
+    "Masked env assignment output such as `KEY=<<KEY_hash>>` also becomes a local env var for later shell commands: use `$env:KEY` on PowerShell or `$KEY` on Unix. If the user asks to echo, curl with, fetch with, or otherwise use KEY, use that env var directly; do not re-read `.env`, grep KEY lines, split assignments, or echo the masked handle as a substitute for using the value.\n",
+    "The command result will still be masked when it returns to you. That is expected: use success/failure, status codes, and non-secret response fields to answer.\n",
 );
 
 fn main() {
@@ -1387,6 +1388,8 @@ mod tests {
             rendered.contains("do not nest Pentect wrappers"),
             "{rendered}"
         );
+        assert!(rendered.contains("$env:KEY"), "{rendered}");
+        assert!(rendered.contains("do not re-read `.env`"), "{rendered}");
         assert!(
             !rendered.contains("pentect exec \\\"pentect exec"),
             "{rendered}"
@@ -1402,6 +1405,8 @@ mod tests {
             rendered.contains("Masked env assignment output"),
             "{rendered}"
         );
+        assert!(rendered.contains("$env:KEY"), "{rendered}");
+        assert!(rendered.contains("do not re-read `.env`"), "{rendered}");
         assert!(
             !rendered.contains("pentect exec \"pentect exec"),
             "{rendered}"
