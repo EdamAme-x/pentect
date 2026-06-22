@@ -9,8 +9,10 @@
 mod approve_ui;
 
 use approve_ui::{ApprovalDecision, ApprovalRequest};
+use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{Config, Engine, Input, Kind, Profile, Recovery};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -24,6 +26,8 @@ const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const VAULT_FILE: &str = "capability-vault.pnt";
 const VAULT_MAGIC: &[u8; 4] = b"PNV1";
 const VAULT_VERSION: u8 = 1;
+const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
+const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -47,9 +51,9 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect [dashboard] [--session NAME] [--dir PATH]\n\
-         pentect exec [--session NAME] [--approve] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
-         pentect exec [--session NAME] [--approve] [--live] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... -- PROGRAM [ARG...]\n\
-         pentect approve [--session NAME] [--env NAME=VALUE]... [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
+         pentect exec [--session NAME] [--approve] [--live] [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
+         pentect exec [--session NAME] [--approve] [--live] [--allow-env NAME]... [--deny-env NAME]... -- PROGRAM [ARG...]\n\
+         pentect approve [--session NAME] [--allow-env NAME]... [--deny-env NAME]... COMMAND\n\
          pentect read [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
          pentect hook [--capability] codex|claude|gemini < hook-json\n\
          pentect purge [--session NAME]\n\
@@ -258,23 +262,26 @@ fn request_approval(
 }
 
 fn approval_warnings(
-    _store: &RecoveryStore,
+    store: &RecoveryStore,
     opts: &ExecOpts,
     display_command: &str,
 ) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
-    let env = opts
-        .env
-        .iter()
-        .map(|binding| (binding.name.clone(), String::new()))
-        .collect::<Vec<_>>();
+    let env = store.auto_env_bindings()?;
     let policy = exec_env_policy(&env, opts)?;
     let guard = match &opts.mode {
         ExecMode::Program(args) => {
-            let program = args.first().map(String::as_str).unwrap_or_default();
-            guard_program_invocation_with_env(program, &args[1..], &policy)
+            let resolved_args = resolve_command_args(store, args)?;
+            let program = resolved_args
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default();
+            guard_program_invocation_with_env(program, &resolved_args[1..], &policy)
         }
-        ExecMode::Shell(_) => guard_shell_script_with_env(display_command, &policy),
+        ExecMode::Shell(_) => {
+            let command = resolve_command_text(store, display_command)?;
+            guard_shell_script_with_env(&command, &policy)
+        }
     };
     if let Err(reason) = guard {
         warnings.push(reason);
@@ -344,15 +351,16 @@ fn run_resolved_command(
     store: &RecoveryStore,
     opts: &ExecOpts,
 ) -> Result<std::process::Output, String> {
-    let env = resolve_env_bindings(store, &opts.env)?;
+    let env = store.auto_env_bindings()?;
     let env_policy = exec_env_policy(&env, opts)?;
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
-            let program = &args[0];
-            let command_args = &args[1..];
+            let resolved_args = resolve_command_args(store, args)?;
+            let program = &resolved_args[0];
+            let command_args = &resolved_args[1..];
             guard_program_invocation_with_env(program, command_args, &env_policy)?;
             let mut command = Command::new(program);
             command.args(command_args);
@@ -362,22 +370,24 @@ fn run_resolved_command(
                 .map_err(|e| format!("could not execute command: {e}"))
         }
         ExecMode::Shell(command) => {
-            guard_shell_script_with_env(command, &env_policy)?;
-            run_shell_script(command, &env)
+            let command = resolve_command_text(store, command)?;
+            guard_shell_script_with_env(&command, &env_policy)?;
+            run_shell_script(&command, &env)
         }
     }
 }
 
 fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExitStatus, String> {
-    let env = resolve_env_bindings(store, &opts.env)?;
+    let env = store.auto_env_bindings()?;
     let env_policy = exec_env_policy(&env, opts)?;
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
-            let program = &args[0];
-            let command_args = &args[1..];
+            let resolved_args = resolve_command_args(store, args)?;
+            let program = &resolved_args[0];
+            let command_args = &resolved_args[1..];
             guard_program_invocation_with_env(program, command_args, &env_policy)?;
             let mut command = Command::new(program);
             command.args(command_args);
@@ -385,30 +395,30 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             run_live_command(command, None, store.clone())
         }
         ExecMode::Shell(command) => {
-            guard_shell_script_with_env(command, &env_policy)?;
+            let command = resolve_command_text(store, command)?;
+            guard_shell_script_with_env(&command, &env_policy)?;
             let mut shell = shell_script_command();
             apply_env_bindings(&mut shell, &env);
-            run_live_command(shell, Some(command), store.clone())
+            run_live_command(shell, Some(&command), store.clone())
         }
     }
 }
 
-fn resolve_env_bindings(
-    store: &RecoveryStore,
-    env: &[EnvBinding],
-) -> Result<Vec<(String, String)>, String> {
-    env.iter()
-        .map(|binding| {
-            let resolved = store.resolve_all(&binding.value)?;
-            if resolved == binding.value && is_reusable_placeholder(binding.value.trim()) {
-                return Err(format!(
-                    "unknown masked env handle for {}; run from the same Pentect directory/session or re-read it with `pentect exec`",
-                    binding.name
-                ));
-            }
-            Ok((binding.name.clone(), resolved))
-        })
+fn resolve_command_args(store: &RecoveryStore, args: &[String]) -> Result<Vec<String>, String> {
+    args.iter()
+        .map(|arg| resolve_command_text(store, arg))
         .collect()
+}
+
+fn resolve_command_text(store: &RecoveryStore, text: &str) -> Result<String, String> {
+    let resolved = store.resolve_all(text)?;
+    if contains_unresolved_masked_handle(&resolved) {
+        return Err(
+            "unknown masked handle; run from the same Pentect directory/session or re-read it with `pentect exec`"
+                .to_string(),
+        );
+    }
+    Ok(resolved)
 }
 
 fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
@@ -496,7 +506,7 @@ fn guard_sensitive_source_access_with_env(
     let normalized = normalize_policy_text(text);
     if contains_env_read_reference(&normalized, env_policy) {
         return Err(
-            "Pentect blocked direct environment-variable access; pass approved values with `--env NAME=VALUE` instead."
+            "Pentect blocked direct environment-variable access; read the value through `pentect exec` first so a masked handle can be auto-bound."
                 .to_string(),
         );
     }
@@ -854,17 +864,11 @@ impl HookOpts {
 
 struct ExecOpts {
     session: String,
-    env: Vec<EnvBinding>,
     allow_env: Vec<String>,
     deny_env: Vec<String>,
     live: bool,
     approve: bool,
     mode: ExecMode,
-}
-
-struct EnvBinding {
-    name: String,
-    value: String,
 }
 
 enum ExecMode {
@@ -875,7 +879,6 @@ enum ExecMode {
 impl ExecOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut session = DEFAULT_SESSION.to_string();
-        let mut env = Vec::new();
         let mut allow_env = Vec::new();
         let mut deny_env = Vec::new();
         let mut live = false;
@@ -893,9 +896,6 @@ impl ExecOpts {
                 "--approve" => {
                     approve = true;
                     i += 1;
-                }
-                "--env" => {
-                    env.push(parse_env_binding(&value(args, &mut i, "--env")?)?);
                 }
                 "--allow-env" => {
                     allow_env.push(checked_env_name(&value(args, &mut i, "--allow-env")?)?);
@@ -915,7 +915,6 @@ impl ExecOpts {
                     }
                     return Ok(Self {
                         session: checked_session_name(&session)?,
-                        env,
                         allow_env,
                         deny_env,
                         live,
@@ -927,7 +926,6 @@ impl ExecOpts {
                 _ => {
                     return Ok(Self {
                         session: checked_session_name(&session)?,
-                        env,
                         allow_env,
                         deny_env,
                         live,
@@ -941,22 +939,14 @@ impl ExecOpts {
     }
 }
 
-fn parse_env_binding(raw: &str) -> Result<EnvBinding, String> {
-    let Some((name, value)) = raw.split_once('=') else {
-        return Err("--env requires NAME=VALUE".to_string());
-    };
-    Ok(EnvBinding {
-        name: checked_env_name(name)?,
-        value: value.to_string(),
-    })
-}
-
 fn checked_env_name(name: &str) -> Result<String, String> {
     if name.is_empty() {
-        return Err("--env name must not be empty".to_string());
+        return Err("environment variable name must not be empty".to_string());
     }
     if name.as_bytes()[0].is_ascii_digit() || !name.bytes().all(is_env_name_byte) {
-        return Err("--env name must be a shell-style environment variable name".to_string());
+        return Err(
+            "environment variable name must be a shell-style environment variable name".to_string(),
+        );
     }
     Ok(name.to_string())
 }
@@ -1099,6 +1089,14 @@ impl Drop for Session {
     }
 }
 
+fn resolve_with_recoveries(recoveries: &[Recovery], text: &str) -> String {
+    let mut out = text.to_string();
+    for rec in recoveries {
+        out = rec.resolve(&out);
+    }
+    out
+}
+
 #[derive(Clone)]
 struct RecoveryStore {
     session: Session,
@@ -1133,6 +1131,28 @@ impl RecoveryStore {
 
     fn snapshot(&self) -> Result<Vec<Recovery>, String> {
         Ok(self.lock()?.clone())
+    }
+
+    fn auto_env_bindings(&self) -> Result<Vec<(String, String)>, String> {
+        let recoveries = self.snapshot()?;
+        let mut bindings: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for recovery in &recoveries {
+            for placeholder in recovery.placeholders() {
+                if !is_env_alias_placeholder(&placeholder) {
+                    continue;
+                }
+                let record = recovery.resolve(&placeholder);
+                let Some((name, handle)) = decode_env_alias_record(&record) else {
+                    continue;
+                };
+                let value = resolve_with_recoveries(&recoveries, handle);
+                if value == handle {
+                    continue;
+                }
+                bindings.insert(name.to_ascii_lowercase(), (name.to_string(), value));
+            }
+        }
+        Ok(bindings.into_values().collect())
     }
 
     fn add_recovery(&self, recovery: Recovery) -> Result<(), String> {
@@ -1271,6 +1291,7 @@ impl OutputMasker {
             masked = text_result.masked;
             recovery.extend_same_key(text_result.recovery);
         }
+        recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
         match &mut self.mode {
             OutputMaskerMode::Shared => self.store.add_recovery(recovery)?,
             OutputMaskerMode::Deferred { .. } => self.pending.extend_same_key(recovery),
@@ -1859,16 +1880,34 @@ fn looks_like_sensitive_env_output(text: &str) -> bool {
 }
 
 fn env_handle_hint(masked: &str) -> Option<String> {
-    let (name, handle) = first_reusable_env_handle(masked)?;
-    if masked.contains("# pentect: pass masked env handles with") {
+    let (name, _) = reusable_env_handles(masked).into_iter().next()?;
+    if masked.contains("# pentect: masked env keys are auto-bound") {
         return None;
     }
     Some(format!(
-        "# pentect: pass masked env handles with `pentect exec --env \"{name}={handle}\" \"<command>\"`"
+        "# pentect: masked env keys are auto-bound for later `pentect exec` commands, including {name}"
     ))
 }
 
-fn first_reusable_env_handle(text: &str) -> Option<(&str, &str)> {
+fn env_alias_recovery(masked: &str, key: &[u8; 32]) -> Recovery {
+    let aliases = reusable_env_handles(masked);
+    if aliases.is_empty() {
+        return Recovery::empty_for_key(key);
+    }
+    let map = aliases
+        .into_iter()
+        .map(|(name, handle)| {
+            (
+                env_alias_placeholder(key, &name, &handle),
+                encode_env_alias_record(&name, &handle),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    Recovery::seal(map, key)
+}
+
+fn reusable_env_handles(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
         let Some((key, value)) = trimmed
@@ -1878,11 +1917,7 @@ fn first_reusable_env_handle(text: &str) -> Option<(&str, &str)> {
         else {
             continue;
         };
-        if key.is_empty()
-            || !key
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
-        {
+        if !is_env_name(key) {
             continue;
         }
         let handle = value
@@ -1891,8 +1926,63 @@ fn first_reusable_env_handle(text: &str) -> Option<(&str, &str)> {
             .trim_matches('\'')
             .trim_end_matches(';');
         if is_reusable_placeholder(handle) {
-            return Some((key, handle));
+            out.push((key.to_string(), handle.to_string()));
         }
+    }
+    out
+}
+
+fn env_alias_placeholder(key: &[u8; 32], name: &str, handle: &str) -> String {
+    let hash = identity_hash(key, &format!("env-alias:{name}:{handle}"));
+    render_placeholder(ENV_ALIAS_LABEL, &hash, None)
+}
+
+fn is_env_alias_placeholder(value: &str) -> bool {
+    placeholder_label(value) == Some(ENV_ALIAS_LABEL)
+}
+
+fn encode_env_alias_record(name: &str, handle: &str) -> String {
+    format!("{ENV_ALIAS_RECORD_PREFIX}{name}\0{handle}")
+}
+
+fn decode_env_alias_record(record: &str) -> Option<(&str, &str)> {
+    let rest = record.strip_prefix(ENV_ALIAS_RECORD_PREFIX)?;
+    let (name, handle) = rest.split_once('\0')?;
+    if is_env_name(name) && is_reusable_placeholder(handle) {
+        Some((name, handle))
+    } else {
+        None
+    }
+}
+
+fn contains_unresolved_masked_handle(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'<' {
+            if let Some(close) = find_from(bytes, i + 2, b">>") {
+                if is_reusable_placeholder(&text[i..close + 2]) {
+                    return true;
+                }
+                i = close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn find_from(hay: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || start >= hay.len() {
+        return None;
+    }
+    let mut i = start;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
     }
     None
 }
@@ -1902,6 +1992,25 @@ fn is_reusable_placeholder(value: &str) -> bool {
         && value.ends_with(">>")
         && value.contains('_')
         && !value.contains("REDACTED_DERIVED")
+        && placeholder_label(value) != Some(ENV_ALIAS_LABEL)
+}
+
+fn placeholder_label(value: &str) -> Option<&str> {
+    let inner = value.strip_prefix("<<")?.strip_suffix(">>")?;
+    let inner = match inner.rsplit_once("_len") {
+        Some((prefix, suffix)) if suffix.bytes().all(|b| b.is_ascii_digit()) => prefix,
+        _ => inner,
+    };
+    let (label, hash) = inner.rsplit_once('_')?;
+    if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(label)
+    } else {
+        None
+    }
+}
+
+fn is_env_name(name: &str) -> bool {
+    !name.is_empty() && !name.as_bytes()[0].is_ascii_digit() && name.bytes().all(is_env_name_byte)
 }
 
 fn redact_env_derivative_lines(text: &str) -> String {
@@ -2541,26 +2650,6 @@ mod tests {
     }
 
     #[test]
-    fn exec_parse_accepts_env_bindings() {
-        let args = strings([
-            "pentect-agent",
-            "exec",
-            "--env",
-            "RUNPOD_API_KEY=<<RUNPOD_API_KEY_abc>>",
-            "echo",
-            "hi",
-        ]);
-        let opts = ExecOpts::parse(&args).unwrap();
-        assert_eq!(opts.env.len(), 1);
-        assert_eq!(opts.env[0].name, "RUNPOD_API_KEY");
-        assert_eq!(opts.env[0].value, "<<RUNPOD_API_KEY_abc>>");
-        assert!(matches!(
-            opts.mode,
-            ExecMode::Shell(command) if command == "echo hi"
-        ));
-    }
-
-    #[test]
     fn exec_parse_accepts_live_and_env_policy() {
         let args = strings([
             "pentect-agent",
@@ -2752,20 +2841,22 @@ mod tests {
     }
 
     #[test]
-    fn exec_env_binding_injects_literal_and_masks_output() {
-        let (root, session) = empty_session("exec-env-binding");
+    fn exec_resolves_masked_handle_in_command_text() {
+        let root = temp_root("exec-command-handle");
+        let session = Session::open_capability_at(&root, "t").unwrap();
         let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
+        let handle = masked.split_once('=').unwrap().1.trim().to_string();
+        drop(session);
+
+        let session = Session::open_capability_at(&root, "t").unwrap();
         let command = if cfg!(windows) {
-            "Write-Output $env:OPENAI_API_KEY".to_string()
+            format!("Write-Output '{handle}'")
         } else {
-            "printf '%s' \"$OPENAI_API_KEY\"".to_string()
+            format!("printf '%s' '{handle}'")
         };
         let opts = ExecOpts {
             session: DEFAULT_SESSION.to_string(),
-            env: vec![EnvBinding {
-                name: "OPENAI_API_KEY".to_string(),
-                value: raw.to_string(),
-            }],
             allow_env: Vec::new(),
             deny_env: Vec::new(),
             live: false,
@@ -2785,44 +2876,78 @@ mod tests {
     }
 
     #[test]
-    fn capability_vault_restores_env_binding_across_sessions() {
-        let root = temp_root("capability-env-binding");
+    fn exec_auto_binds_masked_env_output_across_sessions() {
+        let root = temp_root("capability-auto-env-binding");
         let session = Session::open_capability_at(&root, "t").unwrap();
-        let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-        let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={raw}\n")).unwrap();
-        assert!(masked.contains("<<OPENAI_API_KEY_"), "{masked}");
-
-        let placeholder = masked.split_once('=').unwrap().1.trim().to_string();
+        let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
+        let masked = mask_tool_output(&session, output).unwrap();
+        assert!(
+            masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+            "{masked}"
+        );
+        assert!(masked.contains("TEST_SECRET=<<SECRET_"), "{masked}");
+        assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
         drop(session);
 
         let session = Session::open_capability_at(&root, "t").unwrap();
         let store = RecoveryStore::load(&session).unwrap();
-        let env = resolve_env_bindings(
-            &store,
-            &[EnvBinding {
-                name: "OPENAI_API_KEY".to_string(),
-                value: placeholder,
-            }],
-        )
-        .unwrap();
-        assert_eq!(env, vec![("OPENAI_API_KEY".to_string(), raw.to_string())]);
+        let env = store.auto_env_bindings().unwrap();
+        assert!(
+            env.iter().any(|(name, value)| name == "RUNPOD_API_KEY"
+                && value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+            "{env:?}"
+        );
+        assert!(
+            env.iter()
+                .any(|(name, value)| name == "TEST_SECRET" && value == "114514810"),
+            "{env:?}"
+        );
+        assert!(
+            env.iter()
+                .any(|(name, value)| name == "NOTE" && value == "hello world"),
+            "{env:?}"
+        );
+
+        let command = if cfg!(windows) {
+            "Write-Output $env:RUNPOD_API_KEY; Write-Output $env:TEST_SECRET; Write-Output $env:NOTE"
+                .to_string()
+        } else {
+            "printf '%s\n%s\n%s\n' \"$RUNPOD_API_KEY\" \"$TEST_SECRET\" \"$NOTE\"".to_string()
+        };
+        let opts = ExecOpts {
+            session: DEFAULT_SESSION.to_string(),
+            allow_env: Vec::new(),
+            deny_env: Vec::new(),
+            live: false,
+            approve: false,
+            mode: ExecMode::Shell(command),
+        };
+        let output = run_resolved_command(&store, &opts).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("114514810"), "{stdout}");
+        assert!(stdout.contains("hello world"), "{stdout}");
+
+        let safe = mask_tool_output(&session, &stdout).unwrap();
+        assert!(!safe.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ"), "{safe}");
+        assert!(!safe.contains("114514810"), "{safe}");
+        assert!(!safe.contains("hello world"), "{safe}");
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn unresolved_masked_env_handle_is_rejected() {
-        let (root, session) = empty_session("unresolved-env-handle");
+    fn unresolved_masked_command_handle_is_rejected() {
+        let (root, session) = empty_session("unresolved-command-handle");
         let store = RecoveryStore::load(&session).unwrap();
-        let err = resolve_env_bindings(
+        let err = resolve_command_text(
             &store,
-            &[EnvBinding {
-                name: "RUNPOD_API_KEY".to_string(),
-                value: "<<RUNPOD_API_KEY_missing>>".to_string(),
-            }],
+            "curl -H \"Authorization: Bearer <<RUNPOD_API_KEY_missing>>\" example.test",
         )
         .unwrap_err();
-        assert!(err.contains("unknown masked env handle"), "{err}");
-        assert!(err.contains("RUNPOD_API_KEY"), "{err}");
+        assert!(err.contains("unknown masked handle"), "{err}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2899,16 +3024,16 @@ mod tests {
     }
 
     #[test]
-    fn env_handle_output_teaches_ai_how_to_use_it() {
+    fn env_handle_output_says_keys_are_auto_bound() {
         let (root, session) = empty_session("exec-dotenv-handle-hint");
         let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n";
         let masked = mask_tool_output(&session, output).unwrap();
         let hint = env_handle_hint(&masked).unwrap();
         assert!(
-            hint.contains("# pentect: pass masked env handles with `pentect exec --env \"RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+            hint.contains("# pentect: masked env keys are auto-bound"),
             "{hint}"
         );
-        assert!(hint.contains("\" \"<command>\"`"), "{hint}");
+        assert!(hint.contains("RUNPOD_API_KEY"), "{hint}");
         let _ = std::fs::remove_dir_all(root);
     }
 

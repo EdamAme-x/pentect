@@ -57,6 +57,14 @@ impl Recovery {
         self.map.is_empty()
     }
 
+    /// Public placeholder tokens known to this recovery map.
+    ///
+    /// This does not reveal plaintext values. Adapters use it for local metadata
+    /// records that are themselves stored under synthetic placeholders.
+    pub fn placeholders(&self) -> Vec<String> {
+        self.map.keys().cloned().collect()
+    }
+
     /// Merge another recovery produced with the same key into this one.
     ///
     /// Placeholders are deterministic for a given key/value/label pair, so
