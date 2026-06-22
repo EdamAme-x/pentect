@@ -8,8 +8,7 @@
             "type": "command",
             "command": "pentect hook --capability codex",
             "commandWindows": "& pentect hook --capability codex",
-            "timeout": 30,
-            "statusMessage": "Pentect resolving masked tool input"
+            "timeout": 30
           }
         ]
       }
@@ -22,8 +21,7 @@
             "type": "command",
             "command": "pentect hook --capability codex",
             "commandWindows": "& pentect hook --capability codex",
-            "timeout": 30,
-            "statusMessage": "Pentect masking tool output"
+            "timeout": 30
           }
         ]
       }

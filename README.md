@@ -6,7 +6,8 @@ MVP: secret-aware tool boundary for AI agents.
 - Rewrite shell tools to `pentect exec "<command>"` from hooks.
 - Mask read/shell/MCP-like tool output before it returns to the agent.
 - Keep `pentect exec` output clean: normal stdout/stderr, with secrets masked.
-- Put the short agent contract in `pentect help` and the first-run wrapper hint.
+- Put the short agent contract in explicit `pentect help`; do not print wrapper hints during normal agent startup.
+- Future discoverability should live in agent-native skills/plugins, not terminal output.
 - Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be reused without showing plaintext to the AI.
 - Masked env values become normal env vars inside later `pentect exec` commands; the agent can use `$env:KEY` on PowerShell or `$KEY` on Unix while stdout/stderr are masked before returning.
 - Large opaque masked values carry readable coarse metadata such as `_length_at_least_512_chars`; exact length is not disclosed.

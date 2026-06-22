@@ -107,7 +107,6 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
     }
     if !opts.dry_run {
         terminal::restore_after_tui();
-        maybe_print_first_run_agent_hint(&opts.session);
     }
     let status = match tool {
         AgentTool::Codex => run_codex(&opts, &agent),
@@ -544,12 +543,12 @@ fn codex_hook_config_args(agent: &Path, session: &str) -> Vec<String> {
     vec![
         "features.hooks=true".to_string(),
         format!(
-            "hooks.PreToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30,statusMessage=\"Pentect resolving masked tool input\"}}]}}]",
+            "hooks.PreToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30}}]}}]",
             toml_string(&unix),
             toml_string(&windows)
         ),
         format!(
-            "hooks.PostToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30,statusMessage=\"Pentect masking tool output\"}}]}}]",
+            "hooks.PostToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30}}]}}]",
             toml_string(&unix),
             toml_string(&windows)
         ),
@@ -883,27 +882,6 @@ fn success_status() -> std::process::ExitStatus {
         use std::os::unix::process::ExitStatusExt;
         std::process::ExitStatus::from_raw(0)
     }
-}
-
-fn maybe_print_first_run_agent_hint(session: &str) {
-    let root = agent_session_root(session);
-    let marker = root.join("first-run-hint-shown");
-    if marker.exists() {
-        return;
-    }
-    if std::fs::create_dir_all(&root).is_err() {
-        return;
-    }
-    eprintln!("[pentect] active: use `pentect exec \"<command>\"`; stdout/stderr are masked.");
-    eprintln!("[pentect] handles/env from masked output resolve locally in later `pentect exec`; details: `pentect help`.");
-    let _ = std::fs::write(marker, b"shown\n");
-}
-
-fn agent_session_root(session: &str) -> PathBuf {
-    let base = std::env::var_os("PENTECT_AGENT_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".pentect-agent"));
-    base.join(session)
 }
 
 fn shell_quote_display(value: &str) -> String {
