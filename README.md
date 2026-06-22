@@ -10,7 +10,7 @@ MVP: secret-aware tool boundary for AI agents.
 - Do not print wrapper hints during normal agent startup; explicit `pentect help` is for humans.
 - Canonicalize nested wrappers so `pentect exec "pentect exec ..."` becomes one protected boundary, while `pentect read` remains blocked from AI hooks.
 - Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be reused without showing plaintext to the AI.
-- Masked env values become normal env vars inside later shell commands; after seeing `KEY=<<...>>`, the agent should use `$env:KEY` on PowerShell or `$KEY` on Unix instead of re-reading `.env` and parsing assignments.
+- Masked env values become normal env vars inside later shell commands; after seeing `KEY=<<...>>`, the agent should use `$env:KEY` on PowerShell or `$KEY` on Unix instead of re-reading the original source or parsing prior assignments.
 - Large opaque masked values carry readable coarse metadata such as `_length_at_least_512_chars`; exact length is not disclosed.
 - Materialize known handles into `.env` writes: when a Write-like tool tries to write `KEY=<<HANDLE>>`, Pentect writes the resolved local `.env` itself and blocks the original Write tool so plaintext is not returned in hook JSON.
 - Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.
