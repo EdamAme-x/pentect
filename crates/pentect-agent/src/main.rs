@@ -1039,20 +1039,45 @@ fn before_tool_updated_input(
                     .to_string(),
             );
         }
-        if is_pentect_exec_program_command(command) {
+        let (command, changed_by_canonicalization) = canonical_hook_shell_command(command)?;
+        if !changed_by_canonicalization && is_pentect_exec_program_command(&command) {
             return Ok((tool_input.clone(), false));
         }
-        let command = extract_pentect_exec_shell_payload(command).unwrap_or_else(|| command.into());
         let mut updated = tool_input.clone();
         if let Some(object) = updated.as_object_mut() {
             object.insert(
                 "command".to_string(),
-                Value::String(wrap_shell_command(provider, session_name, &command)?),
+                Value::String(if is_pentect_exec_program_command(&command) {
+                    command
+                } else {
+                    wrap_shell_command(provider, session_name, &command)?
+                }),
             );
             return Ok((updated, true));
         }
     }
     Ok((tool_input.clone(), false))
+}
+
+fn canonical_hook_shell_command(command: &str) -> Result<(String, bool), String> {
+    let mut command = command.to_string();
+    let mut changed = false;
+    loop {
+        if is_pentect_read_command(&command) {
+            return Err(
+                "use `pentect exec \"Get-Content ...\"` instead of `pentect read` from AI hooks"
+                    .to_string(),
+            );
+        }
+        if is_pentect_exec_program_command(&command) {
+            return Ok((command, changed));
+        }
+        let Some(payload) = extract_pentect_exec_shell_payload(&command) else {
+            return Ok((command, changed));
+        };
+        command = payload;
+        changed = true;
+    }
 }
 
 fn posttool_came_from_pentect_exec(input: &Value) -> bool {

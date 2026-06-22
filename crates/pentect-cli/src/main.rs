@@ -14,6 +14,11 @@ use std::process::Command;
 /// Refuse oversized input rather than emit partially-masked output (a masked
 /// head plus a raw tail would leak the tail).
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
+    "Pentect protects this agent's tool boundary. Shell tools are automatically routed through `pentect exec`; do not nest Pentect wrappers around each other.\n",
+    "When you see masked handles like `<<NAME_hash>>`, you may reuse them in later shell commands. Pentect resolves them locally before execution and masks stdout/stderr again before returning output.\n",
+    "Masked env assignment output such as `KEY=<<KEY_hash>>` also becomes a local env var for later `pentect exec` commands: use `$env:KEY` on PowerShell or `$KEY` on Unix. Do not try to reveal the plaintext value; use the handle or env var to call downstream tools.\n",
+);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -522,17 +527,27 @@ fn run_interactive_command(cmd: Command, display: &Path) -> std::process::ExitSt
 }
 
 fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
-    let mut args = Vec::with_capacity(configs.len() * 2 + tool_args.len());
+    let mut args = Vec::with_capacity(configs.len() * 2 + 2 + tool_args.len());
     for config in configs {
         args.push("--config".to_string());
         args.push(config.clone());
     }
+    args.push("--config".to_string());
+    args.push(format!(
+        "developer_instructions={}",
+        toml_string(PENTECT_AGENT_INSTRUCTIONS)
+    ));
     args.extend(tool_args.iter().cloned());
     args
 }
 
 fn claude_args(settings: &str, tool_args: &[String]) -> Vec<String> {
-    let mut args = vec!["--settings".to_string(), settings.to_string()];
+    let mut args = vec![
+        "--settings".to_string(),
+        settings.to_string(),
+        "--append-system-prompt".to_string(),
+        PENTECT_AGENT_INSTRUCTIONS.to_string(),
+    ];
     args.extend(tool_args.iter().cloned());
     args
 }
@@ -1360,6 +1375,37 @@ mod tests {
         assert!(help.contains("$env:KEY"), "{help}");
         assert!(help.contains("$KEY"), "{help}");
         assert!(help.contains("pentect purge"), "{help}");
+    }
+
+    #[test]
+    fn codex_args_inject_model_visible_pentect_contract() {
+        let args = codex_args(&["features.hooks=true".to_string()], &["hello".to_string()]);
+        let rendered = args.join("\n");
+        assert!(rendered.contains("developer_instructions="), "{rendered}");
+        assert!(rendered.contains("masked handles"), "{rendered}");
+        assert!(
+            rendered.contains("do not nest Pentect wrappers"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("pentect exec \\\"pentect exec"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn claude_args_inject_model_visible_pentect_contract() {
+        let args = claude_args("{}", &["hello".to_string()]);
+        let rendered = args.join("\n");
+        assert!(rendered.contains("--append-system-prompt"), "{rendered}");
+        assert!(
+            rendered.contains("Masked env assignment output"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("pentect exec \"pentect exec"),
+            "{rendered}"
+        );
     }
 
     #[test]

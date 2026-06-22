@@ -706,6 +706,52 @@ fn pretool_canonicalizes_quoted_pentect_exec_shell_command() {
 }
 
 #[test]
+fn pretool_collapses_nested_pentect_exec_shell_commands() {
+    let (root, session) = empty_session("hook-pre-nested-exec");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": r#"pentect exec "pentect exec 'Get-Content .\.env'""#
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains("pentect"), "{command}");
+    assert!(command.contains("exec"), "{command}");
+    assert!(command.contains("Get-Content"), "{command}");
+    assert!(!command.contains("pentect exec 'pentect exec"), "{command}");
+    assert!(
+        !command.contains("pentect exec \"pentect exec"),
+        "{command}"
+    );
+    assert_eq!(command.matches(" exec ").count(), 1, "{command}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pretool_blocks_nested_pentect_read_escape() {
+    let (root, session) = empty_session("hook-pre-nested-read");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": r#"pentect exec "pentect read .\.env""#
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("pentect exec"), "{reason}");
+    assert!(reason.contains("pentect read"), "{reason}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn pretool_canonicalizes_pentect_exec_shell_commands() {
     let (root, session) = empty_session("hook-pre-canonical");
     let input = json!({
