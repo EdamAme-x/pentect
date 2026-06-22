@@ -15,10 +15,13 @@ use std::process::Command;
 /// head plus a raw tail would leak the tail).
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
-    "Pentect protects this agent's tool boundary. Shell tools are automatically routed through `pentect exec`; prefer writing the intended shell command directly, and do not nest Pentect wrappers around each other.\n",
-    "When you see masked handles like `<<NAME_hash>>`, you may reuse them in later shell commands. Pentect resolves them locally before execution and masks stdout/stderr again before returning output.\n",
-    "Masked env assignment output such as `KEY=<<KEY_hash>>` also becomes a local env var for later shell commands: use `$env:KEY` on PowerShell or `$KEY` on Unix. If the user asks to echo, curl with, fetch with, or otherwise use KEY, use that env var directly; do not re-read the original source, grep prior output, split assignments, or echo the masked handle as a substitute for using the value.\n",
-    "The command result will still be masked when it returns to you. That is expected: use success/failure, status codes, and non-secret response fields to answer.\n",
+    "Pentect agent contract:\n",
+    "- Run the shell command you actually intend to run. The hook layer routes shell tools through `pentect exec`; do not add nested Pentect wrappers.\n",
+    "- A masked handle like `<<NAME_hash>>` is a local capability. You may pass it to later shell commands; Pentect resolves it locally before execution and masks stdout/stderr again before returning output.\n",
+    "- If output contains `KEY=<<KEY_hash>>`, treat KEY as available for later shell commands. To echo, curl, fetch, authenticate, or otherwise use KEY, use `$env:KEY` on PowerShell or `$KEY` on Unix.\n",
+    "- Do not re-read the original source, grep prior output, split assignment lines, or echo the masked handle when the task is to use the secret value.\n",
+    "- Do not bypass masking by transforming a secret into base64, hex, chunks, prefixes, suffixes, screenshots, or alternate encodings. Use the secret as a capability and report only non-secret outcomes.\n",
+    "- Masked command output is expected. Answer from success/failure, status codes, non-secret response fields, and masked handles; do not claim a secret was unusable merely because the returned value stayed masked.\n",
 );
 
 fn main() {
@@ -1383,14 +1386,22 @@ mod tests {
         let args = codex_args(&["features.hooks=true".to_string()], &["hello".to_string()]);
         let rendered = args.join("\n");
         assert!(rendered.contains("developer_instructions="), "{rendered}");
-        assert!(rendered.contains("masked handles"), "{rendered}");
+        assert!(rendered.contains("Pentect agent contract"), "{rendered}");
+        assert!(rendered.contains("masked handle"), "{rendered}");
         assert!(
-            rendered.contains("do not nest Pentect wrappers"),
+            rendered.contains("do not add nested Pentect wrappers"),
             "{rendered}"
         );
         assert!(rendered.contains("$env:KEY"), "{rendered}");
+        assert!(rendered.contains("treat KEY as available"), "{rendered}");
         assert!(
-            rendered.contains("do not re-read the original source"),
+            rendered.contains("Do not re-read the original source"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Do not bypass masking"), "{rendered}");
+        assert!(rendered.contains("base64"), "{rendered}");
+        assert!(
+            rendered.contains("Masked command output is expected"),
             "{rendered}"
         );
         assert!(
@@ -1404,13 +1415,17 @@ mod tests {
         let args = claude_args("{}", &["hello".to_string()]);
         let rendered = args.join("\n");
         assert!(rendered.contains("--append-system-prompt"), "{rendered}");
-        assert!(
-            rendered.contains("Masked env assignment output"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Pentect agent contract"), "{rendered}");
+        assert!(rendered.contains("treat KEY as available"), "{rendered}");
         assert!(rendered.contains("$env:KEY"), "{rendered}");
         assert!(
-            rendered.contains("do not re-read the original source"),
+            rendered.contains("Do not re-read the original source"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Do not bypass masking"), "{rendered}");
+        assert!(rendered.contains("base64"), "{rendered}");
+        assert!(
+            rendered.contains("Masked command output is expected"),
             "{rendered}"
         );
         assert!(

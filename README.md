@@ -6,7 +6,7 @@ MVP: secret-aware tool boundary for AI agents.
 - Rewrite shell tools to `pentect exec "<command>"` from hooks.
 - Mask read/shell/MCP-like tool output before it returns to the agent.
 - Keep `pentect exec` output clean: normal stdout/stderr, with secrets masked.
-- Inject the short agent contract invisibly for supported agents: Codex uses temporary `developer_instructions`, Claude uses `--append-system-prompt`.
+- Inject a model-visible agent contract invisibly for supported agents: Codex uses temporary `developer_instructions`, Claude uses `--append-system-prompt`.
 - Do not print wrapper hints during normal agent startup; explicit `pentect help` is for humans.
 - Canonicalize nested wrappers so `pentect exec "pentect exec ..."` becomes one protected boundary, while `pentect read` remains blocked from AI hooks.
 - Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be reused without showing plaintext to the AI.
