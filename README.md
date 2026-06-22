@@ -6,7 +6,7 @@ MVP: secret-aware tool boundary for AI agents.
 - Rewrite shell tools to `pentect exec "<command>"` from hooks.
 - Mask read/shell/MCP-like tool output before it returns to the agent.
 - Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be reused without showing plaintext to the AI.
-- Masked env values are auto-bound inside later `pentect exec` commands; the agent can use ordinary `$KEY` / `$env:KEY` references while stdout/stderr are masked before returning.
+- Masked env values become normal env vars inside later `pentect exec` commands; the agent can use `$env:KEY` on PowerShell or `$KEY` on Unix while stdout/stderr are masked before returning.
 - Materialize known handles into `.env` writes: when a Write-like tool tries to write `KEY=<<HANDLE>>`, Pentect writes the resolved local `.env` itself and blocks the original Write tool so plaintext is not returned in hook JSON.
 - Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.
 - Gate direct environment-variable reads with `--allow-env NAME` / `--deny-env NAME`.

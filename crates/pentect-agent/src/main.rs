@@ -506,7 +506,7 @@ fn guard_sensitive_source_access_with_env(
     let normalized = normalize_policy_text(text);
     if contains_env_read_reference(&normalized, env_policy) {
         return Err(
-            "Pentect blocked direct environment-variable access; read the value through `pentect exec` first so a masked handle can be auto-bound."
+            "Pentect blocked direct environment-variable access; first read it through `pentect exec`, then use `$env:KEY` on PowerShell or `$KEY` on Unix in later `pentect exec` commands."
                 .to_string(),
         );
     }
@@ -1885,7 +1885,7 @@ fn env_handle_hint(masked: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "# pentect: masked env keys are auto-bound for later `pentect exec` commands, including {name}"
+        "# pentect: masked env keys are auto-bound for later `pentect exec`; use `$env:{name}` on PowerShell or `${name}` on Unix, never the masked value."
     ))
 }
 
@@ -3029,11 +3029,10 @@ mod tests {
         let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n";
         let masked = mask_tool_output(&session, output).unwrap();
         let hint = env_handle_hint(&masked).unwrap();
-        assert!(
-            hint.contains("# pentect: masked env keys are auto-bound"),
-            "{hint}"
-        );
-        assert!(hint.contains("RUNPOD_API_KEY"), "{hint}");
+        assert!(hint.contains("masked env keys are auto-bound"), "{hint}");
+        assert!(hint.contains("$env:RUNPOD_API_KEY"), "{hint}");
+        assert!(hint.contains("$RUNPOD_API_KEY"), "{hint}");
+        assert!(hint.contains("never the masked value"), "{hint}");
         let _ = std::fs::remove_dir_all(root);
     }
 
