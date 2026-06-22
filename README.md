@@ -11,9 +11,9 @@ MVP: secret-aware tool boundary for AI agents.
 - Canonicalize nested wrappers so `pentect exec "pentect exec ..."` becomes one protected boundary, while `pentect read` remains blocked from AI hooks.
 - Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be reused without showing plaintext to the AI.
 - Masked env values become normal env vars inside later shell commands; after seeing `KEY=<<...>>`, the agent should use `$env:KEY` on PowerShell or `$KEY` on Unix instead of re-reading the original source or parsing prior assignments.
-- `pentect materialize <path>` rewrites a local file containing masked handles with real values without printing the secrets; `pentect resolve` lets scripts running under `pentect exec` turn a handle into a usable local value.
+- `pentect resolve <path>` rewrites a local file containing masked handles with real values without printing the secrets; with no path it resolves stdin, so scripts running under `pentect exec` can turn a handle into a usable local value.
 - Large opaque masked values carry readable coarse metadata such as `_length_at_least_512_chars`; exact length is not disclosed.
-- Materialize known handles into `.env` writes: when a Write-like tool tries to write `KEY=<<HANDLE>>`, Pentect writes the resolved local `.env` itself and blocks the original Write tool so plaintext is not returned in hook JSON.
+- Resolve known handles into `.env` writes: when a Write-like tool tries to write `KEY=<<HANDLE>>`, Pentect writes the resolved local `.env` itself and blocks the original Write tool so plaintext is not returned in hook JSON.
 - Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.
 - Block direct environment-variable reads unless the value was auto-bound from prior masked output.
 - Open the terminal control screen with `pentect`; inspect another scope with `pentect dashboard --dir PATH --session NAME`.

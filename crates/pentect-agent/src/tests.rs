@@ -97,17 +97,21 @@ fn exec_parse_accepts_program_after_separator() {
 }
 
 #[test]
-fn materialize_parse_accepts_multiple_paths() {
-    let args = strings(["pentect-agent", "materialize", "a.env", "b.env"]);
-    let opts = MaterializeOpts::parse(&args).unwrap();
-    assert_eq!(opts.paths, [PathBuf::from("a.env"), PathBuf::from("b.env")]);
+fn resolve_parse_accepts_multiple_paths() {
+    let args = strings(["pentect-agent", "resolve", "a.env", "b.env"]);
+    let opts = ResolveOpts::parse(&args).unwrap();
+    assert!(matches!(
+        opts.mode,
+        ResolveMode::Files(paths)
+            if paths == [PathBuf::from("a.env"), PathBuf::from("b.env")]
+    ));
 }
 
 #[test]
-fn resolve_parse_joins_text_arguments() {
-    let args = strings(["pentect-agent", "resolve", "<<A_0011223344556677>>", "tail"]);
+fn resolve_parse_defaults_to_stdin_without_paths() {
+    let args = strings(["pentect-agent", "resolve"]);
     let opts = ResolveOpts::parse(&args).unwrap();
-    assert_eq!(opts.text.as_deref(), Some("<<A_0011223344556677>> tail"));
+    assert!(matches!(opts.mode, ResolveMode::Stdin));
 }
 
 #[test]
@@ -352,8 +356,8 @@ fn exec_auto_binds_masked_env_output_across_sessions() {
 }
 
 #[test]
-fn materialize_path_rewrites_known_handles_without_printing_secret() {
-    let root = temp_root("materialize-file");
+fn resolve_path_rewrites_known_handles_without_printing_secret() {
+    let root = temp_root("resolve-file");
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
     let session = Session::open_capability_at(&root, "t").unwrap();
@@ -370,7 +374,7 @@ fn materialize_path_rewrites_known_handles_without_printing_secret() {
 
     let path = project.join(".env");
     std::fs::write(&path, result.masked).unwrap();
-    materialize_path(&store, &path).unwrap();
+    resolve_path_in_place(&store, &path).unwrap();
 
     let written = std::fs::read_to_string(&path).unwrap();
     assert_eq!(written, raw);
@@ -883,6 +887,16 @@ fn pretool_non_default_session_is_inserted_before_command() {
     assert!(command.contains("echo hello"), "{command}");
     assert!(!command.contains("--shell-b64"), "{command}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn implicit_directory_session_is_not_rendered_in_wrapped_command() {
+    let implicit = default_directory_session_name().unwrap();
+    let command = wrap_shell_command(HookProvider::Claude, &implicit, "echo hello").unwrap();
+    assert!(command.contains("pentect"), "{command}");
+    assert!(command.contains("exec"), "{command}");
+    assert!(!command.contains("--session"), "{command}");
+    assert!(command.contains("echo hello"), "{command}");
 }
 
 #[test]

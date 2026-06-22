@@ -17,11 +17,10 @@ const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
     "- Run the shell command you actually intend to run. The hook layer routes shell tools through `pentect exec`; do not add nested Pentect wrappers.\n",
-    "- A masked handle like `<<NAME_hash>>` is a local capability. You may pass it to later shell commands; Pentect resolves it locally before execution and masks stdout/stderr again before returning output.\n",
-    "- If output contains `KEY=<<KEY_hash>>`, treat KEY as available for later shell commands. To echo, curl, fetch, authenticate, or otherwise use KEY, use `$env:KEY` on PowerShell or `$KEY` on Unix.\n",
-    "- If a local file contains masked handles and the user wants that file to carry real values, run `pentect materialize <path>`. It rewrites the file locally without printing the secret value.\n",
-    "- If a script run by `pentect exec` reads a masked handle and must use the real value, have the script call `pentect resolve` on that handle. The child process gets the same Pentect session automatically, and any returned stdout/stderr is masked again.\n",
-    "- Do not re-read the original source, grep prior output, split assignment lines, or echo the masked handle when the task is to use the secret value.\n",
+    "- Masked handles like `<<NAME_hash>>` are local capabilities. Later `pentect exec` commands resolve them locally and mask stdout/stderr again.\n",
+    "- If output contains `KEY=<<KEY_hash>>`, treat KEY as available in later commands as `$env:KEY` on PowerShell or `$KEY` on Unix.\n",
+    "- If a file should contain real values, run `pentect resolve <path>`. If a child script needs a handle's real value, pipe the handle into `pentect resolve`; it inherits the same Pentect session.\n",
+    "- Do not re-read the original source, grep prior output, split assignment lines, or echo the masked handle when the task is to use the value.\n",
     "- Do not bypass masking by transforming a secret into base64, hex, chunks, prefixes, suffixes, screenshots, or alternate encodings. Use the secret as a capability and report only non-secret outcomes.\n",
     "- Masked command output is expected. Answer from success/failure, status codes, non-secret response fields, and masked handles; do not claim a secret was unusable merely because the returned value stayed masked.\n",
 );
@@ -35,7 +34,7 @@ fn main() {
         Some("--dir" | "--session") => cmd_agent_passthrough_from(1, &args),
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
-        Some("exec" | "materialize" | "resolve" | "approve" | "hook" | "purge") => {
+        Some("exec" | "resolve" | "approve" | "hook" | "purge") => {
             cmd_agent_passthrough_from(1, &args)
         }
         Some("agent") => cmd_agent_passthrough(&args),
@@ -48,21 +47,14 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "pentect mask [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--semantic] [--length] [--aggressive] [--pack FILE]... [--pack-dir DIR]... [--disable LABEL]...\n\
+        "pentect\n\
+         pentect codex|claude|gemini\n\
+         pentect exec \"<command>\"\n\
+         pentect resolve [PATH...]\n\
          pentect help\n\
-         pentect [dashboard] [--session NAME] [--dir PATH]\n\
-         pentect read|exec|materialize|resolve|approve|hook|purge ...\n\
-         pentect codex|claude|gemini [--session NAME] [--agent PATH] [--tool PATH] [--dry-run] [--allow-unverified-hooks] [-- TOOL_ARGS...]\n\
-         \x20 mask secrets from stdin to stdout\n\
-         \x20 codex|claude|gemini starts that agent with temporary Pentect hook config\n\
-         \x20 --allow-unverified-hooks bypasses fail-closed checks for agent CLIs whose hook path was not verified\n\
-         \x20 prompt masking is TODO; this wrapper protects tool boundaries via hooks\n\
-         \x20 --input text|pdf read stdin as UTF-8 text or extract text from a PDF first\n\
-         \x20 --pack FILE      load extra rules from a TOML pack (repeatable)\n\
-         \x20 --pack-dir DIR   load every *.toml pack in a directory (repeatable)\n\
-         \x20 --disable LABEL  turn off a built-in detector by label (repeatable)\n\
-         \x20 --enable LABEL   turn on an off-by-default built-in (e.g. DATE_TIME)\n\
-         \x20 --semantic       also mask person/location/org/address via a spaCy sidecar"
+         \n\
+         exec runs commands with masked output.\n\
+         resolve rewrites files containing handles, or resolves stdin when no path is given."
     );
 }
 
@@ -79,8 +71,8 @@ fn help_text() -> &'static str {
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
         "Masked handles resolve locally in later `pentect exec` commands.\n",
         "Masked env lines become env vars: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
-        "`pentect materialize <path>` rewrites a local placeholder file with real values.\n",
-        "Use `pentect purge` to clear local capability state.\n",
+        "`pentect resolve <path>` rewrites a local placeholder file with real values.\n",
+        "Child scripts can pipe a handle into `pentect resolve` to use the real value locally.\n",
     )
 }
 
@@ -392,7 +384,7 @@ impl AgentTool {
 
 #[derive(Debug)]
 struct AgentToolOpts {
-    session: String,
+    session: Option<String>,
     agent: Option<PathBuf>,
     command: PathBuf,
     dry_run: bool,
@@ -402,7 +394,7 @@ struct AgentToolOpts {
 
 impl AgentToolOpts {
     fn parse(tool: AgentTool, args: &[String]) -> Result<Self, String> {
-        let mut session = "default".to_string();
+        let mut session = None;
         let mut agent = None;
         let mut command = std::env::var_os(tool.env_var())
             .map(PathBuf::from)
@@ -418,8 +410,11 @@ impl AgentToolOpts {
                     break;
                 }
                 "--session" => {
-                    session =
-                        checked_agent_session_name(&required_value(args, &mut i, "--session")?)?;
+                    session = Some(checked_agent_session_name(&required_value(
+                        args,
+                        &mut i,
+                        "--session",
+                    )?)?);
                 }
                 "--agent" => {
                     agent = Some(PathBuf::from(required_value(args, &mut i, "--agent")?));
@@ -462,7 +457,7 @@ impl AgentToolOpts {
 }
 
 fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
-    let configs = codex_hook_config_args(agent, &opts.session);
+    let configs = codex_hook_config_args(agent, opts.session.as_deref());
     if opts.dry_run {
         if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
             eprintln!(
@@ -484,7 +479,7 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
 }
 
 fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
-    let settings = claude_settings_json(agent, &opts.session);
+    let settings = claude_settings_json(agent, opts.session.as_deref());
     let args = claude_args(&settings, &opts.tool_args);
     if opts.dry_run {
         print_dry_run(&opts.command, &args);
@@ -508,7 +503,7 @@ fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     if !opts.allow_unverified_hooks && !gemini_cli_mentions_hooks(&opts.command) {
         die("refusing to start Gemini with Pentect hooks: this Gemini CLI does not advertise hook support, so temporary settings may be ignored and raw tool output could leak. Upgrade Gemini CLI or pass --allow-unverified-hooks only for debugging.");
     }
-    let original = match install_gemini_hooks(&settings_path, agent, &opts.session) {
+    let original = match install_gemini_hooks(&settings_path, agent, opts.session.as_deref()) {
         Ok(o) => o,
         Err(e) => die(&e),
     };
@@ -561,7 +556,7 @@ fn claude_args(settings: &str, tool_args: &[String]) -> Vec<String> {
     args
 }
 
-fn codex_hook_config_args(agent: &Path, session: &str) -> Vec<String> {
+fn codex_hook_config_args(agent: &Path, session: Option<&str>) -> Vec<String> {
     let unix = hook_command_unix(agent, "codex", session);
     let windows = hook_command_windows(agent, "codex", session);
     vec![
@@ -658,7 +653,7 @@ fn gemini_cli_mentions_hooks(command: &Path) -> bool {
     text.to_ascii_lowercase().contains("hook")
 }
 
-fn claude_settings_json(agent: &Path, session: &str) -> String {
+fn claude_settings_json(agent: &Path, session: Option<&str>) -> String {
     let words = hook_words(agent, "claude", session);
     let command = words[0].clone();
     let args = words[1..].to_vec();
@@ -687,7 +682,7 @@ fn claude_settings_json(agent: &Path, session: &str) -> String {
     .to_string()
 }
 
-fn gemini_hook_settings(agent: &Path, session: &str) -> Value {
+fn gemini_hook_settings(agent: &Path, session: Option<&str>) -> Value {
     let command = if cfg!(windows) {
         hook_command_windows(agent, "gemini", session)
     } else {
@@ -720,7 +715,7 @@ fn gemini_hook_settings(agent: &Path, session: &str) -> Value {
 fn install_gemini_hooks(
     settings_path: &Path,
     agent: &Path,
-    session: &str,
+    session: Option<&str>,
 ) -> Result<Option<Vec<u8>>, String> {
     let original = if settings_path.exists() {
         Some(
@@ -799,7 +794,7 @@ fn merge_hooks(settings: &mut Value, extra: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn hook_command_unix(agent: &Path, provider: &str, session: &str) -> String {
+fn hook_command_unix(agent: &Path, provider: &str, session: Option<&str>) -> String {
     hook_words(agent, provider, session)
         .iter()
         .map(|word| shell_quote_unix(word))
@@ -807,7 +802,7 @@ fn hook_command_unix(agent: &Path, provider: &str, session: &str) -> String {
         .join(" ")
 }
 
-fn hook_command_windows(agent: &Path, provider: &str, session: &str) -> String {
+fn hook_command_windows(agent: &Path, provider: &str, session: Option<&str>) -> String {
     let mut out = String::from("& ");
     out.push_str(
         &hook_words(agent, provider, session)
@@ -819,7 +814,7 @@ fn hook_command_windows(agent: &Path, provider: &str, session: &str) -> String {
     out
 }
 
-fn hook_words(agent: &Path, provider: &str, session: &str) -> Vec<String> {
+fn hook_words(agent: &Path, provider: &str, session: Option<&str>) -> Vec<String> {
     if pentect_agent_passthrough_available() {
         let mut words = vec![
             "pentect".to_string(),
@@ -827,7 +822,7 @@ fn hook_words(agent: &Path, provider: &str, session: &str) -> Vec<String> {
             "--capability".to_string(),
             provider.to_string(),
         ];
-        add_non_default_session(&mut words, session);
+        add_explicit_session(&mut words, session);
         return words;
     }
     let agent = agent_command_path(agent);
@@ -837,15 +832,16 @@ fn hook_words(agent: &Path, provider: &str, session: &str) -> Vec<String> {
         "--capability".to_string(),
         provider.to_string(),
     ];
-    add_non_default_session(&mut words, session);
+    add_explicit_session(&mut words, session);
     words
 }
 
-fn add_non_default_session(words: &mut Vec<String>, session: &str) {
-    if session != "default" {
-        words.push("--session".to_string());
-        words.push(session.to_string());
-    }
+fn add_explicit_session(words: &mut Vec<String>, session: Option<&str>) {
+    let Some(session) = session else {
+        return;
+    };
+    words.push("--session".to_string());
+    words.push(session.to_string());
 }
 
 fn pentect_agent_passthrough_available() -> bool {
@@ -1383,8 +1379,9 @@ mod tests {
         assert!(help.contains("pentect exec"), "{help}");
         assert!(help.contains("$env:KEY"), "{help}");
         assert!(help.contains("$KEY"), "{help}");
-        assert!(help.contains("pentect materialize"), "{help}");
-        assert!(help.contains("pentect purge"), "{help}");
+        assert!(help.contains("pentect resolve"), "{help}");
+        assert!(!help.contains("pentect materialize"), "{help}");
+        assert!(!help.contains("pentect purge"), "{help}");
     }
 
     #[test]
@@ -1400,8 +1397,8 @@ mod tests {
         );
         assert!(rendered.contains("$env:KEY"), "{rendered}");
         assert!(rendered.contains("treat KEY as available"), "{rendered}");
-        assert!(rendered.contains("pentect materialize"), "{rendered}");
         assert!(rendered.contains("pentect resolve"), "{rendered}");
+        assert!(!rendered.contains("pentect materialize"), "{rendered}");
         assert!(rendered.contains("same Pentect session"), "{rendered}");
         assert!(
             rendered.contains("Do not re-read the original source"),
@@ -1427,8 +1424,8 @@ mod tests {
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
         assert!(rendered.contains("treat KEY as available"), "{rendered}");
         assert!(rendered.contains("$env:KEY"), "{rendered}");
-        assert!(rendered.contains("pentect materialize"), "{rendered}");
         assert!(rendered.contains("pentect resolve"), "{rendered}");
+        assert!(!rendered.contains("pentect materialize"), "{rendered}");
         assert!(rendered.contains("same Pentect session"), "{rendered}");
         assert!(
             rendered.contains("Do not re-read the original source"),
