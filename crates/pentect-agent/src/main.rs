@@ -42,6 +42,8 @@ fn main() {
         Some("--dir" | "--session") => cmd_dashboard(&args),
         Some("read") => cmd_read(&args),
         Some("exec") => cmd_exec(&args),
+        Some("materialize") => cmd_materialize(&args),
+        Some("resolve") => cmd_resolve(&args),
         Some("approve") => cmd_approve(&args),
         Some("hook") => cmd_hook(&args),
         Some("purge") => cmd_purge(&args),
@@ -58,6 +60,8 @@ fn usage() {
         "pentect [dashboard] [--session NAME] [--dir PATH]\n\
          pentect exec [--session NAME] [--approve] [--live] COMMAND\n\
          pentect exec [--session NAME] [--approve] [--live] -- PROGRAM [ARG...]\n\
+         pentect materialize [--session NAME] PATH...\n\
+         pentect resolve [--session NAME] [TEXT...]\n\
          pentect approve [--session NAME] COMMAND\n\
          pentect read [--input text|pdf] [--kind text|json|env|har] [--profile strict|balanced|dev|paranoid] [--length] [--meta] PATH\n\
          pentect hook [--capability] codex|claude|gemini < hook-json\n\
@@ -204,6 +208,57 @@ fn cmd_exec(args: &[String]) -> i32 {
     exit_code(output.status)
 }
 
+fn cmd_materialize(args: &[String]) -> i32 {
+    let opts = match MaterializeOpts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return die(&e),
+    };
+    let session = match Session::open_capability(&opts.session) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
+    let store = match RecoveryStore::load(&session) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
+    for path in &opts.paths {
+        if let Err(e) = materialize_path(&store, path) {
+            return die(&e);
+        }
+        println!("materialized {}", path.display());
+    }
+    0
+}
+
+fn cmd_resolve(args: &[String]) -> i32 {
+    let opts = match ResolveOpts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return die(&e),
+    };
+    let session = match Session::open_capability(&opts.session) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
+    let store = match RecoveryStore::load(&session) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
+    let input = match opts.text {
+        Some(text) => text,
+        None => match read_stdin_text() {
+            Ok(s) => s,
+            Err(e) => return die(&e),
+        },
+    };
+    let resolved = match resolve_command_text(&store, &input) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
+    print!("{resolved}");
+    let _ = std::io::stdout().flush();
+    0
+}
+
 fn exec_help() {
     print!(
         "{}",
@@ -212,6 +267,7 @@ fn exec_help() {
             "pentect exec --live \"<command>\"\n\n",
             "Runs a command and prints normal stdout/stderr with secrets masked.\n",
             "Masked handles and env values from prior output resolve locally in later `pentect exec` commands.\n",
+            "Use `pentect materialize <path>` to rewrite a local file containing handles.\n",
         )
     );
 }
@@ -382,6 +438,7 @@ fn run_resolved_command(
             let mut command = Command::new(program);
             command.args(command_args);
             apply_env_bindings(&mut command, &env);
+            apply_pentect_session(&mut command, &opts.session);
             command
                 .output()
                 .map_err(|e| format!("could not execute command: {e}"))
@@ -389,7 +446,7 @@ fn run_resolved_command(
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
             guard_shell_script_with_env(&command, &env_policy)?;
-            run_shell_script(&command, &env)
+            run_shell_script(&command, &env, &opts.session)
         }
     }
 }
@@ -409,6 +466,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             let mut command = Command::new(program);
             command.args(command_args);
             apply_env_bindings(&mut command, &env);
+            apply_pentect_session(&mut command, &opts.session);
             run_live_command(command, None, store.clone())
         }
         ExecMode::Shell(command) => {
@@ -416,6 +474,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             guard_shell_script_with_env(&command, &env_policy)?;
             let mut shell = shell_script_command();
             apply_env_bindings(&mut shell, &env);
+            apply_pentect_session(&mut shell, &opts.session);
             run_live_command(shell, Some(&command), store.clone())
         }
     }
@@ -438,10 +497,27 @@ fn resolve_command_text(store: &RecoveryStore, text: &str) -> Result<String, Str
     Ok(resolved)
 }
 
+fn materialize_path(store: &RecoveryStore, path: &Path) -> Result<(), String> {
+    if path == Path::new("-") {
+        return Err("materialize requires a real file path".to_string());
+    }
+    let input = read_input(path, InputFormat::Text)?;
+    let resolved = resolve_command_text(store, &input)?;
+    if resolved != input {
+        std::fs::write(path, resolved)
+            .map_err(|e| format!("could not write '{}': {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
     for (name, value) in env {
         command.env(name, value);
     }
+}
+
+fn apply_pentect_session(command: &mut Command, session: &str) {
+    command.env("PENTECT_AGENT_SESSION", session);
 }
 
 #[derive(Debug, Default)]
@@ -533,9 +609,11 @@ fn guard_sensitive_source_access_with_env(
 fn run_shell_script(
     script: &str,
     env: &[(String, String)],
+    session: &str,
 ) -> Result<std::process::Output, String> {
     let mut command = shell_script_command();
     apply_env_bindings(&mut command, env);
+    apply_pentect_session(&mut command, session);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -893,9 +971,71 @@ enum ExecMode {
     Shell(String),
 }
 
+struct MaterializeOpts {
+    session: String,
+    paths: Vec<PathBuf>,
+}
+
+impl MaterializeOpts {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut session = default_session_name()?;
+        let mut paths = Vec::new();
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--session" => {
+                    session = checked_session_name(&value(args, &mut i, "--session")?)?;
+                }
+                flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
+                path => {
+                    paths.push(PathBuf::from(path));
+                    i += 1;
+                }
+            }
+        }
+        if paths.is_empty() {
+            return Err("materialize requires PATH".to_string());
+        }
+        Ok(Self { session, paths })
+    }
+}
+
+struct ResolveOpts {
+    session: String,
+    text: Option<String>,
+}
+
+impl ResolveOpts {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut session = default_session_name()?;
+        let mut text = Vec::new();
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--session" => {
+                    session = checked_session_name(&value(args, &mut i, "--session")?)?;
+                }
+                "--" => {
+                    text.extend(args[i + 1..].iter().cloned());
+                    break;
+                }
+                flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
+                value => {
+                    text.push(value.to_string());
+                    i += 1;
+                }
+            }
+        }
+        Ok(Self {
+            session,
+            text: (!text.is_empty()).then(|| text.join(" ")),
+        })
+    }
+}
+
 impl ExecOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
-        let mut session = DEFAULT_SESSION.to_string();
+        let mut session = default_session_name()?;
         let mut allow_env = Vec::new();
         let mut deny_env = Vec::new();
         let mut live = false;
@@ -953,6 +1093,13 @@ impl ExecOpts {
             }
         }
         Err("exec requires COMMAND or `-- PROGRAM...`".to_string())
+    }
+}
+
+fn default_session_name() -> Result<String, String> {
+    match std::env::var("PENTECT_AGENT_SESSION") {
+        Ok(value) => checked_session_name(&value),
+        Err(_) => Ok(DEFAULT_SESSION.to_string()),
     }
 }
 

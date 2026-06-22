@@ -97,6 +97,20 @@ fn exec_parse_accepts_program_after_separator() {
 }
 
 #[test]
+fn materialize_parse_accepts_multiple_paths() {
+    let args = strings(["pentect-agent", "materialize", "a.env", "b.env"]);
+    let opts = MaterializeOpts::parse(&args).unwrap();
+    assert_eq!(opts.paths, [PathBuf::from("a.env"), PathBuf::from("b.env")]);
+}
+
+#[test]
+fn resolve_parse_joins_text_arguments() {
+    let args = strings(["pentect-agent", "resolve", "<<A_0011223344556677>>", "tail"]);
+    let opts = ResolveOpts::parse(&args).unwrap();
+    assert_eq!(opts.text.as_deref(), Some("<<A_0011223344556677>> tail"));
+}
+
+#[test]
 fn read_defaults_to_strict_and_infers_dotenv() {
     let args = strings(["pentect-agent", "read", r".\.env"]);
     let opts = ReadOpts::parse(&args).unwrap();
@@ -335,6 +349,43 @@ fn exec_auto_binds_masked_env_output_across_sessions() {
     assert!(!safe.contains("114514810"), "{safe}");
     assert!(!safe.contains("hello world"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn materialize_path_rewrites_known_handles_without_printing_secret() {
+    let root = temp_root("materialize-file");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+    let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n";
+    let result = Engine::with_profile(Profile::Balanced).mask(
+        Input {
+            kind: Kind::Env,
+            data: raw.to_string(),
+        },
+        &Config::new(session.key),
+    );
+    store.add_recovery(result.recovery).unwrap();
+
+    let path = project.join(".env");
+    std::fs::write(&path, result.masked).unwrap();
+    materialize_path(&store, &path).unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(written, raw);
+    assert!(!written.contains("<<OPENAI_API_KEY_"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn child_commands_receive_pentect_session_name() {
+    let mut command = Command::new("dummy");
+    apply_pentect_session(&mut command, "child-session");
+    assert!(command.get_envs().any(|(name, value)| {
+        name == "PENTECT_AGENT_SESSION"
+            && value.is_some_and(|value| value.to_string_lossy() == "child-session")
+    }));
 }
 
 #[test]
