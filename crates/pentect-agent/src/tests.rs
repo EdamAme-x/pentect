@@ -308,6 +308,44 @@ fn exec_policy_does_not_block_regular_shell_state_changes() {
 }
 
 #[test]
+fn exec_does_not_inherit_parent_environment() {
+    let root = temp_root("env-clear");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+    let var = format!("PENTECT_PARENT_CANARY_{}", unix_millis());
+    let value = "rpa_SHOULD_NOT_LEAK_FROM_PARENT_ENV_1234567890abcdef";
+    std::env::set_var(&var, value);
+    let mode = if cfg!(windows) {
+        ExecMode::Program(vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            format!("if defined {var} (echo %{var}%) else (echo missing)"),
+        ])
+    } else {
+        ExecMode::Program(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "if [ -z \"${{{var}}}\" ]; then printf missing; else printf '%s' \"${{{var}}}\"; fi"
+            ),
+        ])
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        approve: false,
+        mode,
+    };
+    let output = run_resolved_command(&store, &opts);
+    std::env::remove_var(&var);
+    let output = output.unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("missing"), "{stdout}");
+    assert!(!stdout.contains(value), "{stdout}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn exec_resolves_masked_handle_in_command_text() {
     let root = temp_root("exec-command-handle");
     let session = Session::open_capability_at(&root, "t").unwrap();
@@ -502,7 +540,12 @@ fn unresolved_masked_command_handle_is_rejected() {
 #[test]
 fn write_tool_materializes_masked_content_without_returning_plaintext() {
     let root = temp_root("capability-write-generic");
-    let project = root.join("project");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-agent-write-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
     std::fs::create_dir_all(&project).unwrap();
     let session = Session::open_capability_at(&root, "t").unwrap();
     let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
@@ -524,11 +567,40 @@ fn write_tool_materializes_masked_content_without_returning_plaintext() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("materialized masked content"), "{reason}");
+    assert!(reason.contains("wrote resolved masked content"), "{reason}");
+    assert!(reason.contains("treat this as success"), "{reason}");
     assert!(!reason.contains(raw), "{reason}");
 
     let written = std::fs::read_to_string(&config).unwrap();
     assert_eq!(written, format!("token={raw}\n"));
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_tool_refuses_masked_materialization_outside_current_dir() {
+    let root = temp_root("capability-write-outside");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    drop(session);
+
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "../pentect-should-not-write.txt",
+            "content": masked
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("outside the current directory"), "{reason}");
+    assert!(!reason.contains(raw), "{reason}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -544,7 +616,9 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
                 "text": "created RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"
             }],
             "structuredContent": {
-                "apiKey": "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+                "apiKey": "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+                "password": "hunter2",
+                "otp": 100482
             }
         }
     });
@@ -555,6 +629,8 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
     assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
     assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     assert!(!rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(!rendered.contains("100482"), "{rendered}");
     let store = RecoveryStore::load(&session).unwrap();
     let env = store.auto_env_bindings().unwrap();
     assert!(
@@ -566,6 +642,16 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
         env.iter()
             .any(|(name, value)| name.starts_with("PENTECT_")
                 && value == "sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        "{env:?}"
+    );
+    assert!(
+        env.iter()
+            .any(|(name, value)| name == "PASSWORD" && value == "hunter2"),
+        "{env:?}"
+    );
+    assert!(
+        env.iter()
+            .any(|(name, value)| name == "OTP" && value == "100482"),
         "{env:?}"
     );
     let _ = std::fs::remove_dir_all(root);

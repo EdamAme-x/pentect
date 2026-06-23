@@ -1,5 +1,4 @@
-//! Pentect CLI: mask secrets from stdin to stdout. One-way for now; nothing is
-//! written to disk.
+//! Pentect CLI: local secret-capability tool boundary for AI agents.
 
 mod input;
 mod terminal;
@@ -16,17 +15,11 @@ use std::process::Command;
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
-    "- Run the shell command you actually intend to run. The hook layer routes shell tools through `pentect exec`; do not add nested Pentect wrappers.\n",
-    "- Common secret-source flow: run the native file/API/browser/MCP command and let masked handles appear; then use `$env:PENTECT_LABEL_hash` on PowerShell or `$PENTECT_LABEL_hash` on Unix in later commands.\n",
-    "- Masked handles like `<<NAME_hash>>` are local capabilities. Later `pentect exec` commands resolve them locally before execution and mask stdout/stderr again.\n",
-    "- Every masked handle is also available in later `pentect exec` commands as a `PENTECT_...` env var: `<<LABEL_hash>>` becomes `$env:PENTECT_LABEL_hash` on PowerShell or `$PENTECT_LABEL_hash` on Unix.\n",
-    "- If output contains `KEY=<<KEY_hash>>`, KEY is also available as `$env:KEY` on PowerShell or `$KEY` on Unix.\n",
-    "- To register a secret from a file, API, browser, or MCP result, run the source command through the protected tool boundary. Masked output such as `<<LABEL_hash>>` is safe to show and registers capabilities; local files referenced by `pentect exec` are also pre-registered when detectable.\n",
-    "- Use normal source/read/fetch commands and let Pentect mask the result. Do not suppress output, hand-roll parsers, or build encoded scripts just to avoid showing masked handles.\n",
-    "- Shell state does not persist across tool calls. If a command reads, sources, or consumes a local file, Pentect treats that file as a registration hint; later commands must still use the masked env capabilities.\n",
-    "- When the task is to use a secret, use the env var. Do not echo the handle, parse the source file again, grep prior output, switch shells, run `pentect help`/`pentect --help`, or add flags.\n",
-    "- Do not bypass masking by transforming a secret into base64, hex, chunks, prefixes, suffixes, screenshots, or alternate encodings. Use the secret as a capability and report only non-secret outcomes.\n",
-    "- Masked command output is expected. Answer from success/failure, status codes, non-secret response fields, and masked handles; do not claim a secret was unusable merely because the returned value stayed masked.\n",
+    "- Run normal shell commands. The hook layer routes them through `pentect exec`; do not nest Pentect wrappers.\n",
+    "- Masked handles like `<<NAME_hash>>` are local capabilities. Later commands get them as `$env:PENTECT_NAME_hash` on PowerShell or `$PENTECT_NAME_hash` on Unix; `KEY=<<...>>` also exposes `$env:KEY` / `$KEY`.\n",
+    "- To register a secret from a file, API, browser, or MCP result, run the normal read/fetch command and let masked output appear.\n",
+    "- When using a secret, use its env var capability. Do not re-read source files, echo handles for inspection, or run help to discover extra flags.\n",
+    "- Do not exfiltrate secrets through encodings, chunks, screenshots, prefixes/suffixes, or derived previews. Report only non-secret outcomes.\n",
 );
 
 fn main() {
@@ -1400,37 +1393,29 @@ mod tests {
         let rendered = args.join("\n");
         assert!(rendered.contains("developer_instructions="), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
-        assert!(rendered.contains("masked handle"), "{rendered}");
+        assert!(rendered.contains("Masked handles"), "{rendered}");
         assert!(
-            rendered.contains("do not add nested Pentect wrappers"),
+            rendered.contains("do not nest Pentect wrappers"),
             "{rendered}"
         );
         assert!(rendered.contains("$env:KEY"), "{rendered}");
-        assert!(rendered.contains("Common secret-source flow"), "{rendered}");
-        assert!(rendered.contains("file/API/browser/MCP"), "{rendered}");
-        assert!(rendered.contains("PENTECT_"), "{rendered}");
-        assert!(rendered.contains("KEY is also available"), "{rendered}");
         assert!(
-            rendered.contains("Shell state does not persist"),
+            rendered.contains("file, API, browser, or MCP"),
             "{rendered}"
         );
-        assert!(rendered.contains("registers capabilities"), "{rendered}");
-        assert!(rendered.contains("pre-registered"), "{rendered}");
-        assert!(rendered.contains("local file"), "{rendered}");
-        assert!(rendered.contains("Do not suppress output"), "{rendered}");
-        assert!(rendered.contains("pentect --help"), "{rendered}");
+        assert!(rendered.contains("PENTECT_"), "{rendered}");
+        assert!(rendered.contains("env var capability"), "{rendered}");
+        assert!(rendered.contains("normal read/fetch command"), "{rendered}");
+        assert!(rendered.contains("masked output"), "{rendered}");
+        assert!(
+            rendered.contains("Do not re-read source files"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("run help"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(!rendered.contains("pentect materialize"), "{rendered}");
-        assert!(
-            rendered.contains("parse the source file again"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("Do not bypass masking"), "{rendered}");
-        assert!(rendered.contains("base64"), "{rendered}");
-        assert!(
-            rendered.contains("Masked command output is expected"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Do not exfiltrate secrets"), "{rendered}");
+        assert!(rendered.contains("encodings"), "{rendered}");
         assert!(
             !rendered.contains("pentect exec \\\"pentect exec"),
             "{rendered}"
@@ -1443,32 +1428,23 @@ mod tests {
         let rendered = args.join("\n");
         assert!(rendered.contains("--append-system-prompt"), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
-        assert!(rendered.contains("KEY is also available"), "{rendered}");
         assert!(rendered.contains("$env:KEY"), "{rendered}");
-        assert!(rendered.contains("Common secret-source flow"), "{rendered}");
-        assert!(rendered.contains("file/API/browser/MCP"), "{rendered}");
-        assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(
-            rendered.contains("Shell state does not persist"),
+            rendered.contains("file, API, browser, or MCP"),
             "{rendered}"
         );
-        assert!(rendered.contains("registers capabilities"), "{rendered}");
-        assert!(rendered.contains("pre-registered"), "{rendered}");
-        assert!(rendered.contains("local file"), "{rendered}");
-        assert!(rendered.contains("Do not suppress output"), "{rendered}");
-        assert!(rendered.contains("pentect --help"), "{rendered}");
+        assert!(rendered.contains("PENTECT_"), "{rendered}");
+        assert!(rendered.contains("env var capability"), "{rendered}");
+        assert!(rendered.contains("normal read/fetch command"), "{rendered}");
+        assert!(
+            rendered.contains("Do not re-read source files"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("run help"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(!rendered.contains("pentect materialize"), "{rendered}");
-        assert!(
-            rendered.contains("parse the source file again"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("Do not bypass masking"), "{rendered}");
-        assert!(rendered.contains("base64"), "{rendered}");
-        assert!(
-            rendered.contains("Masked command output is expected"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Do not exfiltrate secrets"), "{rendered}");
+        assert!(rendered.contains("encodings"), "{rendered}");
         assert!(
             !rendered.contains("pentect exec \"pentect exec"),
             "{rendered}"

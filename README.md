@@ -1,7 +1,15 @@
-progress: https://github.com/setu1421/SecretBench
-memo: ui / approve / shell result / prompt
+Pentect is a local secret-capability tool boundary for AI agents.
 
-MVP: secret-aware tool boundary for AI agents.
+Thesis: agents should operate on secrets as local capabilities, not as plaintext
+conversation data. Pentect masks tool/file/MCP-like output before it reaches the
+agent, turns reusable masked handles into local env capabilities for later
+`pentect exec` commands, resolves those capabilities only inside the local tool
+boundary, and remasks stdout/stderr afterward.
+
+Threat model for the MVP: Pentect is designed to reduce model-visible and
+transcript-visible secret exposure. It is not yet a hardened secrets manager, and
+the local capability vault is not a defense against a local attacker who can read
+the project files.
 
 - Rewrite shell tools to `pentect exec "<command>"` from hooks.
 - Mask read/shell/MCP-like tool output before it returns to the agent.
@@ -17,7 +25,7 @@ MVP: secret-aware tool boundary for AI agents.
 - Large opaque masked values carry readable coarse metadata such as `_length_at_least_512_chars`; exact length is not disclosed.
 - Resolve known handles into Write-like tool calls: when a Write-like tool tries to write content containing `<<HANDLE>>`, Pentect writes the resolved local file itself and blocks the original Write tool so plaintext is not returned in hook JSON.
 - Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.
-- Block direct environment-variable reads unless the value was auto-bound from prior masked output.
+- Child commands run with a cleared environment plus a minimal safe baseline and Pentect capability env vars.
 - Open the terminal control screen with `pentect`; inspect another scope with `pentect dashboard --dir PATH --session NAME`.
 - Show the command approval screen with `pentect approve "<command>"` or gate execution with `pentect exec --approve "<command>"`.
 - Block direct AI Read tools; use `pentect exec "<command>"` at the tool boundary.

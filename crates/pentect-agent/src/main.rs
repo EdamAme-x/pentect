@@ -431,8 +431,7 @@ fn run_resolved_command(
             guard_program_invocation_with_env(program, command_args, &env_policy)?;
             let mut command = Command::new(program);
             command.args(command_args);
-            apply_env_bindings(&mut command, &env);
-            apply_pentect_session(&mut command, &opts.session);
+            apply_protected_child_env(&mut command, &env, &opts.session);
             command
                 .output()
                 .map_err(|e| format!("could not execute command: {e}"))
@@ -462,8 +461,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             guard_program_invocation_with_env(program, command_args, &env_policy)?;
             let mut command = Command::new(program);
             command.args(command_args);
-            apply_env_bindings(&mut command, &env);
-            apply_pentect_session(&mut command, &opts.session);
+            apply_protected_child_env(&mut command, &env, &opts.session);
             run_live_command(command, None, store.clone())
         }
         ExecMode::Shell(command) => {
@@ -473,8 +471,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             let env_policy = exec_env_policy(&env);
             guard_shell_script_with_env(&command, &env_policy)?;
             let mut shell = shell_script_command();
-            apply_env_bindings(&mut shell, &env);
-            apply_pentect_session(&mut shell, &opts.session);
+            apply_protected_child_env(&mut shell, &env, &opts.session);
             run_live_command(shell, Some(&command), store.clone())
         }
     }
@@ -508,6 +505,52 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
             .map_err(|e| format!("could not write '{}': {e}", path.display()))?;
     }
     Ok(())
+}
+
+fn apply_protected_child_env(command: &mut Command, env: &[(String, String)], session: &str) {
+    command.env_clear();
+    apply_safe_parent_env(command);
+    apply_env_bindings(command, env);
+    apply_pentect_session(command, session);
+}
+
+fn apply_safe_parent_env(command: &mut Command) {
+    for name in safe_parent_env_names() {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+fn safe_parent_env_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[
+            "Path",
+            "PATH",
+            "PATHEXT",
+            "SystemRoot",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "PENTECT_AGENT",
+            "PENTECT_AGENT_HOME",
+        ]
+    } else {
+        &[
+            "PATH",
+            "HOME",
+            "SHELL",
+            "TERM",
+            "LANG",
+            "LC_ALL",
+            "TMPDIR",
+            "PENTECT_AGENT",
+            "PENTECT_AGENT_HOME",
+        ]
+    }
 }
 
 fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
@@ -676,8 +719,7 @@ fn run_shell_script(
     session: &str,
 ) -> Result<std::process::Output, String> {
     let mut command = shell_script_command();
-    apply_env_bindings(&mut command, env);
-    apply_pentect_session(&mut command, session);
+    apply_protected_child_env(&mut command, env, session);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1180,8 +1222,7 @@ fn handle_hook(
             };
             let store = RecoveryStore::load(session)?;
             let mut masker = OutputMasker::new_shared(store);
-            let (updated, changed) =
-                transform_json_strings(tool_response, &mut |text| masker.mask_tool_output(text))?;
+            let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
             if changed {
                 Ok(after_tool_output(provider, updated))
             } else {
@@ -1279,10 +1320,11 @@ fn maybe_materialize_masked_write(
     if resolved == content {
         return Ok(None);
     }
-    materialize_file(Path::new(path), &resolved)?;
+    let path = checked_materialize_path(path)?;
+    materialize_file(&path, &resolved)?;
     Ok(Some(format!(
-        "Pentect materialized masked content into '{}' and blocked the original Write tool so plaintext never returns to the AI.",
-        path
+        "Pentect wrote resolved masked content to '{}' locally. The original Write tool was blocked so plaintext never returns to the AI; treat this as success and do not retry.",
+        path.display()
     )))
 }
 
@@ -1319,6 +1361,35 @@ fn write_input_candidates(value: &Value) -> Vec<&Value> {
 
 fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| value.get(*name)?.as_str())
+}
+
+fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return Err(
+            "Pentect only materializes masked writes to relative paths inside the current directory"
+                .to_string(),
+        );
+    }
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => clean.push(part),
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(
+                    "Pentect refused to materialize masked content outside the current directory"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err("Pentect refused to materialize masked content to an empty path".to_string());
+    }
+    Ok(clean)
 }
 
 fn materialize_file(path: &Path, content: &str) -> Result<(), String> {
@@ -1622,13 +1693,10 @@ fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
     }
 }
 
-fn transform_json_strings<F>(value: &Value, f: &mut F) -> Result<(Value, bool), String>
-where
-    F: FnMut(&str) -> Result<String, String>,
-{
+fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bool), String> {
     match value {
         Value::String(text) => {
-            let out = f(text)?;
+            let out = masker.mask_tool_output(text)?;
             let changed = out != *text;
             Ok((Value::String(out), changed))
         }
@@ -1636,7 +1704,7 @@ where
             let mut changed = false;
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                let (item, item_changed) = transform_json_strings(item, f)?;
+                let (item, item_changed) = mask_tool_json(item, masker)?;
                 changed |= item_changed;
                 out.push(item);
             }
@@ -1646,7 +1714,11 @@ where
             let mut changed = false;
             let mut out = serde_json::Map::with_capacity(map.len());
             for (key, value) in map {
-                let (value, value_changed) = transform_json_strings(value, f)?;
+                let (value, value_changed) = if is_sensitive_structured_key(key) {
+                    mask_sensitive_structured_value(key, value, masker)?
+                } else {
+                    mask_tool_json(value, masker)?
+                };
                 changed |= value_changed;
                 out.insert(key.clone(), value);
             }
@@ -1654,6 +1726,78 @@ where
         }
         other => Ok((other.clone(), false)),
     }
+}
+
+fn mask_sensitive_structured_value(
+    key: &str,
+    value: &Value,
+    masker: &mut OutputMasker,
+) -> Result<(Value, bool), String> {
+    match value {
+        Value::Null => Ok((Value::Null, false)),
+        Value::String(text) => {
+            let masked = mask_sensitive_scalar_for_key(key, text, masker)?;
+            Ok((Value::String(masked.clone()), masked != *text))
+        }
+        Value::Number(_) | Value::Bool(_) => {
+            let raw = value.to_string();
+            let masked = mask_sensitive_scalar_for_key(key, &raw, masker)?;
+            Ok((Value::String(masked.clone()), masked != raw))
+        }
+        Value::Array(_) | Value::Object(_) => {
+            let raw = serde_json::to_string(value)
+                .map_err(|e| format!("could not serialize sensitive structured value: {e}"))?;
+            let masked = mask_sensitive_scalar_for_key(key, &raw, masker)?;
+            Ok((Value::String(masked.clone()), masked != raw))
+        }
+    }
+}
+
+fn mask_sensitive_scalar_for_key(
+    key: &str,
+    raw: &str,
+    masker: &mut OutputMasker,
+) -> Result<String, String> {
+    let assignment_key = structured_env_key(key);
+    let masked_assignment = masker.mask_text(&format!("{assignment_key}={raw}"), Kind::Env)?;
+    Ok(masked_assignment
+        .split_once('=')
+        .map(|(_, value)| value.to_string())
+        .unwrap_or(masked_assignment))
+}
+
+fn structured_env_key(key: &str) -> String {
+    let mut out = String::new();
+    for ch in key.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() || out.as_bytes()[0].is_ascii_digit() {
+        format!("SECRET_{out}")
+    } else {
+        out
+    }
+}
+
+fn is_sensitive_structured_key(key: &str) -> bool {
+    let normalized = normalize_structured_key(key);
+    normalized == "key" || is_sensitive_env_name(&normalized)
+}
+
+fn normalize_structured_key(key: &str) -> String {
+    let mut out = String::new();
+    for ch in key.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn stringify_tool_output(value: &Value) -> String {

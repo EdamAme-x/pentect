@@ -541,8 +541,16 @@ pub(crate) fn is_sensitive_env_name(name: &str) -> bool {
         "token",
         "password",
         "passwd",
+        "passcode",
         "private",
         "credential",
+        "otp",
+        "totp",
+        "mfa",
+        "session",
+        "cookie",
+        "jwt",
+        "bearer",
     ]
     .iter()
     .any(|needle| name.contains(needle))
