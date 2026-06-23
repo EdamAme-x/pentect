@@ -257,7 +257,7 @@ fn exec_help() {
             "Runs a command and prints normal stdout/stderr with secrets masked.\n",
             "Every prior `<<LABEL_hash>>` handle becomes a PENTECT_LABEL_hash env var in later execs.\n",
             "If prior output showed `KEY=<<...>>`, later `pentect exec` commands also get KEY as an env var.\n",
-            "Print source output through `pentect exec` to register it; suppressing output does not register it.\n",
+            "Masked output registers capabilities; sourcing .env also registers it as a hint.\n",
             "For .env, use a normal read command and let Pentect return masked handles.\n",
             "Use `$env:KEY` on PowerShell or `$KEY` on Unix; stdout/stderr stays masked.\n",
             "Masked handles in command text also resolve locally before execution.\n",
@@ -417,13 +417,13 @@ fn run_resolved_command(
     store: &RecoveryStore,
     opts: &ExecOpts,
 ) -> Result<std::process::Output, String> {
-    let env = store.auto_env_bindings()?;
-    let env_policy = exec_env_policy(&env);
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
+            let env = store.auto_env_bindings()?;
+            let env_policy = exec_env_policy(&env);
             let resolved_args = resolve_command_args(store, args)?;
             let program = &resolved_args[0];
             let command_args = &resolved_args[1..];
@@ -438,6 +438,9 @@ fn run_resolved_command(
         }
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
+            register_dotenv_sources(store, &command)?;
+            let env = store.auto_env_bindings()?;
+            let env_policy = exec_env_policy(&env);
             guard_shell_script_with_env(&command, &env_policy)?;
             run_shell_script(&command, &env, &opts.session)
         }
@@ -445,13 +448,13 @@ fn run_resolved_command(
 }
 
 fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExitStatus, String> {
-    let env = store.auto_env_bindings()?;
-    let env_policy = exec_env_policy(&env);
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
+            let env = store.auto_env_bindings()?;
+            let env_policy = exec_env_policy(&env);
             let resolved_args = resolve_command_args(store, args)?;
             let program = &resolved_args[0];
             let command_args = &resolved_args[1..];
@@ -464,6 +467,9 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
         }
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
+            register_dotenv_sources(store, &command)?;
+            let env = store.auto_env_bindings()?;
+            let env_policy = exec_env_policy(&env);
             guard_shell_script_with_env(&command, &env_policy)?;
             let mut shell = shell_script_command();
             apply_env_bindings(&mut shell, &env);
@@ -570,12 +576,6 @@ fn guard_sensitive_source_access_with_env(
     env_policy: &EnvPolicy,
 ) -> Result<(), String> {
     let normalized = normalize_policy_text(text);
-    if contains_dotenv_source_reference(&normalized) {
-        return Err(
-            "Pentect does not carry shell state across tool calls. Do not source .env files; print them through `pentect exec` instead (`Get-Content .env` or `cat .env`) so masked `KEY=<<...>>` output registers env capabilities."
-                .to_string(),
-        );
-    }
     if contains_env_read_reference(&normalized, env_policy) {
         return Err(
             "Pentect only exposes environment variables that came from prior masked output. Run the source command through `pentect exec`; if it prints `KEY=<<...>>`, use `$env:KEY` on PowerShell or `$KEY` on Unix in later `pentect exec` commands."
@@ -585,29 +585,52 @@ fn guard_sensitive_source_access_with_env(
     Ok(())
 }
 
-fn contains_dotenv_source_reference(normalized: &str) -> bool {
+fn register_dotenv_sources(store: &RecoveryStore, script: &str) -> Result<(), String> {
+    let paths = dotenv_source_paths(script);
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut masker = OutputMasker::new_shared(store.clone());
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let input = read_input(&path, InputFormat::Text)?;
+        let _ = masker.mask_text(&input, Kind::Env)?;
+    }
+    Ok(())
+}
+
+fn dotenv_source_paths(script: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
     let mut cursor = 0usize;
-    while let Some((word, _, next)) = next_shell_word(normalized, cursor) {
-        if (word == "source" || word == ".")
-            && next_shell_word(normalized, next)
-                .is_some_and(|(path, _, _)| is_dotenv_source_path(&path))
-        {
-            return true;
+    while let Some((word, _, next)) = next_shell_word(script, cursor) {
+        let normalized_word = word.to_ascii_lowercase();
+        if matches!(normalized_word.as_str(), "source" | ".") {
+            if let Some((path, _, _)) = next_shell_word(script, next) {
+                if is_dotenv_source_path(&path) {
+                    out.push(PathBuf::from(clean_source_path_word(&path)));
+                }
+            }
         }
         cursor = next;
     }
-    false
+    out
 }
 
 fn is_dotenv_source_path(path: &str) -> bool {
-    let name = path
-        .trim_matches('"')
-        .trim_matches('\'')
+    let cleaned = clean_source_path_word(path).replace('\\', "/");
+    let name = cleaned
         .trim_start_matches("./")
         .rsplit('/')
         .next()
-        .unwrap_or(path);
+        .unwrap_or(&cleaned)
+        .to_ascii_lowercase();
     name == ".env" || name.starts_with(".env.")
+}
+
+fn clean_source_path_word(path: &str) -> String {
+    path.trim_matches('"').trim_matches('\'').to_string()
 }
 
 fn run_shell_script(

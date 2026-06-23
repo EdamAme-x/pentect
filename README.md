@@ -11,8 +11,8 @@ MVP: secret-aware tool boundary for AI agents.
 - Canonicalize nested wrappers so `pentect exec "pentect exec ..."` becomes one protected boundary, while `pentect read` remains blocked from AI hooks.
 - Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be used without showing plaintext to the AI.
 - Every masked handle becomes a normal env var inside later shell commands: `<<LABEL_hash>>` is available as `$env:PENTECT_LABEL_hash` on PowerShell or `$PENTECT_LABEL_hash` on Unix. If the output was `KEY=<<...>>`, `KEY` is also available.
-- Printing masked output through `pentect exec` is the registration step; suppressing output means no capability gets registered. For `.env`, use a normal read command and let Pentect return masked handles.
-- Do not rely on shell state, `source`, `export`, or `$env:KEY=...` assignments carrying between tool calls.
+- Printing masked output through `pentect exec` registers capabilities. For `.env`, a normal read command is clearest, and source/export commands also register as hints without exposing plaintext.
+- Shell state does not carry between tool calls. If a command sources or exports a `.env` file, Pentect treats that as a registration hint and exposes the resulting capabilities in later `pentect exec` calls.
 - `pentect resolve <path>` is only for the file-materialization case; the agent path should prefer env vars inside `pentect exec`.
 - Large opaque masked values carry readable coarse metadata such as `_length_at_least_512_chars`; exact length is not disclosed.
 - Resolve known handles into `.env` writes: when a Write-like tool tries to write `KEY=<<HANDLE>>`, Pentect writes the resolved local `.env` itself and blocks the original Write tool so plaintext is not returned in hook JSON.

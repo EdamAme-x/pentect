@@ -223,14 +223,33 @@ fn exec_allows_secret_file_reads_because_output_is_remasked() {
 }
 
 #[test]
-fn exec_blocks_dotenv_sourcing_because_it_does_not_register_capabilities() {
-    let err = guard_shell_script_with_env("set -a; . ./.env >/dev/null", &EnvPolicy::default())
-        .unwrap_err();
-    assert!(err.contains("Do not source .env"), "{err}");
-    assert!(err.contains("KEY=<<...>>"), "{err}");
+fn exec_registers_dotenv_sourcing_as_env_capabilities() {
+    guard_shell_script_with_env("set -a; . ./.env >/dev/null", &EnvPolicy::default()).unwrap();
+    guard_shell_script_with_env("source .env.local", &EnvPolicy::default()).unwrap();
 
-    let err = guard_shell_script_with_env("source .env.local", &EnvPolicy::default()).unwrap_err();
-    assert!(err.contains("Do not source .env"), "{err}");
+    let root = temp_root("source-dotenv-registers");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let dotenv = project.join(".env");
+    let raw =
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\n";
+    std::fs::write(&dotenv, raw).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+
+    register_dotenv_sources(&store, &format!("source '{}'", dotenv.display())).unwrap();
+    let env = store.auto_env_bindings().unwrap();
+    assert!(
+        env.iter().any(|(name, value)| name == "RUNPOD_API_KEY"
+            && value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+        "{env:?}"
+    );
+    assert!(
+        env.iter()
+            .any(|(name, value)| name == "TEST_SECRET" && value == "114514810"),
+        "{env:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
