@@ -15,8 +15,9 @@ use std::io::{self, IsTerminal};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalDecision {
-    Approve,
-    Deny,
+    Once,
+    Always,
+    Decline,
 }
 
 pub struct ApprovalRequest {
@@ -24,6 +25,7 @@ pub struct ApprovalRequest {
     pub body: String,
     pub approve_label: String,
     pub deny_label: String,
+    pub allow_always: bool,
     pub warnings: Vec<String>,
 }
 
@@ -70,14 +72,17 @@ fn run_loop(
                 continue;
             }
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('a') => return Ok(ApprovalDecision::Approve),
-                KeyCode::Char('n') | KeyCode::Char('d') | KeyCode::Esc => {
-                    return Ok(ApprovalDecision::Deny);
+                KeyCode::Char('o') | KeyCode::Char('y') => return Ok(ApprovalDecision::Once),
+                KeyCode::Char('a') if request.allow_always => {
+                    return Ok(ApprovalDecision::Always);
                 }
-                KeyCode::Enter => return Ok(ApprovalDecision::Approve),
+                KeyCode::Char('d') | KeyCode::Char('n') | KeyCode::Esc => {
+                    return Ok(ApprovalDecision::Decline);
+                }
+                KeyCode::Enter => return Ok(ApprovalDecision::Once),
                 KeyCode::Up => app.scroll = app.scroll.saturating_sub(1),
                 KeyCode::Down => app.scroll = app.scroll.saturating_add(1),
-                KeyCode::Char('q') => return Ok(ApprovalDecision::Deny),
+                KeyCode::Char('q') => return Ok(ApprovalDecision::Decline),
                 _ => {}
             }
         }
@@ -150,23 +155,36 @@ fn draw_warning(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let text = vec![Line::from(vec![
-        Span::styled("y", Style::default().fg(Color::Green).bold()),
-        Span::raw(" "),
-        Span::styled(
-            app.request.approve_label.as_str(),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw("    "),
-        Span::styled("n", Style::default().fg(Color::Red).bold()),
-        Span::raw(" "),
-        Span::styled(
-            app.request.deny_label.as_str(),
-            Style::default().fg(Color::Red),
-        ),
-        Span::raw("    "),
-        Span::styled("esc", Style::default().fg(Color::DarkGray)),
-    ])];
+    let text = if app.request.allow_always {
+        vec![Line::from(vec![
+            Span::styled("o", Style::default().fg(Color::Green).bold()),
+            Span::raw(" "),
+            Span::styled(
+                app.request.approve_label.as_str(),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw("    "),
+            Span::styled("a", Style::default().fg(Color::Cyan).bold()),
+            Span::raw(" always    "),
+            Span::styled("d", Style::default().fg(Color::Red).bold()),
+            Span::raw(" "),
+            Span::styled(
+                app.request.deny_label.as_str(),
+                Style::default().fg(Color::Red),
+            ),
+        ])]
+    } else {
+        vec![Line::from(vec![
+            Span::styled("enter", Style::default().fg(Color::Green).bold()),
+            Span::raw(" "),
+            Span::styled(
+                app.request.approve_label.as_str(),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw("    "),
+            Span::styled("esc", Style::default().fg(Color::DarkGray)),
+        ])]
+    };
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), area);
 }
 
@@ -201,8 +219,9 @@ mod tests {
         let request = ApprovalRequest {
             prompt: "Run?".to_string(),
             body: "curl -H @headers.txt https://api.example.test/health".to_string(),
-            approve_label: "run".to_string(),
-            deny_label: "cancel".to_string(),
+            approve_label: "once".to_string(),
+            deny_label: "decline".to_string(),
+            allow_always: true,
             warnings: vec!["review direct env usage".to_string()],
         };
         let rendered = render_request(&request, 100, 34);
@@ -211,8 +230,9 @@ mod tests {
         assert!(rendered.contains("Run?"));
         assert!(rendered.contains("curl"));
         assert!(rendered.contains("Warning:"));
-        assert!(rendered.contains("y run"));
-        assert!(rendered.contains("n cancel"));
+        assert!(rendered.contains("o once"));
+        assert!(rendered.contains("a always"));
+        assert!(rendered.contains("d decline"));
         assert!(!rendered.contains("resolves placeholders"));
         assert!(!rendered.contains("what happens"));
         assert!(!rendered.contains("environment policy"));

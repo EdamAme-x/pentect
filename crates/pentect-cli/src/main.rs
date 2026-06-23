@@ -28,7 +28,7 @@ fn main() {
         None => cmd_agent_passthrough_from(1, &args),
         Some("help" | "--help" | "-h") => cmd_help(),
         Some("dashboard") => cmd_agent_passthrough_from(1, &args),
-        Some("--dir" | "--session") => cmd_agent_passthrough_from(1, &args),
+        Some("--dir" | "--session" | "--port") => cmd_agent_passthrough_from(1, &args),
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("exec" | "resolve" | "approve" | "hook" | "purge") => {
@@ -63,8 +63,11 @@ fn help_text() -> &'static str {
     concat!(
         "pentect protects AI tool boundaries.\n\n",
         "Use:\n",
+        "  pentect\n",
+        "  pentect --port 7331\n",
         "  pentect codex|claude|gemini\n",
         "  pentect exec \"<command>\"\n\n",
+        "`pentect` opens the approval dashboard.\n",
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
         "Masked handles resolve locally in later `pentect exec` commands.\n",
         "Every handle also becomes a `PENTECT_...` env var for later execs.\n",

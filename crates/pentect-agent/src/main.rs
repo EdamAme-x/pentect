@@ -6,11 +6,13 @@
 //! `read` is a one-way human preview. `exec` and hooks use a local capability
 //! vault so masked handles can be passed back into later tool-boundary commands.
 
+mod approval;
 mod approve_ui;
 mod masking;
 mod session;
 mod shell;
 
+use approval::{ticket_summary, ApprovalQueue, ApprovalTicket};
 use approve_ui::{ApprovalDecision, ApprovalRequest};
 use masking::{
     contains_unresolved_masked_handle, is_ascii_word_char, is_env_name_byte, is_sensitive_env_name,
@@ -26,22 +28,24 @@ use shell::{
     command_available, next_shell_word, powershell_command, powershell_word, shell_command,
     shell_quote_unix,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::Duration;
 
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
+const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
         None => cmd_dashboard(&args),
         Some("dashboard") => cmd_dashboard(&args),
-        Some("--dir" | "--session") => cmd_dashboard(&args),
+        Some("--dir" | "--session" | "--port") => cmd_dashboard(&args),
         Some("read") => cmd_read(&args),
         Some("exec") => cmd_exec(&args),
         Some("resolve") => cmd_resolve(&args),
@@ -87,12 +91,8 @@ fn cmd_dashboard(args: &[String]) -> i32 {
             Err(e) => return die(&e),
         },
     };
-    let request = match dashboard_request(&session) {
-        Ok(request) => request,
-        Err(e) => return die(&e),
-    };
-    match approve_ui::run(&request) {
-        Ok(ApprovalDecision::Approve) | Ok(ApprovalDecision::Deny) => 0,
+    match run_dashboard(&session, opts.port) {
+        Ok(()) => 0,
         Err(e) => die(&e),
     }
 }
@@ -120,8 +120,67 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
         body,
         approve_label: "close".to_string(),
         deny_label: "close".to_string(),
+        allow_always: false,
         warnings,
     })
+}
+
+fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
+    let queue = ApprovalQueue::open(session)?;
+    if let Some(port) = port {
+        return queue.serve_web(session, port, DASHBOARD_HEARTBEAT_MAX_AGE);
+    }
+
+    let heartbeat_queue = queue.clone();
+    let _heartbeat_thread = std::thread::spawn(move || loop {
+        let _ = heartbeat_queue.heartbeat(None);
+        std::thread::sleep(Duration::from_millis(500));
+    });
+
+    print_dashboard_status(session, &queue, None)?;
+    loop {
+        if let Some(ticket) = queue.next_pending()? {
+            let request = ApprovalRequest {
+                prompt: "Use secret?".to_string(),
+                body: ticket_summary(&ticket),
+                approve_label: "once".to_string(),
+                deny_label: "decline".to_string(),
+                allow_always: true,
+                warnings: ticket_warnings(&ticket),
+            };
+            let decision = approve_ui::run(&request)?;
+            queue.decide(&ticket, decision, "ui")?;
+            print_dashboard_status(session, &queue, None)?;
+        } else {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+fn print_dashboard_status(
+    session: &str,
+    queue: &ApprovalQueue,
+    port: Option<u16>,
+) -> Result<(), String> {
+    let request = dashboard_request(session)?;
+    print!("\x1b[2J\x1b[H");
+    println!("pentect");
+    println!("{}", request.body);
+    if let Some(port) = port {
+        println!("port: {port}");
+    }
+    println!();
+    println!("waiting for approvals");
+    let history = queue.recent_history(5)?;
+    if !history.is_empty() {
+        println!();
+        println!("history");
+        for line in history {
+            println!("{line}");
+        }
+    }
+    let _ = std::io::stdout().flush();
+    Ok(())
 }
 
 fn cmd_read(args: &[String]) -> i32 {
@@ -172,11 +231,38 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
+    if let Err(e) = prepare_exec_capabilities(&store, &opts) {
+        return die(&e);
+    }
+    let approval = match exec_approval(&store, &opts) {
+        Ok(approval) => approval,
+        Err(e) => return die(&e),
+    };
+    let already_allowed = match approval_always_granted(&opts.session, &approval) {
+        Ok(allowed) => allowed,
+        Err(e) => return die(&e),
+    };
     if opts.approve {
-        match request_approval(&store, &opts, "Approve command execution") {
-            Ok(ApprovalDecision::Approve) => {}
-            Ok(ApprovalDecision::Deny) => {
-                eprintln!("[pentect] command denied");
+        match request_approval(&store, &opts, &approval, false) {
+            Ok(ApprovalDecision::Once) => {}
+            Ok(ApprovalDecision::Always) => {
+                if let Err(e) = ApprovalQueue::open(&opts.session).and_then(|queue| {
+                    queue.record(&approval.ticket(), ApprovalDecision::Always, "local")
+                }) {
+                    return die(&e);
+                }
+            }
+            Ok(ApprovalDecision::Decline) => {
+                eprintln!("[pentect] command declined");
+                return 1;
+            }
+            Err(e) => return die(&e),
+        }
+    } else if approval.requires_approval() && !already_allowed {
+        match approval_decision_for_exec(&opts.session, &approval) {
+            Ok(ApprovalDecision::Once | ApprovalDecision::Always) => {}
+            Ok(ApprovalDecision::Decline) => {
+                eprintln!("[pentect] command declined");
                 return 1;
             }
             Err(e) => return die(&e),
@@ -256,8 +342,9 @@ fn exec_help() {
             "pentect exec \"<command>\"\n",
             "pentect exec --live \"<command>\"\n\n",
             "Runs a command and prints normal stdout/stderr with secrets masked.\n",
-            "Every prior `<<LABEL_hash>>` handle becomes a PENTECT_LABEL_hash env var in later execs.\n",
-            "If prior output showed `KEY=<<...>>`, later `pentect exec` commands also get KEY as an env var.\n",
+            "Referenced `<<LABEL_hash>>` handles become PENTECT_LABEL_hash env vars in child commands.\n",
+            "If prior output showed `KEY=<<...>>`, commands that reference KEY can use it as an env var.\n",
+            "Run `pentect` for approval UI or `pentect --port 7331` for the local web dashboard.\n",
             "Masked output registers capabilities; referenced local files are also scanned as hints.\n",
             "Use normal commands and let Pentect return masked handles; do not hand-roll parsers to avoid output.\n",
             "Use `$env:KEY` on PowerShell or `$KEY` on Unix; stdout/stderr stays masked.\n",
@@ -279,9 +366,22 @@ fn cmd_approve(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    match request_approval(&store, &opts, "Preview Pentect approval") {
-        Ok(ApprovalDecision::Approve) => 0,
-        Ok(ApprovalDecision::Deny) => 1,
+    if let Err(e) = prepare_exec_capabilities(&store, &opts) {
+        return die(&e);
+    }
+    let approval = match exec_approval(&store, &opts) {
+        Ok(approval) => approval,
+        Err(e) => return die(&e),
+    };
+    match request_approval(&store, &opts, &approval, true) {
+        Ok(ApprovalDecision::Once) => 0,
+        Ok(ApprovalDecision::Always) => match ApprovalQueue::open(&opts.session)
+            .and_then(|queue| queue.record(&approval.ticket(), ApprovalDecision::Always, "local"))
+        {
+            Ok(()) => 0,
+            Err(e) => die(&e),
+        },
+        Ok(ApprovalDecision::Decline) => 1,
         Err(e) => die(&e),
     }
 }
@@ -311,19 +411,20 @@ fn cmd_purge(args: &[String]) -> i32 {
 fn request_approval(
     store: &RecoveryStore,
     opts: &ExecOpts,
-    title: &str,
+    approval: &ExecApproval,
+    preview: bool,
 ) -> Result<ApprovalDecision, String> {
-    let command = display_exec_mode(&opts.mode);
     let request = ApprovalRequest {
-        prompt: if title.contains("Preview") {
+        prompt: if preview {
             "Preview".to_string()
         } else {
             "Run?".to_string()
         },
-        body: command.clone(),
-        approve_label: "run".to_string(),
-        deny_label: "cancel".to_string(),
-        warnings: approval_warnings(store, opts, &command)?,
+        body: approval.body(),
+        approve_label: "once".to_string(),
+        deny_label: "decline".to_string(),
+        allow_always: true,
+        warnings: approval_warnings(store, opts, approval)?,
     };
     approve_ui::run(&request)
 }
@@ -331,10 +432,10 @@ fn request_approval(
 fn approval_warnings(
     store: &RecoveryStore,
     opts: &ExecOpts,
-    display_command: &str,
+    approval: &ExecApproval,
 ) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
-    let env = store.auto_env_bindings()?;
+    let env = requested_env_bindings(store, &opts.mode)?;
     let policy = exec_env_policy(&env);
     let guard = match &opts.mode {
         ExecMode::Program(args) => {
@@ -346,7 +447,7 @@ fn approval_warnings(
             guard_program_invocation_with_env(program, &resolved_args[1..], &policy)
         }
         ExecMode::Shell(_) => {
-            let command = resolve_command_text(store, display_command)?;
+            let command = resolve_command_text(store, &approval.command)?;
             guard_shell_script_with_env(&command, &policy)
         }
     };
@@ -356,7 +457,226 @@ fn approval_warnings(
     if opts.live {
         warnings.push("live output is masked in chunks".to_string());
     }
+    if approval.network_like && approval.requires_approval() {
+        warnings.push("this command may send approved capabilities to the network".to_string());
+    }
     Ok(warnings)
+}
+
+fn approval_decision_for_exec(
+    session: &str,
+    approval: &ExecApproval,
+) -> Result<ApprovalDecision, String> {
+    let queue = ApprovalQueue::open(session)?;
+    let ticket = approval.ticket();
+    if !queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
+        queue.record(&ticket, ApprovalDecision::Once, "auto")?;
+        return Ok(ApprovalDecision::Once);
+    }
+    queue.submit(&ticket)?;
+    queue.wait_for_decision(&ticket, DASHBOARD_HEARTBEAT_MAX_AGE)
+}
+
+fn ticket_warnings(ticket: &ApprovalTicket) -> Vec<String> {
+    if ticket.network_like {
+        vec!["may send secret".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+#[derive(Debug)]
+struct ExecApproval {
+    command: String,
+    env_refs: Vec<EnvApprovalRef>,
+    direct_handles: Vec<String>,
+    destinations: Vec<String>,
+    network_like: bool,
+}
+
+#[derive(Debug)]
+struct EnvApprovalRef {
+    name: String,
+    value_hash: String,
+}
+
+impl ExecApproval {
+    fn requires_approval(&self) -> bool {
+        !self.env_refs.is_empty() || !self.direct_handles.is_empty()
+    }
+
+    fn env_names(&self) -> Vec<String> {
+        self.env_refs.iter().map(|env| env.name.clone()).collect()
+    }
+
+    fn fingerprint(&self) -> String {
+        let mut material = String::new();
+        material.push_str("approval-v1\0");
+        material.push_str(&self.command);
+        material.push('\0');
+        for env in &self.env_refs {
+            material.push_str(&env.name);
+            material.push('\0');
+            material.push_str(&env.value_hash);
+            material.push('\0');
+        }
+        material.push_str("handles:");
+        for handle in &self.direct_handles {
+            material.push_str(handle);
+            material.push('\0');
+        }
+        let digest = Sha256::digest(material.as_bytes());
+        data_encoding::HEXLOWER.encode(&digest[..16])
+    }
+
+    fn body(&self) -> String {
+        let mut lines = vec!["command".to_string(), self.command.clone()];
+        if self.requires_approval() {
+            lines.push(String::new());
+            let env_names = self.env_names();
+            if !env_names.is_empty() {
+                lines.push(format!("secret {}", env_names.join(", ")));
+            }
+            if !self.direct_handles.is_empty() {
+                lines.push(format!("handles {}", self.direct_handles.len()));
+            }
+            if !self.destinations.is_empty() {
+                lines.push(format!("send {}", self.destinations.join(", ")));
+            } else if self.network_like {
+                lines.push("send possible".to_string());
+            }
+        } else {
+            lines.push(String::new());
+            lines.push("no secret".to_string());
+        }
+        lines.join("\n")
+    }
+
+    fn ticket(&self) -> ApprovalTicket {
+        ApprovalTicket::new(
+            self.fingerprint(),
+            self.command.clone(),
+            self.env_names(),
+            self.direct_handles.len(),
+            self.destinations.clone(),
+            self.network_like,
+        )
+    }
+}
+
+fn exec_approval(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExecApproval, String> {
+    let command = display_exec_mode(&opts.mode);
+    let env = requested_env_bindings(store, &opts.mode)?;
+    let mut env_refs = env
+        .into_iter()
+        .map(|(name, value)| EnvApprovalRef {
+            name,
+            value_hash: secret_value_hash(&value),
+        })
+        .collect::<Vec<_>>();
+    env_refs.sort_by_key(|env| env.name.to_ascii_lowercase());
+    env_refs.dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name));
+    let direct_handles = masked_handles_in_mode(&opts.mode);
+    let destinations = network_destinations(&command);
+    let network_like = !destinations.is_empty() || command_looks_network_like(&command);
+    Ok(ExecApproval {
+        command,
+        env_refs,
+        direct_handles,
+        destinations,
+        network_like,
+    })
+}
+
+fn approval_always_granted(session: &str, approval: &ExecApproval) -> Result<bool, String> {
+    if !approval.requires_approval() {
+        return Ok(false);
+    }
+    Ok(ApprovalQueue::open(session)?.always_granted(&approval.fingerprint()))
+}
+
+fn prepare_exec_capabilities(store: &RecoveryStore, opts: &ExecOpts) -> Result<(), String> {
+    if let ExecMode::Shell(command) = &opts.mode {
+        let command = resolve_command_text(store, command)?;
+        register_local_file_inputs(store, &command)?;
+    }
+    Ok(())
+}
+
+fn secret_value_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    data_encoding::HEXLOWER.encode(&digest[..16])
+}
+
+fn masked_handles_in_mode(mode: &ExecMode) -> Vec<String> {
+    let text = match mode {
+        ExecMode::Shell(command) => command.clone(),
+        ExecMode::Program(args) => args.join(" "),
+    };
+    masked_handles_in_text(&text)
+}
+
+fn masked_handles_in_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while let Some(start) = text[offset..].find("<<") {
+        let start = offset + start;
+        let Some(end_rel) = text[start + 2..].find(">>") else {
+            break;
+        };
+        let end = start + 2 + end_rel + 2;
+        let handle = &text[start..end];
+        if !handle.starts_with("<<PENTECT_APPROVAL_")
+            && !out.iter().any(|existing| existing == handle)
+        {
+            out.push(handle.to_string());
+        }
+        offset = end;
+    }
+    out
+}
+
+fn network_destinations(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some((word, _, next)) = next_shell_word(command, cursor) {
+        let cleaned = word.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ')' | ']'));
+        if (cleaned.starts_with("https://") || cleaned.starts_with("http://"))
+            && !out.iter().any(|existing| existing == cleaned)
+        {
+            out.push(cleaned.to_string());
+        }
+        cursor = next;
+    }
+    out
+}
+
+fn command_looks_network_like(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some((word, _, next)) = next_shell_word(&lower, cursor) {
+        let word = word.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | '(' | ')'));
+        if matches!(
+            word,
+            "curl"
+                | "curl.exe"
+                | "wget"
+                | "wget.exe"
+                | "ssh"
+                | "scp"
+                | "gh"
+                | "http"
+                | "httpie"
+                | "invoke-restmethod"
+                | "invoke-webrequest"
+                | "irm"
+                | "iwr"
+        ) {
+            return true;
+        }
+        cursor = next;
+    }
+    lower.contains("://")
 }
 
 fn display_exec_mode(mode: &ExecMode) -> String {
@@ -423,7 +743,7 @@ fn run_resolved_command(
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
-            let env = store.auto_env_bindings()?;
+            let env = requested_env_bindings(store, &opts.mode)?;
             let env_policy = exec_env_policy(&env);
             let resolved_args = resolve_command_args(store, args)?;
             let program = &resolved_args[0];
@@ -439,7 +759,7 @@ fn run_resolved_command(
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
             register_local_file_inputs(store, &command)?;
-            let env = store.auto_env_bindings()?;
+            let env = requested_env_bindings(store, &opts.mode)?;
             let env_policy = exec_env_policy(&env);
             guard_shell_script_with_env(&command, &env_policy)?;
             run_shell_script(&command, &env, &opts.session)
@@ -453,7 +773,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             if args.is_empty() {
                 return Err("exec requires a program after `--`".to_string());
             }
-            let env = store.auto_env_bindings()?;
+            let env = requested_env_bindings(store, &opts.mode)?;
             let env_policy = exec_env_policy(&env);
             let resolved_args = resolve_command_args(store, args)?;
             let program = &resolved_args[0];
@@ -467,7 +787,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
             register_local_file_inputs(store, &command)?;
-            let env = store.auto_env_bindings()?;
+            let env = requested_env_bindings(store, &opts.mode)?;
             let env_policy = exec_env_policy(&env);
             guard_shell_script_with_env(&command, &env_policy)?;
             let mut shell = shell_script_command();
@@ -589,6 +909,132 @@ fn exec_env_policy(env: &[(String, String)]) -> EnvPolicy {
         push_unique_env_name(&mut allowed, name);
     }
     EnvPolicy { allowed }
+}
+
+fn requested_env_bindings(
+    store: &RecoveryStore,
+    mode: &ExecMode,
+) -> Result<Vec<(String, String)>, String> {
+    let available = store.auto_env_bindings()?;
+    if available.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names = referenced_env_names(mode);
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut by_name = BTreeMap::new();
+    for (name, value) in available {
+        by_name.insert(name.to_ascii_lowercase(), (name, value));
+    }
+    let mut out = Vec::new();
+    for name in names {
+        if let Some(binding) = by_name.get(&name) {
+            out.push(binding.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn referenced_env_names(mode: &ExecMode) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    match mode {
+        ExecMode::Shell(command) => {
+            collect_powershell_env_refs(command, &mut names);
+            collect_printenv_refs(command, &mut names);
+            collect_percent_env_refs(command, &mut names);
+            if !cfg!(windows) {
+                collect_bare_dollar_env_refs(command, &mut names);
+            }
+        }
+        ExecMode::Program(args) => {
+            let text = args.join(" ");
+            collect_powershell_env_refs(&text, &mut names);
+            collect_printenv_refs(&text, &mut names);
+            collect_percent_env_refs(&text, &mut names);
+            collect_bare_dollar_env_refs(&text, &mut names);
+        }
+    }
+    names
+}
+
+fn collect_powershell_env_refs(text: &str, out: &mut BTreeSet<String>) {
+    let lower = text.to_ascii_lowercase();
+    let mut offset = 0usize;
+    while let Some(index) = lower[offset..].find("$env:") {
+        let name_start = offset + index + "$env:".len();
+        let mut name_end = name_start;
+        let bytes = lower.as_bytes();
+        while name_end < bytes.len() && is_env_name_byte(bytes[name_end]) {
+            name_end += 1;
+        }
+        if name_end > name_start {
+            out.insert(lower[name_start..name_end].to_string());
+        }
+        offset = name_end.max(offset + index + "$env:".len());
+    }
+}
+
+fn collect_bare_dollar_env_refs(text: &str, out: &mut BTreeSet<String>) {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                if let Some((name, next)) = env_name_after_marker(text, i + 1, '$') {
+                    out.insert(name.to_ascii_lowercase());
+                    i = next;
+                    continue;
+                }
+            } else if let Some((name, next)) = env_name_after_marker(text, i + 1, '$') {
+                if !name.eq_ignore_ascii_case("env") {
+                    out.insert(name.to_ascii_lowercase());
+                }
+                i = next;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn collect_percent_env_refs(text: &str, out: &mut BTreeSet<String>) {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some((name, next)) = env_name_after_marker(text, i + 1, '%') {
+                out.insert(name.to_ascii_lowercase());
+                i = next;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn collect_printenv_refs(text: &str, out: &mut BTreeSet<String>) {
+    let normalized = normalize_policy_text(text);
+    let mut offset = 0usize;
+    while let Some(index) = normalized[offset..].find("printenv") {
+        let word_start = offset + index;
+        let word_end = word_start + "printenv".len();
+        let before = normalized[..word_start].chars().next_back();
+        let after = normalized[word_end..].chars().next();
+        if !is_ascii_word_char(before) && !is_ascii_word_char(after) {
+            let mut cursor = word_end;
+            while let Some((word, _, next)) = next_shell_word(&normalized, cursor) {
+                if is_shell_separator_word(&word) {
+                    break;
+                }
+                if !word.starts_with('-') && looks_like_env_name(&word) {
+                    out.insert(word.to_ascii_lowercase());
+                }
+                cursor = next;
+            }
+        }
+        offset = word_end;
+    }
 }
 
 fn push_unique_env_name(names: &mut Vec<String>, name: &str) {
@@ -988,12 +1434,14 @@ impl PurgeOpts {
 struct DashboardOpts {
     session: Option<String>,
     dir: Option<PathBuf>,
+    port: Option<u16>,
 }
 
 impl DashboardOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut session = None;
         let mut dir = None;
+        let mut port = None;
         let mut i = if matches!(args.get(1).map(String::as_str), Some("dashboard")) {
             2
         } else {
@@ -1005,11 +1453,18 @@ impl DashboardOpts {
                     session = Some(checked_session_name(&value(args, &mut i, "--session")?)?)
                 }
                 "--dir" => dir = Some(PathBuf::from(value(args, &mut i, "--dir")?)),
+                "--port" => {
+                    let raw = value(args, &mut i, "--port")?;
+                    port = Some(
+                        raw.parse::<u16>()
+                            .map_err(|_| format!("invalid port: {raw}"))?,
+                    );
+                }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 arg => return Err(format!("unexpected dashboard argument: {arg}")),
             }
         }
-        Ok(Self { session, dir })
+        Ok(Self { session, dir, port })
     }
 }
 

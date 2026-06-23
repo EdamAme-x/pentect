@@ -136,6 +136,13 @@ fn resolve_parse_defaults_to_stdin_without_paths() {
 }
 
 #[test]
+fn dashboard_parse_accepts_top_level_port() {
+    let args = strings(["pentect-agent", "--port", "7319"]);
+    let opts = DashboardOpts::parse(&args).unwrap();
+    assert_eq!(opts.port, Some(7319));
+}
+
+#[test]
 fn read_defaults_to_strict_and_infers_dotenv() {
     let args = strings(["pentect-agent", "read", r".\.env"]);
     let opts = ReadOpts::parse(&args).unwrap();
@@ -295,6 +302,75 @@ fn exec_registers_referenced_local_files_as_env_capabilities() {
         "{env:?}"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_approval_sees_capabilities_registered_from_referenced_files() {
+    let root = temp_root("approval-registers-file-before-decision");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("secrets.env"),
+        "API_TOKEN=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+    )
+    .unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+    let secret_path = project.join("secrets.env");
+    let command = if cfg!(windows) {
+        format!(
+            "Get-Content -LiteralPath '{}' > $null; Write-Output $env:API_TOKEN",
+            secret_path.display()
+        )
+    } else {
+        format!(
+            "cat '{}' >/dev/null; printf '%s' \"$API_TOKEN\"",
+            secret_path.display()
+        )
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        approve: false,
+        mode: ExecMode::Shell(command),
+    };
+
+    let before = exec_approval(&store, &opts).unwrap();
+    assert!(!before.requires_approval(), "{before:?}");
+
+    prepare_exec_capabilities(&store, &opts).unwrap();
+    let after = exec_approval(&store, &opts).unwrap();
+
+    assert!(after.requires_approval(), "{after:?}");
+    assert_eq!(after.env_names(), vec!["API_TOKEN".to_string()]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn always_fingerprint_includes_capability_value_identity() {
+    let command = "Write-Output $env:API_TOKEN".to_string();
+    let a = ExecApproval {
+        command: command.clone(),
+        env_refs: vec![EnvApprovalRef {
+            name: "API_TOKEN".to_string(),
+            value_hash: secret_value_hash("first-secret"),
+        }],
+        direct_handles: Vec::new(),
+        destinations: Vec::new(),
+        network_like: false,
+    };
+    let b = ExecApproval {
+        command,
+        env_refs: vec![EnvApprovalRef {
+            name: "API_TOKEN".to_string(),
+            value_hash: secret_value_hash("second-secret"),
+        }],
+        direct_handles: Vec::new(),
+        destinations: Vec::new(),
+        network_like: false,
+    };
+
+    assert_ne!(a.fingerprint(), b.fingerprint());
 }
 
 #[test]
@@ -472,6 +548,41 @@ fn exec_auto_binds_masked_env_output_across_sessions() {
     assert!(!safe.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ"), "{safe}");
     assert!(!safe.contains("114514810"), "{safe}");
     assert!(!safe.contains("hello world"), "{safe}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_only_injects_referenced_capability_env() {
+    let root = temp_root("capability-env-least");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let output =
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\n";
+    let _masked = mask_tool_output(&session, output).unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+
+    let none = requested_env_bindings(
+        &store,
+        &ExecMode::Shell(if cfg!(windows) {
+            "Write-Output hi".to_string()
+        } else {
+            "printf hi".to_string()
+        }),
+    )
+    .unwrap();
+    assert!(none.is_empty(), "{none:?}");
+
+    let one = requested_env_bindings(
+        &store,
+        &ExecMode::Shell(if cfg!(windows) {
+            "Write-Output $env:RUNPOD_API_KEY".to_string()
+        } else {
+            "printf '%s' \"$RUNPOD_API_KEY\"".to_string()
+        }),
+    )
+    .unwrap();
+    assert_eq!(one.len(), 1, "{one:?}");
+    assert_eq!(one[0].0, "RUNPOD_API_KEY");
+    assert_eq!(one[0].1, "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -831,7 +942,7 @@ fn codex_posttool_does_not_block_already_masked_exec_output() {
 }
 
 #[test]
-fn codex_posttool_does_not_block_legacy_exec_footer() {
+fn codex_posttool_does_not_block_short_exec_footer() {
     let (root, session) = empty_session("hook-post-codex-legacy-footer");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -839,7 +950,7 @@ fn codex_posttool_does_not_block_legacy_exec_footer() {
         "tool_input": {
             "command": "pentect exec 'Get-Content -LiteralPath .\\.env'"
         },
-        "tool_response": "RUNPOD_API_KEY=<<RUNPOD_API_KEY_f6a375b6c449645f>>\nTEST_SECRET=<<SECRET_ea193cc4740362de>>\nNOTE=<<SECRET_36da7f6aab3d75f1>>\n# pentect: usage: use `pentect exec \"<command>\"`; known `<<...>>` handles resolve locally before execution; `RUNPOD_API_KEY` is available as `$env:RUNPOD_API_KEY` on PowerShell or `$RUNPOD_API_KEY` on Unix; opaque blobs may show `_length_at_least_N_chars`."
+        "tool_response": "RUNPOD_API_KEY=<<RUNPOD_API_KEY_f6a375b6c449645f>>\nTEST_SECRET=<<SECRET_ea193cc4740362de>>\nNOTE=<<SECRET_36da7f6aab3d75f1>>\n# pentect: help: `pentect help`."
     });
     let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
     assert_eq!(output, json!({}));
