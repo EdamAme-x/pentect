@@ -88,11 +88,45 @@ impl OutputMasker {
             recovery.extend_same_key(text_result.recovery);
         }
         recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
+        self.record_recovery(recovery)?;
+        Ok(masked)
+    }
+
+    pub(crate) fn mask_sensitive_value(
+        &mut self,
+        env_name: &str,
+        value: &str,
+    ) -> Result<String, String> {
+        let masked = self.mask_tool_output(value)?;
+        if masked != value {
+            let alias_line = format!("{env_name}={masked}");
+            self.record_recovery(env_alias_recovery(&alias_line, &self.store.session.key))?;
+            return Ok(masked);
+        }
+
+        let label = forced_label(env_name);
+        let hash = identity_hash(&self.store.session.key, &format!("{label}\0{value}"));
+        let placeholder = render_placeholder(&label, &hash, None);
+        let mut map = HashMap::new();
+        map.insert(placeholder.clone(), value.to_string());
+        let mut recovery = Recovery::seal(map, &self.store.session.key);
+        recovery.extend_same_key(env_alias_recovery(
+            &format!("{env_name}={placeholder}"),
+            &self.store.session.key,
+        ));
+        self.record_recovery(recovery)?;
+        Ok(placeholder)
+    }
+
+    fn record_recovery(&mut self, recovery: Recovery) -> Result<(), String> {
+        if recovery.is_empty() {
+            return Ok(());
+        }
         match &mut self.mode {
             OutputMaskerMode::Shared => self.store.add_recovery(recovery)?,
             OutputMaskerMode::Deferred { .. } => self.pending.extend_same_key(recovery),
         }
-        Ok(masked)
+        Ok(())
     }
 
     fn remask_all(&self, text: &str) -> Result<String, String> {
@@ -106,6 +140,23 @@ impl OutputMasker {
                 Ok(out)
             }
         }
+    }
+}
+
+fn forced_label(env_name: &str) -> String {
+    let mut out = String::new();
+    for ch in env_name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() || out.as_bytes()[0].is_ascii_digit() {
+        "SECRET".to_string()
+    } else {
+        out
     }
 }
 
@@ -530,7 +581,12 @@ pub(crate) fn is_env_name_byte(byte: u8) -> bool {
 }
 
 pub(crate) fn is_sensitive_env_name(name: &str) -> bool {
-    if name == "auth" || name.contains("auth_") || name.contains("_auth") {
+    if name == "auth"
+        || name == "authorization"
+        || name.contains("auth_")
+        || name.contains("_auth")
+        || name.contains("authorization")
+    {
         return true;
     }
     [

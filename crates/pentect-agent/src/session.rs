@@ -43,7 +43,8 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn open_at(base: &Path, name: &str) -> Result<Self, String> {
         let _ = base;
-        Self::open(name)
+        checked_session_name(name)?;
+        Ok(Self::in_memory())
     }
 
     #[cfg(test)]
@@ -204,6 +205,9 @@ impl RecoveryStore {
                 let Some((name, handle)) = decode_env_alias_record(&record) else {
                     continue;
                 };
+                if is_reserved_child_env_name(name) {
+                    continue;
+                }
                 let value = resolve_with_recoveries(&recoveries, handle);
                 if value == handle {
                     continue;
@@ -230,6 +234,30 @@ impl RecoveryStore {
             .lock()
             .map_err(|_| "recovery cache lock poisoned".to_string())
     }
+}
+
+fn is_reserved_child_env_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "path"
+            | "pathext"
+            | "systemroot"
+            | "windir"
+            | "comspec"
+            | "temp"
+            | "tmp"
+            | "userprofile"
+            | "home"
+            | "shell"
+            | "term"
+            | "lang"
+            | "lc_all"
+            | "tmpdir"
+            | "pentect_agent"
+            | "pentect_agent_home"
+            | "pentect_agent_session"
+    )
 }
 
 fn encode_vault(key: &[u8; 32], recovery: &Recovery) -> Vec<u8> {
@@ -285,6 +313,9 @@ pub(crate) fn session_root(name: &str) -> Result<PathBuf, String> {
 pub(crate) fn checked_session_name(name: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("session name must not be empty".to_string());
+    }
+    if matches!(name, "." | "..") {
+        return Err("session name must not be a dot path segment".to_string());
     }
     if name.chars().any(|c| {
         c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')

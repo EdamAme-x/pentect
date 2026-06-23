@@ -1172,7 +1172,12 @@ fn default_session_name() -> Result<String, String> {
 
 fn default_directory_session_name() -> Result<String, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?;
-    let normalized = cwd
+    directory_session_name_for(&cwd)
+}
+
+fn directory_session_name_for(path: &Path) -> Result<String, String> {
+    let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let normalized = identity
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
@@ -1259,12 +1264,14 @@ fn before_tool_updated_input(
         }
         let mut updated = tool_input.clone();
         if let Some(object) = updated.as_object_mut() {
+            let should_wrap =
+                changed_by_canonicalization || !is_pentect_exec_program_command(&command);
             object.insert(
                 "command".to_string(),
-                Value::String(if is_pentect_exec_program_command(&command) {
-                    command
-                } else {
+                Value::String(if should_wrap {
                     wrap_shell_command(provider, session_name, &command)?
+                } else {
+                    command
                 }),
             );
             return Ok((updated, true));
@@ -1298,7 +1305,7 @@ fn posttool_came_from_pentect_exec(input: &Value) -> bool {
     hook_field(input, &["tool_input"])
         .and_then(|tool_input| tool_input.get("command"))
         .and_then(Value::as_str)
-        .is_some_and(is_pentect_exec_command)
+        .is_some_and(is_single_pentect_exec_boundary_command)
 }
 
 fn maybe_materialize_masked_write(
@@ -1399,7 +1406,32 @@ fn materialize_file(path: &Path, content: &str) -> Result<(), String> {
                 .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
         }
     }
+    ensure_materialize_path_within_cwd(path)?;
     std::fs::write(path, content).map_err(|e| format!("could not write '{}': {e}", path.display()))
+}
+
+fn ensure_materialize_path_within_cwd(path: &Path) -> Result<(), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("could not read current directory: {e}"))?
+        .canonicalize()
+        .map_err(|e| format!("could not canonicalize current directory: {e}"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| format!("could not canonicalize '{}': {e}", parent.display()))?;
+    if !parent.starts_with(&cwd) {
+        return Err(
+            "Pentect refused to materialize masked content outside the current directory"
+                .to_string(),
+        );
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err("Pentect refused to materialize masked content through a symlink".to_string());
+    }
+    Ok(())
 }
 
 fn is_read_like_tool_name(tool_name: &str) -> bool {
@@ -1409,24 +1441,68 @@ fn is_read_like_tool_name(tool_name: &str) -> bool {
     )
 }
 
-fn is_pentect_exec_command(command: &str) -> bool {
-    matches!(
-        parse_pentect_subcommand(command),
-        Some(PentectInvocation {
-            subcommand: PentectSubcommand::Exec,
-            ..
-        })
-    )
-}
-
 fn is_pentect_exec_program_command(command: &str) -> bool {
     matches!(
         parse_pentect_subcommand(command),
         Some(PentectInvocation {
             subcommand: PentectSubcommand::Exec,
             rest
-        }) if rest.trim_start().starts_with("-- ")
+        }) if !contains_unquoted_shell_control(rest) && pentect_exec_rest_is_passthrough(rest)
     )
+}
+
+fn is_single_pentect_exec_boundary_command(command: &str) -> bool {
+    matches!(
+        parse_pentect_subcommand(command),
+        Some(PentectInvocation {
+            subcommand: PentectSubcommand::Exec,
+            rest
+        }) if !contains_unquoted_shell_control(rest)
+    )
+}
+
+fn pentect_exec_rest_is_passthrough(rest: &str) -> bool {
+    let mut rest = rest.trim_start();
+    let mut saw_runtime_flag = false;
+    loop {
+        let Some((word, _, word_end)) = next_shell_word(rest, 0) else {
+            return saw_runtime_flag;
+        };
+        match word.as_str() {
+            "--session" => {
+                let Some((_, _, value_end)) = next_shell_word(rest, word_end) else {
+                    return false;
+                };
+                rest = rest[value_end..].trim_start();
+            }
+            "--live" | "--approve" => {
+                saw_runtime_flag = true;
+                rest = rest[word_end..].trim_start();
+            }
+            "--" => return true,
+            "--shell" => return false,
+            flag if flag.starts_with("--") => return false,
+            _ => return saw_runtime_flag,
+        }
+    }
+}
+
+fn contains_unquoted_shell_control(text: &str) -> bool {
+    let mut quote = None;
+    for ch in text.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            ';' | '|' | '&' | '\n' | '\r' => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn extract_pentect_exec_shell_payload(command: &str) -> Option<String> {
@@ -1442,10 +1518,19 @@ fn extract_pentect_exec_shell_payload(command: &str) -> Option<String> {
                 let (_, _, value_end) = next_shell_word(rest, word_end)?;
                 rest = rest[value_end..].trim_start();
             }
+            "--live" | "--approve" => {
+                rest = rest[word_end..].trim_start();
+            }
             "--shell" => {
                 return Some(unquote_wrapped_shell_arg(rest[word_end..].trim_start()));
             }
-            "--" => return None,
+            "--" => {
+                let payload = rest[word_end..].trim_start();
+                if payload.is_empty() {
+                    return None;
+                }
+                return Some(unquote_wrapped_shell_arg(payload));
+            }
             _ => return Some(unquote_wrapped_shell_arg(rest)),
         }
     }
@@ -1714,13 +1799,15 @@ fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bo
             let mut changed = false;
             let mut out = serde_json::Map::with_capacity(map.len());
             for (key, value) in map {
+                let masked_key = masker.mask_tool_output(key)?;
+                changed |= masked_key != *key;
                 let (value, value_changed) = if is_sensitive_structured_key(key) {
                     mask_sensitive_structured_value(key, value, masker)?
                 } else {
                     mask_tool_json(value, masker)?
                 };
                 changed |= value_changed;
-                out.insert(key.clone(), value);
+                out.insert(masked_key, value);
             }
             Ok((Value::Object(out), changed))
         }
@@ -1759,11 +1846,7 @@ fn mask_sensitive_scalar_for_key(
     masker: &mut OutputMasker,
 ) -> Result<String, String> {
     let assignment_key = structured_env_key(key);
-    let masked_assignment = masker.mask_text(&format!("{assignment_key}={raw}"), Kind::Env)?;
-    Ok(masked_assignment
-        .split_once('=')
-        .map(|(_, value)| value.to_string())
-        .unwrap_or(masked_assignment))
+    masker.mask_sensitive_value(&assignment_key, raw)
 }
 
 fn structured_env_key(key: &str) -> String {

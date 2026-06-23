@@ -960,6 +960,9 @@ fn checked_agent_session_name(name: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("session name must not be empty".to_string());
     }
+    if matches!(name, "." | "..") {
+        return Err("session name must not be a dot path segment".to_string());
+    }
     if name.chars().any(|c| {
         c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
     }) {
@@ -1385,6 +1388,14 @@ mod tests {
         assert!(help.contains("pentect resolve"), "{help}");
         assert!(!help.contains("pentect materialize"), "{help}");
         assert!(!help.contains("pentect purge"), "{help}");
+    }
+
+    #[test]
+    fn agent_session_names_reject_dot_segments() {
+        assert!(checked_agent_session_name(".").is_err());
+        assert!(checked_agent_session_name("..").is_err());
+        assert!(checked_agent_session_name("../x").is_err());
+        assert_eq!(checked_agent_session_name("demo").unwrap(), "demo");
     }
 
     #[test]

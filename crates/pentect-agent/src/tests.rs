@@ -35,7 +35,24 @@ fn session_recovery_is_process_local() {
 fn rejects_pathlike_session_names() {
     assert!(checked_session_name("../x").is_err());
     assert!(checked_session_name(r"a\b").is_err());
+    assert!(checked_session_name(".").is_err());
+    assert!(checked_session_name("..").is_err());
     assert_eq!(checked_session_name("demo").unwrap(), "demo");
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_session_name_uses_canonical_directory_identity() {
+    let root = temp_root("session-symlink");
+    let real = root.join("real");
+    let link = root.join("link");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let a = directory_session_name_for(&real).unwrap();
+    let b = directory_session_name_for(&link).unwrap();
+    assert_eq!(a, b);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -165,6 +182,18 @@ fn session_does_not_create_key_or_recovery_dir() {
 
     let _session = Session::open_at(&root, "t").unwrap();
     assert!(!root.exists(), "{}", root.display());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn open_at_stays_in_memory_even_when_base_has_capability_vault() {
+    let root = temp_root("open-at-in-memory");
+    let persisted = Session::open_capability_at(&root, "t").unwrap();
+    let persisted_key = persisted.key;
+    drop(persisted);
+
+    let opened = Session::open_at(&root, "t").unwrap();
+    assert_ne!(opened.key, persisted_key);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -447,6 +476,33 @@ fn exec_auto_binds_masked_env_output_across_sessions() {
 }
 
 #[test]
+fn auto_env_bindings_do_not_override_baseline_environment() {
+    let root = temp_root("capability-reserved-env-binding");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let output = "PATH=sk-ABCDEFGHIJKLMNOPQRSTUVWX\nDUMMY_SECRET=sk-YYYYYYYYYYYYYYYYYYYY\n";
+    let masked = mask_tool_output(&session, output).unwrap();
+    assert!(masked.contains("PATH=<<OPENAI_API_KEY_"), "{masked}");
+    assert!(
+        masked.contains("DUMMY_SECRET=<<OPENAI_API_KEY_"),
+        "{masked}"
+    );
+
+    let store = RecoveryStore::load(&session).unwrap();
+    let env = store.auto_env_bindings().unwrap();
+    assert!(
+        !env.iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("PATH")),
+        "{env:?}"
+    );
+    assert!(
+        env.iter()
+            .any(|(name, value)| name == "DUMMY_SECRET" && value == "sk-YYYYYYYYYYYYYYYYYYYY"),
+        "{env:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn resolve_path_rewrites_known_handles_without_printing_secret() {
     let root = temp_root("resolve-file");
     let project = root.join("project");
@@ -604,6 +660,47 @@ fn write_tool_refuses_masked_materialization_outside_current_dir() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn write_tool_refuses_masked_materialization_through_symlink_dir() {
+    let root = temp_root("capability-write-symlink");
+    let outside = temp_root("capability-write-symlink-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let project = PathBuf::from("target").join(format!(
+        "pentect-agent-symlink-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    std::os::unix::fs::symlink(&outside, project.join("link")).unwrap();
+
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    drop(session);
+
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": project.join("link").join("config.txt").to_string_lossy(),
+            "content": masked
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("outside the current directory"), "{reason}");
+    assert!(!outside.join("config.txt").exists());
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(outside);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn mcp_style_tool_result_masks_content_and_structured_content() {
     let (root, session) = empty_session("hook-post-mcp");
@@ -617,7 +714,7 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
             }],
             "structuredContent": {
                 "apiKey": "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
-                "password": "hunter2",
+                "password": "hunter2\nsecond-line",
                 "otp": 100482
             }
         }
@@ -630,6 +727,7 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
     assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     assert!(!rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
     assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(!rendered.contains("second-line"), "{rendered}");
     assert!(!rendered.contains("100482"), "{rendered}");
     let store = RecoveryStore::load(&session).unwrap();
     let env = store.auto_env_bindings().unwrap();
@@ -646,7 +744,7 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
     );
     assert!(
         env.iter()
-            .any(|(name, value)| name == "PASSWORD" && value == "hunter2"),
+            .any(|(name, value)| name == "PASSWORD" && value == "hunter2\nsecond-line"),
         "{env:?}"
     );
     assert!(
@@ -654,6 +752,50 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
             .any(|(name, value)| name == "OTP" && value == "100482"),
         "{env:?}"
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn posttool_masks_secret_object_keys() {
+    let (root, session) = empty_session("hook-post-secret-key");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let mut structured = serde_json::Map::new();
+    structured.insert(raw.to_string(), json!({"status": "created"}));
+    structured.insert("token".to_string(), json!("hunter2"));
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__x__y",
+        "tool_response": {
+            "structuredContent": structured
+        }
+    });
+
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert!(!rendered.contains(raw), "{rendered}");
+    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn posttool_masks_authorization_structured_key() {
+    let (root, session) = empty_session("hook-post-authz-key");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__x__y",
+        "tool_response": {
+            "structuredContent": {
+                "authorization": "Bearer short",
+                "password": "hunter2"
+            }
+        }
+    });
+
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert!(!rendered.contains("Bearer short"), "{rendered}");
+    assert!(!rendered.contains("hunter2"), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -701,6 +843,28 @@ fn codex_posttool_does_not_block_legacy_exec_footer() {
     });
     let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
     assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn codex_posttool_masks_pentect_exec_with_trailing_shell_escape() {
+    let (root, session) = empty_session("hook-post-codex-exec-trailing-shell");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "pentect exec -- echo ok; Write-Output OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+        },
+        "tool_response": "ok\nOPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
+    });
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert_eq!(output["decision"], "block");
+    assert!(
+        !rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -950,6 +1114,42 @@ fn pretool_canonicalizes_quoted_pentect_exec_shell_command() {
     assert!(!command.contains("--shell"), "{command}");
     assert!(command.contains("Get-Content"), "{command}");
     assert_eq!(command.matches(" exec ").count(), 1, "{command}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pretool_wraps_pentect_exec_with_trailing_shell_escape() {
+    let (root, session) = empty_session("hook-pre-exec-trailing-shell");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "pentect exec -- echo ok; Write-Output OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.starts_with("pentect exec "), "{command}");
+    assert!(command.contains("echo ok; Write-Output"), "{command}");
+    assert!(!command.contains("pentect exec -- echo ok"), "{command}");
+    assert_eq!(command.matches(" exec ").count(), 1, "{command}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pretool_preserves_pentect_exec_live_flag() {
+    let (root, session) = empty_session("hook-pre-exec-live");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": r#"pentect exec --live "Write-Output hi""#
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    assert_eq!(output, json!({}));
     let _ = std::fs::remove_dir_all(root);
 }
 
