@@ -17,13 +17,13 @@ const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
     "- Run the shell command you actually intend to run. The hook layer routes shell tools through `pentect exec`; do not add nested Pentect wrappers.\n",
-    "- Common .env flow: run the native file-read command (`Get-Content .env` on PowerShell, `cat .env` on Unix) and let masked `KEY=<<...>>` lines appear; then use `$env:KEY` on PowerShell or `$KEY` on Unix in later commands.\n",
+    "- Common secret-source flow: run the native file/API/browser/MCP command and let masked handles appear; then use `$env:PENTECT_LABEL_hash` on PowerShell or `$PENTECT_LABEL_hash` on Unix in later commands.\n",
     "- Masked handles like `<<NAME_hash>>` are local capabilities. Later `pentect exec` commands resolve them locally before execution and mask stdout/stderr again.\n",
     "- Every masked handle is also available in later `pentect exec` commands as a `PENTECT_...` env var: `<<LABEL_hash>>` becomes `$env:PENTECT_LABEL_hash` on PowerShell or `$PENTECT_LABEL_hash` on Unix.\n",
     "- If output contains `KEY=<<KEY_hash>>`, KEY is also available as `$env:KEY` on PowerShell or `$KEY` on Unix.\n",
-    "- To register a secret from a file, API, browser, or MCP result, run the source command through the protected tool boundary. Masked output such as `KEY=<<...>>` is safe to show and registers capabilities; `.env` source/export commands are also treated as registration hints.\n",
-    "- For files like `.env`, use the simple read command (`Get-Content .env` or `cat .env`) and let Pentect mask it. Do not suppress output, hand-roll parsers, or build encoded scripts just to avoid showing masked handles.\n",
-    "- Shell state does not persist across tool calls. If a command sources/exports a `.env` file, Pentect treats that as a registration hint; later commands must still use the masked env capabilities.\n",
+    "- To register a secret from a file, API, browser, or MCP result, run the source command through the protected tool boundary. Masked output such as `<<LABEL_hash>>` is safe to show and registers capabilities; local files referenced by `pentect exec` are also pre-registered when detectable.\n",
+    "- Use normal source/read/fetch commands and let Pentect mask the result. Do not suppress output, hand-roll parsers, or build encoded scripts just to avoid showing masked handles.\n",
+    "- Shell state does not persist across tool calls. If a command reads, sources, or consumes a local file, Pentect treats that file as a registration hint; later commands must still use the masked env capabilities.\n",
     "- When the task is to use a secret, use the env var. Do not echo the handle, parse the source file again, grep prior output, switch shells, run `pentect help`/`pentect --help`, or add flags.\n",
     "- Do not bypass masking by transforming a secret into base64, hex, chunks, prefixes, suffixes, screenshots, or alternate encodings. Use the secret as a capability and report only non-secret outcomes.\n",
     "- Masked command output is expected. Answer from success/failure, status codes, non-secret response fields, and masked handles; do not claim a secret was unusable merely because the returned value stayed masked.\n",
@@ -76,8 +76,8 @@ fn help_text() -> &'static str {
         "Masked handles resolve locally in later `pentect exec` commands.\n",
         "Every handle also becomes a `PENTECT_...` env var for later execs.\n",
         "Masked env lines become env vars in later execs: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
-        "Masked output registers capabilities; .env source/export commands also register as hints.\n",
-        "For .env, use a normal read command and let Pentect return masked handles.\n",
+        "Masked output and referenced local files register capabilities for later execs.\n",
+        "Use normal commands and let Pentect return masked handles.\n",
         "Use `pentect resolve <path>` only when a local file must be materialized with real values.\n",
     )
 }
@@ -1054,7 +1054,10 @@ fn infer_kind(path: &Path) -> Kind {
     if path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case(".env"))
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower == ".env" || lower.starts_with(".env.")
+        })
     {
         return Kind::Env;
     }
@@ -1403,8 +1406,8 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("$env:KEY"), "{rendered}");
-        assert!(rendered.contains("Common .env flow"), "{rendered}");
-        assert!(rendered.contains("Get-Content .env"), "{rendered}");
+        assert!(rendered.contains("Common secret-source flow"), "{rendered}");
+        assert!(rendered.contains("file/API/browser/MCP"), "{rendered}");
         assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(rendered.contains("KEY is also available"), "{rendered}");
         assert!(
@@ -1412,7 +1415,8 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("registers capabilities"), "{rendered}");
-        assert!(rendered.contains("registration hints"), "{rendered}");
+        assert!(rendered.contains("pre-registered"), "{rendered}");
+        assert!(rendered.contains("local file"), "{rendered}");
         assert!(rendered.contains("Do not suppress output"), "{rendered}");
         assert!(rendered.contains("pentect --help"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
@@ -1441,15 +1445,16 @@ mod tests {
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
         assert!(rendered.contains("KEY is also available"), "{rendered}");
         assert!(rendered.contains("$env:KEY"), "{rendered}");
-        assert!(rendered.contains("Common .env flow"), "{rendered}");
-        assert!(rendered.contains("Get-Content .env"), "{rendered}");
+        assert!(rendered.contains("Common secret-source flow"), "{rendered}");
+        assert!(rendered.contains("file/API/browser/MCP"), "{rendered}");
         assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(
             rendered.contains("Shell state does not persist"),
             "{rendered}"
         );
         assert!(rendered.contains("registers capabilities"), "{rendered}");
-        assert!(rendered.contains("registration hints"), "{rendered}");
+        assert!(rendered.contains("pre-registered"), "{rendered}");
+        assert!(rendered.contains("local file"), "{rendered}");
         assert!(rendered.contains("Do not suppress output"), "{rendered}");
         assert!(rendered.contains("pentect --help"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");

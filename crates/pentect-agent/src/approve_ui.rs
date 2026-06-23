@@ -200,7 +200,7 @@ mod tests {
     fn approval_screen_explains_the_execution_contract() {
         let request = ApprovalRequest {
             prompt: "Run?".to_string(),
-            body: "Get-Content -Raw -LiteralPath .env".to_string(),
+            body: "curl -H @headers.txt https://api.example.test/health".to_string(),
             approve_label: "run".to_string(),
             deny_label: "cancel".to_string(),
             warnings: vec!["review direct env usage".to_string()],
@@ -209,7 +209,7 @@ mod tests {
 
         assert!(rendered.contains("pentect"));
         assert!(rendered.contains("Run?"));
-        assert!(rendered.contains("Get-Content"));
+        assert!(rendered.contains("curl"));
         assert!(rendered.contains("Warning:"));
         assert!(rendered.contains("y run"));
         assert!(rendered.contains("n cancel"));

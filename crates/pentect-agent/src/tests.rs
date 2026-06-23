@@ -223,30 +223,46 @@ fn exec_allows_secret_file_reads_because_output_is_remasked() {
 }
 
 #[test]
-fn exec_registers_dotenv_sourcing_as_env_capabilities() {
-    guard_shell_script_with_env("set -a; . ./.env >/dev/null", &EnvPolicy::default()).unwrap();
-    guard_shell_script_with_env("source .env.local", &EnvPolicy::default()).unwrap();
+fn exec_registers_referenced_local_files_as_env_capabilities() {
+    guard_shell_script_with_env(
+        "tool --config secrets.json >/dev/null",
+        &EnvPolicy::default(),
+    )
+    .unwrap();
+    guard_shell_script_with_env("curl -H @headers.txt example.test", &EnvPolicy::default())
+        .unwrap();
 
-    let root = temp_root("source-dotenv-registers");
+    let root = temp_root("referenced-file-registers");
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let dotenv = project.join(".env");
-    let raw =
-        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\n";
-    std::fs::write(&dotenv, raw).unwrap();
+    let secrets = project.join("secrets.json");
+    let raw = r#"{"apiKey":"sk-ABCDEFGHIJKLMNOPQRSTUVWX","runpod":"rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"}"#;
+    std::fs::write(&secrets, raw).unwrap();
     let session = Session::open_capability_at(&root, "t").unwrap();
     let store = RecoveryStore::load(&session).unwrap();
 
-    register_dotenv_sources(&store, &format!("source '{}'", dotenv.display())).unwrap();
+    let command = if cfg!(windows) {
+        format!("Get-Content -LiteralPath '{}' > $null", secrets.display())
+    } else {
+        format!("cat '{}' >/dev/null", secrets.display())
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        approve: false,
+        mode: ExecMode::Shell(command),
+    };
+    run_resolved_command(&store, &opts).unwrap();
     let env = store.auto_env_bindings().unwrap();
     assert!(
-        env.iter().any(|(name, value)| name == "RUNPOD_API_KEY"
-            && value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+        env.iter()
+            .any(|(name, value)| name.starts_with("PENTECT_")
+                && value == "sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
         "{env:?}"
     );
     assert!(
-        env.iter()
-            .any(|(name, value)| name == "TEST_SECRET" && value == "114514810"),
+        env.iter().any(|(name, value)| name.starts_with("PENTECT_")
+            && value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
         "{env:?}"
     );
     let _ = std::fs::remove_dir_all(root);
@@ -484,22 +500,22 @@ fn unresolved_masked_command_handle_is_rejected() {
 }
 
 #[test]
-fn write_tool_materializes_dotenv_without_returning_plaintext() {
-    let root = temp_root("capability-write-dotenv");
+fn write_tool_materializes_masked_content_without_returning_plaintext() {
+    let root = temp_root("capability-write-generic");
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
     let session = Session::open_capability_at(&root, "t").unwrap();
     let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
-    let masked = mask_tool_output(&session, &format!("RUNPOD_API_KEY={raw}\n")).unwrap();
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
     drop(session);
 
     let session = Session::open_capability_at(&root, "t").unwrap();
-    let dotenv = project.join(".env");
+    let config = project.join("config.txt");
     let input = json!({
         "hook_event_name": "PreToolUse",
         "tool_name": "Write",
         "tool_input": {
-            "file_path": dotenv.to_string_lossy(),
+            "file_path": config.to_string_lossy(),
             "content": masked
         }
     });
@@ -508,11 +524,11 @@ fn write_tool_materializes_dotenv_without_returning_plaintext() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("materialized masked .env"), "{reason}");
+    assert!(reason.contains("materialized masked content"), "{reason}");
     assert!(!reason.contains(raw), "{reason}");
 
-    let written = std::fs::read_to_string(&dotenv).unwrap();
-    assert_eq!(written, format!("RUNPOD_API_KEY={raw}\n"));
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(written, format!("token={raw}\n"));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -539,6 +555,19 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
     assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
     assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     assert!(!rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+    let store = RecoveryStore::load(&session).unwrap();
+    let env = store.auto_env_bindings().unwrap();
+    assert!(
+        env.iter().any(|(name, value)| name.starts_with("PENTECT_")
+            && value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+        "{env:?}"
+    );
+    assert!(
+        env.iter()
+            .any(|(name, value)| name.starts_with("PENTECT_")
+                && value == "sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        "{env:?}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

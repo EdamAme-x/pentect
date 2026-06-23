@@ -26,6 +26,7 @@ use shell::{
     command_available, next_shell_word, powershell_command, powershell_word, shell_command,
     shell_quote_unix,
 };
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -257,8 +258,8 @@ fn exec_help() {
             "Runs a command and prints normal stdout/stderr with secrets masked.\n",
             "Every prior `<<LABEL_hash>>` handle becomes a PENTECT_LABEL_hash env var in later execs.\n",
             "If prior output showed `KEY=<<...>>`, later `pentect exec` commands also get KEY as an env var.\n",
-            "Masked output registers capabilities; sourcing .env also registers it as a hint.\n",
-            "For .env, use a normal read command and let Pentect return masked handles.\n",
+            "Masked output registers capabilities; referenced local files are also scanned as hints.\n",
+            "Use normal commands and let Pentect return masked handles; do not hand-roll parsers to avoid output.\n",
             "Use `$env:KEY` on PowerShell or `$KEY` on Unix; stdout/stderr stays masked.\n",
             "Masked handles in command text also resolve locally before execution.\n",
         )
@@ -438,7 +439,7 @@ fn run_resolved_command(
         }
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
-            register_dotenv_sources(store, &command)?;
+            register_local_file_inputs(store, &command)?;
             let env = store.auto_env_bindings()?;
             let env_policy = exec_env_policy(&env);
             guard_shell_script_with_env(&command, &env_policy)?;
@@ -467,7 +468,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
         }
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
-            register_dotenv_sources(store, &command)?;
+            register_local_file_inputs(store, &command)?;
             let env = store.auto_env_bindings()?;
             let env_policy = exec_env_policy(&env);
             guard_shell_script_with_env(&command, &env_policy)?;
@@ -585,31 +586,40 @@ fn guard_sensitive_source_access_with_env(
     Ok(())
 }
 
-fn register_dotenv_sources(store: &RecoveryStore, script: &str) -> Result<(), String> {
-    let paths = dotenv_source_paths(script);
+fn register_local_file_inputs(store: &RecoveryStore, script: &str) -> Result<(), String> {
+    let paths = local_file_input_paths(script);
     if paths.is_empty() {
         return Ok(());
     }
     let mut masker = OutputMasker::new_shared(store.clone());
     for path in paths {
-        if !path.exists() {
+        if !path.is_file() {
             continue;
         }
-        let input = read_input(&path, InputFormat::Text)?;
-        let _ = masker.mask_text(&input, Kind::Env)?;
+        let Ok(input) = read_input(&path, InputFormat::Text) else {
+            continue;
+        };
+        let kind = infer_kind(&path);
+        if kind == Kind::Text {
+            let _ = masker.mask_tool_output(&input)?;
+        } else {
+            let _ = masker.mask_text(&input, kind)?;
+        }
     }
     Ok(())
 }
 
-fn dotenv_source_paths(script: &str) -> Vec<PathBuf> {
+fn local_file_input_paths(script: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
     let mut cursor = 0usize;
     while let Some((word, _, next)) = next_shell_word(script, cursor) {
-        let normalized_word = word.to_ascii_lowercase();
-        if matches!(normalized_word.as_str(), "source" | ".") {
-            if let Some((path, _, _)) = next_shell_word(script, next) {
-                if is_dotenv_source_path(&path) {
-                    out.push(PathBuf::from(clean_source_path_word(&path)));
+        for candidate in local_file_path_candidates(&word) {
+            let path = PathBuf::from(candidate);
+            if path.is_file() {
+                let key = path.to_string_lossy().to_string();
+                if seen.insert(key) {
+                    out.push(path);
                 }
             }
         }
@@ -618,19 +628,46 @@ fn dotenv_source_paths(script: &str) -> Vec<PathBuf> {
     out
 }
 
-fn is_dotenv_source_path(path: &str) -> bool {
-    let cleaned = clean_source_path_word(path).replace('\\', "/");
-    let name = cleaned
-        .trim_start_matches("./")
-        .rsplit('/')
-        .next()
-        .unwrap_or(&cleaned)
-        .to_ascii_lowercase();
-    name == ".env" || name.starts_with(".env.")
+fn local_file_path_candidates(word: &str) -> Vec<String> {
+    let cleaned = clean_path_word(word);
+    if cleaned.is_empty() || looks_like_non_file_reference(&cleaned) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    push_file_candidate(&mut out, &cleaned);
+    if let Some((_, value)) = cleaned.split_once('=') {
+        push_file_candidate(&mut out, value);
+    }
+    if let Some(value) = cleaned.strip_prefix('@') {
+        push_file_candidate(&mut out, value);
+    }
+    out
 }
 
-fn clean_source_path_word(path: &str) -> String {
-    path.trim_matches('"').trim_matches('\'').to_string()
+fn push_file_candidate(out: &mut Vec<String>, value: &str) {
+    let candidate = clean_path_word(value);
+    if candidate.is_empty() || looks_like_non_file_reference(&candidate) {
+        return;
+    }
+    out.push(candidate);
+}
+
+fn clean_path_word(path: &str) -> String {
+    path.trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches(|ch| matches!(ch, ';' | ',' | ')' | ']'))
+        .to_string()
+}
+
+fn looks_like_non_file_reference(value: &str) -> bool {
+    value == "-"
+        || value.contains("://")
+        || value.starts_with('$')
+        || value.starts_with('%')
+        || value.contains('*')
+        || value.contains('?')
+        || value.contains('{')
+        || value.contains('}')
 }
 
 fn run_shell_script(
@@ -1165,7 +1202,7 @@ fn before_tool_updated_input(
     if is_read_like_tool_name(tool_name) {
         return Err(read_tool_block_reason(tool_name));
     }
-    if let Some(reason) = maybe_materialize_dotenv_write(session, tool_name, tool_input)? {
+    if let Some(reason) = maybe_materialize_masked_write(session, tool_name, tool_input)? {
         return Err(reason);
     }
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
@@ -1223,7 +1260,7 @@ fn posttool_came_from_pentect_exec(input: &Value) -> bool {
         .is_some_and(is_pentect_exec_command)
 }
 
-fn maybe_materialize_dotenv_write(
+fn maybe_materialize_masked_write(
     session: &Session,
     tool_name: &str,
     tool_input: &Value,
@@ -1234,7 +1271,7 @@ fn maybe_materialize_dotenv_write(
     let Some((path, content)) = write_path_and_content(tool_input) else {
         return Ok(None);
     };
-    if !is_dotenv_materialization_path(path) || !content.contains("<<") {
+    if !content.contains("<<") {
         return Ok(None);
     }
     let store = RecoveryStore::load(session)?;
@@ -1244,7 +1281,7 @@ fn maybe_materialize_dotenv_write(
     }
     materialize_file(Path::new(path), &resolved)?;
     Ok(Some(format!(
-        "Pentect materialized masked .env content into '{}' and blocked the original Write tool so plaintext never returns to the AI.",
+        "Pentect materialized masked content into '{}' and blocked the original Write tool so plaintext never returns to the AI.",
         path
     )))
 }
@@ -1282,14 +1319,6 @@ fn write_input_candidates(value: &Value) -> Vec<&Value> {
 
 fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| value.get(*name)?.as_str())
-}
-
-fn is_dotenv_materialization_path(path: &str) -> bool {
-    let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let lower = name.to_ascii_lowercase();
-    lower == ".env" || lower.starts_with(".env.")
 }
 
 fn materialize_file(path: &Path, content: &str) -> Result<(), String> {
@@ -1836,7 +1865,10 @@ fn infer_kind(path: &Path) -> Kind {
     if path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case(".env"))
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower == ".env" || lower.starts_with(".env.")
+        })
     {
         return Kind::Env;
     }

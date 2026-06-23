@@ -11,11 +11,11 @@ MVP: secret-aware tool boundary for AI agents.
 - Canonicalize nested wrappers so `pentect exec "pentect exec ..."` becomes one protected boundary, while `pentect read` remains blocked from AI hooks.
 - Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be used without showing plaintext to the AI.
 - Every masked handle becomes a normal env var inside later shell commands: `<<LABEL_hash>>` is available as `$env:PENTECT_LABEL_hash` on PowerShell or `$PENTECT_LABEL_hash` on Unix. If the output was `KEY=<<...>>`, `KEY` is also available.
-- Printing masked output through `pentect exec` registers capabilities. For `.env`, a normal read command is clearest, and source/export commands also register as hints without exposing plaintext.
-- Shell state does not carry between tool calls. If a command sources or exports a `.env` file, Pentect treats that as a registration hint and exposes the resulting capabilities in later `pentect exec` calls.
+- Printing masked output through `pentect exec` registers capabilities. Referenced local files are also scanned as registration hints without exposing plaintext.
+- Shell state does not carry between tool calls. If a command reads, sources, or consumes a local file, Pentect treats that file as a registration hint and exposes the resulting capabilities in later `pentect exec` calls.
 - `pentect resolve <path>` is only for the file-materialization case; the agent path should prefer env vars inside `pentect exec`.
 - Large opaque masked values carry readable coarse metadata such as `_length_at_least_512_chars`; exact length is not disclosed.
-- Resolve known handles into `.env` writes: when a Write-like tool tries to write `KEY=<<HANDLE>>`, Pentect writes the resolved local `.env` itself and blocks the original Write tool so plaintext is not returned in hook JSON.
+- Resolve known handles into Write-like tool calls: when a Write-like tool tries to write content containing `<<HANDLE>>`, Pentect writes the resolved local file itself and blocks the original Write tool so plaintext is not returned in hook JSON.
 - Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.
 - Block direct environment-variable reads unless the value was auto-bound from prior masked output.
 - Open the terminal control screen with `pentect`; inspect another scope with `pentect dashboard --dir PATH --session NAME`.
