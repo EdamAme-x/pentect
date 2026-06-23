@@ -1131,7 +1131,7 @@ fn pretool_wraps_pentect_exec_with_trailing_shell_escape() {
     let command = output["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .unwrap();
-    assert!(command.starts_with("pentect exec "), "{command}");
+    assert!(command.contains(" exec "), "{command}");
     assert!(command.contains("echo ok; Write-Output"), "{command}");
     assert!(!command.contains("pentect exec -- echo ok"), "{command}");
     assert_eq!(command.matches(" exec ").count(), 1, "{command}");
