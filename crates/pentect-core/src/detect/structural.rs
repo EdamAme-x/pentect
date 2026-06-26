@@ -14,8 +14,9 @@ const SENSITIVE_HEADERS: &[&str] = &[
 /// Masks values that are sensitive by their *structural position* in a known
 /// format, not by guessing an arbitrary key name: a cookie value (carries session
 /// state) or a credential-bearing HTTP header. Bounded and protocol-grounded.
-/// Open-vocabulary, multilingual key sensitivity (`password`=`パスワード`=…) is a
-/// model's job (ML sidecar), not core's — core does not enumerate key names.
+/// Open-vocabulary, multilingual key sensitivity (`password`=`パスワード`=…)
+/// belongs behind the extension/model boundary; core does not enumerate key
+/// names by default.
 pub struct StructuralDetector;
 
 /// `.env` value regions are masked wholesale. The parser already strips the

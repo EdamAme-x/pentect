@@ -749,7 +749,7 @@ mod tests {
                 "core recall floor regressed on {label}: {sample:?}"
             );
         }
-        // Sanity: the corpus exercises the floor and the known sidecar gap.
+        // Sanity: the corpus exercises the floor and the known extension gap.
         assert!(CORE_FLOOR.len() + CHECKSUM_FLOOR.len() >= 30 && EXTENSION_GAP.len() >= 4);
         let gap_hit: Vec<&str> = EXTENSION_GAP
             .iter()
@@ -975,7 +975,7 @@ mod tests {
     // measured against the REAL default profile (Balanced). Each sample lists the
     // values that must be masked and the benign values that must be preserved;
     // the corpus is the skeleton that real TAB / SecretBench data plugs into.
-    // Person/location names are NER-scope (off by default) and excluded here.
+    // Person/location names are extension/model-scope and excluded here.
     type Labeled = (
         &'static str,
         &'static [&'static str],
@@ -1090,7 +1090,7 @@ mod tests {
     // The two standing goals: surpass Presidio and surpass Azure. We measure it
     // entity-by-entity. Each entry is classified:
     //   Core    — deterministic (pattern/checksum); core MUST catch it (asserted).
-    //   Extension — semantic/locale-heavy entities (person, location, org,
+    //   Extension — language/locale-heavy entities (person, location, org,
     //               nationality, address, age, person-type): no closed pattern,
     //               so these belong behind the extension boundary. Recorded,
     //               not asserted.

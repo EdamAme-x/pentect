@@ -66,11 +66,12 @@ fn help_text() -> &'static str {
         "Use:\n",
         "  pentect\n",
         "  pentect --port 7331\n",
-        "  pentect codex|claude|gemini [--extensions NAME]\n",
+        "  pentect codex|claude|gemini [--extensions NAME|PATH.toml]\n",
         "  pentect exec \"<command>\"\n\n",
         "`pentect` opens the approval dashboard.\n",
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
-        "`--extensions NAME` installs/activates local extension state under .pentect/extensions/NAME.\n",
+        "`--extensions NAME` uses .pentect/extensions/NAME; `--extensions PATH.toml` uses a rule-pack file.\n",
+        "Default extensions can be listed in `.pentect/config.toml` as `extensions = [...]`.\n",
         "Masked handles resolve locally in later `pentect exec` commands.\n",
         "Every handle also becomes a `PENTECT_...` env var for later execs.\n",
         "Masked env lines become env vars in later execs: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
@@ -97,8 +98,22 @@ fn cmd_agent_passthrough_from(start: usize, args: &[String]) {
     let agent = std::env::var_os("PENTECT_AGENT")
         .map(PathBuf::from)
         .unwrap_or_else(default_agent_path);
+    let (forward_args, explicit_extensions) = match extensions::strip_from_args(&args[start..]) {
+        Ok(parsed) => parsed,
+        Err(e) => die(&e),
+    };
+    let active_extensions = match extensions::active_from_specs(explicit_extensions, true) {
+        Ok(active) => active,
+        Err(e) => die(&e),
+    };
     let mut cmd = Command::new(&agent);
-    cmd.args(&args[start..]);
+    if let Some(value) = match active_extensions.env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    } {
+        cmd.env(extensions::PACKS_ENV, value);
+    }
+    cmd.args(&forward_args);
     let status = run_command(cmd, &agent);
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -255,7 +270,11 @@ fn cmd_read(args: &[String]) {
         Err(e) => die(&e),
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
-    let engine = Engine::with_profile(opts.profile);
+    let packs = match extensions::load_packs_from_specs(opts.extensions.clone(), true) {
+        Ok(packs) => packs,
+        Err(e) => die(&e),
+    };
+    let engine = Engine::with_profile_and_packs(opts.profile, packs, false);
     let cfg = Config {
         disclose_length: opts.disclose_length,
         ..Config::generate()
@@ -291,6 +310,7 @@ struct ReadOpts {
     profile: Profile,
     disclose_length: bool,
     emit_meta: bool,
+    extensions: Vec<String>,
     path: PathBuf,
 }
 
@@ -301,6 +321,7 @@ impl ReadOpts {
         let mut profile = Profile::Strict;
         let mut disclose_length = false;
         let mut emit_meta = false;
+        let mut extensions = Vec::new();
         let mut path = None;
         let mut i = 2;
         while i < args.len() {
@@ -323,6 +344,17 @@ impl ReadOpts {
                     emit_meta = true;
                     i += 1;
                 }
+                "--extensions" => {
+                    for spec in extensions::parse_extension_value(&required_value(
+                        args,
+                        &mut i,
+                        "--extensions",
+                    )?)? {
+                        if !extensions.iter().any(|existing| existing == &spec) {
+                            extensions.push(spec);
+                        }
+                    }
+                }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 p => {
                     if path.is_some() {
@@ -339,6 +371,7 @@ impl ReadOpts {
             profile,
             disclose_length,
             emit_meta,
+            extensions,
             path: path.ok_or_else(|| "read requires PATH".to_string())?,
         })
     }
@@ -466,9 +499,6 @@ impl AgentToolOpts {
 }
 
 fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
-    if let Err(e) = extensions::prepare(&opts.extensions) {
-        die(&e);
-    }
     let configs = codex_hook_config_args(agent, opts.session.as_deref());
     if opts.dry_run {
         if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
@@ -482,8 +512,12 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     if codex_uses_unverified_headless_hook_path(&opts.tool_args) && !opts.allow_unverified_hooks {
         die("refusing to start Codex headless subcommand with Pentect hooks: local probes showed `codex exec` runs shell commands without dispatching PreToolUse/PostToolUse hooks, even under a TTY. Use interactive `pentect codex`, `pentect claude`, `pentect exec`, or pass --allow-unverified-hooks only for debugging.");
     }
+    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
+        Ok(active) => active,
+        Err(e) => die(&e),
+    };
     let mut cmd = Command::new(&opts.command);
-    apply_extension_env(&mut cmd, opts);
+    apply_extension_env(&mut cmd, &active_extensions);
     for config in configs {
         cmd.arg("--config").arg(config);
     }
@@ -492,25 +526,23 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
 }
 
 fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
-    if let Err(e) = extensions::prepare(&opts.extensions) {
-        die(&e);
-    }
     let settings = claude_settings_json(agent, opts.session.as_deref());
     let args = claude_args(&settings, &opts.tool_args);
     if opts.dry_run {
         print_dry_run(&opts.command, &args);
         return success_status();
     }
+    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
+        Ok(active) => active,
+        Err(e) => die(&e),
+    };
     let mut cmd = Command::new(&opts.command);
-    apply_extension_env(&mut cmd, opts);
+    apply_extension_env(&mut cmd, &active_extensions);
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
 }
 
 fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
-    if let Err(e) = extensions::prepare(&opts.extensions) {
-        die(&e);
-    }
     let settings_path = PathBuf::from(".gemini").join("settings.json");
     if opts.dry_run {
         eprintln!(
@@ -523,13 +555,17 @@ fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     if !opts.allow_unverified_hooks && !gemini_cli_mentions_hooks(&opts.command) {
         die("refusing to start Gemini with Pentect hooks: this Gemini CLI does not advertise hook support, so temporary settings may be ignored and raw tool output could leak. Upgrade Gemini CLI or pass --allow-unverified-hooks only for debugging.");
     }
+    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
+        Ok(active) => active,
+        Err(e) => die(&e),
+    };
     let original = match install_gemini_hooks(&settings_path, agent, opts.session.as_deref()) {
         Ok(o) => o,
         Err(e) => die(&e),
     };
     let status = {
         let mut cmd = Command::new(&opts.command);
-        apply_extension_env(&mut cmd, opts);
+        apply_extension_env(&mut cmd, &active_extensions);
         cmd.args(&opts.tool_args);
         run_interactive_command(cmd, &opts.command)
     };
@@ -551,9 +587,12 @@ fn run_interactive_command(cmd: Command, display: &Path) -> std::process::ExitSt
     status
 }
 
-fn apply_extension_env(cmd: &mut Command, opts: &AgentToolOpts) {
-    if let Some(value) = extensions::env_value(&opts.extensions) {
-        cmd.env("PENTECT_EXTENSIONS", value);
+fn apply_extension_env(cmd: &mut Command, active: &extensions::ActiveExtensions) {
+    if let Some(value) = match active.env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    } {
+        cmd.env(extensions::PACKS_ENV, value);
     }
 }
 
@@ -1122,16 +1161,14 @@ fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Result<
 /// author can see exactly what to fix.
 fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
     let mut packs = Vec::new();
-    let mut paths = pack_paths(args)?;
-    let extension_names = extensions::collect_from_args(args)?;
-    paths.extend(extensions::pack_paths(&extension_names)?);
-    for path in paths {
+    for path in pack_paths(args)? {
         let display = path.display();
         let src = std::fs::read_to_string(&path)
             .map_err(|e| format!("could not read pack '{display}': {e}"))?;
         let pack = load_pack(&src).map_err(|e| format!("pack '{display}' is invalid: {e}"))?;
         packs.push(pack);
     }
+    packs.extend(extensions::load_packs_from_args(args, true)?);
     Ok(packs)
 }
 

@@ -7,10 +7,12 @@ use pentect_core::{
     RegionKind, SensitiveKeyDetector, ShapeGuard, ToolResultParser,
 };
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
+const EXTENSION_PACKS_ENV: &str = "PENTECT_EXTENSION_PACKS";
+
 pub(crate) struct OutputMasker {
     store: RecoveryStore,
     engine: Engine,
@@ -24,14 +26,14 @@ enum OutputMaskerMode {
 }
 
 impl OutputMasker {
-    pub(crate) fn new_shared(store: RecoveryStore) -> Self {
+    pub(crate) fn new_shared(store: RecoveryStore) -> Result<Self, String> {
         let key = store.session.key;
-        Self {
+        Ok(Self {
             store,
-            engine: tool_boundary_engine(),
+            engine: tool_boundary_engine()?,
             mode: OutputMaskerMode::Shared,
             pending: Recovery::empty_for_key(&key),
-        }
+        })
     }
 
     pub(crate) fn new_deferred(store: RecoveryStore) -> Result<Self, String> {
@@ -39,7 +41,7 @@ impl OutputMasker {
         let remask_recoveries = store.snapshot()?;
         Ok(Self {
             store,
-            engine: tool_boundary_engine(),
+            engine: tool_boundary_engine()?,
             mode: OutputMaskerMode::Deferred { remask_recoveries },
             pending: Recovery::empty_for_key(&key),
         })
@@ -157,97 +159,59 @@ impl OutputMasker {
     }
 }
 
-fn tool_boundary_engine() -> Engine {
+fn tool_boundary_engine() -> Result<Engine, String> {
     let mut builder = Engine::builder()
         .standard_stack(Profile::Strict.knobs())
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
         .detector(Box::new(SensitiveKeyDetector));
-    for pack in extension_packs_from_env() {
+    for pack in extension_packs_from_env()? {
         builder = builder
             .detector(Box::new(pack.rules))
             .disable_labels(pack.disable);
     }
-    builder
+    Ok(builder
         .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
         .guard(Box::new(ShapeGuard::builtin()))
-        .build()
+        .build())
 }
 
-fn extension_packs_from_env() -> Vec<pentect_core::Pack> {
-    let Some(value) = std::env::var_os("PENTECT_EXTENSIONS") else {
-        return Vec::new();
+fn extension_packs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
+    static CACHE: OnceLock<Result<Vec<pentect_core::Pack>, String>> = OnceLock::new();
+    CACHE.get_or_init(load_extension_packs_from_env).clone()
+}
+
+fn load_extension_packs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
+    let Some(value) = std::env::var_os(EXTENSION_PACKS_ENV) else {
+        return Ok(Vec::new());
     };
-    let value = value.to_string_lossy();
     let mut packs = Vec::new();
-    for name in value
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        if !is_extension_name(name) {
+    for path in std::env::split_paths(&value) {
+        if path.as_os_str().is_empty() {
             continue;
         }
-        let Ok(paths) = extension_pack_paths(name) else {
-            continue;
-        };
-        for path in paths {
-            let Ok(src) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if let Ok(pack) = load_pack(&src) {
-                packs.push(pack);
-            }
+        if !path.is_file() {
+            return Err(format!("extension pack does not exist: {}", path.display()));
         }
+        let src = std::fs::read_to_string(&path)
+            .map_err(|e| format!("could not read extension pack '{}': {e}", path.display()))?;
+        packs.push(
+            load_pack(&src)
+                .map_err(|e| format!("extension pack '{}' is invalid: {e}", path.display()))?,
+        );
     }
-    packs
-}
-
-fn extension_pack_paths(name: &str) -> Result<Vec<PathBuf>, String> {
-    let dir = PathBuf::from(".pentect").join("extensions").join(name);
-    let mut paths = Vec::new();
-    let pack = dir.join("pack.toml");
-    if pack.exists() {
-        paths.push(pack);
-    }
-    let packs_dir = dir.join("packs");
-    if packs_dir.exists() {
-        paths.extend(toml_files_in_dir(&packs_dir)?);
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-fn toml_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        if path.extension().is_some_and(|ext| ext == "toml") {
-            files.push(path);
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-fn is_extension_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|first| first.is_ascii_alphanumeric())
-        && name.len() <= 64
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    Ok(packs)
 }
 
 #[cfg(test)]
 pub(crate) fn mask_tool_output(session: &Session, text: &str) -> Result<String, String> {
     let store = RecoveryStore::load(session)?;
-    OutputMasker::new_shared(store).mask_tool_output(text)
+    OutputMasker::new_shared(store)?.mask_tool_output(text)
 }
 
 #[cfg(test)]
 pub(crate) fn mask_live_output(session: &Session, text: &str) -> Result<String, String> {
     let store = RecoveryStore::load(session)?;
-    OutputMasker::new_shared(store).mask_text(text, live_output_kind(text))
+    OutputMasker::new_shared(store)?.mask_text(text, live_output_kind(text))
 }
 
 pub(crate) fn live_output_kind(text: &str) -> Kind {

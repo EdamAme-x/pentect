@@ -29,7 +29,7 @@ the project files.
 - Open the approval dashboard with `pentect`; use `pentect --port 7331` for the small local web dashboard. Inspect another scope with `pentect dashboard --dir PATH --session NAME`.
 - When a command uses a stored capability and the dashboard is running, `pentect exec` waits for `once`, `always`, or `decline`. If no dashboard is running, MVP behavior is auto-`once`.
 - Show the command approval preview with `pentect approve "<command>"`.
-- Non-core detectors are managed as local extensions: `pentect codex --extensions openai-privacy-filter` creates `.pentect/extensions/openai-privacy-filter`. Extension rule packs live at `pack.toml` or `packs/*.toml`.
+- Non-core detectors are managed as local extensions: `pentect codex --extensions openai-privacy-filter` uses `.pentect/extensions/openai-privacy-filter`, while `--extensions ./rules.toml` activates a standalone TOML rule pack. Default project extensions live in `.pentect/config.toml` as `extensions = ["openai-privacy-filter", "./rules.toml"]`.
 - Block direct AI Read tools; use `pentect exec "<command>"` at the tool boundary.
 - Keep `pentect read` as a one-way human masked-preview helper, not the AI path.
 - Delete local capability state with `pentect purge`.
@@ -50,7 +50,7 @@ python tools/eval_hostile_realworld.py --bin target\release\pentect.exe
 ```
 
 This corpus is intentionally mean: encoded/fractured secrets, low-entropy keyed
-values, semantic PII, real-looking logs, and benign near misses. It is for gap
+values, language-heavy PII, real-looking logs, and benign near misses. It is for gap
 tracking, not a CI pass/fail gate.
 
 External recall bench:

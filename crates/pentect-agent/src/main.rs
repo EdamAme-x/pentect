@@ -281,7 +281,10 @@ fn cmd_exec(args: &[String]) -> i32 {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut masker = OutputMasker::new_shared(store);
+    let mut masker = match OutputMasker::new_shared(store) {
+        Ok(masker) => masker,
+        Err(e) => return die(&e),
+    };
     let safe_stdout = match masker.mask_tool_output(&stdout) {
         Ok(s) => s,
         Err(e) => return die(&e),
@@ -1080,7 +1083,7 @@ fn register_local_file_inputs(store: &RecoveryStore, script: &str) -> Result<(),
     if paths.is_empty() {
         return Ok(());
     }
-    let mut masker = OutputMasker::new_shared(store.clone());
+    let mut masker = OutputMasker::new_shared(store.clone())?;
     for path in paths {
         if !path.is_file() {
             continue;
@@ -1681,7 +1684,7 @@ fn handle_hook(
                 return Ok(json!({}));
             };
             let store = RecoveryStore::load(session)?;
-            let mut masker = OutputMasker::new_shared(store);
+            let mut masker = OutputMasker::new_shared(store)?;
             let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
             if changed {
                 Ok(after_tool_output(provider, updated))

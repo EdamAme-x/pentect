@@ -3,7 +3,7 @@
 
 This is intentionally not a "make the current engine look good" benchmark.
 It mixes structural secrets, shell/config/log contexts, encoded/fractured
-values, low-entropy keyed values, and semantic PII that a deterministic core
+values, low-entropy keyed values, and language-heavy PII that a deterministic core
 should not pretend to understand. The goal is not a pass/fail target; it is a
 gap corpus that makes today's misses obvious enough to prioritize.
 
@@ -12,8 +12,8 @@ No-cheat rule for using this corpus:
 - Do not hard-code generated values, names, addresses, counts, or case IDs.
 - Only add detectors that generalize to a documented syntax, protocol, or
   defensible context pattern.
-- Semantic PII should be handled by a general NER layer, not by copying names
-  from this file into regexes.
+- Language-heavy PII should be handled behind the extension/model boundary, not by
+  copying names from this file into core regexes.
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def build_cases(scale: int) -> list[Case]:
         cases.extend(ops_log_cases(round_no))
         cases.extend(encoded_and_fragmented_cases(round_no))
         cases.extend(low_entropy_keyed_cases(round_no))
-        cases.extend(semantic_pii_cases(round_no))
+        cases.extend(extension_pii_cases(round_no))
         cases.extend(benign_near_miss_cases(round_no))
     return cases
 
@@ -288,7 +288,7 @@ def low_entropy_keyed_cases(round_no: int) -> list[Case]:
     return cases
 
 
-def semantic_pii_cases(round_no: int) -> list[Case]:
+def extension_pii_cases(round_no: int) -> list[Case]:
     cases: list[Case] = []
     names = [
         "Alice Tanaka",
@@ -335,15 +335,15 @@ def semantic_pii_cases(round_no: int) -> list[Case]:
         )
         cases.append(
             Case(
-                f"semantic_pii_{n}",
+                f"extension_pii_{n}",
                 text,
                 (
-                    target(name, "semantic_pii", "person name"),
-                    target(org, "semantic_pii", "organization"),
-                    target(street, "semantic_pii", "street address"),
+                    target(name, "extension_pii", "person name"),
+                    target(org, "extension_pii", "organization"),
+                    target(street, "extension_pii", "street address"),
                     target(patient_id, "case_identifier", "patient/customer case id"),
-                    target(japanese_name, "semantic_pii", "Japanese person name"),
-                    target(japanese_addr, "semantic_pii", "Japanese address"),
+                    target(japanese_name, "extension_pii", "Japanese person name"),
+                    target(japanese_addr, "extension_pii", "Japanese address"),
                 ),
                 (
                     "sprint=42",

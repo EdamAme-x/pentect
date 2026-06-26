@@ -5,6 +5,7 @@ use serde::Deserialize;
 /// A loaded Layer-1 rule pack: pure data, no code. Carries extra regex/keyword
 /// rules and a list of built-in labels to turn off. (No key-name vocabulary —
 /// open-vocabulary key sensitivity is a model's job, not a hardcoded list's.)
+#[derive(Clone)]
 pub struct Pack {
     pub rules: RuleDetector,
     /// Built-in (or other) labels this pack suppresses, e.g. `IP_ADDRESS_V4`.
@@ -14,10 +15,10 @@ pub struct Pack {
 /// Parse a TOML rule pack. Two knobs cover the real demand: add your own rules
 /// (`[[detector]]` with `keywords = [...]` literals, or a regex `pattern` plus an
 /// optional checksum `validator`, `capture` group, or `prefilter` literals), and
-/// turn built-ins off (`disable = ["LABEL"]`). Detector entries without a
-/// `pattern`/`keywords` are skipped so a mixed pack still loads its Layer-1
-/// rules. Errors on malformed TOML, an unknown category / confidence /
-/// validator, an invalid regex, or a missing capture group.
+/// turn built-ins off (`disable = ["LABEL"]`). Errors on malformed TOML,
+/// unsupported pack fields, detector entries without a `pattern` or non-empty
+/// `keywords`, an unknown category / confidence / validator, an invalid regex,
+/// or a missing capture group.
 pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
     let pack: PackFile = toml::from_str(toml_src).map_err(|e| e.to_string())?;
     let mut specs = Vec::new();
@@ -27,7 +28,7 @@ pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
         let pattern = match (d.pattern, d.keywords) {
             (Some(p), _) => p,
             (None, Some(kw)) if !kw.is_empty() => keyword_regex(&kw),
-            _ => continue, // higher-layer entry (e.g. sidecar) — ignored here
+            _ => return Err("detector entry requires pattern or non-empty keywords".to_string()),
         };
         // Sensible defaults so the minimal entry is just a keyword list: mask
         // (Secret) under a CUSTOM label.
@@ -57,6 +58,7 @@ pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackFile {
     #[serde(default)]
     detector: Vec<DetectorEntry>,
@@ -66,6 +68,7 @@ struct PackFile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DetectorEntry {
     /// Regex (power users). Mutually exclusive-ish with `keywords`.
     pattern: Option<String>,
@@ -145,10 +148,7 @@ mod tests {
     use crate::{Config, Engine, Input, MaskAll, Profile};
 
     const ACME: &str = r#"
-        schema_version = 1
-        name = "acme"
         [[detector]]
-        name = "acme-account"
         pattern = '\bACC-[0-9]{10}\b'
         category = "Identifier"
         label = "ACME_ACCOUNT"
@@ -308,19 +308,46 @@ mod tests {
     }
 
     #[test]
-    fn higher_layer_entries_are_skipped_not_errors() {
-        // A sidecar entry has no pattern; it is ignored, leaving zero Layer-1 rules.
+    fn rejects_unknown_detector_fields() {
         let pack = r#"
             [[detector]]
             name = "ml"
-            kind = "sidecar"
+            kind = "model"
             cmd = "python"
         "#;
-        let rules = load_pack(pack).unwrap().rules;
-        let raw = "AKIAIOSFODNN7EXAMPLE";
-        assert!(rules
-            .detect(&NormalizedView::build(&region(raw), raw))
-            .is_empty());
+        assert!(load_pack(pack).is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_old_pack_fields() {
+        assert!(load_pack(
+            r#"schema_version = 1
+               [[detector]]
+               pattern = "x""#
+        )
+        .is_err());
+        assert!(load_pack(
+            r#"name = "acme"
+               [[detector]]
+               pattern = "x""#
+        )
+        .is_err());
+        assert!(load_pack(
+            r#"[[detector]]
+               name = "acme-account"
+               pattern = "x""#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_detector_entries_without_rules() {
+        assert!(load_pack(r#"[[detector]]"#).is_err());
+        assert!(load_pack(
+            r#"[[detector]]
+               keywords = []"#
+        )
+        .is_err());
     }
 
     #[test]
