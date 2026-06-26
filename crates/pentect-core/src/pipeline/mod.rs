@@ -1627,6 +1627,7 @@ mod tests {
             Context {
                 path: Some("structured.password".to_string()),
                 key: Some("password".to_string()),
+                hints: Vec::new(),
                 kind: RegionKind::JsonValue,
                 format: Kind::ToolResult,
             },
@@ -1639,6 +1640,7 @@ mod tests {
             Context {
                 path: Some("structured.password".to_string()),
                 key: None,
+                hints: Vec::new(),
                 kind: RegionKind::JsonKey,
                 format: Kind::ToolResult,
             },

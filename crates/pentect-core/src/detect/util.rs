@@ -33,6 +33,7 @@ pub(crate) fn region(raw: &str) -> crate::model::Region {
         ctx: Context {
             path: None,
             key: None,
+            hints: Vec::new(),
             kind: RegionKind::PlainText,
             format: Kind::Text,
         },

@@ -487,6 +487,11 @@ impl RuleDetector {
         ];
         #[rustfmt::skip]
         let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
+            // Browser/mail UIs often surface short login codes in prose or HTML.
+            // Keep this explicitly OTP/verification-word gated; a bare "code
+            // 100482" is too common in issue IDs, SKUs, and examples.
+            (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])(?:$|[\s<>"',;).!])"#, Secret, "OTP", High, 1, V::None),
+            (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])"#, Secret, "OTP", High, 1, V::None),
             // Context-keyed values in free text / shell logs. This is deliberately
             // not a raw "any key=value" detector: it fires only on a closed set of
             // credential-bearing nouns, and captures the value rather than the
@@ -760,6 +765,10 @@ mod tests {
         assert!(has("password is summer-2026! for the demo", "KEYED_SECRET"));
         assert!(has("client_secret: tenant-7-trial", "KEYED_SECRET"));
         assert!(has("otp=100482 expires soon", "KEYED_SECRET"));
+        assert!(has("otp=100482 expires soon", "OTP"));
+        assert!(has("Your verification code is 837291.", "OTP"));
+        assert!(has("Use security code: <b>402118</b> to continue.", "OTP"));
+        assert!(has("認証コード: 483920 を入力してください", "OTP"));
         assert!(has(
             "k8s secret data api-key: abcDEF123456+/==",
             "KEYED_SECRET"
@@ -772,6 +781,10 @@ mod tests {
         assert!(!has(
             "port=5432 workers=4 timeout_ms=30000 status=200",
             "KEYED_SECRET"
+        ));
+        assert!(!has(
+            "order code 100482 remains a visible support detail",
+            "OTP"
         ));
         assert!(!has("jwt_like=aaa.bbb.ccc css=#aabbcc", "SESSION_TOKEN"));
         assert!(!has("story=SEC-100482 estimate=8", "CASE_IDENTIFIER"));

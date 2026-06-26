@@ -232,6 +232,7 @@ mod tests {
             ctx: Context {
                 path: None,
                 key: None,
+                hints: Vec::new(),
                 kind: RegionKind::PlainText,
                 format: Kind::Text,
             },

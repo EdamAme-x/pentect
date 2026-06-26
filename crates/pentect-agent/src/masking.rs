@@ -101,6 +101,7 @@ impl OutputMasker {
         region_kind: RegionKind,
         key: Option<&str>,
         path: Option<&str>,
+        hints: &[String],
     ) -> Result<String, String> {
         let redacted = redact_env_derivative_lines(text);
         let remasked = self.remask_all(&redacted)?;
@@ -113,6 +114,7 @@ impl OutputMasker {
             Context {
                 path: path.map(str::to_string),
                 key: key.map(str::to_string),
+                hints: hints.to_vec(),
                 kind: region_kind,
                 format: Kind::ToolResult,
             },

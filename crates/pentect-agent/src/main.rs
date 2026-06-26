@@ -2234,24 +2234,27 @@ fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
 }
 
 fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bool), String> {
-    mask_tool_json_with_context(value, None, None, masker)
+    mask_tool_json_with_context(value, None, None, &[], masker)
 }
 
 fn mask_tool_json_with_context(
     value: &Value,
     key: Option<&str>,
     path: Option<&str>,
+    hints: &[String],
     masker: &mut OutputMasker,
 ) -> Result<(Value, bool), String> {
     match value {
         Value::String(text) => {
-            let out = masker.mask_tool_result_scalar(text, RegionKind::JsonValue, key, path)?;
+            let out =
+                masker.mask_tool_result_scalar(text, RegionKind::JsonValue, key, path, hints)?;
             let changed = out != *text;
             Ok((Value::String(out), changed))
         }
         Value::Number(_) | Value::Bool(_) => {
             let raw = value.to_string();
-            let out = masker.mask_tool_result_scalar(&raw, RegionKind::JsonValue, key, path)?;
+            let out =
+                masker.mask_tool_result_scalar(&raw, RegionKind::JsonValue, key, path, hints)?;
             if out == raw {
                 Ok((value.clone(), false))
             } else {
@@ -2265,7 +2268,7 @@ fn mask_tool_json_with_context(
             for (index, item) in items.iter().enumerate() {
                 let child_path = path_with_segment(path, &index.to_string());
                 let (item, item_changed) =
-                    mask_tool_json_with_context(item, key, Some(&child_path), masker)?;
+                    mask_tool_json_with_context(item, key, Some(&child_path), hints, masker)?;
                 changed |= item_changed;
                 out.push(item);
             }
@@ -2281,16 +2284,36 @@ fn mask_tool_json_with_context(
                     RegionKind::JsonKey,
                     None,
                     Some(&child_path),
+                    &[],
                 )?;
                 changed |= masked_key != *object_key;
-                let (item, item_changed) =
-                    mask_tool_json_with_context(item, Some(object_key), Some(&child_path), masker)?;
+                let child_hints = sibling_context_hints(map, object_key);
+                let (item, item_changed) = mask_tool_json_with_context(
+                    item,
+                    Some(object_key),
+                    Some(&child_path),
+                    &child_hints,
+                    masker,
+                )?;
                 changed |= item_changed;
                 out.insert(masked_key, item);
             }
             Ok((Value::Object(out), changed))
         }
     }
+}
+
+fn sibling_context_hints(map: &serde_json::Map<String, Value>, object_key: &str) -> Vec<String> {
+    if !object_key.eq_ignore_ascii_case("value") {
+        return Vec::new();
+    }
+    ["label", "name", "ariaLabel", "placeholder", "title"]
+        .iter()
+        .filter_map(|key| map.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn path_with_segment(parent: Option<&str>, segment: &str) -> String {

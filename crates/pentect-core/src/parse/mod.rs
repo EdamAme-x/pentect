@@ -18,6 +18,7 @@ impl Parser for TextParser {
             ctx: Context {
                 path: None,
                 key: None,
+                hints: Vec::new(),
                 kind: RegionKind::PlainText,
                 format: Kind::Text,
             },
@@ -70,6 +71,7 @@ impl Parser for EnvParser {
                     ctx: Context {
                         path: None,
                         key: Some(key),
+                        hints: Vec::new(),
                         kind: RegionKind::Body,
                         format: Kind::Env,
                     },

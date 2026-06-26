@@ -52,6 +52,7 @@ impl Har<'_> {
             ctx: Context {
                 path: None,
                 key,
+                hints: Vec::new(),
                 kind,
                 format: Kind::Har,
             },

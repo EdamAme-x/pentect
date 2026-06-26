@@ -917,6 +917,162 @@ fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
 }
 
 #[test]
+fn browser_email_html_masks_otp_but_keeps_content_readable() {
+    let (root, session) = empty_session("hook-post-browser-email-html");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__chrome__snapshot",
+        "tool_response": {
+            "content": [{
+                "type": "text",
+                "text": concat!(
+                    "Subject: Sign-in request\n",
+                    "<html><body>",
+                    "<p>Your verification code is <b>837291</b>.</p>",
+                    "<p>Device: Chrome on Windows. Seat 12A stays visible.</p>",
+                    "</body></html>"
+                )
+            }],
+            "structuredContent": {
+                "url": "https://mail.example.test/inbox/42",
+                "emailHtml": "<main><span>Security code:</span><strong>402118</strong><p>Expires in 10 minutes.</p></main>",
+                "visibleText": "認証コード: 483920 を入力してください\nInvoice INV-100482 remains readable."
+            }
+        }
+    });
+
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
+    let rendered = serde_json::to_string(updated).unwrap();
+    for secret in ["837291", "402118", "483920"] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    assert!(rendered.contains("<<OTP_"), "{rendered}");
+    assert!(rendered.contains("Sign-in request"), "{rendered}");
+    assert!(rendered.contains("Chrome on Windows"), "{rendered}");
+    assert!(rendered.contains("Seat 12A stays visible"), "{rendered}");
+    assert!(
+        rendered.contains("Invoice INV-100482 remains readable"),
+        "{rendered}"
+    );
+
+    let env = RecoveryStore::load(&session)
+        .unwrap()
+        .auto_env_bindings()
+        .unwrap();
+    for secret in ["837291", "402118", "483920"] {
+        assert!(
+            env.iter()
+                .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
+            "{env:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
+    let (root, session) = empty_session("hook-post-browser-apikey-html");
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__playwright__browser_snapshot",
+        "tool_response": {
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "Page snapshot\nbutton: Create API key\noutput: RUNPOD_API_KEY={raw}\nstatus: created"
+                )
+            }],
+            "structuredContent": {
+                "ariaSnapshot": format!("textbox API key value {raw}"),
+                "html": format!(r#"<input aria-label="API key" value="{raw}"><button>Copy</button>"#),
+                "nextStep": "Use this key to call the health endpoint."
+            }
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert!(!rendered.contains(raw), "{rendered}");
+    assert!(
+        rendered.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Create API key"), "{rendered}");
+    assert!(
+        rendered.contains("Use this key to call the health endpoint."),
+        "{rendered}"
+    );
+
+    let store = RecoveryStore::load(&session).unwrap();
+    let env = store.auto_env_bindings().unwrap();
+    let env_name = env
+        .iter()
+        .find_map(|(name, value)| {
+            (name.starts_with("PENTECT_RUNPOD_API_KEY_") && value == raw).then(|| name.clone())
+        })
+        .unwrap_or_else(|| panic!("missing RUNPOD capability in {env:?}"));
+    let command = if cfg!(windows) {
+        format!("Write-Output $env:{env_name}")
+    } else {
+        format!("printf '%s' \"${env_name}\"")
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        approve: false,
+        mode: ExecMode::Shell(command),
+    };
+    let output = run_resolved_command(&store, &opts).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(raw), "{stdout}");
+    let safe = mask_tool_output(&session, &stdout).unwrap();
+    assert!(!safe.contains(raw), "{safe}");
+    assert!(safe.contains("<<RUNPOD_API_KEY_"), "{safe}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn browser_structured_otp_fields_mask_without_locking_to_email_format() {
+    let (root, session) = empty_session("hook-post-browser-otp-fields");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__chrome__get_page_content",
+        "tool_response": {
+            "structuredContent": {
+                "verificationCode": "837291",
+                "mfaCode": "402118",
+                "formFields": [
+                    {"label": "One-time passcode", "value": "483920"},
+                    {"label": "Order code", "value": "ORD-100482"}
+                ],
+                "bodyText": "Login code: 729004\nDelivery code ORD-100482 remains visible."
+            }
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    for secret in ["837291", "402118", "483920", "729004"] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    assert!(rendered.contains("<<OTP_"), "{rendered}");
+    assert!(rendered.contains("ORD-100482"), "{rendered}");
+
+    let env = RecoveryStore::load(&session)
+        .unwrap()
+        .auto_env_bindings()
+        .unwrap();
+    for secret in ["837291", "402118", "483920", "729004"] {
+        assert!(
+            env.iter()
+                .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
+            "{env:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn posttool_masks_secret_object_keys() {
     let (root, session) = empty_session("hook-post-secret-key");
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";

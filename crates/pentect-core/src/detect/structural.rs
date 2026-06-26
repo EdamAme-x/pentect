@@ -101,12 +101,16 @@ impl Detector for SensitiveKeyDetector {
 
 fn sensitive_context_label(ctx: &Context) -> Option<String> {
     if let Some(key) = ctx.key.as_deref().filter(|key| is_sensitive_key_name(key)) {
-        return Some(forced_label(key));
+        return Some(sensitive_label_for_key(key));
     }
-    let path = ctx.path.as_deref()?;
-    path.split(|ch: char| !ch.is_ascii_alphanumeric())
+    if let Some(hint) = ctx.hints.iter().find(|hint| is_sensitive_key_name(hint)) {
+        return Some(sensitive_label_for_key(hint));
+    }
+    ctx.path
+        .as_deref()?
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
         .find(|segment| is_sensitive_key_name(segment))
-        .map(forced_label)
+        .map(sensitive_label_for_key)
 }
 
 fn is_sensitive_key_name(key: &str) -> bool {
@@ -131,6 +135,17 @@ fn is_sensitive_key_name(key: &str) -> bool {
             "otp",
             "totp",
             "mfa",
+            "2fa",
+            "verification_code",
+            "verificationcode",
+            "security_code",
+            "securitycode",
+            "login_code",
+            "logincode",
+            "signin_code",
+            "signincode",
+            "one_time",
+            "onetime",
             "session",
             "cookie",
             "jwt",
@@ -138,6 +153,37 @@ fn is_sensitive_key_name(key: &str) -> bool {
         ]
         .iter()
         .any(|needle| name.contains(needle))
+}
+
+fn sensitive_label_for_key(key: &str) -> String {
+    if is_otp_key_name(key) {
+        labels::OTP.to_string()
+    } else {
+        forced_label(key)
+    }
+}
+
+fn is_otp_key_name(key: &str) -> bool {
+    let name = normalize_key(key);
+    [
+        "otp",
+        "totp",
+        "mfa",
+        "2fa",
+        "passcode",
+        "verification_code",
+        "verificationcode",
+        "security_code",
+        "securitycode",
+        "login_code",
+        "logincode",
+        "signin_code",
+        "signincode",
+        "one_time",
+        "onetime",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
 }
 
 fn forced_label(key: &str) -> String {
@@ -191,6 +237,7 @@ mod tests {
             ctx: Context {
                 path: None,
                 key: key.map(str::to_string),
+                hints: Vec::new(),
                 kind,
                 format,
             },
@@ -207,6 +254,7 @@ mod tests {
             ctx: Context {
                 path: None,
                 key: key.map(str::to_string),
+                hints: Vec::new(),
                 kind: RegionKind::Body,
                 format: Kind::Env,
             },
@@ -225,12 +273,22 @@ mod tests {
         key: Option<&str>,
         value: &str,
     ) -> Option<String> {
+        sensitive_key_fires_with_context(path, key, &[], value)
+    }
+
+    fn sensitive_key_fires_with_context(
+        path: Option<&str>,
+        key: Option<&str>,
+        hints: &[&str],
+        value: &str,
+    ) -> Option<String> {
         let raw = value.to_string();
         let region = Region {
             span: ByteRange::new(0, raw.len()),
             ctx: Context {
                 path: path.map(str::to_string),
                 key: key.map(str::to_string),
+                hints: hints.iter().map(|hint| hint.to_string()).collect(),
                 kind: RegionKind::JsonValue,
                 format: Kind::ToolResult,
             },
@@ -306,11 +364,23 @@ mod tests {
             sensitive_key_fires(Some("otp"), "100482"),
             Some("OTP".to_string())
         );
+        assert_eq!(
+            sensitive_key_fires(Some("verificationCode"), "100482"),
+            Some("OTP".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("One-time passcode"), "100482"),
+            Some("OTP".to_string())
+        );
         assert_eq!(sensitive_key_fires(Some("note"), "hello"), None);
         assert_eq!(sensitive_key_fires(None, "hunter2"), None);
         assert_eq!(
             sensitive_key_fires_with_path(Some("structured.credentials.id"), Some("id"), "abc123"),
             Some("CREDENTIALS".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires_with_context(None, Some("value"), &["One-time passcode"], "100482"),
+            Some("OTP".to_string())
         );
     }
 

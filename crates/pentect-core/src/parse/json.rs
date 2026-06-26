@@ -73,6 +73,7 @@ impl Parser<'_> {
                     ctx: Context {
                         path: None,
                         key,
+                        hints: Vec::new(),
                         kind: RegionKind::JsonValue,
                         format: self.format(),
                     },
@@ -105,6 +106,7 @@ impl Parser<'_> {
                     ctx: Context {
                         path: None,
                         key: None,
+                        hints: Vec::new(),
                         kind: RegionKind::JsonKey,
                         format: self.format(),
                     },

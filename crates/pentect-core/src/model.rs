@@ -14,6 +14,8 @@ pub mod labels {
     pub const OPAQUE_BLOB: &str = "OPAQUE_BLOB";
     /// Value masked because its key name looks sensitive.
     pub const SECRET: &str = "SECRET";
+    /// One-time password or verification code.
+    pub const OTP: &str = "OTP";
     /// Body of a PEM private-key block.
     pub const PRIVATE_KEY: &str = "PRIVATE_KEY";
 }
@@ -117,6 +119,10 @@ pub enum RegionKind {
 pub struct Context {
     pub path: Option<String>,
     pub key: Option<String>,
+    /// Non-secret structural clues from the adapter, such as a form label,
+    /// aria-label, placeholder, or column heading. These are not values.
+    #[serde(default)]
+    pub hints: Vec<String>,
     pub kind: RegionKind,
     pub format: Kind,
 }
