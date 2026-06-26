@@ -3,6 +3,9 @@
 //! lets a permissive pattern avoid false positives (the Presidio approach).
 //! Every function is covered by reference test vectors below.
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 /// ASCII digits of `s` as 0-9 values, ignoring all other bytes (so separators
 /// like spaces/hyphens/dots don't matter).
 fn digits(s: &str) -> Vec<u32> {
@@ -736,6 +739,13 @@ pub fn ipv6(s: &str) -> bool {
 }
 
 static BIP39_ENGLISH: &str = include_str!("bip39_english.txt");
+static BIP39_INDEX: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {
+    BIP39_ENGLISH
+        .lines()
+        .enumerate()
+        .map(|(index, word)| (word, index))
+        .collect()
+});
 
 /// BIP-39 mnemonic seed phrase: a contiguous run of 12/15/18/21/24 words from
 /// the English wordlist with a valid SHA-256 checksum. Wordlist membership +
@@ -766,7 +776,7 @@ fn bip39_window_valid(words: &[&str]) -> bool {
     let mut bits = Vec::with_capacity(total_bits);
     for w in words {
         let lw = w.to_ascii_lowercase();
-        let Some(idx) = BIP39_ENGLISH.lines().position(|x| x == lw) else {
+        let Some(&idx) = BIP39_INDEX.get(lw.as_str()) else {
             return false;
         };
         for b in (0..11).rev() {

@@ -8,7 +8,8 @@ use crate::model::*;
 use crate::normalize::NormalizedView;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
+use std::time::Duration;
 
 pub struct SemanticDetector {
     proc: Mutex<NerProc>,
@@ -33,11 +34,10 @@ impl SemanticDetector {
             .stderr(Stdio::null())
             .spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
-        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        let mut ready = String::new();
-        stdout.read_line(&mut ready)?;
+        let (ready, stdout) = wait_for_ready_line(&mut child)?;
         let ready = ready.trim();
         if ready != "READY" {
+            let _ = child.kill();
             return Err(std::io::Error::other(
                 "semantic sidecar did not signal READY",
             ));
@@ -49,6 +49,36 @@ impl SemanticDetector {
                 stdout,
             }),
         })
+    }
+}
+
+fn wait_for_ready_line(child: &mut Child) -> std::io::Result<(String, BufReader<ChildStdout>)> {
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let timeout = std::env::var("PENTECT_NER_READY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(10));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut ready = String::new();
+        let result = stdout.read_line(&mut ready).map(|_| ready);
+        let _ = tx.send((result, stdout));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok((Ok(ready), stdout)) => Ok((ready, stdout)),
+        Ok((Err(err), _)) => Err(err),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = child.kill();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "semantic sidecar did not signal READY before timeout",
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = child.kill();
+            Err(std::io::Error::other("semantic sidecar reader stopped"))
+        }
     }
 }
 
@@ -105,9 +135,17 @@ mod tests {
     #[test]
     fn semantic_detects_person_org_location() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/ner_sidecar.py");
+        let old_timeout = std::env::var_os("PENTECT_NER_READY_TIMEOUT_MS");
+        std::env::set_var("PENTECT_NER_READY_TIMEOUT_MS", "1000");
         let det = match SemanticDetector::spawn(script) {
-            Ok(d) => d,
-            Err(_) => return, // python/spaCy unavailable here — skip, don't fail
+            Ok(d) => {
+                restore_timeout(old_timeout);
+                d
+            }
+            Err(_) => {
+                restore_timeout(old_timeout);
+                return; // python/spaCy unavailable here — skip, don't fail
+            }
         };
         let raw = "John Smith works at Acme Corporation in Tokyo";
         let labels: Vec<String> = det
@@ -118,5 +156,13 @@ mod tests {
         assert!(labels.contains(&"PERSON".to_string()), "{labels:?}");
         assert!(labels.contains(&"ORGANIZATION".to_string()), "{labels:?}");
         assert!(labels.contains(&"LOCATION".to_string()), "{labels:?}");
+    }
+
+    fn restore_timeout(old_timeout: Option<std::ffi::OsString>) {
+        if let Some(value) = old_timeout {
+            std::env::set_var("PENTECT_NER_READY_TIMEOUT_MS", value);
+        } else {
+            std::env::remove_var("PENTECT_NER_READY_TIMEOUT_MS");
+        }
     }
 }

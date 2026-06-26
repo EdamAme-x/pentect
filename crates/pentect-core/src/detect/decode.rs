@@ -1,5 +1,5 @@
 use super::util::token_runs;
-use super::{Detector, RuleDetector};
+use super::{AuthCodeDetector, Bip39Detector, Detector, RuleDetector};
 use crate::codec::{Base32Codec, Base58Codec, Base64Codec, Codec, HexCodec};
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -59,7 +59,11 @@ impl DecodeDetector {
                 Box::new(Base64Codec),
                 Box::new(Base58Codec),
             ],
-            vec![Box::new(RuleDetector::builtin())],
+            vec![
+                Box::new(RuleDetector::builtin()),
+                Box::new(AuthCodeDetector),
+                Box::new(Bip39Detector),
+            ],
             DEFAULT_DECODE_DEPTH,
         )
     }
@@ -332,6 +336,21 @@ mod tests {
             DecodeDetector::builtin().detect(&NormalizedView::build(&region(&sample), &sample));
         assert!(
             spans.iter().any(|span| span.label == labels::SECRET),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn encoded_seed_phrase_is_identified_by_dedicated_detector() {
+        let raw = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let enc = data_encoding::BASE64.encode(raw.as_bytes());
+        let sample = format!("blob={enc}");
+        let spans =
+            DecodeDetector::builtin().detect(&NormalizedView::build(&region(&sample), &sample));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.label == labels::BIP39_MNEMONIC),
             "{spans:?}"
         );
     }

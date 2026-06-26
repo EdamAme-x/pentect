@@ -1,6 +1,7 @@
 use crate::model::Span;
 use crate::normalize::NormalizedView;
 
+mod auth_code;
 mod bip39;
 mod card;
 mod date;
@@ -8,6 +9,7 @@ mod decode;
 mod entropy;
 #[cfg(feature = "semantic")]
 mod ner;
+mod pattern;
 mod pem;
 mod phone;
 mod rule;
@@ -15,12 +17,14 @@ mod structural;
 mod util;
 mod validate;
 
+pub use auth_code::AuthCodeDetector;
 pub use bip39::Bip39Detector;
 pub use card::CardDetector;
 pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
 #[cfg(feature = "semantic")]
 pub use ner::SemanticDetector;
+pub use pattern::{PatternMatchDetector, PatternSpec};
 pub use pem::PemDetector;
 pub use phone::PhoneDetector;
 pub use rule::{RuleDetector, RuleSpec};

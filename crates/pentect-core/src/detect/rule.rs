@@ -1,68 +1,20 @@
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use std::sync::LazyLock;
 
+use super::pattern::{PatternMatchDetector, PatternSpec};
 use super::validate::Validator;
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
-use regex::{Regex, RegexSet};
-
-#[derive(Clone)]
-struct Rule {
-    re: Regex,
-    category: Category,
-    label: String,
-    confidence: Confidence,
-    /// Checksum gate applied to each match before it becomes a span (the
-    /// precision lever that lets a permissive pattern avoid false positives).
-    validator: Validator,
-    /// 0 masks the full regex match; N masks capture group N.
-    capture: usize,
-}
 
 /// A data-form rule (e.g. a TOML pack entry) before its pattern is compiled.
-pub struct RuleSpec {
-    pub pattern: String,
-    pub category: Category,
-    pub label: String,
-    pub confidence: Confidence,
-    pub validator: Validator,
-    pub capture: usize,
-    pub prefilter: Vec<String>,
-}
+pub type RuleSpec = PatternSpec;
 
 /// Anchored vendor-token rules. High confidence and linear-time (no ReDoS), so
 /// these bypass the entropy/profile uncertainty. The built-in set is just the
 /// default pack — `from_specs` builds the same detector from loaded data.
+#[derive(Clone)]
 pub struct RuleDetector {
-    rules: Vec<Rule>,
-    /// Unprefiltered rules share one RegexSet, so we do a merged candidate scan
-    /// instead of trying every regex blindly. Each matching rule is then scanned
-    /// exactly to preserve overlaps, captures, and validators.
-    exact: Option<ExactGroup>,
-    prefiltered: Option<PrefilterGroup>,
-}
-
-#[derive(Clone)]
-struct ExactGroup {
-    set: RegexSet,
-    rules: Vec<usize>,
-}
-
-#[derive(Clone)]
-struct PrefilterGroup {
-    ac: AhoCorasick,
-    rules_by_pattern: Vec<Vec<usize>>,
-}
-
-impl Clone for RuleDetector {
-    fn clone(&self) -> Self {
-        Self {
-            rules: self.rules.clone(),
-            exact: self.exact.clone(),
-            prefiltered: self.prefiltered.clone(),
-        }
-    }
+    inner: PatternMatchDetector,
 }
 
 static BUILTIN_RULE_DETECTOR: LazyLock<RuleDetector> = LazyLock::new(RuleDetector::build_builtin);
@@ -70,73 +22,18 @@ static BUILTIN_RULE_DETECTOR: LazyLock<RuleDetector> = LazyLock::new(RuleDetecto
 impl RuleDetector {
     /// Compile data-form rules into a detector; errors if any pattern is invalid.
     pub fn from_specs(specs: Vec<RuleSpec>) -> Result<Self, String> {
-        let mut rules = Vec::with_capacity(specs.len());
-        let mut exact_patterns = Vec::new();
-        let mut exact_rules = Vec::new();
-        let mut prefilter_literals = Vec::new();
-        let mut rules_by_pattern: Vec<Vec<usize>> = Vec::new();
-
-        for s in specs {
-            let re = Regex::new(&s.pattern).map_err(|e| format!("rule {}: {e}", s.label))?;
-            if s.capture >= re.captures_len() {
-                return Err(format!(
-                    "rule {}: capture {} does not exist",
-                    s.label, s.capture
-                ));
-            }
-            let rule_index = rules.len();
-            if s.prefilter.is_empty() {
-                exact_patterns.push(s.pattern);
-                exact_rules.push(rule_index);
-            } else {
-                for literal in &s.prefilter {
-                    if literal.is_empty() {
-                        continue;
-                    }
-                    prefilter_literals.push(literal.clone());
-                    rules_by_pattern.push(vec![rule_index]);
-                }
-            }
-            rules.push(Rule {
-                re,
-                category: s.category,
-                label: s.label,
-                confidence: s.confidence,
-                validator: s.validator,
-                capture: s.capture,
-            });
-        }
-
-        let exact = if exact_patterns.is_empty() {
-            None
-        } else {
-            Some(ExactGroup {
-                set: RegexSet::new(exact_patterns.iter().map(|s| s.as_str()))
-                    .map_err(|e| format!("rule set: {e}"))?,
-                rules: exact_rules,
-            })
-        };
-        let prefiltered = if prefilter_literals.is_empty() {
-            None
-        } else {
-            Some(PrefilterGroup {
-                ac: AhoCorasickBuilder::new()
-                    .ascii_case_insensitive(true)
-                    .build(&prefilter_literals)
-                    .map_err(|e| format!("prefilter set: {e}"))?,
-                rules_by_pattern,
-            })
-        };
-
         Ok(Self {
-            rules,
-            exact,
-            prefiltered,
+            inner: PatternMatchDetector::from_specs(specs)?,
         })
     }
 
     pub fn builtin() -> Self {
         BUILTIN_RULE_DETECTOR.clone()
+    }
+
+    #[cfg(test)]
+    fn labels(&self) -> impl Iterator<Item = &str> {
+        self.inner.labels()
     }
 
     fn build_builtin() -> Self {
@@ -477,7 +374,6 @@ impl RuleDetector {
             (r"\b[0-8][0-9]{2}[- ][0-9]{2}[- ][0-9]{4}\b", Pii, "US_SSN", Medium, V::UsSsn),
             (r"\bbc1[02-9ac-hj-np-z]{6,87}\b", Identifier, "BTC_ADDRESS_BECH32", High, V::BtcBech32),
             (r"\b0x[0-9a-fA-F]{40}\b", Identifier, "ETH_ADDRESS", High, V::EthAddress),
-            (r"\b(?:[a-z]{3,8}\s+){11,23}[a-z]{3,8}\b", Secret, "BIP39_MNEMONIC", High, V::Bip39),
             (r"(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[0-9A-Za-z]+)?(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?", Endpoint, "IP_ADDRESS_V6", High, V::Ipv6),
             (r"\b[0-9]{6}[-+A-Y][0-9]{3}[0-9A-Y]\b", Identifier, "FI_HETU", High, V::FiHetu),
             (r"(?i)\b[A-Z]{6}[0-9A-Z]{2}[A-Z][0-9A-Z]{2}[A-Z][0-9A-Z]{3}[A-Z]\b", Identifier, "IT_FISCAL_CODE", High, V::ItFiscalCode),
@@ -487,22 +383,6 @@ impl RuleDetector {
         ];
         #[rustfmt::skip]
         let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
-            // Auth flows often surface short login codes in prose.
-            // Keep this explicitly OTP/verification-word gated; a bare "code
-            // 100482" is too common in issue IDs, SKUs, and examples.
-            (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])(?:$|[\s<>"',;).!])"#, Secret, "OTP", High, 1, V::None),
-            (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])"#, Secret, "OTP", High, 1, V::None),
-            // The auth word and actual code may be separated by expiry copy or
-            // a few UI labels; require a 6-8 digit candidate for the wider form.
-            (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n]{0,160}\b([0-9]{6,8})\b"#, Secret, "OTP", High, 1, V::None),
-            (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n]{0,160}\b([0-9]{6,8})\b"#, Secret, "OTP", High, 1, V::None),
-            // Some auth messages do not literally say "OTP", and some use
-            // 4-digit or alphanumeric codes. Still keep this gated by login /
-            // account / verification context so ordinary order codes survive.
-            (r#"(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account|security|two[-_ ]?step|two[-_ ]?factor|2fa|mfa)\b)[^.\r\n]{0,120}(?i:\b(?:code|passcode)\b)[^.\r\n]{0,80}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b"#, Secret, "OTP", High, 1, V::None),
-            (r#"(?i:\b(?:code|passcode)\b)[^.\r\n]{0,80}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b[^.\r\n]{0,120}(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account|security|two[-_ ]?step|two[-_ ]?factor|2fa|mfa)\b)"#, Secret, "OTP", High, 1, V::None),
-            (r#"(?i:\b(?:enter|use|input|type|paste)\b)[^.\r\n]{0,32}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b[^.\r\n]{0,120}(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account)\b)"#, Secret, "OTP", High, 1, V::None),
-            (r#"(?:ログイン|サインイン|認証|本人確認|二段階認証)[^\r\n]{0,120}([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})"#, Secret, "OTP", High, 1, V::None),
             // Context-keyed values in free text / shell logs. This is deliberately
             // not a raw "any key=value" detector: it fires only on a closed set of
             // credential-bearing nouns, and captures the value rather than the
@@ -572,66 +452,15 @@ impl RuleDetector {
 
 impl Detector for RuleDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
-        let s = view.text();
-        let mut out = Vec::new();
-        if let Some(exact) = &self.exact {
-            for i in exact.set.matches(s) {
-                let rule = &self.rules[exact.rules[i]];
-                for captures in rule.re.captures_iter(s) {
-                    if let Some(m) = captures.get(rule.capture) {
-                        push_match(view, rule, m.start(), m.end(), m.as_str(), &mut out);
-                    }
-                }
-            }
-        }
-        if let Some(prefiltered) = &self.prefiltered {
-            let mut seen = vec![false; self.rules.len()];
-            let mut candidates = Vec::new();
-            for m in prefiltered.ac.find_overlapping_iter(s) {
-                for &rule_index in &prefiltered.rules_by_pattern[m.pattern().as_usize()] {
-                    if !seen[rule_index] {
-                        seen[rule_index] = true;
-                        candidates.push(rule_index);
-                    }
-                }
-            }
-            for rule_index in candidates {
-                let rule = &self.rules[rule_index];
-                for captures in rule.re.captures_iter(s) {
-                    if let Some(m) = captures.get(rule.capture) {
-                        push_match(view, rule, m.start(), m.end(), m.as_str(), &mut out);
-                    }
-                }
-            }
-        }
-        out
+        self.inner.detect(view)
     }
-}
-
-fn push_match(
-    view: &NormalizedView,
-    rule: &Rule,
-    start: usize,
-    end: usize,
-    value: &str,
-    out: &mut Vec<Span>,
-) {
-    if value.is_empty() || !rule.validator.accepts(value) {
-        return;
-    }
-    out.push(Span {
-        range: view.to_raw(ByteRange::new(start, end)),
-        category: rule.category,
-        label: rule.label.clone(),
-        confidence: rule.confidence,
-        source: DetectorId::Rule,
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::detect::region;
+    use regex::Regex;
 
     // Small labelled recall corpus: each vendor secret must be detected under
     // the right label. Samples are split with concat! so the provider prefix and
@@ -740,8 +569,8 @@ mod tests {
     #[test]
     fn rule_labels_are_upper_snake() {
         let label_re = Regex::new(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$").unwrap();
-        for rule in &RuleDetector::builtin().rules {
-            assert!(label_re.is_match(&rule.label), "bad label: {}", rule.label);
+        for label in RuleDetector::builtin().labels() {
+            assert!(label_re.is_match(label), "bad label: {label}");
         }
     }
 
@@ -773,43 +602,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let has = |text: &str, label: &str| labels(text).iter().any(|got| got == label);
-        let values_for = |text: &str, label: &str| {
-            let reg = region(text);
-            let v = NormalizedView::build(&reg, text);
-            det.detect(&v)
-                .into_iter()
-                .filter(|sp| sp.label == label)
-                .map(|sp| text[sp.range.start..sp.range.end].to_string())
-                .collect::<Vec<_>>()
-        };
-        let has_value = |text: &str, label: &str, value: &str| {
-            values_for(text, label).iter().any(|v| v == value)
-        };
         assert!(has("password is summer-2026! for the demo", "KEYED_SECRET"));
         assert!(has("client_secret: tenant-7-trial", "KEYED_SECRET"));
         assert!(has("otp=100482 expires soon", "KEYED_SECRET"));
-        assert!(has("otp=100482 expires soon", "OTP"));
-        assert!(has("Your verification code is 837291.", "OTP"));
-        assert!(has("Use security code: 402118 to continue.", "OTP"));
-        assert!(has("認証コード: 483920 を入力してください", "OTP"));
-        assert!(has_value(
-            "Your verification code expires in 10 minutes: 837291.",
-            "OTP",
-            "837291"
-        ));
-        assert!(has_value(
-            "Your verification code expires in 10 minutes: 729004.",
-            "OTP",
-            "729004"
-        ));
-        assert!(has_value("Your sign-in code is 1234.", "OTP", "1234"));
-        assert!(has_value("Use AB12-CD to sign in.", "OTP", "AB12-CD"));
-        assert!(has_value("Enter 7QK4P on the login page.", "OTP", "7QK4P"));
-        assert!(has_value(
-            "サインインするには 7391 を入力してください",
-            "OTP",
-            "7391"
-        ));
         assert!(has(
             "k8s secret data api-key: abcDEF123456+/==",
             "KEYED_SECRET"
@@ -822,22 +617,6 @@ mod tests {
         assert!(!has(
             "port=5432 workers=4 timeout_ms=30000 status=200",
             "KEYED_SECRET"
-        ));
-        assert!(!has(
-            "order code 100482 remains a visible support detail",
-            "OTP"
-        ));
-        assert!(!has("Use SAVE10 to continue checkout", "OTP"));
-        assert!(!has("Order code AB12-CD ships tomorrow", "OTP"));
-        assert!(!has_value(
-            "Enter 7QK4P on the login page. Order code AB12-CD ships tomorrow.",
-            "OTP",
-            "AB12-CD"
-        ));
-        assert!(!has_value(
-            "Login page loaded. Order code 1234 ships tomorrow.",
-            "OTP",
-            "1234"
         ));
         assert!(!has("jwt_like=aaa.bbb.ccc css=#aabbcc", "SESSION_TOKEN"));
         assert!(!has("story=SEC-100482 estimate=8", "CASE_IDENTIFIER"));
