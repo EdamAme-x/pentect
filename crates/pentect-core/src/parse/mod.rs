@@ -33,6 +33,14 @@ impl Parser for JsonParser {
     }
 }
 
+pub struct ToolResultParser;
+
+impl Parser for ToolResultParser {
+    fn parse(&self, raw: &str) -> Option<Vec<Region>> {
+        json::parse_tool_result_regions(raw)
+    }
+}
+
 /// Parses a HAR (HTTP Archive, which is JSON) into value regions, tagging
 /// header/cookie/query-string values with their field name so key-anchored
 /// detection fires on Authorization/Cookie/etc. Masks only string values, so the

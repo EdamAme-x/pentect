@@ -48,6 +48,7 @@ impl ByteRange {
 pub enum Kind {
     Text,
     Json,
+    ToolResult,
     Env,
     Har,
     Curl,
@@ -103,6 +104,7 @@ pub enum Confidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegionKind {
     PlainText,
+    JsonKey,
     JsonValue,
     Header,
     Cookie,

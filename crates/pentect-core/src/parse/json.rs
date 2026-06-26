@@ -11,10 +11,19 @@ use crate::model::*;
 const MAX_DEPTH: usize = 128;
 
 pub fn parse_json_regions(raw: &str) -> Option<Vec<Region>> {
+    parse_json_regions_with(raw, JsonRegionMode::Json)
+}
+
+pub fn parse_tool_result_regions(raw: &str) -> Option<Vec<Region>> {
+    parse_json_regions_with(raw, JsonRegionMode::ToolResult)
+}
+
+fn parse_json_regions_with(raw: &str, mode: JsonRegionMode) -> Option<Vec<Region>> {
     let mut p = Parser {
         b: raw.as_bytes(),
         i: 0,
         out: Vec::new(),
+        mode,
     };
     p.skip_ws();
     p.value(None, 0)?;
@@ -25,10 +34,17 @@ pub fn parse_json_regions(raw: &str) -> Option<Vec<Region>> {
     Some(p.out)
 }
 
+#[derive(Clone, Copy)]
+enum JsonRegionMode {
+    Json,
+    ToolResult,
+}
+
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
     out: Vec<Region>,
+    mode: JsonRegionMode,
 }
 
 impl Parser<'_> {
@@ -58,7 +74,7 @@ impl Parser<'_> {
                         path: None,
                         key,
                         kind: RegionKind::JsonValue,
-                        format: Kind::Json,
+                        format: self.format(),
                     },
                 });
                 Some(())
@@ -82,7 +98,18 @@ impl Parser<'_> {
             if self.peek() != Some(b'"') {
                 return None;
             }
-            let (_, key) = self.string()?;
+            let (key_range, key) = self.string()?;
+            if matches!(self.mode, JsonRegionMode::ToolResult) {
+                self.out.push(Region {
+                    span: key_range,
+                    ctx: Context {
+                        path: None,
+                        key: None,
+                        kind: RegionKind::JsonKey,
+                        format: self.format(),
+                    },
+                });
+            }
             self.skip_ws();
             if self.peek() != Some(b':') {
                 return None;
@@ -173,6 +200,13 @@ impl Parser<'_> {
             Some(())
         }
     }
+
+    fn format(&self) -> Kind {
+        match self.mode {
+            JsonRegionMode::Json => Kind::Json,
+            JsonRegionMode::ToolResult => Kind::ToolResult,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +224,31 @@ mod tests {
         assert_eq!(
             got,
             [(Some("a"), "x"), (Some("b"), "y"), (Some("arr"), "z")]
+        );
+    }
+
+    #[test]
+    fn tool_result_extracts_keys_and_string_values() {
+        let raw = r#"{"sk-ABCDEFGHIJKLMNOPQRSTUVWX":{"password":"hunter2"},"ok":1}"#;
+        let regions = parse_tool_result_regions(raw).unwrap();
+        let got: Vec<(RegionKind, Option<&str>, &str)> = regions
+            .iter()
+            .map(|r| {
+                (
+                    r.ctx.kind,
+                    r.ctx.key.as_deref(),
+                    &raw[r.span.start..r.span.end],
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (RegionKind::JsonKey, None, "sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+                (RegionKind::JsonKey, None, "password"),
+                (RegionKind::JsonValue, Some("password"), "hunter2"),
+                (RegionKind::JsonKey, None, "ok"),
+            ]
         );
     }
 

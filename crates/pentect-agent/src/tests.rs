@@ -855,14 +855,64 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
     );
     assert!(
         env.iter()
-            .any(|(name, value)| name == "PASSWORD" && value == "hunter2\nsecond-line"),
+            .any(|(name, value)| name.starts_with("PENTECT_PASSWORD_")
+                && value == "hunter2\nsecond-line"),
         "{env:?}"
     );
     assert!(
         env.iter()
-            .any(|(name, value)| name == "OTP" && value == "100482"),
+            .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == "100482"),
         "{env:?}"
     );
+    assert!(updated.is_object(), "{updated}");
+    assert!(updated["structuredContent"]["otp"].is_string(), "{updated}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
+    let (root, session) = empty_session("hook-post-mcp-env-use");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__browser__create_api_key",
+        "tool_response": {
+            "structuredContent": {
+                "apiKey": raw
+            }
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert!(!rendered.contains(raw), "{rendered}");
+    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+
+    let store = RecoveryStore::load(&session).unwrap();
+    let env = store.auto_env_bindings().unwrap();
+    let env_name = env
+        .iter()
+        .find_map(|(name, value)| {
+            (name.starts_with("PENTECT_OPENAI_API_KEY_") && value == raw).then(|| name.clone())
+        })
+        .unwrap_or_else(|| panic!("missing PENTECT env binding in {env:?}"));
+    let command = if cfg!(windows) {
+        format!("Write-Output $env:{env_name}")
+    } else {
+        format!("printf '%s' \"${env_name}\"")
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        approve: false,
+        mode: ExecMode::Shell(command),
+    };
+    let output = run_resolved_command(&store, &opts).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(raw), "{stdout}");
+
+    let safe = mask_tool_output(&session, &stdout).unwrap();
+    assert!(!safe.contains(raw), "{safe}");
+    assert!(safe.contains("<<OPENAI_API_KEY_"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 

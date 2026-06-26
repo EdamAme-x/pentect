@@ -197,6 +197,25 @@ impl Engine {
         result
     }
 
+    /// Mask a single adapter-supplied region with explicit structural context.
+    /// This is for adapters that already decoded an outer container (for example
+    /// serde_json `Value`) and need the core detectors/policy/rendering to handle
+    /// each scalar without reparsing or breaking the container's syntax.
+    pub fn mask_context(&self, data: String, ctx: Context, config: &Config) -> MaskResult {
+        let protected = scan_placeholders(&data);
+        self.mask_ir(
+            Ir {
+                regions: vec![Region {
+                    span: ByteRange::new(0, data.len()),
+                    ctx,
+                }],
+                raw: data,
+                protected,
+            },
+            config,
+        )
+    }
+
     /// An adapter can build the same `Ir` and call this directly.
     pub fn mask_ir(&self, ir: Ir, config: &Config) -> MaskResult {
         // Detect to a bounded fixpoint. When a found span sits against an
@@ -1592,6 +1611,40 @@ mod tests {
             .mask(Input::text(raw), &Config::insecure_testing());
         assert!(!r.masked.contains("Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh"));
         assert!(r.masked.contains("<<LIKELY_SECRET_"), "{}", r.masked);
+    }
+
+    #[test]
+    fn mask_context_uses_tool_result_value_context_without_masking_key_names() {
+        let engine = Engine::builder()
+            .standard_stack(Profile::Strict.knobs())
+            .detector(Box::new(crate::detect::SensitiveKeyDetector))
+            .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
+            .guard(Box::new(ShapeGuard::builtin()))
+            .build();
+        let cfg = Config::insecure_testing();
+        let value = engine.mask_context(
+            "hunter2".to_string(),
+            Context {
+                path: Some("structured.password".to_string()),
+                key: Some("password".to_string()),
+                kind: RegionKind::JsonValue,
+                format: Kind::ToolResult,
+            },
+            &cfg,
+        );
+        assert!(value.masked.contains("<<PASSWORD_"), "{}", value.masked);
+
+        let key = engine.mask_context(
+            "password".to_string(),
+            Context {
+                path: Some("structured.password".to_string()),
+                key: None,
+                kind: RegionKind::JsonKey,
+                format: Kind::ToolResult,
+            },
+            &cfg,
+        );
+        assert_eq!(key.masked, "password");
     }
 
     #[test]

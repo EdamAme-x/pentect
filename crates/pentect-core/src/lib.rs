@@ -35,11 +35,11 @@ pub use codec::Codec;
 pub use detect::SemanticDetector;
 pub use detect::{
     CardDetector, DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, RuleSpec,
-    StructuralDetector,
+    SensitiveKeyDetector, StructuralDetector,
 };
-pub use model::{ByteRange, Category, Confidence, Input, Kind, Span};
+pub use model::{ByteRange, Category, Confidence, Context, Input, Kind, RegionKind, Span};
 pub use pack::{load_pack, Pack};
-pub use parse::{EnvParser, HarParser, JsonParser, Parser, TextParser};
+pub use parse::{EnvParser, HarParser, JsonParser, Parser, TextParser, ToolResultParser};
 pub use pipeline::{
     Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote, Summary,
 };

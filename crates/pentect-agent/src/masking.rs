@@ -2,7 +2,10 @@ use crate::session::RecoveryStore;
 #[cfg(test)]
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
-use pentect_core::{Config, Engine, Input, Kind, Profile, Recovery};
+use pentect_core::{
+    Config, Context, Engine, Input, Kind, MaskResult, Profile, ProfilePolicy, Recovery, RegionKind,
+    SensitiveKeyDetector, ShapeGuard, ToolResultParser,
+};
 use std::collections::HashMap;
 
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
@@ -24,7 +27,7 @@ impl OutputMasker {
         let key = store.session.key;
         Self {
             store,
-            engine: Engine::with_profile(Profile::Strict),
+            engine: tool_boundary_engine(),
             mode: OutputMaskerMode::Shared,
             pending: Recovery::empty_for_key(&key),
         }
@@ -35,7 +38,7 @@ impl OutputMasker {
         let remask_recoveries = store.snapshot()?;
         Ok(Self {
             store,
-            engine: Engine::with_profile(Profile::Strict),
+            engine: tool_boundary_engine(),
             mode: OutputMaskerMode::Deferred { remask_recoveries },
             pending: Recovery::empty_for_key(&key),
         })
@@ -62,7 +65,7 @@ impl OutputMasker {
     pub(crate) fn mask_text(&mut self, text: &str, kind: Kind) -> Result<String, String> {
         let redacted = redact_env_derivative_lines(text);
         let remasked = self.remask_all(&redacted)?;
-        let needs_text_pass = kind != Kind::Text;
+        let needs_text_pass = !matches!(kind, Kind::Text | Kind::ToolResult);
         let cfg = Config {
             disclose_length: true,
             ..Config::new(self.store.session.key)
@@ -92,30 +95,38 @@ impl OutputMasker {
         Ok(masked)
     }
 
-    pub(crate) fn mask_sensitive_value(
+    pub(crate) fn mask_tool_result_scalar(
         &mut self,
-        env_name: &str,
-        value: &str,
+        text: &str,
+        region_kind: RegionKind,
+        key: Option<&str>,
+        path: Option<&str>,
     ) -> Result<String, String> {
-        let masked = self.mask_tool_output(value)?;
-        if masked != value {
-            let alias_line = format!("{env_name}={masked}");
-            self.record_recovery(env_alias_recovery(&alias_line, &self.store.session.key))?;
-            return Ok(masked);
-        }
+        let redacted = redact_env_derivative_lines(text);
+        let remasked = self.remask_all(&redacted)?;
+        let cfg = Config {
+            disclose_length: true,
+            ..Config::new(self.store.session.key)
+        };
+        let result = self.engine.mask_context(
+            remasked,
+            Context {
+                path: path.map(str::to_string),
+                key: key.map(str::to_string),
+                kind: region_kind,
+                format: Kind::ToolResult,
+            },
+            &cfg,
+        );
+        self.record_mask_result(result)
+    }
 
-        let label = forced_label(env_name);
-        let hash = identity_hash(&self.store.session.key, &format!("{label}\0{value}"));
-        let placeholder = render_placeholder(&label, &hash, None);
-        let mut map = HashMap::new();
-        map.insert(placeholder.clone(), value.to_string());
-        let mut recovery = Recovery::seal(map, &self.store.session.key);
-        recovery.extend_same_key(env_alias_recovery(
-            &format!("{env_name}={placeholder}"),
-            &self.store.session.key,
-        ));
+    fn record_mask_result(&mut self, result: MaskResult) -> Result<String, String> {
+        let masked = result.masked;
+        let mut recovery = result.recovery;
+        recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
         self.record_recovery(recovery)?;
-        Ok(placeholder)
+        Ok(masked)
     }
 
     fn record_recovery(&mut self, recovery: Recovery) -> Result<(), String> {
@@ -143,21 +154,14 @@ impl OutputMasker {
     }
 }
 
-fn forced_label(env_name: &str) -> String {
-    let mut out = String::new();
-    for ch in env_name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_uppercase());
-        } else if !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    let out = out.trim_matches('_').to_string();
-    if out.is_empty() || out.as_bytes()[0].is_ascii_digit() {
-        "SECRET".to_string()
-    } else {
-        out
-    }
+fn tool_boundary_engine() -> Engine {
+    Engine::builder()
+        .standard_stack(Profile::Strict.knobs())
+        .parser(Kind::ToolResult, Box::new(ToolResultParser))
+        .detector(Box::new(SensitiveKeyDetector))
+        .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
+        .guard(Box::new(ShapeGuard::builtin()))
+        .build()
 }
 
 #[cfg(test)]

@@ -23,6 +23,11 @@ pub struct StructuralDetector;
 /// secret without key-name guessing.
 pub struct EnvValueDetector;
 
+/// Opt-in detector for agent/tool-result adapters. It uses explicit structural
+/// key context supplied by a parser and emits spans only; rendering and recovery
+/// remain the pipeline's job.
+pub struct SensitiveKeyDetector;
+
 impl Detector for StructuralDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let region = view.region;
@@ -72,6 +77,98 @@ impl Detector for EnvValueDetector {
     }
 }
 
+impl Detector for SensitiveKeyDetector {
+    fn detect(&self, view: &NormalizedView) -> Vec<Span> {
+        let region = view.region;
+        if region.span.is_empty() || is_benign_value(view.text()) {
+            return vec![];
+        }
+        if region.ctx.kind != RegionKind::JsonValue {
+            return vec![];
+        }
+        let Some(label) = sensitive_context_label(&region.ctx) else {
+            return vec![];
+        };
+        vec![Span {
+            range: region.span,
+            category: Category::Secret,
+            label,
+            confidence: Confidence::High,
+            source: DetectorId::Structural,
+        }]
+    }
+}
+
+fn sensitive_context_label(ctx: &Context) -> Option<String> {
+    if let Some(key) = ctx.key.as_deref().filter(|key| is_sensitive_key_name(key)) {
+        return Some(forced_label(key));
+    }
+    let path = ctx.path.as_deref()?;
+    path.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .find(|segment| is_sensitive_key_name(segment))
+        .map(forced_label)
+}
+
+fn is_sensitive_key_name(key: &str) -> bool {
+    let name = normalize_key(key);
+    name == "key"
+        || name == "auth"
+        || name == "authorization"
+        || name.contains("auth_")
+        || name.contains("_auth")
+        || name.contains("authorization")
+        || [
+            "api_key",
+            "apikey",
+            "access_key",
+            "secret",
+            "token",
+            "password",
+            "passwd",
+            "passcode",
+            "private",
+            "credential",
+            "otp",
+            "totp",
+            "mfa",
+            "session",
+            "cookie",
+            "jwt",
+            "bearer",
+        ]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn forced_label(key: &str) -> String {
+    let mut out = String::new();
+    for ch in key.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() || out.as_bytes()[0].is_ascii_digit() {
+        labels::SECRET.to_string()
+    } else {
+        out
+    }
+}
+
+fn normalize_key(key: &str) -> String {
+    let mut out = String::new();
+    for ch in key.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
 /// Values that are never secrets even in a sensitive position: empty, JSON
 /// literals, or an already-rendered placeholder (idempotency).
 fn is_benign_value(v: &str) -> bool {
@@ -117,6 +214,32 @@ mod tests {
         !EnvValueDetector
             .detect(&NormalizedView::build(&region, &raw))
             .is_empty()
+    }
+
+    fn sensitive_key_fires(key: Option<&str>, value: &str) -> Option<String> {
+        sensitive_key_fires_with_path(None, key, value)
+    }
+
+    fn sensitive_key_fires_with_path(
+        path: Option<&str>,
+        key: Option<&str>,
+        value: &str,
+    ) -> Option<String> {
+        let raw = value.to_string();
+        let region = Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: Context {
+                path: path.map(str::to_string),
+                key: key.map(str::to_string),
+                kind: RegionKind::JsonValue,
+                format: Kind::ToolResult,
+            },
+        };
+        SensitiveKeyDetector
+            .detect(&NormalizedView::build(&region, &raw))
+            .into_iter()
+            .next()
+            .map(|span| span.label)
     }
 
     #[test]
@@ -171,6 +294,24 @@ mod tests {
         assert!(env_fires(Some("USERNAME"), "alice"));
         assert!(env_fires(Some("FLAG"), "false"));
         assert!(!env_fires(Some("USERNAME"), "<<SECRET_0123456789abcdef>>"));
+    }
+
+    #[test]
+    fn sensitive_key_detector_is_opt_in_key_context() {
+        assert_eq!(
+            sensitive_key_fires(Some("password"), "hunter2"),
+            Some("PASSWORD".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("otp"), "100482"),
+            Some("OTP".to_string())
+        );
+        assert_eq!(sensitive_key_fires(Some("note"), "hello"), None);
+        assert_eq!(sensitive_key_fires(None, "hunter2"), None);
+        assert_eq!(
+            sensitive_key_fires_with_path(Some("structured.credentials.id"), Some("id"), "abc123"),
+            Some("CREDENTIALS".to_string())
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use masking::{
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
-use pentect_core::{Config, Engine, Input, Kind, Profile};
+use pentect_core::{Config, Engine, Input, Kind, Profile, RegionKind};
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
 use sha2::{Digest, Sha256};
@@ -2234,17 +2234,38 @@ fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
 }
 
 fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bool), String> {
+    mask_tool_json_with_context(value, None, None, masker)
+}
+
+fn mask_tool_json_with_context(
+    value: &Value,
+    key: Option<&str>,
+    path: Option<&str>,
+    masker: &mut OutputMasker,
+) -> Result<(Value, bool), String> {
     match value {
         Value::String(text) => {
-            let out = masker.mask_tool_output(text)?;
+            let out = masker.mask_tool_result_scalar(text, RegionKind::JsonValue, key, path)?;
             let changed = out != *text;
             Ok((Value::String(out), changed))
         }
+        Value::Number(_) | Value::Bool(_) => {
+            let raw = value.to_string();
+            let out = masker.mask_tool_result_scalar(&raw, RegionKind::JsonValue, key, path)?;
+            if out == raw {
+                Ok((value.clone(), false))
+            } else {
+                Ok((Value::String(out), true))
+            }
+        }
+        Value::Null => Ok((Value::Null, false)),
         Value::Array(items) => {
             let mut changed = false;
             let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                let (item, item_changed) = mask_tool_json(item, masker)?;
+            for (index, item) in items.iter().enumerate() {
+                let child_path = path_with_segment(path, &index.to_string());
+                let (item, item_changed) =
+                    mask_tool_json_with_context(item, key, Some(&child_path), masker)?;
                 changed |= item_changed;
                 out.push(item);
             }
@@ -2253,89 +2274,30 @@ fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bo
         Value::Object(map) => {
             let mut changed = false;
             let mut out = serde_json::Map::with_capacity(map.len());
-            for (key, value) in map {
-                let masked_key = masker.mask_tool_output(key)?;
-                changed |= masked_key != *key;
-                let (value, value_changed) = if is_sensitive_structured_key(key) {
-                    mask_sensitive_structured_value(key, value, masker)?
-                } else {
-                    mask_tool_json(value, masker)?
-                };
-                changed |= value_changed;
-                out.insert(masked_key, value);
+            for (object_key, item) in map {
+                let child_path = path_with_segment(path, object_key);
+                let masked_key = masker.mask_tool_result_scalar(
+                    object_key,
+                    RegionKind::JsonKey,
+                    None,
+                    Some(&child_path),
+                )?;
+                changed |= masked_key != *object_key;
+                let (item, item_changed) =
+                    mask_tool_json_with_context(item, Some(object_key), Some(&child_path), masker)?;
+                changed |= item_changed;
+                out.insert(masked_key, item);
             }
             Ok((Value::Object(out), changed))
         }
-        other => Ok((other.clone(), false)),
     }
 }
 
-fn mask_sensitive_structured_value(
-    key: &str,
-    value: &Value,
-    masker: &mut OutputMasker,
-) -> Result<(Value, bool), String> {
-    match value {
-        Value::Null => Ok((Value::Null, false)),
-        Value::String(text) => {
-            let masked = mask_sensitive_scalar_for_key(key, text, masker)?;
-            Ok((Value::String(masked.clone()), masked != *text))
-        }
-        Value::Number(_) | Value::Bool(_) => {
-            let raw = value.to_string();
-            let masked = mask_sensitive_scalar_for_key(key, &raw, masker)?;
-            Ok((Value::String(masked.clone()), masked != raw))
-        }
-        Value::Array(_) | Value::Object(_) => {
-            let raw = serde_json::to_string(value)
-                .map_err(|e| format!("could not serialize sensitive structured value: {e}"))?;
-            let masked = mask_sensitive_scalar_for_key(key, &raw, masker)?;
-            Ok((Value::String(masked.clone()), masked != raw))
-        }
+fn path_with_segment(parent: Option<&str>, segment: &str) -> String {
+    match parent {
+        Some(parent) if !parent.is_empty() => format!("{parent}.{segment}"),
+        _ => segment.to_string(),
     }
-}
-
-fn mask_sensitive_scalar_for_key(
-    key: &str,
-    raw: &str,
-    masker: &mut OutputMasker,
-) -> Result<String, String> {
-    let assignment_key = structured_env_key(key);
-    masker.mask_sensitive_value(&assignment_key, raw)
-}
-
-fn structured_env_key(key: &str) -> String {
-    let mut out = String::new();
-    for ch in key.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_uppercase());
-        } else if !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    let out = out.trim_matches('_').to_string();
-    if out.is_empty() || out.as_bytes()[0].is_ascii_digit() {
-        format!("SECRET_{out}")
-    } else {
-        out
-    }
-}
-
-fn is_sensitive_structured_key(key: &str) -> bool {
-    let normalized = normalize_structured_key(key);
-    normalized == "key" || is_sensitive_env_name(&normalized)
-}
-
-fn normalize_structured_key(key: &str) -> String {
-    let mut out = String::new();
-    for ch in key.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    out.trim_matches('_').to_string()
 }
 
 fn stringify_tool_output(value: &Value) -> String {

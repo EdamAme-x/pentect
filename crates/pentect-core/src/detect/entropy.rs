@@ -41,7 +41,21 @@ impl Detector for EntropyDetector {
         let text = view.text();
         let mut out = Vec::new();
         for (start, end) in token_runs(text) {
-            let run = &text.as_bytes()[start..end];
+            let run = &text[start..end];
+            if let Some(value_start) = assignment_value_offset(run) {
+                let value = &run.as_bytes()[value_start..];
+                if value.len() >= self.min_len && shannon(value) >= self.threshold {
+                    out.push(Span {
+                        range: view.to_raw(ByteRange::new(start + value_start, end)),
+                        category: Category::Secret,
+                        label: labels::LIKELY_SECRET.to_string(),
+                        confidence: Confidence::Low,
+                        source: DetectorId::Entropy,
+                    });
+                }
+                continue;
+            }
+            let run = run.as_bytes();
             if run.len() >= self.min_len && shannon(run) >= self.threshold {
                 out.push(Span {
                     range: view.to_raw(ByteRange::new(start, end)),
@@ -54,6 +68,40 @@ impl Detector for EntropyDetector {
         }
         out
     }
+}
+
+fn assignment_value_offset(run: &str) -> Option<usize> {
+    let eq = run.find('=')?;
+    let key = &run[..eq];
+    let value = &run[eq + 1..];
+    if key.is_empty()
+        || value.is_empty()
+        || value.starts_with('=')
+        || key.as_bytes()[0].is_ascii_digit()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return None;
+    }
+    let lower = key.to_ascii_lowercase();
+    let assignment_like = key.bytes().any(|b| matches!(b, b'_' | b'.' | b'-'))
+        || key.bytes().all(|b| !b.is_ascii_lowercase())
+        || [
+            "api_key",
+            "apikey",
+            "key",
+            "secret",
+            "token",
+            "password",
+            "auth",
+            "credential",
+            "session",
+            "cookie",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    assignment_like.then_some(eq + 1)
 }
 
 fn shannon(bytes: &[u8]) -> f64 {
@@ -98,5 +146,18 @@ mod tests {
         let reg = region(raw);
         let v = NormalizedView::build(&reg, raw);
         assert!(EntropyDetector::with(8, 1.0).detect(&v).is_empty());
+    }
+
+    #[test]
+    fn assignment_entropy_masks_value_not_key_prefix() {
+        let raw = "RUNPOD_API_KEY=ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+        let reg = region(raw);
+        let v = NormalizedView::build(&reg, raw);
+        let spans = EntropyDetector::with(16, 2.0).detect(&v);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(
+            &raw[spans[0].range.start..spans[0].range.end],
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"
+        );
     }
 }
