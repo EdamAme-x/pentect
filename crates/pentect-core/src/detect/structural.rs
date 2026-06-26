@@ -115,6 +115,9 @@ fn sensitive_context_label(ctx: &Context) -> Option<String> {
 
 fn is_sensitive_key_name(key: &str) -> bool {
     let name = normalize_key(key);
+    if is_explicitly_non_sensitive_key(&name) {
+        return false;
+    }
     name == "key"
         || name == "auth"
         || name == "authorization"
@@ -153,6 +156,16 @@ fn is_sensitive_key_name(key: &str) -> bool {
         ]
         .iter()
         .any(|needle| name.contains(needle))
+}
+
+fn is_explicitly_non_sensitive_key(name: &str) -> bool {
+    name == "nonsecret"
+        || name == "non_secret"
+        || name == "notsecret"
+        || name == "not_secret"
+        || name == "public"
+        || name.starts_with("public_")
+        || name.ends_with("_public")
 }
 
 fn sensitive_label_for_key(key: &str) -> String {
@@ -381,6 +394,14 @@ mod tests {
         assert_eq!(
             sensitive_key_fires_with_context(None, Some("value"), &["One-time passcode"], "100482"),
             Some("OTP".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("nonSecret"), "invoice INV-100482"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("public_token_label"), "visible docs"),
+            None
         );
     }
 

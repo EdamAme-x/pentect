@@ -16,6 +16,8 @@ pub mod labels {
     pub const SECRET: &str = "SECRET";
     /// One-time password or verification code.
     pub const OTP: &str = "OTP";
+    /// BIP-39 wallet recovery phrase.
+    pub const BIP39_MNEMONIC: &str = "BIP39_MNEMONIC";
     /// Body of a PEM private-key block.
     pub const PRIVATE_KEY: &str = "PRIVATE_KEY";
 }

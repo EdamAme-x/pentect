@@ -34,8 +34,8 @@ pub use codec::Codec;
 #[cfg(feature = "semantic")]
 pub use detect::SemanticDetector;
 pub use detect::{
-    CardDetector, DecodeDetector, Detector, EntropyDetector, PemDetector, RuleDetector, RuleSpec,
-    SensitiveKeyDetector, StructuralDetector,
+    Bip39Detector, CardDetector, DecodeDetector, Detector, EntropyDetector, PemDetector,
+    RuleDetector, RuleSpec, SensitiveKeyDetector, StructuralDetector,
 };
 pub use model::{ByteRange, Category, Confidence, Context, Input, Kind, RegionKind, Span};
 pub use pack::{load_pack, Pack};

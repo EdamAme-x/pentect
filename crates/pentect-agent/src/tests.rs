@@ -1073,6 +1073,143 @@ fn browser_structured_otp_fields_mask_without_locking_to_email_format() {
 }
 
 #[test]
+fn gmail_like_rows_mask_otp_without_label_value_context() {
+    let (root, session) = empty_session("hook-post-gmail-row-otp");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__chrome__snapshot",
+        "tool_response": {
+            "content": [{
+                "type": "text",
+                "text": concat!(
+                    "Gmail row snapshot\n",
+                    "tr role=row aria-labelledby=:2c class='zA zE s00Hgd'\n",
+                    "td class='yX xY ulKHrd' text='Service Alerts'\n",
+                    "td class='xY a4W' text='New sign-in - Your verification code expires in 10 minutes: 837291.'\n",
+                    "td class='xY a4W' text='Use AB12-CD to sign in from this browser.'\n",
+                    "td class='xW xY' text='8:42 AM'\n",
+                    "Order code ORD-100482 and invoice INV-100482 remain visible.\n"
+                )
+            }],
+            "structuredContent": {
+                "rows": [{
+                    "tag": "TR",
+                    "role": "row",
+                    "ariaLabelledBy": ":2c :2d :2e",
+                    "className": "zA zE s00Hgd",
+                    "cells": [
+                        {"tag": "TD", "className": "PF xY", "text": ""},
+                        {"tag": "TD", "className": "yX xY ulKHrd", "text": "Service Alerts"},
+                        {"tag": "TD", "className": "xY a4W", "text": "New sign-in - Your verification code expires in 10 minutes: 837291."},
+                        {"tag": "TD", "className": "xY a4W", "text": "Your sign-in code is 1234."},
+                        {"tag": "TD", "className": "xY a4W", "text": "Enter 7QK4P on the login page."},
+                        {"tag": "TD", "className": "xW xY", "text": "8:42 AM"}
+                    ]
+                }],
+                "messageHtml": concat!(
+                    "<div class=\"ii gt\"><div class=\"a3s aiL\">",
+                    "<table><tr><td>Your verification code expires in 10 minutes.</td>",
+                    "<td><span>729004</span></td></tr></table>",
+                    "</div></div>"
+                ),
+                "visibleText": concat!(
+                    "確認コードは5分後に期限切れです: 483920\n",
+                    "サインインするには 7391 を入力してください\n",
+                    "Support ticket SUP-100482 remains visible.\n",
+                    "Use SAVE10 to continue checkout.\n",
+                    "Order code GH56-JK ships tomorrow."
+                )
+            }
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    for secret in [
+        "837291", "AB12-CD", "1234", "7QK4P", "729004", "483920", "7391",
+    ] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    assert!(rendered.contains("<<OTP_"), "{rendered}");
+    assert!(rendered.contains("role=row"), "{rendered}");
+    assert!(rendered.contains("xY a4W"), "{rendered}");
+    assert!(rendered.contains("expires in 10 minutes"), "{rendered}");
+    assert!(rendered.contains("ORD-100482"), "{rendered}");
+    assert!(rendered.contains("INV-100482"), "{rendered}");
+    assert!(rendered.contains("SUP-100482"), "{rendered}");
+    assert!(rendered.contains("SAVE10"), "{rendered}");
+    assert!(rendered.contains("GH56-JK"), "{rendered}");
+
+    let env = RecoveryStore::load(&session)
+        .unwrap()
+        .auto_env_bindings()
+        .unwrap();
+    for secret in [
+        "837291", "AB12-CD", "1234", "7QK4P", "729004", "483920", "7391",
+    ] {
+        assert!(
+            env.iter()
+                .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
+            "{env:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn browser_wallet_seed_phrase_masks_plain_numbered_and_html_shapes() {
+    let (root, session) = empty_session("hook-post-browser-seed-phrase");
+    let phrase = concat!(
+        "abandon abandon abandon abandon abandon abandon ",
+        "abandon abandon abandon abandon abandon about"
+    );
+    let numbered = concat!(
+        "1. abandon\n2. abandon\n3. abandon\n4. abandon\n",
+        "5. abandon\n6. abandon\n7. abandon\n8. abandon\n",
+        "9. abandon\n10. abandon\n11. abandon\n12. about"
+    );
+    let html_list = concat!(
+        "<ol><li>abandon</li><li>abandon</li><li>abandon</li><li>abandon</li>",
+        "<li>abandon</li><li>abandon</li><li>abandon</li><li>abandon</li>",
+        "<li>abandon</li><li>abandon</li><li>abandon</li><li>about</li></ol>"
+    );
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__chrome__snapshot",
+        "tool_response": {
+            "content": [{
+                "type": "text",
+                "text": format!("Wallet setup page\nRecovery phrase:\n{phrase}")
+            }],
+            "structuredContent": {
+                "visibleText": numbered,
+                "html": html_list,
+                "nonSecret": "invoice INV-100482 and checkout code SAVE10 remain visible"
+            }
+        }
+    });
+
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert!(!rendered.contains(phrase), "{rendered}");
+    assert!(!rendered.contains("abandon abandon abandon"), "{rendered}");
+    assert!(!rendered.contains("<li>abandon</li>"), "{rendered}");
+    assert!(rendered.contains("<<BIP39_MNEMONIC_"), "{rendered}");
+    assert!(rendered.contains("INV-100482"), "{rendered}");
+    assert!(rendered.contains("SAVE10"), "{rendered}");
+
+    let env = RecoveryStore::load(&session)
+        .unwrap()
+        .auto_env_bindings()
+        .unwrap();
+    assert!(
+        env.iter()
+            .any(|(name, value)| name.starts_with("PENTECT_BIP39_MNEMONIC_") && value == phrase),
+        "{env:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn posttool_masks_secret_object_keys() {
     let (root, session) = empty_session("hook-post-secret-key");
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";

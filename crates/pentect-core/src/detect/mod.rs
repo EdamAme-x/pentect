@@ -1,6 +1,7 @@
 use crate::model::Span;
 use crate::normalize::NormalizedView;
 
+mod bip39;
 mod card;
 mod date;
 mod decode;
@@ -14,6 +15,7 @@ mod structural;
 mod util;
 mod validate;
 
+pub use bip39::Bip39Detector;
 pub use card::CardDetector;
 pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
