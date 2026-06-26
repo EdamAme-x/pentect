@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Evaluate Pentect on ai4privacy-style PII masking exports.
+"""Evaluate Pentect on ai4privacy/OpenPII-style PII masking exports.
 
-This runner consumes external JSON, JSONL, or CSV rows. It does not contain a
-local fixture corpus. It expects ai4privacy-style fields:
+This runner consumes external JSON, JSONL, or CSV rows, or downloads the public
+OpenPII Nano fixture from Hugging Face. It expects ai4privacy/OpenPII fields:
 
   - source_text: original text
   - privacy_mask: list of {value,start,end,label}, often encoded as a string
   - span_labels: fallback list of [start,end,label]
 
-The metric is detection-only recall: a labeled value is counted as concealed if
-the raw value is absent from Pentect's masked output. Pentect does not emit
-ai4privacy label names, so this runner intentionally does not score type
-accuracy.
+The metric is annotation-level recall. Each annotated value is a positive
+candidate:
+
+  - value disappears from Pentect output => true positive
+  - value remains in Pentect output      => false negative
+
+OpenPII does not provide negative candidate labels, so false positives and true
+negatives are not scored here. Use tools/eval_secretbench.py for a benchmark
+with both positive and negative secret candidates.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import json
 import re
 import subprocess
 import sys
+import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,25 +42,32 @@ CORE_STRUCTURED_LABELS = {
     "CREDITCARD",
     "CREDIT_CARD",
     "CREDIT_CARD_NUMBER",
+    "CREDITCARDNUMBER",
     "DRIVERLICENSE",
     "DRIVER_LICENSE",
+    "DRIVERLICENSENUM",
     "EMAIL",
     "IBAN",
     "IBAN_CODE",
+    "IDCARDNUM",
     "IP",
     "IPV4",
     "IPV6",
     "MAC",
     "PASSPORT",
+    "PASSPORTNUM",
     "PHONENUMBER",
     "PHONE_NUMBER",
+    "SOCIALNUM",
     "SOCIALNUMBER",
     "SOCIAL_SECURITY_NUMBER",
     "SSN",
     "SWIFT",
     "TAXNUMBER",
     "TAX_ID",
+    "TAXNUM",
     "TEL",
+    "TELEPHONENUM",
     "URL",
     "USERNAME",
     "VAT",
@@ -77,6 +90,13 @@ SEMANTIC_LABELS = {
     "STATE",
     "TIME",
     "TITLE",
+    "ZIPCODE",
+}
+
+
+DOWNLOADS = {
+    "openpii-nano-validation": "https://huggingface.co/datasets/ai4privacy/openpii-masking-nano-1k/resolve/main/data/validation.jsonl",
+    "openpii-nano-train": "https://huggingface.co/datasets/ai4privacy/openpii-masking-nano-1k/resolve/main/data/train.jsonl",
 }
 
 
@@ -91,7 +111,8 @@ class Annotation:
 
 def main() -> int:
     args = parse_args()
-    rows = list(read_rows(args.data))
+    data = resolve_data_path(args)
+    rows = list(read_rows(data))
     if args.limit:
         rows = rows[: args.limit]
     if not rows:
@@ -115,7 +136,23 @@ def main() -> int:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("data", type=Path, help="ai4privacy export: .jsonl, .json, or .csv")
+    p.add_argument(
+        "data",
+        nargs="?",
+        type=Path,
+        help="ai4privacy/OpenPII export: .jsonl, .json, or .csv",
+    )
+    p.add_argument(
+        "--download",
+        choices=sorted(DOWNLOADS),
+        help="download a known public OpenPII fixture into --cache-dir and evaluate it",
+    )
+    p.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path("target/bench"),
+        help="where --download stores benchmark data",
+    )
     p.add_argument(
         "--bin",
         default="target/release/pentect.exe" if sys.platform == "win32" else "target/release/pentect",
@@ -147,6 +184,20 @@ def parse_args() -> argparse.Namespace:
         help="extra argument passed after `pentect mask` (repeatable)",
     )
     return p.parse_args()
+
+
+def resolve_data_path(args: argparse.Namespace) -> Path:
+    if args.download:
+        args.cache_dir.mkdir(parents=True, exist_ok=True)
+        out = args.cache_dir / f"{args.download}.jsonl"
+        if not out.exists():
+            url = DOWNLOADS[args.download]
+            print(f"downloading {args.download} -> {out}", file=sys.stderr)
+            urllib.request.urlretrieve(url, out)
+        return out
+    if args.data is None:
+        raise SystemExit("provide DATA or use --download")
+    return args.data
 
 
 def read_rows(path: Path) -> Iterable[dict[str, Any]]:
@@ -193,10 +244,12 @@ def evaluate(args: argparse.Namespace, rows: list[dict[str, Any]]) -> list[dict[
         masked = run_pentect(args, text)
         for ann in annotations:
             concealed = ann.value not in masked
+            outcome = "true_positive" if concealed else "false_negative"
             results.append(
                 {
                     "row_id": ann.row_id,
                     "label": ann.label,
+                    "outcome": outcome,
                     "concealed": concealed,
                     "value_preview": preview(ann.value),
                     "span": span_preview(ann),
@@ -328,49 +381,59 @@ def run_pentect(args: argparse.Namespace, text: str) -> str:
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(results)
-    concealed = sum(1 for r in results if r["concealed"])
+    counts = Counter(r["outcome"] for r in results)
+    tp = counts["true_positive"]
+    fn = counts["false_negative"]
     by_label = {}
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in results:
         grouped[r["label"]].append(r)
     for label, rows in sorted(grouped.items(), key=lambda item: len(item[1]), reverse=True):
         label_total = len(rows)
-        label_concealed = sum(1 for r in rows if r["concealed"])
+        label_counts = Counter(r["outcome"] for r in rows)
+        label_tp = label_counts["true_positive"]
+        label_fn = label_counts["false_negative"]
         by_label[label] = {
             "total": label_total,
-            "concealed": label_concealed,
-            "missed": label_total - label_concealed,
-            "recall": ratio(label_concealed, label_total),
+            "true_positive": label_tp,
+            "false_negative": label_fn,
+            "false_positive": None,
+            "true_negative": None,
+            "recall": ratio(label_tp, label_tp + label_fn),
         }
     return {
         "overall": {
             "annotations": total,
-            "concealed": concealed,
-            "missed": total - concealed,
-            "recall": ratio(concealed, total),
+            "true_positive": tp,
+            "false_negative": fn,
+            "false_positive": None,
+            "true_negative": None,
+            "recall": ratio(tp, tp + fn),
+            "note": "positive-only confusion matrix: OpenPII annotations provide TP/FN for recall, not FP/TN",
         },
         "by_label": by_label,
-        "miss_examples": [r for r in results if not r["concealed"]][:20],
+        "false_negative_examples": [r for r in results if r["outcome"] == "false_negative"][:20],
     }
 
 
 def print_report(report: dict[str, Any]) -> None:
     o = report["overall"]
     print(
-        "ai4privacy export: "
+        "OpenPII/ai4privacy positive-only confusion matrix: "
         f"annotations={o['annotations']} recall={fmt(o['recall'])} "
-        f"concealed={o['concealed']} missed={o['missed']}"
+        f"tp={o['true_positive']} fn={o['false_negative']} "
+        "fp=n/a tn=n/a"
     )
     print()
-    print(f"{'label':<28} {'total':>8} {'recall':>8} {'concealed/missed':>18}")
+    print(f"{'label':<28} {'total':>8} {'recall':>8} {'tp/fn':>14}")
     for label, row in report["by_label"].items():
         print(
             f"{label[:28]:<28} {row['total']:>8} {fmt(row['recall']):>8} "
-            f"{row['concealed']}/{row['missed']:>8}"
+            f"{row['true_positive']}/{row['false_negative']:>8}"
         )
-    if report["miss_examples"]:
+    if report["false_negative_examples"]:
         print("\nmiss examples:")
-        for ex in report["miss_examples"][:10]:
+        for ex in report["false_negative_examples"][:10]:
             print(
                 f"  row={ex['row_id']} label={ex['label']} "
                 f"value={ex['value_preview']} span={ex['span']}"

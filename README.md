@@ -62,3 +62,21 @@ python tools/eval_hostile_realworld.py --bin target\release\pentect.exe --pentec
 Semantic detection is optional and intentionally outside the deterministic core.
 It uses the local spaCy sidecar when enabled; keep the AI tool boundary and
 reversible masking path as the main Pentect surface.
+
+External recall bench:
+
+```powershell
+cargo build -p pentect-cli --release
+python tools/eval_ai4privacy.py --download openpii-nano-validation --bin target\release\pentect.exe --preset core-structured
+```
+
+This downloads Ai4Privacy OpenPII Nano validation data into `target/bench/` and
+prints a positive-only confusion matrix: `TP` means the annotated value
+disappeared from Pentect output, `FN` means it leaked, and recall is
+`TP / (TP + FN)`. OpenPII has no negative candidate labels, so FP/TN are not
+scored by this runner. Use `tools/eval_secretbench.py` for positive and negative
+secret-candidate confusion matrices after exporting SecretBench.
+
+OpenPII Nano is synthetic multilingual PII, CC-BY-4.0. It is useful for
+measuring recall gaps on names, addresses, phone numbers, IDs, and dates; it is
+not a secrets-only benchmark.
