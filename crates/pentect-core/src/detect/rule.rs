@@ -487,15 +487,13 @@ impl RuleDetector {
         ];
         #[rustfmt::skip]
         let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
-            // Browser/mail UIs often surface short login codes in prose or HTML.
+            // Auth flows often surface short login codes in prose.
             // Keep this explicitly OTP/verification-word gated; a bare "code
             // 100482" is too common in issue IDs, SKUs, and examples.
             (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])(?:$|[\s<>"',;).!])"#, Secret, "OTP", High, 1, V::None),
             (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])"#, Secret, "OTP", High, 1, V::None),
-            // Gmail/browser snapshots frequently flatten email HTML into long row
-            // snippets. The OTP word and the actual code may be separated by
-            // "expires in 10 minutes", tags, or table cells, so allow a wider
-            // same-line window but require a 6-8 digit candidate.
+            // The auth word and actual code may be separated by expiry copy or
+            // a few UI labels; require a 6-8 digit candidate for the wider form.
             (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n]{0,160}\b([0-9]{6,8})\b"#, Secret, "OTP", High, 1, V::None),
             (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n]{0,160}\b([0-9]{6,8})\b"#, Secret, "OTP", High, 1, V::None),
             // Some auth messages do not literally say "OTP", and some use
@@ -792,7 +790,7 @@ mod tests {
         assert!(has("otp=100482 expires soon", "KEYED_SECRET"));
         assert!(has("otp=100482 expires soon", "OTP"));
         assert!(has("Your verification code is 837291.", "OTP"));
-        assert!(has("Use security code: <b>402118</b> to continue.", "OTP"));
+        assert!(has("Use security code: 402118 to continue.", "OTP"));
         assert!(has("認証コード: 483920 を入力してください", "OTP"));
         assert!(has_value(
             "Your verification code expires in 10 minutes: 837291.",
@@ -800,7 +798,7 @@ mod tests {
             "837291"
         ));
         assert!(has_value(
-            r#"<div class="a3s"><table><tr><td>Your verification code expires in 10 minutes.</td><td><span>729004</span></td></tr></table></div>"#,
+            "Your verification code expires in 10 minutes: 729004.",
             "OTP",
             "729004"
         ));

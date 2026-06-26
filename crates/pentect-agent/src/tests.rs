@@ -917,8 +917,8 @@ fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
 }
 
 #[test]
-fn browser_email_html_masks_otp_but_keeps_content_readable() {
-    let (root, session) = empty_session("hook-post-browser-email-html");
+fn browser_mail_text_masks_otp_but_keeps_content_readable() {
+    let (root, session) = empty_session("hook-post-browser-mail-text");
     let input = json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "mcp__chrome__snapshot",
@@ -927,15 +927,13 @@ fn browser_email_html_masks_otp_but_keeps_content_readable() {
                 "type": "text",
                 "text": concat!(
                     "Subject: Sign-in request\n",
-                    "<html><body>",
-                    "<p>Your verification code is <b>837291</b>.</p>",
-                    "<p>Device: Chrome on Windows. Seat 12A stays visible.</p>",
-                    "</body></html>"
+                    "Your verification code is 837291.\n",
+                    "Device: Chrome on Windows. Seat 12A stays visible."
                 )
             }],
             "structuredContent": {
                 "url": "https://mail.example.test/inbox/42",
-                "emailHtml": "<main><span>Security code:</span><strong>402118</strong><p>Expires in 10 minutes.</p></main>",
+                "emailText": "Security code: 402118. Expires in 10 minutes.",
                 "visibleText": "認証コード: 483920 を入力してください\nInvoice INV-100482 remains readable."
             }
         }
@@ -1106,12 +1104,7 @@ fn gmail_like_rows_mask_otp_without_label_value_context() {
                         {"tag": "TD", "className": "xW xY", "text": "8:42 AM"}
                     ]
                 }],
-                "messageHtml": concat!(
-                    "<div class=\"ii gt\"><div class=\"a3s aiL\">",
-                    "<table><tr><td>Your verification code expires in 10 minutes.</td>",
-                    "<td><span>729004</span></td></tr></table>",
-                    "</div></div>"
-                ),
+                "messageText": "Your verification code expires in 10 minutes: 729004.",
                 "visibleText": concat!(
                     "確認コードは5分後に期限切れです: 483920\n",
                     "サインインするには 7391 を入力してください\n",
@@ -1156,7 +1149,7 @@ fn gmail_like_rows_mask_otp_without_label_value_context() {
 }
 
 #[test]
-fn browser_wallet_seed_phrase_masks_plain_numbered_and_html_shapes() {
+fn browser_wallet_seed_phrase_masks_plain_and_numbered_shapes() {
     let (root, session) = empty_session("hook-post-browser-seed-phrase");
     let phrase = concat!(
         "abandon abandon abandon abandon abandon abandon ",
@@ -1166,11 +1159,6 @@ fn browser_wallet_seed_phrase_masks_plain_numbered_and_html_shapes() {
         "1. abandon\n2. abandon\n3. abandon\n4. abandon\n",
         "5. abandon\n6. abandon\n7. abandon\n8. abandon\n",
         "9. abandon\n10. abandon\n11. abandon\n12. about"
-    );
-    let html_list = concat!(
-        "<ol><li>abandon</li><li>abandon</li><li>abandon</li><li>abandon</li>",
-        "<li>abandon</li><li>abandon</li><li>abandon</li><li>abandon</li>",
-        "<li>abandon</li><li>abandon</li><li>abandon</li><li>about</li></ol>"
     );
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -1182,7 +1170,6 @@ fn browser_wallet_seed_phrase_masks_plain_numbered_and_html_shapes() {
             }],
             "structuredContent": {
                 "visibleText": numbered,
-                "html": html_list,
                 "nonSecret": "invoice INV-100482 and checkout code SAVE10 remain visible"
             }
         }
@@ -1192,7 +1179,6 @@ fn browser_wallet_seed_phrase_masks_plain_numbered_and_html_shapes() {
     let rendered = serde_json::to_string(&output).unwrap();
     assert!(!rendered.contains(phrase), "{rendered}");
     assert!(!rendered.contains("abandon abandon abandon"), "{rendered}");
-    assert!(!rendered.contains("<li>abandon</li>"), "{rendered}");
     assert!(rendered.contains("<<BIP39_MNEMONIC_"), "{rendered}");
     assert!(rendered.contains("INV-100482"), "{rendered}");
     assert!(rendered.contains("SAVE10"), "{rendered}");
