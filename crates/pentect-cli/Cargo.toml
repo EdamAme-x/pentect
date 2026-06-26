@@ -15,9 +15,6 @@ default = ["pdf"]
 # PDF input is an adapter concern: extract text locally, then feed the normal
 # masking kernel. Disable default features for a slimmer text-only CLI.
 pdf = ["dep:pdf-extract"]
-# Enable the optional semantic PII sidecar (--semantic). Requires Python + spaCy
-# at runtime.
-semantic = ["pentect-core/semantic"]
 
 [dependencies]
 pentect-core = { path = "../pentect-core" }

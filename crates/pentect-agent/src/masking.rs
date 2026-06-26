@@ -3,10 +3,11 @@ use crate::session::RecoveryStore;
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
-    Config, Context, Engine, Input, Kind, MaskResult, Profile, ProfilePolicy, Recovery, RegionKind,
-    SensitiveKeyDetector, ShapeGuard, ToolResultParser,
+    load_pack, Config, Context, Engine, Input, Kind, MaskResult, Profile, ProfilePolicy, Recovery,
+    RegionKind, SensitiveKeyDetector, ShapeGuard, ToolResultParser,
 };
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
@@ -157,13 +158,84 @@ impl OutputMasker {
 }
 
 fn tool_boundary_engine() -> Engine {
-    Engine::builder()
+    let mut builder = Engine::builder()
         .standard_stack(Profile::Strict.knobs())
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
-        .detector(Box::new(SensitiveKeyDetector))
+        .detector(Box::new(SensitiveKeyDetector));
+    for pack in extension_packs_from_env() {
+        builder = builder
+            .detector(Box::new(pack.rules))
+            .disable_labels(pack.disable);
+    }
+    builder
         .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
         .guard(Box::new(ShapeGuard::builtin()))
         .build()
+}
+
+fn extension_packs_from_env() -> Vec<pentect_core::Pack> {
+    let Some(value) = std::env::var_os("PENTECT_EXTENSIONS") else {
+        return Vec::new();
+    };
+    let value = value.to_string_lossy();
+    let mut packs = Vec::new();
+    for name in value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if !is_extension_name(name) {
+            continue;
+        }
+        let Ok(paths) = extension_pack_paths(name) else {
+            continue;
+        };
+        for path in paths {
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Ok(pack) = load_pack(&src) {
+                packs.push(pack);
+            }
+        }
+    }
+    packs
+}
+
+fn extension_pack_paths(name: &str) -> Result<Vec<PathBuf>, String> {
+    let dir = PathBuf::from(".pentect").join("extensions").join(name);
+    let mut paths = Vec::new();
+    let pack = dir.join("pack.toml");
+    if pack.exists() {
+        paths.push(pack);
+    }
+    let packs_dir = dir.join("packs");
+    if packs_dir.exists() {
+        paths.extend(toml_files_in_dir(&packs_dir)?);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn toml_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().is_some_and(|ext| ext == "toml") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn is_extension_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && name.len() <= 64
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
 #[cfg(test)]

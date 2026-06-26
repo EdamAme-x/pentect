@@ -12,10 +12,8 @@ FINDINGS (echr_test.json, 127 docs):
     exactly what the deterministic core detects. TAB's per-span mask format
     fits a masking engine, but its CONTENT does not fit a secrets/technical-
     text tool. Pentect is not a court-document anonymizer.
-  - With `--enable DATE_TIME`: DATETIME recall jumps to 73.2% (1719/2349),
-    validating the date detector on real prose.
-  - DIRECT identifiers (mostly PERSON names + codes): 0% — these need the NER
-    sidecar (GLiNER), confirming the research recommendation.
+  - DIRECT identifiers (mostly PERSON names + codes): 0% — these belong behind
+    an extension/model boundary, not in deterministic core.
 Takeaway: evaluate Pentect on secrets-in-technical-text (SecretBench — gated
 behind GCP BigQuery; ai4privacy structured PII; or the in-repo research-metric
 corpus), not prose anonymization. Run:  python tools/eval_tab.py [BIN] [DATA] [flags...]
@@ -27,7 +25,7 @@ from collections import defaultdict
 
 BIN = sys.argv[1] if len(sys.argv) > 1 else "target/debug/pentect.exe"
 DATA = sys.argv[2] if len(sys.argv) > 2 else "target/tab/echr_test.json"
-EXTRA = sys.argv[3:]  # extra engine flags, e.g. --enable DATE_TIME
+EXTRA = sys.argv[3:]  # extra pentect mask flags
 
 docs = json.load(open(DATA, encoding="utf-8"))
 by_type = defaultdict(lambda: [0, 0])  # entity_type -> [concealed, total]

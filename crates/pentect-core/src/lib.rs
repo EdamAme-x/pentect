@@ -31,8 +31,6 @@ pub mod policy;
 pub mod recovery;
 
 pub use codec::Codec;
-#[cfg(feature = "semantic")]
-pub use detect::SemanticDetector;
 pub use detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, DecodeDetector, Detector, EntropyDetector,
     PatternMatchDetector, PatternSpec, PemDetector, RuleDetector, RuleSpec, SensitiveKeyDetector,

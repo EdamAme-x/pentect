@@ -393,19 +393,6 @@ impl RuleDetector {
             // test/noise; a long three-segment token after session/jwt/cookie is
             // credential-bearing even if the header is opaque or not JSON.
             (r#"(?i)\b(?:session|sid|jwt|cookie|auth[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token)\b[^\r\n]{0,16}?(?:=|:)[ \t'"]{0,3}([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})(?:$|[\s"',;)])"#, Secret, "SESSION_TOKEN", Medium, 1, V::None),
-            // Support/health/customer case IDs are sensitive when keyed by
-            // patient/case/customer language. This does not mask ordinary JIRA
-            // stories or invoice numbers because the year-like middle segment is
-            // required and the keyword is required.
-            (r#"(?i)\b(?:case|patient|customer|member|mrn|medical record|health record)[^\r\n]{0,16}?\b([A-Z]{2,6}-[0-9]{4}-[0-9]{6,})\b"#, Identifier, "CASE_IDENTIFIER", Medium, 1, V::None),
-            // Long-tail PII datasets contain country-local identifiers without a
-            // public checksum. Keep these keyword-gated so generic order numbers,
-            // SKUs, and issue IDs survive.
-            (r#"(?i)\b(?:idcardnum|identity card|id card|national id|owner[’']?s id|reference id|id[-_ ]?number|identification (?:document|number)s?|cmnd|cccd|identitas|dowodu osobistego|personalausweis|id[-‑]nummer)\b[^\r\n]{0,40}?\b([A-Z0-9][A-Z0-9-]{0,12}[0-9][A-Z0-9-]{0,19}[A-Z0-9]|[A-Z]{2,4}-[0-9][0-9 -]{5,20}[0-9]|[0-9][0-9 -]{6,28}[0-9])(?:$|[\s"',;.)])"#, Pii, "CONTEXTUAL_ID", Low, 1, V::None),
-            (r#"(?i)\b(?:taxnum|tax[-_ ]?(?:id|number)|tax compliance|tax file|mã số thuế|cukai|daň\w*|fiscal|rfc|afm|αφμ)\b[^\r\n]{0,40}?\b([A-Z0-9][A-Z0-9-]{0,12}[0-9][A-Z0-9-]{0,19}[A-Z0-9]|[A-Z]{2,4}-[0-9][0-9 -]{5,20}[0-9]|[0-9][0-9 -]{6,28}[0-9])(?:$|[\s"',;.)])"#, Pii, "CONTEXTUAL_TAX_ID", Low, 1, V::None),
-            (r#"(?i)\b(?:driver'?s?\s*licen[sc]e|driverlicensenum|driving licence|driving license|license number|licence number|nombor pemandu|numero di patente|licenţa de conducere|licenta de conducere|patente)\b[^\r\n]{0,40}?\b([A-Z0-9][A-Z0-9-]{0,12}[0-9][A-Z0-9-]{0,19}[A-Z0-9]|[A-Z]{2,4}-[0-9][0-9 -]{5,20}[0-9]|[0-9][0-9 -]{6,28}[0-9])(?:$|[\s"',;.)])"#, Pii, "CONTEXTUAL_DRIVER_LICENSE", Low, 1, V::None),
-            (r#"(?i)\b(?:passportnum|passport|passport number|pasaporte|passeport|passaporto|reisepass|paszportu|パスポート|旅券)\b[^\r\n]{0,40}?\b([A-Z0-9][A-Z0-9-]{0,12}[0-9][A-Z0-9-]{0,19}[A-Z0-9]|[A-Z]{2,4}-[0-9][0-9 -]{5,20}[0-9]|[0-9][0-9 -]{6,28}[0-9])(?:$|[\s"',;.)])"#, Pii, "CONTEXTUAL_PASSPORT", Low, 1, V::None),
-            (r#"(?i)\b(?:socialnum|social security|social insurance|nombor sosial|seguro social|sicurezza sociale|assurance sociale|num[eé]ro d'assurance sociale|κοινωνικής ασφάλισης|cardul de asigurare)\b[^\r\n]{0,40}?\b([A-Z0-9][A-Z0-9-]{0,12}[0-9][A-Z0-9-]{0,19}[A-Z0-9]|[A-Z]{2,4}-[0-9][0-9 -]{5,20}[0-9]|[0-9][0-9 -]{6,28}[0-9])(?:$|[\s"',;.)])"#, Pii, "CONTEXTUAL_SOCIAL_ID", Low, 1, V::None),
             // Preserve path structure for debugging, but hide the local account
             // segment that frequently leaks in stack traces and tool output.
             (r#"(?i)\b[A-Z]:[\\/]+Users[\\/]+([^\\/\s:\r\n"<>|?*]{1,64})(?:[\\/]|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
@@ -621,50 +608,11 @@ mod tests {
             "cookie session=abcdefghijkl.mnopqrstuvwxyz.ABCDEFGHIJKLMN",
             "SESSION_TOKEN"
         ));
-        assert!(has("Case PT-2026-100482 follows up", "CASE_IDENTIFIER"));
         assert!(!has(
             "port=5432 workers=4 timeout_ms=30000 status=200",
             "KEYED_SECRET"
         ));
         assert!(!has("jwt_like=aaa.bbb.ccc css=#aabbcc", "SESSION_TOKEN"));
-        assert!(!has("story=SEC-100482 estimate=8", "CASE_IDENTIFIER"));
-    }
-
-    #[test]
-    fn contextual_pii_ids_mask_values_only() {
-        let det = RuleDetector::builtin();
-        let values_for = |text: &str, label: &str| {
-            let reg = region(text);
-            let v = NormalizedView::build(&reg, text);
-            det.detect(&v)
-                .into_iter()
-                .filter(|sp| sp.label == label)
-                .map(|sp| text[sp.range.start..sp.range.end].to_string())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            values_for("passport MY8405029 on file", "CONTEXTUAL_PASSPORT"),
-            ["MY8405029"]
-        );
-        assert_eq!(
-            values_for("tax compliance verified via S5266520O", "CONTEXTUAL_TAX_ID"),
-            ["S5266520O"]
-        );
-        assert_eq!(
-            values_for(
-                "licenţa de conducere (SXYDSNQ2W4)",
-                "CONTEXTUAL_DRIVER_LICENSE"
-            ),
-            ["SXYDSNQ2W4"]
-        );
-        assert_eq!(
-            values_for(
-                "número d'assurance sociale 1-88-01-06462-057-64",
-                "CONTEXTUAL_SOCIAL_ID"
-            ),
-            ["1-88-01-06462-057-64"]
-        );
-        assert!(values_for("Order code AB12-CD ships tomorrow", "CONTEXTUAL_ID").is_empty());
     }
 
     #[test]

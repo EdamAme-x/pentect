@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
         "--pentect-arg",
         action="append",
         default=[],
-        help="extra argument passed after `pentect mask` (repeatable), e.g. --pentect-arg=--semantic",
+        help="extra argument passed after `pentect mask` (repeatable)",
     )
     p.add_argument("--json", action="store_true")
     p.add_argument("--fail-under-coverage", type=float)

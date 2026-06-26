@@ -4,12 +4,8 @@ use crate::normalize::NormalizedView;
 mod auth_code;
 mod bip39;
 mod card;
-mod contextual_id;
-mod date;
 mod decode;
 mod entropy;
-#[cfg(feature = "semantic")]
-mod ner;
 mod pattern;
 mod pem;
 mod phone;
@@ -21,11 +17,8 @@ mod validate;
 pub use auth_code::AuthCodeDetector;
 pub use bip39::Bip39Detector;
 pub use card::CardDetector;
-pub use contextual_id::ContextualIdDetector;
 pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
-#[cfg(feature = "semantic")]
-pub use ner::SemanticDetector;
 pub use pattern::{PatternMatchDetector, PatternSpec};
 pub use pem::PemDetector;
 pub use phone::PhoneDetector;
@@ -42,25 +35,4 @@ pub(crate) use util::region;
 /// returns spans in absolute raw coordinates (each tagged with its `DetectorId`).
 pub trait Detector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span>;
-}
-
-/// Built-in detectors that are OFF by default (their default behaviour is wrong
-/// for the paste-to-LLM use case) but available by label via `enable`. Returns
-/// `None` for an unknown name.
-pub fn enable_builtin(name: &str) -> Option<Box<dyn Detector>> {
-    match name {
-        "CONTEXTUAL_ID" => Some(Box::new(contextual_id::ContextualIdDetector)),
-        "DATE_TIME" => Some(Box::new(date::date_detector())),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn contextual_id_is_opt_in_builtin() {
-        assert!(enable_builtin("CONTEXTUAL_ID").is_some());
-    }
 }

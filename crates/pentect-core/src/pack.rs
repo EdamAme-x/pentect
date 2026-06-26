@@ -9,8 +9,6 @@ pub struct Pack {
     pub rules: RuleDetector,
     /// Built-in (or other) labels this pack suppresses, e.g. `IP_ADDRESS_V4`.
     pub disable: Vec<String>,
-    /// Off-by-default built-ins this pack turns on, e.g. `DATE_TIME`.
-    pub enable: Vec<String>,
 }
 
 /// Parse a TOML rule pack. Two knobs cover the real demand: add your own rules
@@ -55,7 +53,6 @@ pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
     Ok(Pack {
         rules: RuleDetector::from_specs(specs)?,
         disable: pack.disable,
-        enable: pack.enable,
     })
 }
 
@@ -66,9 +63,6 @@ struct PackFile {
     /// Built-in detector labels to turn off (e.g. `disable = ["IP_ADDRESS_V4"]`).
     #[serde(default)]
     disable: Vec<String>,
-    /// Off-by-default built-ins to turn on (e.g. `enable = ["DATE_TIME"]`).
-    #[serde(default)]
-    enable: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,21 +291,6 @@ mod tests {
         let out = tuned.mask(input(), &cfg).masked;
         assert!(out.contains("192.168.1.1"), "{out}");
         assert!(out.contains("<<CARD_"), "{out}");
-    }
-
-    #[test]
-    fn pack_enables_an_off_by_default_builtin() {
-        let on = load_pack(r#"enable = ["DATE_TIME"]"#).unwrap();
-        assert_eq!(on.enable, ["DATE_TIME"]);
-        let engine = Engine::with_profile_and_packs(Profile::Balanced, vec![on], false);
-        let out = engine
-            .mask(
-                Input::text("meet on 2026-06-11 about order 100482931"),
-                &Config::insecure_testing(),
-            )
-            .masked;
-        assert!(out.contains("<<DATE_TIME_"), "{out}");
-        assert!(out.contains("100482931"), "{out}"); // order id still untouched
     }
 
     #[test]

@@ -154,30 +154,11 @@ impl Engine {
         packs: Vec<crate::pack::Pack>,
         aggressive: bool,
     ) -> Self {
-        Self::with_profile_packs_detectors(profile, packs, Vec::new(), aggressive)
-    }
-
-    /// Like `with_profile_and_packs`, plus extra detectors (e.g. the NER
-    /// sidecar) appended after the built-ins and pack rules.
-    pub fn with_profile_packs_detectors(
-        profile: Profile,
-        packs: Vec<crate::pack::Pack>,
-        extra: Vec<Box<dyn Detector>>,
-        aggressive: bool,
-    ) -> Self {
         let mut builder = Engine::builder().standard_stack(profile.knobs());
         for pack in packs {
-            for name in &pack.enable {
-                if let Some(d) = crate::detect::enable_builtin(name) {
-                    builder = builder.detector(d);
-                }
-            }
             builder = builder
                 .detector(Box::new(pack.rules))
                 .disable_labels(pack.disable);
-        }
-        for d in extra {
-            builder = builder.detector(d);
         }
         let guard: Box<dyn OverMaskGuard> = if aggressive {
             Box::new(NoGuard)
@@ -686,10 +667,11 @@ mod tests {
 
     // Categorized recall corpus. CORE_FLOOR = what the deterministic core must
     // catch by value/structure (hard-asserted, so recall can't silently
-    // regress). SIDECAR_GAP = categories that need the semantic ML layer (names,
-    // addresses, weak/keyed values, multilingual, locale IDs); recorded, not
-    // asserted — that is the honest boundary, not a core failure. Secret-shaped
-    // samples are split with concat! so no contiguous secret literal exists.
+    // regress). EXTENSION_GAP = categories that need a non-core detector
+    // (names, addresses, weak/keyed values, multilingual, locale IDs);
+    // recorded, not asserted — that is the honest boundary, not a core failure.
+    // Secret-shaped samples are split with concat! so no contiguous secret
+    // literal exists.
     const CORE_FLOOR: &[(&str, &str)] = &[
         ("AKIAIOSFODNN7EXAMPLE", "aws_access_key"),
         (concat!("sk", "-ABCDEFGHIJKLMNOPQRSTUVWX"), "openai_api_key"),
@@ -749,7 +731,7 @@ mod tests {
         ("27AAPFU0939F1ZV", "in_gstin"),
         ("ACN 004085616", "au_acn"),
     ];
-    const SIDECAR_GAP: &[(&str, &str)] = &[
+    const EXTENSION_GAP: &[(&str, &str)] = &[
         ("John Smith", "person_name"),
         ("山田太郎", "person_name_ja"),
         (
@@ -768,14 +750,14 @@ mod tests {
             );
         }
         // Sanity: the corpus exercises the floor and the known sidecar gap.
-        assert!(CORE_FLOOR.len() + CHECKSUM_FLOOR.len() >= 30 && SIDECAR_GAP.len() >= 4);
-        let gap_hit: Vec<&str> = SIDECAR_GAP
+        assert!(CORE_FLOOR.len() + CHECKSUM_FLOOR.len() >= 30 && EXTENSION_GAP.len() >= 4);
+        let gap_hit: Vec<&str> = EXTENSION_GAP
             .iter()
             .filter(|(s, _)| !m(s).items.is_empty())
             .map(|(_, l)| *l)
             .collect();
         eprintln!(
-            "recall corpus: floor {}/{} caught; sidecar_gap incidentally caught: {gap_hit:?}",
+            "recall corpus: floor {}/{} caught; extension_gap incidentally caught: {gap_hit:?}",
             CORE_FLOOR.len() + CHECKSUM_FLOOR.len(),
             CORE_FLOOR.len() + CHECKSUM_FLOOR.len()
         );
@@ -1108,25 +1090,22 @@ mod tests {
     // The two standing goals: surpass Presidio and surpass Azure. We measure it
     // entity-by-entity. Each entry is classified:
     //   Core    — deterministic (pattern/checksum); core MUST catch it (asserted).
-    //   Ner     — semantic (person, location, org, nationality, address, age,
-    //             person-type): no closed pattern, so these need a model. That
-    //             layer exists — the `semantic` feature's sidecar (spaCy-class, or
-    //             swap to ai4privacy/DeBERTa to beat spaCy). This default-build
-    //             benchmark runs the deterministic core only, so it records
-    //             these rather than asserting them. Recorded, not asserted.
+    //   Extension — semantic/locale-heavy entities (person, location, org,
+    //               nationality, address, age, person-type): no closed pattern,
+    //               so these belong behind the extension boundary. Recorded,
+    //               not asserted.
     //   Todo    — deterministic but not implemented yet; the remaining gap to
     //             close for full deterministic parity. Recorded, not asserted.
     // "Surpassed" on the deterministic axis = every Core caught AND we add
     // entities neither vendor has (see EXCLUSIVE). Todo = the deterministic
-    // distance to zero-gap; Ner = entities awaiting Pentect's NER layer (which
-    // beats Presidio's spaCy), so a win in progress, not a concession.
+    // distance to zero-gap; Extension = entities outside deterministic core.
     #[derive(PartialEq, Clone, Copy)]
     enum Cov {
         Core,
-        Ner,
+        Extension,
         Todo,
     }
-    use Cov::{Core, Ner, Todo};
+    use Cov::{Core, Extension, Todo};
 
     // Microsoft Presidio predefined recognizers (entity, sample, classification).
     const PRESIDIO: &[(&str, &str, Cov)] = &[
@@ -1171,15 +1150,11 @@ mod tests {
         ("IN_PASSPORT", "passport A1234567", Core),
         ("IN_VEHICLE_REGISTRATION", "vehicle KA01AB1234", Core),
         ("SG_UEN", "uen 53312345A", Core),
-        // Capability exists (date_detector / `enable = ["DATE_TIME"]`) but ships
-        // OFF: masking every date floods the paste-to-LLM use case. So the
-        // default engine here doesn't catch it — Todo means "off by default", not
-        // "can't do it".
         ("DATE_TIME", "January 5, 1990", Todo),
-        ("PERSON", "John Smith", Ner),
-        ("LOCATION", "Mountain View", Ner),
-        ("NRP", "British", Ner),
-        ("ORGANIZATION", "Acme Corporation", Ner),
+        ("PERSON", "John Smith", Extension),
+        ("LOCATION", "Mountain View", Extension),
+        ("NRP", "British", Extension),
+        ("ORGANIZATION", "Acme Corporation", Extension),
     ];
 
     // Azure AI Language PII entity categories (representative; ~200 total, the
@@ -1223,15 +1198,15 @@ mod tests {
         ("URL", "https://example.com/x", Core),
         ("FrenchINSEE", "180047509112541", Core),
         ("DateTime", "2025-06-11", Todo),
-        ("Age", "35 years old", Ner),
+        ("Age", "35 years old", Extension),
         (
             "Address",
             "1600 Amphitheatre Parkway, Mountain View CA",
-            Ner,
+            Extension,
         ),
-        ("Person", "John Smith", Ner),
-        ("PersonType", "doctor", Ner),
-        ("Organization", "Microsoft", Ner),
+        ("Person", "John Smith", Extension),
+        ("PersonType", "doctor", Extension),
+        ("Organization", "Microsoft", Extension),
     ];
 
     // Deterministic entities Pentect catches that NEITHER Presidio nor Azure has
@@ -1254,7 +1229,7 @@ mod tests {
             let caught = |s: &str| !m(s).items.is_empty();
             let core: Vec<_> = table.iter().filter(|(_, _, c)| *c == Core).collect();
             let todo: Vec<_> = table.iter().filter(|(_, _, c)| *c == Todo).collect();
-            let ner: Vec<_> = table.iter().filter(|(_, _, c)| *c == Ner).collect();
+            let extension: Vec<_> = table.iter().filter(|(_, _, c)| *c == Extension).collect();
 
             // The goal, asserted: every deterministic entity is caught.
             let core_missed: Vec<&str> = core
@@ -1269,10 +1244,10 @@ mod tests {
 
             let det_total = core.len() + todo.len();
             eprintln!(
-                "vs {name}: deterministic {}/{} covered; NER {} (via --features semantic sidecar); remaining deterministic gap: {:?}",
+                "vs {name}: deterministic {}/{} covered; extension gap {}; remaining deterministic gap: {:?}",
                 core.len(),
                 det_total,
-                ner.len(),
+                extension.len(),
                 todo.iter().map(|(e, _, _)| *e).collect::<Vec<_>>(),
             );
         }

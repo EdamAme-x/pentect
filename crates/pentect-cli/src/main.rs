@@ -1,10 +1,11 @@
 //! Pentect CLI: local secret-capability tool boundary for AI agents.
 
+mod extensions;
 mod input;
 mod terminal;
 
 use input::{InputAdapter, TextInput};
-use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile, RuleDetector};
+use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -65,10 +66,11 @@ fn help_text() -> &'static str {
         "Use:\n",
         "  pentect\n",
         "  pentect --port 7331\n",
-        "  pentect codex|claude|gemini\n",
+        "  pentect codex|claude|gemini [--extensions NAME]\n",
         "  pentect exec \"<command>\"\n\n",
         "`pentect` opens the approval dashboard.\n",
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
+        "`--extensions NAME` installs/activates local extension state under .pentect/extensions/NAME.\n",
         "Masked handles resolve locally in later `pentect exec` commands.\n",
         "Every handle also becomes a `PENTECT_...` env var for later execs.\n",
         "Masked env lines become env vars in later execs: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
@@ -179,7 +181,7 @@ fn cmd_mask(args: &[String]) {
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (resolve/restore is unavailable by design).
     let kind_label = format!("{kind:?}");
-    let engine = match build_engine(profile, aggressive, packs, args) {
+    let engine = match build_engine(profile, aggressive, packs) {
         Ok(engine) => engine,
         Err(e) => die(&e),
     };
@@ -211,8 +213,7 @@ fn validate_mask_args(args: &[String]) -> Result<(), String> {
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--kind" | "--profile" | "--input" | "--pack" | "--pack-dir" | "--disable"
-            | "--enable" => {
+            "--kind" | "--profile" | "--input" | "--pack" | "--pack-dir" | "--extensions" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err(format!("{} requires a value", args[i]));
                 };
@@ -225,30 +226,19 @@ fn validate_mask_args(args: &[String]) -> Result<(), String> {
                 if args[i] == "--profile" {
                     value.parse::<Profile>()?;
                 }
+                if args[i] == "--extensions" {
+                    extensions::parse_extension_value(value)?;
+                }
                 i += 2;
             }
-            "--length" | "--aggressive" | "--semantic" => {
+            "--length" | "--aggressive" => {
                 i += 1;
-            }
-            "--ner" => {
-                return Err("--ner was removed; use --semantic".to_string());
-            }
-            "--semantic-provider" | "--semantic-script" => {
-                return Err(format!(
-                    "{} was removed; use --semantic with the default sidecar",
-                    args[i]
-                ));
-            }
-            flag if flag.starts_with("--semantic=") => {
-                return Err("--semantic no longer accepts a provider; use --semantic".to_string());
             }
             flag if flag.starts_with("--") => {
                 return Err(format!("unknown option: {flag}"));
             }
             value => {
-                return Err(format!(
-                    "unexpected argument for mask: {value}; --semantic takes no provider"
-                ));
+                return Err(format!("unexpected argument for mask: {value}"));
             }
         }
     }
@@ -392,6 +382,7 @@ struct AgentToolOpts {
     session: Option<String>,
     agent: Option<PathBuf>,
     command: PathBuf,
+    extensions: Vec<String>,
     dry_run: bool,
     allow_unverified_hooks: bool,
     tool_args: Vec<String>,
@@ -404,6 +395,7 @@ impl AgentToolOpts {
         let mut command = std::env::var_os(tool.env_var())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(tool.default_command()));
+        let mut extensions = Vec::new();
         let mut dry_run = false;
         let mut allow_unverified_hooks = false;
         let mut tool_args = Vec::new();
@@ -430,6 +422,17 @@ impl AgentToolOpts {
                 flag if flag == tool.path_flag() => {
                     command = PathBuf::from(required_value(args, &mut i, flag)?);
                 }
+                "--extensions" => {
+                    for name in extensions::parse_extension_value(&required_value(
+                        args,
+                        &mut i,
+                        "--extensions",
+                    )?)? {
+                        if !extensions.iter().any(|existing| existing == &name) {
+                            extensions.push(name);
+                        }
+                    }
+                }
                 "--dry-run" => {
                     dry_run = true;
                     i += 1;
@@ -454,6 +457,7 @@ impl AgentToolOpts {
             session,
             agent: agent.or_else(|| std::env::var_os("PENTECT_AGENT").map(PathBuf::from)),
             command,
+            extensions,
             dry_run,
             allow_unverified_hooks,
             tool_args,
@@ -462,6 +466,9 @@ impl AgentToolOpts {
 }
 
 fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
+    if let Err(e) = extensions::prepare(&opts.extensions) {
+        die(&e);
+    }
     let configs = codex_hook_config_args(agent, opts.session.as_deref());
     if opts.dry_run {
         if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
@@ -476,6 +483,7 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
         die("refusing to start Codex headless subcommand with Pentect hooks: local probes showed `codex exec` runs shell commands without dispatching PreToolUse/PostToolUse hooks, even under a TTY. Use interactive `pentect codex`, `pentect claude`, `pentect exec`, or pass --allow-unverified-hooks only for debugging.");
     }
     let mut cmd = Command::new(&opts.command);
+    apply_extension_env(&mut cmd, opts);
     for config in configs {
         cmd.arg("--config").arg(config);
     }
@@ -484,6 +492,9 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
 }
 
 fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
+    if let Err(e) = extensions::prepare(&opts.extensions) {
+        die(&e);
+    }
     let settings = claude_settings_json(agent, opts.session.as_deref());
     let args = claude_args(&settings, &opts.tool_args);
     if opts.dry_run {
@@ -491,11 +502,15 @@ fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
         return success_status();
     }
     let mut cmd = Command::new(&opts.command);
+    apply_extension_env(&mut cmd, opts);
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
 }
 
 fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
+    if let Err(e) = extensions::prepare(&opts.extensions) {
+        die(&e);
+    }
     let settings_path = PathBuf::from(".gemini").join("settings.json");
     if opts.dry_run {
         eprintln!(
@@ -514,6 +529,7 @@ fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     };
     let status = {
         let mut cmd = Command::new(&opts.command);
+        apply_extension_env(&mut cmd, opts);
         cmd.args(&opts.tool_args);
         run_interactive_command(cmd, &opts.command)
     };
@@ -533,6 +549,12 @@ fn run_interactive_command(cmd: Command, display: &Path) -> std::process::ExitSt
     let status = run_command(cmd, display);
     terminal::restore_after_tui();
     status
+}
+
+fn apply_extension_env(cmd: &mut Command, opts: &AgentToolOpts) {
+    if let Some(value) = extensions::env_value(&opts.extensions) {
+        cmd.env("PENTECT_EXTENSIONS", value);
+    }
 }
 
 fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
@@ -1088,51 +1110,11 @@ fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
 /// masked. Output is then mostly unusable for reasoning, but still reversible.
-fn build_engine(
-    profile: Profile,
-    aggressive: bool,
-    packs: Vec<Pack>,
-    args: &[String],
-) -> Result<Engine, String> {
+fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Result<Engine, String> {
     if aggressive {
         eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
     }
-    Ok(Engine::with_profile_packs_detectors(
-        profile,
-        packs,
-        semantic_detectors(args)?,
-        aggressive,
-    ))
-}
-
-fn semantic_requested(args: &[String]) -> bool {
-    has_flag(args, "--semantic")
-}
-
-/// `--semantic` adds the semantic sidecar (person/location/org/address).
-/// Built only with `--features semantic`; the script defaults to
-/// PENTECT_SEMANTIC_SCRIPT or tools/ner_sidecar.py.
-#[cfg(feature = "semantic")]
-fn semantic_detectors(args: &[String]) -> Result<Vec<Box<dyn pentect_core::Detector>>, String> {
-    if !semantic_requested(args) {
-        return Ok(Vec::new());
-    }
-    let script =
-        std::env::var("PENTECT_SEMANTIC_SCRIPT").unwrap_or_else(|_| "tools/ner_sidecar.py".into());
-    match pentect_core::SemanticDetector::spawn(&script) {
-        Ok(d) => Ok(vec![Box::new(d)]),
-        Err(e) => Err(format!(
-            "--semantic requested, but semantic sidecar could not start: {e}"
-        )),
-    }
-}
-
-#[cfg(not(feature = "semantic"))]
-fn semantic_detectors(args: &[String]) -> Result<Vec<Box<dyn pentect_core::Detector>>, String> {
-    if semantic_requested(args) {
-        return Err("--semantic requires a build with `--features semantic`".to_string());
-    }
-    Ok(Vec::new())
+    Ok(Engine::with_profile_and_packs(profile, packs, aggressive))
 }
 
 /// Load each `--pack FILE` as a TOML rule pack. Reading a config file is input,
@@ -1140,22 +1122,15 @@ fn semantic_detectors(args: &[String]) -> Result<Vec<Box<dyn pentect_core::Detec
 /// author can see exactly what to fix.
 fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
     let mut packs = Vec::new();
-    for path in pack_paths(args)? {
+    let mut paths = pack_paths(args)?;
+    let extension_names = extensions::collect_from_args(args)?;
+    paths.extend(extensions::pack_paths(&extension_names)?);
+    for path in paths {
         let display = path.display();
         let src = std::fs::read_to_string(&path)
             .map_err(|e| format!("could not read pack '{display}': {e}"))?;
         let pack = load_pack(&src).map_err(|e| format!("pack '{display}' is invalid: {e}"))?;
         packs.push(pack);
-    }
-    // --disable / --enable are a pack with no rules, only toggles.
-    let disable = arg_values(args, "--disable");
-    let enable = arg_values(args, "--enable");
-    if !disable.is_empty() || !enable.is_empty() {
-        packs.push(Pack {
-            rules: RuleDetector::from_specs(Vec::new())?,
-            disable,
-            enable,
-        });
     }
     Ok(packs)
 }
@@ -1253,42 +1228,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_flag_requests_semantic_sidecar() {
-        let args = vec!["pentect".into(), "mask".into(), "--semantic".into()];
-        assert!(semantic_requested(&args));
-        assert!(validate_mask_args(&args).is_ok());
-    }
-
-    #[test]
-    fn semantic_request_fails_if_sidecar_is_unavailable() {
-        let args = vec!["pentect".into(), "mask".into(), "--semantic".into()];
-        let old_script = std::env::var_os("PENTECT_SEMANTIC_SCRIPT");
-        std::env::set_var("PENTECT_SEMANTIC_SCRIPT", "__missing_semantic_sidecar__.py");
-        let err = match build_engine(Profile::Balanced, false, Vec::new(), &args) {
-            Ok(_) => panic!("expected --semantic to fail without a usable sidecar"),
-            Err(err) => err,
-        };
-        restore_semantic_script(old_script);
-        assert!(
-            err.contains("--semantic") || err.contains("sidecar"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn semantic_provider_argument_is_rejected() {
-        let args = vec![
-            "pentect".into(),
-            "mask".into(),
-            "--semantic".into(),
-            "gliner".into(),
-        ];
-        assert!(validate_mask_args(&args)
-            .unwrap_err()
-            .contains("no provider"));
-    }
-
-    #[test]
     fn mask_rejects_unknown_kind_and_missing_values() {
         let args = vec![
             "pentect".into(),
@@ -1304,7 +1243,7 @@ mod tests {
             "pentect".into(),
             "mask".into(),
             "--profile".into(),
-            "--semantic".into(),
+            "--extensions".into(),
         ];
         assert!(validate_mask_args(&args)
             .unwrap_err()
@@ -1312,40 +1251,14 @@ mod tests {
     }
 
     #[test]
-    fn semantic_equals_provider_is_rejected() {
+    fn mask_accepts_extension_names() {
         let args = vec![
             "pentect".into(),
             "mask".into(),
-            "--semantic=presidio".into(),
+            "--extensions".into(),
+            "openai-privacy-filter,local.rules".into(),
         ];
-        assert!(validate_mask_args(&args).unwrap_err().contains("no longer"));
-    }
-
-    #[test]
-    fn removed_semantic_provider_flags_are_rejected() {
-        let args = vec![
-            "pentect".into(),
-            "mask".into(),
-            "--semantic-provider".into(),
-            "gliner".into(),
-            "--semantic-script".into(),
-            "tools/custom_sidecar.py".into(),
-        ];
-        assert!(validate_mask_args(&args).unwrap_err().contains("removed"));
-    }
-
-    fn restore_semantic_script(old_script: Option<std::ffi::OsString>) {
-        if let Some(value) = old_script {
-            std::env::set_var("PENTECT_SEMANTIC_SCRIPT", value);
-        } else {
-            std::env::remove_var("PENTECT_SEMANTIC_SCRIPT");
-        }
-    }
-
-    #[test]
-    fn legacy_ner_flag_is_rejected() {
-        let args = vec!["pentect".into(), "mask".into(), "--ner".into()];
-        assert!(validate_mask_args(&args).unwrap_err().contains("removed"));
+        assert!(validate_mask_args(&args).is_ok());
     }
 
     #[test]
@@ -1387,6 +1300,27 @@ mod tests {
         let opts = AgentToolOpts::parse(AgentTool::Codex, &args).unwrap();
         assert!(opts.allow_unverified_hooks);
         assert_eq!(opts.tool_args, vec!["exec", "do something"]);
+    }
+
+    #[test]
+    fn agent_tool_parse_consumes_extensions_before_tool_args() {
+        let args = vec![
+            "pentect".to_string(),
+            "codex".to_string(),
+            "--extensions".to_string(),
+            "openai-privacy-filter,local.rules".to_string(),
+            "--".to_string(),
+            "hello".to_string(),
+        ];
+        let opts = AgentToolOpts::parse(AgentTool::Codex, &args).unwrap();
+        assert_eq!(
+            opts.extensions,
+            vec![
+                "openai-privacy-filter".to_string(),
+                "local.rules".to_string()
+            ]
+        );
+        assert_eq!(opts.tool_args, vec!["hello"]);
     }
 
     #[test]

@@ -29,6 +29,7 @@ the project files.
 - Open the approval dashboard with `pentect`; use `pentect --port 7331` for the small local web dashboard. Inspect another scope with `pentect dashboard --dir PATH --session NAME`.
 - When a command uses a stored capability and the dashboard is running, `pentect exec` waits for `once`, `always`, or `decline`. If no dashboard is running, MVP behavior is auto-`once`.
 - Show the command approval preview with `pentect approve "<command>"`.
+- Non-core detectors are managed as local extensions: `pentect codex --extensions openai-privacy-filter` creates `.pentect/extensions/openai-privacy-filter`. Extension rule packs live at `pack.toml` or `packs/*.toml`.
 - Block direct AI Read tools; use `pentect exec "<command>"` at the tool boundary.
 - Keep `pentect read` as a one-way human masked-preview helper, not the AI path.
 - Delete local capability state with `pentect purge`.
@@ -52,17 +53,6 @@ This corpus is intentionally mean: encoded/fractured secrets, low-entropy keyed
 values, semantic PII, real-looking logs, and benign near misses. It is for gap
 tracking, not a CI pass/fail gate.
 
-For the semantic layer:
-
-```powershell
-cargo build -p pentect-cli --release --features semantic
-python tools/eval_hostile_realworld.py --bin target\release\pentect.exe --pentect-arg=--semantic
-```
-
-Semantic detection is optional and intentionally outside the deterministic core.
-It uses the local spaCy sidecar when enabled; keep the AI tool boundary and
-reversible masking path as the main Pentect surface.
-
 External recall bench:
 
 ```powershell
@@ -81,12 +71,6 @@ OpenPII Nano is synthetic multilingual PII, CC-BY-4.0. It is useful for
 measuring recall gaps on names, addresses, phone numbers, IDs, and dates; it is
 not a secrets-only benchmark.
 
-Long-tail local document IDs can be measured with the opt-in contextual detector:
-
-```powershell
-python tools/eval_ai4privacy.py --download openpii-nano-validation --bin target\release\pentect.exe --preset core-structured --extra-arg=--enable --extra-arg=CONTEXTUAL_ID
-```
-
-Keep this separate from the default core score. `CONTEXTUAL_ID` uses language
-and workflow context, so it is useful for recall research but easier to
-overfit than checksum/structure detectors.
+Long-tail names, addresses, and locale-specific document IDs are intentionally
+outside deterministic core. Put those behind an extension rather than adding
+language-heavy keyword circuits to `pentect-core`.

@@ -27,6 +27,7 @@ docs/
 
 # Local agent recovery/session state
 .pentect-agent/
+.pentect/
 
 # Rust build output
 /target/
