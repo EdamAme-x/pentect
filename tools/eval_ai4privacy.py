@@ -76,9 +76,12 @@ CORE_STRUCTURED_LABELS = {
 
 SEMANTIC_LABELS = {
     "ADDRESS",
+    "AGE",
+    "BUILDINGNUM",
     "CITY",
     "COUNTRY",
     "DATE",
+    "GIVENNAME",
     "FIRSTNAME",
     "GENDER",
     "JOBTITLE",
@@ -87,7 +90,10 @@ SEMANTIC_LABELS = {
     "NAME",
     "ORGANIZATION",
     "PERSON",
+    "SEX",
     "STATE",
+    "STREET",
+    "SURNAME",
     "TIME",
     "TITLE",
     "ZIPCODE",
