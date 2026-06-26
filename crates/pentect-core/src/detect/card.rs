@@ -1,13 +1,22 @@
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
+use regex::Regex;
+use std::sync::LazyLock;
 
 /// Credit-card numbers: maximal 13–19 digit runs that pass the Luhn checksum.
 /// The checksum is the precision lever — a random 16-digit number almost never
-/// validates — so detection needs no key or context and is language-agnostic.
-/// (Separator-formatted `4111 1111 ...` is left for later; machine artifacts
-/// carry contiguous digits.)
+/// validates — so detection needs no key or context and is language-agnostic. A
+/// lower-confidence fallback catches synthetic/non-Luhn card-like values only
+/// when nearby card-payment words disambiguate them.
 pub struct CardDetector;
+
+static CARD_CONTEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:credit\s*card|card\s*(?:number|no\.?)|creditcardnumber|payment\s*card|thẻ tín dụng|kreditkarte|kreditní karty|kreditnou kartou|číslo karty|carte bancaire|carte de cr[eé]dit|num[eé]ro de carte|tarjeta|carta di credito)",
+    )
+    .unwrap()
+});
 
 impl Detector for CardDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
@@ -30,6 +39,14 @@ impl Detector for CardDetector {
                     category: Category::Pii,
                     label: "CARD".to_string(),
                     confidence: Confidence::High,
+                    source: DetectorId::Rule,
+                });
+            } else if (13..=19).contains(&(i - start)) && has_card_context(s, start, i) {
+                out.push(Span {
+                    range: view.to_raw(ByteRange::new(start, i)),
+                    category: Category::Pii,
+                    label: "CARD".to_string(),
+                    confidence: Confidence::Medium,
                     source: DetectorId::Rule,
                 });
             }
@@ -55,6 +72,23 @@ fn luhn(digits: &[u8]) -> bool {
     sum.is_multiple_of(10)
 }
 
+fn has_card_context(text: &str, start: usize, end: usize) -> bool {
+    let left = text[..start].rfind('\n').map_or(0, |index| index + 1);
+    let right = text[end..]
+        .find('\n')
+        .map_or(text.len(), |index| end + index);
+    let context_start = floor_char_boundary(text, start.saturating_sub(96).max(left));
+    let context_end = floor_char_boundary(text, (end + 32).min(right));
+    CARD_CONTEXT.is_match(&text[context_start..context_end])
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +106,10 @@ mod tests {
     fn valid_card_detected_invalid_not() {
         assert_eq!(labels("pay 4242424242424242 now"), ["CARD"]); // valid Luhn
         assert!(labels("id 1234567812345678 x").is_empty()); // fails Luhn
+        assert_eq!(
+            labels("credit card on file ending with 650930963320025580"),
+            ["CARD"]
+        );
     }
 
     #[test]

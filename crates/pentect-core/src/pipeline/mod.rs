@@ -4,8 +4,9 @@ mod render;
 mod sweep;
 
 use crate::detect::{
-    AuthCodeDetector, Bip39Detector, CardDetector, DecodeDetector, Detector, EntropyDetector,
-    EnvValueDetector, PemDetector, PhoneDetector, RuleDetector, StructuralDetector,
+    AuthCodeDetector, Bip39Detector, CardDetector, ContextualIdDetector, DecodeDetector, Detector,
+    EntropyDetector, EnvValueDetector, PemDetector, PhoneDetector, RuleDetector,
+    StructuralDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -381,6 +382,7 @@ impl EngineBuilder {
             .detector(Box::new(AuthCodeDetector))
             .detector(Box::new(Bip39Detector))
             .detector(Box::new(CardDetector))
+            .detector(Box::new(ContextualIdDetector))
             .detector(Box::new(PemDetector::default()))
             .detector(Box::new(EntropyDetector::with(
                 knobs.entropy_min_len,
