@@ -13,7 +13,7 @@ pub struct CardDetector;
 
 static CARD_CONTEXT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:credit\s*card|card\s*(?:number|no\.?)|creditcardnumber|payment\s*card|thẻ tín dụng|kreditkarte|kreditní karty|kreditnou kartou|číslo karty|carte bancaire|carte de cr[eé]dit|num[eé]ro de carte|tarjeta|carta di credito)",
+        r"(?i)(?:credit\s*card|card\s*(?:number|no\.?)|creditcardnumber|payment\s*card|thẻ tín dụng|kreditkarte|kreditní karty|kreditnou kartou|kreditnoj kartici|číslo karty|carte bancaire|carte de cr[eé]dit|num[eé]ro de carte|tarjeta|carta di credito)",
     )
     .unwrap()
 });
@@ -108,6 +108,10 @@ mod tests {
         assert!(labels("id 1234567812345678 x").is_empty()); // fails Luhn
         assert_eq!(
             labels("credit card on file ending with 650930963320025580"),
+            ["CARD"]
+        );
+        assert_eq!(
+            labels("dostavite podatke o kreditnoj kartici 5246089887206645"),
             ["CARD"]
         );
     }

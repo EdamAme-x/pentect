@@ -14,13 +14,13 @@ static CANDIDATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\+[0-9][0-9 ().\-/]{5,18}[0-9]").unwrap());
 static CONTEXT_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(?:phone|telephone|mobile|contact|call|tel\.?|telefone|telefono|tel[eé]fono|t[eé]l[eé]phone|telefon|telepon|điện thoại|số điện thoại|電話|連絡先| 연락처|연락처)[^\r\n0-9+()]{0,48}(\+?[0-9(][0-9 ().\-/]{6,24}[0-9])"#,
+        r#"(?i)(?:phone|telephone|mobile|contact|call|tel\.?|telefone|telefono|tel[eé]fono|t[eé]l[eé]phone|telefon|telepon|điện thoại|số điện thoại|телефон|телефонен номер|телефонен|電話|連絡先| 연락처|연락처)[^\r\n0-9+()]{0,48}(\+?[0-9(][0-9 ().\-/]{6,24}[0-9])"#,
     )
     .unwrap()
 });
 static TRAILING_CONTEXT_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(\+?[0-9(][0-9 ().\-/]{6,24}[0-9])[^\r\n]{0,32}(?:phone|telephone|mobile|contact|call|tel\.?|telefone|telefono|tel[eé]fono|t[eé]l[eé]phone|telefon|telepon|điện thoại|số điện thoại|電話|連絡| 연락처|연락처)"#,
+        r#"(?i)(\+?[0-9(][0-9 ().\-/]{6,24}[0-9])[^\r\n]{0,32}(?:phone|telephone|mobile|contact|call|tel\.?|telefone|telefono|tel[eé]fono|t[eé]l[eé]phone|telefon|telepon|điện thoại|số điện thoại|телефон|телефонен|電話|連絡| 연락처|연락처)"#,
     )
     .unwrap()
 });
@@ -148,6 +148,7 @@ mod tests {
             labels("questions can be directed to a@example.com or 01472.27346"),
             ["PHONE_NUMBER"]
         );
+        assert_eq!(labels("телефонен номер 5977.025 7979"), ["PHONE_NUMBER"]);
         // `+`-shaped but too weak, and a bare id, do not mask.
         assert!(labels("ref +12 000 0000").is_empty());
         assert!(labels("order 183920475 shipped").is_empty());
