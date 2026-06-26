@@ -179,7 +179,10 @@ fn cmd_mask(args: &[String]) {
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (resolve/restore is unavailable by design).
     let kind_label = format!("{kind:?}");
-    let engine = build_engine(profile, aggressive, packs, args);
+    let engine = match build_engine(profile, aggressive, packs, args) {
+        Ok(engine) => engine,
+        Err(e) => die(&e),
+    };
     let cfg = Config {
         disclose_length,
         ..Config::generate()
@@ -1085,11 +1088,21 @@ fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
 /// masked. Output is then mostly unusable for reasoning, but still reversible.
-fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>, args: &[String]) -> Engine {
+fn build_engine(
+    profile: Profile,
+    aggressive: bool,
+    packs: Vec<Pack>,
+    args: &[String],
+) -> Result<Engine, String> {
     if aggressive {
         eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
     }
-    Engine::with_profile_packs_detectors(profile, packs, semantic_detectors(args), aggressive)
+    Ok(Engine::with_profile_packs_detectors(
+        profile,
+        packs,
+        semantic_detectors(args)?,
+        aggressive,
+    ))
 }
 
 fn semantic_requested(args: &[String]) -> bool {
@@ -1100,29 +1113,26 @@ fn semantic_requested(args: &[String]) -> bool {
 /// Built only with `--features semantic`; the script defaults to
 /// PENTECT_SEMANTIC_SCRIPT or tools/ner_sidecar.py.
 #[cfg(feature = "semantic")]
-fn semantic_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
+fn semantic_detectors(args: &[String]) -> Result<Vec<Box<dyn pentect_core::Detector>>, String> {
     if !semantic_requested(args) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let script =
         std::env::var("PENTECT_SEMANTIC_SCRIPT").unwrap_or_else(|_| "tools/ner_sidecar.py".into());
     match pentect_core::SemanticDetector::spawn(&script) {
-        Ok(d) => vec![Box::new(d)],
-        Err(e) => {
-            eprintln!(
-                "[pentect] --semantic: could not start semantic sidecar ({e}); continuing without semantic detection."
-            );
-            Vec::new()
-        }
+        Ok(d) => Ok(vec![Box::new(d)]),
+        Err(e) => Err(format!(
+            "--semantic requested, but semantic sidecar could not start: {e}"
+        )),
     }
 }
 
 #[cfg(not(feature = "semantic"))]
-fn semantic_detectors(args: &[String]) -> Vec<Box<dyn pentect_core::Detector>> {
+fn semantic_detectors(args: &[String]) -> Result<Vec<Box<dyn pentect_core::Detector>>, String> {
     if semantic_requested(args) {
-        eprintln!("[pentect] --semantic requires a build with `--features semantic`; ignoring.");
+        return Err("--semantic requires a build with `--features semantic`".to_string());
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 /// Load each `--pack FILE` as a TOML rule pack. Reading a config file is input,
@@ -1250,6 +1260,22 @@ mod tests {
     }
 
     #[test]
+    fn semantic_request_fails_if_sidecar_is_unavailable() {
+        let args = vec!["pentect".into(), "mask".into(), "--semantic".into()];
+        let old_script = std::env::var_os("PENTECT_SEMANTIC_SCRIPT");
+        std::env::set_var("PENTECT_SEMANTIC_SCRIPT", "__missing_semantic_sidecar__.py");
+        let err = match build_engine(Profile::Balanced, false, Vec::new(), &args) {
+            Ok(_) => panic!("expected --semantic to fail without a usable sidecar"),
+            Err(err) => err,
+        };
+        restore_semantic_script(old_script);
+        assert!(
+            err.contains("--semantic") || err.contains("sidecar"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn semantic_provider_argument_is_rejected() {
         let args = vec![
             "pentect".into(),
@@ -1306,6 +1332,14 @@ mod tests {
             "tools/custom_sidecar.py".into(),
         ];
         assert!(validate_mask_args(&args).unwrap_err().contains("removed"));
+    }
+
+    fn restore_semantic_script(old_script: Option<std::ffi::OsString>) {
+        if let Some(value) = old_script {
+            std::env::set_var("PENTECT_SEMANTIC_SCRIPT", value);
+        } else {
+            std::env::remove_var("PENTECT_SEMANTIC_SCRIPT");
+        }
     }
 
     #[test]

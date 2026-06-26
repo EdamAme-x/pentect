@@ -49,7 +49,18 @@ pub trait Detector {
 /// `None` for an unknown name.
 pub fn enable_builtin(name: &str) -> Option<Box<dyn Detector>> {
     match name {
+        "CONTEXTUAL_ID" => Some(Box::new(contextual_id::ContextualIdDetector)),
         "DATE_TIME" => Some(Box::new(date::date_detector())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contextual_id_is_opt_in_builtin() {
+        assert!(enable_builtin("CONTEXTUAL_ID").is_some());
     }
 }

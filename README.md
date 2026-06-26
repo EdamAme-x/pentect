@@ -80,3 +80,13 @@ secret-candidate confusion matrices after exporting SecretBench.
 OpenPII Nano is synthetic multilingual PII, CC-BY-4.0. It is useful for
 measuring recall gaps on names, addresses, phone numbers, IDs, and dates; it is
 not a secrets-only benchmark.
+
+Long-tail local document IDs can be measured with the opt-in contextual detector:
+
+```powershell
+python tools/eval_ai4privacy.py --download openpii-nano-validation --bin target\release\pentect.exe --preset core-structured --extra-arg=--enable --extra-arg=CONTEXTUAL_ID
+```
+
+Keep this separate from the default core score. `CONTEXTUAL_ID` uses language
+and workflow context, so it is useful for recall research but easier to
+overfit than checksum/structure detectors.

@@ -19,10 +19,10 @@ static CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:[A-Z0-9][A-Z0-9-]{6,38}[A-Z0-9]|[0-9][0-9 .-]{6,28}[0-9])").unwrap()
 });
 
-/// Generic local document/account identifiers where the value's shape is not
-/// enough by itself. This is deliberately context-gated: it masks ID-looking
-/// values inside verification/copy/certification/sensitive-data prose, while
-/// leaving ordinary order numbers, SKUs, and logs alone.
+/// Opt-in generic local document/account identifiers where the value's shape is
+/// not enough by itself. This deliberately stays out of the default core stack:
+/// language/context lexicons are useful for recall measurement, but too easy to
+/// turn into benchmark-specific overreach.
 pub struct ContextualIdDetector;
 
 impl Detector for ContextualIdDetector {
