@@ -9,6 +9,7 @@ pub struct Bip39Detector;
 struct WordToken {
     start: usize,
     end: usize,
+    language_mask: u16,
 }
 
 impl Detector for Bip39Detector {
@@ -27,13 +28,18 @@ impl Detector for Bip39Detector {
                 if end > tokens.len() {
                     continue;
                 }
-                let phrase = tokens[start..end]
+                let language_mask = tokens[start..end]
+                    .iter()
+                    .fold(u16::MAX, |mask, token| mask & token.language_mask);
+                if language_mask == 0 {
+                    continue;
+                }
+                let words = tokens[start..end]
                     .iter()
                     .map(|token| &text[token.start..token.end])
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    .collect::<Vec<_>>();
                 if !has_strong_boundary(text, &tokens, start, end)
-                    || !validate::bip39_mnemonic(&phrase)
+                    || !validate::bip39_mnemonic_window(&words)
                 {
                     continue;
                 }
@@ -59,7 +65,7 @@ fn word_tokens(text: &str) -> Vec<WordToken> {
     let mut start = None;
 
     for (index, ch) in text.char_indices() {
-        if ch.is_ascii_alphabetic() {
+        if ch.is_alphabetic() {
             start.get_or_insert(index);
             continue;
         }
@@ -98,9 +104,14 @@ fn is_strong_separator(value: &str) -> bool {
 }
 
 fn push_token(text: &str, start: usize, end: usize, tokens: &mut Vec<WordToken>) {
-    let len = text[start..end].len();
-    if (3..=8).contains(&len) {
-        tokens.push(WordToken { start, end });
+    let len = text[start..end].chars().count();
+    if (1..=16).contains(&len) {
+        let language_mask = validate::bip39_language_mask(&text[start..end]);
+        tokens.push(WordToken {
+            start,
+            end,
+            language_mask,
+        });
     }
 }
 
@@ -139,6 +150,12 @@ mod tests {
                 "abandon\n2. abandon\n3. abandon\n4. abandon\n5. abandon\n6. abandon\n7. abandon\n8. abandon\n9. abandon\n10. abandon\n11. abandon\n12. about"
             ]
         );
+    }
+
+    #[test]
+    fn detects_non_english_seed_phrases() {
+        let japanese = "あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あおぞら";
+        assert_eq!(hit_values(japanese), vec![japanese]);
     }
 
     #[test]

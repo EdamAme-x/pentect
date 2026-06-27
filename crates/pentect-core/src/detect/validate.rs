@@ -3,8 +3,17 @@
 //! lets a permissive pattern avoid false positives (the Presidio approach).
 //! Every function is covered by reference test vectors below.
 
-use std::collections::HashMap;
+use bip39::{Language, Mnemonic};
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::LazyLock;
+
+static BIP39_WORDSETS: LazyLock<Vec<(Language, HashSet<&'static str>)>> = LazyLock::new(|| {
+    Language::ALL
+        .iter()
+        .map(|language| (*language, language.word_list().iter().copied().collect()))
+        .collect()
+});
 
 /// ASCII digits of `s` as 0-9 values, ignoring all other bytes (so separators
 /// like spaces/hyphens/dots don't matter).
@@ -738,23 +747,17 @@ pub fn ipv6(s: &str) -> bool {
     }
 }
 
-static BIP39_ENGLISH: &str = include_str!("bip39_english.txt");
-static BIP39_INDEX: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {
-    BIP39_ENGLISH
-        .lines()
-        .enumerate()
-        .map(|(index, word)| (word, index))
-        .collect()
-});
-
 /// BIP-39 mnemonic seed phrase: a contiguous run of 12/15/18/21/24 words from
-/// the English wordlist with a valid SHA-256 checksum. Wordlist membership +
-/// checksum make false positives negligible (a random word sequence almost never
-/// validates). The match may include a few adjacent words, so we scan windows
-/// of each valid length — a hit masks the whole region (over-masking an adjacent
-/// word is safe; leaking a seed phrase is not).
+/// an official wordlist with a valid checksum. The `bip39` crate handles all
+/// enabled BIP-39 languages and Unicode normalization; checksum validation keeps
+/// false positives negligible.
 pub fn bip39_mnemonic(s: &str) -> bool {
-    let words: Vec<&str> = s.split_whitespace().collect();
+    let mut normalized = Cow::Borrowed(s);
+    Mnemonic::normalize_utf8_cow(&mut normalized);
+    let words: Vec<String> = normalized
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect();
     for &len in &[24usize, 21, 18, 15, 12] {
         if words.len() < len {
             continue;
@@ -768,29 +771,46 @@ pub fn bip39_mnemonic(s: &str) -> bool {
     false
 }
 
-fn bip39_window_valid(words: &[&str]) -> bool {
-    use sha2::{Digest, Sha256};
-    let total_bits = words.len() * 11;
-    let cs_bits = total_bits / 33;
-    let ent_bits = total_bits - cs_bits;
-    let mut bits = Vec::with_capacity(total_bits);
-    for w in words {
-        let lw = w.to_ascii_lowercase();
-        let Some(&idx) = BIP39_INDEX.get(lw.as_str()) else {
-            return false;
-        };
-        for b in (0..11).rev() {
-            bits.push(((idx >> b) & 1) as u8);
+pub(crate) fn bip39_mnemonic_window(words: &[&str]) -> bool {
+    if !matches!(words.len(), 12 | 15 | 18 | 21 | 24) {
+        return false;
+    }
+    let words = words
+        .iter()
+        .map(|word| {
+            let mut normalized = Cow::Borrowed(*word);
+            Mnemonic::normalize_utf8_cow(&mut normalized);
+            normalized.to_lowercase()
+        })
+        .collect::<Vec<_>>();
+    bip39_window_valid(&words)
+}
+
+pub(crate) fn bip39_language_mask(word: &str) -> u16 {
+    let mut normalized = Cow::Borrowed(word);
+    Mnemonic::normalize_utf8_cow(&mut normalized);
+    let word = normalized.to_lowercase();
+    let mut mask = 0u16;
+    for (index, (_, wordset)) in BIP39_WORDSETS.iter().enumerate() {
+        if wordset.contains(word.as_str()) {
+            mask |= 1 << index;
         }
     }
-    let mut ent = vec![0u8; ent_bits / 8];
-    for (i, &bit) in bits.iter().take(ent_bits).enumerate() {
-        if bit == 1 {
-            ent[i / 8] |= 1 << (7 - (i % 8));
+    mask
+}
+
+fn bip39_window_valid(words: &[String]) -> bool {
+    let mut phrase = None;
+    for (language, wordset) in BIP39_WORDSETS.iter() {
+        if !words.iter().all(|word| wordset.contains(word.as_str())) {
+            continue;
+        }
+        let phrase = phrase.get_or_insert_with(|| words.join(" "));
+        if Mnemonic::parse_in(*language, phrase.as_str()).is_ok() {
+            return true;
         }
     }
-    let hash = Sha256::digest(&ent);
-    (0..cs_bits).all(|i| (hash[i / 8] >> (7 - (i % 8))) & 1 == bits[ent_bits + i])
+    false
 }
 
 /// Local account names captured from home-directory paths. This is not a
@@ -1053,6 +1073,9 @@ mod tests {
         ));
         assert!(bip39_mnemonic(
             "legal winner thank year wave sausage worth useful legal winner thank yellow"
+        ));
+        assert!(bip39_mnemonic(
+            "あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あいこくしん　あおぞら"
         ));
         // Right length & wordlist but wrong checksum (last word swapped).
         assert!(!bip39_mnemonic(

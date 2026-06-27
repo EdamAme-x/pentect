@@ -61,4 +61,35 @@ mod tests {
             "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAA"
         );
     }
+
+    #[test]
+    fn detects_common_private_key_armor_types() {
+        for label in [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+        ] {
+            let body = "MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT";
+            let raw = format!("-----BEGIN {label}-----\n{body}\n-----END {label}-----");
+            let region = region(&raw);
+            let view = NormalizedView::build(&region, &raw);
+            let spans = PemDetector::default().detect(&view);
+            assert_eq!(spans.len(), 1, "{label}");
+            assert_eq!(&raw[spans[0].range.start..spans[0].range.end], body);
+        }
+    }
+
+    #[test]
+    fn does_not_mask_public_key_armor_as_private_key() {
+        let raw = concat!(
+            "-----BEGIN PUBLIC KEY-----\n",
+            "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A\n",
+            "-----END PUBLIC KEY-----"
+        );
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        assert!(PemDetector::default().detect(&view).is_empty());
+    }
 }

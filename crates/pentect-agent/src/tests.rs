@@ -381,44 +381,38 @@ fn resolve_file_materialization_requires_approval_without_dashboard() {
 }
 
 #[test]
-fn approval_config_can_disable_dashboard_requirement() {
-    let root = temp_root("approval-config-optional");
-    let session_name = format!("approval_config_optional_{}", unix_millis());
-    let ticket = resolve_approval_ticket(&[PathBuf::from(".env.prod")]);
-
-    let decision = approval_decision_for_ticket_with_config(
-        &session_name,
-        &ticket,
-        ProjectConfig {
-            approval_required: false,
-        },
+fn forged_unsigned_heartbeat_is_not_alive() {
+    let root = temp_root("approval-forged-heartbeat");
+    let session_name = format!("approval_forged_heartbeat_{}", unix_millis());
+    let queue = ApprovalQueue::open(&session_name).unwrap();
+    let heartbeat = session_root(&session_name)
+        .unwrap()
+        .join("approvals")
+        .join("dashboard.heartbeat");
+    std::fs::write(
+        &heartbeat,
+        format!(
+            "time={}\nkey={}\nbypass=true\n",
+            unix_millis(),
+            "00".repeat(32)
+        ),
     )
     .unwrap();
 
-    assert_eq!(decision, ApprovalDecision::Once);
+    assert!(!queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE));
     let _ = std::fs::remove_dir_all(session_root(&session_name).unwrap());
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn dashboard_bypass_all_allows_pending_approval_temporarily() {
-    let root = temp_root("approval-bypass");
-    let session_name = format!("approval_bypass_{}", unix_millis());
-    let queue = ApprovalQueue::open_dashboard(&session_name).unwrap();
-    queue.heartbeat(None, true).unwrap();
-    let ticket = resolve_approval_ticket(&[PathBuf::from(".env.prod")]);
+fn resolve_stdin_materialization_requires_approval_without_dashboard() {
+    let root = temp_root("approval-resolve-stdin-fail-closed");
+    let approval_session = format!("approval_resolve_stdin_fail_closed_{}", unix_millis());
+    let input = "OPENAI_API_KEY=<<OPENAI_API_KEY_abcdef0123456789>>\n";
 
-    let decision = approval_decision_for_ticket_with_config(
-        &session_name,
-        &ticket,
-        ProjectConfig {
-            approval_required: true,
-        },
-    )
-    .unwrap();
-
-    assert_eq!(decision, ApprovalDecision::Once);
-    let _ = std::fs::remove_dir_all(session_root(&session_name).unwrap());
+    let err = approval_decision_for_resolve_stdin(&approval_session, input).unwrap_err();
+    assert!(err.contains("approval UI is not running"), "{err}");
+    let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
     let _ = std::fs::remove_dir_all(root);
 }
 

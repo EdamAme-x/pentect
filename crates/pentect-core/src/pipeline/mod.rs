@@ -452,6 +452,7 @@ mod tests {
     use super::*;
     use crate::recovery::restore;
     use proptest::prelude::*;
+    use sha2::Digest as _;
     use std::cell::OnceCell;
 
     thread_local! {
@@ -502,6 +503,18 @@ mod tests {
                 &Config::insecure_testing(),
             )
         })
+    }
+
+    fn bitcoin_base58check(version: u8, payload: &[u8]) -> String {
+        let mut data = Vec::with_capacity(1 + payload.len() + 4);
+        data.push(version);
+        data.extend_from_slice(payload);
+        let first = sha2::Sha256::digest(&data);
+        let second = sha2::Sha256::digest(first);
+        data.extend_from_slice(&second[..4]);
+        bs58::encode(data)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string()
     }
 
     #[test]
@@ -1518,6 +1531,40 @@ mod tests {
         // Armor preserved so the model knows what was masked.
         assert!(
             r.masked.contains("-----BEGIN RSA PRIVATE KEY-----"),
+            "{}",
+            r.masked
+        );
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn private_key_variants_mask_under_default_profile() {
+        for label in [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+        ] {
+            let body = "MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT";
+            let input = format!("-----BEGIN {label}-----\n{body}\n-----END {label}-----");
+            let r = Engine::with_profile(Profile::Balanced)
+                .mask(Input::text(&input), &Config::insecure_testing());
+            assert!(r.masked.contains("<<PRIVATE_KEY_"), "{label}: {}", r.masked);
+            assert!(!r.masked.contains(body), "{label}: {}", r.masked);
+            assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn bitcoin_wif_private_key_masks_under_default_profile() {
+        let wif = bitcoin_base58check(0x80, &[0x22u8; 32]);
+        let input = format!("wallet private key: {wif}");
+        let r = Engine::with_profile(Profile::Balanced)
+            .mask(Input::text(&input), &Config::insecure_testing());
+        assert!(!r.masked.contains(&wif), "{}", r.masked);
+        assert!(
+            r.masked.contains("<<CRYPTO_PRIVATE_KEY_WIF_"),
             "{}",
             r.masked
         );

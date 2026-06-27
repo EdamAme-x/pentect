@@ -9,7 +9,6 @@
 mod approval;
 mod approve_ui;
 mod masking;
-mod project_config;
 mod session;
 mod shell;
 
@@ -22,7 +21,6 @@ use masking::{
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
 use pentect_core::{Config, Engine, Input, Kind, Profile, RegionKind};
-use project_config::{load_project_config, ProjectConfig};
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
 use sha2::{Digest, Sha256};
@@ -34,10 +32,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use std::time::Duration;
 
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
@@ -138,15 +132,13 @@ fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
             .map_err(|e| e.to_string());
     }
 
-    let bypass_all = Arc::new(AtomicBool::new(false));
     let heartbeat_queue = queue.clone();
-    let heartbeat_bypass = Arc::clone(&bypass_all);
     let _heartbeat_thread = std::thread::spawn(move || loop {
-        let _ = heartbeat_queue.heartbeat(None, heartbeat_bypass.load(Ordering::Relaxed));
+        let _ = heartbeat_queue.heartbeat(None);
         std::thread::sleep(Duration::from_millis(500));
     });
 
-    print_dashboard_status(session, &queue, None, bypass_all.load(Ordering::Relaxed))?;
+    print_dashboard_status(session, &queue, None)?;
     loop {
         if let Some(ticket) = queue.next_pending()? {
             let request = ApprovalRequest {
@@ -159,7 +151,7 @@ fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
             };
             let decision = approve_ui::run(&request).map_err(|e| e.to_string())?;
             queue.decide(&ticket, decision, "ui")?;
-            print_dashboard_status(session, &queue, None, bypass_all.load(Ordering::Relaxed))?;
+            print_dashboard_status(session, &queue, None)?;
         } else {
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -170,10 +162,8 @@ fn print_dashboard_status(
     session: &str,
     queue: &ApprovalQueue,
     port: Option<u16>,
-    bypass_all: bool,
 ) -> Result<(), String> {
     let request = dashboard_request(session)?;
-    let config = load_project_config().map_err(|e| e.to_string())?;
     print!("\x1b[2J\x1b[H");
     println!("pentect");
     println!("{}", request.body);
@@ -181,16 +171,7 @@ fn print_dashboard_status(
         println!("port: {port}");
     }
     println!();
-    println!(
-        "approval: {}",
-        if config.approval_required {
-            "required"
-        } else {
-            "optional"
-        }
-    );
-    println!("bypass all: {}", if bypass_all { "on" } else { "off" });
-    println!();
+    println!("approval: required");
     println!("waiting for approvals");
     let history = queue.recent_history(5)?;
     if !history.is_empty() {
@@ -360,6 +341,16 @@ fn cmd_resolve(args: &[String]) -> i32 {
                 Ok(s) => s,
                 Err(e) => return die(&e),
             };
+            if resolved != input {
+                match approval_decision_for_resolve_stdin(&opts.session, &input) {
+                    Ok(ApprovalDecision::Once | ApprovalDecision::Always) => {}
+                    Ok(ApprovalDecision::Decline) => {
+                        eprintln!("[pentect] resolve declined");
+                        return 1;
+                    }
+                    Err(e) => return die(&e),
+                }
+            }
             print!("{resolved}");
             let _ = std::io::stdout().flush();
         }
@@ -372,6 +363,17 @@ fn approval_decision_for_resolve(
     paths: &[PathBuf],
 ) -> Result<ApprovalDecision, String> {
     let ticket = resolve_approval_ticket(paths);
+    if ApprovalQueue::open(session)?.always_granted(&ticket.fingerprint) {
+        return Ok(ApprovalDecision::Always);
+    }
+    approval_decision_for_ticket(session, &ticket)
+}
+
+fn approval_decision_for_resolve_stdin(
+    session: &str,
+    input: &str,
+) -> Result<ApprovalDecision, String> {
+    let ticket = resolve_stdin_approval_ticket(input);
     if ApprovalQueue::open(session)?.always_granted(&ticket.fingerprint) {
         return Ok(ApprovalDecision::Always);
     }
@@ -396,6 +398,23 @@ fn resolve_approval_ticket(paths: &[PathBuf]) -> ApprovalTicket {
         command,
         Vec::new(),
         0,
+        Vec::new(),
+        false,
+        true,
+    )
+}
+
+fn resolve_stdin_approval_ticket(input: &str) -> ApprovalTicket {
+    let command = "pentect resolve <stdin>".to_string();
+    let mut material = String::from("resolve-stdin-materialize-v1\0");
+    material.push_str(&secret_value_hash(input));
+    material.push('\0');
+    let digest = Sha256::digest(material.as_bytes());
+    ApprovalTicket::new(
+        data_encoding::HEXLOWER.encode(&digest[..16]),
+        command,
+        Vec::new(),
+        masked_handles_in_text(input).len(),
         Vec::new(),
         false,
         true,
@@ -548,27 +567,7 @@ fn approval_decision_for_ticket(
     session: &str,
     ticket: &ApprovalTicket,
 ) -> Result<ApprovalDecision, String> {
-    approval_decision_for_ticket_with_config(
-        session,
-        ticket,
-        load_project_config().map_err(|e| e.to_string())?,
-    )
-}
-
-fn approval_decision_for_ticket_with_config(
-    session: &str,
-    ticket: &ApprovalTicket,
-    config: ProjectConfig,
-) -> Result<ApprovalDecision, String> {
     let queue = ApprovalQueue::open(session)?;
-    if !config.approval_required {
-        queue.record(ticket, ApprovalDecision::Once, "config")?;
-        return Ok(ApprovalDecision::Once);
-    }
-    if queue.dashboard_bypass_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
-        queue.record(ticket, ApprovalDecision::Once, "bypass")?;
-        return Ok(ApprovalDecision::Once);
-    }
     if !queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
         queue.record(ticket, ApprovalDecision::Decline, "auto")?;
         return Err(

@@ -29,9 +29,8 @@ the project files.
 - Open the approval dashboard with `pentect`; use `pentect --port 7331` for the small local web dashboard. Inspect another scope with `pentect dashboard --dir PATH --session NAME`.
 - Approval is required by default. When a command uses a stored capability, sends to the network, or materializes a resolved file, `pentect exec` waits for `once`, `always`, or `decline`; if no dashboard is running, it fails closed.
 - If the dashboard is not running, agents should ask the user to run `pentect` in the project and retry.
-- The web dashboard can temporarily `bypass all` while it is running and can toggle `.pentect/config.toml` `approval_required`.
+- The web dashboard only serves the approval queue; state-changing actions use signed decisions from the live dashboard.
 - Approval history and readable `always` records are mirrored under `.pentect/approvals/`; runtime queue files stay under `.pentect-agent/`.
-- For local throwaway demos only, `.pentect/config.toml` can set `approval_required = false`.
 - Show the command approval preview with `pentect approve "<command>"`.
 - Non-core detectors are managed as local extensions: `pentect codex --extensions openai-privacy-filter` uses `.pentect/extensions/openai-privacy-filter`, while `--extensions ./rules.toml` activates a standalone TOML rule pack. Default project extensions live in `.pentect/config.toml` as `extensions = ["openai-privacy-filter", "./rules.toml"]`.
 - Block direct AI Read tools; use `pentect exec "<command>"` at the tool boundary.

@@ -1,24 +1,21 @@
 use crate::approve_ui::ApprovalDecision;
-use crate::project_config::{load_project_config, set_approval_required};
 use crate::session::session_root;
 use anyhow::Context;
 use axum::{
-    extract::{RawQuery, State},
+    extract::{Form, State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::{json, Value};
 use sha2::Digest;
+use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::Duration;
 
 const PENTECT_DIR: &str = ".pentect";
@@ -59,7 +56,6 @@ struct ApprovalDirs {
 
 struct DashboardHeartbeat {
     key: VerifyingKey,
-    bypass_all: bool,
 }
 
 #[derive(Clone)]
@@ -67,7 +63,7 @@ struct WebState {
     queue: ApprovalQueue,
     session: Arc<str>,
     port: u16,
-    bypass_all: Arc<AtomicBool>,
+    csrf: Arc<str>,
 }
 
 impl ApprovalQueue {
@@ -106,39 +102,24 @@ impl ApprovalQueue {
         Ok(queue)
     }
 
-    pub(crate) fn heartbeat(&self, port: Option<u16>, bypass_all: bool) -> Result<(), String> {
-        let mut body = format!("time={}\n", unix_millis());
-        if let Some(signer) = &self.signer {
-            body.push_str(&format!(
-                "key={}\n",
-                public_key_hex(&signer.verifying_key())
-            ));
-        }
+    pub(crate) fn heartbeat(&self, port: Option<u16>) -> Result<(), String> {
+        let time_ms = unix_millis();
+        let Some(signer) = &self.signer else {
+            return Ok(());
+        };
+        let key = public_key_hex(&signer.verifying_key());
+        let payload = heartbeat_payload(time_ms, &key, port);
+        let mut body = format!("time={time_ms}\nkey={key}\n");
         if let Some(port) = port {
             body.push_str(&format!("port={port}\n"));
         }
-        body.push_str(if bypass_all {
-            "bypass=true\n"
-        } else {
-            "bypass=false\n"
-        });
+        body.push_str(&format!("signature={}\n", sign_hex(signer, &payload)));
         fs::write(&self.dirs.heartbeat, body)
             .map_err(|e| format!("could not write '{}': {e}", self.dirs.heartbeat.display()))
     }
 
     pub(crate) fn dashboard_alive(&self, max_age: Duration) -> bool {
-        let Ok(meta) = fs::metadata(&self.dirs.heartbeat) else {
-            return false;
-        };
-        let Ok(modified) = meta.modified() else {
-            return false;
-        };
-        modified.elapsed().is_ok_and(|age| age <= max_age)
-    }
-
-    pub(crate) fn dashboard_bypass_alive(&self, max_age: Duration) -> bool {
-        self.dashboard_heartbeat(max_age)
-            .is_some_and(|heartbeat| heartbeat.bypass_all)
+        self.dashboard_heartbeat(max_age).is_some()
     }
 
     pub(crate) fn always_granted(&self, fingerprint: &str) -> bool {
@@ -197,17 +178,6 @@ impl ApprovalQueue {
                 remove_file_if_exists(&self.pending_path(&ticket.id))?;
                 remove_file_if_exists(&self.decision_path(&ticket.id))?;
                 return Ok(decision);
-            }
-            if self.dashboard_bypass_alive(heartbeat_max_age) {
-                self.finish(ticket, ApprovalDecision::Once, "bypass")?;
-                return Ok(ApprovalDecision::Once);
-            }
-            if !load_project_config()
-                .map_err(|e| e.to_string())?
-                .approval_required
-            {
-                self.finish(ticket, ApprovalDecision::Once, "config")?;
-                return Ok(ApprovalDecision::Once);
             }
             if !self.dashboard_alive(heartbeat_max_age) {
                 self.finish(ticket, ApprovalDecision::Decline, "auto")?;
@@ -275,9 +245,25 @@ impl ApprovalQueue {
     }
 
     pub(crate) fn recent_history(&self, limit: usize) -> Result<Vec<String>, String> {
-        let Ok(text) = fs::read_to_string(&self.dirs.history) else {
+        let Ok(mut file) = fs::File::open(&self.dirs.history) else {
             return Ok(Vec::new());
         };
+        let len = file
+            .metadata()
+            .map_err(|e| format!("could not stat '{}': {e}", self.dirs.history.display()))?
+            .len();
+        let window = len.min(16 * 1024);
+        file.seek(SeekFrom::Start(len - window))
+            .map_err(|e| format!("could not seek '{}': {e}", self.dirs.history.display()))?;
+        let mut bytes = Vec::with_capacity(window as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|e| format!("could not read '{}': {e}", self.dirs.history.display()))?;
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        if window < len {
+            if let Some(index) = text.find('\n') {
+                text.drain(..=index);
+            }
+        }
         let mut lines = text
             .lines()
             .rev()
@@ -302,28 +288,22 @@ impl ApprovalQueue {
     }
 
     async fn serve_web_async(&self, session: String, port: u16) -> crate::Result<()> {
-        let bypass_all = Arc::new(AtomicBool::new(false));
         let state = WebState {
             queue: self.clone(),
             session: Arc::from(session),
             port,
-            bypass_all,
+            csrf: Arc::from(random_hex_or_fallback("approval-csrf")),
         };
         let heartbeat_state = state.clone();
         tokio::spawn(async move {
             loop {
-                let _ = heartbeat_state.queue.heartbeat(
-                    Some(heartbeat_state.port),
-                    heartbeat_state.bypass_all.load(Ordering::Relaxed),
-                );
+                let _ = heartbeat_state.queue.heartbeat(Some(heartbeat_state.port));
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         });
         let app = Router::new()
             .route("/", get(web_index))
-            .route("/decide", get(web_decide))
-            .route("/bypass", get(web_bypass))
-            .route("/config", get(web_config))
+            .route("/decide", post(web_decide))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
@@ -334,44 +314,17 @@ impl ApprovalQueue {
             .context("web dashboard failed")
     }
 
-    fn render_html(&self, session: &str, bypass_all: bool) -> Result<String, String> {
+    fn render_html(&self, session: &str, csrf: &str) -> Result<String, String> {
         let pending = self.next_pending()?;
         let history = self.recent_history(8)?;
-        let config = load_project_config().map_err(|e| e.to_string())?;
         let mut html = String::from(
             "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta http-equiv=refresh content=1><title>pentect</title>\
-             <style>body{font:15px system-ui;margin:32px;max-width:880px;background:#0b0d10;color:#f4f7fb}pre{white-space:pre-wrap;background:#151922;padding:16px;border:1px solid #2b3340;border-radius:8px}button{min-height:40px;padding:0 16px;margin:4px 8px 4px 0;border-radius:8px;border:1px solid #394452;background:#1b2230;color:#f4f7fb}.good{color:#75e0a7}.bad{color:#ff9d9d}.muted{color:#9ca7b4}</style>",
+             <style>body{font:15px system-ui;margin:24px;max-width:760px;color:#111;background:#fff}h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:24px 0 8px}p{margin:6px 0}pre{white-space:pre-wrap;background:#f6f6f6;padding:12px;border:1px solid #ddd}button{font:inherit;padding:6px 12px;margin:0 8px 8px 0;border:1px solid #999;background:#fff;color:#111}.muted{color:#666}</style>",
         );
         html.push_str(&format!(
-            "<h1>pentect</h1><p class=muted>session {}</p><p>approval: <b>{}</b> · bypass: <b>{}</b></p>",
+            "<h1>pentect</h1><p class=muted>{}</p>",
             esc(session),
-            if config.approval_required { "required" } else { "optional" },
-            if bypass_all { "on" } else { "off" }
         ));
-        html.push_str("<p>");
-        html.push_str(&format!(
-            "<a href=\"/bypass?enabled={}\"><button>{}</button></a>",
-            if bypass_all { "false" } else { "true" },
-            if bypass_all {
-                "disable bypass"
-            } else {
-                "bypass all"
-            }
-        ));
-        html.push_str(&format!(
-            "<a href=\"/config?approval_required={}\"><button>{}</button></a>",
-            if config.approval_required {
-                "false"
-            } else {
-                "true"
-            },
-            if config.approval_required {
-                "make optional"
-            } else {
-                "require approval"
-            }
-        ));
-        html.push_str("</p>");
         if let Some(ticket) = pending {
             html.push_str("<h2>approval</h2><pre>");
             html.push_str(&esc(&ticket_summary(&ticket)));
@@ -382,7 +335,12 @@ impl ApprovalQueue {
                 ("decline", "decline"),
             ] {
                 html.push_str(&format!(
-                    "<a href=\"/decide?id={}&decision={}\"><button>{}</button></a>",
+                    "<form method=\"post\" action=\"/decide\" style=\"display:inline\">\
+                     <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+                     <input type=\"hidden\" name=\"id\" value=\"{}\">\
+                     <input type=\"hidden\" name=\"decision\" value=\"{}\">\
+                     <button>{}</button></form>",
+                    esc_attr(csrf),
                     esc_attr(&ticket.id),
                     decision,
                     label
@@ -549,25 +507,41 @@ impl ApprovalQueue {
     }
 
     fn dashboard_heartbeat(&self, max_age: Duration) -> Option<DashboardHeartbeat> {
-        if !self.dashboard_alive(max_age) {
-            return None;
-        }
         let text = fs::read_to_string(&self.dirs.heartbeat).ok()?;
         let mut key = None;
-        let mut bypass_all = false;
+        let mut key_hex = None;
+        let mut time_ms = None;
+        let mut port = None;
+        let mut signature = None;
         for line in text.lines() {
-            if let Some(value) = line.strip_prefix("key=") {
-                key = verifying_key_from_hex(value.trim()).ok();
-            } else if line.trim() == "bypass=true" {
-                bypass_all = true;
+            let line = line.trim();
+            if let Some(value) = line.strip_prefix("time=") {
+                time_ms = value.trim().parse::<u128>().ok();
+            } else if let Some(value) = line.strip_prefix("key=") {
+                let value = value.trim();
+                key = verifying_key_from_hex(value).ok();
+                key_hex = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("port=") {
+                port = value.trim().parse::<u16>().ok();
+            } else if let Some(value) = line.strip_prefix("signature=") {
+                signature = Some(value.trim().to_string());
             }
         }
-        let key = key.or_else(|| {
-            fs::read_to_string(&self.dirs.dashboard_key)
-                .ok()
-                .and_then(|text| verifying_key_from_hex(text.trim()).ok())
-        })?;
-        Some(DashboardHeartbeat { key, bypass_all })
+        let key = key?;
+        let key_hex = key_hex?;
+        let time_ms = time_ms?;
+        let signature = signature?;
+        let now = unix_millis();
+        let max_age_ms = max_age.as_millis();
+        if time_ms > now.saturating_add(max_age_ms) {
+            return None;
+        }
+        if now.saturating_sub(time_ms) > max_age_ms {
+            return None;
+        }
+        let payload = heartbeat_payload(time_ms, &key_hex, port);
+        verify_signature(&key, &payload, &signature).ok()?;
+        Some(DashboardHeartbeat { key })
     }
 
     fn verify_decision(
@@ -630,57 +604,86 @@ impl ApprovalQueue {
 }
 
 async fn web_index(State(state): State<WebState>) -> Response {
-    match state.queue.render_html(
-        state.session.as_ref(),
-        state.bypass_all.load(Ordering::Relaxed),
-    ) {
+    match state
+        .queue
+        .render_html(state.session.as_ref(), state.csrf.as_ref())
+    {
         Ok(html) => Html(html).into_response(),
         Err(e) => web_error(e),
     }
 }
 
-async fn web_decide(State(state): State<WebState>, RawQuery(query): RawQuery) -> Response {
+async fn web_decide(
+    State(state): State<WebState>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
     let result = (|| {
-        let query = query.unwrap_or_default();
-        let id = query_param(&query, "id").unwrap_or_default();
-        let decision = query_param(&query, "decision")
-            .and_then(|value| decision_from_str(&value))
-            .unwrap_or(ApprovalDecision::Decline);
-        if let Some(ticket) = state.queue.pending_by_id(&id)? {
-            state.queue.decide(&ticket, decision, "web")?;
-        }
+        require_csrf(&form, state.csrf.as_ref())?;
+        let id = form
+            .get("id")
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| WebRouteError::bad_request("missing approval id"))?;
+        let decision = form
+            .get("decision")
+            .and_then(|value| decision_from_str(value))
+            .ok_or_else(|| WebRouteError::bad_request("invalid approval decision"))?;
+        let ticket = state
+            .queue
+            .pending_by_id(id)?
+            .ok_or_else(|| WebRouteError::not_found("approval request not found"))?;
+        state.queue.decide(&ticket, decision, "web")?;
         Ok(())
     })();
     redirect_or_error(result)
 }
 
-async fn web_bypass(State(state): State<WebState>, RawQuery(query): RawQuery) -> Response {
-    let query = query.unwrap_or_default();
-    let enabled = query_param(&query, "enabled").is_some_and(|value| value == "true");
-    state.bypass_all.store(enabled, Ordering::Relaxed);
-    let result = state.queue.heartbeat(Some(state.port), enabled);
-    redirect_or_error(result)
-}
-
-async fn web_config(State(_state): State<WebState>, RawQuery(query): RawQuery) -> Response {
-    let query = query.unwrap_or_default();
-    let required = query_param(&query, "approval_required").is_none_or(|value| value != "false");
-    redirect_or_error(
-        set_approval_required(required)
-            .map(|_| ())
-            .map_err(|e| e.to_string()),
-    )
-}
-
-fn redirect_or_error(result: Result<(), String>) -> Response {
+fn redirect_or_error(result: Result<(), WebRouteError>) -> Response {
     match result {
         Ok(()) => Redirect::to("/").into_response(),
-        Err(e) => web_error(e),
+        Err(e) => (e.status, e.message).into_response(),
     }
 }
 
 fn web_error(message: String) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+}
+
+#[derive(Debug)]
+struct WebRouteError {
+    status: StatusCode,
+    message: String,
+}
+
+impl WebRouteError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for WebRouteError {
+    fn from(message: String) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        }
+    }
+}
+
+fn require_csrf(form: &HashMap<String, String>, expected: &str) -> Result<(), WebRouteError> {
+    match form.get("csrf") {
+        Some(actual) if actual == expected => Ok(()),
+        _ => Err(WebRouteError::bad_request("invalid csrf token")),
+    }
 }
 
 impl ApprovalTicket {
@@ -848,6 +851,19 @@ fn always_payload(fingerprint: &str, created_at_ms: u128) -> String {
     out
 }
 
+fn heartbeat_payload(time_ms: u128, key_hex: &str, port: Option<u16>) -> String {
+    let mut out = String::new();
+    canonical_field(&mut out, "kind", "approval-heartbeat-v1");
+    canonical_field(&mut out, "time_ms", &time_ms.to_string());
+    canonical_field(&mut out, "key", key_hex);
+    canonical_field(
+        &mut out,
+        "port",
+        &port.map(|value| value.to_string()).unwrap_or_default(),
+    );
+    out
+}
+
 fn canonical_list(out: &mut String, key: &str, values: &[String]) {
     canonical_field(out, key, &values.join("\u{1f}"));
 }
@@ -981,36 +997,6 @@ fn toml_string(value: &str) -> String {
     toml::Value::String(value.to_string()).to_string()
 }
 
-fn query_param(query: &str, name: &str) -> Option<String> {
-    for part in query.split('&') {
-        let Some((key, value)) = part.split_once('=') else {
-            continue;
-        };
-        if key == name {
-            return Some(percent_decode(value));
-        }
-    }
-    None
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn esc(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1052,7 +1038,7 @@ mod tests {
     fn unsigned_plaintext_decision_is_rejected() {
         let session = unique_session("unsigned-decision");
         let dashboard = ApprovalQueue::open_dashboard(&session).unwrap();
-        dashboard.heartbeat(None, false).unwrap();
+        dashboard.heartbeat(None).unwrap();
         let ticket = sample_ticket();
         fs::write(dashboard.decision_path(&ticket.id), "once").unwrap();
 
@@ -1069,7 +1055,7 @@ mod tests {
     fn signed_decision_round_trips() {
         let session = unique_session("signed-decision");
         let dashboard = ApprovalQueue::open_dashboard(&session).unwrap();
-        dashboard.heartbeat(None, false).unwrap();
+        dashboard.heartbeat(None).unwrap();
         let ticket = sample_ticket();
         dashboard
             .decide(&ticket, ApprovalDecision::Once, "ui")
@@ -1086,7 +1072,7 @@ mod tests {
     fn signed_decision_rejects_tampering() {
         let session = unique_session("tampered-decision");
         let dashboard = ApprovalQueue::open_dashboard(&session).unwrap();
-        dashboard.heartbeat(None, false).unwrap();
+        dashboard.heartbeat(None).unwrap();
         let ticket = sample_ticket();
         dashboard
             .decide(&ticket, ApprovalDecision::Once, "ui")
@@ -1109,7 +1095,7 @@ mod tests {
     fn raw_always_file_is_not_trusted() {
         let session = unique_session("fake-always");
         let dashboard = ApprovalQueue::open_dashboard(&session).unwrap();
-        dashboard.heartbeat(None, false).unwrap();
+        dashboard.heartbeat(None).unwrap();
         let fingerprint = "abcdef";
         fs::write(dashboard.dirs.always.join(fingerprint), "ok").unwrap();
 

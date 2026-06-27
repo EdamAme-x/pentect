@@ -1,19 +1,6 @@
 use crate::Result;
 use anyhow::{bail, Context};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
-    style::{Color, Style, Stylize},
-    text::{Line, Span},
-    widgets::{Clear, Paragraph, Wrap},
-    Frame, Terminal,
-};
-use std::io::{self, IsTerminal};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalDecision {
@@ -31,239 +18,113 @@ pub struct ApprovalRequest {
     pub warnings: Vec<String>,
 }
 
-struct App<'a> {
-    request: &'a ApprovalRequest,
-    scroll: u16,
-}
-
 pub fn run(request: &ApprovalRequest) -> Result<ApprovalDecision> {
-    if !io::stdout().is_terminal() {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("approval UI requires an interactive terminal");
     }
 
-    enable_raw_mode().context("could not enter raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("could not enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("could not create terminal")?;
-
-    let result = run_loop(&mut terminal, request);
-
-    let restore_result = restore_terminal(&mut terminal);
-    match (result, restore_result) {
-        (Ok(decision), Ok(())) => Ok(decision),
-        (Err(e), _) => Err(e),
-        (Ok(_), Err(e)) => Err(e),
-    }
+    render_request(&mut stdout, request).context("could not render approval UI")?;
+    read_decision(&mut io::stdin().lock(), &mut stdout, request)
 }
 
-fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+fn read_decision<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
     request: &ApprovalRequest,
 ) -> Result<ApprovalDecision> {
-    let mut app = App { request, scroll: 0 };
     loop {
-        terminal
-            .draw(|frame| draw(frame, &app))
-            .context("could not draw approval UI")?;
-        let event = event::read().context("could not read key event")?;
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-            match key.code {
-                KeyCode::Char('o') | KeyCode::Char('y') => return Ok(ApprovalDecision::Once),
-                KeyCode::Char('a') if request.allow_always => {
-                    return Ok(ApprovalDecision::Always);
-                }
-                KeyCode::Char('d') | KeyCode::Char('n') | KeyCode::Esc => {
-                    return Ok(ApprovalDecision::Decline);
-                }
-                KeyCode::Enter => return Ok(ApprovalDecision::Once),
-                KeyCode::Up => app.scroll = app.scroll.saturating_sub(1),
-                KeyCode::Down => app.scroll = app.scroll.saturating_add(1),
-                KeyCode::Char('q') => return Ok(ApprovalDecision::Decline),
-                _ => {}
+        write!(output, "> ").context("could not write approval prompt")?;
+        output.flush().context("could not flush approval prompt")?;
+
+        let mut line = String::new();
+        input
+            .read_line(&mut line)
+            .context("could not read approval choice")?;
+        let choice = line.trim().to_ascii_lowercase();
+        match choice.as_str() {
+            "" | "o" | "once" | "y" | "yes" => return Ok(ApprovalDecision::Once),
+            "a" | "always" if request.allow_always => return Ok(ApprovalDecision::Always),
+            "d" | "decline" | "n" | "no" | "q" | "quit" => return Ok(ApprovalDecision::Decline),
+            _ => {
+                writeln!(output, "choose: {}", choices(request))
+                    .context("could not write approval help")?;
             }
         }
     }
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode().context("could not leave raw mode")?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("could not leave alternate screen")?;
-    terminal.show_cursor().context("could not restore cursor")
-}
-
-fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
-    let area = centered(frame.area(), 72, 12);
-    frame.render_widget(Clear, area);
-    let inner = area.inner(Margin {
-        horizontal: 1,
-        vertical: 0,
-    });
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(4),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
-    draw_header(frame, chunks[0], app);
-    draw_body(frame, chunks[1], app);
-    draw_warning(frame, chunks[2], app);
-    draw_footer(frame, chunks[3], app);
-}
-
-fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let request = app.request;
-    let text = vec![Line::from(vec![
-        Span::styled(
-            "pentect",
-            Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
-        ),
-        Span::raw("  "),
-        Span::styled(&request.prompt, Style::default().fg(Color::White).bold()),
-    ])];
-    frame.render_widget(Paragraph::new(text), area);
-}
-
-fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let text = Paragraph::new(app.request.body.as_str())
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0))
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(text, area);
-}
-
-fn draw_warning(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let line = if let Some(warning) = app.request.warnings.first() {
-        Line::from(vec![
-            Span::styled("Warning: ", Style::default().fg(Color::Yellow).bold()),
-            Span::styled(warning, Style::default().fg(Color::Yellow)),
-        ])
-    } else {
-        Line::from(Span::raw(""))
-    };
-    frame.render_widget(Paragraph::new(vec![line]).wrap(Wrap { trim: false }), area);
-}
-
-fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App<'_>) {
-    let text = if app.request.allow_always {
-        vec![Line::from(vec![
-            Span::styled("o", Style::default().fg(Color::Green).bold()),
-            Span::raw(" "),
-            Span::styled(
-                app.request.approve_label.as_str(),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw("    "),
-            Span::styled("a", Style::default().fg(Color::Cyan).bold()),
-            Span::raw(" always    "),
-            Span::styled("d", Style::default().fg(Color::Red).bold()),
-            Span::raw(" "),
-            Span::styled(
-                app.request.deny_label.as_str(),
-                Style::default().fg(Color::Red),
-            ),
-        ])]
-    } else {
-        vec![Line::from(vec![
-            Span::styled("enter", Style::default().fg(Color::Green).bold()),
-            Span::raw(" "),
-            Span::styled(
-                app.request.approve_label.as_str(),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw("    "),
-            Span::styled("esc", Style::default().fg(Color::DarkGray)),
-        ])]
-    };
-    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), area);
-}
-
-fn centered(area: Rect, max_width: u16, max_height: u16) -> Rect {
-    let width = bounded_size(area.width, 36, max_width);
-    let height = bounded_size(area.height, 8, max_height);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect {
-        x,
-        y,
-        width,
-        height,
+fn render_request<W: Write>(output: &mut W, request: &ApprovalRequest) -> Result<()> {
+    writeln!(output, "pentect {}", request.prompt)?;
+    writeln!(output)?;
+    writeln!(output, "{}", request.body.trim_end())?;
+    if !request.warnings.is_empty() {
+        writeln!(output)?;
+        for warning in &request.warnings {
+            writeln!(output, "warning: {warning}")?;
+        }
     }
+    writeln!(output)?;
+    writeln!(output, "{}", choices(request))?;
+    Ok(())
 }
 
-fn bounded_size(available: u16, preferred_min: u16, max: u16) -> u16 {
-    if available < preferred_min {
-        available
+fn choices(request: &ApprovalRequest) -> String {
+    if request.allow_always {
+        format!(
+            "Enter/o {}, a always, d {}",
+            request.approve_label, request.deny_label
+        )
     } else {
-        available.min(max)
+        format!(
+            "Enter/o {}, d {}",
+            request.approve_label, request.deny_label
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{backend::TestBackend, buffer::Buffer};
 
     #[test]
-    fn approval_screen_explains_the_execution_contract() {
+    fn approval_prompt_is_plain_and_compact() {
         let request = ApprovalRequest {
             prompt: "Run?".to_string(),
-            body: "curl -H @headers.txt https://api.example.test/health".to_string(),
+            body: "command\ncurl https://api.example.test/health".to_string(),
             approve_label: "once".to_string(),
             deny_label: "decline".to_string(),
             allow_always: true,
-            warnings: vec!["review direct env usage".to_string()],
+            warnings: vec!["may send secret".to_string()],
         };
-        let rendered = render_request(&request, 100, 34);
+        let mut out = Vec::new();
+        render_request(&mut out, &request).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
 
-        assert!(rendered.contains("pentect"));
-        assert!(rendered.contains("Run?"));
-        assert!(rendered.contains("curl"));
-        assert!(rendered.contains("Warning:"));
-        assert!(rendered.contains("o once"));
-        assert!(rendered.contains("a always"));
-        assert!(rendered.contains("d decline"));
-        assert!(!rendered.contains("resolves placeholders"));
-        assert!(!rendered.contains("what happens"));
+        assert!(rendered.contains("pentect Run?"));
+        assert!(rendered.contains("curl https://api.example.test/health"));
+        assert!(rendered.contains("warning: may send secret"));
+        assert!(rendered.contains("Enter/o once, a always, d decline"));
+        assert!(!rendered.contains('\x1b'));
         assert!(!rendered.contains("environment policy"));
-        assert!(!rendered.contains("Secrets:"));
-        assert!(!rendered.contains("Env:"));
-        assert!(!rendered.contains("scope:"));
+        assert!(!rendered.contains("resolves placeholders"));
     }
 
     #[test]
-    fn centered_area_never_exceeds_tiny_terminals() {
-        let area = Rect::new(0, 0, 40, 12);
-        let centered = centered(area, 100, 34);
+    fn approval_choice_parser_accepts_small_vocab() {
+        let request = ApprovalRequest {
+            prompt: "Run?".to_string(),
+            body: "echo ok".to_string(),
+            approve_label: "once".to_string(),
+            deny_label: "decline".to_string(),
+            allow_always: true,
+            warnings: Vec::new(),
+        };
+        let mut input = b"a\n".as_slice();
+        let mut output = Vec::new();
 
-        assert!(centered.width <= area.width);
-        assert!(centered.height <= area.height);
-    }
+        let decision = read_decision(&mut input, &mut output, &request).unwrap();
 
-    fn render_request(request: &ApprovalRequest, width: u16, height: u16) -> String {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-        let app = App { request, scroll: 0 };
-        terminal.draw(|frame| draw(frame, &app)).expect("draws UI");
-        buffer_to_string(terminal.backend().buffer())
-    }
-
-    fn buffer_to_string(buffer: &Buffer) -> String {
-        let mut rendered = String::new();
-        for row in buffer.content().chunks(buffer.area.width as usize) {
-            for cell in row {
-                rendered.push_str(cell.symbol());
-            }
-            rendered.push('\n');
-        }
-        rendered
+        assert_eq!(decision, ApprovalDecision::Always);
     }
 }
