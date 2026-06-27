@@ -4,7 +4,7 @@ mod extensions;
 mod input;
 mod terminal;
 
-use input::{InputAdapter, TextInput};
+use input::{decode_utf8_text, InputAdapter, TextInput};
 use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -1073,8 +1073,10 @@ fn parse_kind(value: &str) -> Result<Kind, String> {
 fn read_input(path: &Path, format: ReadInputFormat) -> Result<String, String> {
     let bytes = read_bytes(path)?;
     match format {
-        ReadInputFormat::Text => String::from_utf8(bytes)
-            .map_err(|_| format!("input '{}' is not UTF-8 text", path.display())),
+        ReadInputFormat::Text => decode_utf8_text(
+            bytes,
+            format!("input '{}' is not UTF-8 text", path.display()),
+        ),
         ReadInputFormat::Pdf => pdf_text(&bytes),
     }
 }

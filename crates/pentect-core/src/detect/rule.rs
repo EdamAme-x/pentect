@@ -55,6 +55,12 @@ impl RuleDetector {
                 High,
             ),
             (r"AKIA[A-Z0-9]{16}", Secret, "AWS_AKID", High),
+            (
+                r"sk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_-]{20,}",
+                Secret,
+                "ANTHROPIC_API_KEY",
+                High,
+            ),
             (r"sk-[A-Za-z0-9_-]{20,}", Secret, "OPENAI_API_KEY", High),
             // Copy/paste, log wrapping, and markdown often insert whitespace
             // around the vendor delimiter. Keep this specific to the distinctive
@@ -66,11 +72,24 @@ impl RuleDetector {
                 High,
             ),
             (r"rpa_[A-Za-z0-9]{24,}", Secret, "RUNPOD_API_KEY", High),
+            (r"hf_[A-Za-z0-9]{30,}", Secret, "HUGGINGFACE_TOKEN", High),
             (r"xox[baprs]-[A-Za-z0-9-]{10,}", Secret, "SLACK_TOKEN", High),
             (
                 r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",
                 Secret,
                 "SLACK_WEBHOOK",
+                High,
+            ),
+            (
+                r"https://(?:discord|discordapp)\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{50,}",
+                Secret,
+                "DISCORD_WEBHOOK",
+                High,
+            ),
+            (
+                r"\b[0-9]{8,10}:[A-Za-z0-9_-]{35}\b",
+                Secret,
+                "TELEGRAM_BOT_TOKEN",
                 High,
             ),
             (
@@ -395,6 +414,8 @@ impl RuleDetector {
             (r#"(?i)\b(?:session|sid|jwt|cookie|auth[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token)\b[^\r\n]{0,16}?(?:=|:)[ \t'"]{0,3}([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})(?:$|[\s"',;)])"#, Secret, "SESSION_TOKEN", Medium, 1, V::None),
             // Preserve path structure for debugging, but hide the local account
             // segment that frequently leaks in stack traces and tool output.
+            (r#"(?i)\bAccountKey\b[ \t]*=[ \t]*([A-Za-z0-9+/=]{40,})(?:;|$|[\s"',)])"#, Secret, "AZURE_STORAGE_ACCOUNT_KEY", High, 1, V::None),
+            (r#"(?i)\bclient[-_]?key[-_]?data\b[ \t]*:[ \t]*['"]?([A-Za-z0-9+/=]{40,})['"]?(?:$|[\s"',;)])"#, Secret, "KUBE_CLIENT_KEY_DATA", High, 1, V::None),
             (r#"(?i)\b[A-Z]:[\\/]+Users[\\/]+([^\\/\s:\r\n"<>|?*]{1,64})(?:[\\/]|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])/(?:home|Users|var/home|export/home)/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])~([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
@@ -475,6 +496,14 @@ mod tests {
                 "RUNPOD_API_KEY",
             ),
             (
+                concat!("sk-ant-api03-", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"),
+                "ANTHROPIC_API_KEY",
+            ),
+            (
+                concat!("hf", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"),
+                "HUGGINGFACE_TOKEN",
+            ),
+            (
                 concat!("ghp", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
                 "GITHUB_TOKEN",
             ),
@@ -523,6 +552,17 @@ mod tests {
                     "T00000000/B00000000/abcdEFGH"
                 ),
                 "SLACK_WEBHOOK",
+            ),
+            (
+                concat!(
+                    "https://discord.com/api/webhooks/123456789012345678/",
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
+                ),
+                "DISCORD_WEBHOOK",
+            ),
+            (
+                concat!("1234567890:", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"),
+                "TELEGRAM_BOT_TOKEN",
             ),
             (
                 concat!(
@@ -607,6 +647,21 @@ mod tests {
         assert!(has(
             "cookie session=abcdefghijkl.mnopqrstuvwxyz.ABCDEFGHIJKLMN",
             "SESSION_TOKEN"
+        ));
+        assert!(has(
+            concat!(
+                "DefaultEndpointsProtocol=https;AccountName=demo;AccountKey=",
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGH;",
+                "EndpointSuffix=core.windows.net"
+            ),
+            "AZURE_STORAGE_ACCOUNT_KEY"
+        ));
+        assert!(has(
+            concat!(
+                "client-key-data: ",
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGH"
+            ),
+            "KUBE_CLIENT_KEY_DATA"
         ));
         assert!(!has(
             "port=5432 workers=4 timeout_ms=30000 status=200",

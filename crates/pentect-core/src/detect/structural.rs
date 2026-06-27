@@ -11,12 +11,9 @@ const SENSITIVE_HEADERS: &[&str] = &[
     "set-cookie",
 ];
 
-/// Masks values that are sensitive by their *structural position* in a known
-/// format, not by guessing an arbitrary key name: a cookie value (carries session
-/// state) or a credential-bearing HTTP header. Bounded and protocol-grounded.
-/// Open-vocabulary, multilingual key sensitivity (`password`=`パスワード`=…)
-/// belongs behind the extension/model boundary; core does not enumerate key
-/// names by default.
+/// Masks values that are sensitive by protocol-defined structural position: a
+/// cookie value or a credential-bearing HTTP header. Bounded and protocol-
+/// grounded, so it is separate from key-name based structured value masking.
 pub struct StructuralDetector;
 
 /// `.env` value regions are masked wholesale. The parser already strips the
@@ -24,9 +21,8 @@ pub struct StructuralDetector;
 /// secret without key-name guessing.
 pub struct EnvValueDetector;
 
-/// Opt-in detector for agent/tool-result adapters. It uses explicit structural
-/// key context supplied by a parser and emits spans only; rendering and recovery
-/// remain the pipeline's job.
+/// Masks values under explicit structured key/path context supplied by a parser.
+/// It emits spans only; rendering and recovery remain the pipeline's job.
 pub struct SensitiveKeyDetector;
 
 impl Detector for StructuralDetector {
@@ -345,7 +341,8 @@ mod tests {
 
     #[test]
     fn arbitrary_keys_are_not_guessed() {
-        // The whole point: open-vocabulary key names are NOT enumerated here.
+        // Protocol structural masking itself does not guess key names; that is
+        // handled by SensitiveKeyDetector with JsonValue context.
         assert!(!fires(
             RegionKind::JsonValue,
             Kind::Har,
@@ -369,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_key_detector_is_opt_in_key_context() {
+    fn sensitive_key_detector_uses_explicit_key_context() {
         assert_eq!(
             sensitive_key_fires(Some("password"), "hunter2"),
             Some("PASSWORD".to_string())

@@ -1,4 +1,5 @@
 use crate::model::*;
+use memchr::memchr2;
 
 /// Parse JSON and return one region per string *value* (inner bytes, excluding
 /// the quotes), tagged with the key it sits under. Returns None when the input
@@ -25,6 +26,9 @@ fn parse_json_regions_with(raw: &str, mode: JsonRegionMode) -> Option<Vec<Region
         out: Vec::new(),
         mode,
     };
+    if p.b.starts_with(&[0xef, 0xbb, 0xbf]) {
+        p.i = 3;
+    }
     p.skip_ws();
     p.value(None, 0)?;
     p.skip_ws();
@@ -53,7 +57,11 @@ impl Parser<'_> {
     }
 
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        while self
+            .b
+            .get(self.i)
+            .is_some_and(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
+        {
             self.i += 1;
         }
     }
@@ -157,29 +165,38 @@ impl Parser<'_> {
     fn string(&mut self) -> Option<(ByteRange, String)> {
         self.i += 1; // opening quote
         let start = self.i;
-        while let Some(c) = self.peek() {
-            match c {
-                b'\\' => {
-                    self.i += 1;
-                    match self.peek()? {
-                        b'u' => self.i += 5,
-                        _ => self.i += 1,
-                    }
-                }
+        loop {
+            let off = memchr2(b'"', b'\\', self.b.get(self.i..)?)?;
+            self.i += off;
+            match self.b[self.i] {
                 b'"' => {
                     let end = self.i;
                     self.i += 1; // closing quote
                     let text = std::str::from_utf8(&self.b[start..end]).ok()?.to_string();
                     return Some((ByteRange::new(start, end), text));
                 }
-                _ => self.i += 1,
+                b'\\' => self.skip_escape()?,
+                _ => unreachable!("memchr2 only returns quote or backslash"),
             }
         }
-        None
+    }
+
+    fn skip_escape(&mut self) -> Option<()> {
+        self.i += 1; // backslash
+        match *self.b.get(self.i)? {
+            b'u' => {
+                if self.i + 5 > self.b.len() {
+                    return None;
+                }
+                self.i += 5;
+            }
+            _ => self.i += 1,
+        }
+        Some(())
     }
 
     fn literal(&mut self, lit: &[u8]) -> Option<()> {
-        if self.b[self.i..].starts_with(lit) {
+        if self.b.get(self.i..)?.starts_with(lit) {
             self.i += lit.len();
             Some(())
         } else {
@@ -189,10 +206,13 @@ impl Parser<'_> {
 
     fn number(&mut self) -> Option<()> {
         let start = self.i;
-        if self.peek() == Some(b'-') {
+        if self.b.get(self.i) == Some(&b'-') {
             self.i += 1;
         }
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'))
+        while self
+            .b
+            .get(self.i)
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'))
         {
             self.i += 1;
         }
@@ -227,6 +247,14 @@ mod tests {
             got,
             [(Some("a"), "x"), (Some("b"), "y"), (Some("arr"), "z")]
         );
+    }
+
+    #[test]
+    fn utf8_bom_does_not_force_plaintext_fallback() {
+        let raw = "\u{feff}{\"password\":\"hunter2\"}";
+        let regions = parse_json_regions(raw).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].ctx.key.as_deref(), Some("password"));
     }
 
     #[test]

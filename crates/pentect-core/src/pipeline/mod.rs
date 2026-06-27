@@ -5,7 +5,8 @@ mod sweep;
 
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, DecodeDetector, Detector, EntropyDetector,
-    EnvValueDetector, PemDetector, PhoneDetector, RuleDetector, StructuralDetector,
+    EnvValueDetector, PemDetector, PhoneDetector, RuleDetector, SensitiveKeyDetector,
+    StructuralDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -386,6 +387,7 @@ impl EngineBuilder {
                 DecodeDetector::builtin()
                     .with_opaque(knobs.mask_unknown_codec, knobs.min_opaque_run),
             ))
+            .detector(Box::new(SensitiveKeyDetector))
             .detector(Box::new(EnvValueDetector))
             .detector(Box::new(StructuralDetector))
             .detector(Box::new(PhoneDetector))
@@ -670,8 +672,9 @@ mod tests {
 
     #[test]
     fn json_structure_preserved() {
-        // Detectable-by-value secrets (core no longer guesses arbitrary keys); a
-        // benign string stays untouched and the output re-parses as JSON.
+        // Detectable-by-value secrets and sensitive structured value positions
+        // are masked; a benign string stays untouched and the output re-parses
+        // as JSON.
         let input =
             r#"{"user":"alice@example.com","api_key":"AKIAIOSFODNN7EXAMPLE","note":"hello world"}"#;
         let r = mj(input);
@@ -681,6 +684,21 @@ mod tests {
         assert!(o["api_key"].as_str().unwrap().starts_with("<<"));
         assert!(o["user"].as_str().unwrap().starts_with("<<"));
         assert_eq!(o["note"].as_str().unwrap(), "hello world");
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn json_sensitive_key_values_mask_low_entropy_without_masking_public_keys() {
+        let input =
+            r#"{"password":"hunter2","token":"abc12345","public_key":"visible","note":"ok"}"#;
+        let r = mj(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&r.masked).expect("masked output is valid JSON");
+        let o = v.as_object().unwrap();
+        assert!(o["password"].as_str().unwrap().starts_with("<<PASSWORD_"));
+        assert!(o["token"].as_str().unwrap().starts_with("<<TOKEN_"));
+        assert_eq!(o["public_key"].as_str().unwrap(), "visible");
+        assert_eq!(o["note"].as_str().unwrap(), "ok");
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
     }
 
@@ -704,6 +722,14 @@ mod tests {
         ("AKIAIOSFODNN7EXAMPLE", "aws_access_key"),
         (concat!("sk", "-ABCDEFGHIJKLMNOPQRSTUVWX"), "openai_api_key"),
         (
+            concat!("sk-ant-api03-", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"),
+            "anthropic_api_key",
+        ),
+        (
+            concat!("hf", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"),
+            "huggingface_token",
+        ),
+        (
             concat!("ghp", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
             "github_token",
         ),
@@ -715,6 +741,17 @@ mod tests {
         (
             concat!("npm", "_abcdefghijklmnopqrstuvwxyz0123456789"),
             "npm_token",
+        ),
+        (
+            concat!(
+                "https://discord.com/api/webhooks/123456789012345678/",
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
+            ),
+            "discord_webhook",
+        ),
+        (
+            concat!("1234567890:", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"),
+            "telegram_bot_token",
         ),
         ("4242424242424242", "credit_card_luhn"),
         ("alice@example.com", "email"),
@@ -1656,7 +1693,6 @@ mod tests {
     fn mask_context_uses_tool_result_value_context_without_masking_key_names() {
         let engine = Engine::builder()
             .standard_stack(Profile::Strict.knobs())
-            .detector(Box::new(crate::detect::SensitiveKeyDetector))
             .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
             .guard(Box::new(ShapeGuard::builtin()))
             .build();
