@@ -9,6 +9,7 @@ repository = "https://github.com/EdamAme-x/pentect"
 
 [workspace.dependencies]
 aho-corasick = "1"
+anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 simd-json = "0.17"
@@ -28,3 +29,4 @@ pdf-extract = "0.10.0"
 anstream = "0.6"
 ratatui = "0.29"
 crossterm = "0.28"
+ed25519-dalek = "2"

@@ -1,3 +1,5 @@
+use crate::Result;
+use anyhow::{bail, Context};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -34,18 +36,16 @@ struct App<'a> {
     scroll: u16,
 }
 
-pub fn run(request: &ApprovalRequest) -> Result<ApprovalDecision, String> {
+pub fn run(request: &ApprovalRequest) -> Result<ApprovalDecision> {
     if !io::stdout().is_terminal() {
-        return Err("approval UI requires an interactive terminal".to_string());
+        bail!("approval UI requires an interactive terminal");
     }
 
-    enable_raw_mode().map_err(|e| format!("could not enter raw mode: {e}"))?;
+    enable_raw_mode().context("could not enter raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)
-        .map_err(|e| format!("could not enter alternate screen: {e}"))?;
+    execute!(stdout, EnterAlternateScreen).context("could not enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal =
-        Terminal::new(backend).map_err(|e| format!("could not create terminal: {e}"))?;
+    let mut terminal = Terminal::new(backend).context("could not create terminal")?;
 
     let result = run_loop(&mut terminal, request);
 
@@ -60,13 +60,13 @@ pub fn run(request: &ApprovalRequest) -> Result<ApprovalDecision, String> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     request: &ApprovalRequest,
-) -> Result<ApprovalDecision, String> {
+) -> Result<ApprovalDecision> {
     let mut app = App { request, scroll: 0 };
     loop {
         terminal
             .draw(|frame| draw(frame, &app))
-            .map_err(|e| format!("could not draw approval UI: {e}"))?;
-        let event = event::read().map_err(|e| format!("could not read key event: {e}"))?;
+            .context("could not draw approval UI")?;
+        let event = event::read().context("could not read key event")?;
         if let Event::Key(key) = event {
             if key.kind == KeyEventKind::Release {
                 continue;
@@ -89,13 +89,11 @@ fn run_loop(
     }
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), String> {
-    disable_raw_mode().map_err(|e| format!("could not leave raw mode: {e}"))?;
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    disable_raw_mode().context("could not leave raw mode")?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .map_err(|e| format!("could not leave alternate screen: {e}"))?;
-    terminal
-        .show_cursor()
-        .map_err(|e| format!("could not restore cursor: {e}"))
+        .context("could not leave alternate screen")?;
+    terminal.show_cursor().context("could not restore cursor")
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App<'_>) {

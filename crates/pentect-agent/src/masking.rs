@@ -52,7 +52,7 @@ impl OutputMasker {
 
     pub(crate) fn new_deferred(store: RecoveryStore) -> Result<Self, String> {
         let key = store.session.key;
-        let remask_recoveries = store.snapshot()?;
+        let remask_recoveries = store.snapshot().map_err(|e| e.to_string())?;
         Ok(Self {
             store,
             engine: tool_boundary_engine()?,
@@ -67,7 +67,7 @@ impl OutputMasker {
         }
         let next = Recovery::empty_for_key(&self.store.session.key);
         let pending = std::mem::replace(&mut self.pending, next);
-        self.store.add_recovery(pending)
+        self.store.add_recovery(pending).map_err(|e| e.to_string())
     }
 
     pub(crate) fn mask_tool_output(&mut self, text: &str) -> Result<String, String> {
@@ -214,7 +214,10 @@ impl OutputMasker {
             return Ok(());
         }
         match &mut self.mode {
-            OutputMaskerMode::Shared => self.store.add_recovery(recovery)?,
+            OutputMaskerMode::Shared => self
+                .store
+                .add_recovery(recovery)
+                .map_err(|e| e.to_string())?,
             OutputMaskerMode::Deferred { .. } => self.pending.extend_same_key(recovery),
         }
         Ok(())
@@ -222,7 +225,7 @@ impl OutputMasker {
 
     fn remask_all(&self, text: &str) -> Result<String, String> {
         match &self.mode {
-            OutputMaskerMode::Shared => self.store.remask_all(text),
+            OutputMaskerMode::Shared => self.store.remask_all(text).map_err(|e| e.to_string()),
             OutputMaskerMode::Deferred { remask_recoveries } => {
                 let mut out = text.to_string();
                 for rec in remask_recoveries {
@@ -284,13 +287,13 @@ fn load_extension_packs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
 
 #[cfg(test)]
 pub(crate) fn mask_tool_output(session: &Session, text: &str) -> Result<String, String> {
-    let store = RecoveryStore::load(session)?;
+    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     OutputMasker::new_shared(store)?.mask_tool_output(text)
 }
 
 #[cfg(test)]
 pub(crate) fn mask_live_output(session: &Session, text: &str) -> Result<String, String> {
-    let store = RecoveryStore::load(session)?;
+    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     OutputMasker::new_shared(store)?.mask_text(text, live_output_kind(text))
 }
 

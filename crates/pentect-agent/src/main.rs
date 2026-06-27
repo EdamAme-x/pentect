@@ -46,6 +46,8 @@ const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
 
+pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
@@ -84,10 +86,7 @@ fn cmd_dashboard(args: &[String]) -> i32 {
     };
     if let Some(dir) = &opts.dir {
         if let Err(e) = std::env::set_current_dir(dir) {
-            return die(&format!(
-                "could not open directory '{}': {e}",
-                dir.display()
-            ));
+            return die(format!("could not open directory '{}': {e}", dir.display()));
         }
     }
     let session = match opts.session {
@@ -105,7 +104,7 @@ fn cmd_dashboard(args: &[String]) -> i32 {
 
 fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?;
-    let vault = Session::vault_status(session)?;
+    let vault = Session::vault_status(session).map_err(|e| e.to_string())?;
     let vault_line = match &vault {
         Some(path) => format!("active ({})", path.display()),
         None => "not created yet".to_string(),
@@ -132,7 +131,7 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
 }
 
 fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
-    let queue = ApprovalQueue::open(session)?;
+    let queue = ApprovalQueue::open_dashboard(session)?;
     if let Some(port) = port {
         return queue.serve_web(session, port, DASHBOARD_HEARTBEAT_MAX_AGE);
     }
@@ -156,7 +155,7 @@ fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
                 allow_always: true,
                 warnings: ticket_warnings(&ticket),
             };
-            let decision = approve_ui::run(&request)?;
+            let decision = approve_ui::run(&request).map_err(|e| e.to_string())?;
             queue.decide(&ticket, decision, "ui")?;
             print_dashboard_status(session, &queue, None, bypass_all.load(Ordering::Relaxed))?;
         } else {
@@ -172,7 +171,7 @@ fn print_dashboard_status(
     bypass_all: bool,
 ) -> Result<(), String> {
     let request = dashboard_request(session)?;
-    let config = load_project_config()?;
+    let config = load_project_config().map_err(|e| e.to_string())?;
     print!("\x1b[2J\x1b[H");
     println!("pentect");
     println!("{}", request.body);
@@ -474,10 +473,7 @@ fn cmd_purge(args: &[String]) -> i32 {
         return 0;
     }
     if let Err(e) = std::fs::remove_dir_all(&root) {
-        return die(&format!(
-            "could not purge session '{}': {e}",
-            root.display()
-        ));
+        return die(format!("could not purge session '{}': {e}", root.display()));
     }
     eprintln!("[pentect] purged session state: {}", root.display());
     0
@@ -501,7 +497,7 @@ fn request_approval(
         allow_always: true,
         warnings: approval_warnings(store, opts, approval)?,
     };
-    approve_ui::run(&request)
+    approve_ui::run(&request).map_err(|e| e.to_string())
 }
 
 fn approval_warnings(
@@ -550,7 +546,11 @@ fn approval_decision_for_ticket(
     session: &str,
     ticket: &ApprovalTicket,
 ) -> Result<ApprovalDecision, String> {
-    approval_decision_for_ticket_with_config(session, ticket, load_project_config()?)
+    approval_decision_for_ticket_with_config(
+        session,
+        ticket,
+        load_project_config().map_err(|e| e.to_string())?,
+    )
 }
 
 fn approval_decision_for_ticket_with_config(
@@ -813,7 +813,7 @@ fn cmd_hook(args: &[String]) -> i32 {
     let mut raw_bytes = raw.into_bytes();
     let input: Value = match simd_json::serde::from_slice(&mut raw_bytes) {
         Ok(v) => v,
-        Err(e) => return die(&format!("hook input must be JSON: {e}")),
+        Err(e) => return die(format!("hook input must be JSON: {e}")),
     };
     let session_name = match opts.session_name(&input) {
         Ok(s) => s,
@@ -836,7 +836,7 @@ fn cmd_hook(args: &[String]) -> i32 {
             println!("{s}");
             0
         }
-        Err(e) => die(&format!("could not serialize hook output: {e}")),
+        Err(e) => die(format!("could not serialize hook output: {e}")),
     }
 }
 
@@ -910,7 +910,7 @@ fn resolve_command_args(store: &RecoveryStore, args: &[String]) -> Result<Vec<St
 }
 
 fn resolve_command_text(store: &RecoveryStore, text: &str) -> Result<String, String> {
-    let resolved = store.resolve_all(text)?;
+    let resolved = store.resolve_all(text).map_err(|e| e.to_string())?;
     if contains_unresolved_masked_handle(&resolved) {
         return Err(
             "unknown masked handle; run from the same Pentect directory/session or re-read it with `pentect exec`"
@@ -1026,7 +1026,7 @@ fn requested_env_bindings(
     store: &RecoveryStore,
     mode: &ExecMode,
 ) -> Result<Vec<(String, String)>, String> {
-    let available = store.auto_env_bindings()?;
+    let available = store.auto_env_bindings().map_err(|e| e.to_string())?;
     if available.is_empty() {
         return Ok(Vec::new());
     }
@@ -1561,7 +1561,10 @@ impl DashboardOpts {
         while i < args.len() {
             match args[i].as_str() {
                 "--session" => {
-                    session = Some(checked_session_name(&value(args, &mut i, "--session")?)?)
+                    session = Some(
+                        checked_session_name(&value(args, &mut i, "--session")?)
+                            .map_err(|e| e.to_string())?,
+                    )
                 }
                 "--dir" => dir = Some(PathBuf::from(value(args, &mut i, "--dir")?)),
                 "--port" => {
@@ -1598,7 +1601,10 @@ impl HookOpts {
                     i += 1;
                 }
                 "--session" => {
-                    session = Some(checked_session_name(&value(args, &mut i, "--session")?)?);
+                    session = Some(
+                        checked_session_name(&value(args, &mut i, "--session")?)
+                            .map_err(|e| e.to_string())?,
+                    );
                 }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 value if provider.is_none() => {
@@ -1621,7 +1627,7 @@ impl HookOpts {
             return Ok(session.clone());
         }
         if let Ok(session) = std::env::var("PENTECT_AGENT_SESSION") {
-            return checked_session_name(&session);
+            return checked_session_name(&session).map_err(|e| e.to_string());
         }
         let _ = input;
         default_session_name()
@@ -1658,7 +1664,8 @@ impl ResolveOpts {
         while i < args.len() {
             match args[i].as_str() {
                 "--session" => {
-                    session = checked_session_name(&value(args, &mut i, "--session")?)?;
+                    session = checked_session_name(&value(args, &mut i, "--session")?)
+                        .map_err(|e| e.to_string())?;
                 }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 path => {
@@ -1708,7 +1715,7 @@ impl ExecOpts {
                         return Err("exec requires a command after `--`".to_string());
                     }
                     return Ok(Self {
-                        session: checked_session_name(&session)?,
+                        session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
                         approve,
                         mode: ExecMode::Program(command),
@@ -1717,7 +1724,7 @@ impl ExecOpts {
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 _ => {
                     return Ok(Self {
-                        session: checked_session_name(&session)?,
+                        session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
                         approve,
                         mode: ExecMode::Shell(args[i..].join(" ")),
@@ -1731,7 +1738,7 @@ impl ExecOpts {
 
 fn default_session_name() -> Result<String, String> {
     match std::env::var("PENTECT_AGENT_SESSION") {
-        Ok(value) => checked_session_name(&value),
+        Ok(value) => checked_session_name(&value).map_err(|e| e.to_string()),
         Err(_) => default_directory_session_name(),
     }
 }
@@ -1788,7 +1795,7 @@ fn handle_hook(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
-            let store = RecoveryStore::load(session)?;
+            let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
             let mut masker = OutputMasker::new_deferred(store)?;
             let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
             masker.flush()?;
@@ -1873,8 +1880,8 @@ fn maybe_materialize_masked_write(
     if !content.contains("<<") {
         return Ok(None);
     }
-    let store = RecoveryStore::load(session)?;
-    let resolved = store.resolve_all(content)?;
+    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if resolved == content {
         return Ok(None);
     }
@@ -2725,7 +2732,10 @@ fn parse_session_and_rest(args: &[String], start: usize) -> Result<(String, Vec<
             }
         }
     }
-    Ok((checked_session_name(&session)?, rest))
+    Ok((
+        checked_session_name(&session).map_err(|e| e.to_string())?,
+        rest,
+    ))
 }
 
 fn value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -2736,7 +2746,7 @@ fn value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     Ok(value.clone())
 }
 
-fn die(msg: &str) -> i32 {
+fn die(msg: impl std::fmt::Display) -> i32 {
     eprintln!("[pentect] {msg}");
     2
 }

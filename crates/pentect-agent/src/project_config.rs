@@ -1,3 +1,5 @@
+use crate::Result;
+use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
 
 const PENTECT_DIR: &str = ".pentect";
@@ -16,39 +18,39 @@ impl Default for ProjectConfig {
     }
 }
 
-pub(crate) fn load_project_config() -> Result<ProjectConfig, String> {
+pub(crate) fn load_project_config() -> Result<ProjectConfig> {
     load_project_config_from(&PathBuf::from(PENTECT_DIR).join(CONFIG_FILE))
 }
 
-pub(crate) fn set_approval_required(required: bool) -> Result<ProjectConfig, String> {
+pub(crate) fn set_approval_required(required: bool) -> Result<ProjectConfig> {
     let path = PathBuf::from(PENTECT_DIR).join(CONFIG_FILE);
     set_approval_required_at(&path, required)
 }
 
-fn load_project_config_from(path: &Path) -> Result<ProjectConfig, String> {
+fn load_project_config_from(path: &Path) -> Result<ProjectConfig> {
     if !path.exists() {
         return Ok(ProjectConfig::default());
     }
     let src = std::fs::read_to_string(path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    parse_project_config(&src).map_err(|e| format!("could not parse '{}': {e}", path.display()))
+        .with_context(|| format!("could not read '{}'", path.display()))?;
+    parse_project_config(&src).with_context(|| format!("could not parse '{}'", path.display()))
 }
 
-fn set_approval_required_at(path: &Path, required: bool) -> Result<ProjectConfig, String> {
+fn set_approval_required_at(path: &Path, required: bool) -> Result<ProjectConfig> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
+            .with_context(|| format!("could not create '{}'", parent.display()))?;
     }
     let mut value = if path.exists() {
         let src = std::fs::read_to_string(path)
-            .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+            .with_context(|| format!("could not read '{}'", path.display()))?;
         src.parse::<toml::Value>()
-            .map_err(|e| format!("could not parse '{}': {e}", path.display()))?
+            .with_context(|| format!("could not parse '{}'", path.display()))?
     } else {
         toml::Value::Table(toml::map::Map::new())
     };
     let Some(table) = value.as_table_mut() else {
-        return Err(".pentect/config.toml must be a TOML table".to_string());
+        bail!(".pentect/config.toml must be a TOML table");
     };
     table.insert(
         "approval_required".to_string(),
@@ -61,16 +63,14 @@ fn set_approval_required_at(path: &Path, required: bool) -> Result<ProjectConfig
         approval.insert("required".to_string(), toml::Value::Boolean(required));
     }
     std::fs::write(path, value.to_string())
-        .map_err(|e| format!("could not write '{}': {e}", path.display()))?;
+        .with_context(|| format!("could not write '{}'", path.display()))?;
     Ok(ProjectConfig {
         approval_required: required,
     })
 }
 
-fn parse_project_config(src: &str) -> Result<ProjectConfig, String> {
-    let value = src
-        .parse::<toml::Value>()
-        .map_err(|e| format!("invalid TOML: {e}"))?;
+fn parse_project_config(src: &str) -> Result<ProjectConfig> {
+    let value = src.parse::<toml::Value>().context("invalid TOML")?;
     let top_level = optional_bool(&value, "approval_required")?;
     let nested = value
         .get("approval")
@@ -79,7 +79,7 @@ fn parse_project_config(src: &str) -> Result<ProjectConfig, String> {
         .flatten();
     if let (Some(a), Some(b)) = (top_level, nested) {
         if a != b {
-            return Err("approval_required conflicts with approval.required".to_string());
+            bail!("approval_required conflicts with approval.required");
         }
     }
     Ok(ProjectConfig {
@@ -87,13 +87,13 @@ fn parse_project_config(src: &str) -> Result<ProjectConfig, String> {
     })
 }
 
-fn optional_bool(value: &toml::Value, key: &str) -> Result<Option<bool>, String> {
+fn optional_bool(value: &toml::Value, key: &str) -> Result<Option<bool>> {
     let Some(raw) = value.get(key) else {
         return Ok(None);
     };
     raw.as_bool()
         .map(Some)
-        .ok_or_else(|| format!("{key} must be a boolean"))
+        .with_context(|| format!("{key} must be a boolean"))
 }
 
 #[cfg(test)]
@@ -126,7 +126,8 @@ mod tests {
     #[test]
     fn config_rejects_conflicting_approval_fields() {
         let err = parse_project_config("approval_required = true\n[approval]\nrequired = false")
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("conflicts"), "{err}");
     }
 

@@ -11,6 +11,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
+
 /// Refuse oversized input rather than emit partially-masked output (a masked
 /// head plus a raw tail would leak the tail).
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
@@ -81,7 +83,7 @@ fn help_text() -> &'static str {
     )
 }
 
-fn die(msg: &str) -> ! {
+fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("[pentect] {msg}");
     std::process::exit(2);
 }
@@ -125,7 +127,7 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
     };
     let agent = opts.agent.clone().unwrap_or_else(default_agent_path);
     if !agent.exists() && agent.components().count() > 1 {
-        die(&format!(
+        die(format!(
             "pentect-agent not found at '{}'; run `cargo build -p pentect-agent --release` or pass --agent PATH",
             agent.display()
         ));
@@ -242,7 +244,7 @@ fn validate_mask_args(args: &[String]) -> Result<(), String> {
                     value.parse::<Profile>()?;
                 }
                 if args[i] == "--extensions" {
-                    extensions::parse_extension_value(value)?;
+                    extensions::parse_extension_value(value).map_err(|e| e.to_string())?;
                 }
                 i += 2;
             }
@@ -349,7 +351,9 @@ impl ReadOpts {
                         args,
                         &mut i,
                         "--extensions",
-                    )?)? {
+                    )?)
+                    .map_err(|e| e.to_string())?
+                    {
                         if !extensions.iter().any(|existing| existing == &spec) {
                             extensions.push(spec);
                         }
@@ -460,7 +464,9 @@ impl AgentToolOpts {
                         args,
                         &mut i,
                         "--extensions",
-                    )?)? {
+                    )?)
+                    .map_err(|e| e.to_string())?
+                    {
                         if !extensions.iter().any(|existing| existing == &name) {
                             extensions.push(name);
                         }
@@ -577,7 +583,7 @@ fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
 
 fn run_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
     cmd.status()
-        .unwrap_or_else(|e| die(&format!("could not start '{}': {e}", display.display())))
+        .unwrap_or_else(|e| die(format!("could not start '{}': {e}", display.display())))
 }
 
 fn run_interactive_command(cmd: Command, display: &Path) -> std::process::ExitStatus {
@@ -1168,7 +1174,7 @@ fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
         let pack = load_pack(&src).map_err(|e| format!("pack '{display}' is invalid: {e}"))?;
         packs.push(pack);
     }
-    packs.extend(extensions::load_packs_from_args(args, true)?);
+    packs.extend(extensions::load_packs_from_args(args, true).map_err(|e| e.to_string())?);
     Ok(packs)
 }
 

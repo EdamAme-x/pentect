@@ -1,6 +1,7 @@
 use crate::approve_ui::ApprovalDecision;
 use crate::project_config::{load_project_config, set_approval_required};
 use crate::session::session_root;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::fs;
@@ -15,10 +16,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PENTECT_DIR: &str = ".pentect";
 const APPROVALS_DIR: &str = "approvals";
+const APPROVAL_SIGNATURE_SCHEME: &str = "ed25519-v1";
+const HEARTBEAT_TRUST_MAX_AGE: Duration = Duration::from_secs(3);
+const DECISION_TTL_MS: u128 = 5 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ApprovalTicket {
     pub(crate) id: String,
+    pub(crate) nonce: String,
     pub(crate) fingerprint: String,
     pub(crate) command: String,
     pub(crate) env_names: Vec<String>,
@@ -32,6 +37,7 @@ pub(crate) struct ApprovalTicket {
 #[derive(Clone)]
 pub(crate) struct ApprovalQueue {
     dirs: ApprovalDirs,
+    signer: Option<Arc<SigningKey>>,
 }
 
 #[derive(Clone)]
@@ -40,17 +46,26 @@ struct ApprovalDirs {
     decisions: PathBuf,
     always: PathBuf,
     heartbeat: PathBuf,
+    dashboard_key: PathBuf,
     history: PathBuf,
+}
+
+struct DashboardHeartbeat {
+    key: VerifyingKey,
+    bypass_all: bool,
 }
 
 impl ApprovalQueue {
     pub(crate) fn open(session: &str) -> Result<Self, String> {
-        let root = session_root(session)?.join("approvals");
+        let root = session_root(session)
+            .map_err(|e| e.to_string())?
+            .join("approvals");
         let dirs = ApprovalDirs {
             pending: root.join("pending"),
             decisions: root.join("decisions"),
             always: root.join("always"),
             heartbeat: root.join("dashboard.heartbeat"),
+            dashboard_key: root.join("dashboard.pub"),
             history: root.join("history.log"),
         };
         fs::create_dir_all(&dirs.pending)
@@ -59,11 +74,31 @@ impl ApprovalQueue {
             .map_err(|e| format!("could not create '{}': {e}", dirs.decisions.display()))?;
         fs::create_dir_all(&dirs.always)
             .map_err(|e| format!("could not create '{}': {e}", dirs.always.display()))?;
-        Ok(Self { dirs })
+        Ok(Self { dirs, signer: None })
+    }
+
+    pub(crate) fn open_dashboard(session: &str) -> Result<Self, String> {
+        let mut queue = Self::open(session)?;
+        let signer = Arc::new(new_dashboard_signer()?);
+        let public_key = public_key_hex(&signer.verifying_key());
+        fs::write(&queue.dirs.dashboard_key, format!("{public_key}\n")).map_err(|e| {
+            format!(
+                "could not write '{}': {e}",
+                queue.dirs.dashboard_key.display()
+            )
+        })?;
+        queue.signer = Some(signer);
+        Ok(queue)
     }
 
     pub(crate) fn heartbeat(&self, port: Option<u16>, bypass_all: bool) -> Result<(), String> {
         let mut body = format!("time={}\n", unix_millis());
+        if let Some(signer) = &self.signer {
+            body.push_str(&format!(
+                "key={}\n",
+                public_key_hex(&signer.verifying_key())
+            ));
+        }
         if let Some(port) = port {
             body.push_str(&format!("port={port}\n"));
         }
@@ -87,19 +122,38 @@ impl ApprovalQueue {
     }
 
     pub(crate) fn dashboard_bypass_alive(&self, max_age: Duration) -> bool {
-        if !self.dashboard_alive(max_age) {
-            return false;
-        }
-        fs::read_to_string(&self.dirs.heartbeat)
-            .is_ok_and(|text| text.lines().any(|line| line.trim() == "bypass=true"))
+        self.dashboard_heartbeat(max_age)
+            .is_some_and(|heartbeat| heartbeat.bypass_all)
     }
 
     pub(crate) fn always_granted(&self, fingerprint: &str) -> bool {
-        self.dirs.always.join(fingerprint).exists()
+        let Some(heartbeat) = self.dashboard_heartbeat(HEARTBEAT_TRUST_MAX_AGE) else {
+            return false;
+        };
+        let path = self.dirs.always.join(fingerprint);
+        let Ok(text) = fs::read_to_string(&path) else {
+            return false;
+        };
+        self.verify_always_grant(fingerprint, &text, &heartbeat.key)
+            .unwrap_or(false)
     }
 
     pub(crate) fn remember_always(&self, fingerprint: &str) -> Result<(), String> {
-        fs::write(self.dirs.always.join(fingerprint), b"ok")
+        let Some(signer) = &self.signer else {
+            return Ok(());
+        };
+        let created_at_ms = unix_millis();
+        let payload = always_payload(fingerprint, created_at_ms);
+        let signature = sign_hex(signer, &payload);
+        let body = json!({
+            "scheme": APPROVAL_SIGNATURE_SCHEME,
+            "kind": "always",
+            "fingerprint": fingerprint,
+            "created_at_ms": created_at_ms.to_string(),
+            "signer": public_key_hex(&signer.verifying_key()),
+            "signature": signature,
+        });
+        fs::write(self.dirs.always.join(fingerprint), body.to_string())
             .map_err(|e| format!("could not write approval: {e}"))
     }
 
@@ -120,7 +174,7 @@ impl ApprovalQueue {
         heartbeat_max_age: Duration,
     ) -> Result<ApprovalDecision, String> {
         loop {
-            if let Some(decision) = self.read_decision(&ticket.id)? {
+            if let Some(decision) = self.read_decision(ticket, heartbeat_max_age)? {
                 if decision == ApprovalDecision::Always {
                     self.remember_always(&ticket.fingerprint)?;
                     self.remember_project_always(ticket)?;
@@ -133,7 +187,10 @@ impl ApprovalQueue {
                 self.finish(ticket, ApprovalDecision::Once, "bypass")?;
                 return Ok(ApprovalDecision::Once);
             }
-            if !load_project_config()?.approval_required {
+            if !load_project_config()
+                .map_err(|e| e.to_string())?
+                .approval_required
+            {
                 self.finish(ticket, ApprovalDecision::Once, "config")?;
                 return Ok(ApprovalDecision::Once);
             }
@@ -180,7 +237,7 @@ impl ApprovalQueue {
         decision: ApprovalDecision,
         actor: &str,
     ) -> Result<(), String> {
-        self.write_decision(&ticket.id, decision)?;
+        self.write_decision(ticket, decision)?;
         if decision == ApprovalDecision::Always {
             self.remember_always(&ticket.fingerprint)?;
             self.remember_project_always(ticket)?;
@@ -292,7 +349,7 @@ impl ApprovalQueue {
         if let Some(query) = path.strip_prefix("/config?") {
             let required =
                 query_param(query, "approval_required").is_none_or(|value| value != "false");
-            set_approval_required(required)?;
+            set_approval_required(required).map_err(|e| e.to_string())?;
             return write_http(&mut stream, "303 See Other", "text/plain", "ok", Some("/"));
         }
         let html = self.render_html(session, bypass_all.load(Ordering::Relaxed))?;
@@ -308,7 +365,7 @@ impl ApprovalQueue {
     fn render_html(&self, session: &str, bypass_all: bool) -> Result<String, String> {
         let pending = self.next_pending()?;
         let history = self.recent_history(8)?;
-        let config = load_project_config()?;
+        let config = load_project_config().map_err(|e| e.to_string())?;
         let mut html = String::from(
             "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta http-equiv=refresh content=1><title>pentect</title>\
              <style>body{font:15px system-ui;margin:32px;max-width:880px;background:#0b0d10;color:#f4f7fb}pre{white-space:pre-wrap;background:#151922;padding:16px;border:1px solid #2b3340;border-radius:8px}button{min-height:40px;padding:0 16px;margin:4px 8px 4px 0;border-radius:8px;border:1px solid #394452;background:#1b2230;color:#f4f7fb}.good{color:#75e0a7}.bad{color:#ff9d9d}.muted{color:#9ca7b4}</style>",
@@ -472,19 +529,123 @@ impl ApprovalQueue {
             .map_err(|e| format!("could not write project always approvals: {e}"))
     }
 
-    fn write_decision(&self, id: &str, decision: ApprovalDecision) -> Result<(), String> {
-        fs::write(self.decision_path(id), decision.as_str())
+    fn write_decision(
+        &self,
+        ticket: &ApprovalTicket,
+        decision: ApprovalDecision,
+    ) -> Result<(), String> {
+        let Some(signer) = &self.signer else {
+            return Err("approval decisions require a dashboard signing key".to_string());
+        };
+        let created_at_ms = unix_millis();
+        let expires_at_ms = created_at_ms + DECISION_TTL_MS;
+        let payload = decision_payload(ticket, decision, created_at_ms, expires_at_ms);
+        let body = json!({
+            "scheme": APPROVAL_SIGNATURE_SCHEME,
+            "kind": "decision",
+            "ticket_id": ticket.id,
+            "ticket_nonce": ticket.nonce,
+            "fingerprint": ticket.fingerprint,
+            "decision": decision.as_str(),
+            "created_at_ms": created_at_ms.to_string(),
+            "expires_at_ms": expires_at_ms.to_string(),
+            "signer": public_key_hex(&signer.verifying_key()),
+            "signature": sign_hex(signer, &payload),
+        });
+        fs::write(self.decision_path(&ticket.id), body.to_string())
             .map_err(|e| format!("could not write approval decision: {e}"))
     }
 
-    fn read_decision(&self, id: &str) -> Result<Option<ApprovalDecision>, String> {
-        let path = self.decision_path(id);
+    fn read_decision(
+        &self,
+        ticket: &ApprovalTicket,
+        heartbeat_max_age: Duration,
+    ) -> Result<Option<ApprovalDecision>, String> {
+        let path = self.decision_path(&ticket.id);
         if !path.exists() {
             return Ok(None);
         }
         let text = fs::read_to_string(&path)
             .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-        Ok(decision_from_str(text.trim()))
+        let Some(heartbeat) = self.dashboard_heartbeat(heartbeat_max_age) else {
+            return Err(
+                "approval decision exists but no trusted dashboard heartbeat is alive".to_string(),
+            );
+        };
+        self.verify_decision(ticket, &text, &heartbeat.key)
+            .map(Some)
+    }
+
+    fn dashboard_heartbeat(&self, max_age: Duration) -> Option<DashboardHeartbeat> {
+        if !self.dashboard_alive(max_age) {
+            return None;
+        }
+        let text = fs::read_to_string(&self.dirs.heartbeat).ok()?;
+        let mut key = None;
+        let mut bypass_all = false;
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("key=") {
+                key = verifying_key_from_hex(value.trim()).ok();
+            } else if line.trim() == "bypass=true" {
+                bypass_all = true;
+            }
+        }
+        let key = key.or_else(|| {
+            fs::read_to_string(&self.dirs.dashboard_key)
+                .ok()
+                .and_then(|text| verifying_key_from_hex(text.trim()).ok())
+        })?;
+        Some(DashboardHeartbeat { key, bypass_all })
+    }
+
+    fn verify_decision(
+        &self,
+        ticket: &ApprovalTicket,
+        text: &str,
+        heartbeat_key: &VerifyingKey,
+    ) -> Result<ApprovalDecision, String> {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|e| format!("approval decision is unsigned or malformed: {e}"))?;
+        require_json_string(&value, "scheme", APPROVAL_SIGNATURE_SCHEME)?;
+        require_json_string(&value, "kind", "decision")?;
+        require_json_string(&value, "ticket_id", &ticket.id)?;
+        require_json_string(&value, "ticket_nonce", &ticket.nonce)?;
+        require_json_string(&value, "fingerprint", &ticket.fingerprint)?;
+        let decision = decision_from_str(&string_json(&value, "decision")?)
+            .ok_or_else(|| "approval decision is unknown".to_string())?;
+        let created_at_ms = u128_json(&value, "created_at_ms")?;
+        let expires_at_ms = u128_json(&value, "expires_at_ms")?;
+        if unix_millis() > expires_at_ms {
+            return Err("approval decision expired".to_string());
+        }
+        let signer = verifying_key_from_hex(&string_json(&value, "signer")?)?;
+        if signer.to_bytes() != heartbeat_key.to_bytes() {
+            return Err("approval decision was not signed by the active dashboard".to_string());
+        }
+        let payload = decision_payload(ticket, decision, created_at_ms, expires_at_ms);
+        verify_signature(&signer, &payload, &string_json(&value, "signature")?)?;
+        Ok(decision)
+    }
+
+    fn verify_always_grant(
+        &self,
+        fingerprint: &str,
+        text: &str,
+        heartbeat_key: &VerifyingKey,
+    ) -> Result<bool, String> {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|e| format!("approval grant is unsigned or malformed: {e}"))?;
+        require_json_string(&value, "scheme", APPROVAL_SIGNATURE_SCHEME)?;
+        require_json_string(&value, "kind", "always")?;
+        require_json_string(&value, "fingerprint", fingerprint)?;
+        let created_at_ms = u128_json(&value, "created_at_ms")?;
+        let signer = verifying_key_from_hex(&string_json(&value, "signer")?)?;
+        if signer.to_bytes() != heartbeat_key.to_bytes() {
+            return Ok(false);
+        }
+        let payload = always_payload(fingerprint, created_at_ms);
+        verify_signature(&signer, &payload, &string_json(&value, "signature")?)?;
+        Ok(true)
     }
 
     fn pending_path(&self, id: &str) -> PathBuf {
@@ -506,11 +667,10 @@ impl ApprovalTicket {
         network_like: bool,
         materialize_like: bool,
     ) -> Self {
-        let id_material = format!("{fingerprint}:{}:{}", unix_millis(), std::process::id());
-        let digest = sha2::Sha256::digest(id_material.as_bytes());
-        let id = data_encoding::HEXLOWER.encode(&digest[..8]);
-        Self {
-            id,
+        let nonce = random_hex_or_fallback("approval-ticket");
+        let mut ticket = Self {
+            id: String::new(),
+            nonce,
             fingerprint,
             command,
             env_names,
@@ -519,7 +679,9 @@ impl ApprovalTicket {
             network_like,
             materialize_like,
             path: None,
-        }
+        };
+        ticket.id = ticket_id(&ticket);
+        ticket
     }
 
     pub(crate) fn short(&self) -> String {
@@ -574,6 +736,7 @@ pub(crate) fn ticket_summary(ticket: &ApprovalTicket) -> String {
 fn ticket_json(ticket: &ApprovalTicket) -> Value {
     json!({
         "id": ticket.id,
+        "nonce": ticket.nonce,
         "fingerprint": ticket.fingerprint,
         "command": ticket.command,
         "env": ticket.env_names,
@@ -587,8 +750,9 @@ fn ticket_json(ticket: &ApprovalTicket) -> Value {
 fn ticket_from_json(text: &str) -> Result<ApprovalTicket, String> {
     let value: Value =
         serde_json::from_str(text).map_err(|e| format!("approval request is malformed: {e}"))?;
-    Ok(ApprovalTicket {
+    let ticket = ApprovalTicket {
         id: string_json(&value, "id")?,
+        nonce: string_json(&value, "nonce")?,
         fingerprint: string_json(&value, "fingerprint")?,
         command: string_json(&value, "command")?,
         env_names: string_array_json(&value, "env")?,
@@ -606,7 +770,139 @@ fn ticket_from_json(text: &str) -> Result<ApprovalTicket, String> {
             .and_then(Value::as_bool)
             .unwrap_or_default(),
         path: None,
-    })
+    };
+    let expected = ticket_id(&ticket);
+    if ticket.id != expected {
+        return Err("approval request id does not match its signed content".to_string());
+    }
+    Ok(ticket)
+}
+
+fn ticket_id(ticket: &ApprovalTicket) -> String {
+    let digest = sha2::Sha256::digest(canonical_ticket_payload(ticket).as_bytes());
+    data_encoding::HEXLOWER.encode(&digest[..16])
+}
+
+fn canonical_ticket_payload(ticket: &ApprovalTicket) -> String {
+    let mut out = String::new();
+    canonical_field(&mut out, "kind", "approval-ticket-v1");
+    canonical_field(&mut out, "nonce", &ticket.nonce);
+    canonical_field(&mut out, "fingerprint", &ticket.fingerprint);
+    canonical_field(&mut out, "command", &ticket.command);
+    canonical_list(&mut out, "env", &ticket.env_names);
+    canonical_field(&mut out, "handles", &ticket.direct_handles.to_string());
+    canonical_list(&mut out, "destinations", &ticket.destinations);
+    canonical_field(&mut out, "network", bool_str(ticket.network_like));
+    canonical_field(&mut out, "materialize", bool_str(ticket.materialize_like));
+    out
+}
+
+fn decision_payload(
+    ticket: &ApprovalTicket,
+    decision: ApprovalDecision,
+    created_at_ms: u128,
+    expires_at_ms: u128,
+) -> String {
+    let mut out = String::new();
+    canonical_field(&mut out, "kind", "approval-decision-v1");
+    canonical_field(&mut out, "ticket_id", &ticket.id);
+    canonical_field(&mut out, "ticket_nonce", &ticket.nonce);
+    canonical_field(&mut out, "fingerprint", &ticket.fingerprint);
+    canonical_field(&mut out, "decision", decision.as_str());
+    canonical_field(&mut out, "created_at_ms", &created_at_ms.to_string());
+    canonical_field(&mut out, "expires_at_ms", &expires_at_ms.to_string());
+    out
+}
+
+fn always_payload(fingerprint: &str, created_at_ms: u128) -> String {
+    let mut out = String::new();
+    canonical_field(&mut out, "kind", "approval-always-v1");
+    canonical_field(&mut out, "fingerprint", fingerprint);
+    canonical_field(&mut out, "created_at_ms", &created_at_ms.to_string());
+    out
+}
+
+fn canonical_list(out: &mut String, key: &str, values: &[String]) {
+    canonical_field(out, key, &values.join("\u{1f}"));
+}
+
+fn canonical_field(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push(':');
+    out.push_str(&value.len().to_string());
+    out.push(':');
+    out.push_str(value);
+    out.push('\n');
+}
+
+fn bool_str(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn new_dashboard_signer() -> Result<SigningKey, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| format!("could not generate approval signing key: {e}"))?;
+    Ok(SigningKey::from_bytes(&bytes))
+}
+
+fn random_hex_or_fallback(label: &str) -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        return data_encoding::HEXLOWER.encode(&bytes);
+    }
+    let fallback = format!("{label}:{}:{}", unix_millis(), std::process::id());
+    let digest = sha2::Sha256::digest(fallback.as_bytes());
+    data_encoding::HEXLOWER.encode(&digest[..16])
+}
+
+fn public_key_hex(key: &VerifyingKey) -> String {
+    data_encoding::HEXLOWER.encode(&key.to_bytes())
+}
+
+fn sign_hex(signer: &SigningKey, payload: &str) -> String {
+    let signature: Signature = signer.sign(payload.as_bytes());
+    data_encoding::HEXLOWER.encode(&signature.to_bytes())
+}
+
+fn verify_signature(key: &VerifyingKey, payload: &str, signature_hex: &str) -> Result<(), String> {
+    let signature_bytes = decode_hex_array::<64>(signature_hex)?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    key.verify(payload.as_bytes(), &signature)
+        .map_err(|_| "approval signature is invalid".to_string())
+}
+
+fn verifying_key_from_hex(value: &str) -> Result<VerifyingKey, String> {
+    let bytes = decode_hex_array::<32>(value)?;
+    VerifyingKey::from_bytes(&bytes).map_err(|_| "approval public key is invalid".to_string())
+}
+
+fn decode_hex_array<const N: usize>(value: &str) -> Result<[u8; N], String> {
+    let bytes = data_encoding::HEXLOWER
+        .decode(value.as_bytes())
+        .map_err(|_| "approval signature material is not valid lowercase hex".to_string())?;
+    bytes
+        .try_into()
+        .map_err(|_| "approval signature material has the wrong length".to_string())
+}
+
+fn require_json_string(value: &Value, key: &str, expected: &str) -> Result<(), String> {
+    let actual = string_json(value, key)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("approval field {key} does not match"))
+    }
+}
+
+fn u128_json(value: &Value, key: &str) -> Result<u128, String> {
+    string_json(value, key)?
+        .parse::<u128>()
+        .map_err(|_| format!("approval field {key} is not a valid timestamp"))
 }
 
 fn string_json(value: &Value, key: &str) -> Result<String, String> {
@@ -734,4 +1030,119 @@ fn unix_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticket_json_rejects_content_tampering() {
+        let ticket = sample_ticket();
+        let mut value = ticket_json(&ticket);
+        value["command"] = Value::String("curl https://attacker.example".to_string());
+
+        let err = ticket_from_json(&value.to_string()).unwrap_err();
+        assert!(err.contains("id does not match"), "{err}");
+    }
+
+    #[test]
+    fn unsigned_plaintext_decision_is_rejected() {
+        let session = unique_session("unsigned-decision");
+        let dashboard = ApprovalQueue::open_dashboard(&session).unwrap();
+        dashboard.heartbeat(None, false).unwrap();
+        let ticket = sample_ticket();
+        fs::write(dashboard.decision_path(&ticket.id), "once").unwrap();
+
+        let exec = ApprovalQueue::open(&session).unwrap();
+        let err = exec
+            .read_decision(&ticket, Duration::from_secs(2))
+            .unwrap_err();
+        assert!(err.contains("unsigned or malformed"), "{err}");
+
+        cleanup_session(&session);
+    }
+
+    #[test]
+    fn signed_decision_round_trips() {
+        let session = unique_session("signed-decision");
+        let dashboard = ApprovalQueue::open_dashboard(&session).unwrap();
+        dashboard.heartbeat(None, false).unwrap();
+        let ticket = sample_ticket();
+        dashboard
+            .decide(&ticket, ApprovalDecision::Once, "ui")
+            .unwrap();
+
+        let exec = ApprovalQueue::open(&session).unwrap();
+        let decision = exec.read_decision(&ticket, Duration::from_secs(2)).unwrap();
+        assert_eq!(decision, Some(ApprovalDecision::Once));
+
+        cleanup_session(&session);
+    }
+
+    #[test]
+    fn signed_decision_rejects_tampering() {
+        let session = unique_session("tampered-decision");
+        let dashboard = ApprovalQueue::open_dashboard(&session).unwrap();
+        dashboard.heartbeat(None, false).unwrap();
+        let ticket = sample_ticket();
+        dashboard
+            .decide(&ticket, ApprovalDecision::Once, "ui")
+            .unwrap();
+        let path = dashboard.decision_path(&ticket.id);
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["decision"] = Value::String("always".to_string());
+        fs::write(&path, value.to_string()).unwrap();
+
+        let exec = ApprovalQueue::open(&session).unwrap();
+        let err = exec
+            .read_decision(&ticket, Duration::from_secs(2))
+            .unwrap_err();
+        assert!(err.contains("signature is invalid"), "{err}");
+
+        cleanup_session(&session);
+    }
+
+    #[test]
+    fn raw_always_file_is_not_trusted() {
+        let session = unique_session("fake-always");
+        let dashboard = ApprovalQueue::open_dashboard(&session).unwrap();
+        dashboard.heartbeat(None, false).unwrap();
+        let fingerprint = "abcdef";
+        fs::write(dashboard.dirs.always.join(fingerprint), "ok").unwrap();
+
+        let exec = ApprovalQueue::open(&session).unwrap();
+        assert!(!exec.always_granted(fingerprint));
+
+        dashboard.remember_always(fingerprint).unwrap();
+        assert!(exec.always_granted(fingerprint));
+
+        cleanup_session(&session);
+    }
+
+    fn sample_ticket() -> ApprovalTicket {
+        ApprovalTicket::new(
+            "fingerprint".to_string(),
+            "curl -H \"Authorization: Bearer $env:API_TOKEN\" https://api.example.test".to_string(),
+            vec!["API_TOKEN".to_string()],
+            0,
+            vec!["https://api.example.test".to_string()],
+            true,
+            false,
+        )
+    }
+
+    fn unique_session(name: &str) -> String {
+        format!(
+            "approval_test_{name}_{}_{}",
+            std::process::id(),
+            unix_millis()
+        )
+    }
+
+    fn cleanup_session(session: &str) {
+        if let Ok(root) = session_root(session) {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
 }

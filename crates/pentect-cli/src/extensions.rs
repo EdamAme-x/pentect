@@ -1,3 +1,5 @@
+use crate::Result;
+use anyhow::{anyhow, bail, Context};
 use pentect_core::{load_pack, Pack};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -14,17 +16,17 @@ pub(crate) struct ActiveExtensions {
 }
 
 impl ActiveExtensions {
-    pub(crate) fn env_value(&self) -> Result<Option<OsString>, String> {
+    pub(crate) fn env_value(&self) -> Result<Option<OsString>> {
         if self.pack_paths.is_empty() {
             return Ok(None);
         }
         std::env::join_paths(&self.pack_paths)
             .map(Some)
-            .map_err(|e| format!("could not encode extension pack paths: {e}"))
+            .context("could not encode extension pack paths")
     }
 }
 
-pub(crate) fn parse_extension_value(value: &str) -> Result<Vec<String>, String> {
+pub(crate) fn parse_extension_value(value: &str) -> Result<Vec<String>> {
     let mut specs = Vec::new();
     for raw in value.split(',') {
         let spec = raw.trim();
@@ -37,21 +39,21 @@ pub(crate) fn parse_extension_value(value: &str) -> Result<Vec<String>, String> 
         }
     }
     if specs.is_empty() {
-        return Err("--extensions requires at least one extension".to_string());
+        bail!("--extensions requires at least one extension");
     }
     Ok(specs)
 }
 
-pub(crate) fn collect_from_args(args: &[String]) -> Result<Vec<String>, String> {
+pub(crate) fn collect_from_args(args: &[String]) -> Result<Vec<String>> {
     let mut specs = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
         if args[i] == "--extensions" {
             let Some(value) = args.get(i + 1) else {
-                return Err("--extensions requires a value".to_string());
+                bail!("--extensions requires a value");
             };
             if value.starts_with("--") {
-                return Err("--extensions requires a value".to_string());
+                bail!("--extensions requires a value");
             }
             extend_unique(&mut specs, parse_extension_value(value)?);
             i += 2;
@@ -62,7 +64,7 @@ pub(crate) fn collect_from_args(args: &[String]) -> Result<Vec<String>, String> 
     Ok(specs)
 }
 
-pub(crate) fn strip_from_args(args: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
+pub(crate) fn strip_from_args(args: &[String]) -> Result<(Vec<String>, Vec<String>)> {
     match args.first().map(String::as_str) {
         Some("exec" | "approve") => strip_exec_like_args(args),
         Some("dashboard") | Some("--dir" | "--session" | "--port") | None => {
@@ -73,7 +75,7 @@ pub(crate) fn strip_from_args(args: &[String]) -> Result<(Vec<String>, Vec<Strin
     }
 }
 
-fn strip_exec_like_args(args: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
+fn strip_exec_like_args(args: &[String]) -> Result<(Vec<String>, Vec<String>)> {
     let mut stripped = Vec::new();
     let mut specs = Vec::new();
     let mut i = 0usize;
@@ -84,17 +86,17 @@ fn strip_exec_like_args(args: &[String]) -> Result<(Vec<String>, Vec<String>), S
         }
         if args[i] == "--extensions" {
             let Some(value) = args.get(i + 1) else {
-                return Err("--extensions requires a value".to_string());
+                bail!("--extensions requires a value");
             };
             if value.starts_with("--") {
-                return Err("--extensions requires a value".to_string());
+                bail!("--extensions requires a value");
             }
             extend_unique(&mut specs, parse_extension_value(value)?);
             i += 2;
         } else if matches!(args[i].as_str(), "--session") {
             stripped.push(args[i].clone());
             let Some(value) = args.get(i + 1) else {
-                return Err(format!("{} requires a value", args[i]));
+                bail!("{} requires a value", args[i]);
             };
             stripped.push(value.clone());
             i += 2;
@@ -109,10 +111,7 @@ fn strip_exec_like_args(args: &[String]) -> Result<(Vec<String>, Vec<String>), S
     Ok((stripped, specs))
 }
 
-fn strip_option_args(
-    args: &[String],
-    value_flags: &[&str],
-) -> Result<(Vec<String>, Vec<String>), String> {
+fn strip_option_args(args: &[String], value_flags: &[&str]) -> Result<(Vec<String>, Vec<String>)> {
     let mut stripped = Vec::new();
     let mut specs = Vec::new();
     let mut i = 0usize;
@@ -123,10 +122,10 @@ fn strip_option_args(
         }
         if args[i] == "--extensions" {
             let Some(value) = args.get(i + 1) else {
-                return Err("--extensions requires a value".to_string());
+                bail!("--extensions requires a value");
             };
             if value.starts_with("--") {
-                return Err("--extensions requires a value".to_string());
+                bail!("--extensions requires a value");
             }
             extend_unique(&mut specs, parse_extension_value(value)?);
             i += 2;
@@ -135,7 +134,7 @@ fn strip_option_args(
         stripped.push(args[i].clone());
         if value_flags.contains(&args[i].as_str()) {
             let Some(value) = args.get(i + 1) else {
-                return Err(format!("{} requires a value", args[i]));
+                bail!("{} requires a value", args[i]);
             };
             stripped.push(value.clone());
             i += 2;
@@ -149,71 +148,68 @@ fn strip_option_args(
 pub(crate) fn active_from_specs(
     explicit_specs: Vec<String>,
     create_named: bool,
-) -> Result<ActiveExtensions, String> {
+) -> Result<ActiveExtensions> {
     let mut specs = config_specs()?;
     extend_unique(&mut specs, explicit_specs);
     let pack_paths = pack_paths_for_specs(&specs, create_named)?;
     Ok(ActiveExtensions { pack_paths })
 }
 
-pub(crate) fn load_packs_from_args(
-    args: &[String],
-    create_named: bool,
-) -> Result<Vec<Pack>, String> {
+pub(crate) fn load_packs_from_args(args: &[String], create_named: bool) -> Result<Vec<Pack>> {
     load_packs_from_specs(collect_from_args(args)?, create_named)
 }
 
 pub(crate) fn load_packs_from_specs(
     explicit_specs: Vec<String>,
     create_named: bool,
-) -> Result<Vec<Pack>, String> {
+) -> Result<Vec<Pack>> {
     let active = active_from_specs(explicit_specs, create_named)?;
     let mut packs = Vec::new();
     for path in active.pack_paths {
         let display = path.display();
         let src = std::fs::read_to_string(&path)
-            .map_err(|e| format!("could not read extension pack '{display}': {e}"))?;
+            .with_context(|| format!("could not read extension pack '{display}'"))?;
         packs.push(
-            load_pack(&src).map_err(|e| format!("extension pack '{display}' is invalid: {e}"))?,
+            load_pack(&src).map_err(|e| anyhow!("extension pack '{display}' is invalid: {e}"))?,
         );
     }
     Ok(packs)
 }
 
-fn config_specs() -> Result<Vec<String>, String> {
+fn config_specs() -> Result<Vec<String>> {
     let path = PathBuf::from(PENTECT_DIR).join(CONFIG_FILE);
     if !path.exists() {
         return Ok(Vec::new());
     }
     let src = std::fs::read_to_string(&path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+        .with_context(|| format!("could not read '{}'", path.display()))?;
     let value = src
         .parse::<toml::Value>()
-        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+        .with_context(|| format!("could not parse '{}'", path.display()))?;
     let Some(raw_extensions) = value.get("extensions") else {
         return Ok(Vec::new());
     };
     parse_config_extensions(raw_extensions)
 }
 
-fn parse_config_extensions(value: &toml::Value) -> Result<Vec<String>, String> {
+fn parse_config_extensions(value: &toml::Value) -> Result<Vec<String>> {
     match value {
         toml::Value::String(s) => parse_extension_value(s),
         toml::Value::Array(items) => {
             let mut specs = Vec::new();
             for item in items {
                 let Some(s) = item.as_str() else {
-                    return Err(".pentect/config.toml extensions must be strings".to_string());
+                    bail!(".pentect/config.toml extensions must be strings");
                 };
                 extend_unique(&mut specs, parse_extension_value(s)?);
             }
             Ok(specs)
         }
-        _ => Err(".pentect/config.toml extensions must be a string or string array".to_string()),
+        _ => bail!(".pentect/config.toml extensions must be a string or string array"),
     }
 }
 
-fn pack_paths_for_specs(specs: &[String], create_named: bool) -> Result<Vec<PathBuf>, String> {
+fn pack_paths_for_specs(specs: &[String], create_named: bool) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for spec in specs {
         if is_path_spec(spec) {
@@ -227,44 +223,38 @@ fn pack_paths_for_specs(specs: &[String], create_named: bool) -> Result<Vec<Path
     Ok(paths)
 }
 
-fn pack_paths_for_named(name: &str, _create: bool) -> Result<Vec<PathBuf>, String> {
+fn pack_paths_for_named(name: &str, _create: bool) -> Result<Vec<PathBuf>> {
     validate_extension_name(name)?;
     let root = extensions_root();
     let dir = root.join(name);
     if !dir.exists() {
-        return Err(format!(
-            "extension '{name}' was not found at '{}'",
-            dir.display()
-        ));
+        bail!("extension '{name}' was not found at '{}'", dir.display());
     }
     let paths = pack_paths_in_extension_dir(&dir)?;
     if paths.is_empty() {
-        return Err(format!(
+        bail!(
             "extension '{name}' has no rule packs; add '{}' or '{}'",
             dir.join("pack.toml").display(),
             dir.join("packs").display()
-        ));
+        );
     }
     Ok(paths)
 }
 
-fn pack_paths_for_path(path: &Path) -> Result<Vec<PathBuf>, String> {
+fn pack_paths_for_path(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_file() {
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-            return Err(format!(
-                "extension pack must be a .toml file: {}",
-                path.display()
-            ));
+            bail!("extension pack must be a .toml file: {}", path.display());
         }
         return canonical_file(path).map(|path| vec![path]);
     }
     if path.is_dir() {
         return pack_paths_in_extension_dir(path);
     }
-    Err(format!("extension path does not exist: {}", path.display()))
+    bail!("extension path does not exist: {}", path.display())
 }
 
-fn pack_paths_in_extension_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
+fn pack_paths_in_extension_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     let pack = dir.join("pack.toml");
     if pack.exists() {
@@ -278,34 +268,34 @@ fn pack_paths_in_extension_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-fn canonical_file(path: &Path) -> Result<PathBuf, String> {
+fn canonical_file(path: &Path) -> Result<PathBuf> {
     path.canonicalize()
-        .map_err(|e| format!("could not resolve '{}': {e}", path.display()))
+        .with_context(|| format!("could not resolve '{}'", path.display()))
 }
 
 fn extensions_root() -> PathBuf {
     PathBuf::from(PENTECT_DIR).join(EXTENSIONS_DIR)
 }
 
-fn validate_extension_spec(spec: &str) -> Result<(), String> {
+fn validate_extension_spec(spec: &str) -> Result<()> {
     if is_path_spec(spec) {
         return Ok(());
     }
     validate_extension_name(spec)
 }
 
-fn validate_extension_name(name: &str) -> Result<(), String> {
+fn validate_extension_name(name: &str) -> Result<()> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
-        return Err("extension name must not be empty".to_string());
+        bail!("extension name must not be empty");
     };
     if !first.is_ascii_alphanumeric() {
-        return Err(format!("invalid extension name: {name}"));
+        bail!("invalid extension name: {name}");
     }
     if name.len() > 64
         || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
-        return Err(format!("invalid extension name: {name}"));
+        bail!("invalid extension name: {name}");
     }
     Ok(())
 }
@@ -319,21 +309,13 @@ fn is_path_spec(spec: &str) -> bool {
         || spec.starts_with('.')
 }
 
-fn toml_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
+fn toml_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| {
-        format!(
-            "could not read extension directory '{}': {e}",
-            dir.display()
-        )
-    })? {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("could not read extension directory '{}'", dir.display()))?
+    {
         let path = entry
-            .map_err(|e| {
-                format!(
-                    "could not read extension directory '{}': {e}",
-                    dir.display()
-                )
-            })?
+            .with_context(|| format!("could not read extension directory '{}'", dir.display()))?
             .path();
         if path.extension().is_some_and(|ext| ext == "toml") {
             files.push(canonical_file(&path)?);
@@ -444,7 +426,7 @@ mod tests {
                 .unwrap()
                 .as_millis()
         );
-        let err = pack_paths_for_named(&name, true).unwrap_err();
+        let err = pack_paths_for_named(&name, true).unwrap_err().to_string();
         assert!(err.contains("was not found"), "{err}");
     }
 }

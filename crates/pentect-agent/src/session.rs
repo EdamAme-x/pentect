@@ -1,4 +1,6 @@
 use crate::masking::{decode_env_alias_record, is_env_alias_placeholder};
+use crate::Result;
+use anyhow::{anyhow, bail, Context};
 use pentect_core::{Config, Recovery};
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -18,7 +20,7 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn open(name: &str) -> Result<Self, String> {
+    pub(crate) fn open(name: &str) -> Result<Self> {
         let root = session_root(name)?;
         let vault_path = root.join(VAULT_FILE);
         if vault_path.exists() {
@@ -27,7 +29,7 @@ impl Session {
         Ok(Self::in_memory())
     }
 
-    pub(crate) fn open_capability(name: &str) -> Result<Self, String> {
+    pub(crate) fn open_capability(name: &str) -> Result<Self> {
         let root = session_root(name)?;
         Self::open_capability_root(root)
     }
@@ -41,31 +43,31 @@ impl Session {
     }
 
     #[cfg(test)]
-    pub(crate) fn open_at(base: &Path, name: &str) -> Result<Self, String> {
+    pub(crate) fn open_at(base: &Path, name: &str) -> Result<Self> {
         let _ = base;
         checked_session_name(name)?;
         Ok(Self::in_memory())
     }
 
     #[cfg(test)]
-    pub(crate) fn open_capability_at(base: &Path, name: &str) -> Result<Self, String> {
+    pub(crate) fn open_capability_at(base: &Path, name: &str) -> Result<Self> {
         Self::open_capability_root(base.join(checked_session_name(name)?))
     }
 
     #[cfg(test)]
-    pub(crate) fn save_recovery(&self, recovery: &Recovery) -> Result<(), String> {
+    pub(crate) fn save_recovery(&self, recovery: &Recovery) -> Result<()> {
         if recovery.is_empty() {
             return Ok(());
         }
         self.recoveries
             .lock()
-            .map_err(|_| "recovery cache lock poisoned".to_string())?
+            .map_err(|_| anyhow!("recovery cache lock poisoned"))?
             .push(recovery.clone());
         Ok(())
     }
 
     #[cfg(test)]
-    pub(crate) fn resolve_all(&self, text: &str) -> Result<String, String> {
+    pub(crate) fn resolve_all(&self, text: &str) -> Result<String> {
         let mut out = text.to_string();
         for rec in self.recoveries()? {
             out = rec.resolve(&out);
@@ -74,7 +76,7 @@ impl Session {
     }
 
     #[cfg(test)]
-    pub(crate) fn remask_all(&self, text: &str) -> Result<String, String> {
+    pub(crate) fn remask_all(&self, text: &str) -> Result<String> {
         let mut out = text.to_string();
         for rec in self.recoveries()? {
             out = rec.remask(&out);
@@ -82,21 +84,21 @@ impl Session {
         Ok(out)
     }
 
-    fn recoveries(&self) -> Result<Vec<Recovery>, String> {
+    fn recoveries(&self) -> Result<Vec<Recovery>> {
         Ok(self
             .recoveries
             .lock()
-            .map_err(|_| "recovery cache lock poisoned".to_string())?
+            .map_err(|_| anyhow!("recovery cache lock poisoned"))?
             .clone())
     }
 
-    fn open_capability_root(root: PathBuf) -> Result<Self, String> {
+    fn open_capability_root(root: PathBuf) -> Result<Self> {
         let vault_path = root.join(VAULT_FILE);
         if vault_path.exists() {
             return Self::load_vault(vault_path);
         }
         std::fs::create_dir_all(&root)
-            .map_err(|e| format!("could not create '{}': {e}", root.display()))?;
+            .with_context(|| format!("could not create '{}'", root.display()))?;
         let session = Self {
             key: Config::generate().key,
             recoveries: Arc::new(Mutex::new(Vec::new())),
@@ -106,9 +108,9 @@ impl Session {
         Ok(session)
     }
 
-    fn load_vault(path: PathBuf) -> Result<Self, String> {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    fn load_vault(path: PathBuf) -> Result<Self> {
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("could not read '{}'", path.display()))?;
         let (key, recovery) = decode_vault(&bytes)?;
         Ok(Self {
             key,
@@ -121,7 +123,7 @@ impl Session {
         })
     }
 
-    fn persist_recoveries(&self) -> Result<(), String> {
+    fn persist_recoveries(&self) -> Result<()> {
         let Some(path) = &self.vault_path else {
             return Ok(());
         };
@@ -131,13 +133,13 @@ impl Session {
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
+                .with_context(|| format!("could not create '{}'", parent.display()))?;
         }
         std::fs::write(path, encode_vault(&self.key, &batch))
-            .map_err(|e| format!("could not write '{}': {e}", path.display()))
+            .with_context(|| format!("could not write '{}'", path.display()))
     }
 
-    pub(crate) fn vault_status(name: &str) -> Result<Option<PathBuf>, String> {
+    pub(crate) fn vault_status(name: &str) -> Result<Option<PathBuf>> {
         let path = session_root(name)?.join(VAULT_FILE);
         Ok(path.exists().then_some(path))
     }
@@ -164,14 +166,14 @@ pub(crate) struct RecoveryStore {
 }
 
 impl RecoveryStore {
-    pub(crate) fn load(session: &Session) -> Result<Self, String> {
+    pub(crate) fn load(session: &Session) -> Result<Self> {
         Ok(Self {
             session: session.clone(),
             recoveries: session.recoveries.clone(),
         })
     }
 
-    pub(crate) fn resolve_all(&self, text: &str) -> Result<String, String> {
+    pub(crate) fn resolve_all(&self, text: &str) -> Result<String> {
         let recoveries = self.lock()?;
         let mut out = text.to_string();
         for rec in recoveries.iter() {
@@ -180,7 +182,7 @@ impl RecoveryStore {
         Ok(out)
     }
 
-    pub(crate) fn remask_all(&self, text: &str) -> Result<String, String> {
+    pub(crate) fn remask_all(&self, text: &str) -> Result<String> {
         let recoveries = self.lock()?;
         let mut out = text.to_string();
         for rec in recoveries.iter() {
@@ -189,11 +191,11 @@ impl RecoveryStore {
         Ok(out)
     }
 
-    pub(crate) fn snapshot(&self) -> Result<Vec<Recovery>, String> {
+    pub(crate) fn snapshot(&self) -> Result<Vec<Recovery>> {
         Ok(self.lock()?.clone())
     }
 
-    pub(crate) fn auto_env_bindings(&self) -> Result<Vec<(String, String)>, String> {
+    pub(crate) fn auto_env_bindings(&self) -> Result<Vec<(String, String)>> {
         let recoveries = self.snapshot()?;
         let mut bindings: BTreeMap<String, (String, String)> = BTreeMap::new();
         for recovery in &recoveries {
@@ -218,7 +220,7 @@ impl RecoveryStore {
         Ok(bindings.into_values().collect())
     }
 
-    pub(crate) fn add_recovery(&self, recovery: Recovery) -> Result<(), String> {
+    pub(crate) fn add_recovery(&self, recovery: Recovery) -> Result<()> {
         if recovery.is_empty() {
             return Ok(());
         }
@@ -229,10 +231,10 @@ impl RecoveryStore {
         Ok(())
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Vec<Recovery>>, String> {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Vec<Recovery>>> {
         self.recoveries
             .lock()
-            .map_err(|_| "recovery cache lock poisoned".to_string())
+            .map_err(|_| anyhow!("recovery cache lock poisoned"))
     }
 }
 
@@ -271,38 +273,35 @@ fn encode_vault(key: &[u8; 32], recovery: &Recovery) -> Vec<u8> {
     out
 }
 
-fn decode_vault(bytes: &[u8]) -> Result<([u8; 32], Recovery), String> {
+fn decode_vault(bytes: &[u8]) -> Result<([u8; 32], Recovery)> {
     if bytes.len() < 4 + 1 + 32 + 4 {
-        return Err("capability vault is malformed".to_string());
+        bail!("capability vault is malformed");
     }
     if &bytes[..4] != VAULT_MAGIC {
-        return Err("capability vault has unknown magic".to_string());
+        bail!("capability vault has unknown magic");
     }
     if bytes[4] != VAULT_VERSION {
-        return Err(format!(
-            "unsupported capability vault version: {}",
-            bytes[4]
-        ));
+        bail!("unsupported capability vault version: {}", bytes[4]);
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes[5..37]);
     let len = u32::from_le_bytes(
         bytes[37..41]
             .try_into()
-            .map_err(|_| "capability vault is malformed".to_string())?,
+            .map_err(|_| anyhow!("capability vault is malformed"))?,
     ) as usize;
     let end = 41usize
         .checked_add(len)
-        .ok_or_else(|| "capability vault is too large".to_string())?;
+        .ok_or_else(|| anyhow!("capability vault is too large"))?;
     if end != bytes.len() {
-        return Err("capability vault has trailing or truncated data".to_string());
+        bail!("capability vault has trailing or truncated data");
     }
     let recovery = Recovery::load(&bytes[41..end], &key)
-        .map_err(|e| format!("could not load capability vault recovery: {e}"))?;
+        .map_err(|e| anyhow!("could not load capability vault recovery: {e}"))?;
     Ok((key, recovery))
 }
 
-pub(crate) fn session_root(name: &str) -> Result<PathBuf, String> {
+pub(crate) fn session_root(name: &str) -> Result<PathBuf> {
     let name = checked_session_name(name)?;
     let base = std::env::var_os("PENTECT_AGENT_HOME")
         .map(PathBuf::from)
@@ -310,17 +309,17 @@ pub(crate) fn session_root(name: &str) -> Result<PathBuf, String> {
     Ok(base.join(name))
 }
 
-pub(crate) fn checked_session_name(name: &str) -> Result<String, String> {
+pub(crate) fn checked_session_name(name: &str) -> Result<String> {
     if name.is_empty() {
-        return Err("session name must not be empty".to_string());
+        bail!("session name must not be empty");
     }
     if matches!(name, "." | "..") {
-        return Err("session name must not be a dot path segment".to_string());
+        bail!("session name must not be a dot path segment");
     }
     if name.chars().any(|c| {
         c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
     }) {
-        return Err("session name must be a simple file-name segment".to_string());
+        bail!("session name must be a simple file-name segment");
     }
     Ok(name.to_string())
 }

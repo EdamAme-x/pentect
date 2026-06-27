@@ -404,7 +404,7 @@ fn approval_config_can_disable_dashboard_requirement() {
 fn dashboard_bypass_all_allows_pending_approval_temporarily() {
     let root = temp_root("approval-bypass");
     let session_name = format!("approval_bypass_{}", unix_millis());
-    let queue = ApprovalQueue::open(&session_name).unwrap();
+    let queue = ApprovalQueue::open_dashboard(&session_name).unwrap();
     queue.heartbeat(None, true).unwrap();
     let ticket = resolve_approval_ticket(&[PathBuf::from(".env.prod")]);
 
