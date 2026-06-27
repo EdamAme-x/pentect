@@ -17,6 +17,7 @@ pdf = ["dep:pdf-extract"]
 [dependencies]
 pentect-core = { path = "../pentect-core" }
 anyhow = { workspace = true }
+axum = { workspace = true }
 data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 serde_json = { workspace = true }
@@ -29,3 +30,5 @@ crossterm = { workspace = true }
 zeroize = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
+jiff = { workspace = true }
+tokio = { workspace = true }

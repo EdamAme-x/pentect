@@ -1,18 +1,25 @@
 use crate::approve_ui::ApprovalDecision;
 use crate::project_config::{load_project_config, set_approval_required};
 use crate::session::session_root;
+use anyhow::Context;
+use axum::{
+    extract::{RawQuery, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::get,
+    Router,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const PENTECT_DIR: &str = ".pentect";
 const APPROVALS_DIR: &str = "approvals";
@@ -53,6 +60,14 @@ struct ApprovalDirs {
 struct DashboardHeartbeat {
     key: VerifyingKey,
     bypass_all: bool,
+}
+
+#[derive(Clone)]
+struct WebState {
+    queue: ApprovalQueue,
+    session: Arc<str>,
+    port: u16,
+    bypass_all: Arc<AtomicBool>,
 }
 
 impl ApprovalQueue {
@@ -278,88 +293,45 @@ impl ApprovalQueue {
         session: &str,
         port: u16,
         _heartbeat_max_age: Duration,
-    ) -> Result<(), String> {
-        let bypass_all = Arc::new(AtomicBool::new(false));
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .map_err(|e| format!("could not bind 127.0.0.1:{port}: {e}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|e| format!("could not configure web dashboard: {e}"))?;
-        let heartbeat_queue = self.clone();
-        let heartbeat_bypass = Arc::clone(&bypass_all);
-        let _heartbeat_thread = std::thread::spawn(move || loop {
-            let _ = heartbeat_queue.heartbeat(Some(port), heartbeat_bypass.load(Ordering::Relaxed));
-            std::thread::sleep(Duration::from_millis(500));
-        });
-        println!("pentect web dashboard: http://127.0.0.1:{port}");
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => self.handle_http(stream, session, port, &bypass_all)?,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                Err(e) => return Err(format!("web dashboard failed: {e}")),
-            }
-        }
+    ) -> crate::Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("could not start web dashboard runtime")?;
+        runtime.block_on(self.serve_web_async(session.to_string(), port))
     }
 
-    fn handle_http(
-        &self,
-        mut stream: TcpStream,
-        session: &str,
-        port: u16,
-        bypass_all: &Arc<AtomicBool>,
-    ) -> Result<(), String> {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| format!("could not configure web request timeout: {e}"))?;
-        let mut buf = [0u8; 4096];
-        let n = match stream.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(e) => return Err(format!("could not read web request: {e}")),
+    async fn serve_web_async(&self, session: String, port: u16) -> crate::Result<()> {
+        let bypass_all = Arc::new(AtomicBool::new(false));
+        let state = WebState {
+            queue: self.clone(),
+            session: Arc::from(session),
+            port,
+            bypass_all,
         };
-        let request = String::from_utf8_lossy(&buf[..n]);
-        let first = request.lines().next().unwrap_or_default();
-        let path = first.split_whitespace().nth(1).unwrap_or("/").to_string();
-        if let Some(query) = path.strip_prefix("/decide?") {
-            let id = query_param(query, "id").unwrap_or_default();
-            let decision = query_param(query, "decision")
-                .and_then(|value| decision_from_str(&value))
-                .unwrap_or(ApprovalDecision::Decline);
-            if let Some(ticket) = self.pending_by_id(&id)? {
-                self.decide(&ticket, decision, "web")?;
+        let heartbeat_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = heartbeat_state.queue.heartbeat(
+                    Some(heartbeat_state.port),
+                    heartbeat_state.bypass_all.load(Ordering::Relaxed),
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            return write_http(&mut stream, "303 See Other", "text/plain", "ok", Some("/"));
-        }
-        if let Some(query) = path.strip_prefix("/bypass?") {
-            let enabled = query_param(query, "enabled").is_some_and(|value| value == "true");
-            bypass_all.store(enabled, Ordering::Relaxed);
-            let _ = self.heartbeat(Some(port), enabled);
-            return write_http(&mut stream, "303 See Other", "text/plain", "ok", Some("/"));
-        }
-        if let Some(query) = path.strip_prefix("/config?") {
-            let required =
-                query_param(query, "approval_required").is_none_or(|value| value != "false");
-            set_approval_required(required).map_err(|e| e.to_string())?;
-            return write_http(&mut stream, "303 See Other", "text/plain", "ok", Some("/"));
-        }
-        let html = self.render_html(session, bypass_all.load(Ordering::Relaxed))?;
-        write_http(
-            &mut stream,
-            "200 OK",
-            "text/html; charset=utf-8",
-            &html,
-            None,
-        )
+        });
+        let app = Router::new()
+            .route("/", get(web_index))
+            .route("/decide", get(web_decide))
+            .route("/bypass", get(web_bypass))
+            .route("/config", get(web_config))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .with_context(|| format!("could not bind 127.0.0.1:{port}"))?;
+        println!("pentect web dashboard: http://127.0.0.1:{port}");
+        axum::serve(listener, app)
+            .await
+            .context("web dashboard failed")
     }
 
     fn render_html(&self, session: &str, bypass_all: bool) -> Result<String, String> {
@@ -655,6 +627,60 @@ impl ApprovalQueue {
     fn decision_path(&self, id: &str) -> PathBuf {
         self.dirs.decisions.join(format!("{id}.txt"))
     }
+}
+
+async fn web_index(State(state): State<WebState>) -> Response {
+    match state.queue.render_html(
+        state.session.as_ref(),
+        state.bypass_all.load(Ordering::Relaxed),
+    ) {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => web_error(e),
+    }
+}
+
+async fn web_decide(State(state): State<WebState>, RawQuery(query): RawQuery) -> Response {
+    let result = (|| {
+        let query = query.unwrap_or_default();
+        let id = query_param(&query, "id").unwrap_or_default();
+        let decision = query_param(&query, "decision")
+            .and_then(|value| decision_from_str(&value))
+            .unwrap_or(ApprovalDecision::Decline);
+        if let Some(ticket) = state.queue.pending_by_id(&id)? {
+            state.queue.decide(&ticket, decision, "web")?;
+        }
+        Ok(())
+    })();
+    redirect_or_error(result)
+}
+
+async fn web_bypass(State(state): State<WebState>, RawQuery(query): RawQuery) -> Response {
+    let query = query.unwrap_or_default();
+    let enabled = query_param(&query, "enabled").is_some_and(|value| value == "true");
+    state.bypass_all.store(enabled, Ordering::Relaxed);
+    let result = state.queue.heartbeat(Some(state.port), enabled);
+    redirect_or_error(result)
+}
+
+async fn web_config(State(_state): State<WebState>, RawQuery(query): RawQuery) -> Response {
+    let query = query.unwrap_or_default();
+    let required = query_param(&query, "approval_required").is_none_or(|value| value != "false");
+    redirect_or_error(
+        set_approval_required(required)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+    )
+}
+
+fn redirect_or_error(result: Result<(), String>) -> Response {
+    match result {
+        Ok(()) => Redirect::to("/").into_response(),
+        Err(e) => web_error(e),
+    }
+}
+
+fn web_error(message: String) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
 }
 
 impl ApprovalTicket {
@@ -955,27 +981,6 @@ fn toml_string(value: &str) -> String {
     toml::Value::String(value.to_string()).to_string()
 }
 
-fn write_http(
-    stream: &mut TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &str,
-    location: Option<&str>,
-) -> Result<(), String> {
-    let mut head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.len()
-    );
-    if let Some(location) = location {
-        head.push_str(&format!("Location: {location}\r\n"));
-    }
-    head.push_str("\r\n");
-    stream
-        .write_all(head.as_bytes())
-        .and_then(|_| stream.write_all(body.as_bytes()))
-        .map_err(|e| format!("could not write web response: {e}"))
-}
-
 fn query_param(query: &str, name: &str) -> Option<String> {
     for part in query.split('&') {
         let Some((key, value)) = part.split_once('=') else {
@@ -1026,10 +1031,7 @@ fn remove_file_if_exists(path: &Path) -> Result<(), String> {
 }
 
 fn unix_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+    jiff::Timestamp::now().as_millisecond().max(0) as u128
 }
 
 #[cfg(test)]

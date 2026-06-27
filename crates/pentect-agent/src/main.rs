@@ -133,7 +133,9 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
 fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
     let queue = ApprovalQueue::open_dashboard(session)?;
     if let Some(port) = port {
-        return queue.serve_web(session, port, DASHBOARD_HEARTBEAT_MAX_AGE);
+        return queue
+            .serve_web(session, port, DASHBOARD_HEARTBEAT_MAX_AGE)
+            .map_err(|e| e.to_string());
     }
 
     let bypass_all = Arc::new(AtomicBool::new(false));
