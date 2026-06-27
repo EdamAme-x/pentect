@@ -247,9 +247,7 @@ fn tool_boundary_engine() -> Result<Engine, String> {
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
         .detector(Box::new(SensitiveKeyDetector));
     for pack in extension_packs_from_env()? {
-        builder = builder
-            .detector(Box::new(pack.rules))
-            .disable_labels(pack.disable);
+        builder = builder.detector(Box::new(pack.rules));
     }
     Ok(builder
         .policy(Box::new(ProfilePolicy::new(Profile::Strict)))

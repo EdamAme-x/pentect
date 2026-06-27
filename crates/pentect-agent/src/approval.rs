@@ -107,8 +107,8 @@ impl ApprovalQueue {
                 return Ok(decision);
             }
             if !self.dashboard_alive(heartbeat_max_age) {
-                self.finish(ticket, ApprovalDecision::Once, "auto")?;
-                return Ok(ApprovalDecision::Once);
+                self.finish(ticket, ApprovalDecision::Decline, "auto")?;
+                return Ok(ApprovalDecision::Decline);
             }
             std::thread::sleep(Duration::from_millis(200));
         }

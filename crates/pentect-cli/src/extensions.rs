@@ -7,7 +7,6 @@ pub(crate) const PACKS_ENV: &str = "PENTECT_EXTENSION_PACKS";
 const PENTECT_DIR: &str = ".pentect";
 const EXTENSIONS_DIR: &str = "extensions";
 const CONFIG_FILE: &str = "config.toml";
-const MANIFEST_FILE: &str = "extension.toml";
 
 #[derive(Debug, Default)]
 pub(crate) struct ActiveExtensions {
@@ -228,24 +227,25 @@ fn pack_paths_for_specs(specs: &[String], create_named: bool) -> Result<Vec<Path
     Ok(paths)
 }
 
-fn pack_paths_for_named(name: &str, create: bool) -> Result<Vec<PathBuf>, String> {
+fn pack_paths_for_named(name: &str, _create: bool) -> Result<Vec<PathBuf>, String> {
     validate_extension_name(name)?;
     let root = extensions_root();
     let dir = root.join(name);
-    if create {
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("could not create '{}': {e}", dir.display()))?;
-        let manifest = dir.join(MANIFEST_FILE);
-        if !manifest.exists() {
-            let src = format!("name = \"{name}\"\n");
-            std::fs::write(&manifest, src)
-                .map_err(|e| format!("could not write '{}': {e}", manifest.display()))?;
-        }
-    }
     if !dir.exists() {
-        return Ok(Vec::new());
+        return Err(format!(
+            "extension '{name}' was not found at '{}'",
+            dir.display()
+        ));
     }
-    pack_paths_in_extension_dir(&dir)
+    let paths = pack_paths_in_extension_dir(&dir)?;
+    if paths.is_empty() {
+        return Err(format!(
+            "extension '{name}' has no rule packs; add '{}' or '{}'",
+            dir.join("pack.toml").display(),
+            dir.join("packs").display()
+        ));
+    }
+    Ok(paths)
 }
 
 fn pack_paths_for_path(path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -433,5 +433,18 @@ mod tests {
                 "7331".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn named_extension_missing_is_an_error() {
+        let name = format!(
+            "missing-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        let err = pack_paths_for_named(&name, true).unwrap_err();
+        assert!(err.contains("was not found"), "{err}");
     }
 }

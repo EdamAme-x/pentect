@@ -473,8 +473,11 @@ fn approval_decision_for_exec(
     let queue = ApprovalQueue::open(session)?;
     let ticket = approval.ticket();
     if !queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
-        queue.record(&ticket, ApprovalDecision::Once, "auto")?;
-        return Ok(ApprovalDecision::Once);
+        queue.record(&ticket, ApprovalDecision::Decline, "auto")?;
+        return Err(
+            "approval required; start `pentect` in this project or run `pentect approve \"<command>\"`"
+                .to_string(),
+        );
     }
     queue.submit(&ticket)?;
     queue.wait_for_decision(&ticket, DASHBOARD_HEARTBEAT_MAX_AGE)
@@ -505,7 +508,7 @@ struct EnvApprovalRef {
 
 impl ExecApproval {
     fn requires_approval(&self) -> bool {
-        !self.env_refs.is_empty() || !self.direct_handles.is_empty()
+        !self.env_refs.is_empty() || !self.direct_handles.is_empty() || self.network_like
     }
 
     fn env_names(&self) -> Vec<String> {
@@ -821,10 +824,15 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
     if path == Path::new("-") {
         return Err("resolve requires a real file path".to_string());
     }
-    let input = read_input(path, InputFormat::Text)?;
+    let Some(path_text) = path.to_str() else {
+        return Err("resolve requires a UTF-8 relative path".to_string());
+    };
+    let path = checked_materialize_path(path_text)?;
+    ensure_materialize_path_within_cwd(&path)?;
+    let input = read_input(&path, InputFormat::Text)?;
     let resolved = resolve_command_text(store, &input)?;
     if resolved != input {
-        std::fs::write(path, resolved)
+        std::fs::write(&path, resolved)
             .map_err(|e| format!("could not write '{}': {e}", path.display()))?;
     }
     Ok(())
@@ -1677,9 +1685,6 @@ fn handle_hook(
             }
         }
         HookPhase::AfterTool => {
-            if posttool_came_from_pentect_exec(&input) {
-                return Ok(json!({}));
-            }
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
@@ -1711,11 +1716,8 @@ fn before_tool_updated_input(
         return Err(reason);
     }
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
-        if is_pentect_read_command(command) {
-            return Err(
-                "use `pentect exec \"Get-Content ...\"` instead of `pentect read` from AI hooks"
-                    .to_string(),
-            );
+        if let Some(reason) = pentect_human_only_command_reason(command) {
+            return Err(reason);
         }
         let (command, changed_by_canonicalization) = canonical_hook_shell_command(command)?;
         if !changed_by_canonicalization && is_pentect_exec_program_command(&command) {
@@ -1743,11 +1745,8 @@ fn canonical_hook_shell_command(command: &str) -> Result<(String, bool), String>
     let mut command = command.to_string();
     let mut changed = false;
     loop {
-        if is_pentect_read_command(&command) {
-            return Err(
-                "use `pentect exec \"Get-Content ...\"` instead of `pentect read` from AI hooks"
-                    .to_string(),
-            );
+        if let Some(reason) = pentect_human_only_command_reason(&command) {
+            return Err(reason);
         }
         if is_pentect_exec_program_command(&command) {
             return Ok((command, changed));
@@ -1758,13 +1757,6 @@ fn canonical_hook_shell_command(command: &str) -> Result<(String, bool), String>
         command = payload;
         changed = true;
     }
-}
-
-fn posttool_came_from_pentect_exec(input: &Value) -> bool {
-    hook_field(input, &["tool_input"])
-        .and_then(|tool_input| tool_input.get("command"))
-        .and_then(Value::as_str)
-        .is_some_and(is_single_pentect_exec_boundary_command)
 }
 
 fn maybe_materialize_masked_write(
@@ -1910,16 +1902,6 @@ fn is_pentect_exec_program_command(command: &str) -> bool {
     )
 }
 
-fn is_single_pentect_exec_boundary_command(command: &str) -> bool {
-    matches!(
-        parse_pentect_subcommand(command),
-        Some(PentectInvocation {
-            subcommand: PentectSubcommand::Exec,
-            rest
-        }) if !contains_unquoted_shell_control(rest)
-    )
-}
-
 fn pentect_exec_rest_is_passthrough(rest: &str) -> bool {
     let mut rest = rest.trim_start();
     let mut saw_runtime_flag = false;
@@ -1995,14 +1977,19 @@ fn extract_pentect_exec_shell_payload(command: &str) -> Option<String> {
     }
 }
 
-fn is_pentect_read_command(command: &str) -> bool {
-    matches!(
-        parse_pentect_subcommand(command),
-        Some(PentectInvocation {
-            subcommand: PentectSubcommand::Read,
-            ..
-        })
-    )
+fn pentect_human_only_command_reason(command: &str) -> Option<String> {
+    let invocation = parse_pentect_subcommand(command)?;
+    match invocation.subcommand {
+        PentectSubcommand::Read => Some(
+            "use `pentect exec \"Get-Content ...\"` instead of `pentect read` from AI hooks"
+                .to_string(),
+        ),
+        PentectSubcommand::Resolve => Some(
+            "`pentect resolve` is human-only; AI hooks should pass masked handles through `pentect exec`"
+                .to_string(),
+        ),
+        PentectSubcommand::Exec => None,
+    }
 }
 
 fn read_tool_block_reason(tool_name: &str) -> String {
@@ -2015,6 +2002,7 @@ fn read_tool_block_reason(tool_name: &str) -> String {
 enum PentectSubcommand {
     Exec,
     Read,
+    Resolve,
 }
 
 struct PentectInvocation<'a> {
@@ -2045,6 +2033,7 @@ fn parse_pentect_subcommand(command: &str) -> Option<PentectInvocation<'_>> {
     let subcommand = match subcommand.to_ascii_lowercase().as_str() {
         "exec" => PentectSubcommand::Exec,
         "read" => PentectSubcommand::Read,
+        "resolve" => PentectSubcommand::Resolve,
         _ => return None,
     };
     Some(PentectInvocation {
