@@ -1,4 +1,5 @@
 use crate::approve_ui::ApprovalDecision;
+use crate::project_config::{load_project_config, set_approval_required};
 use crate::session::session_root;
 use serde_json::{json, Value};
 use sha2::Digest;
@@ -6,7 +7,14 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const PENTECT_DIR: &str = ".pentect";
+const APPROVALS_DIR: &str = "approvals";
 
 #[derive(Clone, Debug)]
 pub(crate) struct ApprovalTicket {
@@ -54,11 +62,16 @@ impl ApprovalQueue {
         Ok(Self { dirs })
     }
 
-    pub(crate) fn heartbeat(&self, port: Option<u16>) -> Result<(), String> {
+    pub(crate) fn heartbeat(&self, port: Option<u16>, bypass_all: bool) -> Result<(), String> {
         let mut body = format!("time={}\n", unix_millis());
         if let Some(port) = port {
             body.push_str(&format!("port={port}\n"));
         }
+        body.push_str(if bypass_all {
+            "bypass=true\n"
+        } else {
+            "bypass=false\n"
+        });
         fs::write(&self.dirs.heartbeat, body)
             .map_err(|e| format!("could not write '{}': {e}", self.dirs.heartbeat.display()))
     }
@@ -71,6 +84,14 @@ impl ApprovalQueue {
             return false;
         };
         modified.elapsed().is_ok_and(|age| age <= max_age)
+    }
+
+    pub(crate) fn dashboard_bypass_alive(&self, max_age: Duration) -> bool {
+        if !self.dashboard_alive(max_age) {
+            return false;
+        }
+        fs::read_to_string(&self.dirs.heartbeat)
+            .is_ok_and(|text| text.lines().any(|line| line.trim() == "bypass=true"))
     }
 
     pub(crate) fn always_granted(&self, fingerprint: &str) -> bool {
@@ -102,10 +123,19 @@ impl ApprovalQueue {
             if let Some(decision) = self.read_decision(&ticket.id)? {
                 if decision == ApprovalDecision::Always {
                     self.remember_always(&ticket.fingerprint)?;
+                    self.remember_project_always(ticket)?;
                 }
                 remove_file_if_exists(&self.pending_path(&ticket.id))?;
                 remove_file_if_exists(&self.decision_path(&ticket.id))?;
                 return Ok(decision);
+            }
+            if self.dashboard_bypass_alive(heartbeat_max_age) {
+                self.finish(ticket, ApprovalDecision::Once, "bypass")?;
+                return Ok(ApprovalDecision::Once);
+            }
+            if !load_project_config()?.approval_required {
+                self.finish(ticket, ApprovalDecision::Once, "config")?;
+                return Ok(ApprovalDecision::Once);
             }
             if !self.dashboard_alive(heartbeat_max_age) {
                 self.finish(ticket, ApprovalDecision::Decline, "auto")?;
@@ -153,6 +183,7 @@ impl ApprovalQueue {
         self.write_decision(&ticket.id, decision)?;
         if decision == ApprovalDecision::Always {
             self.remember_always(&ticket.fingerprint)?;
+            self.remember_project_always(ticket)?;
         }
         self.append_history(ticket, decision, actor)?;
         remove_file_if_exists(&self.pending_path(&ticket.id))?;
@@ -191,20 +222,22 @@ impl ApprovalQueue {
         port: u16,
         _heartbeat_max_age: Duration,
     ) -> Result<(), String> {
+        let bypass_all = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind(("127.0.0.1", port))
             .map_err(|e| format!("could not bind 127.0.0.1:{port}: {e}"))?;
         listener
             .set_nonblocking(true)
             .map_err(|e| format!("could not configure web dashboard: {e}"))?;
         let heartbeat_queue = self.clone();
+        let heartbeat_bypass = Arc::clone(&bypass_all);
         let _heartbeat_thread = std::thread::spawn(move || loop {
-            let _ = heartbeat_queue.heartbeat(Some(port));
+            let _ = heartbeat_queue.heartbeat(Some(port), heartbeat_bypass.load(Ordering::Relaxed));
             std::thread::sleep(Duration::from_millis(500));
         });
         println!("pentect web dashboard: http://127.0.0.1:{port}");
         loop {
             match listener.accept() {
-                Ok((stream, _)) => self.handle_http(stream, session)?,
+                Ok((stream, _)) => self.handle_http(stream, session, port, &bypass_all)?,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(200));
                 }
@@ -213,7 +246,13 @@ impl ApprovalQueue {
         }
     }
 
-    fn handle_http(&self, mut stream: TcpStream, session: &str) -> Result<(), String> {
+    fn handle_http(
+        &self,
+        mut stream: TcpStream,
+        session: &str,
+        port: u16,
+        bypass_all: &Arc<AtomicBool>,
+    ) -> Result<(), String> {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|e| format!("could not configure web request timeout: {e}"))?;
@@ -244,7 +283,19 @@ impl ApprovalQueue {
             }
             return write_http(&mut stream, "303 See Other", "text/plain", "ok", Some("/"));
         }
-        let html = self.render_html(session)?;
+        if let Some(query) = path.strip_prefix("/bypass?") {
+            let enabled = query_param(query, "enabled").is_some_and(|value| value == "true");
+            bypass_all.store(enabled, Ordering::Relaxed);
+            let _ = self.heartbeat(Some(port), enabled);
+            return write_http(&mut stream, "303 See Other", "text/plain", "ok", Some("/"));
+        }
+        if let Some(query) = path.strip_prefix("/config?") {
+            let required =
+                query_param(query, "approval_required").is_none_or(|value| value != "false");
+            set_approval_required(required)?;
+            return write_http(&mut stream, "303 See Other", "text/plain", "ok", Some("/"));
+        }
+        let html = self.render_html(session, bypass_all.load(Ordering::Relaxed))?;
         write_http(
             &mut stream,
             "200 OK",
@@ -254,17 +305,44 @@ impl ApprovalQueue {
         )
     }
 
-    fn render_html(&self, session: &str) -> Result<String, String> {
+    fn render_html(&self, session: &str, bypass_all: bool) -> Result<String, String> {
         let pending = self.next_pending()?;
         let history = self.recent_history(8)?;
+        let config = load_project_config()?;
         let mut html = String::from(
             "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta http-equiv=refresh content=1><title>pentect</title>\
-             <style>body{font:15px system-ui;margin:32px;max-width:760px}pre{white-space:pre-wrap;background:#f6f6f6;padding:16px;border:1px solid #ddd}button{min-height:44px;padding:0 18px;margin-right:8px} .muted{color:#666}</style>",
+             <style>body{font:15px system-ui;margin:32px;max-width:880px;background:#0b0d10;color:#f4f7fb}pre{white-space:pre-wrap;background:#151922;padding:16px;border:1px solid #2b3340;border-radius:8px}button{min-height:40px;padding:0 16px;margin:4px 8px 4px 0;border-radius:8px;border:1px solid #394452;background:#1b2230;color:#f4f7fb}.good{color:#75e0a7}.bad{color:#ff9d9d}.muted{color:#9ca7b4}</style>",
         );
         html.push_str(&format!(
-            "<h1>pentect</h1><p class=muted>session {}</p>",
-            esc(session)
+            "<h1>pentect</h1><p class=muted>session {}</p><p>approval: <b>{}</b> · bypass: <b>{}</b></p>",
+            esc(session),
+            if config.approval_required { "required" } else { "optional" },
+            if bypass_all { "on" } else { "off" }
         ));
+        html.push_str("<p>");
+        html.push_str(&format!(
+            "<a href=\"/bypass?enabled={}\"><button>{}</button></a>",
+            if bypass_all { "false" } else { "true" },
+            if bypass_all {
+                "disable bypass"
+            } else {
+                "bypass all"
+            }
+        ));
+        html.push_str(&format!(
+            "<a href=\"/config?approval_required={}\"><button>{}</button></a>",
+            if config.approval_required {
+                "false"
+            } else {
+                "true"
+            },
+            if config.approval_required {
+                "make optional"
+            } else {
+                "require approval"
+            }
+        ));
+        html.push_str("</p>");
         if let Some(ticket) = pending {
             html.push_str("<h2>approval</h2><pre>");
             html.push_str(&esc(&ticket_summary(&ticket)));
@@ -312,6 +390,7 @@ impl ApprovalQueue {
     ) -> Result<(), String> {
         if decision == ApprovalDecision::Always {
             self.remember_always(&ticket.fingerprint)?;
+            self.remember_project_always(ticket)?;
         }
         self.append_history(ticket, decision, actor)?;
         remove_file_if_exists(&self.pending_path(&ticket.id))?;
@@ -341,7 +420,56 @@ impl ApprovalQueue {
             .open(&self.dirs.history)
             .map_err(|e| format!("could not open '{}': {e}", self.dirs.history.display()))?;
         file.write_all(line.as_bytes())
-            .map_err(|e| format!("could not write approval history: {e}"))
+            .map_err(|e| format!("could not write approval history: {e}"))?;
+        self.append_project_history(ticket, decision, actor)
+    }
+
+    fn append_project_history(
+        &self,
+        ticket: &ApprovalTicket,
+        decision: ApprovalDecision,
+        actor: &str,
+    ) -> Result<(), String> {
+        let dir = project_approvals_dir()?;
+        let line = format!(
+            "{} actor={} decision={} {}\n  command={}\n",
+            unix_millis(),
+            actor,
+            decision.as_str(),
+            ticket.short(),
+            single_line(&ticket.command)
+        );
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("history.log"))
+            .and_then(|mut file| file.write_all(line.as_bytes()))
+            .map_err(|e| format!("could not write project approval history: {e}"))
+    }
+
+    fn remember_project_always(&self, ticket: &ApprovalTicket) -> Result<(), String> {
+        let dir = project_approvals_dir()?;
+        let path = dir.join("always.toml");
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        if existing.contains(&format!(
+            "fingerprint = {}",
+            toml_string(&ticket.fingerprint)
+        )) {
+            return Ok(());
+        }
+        let entry = format!(
+            "\n[[always]]\nfingerprint = {}\ncommand = {}\nsummary = {}\ncreated_at_ms = {}\n",
+            toml_string(&ticket.fingerprint),
+            toml_string(&ticket.command),
+            toml_string(&ticket.short()),
+            unix_millis()
+        );
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(entry.as_bytes()))
+            .map_err(|e| format!("could not write project always approvals: {e}"))
     }
 
     fn write_decision(&self, id: &str, decision: ApprovalDecision) -> Result<(), String> {
@@ -510,6 +638,25 @@ fn decision_from_str(value: &str) -> Option<ApprovalDecision> {
         "decline" => Some(ApprovalDecision::Decline),
         _ => None,
     }
+}
+
+fn project_approvals_dir() -> Result<PathBuf, String> {
+    let dir = PathBuf::from(PENTECT_DIR).join(APPROVALS_DIR);
+    fs::create_dir_all(&dir).map_err(|e| format!("could not create '{}': {e}", dir.display()))?;
+    Ok(dir)
+}
+
+fn single_line(value: &str) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
 }
 
 fn write_http(

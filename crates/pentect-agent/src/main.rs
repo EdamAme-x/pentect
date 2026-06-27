@@ -34,6 +34,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
@@ -133,13 +137,15 @@ fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
         return queue.serve_web(session, port, DASHBOARD_HEARTBEAT_MAX_AGE);
     }
 
+    let bypass_all = Arc::new(AtomicBool::new(false));
     let heartbeat_queue = queue.clone();
+    let heartbeat_bypass = Arc::clone(&bypass_all);
     let _heartbeat_thread = std::thread::spawn(move || loop {
-        let _ = heartbeat_queue.heartbeat(None);
+        let _ = heartbeat_queue.heartbeat(None, heartbeat_bypass.load(Ordering::Relaxed));
         std::thread::sleep(Duration::from_millis(500));
     });
 
-    print_dashboard_status(session, &queue, None)?;
+    print_dashboard_status(session, &queue, None, bypass_all.load(Ordering::Relaxed))?;
     loop {
         if let Some(ticket) = queue.next_pending()? {
             let request = ApprovalRequest {
@@ -152,7 +158,7 @@ fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
             };
             let decision = approve_ui::run(&request)?;
             queue.decide(&ticket, decision, "ui")?;
-            print_dashboard_status(session, &queue, None)?;
+            print_dashboard_status(session, &queue, None, bypass_all.load(Ordering::Relaxed))?;
         } else {
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -163,14 +169,26 @@ fn print_dashboard_status(
     session: &str,
     queue: &ApprovalQueue,
     port: Option<u16>,
+    bypass_all: bool,
 ) -> Result<(), String> {
     let request = dashboard_request(session)?;
+    let config = load_project_config()?;
     print!("\x1b[2J\x1b[H");
     println!("pentect");
     println!("{}", request.body);
     if let Some(port) = port {
         println!("port: {port}");
     }
+    println!();
+    println!(
+        "approval: {}",
+        if config.approval_required {
+            "required"
+        } else {
+            "optional"
+        }
+    );
+    println!("bypass all: {}", if bypass_all { "on" } else { "off" });
     println!();
     println!("waiting for approvals");
     let history = queue.recent_history(5)?;
@@ -545,10 +563,14 @@ fn approval_decision_for_ticket_with_config(
         queue.record(ticket, ApprovalDecision::Once, "config")?;
         return Ok(ApprovalDecision::Once);
     }
+    if queue.dashboard_bypass_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
+        queue.record(ticket, ApprovalDecision::Once, "bypass")?;
+        return Ok(ApprovalDecision::Once);
+    }
     if !queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
         queue.record(ticket, ApprovalDecision::Decline, "auto")?;
         return Err(
-            "approval required; start `pentect` in this project and approve the request"
+            "Pentect blocked this command because the approval UI is not running. Ask the user to run `pentect` in this project, then retry the command."
                 .to_string(),
         );
     }
@@ -788,7 +810,8 @@ fn cmd_hook(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let input: Value = match serde_json::from_str(&raw) {
+    let mut raw_bytes = raw.into_bytes();
+    let input: Value = match simd_json::serde::from_slice(&mut raw_bytes) {
         Ok(v) => v,
         Err(e) => return die(&format!("hook input must be JSON: {e}")),
     };

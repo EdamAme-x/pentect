@@ -28,6 +28,9 @@ the project files.
 - Child commands run with a cleared environment plus a minimal safe baseline and only the Pentect capability env vars referenced by that command.
 - Open the approval dashboard with `pentect`; use `pentect --port 7331` for the small local web dashboard. Inspect another scope with `pentect dashboard --dir PATH --session NAME`.
 - Approval is required by default. When a command uses a stored capability, sends to the network, or materializes a resolved file, `pentect exec` waits for `once`, `always`, or `decline`; if no dashboard is running, it fails closed.
+- If the dashboard is not running, agents should ask the user to run `pentect` in the project and retry.
+- The web dashboard can temporarily `bypass all` while it is running and can toggle `.pentect/config.toml` `approval_required`.
+- Approval history and readable `always` records are mirrored under `.pentect/approvals/`; runtime queue files stay under `.pentect-agent/`.
 - For local throwaway demos only, `.pentect/config.toml` can set `approval_required = false`.
 - Show the command approval preview with `pentect approve "<command>"`.
 - Non-core detectors are managed as local extensions: `pentect codex --extensions openai-privacy-filter` uses `.pentect/extensions/openai-privacy-filter`, while `--extensions ./rules.toml` activates a standalone TOML rule pack. Default project extensions live in `.pentect/config.toml` as `extensions = ["openai-privacy-filter", "./rules.toml"]`.
@@ -35,6 +38,7 @@ the project files.
 - Keep `pentect read` as a one-way human masked-preview helper, not the AI path.
 - Delete local capability state with `pentect purge`.
 - Prompt/TUI masking and external UI logs are out of scope for this MVP.
+- Hook JSON input is parsed with `simd-json`; core masking parsers stay deterministic Rust code.
 
 - Hooks
   - https://developers.openai.com/codex/hooks

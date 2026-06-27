@@ -363,7 +363,7 @@ fn network_like_exec_requires_approval_without_dashboard() {
     assert!(approval.requires_approval(), "{approval:?}");
     assert!(approval.network_like, "{approval:?}");
     let err = approval_decision_for_exec(&opts.session, &approval).unwrap_err();
-    assert!(err.contains("approval required"), "{err}");
+    assert!(err.contains("approval UI is not running"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
     let _ = std::fs::remove_dir_all(root);
 }
@@ -375,7 +375,7 @@ fn resolve_file_materialization_requires_approval_without_dashboard() {
 
     let err = approval_decision_for_resolve(&approval_session, &[PathBuf::from(".env.prod")])
         .unwrap_err();
-    assert!(err.contains("approval required"), "{err}");
+    assert!(err.contains("approval UI is not running"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
     let _ = std::fs::remove_dir_all(root);
 }
@@ -391,6 +391,28 @@ fn approval_config_can_disable_dashboard_requirement() {
         &ticket,
         ProjectConfig {
             approval_required: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(decision, ApprovalDecision::Once);
+    let _ = std::fs::remove_dir_all(session_root(&session_name).unwrap());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn dashboard_bypass_all_allows_pending_approval_temporarily() {
+    let root = temp_root("approval-bypass");
+    let session_name = format!("approval_bypass_{}", unix_millis());
+    let queue = ApprovalQueue::open(&session_name).unwrap();
+    queue.heartbeat(None, true).unwrap();
+    let ticket = resolve_approval_ticket(&[PathBuf::from(".env.prod")]);
+
+    let decision = approval_decision_for_ticket_with_config(
+        &session_name,
+        &ticket,
+        ProjectConfig {
+            approval_required: true,
         },
     )
     .unwrap();
