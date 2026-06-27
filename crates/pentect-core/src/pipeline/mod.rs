@@ -197,6 +197,21 @@ impl Engine {
         )
     }
 
+    /// Mask adapter-supplied regions inside a single synthetic raw buffer. This
+    /// lets adapters batch many already-decoded scalars without reparsing each
+    /// one or losing per-region key/path context.
+    pub fn mask_regions(&self, raw: String, regions: Vec<Region>, config: &Config) -> MaskResult {
+        let protected = scan_placeholders(&raw);
+        self.mask_ir(
+            Ir {
+                raw,
+                regions,
+                protected,
+            },
+            config,
+        )
+    }
+
     /// An adapter can build the same `Ir` and call this directly.
     pub fn mask_ir(&self, ir: Ir, config: &Config) -> MaskResult {
         // Detect to a bounded fixpoint. When a found span sits against an

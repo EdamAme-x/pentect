@@ -3,8 +3,8 @@ use crate::session::RecoveryStore;
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
-    load_pack, Config, Context, Engine, Input, Kind, MaskResult, Profile, ProfilePolicy, Recovery,
-    RegionKind, SensitiveKeyDetector, ShapeGuard, ToolResultParser,
+    load_pack, ByteRange, Config, Context, Engine, Input, Kind, MaskResult, Profile, ProfilePolicy,
+    Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard, ToolResultParser,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -12,6 +12,20 @@ use std::sync::OnceLock;
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
 const EXTENSION_PACKS_ENV: &str = "PENTECT_EXTENSION_PACKS";
+const BATCH_DELIMITERS: [&str; 4] = [
+    "\u{1f}pentect-batch-0\u{1e}",
+    "\u{1f}pentect-batch-1\u{1d}",
+    "\u{1f}pentect-batch-2\u{1c}",
+    "\u{1f}pentect-batch-3\u{1b}",
+];
+
+pub(crate) struct ToolScalarInput {
+    pub(crate) text: String,
+    pub(crate) region_kind: RegionKind,
+    pub(crate) key: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) hints: Vec<String>,
+}
 
 pub(crate) struct OutputMasker {
     store: RecoveryStore,
@@ -126,6 +140,67 @@ impl OutputMasker {
         self.record_mask_result(result)
     }
 
+    pub(crate) fn mask_tool_result_scalars(
+        &mut self,
+        scalars: &[ToolScalarInput],
+    ) -> Result<Vec<String>, String> {
+        if scalars.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut prepared = Vec::with_capacity(scalars.len());
+        for scalar in scalars {
+            let redacted = redact_env_derivative_lines(&scalar.text);
+            prepared.push(self.remask_all(&redacted)?);
+        }
+        let Some(delimiter) = choose_batch_delimiter(&prepared) else {
+            return scalars
+                .iter()
+                .map(|scalar| {
+                    self.mask_tool_result_scalar(
+                        &scalar.text,
+                        scalar.region_kind,
+                        scalar.key.as_deref(),
+                        scalar.path.as_deref(),
+                        &scalar.hints,
+                    )
+                })
+                .collect();
+        };
+
+        let mut raw = String::new();
+        let mut regions = Vec::with_capacity(scalars.len());
+        for (index, (scalar, text)) in scalars.iter().zip(prepared.iter()).enumerate() {
+            if index > 0 {
+                raw.push_str(delimiter);
+            }
+            let start = raw.len();
+            raw.push_str(text);
+            let end = raw.len();
+            regions.push(Region {
+                span: ByteRange::new(start, end),
+                ctx: Context {
+                    path: scalar.path.clone(),
+                    key: scalar.key.clone(),
+                    hints: scalar.hints.clone(),
+                    kind: scalar.region_kind,
+                    format: Kind::ToolResult,
+                },
+            });
+        }
+
+        let cfg = Config {
+            disclose_length: true,
+            ..Config::new(self.store.session.key)
+        };
+        let result = self.engine.mask_regions(raw, regions, &cfg);
+        let masked = self.record_mask_result(result)?;
+        let parts: Vec<String> = masked.split(delimiter).map(str::to_string).collect();
+        if parts.len() != scalars.len() {
+            return Err("internal error: batched tool-result masking split mismatch".to_string());
+        }
+        Ok(parts)
+    }
+
     fn record_mask_result(&mut self, result: MaskResult) -> Result<String, String> {
         let masked = result.masked;
         let mut recovery = result.recovery;
@@ -157,6 +232,13 @@ impl OutputMasker {
             }
         }
     }
+}
+
+fn choose_batch_delimiter(values: &[String]) -> Option<&'static str> {
+    BATCH_DELIMITERS
+        .iter()
+        .copied()
+        .find(|delimiter| values.iter().all(|value| !value.contains(delimiter)))
 }
 
 fn tool_boundary_engine() -> Result<Engine, String> {

@@ -16,7 +16,7 @@ use approval::{ticket_summary, ApprovalQueue, ApprovalTicket};
 use approve_ui::{ApprovalDecision, ApprovalRequest};
 use masking::{
     contains_unresolved_masked_handle, is_ascii_word_char, is_env_name_byte, is_sensitive_env_name,
-    live_output_kind, OutputMasker,
+    live_output_kind, OutputMasker, ToolScalarInput,
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
@@ -1684,8 +1684,9 @@ fn handle_hook(
                 return Ok(json!({}));
             };
             let store = RecoveryStore::load(session)?;
-            let mut masker = OutputMasker::new_shared(store)?;
+            let mut masker = OutputMasker::new_deferred(store)?;
             let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
+            masker.flush()?;
             if changed {
                 Ok(after_tool_output(provider, updated))
             } else {
@@ -2237,73 +2238,116 @@ fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
 }
 
 fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bool), String> {
-    mask_tool_json_with_context(value, None, None, &[], masker)
+    let mut scalars = Vec::new();
+    collect_tool_json_scalars(value, None, None, &[], &mut scalars);
+    let masked = masker.mask_tool_result_scalars(&scalars)?;
+    let mut cursor = 0usize;
+    let out = rebuild_masked_tool_json(value, &masked, &mut cursor)?;
+    if cursor != masked.len() {
+        return Err("internal error: unused batched tool-result masks".to_string());
+    }
+    Ok((out.clone(), out != *value))
 }
 
-fn mask_tool_json_with_context(
+fn collect_tool_json_scalars(
     value: &Value,
     key: Option<&str>,
     path: Option<&str>,
     hints: &[String],
-    masker: &mut OutputMasker,
-) -> Result<(Value, bool), String> {
+    out: &mut Vec<ToolScalarInput>,
+) {
     match value {
-        Value::String(text) => {
-            let out =
-                masker.mask_tool_result_scalar(text, RegionKind::JsonValue, key, path, hints)?;
-            let changed = out != *text;
-            Ok((Value::String(out), changed))
-        }
+        Value::String(text) => out.push(ToolScalarInput {
+            text: text.clone(),
+            region_kind: RegionKind::JsonValue,
+            key: key.map(str::to_string),
+            path: path.map(str::to_string),
+            hints: hints.to_vec(),
+        }),
         Value::Number(_) | Value::Bool(_) => {
-            let raw = value.to_string();
-            let out =
-                masker.mask_tool_result_scalar(&raw, RegionKind::JsonValue, key, path, hints)?;
-            if out == raw {
-                Ok((value.clone(), false))
-            } else {
-                Ok((Value::String(out), true))
-            }
+            out.push(ToolScalarInput {
+                text: value.to_string(),
+                region_kind: RegionKind::JsonValue,
+                key: key.map(str::to_string),
+                path: path.map(str::to_string),
+                hints: hints.to_vec(),
+            });
         }
-        Value::Null => Ok((Value::Null, false)),
+        Value::Null => {}
         Value::Array(items) => {
-            let mut changed = false;
-            let mut out = Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
                 let child_path = path_with_segment(path, &index.to_string());
-                let (item, item_changed) =
-                    mask_tool_json_with_context(item, key, Some(&child_path), hints, masker)?;
-                changed |= item_changed;
-                out.push(item);
+                collect_tool_json_scalars(item, key, Some(&child_path), hints, out);
             }
-            Ok((Value::Array(out), changed))
         }
         Value::Object(map) => {
-            let mut changed = false;
-            let mut out = serde_json::Map::with_capacity(map.len());
             for (object_key, item) in map {
                 let child_path = path_with_segment(path, object_key);
-                let masked_key = masker.mask_tool_result_scalar(
-                    object_key,
-                    RegionKind::JsonKey,
-                    None,
-                    Some(&child_path),
-                    &[],
-                )?;
-                changed |= masked_key != *object_key;
+                out.push(ToolScalarInput {
+                    text: object_key.clone(),
+                    region_kind: RegionKind::JsonKey,
+                    key: None,
+                    path: Some(child_path.clone()),
+                    hints: Vec::new(),
+                });
                 let child_hints = sibling_context_hints(map, object_key);
-                let (item, item_changed) = mask_tool_json_with_context(
+                collect_tool_json_scalars(
                     item,
                     Some(object_key),
                     Some(&child_path),
                     &child_hints,
-                    masker,
-                )?;
-                changed |= item_changed;
-                out.insert(masked_key, item);
+                    out,
+                );
             }
-            Ok((Value::Object(out), changed))
         }
     }
+}
+
+fn rebuild_masked_tool_json(
+    value: &Value,
+    masked: &[String],
+    cursor: &mut usize,
+) -> Result<Value, String> {
+    match value {
+        Value::String(_) => {
+            let out = take_masked(masked, cursor)?;
+            Ok(Value::String(out))
+        }
+        Value::Number(_) | Value::Bool(_) => {
+            let raw = value.to_string();
+            let out = take_masked(masked, cursor)?;
+            if out == raw {
+                Ok(value.clone())
+            } else {
+                Ok(Value::String(out))
+            }
+        }
+        Value::Null => Ok(Value::Null),
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(rebuild_masked_tool_json(item, masked, cursor)?);
+            }
+            Ok(Value::Array(out))
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (_, item) in map {
+                let masked_key = take_masked(masked, cursor)?;
+                let item = rebuild_masked_tool_json(item, masked, cursor)?;
+                out.insert(masked_key, item);
+            }
+            Ok(Value::Object(out))
+        }
+    }
+}
+
+fn take_masked(masked: &[String], cursor: &mut usize) -> Result<String, String> {
+    let Some(value) = masked.get(*cursor) else {
+        return Err("internal error: missing batched tool-result mask".to_string());
+    };
+    *cursor += 1;
+    Ok(value.clone())
 }
 
 fn sibling_context_hints(map: &serde_json::Map<String, Value>, object_key: &str) -> Vec<String> {
