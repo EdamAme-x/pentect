@@ -9,6 +9,7 @@
 mod approval;
 mod approve_ui;
 mod masking;
+mod project_config;
 mod session;
 mod shell;
 
@@ -21,6 +22,7 @@ use masking::{
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
 use pentect_core::{Config, Engine, Input, Kind, Profile, RegionKind};
+use project_config::{load_project_config, ProjectConfig};
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
 use sha2::{Digest, Sha256};
@@ -315,6 +317,14 @@ fn cmd_resolve(args: &[String]) -> i32 {
     };
     match opts.mode {
         ResolveMode::Files(paths) => {
+            match approval_decision_for_resolve(&opts.session, &paths) {
+                Ok(ApprovalDecision::Once | ApprovalDecision::Always) => {}
+                Ok(ApprovalDecision::Decline) => {
+                    eprintln!("[pentect] resolve declined");
+                    return 1;
+                }
+                Err(e) => return die(&e),
+            }
             for path in &paths {
                 if let Err(e) = resolve_path_in_place(&store, path) {
                     return die(&e);
@@ -336,6 +346,50 @@ fn cmd_resolve(args: &[String]) -> i32 {
         }
     }
     0
+}
+
+fn approval_decision_for_resolve(
+    session: &str,
+    paths: &[PathBuf],
+) -> Result<ApprovalDecision, String> {
+    let ticket = resolve_approval_ticket(paths);
+    if ApprovalQueue::open(session)?.always_granted(&ticket.fingerprint) {
+        return Ok(ApprovalDecision::Always);
+    }
+    approval_decision_for_ticket(session, &ticket)
+}
+
+fn resolve_approval_ticket(paths: &[PathBuf]) -> ApprovalTicket {
+    let command = format!(
+        "pentect resolve {}",
+        paths
+            .iter()
+            .map(|path| shell_quote_path(path))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut material = String::from("resolve-materialize-v1\0");
+    material.push_str(&command);
+    material.push('\0');
+    let digest = Sha256::digest(material.as_bytes());
+    ApprovalTicket::new(
+        data_encoding::HEXLOWER.encode(&digest[..16]),
+        command,
+        Vec::new(),
+        0,
+        Vec::new(),
+        false,
+        true,
+    )
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if cfg!(windows) {
+        powershell_word(&value)
+    } else {
+        shell_quote_unix(&value)
+    }
 }
 
 fn exec_help() {
@@ -470,25 +524,47 @@ fn approval_decision_for_exec(
     session: &str,
     approval: &ExecApproval,
 ) -> Result<ApprovalDecision, String> {
-    let queue = ApprovalQueue::open(session)?;
     let ticket = approval.ticket();
+    approval_decision_for_ticket(session, &ticket)
+}
+
+fn approval_decision_for_ticket(
+    session: &str,
+    ticket: &ApprovalTicket,
+) -> Result<ApprovalDecision, String> {
+    approval_decision_for_ticket_with_config(session, ticket, load_project_config()?)
+}
+
+fn approval_decision_for_ticket_with_config(
+    session: &str,
+    ticket: &ApprovalTicket,
+    config: ProjectConfig,
+) -> Result<ApprovalDecision, String> {
+    let queue = ApprovalQueue::open(session)?;
+    if !config.approval_required {
+        queue.record(ticket, ApprovalDecision::Once, "config")?;
+        return Ok(ApprovalDecision::Once);
+    }
     if !queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
-        queue.record(&ticket, ApprovalDecision::Decline, "auto")?;
+        queue.record(ticket, ApprovalDecision::Decline, "auto")?;
         return Err(
-            "approval required; start `pentect` in this project or run `pentect approve \"<command>\"`"
+            "approval required; start `pentect` in this project and approve the request"
                 .to_string(),
         );
     }
-    queue.submit(&ticket)?;
-    queue.wait_for_decision(&ticket, DASHBOARD_HEARTBEAT_MAX_AGE)
+    queue.submit(ticket)?;
+    queue.wait_for_decision(ticket, DASHBOARD_HEARTBEAT_MAX_AGE)
 }
 
 fn ticket_warnings(ticket: &ApprovalTicket) -> Vec<String> {
+    let mut warnings = Vec::new();
     if ticket.network_like {
-        vec!["may send secret".to_string()]
-    } else {
-        Vec::new()
+        warnings.push("may send secret".to_string());
     }
+    if ticket.materialize_like {
+        warnings.push("may write secret".to_string());
+    }
+    warnings
 }
 
 #[derive(Debug)]
@@ -566,6 +642,7 @@ impl ExecApproval {
             self.direct_handles.len(),
             self.destinations.clone(),
             self.network_like,
+            false,
         )
     }
 }
@@ -1984,11 +2061,7 @@ fn pentect_human_only_command_reason(command: &str) -> Option<String> {
             "use `pentect exec \"Get-Content ...\"` instead of `pentect read` from AI hooks"
                 .to_string(),
         ),
-        PentectSubcommand::Resolve => Some(
-            "`pentect resolve` is human-only; AI hooks should pass masked handles through `pentect exec`"
-                .to_string(),
-        ),
-        PentectSubcommand::Exec => None,
+        PentectSubcommand::Exec | PentectSubcommand::Resolve => None,
     }
 }
 

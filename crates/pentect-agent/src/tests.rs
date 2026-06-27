@@ -369,6 +369,38 @@ fn network_like_exec_requires_approval_without_dashboard() {
 }
 
 #[test]
+fn resolve_file_materialization_requires_approval_without_dashboard() {
+    let root = temp_root("approval-resolve-fail-closed");
+    let approval_session = format!("approval_resolve_fail_closed_{}", unix_millis());
+
+    let err = approval_decision_for_resolve(&approval_session, &[PathBuf::from(".env.prod")])
+        .unwrap_err();
+    assert!(err.contains("approval required"), "{err}");
+    let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn approval_config_can_disable_dashboard_requirement() {
+    let root = temp_root("approval-config-optional");
+    let session_name = format!("approval_config_optional_{}", unix_millis());
+    let ticket = resolve_approval_ticket(&[PathBuf::from(".env.prod")]);
+
+    let decision = approval_decision_for_ticket_with_config(
+        &session_name,
+        &ticket,
+        ProjectConfig {
+            approval_required: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(decision, ApprovalDecision::Once);
+    let _ = std::fs::remove_dir_all(session_root(&session_name).unwrap());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn always_fingerprint_includes_capability_value_identity() {
     let command = "Write-Output $env:API_TOKEN".to_string();
     let a = ExecApproval {
@@ -1573,7 +1605,7 @@ fn pretool_blocks_pentect_read_from_ai_hooks() {
 }
 
 #[test]
-fn pretool_blocks_pentect_resolve_from_ai_hooks() {
+fn pretool_wraps_pentect_resolve_for_approval() {
     let (root, session) = empty_session("hook-pre-resolve");
     let input = json!({
         "hook_event_name": "PreToolUse",
@@ -1583,12 +1615,13 @@ fn pretool_blocks_pentect_resolve_from_ai_hooks() {
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("pentect resolve"), "{reason}");
-    assert!(reason.contains("human-only"), "{reason}");
+    assert!(command.contains("pentect"), "{command}");
+    assert!(command.contains("exec"), "{command}");
+    assert!(command.contains("resolve"), "{command}");
+    assert_eq!(command.matches(" exec ").count(), 1, "{command}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1717,7 +1750,7 @@ fn pretool_blocks_nested_pentect_read_escape() {
 }
 
 #[test]
-fn pretool_blocks_nested_pentect_resolve_escape() {
+fn pretool_collapses_nested_pentect_resolve_for_approval() {
     let (root, session) = empty_session("hook-pre-nested-resolve");
     let input = json!({
         "hook_event_name": "PreToolUse",
@@ -1727,12 +1760,17 @@ fn pretool_blocks_nested_pentect_resolve_escape() {
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("pentect resolve"), "{reason}");
-    assert!(reason.contains("human-only"), "{reason}");
+    assert!(command.contains("pentect"), "{command}");
+    assert!(command.contains("exec"), "{command}");
+    assert!(command.contains("resolve"), "{command}");
+    assert!(
+        !command.contains("pentect exec \"pentect resolve"),
+        "{command}"
+    );
+    assert_eq!(command.matches(" exec ").count(), 1, "{command}");
     let _ = std::fs::remove_dir_all(root);
 }
 

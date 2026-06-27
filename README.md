@@ -27,7 +27,8 @@ the project files.
 - Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.
 - Child commands run with a cleared environment plus a minimal safe baseline and only the Pentect capability env vars referenced by that command.
 - Open the approval dashboard with `pentect`; use `pentect --port 7331` for the small local web dashboard. Inspect another scope with `pentect dashboard --dir PATH --session NAME`.
-- When a command uses a stored capability and the dashboard is running, `pentect exec` waits for `once`, `always`, or `decline`. If no dashboard is running, MVP behavior is auto-`once`.
+- Approval is required by default. When a command uses a stored capability, sends to the network, or materializes a resolved file, `pentect exec` waits for `once`, `always`, or `decline`; if no dashboard is running, it fails closed.
+- For local throwaway demos only, `.pentect/config.toml` can set `approval_required = false`.
 - Show the command approval preview with `pentect approve "<command>"`.
 - Non-core detectors are managed as local extensions: `pentect codex --extensions openai-privacy-filter` uses `.pentect/extensions/openai-privacy-filter`, while `--extensions ./rules.toml` activates a standalone TOML rule pack. Default project extensions live in `.pentect/config.toml` as `extensions = ["openai-privacy-filter", "./rules.toml"]`.
 - Block direct AI Read tools; use `pentect exec "<command>"` at the tool boundary.

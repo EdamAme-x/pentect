@@ -17,6 +17,7 @@ pub(crate) struct ApprovalTicket {
     pub(crate) direct_handles: usize,
     pub(crate) destinations: Vec<String>,
     pub(crate) network_like: bool,
+    pub(crate) materialize_like: bool,
     pub(crate) path: Option<PathBuf>,
 }
 
@@ -375,6 +376,7 @@ impl ApprovalTicket {
         direct_handles: usize,
         destinations: Vec<String>,
         network_like: bool,
+        materialize_like: bool,
     ) -> Self {
         let id_material = format!("{fingerprint}:{}:{}", unix_millis(), std::process::id());
         let digest = sha2::Sha256::digest(id_material.as_bytes());
@@ -387,6 +389,7 @@ impl ApprovalTicket {
             direct_handles,
             destinations,
             network_like,
+            materialize_like,
             path: None,
         }
     }
@@ -398,6 +401,9 @@ impl ApprovalTicket {
         }
         if self.direct_handles > 0 {
             bits.push(format!("{} handle(s)", self.direct_handles));
+        }
+        if self.materialize_like {
+            bits.push("materialize".to_string());
         }
         if bits.is_empty() {
             "no-secret".to_string()
@@ -431,6 +437,9 @@ pub(crate) fn ticket_summary(ticket: &ApprovalTicket) -> String {
     } else if ticket.network_like {
         lines.push("send possible".to_string());
     }
+    if ticket.materialize_like {
+        lines.push("write local file".to_string());
+    }
     lines.join("\n")
 }
 
@@ -443,6 +452,7 @@ fn ticket_json(ticket: &ApprovalTicket) -> Value {
         "handles": ticket.direct_handles,
         "destinations": ticket.destinations,
         "network": ticket.network_like,
+        "materialize": ticket.materialize_like,
     })
 }
 
@@ -461,6 +471,10 @@ fn ticket_from_json(text: &str) -> Result<ApprovalTicket, String> {
         destinations: string_array_json(&value, "destinations")?,
         network_like: value
             .get("network")
+            .and_then(Value::as_bool)
+            .unwrap_or_default(),
+        materialize_like: value
+            .get("materialize")
             .and_then(Value::as_bool)
             .unwrap_or_default(),
         path: None,
