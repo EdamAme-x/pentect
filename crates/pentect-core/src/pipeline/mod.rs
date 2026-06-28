@@ -10,7 +10,7 @@ use crate::detect::{
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
-use crate::parse::{EnvParser, HarParser, JsonParser, Parser, TextParser};
+use crate::parse::{EnvParser, JsonParser, Parser, TextParser};
 use crate::policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
 use crate::policy::{
     is_context_free, Action, MaskAll, Policy, Profile, ProfileKnobs, ProfilePolicy,
@@ -373,7 +373,7 @@ impl EngineBuilder {
     pub fn standard_stack(self, knobs: ProfileKnobs) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
-            .parser(Kind::Har, Box::new(HarParser))
+            .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(RuleDetector::builtin()))
             .detector(Box::new(AuthCodeDetector))
             .detector(Box::new(Bip39Detector))
@@ -700,6 +700,23 @@ mod tests {
         assert_eq!(o["public_key"].as_str().unwrap(), "visible");
         assert_eq!(o["note"].as_str().unwrap(), "ok");
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn har_kind_uses_plain_json_parser() {
+        let input = r#"{"headers":[{"name":"Authorization","value":"Bearer abc123"}],"password":"hunter2"}"#;
+        let r = Engine::with_profile(Profile::Balanced).mask(
+            Input {
+                kind: Kind::Har,
+                data: input.to_string(),
+            },
+            &Config::insecure_testing(),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&r.masked).expect("masked output is valid JSON");
+        assert_eq!(v["headers"][0]["name"], "Authorization");
+        assert_eq!(v["headers"][0]["value"], "Bearer abc123");
+        assert!(v["password"].as_str().unwrap().starts_with("<<PASSWORD_"));
     }
 
     #[test]
@@ -1428,15 +1445,17 @@ mod tests {
         assert!(mp(Profile::Paranoid, &format!("id {uuid} x"))
             .masked
             .contains(uuid));
-        // As a cookie value it is anchored by structure, so it masks despite the
-        // benign shape (the guard only retracts context-free guesses).
-        let har = format!(
-            r#"{{"log":{{"entries":[{{"request":{{"cookies":[{{"name":"sid","value":"{uuid}"}}]}}}}]}}}}"#
-        );
-        let r = Engine::with_profile(Profile::Balanced).mask(
-            Input {
-                kind: Kind::Har,
-                data: har,
+        // As an adapter-supplied cookie value it is anchored by structure, so it
+        // masks despite the benign shape (the guard only retracts context-free
+        // guesses).
+        let r = Engine::with_profile(Profile::Balanced).mask_context(
+            uuid.to_string(),
+            Context {
+                path: None,
+                key: Some("sid".to_string()),
+                hints: Vec::new(),
+                kind: RegionKind::Cookie,
+                format: Kind::ToolResult,
             },
             &Config::insecure_testing(),
         );

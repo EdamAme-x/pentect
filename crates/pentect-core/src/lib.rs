@@ -38,7 +38,7 @@ pub use detect::{
 };
 pub use model::{ByteRange, Category, Confidence, Context, Input, Kind, Region, RegionKind, Span};
 pub use pack::{load_pack, Pack};
-pub use parse::{EnvParser, HarParser, JsonParser, Parser, TextParser, ToolResultParser};
+pub use parse::{EnvParser, JsonParser, Parser, TextParser, ToolResultParser};
 pub use pipeline::{
     Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote, Summary,
 };

@@ -160,4 +160,22 @@ mod tests {
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"
         );
     }
+
+    #[test]
+    fn webhook_like_url_path_is_entropy_candidate_without_vendor_rule() {
+        let raw = concat!(
+            "https://example.invalid/hooks/123456789012345678/",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
+        );
+        let reg = region(raw);
+        let v = NormalizedView::build(&reg, raw);
+        let spans = EntropyDetector::default().detect(&v);
+        assert!(
+            spans.iter().any(|span| {
+                raw[span.range.start..span.range.end]
+                    .contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB")
+            }),
+            "{spans:?}"
+        );
+    }
 }
