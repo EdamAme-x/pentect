@@ -907,9 +907,17 @@ fn run_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
         .unwrap_or_else(|e| die(format!("could not start '{}': {e}", display.display())))
 }
 
-fn run_interactive_command(cmd: Command, display: &Path) -> std::process::ExitStatus {
+fn run_interactive_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
     terminal::restore_after_tui();
-    let status = run_command(cmd, display);
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| die(format!("could not start '{}': {e}", display.display())));
+    // Set this after spawn so child TUIs still receive Ctrl+C; the parent
+    // stays alive long enough to restore terminal state after the child exits.
+    let _ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
+    let status = child
+        .wait()
+        .unwrap_or_else(|e| die(format!("could not wait for '{}': {e}", display.display())));
     terminal::restore_after_tui();
     status
 }

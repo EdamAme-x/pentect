@@ -7,6 +7,26 @@ use crossterm::{
 };
 use std::io::{IsTerminal, Write};
 
+pub(crate) struct IgnoreCtrlCGuard {
+    active: bool,
+}
+
+impl IgnoreCtrlCGuard {
+    pub(crate) fn new() -> Self {
+        let active = ignore_ctrl_c_for_parent_process();
+        Self { active }
+    }
+}
+
+impl Drop for IgnoreCtrlCGuard {
+    fn drop(&mut self) {
+        if self.active {
+            restore_ctrl_c_for_parent_process();
+            restore_after_tui();
+        }
+    }
+}
+
 pub(crate) fn restore_after_tui() {
     restore_platform_console_mode();
     restore_ansi_state();
@@ -74,6 +94,22 @@ fn restore_platform_console_mode() {
     }
 }
 
+#[cfg(windows)]
+fn ignore_ctrl_c_for_parent_process() -> bool {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    unsafe { SetConsoleCtrlHandler(None, 1) != 0 }
+}
+
+#[cfg(windows)]
+fn restore_ctrl_c_for_parent_process() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    unsafe {
+        let _ = SetConsoleCtrlHandler(None, 0);
+    }
+}
+
 #[cfg(unix)]
 fn restore_platform_console_mode() {
     if !std::io::stdin().is_terminal() {
@@ -88,3 +124,11 @@ fn restore_platform_console_mode() {
 
 #[cfg(not(any(unix, windows)))]
 fn restore_platform_console_mode() {}
+
+#[cfg(not(windows))]
+fn ignore_ctrl_c_for_parent_process() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn restore_ctrl_c_for_parent_process() {}
