@@ -2,6 +2,7 @@
 
 mod extensions;
 mod input;
+mod scan;
 mod terminal;
 
 use input::{decode_utf8_text, InputAdapter, TextInput};
@@ -34,6 +35,7 @@ fn main() {
         Some("--dir" | "--session" | "--port") => cmd_agent_passthrough_from(1, &args),
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
+        Some("scan") => scan::cmd_scan(&args),
         Some("exec" | "resolve" | "approve" | "hook" | "purge") => {
             cmd_agent_passthrough_from(1, &args)
         }
@@ -50,10 +52,12 @@ fn usage() {
         "pentect\n\
          pentect codex|claude|gemini\n\
          pentect exec \"<command>\"\n\
+         pentect scan [PATH...]\n\
          pentect resolve [PATH...]\n\
          pentect help\n\
          \n\
          exec runs commands with masked output.\n\
+         scan reports files that contain likely secrets.\n\
          resolve rewrites files containing handles, or resolves stdin when no path is given."
     );
 }
@@ -70,8 +74,10 @@ fn help_text() -> &'static str {
         "  pentect --port 7331\n",
         "  pentect codex|claude|gemini [--extensions NAME|PATH.toml]\n",
         "  pentect exec \"<command>\"\n\n",
+        "  pentect scan [PATH...]\n\n",
         "`pentect` opens the approval dashboard.\n",
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
+        "`pentect scan` reports likely secret files without printing secret values.\n",
         "`--extensions NAME` uses .pentect/extensions/NAME; `--extensions PATH.toml` uses a rule-pack file.\n",
         "Default extensions can be listed in `.pentect/config.toml` as `extensions = [...]`.\n",
         "Masked handles resolve locally in later `pentect exec` commands.\n",
