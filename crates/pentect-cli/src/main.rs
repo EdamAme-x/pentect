@@ -8,9 +8,12 @@ mod terminal;
 use input::{decode_utf8_text, InputAdapter, TextInput};
 use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile};
 use serde_json::json;
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -88,7 +91,7 @@ fn help_text() -> &'static str {
         "Masked output and referenced local files register capabilities for later execs.\n",
         "Use normal commands and let Pentect return masked handles.\n",
         "Use `pentect resolve <path>` only when a local file must be materialized with real values.\n",
-        "`pentect gemini` currently fails closed because Gemini hook injection requires mutable `.gemini/settings.json`.\n",
+        "`pentect gemini` uses a temporary Gemini home overlay when hook support is available; otherwise it fails closed.\n",
     )
 }
 
@@ -551,12 +554,352 @@ fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     run_interactive_command(cmd, &opts.command)
 }
 
-fn run_gemini(opts: &AgentToolOpts, _agent: &Path) -> std::process::ExitStatus {
+fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     if opts.dry_run {
+        eprintln!(
+            "[pentect] note: Gemini will run with a temporary home overlay containing Pentect hooks and context."
+        );
         print_dry_run(&opts.command, &opts.tool_args);
         return success_status();
     }
-    die("refusing to start Gemini with Pentect hooks: this Gemini CLI only accepts hooks through workspace/user settings. Pentect will not mutate `.gemini/settings.json` because interrupted runs can leave hook/context files behind. Use `pentect codex`, `pentect claude`, or `pentect exec` until Gemini exposes a non-mutating hook injection surface.")
+    if !opts.allow_unverified_hooks {
+        if let Err(reason) = gemini_hook_support(&opts.command) {
+            die(format!(
+                "refusing to start Gemini with Pentect hooks: {reason}. Pentect will not launch Gemini without verified BeforeTool/AfterTool support because raw tool output could reach the model. Upgrade Gemini CLI to a hook-capable release, use `pentect codex`, `pentect claude`, or pass --allow-unverified-hooks only for manual adapter debugging."
+            ));
+        }
+    }
+    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
+        Ok(active) => active,
+        Err(e) => die(&e),
+    };
+    let overlay = match GeminiHookOverlay::install(agent, opts.session.as_deref()) {
+        Ok(overlay) => overlay,
+        Err(e) => die(e),
+    };
+    let mut cmd = Command::new(&opts.command);
+    apply_extension_env(&mut cmd, &active_extensions);
+    overlay.apply_env(&mut cmd);
+    cmd.args(&opts.tool_args);
+    let status = run_interactive_command(cmd, &opts.command);
+    drop(overlay);
+    status
+}
+
+struct GeminiHookOverlay {
+    root: PathBuf,
+}
+
+impl GeminiHookOverlay {
+    fn install(agent: &Path, session: Option<&str>) -> Result<Self, String> {
+        let root = unique_temp_root("pentect-gemini")?;
+        Self::install_at(root, agent, session)
+    }
+
+    fn install_at(root: PathBuf, agent: &Path, session: Option<&str>) -> Result<Self, String> {
+        let gemini_dir = root.join(".gemini");
+        fs::create_dir_all(&gemini_dir)
+            .map_err(|e| format!("could not create Gemini hook overlay: {e}"))?;
+        fs::write(gemini_dir.join("GEMINI.md"), PENTECT_AGENT_INSTRUCTIONS)
+            .map_err(|e| format!("could not write Gemini Pentect context: {e}"))?;
+        let session_start_path = root.join("pentect-session-start.json");
+        fs::write(
+            &session_start_path,
+            serde_json::to_string(&json!({
+                "suppressOutput": true,
+                "hookSpecificOutput": {
+                    "additionalContext": PENTECT_AGENT_INSTRUCTIONS
+                }
+            }))
+            .map_err(|e| format!("could not render Gemini session context hook: {e}"))?,
+        )
+        .map_err(|e| format!("could not write Gemini session context hook: {e}"))?;
+        let settings = gemini_hook_settings(agent, session, &session_start_path);
+        fs::write(
+            gemini_dir.join("settings.json"),
+            serde_json::to_string_pretty(&settings)
+                .map_err(|e| format!("could not render Gemini hook settings: {e}"))?,
+        )
+        .map_err(|e| format!("could not write Gemini hook settings: {e}"))?;
+        Ok(Self { root })
+    }
+
+    fn apply_env(&self, cmd: &mut Command) {
+        cmd.env("HOME", &self.root);
+        cmd.env("USERPROFILE", &self.root);
+    }
+}
+
+impl Drop for GeminiHookOverlay {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn gemini_hook_settings(
+    agent: &Path,
+    session: Option<&str>,
+    session_start_path: &Path,
+) -> serde_json::Value {
+    let hook_command = gemini_hook_command(agent, session);
+    let context_command = if cfg!(windows) {
+        format!(
+            "cmd /c type {}",
+            shell_quote_windows(&session_start_path.to_string_lossy())
+        )
+    } else {
+        format!(
+            "cat {}",
+            shell_quote_unix(&session_start_path.to_string_lossy())
+        )
+    };
+    json!({
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "name": "pentect-context",
+                    "description": "Inject the Pentect agent contract without mutating workspace files.",
+                    "command": context_command,
+                    "timeout": 30000
+                }]
+            }],
+            "BeforeTool": [{
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "name": "pentect-before-tool",
+                    "description": "Route shell commands through Pentect before execution.",
+                    "command": hook_command,
+                    "timeout": 30000
+                }]
+            }],
+            "AfterTool": [{
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "name": "pentect-after-tool",
+                    "description": "Mask tool output before it is returned to the model.",
+                    "command": hook_command,
+                    "timeout": 30000
+                }]
+            }]
+        }
+    })
+}
+
+fn gemini_hook_command(agent: &Path, session: Option<&str>) -> String {
+    if cfg!(windows) {
+        format!(
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command {}",
+            shell_quote_windows(&hook_command_windows(agent, "gemini", session))
+        )
+    } else {
+        hook_command_unix(agent, "gemini", session)
+    }
+}
+
+fn unique_temp_root(prefix: &str) -> Result<PathBuf, String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system clock is before UNIX_EPOCH: {e}"))?
+        .as_millis();
+    for attempt in 0..100 {
+        let root =
+            std::env::temp_dir().join(format!("{prefix}-{}-{stamp}-{attempt}", std::process::id()));
+        match fs::create_dir(&root) {
+            Ok(()) => return Ok(root),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "could not create temporary Gemini hook overlay: {e}"
+                ))
+            }
+        }
+    }
+    Err("could not allocate a unique temporary Gemini hook overlay".to_string())
+}
+
+fn gemini_hook_support(command: &Path) -> Result<(), String> {
+    if let Some(path) = resolve_command_path(command) {
+        if let Some(package_root) = gemini_package_root_from_command(&path) {
+            if gemini_package_tree_has_hooks(&package_root) {
+                return Ok(());
+            }
+            let version = gemini_package_version(&package_root)
+                .map(|v| format!(" @google/gemini-cli {v}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "'{}' resolves to{} at '{}', but its installed source has no Gemini hook runtime symbols (BeforeTool/AfterTool)",
+                command.display(),
+                version,
+                package_root.display()
+            ));
+        }
+    }
+    let Some(help) = command_output_text_with_timeout(command, &["--help"], Duration::from_secs(3))
+    else {
+        return Err(format!(
+            "could not verify hook support for '{}' from installed source or `--help`",
+            command.display()
+        ));
+    };
+    if help.contains("BeforeTool") || help.contains("AfterTool") || help.contains("hook_event_name")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{} --help' does not advertise Gemini hook events",
+            command.display()
+        ))
+    }
+}
+
+fn resolve_command_path(command: &Path) -> Option<PathBuf> {
+    if command.is_absolute() || command.components().count() > 1 {
+        return command.exists().then(|| command.to_path_buf());
+    }
+    let name = command.to_string_lossy();
+    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
+        let candidate = dir.join(name.as_ref());
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            if Path::new(name.as_ref()).extension().is_none() {
+                let pathext = std::env::var_os("PATHEXT")
+                    .and_then(|v| v.into_string().ok())
+                    .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+                for ext in pathext.split(';').filter(|ext| !ext.is_empty()) {
+                    let candidate = dir.join(format!("{name}{ext}"));
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn gemini_package_root_from_command(command_path: &Path) -> Option<PathBuf> {
+    let command_dir = command_path.parent()?;
+    let package_root = command_dir
+        .join("node_modules")
+        .join("@google")
+        .join("gemini-cli");
+    if package_root.exists() {
+        return Some(package_root);
+    }
+    let wrapper = fs::read_to_string(command_path).ok()?;
+    if wrapper.contains("node_modules\\@google\\gemini-cli\\dist\\index.js")
+        || wrapper.contains("node_modules/@google/gemini-cli/dist/index.js")
+    {
+        return Some(package_root);
+    }
+    None
+}
+
+fn gemini_package_tree_has_hooks(package_root: &Path) -> bool {
+    let dist = package_root.join("dist");
+    if !dist.exists() {
+        return false;
+    }
+    let settings_have_hooks = [
+        package_root.join("dist/src/config/settings.d.ts"),
+        package_root.join("dist/src/config/settings.js"),
+    ]
+    .iter()
+    .any(|path| file_contains(path, "hooks"));
+    settings_have_hooks
+        && tree_contains_all(
+            &dist,
+            &["BeforeTool", "AfterTool", "hookSpecificOutput"],
+            4096,
+        )
+}
+
+fn gemini_package_version(package_root: &Path) -> Option<String> {
+    let package = fs::read_to_string(package_root.join("package.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&package).ok()?;
+    value.get("version")?.as_str().map(str::to_string)
+}
+
+fn file_contains(path: &Path, needle: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| text.contains(needle))
+}
+
+fn tree_contains_all(root: &Path, needles: &[&str], max_files: usize) -> bool {
+    let mut found = vec![false; needles.len()];
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen_files = 0usize;
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            let Ok(entries) = fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                stack.push(entry.path());
+            }
+            continue;
+        }
+        if seen_files >= max_files {
+            break;
+        }
+        seen_files += 1;
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("js" | "mjs" | "cjs" | "ts" | "d.ts" | "md")
+        ) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for (idx, needle) in needles.iter().enumerate() {
+            if text.contains(needle) {
+                found[idx] = true;
+            }
+        }
+        if found.iter().all(|value| *value) {
+            return true;
+        }
+    }
+    false
+}
+
+fn command_output_text_with_timeout(
+    command: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let mut child = Command::new(command)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait().ok()?.is_some() {
+            let output = child.wait_with_output().ok()?;
+            let mut text = String::new();
+            text.push_str(&String::from_utf8_lossy(&output.stdout));
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            return Some(text);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn run_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
@@ -1260,6 +1603,63 @@ mod tests {
     }
 
     #[test]
+    fn gemini_hook_overlay_writes_temp_hooks_and_context() {
+        let root = cli_test_temp("gemini-overlay");
+        let _ = std::fs::remove_dir_all(&root);
+        let overlay =
+            GeminiHookOverlay::install_at(root.clone(), Path::new("pentect-agent"), Some("demo"))
+                .unwrap();
+        let settings = std::fs::read_to_string(root.join(".gemini/settings.json")).unwrap();
+        assert!(settings.contains("SessionStart"), "{settings}");
+        assert!(settings.contains("BeforeTool"), "{settings}");
+        assert!(settings.contains("AfterTool"), "{settings}");
+        assert!(settings.contains("\"matcher\": \".*\""), "{settings}");
+        assert!(settings.contains("\"timeout\": 30000"), "{settings}");
+        assert!(settings.contains("--capability"), "{settings}");
+        assert!(settings.contains("gemini"), "{settings}");
+        assert!(settings.contains("--session"), "{settings}");
+        assert!(settings.contains("demo"), "{settings}");
+        let memory = std::fs::read_to_string(root.join(".gemini/GEMINI.md")).unwrap();
+        assert!(memory.contains("Pentect agent contract"), "{memory}");
+        let session_start =
+            std::fs::read_to_string(root.join("pentect-session-start.json")).unwrap();
+        assert!(
+            session_start.contains("Pentect agent contract"),
+            "{session_start}"
+        );
+
+        drop(overlay);
+        assert!(!root.exists(), "overlay should clean itself up");
+    }
+
+    #[test]
+    fn gemini_source_probe_requires_settings_and_runtime_hooks() {
+        let root = cli_test_temp("gemini-source-probe");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dist/src/config")).unwrap();
+        std::fs::create_dir_all(root.join("dist/src/hooks")).unwrap();
+        std::fs::write(
+            root.join("dist/src/config/settings.d.ts"),
+            "export interface Settings { hooks?: Record<string, unknown>; }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("dist/src/hooks/runtime.js"),
+            "const phases = ['BeforeTool', 'AfterTool']; const hookSpecificOutput = {};",
+        )
+        .unwrap();
+        assert!(gemini_package_tree_has_hooks(&root));
+
+        std::fs::write(
+            root.join("dist/src/config/settings.d.ts"),
+            "export interface Settings {}",
+        )
+        .unwrap();
+        assert!(!gemini_package_tree_has_hooks(&root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn help_text_explains_agent_handle_reuse() {
         let help = help_text();
         assert!(help.contains("pentect exec"), "{help}");
@@ -1469,5 +1869,9 @@ mod tests {
             "foo".to_string(),
             "exec".to_string()
         ]));
+    }
+
+    fn cli_test_temp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("pentect-cli-{name}-{}", std::process::id()))
     }
 }
