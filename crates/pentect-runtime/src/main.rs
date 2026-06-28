@@ -19,13 +19,15 @@ use approval::{ticket_summary, ApprovalQueue, ApprovalTicket, ApprovalTicketDraf
 use approve_ui::{ApprovalDecision, ApprovalRequest};
 use config::{approval_bypassed_by_config, approval_config_state};
 use masking::{
-    contains_unresolved_masked_handle, is_ascii_word_char, is_env_name_byte, is_sensitive_env_name,
-    live_output_kind, OutputMasker, ToolScalarInput,
+    contains_unresolved_masked_handle, env_alias_recovery, is_ascii_word_char, is_env_name_byte,
+    is_sensitive_env_name, live_output_kind, OutputMasker, ToolScalarInput,
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
 use memory_vault::MemoryVaultClient;
-use pentect_core::{Config, Engine, Input, Kind, Profile, RegionKind};
+use pentect_core::{
+    parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile, RegionKind,
+};
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
 use sha2::{Digest, Sha256};
@@ -54,6 +56,7 @@ pub fn run_from(args: Vec<String>) -> i32 {
         Some("dashboard") => cmd_dashboard(&args),
         Some("--dir" | "--session" | "--port") => cmd_dashboard(&args),
         Some("read") => cmd_read(&args),
+        Some("view") => cmd_view(&args),
         Some("exec") => cmd_exec(&args),
         Some("resolve") => cmd_resolve(&args),
         Some("approve") => cmd_approve(&args),
@@ -67,13 +70,49 @@ pub fn run_from(args: Vec<String>) -> i32 {
     }
 }
 
+pub fn mask_input_into_active_memory_vault(
+    input: Input,
+    profile: Profile,
+    packs: Vec<Pack>,
+    disclose_length: bool,
+) -> Result<Option<MaskResult>, String> {
+    let Some(client) = MemoryVaultClient::from_env() else {
+        return Ok(None);
+    };
+    mask_input_into_memory_vault_client(&client, input, profile, packs, disclose_length).map(Some)
+}
+
+fn mask_input_into_memory_vault_client(
+    client: &MemoryVaultClient,
+    input: Input,
+    profile: Profile,
+    packs: Vec<Pack>,
+    disclose_length: bool,
+) -> Result<MaskResult, String> {
+    let snapshot = client.snapshot().map_err(|e| e.to_string())?;
+    let engine = Engine::with_profile_and_packs(profile, packs, false);
+    let cfg = Config {
+        disclose_length,
+        ..Config::new(snapshot.key)
+    };
+    let result = engine.mask(input, &cfg);
+    let mut recovery = result.recovery.clone();
+    recovery.extend_same_key(env_alias_recovery(&result.masked, &snapshot.key));
+    client
+        .add_recovery(&snapshot.key, &recovery)
+        .map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
 fn usage() {
     eprintln!(
         "pentect\n\
          pentect exec \"<command>\"\n\
+         pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          \n\
          exec runs commands with masked output.\n\
+         view handle metadata.\n\
          resolve rewrites files containing handles, or resolves stdin when no path is given."
     );
 }
@@ -120,7 +159,7 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
         Vec::new()
     };
     Ok(ApprovalRequest {
-        prompt: "Status".to_string(),
+        prompt: "status".to_string(),
         body,
         approve_label: "close".to_string(),
         deny_label: "close".to_string(),
@@ -152,7 +191,7 @@ fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
         }
         if let Some(ticket) = queue.next_pending()? {
             let request = ApprovalRequest {
-                prompt: "Use secret?".to_string(),
+                prompt: "secret".to_string(),
                 body: ticket_summary(&ticket),
                 approve_label: "once".to_string(),
                 deny_label: "decline".to_string(),
@@ -187,13 +226,11 @@ fn print_dashboard_status(
             "approval: no-approve ({})",
             approval_source_label(config.effective_source)
         );
-        println!("approval prompts are bypassed");
     } else {
         println!(
             "approval: required ({})",
             approval_source_label(config.effective_source)
         );
-        println!("waiting for approvals");
     }
     let history = queue.recent_history(5)?;
     if !history.is_empty() {
@@ -225,20 +262,55 @@ fn cmd_read(args: &[String]) -> i32 {
         Err(e) => return die(&e),
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
+    let input = Input { kind, data };
+    match mask_input_into_active_memory_vault(
+        input.clone(),
+        Profile::Strict,
+        Vec::new(),
+        opts.disclose_length,
+    ) {
+        Ok(Some(result)) => {
+            print_read_result(result, opts.emit_meta);
+            return 0;
+        }
+        Ok(None) => {}
+        Err(e) => return die(&e),
+    }
     let engine = Engine::with_profile(Profile::Strict);
     let cfg = Config {
         disclose_length: opts.disclose_length,
         ..Config::generate()
     };
-    let result = engine.mask(Input { kind, data }, &cfg);
+    let result = engine.mask(input, &cfg);
+    print_read_result(result, opts.emit_meta);
+    0
+}
+
+fn print_read_result(result: MaskResult, emit_meta: bool) {
     print!("{}", result.masked);
     let _ = std::io::stdout().flush();
-    if opts.emit_meta {
+    if emit_meta {
         eprintln!(
             "[pentect] masked={}, warned={}",
             result.summary.masked_count,
             result.summary.residual.len()
         );
+    }
+}
+
+fn cmd_view(args: &[String]) -> i32 {
+    if args.len() != 3 {
+        return die("view HANDLE");
+    }
+    let parts = match parse_placeholder(&args[2]) {
+        Ok(parts) => parts,
+        Err(_) => return die("invalid handle"),
+    };
+    println!("label: {}", parts.label);
+    println!("hash: {}", parts.hash);
+    match parts.length_hint {
+        Some(hint) => println!("length: {}", hint.short()),
+        None => println!("length: -"),
     }
     0
 }
@@ -563,9 +635,9 @@ fn request_approval(
     }
     let request = ApprovalRequest {
         prompt: if preview {
-            "Preview".to_string()
+            "preview".to_string()
         } else {
-            "Run?".to_string()
+            "run".to_string()
         },
         body: approval.body(),
         approve_label: "once".to_string(),
@@ -1010,7 +1082,7 @@ fn cmd_hook(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let session = match if opts.capability {
+    let session = match if opts.cli {
         Session::open_capability(&session_name)
     } else {
         Session::open(&session_name)
@@ -1789,19 +1861,19 @@ impl DashboardOpts {
 struct HookOpts {
     provider: HookProvider,
     session: Option<String>,
-    capability: bool,
+    cli: bool,
 }
 
 impl HookOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut provider = None;
         let mut session = None;
-        let mut capability = false;
+        let mut cli = false;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
-                "--capability" => {
-                    capability = true;
+                "--cli" => {
+                    cli = true;
                     i += 1;
                 }
                 "--session" => {
@@ -1819,10 +1891,9 @@ impl HookOpts {
             }
         }
         Ok(Self {
-            provider: provider
-                .ok_or_else(|| "hook requires provider: codex or claude".to_string())?,
+            provider: provider.ok_or_else(|| "hook requires cli: codex or claude".to_string())?,
             session,
-            capability,
+            cli,
         })
     }
 

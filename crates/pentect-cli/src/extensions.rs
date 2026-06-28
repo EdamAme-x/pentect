@@ -228,12 +228,23 @@ fn pack_paths_for_specs(specs: &[String], create_named: bool) -> Result<Vec<Path
 
 fn pack_paths_for_named(name: &str, _create: bool) -> Result<Vec<PathBuf>> {
     validate_extension_name(name)?;
-    let root = extensions_root();
-    let dir = root.join(name);
-    if !dir.exists() {
-        bail!("extension '{name}' was not found at '{}'", dir.display());
+    let project_dir = extensions_root().join(name);
+    let example_dir = examples_extensions_root().join(name);
+    let dir = if project_dir.exists() {
+        project_dir
+    } else if example_dir.exists() {
+        example_dir.clone()
+    } else {
+        bail!(
+            "extension '{name}' was not found at '{}' or '{}'",
+            project_dir.display(),
+            example_dir.display()
+        );
+    };
+    let mut paths = pack_paths_in_extension_dir(&dir)?;
+    if paths.is_empty() && dir != example_dir && example_dir.exists() {
+        paths = pack_paths_in_extension_dir(&example_dir)?;
     }
-    let paths = pack_paths_in_extension_dir(&dir)?;
     if paths.is_empty() {
         bail!(
             "extension '{name}' has no rule packs; add '{}' or '{}'",
@@ -278,6 +289,10 @@ fn canonical_file(path: &Path) -> Result<PathBuf> {
 
 fn extensions_root() -> PathBuf {
     PathBuf::from(PENTECT_DIR).join(EXTENSIONS_DIR)
+}
+
+fn examples_extensions_root() -> PathBuf {
+    PathBuf::from("examples").join(EXTENSIONS_DIR)
 }
 
 fn validate_extension_spec(spec: &str) -> Result<()> {

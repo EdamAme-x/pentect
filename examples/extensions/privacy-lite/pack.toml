@@ -1,0 +1,17 @@
+# Lightweight privacy pack. Deterministic examples only; true NER belongs in an
+# external extension, not core.
+
+[[detector]]
+pattern = '\bCUST-[A-Z0-9]{8,16}\b'
+category = "identifier"
+label = "CUSTOMER_ID"
+
+[[detector]]
+pattern = '\bCASE-[0-9]{8}\b'
+category = "identifier"
+label = "CASE_ID"
+
+[[detector]]
+pattern = '\b(?:room|floor|building)[-_ ][A-Z0-9]{2,12}\b'
+category = "identifier"
+label = "LOCATION_CODE"

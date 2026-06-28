@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pentect hook --capability codex",
-            "commandWindows": "& pentect hook --capability codex",
+            "command": "pentect hook --cli codex",
+            "commandWindows": "& pentect hook --cli codex",
             "timeout": 30
           }
         ]
@@ -19,8 +19,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pentect hook --capability codex",
-            "commandWindows": "& pentect hook --capability codex",
+            "command": "pentect hook --cli codex",
+            "commandWindows": "& pentect hook --cli codex",
             "timeout": 30
           }
         ]

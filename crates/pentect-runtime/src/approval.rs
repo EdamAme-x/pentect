@@ -324,7 +324,7 @@ impl ApprovalQueue {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .with_context(|| format!("could not bind 127.0.0.1:{port}"))?;
-        println!("pentect web dashboard: http://127.0.0.1:{port}");
+        println!("pentect http://127.0.0.1:{port}");
         axum::serve(listener, app)
             .await
             .context("web dashboard failed")
@@ -344,9 +344,9 @@ impl ApprovalQueue {
         ));
         render_config_html(&mut html, csrf, &config);
         if config.effective_no_approve {
-            html.push_str("<h2>approval</h2><p class=ok>No-approve is enabled. New materialization requests bypass approval prompts.</p>");
+            html.push_str("<h2>approval</h2><p class=ok>no-approve</p>");
             if pending.is_some() {
-                html.push_str("<p class=muted>Pending approval files are not shown while no-approve is effective.</p>");
+                html.push_str("<p class=muted>pending</p>");
             }
         } else if let Some(ticket) = pending {
             html.push_str("<h2>approval</h2><pre>");
@@ -370,7 +370,7 @@ impl ApprovalQueue {
                 ));
             }
         } else {
-            html.push_str("<h2>waiting</h2><p>No pending approvals.</p>");
+            html.push_str("<h2>waiting</h2><p>none</p>");
         }
         if !history.is_empty() {
             html.push_str("<h2>history</h2><pre>");
@@ -639,11 +639,11 @@ fn render_config_html(html: &mut String, csrf: &str, config: &crate::config::App
     let mode = if config.effective_no_approve {
         "<span class=ok>no-approve</span>"
     } else {
-        "<span class=warn>approval required</span>"
+        "<span class=warn>required</span>"
     };
-    html.push_str("<h2>approval mode</h2>");
+    html.push_str("<h2>mode</h2>");
     html.push_str(&format!(
-        "<p>effective: {} ({})</p>",
+        "<p>{} ({})</p>",
         mode,
         approval_source_label(config.effective_source)
     ));
@@ -660,7 +660,7 @@ fn render_config_scope_html(
 ) {
     let state = match scope.no_approve {
         Some(true) => "no-approve",
-        Some(false) => "approval required",
+        Some(false) => "required",
         None => "unset",
     };
     html.push_str(&format!(
@@ -670,9 +670,9 @@ fn render_config_scope_html(
         esc(&scope.display_path)
     ));
     for (button, mode) in [
-        ("No-approve", "no_approve"),
-        ("Require approval", "required"),
-        ("Unset", "unset"),
+        ("no-approve", "no_approve"),
+        ("required", "required"),
+        ("unset", "unset"),
     ] {
         html.push_str(&format!(
             "<form method=\"post\" action=\"/config\" style=\"display:inline\">\

@@ -356,7 +356,7 @@ pub(crate) fn first_reusable_env_name(masked: &str) -> Option<String> {
         .map(|(name, _)| name)
 }
 
-fn env_alias_recovery(masked: &str, key: &[u8; 32]) -> Recovery {
+pub(crate) fn env_alias_recovery(masked: &str, key: &[u8; 32]) -> Recovery {
     let aliases = reusable_env_aliases(masked);
     if aliases.is_empty() {
         return Recovery::empty_for_key(key);

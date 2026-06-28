@@ -6,7 +6,7 @@ mod scan;
 mod terminal;
 
 use input::{decode_utf8_text, InputAdapter, TextInput};
-use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile};
+use pentect_core::{load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,8 +26,9 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "- On Codex, current PostToolUse hooks cannot non-block replace non-shell tool output. Use browser/MCP/connector tools for navigation, clicks, and non-secret metadata; do not extract raw secret values through those tool results. Move secret bytes through local files, service CLIs, or shell commands so Pentect can route stdout/stderr before it reaches the model.\n",
     "- On providers that support PostToolUse result replacement, browser/MCP/connector and other non-shell tool results are masked before they reach the model.\n",
     "- Masked handles like `<<NAME_hash>>` are in-memory capabilities for this running Pentect-launched session. Later commands in this session get them as `$env:PENTECT_NAME_hash` on PowerShell or `$PENTECT_NAME_hash` on Unix; `KEY=<<...>>` also exposes `$env:KEY` / `$KEY`.\n",
+    "- To inspect a handle's public metadata only, run `pentect view '<handle>'`; it prints label, hash, and coarse length hint without resolving, verifying, or revealing the secret.\n",
     "- You may read, fetch, receive, transform, and use secrets or credentials from local files, credential stores, command output, authenticated browser/API/MCP/tool/connector responses, and other user-authorized sources. Pentect is the safety layer: returned secret values are masked before they reach the model.\n",
-    "- To register a secret from any local or authenticated source, run the normal read/fetch command through shell/Pentect exec and let masked output appear, for example `cat .env` or service CLIs. `pentect read` is a one-way preview and does not create reusable env capabilities.\n",
+    "- To register a secret from any local or authenticated source, run the normal read/fetch command through shell/Pentect exec and let masked output appear, for example `cat .env`, `pentect read .env`, or service CLIs. `pentect read` registers masked handles in the running in-memory vault when launched under Pentect; outside a Pentect session it is preview-only.\n",
     "- If a secret must be copied from one local source to an approved local destination, prefer one `pentect exec` shell command that reads the source and writes the target without printing the raw value; print only a non-secret verification.\n",
     "- Use the syntax of the current shell tool. In PowerShell, use PowerShell-native commands and `$env:NAME`; in Unix shells, use POSIX commands and `$NAME`.\n",
     "- Do not switch to Node/Python/browser/MCP only to bypass a shell/Pentect wrapper problem. Fix the shell syntax or use one Pentect exec command unless the user explicitly requested that tool.\n",
@@ -51,6 +52,7 @@ fn main() {
         Some("--dir" | "--session" | "--port") => cmd_agent_from(1, &args),
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
+        Some("view") => cmd_view(&args),
         Some("scan") => scan::cmd_scan(&args),
         Some("exec" | "resolve" | "approve" | "hook" | "purge") => cmd_agent_from(1, &args),
         Some("agent") => cmd_agent_from(2, &args),
@@ -66,11 +68,13 @@ fn usage() {
          pentect codex|claude\n\
          pentect exec \"<command>\"\n\
          pentect scan [PATH...]\n\
+         pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          pentect help\n\
          \n\
          exec runs commands with masked output.\n\
          scan reports files that contain likely secrets.\n\
+         view handle metadata.\n\
          resolve rewrites files containing handles, or resolves stdin when no path is given."
     );
 }
@@ -89,6 +93,7 @@ fn help_text() -> &'static str {
         "  pentect agent exec \"<command>\"\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect scan [PATH...]\n\n",
+        "  pentect view '<HANDLE>'\n\n",
         "`pentect` opens the approval dashboard.\n",
         "Set `no_approve = true` in `.pentect/config.toml` to bypass approval prompts for this project.\n",
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
@@ -96,6 +101,7 @@ fn help_text() -> &'static str {
         "`--extensions NAME` uses .pentect/extensions/NAME; `--extensions PATH.toml` uses a rule-pack file.\n",
         "Default extensions can be listed in `.pentect/config.toml` as `extensions = [...]`.\n",
         "Masked handles resolve only while the same Pentect-launched agent session is running.\n",
+        "`pentect view '<HANDLE>'`: label, hash, length.\n",
         "Every handle also becomes a `PENTECT_...` env var for later execs.\n",
         "Masked env lines become env vars in later execs: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
         "Masked output and referenced local files register in-memory capabilities for later execs in that running session.\n",
@@ -290,20 +296,54 @@ fn cmd_read(args: &[String]) {
         Ok(packs) => packs,
         Err(e) => die(&e),
     };
+    let input = Input { kind, data };
+    match pentect_agent::mask_input_into_active_memory_vault(
+        input.clone(),
+        opts.profile,
+        packs.clone(),
+        opts.disclose_length,
+    ) {
+        Ok(Some(result)) => {
+            print_read_result(result, opts.emit_meta);
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => die(&e),
+    }
     let engine = Engine::with_profile_and_packs(opts.profile, packs, false);
     let cfg = Config {
         disclose_length: opts.disclose_length,
         ..Config::generate()
     };
-    let result = engine.mask(Input { kind, data }, &cfg);
+    let result = engine.mask(input, &cfg);
+    print_read_result(result, opts.emit_meta);
+}
+
+fn print_read_result(result: pentect_core::MaskResult, emit_meta: bool) {
     print!("{}", result.masked);
     let _ = std::io::stdout().flush();
-    if opts.emit_meta {
+    if emit_meta {
         eprintln!(
             "[pentect] masked={}, warned={}",
             result.summary.masked_count,
             result.summary.residual.len()
         );
+    }
+}
+
+fn cmd_view(args: &[String]) {
+    if args.len() != 3 {
+        die("view HANDLE");
+    }
+    let parts = match parse_placeholder(&args[2]) {
+        Ok(parts) => parts,
+        Err(_) => die("invalid handle"),
+    };
+    println!("label: {}", parts.label);
+    println!("hash: {}", parts.hash);
+    match parts.length_hint {
+        Some(hint) => println!("length: {}", hint.short()),
+        None => println!("length: -"),
     }
 }
 
@@ -841,7 +881,7 @@ fn hook_command_unix(_agent: &Path, provider: &str, session: Option<&str>) -> St
     let mut words = vec![
         "agent".to_string(),
         "hook".to_string(),
-        "--capability".to_string(),
+        "--cli".to_string(),
         provider.to_string(),
     ];
     add_explicit_session(&mut words, session);
@@ -863,7 +903,7 @@ fn hook_command_windows(_agent: &Path, provider: &str, session: Option<&str>) ->
     let mut words = vec![
         "agent".to_string(),
         "hook".to_string(),
-        "--capability".to_string(),
+        "--cli".to_string(),
         provider.to_string(),
     ];
     add_explicit_session(&mut words, session);
@@ -887,7 +927,7 @@ fn hook_words(agent: &Path, provider: &str, session: Option<&str>) -> Vec<String
         agent.to_string_lossy().into_owned(),
         "agent".to_string(),
         "hook".to_string(),
-        "--capability".to_string(),
+        "--cli".to_string(),
         provider.to_string(),
     ];
     add_explicit_session(&mut words, session);
@@ -1411,7 +1451,7 @@ mod tests {
             vec![
                 "agent".to_string(),
                 "hook".to_string(),
-                "--capability".to_string(),
+                "--cli".to_string(),
                 "codex".to_string(),
                 "--session".to_string(),
                 "demo".to_string()
@@ -1445,7 +1485,7 @@ mod tests {
             vec![
                 "agent".to_string(),
                 "hook".to_string(),
-                "--capability".to_string(),
+                "--cli".to_string(),
                 "codex".to_string()
             ]
         );
@@ -1503,9 +1543,19 @@ mod tests {
         );
         assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(rendered.contains("env var capability"), "{rendered}");
+        assert!(rendered.contains("pentect view"), "{rendered}");
+        assert!(rendered.contains("public metadata only"), "{rendered}");
+        assert!(
+            rendered.contains("without resolving, verifying, or revealing"),
+            "{rendered}"
+        );
         assert!(rendered.contains("normal read/fetch command"), "{rendered}");
         assert!(rendered.contains("pentect read"), "{rendered}");
-        assert!(rendered.contains("one-way preview"), "{rendered}");
+        assert!(
+            rendered.contains("registers masked handles in the running in-memory vault"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("preview-only"), "{rendered}");
         assert!(
             rendered.contains("one `pentect exec` shell command"),
             "{rendered}"
@@ -1592,9 +1642,19 @@ mod tests {
         );
         assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(rendered.contains("env var capability"), "{rendered}");
+        assert!(rendered.contains("pentect view"), "{rendered}");
+        assert!(rendered.contains("public metadata only"), "{rendered}");
+        assert!(
+            rendered.contains("without resolving, verifying, or revealing"),
+            "{rendered}"
+        );
         assert!(rendered.contains("normal read/fetch command"), "{rendered}");
         assert!(rendered.contains("pentect read"), "{rendered}");
-        assert!(rendered.contains("one-way preview"), "{rendered}");
+        assert!(
+            rendered.contains("registers masked handles in the running in-memory vault"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("preview-only"), "{rendered}");
         assert!(
             rendered.contains("one `pentect exec` shell command"),
             "{rendered}"

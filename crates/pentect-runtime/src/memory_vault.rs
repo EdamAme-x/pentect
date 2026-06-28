@@ -342,4 +342,56 @@ mod tests {
         );
         assert!(client.take_script(&script_id).is_err());
     }
+
+    #[test]
+    fn read_style_masking_registers_recovery_and_env_aliases_in_memory_vault() {
+        let token = "test-token-read".to_string();
+        let state = Arc::new(Mutex::new(MemoryVaultState {
+            key: Config::generate().key,
+            recoveries: Vec::new(),
+            scripts: BTreeMap::new(),
+        }));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server_state = state.clone();
+        let server_token = token.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(5) {
+                handle_client(stream.unwrap(), &server_token, &server_state).unwrap();
+            }
+        });
+
+        let client = MemoryVaultClient { addr, token };
+        let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n";
+        let result = crate::mask_input_into_memory_vault_client(
+            &client,
+            Input {
+                kind: Kind::Env,
+                data: raw.to_string(),
+            },
+            Profile::Strict,
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        assert!(result.masked.contains("OPENAI_API_KEY=<<OPENAI_API_KEY_"));
+
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.recovery.resolve(&result.masked), raw);
+        let alias_records: Vec<_> = snapshot
+            .recovery
+            .placeholders()
+            .into_iter()
+            .filter(|placeholder| crate::masking::is_env_alias_placeholder(placeholder))
+            .filter_map(|placeholder| {
+                let record = snapshot.recovery.resolve(&placeholder);
+                crate::masking::decode_env_alias_record(&record)
+                    .map(|(name, handle)| (name.to_string(), handle.to_string()))
+            })
+            .collect();
+        assert!(alias_records.iter().any(|(name, handle)| {
+            name == "OPENAI_API_KEY"
+                && snapshot.recovery.resolve(handle) == "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+        }));
+    }
 }

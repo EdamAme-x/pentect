@@ -42,6 +42,7 @@ pub use parse::{EnvParser, JsonParser, Parser, TextParser, ToolResultParser};
 pub use pipeline::{
     Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote, Summary,
 };
+pub use placeholder::{parse_placeholder, LengthHint, PlaceholderParts};
 pub use policy::guard::{OverMaskGuard, ShapeGuard};
 pub use policy::{Action, MaskAll, Policy, Profile, ProfilePolicy};
 pub use recovery::{restore, Recovery, RecoveryError, RestoreError};

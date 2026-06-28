@@ -1,7 +1,8 @@
 # Pentect rule pack — tune what gets masked. Two things you can do:
 #   (A) turn OFF built-in detectors you don't want, and
 #   (B) add your own company-specific things to mask.
-# Load it with:  pentect mask --pack company-pack.toml < input.txt
+# Load it with:  pentect mask --pack examples/company-pack.toml < input.txt
+# Extension form: examples/extensions/company/pack.toml
 # You do NOT need to know regular expressions.
 
 # (A) Turn OFF built-in detectors by label. E.g. if your logs are full of

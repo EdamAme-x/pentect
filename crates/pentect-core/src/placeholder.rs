@@ -7,6 +7,35 @@ type HmacSha256 = Hmac<Sha256>;
 /// function of (key, value), independent of scan order.
 pub const HASH_HEX_WIDTH: usize = 16;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaceholderParts {
+    pub handle: String,
+    pub label: String,
+    pub hash: String,
+    pub length_hint: Option<LengthHint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LengthHint {
+    AtLeastChars(u32),
+    LegacyLen(u32),
+}
+
+impl LengthHint {
+    pub fn floor_chars(self) -> u32 {
+        match self {
+            LengthHint::AtLeastChars(n) | LengthHint::LegacyLen(n) => n,
+        }
+    }
+
+    pub fn short(self) -> String {
+        match self {
+            LengthHint::AtLeastChars(n) => format!("{n}+"),
+            LengthHint::LegacyLen(n) => n.to_string(),
+        }
+    }
+}
+
 /// Keyed so the cloud side cannot dictionary-attack low-entropy values such as
 /// emails, names, or "admin"; an unkeyed digest would be a reversible commitment.
 pub fn identity_hash(key: &[u8; 32], n_id_value: &str) -> String {
@@ -35,6 +64,87 @@ pub fn render_placeholder(label: &str, hash: &str, bucket: Option<u32>) -> Strin
         Some(n) => format!("<<{label}_{hash}_length_at_least_{n}_chars>>"),
         None => format!("<<{label}_{hash}>>"),
     }
+}
+
+pub fn parse_placeholder(value: &str) -> Result<PlaceholderParts, String> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return Err("placeholder is empty".to_string());
+    }
+    let inner = raw
+        .strip_prefix("<<")
+        .and_then(|v| v.strip_suffix(">>"))
+        .unwrap_or(raw)
+        .strip_prefix("PENTECT_")
+        .unwrap_or_else(|| {
+            raw.strip_prefix("<<")
+                .and_then(|v| v.strip_suffix(">>"))
+                .unwrap_or(raw)
+        });
+    let (core, length_hint) = split_length_hint(inner)?;
+    let Some((label, hash)) = core.rsplit_once('_') else {
+        return Err("placeholder must look like <<LABEL_hash>>".to_string());
+    };
+    validate_label(label)?;
+    validate_hash(hash)?;
+    Ok(PlaceholderParts {
+        handle: format!("<<{inner}>>"),
+        label: label.to_string(),
+        hash: hash.to_string(),
+        length_hint,
+    })
+}
+
+fn split_length_hint(inner: &str) -> Result<(&str, Option<LengthHint>), String> {
+    if let Some((prefix, suffix)) = inner.rsplit_once("_length_at_least_") {
+        let Some(raw_n) = suffix.strip_suffix("_chars") else {
+            return Err("placeholder length hint is malformed".to_string());
+        };
+        return Ok((prefix, Some(LengthHint::AtLeastChars(parse_u32(raw_n)?))));
+    }
+    if let Some((prefix, raw_n)) = inner.rsplit_once("_len") {
+        if !raw_n.is_empty() && raw_n.bytes().all(|b| b.is_ascii_digit()) {
+            return Ok((prefix, Some(LengthHint::LegacyLen(parse_u32(raw_n)?))));
+        }
+    }
+    Ok((inner, None))
+}
+
+fn validate_label(label: &str) -> Result<(), String> {
+    let mut chars = label.chars();
+    let Some(first) = chars.next() else {
+        return Err("placeholder label is empty".to_string());
+    };
+    if !first.is_ascii_uppercase() {
+        return Err("placeholder label must start with A-Z".to_string());
+    }
+    if !chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_') {
+        return Err("placeholder label must use A-Z, 0-9, and underscore".to_string());
+    }
+    Ok(())
+}
+
+fn validate_hash(hash: &str) -> Result<(), String> {
+    if hash.len() != HASH_HEX_WIDTH || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "placeholder hash must be {HASH_HEX_WIDTH} lowercase hex chars"
+        ));
+    }
+    if !hash
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(format!(
+            "placeholder hash must be {HASH_HEX_WIDTH} lowercase hex chars"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_u32(value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| "placeholder length hint is malformed".to_string())
 }
 
 /// Coarse length bucket for opaque blobs, opt-in. Returns the floor of one of
@@ -81,6 +191,33 @@ mod tests {
             render_placeholder("X", "abc", Some(24)),
             "<<X_abc_length_at_least_24_chars>>"
         );
+    }
+
+    #[test]
+    fn placeholder_parse_splits_public_parts_without_recovery() {
+        let parts =
+            parse_placeholder("<<OPENAI_API_KEY_0123456789abcdef_length_at_least_64_chars>>")
+                .unwrap();
+        assert_eq!(parts.label, "OPENAI_API_KEY");
+        assert_eq!(parts.hash, "0123456789abcdef");
+        assert_eq!(parts.length_hint, Some(LengthHint::AtLeastChars(64)));
+        assert_eq!(
+            parts.handle,
+            "<<OPENAI_API_KEY_0123456789abcdef_length_at_least_64_chars>>"
+        );
+
+        let env = parse_placeholder("PENTECT_TOKEN_0123456789abcdef_len24").unwrap();
+        assert_eq!(env.label, "TOKEN");
+        assert_eq!(env.hash, "0123456789abcdef");
+        assert_eq!(env.length_hint, Some(LengthHint::LegacyLen(24)));
+    }
+
+    #[test]
+    fn placeholder_parse_rejects_malformed_handles() {
+        assert!(parse_placeholder("<<openai_0123456789abcdef>>").is_err());
+        assert!(parse_placeholder("<<OPENAI_0123456789ABCDEf>>").is_err());
+        assert!(parse_placeholder("OPENAI_short").is_err());
+        assert!(parse_placeholder("<<OPENAI_0123456789abcdef_length_at_least_x_chars>>").is_err());
     }
 
     #[test]

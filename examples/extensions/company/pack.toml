@@ -1,0 +1,25 @@
+# Company extension pack. Load with:
+#   pentect --extensions company codex
+#   pentect mask --extensions company < input.txt
+
+[[detector]]
+keywords = [
+  "Project Titan",
+  "vault.acme.internal",
+  "acme-prod-db",
+]
+category = "secret"
+label = "COMPANY_SECRET"
+
+[[detector]]
+keywords = [
+  "bastion.acme.internal",
+  "jump.acme.internal",
+]
+category = "endpoint"
+label = "INTERNAL_HOST"
+
+[[detector]]
+pattern = '\bEMP-[0-9]{6}\b'
+category = "identifier"
+label = "EMPLOYEE_ID"

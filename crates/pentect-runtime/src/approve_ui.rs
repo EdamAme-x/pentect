@@ -61,7 +61,7 @@ fn render_request<W: Write>(output: &mut W, request: &ApprovalRequest) -> Result
     if !request.warnings.is_empty() {
         writeln!(output)?;
         for warning in &request.warnings {
-            writeln!(output, "warning: {warning}")?;
+            writeln!(output, "warning {warning}")?;
         }
     }
     writeln!(output)?;
@@ -72,14 +72,11 @@ fn render_request<W: Write>(output: &mut W, request: &ApprovalRequest) -> Result
 fn choices(request: &ApprovalRequest) -> String {
     if request.allow_always {
         format!(
-            "Enter/o {}, a always, d {}",
+            "o {} | a always | d {}",
             request.approve_label, request.deny_label
         )
     } else {
-        format!(
-            "Enter/o {}, d {}",
-            request.approve_label, request.deny_label
-        )
+        format!("o {} | d {}", request.approve_label, request.deny_label)
     }
 }
 
@@ -90,7 +87,7 @@ mod tests {
     #[test]
     fn approval_prompt_is_plain_and_compact() {
         let request = ApprovalRequest {
-            prompt: "Run?".to_string(),
+            prompt: "run".to_string(),
             body: "command\ncurl https://api.example.test/health".to_string(),
             approve_label: "once".to_string(),
             deny_label: "decline".to_string(),
@@ -101,10 +98,10 @@ mod tests {
         render_request(&mut out, &request).unwrap();
         let rendered = String::from_utf8(out).unwrap();
 
-        assert!(rendered.contains("pentect Run?"));
+        assert!(rendered.contains("pentect run"));
         assert!(rendered.contains("curl https://api.example.test/health"));
-        assert!(rendered.contains("warning: may send secret"));
-        assert!(rendered.contains("Enter/o once, a always, d decline"));
+        assert!(rendered.contains("warning may send secret"));
+        assert!(rendered.contains("o once | a always | d decline"));
         assert!(!rendered.contains('\x1b'));
         assert!(!rendered.contains("environment policy"));
         assert!(!rendered.contains("resolves placeholders"));
@@ -113,7 +110,7 @@ mod tests {
     #[test]
     fn approval_choice_parser_accepts_small_vocab() {
         let request = ApprovalRequest {
-            prompt: "Run?".to_string(),
+            prompt: "run".to_string(),
             body: "echo ok".to_string(),
             approve_label: "once".to_string(),
             deny_label: "decline".to_string(),
