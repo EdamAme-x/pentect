@@ -82,6 +82,29 @@ fn exec_parse_accepts_live_and_approve_without_env_flags() {
 }
 
 #[test]
+fn exec_parse_accepts_stdin_mode_without_shell_text() {
+    let args = strings(["pentect-agent", "exec", "--stdin"]);
+    let opts = ExecOpts::parse(&args).unwrap();
+    assert!(matches!(opts.mode, ExecMode::Stdin));
+
+    let args = strings(["pentect-agent", "exec", "--stdin", "echo", "hi"]);
+    let err = match ExecOpts::parse(&args) {
+        Ok(_) => panic!("expected --stdin with shell text to fail"),
+        Err(err) => err,
+    };
+    assert!(err.contains("--stdin"), "{err}");
+}
+
+#[test]
+fn exec_parse_accepts_base64_script_mode() {
+    let script = "Write-Output \"日本語|OK\"";
+    let encoded = data_encoding::BASE64.encode(script.as_bytes());
+    let args = strings(["pentect-agent", "exec", "--script-b64", &encoded]);
+    let opts = ExecOpts::parse(&args).unwrap();
+    assert!(matches!(opts.mode, ExecMode::Shell(command) if command == script));
+}
+
+#[test]
 fn exec_parse_rejects_manual_env_policy_flags() {
     let args = strings([
         "pentect-agent",
@@ -376,6 +399,52 @@ fn network_like_exec_requires_approval_without_dashboard() {
 }
 
 #[test]
+fn env_capability_local_write_is_reported_as_materialization() {
+    let (root, session) = empty_session("approval-local-write");
+    let store = RecoveryStore::load(&session).unwrap();
+    let mut masker = OutputMasker::new_shared(store.clone()).unwrap();
+    let masked = masker
+        .mask_tool_output("API_TOKEN=sk-ABCDEFGHIJKLMNOPQRSTUVWX")
+        .unwrap();
+    assert!(masked.contains("API_TOKEN=<<"), "{masked}");
+
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        approve: false,
+        mode: ExecMode::Shell(
+            "Set-Content -LiteralPath credentials.local -Value ('API_TOKEN=' + $env:API_TOKEN)"
+                .to_string(),
+        ),
+    };
+    let approval = exec_approval(&store, &opts).unwrap();
+
+    assert!(approval.requires_approval(), "{approval:?}");
+    assert_eq!(approval.env_names(), vec!["API_TOKEN".to_string()]);
+    assert!(approval.materialize_like, "{approval:?}");
+    assert!(
+        approval.body().contains("write local file"),
+        "{:?}",
+        approval.body()
+    );
+    assert!(approval.ticket().materialize_like);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn local_write_detection_covers_common_powershell_write_forms() {
+    assert!(command_looks_local_materialize_like(
+        "[IO.File]::WriteAllText('credentials.local', $env:API_TOKEN)"
+    ));
+    assert!(command_looks_local_materialize_like(
+        "Write-Output $env:API_TOKEN>credentials.local"
+    ));
+    assert!(command_looks_local_materialize_like(
+        "Write-Output $env:API_TOKEN 2>errors.log"
+    ));
+}
+
+#[test]
 fn resolve_file_materialization_requires_approval_without_dashboard() {
     let root = temp_root("approval-resolve-fail-closed");
     let approval_session = format!("approval_resolve_fail_closed_{}", unix_millis());
@@ -436,6 +505,7 @@ fn always_fingerprint_includes_capability_value_identity() {
         direct_handles: Vec::new(),
         destinations: Vec::new(),
         network_like: false,
+        materialize_like: false,
     };
     let b = ExecApproval {
         command,
@@ -447,6 +517,7 @@ fn always_fingerprint_includes_capability_value_identity() {
         direct_handles: Vec::new(),
         destinations: Vec::new(),
         network_like: false,
+        materialize_like: false,
     };
 
     assert_ne!(a.fingerprint(), b.fingerprint());
@@ -1840,6 +1911,58 @@ fn pretool_canonicalizes_pentect_exec_shell_commands() {
     assert!(!command.contains("--shell"), "{command}");
     assert!(command.contains("Test-Path"), "{command}");
     assert!(command.contains("missing"), "{command}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pretool_preserves_powershell_sensitive_regex_pipe_via_stdin_wrapper() {
+    let (root, session) = empty_session("hook-pre-powershell-regex-pipe");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": r#"rg -n "TOKEN_ALPHA|TOKEN_BETA|TOKEN_GAMMA" -S ."#
+        }
+    });
+    let output = handle_hook(HookProvider::Codex, DEFAULT_SESSION, &session, input).unwrap();
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(
+        command.contains("TOKEN_ALPHA|TOKEN_BETA|TOKEN_GAMMA"),
+        "{command}"
+    );
+    if cfg!(windows) {
+        assert!(command.contains("--stdin"), "{command}");
+        assert!(command.starts_with("@'\n"), "{command}");
+        assert!(
+            !command.contains("'rg -n \"TOKEN_ALPHA|TOKEN_BETA|TOKEN_GAMMA\" -S .'"),
+            "{command}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pretool_uses_base64_script_wrapper_for_non_ascii_powershell_payloads() {
+    let (root, session) = empty_session("hook-pre-powershell-unicode");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "Write-Output \"日本語|OK\""
+        }
+    });
+    let output = handle_hook(HookProvider::Codex, DEFAULT_SESSION, &session, input).unwrap();
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    if cfg!(windows) {
+        assert!(command.contains("--script-b64"), "{command}");
+        assert!(!command.contains("--stdin --script-b64"), "{command}");
+        assert!(!command.contains("日本語"), "{command}");
+        assert!(!command.contains("@'\n"), "{command}");
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 

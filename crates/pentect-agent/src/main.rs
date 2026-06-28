@@ -220,7 +220,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         exec_help();
         return 0;
     }
-    let opts = match ExecOpts::parse(args) {
+    let opts = match ExecOpts::parse(args).and_then(materialize_stdin_exec_opts) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
@@ -447,8 +447,10 @@ fn exec_help() {
         "{}",
         concat!(
             "pentect exec \"<command>\"\n",
+            "pentect exec --stdin\n",
             "pentect exec --live \"<command>\"\n\n",
             "Runs a command and prints normal stdout/stderr with secrets masked.\n",
+            "`--stdin` reads the shell script from stdin; hooks use it on PowerShell so quotes and pipes survive the outer shell.\n",
             "Referenced `<<LABEL_hash>>` handles become PENTECT_LABEL_hash env vars in child commands.\n",
             "If prior output showed `KEY=<<...>>`, commands that reference KEY can use it as an env var.\n",
             "Run `pentect` for approval UI or `pentect --port 7331` for the local web dashboard.\n",
@@ -461,7 +463,7 @@ fn exec_help() {
 }
 
 fn cmd_approve(args: &[String]) -> i32 {
-    let opts = match ExecOpts::parse(args) {
+    let opts = match ExecOpts::parse(args).and_then(materialize_stdin_exec_opts) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
@@ -554,6 +556,7 @@ fn approval_warnings(
             let command = resolve_command_text(store, &approval.command)?;
             guard_shell_script_with_env(&command, &policy)
         }
+        ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
     };
     if let Err(reason) = guard {
         warnings.push(reason);
@@ -566,6 +569,9 @@ fn approval_warnings(
     }
     if approval.network_like && approval.requires_approval() {
         warnings.push("this command may send approved capabilities to the network".to_string());
+    }
+    if approval.materialize_like && approval.requires_approval() {
+        warnings.push("this command may write approved capabilities to local files".to_string());
     }
     Ok(warnings)
 }
@@ -613,6 +619,7 @@ struct ExecApproval {
     direct_handles: Vec<String>,
     destinations: Vec<String>,
     network_like: bool,
+    materialize_like: bool,
 }
 
 #[derive(Debug)]
@@ -664,6 +671,16 @@ impl ExecApproval {
             material.push_str(handle);
             material.push('\0');
         }
+        material.push_str("network:");
+        material.push_str(if self.network_like { "true" } else { "false" });
+        material.push('\0');
+        material.push_str("materialize:");
+        material.push_str(if self.materialize_like {
+            "true"
+        } else {
+            "false"
+        });
+        material.push('\0');
         let digest = Sha256::digest(material.as_bytes());
         data_encoding::HEXLOWER.encode(&digest[..16])
     }
@@ -694,6 +711,9 @@ impl ExecApproval {
             } else if self.network_like {
                 lines.push("send possible".to_string());
             }
+            if self.materialize_like {
+                lines.push("write local file".to_string());
+            }
         } else {
             lines.push(String::new());
             lines.push("no secret".to_string());
@@ -714,7 +734,7 @@ impl ExecApproval {
             direct_handles: self.direct_handles.len(),
             destinations: self.destinations.clone(),
             network_like: self.network_like,
-            materialize_like: false,
+            materialize_like: self.materialize_like,
         })
     }
 }
@@ -735,6 +755,7 @@ fn exec_approval(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExecApproval,
     let direct_handles = masked_handles_in_mode(&opts.mode);
     let destinations = network_destinations(&command);
     let network_like = !destinations.is_empty() || command_looks_network_like(&command);
+    let materialize_like = command_looks_local_materialize_like(&command);
     Ok(ExecApproval {
         command,
         env_refs,
@@ -742,6 +763,7 @@ fn exec_approval(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExecApproval,
         direct_handles,
         destinations,
         network_like,
+        materialize_like,
     })
 }
 
@@ -815,6 +837,7 @@ fn masked_handles_in_mode(mode: &ExecMode) -> Vec<String> {
     let text = match mode {
         ExecMode::Shell(command) => command.clone(),
         ExecMode::Program(args) => args.join(" "),
+        ExecMode::Stdin => String::new(),
     };
     masked_handles_in_text(&text)
 }
@@ -882,6 +905,31 @@ fn command_looks_network_like(command: &str) -> bool {
     lower.contains("://")
 }
 
+fn command_looks_local_materialize_like(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some((word, _, next)) = next_shell_word(&lower, cursor) {
+        let word = word.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | '(' | ')'));
+        if matches!(
+            word,
+            "set-content" | "add-content" | "out-file" | "tee-object" | "sc" | "ac"
+        ) || word.contains("::writealltext")
+            || looks_like_shell_redirection(word)
+        {
+            return true;
+        }
+        cursor = next;
+    }
+    false
+}
+
+fn looks_like_shell_redirection(word: &str) -> bool {
+    if !word.contains('>') {
+        return false;
+    }
+    !word.contains("=>")
+}
+
 fn display_exec_mode(mode: &ExecMode) -> String {
     match mode {
         ExecMode::Shell(command) => command.clone(),
@@ -896,6 +944,7 @@ fn display_exec_mode(mode: &ExecMode) -> String {
             })
             .collect::<Vec<_>>()
             .join(" "),
+        ExecMode::Stdin => "<stdin>".to_string(),
     }
 }
 
@@ -968,6 +1017,7 @@ fn run_resolved_command(
             guard_shell_script_with_env(&command, &env_policy)?;
             run_shell_script(&command, &env, &opts.session)
         }
+        ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
     }
 }
 
@@ -998,6 +1048,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             apply_protected_child_env(&mut shell, &env, &opts.session);
             run_live_command(shell, Some(&command), store.clone())
         }
+        ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
     }
 }
 
@@ -1156,6 +1207,7 @@ fn referenced_env_names(mode: &ExecMode) -> BTreeSet<String> {
                 collect_bare_dollar_env_refs(command, &mut names);
             }
         }
+        ExecMode::Stdin => {}
         ExecMode::Program(args) => {
             let text = args.join(" ");
             collect_powershell_env_refs(&text, &mut names);
@@ -1751,6 +1803,7 @@ struct ExecOpts {
 enum ExecMode {
     Program(Vec<String>),
     Shell(String),
+    Stdin,
 }
 
 struct ResolveOpts {
@@ -1797,6 +1850,7 @@ impl ExecOpts {
         let mut session = default_session_name()?;
         let mut live = false;
         let mut approve = false;
+        let mut stdin = false;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
@@ -1811,12 +1865,38 @@ impl ExecOpts {
                     approve = true;
                     i += 1;
                 }
+                "--stdin" => {
+                    stdin = true;
+                    i += 1;
+                }
+                "--script-b64" => {
+                    if stdin {
+                        return Err(
+                            "exec --stdin does not accept a base64 script argument".to_string()
+                        );
+                    }
+                    let script = decode_script_base64(&value(args, &mut i, "--script-b64")?)?;
+                    if i < args.len() {
+                        return Err(
+                            "exec --script-b64 does not accept trailing arguments".to_string()
+                        );
+                    }
+                    return Ok(Self {
+                        session: checked_session_name(&session).map_err(|e| e.to_string())?,
+                        live,
+                        approve,
+                        mode: ExecMode::Shell(script),
+                    });
+                }
                 "--shell" => {
                     return Err(
                         "`--shell` was removed; use `pentect exec \"<command>\"`".to_string()
                     );
                 }
                 "--" => {
+                    if stdin {
+                        return Err("exec --stdin does not accept a program command".to_string());
+                    }
                     let command = args[i + 1..].to_vec();
                     if command.is_empty() {
                         return Err("exec requires a command after `--`".to_string());
@@ -1830,6 +1910,9 @@ impl ExecOpts {
                 }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 _ => {
+                    if stdin {
+                        return Err("exec --stdin does not accept a command argument".to_string());
+                    }
                     return Ok(Self {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
@@ -1839,8 +1922,30 @@ impl ExecOpts {
                 }
             }
         }
-        Err("exec requires COMMAND or `-- PROGRAM...`".to_string())
+        if stdin {
+            return Ok(Self {
+                session: checked_session_name(&session).map_err(|e| e.to_string())?,
+                live,
+                approve,
+                mode: ExecMode::Stdin,
+            });
+        }
+        Err("exec requires COMMAND, `--stdin`, or `-- PROGRAM...`".to_string())
     }
+}
+
+fn materialize_stdin_exec_opts(mut opts: ExecOpts) -> Result<ExecOpts, String> {
+    if matches!(opts.mode, ExecMode::Stdin) {
+        opts.mode = ExecMode::Shell(read_stdin_text()?);
+    }
+    Ok(opts)
+}
+
+fn decode_script_base64(value: &str) -> Result<String, String> {
+    let bytes = data_encoding::BASE64
+        .decode(value.as_bytes())
+        .map_err(|_| "exec --script-b64 requires valid base64".to_string())?;
+    String::from_utf8(bytes).map_err(|_| "exec --script-b64 requires UTF-8 text".to_string())
 }
 
 fn default_session_name() -> Result<String, String> {
@@ -2174,6 +2279,7 @@ fn extract_pentect_exec_shell_payload(command: &str) -> Option<String> {
             "--live" | "--approve" => {
                 rest = rest[word_end..].trim_start();
             }
+            "--stdin" => return None,
             "--shell" => {
                 return Some(unquote_wrapped_shell_arg(rest[word_end..].trim_start()));
             }
@@ -2282,20 +2388,53 @@ fn wrap_shell_command(
     session_name: &str,
     masked_command: &str,
 ) -> Result<String, String> {
-    let words = agent_exec_words(session_name, masked_command)?;
     if cfg!(windows) {
-        Ok(powershell_command(&words))
+        let words = agent_exec_stdin_words(session_name)?;
+        Ok(powershell_stdin_exec_command(&words, masked_command))
     } else {
+        let words = agent_exec_words(session_name, masked_command)?;
         Ok(shell_command(&words))
     }
 }
 
+fn powershell_stdin_exec_command(words: &[String], script: &str) -> String {
+    if script.is_ascii() && !has_powershell_single_here_string_terminator(script) {
+        let exec = powershell_command(words);
+        return format!("@'\n{script}\n'@ | {exec}");
+    }
+    let encoded = data_encoding::BASE64.encode(script.as_bytes());
+    let mut words = words.to_vec();
+    if words.last().is_some_and(|word| word == "--stdin") {
+        words.pop();
+    }
+    words.push("--script-b64".to_string());
+    words.push(encoded);
+    powershell_command(&words)
+}
+
+fn has_powershell_single_here_string_terminator(script: &str) -> bool {
+    script
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == "'@")
+}
+
+fn agent_exec_stdin_words(session_name: &str) -> Result<Vec<String>, String> {
+    let mut words = agent_exec_base_words(session_name)?;
+    words.push("--stdin".to_string());
+    Ok(words)
+}
+
 fn agent_exec_words(session_name: &str, masked_command: &str) -> Result<Vec<String>, String> {
+    let mut words = agent_exec_base_words(session_name)?;
+    words.push(masked_command.to_string());
+    Ok(words)
+}
+
+fn agent_exec_base_words(session_name: &str) -> Result<Vec<String>, String> {
     let agent = std::env::current_exe()
         .map_err(|e| format!("could not resolve pentect-agent executable: {e}"))?;
     let mut words = vec![agent.to_string_lossy().into_owned(), "exec".to_string()];
     add_non_default_session(&mut words, session_name);
-    words.push(masked_command.to_string());
     Ok(words)
 }
 
