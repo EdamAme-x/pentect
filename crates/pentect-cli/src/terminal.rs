@@ -32,6 +32,28 @@ pub(crate) fn restore_after_tui() {
     restore_ansi_state();
 }
 
+const ANSI_TUI_RESET: &str = concat!(
+    "\x1b[0m",     // reset SGR attributes
+    "\x1b(B",      // restore ASCII character set
+    "\x1b[?25h",   // show cursor
+    "\x1b[?7h",    // enable line wrap
+    "\x1b[?12l",   // disable blinking cursor mode
+    "\x1b[?1l",    // leave application cursor-key mode
+    "\x1b[?1000l", // disable X10 mouse
+    "\x1b[?1002l", // disable button-event mouse
+    "\x1b[?1003l", // disable any-event mouse
+    "\x1b[?1004l", // disable focus events
+    "\x1b[?1005l", // disable UTF-8 mouse mode
+    "\x1b[?1006l", // disable SGR mouse mode
+    "\x1b[?1015l", // disable urxvt mouse mode
+    "\x1b[?2004l", // disable bracketed paste
+    "\x1b[?2026l", // disable synchronized output
+    "\x1b[?1048l", // restore cursor from older alt-screen flows
+    "\x1b[?1047l", // leave older alternate screen
+    "\x1b[?1049l", // leave alternate screen
+    "\r\x1b[0K",   // clear a partially drawn prompt line
+);
+
 fn restore_ansi_state() {
     let mut out = std::io::stdout();
     if !out.is_terminal() {
@@ -46,6 +68,7 @@ fn restore_ansi_state() {
         Show,
         ResetColor
     );
+    let _ = out.write_all(ANSI_TUI_RESET.as_bytes());
     let _ = out.flush();
 }
 
@@ -132,3 +155,30 @@ fn ignore_ctrl_c_for_parent_process() -> bool {
 
 #[cfg(not(windows))]
 fn restore_ctrl_c_for_parent_process() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ansi_tui_reset_covers_common_leftover_private_modes() {
+        for mode in [
+            "\x1b[?25h",
+            "\x1b[?1000l",
+            "\x1b[?1002l",
+            "\x1b[?1003l",
+            "\x1b[?1004l",
+            "\x1b[?1005l",
+            "\x1b[?1006l",
+            "\x1b[?1015l",
+            "\x1b[?2004l",
+            "\x1b[?2026l",
+            "\x1b[?1047l",
+            "\x1b[?1048l",
+            "\x1b[?1049l",
+            "\r\x1b[0K",
+        ] {
+            assert!(ANSI_TUI_RESET.contains(mode), "{mode:?}");
+        }
+    }
+}

@@ -30,6 +30,7 @@ const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
     "- When using a registered secret, prefer its env var capability instead of re-reading or echoing it only to inspect/copy it. Do not run help just to discover extra flags.\n",
     "- Do not disclose raw secrets in chat, logs, screenshots, derived previews, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or persistent external services that are not the exact target of the user's requested operation. Report only non-secret outcomes.\n",
 );
+const PENTECT_AGENT_ENV: &str = "PENTECT_AGENT";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -109,7 +110,7 @@ fn cmd_agent_passthrough(args: &[String]) {
 }
 
 fn cmd_agent_passthrough_from(start: usize, args: &[String]) {
-    let agent = std::env::var_os("PENTECT_AGENT")
+    let agent = std::env::var_os(PENTECT_AGENT_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(default_agent_path);
     let (forward_args, explicit_extensions) = match extensions::strip_from_args(&args[start..]) {
@@ -500,7 +501,7 @@ impl AgentToolOpts {
         }
         Ok(Self {
             session,
-            agent: agent.or_else(|| std::env::var_os("PENTECT_AGENT").map(PathBuf::from)),
+            agent: agent.or_else(|| std::env::var_os(PENTECT_AGENT_ENV).map(PathBuf::from)),
             command,
             extensions,
             dry_run,
@@ -529,6 +530,7 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
         Err(e) => die(&e),
     };
     let mut cmd = Command::new(&opts.command);
+    apply_agent_env(&mut cmd, agent);
     apply_extension_env(&mut cmd, &active_extensions);
     for config in configs {
         cmd.arg("--config").arg(config);
@@ -549,6 +551,7 @@ fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
         Err(e) => die(&e),
     };
     let mut cmd = Command::new(&opts.command);
+    apply_agent_env(&mut cmd, agent);
     apply_extension_env(&mut cmd, &active_extensions);
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
@@ -578,6 +581,7 @@ fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
         Err(e) => die(e),
     };
     let mut cmd = Command::new(&opts.command);
+    apply_agent_env(&mut cmd, agent);
     apply_extension_env(&mut cmd, &active_extensions);
     overlay.apply_env(&mut cmd);
     cmd.args(&opts.tool_args);
@@ -914,12 +918,22 @@ fn run_interactive_command(mut cmd: Command, display: &Path) -> std::process::Ex
         .unwrap_or_else(|e| die(format!("could not start '{}': {e}", display.display())));
     // Set this after spawn so child TUIs still receive Ctrl+C; the parent
     // stays alive long enough to restore terminal state after the child exits.
-    let _ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
-    let status = child
-        .wait()
-        .unwrap_or_else(|e| die(format!("could not wait for '{}': {e}", display.display())));
+    let ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            drop(ctrl_c_guard);
+            terminal::restore_after_tui();
+            die(format!("could not wait for '{}': {e}", display.display()))
+        }
+    };
+    drop(ctrl_c_guard);
     terminal::restore_after_tui();
     status
+}
+
+fn apply_agent_env(cmd: &mut Command, agent: &Path) {
+    cmd.env(PENTECT_AGENT_ENV, agent);
 }
 
 fn apply_extension_env(cmd: &mut Command, active: &extensions::ActiveExtensions) {
@@ -1094,9 +1108,18 @@ fn hook_command_windows(agent: &Path, provider: &str, session: Option<&str>) -> 
 }
 
 fn hook_words(agent: &Path, provider: &str, session: Option<&str>) -> Vec<String> {
-    if pentect_agent_passthrough_available() {
+    hook_words_with_passthrough(hook_passthrough_command(), agent, provider, session)
+}
+
+fn hook_words_with_passthrough(
+    passthrough: Option<String>,
+    agent: &Path,
+    provider: &str,
+    session: Option<&str>,
+) -> Vec<String> {
+    if let Some(pentect) = passthrough {
         let mut words = vec![
-            "pentect".to_string(),
+            pentect,
             "hook".to_string(),
             "--capability".to_string(),
             provider.to_string(),
@@ -1123,8 +1146,17 @@ fn add_explicit_session(words: &mut Vec<String>, session: Option<&str>) {
     words.push(session.to_string());
 }
 
-fn pentect_agent_passthrough_available() -> bool {
-    let Ok(output) = Command::new("pentect").arg("agent").arg("--probe").output() else {
+fn hook_passthrough_command() -> Option<String> {
+    if let Ok(current) = std::env::current_exe() {
+        if pentect_agent_passthrough_available_at(&current) {
+            return Some(current.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn pentect_agent_passthrough_available_at(command: &Path) -> bool {
+    let Ok(output) = Command::new(command).arg("agent").arg("--probe").output() else {
         return false;
     };
     output.status.success()
@@ -1685,6 +1717,63 @@ mod tests {
         assert!(checked_agent_session_name("..").is_err());
         assert!(checked_agent_session_name("../x").is_err());
         assert_eq!(checked_agent_session_name("demo").unwrap(), "demo");
+    }
+
+    #[test]
+    fn hook_words_prefer_verified_launching_pentect_binary() {
+        let words = hook_words_with_passthrough(
+            Some(r"C:\repo\target\debug\pentect.exe".to_string()),
+            Path::new("pentect-agent"),
+            "codex",
+            Some("demo"),
+        );
+        assert_eq!(words[0], r"C:\repo\target\debug\pentect.exe");
+        assert_eq!(
+            words[1..].to_vec(),
+            vec![
+                "hook".to_string(),
+                "--capability".to_string(),
+                "codex".to_string(),
+                "--session".to_string(),
+                "demo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn hook_words_fall_back_to_agent_path_without_verified_passthrough() {
+        let agent = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("debug")
+            .join(if cfg!(windows) {
+                "pentect-agent.exe"
+            } else {
+                "pentect-agent"
+            });
+        let words = hook_words_with_passthrough(None, &agent, "codex", None);
+        assert_eq!(words[0], agent.to_string_lossy().as_ref());
+        assert_eq!(
+            words[1..].to_vec(),
+            vec![
+                "hook".to_string(),
+                "--capability".to_string(),
+                "codex".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn launched_agent_tools_export_agent_path_for_passthrough_hooks() {
+        let agent = Path::new(r"C:\repo\target\debug\pentect-agent.exe");
+        let mut cmd = Command::new("codex");
+        apply_agent_env(&mut cmd, agent);
+        let actual = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(actual, agent.as_os_str());
     }
 
     #[test]
