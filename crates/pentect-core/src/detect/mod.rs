@@ -11,6 +11,7 @@ mod pem;
 mod phone;
 mod rule;
 mod structural;
+mod url;
 mod util;
 mod validate;
 
@@ -24,6 +25,7 @@ pub use pem::PemDetector;
 pub use phone::PhoneDetector;
 pub use rule::{RuleDetector, RuleSpec};
 pub use structural::{EnvValueDetector, SensitiveKeyDetector, StructuralDetector};
+pub use url::UrlDetector;
 pub use validate::Validator;
 
 pub(crate) use util::is_token_byte;

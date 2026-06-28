@@ -20,6 +20,10 @@ pub mod labels {
     pub const BIP39_MNEMONIC: &str = "BIP39_MNEMONIC";
     /// Body of a PEM private-key block.
     pub const PRIVATE_KEY: &str = "PRIVATE_KEY";
+    /// Host/authority of an internal service URL.
+    pub const INTERNAL_ENDPOINT: &str = "INTERNAL_ENDPOINT";
+    /// Resource identifier inside an internal URL path.
+    pub const RESOURCE_ID: &str = "RESOURCE_ID";
 }
 
 /// Half-open byte range into the raw input, aligned to UTF-8 char boundaries.

@@ -43,9 +43,9 @@ pub struct Rendered {
 // Render granularity is shape-driven: a value that parses as an email splits its
 // local part and domain into separate hashes joined by a literal `@`, so
 // same-domain addresses still aggregate (a model can tell two users share an org
-// without seeing the addresses) — regardless of category. Everything else is one
-// opaque placeholder; we never keep value prefixes, so there is no separate
-// "whole vs hash-only" mode. Structured URL masking awaits a URL detector.
+// without seeing the addresses) — regardless of category. Other structured
+// values, such as internal URLs, are split by detectors before rendering. We
+// never keep value prefixes, so there is no separate "whole vs hash-only" mode.
 
 /// Split an email into (local, domain), or None unless it is a single-`@` address
 /// with a dotted, alphabetic-TLD domain — so a value that merely contains `@`

@@ -34,7 +34,7 @@ pub use codec::Codec;
 pub use detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, DecodeDetector, Detector, EntropyDetector,
     PatternMatchDetector, PatternSpec, PemDetector, RuleDetector, RuleSpec, SensitiveKeyDetector,
-    StructuralDetector,
+    StructuralDetector, UrlDetector,
 };
 pub use model::{ByteRange, Category, Confidence, Context, Input, Kind, Region, RegionKind, Span};
 pub use pack::{load_pack, Pack};

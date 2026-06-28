@@ -6,7 +6,7 @@ mod sweep;
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, DecodeDetector, Detector, EntropyDetector,
     EnvValueDetector, PemDetector, PhoneDetector, RuleDetector, SensitiveKeyDetector,
-    StructuralDetector,
+    StructuralDetector, UrlDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -374,6 +374,7 @@ impl EngineBuilder {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
             .parser(Kind::Har, Box::new(JsonParser))
+            .detector(Box::new(UrlDetector))
             .detector(Box::new(RuleDetector::builtin()))
             .detector(Box::new(AuthCodeDetector))
             .detector(Box::new(Bip39Detector))
@@ -717,6 +718,34 @@ mod tests {
         assert_eq!(v["headers"][0]["name"], "Authorization");
         assert_eq!(v["headers"][0]["value"], "Bearer abc123");
         assert!(v["password"].as_str().unwrap().starts_with("<<PASSWORD_"));
+    }
+
+    #[test]
+    fn internal_url_preserves_route_shape() {
+        let input = "see http://local.jira.corp/api/issues/1234 now";
+        let r = m(input);
+        assert!(
+            r.masked.contains("http://<<INTERNAL_ENDPOINT_"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            r.masked.contains("/api/issues/<<RESOURCE_ID_"),
+            "{}",
+            r.masked
+        );
+        assert!(!r.masked.contains("local.jira.corp"), "{}", r.masked);
+        assert!(!r.masked.contains("/1234"), "{}", r.masked);
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn external_url_still_masks_as_whole_url() {
+        let input = "see https://example.com/api/issues/1234 now";
+        let r = m(input);
+        assert!(r.masked.contains("<<URL_"), "{}", r.masked);
+        assert!(!r.masked.contains("example.com"), "{}", r.masked);
+        assert!(!r.masked.contains("/api/issues/1234"), "{}", r.masked);
     }
 
     #[test]
