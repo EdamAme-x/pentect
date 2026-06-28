@@ -1899,6 +1899,9 @@ fn handle_hook(
             }
         }
         HookPhase::AfterTool => {
+            let tool_name = hook_field(&input, &["tool_name"])
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
@@ -1907,7 +1910,7 @@ fn handle_hook(
             let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
             masker.flush()?;
             if changed {
-                Ok(after_tool_output(provider, updated))
+                Ok(after_tool_output(provider, tool_name, updated))
             } else {
                 Ok(json!({}))
             }
@@ -2385,7 +2388,7 @@ fn before_tool_block_output(provider: HookProvider, reason: &str) -> Value {
     }
 }
 
-fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
+fn after_tool_output(provider: HookProvider, tool_name: &str, updated_output: Value) -> Value {
     match provider {
         HookProvider::Claude => json!({
             "hookSpecificOutput": {
@@ -2393,14 +2396,14 @@ fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
                 "updatedToolOutput": updated_output
             }
         }),
-        HookProvider::Codex => json!({
-            "decision": "block",
-            "reason": stringify_tool_output(&updated_output),
+        HookProvider::Codex if is_mcp_tool_name(tool_name) => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": "Pentect replaced the original tool result with a masked version."
+                "updatedMCPToolOutput": updated_output,
+                "additionalContext": "Pentect replaced the original MCP tool result with a masked version."
             }
         }),
+        HookProvider::Codex => codex_blocking_after_tool_output(updated_output),
         HookProvider::Gemini => json!({
             "decision": "deny",
             "reason": stringify_tool_output(&updated_output),
@@ -2409,6 +2412,21 @@ fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
             }
         }),
     }
+}
+
+fn codex_blocking_after_tool_output(updated_output: Value) -> Value {
+    json!({
+        "decision": "block",
+        "reason": stringify_tool_output(&updated_output),
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "Pentect blocked the original tool result and returned a masked version."
+        }
+    })
+}
+
+fn is_mcp_tool_name(tool_name: &str) -> bool {
+    tool_name.starts_with("mcp__")
 }
 
 fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bool), String> {

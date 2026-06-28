@@ -1987,6 +1987,33 @@ fn codex_posttool_blocks_with_masked_feedback() {
 }
 
 #[test]
+fn codex_mcp_posttool_updates_output_without_blocking() {
+    let (root, session) = empty_session("hook-post-codex-mcp");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__node_repl__js",
+        "tool_response": {
+            "content": [{
+                "type": "text",
+                "text": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+            }],
+            "isError": false
+        }
+    });
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    assert!(output.get("decision").is_none(), "{output}");
+    let updated = &output["hookSpecificOutput"]["updatedMCPToolOutput"];
+    let text = updated["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("<<OPENAI_API_KEY_"), "{text}");
+    assert!(!text.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{text}");
+    assert_eq!(
+        output["hookSpecificOutput"]["hookEventName"].as_str(),
+        Some("PostToolUse")
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn gemini_beforetool_uses_tool_input_override() {
     let (root, session, masked) = masked_session("hook-before-gemini");
     let input = json!({
