@@ -1403,12 +1403,9 @@ mod tests {
 
     #[test]
     fn hook_words_use_pentect_agent_subcommand() {
-        let words = hook_words(
-            Path::new(r"C:\repo\target\debug\pentect.exe"),
-            "codex",
-            Some("demo"),
-        );
-        assert_eq!(words[0], r"C:\repo\target\debug\pentect.exe");
+        let pentect = absolute_pentect_fixture_path();
+        let words = hook_words(&pentect, "codex", Some("demo"));
+        assert_eq!(words[0], pentect.to_string_lossy().as_ref());
         assert_eq!(
             words[1..].to_vec(),
             vec![
@@ -1420,6 +1417,14 @@ mod tests {
                 "demo".to_string()
             ]
         );
+    }
+
+    fn absolute_pentect_fixture_path() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\repo\target\debug\pentect.exe")
+        } else {
+            PathBuf::from("/repo/target/debug/pentect")
+        }
     }
 
     #[test]

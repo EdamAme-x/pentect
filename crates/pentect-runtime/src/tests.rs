@@ -939,9 +939,7 @@ fn write_tool_refuses_masked_materialization_through_symlink_dir() {
     let session = Session::open_capability_at(&root, "t").unwrap();
     let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
     let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
-    drop(session);
 
-    let session = Session::open_capability_at(&root, "t").unwrap();
     let input = json!({
         "hook_event_name": "PreToolUse",
         "tool_name": "Write",
