@@ -1481,13 +1481,13 @@ fn codex_posttool_masks_pentect_exec_with_trailing_shell_escape() {
 }
 
 #[test]
-fn exec_tool_output_discloses_readable_coarse_opaque_length() {
+fn exec_tool_output_discloses_readable_exact_length() {
     let (root, session) = empty_session("exec-readable-length");
     let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
     let masked = mask_tool_output(&session, &format!("payload={blob}\n")).unwrap();
     assert!(!masked.contains(blob), "{masked}");
     assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
-    assert!(masked.contains("_length_at_least_24_chars>>"), "{masked}");
+    assert!(masked.contains("_length_29_chars>>"), "{masked}");
     assert!(!masked.contains("_len24"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2225,6 +2225,16 @@ fn pentect_env_name_for_handle(handle: &str) -> String {
             prefix
         }
         _ => inner,
+    };
+    let core = match core.rsplit_once("_length_") {
+        Some((prefix, suffix))
+            if suffix
+                .strip_suffix("_chars")
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            prefix
+        }
+        _ => core,
     };
     let core = match core.rsplit_once("_len") {
         Some((prefix, suffix)) if suffix.bytes().all(|b| b.is_ascii_digit()) => prefix,

@@ -515,6 +515,16 @@ fn placeholder_core(value: &str) -> Option<&str> {
         }
         _ => inner,
     };
+    let inner = match inner.rsplit_once("_length_") {
+        Some((prefix, suffix))
+            if suffix
+                .strip_suffix("_chars")
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            prefix
+        }
+        _ => inner,
+    };
     let inner = match inner.rsplit_once("_len") {
         Some((prefix, suffix)) if suffix.bytes().all(|b| b.is_ascii_digit()) => prefix,
         _ => inner,

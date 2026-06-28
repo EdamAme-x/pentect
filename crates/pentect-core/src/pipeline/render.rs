@@ -1,7 +1,6 @@
 use crate::model::*;
 use crate::normalize::n_id;
-use crate::placeholder::{approx_length, identity_hash, render_placeholder};
-use crate::policy::is_context_free;
+use crate::placeholder::{identity_hash, render_placeholder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -66,9 +65,8 @@ fn split_email(v: &str) -> Option<(&str, &str)> {
 }
 
 /// Replace each span with a placeholder. Same identity yields the same
-/// placeholder, keeping the whole document consistent. Length is disclosed only
-/// when opted in, and only for context-free opaque blobs (LIKELY_SECRET /
-/// OPAQUE_BLOB) — never for typed credentials, whose length is sensitive.
+/// placeholder, keeping the whole document consistent. Exact character length is
+/// disclosed only when opted in.
 pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: bool) -> Rendered {
     spans.sort_by_key(|s| s.range.start);
     let mut segments: Vec<RenderSegment> =
@@ -91,13 +89,15 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
             // Mask each side under the same label; the `@` stays literal so
             // restore reconstructs the address from the two mappings.
             Some((local, domain)) => {
+                let local_len = disclose_length.then(|| local.chars().count() as u32);
+                let domain_len = disclose_length.then(|| domain.chars().count() as u32);
                 push_masked(
                     &mut segments,
                     &mut masked,
                     key,
                     s,
                     local,
-                    None,
+                    local_len,
                     &mut map,
                     &mut placeholder_cache,
                     &mut collisions,
@@ -109,15 +109,15 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                     key,
                     s,
                     domain,
-                    None,
+                    domain_len,
                     &mut map,
                     &mut placeholder_cache,
                     &mut collisions,
                 );
             }
             None => {
-                let len = if disclose_length && is_context_free(s) {
-                    approx_length(val.chars().count())
+                let len = if disclose_length {
+                    Some(val.chars().count() as u32)
                 } else {
                     None
                 };

@@ -17,19 +17,21 @@ pub struct PlaceholderParts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LengthHint {
+    ExactChars(u32),
     AtLeastChars(u32),
     LegacyLen(u32),
 }
 
 impl LengthHint {
-    pub fn floor_chars(self) -> u32 {
+    pub fn chars(self) -> u32 {
         match self {
-            LengthHint::AtLeastChars(n) | LengthHint::LegacyLen(n) => n,
+            LengthHint::ExactChars(n) | LengthHint::AtLeastChars(n) | LengthHint::LegacyLen(n) => n,
         }
     }
 
     pub fn short(self) -> String {
         match self {
+            LengthHint::ExactChars(n) => n.to_string(),
             LengthHint::AtLeastChars(n) => format!("{n}+"),
             LengthHint::LegacyLen(n) => n.to_string(),
         }
@@ -49,19 +51,13 @@ pub fn identity_hash(key: &[u8; 32], n_id_value: &str) -> String {
     s
 }
 
-/// Length buckets for opt-in disclosure. Three fixed floors so only three values
-/// are ever emitted and the exact length is never revealed.
-const BUCKET_MED: usize = 24;
-const BUCKET_LONG: usize = 64;
-const BUCKET_XLONG: usize = 512;
-
-/// `<<LABEL_HASH>>`, or `<<LABEL_HASH_length_at_least_N_chars>>` when a length
-/// bucket is given. The suffix is deliberately verbose: it is still made of
-/// shell/env-safe identifier characters, but an AI can read the meaning without
-/// learning a project-specific abbreviation.
-pub fn render_placeholder(label: &str, hash: &str, bucket: Option<u32>) -> String {
-    match bucket {
-        Some(n) => format!("<<{label}_{hash}_length_at_least_{n}_chars>>"),
+/// `<<LABEL_HASH>>`, or `<<LABEL_HASH_length_N_chars>>` when exact length is
+/// disclosed. The suffix is deliberately verbose: it is still made of
+/// shell/env-safe identifier characters, but an AI can read it without learning
+/// a project-specific abbreviation.
+pub fn render_placeholder(label: &str, hash: &str, char_len: Option<u32>) -> String {
+    match char_len {
+        Some(n) => format!("<<{label}_{hash}_length_{n}_chars>>"),
         None => format!("<<{label}_{hash}>>"),
     }
 }
@@ -101,6 +97,12 @@ fn split_length_hint(inner: &str) -> Result<(&str, Option<LengthHint>), String> 
             return Err("placeholder length hint is malformed".to_string());
         };
         return Ok((prefix, Some(LengthHint::AtLeastChars(parse_u32(raw_n)?))));
+    }
+    if let Some((prefix, suffix)) = inner.rsplit_once("_length_") {
+        let Some(raw_n) = suffix.strip_suffix("_chars") else {
+            return Err("placeholder length hint is malformed".to_string());
+        };
+        return Ok((prefix, Some(LengthHint::ExactChars(parse_u32(raw_n)?))));
     }
     if let Some((prefix, raw_n)) = inner.rsplit_once("_len") {
         if !raw_n.is_empty() && raw_n.bytes().all(|b| b.is_ascii_digit()) {
@@ -147,20 +149,6 @@ fn parse_u32(value: &str) -> Result<u32, String> {
         .map_err(|_| "placeholder length hint is malformed".to_string())
 }
 
-/// Coarse length bucket for opaque blobs, opt-in. Returns the floor of one of
-/// three buckets (24/64/512), so the value reads as "at least N chars" but the
-/// exact length never leaks (only three possible outputs). Below BUCKET_MED
-/// nothing is disclosed. Emits the legible floor (not ~med/~long) so a model
-/// understands it.
-pub fn approx_length(char_len: usize) -> Option<u32> {
-    match char_len {
-        n if n >= BUCKET_XLONG => Some(BUCKET_XLONG as u32),
-        n if n >= BUCKET_LONG => Some(BUCKET_LONG as u32),
-        n if n >= BUCKET_MED => Some(BUCKET_MED as u32),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,22 +177,25 @@ mod tests {
         );
         assert_eq!(
             render_placeholder("X", "abc", Some(24)),
-            "<<X_abc_length_at_least_24_chars>>"
+            "<<X_abc_length_24_chars>>"
         );
     }
 
     #[test]
     fn placeholder_parse_splits_public_parts_without_recovery() {
         let parts =
-            parse_placeholder("<<OPENAI_API_KEY_0123456789abcdef_length_at_least_64_chars>>")
-                .unwrap();
+            parse_placeholder("<<OPENAI_API_KEY_0123456789abcdef_length_64_chars>>").unwrap();
         assert_eq!(parts.label, "OPENAI_API_KEY");
         assert_eq!(parts.hash, "0123456789abcdef");
-        assert_eq!(parts.length_hint, Some(LengthHint::AtLeastChars(64)));
+        assert_eq!(parts.length_hint, Some(LengthHint::ExactChars(64)));
         assert_eq!(
             parts.handle,
-            "<<OPENAI_API_KEY_0123456789abcdef_length_at_least_64_chars>>"
+            "<<OPENAI_API_KEY_0123456789abcdef_length_64_chars>>"
         );
+
+        let old = parse_placeholder("<<OPENAI_API_KEY_0123456789abcdef_length_at_least_64_chars>>")
+            .unwrap();
+        assert_eq!(old.length_hint, Some(LengthHint::AtLeastChars(64)));
 
         let env = parse_placeholder("PENTECT_TOKEN_0123456789abcdef_len24").unwrap();
         assert_eq!(env.label, "TOKEN");
@@ -217,16 +208,7 @@ mod tests {
         assert!(parse_placeholder("<<openai_0123456789abcdef>>").is_err());
         assert!(parse_placeholder("<<OPENAI_0123456789ABCDEf>>").is_err());
         assert!(parse_placeholder("OPENAI_short").is_err());
+        assert!(parse_placeholder("<<OPENAI_0123456789abcdef_length_x_chars>>").is_err());
         assert!(parse_placeholder("<<OPENAI_0123456789abcdef_length_at_least_x_chars>>").is_err());
-    }
-
-    #[test]
-    fn approx_length_is_three_coarse_buckets() {
-        assert_eq!(approx_length(23), None);
-        assert_eq!(approx_length(24), Some(24));
-        assert_eq!(approx_length(63), Some(24));
-        assert_eq!(approx_length(64), Some(64));
-        assert_eq!(approx_length(511), Some(64));
-        assert_eq!(approx_length(512), Some(512));
     }
 }

@@ -30,7 +30,7 @@ use sweep::identity_sweep;
 pub struct Config {
     pub key: [u8; 32],
     pub locale: String,
-    /// Opt-in coarse length disclosure for opaque blobs (off by default).
+    /// Opt-in exact length disclosure (off by default).
     pub disclose_length: bool,
 }
 
@@ -436,7 +436,7 @@ static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
     // what we emit.
     let w = crate::placeholder::HASH_HEX_WIDTH;
     Regex::new(&format!(
-        r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{{{w}}}(?:_(?:len[0-9]+|length_at_least_[0-9]+_chars))?>>"
+        r"<<[A-Z][A-Z0-9_]*_[0-9a-f]{{{w}}}(?:_(?:len[0-9]+|length_[0-9]+_chars|length_at_least_[0-9]+_chars))?>>"
     ))
     .expect("placeholder regex compiles")
 });
@@ -565,8 +565,8 @@ mod tests {
     }
 
     #[test]
-    fn opt_in_length_for_opaque_only() {
-        let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh"; // ~29 chars, high entropy
+    fn opt_in_exact_length() {
+        let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
         let input = format!("blob {blob} end");
         let on = Config {
             disclose_length: true,
@@ -580,14 +580,14 @@ mod tests {
             &on,
         );
         assert!(
-            r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_length_at_least_24_chars"),
+            r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_length_29_chars"),
             "{}",
             r.masked
         );
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
 
         let r2 = m(&input);
-        assert!(!r2.masked.contains("_length_at_least_"), "{}", r2.masked);
+        assert!(!r2.masked.contains("_length_"), "{}", r2.masked);
     }
 
     #[test]
@@ -603,7 +603,7 @@ mod tests {
         };
         let r = Engine::with_profile(Profile::Strict).mask(Input::text(&input), &on);
         assert!(
-            r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_length_at_least_24_chars"),
+            r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_length_32_chars"),
             "{}",
             r.masked
         );
