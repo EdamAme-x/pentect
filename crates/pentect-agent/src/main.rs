@@ -1988,6 +1988,7 @@ fn maybe_materialize_masked_write(
         return Ok(None);
     }
     let path = checked_materialize_path(path)?;
+    ensure_materialize_path_within_cwd(&path)?;
     match approval_decision_for_materialized_write(session_name, &path, content, &resolved)? {
         ApprovalDecision::Once | ApprovalDecision::Always => {}
         ApprovalDecision::Decline => {
@@ -2118,10 +2119,22 @@ fn ensure_materialize_path_within_cwd(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("could not read current directory: {e}"))?
         .canonicalize()
         .map_err(|e| format!("could not canonicalize current directory: {e}"))?;
-    let parent = path
+    let mut parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    while !parent.exists() {
+        let Some(next) = parent.parent() else {
+            parent = PathBuf::from(".");
+            break;
+        };
+        if next.as_os_str().is_empty() {
+            parent = PathBuf::from(".");
+            break;
+        }
+        parent = next.to_path_buf();
+    }
     let parent = parent
         .canonicalize()
         .map_err(|e| format!("could not canonicalize '{}': {e}", parent.display()))?;
