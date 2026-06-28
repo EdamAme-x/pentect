@@ -12,7 +12,7 @@ mod masking;
 mod session;
 mod shell;
 
-use approval::{ticket_summary, ApprovalQueue, ApprovalTicket};
+use approval::{ticket_summary, ApprovalQueue, ApprovalTicket, ApprovalTicketDraft};
 use approve_ui::{ApprovalDecision, ApprovalRequest};
 use masking::{
     contains_unresolved_masked_handle, is_ascii_word_char, is_env_name_byte, is_sensitive_env_name,
@@ -25,8 +25,7 @@ use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
 use sha2::{Digest, Sha256};
 use shell::{
-    command_available, next_shell_word, powershell_command, powershell_word, shell_command,
-    shell_quote_unix,
+    next_shell_word, powershell_command, powershell_word, shell_command, shell_quote_unix,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -392,16 +391,28 @@ fn resolve_approval_ticket(paths: &[PathBuf]) -> ApprovalTicket {
     let mut material = String::from("resolve-materialize-v1\0");
     material.push_str(&command);
     material.push('\0');
+    for path in paths {
+        material.push_str(&path.to_string_lossy());
+        material.push('\0');
+        if let Ok(input) = read_input(path, InputFormat::Text) {
+            material.push_str(&secret_value_hash(&input));
+        }
+        material.push('\0');
+    }
     let digest = Sha256::digest(material.as_bytes());
-    ApprovalTicket::new(
-        data_encoding::HEXLOWER.encode(&digest[..16]),
+    ApprovalTicket::new(ApprovalTicketDraft {
+        fingerprint: data_encoding::HEXLOWER.encode(&digest[..16]),
         command,
-        Vec::new(),
-        0,
-        Vec::new(),
-        false,
-        true,
-    )
+        env_names: Vec::new(),
+        secret_files: paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect(),
+        direct_handles: 0,
+        destinations: Vec::new(),
+        network_like: false,
+        materialize_like: true,
+    })
 }
 
 fn resolve_stdin_approval_ticket(input: &str) -> ApprovalTicket {
@@ -410,15 +421,16 @@ fn resolve_stdin_approval_ticket(input: &str) -> ApprovalTicket {
     material.push_str(&secret_value_hash(input));
     material.push('\0');
     let digest = Sha256::digest(material.as_bytes());
-    ApprovalTicket::new(
-        data_encoding::HEXLOWER.encode(&digest[..16]),
+    ApprovalTicket::new(ApprovalTicketDraft {
+        fingerprint: data_encoding::HEXLOWER.encode(&digest[..16]),
         command,
-        Vec::new(),
-        masked_handles_in_text(input).len(),
-        Vec::new(),
-        false,
-        true,
-    )
+        env_names: Vec::new(),
+        secret_files: Vec::new(),
+        direct_handles: masked_handles_in_text(input).len(),
+        destinations: Vec::new(),
+        network_like: false,
+        materialize_like: true,
+    })
 }
 
 fn shell_quote_path(path: &Path) -> String {
@@ -549,6 +561,9 @@ fn approval_warnings(
     if opts.live {
         warnings.push("live output is masked in chunks".to_string());
     }
+    if !approval.secret_files.is_empty() {
+        warnings.push("this command can read local secret file content".to_string());
+    }
     if approval.network_like && approval.requires_approval() {
         warnings.push("this command may send approved capabilities to the network".to_string());
     }
@@ -594,6 +609,7 @@ fn ticket_warnings(ticket: &ApprovalTicket) -> Vec<String> {
 struct ExecApproval {
     command: String,
     env_refs: Vec<EnvApprovalRef>,
+    secret_files: Vec<SecretFileRef>,
     direct_handles: Vec<String>,
     destinations: Vec<String>,
     network_like: bool,
@@ -605,9 +621,18 @@ struct EnvApprovalRef {
     value_hash: String,
 }
 
+#[derive(Debug)]
+struct SecretFileRef {
+    path: String,
+    value_hashes: Vec<String>,
+}
+
 impl ExecApproval {
     fn requires_approval(&self) -> bool {
-        !self.env_refs.is_empty() || !self.direct_handles.is_empty() || self.network_like
+        !self.env_refs.is_empty()
+            || !self.secret_files.is_empty()
+            || !self.direct_handles.is_empty()
+            || self.network_like
     }
 
     fn env_names(&self) -> Vec<String> {
@@ -624,6 +649,15 @@ impl ExecApproval {
             material.push('\0');
             material.push_str(&env.value_hash);
             material.push('\0');
+        }
+        material.push_str("files:");
+        for file in &self.secret_files {
+            material.push_str(&file.path);
+            material.push('\0');
+            for hash in &file.value_hashes {
+                material.push_str(hash);
+                material.push('\0');
+            }
         }
         material.push_str("handles:");
         for handle in &self.direct_handles {
@@ -642,6 +676,16 @@ impl ExecApproval {
             if !env_names.is_empty() {
                 lines.push(format!("secret {}", env_names.join(", ")));
             }
+            if !self.secret_files.is_empty() {
+                lines.push(format!(
+                    "file {}",
+                    self.secret_files
+                        .iter()
+                        .map(|file| file.path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             if !self.direct_handles.is_empty() {
                 lines.push(format!("handles {}", self.direct_handles.len()));
             }
@@ -658,15 +702,20 @@ impl ExecApproval {
     }
 
     fn ticket(&self) -> ApprovalTicket {
-        ApprovalTicket::new(
-            self.fingerprint(),
-            self.command.clone(),
-            self.env_names(),
-            self.direct_handles.len(),
-            self.destinations.clone(),
-            self.network_like,
-            false,
-        )
+        ApprovalTicket::new(ApprovalTicketDraft {
+            fingerprint: self.fingerprint(),
+            command: self.command.clone(),
+            env_names: self.env_names(),
+            secret_files: self
+                .secret_files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect(),
+            direct_handles: self.direct_handles.len(),
+            destinations: self.destinations.clone(),
+            network_like: self.network_like,
+            materialize_like: false,
+        })
     }
 }
 
@@ -682,12 +731,14 @@ fn exec_approval(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExecApproval,
         .collect::<Vec<_>>();
     env_refs.sort_by_key(|env| env.name.to_ascii_lowercase());
     env_refs.dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name));
+    let secret_files = secret_file_refs_for_mode(store, &opts.mode)?;
     let direct_handles = masked_handles_in_mode(&opts.mode);
     let destinations = network_destinations(&command);
     let network_like = !destinations.is_empty() || command_looks_network_like(&command);
     Ok(ExecApproval {
         command,
         env_refs,
+        secret_files,
         direct_handles,
         destinations,
         network_like,
@@ -707,6 +758,52 @@ fn prepare_exec_capabilities(store: &RecoveryStore, opts: &ExecOpts) -> Result<(
         register_local_file_inputs(store, &command)?;
     }
     Ok(())
+}
+
+fn secret_file_refs_for_mode(
+    store: &RecoveryStore,
+    mode: &ExecMode,
+) -> Result<Vec<SecretFileRef>, String> {
+    let ExecMode::Shell(command) = mode else {
+        return Ok(Vec::new());
+    };
+    let command = resolve_command_text(store, command)?;
+    secret_file_refs_for_script(&command)
+}
+
+fn secret_file_refs_for_script(script: &str) -> Result<Vec<SecretFileRef>, String> {
+    let mut refs = Vec::new();
+    let mut seen = BTreeSet::new();
+    let engine = Engine::with_profile(Profile::Strict);
+    let cfg = Config::generate();
+    for path in local_file_input_paths(script) {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(input) = read_input(&path, InputFormat::Text) else {
+            continue;
+        };
+        let value_hash = secret_value_hash(&input);
+        let result = engine.mask(
+            Input {
+                kind: infer_kind(&path),
+                data: input,
+            },
+            &cfg,
+        );
+        if result.recovery.is_empty() {
+            continue;
+        }
+        let display = path.to_string_lossy().to_string();
+        if !seen.insert(display.clone()) {
+            continue;
+        }
+        refs.push(SecretFileRef {
+            path: display,
+            value_hashes: vec![value_hash],
+        });
+    }
+    Ok(refs)
 }
 
 fn secret_value_hash(value: &str) -> String {
@@ -1435,14 +1532,29 @@ fn live_status(message: &str) {
 
 #[cfg(windows)]
 fn shell_script_command() -> Command {
-    let mut cmd = Command::new("powershell");
+    let shell = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("powershell"));
+    let mut cmd = Command::new(shell);
     cmd.arg("-NoProfile").arg("-Command").arg("-");
     cmd
 }
 
 #[cfg(not(windows))]
 fn shell_script_command() -> Command {
-    let mut cmd = Command::new("sh");
+    let shell = if Path::new("/bin/sh").is_file() {
+        PathBuf::from("/bin/sh")
+    } else {
+        PathBuf::from("sh")
+    };
+    let mut cmd = Command::new(shell);
     cmd.arg("-s");
     cmd
 }
@@ -1820,28 +1932,21 @@ fn before_tool_updated_input(
     if is_read_like_tool_name(tool_name) {
         return Err(read_tool_block_reason(tool_name));
     }
-    if let Some(reason) = maybe_materialize_masked_write(session, tool_name, tool_input)? {
+    if let Some(reason) =
+        maybe_materialize_masked_write(session_name, session, tool_name, tool_input)?
+    {
         return Err(reason);
     }
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
         if let Some(reason) = pentect_human_only_command_reason(command) {
             return Err(reason);
         }
-        let (command, changed_by_canonicalization) = canonical_hook_shell_command(command)?;
-        if !changed_by_canonicalization && is_pentect_exec_program_command(&command) {
-            return Ok((tool_input.clone(), false));
-        }
+        let command = canonical_hook_shell_command(command)?;
         let mut updated = tool_input.clone();
         if let Some(object) = updated.as_object_mut() {
-            let should_wrap =
-                changed_by_canonicalization || !is_pentect_exec_program_command(&command);
             object.insert(
                 "command".to_string(),
-                Value::String(if should_wrap {
-                    wrap_shell_command(provider, session_name, &command)?
-                } else {
-                    command
-                }),
+                Value::String(wrap_shell_command(provider, session_name, &command)?),
             );
             return Ok((updated, true));
         }
@@ -1849,25 +1954,21 @@ fn before_tool_updated_input(
     Ok((tool_input.clone(), false))
 }
 
-fn canonical_hook_shell_command(command: &str) -> Result<(String, bool), String> {
+fn canonical_hook_shell_command(command: &str) -> Result<String, String> {
     let mut command = command.to_string();
-    let mut changed = false;
     loop {
         if let Some(reason) = pentect_human_only_command_reason(&command) {
             return Err(reason);
         }
-        if is_pentect_exec_program_command(&command) {
-            return Ok((command, changed));
-        }
         let Some(payload) = extract_pentect_exec_shell_payload(&command) else {
-            return Ok((command, changed));
+            return Ok(command);
         };
         command = payload;
-        changed = true;
     }
 }
 
 fn maybe_materialize_masked_write(
+    session_name: &str,
     session: &Session,
     tool_name: &str,
     tool_input: &Value,
@@ -1887,11 +1988,54 @@ fn maybe_materialize_masked_write(
         return Ok(None);
     }
     let path = checked_materialize_path(path)?;
+    match approval_decision_for_materialized_write(session_name, &path, content, &resolved)? {
+        ApprovalDecision::Once | ApprovalDecision::Always => {}
+        ApprovalDecision::Decline => {
+            return Err("Pentect declined masked file materialization".into())
+        }
+    }
     materialize_file(&path, &resolved)?;
     Ok(Some(format!(
         "Pentect wrote resolved masked content to '{}' locally. The original Write tool was blocked so plaintext never returns to the AI; treat this as success and do not retry.",
         path.display()
     )))
+}
+
+fn approval_decision_for_materialized_write(
+    session: &str,
+    path: &Path,
+    masked_content: &str,
+    resolved_content: &str,
+) -> Result<ApprovalDecision, String> {
+    let ticket = materialized_write_approval_ticket(path, masked_content, resolved_content);
+    if ApprovalQueue::open(session)?.always_granted(&ticket.fingerprint) {
+        return Ok(ApprovalDecision::Always);
+    }
+    approval_decision_for_ticket(session, &ticket)
+}
+
+fn materialized_write_approval_ticket(
+    path: &Path,
+    masked_content: &str,
+    resolved_content: &str,
+) -> ApprovalTicket {
+    let command = format!("write {}", shell_quote_path(path));
+    let mut material = String::from("write-materialize-v1\0");
+    material.push_str(&path.to_string_lossy());
+    material.push('\0');
+    material.push_str(&secret_value_hash(resolved_content));
+    material.push('\0');
+    let digest = Sha256::digest(material.as_bytes());
+    ApprovalTicket::new(ApprovalTicketDraft {
+        fingerprint: data_encoding::HEXLOWER.encode(&digest[..16]),
+        command,
+        env_names: Vec::new(),
+        secret_files: vec![path.to_string_lossy().to_string()],
+        direct_handles: masked_handles_in_text(masked_content).len(),
+        destinations: Vec::new(),
+        network_like: false,
+        materialize_like: true,
+    })
 }
 
 fn is_write_like_tool_name(tool_name: &str) -> bool {
@@ -1994,64 +2138,14 @@ fn ensure_materialize_path_within_cwd(path: &Path) -> Result<(), String> {
 }
 
 fn is_read_like_tool_name(tool_name: &str) -> bool {
+    let normalized = tool_name.to_ascii_lowercase().replace('-', "_");
     matches!(
-        tool_name.to_ascii_lowercase().as_str(),
+        normalized.as_str(),
         "read" | "read_file" | "read_many_files" | "multiread" | "notebookread" | "notebook_read"
-    )
-}
-
-fn is_pentect_exec_program_command(command: &str) -> bool {
-    matches!(
-        parse_pentect_subcommand(command),
-        Some(PentectInvocation {
-            subcommand: PentectSubcommand::Exec,
-            rest
-        }) if !contains_unquoted_shell_control(rest) && pentect_exec_rest_is_passthrough(rest)
-    )
-}
-
-fn pentect_exec_rest_is_passthrough(rest: &str) -> bool {
-    let mut rest = rest.trim_start();
-    let mut saw_runtime_flag = false;
-    loop {
-        let Some((word, _, word_end)) = next_shell_word(rest, 0) else {
-            return saw_runtime_flag;
-        };
-        match word.as_str() {
-            "--session" => {
-                let Some((_, _, value_end)) = next_shell_word(rest, word_end) else {
-                    return false;
-                };
-                rest = rest[value_end..].trim_start();
-            }
-            "--live" | "--approve" => {
-                saw_runtime_flag = true;
-                rest = rest[word_end..].trim_start();
-            }
-            "--" => return true,
-            "--shell" => return false,
-            flag if flag.starts_with("--") => return false,
-            _ => return saw_runtime_flag,
-        }
-    }
-}
-
-fn contains_unquoted_shell_control(text: &str) -> bool {
-    let mut quote = None;
-    for ch in text.chars() {
-        if let Some(q) = quote {
-            if ch == q {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' => quote = Some(ch),
-            ';' | '|' | '&' | '\n' | '\r' => return true,
-            _ => {}
-        }
-    }
-    false
+    ) || normalized.ends_with("__read_file")
+        || normalized.ends_with("_read_file")
+        || normalized.ends_with("__read_many_files")
+        || normalized.ends_with("_read_many_files")
 }
 
 fn extract_pentect_exec_shell_payload(command: &str) -> Option<String> {
@@ -2187,18 +2281,6 @@ fn wrap_shell_command(
 }
 
 fn agent_exec_words(session_name: &str, masked_command: &str) -> Result<Vec<String>, String> {
-    if pentect_agent_passthrough_available() {
-        let mut words = vec!["pentect".to_string(), "exec".to_string()];
-        add_non_default_session(&mut words, session_name);
-        words.push(masked_command.to_string());
-        return Ok(words);
-    }
-    if command_available("pentect-agent") {
-        let mut words = vec!["pentect-agent".to_string(), "exec".to_string()];
-        add_non_default_session(&mut words, session_name);
-        words.push(masked_command.to_string());
-        return Ok(words);
-    }
     let agent = std::env::current_exe()
         .map_err(|e| format!("could not resolve pentect-agent executable: {e}"))?;
     let mut words = vec![agent.to_string_lossy().into_owned(), "exec".to_string()];
@@ -2217,14 +2299,6 @@ fn add_non_default_session(words: &mut Vec<String>, session_name: &str) {
 fn should_emit_session_arg(session_name: &str) -> bool {
     session_name != DEFAULT_SESSION
         && !default_session_name().is_ok_and(|default| default == session_name)
-}
-
-fn pentect_agent_passthrough_available() -> bool {
-    let Ok(output) = Command::new("pentect").arg("agent").arg("--probe").output() else {
-        return false;
-    };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout).trim() == "pentect-agent-passthrough"
 }
 
 fn hook_phase(provider: HookProvider, input: &Value) -> HookPhase {

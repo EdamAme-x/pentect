@@ -169,9 +169,12 @@ pub(crate) fn load_packs_from_specs(
         let display = path.display();
         let src = std::fs::read_to_string(&path)
             .with_context(|| format!("could not read extension pack '{display}'"))?;
-        packs.push(
-            load_pack(&src).map_err(|e| anyhow!("extension pack '{display}' is invalid: {e}"))?,
-        );
+        let pack =
+            load_pack(&src).map_err(|e| anyhow!("extension pack '{display}' is invalid: {e}"))?;
+        if !pack.disable.is_empty() {
+            bail!("extension pack '{display}' may add detectors but must not disable built-ins");
+        }
+        packs.push(pack);
     }
     Ok(packs)
 }
@@ -279,6 +282,12 @@ fn extensions_root() -> PathBuf {
 
 fn validate_extension_spec(spec: &str) -> Result<()> {
     if is_path_spec(spec) {
+        if Path::new(spec)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("extension paths must not contain '..': {spec}");
+        }
         return Ok(());
     }
     validate_extension_name(spec)
@@ -343,8 +352,8 @@ mod tests {
             parse_extension_value("openai-privacy-filter,local.rules,./rules.toml").unwrap(),
             vec!["openai-privacy-filter", "local.rules", "./rules.toml"]
         );
-        assert!(parse_extension_value("../x.toml").is_ok());
-        assert!(parse_extension_value("../x").is_ok());
+        assert!(parse_extension_value("../x.toml").is_err());
+        assert!(parse_extension_value("../x").is_err());
         assert!(parse_extension_value("").is_err());
     }
 

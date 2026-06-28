@@ -9,6 +9,7 @@ use std::io::Read;
 /// Shortest run worth attempting to decode (below this it's rarely an encoded
 /// secret and the codec false-positive rate climbs).
 const MIN_DECODE_RUN: usize = 16;
+const MAX_DECODE_RUN: usize = 256 * 1024;
 /// Default nesting limit for decode/decompress recursion (e.g. base64(gzip(..))).
 /// Deep enough for real multi-wrap payloads, bounded so crafted nesting can't fan
 /// out unboundedly.
@@ -193,6 +194,9 @@ impl Detector for DecodeDetector {
         let mut out = Vec::new();
         for (start, end) in token_runs(s) {
             if end - start < MIN_DECODE_RUN {
+                continue;
+            }
+            if end - start > MAX_DECODE_RUN {
                 continue;
             }
             let run = &s[start..end];

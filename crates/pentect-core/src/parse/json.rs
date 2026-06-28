@@ -30,7 +30,7 @@ fn parse_json_regions_with(raw: &str, mode: JsonRegionMode) -> Option<Vec<Region
         p.i = 3;
     }
     p.skip_ws();
-    p.value(None, 0)?;
+    p.value(None, Vec::new(), 0)?;
     p.skip_ws();
     if p.i != p.b.len() {
         return None;
@@ -66,14 +66,14 @@ impl Parser<'_> {
         }
     }
 
-    fn value(&mut self, key: Option<String>, depth: usize) -> Option<()> {
+    fn value(&mut self, key: Option<String>, hints: Vec<String>, depth: usize) -> Option<()> {
         if depth > MAX_DEPTH {
             return None;
         }
         self.skip_ws();
         match self.peek()? {
             b'{' => self.object(depth + 1),
-            b'[' => self.array(key, depth + 1),
+            b'[' => self.array(key, hints, depth + 1),
             b'"' => {
                 let (range, _) = self.string()?;
                 self.out.push(Region {
@@ -81,7 +81,7 @@ impl Parser<'_> {
                     ctx: Context {
                         path: None,
                         key,
-                        hints: Vec::new(),
+                        hints,
                         kind: RegionKind::JsonValue,
                         format: self.format(),
                     },
@@ -102,6 +102,7 @@ impl Parser<'_> {
             self.i += 1;
             return Some(());
         }
+        let mut sibling_name: Option<String> = None;
         loop {
             self.skip_ws();
             if self.peek() != Some(b'"') {
@@ -125,7 +126,28 @@ impl Parser<'_> {
                 return None;
             }
             self.i += 1;
-            self.value(Some(key), depth)?;
+            self.skip_ws();
+            if key.eq_ignore_ascii_case("name") && self.peek() == Some(b'"') {
+                let (range, value) = self.string()?;
+                sibling_name = Some(value);
+                self.out.push(Region {
+                    span: range,
+                    ctx: Context {
+                        path: None,
+                        key: Some(key),
+                        hints: Vec::new(),
+                        kind: RegionKind::JsonValue,
+                        format: self.format(),
+                    },
+                });
+            } else {
+                let hints = if key.eq_ignore_ascii_case("value") {
+                    sibling_name.iter().cloned().collect()
+                } else {
+                    Vec::new()
+                };
+                self.value(Some(key), hints, depth)?;
+            }
             self.skip_ws();
             match self.peek()? {
                 b',' => self.i += 1,
@@ -138,7 +160,7 @@ impl Parser<'_> {
         }
     }
 
-    fn array(&mut self, key: Option<String>, depth: usize) -> Option<()> {
+    fn array(&mut self, key: Option<String>, hints: Vec<String>, depth: usize) -> Option<()> {
         self.i += 1; // '['
         self.skip_ws();
         if self.peek() == Some(b']') {
@@ -147,7 +169,7 @@ impl Parser<'_> {
         }
         loop {
             // Array elements inherit the array's key as their context.
-            self.value(key.clone(), depth)?;
+            self.value(key.clone(), hints.clone(), depth)?;
             self.skip_ws();
             match self.peek()? {
                 b',' => self.i += 1,
@@ -172,7 +194,8 @@ impl Parser<'_> {
                 b'"' => {
                     let end = self.i;
                     self.i += 1; // closing quote
-                    let text = std::str::from_utf8(&self.b[start..end]).ok()?.to_string();
+                    let raw = std::str::from_utf8(&self.b[start..end]).ok()?;
+                    let text = decode_json_string(raw)?;
                     return Some((ByteRange::new(start, end), text));
                 }
                 b'\\' => self.skip_escape()?,
@@ -231,6 +254,56 @@ impl Parser<'_> {
     }
 }
 
+fn decode_json_string(raw: &str) -> Option<String> {
+    if !raw.as_bytes().contains(&b'\\') {
+        return Some(raw.to_string());
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let mut value = 0u32;
+                for _ in 0..4 {
+                    value = value.checked_mul(16)?;
+                    value += chars.next()?.to_digit(16)?;
+                }
+                if (0xd800..=0xdbff).contains(&value) {
+                    if chars.next()? != '\\' || chars.next()? != 'u' {
+                        return None;
+                    }
+                    let mut low = 0u32;
+                    for _ in 0..4 {
+                        low = low.checked_mul(16)?;
+                        low += chars.next()?.to_digit(16)?;
+                    }
+                    if !(0xdc00..=0xdfff).contains(&low) {
+                        return None;
+                    }
+                    let scalar = 0x10000 + ((value - 0xd800) << 10) + (low - 0xdc00);
+                    out.push(char::from_u32(scalar)?);
+                } else {
+                    out.push(char::from_u32(value)?);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +328,27 @@ mod tests {
         let regions = parse_json_regions(raw).unwrap();
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].ctx.key.as_deref(), Some("password"));
+    }
+
+    #[test]
+    fn escaped_keys_are_decoded_for_context() {
+        let raw = r#"{"pass\u0077ord":"hunter2"}"#;
+        let regions = parse_json_regions(raw).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].ctx.key.as_deref(), Some("password"));
+        assert_eq!(&raw[regions[0].span.start..regions[0].span.end], "hunter2");
+    }
+
+    #[test]
+    fn name_value_objects_feed_sibling_hints() {
+        let raw = r#"{"headers":[{"name":"Authorization","value":"Bearer abc123"}]}"#;
+        let regions = parse_json_regions(raw).unwrap();
+        let value = regions
+            .iter()
+            .find(|r| &raw[r.span.start..r.span.end] == "Bearer abc123")
+            .unwrap();
+        assert_eq!(value.ctx.key.as_deref(), Some("value"));
+        assert_eq!(value.ctx.hints, ["Authorization"]);
     }
 
     #[test]

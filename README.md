@@ -19,11 +19,11 @@ the project files.
 - Canonicalize nested wrappers so `pentect exec "pentect exec ..."` becomes one protected boundary, while `pentect read` remains blocked from AI hooks.
 - Plain `mask` / `read` stay one-way. `exec` and agent hooks use a local per-directory capability vault so masked handles can be used without showing plaintext to the AI.
 - Referenced masked handles become env vars inside later `pentect exec` child commands. `<<LABEL_hash>>` is available as `$env:PENTECT_LABEL_hash` on PowerShell or `$PENTECT_LABEL_hash` on Unix. If output was `KEY=<<...>>`, `KEY` is also available when the command references it.
-- Printing masked output through `pentect exec` registers capabilities. Referenced local files are also scanned as registration hints without exposing plaintext.
-- Shell state does not carry between tool calls. If a command reads, sources, or consumes a local file, Pentect treats that file as a registration hint and exposes the resulting capabilities in later `pentect exec` calls.
+- Printing masked output through `pentect exec` registers capabilities. Referenced local files are scanned as registration hints without exposing plaintext; if they contain secrets, the command is approval-gated.
+- Shell state does not carry between tool calls. If an approved command reads, sources, or consumes a local file, Pentect treats that file as a registration hint and exposes the resulting capabilities in later `pentect exec` calls.
 - `pentect resolve <path>` is only for the file-materialization case; the agent path should prefer env vars inside `pentect exec`.
 - Large opaque masked values carry readable coarse metadata such as `_length_at_least_512_chars`; exact length is not disclosed.
-- Resolve known handles into Write-like tool calls: when a Write-like tool tries to write content containing `<<HANDLE>>`, Pentect writes the resolved local file itself and blocks the original Write tool so plaintext is not returned in hook JSON.
+- Resolve known handles into Write-like tool calls after approval: when a Write-like tool tries to write content containing `<<HANDLE>>`, Pentect writes the resolved local file itself and blocks the original Write tool so plaintext is not returned in hook JSON.
 - Stream human terminal output with `pentect exec --live "<command>"`; output is masked line-by-line.
 - Child commands run with a cleared environment plus a minimal safe baseline and only the Pentect capability env vars referenced by that command.
 - Open the approval dashboard with `pentect`; use `pentect --port 7331` for the small local web dashboard. Inspect another scope with `pentect dashboard --dir PATH --session NAME`.
@@ -32,7 +32,7 @@ the project files.
 - The web dashboard only serves the approval queue; state-changing actions use signed decisions from the live dashboard.
 - Approval history and readable `always` records are mirrored under `.pentect/approvals/`; runtime queue files stay under `.pentect-agent/`.
 - Show the command approval preview with `pentect approve "<command>"`.
-- Non-core detectors are managed as local extensions: `pentect codex --extensions openai-privacy-filter` uses `.pentect/extensions/openai-privacy-filter`, while `--extensions ./rules.toml` activates a standalone TOML rule pack. Default project extensions live in `.pentect/config.toml` as `extensions = ["openai-privacy-filter", "./rules.toml"]`.
+- Non-core detectors are managed as local extensions: `pentect codex --extensions openai-privacy-filter` uses `.pentect/extensions/openai-privacy-filter`, while `--extensions ./rules.toml` activates a standalone TOML rule pack. Default project extensions live in `.pentect/config.toml` as `extensions = ["openai-privacy-filter", "./rules.toml"]`. Extensions may add detectors but cannot disable built-ins.
 - Block direct AI Read tools; use `pentect exec "<command>"` at the tool boundary.
 - Keep `pentect read` as a one-way human masked-preview helper, not the AI path.
 - Delete local capability state with `pentect purge`.

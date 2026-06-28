@@ -336,7 +336,8 @@ fn exec_approval_sees_capabilities_registered_from_referenced_files() {
     };
 
     let before = exec_approval(&store, &opts).unwrap();
-    assert!(!before.requires_approval(), "{before:?}");
+    assert!(before.requires_approval(), "{before:?}");
+    assert_eq!(before.secret_files.len(), 1, "{before:?}");
 
     prepare_exec_capabilities(&store, &opts).unwrap();
     let after = exec_approval(&store, &opts).unwrap();
@@ -425,6 +426,7 @@ fn always_fingerprint_includes_capability_value_identity() {
             name: "API_TOKEN".to_string(),
             value_hash: secret_value_hash("first-secret"),
         }],
+        secret_files: Vec::new(),
         direct_handles: Vec::new(),
         destinations: Vec::new(),
         network_like: false,
@@ -435,6 +437,7 @@ fn always_fingerprint_includes_capability_value_identity() {
             name: "API_TOKEN".to_string(),
             value_hash: secret_value_hash("second-secret"),
         }],
+        secret_files: Vec::new(),
         direct_handles: Vec::new(),
         destinations: Vec::new(),
         network_like: false,
@@ -788,7 +791,7 @@ fn unresolved_masked_command_handle_is_rejected() {
 }
 
 #[test]
-fn write_tool_materializes_masked_content_without_returning_plaintext() {
+fn write_tool_materialization_requires_approval_without_dashboard() {
     let root = temp_root("capability-write-generic");
     let project = PathBuf::from("target").join(format!(
         "pentect-agent-write-{}-{}",
@@ -817,12 +820,9 @@ fn write_tool_materializes_masked_content_without_returning_plaintext() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("wrote resolved masked content"), "{reason}");
-    assert!(reason.contains("treat this as success"), "{reason}");
+    assert!(reason.contains("approval UI is not running"), "{reason}");
     assert!(!reason.contains(raw), "{reason}");
-
-    let written = std::fs::read_to_string(&config).unwrap();
-    assert_eq!(written, format!("token={raw}\n"));
+    assert!(!config.exists());
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1705,7 +1705,7 @@ fn pretool_wraps_pentect_exec_with_trailing_shell_escape() {
 }
 
 #[test]
-fn pretool_preserves_pentect_exec_live_flag() {
+fn pretool_rewraps_pentect_exec_live_command() {
     let (root, session) = empty_session("hook-pre-exec-live");
     let input = json!({
         "hook_event_name": "PreToolUse",
@@ -1715,7 +1715,32 @@ fn pretool_preserves_pentect_exec_live_flag() {
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output, json!({}));
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains(" exec "), "{command}");
+    assert!(command.contains("Write-Output hi"), "{command}");
+    assert!(!command.contains("pentect exec --live"), "{command}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pretool_rewraps_pentect_exec_dollar_substitution_as_inert_payload() {
+    let (root, session) = empty_session("hook-pre-exec-dollar-substitution");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": r#"pentect exec -- echo $(python exfil.py)"#
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains(" exec "), "{command}");
+    assert!(command.contains("echo $(python exfil.py)"), "{command}");
+    assert!(!command.contains("pentect exec -- echo $("), "{command}");
     let _ = std::fs::remove_dir_all(root);
 }
 

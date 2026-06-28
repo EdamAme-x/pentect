@@ -6,6 +6,7 @@ use zeroize::Zeroize;
 
 const PAD_DOMAIN: &[u8] = b"pentect-recovery-pad-v1";
 const MAC_DOMAIN: &[u8] = b"pentect-recovery-mac-v1";
+const MAX_PLACEHOLDER_BYTES: usize = 512;
 /// Serialized recovery blob: `MAGIC | VERSION | HMAC(32) | body`. The body is
 /// the already-obfuscated map (no plaintext), the HMAC is keyed by a
 /// key-derived MAC key over `MAGIC | VERSION | body`, so a wrong key, a version
@@ -299,7 +300,7 @@ fn resolve_text(text: &str, rec: &Recovery) -> String {
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
-            if let Some(close) = find_from(bytes, i + 2, b">>") {
+            if let Some(close) = find_from_limited(bytes, i + 2, b">>", MAX_PLACEHOLDER_BYTES) {
                 let token = &text[i..close + 2];
                 if let Some(mut v) = rec.reveal(token) {
                     out.push_str(&v);
@@ -352,12 +353,13 @@ fn xor_keystream(pad: &[u8; 32], nonce: &[u8], data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn find_from(hay: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+fn find_from_limited(hay: &[u8], start: usize, needle: &[u8], max_len: usize) -> Option<usize> {
     if needle.is_empty() || start >= hay.len() {
         return None;
     }
+    let limit = hay.len().min(start.saturating_add(max_len));
     let mut i = start;
-    while i + needle.len() <= hay.len() {
+    while i + needle.len() <= limit {
         if &hay[i..i + needle.len()] == needle {
             return Some(i);
         }

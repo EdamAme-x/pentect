@@ -107,9 +107,14 @@ fn parse_env_line(raw: &str, start: usize, end: usize) -> Option<(String, ByteRa
     let value = &line[vstart..];
 
     let (inner_start, inner_end) = match value.chars().next() {
-        Some(q @ ('"' | '\'')) => {
+        Some('"') => {
             let after = &value[1..];
-            let close = after.find(q).map_or(after.len(), |i| i);
+            let close = closing_double_quote(after).unwrap_or(after.len());
+            (vstart + 1, vstart + 1 + close)
+        }
+        Some('\'') => {
+            let after = &value[1..];
+            let close = after.find('\'').map_or(after.len(), |i| i);
             (vstart + 1, vstart + 1 + close)
         }
         _ => (vstart, vstart + value.trim_end().len()),
@@ -125,6 +130,22 @@ fn parse_env_line(raw: &str, start: usize, end: usize) -> Option<(String, ByteRa
 
 fn is_key_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'
+}
+
+fn closing_double_quote(value: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -170,6 +191,15 @@ mod tests {
                 Some("AWS_ACCESS_KEY_ID".into()),
                 "AKIAIOSFODNN7EXAMPLE".into()
             )]
+        );
+    }
+
+    #[test]
+    fn double_quoted_values_skip_escaped_quotes() {
+        let raw = "DB_PASSWORD=\"abc\\\"def\"\n";
+        assert_eq!(
+            parsed(raw),
+            [(Some("DB_PASSWORD".into()), "abc\\\"def".into())]
         );
     }
 }

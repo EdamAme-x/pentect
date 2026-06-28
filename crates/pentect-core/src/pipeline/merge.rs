@@ -7,13 +7,16 @@ use super::interval::RangeIndex;
 pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
     let protected_index = RangeIndex::new(protected.to_vec());
 
-    // Drop empties and anything overlapping or directly touching a frozen
-    // placeholder. Placeholder delimiters are punctuation, so a second pass can
-    // otherwise create a new synthetic word boundary and mask a harmless tail.
+    // Drop empties and anything overlapping a frozen placeholder. Context-free
+    // lower-confidence spans that only touch a placeholder are also dropped to
+    // avoid idempotency artifacts, but high-confidence anchored/vendor spans
+    // must still be masked; otherwise `<<X_hash>>AKIA...` leaks the adjacent
+    // real secret.
     spans.retain(|s| {
         !s.range.is_empty()
             && !protected_index.overlaps(&s.range)
-            && !touches_protected(&s.range, protected)
+            && !((is_context_free(s) || s.confidence != Confidence::High)
+                && touches_protected(&s.range, protected))
     });
 
     // Strongest first (Span::cmp_strength is the one canonical ordering).
@@ -118,7 +121,16 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_adjacent_spans_are_dropped() {
+    fn context_free_placeholder_adjacent_spans_are_dropped() {
+        let out = merge(
+            vec![entropy_span(5, 10), entropy_span(11, 16)],
+            &[ByteRange::new(0, 5), ByteRange::new(16, 20)],
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn anchored_placeholder_adjacent_spans_are_kept() {
         let out = merge(
             vec![
                 span(5, 10, Confidence::High),
@@ -126,7 +138,7 @@ mod tests {
             ],
             &[ByteRange::new(0, 5), ByteRange::new(16, 20)],
         );
-        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(out.len(), 2, "{out:?}");
     }
 
     #[test]

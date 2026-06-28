@@ -1,5 +1,3 @@
-use std::process::{Command, Stdio};
-
 pub(crate) fn next_shell_word(text: &str, start: usize) -> Option<(String, usize, usize)> {
     let mut word_start = start;
     while word_start < text.len() {
@@ -35,26 +33,6 @@ pub(crate) fn next_shell_word(text: &str, start: usize) -> Option<(String, usize
         end += ch.len_utf8();
     }
     Some((text[word_start..end].to_string(), word_start, end))
-}
-
-pub(crate) fn command_available(command: &str) -> bool {
-    let status = if cfg!(windows) {
-        Command::new("where.exe")
-            .arg(command)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    } else {
-        Command::new("sh")
-            .arg("-c")
-            .arg("command -v \"$1\" >/dev/null 2>&1")
-            .arg("sh")
-            .arg(command)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    };
-    status.is_ok_and(|s| s.success())
 }
 
 pub(crate) fn shell_command(words: &[String]) -> String {

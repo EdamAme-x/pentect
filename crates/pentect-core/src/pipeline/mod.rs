@@ -558,6 +558,13 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_adjacent_vendor_secret_is_masked() {
+        let r = m("<<X_0000000000000000>>AKIAIOSFODNN7EXAMPLE");
+        assert!(!r.masked.contains("AKIAIOSFODNN7EXAMPLE"), "{}", r.masked);
+        assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
+    }
+
+    #[test]
     fn global_identity_no_survivor() {
         let r = m("a@b.com mid a@b.com");
         assert!(!r.masked.contains("a@b.com"), "{}", r.masked);
@@ -704,9 +711,9 @@ mod tests {
     }
 
     #[test]
-    fn har_kind_uses_plain_json_parser() {
+    fn har_kind_uses_json_parser_with_name_value_hints() {
         let input = r#"{"headers":[{"name":"Authorization","value":"Bearer abc123"}],"password":"hunter2"}"#;
-        let r = Engine::with_profile(Profile::Balanced).mask(
+        let r = Engine::with_profile(Profile::Strict).mask(
             Input {
                 kind: Kind::Har,
                 data: input.to_string(),
@@ -716,8 +723,9 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&r.masked).expect("masked output is valid JSON");
         assert_eq!(v["headers"][0]["name"], "Authorization");
-        assert_eq!(v["headers"][0]["value"], "Bearer abc123");
+        assert!(v["headers"][0]["value"].as_str().unwrap().starts_with("<<"));
         assert!(v["password"].as_str().unwrap().starts_with("<<PASSWORD_"));
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
     }
 
     #[test]

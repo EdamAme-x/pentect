@@ -3,7 +3,7 @@ use crate::session::session_root;
 use anyhow::Context;
 use axum::{
     extract::{Form, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
@@ -31,11 +31,23 @@ pub(crate) struct ApprovalTicket {
     pub(crate) fingerprint: String,
     pub(crate) command: String,
     pub(crate) env_names: Vec<String>,
+    pub(crate) secret_files: Vec<String>,
     pub(crate) direct_handles: usize,
     pub(crate) destinations: Vec<String>,
     pub(crate) network_like: bool,
     pub(crate) materialize_like: bool,
     pub(crate) path: Option<PathBuf>,
+}
+
+pub(crate) struct ApprovalTicketDraft {
+    pub(crate) fingerprint: String,
+    pub(crate) command: String,
+    pub(crate) env_names: Vec<String>,
+    pub(crate) secret_files: Vec<String>,
+    pub(crate) direct_handles: usize,
+    pub(crate) destinations: Vec<String>,
+    pub(crate) network_like: bool,
+    pub(crate) materialize_like: bool,
 }
 
 #[derive(Clone)]
@@ -529,6 +541,10 @@ impl ApprovalQueue {
         }
         let key = key?;
         let key_hex = key_hex?;
+        let pinned = self.pinned_dashboard_key()?;
+        if pinned.to_bytes() != key.to_bytes() {
+            return None;
+        }
         let time_ms = time_ms?;
         let signature = signature?;
         let now = unix_millis();
@@ -542,6 +558,11 @@ impl ApprovalQueue {
         let payload = heartbeat_payload(time_ms, &key_hex, port);
         verify_signature(&key, &payload, &signature).ok()?;
         Some(DashboardHeartbeat { key })
+    }
+
+    fn pinned_dashboard_key(&self) -> Option<VerifyingKey> {
+        let text = fs::read_to_string(&self.dirs.dashboard_key).ok()?;
+        verifying_key_from_hex(text.trim()).ok()
     }
 
     fn verify_decision(
@@ -604,20 +625,24 @@ impl ApprovalQueue {
 }
 
 async fn web_index(State(state): State<WebState>) -> Response {
-    match state
-        .queue
-        .render_html(state.session.as_ref(), state.csrf.as_ref())
-    {
-        Ok(html) => Html(html).into_response(),
-        Err(e) => web_error(e),
-    }
+    with_security_headers(
+        match state
+            .queue
+            .render_html(state.session.as_ref(), state.csrf.as_ref())
+        {
+            Ok(html) => Html(html).into_response(),
+            Err(e) => web_error(e),
+        },
+    )
 }
 
 async fn web_decide(
     State(state): State<WebState>,
+    headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     let result = (|| {
+        require_local_web_request(&headers, state.port)?;
         require_csrf(&form, state.csrf.as_ref())?;
         let id = form
             .get("id")
@@ -638,14 +663,55 @@ async fn web_decide(
 }
 
 fn redirect_or_error(result: Result<(), WebRouteError>) -> Response {
-    match result {
+    with_security_headers(match result {
         Ok(()) => Redirect::to("/").into_response(),
         Err(e) => (e.status, e.message).into_response(),
-    }
+    })
 }
 
 fn web_error(message: String) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+    with_security_headers((StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
+}
+
+fn with_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+    );
+    headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+fn require_local_web_request(headers: &HeaderMap, port: u16) -> Result<(), WebRouteError> {
+    let allowed_hosts = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| WebRouteError::bad_request("missing host header"))?;
+    if !allowed_hosts.iter().any(|allowed| host == allowed) {
+        return Err(WebRouteError::bad_request("invalid host header"));
+    }
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        let allowed_origins = [
+            format!("http://127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+        ];
+        if !allowed_origins.iter().any(|allowed| origin == allowed) {
+            return Err(WebRouteError::bad_request("invalid origin header"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -687,26 +753,19 @@ fn require_csrf(form: &HashMap<String, String>, expected: &str) -> Result<(), We
 }
 
 impl ApprovalTicket {
-    pub(crate) fn new(
-        fingerprint: String,
-        command: String,
-        env_names: Vec<String>,
-        direct_handles: usize,
-        destinations: Vec<String>,
-        network_like: bool,
-        materialize_like: bool,
-    ) -> Self {
+    pub(crate) fn new(draft: ApprovalTicketDraft) -> Self {
         let nonce = random_hex_or_fallback("approval-ticket");
         let mut ticket = Self {
             id: String::new(),
             nonce,
-            fingerprint,
-            command,
-            env_names,
-            direct_handles,
-            destinations,
-            network_like,
-            materialize_like,
+            fingerprint: draft.fingerprint,
+            command: draft.command,
+            env_names: draft.env_names,
+            secret_files: draft.secret_files,
+            direct_handles: draft.direct_handles,
+            destinations: draft.destinations,
+            network_like: draft.network_like,
+            materialize_like: draft.materialize_like,
             path: None,
         };
         ticket.id = ticket_id(&ticket);
@@ -717,6 +776,9 @@ impl ApprovalTicket {
         let mut bits = Vec::new();
         if !self.env_names.is_empty() {
             bits.push(self.env_names.join(","));
+        }
+        if !self.secret_files.is_empty() {
+            bits.push(format!("{} file(s)", self.secret_files.len()));
         }
         if self.direct_handles > 0 {
             bits.push(format!("{} handle(s)", self.direct_handles));
@@ -748,6 +810,10 @@ pub(crate) fn ticket_summary(ticket: &ApprovalTicket) -> String {
         lines.push(String::new());
         lines.push(format!("secret {}", ticket.env_names.join(", ")));
     }
+    if !ticket.secret_files.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("file {}", ticket.secret_files.join(", ")));
+    }
     if ticket.direct_handles > 0 {
         lines.push(format!("handles {}", ticket.direct_handles));
     }
@@ -769,6 +835,7 @@ fn ticket_json(ticket: &ApprovalTicket) -> Value {
         "fingerprint": ticket.fingerprint,
         "command": ticket.command,
         "env": ticket.env_names,
+        "files": ticket.secret_files,
         "handles": ticket.direct_handles,
         "destinations": ticket.destinations,
         "network": ticket.network_like,
@@ -785,6 +852,7 @@ fn ticket_from_json(text: &str) -> Result<ApprovalTicket, String> {
         fingerprint: string_json(&value, "fingerprint")?,
         command: string_json(&value, "command")?,
         env_names: string_array_json(&value, "env")?,
+        secret_files: string_array_json(&value, "files")?,
         direct_handles: value
             .get("handles")
             .and_then(Value::as_u64)
@@ -819,6 +887,7 @@ fn canonical_ticket_payload(ticket: &ApprovalTicket) -> String {
     canonical_field(&mut out, "fingerprint", &ticket.fingerprint);
     canonical_field(&mut out, "command", &ticket.command);
     canonical_list(&mut out, "env", &ticket.env_names);
+    canonical_list(&mut out, "files", &ticket.secret_files);
     canonical_field(&mut out, "handles", &ticket.direct_handles.to_string());
     canonical_list(&mut out, "destinations", &ticket.destinations);
     canonical_field(&mut out, "network", bool_str(ticket.network_like));
@@ -1108,16 +1177,43 @@ mod tests {
         cleanup_session(&session);
     }
 
-    fn sample_ticket() -> ApprovalTicket {
-        ApprovalTicket::new(
-            "fingerprint".to_string(),
-            "curl -H \"Authorization: Bearer $env:API_TOKEN\" https://api.example.test".to_string(),
-            vec!["API_TOKEN".to_string()],
-            0,
-            vec!["https://api.example.test".to_string()],
-            true,
-            false,
+    #[test]
+    fn self_signed_heartbeat_not_pinned_to_dashboard_key_is_rejected() {
+        let session = unique_session("forged-heartbeat-key");
+        let dashboard = ApprovalQueue::open_dashboard(&session).unwrap();
+        dashboard.heartbeat(None).unwrap();
+
+        let fake = new_dashboard_signer().unwrap();
+        let time_ms = unix_millis();
+        let key = public_key_hex(&fake.verifying_key());
+        let payload = heartbeat_payload(time_ms, &key, None);
+        fs::write(
+            &dashboard.dirs.heartbeat,
+            format!(
+                "time={time_ms}\nkey={key}\nsignature={}\n",
+                sign_hex(&fake, &payload)
+            ),
         )
+        .unwrap();
+
+        let exec = ApprovalQueue::open(&session).unwrap();
+        assert!(!exec.dashboard_alive(Duration::from_secs(2)));
+
+        cleanup_session(&session);
+    }
+
+    fn sample_ticket() -> ApprovalTicket {
+        ApprovalTicket::new(ApprovalTicketDraft {
+            fingerprint: "fingerprint".to_string(),
+            command: "curl -H \"Authorization: Bearer $env:API_TOKEN\" https://api.example.test"
+                .to_string(),
+            env_names: vec!["API_TOKEN".to_string()],
+            secret_files: Vec::new(),
+            direct_handles: 0,
+            destinations: vec!["https://api.example.test".to_string()],
+            network_like: true,
+            materialize_like: false,
+        })
     }
 
     fn unique_session(name: &str) -> String {

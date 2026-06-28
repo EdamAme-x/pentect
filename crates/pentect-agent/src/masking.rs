@@ -279,10 +279,15 @@ fn load_extension_packs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
         }
         let src = std::fs::read_to_string(&path)
             .map_err(|e| format!("could not read extension pack '{}': {e}", path.display()))?;
-        packs.push(
-            load_pack(&src)
-                .map_err(|e| format!("extension pack '{}' is invalid: {e}", path.display()))?,
-        );
+        let pack = load_pack(&src)
+            .map_err(|e| format!("extension pack '{}' is invalid: {e}", path.display()))?;
+        if !pack.disable.is_empty() {
+            return Err(format!(
+                "extension pack '{}' may add detectors but must not disable built-ins",
+                path.display()
+            ));
+        }
+        packs.push(pack);
     }
     Ok(packs)
 }
