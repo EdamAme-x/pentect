@@ -5,8 +5,8 @@ mod sweep;
 
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, DecodeDetector, Detector, EntropyDetector,
-    EnvValueDetector, PemDetector, PhoneDetector, RuleDetector, SensitiveKeyDetector,
-    StructuralDetector, UrlDetector,
+    EnvValueDetector, KeyValueDetector, PemDetector, PhoneDetector, RuleDetector,
+    SensitiveKeyDetector, StructuralDetector, UrlDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -126,7 +126,7 @@ impl Engine {
         EngineBuilder::new()
     }
 
-    /// Standard stack tuned for a profile. Power users can still build a fully
+    /// Standard stack tuned for the built-in strict profile. Power users can still build a fully
     /// custom Engine via `builder()`.
     pub fn with_profile(profile: Profile) -> Self {
         Engine::builder()
@@ -136,9 +136,7 @@ impl Engine {
             .build()
     }
 
-    /// Like `with_profile` but with the benign-shape guard disabled — the
-    /// "mask everything, even UUIDs/hashes" escape hatch (`--aggressive`). Output
-    /// is then mostly unusable for reasoning, but every mask stays reversible.
+    /// Like `with_profile` but with the benign-shape guard disabled.
     pub fn with_profile_unguarded(profile: Profile) -> Self {
         Engine::builder()
             .standard_stack(profile.knobs())
@@ -147,7 +145,7 @@ impl Engine {
             .build()
     }
 
-    /// Standard profile stack plus user rule packs (loaded from TOML). Each
+    /// Standard strict stack plus user rule packs (loaded from TOML). Each
     /// pack's rules run as additional detectors on top of the built-ins;
     /// `aggressive` disables the benign-shape guard.
     pub fn with_profile_and_packs(
@@ -368,7 +366,7 @@ impl EngineBuilder {
         }
     }
     /// Register the canonical parser + detector set tuned for `knobs`. The single
-    /// definition of the standard stack, so no path (profile, default, aggressive)
+    /// definition of the standard stack, so no path
     /// can silently miss a parser or detector.
     pub fn standard_stack(self, knobs: ProfileKnobs) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
@@ -376,6 +374,7 @@ impl EngineBuilder {
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(RuleDetector::builtin()))
+            .detector(Box::new(KeyValueDetector))
             .detector(Box::new(AuthCodeDetector))
             .detector(Box::new(Bip39Detector))
             .detector(Box::new(CardDetector))
@@ -461,9 +460,6 @@ mod tests {
     thread_local! {
         static DEFAULT_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
         static STRICT_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
-        static BALANCED_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
-        static DEV_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
-        static PARANOID_ENGINE: OnceCell<Engine> = const { OnceCell::new() };
     }
 
     fn with_default_engine<R>(f: impl FnOnce(&Engine) -> R) -> R {
@@ -471,18 +467,7 @@ mod tests {
     }
 
     fn with_profile_engine<R>(profile: Profile, f: impl FnOnce(&Engine) -> R) -> R {
-        match profile {
-            Profile::Strict => {
-                STRICT_ENGINE.with(|engine| f(engine.get_or_init(|| Engine::with_profile(profile))))
-            }
-            Profile::Balanced => BALANCED_ENGINE
-                .with(|engine| f(engine.get_or_init(|| Engine::with_profile(profile)))),
-            Profile::Dev => {
-                DEV_ENGINE.with(|engine| f(engine.get_or_init(|| Engine::with_profile(profile))))
-            }
-            Profile::Paranoid => PARANOID_ENGINE
-                .with(|engine| f(engine.get_or_init(|| Engine::with_profile(profile)))),
-        }
+        STRICT_ENGINE.with(|engine| f(engine.get_or_init(|| Engine::with_profile(profile))))
     }
 
     fn m(s: &str) -> MaskResult {
@@ -540,7 +525,7 @@ mod tests {
     fn agent_loop_resolve_before_exec_and_remask_output() {
         let secret = "AKIAIOSFODNN7EXAMPLE";
         let input = format!("curl -H 'X-Api-Key: {secret}' https://api.example.test");
-        let r = Engine::with_profile(Profile::Balanced)
+        let r = Engine::with_profile(Profile::Strict)
             .mask(Input::text(&input), &Config::insecure_testing());
 
         assert!(!r.masked.contains(secret), "{}", r.masked);
@@ -606,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn length_disclosed_for_opaque_blob_too() {
+    fn length_disclosed_for_encoded_entropy_blob_too() {
         use data_encoding::BASE64;
         let bytes: Vec<u8> = (0u8..24)
             .map(|n| n.wrapping_mul(37).wrapping_add(11))
@@ -616,9 +601,9 @@ mod tests {
             disclose_length: true,
             ..Config::insecure_testing()
         };
-        let r = Engine::with_profile(Profile::Paranoid).mask(Input::text(&input), &on);
+        let r = Engine::with_profile(Profile::Strict).mask(Input::text(&input), &on);
         assert!(
-            r.masked.contains("<<OPAQUE_BLOB_") && r.masked.contains("_length_at_least_24_chars"),
+            r.masked.contains("<<LIKELY_SECRET_") && r.masked.contains("_length_at_least_24_chars"),
             "{}",
             r.masked
         );
@@ -1146,7 +1131,7 @@ mod tests {
     // Research-style evaluation (precision/recall/F1/F2 + utility) on realistic
     // text where secrets and benign look-alikes share the same sentence — the
     // metric framing the Text Anonymization Benchmark / Presidio-evaluator use,
-    // measured against the REAL default profile (Balanced). Each sample lists the
+    // measured against the default strict profile. Each sample lists the
     // values that must be masked and the benign values that must be preserved;
     // the corpus is the skeleton that real TAB / SecretBench data plugs into.
     // Person/location names are extension/model-scope and excluded here.
@@ -1214,7 +1199,7 @@ mod tests {
         let mut leaks = Vec::new();
         let mut overmasks = Vec::new();
         for (text, should_mask, should_not) in LABELED {
-            let out = mp(Profile::Balanced, text).masked;
+            let out = mp(Profile::Strict, text).masked;
             for v in *should_mask {
                 if out.contains(v) {
                     fn_ += 1;
@@ -1238,7 +1223,7 @@ mod tests {
         let f2 = 5.0 * prec * rec / (4.0 * prec + rec).max(f64::MIN_POSITIVE);
         let utility = tn as f64 / (tn + fp).max(1) as f64;
         eprintln!(
-            "research metrics (Balanced, {} samples): P={prec:.3} R={rec:.3} F1={f1:.3} F2={f2:.3} utility={utility:.3} (TP={tp} FP={fp} FN={fn_} TN={tn})\n  leaks={leaks:?} overmasks={overmasks:?}",
+            "research metrics (Strict, {} samples): P={prec:.3} R={rec:.3} F1={f1:.3} F2={f2:.3} utility={utility:.3} (TP={tp} FP={fp} FN={fn_} TN={tn})\n  leaks={leaks:?} overmasks={overmasks:?}",
             LABELED.len()
         );
         // No leaks (recall 1.0) and no over-masking (precision/utility 1.0) on the
@@ -1506,41 +1491,30 @@ mod tests {
     }
 
     #[test]
-    fn context_free_entropy_follows_profile() {
+    fn context_free_entropy_masks_under_default_profile() {
         let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh"; // high entropy, no anchor
         let input = format!("blob {blob} end");
-        // Strict masks it; Balanced warns (kept in output, surfaced in residual).
-        assert!(!mp(Profile::Strict, &input).masked.contains(blob));
-        let bal = mp(Profile::Balanced, &input);
-        assert!(bal.masked.contains(blob), "{}", bal.masked);
-        assert_eq!(bal.summary.residual.len(), 1);
-        assert!(mp(Profile::Dev, &input).masked.contains(blob)); // kept
+        let r = mp(Profile::Strict, &input);
+        assert!(!r.masked.contains(blob), "{}", r.masked);
     }
 
     #[test]
-    fn anchored_secret_masks_under_every_profile() {
-        for p in [
-            Profile::Strict,
-            Profile::Balanced,
-            Profile::Dev,
-            Profile::Paranoid,
-        ] {
-            let r = mp(p, "key AKIAIOSFODNN7EXAMPLE end");
-            assert!(r.masked.contains("<<AWS_AKID_"), "{p:?}: {}", r.masked);
-        }
+    fn anchored_secret_masks_under_default_profile() {
+        let r = mp(Profile::Strict, "key AKIAIOSFODNN7EXAMPLE end");
+        assert!(r.masked.contains("<<AWS_AKID_"), "{}", r.masked);
     }
 
     #[test]
     fn guard_spares_uuid_unless_anchored() {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        // Bare UUID survives even Paranoid (benign shape).
-        assert!(mp(Profile::Paranoid, &format!("id {uuid} x"))
+        // Bare UUID survives the benign-shape guard.
+        assert!(mp(Profile::Strict, &format!("id {uuid} x"))
             .masked
             .contains(uuid));
         // As an adapter-supplied cookie value it is anchored by structure, so it
         // masks despite the benign shape (the guard only retracts context-free
         // guesses).
-        let r = Engine::with_profile(Profile::Balanced).mask_context(
+        let r = Engine::with_profile(Profile::Strict).mask_context(
             uuid.to_string(),
             Context {
                 path: None,
@@ -1555,33 +1529,38 @@ mod tests {
     }
 
     #[test]
-    fn paranoid_masks_opaque_blob() {
+    fn encoded_entropy_blob_masks_under_default_profile() {
         use data_encoding::BASE64;
         let bytes: Vec<u8> = (0u8..24)
             .map(|n| n.wrapping_mul(37).wrapping_add(11))
             .collect();
         let enc = BASE64.encode(&bytes);
         let input = format!("payload {enc} end");
-        assert!(mp(Profile::Balanced, &input).masked.contains(&enc)); // untouched
-        assert!(mp(Profile::Paranoid, &input)
-            .masked
-            .contains("<<OPAQUE_BLOB_"));
+        let out = mp(Profile::Strict, &input).masked;
+        assert!(!out.contains(&enc), "{out}");
+        assert!(out.contains("<<LIKELY_SECRET_"), "{out}");
     }
 
     #[test]
-    fn aggressive_engine_masks_uuid() {
-        // --aggressive == ProfilePolicy(Paranoid) + NoGuard.
+    fn unguarded_entropy_respects_detector_shape_gate() {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         let engine = Engine::builder()
             .detector(Box::new(EntropyDetector::with(20, 2.8)))
-            .policy(Box::new(ProfilePolicy::new(Profile::Paranoid)))
+            .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
             .guard(Box::new(crate::policy::guard::NoGuard))
             .build();
         let r = engine.mask(
             Input::text(format!("id {uuid} x")),
             &Config::insecure_testing(),
         );
-        assert!(!r.masked.contains(uuid), "{}", r.masked);
+        assert!(r.masked.contains(uuid), "{}", r.masked);
+
+        let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
+        let r = engine.mask(
+            Input::text(format!("blob {blob} x")),
+            &Config::insecure_testing(),
+        );
+        assert!(!r.masked.contains(blob), "{}", r.masked);
     }
 
     #[cfg(feature = "rand-key")]
@@ -1617,17 +1596,10 @@ mod tests {
     }
 
     #[test]
-    fn reversible_under_all_profiles() {
+    fn reversible_under_default_profile() {
         let input = "key AKIAIOSFODNN7EXAMPLE and a@b.com and Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
-        for p in [
-            Profile::Strict,
-            Profile::Balanced,
-            Profile::Dev,
-            Profile::Paranoid,
-        ] {
-            let r = mp(p, input);
-            assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input, "{p:?}");
-        }
+        let r = mp(Profile::Strict, input);
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
     }
 
     proptest! {
@@ -1652,19 +1624,17 @@ mod tests {
         }
 
         // No-survivor: a known secret placed at token boundaries never appears
-        // verbatim in the masked output, under any profile.
+        // verbatim in the masked output.
         #[test]
-        fn prop_no_survivor_all_profiles(
+        fn prop_no_survivor_default_profile(
             pre in "[a-z ]{0,20}",
             mid in "[a-z ]{1,20}",
             post in "[a-z ]{0,20}",
         ) {
             let secret = "AKIAIOSFODNN7EXAMPLE";
             let input = format!("{pre} {secret} {mid} {secret} {post}");
-            for p in [Profile::Strict, Profile::Balanced, Profile::Dev, Profile::Paranoid] {
-                let r = mp(p, &input);
-                prop_assert!(!r.masked.contains(secret), "{p:?} left a survivor: {}", r.masked);
-            }
+            let r = mp(Profile::Strict, &input);
+            prop_assert!(!r.masked.contains(secret), "left a survivor: {}", r.masked);
         }
     }
 
@@ -1672,7 +1642,7 @@ mod tests {
     fn pem_private_key_masked_under_default_profile() {
         let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBVAIBADANBgkqh\nkiG9w0BAQEFAASCAT\n-----END RSA PRIVATE KEY-----";
         let input = format!("here is the key:\n{pem}\nthanks");
-        let r = Engine::with_profile(Profile::Balanced)
+        let r = Engine::with_profile(Profile::Strict)
             .mask(Input::text(&input), &Config::insecure_testing());
         assert!(r.masked.contains("<<PRIVATE_KEY_"), "{}", r.masked);
         assert!(!r.masked.contains("MIIBVAIBADANBgkqh"), "{}", r.masked);
@@ -1696,7 +1666,7 @@ mod tests {
         ] {
             let body = "MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT";
             let input = format!("-----BEGIN {label}-----\n{body}\n-----END {label}-----");
-            let r = Engine::with_profile(Profile::Balanced)
+            let r = Engine::with_profile(Profile::Strict)
                 .mask(Input::text(&input), &Config::insecure_testing());
             assert!(r.masked.contains("<<PRIVATE_KEY_"), "{label}: {}", r.masked);
             assert!(!r.masked.contains(body), "{label}: {}", r.masked);
@@ -1708,7 +1678,7 @@ mod tests {
     fn bitcoin_wif_private_key_masks_under_default_profile() {
         let wif = bitcoin_base58check(0x80, &[0x22u8; 32]);
         let input = format!("wallet private key: {wif}");
-        let r = Engine::with_profile(Profile::Balanced)
+        let r = Engine::with_profile(Profile::Strict)
             .mask(Input::text(&input), &Config::insecure_testing());
         assert!(!r.masked.contains(&wif), "{}", r.masked);
         assert!(
@@ -1721,9 +1691,9 @@ mod tests {
 
     #[test]
     fn unguarded_keeps_full_stack_parsers_and_detectors() {
-        // Regression: the --aggressive path must not drop EnvParser or PemDetector.
+        // Regression: the unguarded path must not drop EnvParser or PemDetector.
         let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBVAIBADANBgkqh\nkiG9w0BAQEFAASCAT\n-----END RSA PRIVATE KEY-----";
-        let r = Engine::with_profile_unguarded(Profile::Paranoid)
+        let r = Engine::with_profile_unguarded(Profile::Strict)
             .mask(Input::text(pem), &Config::insecure_testing());
         assert!(
             r.masked.contains("<<PRIVATE_KEY_"),
@@ -1731,7 +1701,7 @@ mod tests {
             r.masked
         );
 
-        let env = Engine::with_profile_unguarded(Profile::Paranoid).mask(
+        let env = Engine::with_profile_unguarded(Profile::Strict).mask(
             Input {
                 kind: Kind::Env,
                 data: "DB_KEY=AKIAIOSFODNN7EXAMPLE\n".into(),
@@ -1748,7 +1718,7 @@ mod tests {
     #[test]
     fn env_values_masked_wholesale_structure_preserved() {
         let raw = "export DB_KEY=AKIAIOSFODNN7EXAMPLE\nNOTE=hello world\n";
-        let r = Engine::with_profile(Profile::Balanced).mask(
+        let r = Engine::with_profile(Profile::Strict).mask(
             Input {
                 kind: Kind::Env,
                 data: raw.into(),
@@ -1767,7 +1737,7 @@ mod tests {
     #[test]
     fn env_numeric_values_masked_even_when_low_entropy() {
         let raw = "TEST_SECRET=114514810\nFEATURE_FLAG=false\n";
-        let r = Engine::with_profile(Profile::Balanced).mask(
+        let r = Engine::with_profile(Profile::Strict).mask(
             Input {
                 kind: Kind::Env,
                 data: raw.into(),
@@ -1783,7 +1753,7 @@ mod tests {
     #[test]
     fn text_masks_runpod_token_without_key_context() {
         let raw = concat!("RUNPOD=", "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
-        let r = Engine::with_profile(Profile::Balanced)
+        let r = Engine::with_profile(Profile::Strict)
             .mask(Input::text(raw), &Config::insecure_testing());
         assert!(!r
             .masked
@@ -1839,7 +1809,7 @@ mod tests {
     fn no_survivor_in_json_values() {
         let secret = "AKIAIOSFODNN7EXAMPLE";
         let input = format!("{{\"a\":\"{secret}\",\"b\":\"see {secret} here\"}}");
-        let r = Engine::with_profile(Profile::Balanced).mask(
+        let r = Engine::with_profile(Profile::Strict).mask(
             Input {
                 kind: Kind::Json,
                 data: input,

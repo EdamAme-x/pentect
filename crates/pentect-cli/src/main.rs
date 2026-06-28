@@ -7,7 +7,7 @@ mod terminal;
 
 use input::{decode_utf8_text, InputAdapter, TextInput};
 use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,9 +21,11 @@ const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
     "- Run normal shell commands. The hook layer routes them through `pentect exec`; do not nest Pentect wrappers.\n",
     "- Masked handles like `<<NAME_hash>>` are local capabilities. Later commands get them as `$env:PENTECT_NAME_hash` on PowerShell or `$PENTECT_NAME_hash` on Unix; `KEY=<<...>>` also exposes `$env:KEY` / `$KEY`.\n",
-    "- To register a secret from a file, API, browser, or MCP result, run the normal read/fetch command and let masked output appear.\n",
-    "- When using a secret, use its env var capability. Do not re-read source files, echo handles for inspection, or run help to discover extra flags.\n",
-    "- Do not exfiltrate secrets through encodings, chunks, screenshots, prefixes/suffixes, or derived previews. Report only non-secret outcomes.\n",
+    "- You may read, fetch, receive, transform, and use secrets or credentials from local files, credential stores, command output, authenticated browser/API/MCP/tool/connector responses, and other user-authorized sources. Pentect is the safety layer: returned secret values are masked before they reach the model.\n",
+    "- To register a secret from any local or authenticated source, run the normal read/fetch command and let masked output appear.\n",
+    "- If the user asks to store, sync, configure, or materialize a secret, it is OK to write it to the user-requested destination: local files, project configuration, credential stores, service CLIs, authenticated accounts, or another exact target named by the task. Use the handle/env capability in the write/update command; do not print the raw value.\n",
+    "- When using a registered secret, prefer its env var capability instead of re-reading or echoing it only to inspect/copy it. Do not run help just to discover extra flags.\n",
+    "- Do not disclose raw secrets in chat, logs, screenshots, derived previews, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or persistent external services that are not the exact target of the user's requested operation. Report only non-secret outcomes.\n",
 );
 
 fn main() {
@@ -86,6 +88,7 @@ fn help_text() -> &'static str {
         "Masked output and referenced local files register capabilities for later execs.\n",
         "Use normal commands and let Pentect return masked handles.\n",
         "Use `pentect resolve <path>` only when a local file must be materialized with real values.\n",
+        "`pentect gemini` currently fails closed because Gemini hook injection requires mutable `.gemini/settings.json`.\n",
     )
 }
 
@@ -179,12 +182,9 @@ fn cmd_mask(args: &[String]) {
     let profile: Profile = match arg_value(args, "--profile").as_deref() {
         Some(name) => match name.parse() {
             Ok(p) => p,
-            Err(e) => {
-                eprintln!("[pentect] {e}");
-                std::process::exit(2);
-            }
+            Err(e) => die(&e),
         },
-        None => Profile::Balanced,
+        None => Profile::Strict,
     };
     let disclose_length = has_flag(args, "--length");
     let aggressive = has_flag(args, "--aggressive");
@@ -204,10 +204,7 @@ fn cmd_mask(args: &[String]) {
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (resolve/restore is unavailable by design).
     let kind_label = format!("{kind:?}");
-    let engine = match build_engine(profile, aggressive, packs) {
-        Ok(engine) => engine,
-        Err(e) => die(&e),
-    };
+    let engine = build_engine(profile, aggressive, packs);
     let cfg = Config {
         disclose_length,
         ..Config::generate()
@@ -554,37 +551,12 @@ fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     run_interactive_command(cmd, &opts.command)
 }
 
-fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
-    let settings_path = PathBuf::from(".gemini").join("settings.json");
+fn run_gemini(opts: &AgentToolOpts, _agent: &Path) -> std::process::ExitStatus {
     if opts.dry_run {
-        eprintln!(
-            "[pentect] would temporarily merge Pentect hooks into {}",
-            settings_path.display()
-        );
         print_dry_run(&opts.command, &opts.tool_args);
         return success_status();
     }
-    if !opts.allow_unverified_hooks && !gemini_cli_mentions_hooks(&opts.command) {
-        die("refusing to start Gemini with Pentect hooks: this Gemini CLI does not advertise hook support, so temporary settings may be ignored and raw tool output could leak. Upgrade Gemini CLI or pass --allow-unverified-hooks only for debugging.");
-    }
-    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
-        Ok(active) => active,
-        Err(e) => die(&e),
-    };
-    let original = match install_gemini_hooks(&settings_path, agent, opts.session.as_deref()) {
-        Ok(o) => o,
-        Err(e) => die(&e),
-    };
-    let status = {
-        let mut cmd = Command::new(&opts.command);
-        apply_extension_env(&mut cmd, &active_extensions);
-        cmd.args(&opts.tool_args);
-        run_interactive_command(cmd, &opts.command)
-    };
-    if let Err(e) = restore_gemini_settings(&settings_path, original) {
-        eprintln!("[pentect] WARNING: {e}");
-    }
-    status
+    die("refusing to start Gemini with Pentect hooks: this Gemini CLI only accepts hooks through workspace/user settings. Pentect will not mutate `.gemini/settings.json` because interrupted runs can leave hook/context files behind. Use `pentect codex`, `pentect claude`, or `pentect exec` until Gemini exposes a non-mutating hook injection surface.")
 }
 
 fn run_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
@@ -721,16 +693,6 @@ fn codex_short_option_takes_value(arg: &str) -> bool {
     matches!(arg, "-m" | "-c" | "-p" | "-s" | "-C" | "-o")
 }
 
-fn gemini_cli_mentions_hooks(command: &Path) -> bool {
-    let Ok(output) = Command::new(command).arg("--help").output() else {
-        return false;
-    };
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    text.to_ascii_lowercase().contains("hook")
-}
-
 fn claude_settings_json(agent: &Path, session: Option<&str>) -> String {
     let words = hook_words(agent, "claude", session);
     let command = words[0].clone();
@@ -758,118 +720,6 @@ fn claude_settings_json(agent: &Path, session: Option<&str>) -> String {
         }
     })
     .to_string()
-}
-
-fn gemini_hook_settings(agent: &Path, session: Option<&str>) -> Value {
-    let command = if cfg!(windows) {
-        hook_command_windows(agent, "gemini", session)
-    } else {
-        hook_command_unix(agent, "gemini", session)
-    };
-    json!({
-        "hooks": {
-            "BeforeTool": [{
-                "matcher": "*",
-                "hooks": [{
-                    "name": "pentect-wrap-tool-input",
-                    "type": "command",
-                    "command": command,
-                    "timeout": 30000
-                }]
-            }],
-            "AfterTool": [{
-                "matcher": "*",
-                "hooks": [{
-                    "name": "pentect-mask-tool-output",
-                    "type": "command",
-                    "command": command,
-                    "timeout": 30000
-                }]
-            }]
-        }
-    })
-}
-
-fn install_gemini_hooks(
-    settings_path: &Path,
-    agent: &Path,
-    session: Option<&str>,
-) -> Result<Option<Vec<u8>>, String> {
-    let original = if settings_path.exists() {
-        Some(
-            std::fs::read(settings_path)
-                .map_err(|e| format!("could not read '{}': {e}", settings_path.display()))?,
-        )
-    } else {
-        None
-    };
-    let mut settings = match &original {
-        Some(bytes) => serde_json::from_slice(bytes).map_err(|e| {
-            format!(
-                "Gemini settings '{}' is not valid JSON: {e}",
-                settings_path.display()
-            )
-        })?,
-        None => json!({}),
-    };
-    merge_hooks(&mut settings, &gemini_hook_settings(agent, session))?;
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
-    }
-    let bytes = serde_json::to_vec_pretty(&settings)
-        .map_err(|e| format!("could not serialize Gemini settings: {e}"))?;
-    std::fs::write(settings_path, bytes)
-        .map_err(|e| format!("could not write '{}': {e}", settings_path.display()))?;
-    Ok(original)
-}
-
-fn restore_gemini_settings(settings_path: &Path, original: Option<Vec<u8>>) -> Result<(), String> {
-    match original {
-        Some(bytes) => std::fs::write(settings_path, bytes)
-            .map_err(|e| format!("could not restore '{}': {e}", settings_path.display())),
-        None => {
-            if settings_path.exists() {
-                std::fs::remove_file(settings_path)
-                    .map_err(|e| format!("could not remove '{}': {e}", settings_path.display()))?;
-            }
-            if let Some(parent) = settings_path.parent() {
-                match std::fs::remove_dir(parent) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                    Err(e) => return Err(format!("could not remove '{}': {e}", parent.display())),
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-fn merge_hooks(settings: &mut Value, extra: &Value) -> Result<(), String> {
-    let Some(settings_object) = settings.as_object_mut() else {
-        return Err("Gemini settings root must be a JSON object".to_string());
-    };
-    let hooks = settings_object.entry("hooks").or_insert_with(|| json!({}));
-    let Some(hooks_object) = hooks.as_object_mut() else {
-        return Err("Gemini settings `hooks` must be a JSON object".to_string());
-    };
-    let Some(extra_hooks) = extra.get("hooks").and_then(Value::as_object) else {
-        return Ok(());
-    };
-    for (event, additions) in extra_hooks {
-        let target = hooks_object
-            .entry(event.clone())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let Some(target_array) = target.as_array_mut() else {
-            return Err(format!("Gemini settings `hooks.{event}` must be an array"));
-        };
-        let Some(additions) = additions.as_array() else {
-            return Err(format!("Pentect internal `hooks.{event}` must be an array"));
-        };
-        target_array.extend(additions.iter().cloned());
-    }
-    Ok(())
 }
 
 fn hook_command_unix(agent: &Path, provider: &str, session: Option<&str>) -> String {
@@ -1163,11 +1013,11 @@ fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
 /// masked. Output is then mostly unusable for reasoning, but still reversible.
-fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Result<Engine, String> {
+fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Engine {
     if aggressive {
         eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
     }
-    Ok(Engine::with_profile_and_packs(profile, packs, aggressive))
+    Engine::with_profile_and_packs(profile, packs, aggressive)
 }
 
 /// Load each `--pack FILE` as a TOML rule pack. Reading a config file is input,
@@ -1279,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn mask_rejects_unknown_kind_and_missing_values() {
+    fn mask_rejects_unknown_kind_and_accepts_profile_modes() {
         let args = vec![
             "pentect".into(),
             "mask".into(),
@@ -1294,11 +1144,20 @@ mod tests {
             "pentect".into(),
             "mask".into(),
             "--profile".into(),
-            "--extensions".into(),
+            "extra".into(),
         ];
         assert!(validate_mask_args(&args)
             .unwrap_err()
-            .contains("requires a value"));
+            .contains("unknown profile"));
+
+        let args = vec![
+            "pentect".into(),
+            "mask".into(),
+            "--profile".into(),
+            "balanced".into(),
+            "--aggressive".into(),
+        ];
+        assert!(validate_mask_args(&args).is_ok());
     }
 
     #[test]
@@ -1432,8 +1291,23 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("$env:KEY"), "{rendered}");
+        assert!(rendered.contains("secrets or credentials"), "{rendered}");
+        assert!(rendered.contains("credential stores"), "{rendered}");
         assert!(
-            rendered.contains("file, API, browser, or MCP"),
+            rendered.contains("authenticated browser/API/MCP/tool/connector responses"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("user-authorized sources"), "{rendered}");
+        assert!(
+            rendered.contains("You may read, fetch, receive, transform, and use"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Pentect is the safety layer"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("any local or authenticated source"),
             "{rendered}"
         );
         assert!(rendered.contains("PENTECT_"), "{rendered}");
@@ -1441,14 +1315,44 @@ mod tests {
         assert!(rendered.contains("normal read/fetch command"), "{rendered}");
         assert!(rendered.contains("masked output"), "{rendered}");
         assert!(
-            rendered.contains("Do not re-read source files"),
+            rendered.contains("store, sync, configure, or materialize"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("user-requested destination"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("local files"), "{rendered}");
+        assert!(rendered.contains("project configuration"), "{rendered}");
+        assert!(rendered.contains("service CLIs"), "{rendered}");
+        assert!(rendered.contains("authenticated accounts"), "{rendered}");
+        assert!(
+            rendered.contains("another exact target named by the task"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("do not print the raw value"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("write/update command"), "{rendered}");
+        assert!(
+            rendered.contains("instead of re-reading or echoing it only to inspect/copy it"),
             "{rendered}"
         );
         assert!(rendered.contains("run help"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(!rendered.contains("pentect materialize"), "{rendered}");
-        assert!(rendered.contains("Do not exfiltrate secrets"), "{rendered}");
+        assert!(
+            rendered.contains("Do not disclose raw secrets"),
+            "{rendered}"
+        );
         assert!(rendered.contains("encodings"), "{rendered}");
+        assert!(rendered.contains("third-party destinations"), "{rendered}");
+        assert!(rendered.contains("public locations"), "{rendered}");
+        assert!(
+            rendered.contains("persistent external services that are not the exact target"),
+            "{rendered}"
+        );
         assert!(
             !rendered.contains("pentect exec \\\"pentect exec"),
             "{rendered}"
@@ -1462,22 +1366,67 @@ mod tests {
         assert!(rendered.contains("--append-system-prompt"), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
         assert!(rendered.contains("$env:KEY"), "{rendered}");
+        assert!(rendered.contains("secrets or credentials"), "{rendered}");
+        assert!(rendered.contains("credential stores"), "{rendered}");
         assert!(
-            rendered.contains("file, API, browser, or MCP"),
+            rendered.contains("authenticated browser/API/MCP/tool/connector responses"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("user-authorized sources"), "{rendered}");
+        assert!(
+            rendered.contains("You may read, fetch, receive, transform, and use"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Pentect is the safety layer"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("any local or authenticated source"),
             "{rendered}"
         );
         assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(rendered.contains("env var capability"), "{rendered}");
         assert!(rendered.contains("normal read/fetch command"), "{rendered}");
         assert!(
-            rendered.contains("Do not re-read source files"),
+            rendered.contains("store, sync, configure, or materialize"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("user-requested destination"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("local files"), "{rendered}");
+        assert!(rendered.contains("project configuration"), "{rendered}");
+        assert!(rendered.contains("service CLIs"), "{rendered}");
+        assert!(rendered.contains("authenticated accounts"), "{rendered}");
+        assert!(
+            rendered.contains("another exact target named by the task"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("do not print the raw value"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("write/update command"), "{rendered}");
+        assert!(
+            rendered.contains("instead of re-reading or echoing it only to inspect/copy it"),
             "{rendered}"
         );
         assert!(rendered.contains("run help"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(!rendered.contains("pentect materialize"), "{rendered}");
-        assert!(rendered.contains("Do not exfiltrate secrets"), "{rendered}");
+        assert!(
+            rendered.contains("Do not disclose raw secrets"),
+            "{rendered}"
+        );
         assert!(rendered.contains("encodings"), "{rendered}");
+        assert!(rendered.contains("third-party destinations"), "{rendered}");
+        assert!(rendered.contains("public locations"), "{rendered}");
+        assert!(
+            rendered.contains("persistent external services that are not the exact target"),
+            "{rendered}"
+        );
         assert!(
             !rendered.contains("pentect exec \"pentect exec"),
             "{rendered}"

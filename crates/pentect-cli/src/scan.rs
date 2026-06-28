@@ -5,7 +5,7 @@ mod walk;
 use crate::{die, infer_kind, load_packs};
 use options::ScanOpts;
 use pentect_core::{Category, Config, Engine, Input, MaskedItem, Profile};
-use report::{print_report, report_json, FileFinding, ScanReport, SkippedFile};
+use report::{print_report, report_json, FileFinding, ScanReport, ScanScope, SkippedFile};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -172,6 +172,7 @@ impl ScanWorker {
         }
         Ok(ScanFile::Finding(FileFinding {
             path: path.to_path_buf(),
+            scope: ScanScope::classify(path),
             kind,
             findings,
             warnings,
@@ -246,7 +247,7 @@ mod tests {
                 "pentect".into(),
                 "scan".into(),
                 flag.into(),
-                "balanced".into(),
+                "extra".into(),
                 "app.env".into(),
             ];
             let err = ScanOpts::parse(&args).unwrap_err();
@@ -292,8 +293,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_uses_core_without_keyword_prefilter() {
-        let root = temp_scan_root("pentect-scan-no-prefilter");
+    fn scan_uses_core_on_keywordless_entropy() {
+        let root = temp_scan_root("pentect-scan-keywordless-entropy");
         let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
         std::fs::write(root.join("plain.txt"), format!("blob {blob} end\n")).unwrap();
 

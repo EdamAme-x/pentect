@@ -33,8 +33,8 @@ pub mod recovery;
 pub use codec::Codec;
 pub use detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, DecodeDetector, Detector, EntropyDetector,
-    PatternMatchDetector, PatternSpec, PemDetector, RuleDetector, RuleSpec, SensitiveKeyDetector,
-    StructuralDetector, UrlDetector,
+    KeyValueDetector, PatternMatchDetector, PatternSpec, PemDetector, RuleDetector, RuleSpec,
+    SensitiveKeyDetector, StructuralDetector, UrlDetector,
 };
 pub use model::{ByteRange, Category, Confidence, Context, Input, Kind, Region, RegionKind, Span};
 pub use pack::{load_pack, Pack};
@@ -43,7 +43,7 @@ pub use pipeline::{
     Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote, Summary,
 };
 pub use policy::guard::{OverMaskGuard, ShapeGuard};
-pub use policy::{Action, MaskAll, OpaqueStance, Policy, Profile, ProfilePolicy};
+pub use policy::{Action, MaskAll, Policy, Profile, ProfilePolicy};
 pub use recovery::{restore, Recovery, RecoveryError, RestoreError};
 
 /// Mask with the default engine. Build an `Engine` once for repeated calls.

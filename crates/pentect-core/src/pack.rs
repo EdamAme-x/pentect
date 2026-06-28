@@ -283,11 +283,11 @@ mod tests {
         let cfg = Config::insecure_testing();
 
         // Control: by default the IP is masked.
-        let base = Engine::with_profile_and_packs(Profile::Balanced, vec![], false);
+        let base = Engine::with_profile_and_packs(Profile::Strict, vec![], false);
         assert!(!base.mask(input(), &cfg).masked.contains("192.168.1.1"));
 
         // With the pack, the IP passes through but the card is still masked.
-        let tuned = Engine::with_profile_and_packs(Profile::Balanced, vec![off], false);
+        let tuned = Engine::with_profile_and_packs(Profile::Strict, vec![off], false);
         let out = tuned.mask(input(), &cfg).masked;
         assert!(out.contains("192.168.1.1"), "{out}");
         assert!(out.contains("<<CARD_"), "{out}");

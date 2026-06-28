@@ -14,6 +14,8 @@ pub mod labels {
     pub const OPAQUE_BLOB: &str = "OPAQUE_BLOB";
     /// Value masked because its key name looks sensitive.
     pub const SECRET: &str = "SECRET";
+    /// Value masked because a plaintext key/value structure carries a sensitive key.
+    pub const KEYED_SECRET: &str = "KEYED_SECRET";
     /// One-time password or verification code.
     pub const OTP: &str = "OTP";
     /// BIP-39 wallet recovery phrase.
@@ -198,6 +200,8 @@ mod tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DetectorId {
     Rule,
+    /// A plaintext key/value assignment whose key and value features are secret-like.
+    KeyValue,
     Pem,
     /// A codec-decoded blob whose decoded content was identified as a secret.
     Decode,
@@ -214,6 +218,7 @@ impl DetectorId {
     pub fn as_str(self) -> &'static str {
         match self {
             DetectorId::Rule => "rule",
+            DetectorId::KeyValue => "key_value",
             DetectorId::Entropy => "entropy",
             DetectorId::Decode => "decode",
             DetectorId::DecodeOpaque => "decode_opaque",

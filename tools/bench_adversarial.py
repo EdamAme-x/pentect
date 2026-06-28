@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_BIN,
         help="pentect binary path",
     )
-    p.add_argument("--profile", default="balanced")
+    p.add_argument("--profile", default="strict", choices=["strict"], help="current CLI profile")
     p.add_argument("--scale", type=float, default=1.0, help="input size multiplier")
     p.add_argument("--case", action="append", default=[], help="case name to run")
     p.add_argument("--json", action="store_true")
@@ -292,8 +292,6 @@ def run_case(args: argparse.Namespace, case: BenchCase) -> RunResult:
         "mask",
         "--kind",
         case.kind,
-        "--profile",
-        args.profile,
         *case.extra_args,
     ]
     start = time.perf_counter()

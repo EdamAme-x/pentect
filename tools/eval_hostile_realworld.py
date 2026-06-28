@@ -85,7 +85,7 @@ def main() -> int:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--bin", default=DEFAULT_BIN, help="pentect binary path")
-    p.add_argument("--profile", default="balanced")
+    p.add_argument("--profile", default="strict", choices=["strict"], help="current CLI profile")
     p.add_argument("--kind", default="text", choices=["text", "json", "env", "har"])
     p.add_argument("--scale", type=int, default=1, help="repeat corpus families N times")
     p.add_argument(
@@ -394,8 +394,6 @@ def run_eval(args: argparse.Namespace, cases: list[Case]) -> EvalResult:
         "mask",
         "--kind",
         args.kind,
-        "--profile",
-        args.profile,
         *args.pentect_arg,
     ]
     start = time.perf_counter()

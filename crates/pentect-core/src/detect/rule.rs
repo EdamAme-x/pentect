@@ -393,7 +393,6 @@ impl RuleDetector {
             (r"\b[0-8][0-9]{2}[- ][0-9]{2}[- ][0-9]{4}\b", Pii, "US_SSN", Medium, V::UsSsn),
             (r"\bbc1[02-9ac-hj-np-z]{6,87}\b", Identifier, "BTC_ADDRESS_BECH32", High, V::BtcBech32),
             (r"\b0x[0-9a-fA-F]{40}\b", Identifier, "ETH_ADDRESS", High, V::EthAddress),
-            (r"(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[0-9A-Za-z]+)?(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?", Endpoint, "IP_ADDRESS_V6", High, V::Ipv6),
             (r"\b[0-9]{6}[-+A-Y][0-9]{3}[0-9A-Y]\b", Identifier, "FI_HETU", High, V::FiHetu),
             (r"(?i)\b[A-Z]{6}[0-9A-Z]{2}[A-Z][0-9A-Z]{2}[A-Z][0-9A-Z]{3}[A-Z]\b", Identifier, "IT_FISCAL_CODE", High, V::ItFiscalCode),
             (r"\b[12][0-9]{4}(?:[0-9]{2}|2[AB])[0-9]{8}\b", Identifier, "FR_NIR_INSEE", High, V::FrNir),
@@ -402,12 +401,6 @@ impl RuleDetector {
         ];
         #[rustfmt::skip]
         let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
-            // Context-keyed values in free text / shell logs. This is deliberately
-            // not a raw "any key=value" detector: it fires only on a closed set of
-            // credential-bearing nouns, and captures the value rather than the
-            // surrounding sentence. That catches low-entropy secrets ("password
-            // is summer-2026!") without masking ports, counters, or status codes.
-            (r#"(?i)\b(?:password|passwd|pwd|passphrase|secret|shared[-_ ]?secret|client[-_ ]?secret|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|auth[-_ ]?token|otp|recovery[-_ ]?phrase)\b[^\r\n]{0,24}?(?:=|:|=>|\bis\b)?[ \t'"]{0,3}([A-Za-z0-9][A-Za-z0-9._~+/=!@#$%^&*()-]{3,160})(?:$|[\s"',;)])"#, Secret, "KEYED_SECRET", Medium, 1, V::None),
             // Session/JWT-like values need context. A bare aaa.bbb.ccc is common
             // test/noise; a long three-segment token after session/jwt/cookie is
             // credential-bearing even if the header is opaque or not JSON.
@@ -416,6 +409,7 @@ impl RuleDetector {
             // segment that frequently leaks in stack traces and tool output.
             (r#"(?i)\bAccountKey\b[ \t]*=[ \t]*([A-Za-z0-9+/=]{40,})(?:;|$|[\s"',)])"#, Secret, "AZURE_STORAGE_ACCOUNT_KEY", High, 1, V::None),
             (r#"(?i)\bclient[-_]?key[-_]?data\b[ \t]*:[ \t]*['"]?([A-Za-z0-9+/=]{40,})['"]?(?:$|[\s"',;)])"#, Secret, "KUBE_CLIENT_KEY_DATA", High, 1, V::None),
+            (r#"(?i)(?:^|[^A-Za-z0-9_:.])((?:[0-9A-F]{0,4}:){2,}[0-9A-F]{0,4}(?:%[0-9A-Za-z]+)?(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?)(?:$|[^A-Za-z0-9_:.])"#, Endpoint, "IP_ADDRESS_V6", High, 1, V::Ipv6),
             (r#"(?i)\b[A-Z]:[\\/]+Users[\\/]+([^\\/\s:\r\n"<>|?*]{1,64})(?:[\\/]|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])/(?:home|Users|var/home|export/home)/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])~([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
@@ -640,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn keyed_value_context_masks_low_entropy_values_without_masking_counters() {
+    fn captured_context_rules_mask_selected_values_without_masking_counters() {
         let det = RuleDetector::builtin();
         let labels = |s: &str| {
             let reg = region(s);
@@ -651,13 +645,6 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let has = |text: &str, label: &str| labels(text).iter().any(|got| got == label);
-        assert!(has("password is summer-2026! for the demo", "KEYED_SECRET"));
-        assert!(has("client_secret: tenant-7-trial", "KEYED_SECRET"));
-        assert!(has("otp=100482 expires soon", "KEYED_SECRET"));
-        assert!(has(
-            "k8s secret data api-key: abcDEF123456+/==",
-            "KEYED_SECRET"
-        ));
         assert!(has(
             "cookie session=abcdefghijkl.mnopqrstuvwxyz.ABCDEFGHIJKLMN",
             "SESSION_TOKEN"
@@ -739,6 +726,24 @@ mod tests {
             panic!("standalone My Number should still detect: {spans:?}");
         };
         assert_eq!(&raw[span.range.start..span.range.end], "123456789018");
+    }
+
+    #[test]
+    fn ipv6_does_not_match_rust_namespace_separators() {
+        let det = RuleDetector::builtin();
+        let rust = r#"std::fs::write(root.join("target"), "SECRET=ignored\n").unwrap();"#;
+        let spans = det.detect(&NormalizedView::build(&region(rust), rust));
+        assert!(
+            spans.iter().all(|s| s.label != "IP_ADDRESS_V6"),
+            "Rust namespace separators should not be IPv6: {spans:?}"
+        );
+
+        let ipv6 = "bind [::1]:8080 and fe80::1%eth0";
+        let spans = det.detect(&NormalizedView::build(&region(ipv6), ipv6));
+        assert!(
+            spans.iter().any(|s| s.label == "IP_ADDRESS_V6"),
+            "real IPv6 should still be detected: {spans:?}"
+        );
     }
 
     #[test]

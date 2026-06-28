@@ -42,35 +42,64 @@ impl Detector for EntropyDetector {
         let mut out = Vec::new();
         for (start, end) in token_runs(text) {
             let run = &text[start..end];
-            if let Some(value_start) = assignment_value_offset(run) {
-                let value = &run.as_bytes()[value_start..];
-                if value.len() >= self.min_len && shannon(value) >= self.threshold {
-                    out.push(Span {
-                        range: view.to_raw(ByteRange::new(start + value_start, end)),
-                        category: Category::Secret,
-                        label: labels::LIKELY_SECRET.to_string(),
-                        confidence: Confidence::Low,
-                        source: DetectorId::Entropy,
-                    });
-                }
+            if let Some(assignment) = assignment_parts(run) {
+                self.push_entropy_span(text, start + assignment.value_start, end, view, &mut out);
                 continue;
             }
-            let run = run.as_bytes();
-            if run.len() >= self.min_len && shannon(run) >= self.threshold {
-                out.push(Span {
-                    range: view.to_raw(ByteRange::new(start, end)),
-                    category: Category::Secret,
-                    label: labels::LIKELY_SECRET.to_string(),
-                    confidence: Confidence::Low,
-                    source: DetectorId::Entropy,
-                });
-            }
+            self.push_entropy_span(text, start, end, view, &mut out);
         }
         out
     }
 }
 
-fn assignment_value_offset(run: &str) -> Option<usize> {
+impl EntropyDetector {
+    fn push_entropy_span(
+        &self,
+        text: &str,
+        start: usize,
+        end: usize,
+        view: &NormalizedView,
+        out: &mut Vec<Span>,
+    ) {
+        let run = &text[start..end];
+        if is_slash_delimited_path_like(run) {
+            for (seg_start, seg_end) in slash_segments(run, start) {
+                self.push_single_entropy_span(text, seg_start, seg_end, view, out);
+            }
+            return;
+        }
+        self.push_single_entropy_span(text, start, end, view, out);
+    }
+
+    fn push_single_entropy_span(
+        &self,
+        text: &str,
+        start: usize,
+        end: usize,
+        view: &NormalizedView,
+        out: &mut Vec<Span>,
+    ) {
+        let run = &text[start..end];
+        if run.len() >= self.min_len
+            && entropy_candidate(run, text, start, end)
+            && shannon(run.as_bytes()) >= self.threshold
+        {
+            out.push(Span {
+                range: view.to_raw(ByteRange::new(start, end)),
+                category: Category::Secret,
+                label: labels::LIKELY_SECRET.to_string(),
+                confidence: Confidence::Low,
+                source: DetectorId::Entropy,
+            });
+        }
+    }
+}
+
+struct Assignment {
+    value_start: usize,
+}
+
+fn assignment_parts(run: &str) -> Option<Assignment> {
     let eq = run.find('=')?;
     let key = &run[..eq];
     let value = &run[eq + 1..];
@@ -84,24 +113,105 @@ fn assignment_value_offset(run: &str) -> Option<usize> {
     {
         return None;
     }
-    let lower = key.to_ascii_lowercase();
-    let assignment_like = key.bytes().any(|b| matches!(b, b'_' | b'.' | b'-'))
-        || key.bytes().all(|b| !b.is_ascii_lowercase())
-        || [
-            "api_key",
-            "apikey",
-            "key",
-            "secret",
-            "token",
-            "password",
-            "auth",
-            "credential",
-            "session",
-            "cookie",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle));
-    assignment_like.then_some(eq + 1)
+    Some(Assignment {
+        value_start: eq + 1,
+    })
+}
+
+fn entropy_candidate(run: &str, text: &str, start: usize, end: usize) -> bool {
+    has_opaque_mix(run)
+        && !is_source_identifier_like(run)
+        && !is_regex_character_class_fragment(text, start, end)
+}
+
+fn has_opaque_mix(run: &str) -> bool {
+    let bytes = run.as_bytes();
+    let has_upper = bytes.iter().any(u8::is_ascii_uppercase);
+    let has_lower = bytes.iter().any(u8::is_ascii_lowercase);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_codec_marker = bytes.iter().any(|b| matches!(b, b'+' | b'='));
+    has_codec_marker || (has_upper && (has_lower || has_digit))
+}
+
+fn is_slash_delimited_path_like(run: &str) -> bool {
+    run.contains('/')
+        && !run.as_bytes().iter().any(|b| matches!(b, b'+' | b'='))
+        && run
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .any(is_word_path_segment)
+}
+
+fn slash_segments(run: &str, base: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut offset = 0usize;
+    run.split('/').filter_map(move |segment| {
+        let start = offset;
+        offset += segment.len() + 1;
+        (!segment.is_empty()).then_some((base + start, base + start + segment.len()))
+    })
+}
+
+fn is_word_path_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    (3..=32).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || matches!(b, b'_' | b'-'))
+        && bytes.iter().any(u8::is_ascii_lowercase)
+}
+
+fn is_source_identifier_like(run: &str) -> bool {
+    let bytes = run.as_bytes();
+    if bytes.is_empty()
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_separator = bytes.iter().any(|b| matches!(b, b'_' | b'-'));
+    if has_alpha && !has_digit {
+        return true;
+    }
+    if has_separator && identifier_like_with_few_digits(bytes) {
+        return true;
+    }
+    false
+}
+
+fn identifier_like_with_few_digits(bytes: &[u8]) -> bool {
+    let digit_count = bytes.iter().filter(|b| b.is_ascii_digit()).count();
+    if digit_count > 4 {
+        return false;
+    }
+    let alpha_count = bytes.iter().filter(|b| b.is_ascii_alphabetic()).count();
+    alpha_count >= digit_count.saturating_mul(4).max(12)
+}
+
+fn is_regex_character_class_fragment(text: &str, start: usize, end: usize) -> bool {
+    let line_start = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
+    let line_end = text[end..]
+        .find('\n')
+        .map_or(text.len(), |offset| end + offset);
+    let before = &text[line_start..start];
+    let after = &text[end..line_end];
+    let last_open = before.rfind('[');
+    let last_close = before.rfind(']');
+    last_open.is_some()
+        && last_open > last_close
+        && after.contains(']')
+        && (run_has_range_operator(before, after) || before.contains("\\b"))
+}
+
+fn run_has_range_operator(before: &str, after: &str) -> bool {
+    let window = format!("{before}{after}");
+    window.contains("-z")
+        || window.contains("-Z")
+        || window.contains("-9")
+        || window.contains("-f")
+        || window.contains("-F")
 }
 
 fn shannon(bytes: &[u8]) -> f64 {
@@ -162,6 +272,64 @@ mod tests {
     }
 
     #[test]
+    fn benign_assignments_do_not_mask_whole_key_value_run() {
+        for raw in [
+            "sha=356a192b7913b04c54574d18c28d46e6395428ab",
+            "SHA256=3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7",
+            "uuid=550e8400-e29b-41d4-a716-446655440000",
+            "request_id=550e8400-e29b-41d4-a716-446655440000",
+            "jwt_like=aaa.bbb.ccc",
+            "path=/Users/carol/work/repo",
+            r"path=C:\Users\Public\Downloads\file.txt",
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn source_identifiers_are_not_entropy_candidates() {
+        for raw in [
+            "fn codex_uses_unverified_headless_hook_path(tool_args: &[String]) -> bool {}",
+            "const PENTECT_AGENT_INSTRUCTIONS: &str = \"contract\";",
+            "--allow-unverified-hooks",
+            "DASHBOARD_HEARTBEAT_MAX_AGE",
+            "clientSecretIdentifierOnly",
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn regex_character_classes_are_not_entropy_candidates() {
+        for raw in [
+            r#"(r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b", Identifier)"#,
+            r#"(r"\br[rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz]{24,34}\b", Identifier)"#,
+            r#"(r"sk-[A-Za-z0-9_-]{20,}", Secret)"#,
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn source_paths_and_lowercase_charsets_are_not_entropy_candidates() {
+        for raw in [
+            "core detectors/policy/rendering pipeline",
+            "const BECH32_CHARSET: &[u8] = b\"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";",
+            "const CTRL: &[u8] = b\"023456789acdefghjklmnpqrstuvwxyz\";",
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
     fn webhook_like_url_path_is_entropy_candidate_without_vendor_rule() {
         let raw = concat!(
             "https://example.invalid/hooks/123456789012345678/",
@@ -172,8 +340,8 @@ mod tests {
         let spans = EntropyDetector::default().detect(&v);
         assert!(
             spans.iter().any(|span| {
-                raw[span.range.start..span.range.end]
-                    .contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB")
+                &raw[span.range.start..span.range.end]
+                    == "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
             }),
             "{spans:?}"
         );

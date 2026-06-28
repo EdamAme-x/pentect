@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
         help="pentect binary path",
     )
     p.add_argument("--kind", default="text", choices=["text", "json", "env", "har"])
-    p.add_argument("--profile", default="balanced")
+    p.add_argument("--profile", default="strict", choices=["strict"], help="current CLI profile")
     p.add_argument("--context-field", action="append", default=[])
     p.add_argument("--secret-field", default="secret")
     p.add_argument("--label-field", default="label")
@@ -159,8 +159,6 @@ def run_pentect(args: argparse.Namespace, text: str) -> str:
         "mask",
         "--kind",
         args.kind,
-        "--profile",
-        args.profile,
         *args.extra_arg,
     ]
     proc = subprocess.run(

@@ -194,7 +194,7 @@ fn cmd_read(args: &[String]) -> i32 {
         Err(e) => return die(&e),
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
-    let engine = Engine::with_profile(opts.profile);
+    let engine = Engine::with_profile(Profile::Strict);
     let cfg = Config {
         disclose_length: opts.disclose_length,
         ..Config::generate()
@@ -1586,7 +1586,6 @@ enum InputFormat {
 struct ReadOpts {
     input_format: InputFormat,
     kind: Option<Kind>,
-    profile: Profile,
     disclose_length: bool,
     emit_meta: bool,
     path: PathBuf,
@@ -1596,7 +1595,6 @@ impl ReadOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut input_format = InputFormat::Text;
         let mut kind = None;
-        let mut profile = Profile::Strict;
         let mut disclose_length = false;
         let mut emit_meta = false;
         let mut path = None;
@@ -1608,9 +1606,6 @@ impl ReadOpts {
                 }
                 "--kind" => {
                     kind = Some(parse_kind(&value(args, &mut i, "--kind")?)?);
-                }
-                "--profile" => {
-                    profile = value(args, &mut i, "--profile")?.parse()?;
                 }
                 "--length" => {
                     disclose_length = true;
@@ -1633,7 +1628,6 @@ impl ReadOpts {
         Ok(Self {
             input_format,
             kind,
-            profile,
             disclose_length,
             emit_meta,
             path: path.ok_or_else(|| "read requires PATH".to_string())?,

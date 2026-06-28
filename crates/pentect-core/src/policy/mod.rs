@@ -28,9 +28,7 @@ impl Policy for MaskAll {
     }
 }
 
-/// A span we couldn't anchor to a key, vendor rule, or identified decode — only
-/// raw entropy or an opaque decodable blob put it here. These are the
-/// "when in doubt" candidates the aggressiveness setting governs.
+/// A span we couldn't anchor to a key, vendor rule, or identified decode.
 pub fn is_context_free(s: &Span) -> bool {
     // Entropy and DecodeOpaque are the only sources that emit unanchored guesses
     // (always Low confidence), so the variant alone identifies a context-free span.
@@ -45,8 +43,8 @@ pub enum OpaqueStance {
     Keep,
 }
 
-/// Behaviour recipe derived from a Profile. Pure data, not a runtime field of
-/// the engine.
+/// Behaviour recipe derived from the built-in profile. Pure data, not a runtime
+/// field of the engine.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProfileKnobs {
     pub context_free: OpaqueStance,
@@ -56,29 +54,21 @@ pub struct ProfileKnobs {
     pub min_opaque_run: usize,
 }
 
-/// Aggressiveness preset, loadable as an option (e.g. TOML `profile = "paranoid"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Profile {
-    /// Bare-library default. Mask every candidate, incl. context-free entropy.
+    /// Mask every candidate selected by the detector stack.
     #[default]
     Strict,
-    /// Recommended app default. Anchored secrets mask; lone opaque blobs are
-    /// surfaced as warnings, not silently masked or kept.
+    /// Compatibility preset: anchored secrets mask; context-free guesses warn.
     Balanced,
-    /// Opt-in, loud. Keeps context-free entropy (relaxes recall); still masks
-    /// every anchored secret.
+    /// Compatibility preset: keep context-free guesses.
     Dev,
-    /// Opt-in, max leak-prevention. Masks all opaque/encrypted-looking content.
+    /// Compatibility preset: tighten context-free opaque/entropy masking.
     Paranoid,
 }
 
 impl Profile {
-    /// Profiles share the detector defaults and move monotonically: Strict and
-    /// Balanced use the defaults (differing only in the context-free stance);
-    /// Dev relaxes (higher thresholds + keeps context-free); Paranoid tightens
-    /// (lower thresholds + masks opaque blobs). The numeric offsets are local to
-    /// each profile and intentionally hand-tuned.
     pub fn knobs(self) -> ProfileKnobs {
         match self {
             Profile::Strict => ProfileKnobs {
@@ -95,7 +85,6 @@ impl Profile {
                 mask_unknown_codec: false,
                 min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
             },
-            // Relaxed: raise thresholds so kept context-free runs are quieter.
             Profile::Dev => ProfileKnobs {
                 context_free: OpaqueStance::Keep,
                 entropy_min_len: DEFAULT_ENTROPY_MIN_LEN + 4,
@@ -103,7 +92,6 @@ impl Profile {
                 mask_unknown_codec: false,
                 min_opaque_run: DEFAULT_MIN_OPAQUE_RUN + 4,
             },
-            // Tightened: lower thresholds and mask decodable opaque blobs.
             Profile::Paranoid => ProfileKnobs {
                 context_free: OpaqueStance::Mask,
                 entropy_min_len: DEFAULT_ENTROPY_MIN_LEN - 4,
@@ -128,8 +116,6 @@ impl FromStr for Profile {
     }
 }
 
-/// Maps a profile's stance onto each span. Anchored spans always mask; the
-/// context-free ones follow the stance.
 pub struct ProfilePolicy {
     stance: OpaqueStance,
 }
@@ -144,14 +130,13 @@ impl ProfilePolicy {
 
 impl Policy for ProfilePolicy {
     fn classify(&self, s: &Span) -> Action {
-        if is_context_free(s) {
-            match self.stance {
-                OpaqueStance::Mask => Action::Mask,
-                OpaqueStance::Warn => Action::Warn,
-                OpaqueStance::Keep => Action::Keep,
-            }
-        } else {
-            Action::Mask
+        if !is_context_free(s) {
+            return Action::Mask;
+        }
+        match self.stance {
+            OpaqueStance::Mask => Action::Mask,
+            OpaqueStance::Warn => Action::Warn,
+            OpaqueStance::Keep => Action::Keep,
         }
     }
 }
@@ -162,13 +147,15 @@ mod tests {
 
     #[test]
     fn profile_from_str() {
+        assert_eq!("strict".parse::<Profile>(), Ok(Profile::Strict));
+        assert_eq!("balanced".parse::<Profile>(), Ok(Profile::Balanced));
+        assert_eq!("dev".parse::<Profile>(), Ok(Profile::Dev));
         assert_eq!("paranoid".parse::<Profile>(), Ok(Profile::Paranoid));
-        assert!("casual".parse::<Profile>().is_err());
+        assert!("extra".parse::<Profile>().is_err());
         assert!("".parse::<Profile>().is_err());
     }
 
-    // Pin every field of every profile, so any knob change is a deliberate,
-    // visible edit here rather than a silent behaviour shift.
+    // Pin every field so a detector-threshold change is a deliberate edit.
     #[test]
     fn knobs_table_pinned() {
         assert_eq!(
@@ -179,36 +166,6 @@ mod tests {
                 entropy_threshold: DEFAULT_ENTROPY_THRESHOLD,
                 mask_unknown_codec: false,
                 min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
-            }
-        );
-        assert_eq!(
-            Profile::Balanced.knobs(),
-            ProfileKnobs {
-                context_free: OpaqueStance::Warn,
-                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN,
-                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD,
-                mask_unknown_codec: false,
-                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN,
-            }
-        );
-        assert_eq!(
-            Profile::Dev.knobs(),
-            ProfileKnobs {
-                context_free: OpaqueStance::Keep,
-                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN + 4,
-                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD + 0.4,
-                mask_unknown_codec: false,
-                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN + 4,
-            }
-        );
-        assert_eq!(
-            Profile::Paranoid.knobs(),
-            ProfileKnobs {
-                context_free: OpaqueStance::Mask,
-                entropy_min_len: DEFAULT_ENTROPY_MIN_LEN - 4,
-                entropy_threshold: DEFAULT_ENTROPY_THRESHOLD - 0.4,
-                mask_unknown_codec: true,
-                min_opaque_run: DEFAULT_MIN_OPAQUE_RUN - 4,
             }
         );
     }

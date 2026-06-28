@@ -727,7 +727,7 @@ pub fn ipv6(s: &str) -> bool {
         return false;
     }
     if s == "::" {
-        return true;
+        return false;
     }
     let compressed = s.matches("::").count();
     if compressed > 1 {
@@ -1094,6 +1094,7 @@ mod tests {
         assert!(ipv6("2001:db8::8a2e:370:7334"));
         assert!(ipv6("::1"));
         assert!(ipv6("fe80::1%eth0"));
+        assert!(!ipv6("::")); // too ambiguous in source text and placeholders
         assert!(!ipv6("2001:db8::8a2e::7334")); // two ::
         assert!(!ipv6("2001:db8:85a3:0:0:8a2e:370:7334:9999")); // 9 groups
         assert!(!ipv6("00:1A:2B:3C:4D:5E")); // MAC, not 8 groups

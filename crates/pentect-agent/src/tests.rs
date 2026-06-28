@@ -9,7 +9,7 @@ fn session_recovery_is_process_local() {
     ));
     let session = Session::open_at(&root, "t").unwrap();
     let input = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n";
-    let result = Engine::with_profile(Profile::Balanced).mask(
+    let result = Engine::with_profile(Profile::Strict).mask(
         Input {
             kind: Kind::Env,
             data: input.to_string(),
@@ -146,7 +146,6 @@ fn dashboard_parse_accepts_top_level_port() {
 fn read_defaults_to_strict_and_infers_dotenv() {
     let args = strings(["pentect-agent", "read", r".\.env"]);
     let opts = ReadOpts::parse(&args).unwrap();
-    assert_eq!(opts.profile, Profile::Strict);
     assert!(!opts.emit_meta);
     assert_eq!(infer_kind(&opts.path), Kind::Env);
 
@@ -699,7 +698,7 @@ fn resolve_path_rewrites_known_handles_without_printing_secret() {
     let session = Session::open_capability_at(&root, "t").unwrap();
     let store = RecoveryStore::load(&session).unwrap();
     let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n";
-    let result = Engine::with_profile(Profile::Balanced).mask(
+    let result = Engine::with_profile(Profile::Strict).mask(
         Input {
             kind: Kind::Env,
             data: raw.to_string(),
@@ -2014,7 +2013,7 @@ fn gemini_beforetool_uses_tool_input_override() {
 
 fn masked_session(name: &str) -> (PathBuf, Session, String) {
     let (root, session) = empty_session(name);
-    let result = Engine::with_profile(Profile::Balanced).mask(
+    let result = Engine::with_profile(Profile::Strict).mask(
         Input {
             kind: Kind::Env,
             data: "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n".to_string(),
