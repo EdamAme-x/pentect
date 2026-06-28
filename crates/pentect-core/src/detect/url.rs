@@ -7,7 +7,7 @@ use crate::model::*;
 use crate::normalize::NormalizedView;
 
 static URL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>()]+"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>()]*[^\s"'<>().,;:!?]"#).unwrap());
 
 /// Preserves useful URL structure for internal systems:
 /// `http://local.jira.corp/api/issues/1234`
@@ -36,7 +36,18 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
     }
 
     let authority = &url[scheme_end..authority_end];
-    let host_start_in_authority = authority.rfind('@').map_or(0, |i| i + 1);
+    let userinfo_end = authority.rfind('@');
+    if let Some(at) = userinfo_end.filter(|&at| at > 0) {
+        push_span(
+            view,
+            out,
+            base + scheme_end,
+            base + scheme_end + at,
+            Category::Secret,
+            labels::URL_CREDENTIAL,
+        );
+    }
+    let host_start_in_authority = userinfo_end.map_or(0, |i| i + 1);
     let host_port = &authority[host_start_in_authority..];
     let Some(host) = host_without_port(host_port) else {
         return;
@@ -45,24 +56,54 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
         return;
     }
 
-    let endpoint_start = base + scheme_end + host_start_in_authority;
-    let endpoint_end = base + authority_end;
+    push_span(
+        view,
+        out,
+        base + scheme_end + host_start_in_authority,
+        base + authority_end,
+        Category::Endpoint,
+        labels::INTERNAL_ENDPOINT,
+    );
+
+    let query_at = url[authority_end..].find('?').map(|i| authority_end + i);
+    let fragment_at = url[authority_end..].find('#').map(|i| authority_end + i);
+    let query_at = query_at.filter(|&q| fragment_at.is_none_or(|f| q < f));
+    let path_end = [query_at, fragment_at]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(url.len());
+
+    if url.as_bytes().get(authority_end) == Some(&b'/') {
+        inspect_path_ids(view, base, url, authority_end, path_end, out);
+    }
+    if let Some(q) = query_at {
+        let query_end = fragment_at.unwrap_or(url.len());
+        inspect_query_values(view, base, url, q + 1, query_end, out);
+    }
+    if let Some(f) = fragment_at {
+        inspect_fragment(view, base, url, f + 1, url.len(), out);
+    }
+}
+
+fn push_span(
+    view: &NormalizedView,
+    out: &mut Vec<Span>,
+    start: usize,
+    end: usize,
+    category: Category,
+    label: &str,
+) {
+    if start >= end {
+        return;
+    }
     out.push(Span {
-        range: view.to_raw(ByteRange::new(endpoint_start, endpoint_end)),
-        category: Category::Endpoint,
-        label: labels::INTERNAL_ENDPOINT.to_string(),
+        range: view.to_raw(ByteRange::new(start, end)),
+        category,
+        label: label.to_string(),
         confidence: Confidence::High,
         source: DetectorId::Rule,
     });
-
-    let path_start = authority_end;
-    if url.as_bytes().get(path_start) != Some(&b'/') {
-        return;
-    }
-    let path_end = url[path_start..]
-        .find(['?', '#'])
-        .map_or(url.len(), |i| path_start + i);
-    inspect_path_ids(view, base, url, path_start, path_end, out);
 }
 
 fn host_without_port(host_port: &str) -> Option<&str> {
@@ -145,17 +186,93 @@ fn inspect_path_ids(
         }
         let segment = &url[start..pos];
         if let Some((trim_start, trim_end)) = resource_id_bounds(segment) {
-            out.push(Span {
-                range: view.to_raw(ByteRange::new(
-                    base + start + trim_start,
-                    base + start + trim_end,
-                )),
-                category: Category::Identifier,
-                label: labels::RESOURCE_ID.to_string(),
-                confidence: Confidence::High,
-                source: DetectorId::Rule,
-            });
+            push_span(
+                view,
+                out,
+                base + start + trim_start,
+                base + start + trim_end,
+                Category::Identifier,
+                labels::RESOURCE_ID,
+            );
         }
+    }
+}
+
+fn inspect_query_values(
+    view: &NormalizedView,
+    base: usize,
+    url: &str,
+    query_start: usize,
+    query_end: usize,
+    out: &mut Vec<Span>,
+) {
+    let mut pos = query_start;
+    while pos < query_end {
+        while pos < query_end && matches!(url.as_bytes()[pos], b'&' | b';') {
+            pos += 1;
+        }
+        let part_start = pos;
+        while pos < query_end && !matches!(url.as_bytes()[pos], b'&' | b';') {
+            pos += 1;
+        }
+        let part = &url[part_start..pos];
+        if let Some(eq) = part.find('=') {
+            let value_start = part_start + eq + 1;
+            let value_end = pos;
+            push_span(
+                view,
+                out,
+                base + value_start,
+                base + value_end,
+                Category::Identifier,
+                labels::URL_QUERY_VALUE,
+            );
+        } else if let Some((trim_start, trim_end)) = resource_id_bounds(part) {
+            push_span(
+                view,
+                out,
+                base + part_start + trim_start,
+                base + part_start + trim_end,
+                Category::Identifier,
+                labels::RESOURCE_ID,
+            );
+        }
+    }
+}
+
+fn inspect_fragment(
+    view: &NormalizedView,
+    base: usize,
+    url: &str,
+    fragment_start: usize,
+    fragment_end: usize,
+    out: &mut Vec<Span>,
+) {
+    if fragment_start >= fragment_end {
+        return;
+    }
+    let fragment = &url[fragment_start..fragment_end];
+    if fragment.contains('=') {
+        inspect_query_values(view, base, url, fragment_start, fragment_end, out);
+        return;
+    }
+    let mut any_resource = false;
+    inspect_path_ids(view, base, url, fragment_start, fragment_end, out);
+    for segment in fragment.split(['/', '&', ';', '?']) {
+        if resource_id_bounds(segment).is_some() {
+            any_resource = true;
+            break;
+        }
+    }
+    if !any_resource && fragment.len() >= 16 && fragment.bytes().any(|b| b.is_ascii_digit()) {
+        push_span(
+            view,
+            out,
+            base + fragment_start,
+            base + fragment_end,
+            Category::Identifier,
+            labels::URL_FRAGMENT,
+        );
     }
 }
 
@@ -181,10 +298,29 @@ fn resource_id_bounds(segment: &str) -> Option<(usize, usize)> {
     }
     let has_digit = bytes.iter().any(u8::is_ascii_digit);
     let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
-    let id_alphabet = bytes
-        .iter()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+    let id_alphabet = is_id_alphabet(s);
     (has_digit && has_alpha && id_alphabet && s.len() >= 6).then_some((start, end))
+}
+
+fn is_id_alphabet(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if i + 2 >= bytes.len()
+                    || !bytes[i + 1].is_ascii_hexdigit()
+                    || !bytes[i + 2].is_ascii_hexdigit()
+                {
+                    return false;
+                }
+                i += 3;
+            }
+            b if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-') => i += 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn looks_uuid(s: &str) -> bool {
@@ -253,6 +389,74 @@ mod tests {
             [
                 ("INTERNAL_ENDPOINT".to_string(), "jira.corp".to_string()),
                 ("RESOURCE_ID".to_string(), "1234".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_keeps_sentence_punctuation_literal_without_path() {
+        assert_eq!(
+            labels("http://jira.corp."),
+            [("INTERNAL_ENDPOINT".to_string(), "jira.corp".to_string())]
+        );
+    }
+
+    #[test]
+    fn masks_userinfo_port_query_and_fragment_without_losing_route_shape() {
+        assert_eq!(
+            labels("http://user:pass@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456"),
+            [
+                ("URL_CREDENTIAL".to_string(), "user:pass".to_string()),
+                (
+                    "INTERNAL_ENDPOINT".to_string(),
+                    "local.jira.corp:8080".to_string()
+                ),
+                ("RESOURCE_ID".to_string(), "ABC-123".to_string()),
+                ("URL_QUERY_VALUE".to_string(), "s3cr3t".to_string()),
+                ("URL_QUERY_VALUE".to_string(), "OPS".to_string()),
+                ("RESOURCE_ID".to_string(), "comment-456".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn query_only_internal_url_masks_values() {
+        assert_eq!(
+            labels("http://jira.corp?issue=1234&debug="),
+            [
+                ("INTERNAL_ENDPOINT".to_string(), "jira.corp".to_string()),
+                ("URL_QUERY_VALUE".to_string(), "1234".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn percent_encoded_path_id_is_resource_id() {
+        assert_eq!(
+            labels("http://jira.corp/api/issues/ABC%2D123"),
+            [
+                ("INTERNAL_ENDPOINT".to_string(), "jira.corp".to_string()),
+                ("RESOURCE_ID".to_string(), "ABC%2D123".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn route_words_and_versions_are_not_resource_ids() {
+        assert_eq!(
+            labels("http://jira.corp/api/v1/issues/list"),
+            [("INTERNAL_ENDPOINT".to_string(), "jira.corp".to_string())]
+        );
+    }
+
+    #[test]
+    fn fragment_query_values_are_masked() {
+        assert_eq!(
+            labels("http://jira.corp/#access_token=abc12345&state=xyz"),
+            [
+                ("INTERNAL_ENDPOINT".to_string(), "jira.corp".to_string()),
+                ("URL_QUERY_VALUE".to_string(), "abc12345".to_string()),
+                ("URL_QUERY_VALUE".to_string(), "xyz".to_string()),
             ]
         );
     }

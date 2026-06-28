@@ -272,7 +272,7 @@ impl RuleDetector {
             ),
             // URL (scheme required, so it doesn't match bare hostnames).
             (
-                r#"(?i)\b(?:https?|ftp|ftps|wss?)://[^\s"'<>()]+"#,
+                r#"(?i)\b(?:https?|ftp|ftps|wss?)://[^\s"'<>()]*[^\s"'<>().,;:!?]"#,
                 Endpoint,
                 "URL",
                 Medium,
@@ -623,6 +623,20 @@ mod tests {
         assert!(hits("a@b.co.uk"));
         assert!(!hits("alice@.com"));
         assert!(!hits("alice@example."));
+    }
+
+    #[test]
+    fn url_rule_keeps_sentence_punctuation_literal() {
+        let det = RuleDetector::builtin();
+        let raw = "see https://example.com/api/issues/1234. next";
+        let spans = det.detect(&NormalizedView::build(&region(raw), raw));
+        let Some(span) = spans.iter().find(|s| s.label == "URL") else {
+            panic!("URL should be detected: {spans:?}");
+        };
+        assert_eq!(
+            &raw[span.range.start..span.range.end],
+            "https://example.com/api/issues/1234"
+        );
     }
 
     #[test]

@@ -24,6 +24,12 @@ pub mod labels {
     pub const INTERNAL_ENDPOINT: &str = "INTERNAL_ENDPOINT";
     /// Resource identifier inside an internal URL path.
     pub const RESOURCE_ID: &str = "RESOURCE_ID";
+    /// User-info credential portion of a URL authority.
+    pub const URL_CREDENTIAL: &str = "URL_CREDENTIAL";
+    /// Query parameter value in an internal URL.
+    pub const URL_QUERY_VALUE: &str = "URL_QUERY_VALUE";
+    /// Fragment value in an internal URL.
+    pub const URL_FRAGMENT: &str = "URL_FRAGMENT";
 }
 
 /// Half-open byte range into the raw input, aligned to UTF-8 char boundaries.

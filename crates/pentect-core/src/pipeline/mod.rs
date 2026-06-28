@@ -749,6 +749,61 @@ mod tests {
     }
 
     #[test]
+    fn internal_url_does_not_leak_userinfo_query_or_fragment() {
+        let input = "open http://user:pass@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456.";
+        let r = m(input);
+        assert!(
+            r.masked.starts_with("open http://<<URL_CREDENTIAL_"),
+            "{}",
+            r.masked
+        );
+        assert!(r.masked.contains("@<<INTERNAL_ENDPOINT_"), "{}", r.masked);
+        assert!(
+            r.masked.contains("/api/issues/<<RESOURCE_ID_"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            r.masked.contains("?token=<<URL_QUERY_VALUE_"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            r.masked.contains("&project=<<URL_QUERY_VALUE_"),
+            "{}",
+            r.masked
+        );
+        assert!(r.masked.contains("#<<RESOURCE_ID_"), "{}", r.masked);
+        for leaked in [
+            "user:pass",
+            "local.jira.corp",
+            "ABC-123",
+            "s3cr3t",
+            "OPS",
+            "comment-456",
+        ] {
+            assert!(
+                !r.masked.contains(leaked),
+                "{leaked} leaked in {}",
+                r.masked
+            );
+        }
+        assert!(r.masked.ends_with('.'), "{}", r.masked);
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn url_masks_keep_sentence_punctuation_literal() {
+        let internal = m("http://jira.corp/api/issues/1234.");
+        assert!(internal.masked.ends_with('.'), "{}", internal.masked);
+        assert!(!internal.masked.contains("1234."), "{}", internal.masked);
+
+        let external = m("https://example.com/api/issues/1234.");
+        assert!(external.masked.ends_with('.'), "{}", external.masked);
+        assert!(external.masked.contains("<<URL_"), "{}", external.masked);
+    }
+
+    #[test]
     fn report_names_what_was_masked_without_offsets() {
         let r = m("key AKIAIOSFODNN7EXAMPLE here");
         // The report carries the label/category but no raw position, so a
