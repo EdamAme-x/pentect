@@ -193,6 +193,13 @@ fn session_does_not_create_key_or_recovery_dir() {
 }
 
 #[test]
+fn default_session_root_lives_under_pentect_agent_dir() {
+    std::env::remove_var("PENTECT_AGENT_HOME");
+    let root = session_root("demo").unwrap();
+    assert_eq!(root, PathBuf::from(".pentect").join("agent").join("demo"));
+}
+
+#[test]
 fn open_at_stays_in_memory_even_when_base_has_capability_vault() {
     let root = temp_root("open-at-in-memory");
     let persisted = Session::open_capability_at(&root, "t").unwrap();

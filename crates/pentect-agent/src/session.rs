@@ -12,6 +12,8 @@ use zeroize::Zeroize;
 const VAULT_FILE: &str = "capability-vault.pnt";
 const VAULT_MAGIC: &[u8; 4] = b"PNV1";
 const VAULT_VERSION: u8 = 1;
+const PENTECT_DIR: &str = ".pentect";
+const AGENT_DIR: &str = "agent";
 #[derive(Clone)]
 pub(crate) struct Session {
     pub(crate) key: [u8; 32],
@@ -305,7 +307,7 @@ pub(crate) fn session_root(name: &str) -> Result<PathBuf> {
     let name = checked_session_name(name)?;
     let base = std::env::var_os("PENTECT_AGENT_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".pentect-agent"));
+        .unwrap_or_else(|| PathBuf::from(PENTECT_DIR).join(AGENT_DIR));
     Ok(base.join(name))
 }
 
