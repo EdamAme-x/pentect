@@ -18,6 +18,7 @@ pdf = ["dep:pdf-extract"]
 
 [dependencies]
 pentect-core = { path = "../pentect-core" }
+pentect-runtime = { path = "../pentect-runtime" }
 anyhow = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 serde_json = { workspace = true }

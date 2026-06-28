@@ -35,42 +35,6 @@ pub(crate) fn next_shell_word(text: &str, start: usize) -> Option<(String, usize
     Some((text[word_start..end].to_string(), word_start, end))
 }
 
-pub(crate) fn shell_command(words: &[String]) -> String {
-    words
-        .iter()
-        .map(|word| shell_quote_unix(word))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub(crate) fn powershell_command(words: &[String]) -> String {
-    if let Some((first, rest)) = words.split_first() {
-        if is_simple_shell_word(first) {
-            let mut out = powershell_word(first);
-            if !rest.is_empty() {
-                out.push(' ');
-                out.push_str(
-                    &rest
-                        .iter()
-                        .map(|word| powershell_word(word))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                );
-            }
-            return out;
-        }
-    }
-    let mut out = String::from("& ");
-    out.push_str(
-        &words
-            .iter()
-            .map(|word| powershell_word(word))
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
-    out
-}
-
 pub(crate) fn shell_quote_unix(value: &str) -> String {
     if is_simple_shell_word(value) {
         return value.to_string();

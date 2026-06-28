@@ -7,48 +7,55 @@ mod terminal;
 
 use input::{decode_utf8_text, InputAdapter, TextInput};
 use pentect_core::{load_pack, Config, Engine, Input, Kind, Pack, Profile};
-use serde_json::json;
-use std::fs;
-use std::io::{Read, Write};
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
 /// Refuse oversized input rather than emit partially-masked output (a masked
 /// head plus a raw tail would leak the tail).
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
-const PENTECT_AGENT_INSTRUCTIONS: &str = concat!(
+const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
-    "- Run normal shell commands. The hook layer routes them through `pentect exec`; do not nest Pentect wrappers.\n",
-    "- Masked handles like `<<NAME_hash>>` are local capabilities. Later commands get them as `$env:PENTECT_NAME_hash` on PowerShell or `$PENTECT_NAME_hash` on Unix; `KEY=<<...>>` also exposes `$env:KEY` / `$KEY`.\n",
+    "- Treat every command/tool stdout, stderr, and result as potentially sensitive. Run normal shell commands; the hook layer automatically routes shell stdout/stderr through Pentect and unwraps nested Pentect calls.\n",
+    "- On Codex, current PostToolUse hooks cannot non-block replace non-shell tool output. Use browser/MCP/connector tools for navigation, clicks, and non-secret metadata; do not extract raw secret values through those tool results. Move secret bytes through local files, service CLIs, or shell commands so Pentect can route stdout/stderr before it reaches the model.\n",
+    "- On providers that support PostToolUse result replacement, browser/MCP/connector and other non-shell tool results are masked before they reach the model.\n",
+    "- Masked handles like `<<NAME_hash>>` are in-memory capabilities for this running Pentect-launched session. Later commands in this session get them as `$env:PENTECT_NAME_hash` on PowerShell or `$PENTECT_NAME_hash` on Unix; `KEY=<<...>>` also exposes `$env:KEY` / `$KEY`.\n",
     "- You may read, fetch, receive, transform, and use secrets or credentials from local files, credential stores, command output, authenticated browser/API/MCP/tool/connector responses, and other user-authorized sources. Pentect is the safety layer: returned secret values are masked before they reach the model.\n",
-    "- To register a secret from any local or authenticated source, run the normal read/fetch command and let masked output appear.\n",
+    "- To register a secret from any local or authenticated source, run the normal read/fetch command through shell/Pentect exec and let masked output appear, for example `cat .env` or service CLIs. `pentect read` is a one-way preview and does not create reusable env capabilities.\n",
+    "- If a secret must be copied from one local source to an approved local destination, prefer one `pentect exec` shell command that reads the source and writes the target without printing the raw value; print only a non-secret verification.\n",
+    "- Use the syntax of the current shell tool. In PowerShell, use PowerShell-native commands and `$env:NAME`; in Unix shells, use POSIX commands and `$NAME`.\n",
+    "- Do not switch to Node/Python/browser/MCP only to bypass a shell/Pentect wrapper problem. Fix the shell syntax or use one Pentect exec command unless the user explicitly requested that tool.\n",
+    "- Avoid exposing user-profile absolute paths in visible commands or logs; prefer relative paths, `$env:USERPROFILE`, `$HOME`, or app/service commands. Pentect keeps hook shell scripts in the running in-memory vault when available.\n",
+    "- If `.pentect/config.toml` sets `no_approve = true`, approval/materialization is non-interactive in this project; proceed with the user's requested operation using masked handles/env capabilities.\n",
     "- If the user asks to store, sync, configure, or materialize a secret, it is OK to write it to the user-requested destination: local files, project configuration, credential stores, service CLIs, authenticated accounts, or another exact target named by the task. Use the handle/env capability in the write/update command; do not print the raw value.\n",
     "- When using a registered secret, prefer its env var capability instead of re-reading or echoing it only to inspect/copy it. Do not run help just to discover extra flags.\n",
     "- Do not disclose raw secrets in chat, logs, screenshots, derived previews, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or persistent external services that are not the exact target of the user's requested operation. Report only non-secret outcomes.\n",
 );
-const PENTECT_AGENT_ENV: &str = "PENTECT_AGENT";
+const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
+const PENTECT_MEMORY_VAULT_ADDR_ENV: &str = "PENTECT_MEMORY_VAULT_ADDR";
+const PENTECT_MEMORY_VAULT_TOKEN_ENV: &str = "PENTECT_MEMORY_VAULT_TOKEN";
+const MEMORY_VAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        None => cmd_agent_passthrough_from(1, &args),
+        None => cmd_agent_from(1, &args),
         Some("help" | "--help" | "-h") => cmd_help(),
-        Some("dashboard") => cmd_agent_passthrough_from(1, &args),
-        Some("--dir" | "--session" | "--port") => cmd_agent_passthrough_from(1, &args),
+        Some("dashboard") => cmd_agent_from(1, &args),
+        Some("--dir" | "--session" | "--port") => cmd_agent_from(1, &args),
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("scan") => scan::cmd_scan(&args),
-        Some("exec" | "resolve" | "approve" | "hook" | "purge") => {
-            cmd_agent_passthrough_from(1, &args)
-        }
-        Some("agent") => cmd_agent_passthrough(&args),
+        Some("exec" | "resolve" | "approve" | "hook" | "purge") => cmd_agent_from(1, &args),
+        Some("agent") => cmd_agent_from(2, &args),
         Some("codex") => cmd_agent_tool(AgentTool::Codex, &args),
         Some("claude") => cmd_agent_tool(AgentTool::Claude, &args),
-        Some("gemini") => cmd_agent_tool(AgentTool::Gemini, &args),
         _ => usage(),
     }
 }
@@ -56,7 +63,7 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect\n\
-         pentect codex|claude|gemini\n\
+         pentect codex|claude\n\
          pentect exec \"<command>\"\n\
          pentect scan [PATH...]\n\
          pentect resolve [PATH...]\n\
@@ -78,21 +85,22 @@ fn help_text() -> &'static str {
         "Use:\n",
         "  pentect\n",
         "  pentect --port 7331\n",
-        "  pentect codex|claude|gemini [--extensions NAME|PATH.toml]\n",
+        "  pentect codex|claude [--extensions NAME|PATH.toml]\n",
+        "  pentect agent exec \"<command>\"\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect scan [PATH...]\n\n",
         "`pentect` opens the approval dashboard.\n",
+        "Set `no_approve = true` in `.pentect/config.toml` to bypass approval prompts for this project.\n",
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
         "`pentect scan` reports likely secret files without printing secret values.\n",
         "`--extensions NAME` uses .pentect/extensions/NAME; `--extensions PATH.toml` uses a rule-pack file.\n",
         "Default extensions can be listed in `.pentect/config.toml` as `extensions = [...]`.\n",
-        "Masked handles resolve locally in later `pentect exec` commands.\n",
+        "Masked handles resolve only while the same Pentect-launched agent session is running.\n",
         "Every handle also becomes a `PENTECT_...` env var for later execs.\n",
         "Masked env lines become env vars in later execs: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
-        "Masked output and referenced local files register capabilities for later execs.\n",
+        "Masked output and referenced local files register in-memory capabilities for later execs in that running session.\n",
         "Use normal commands and let Pentect return masked handles.\n",
         "Use `pentect resolve <path>` only when a local file must be materialized with real values.\n",
-        "`pentect gemini` uses a temporary Gemini home overlay when hook support is available; otherwise it fails closed.\n",
     )
 }
 
@@ -101,18 +109,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(2);
 }
 
-fn cmd_agent_passthrough(args: &[String]) {
-    if matches!(args.get(2).map(String::as_str), Some("--probe")) {
-        println!("pentect-agent-passthrough");
-        return;
-    }
-    cmd_agent_passthrough_from(2, args)
-}
-
-fn cmd_agent_passthrough_from(start: usize, args: &[String]) {
-    let agent = std::env::var_os(PENTECT_AGENT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_agent_path);
+fn cmd_agent_from(start: usize, args: &[String]) {
     let (forward_args, explicit_extensions) = match extensions::strip_from_args(&args[start..]) {
         Ok(parsed) => parsed,
         Err(e) => die(&e),
@@ -121,16 +118,20 @@ fn cmd_agent_passthrough_from(start: usize, args: &[String]) {
         Ok(active) => active,
         Err(e) => die(&e),
     };
-    let mut cmd = Command::new(&agent);
     if let Some(value) = match active_extensions.env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     } {
-        cmd.env(extensions::PACKS_ENV, value);
+        std::env::set_var(extensions::PACKS_ENV, value);
     }
-    cmd.args(&forward_args);
-    let status = run_command(cmd, &agent);
-    std::process::exit(status.code().unwrap_or(1));
+    let mut agent_args = Vec::with_capacity(forward_args.len() + 1);
+    agent_args.push(
+        args.first()
+            .cloned()
+            .unwrap_or_else(|| "pentect".to_string()),
+    );
+    agent_args.extend(forward_args);
+    std::process::exit(pentect_agent::run_from(agent_args));
 }
 
 fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
@@ -138,22 +139,28 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
         Ok(o) => o,
         Err(e) => die(&e),
     };
-    let agent = opts.agent.clone().unwrap_or_else(default_agent_path);
-    if !agent.exists() && agent.components().count() > 1 {
+    let pentect = opts.pentect.clone().unwrap_or_else(default_pentect_path);
+    if !pentect.exists() && pentect.components().count() > 1 {
         die(format!(
-            "pentect-agent not found at '{}'; run `cargo build -p pentect-agent --release` or pass --agent PATH",
-            agent.display()
+            "pentect not found at '{}'; run `cargo build -p pentect-cli --release` or pass --pentect PATH",
+            pentect.display()
         ));
     }
+    let memory_vault = if opts.dry_run {
+        None
+    } else {
+        Some(MemoryVaultGuard::start(&pentect).unwrap_or_else(|e| die(&e)))
+    };
     if !opts.dry_run {
-        terminal::restore_after_tui();
+        terminal::prepare_for_tui();
     }
     let status = match tool {
-        AgentTool::Codex => run_codex(&opts, &agent),
-        AgentTool::Claude => run_claude(&opts, &agent),
-        AgentTool::Gemini => run_gemini(&opts, &agent),
+        AgentTool::Codex => run_codex(&opts, &pentect, memory_vault.as_ref()),
+        AgentTool::Claude => run_claude(&opts, &pentect, memory_vault.as_ref()),
     };
-    std::process::exit(status.code().unwrap_or(1));
+    let code = status.code().unwrap_or(1);
+    drop(memory_vault);
+    std::process::exit(code);
 }
 
 /// Read stdin as bytes (no panic on binary), cap the size, then delegate
@@ -304,7 +311,6 @@ fn cmd_read(args: &[String]) {
 enum AgentTool {
     Codex,
     Claude,
-    Gemini,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,7 +399,6 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "codex",
             AgentTool::Claude => "claude",
-            AgentTool::Gemini => "gemini",
         }
     }
 
@@ -401,22 +406,17 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "PENTECT_CODEX",
             AgentTool::Claude => "PENTECT_CLAUDE",
-            AgentTool::Gemini => "PENTECT_GEMINI",
         }
     }
 
     fn default_command(self) -> &'static str {
-        match self {
-            AgentTool::Gemini if cfg!(windows) => "gemini.cmd",
-            _ => self.name(),
-        }
+        self.name()
     }
 
     fn path_flag(self) -> &'static str {
         match self {
             AgentTool::Codex => "--codex",
             AgentTool::Claude => "--claude",
-            AgentTool::Gemini => "--gemini",
         }
     }
 }
@@ -424,7 +424,7 @@ impl AgentTool {
 #[derive(Debug)]
 struct AgentToolOpts {
     session: Option<String>,
-    agent: Option<PathBuf>,
+    pentect: Option<PathBuf>,
     command: PathBuf,
     extensions: Vec<String>,
     dry_run: bool,
@@ -435,7 +435,7 @@ struct AgentToolOpts {
 impl AgentToolOpts {
     fn parse(tool: AgentTool, args: &[String]) -> Result<Self, String> {
         let mut session = None;
-        let mut agent = None;
+        let mut pentect = None;
         let mut command = std::env::var_os(tool.env_var())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(tool.default_command()));
@@ -457,8 +457,8 @@ impl AgentToolOpts {
                         "--session",
                     )?)?);
                 }
-                "--agent" => {
-                    agent = Some(PathBuf::from(required_value(args, &mut i, "--agent")?));
+                "--pentect" => {
+                    pentect = Some(PathBuf::from(required_value(args, &mut i, "--pentect")?));
                 }
                 "--tool" => {
                     command = PathBuf::from(required_value(args, &mut i, "--tool")?);
@@ -501,7 +501,7 @@ impl AgentToolOpts {
         }
         Ok(Self {
             session,
-            agent: agent.or_else(|| std::env::var_os(PENTECT_AGENT_ENV).map(PathBuf::from)),
+            pentect: pentect.or_else(|| std::env::var_os(PENTECT_BIN_ENV).map(PathBuf::from)),
             command,
             extensions,
             dry_run,
@@ -511,8 +511,12 @@ impl AgentToolOpts {
     }
 }
 
-fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
-    let configs = codex_hook_config_args(agent, opts.session.as_deref());
+fn run_codex(
+    opts: &AgentToolOpts,
+    pentect: &Path,
+    memory_vault: Option<&MemoryVaultGuard>,
+) -> std::process::ExitStatus {
+    let configs = codex_hook_config_args(pentect, opts.session.as_deref());
     if opts.dry_run {
         if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
             eprintln!(
@@ -530,7 +534,8 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
         Err(e) => die(&e),
     };
     let mut cmd = Command::new(&opts.command);
-    apply_agent_env(&mut cmd, agent);
+    apply_pentect_env(&mut cmd, pentect);
+    apply_memory_vault_env(&mut cmd, memory_vault);
     apply_extension_env(&mut cmd, &active_extensions);
     for config in configs {
         cmd.arg("--config").arg(config);
@@ -539,8 +544,12 @@ fn run_codex(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
     run_interactive_command(cmd, &opts.command)
 }
 
-fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
-    let settings = claude_settings_json(agent, opts.session.as_deref());
+fn run_claude(
+    opts: &AgentToolOpts,
+    pentect: &Path,
+    memory_vault: Option<&MemoryVaultGuard>,
+) -> std::process::ExitStatus {
+    let settings = claude_settings_json(pentect, opts.session.as_deref());
     let args = claude_args(&settings, &opts.tool_args);
     if opts.dry_run {
         print_dry_run(&opts.command, &args);
@@ -551,368 +560,15 @@ fn run_claude(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
         Err(e) => die(&e),
     };
     let mut cmd = Command::new(&opts.command);
-    apply_agent_env(&mut cmd, agent);
+    apply_pentect_env(&mut cmd, pentect);
+    apply_memory_vault_env(&mut cmd, memory_vault);
     apply_extension_env(&mut cmd, &active_extensions);
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
 }
 
-fn run_gemini(opts: &AgentToolOpts, agent: &Path) -> std::process::ExitStatus {
-    if opts.dry_run {
-        eprintln!(
-            "[pentect] note: Gemini will run with a temporary home overlay containing Pentect hooks and context."
-        );
-        print_dry_run(&opts.command, &opts.tool_args);
-        return success_status();
-    }
-    if !opts.allow_unverified_hooks {
-        if let Err(reason) = gemini_hook_support(&opts.command) {
-            die(format!(
-                "refusing to start Gemini with Pentect hooks: {reason}. Pentect will not launch Gemini without verified BeforeTool/AfterTool support because raw tool output could reach the model. Upgrade Gemini CLI to a hook-capable release, use `pentect codex`, `pentect claude`, or pass --allow-unverified-hooks only for manual adapter debugging."
-            ));
-        }
-    }
-    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
-        Ok(active) => active,
-        Err(e) => die(&e),
-    };
-    let overlay = match GeminiHookOverlay::install(agent, opts.session.as_deref()) {
-        Ok(overlay) => overlay,
-        Err(e) => die(e),
-    };
-    let mut cmd = Command::new(&opts.command);
-    apply_agent_env(&mut cmd, agent);
-    apply_extension_env(&mut cmd, &active_extensions);
-    overlay.apply_env(&mut cmd);
-    cmd.args(&opts.tool_args);
-    let status = run_interactive_command(cmd, &opts.command);
-    drop(overlay);
-    status
-}
-
-struct GeminiHookOverlay {
-    root: PathBuf,
-}
-
-impl GeminiHookOverlay {
-    fn install(agent: &Path, session: Option<&str>) -> Result<Self, String> {
-        let root = unique_temp_root("pentect-gemini")?;
-        Self::install_at(root, agent, session)
-    }
-
-    fn install_at(root: PathBuf, agent: &Path, session: Option<&str>) -> Result<Self, String> {
-        let gemini_dir = root.join(".gemini");
-        fs::create_dir_all(&gemini_dir)
-            .map_err(|e| format!("could not create Gemini hook overlay: {e}"))?;
-        fs::write(gemini_dir.join("GEMINI.md"), PENTECT_AGENT_INSTRUCTIONS)
-            .map_err(|e| format!("could not write Gemini Pentect context: {e}"))?;
-        let session_start_path = root.join("pentect-session-start.json");
-        fs::write(
-            &session_start_path,
-            serde_json::to_string(&json!({
-                "suppressOutput": true,
-                "hookSpecificOutput": {
-                    "additionalContext": PENTECT_AGENT_INSTRUCTIONS
-                }
-            }))
-            .map_err(|e| format!("could not render Gemini session context hook: {e}"))?,
-        )
-        .map_err(|e| format!("could not write Gemini session context hook: {e}"))?;
-        let settings = gemini_hook_settings(agent, session, &session_start_path);
-        fs::write(
-            gemini_dir.join("settings.json"),
-            serde_json::to_string_pretty(&settings)
-                .map_err(|e| format!("could not render Gemini hook settings: {e}"))?,
-        )
-        .map_err(|e| format!("could not write Gemini hook settings: {e}"))?;
-        Ok(Self { root })
-    }
-
-    fn apply_env(&self, cmd: &mut Command) {
-        cmd.env("HOME", &self.root);
-        cmd.env("USERPROFILE", &self.root);
-    }
-}
-
-impl Drop for GeminiHookOverlay {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-fn gemini_hook_settings(
-    agent: &Path,
-    session: Option<&str>,
-    session_start_path: &Path,
-) -> serde_json::Value {
-    let hook_command = gemini_hook_command(agent, session);
-    let context_command = if cfg!(windows) {
-        format!(
-            "cmd /c type {}",
-            shell_quote_windows(&session_start_path.to_string_lossy())
-        )
-    } else {
-        format!(
-            "cat {}",
-            shell_quote_unix(&session_start_path.to_string_lossy())
-        )
-    };
-    json!({
-        "hooks": {
-            "SessionStart": [{
-                "hooks": [{
-                    "type": "command",
-                    "name": "pentect-context",
-                    "description": "Inject the Pentect agent contract without mutating workspace files.",
-                    "command": context_command,
-                    "timeout": 30000
-                }]
-            }],
-            "BeforeTool": [{
-                "matcher": ".*",
-                "hooks": [{
-                    "type": "command",
-                    "name": "pentect-before-tool",
-                    "description": "Route shell commands through Pentect before execution.",
-                    "command": hook_command,
-                    "timeout": 30000
-                }]
-            }],
-            "AfterTool": [{
-                "matcher": ".*",
-                "hooks": [{
-                    "type": "command",
-                    "name": "pentect-after-tool",
-                    "description": "Mask tool output before it is returned to the model.",
-                    "command": hook_command,
-                    "timeout": 30000
-                }]
-            }]
-        }
-    })
-}
-
-fn gemini_hook_command(agent: &Path, session: Option<&str>) -> String {
-    if cfg!(windows) {
-        format!(
-            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command {}",
-            shell_quote_windows(&hook_command_windows(agent, "gemini", session))
-        )
-    } else {
-        hook_command_unix(agent, "gemini", session)
-    }
-}
-
-fn unique_temp_root(prefix: &str) -> Result<PathBuf, String> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("system clock is before UNIX_EPOCH: {e}"))?
-        .as_millis();
-    for attempt in 0..100 {
-        let root =
-            std::env::temp_dir().join(format!("{prefix}-{}-{stamp}-{attempt}", std::process::id()));
-        match fs::create_dir(&root) {
-            Ok(()) => return Ok(root),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(format!(
-                    "could not create temporary Gemini hook overlay: {e}"
-                ))
-            }
-        }
-    }
-    Err("could not allocate a unique temporary Gemini hook overlay".to_string())
-}
-
-fn gemini_hook_support(command: &Path) -> Result<(), String> {
-    if let Some(path) = resolve_command_path(command) {
-        if let Some(package_root) = gemini_package_root_from_command(&path) {
-            if gemini_package_tree_has_hooks(&package_root) {
-                return Ok(());
-            }
-            let version = gemini_package_version(&package_root)
-                .map(|v| format!(" @google/gemini-cli {v}"))
-                .unwrap_or_default();
-            return Err(format!(
-                "'{}' resolves to{} at '{}', but its installed source has no Gemini hook runtime symbols (BeforeTool/AfterTool)",
-                command.display(),
-                version,
-                package_root.display()
-            ));
-        }
-    }
-    let Some(help) = command_output_text_with_timeout(command, &["--help"], Duration::from_secs(3))
-    else {
-        return Err(format!(
-            "could not verify hook support for '{}' from installed source or `--help`",
-            command.display()
-        ));
-    };
-    if help.contains("BeforeTool") || help.contains("AfterTool") || help.contains("hook_event_name")
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "'{} --help' does not advertise Gemini hook events",
-            command.display()
-        ))
-    }
-}
-
-fn resolve_command_path(command: &Path) -> Option<PathBuf> {
-    if command.is_absolute() || command.components().count() > 1 {
-        return command.exists().then(|| command.to_path_buf());
-    }
-    let name = command.to_string_lossy();
-    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
-        let candidate = dir.join(name.as_ref());
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            if Path::new(name.as_ref()).extension().is_none() {
-                let pathext = std::env::var_os("PATHEXT")
-                    .and_then(|v| v.into_string().ok())
-                    .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
-                for ext in pathext.split(';').filter(|ext| !ext.is_empty()) {
-                    let candidate = dir.join(format!("{name}{ext}"));
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn gemini_package_root_from_command(command_path: &Path) -> Option<PathBuf> {
-    let command_dir = command_path.parent()?;
-    let package_root = command_dir
-        .join("node_modules")
-        .join("@google")
-        .join("gemini-cli");
-    if package_root.exists() {
-        return Some(package_root);
-    }
-    let wrapper = fs::read_to_string(command_path).ok()?;
-    if wrapper.contains("node_modules\\@google\\gemini-cli\\dist\\index.js")
-        || wrapper.contains("node_modules/@google/gemini-cli/dist/index.js")
-    {
-        return Some(package_root);
-    }
-    None
-}
-
-fn gemini_package_tree_has_hooks(package_root: &Path) -> bool {
-    let dist = package_root.join("dist");
-    if !dist.exists() {
-        return false;
-    }
-    let settings_have_hooks = [
-        package_root.join("dist/src/config/settings.d.ts"),
-        package_root.join("dist/src/config/settings.js"),
-    ]
-    .iter()
-    .any(|path| file_contains(path, "hooks"));
-    settings_have_hooks
-        && tree_contains_all(
-            &dist,
-            &["BeforeTool", "AfterTool", "hookSpecificOutput"],
-            4096,
-        )
-}
-
-fn gemini_package_version(package_root: &Path) -> Option<String> {
-    let package = fs::read_to_string(package_root.join("package.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&package).ok()?;
-    value.get("version")?.as_str().map(str::to_string)
-}
-
-fn file_contains(path: &Path, needle: &str) -> bool {
-    fs::read_to_string(path).is_ok_and(|text| text.contains(needle))
-}
-
-fn tree_contains_all(root: &Path, needles: &[&str], max_files: usize) -> bool {
-    let mut found = vec![false; needles.len()];
-    let mut stack = vec![root.to_path_buf()];
-    let mut seen_files = 0usize;
-    while let Some(path) = stack.pop() {
-        let Ok(metadata) = fs::metadata(&path) else {
-            continue;
-        };
-        if metadata.is_dir() {
-            let Ok(entries) = fs::read_dir(&path) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                stack.push(entry.path());
-            }
-            continue;
-        }
-        if seen_files >= max_files {
-            break;
-        }
-        seen_files += 1;
-        if !matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("js" | "mjs" | "cjs" | "ts" | "d.ts" | "md")
-        ) {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for (idx, needle) in needles.iter().enumerate() {
-            if text.contains(needle) {
-                found[idx] = true;
-            }
-        }
-        if found.iter().all(|value| *value) {
-            return true;
-        }
-    }
-    false
-}
-
-fn command_output_text_with_timeout(
-    command: &Path,
-    args: &[&str],
-    timeout: Duration,
-) -> Option<String> {
-    let mut child = Command::new(command)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let start = Instant::now();
-    loop {
-        if child.try_wait().ok()?.is_some() {
-            let output = child.wait_with_output().ok()?;
-            let mut text = String::new();
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            return Some(text);
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn run_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
-    cmd.status()
-        .unwrap_or_else(|e| die(format!("could not start '{}': {e}", display.display())))
-}
-
 fn run_interactive_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
-    terminal::restore_after_tui();
+    terminal::prepare_for_tui();
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| die(format!("could not start '{}': {e}", display.display())));
@@ -932,8 +588,102 @@ fn run_interactive_command(mut cmd: Command, display: &Path) -> std::process::Ex
     status
 }
 
-fn apply_agent_env(cmd: &mut Command, agent: &Path) {
-    cmd.env(PENTECT_AGENT_ENV, agent);
+struct MemoryVaultGuard {
+    child: Child,
+    addr: String,
+    token: String,
+}
+
+impl MemoryVaultGuard {
+    fn start(pentect: &Path) -> Result<Self, String> {
+        let mut child = Command::new(pentect)
+            .arg("agent")
+            .arg("vault")
+            .arg("--serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("could not start Pentect memory vault: {e}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "could not capture Pentect memory vault startup".to_string())?;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout)
+                .read_line(&mut line)
+                .map_err(|e| format!("could not read Pentect memory vault startup: {e}"))
+                .and_then(|_| {
+                    if line.trim().is_empty() {
+                        Err("Pentect memory vault exited before startup".to_string())
+                    } else {
+                        Ok(line)
+                    }
+                });
+            let _ = tx.send(result);
+        });
+        let line = match rx.recv_timeout(MEMORY_VAULT_STARTUP_TIMEOUT) {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Pentect memory vault did not start within 5 seconds".to_string());
+            }
+        };
+        let (addr, token) = match parse_memory_vault_startup(&line) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
+        Ok(Self { child, addr, token })
+    }
+}
+
+impl Drop for MemoryVaultGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn apply_pentect_env(cmd: &mut Command, pentect: &Path) {
+    cmd.env(PENTECT_BIN_ENV, pentect);
+}
+
+fn apply_memory_vault_env(cmd: &mut Command, memory_vault: Option<&MemoryVaultGuard>) {
+    let Some(memory_vault) = memory_vault else {
+        return;
+    };
+    cmd.env(PENTECT_MEMORY_VAULT_ADDR_ENV, &memory_vault.addr);
+    cmd.env(PENTECT_MEMORY_VAULT_TOKEN_ENV, &memory_vault.token);
+}
+
+fn parse_memory_vault_startup(line: &str) -> Result<(String, String), String> {
+    let startup: Value = serde_json::from_str(line)
+        .map_err(|e| format!("Pentect memory vault startup was not JSON: {e}"))?;
+    let addr = startup
+        .get("addr")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Pentect memory vault startup did not include addr".to_string())?
+        .to_string();
+    let token = startup
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Pentect memory vault startup did not include token".to_string())?
+        .to_string();
+    Ok((addr, token))
 }
 
 fn apply_extension_env(cmd: &mut Command, active: &extensions::ActiveExtensions) {
@@ -954,7 +704,7 @@ fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
     args.push("--config".to_string());
     args.push(format!(
         "developer_instructions={}",
-        toml_string(PENTECT_AGENT_INSTRUCTIONS)
+        toml_string(PENTECT_CONTRACT_INSTRUCTIONS)
     ));
     args.extend(tool_args.iter().cloned());
     args
@@ -965,7 +715,7 @@ fn claude_args(settings: &str, tool_args: &[String]) -> Vec<String> {
         "--settings".to_string(),
         settings.to_string(),
         "--append-system-prompt".to_string(),
-        PENTECT_AGENT_INSTRUCTIONS.to_string(),
+        PENTECT_CONTRACT_INSTRUCTIONS.to_string(),
     ];
     args.extend(tool_args.iter().cloned());
     args
@@ -1087,49 +837,55 @@ fn claude_settings_json(agent: &Path, session: Option<&str>) -> String {
     .to_string()
 }
 
-fn hook_command_unix(agent: &Path, provider: &str, session: Option<&str>) -> String {
-    hook_words(agent, provider, session)
-        .iter()
-        .map(|word| shell_quote_unix(word))
-        .collect::<Vec<_>>()
-        .join(" ")
+fn hook_command_unix(_agent: &Path, provider: &str, session: Option<&str>) -> String {
+    let mut words = vec![
+        "agent".to_string(),
+        "hook".to_string(),
+        "--capability".to_string(),
+        provider.to_string(),
+    ];
+    add_explicit_session(&mut words, session);
+    let mut out = String::from("${PENTECT_BIN:-pentect}");
+    if !words.is_empty() {
+        out.push(' ');
+        out.push_str(
+            &words
+                .iter()
+                .map(|word| shell_quote_unix(word))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    out
 }
 
-fn hook_command_windows(agent: &Path, provider: &str, session: Option<&str>) -> String {
-    let mut out = String::from("& ");
-    out.push_str(
-        &hook_words(agent, provider, session)
-            .iter()
-            .map(|word| powershell_quote(word))
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
+fn hook_command_windows(_agent: &Path, provider: &str, session: Option<&str>) -> String {
+    let mut words = vec![
+        "agent".to_string(),
+        "hook".to_string(),
+        "--capability".to_string(),
+        provider.to_string(),
+    ];
+    add_explicit_session(&mut words, session);
+    let mut out = String::from("$p=$env:PENTECT_BIN; if (-not $p) { $p='pentect' }; & $p");
+    if !words.is_empty() {
+        out.push(' ');
+        out.push_str(
+            &words
+                .iter()
+                .map(|word| powershell_quote(word))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
     out
 }
 
 fn hook_words(agent: &Path, provider: &str, session: Option<&str>) -> Vec<String> {
-    hook_words_with_passthrough(hook_passthrough_command(), agent, provider, session)
-}
-
-fn hook_words_with_passthrough(
-    passthrough: Option<String>,
-    agent: &Path,
-    provider: &str,
-    session: Option<&str>,
-) -> Vec<String> {
-    if let Some(pentect) = passthrough {
-        let mut words = vec![
-            pentect,
-            "hook".to_string(),
-            "--capability".to_string(),
-            provider.to_string(),
-        ];
-        add_explicit_session(&mut words, session);
-        return words;
-    }
     let agent = agent_command_path(agent);
     let mut words = vec![
         agent.to_string_lossy().into_owned(),
+        "agent".to_string(),
         "hook".to_string(),
         "--capability".to_string(),
         provider.to_string(),
@@ -1146,23 +902,6 @@ fn add_explicit_session(words: &mut Vec<String>, session: Option<&str>) {
     words.push(session.to_string());
 }
 
-fn hook_passthrough_command() -> Option<String> {
-    if let Ok(current) = std::env::current_exe() {
-        if pentect_agent_passthrough_available_at(&current) {
-            return Some(current.to_string_lossy().into_owned());
-        }
-    }
-    None
-}
-
-fn pentect_agent_passthrough_available_at(command: &Path) -> bool {
-    let Ok(output) = Command::new(command).arg("agent").arg("--probe").output() else {
-        return false;
-    };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout).trim() == "pentect-agent-passthrough"
-}
-
 fn agent_command_path(agent: &Path) -> PathBuf {
     if agent.is_absolute() {
         return agent.to_path_buf();
@@ -1172,11 +911,11 @@ fn agent_command_path(agent: &Path) -> PathBuf {
         .unwrap_or_else(|_| agent.to_path_buf())
 }
 
-fn default_agent_path() -> PathBuf {
+fn default_pentect_path() -> PathBuf {
     let exe_name = if cfg!(windows) {
-        "pentect-agent.exe"
+        "pentect.exe"
     } else {
-        "pentect-agent"
+        "pentect"
     };
     let mut candidates = Vec::new();
     if let Ok(current) = std::env::current_exe() {
@@ -1618,7 +1357,7 @@ mod tests {
 
     #[test]
     fn agent_tool_parse_rejects_prompt_proxy_for_all_agents() {
-        for tool in [AgentTool::Codex, AgentTool::Claude, AgentTool::Gemini] {
+        for tool in [AgentTool::Codex, AgentTool::Claude] {
             let args = vec![
                 "pentect".to_string(),
                 tool.name().to_string(),
@@ -1643,63 +1382,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_hook_overlay_writes_temp_hooks_and_context() {
-        let root = cli_test_temp("gemini-overlay");
-        let _ = std::fs::remove_dir_all(&root);
-        let overlay =
-            GeminiHookOverlay::install_at(root.clone(), Path::new("pentect-agent"), Some("demo"))
-                .unwrap();
-        let settings = std::fs::read_to_string(root.join(".gemini/settings.json")).unwrap();
-        assert!(settings.contains("SessionStart"), "{settings}");
-        assert!(settings.contains("BeforeTool"), "{settings}");
-        assert!(settings.contains("AfterTool"), "{settings}");
-        assert!(settings.contains("\"matcher\": \".*\""), "{settings}");
-        assert!(settings.contains("\"timeout\": 30000"), "{settings}");
-        assert!(settings.contains("--capability"), "{settings}");
-        assert!(settings.contains("gemini"), "{settings}");
-        assert!(settings.contains("--session"), "{settings}");
-        assert!(settings.contains("demo"), "{settings}");
-        let memory = std::fs::read_to_string(root.join(".gemini/GEMINI.md")).unwrap();
-        assert!(memory.contains("Pentect agent contract"), "{memory}");
-        let session_start =
-            std::fs::read_to_string(root.join("pentect-session-start.json")).unwrap();
-        assert!(
-            session_start.contains("Pentect agent contract"),
-            "{session_start}"
-        );
-
-        drop(overlay);
-        assert!(!root.exists(), "overlay should clean itself up");
-    }
-
-    #[test]
-    fn gemini_source_probe_requires_settings_and_runtime_hooks() {
-        let root = cli_test_temp("gemini-source-probe");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("dist/src/config")).unwrap();
-        std::fs::create_dir_all(root.join("dist/src/hooks")).unwrap();
-        std::fs::write(
-            root.join("dist/src/config/settings.d.ts"),
-            "export interface Settings { hooks?: Record<string, unknown>; }",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("dist/src/hooks/runtime.js"),
-            "const phases = ['BeforeTool', 'AfterTool']; const hookSpecificOutput = {};",
-        )
-        .unwrap();
-        assert!(gemini_package_tree_has_hooks(&root));
-
-        std::fs::write(
-            root.join("dist/src/config/settings.d.ts"),
-            "export interface Settings {}",
-        )
-        .unwrap();
-        assert!(!gemini_package_tree_has_hooks(&root));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn help_text_explains_agent_handle_reuse() {
         let help = help_text();
         assert!(help.contains("pentect exec"), "{help}");
@@ -1720,10 +1402,9 @@ mod tests {
     }
 
     #[test]
-    fn hook_words_prefer_verified_launching_pentect_binary() {
-        let words = hook_words_with_passthrough(
-            Some(r"C:\repo\target\debug\pentect.exe".to_string()),
-            Path::new("pentect-agent"),
+    fn hook_words_use_pentect_agent_subcommand() {
+        let words = hook_words(
+            Path::new(r"C:\repo\target\debug\pentect.exe"),
             "codex",
             Some("demo"),
         );
@@ -1731,6 +1412,7 @@ mod tests {
         assert_eq!(
             words[1..].to_vec(),
             vec![
+                "agent".to_string(),
                 "hook".to_string(),
                 "--capability".to_string(),
                 "codex".to_string(),
@@ -1741,21 +1423,22 @@ mod tests {
     }
 
     #[test]
-    fn hook_words_fall_back_to_agent_path_without_verified_passthrough() {
-        let agent = std::env::current_dir()
+    fn hook_words_use_pentect_path_without_session() {
+        let pentect = std::env::current_dir()
             .unwrap()
             .join("target")
             .join("debug")
             .join(if cfg!(windows) {
-                "pentect-agent.exe"
+                "pentect.exe"
             } else {
-                "pentect-agent"
+                "pentect"
             });
-        let words = hook_words_with_passthrough(None, &agent, "codex", None);
-        assert_eq!(words[0], agent.to_string_lossy().as_ref());
+        let words = hook_words(&pentect, "codex", None);
+        assert_eq!(words[0], pentect.to_string_lossy().as_ref());
         assert_eq!(
             words[1..].to_vec(),
             vec![
+                "agent".to_string(),
                 "hook".to_string(),
                 "--capability".to_string(),
                 "codex".to_string()
@@ -1764,16 +1447,16 @@ mod tests {
     }
 
     #[test]
-    fn launched_agent_tools_export_agent_path_for_passthrough_hooks() {
-        let agent = Path::new(r"C:\repo\target\debug\pentect-agent.exe");
+    fn launched_agent_tools_export_pentect_path_for_hooks() {
+        let pentect = Path::new(r"C:\repo\target\debug\pentect.exe");
         let mut cmd = Command::new("codex");
-        apply_agent_env(&mut cmd, agent);
+        apply_pentect_env(&mut cmd, pentect);
         let actual = cmd
             .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_ENV))
+            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_BIN_ENV))
             .and_then(|(_, value)| value)
             .unwrap();
-        assert_eq!(actual, agent.as_os_str());
+        assert_eq!(actual, pentect.as_os_str());
     }
 
     #[test]
@@ -1784,9 +1467,15 @@ mod tests {
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
         assert!(rendered.contains("Masked handles"), "{rendered}");
         assert!(
-            rendered.contains("do not nest Pentect wrappers"),
+            rendered.contains("Treat every command/tool stdout, stderr, and result"),
             "{rendered}"
         );
+        assert!(rendered.contains("Run normal shell commands"), "{rendered}");
+        assert!(
+            rendered.contains("automatically routes shell stdout/stderr through Pentect"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("PostToolUse hook"), "{rendered}");
         assert!(rendered.contains("$env:KEY"), "{rendered}");
         assert!(rendered.contains("secrets or credentials"), "{rendered}");
         assert!(rendered.contains("credential stores"), "{rendered}");
@@ -1810,6 +1499,20 @@ mod tests {
         assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(rendered.contains("env var capability"), "{rendered}");
         assert!(rendered.contains("normal read/fetch command"), "{rendered}");
+        assert!(rendered.contains("pentect read"), "{rendered}");
+        assert!(rendered.contains("one-way preview"), "{rendered}");
+        assert!(
+            rendered.contains("one `pentect exec` shell command"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("PowerShell-native commands"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Do not switch to Node/Python/browser/MCP"),
+            "{rendered}"
+        );
         assert!(rendered.contains("masked output"), "{rendered}");
         assert!(
             rendered.contains("store, sync, configure, or materialize"),
@@ -1885,6 +1588,20 @@ mod tests {
         assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(rendered.contains("env var capability"), "{rendered}");
         assert!(rendered.contains("normal read/fetch command"), "{rendered}");
+        assert!(rendered.contains("pentect read"), "{rendered}");
+        assert!(rendered.contains("one-way preview"), "{rendered}");
+        assert!(
+            rendered.contains("one `pentect exec` shell command"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("PowerShell-native commands"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Do not switch to Node/Python/browser/MCP"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("store, sync, configure, or materialize"),
             "{rendered}"
@@ -1966,9 +1683,5 @@ mod tests {
             "foo".to_string(),
             "exec".to_string()
         ]));
-    }
-
-    fn cli_test_temp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("pentect-cli-{name}-{}", std::process::id()))
     }
 }

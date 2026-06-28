@@ -1,32 +1,35 @@
-//! pentect-agent: a minimal tool-boundary adapter.
+//! `pentect agent`: a minimal tool-boundary adapter.
 //!
 //! It demonstrates the product loop:
 //! shell tool input -> force execution through `pentect exec`;
 //! command output -> mask before it returns to the AI.
-//! `read` is a one-way human preview. `exec` and hooks use a local capability
-//! vault so masked handles can be passed back into later tool-boundary commands.
+//! `read` is a one-way human preview. `exec` and hooks use process-local or
+//! parent-hosted in-memory capabilities so masked handles can be passed back
+//! into later tool-boundary commands without persisting recovery material.
 
 mod approval;
 mod approve_ui;
+mod config;
 mod masking;
+mod memory_vault;
 mod session;
 mod shell;
 
 use approval::{ticket_summary, ApprovalQueue, ApprovalTicket, ApprovalTicketDraft};
 use approve_ui::{ApprovalDecision, ApprovalRequest};
+use config::{approval_bypassed_by_config, approval_config_state};
 use masking::{
     contains_unresolved_masked_handle, is_ascii_word_char, is_env_name_byte, is_sensitive_env_name,
     live_output_kind, OutputMasker, ToolScalarInput,
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
+use memory_vault::MemoryVaultClient;
 use pentect_core::{Config, Engine, Input, Kind, Profile, RegionKind};
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
 use sha2::{Digest, Sha256};
-use shell::{
-    next_shell_word, powershell_command, powershell_word, shell_command, shell_quote_unix,
-};
+use shell::{next_shell_word, powershell_word, shell_quote_unix};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -41,9 +44,12 @@ const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let code = match args.get(1).map(String::as_str) {
+pub fn run() -> i32 {
+    run_from(std::env::args().collect())
+}
+
+pub fn run_from(args: Vec<String>) -> i32 {
+    match args.get(1).map(String::as_str) {
         None => cmd_dashboard(&args),
         Some("dashboard") => cmd_dashboard(&args),
         Some("--dir" | "--session" | "--port") => cmd_dashboard(&args),
@@ -52,13 +58,13 @@ fn main() {
         Some("resolve") => cmd_resolve(&args),
         Some("approve") => cmd_approve(&args),
         Some("hook") => cmd_hook(&args),
+        Some("vault") => cmd_vault(&args),
         Some("purge") => cmd_purge(&args),
         _ => {
             usage();
             2
         }
-    };
-    std::process::exit(code);
+    }
 }
 
 fn usage() {
@@ -99,7 +105,7 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?;
     let vault = Session::vault_status(session).map_err(|e| e.to_string())?;
     let vault_line = match &vault {
-        Some(path) => format!("active ({})", path.display()),
+        Some(status) => format!("active ({status})"),
         None => "not created yet".to_string(),
     };
     let implicit_session = default_session_name().is_ok_and(|default| default == session);
@@ -109,7 +115,7 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
         format!("{}\nsession: {session}\nvault: {vault_line}", cwd.display())
     };
     let warnings = if vault.is_some() {
-        vec!["Capability vault is active for this scope.".to_string()]
+        vec!["In-memory capability vault is active for this process tree.".to_string()]
     } else {
         Vec::new()
     };
@@ -139,6 +145,11 @@ fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
 
     print_dashboard_status(session, &queue, None)?;
     loop {
+        if approval_bypassed_by_config()? {
+            print_dashboard_status(session, &queue, None)?;
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
         if let Some(ticket) = queue.next_pending()? {
             let request = ApprovalRequest {
                 prompt: "Use secret?".to_string(),
@@ -163,6 +174,7 @@ fn print_dashboard_status(
     port: Option<u16>,
 ) -> Result<(), String> {
     let request = dashboard_request(session)?;
+    let config = approval_config_state()?;
     print!("\x1b[2J\x1b[H");
     println!("pentect");
     println!("{}", request.body);
@@ -170,8 +182,19 @@ fn print_dashboard_status(
         println!("port: {port}");
     }
     println!();
-    println!("approval: required");
-    println!("waiting for approvals");
+    if config.effective_no_approve {
+        println!(
+            "approval: no-approve ({})",
+            approval_source_label(config.effective_source)
+        );
+        println!("approval prompts are bypassed");
+    } else {
+        println!(
+            "approval: required ({})",
+            approval_source_label(config.effective_source)
+        );
+        println!("waiting for approvals");
+    }
     let history = queue.recent_history(5)?;
     if !history.is_empty() {
         println!();
@@ -182,6 +205,14 @@ fn print_dashboard_status(
     }
     let _ = std::io::stdout().flush();
     Ok(())
+}
+
+fn approval_source_label(source: config::ApprovalConfigSource) -> &'static str {
+    match source {
+        config::ApprovalConfigSource::Project => "project config",
+        config::ApprovalConfigSource::Global => "global config",
+        config::ApprovalConfigSource::Default => "default",
+    }
 }
 
 fn cmd_read(args: &[String]) -> i32 {
@@ -451,13 +482,13 @@ fn exec_help() {
             "pentect exec --live \"<command>\"\n\n",
             "Runs a command and prints normal stdout/stderr with secrets masked.\n",
             "`--stdin` reads the shell script from stdin; hooks use it on PowerShell so quotes and pipes survive the outer shell.\n",
-            "Referenced `<<LABEL_hash>>` handles become PENTECT_LABEL_hash env vars in child commands.\n",
-            "If prior output showed `KEY=<<...>>`, commands that reference KEY can use it as an env var.\n",
-            "Run `pentect` for approval UI or `pentect --port 7331` for the local web dashboard.\n",
-            "Masked output registers capabilities; referenced local files are also scanned as hints.\n",
+            "Referenced `<<LABEL_hash>>` handles become PENTECT_LABEL_hash env vars in child commands while the same Pentect-launched agent session is running.\n",
+            "If prior output showed `KEY=<<...>>`, commands in that running session can reference KEY as an env var.\n",
+            "Set `no_approve = true` in `.pentect/config.toml` only when this project should bypass approval prompts.\n",
+            "Masked output registers in-memory capabilities; referenced local files are also scanned as hints.\n",
             "Use normal commands and let Pentect return masked handles; do not hand-roll parsers to avoid output.\n",
             "Use `$env:KEY` on PowerShell or `$KEY` on Unix; stdout/stderr stays masked.\n",
-            "Masked handles in command text also resolve locally before execution.\n",
+            "Masked handles in command text resolve in memory before execution.\n",
         )
     );
 }
@@ -514,12 +545,22 @@ fn cmd_purge(args: &[String]) -> i32 {
     0
 }
 
+fn cmd_vault(args: &[String]) -> i32 {
+    match args.get(2).map(String::as_str) {
+        Some("--serve") if args.len() == 3 => memory_vault::serve_memory_vault(),
+        _ => die("vault accepts only `--serve`"),
+    }
+}
+
 fn request_approval(
     store: &RecoveryStore,
     opts: &ExecOpts,
     approval: &ExecApproval,
     preview: bool,
 ) -> Result<ApprovalDecision, String> {
+    if approval_bypassed_by_config()? {
+        return Ok(ApprovalDecision::Once);
+    }
     let request = ApprovalRequest {
         prompt: if preview {
             "Preview".to_string()
@@ -588,6 +629,9 @@ fn approval_decision_for_ticket(
     session: &str,
     ticket: &ApprovalTicket,
 ) -> Result<ApprovalDecision, String> {
+    if approval_bypassed_by_config()? {
+        return Ok(ApprovalDecision::Once);
+    }
     let queue = ApprovalQueue::open(session)?;
     if !queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
         queue.record(ticket, ApprovalDecision::Decline, "auto")?;
@@ -1062,7 +1106,7 @@ fn resolve_command_text(store: &RecoveryStore, text: &str) -> Result<String, Str
     let resolved = store.resolve_all(text).map_err(|e| e.to_string())?;
     if contains_unresolved_masked_handle(&resolved) {
         return Err(
-            "unknown masked handle; run from the same Pentect directory/session or re-read it with `pentect exec`"
+            "unknown masked handle; use it inside the same running Pentect-launched agent session or re-register it with `pentect exec`"
                 .to_string(),
         );
     }
@@ -1115,8 +1159,9 @@ fn safe_parent_env_names() -> &'static [&'static str] {
             "TEMP",
             "TMP",
             "USERPROFILE",
-            "PENTECT_AGENT",
-            "PENTECT_AGENT_HOME",
+            "PENTECT_BIN",
+            "PENTECT_HOME",
+            "PENTECT_SESSION",
         ]
     } else {
         &[
@@ -1127,8 +1172,9 @@ fn safe_parent_env_names() -> &'static [&'static str] {
             "LANG",
             "LC_ALL",
             "TMPDIR",
-            "PENTECT_AGENT",
-            "PENTECT_AGENT_HOME",
+            "PENTECT_BIN",
+            "PENTECT_HOME",
+            "PENTECT_SESSION",
         ]
     }
 }
@@ -1140,7 +1186,7 @@ fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
 }
 
 fn apply_pentect_session(command: &mut Command, session: &str) {
-    command.env("PENTECT_AGENT_SESSION", session);
+    command.env("PENTECT_SESSION", session);
 }
 
 #[derive(Debug, Default)]
@@ -1619,7 +1665,6 @@ fn exit_code(status: ExitStatus) -> i32 {
 enum HookProvider {
     Codex,
     Claude,
-    Gemini,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1775,7 +1820,7 @@ impl HookOpts {
         }
         Ok(Self {
             provider: provider
-                .ok_or_else(|| "hook requires provider: codex, claude, or gemini".to_string())?,
+                .ok_or_else(|| "hook requires provider: codex or claude".to_string())?,
             session,
             capability,
         })
@@ -1785,7 +1830,7 @@ impl HookOpts {
         if let Some(session) = &self.session {
             return Ok(session.clone());
         }
-        if let Ok(session) = std::env::var("PENTECT_AGENT_SESSION") {
+        if let Ok(session) = std::env::var("PENTECT_SESSION") {
             return checked_session_name(&session).map_err(|e| e.to_string());
         }
         let _ = input;
@@ -1888,6 +1933,25 @@ impl ExecOpts {
                         mode: ExecMode::Shell(script),
                     });
                 }
+                "--script-handle" => {
+                    if stdin {
+                        return Err(
+                            "exec --stdin does not accept a script handle argument".to_string()
+                        );
+                    }
+                    let script = take_memory_script(&value(args, &mut i, "--script-handle")?)?;
+                    if i < args.len() {
+                        return Err(
+                            "exec --script-handle does not accept trailing arguments".to_string()
+                        );
+                    }
+                    return Ok(Self {
+                        session: checked_session_name(&session).map_err(|e| e.to_string())?,
+                        live,
+                        approve,
+                        mode: ExecMode::Shell(script),
+                    });
+                }
                 "--shell" => {
                     return Err(
                         "`--shell` was removed; use `pentect exec \"<command>\"`".to_string()
@@ -1948,8 +2012,18 @@ fn decode_script_base64(value: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "exec --script-b64 requires UTF-8 text".to_string())
 }
 
+fn take_memory_script(id: &str) -> Result<String, String> {
+    if id.is_empty() || id.chars().any(|ch| !ch.is_ascii_hexdigit()) {
+        return Err("exec --script-handle requires a hex handle".to_string());
+    }
+    let client = MemoryVaultClient::from_env().ok_or_else(|| {
+        "exec --script-handle requires a running Pentect memory vault".to_string()
+    })?;
+    client.take_script(id).map_err(|e| e.to_string())
+}
+
 fn default_session_name() -> Result<String, String> {
-    match std::env::var("PENTECT_AGENT_SESSION") {
+    match std::env::var("PENTECT_SESSION") {
         Ok(value) => checked_session_name(&value).map_err(|e| e.to_string()),
         Err(_) => default_directory_session_name(),
     }
@@ -2004,9 +2078,6 @@ fn handle_hook(
             }
         }
         HookPhase::AfterTool => {
-            let tool_name = hook_field(&input, &["tool_name"])
-                .and_then(Value::as_str)
-                .unwrap_or_default();
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
@@ -2015,7 +2086,7 @@ fn handle_hook(
             let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
             masker.flush()?;
             if changed {
-                Ok(after_tool_output(provider, tool_name, updated))
+                Ok(after_tool_output(provider, updated))
             } else {
                 Ok(json!({}))
             }
@@ -2361,12 +2432,8 @@ fn is_pentect_command(command: &str) -> bool {
     let command = normalized.trim_start_matches("./");
     command == "pentect"
         || command == "pentect.exe"
-        || command == "pentect-agent"
-        || command == "pentect-agent.exe"
         || command.ends_with("/pentect")
         || command.ends_with("/pentect.exe")
-        || command.ends_with("/pentect-agent")
-        || command.ends_with("/pentect-agent.exe")
 }
 
 fn unquote_wrapped_shell_arg(value: &str) -> String {
@@ -2389,27 +2456,75 @@ fn wrap_shell_command(
     masked_command: &str,
 ) -> Result<String, String> {
     if cfg!(windows) {
-        let words = agent_exec_stdin_words(session_name)?;
-        Ok(powershell_stdin_exec_command(&words, masked_command))
+        if let Some(command) = powershell_memory_script_exec_command(session_name, masked_command)?
+        {
+            return Ok(command);
+        }
+        let mut args = agent_exec_args(session_name);
+        args.push("--stdin".to_string());
+        Ok(powershell_stdin_exec_command(&args, masked_command))
     } else {
-        let words = agent_exec_words(session_name, masked_command)?;
-        Ok(shell_command(&words))
+        let mut args = agent_exec_args(session_name);
+        args.push(masked_command.to_string());
+        Ok(shell_agent_env_command(&args))
     }
 }
 
-fn powershell_stdin_exec_command(words: &[String], script: &str) -> String {
+fn powershell_memory_script_exec_command(
+    session_name: &str,
+    script: &str,
+) -> Result<Option<String>, String> {
+    let Some(client) = MemoryVaultClient::from_env() else {
+        return Ok(None);
+    };
+    let handle = client.put_script(script).map_err(|e| e.to_string())?;
+    let mut args = vec!["agent".to_string(), "exec".to_string()];
+    add_non_default_session(&mut args, session_name);
+    args.push("--script-handle".to_string());
+    args.push(handle);
+    Ok(Some(powershell_agent_env_command(&args)))
+}
+
+fn powershell_agent_env_command(args: &[String]) -> String {
+    let mut out = powershell_agent_env_setup();
+    out.push_str("; ");
+    out.push_str(&powershell_agent_env_invocation(args));
+    out
+}
+
+fn powershell_agent_env_setup() -> String {
+    String::from("$p=$env:PENTECT_BIN; if (-not $p) { $p='pentect' }")
+}
+
+fn powershell_agent_env_invocation(args: &[String]) -> String {
+    let mut out = String::from("& $p");
+    if !args.is_empty() {
+        out.push(' ');
+        out.push_str(
+            &args
+                .iter()
+                .map(|arg| powershell_word(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    out
+}
+
+fn powershell_stdin_exec_command(args: &[String], script: &str) -> String {
     if script.is_ascii() && !has_powershell_single_here_string_terminator(script) {
-        let exec = powershell_command(words);
-        return format!("@'\n{script}\n'@ | {exec}");
+        let setup = powershell_agent_env_setup();
+        let exec = powershell_agent_env_invocation(args);
+        return format!("{setup}\n@'\n{script}\n'@ | {exec}");
     }
     let encoded = data_encoding::BASE64.encode(script.as_bytes());
-    let mut words = words.to_vec();
-    if words.last().is_some_and(|word| word == "--stdin") {
-        words.pop();
+    let mut args = args.to_vec();
+    if args.last().is_some_and(|word| word == "--stdin") {
+        args.pop();
     }
-    words.push("--script-b64".to_string());
-    words.push(encoded);
-    powershell_command(&words)
+    args.push("--script-b64".to_string());
+    args.push(encoded);
+    powershell_agent_env_command(&args)
 }
 
 fn has_powershell_single_here_string_terminator(script: &str) -> bool {
@@ -2418,24 +2533,25 @@ fn has_powershell_single_here_string_terminator(script: &str) -> bool {
         .any(|line| line.trim_end_matches('\r') == "'@")
 }
 
-fn agent_exec_stdin_words(session_name: &str) -> Result<Vec<String>, String> {
-    let mut words = agent_exec_base_words(session_name)?;
-    words.push("--stdin".to_string());
-    Ok(words)
-}
-
-fn agent_exec_words(session_name: &str, masked_command: &str) -> Result<Vec<String>, String> {
-    let mut words = agent_exec_base_words(session_name)?;
-    words.push(masked_command.to_string());
-    Ok(words)
-}
-
-fn agent_exec_base_words(session_name: &str) -> Result<Vec<String>, String> {
-    let agent = std::env::current_exe()
-        .map_err(|e| format!("could not resolve pentect-agent executable: {e}"))?;
-    let mut words = vec![agent.to_string_lossy().into_owned(), "exec".to_string()];
+fn agent_exec_args(session_name: &str) -> Vec<String> {
+    let mut words = vec!["agent".to_string(), "exec".to_string()];
     add_non_default_session(&mut words, session_name);
-    Ok(words)
+    words
+}
+
+fn shell_agent_env_command(args: &[String]) -> String {
+    let mut out = String::from("${PENTECT_BIN:-pentect}");
+    if !args.is_empty() {
+        out.push(' ');
+        out.push_str(
+            &args
+                .iter()
+                .map(|arg| shell_quote_unix(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    out
 }
 
 fn add_non_default_session(words: &mut Vec<String>, session_name: &str) {
@@ -2456,11 +2572,6 @@ fn hook_phase(provider: HookProvider, input: &Value) -> HookPhase {
         HookProvider::Codex | HookProvider::Claude => match event {
             "PreToolUse" => HookPhase::BeforeTool,
             "PostToolUse" => HookPhase::AfterTool,
-            _ => HookPhase::Other,
-        },
-        HookProvider::Gemini => match event {
-            "BeforeTool" => HookPhase::BeforeTool,
-            "AfterTool" => HookPhase::AfterTool,
             _ => HookPhase::Other,
         },
     }
@@ -2502,12 +2613,6 @@ fn before_tool_output(provider: HookProvider, updated_input: Value) -> Value {
                 "updatedInput": updated_input
             }
         }),
-        HookProvider::Gemini => json!({
-            "decision": "allow",
-            "hookSpecificOutput": {
-                "tool_input": updated_input
-            }
-        }),
     }
 }
 
@@ -2520,14 +2625,10 @@ fn before_tool_block_output(provider: HookProvider, reason: &str) -> Value {
                 "permissionDecisionReason": reason
             }
         }),
-        HookProvider::Gemini => json!({
-            "decision": "deny",
-            "reason": reason
-        }),
     }
 }
 
-fn after_tool_output(provider: HookProvider, tool_name: &str, updated_output: Value) -> Value {
+fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
     match provider {
         HookProvider::Claude => json!({
             "hookSpecificOutput": {
@@ -2535,37 +2636,11 @@ fn after_tool_output(provider: HookProvider, tool_name: &str, updated_output: Va
                 "updatedToolOutput": updated_output
             }
         }),
-        HookProvider::Codex if is_mcp_tool_name(tool_name) => json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "updatedMCPToolOutput": updated_output,
-                "additionalContext": "Pentect replaced the original MCP tool result with a masked version."
-            }
-        }),
-        HookProvider::Codex => codex_blocking_after_tool_output(updated_output),
-        HookProvider::Gemini => json!({
-            "decision": "deny",
-            "reason": stringify_tool_output(&updated_output),
-            "hookSpecificOutput": {
-                "additionalContext": "Pentect replaced the original tool result with a masked version."
-            }
+        HookProvider::Codex => json!({
+            "decision": "block",
+            "reason": stringify_tool_output(&updated_output)
         }),
     }
-}
-
-fn codex_blocking_after_tool_output(updated_output: Value) -> Value {
-    json!({
-        "decision": "block",
-        "reason": stringify_tool_output(&updated_output),
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "additionalContext": "Pentect blocked the original tool result and returned a masked version."
-        }
-    })
-}
-
-fn is_mcp_tool_name(tool_name: &str) -> bool {
-    tool_name.starts_with("mcp__")
 }
 
 fn mask_tool_json(value: &Value, masker: &mut OutputMasker) -> Result<(Value, bool), String> {
@@ -2944,7 +3019,6 @@ fn parse_hook_provider(value: &str) -> Result<HookProvider, String> {
     match value {
         "codex" => Ok(HookProvider::Codex),
         "claude" => Ok(HookProvider::Claude),
-        "gemini" => Ok(HookProvider::Gemini),
         other => Err(format!("unknown hook provider: {other}")),
     }
 }

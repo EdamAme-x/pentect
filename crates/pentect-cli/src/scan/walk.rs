@@ -195,7 +195,6 @@ fn is_ignored_dir(path: &Path) -> bool {
         ".git"
             | ".hg"
             | ".svn"
-            | ".pentect-agent"
             | "target"
             | "node_modules"
             | ".venv"

@@ -22,23 +22,34 @@ impl Drop for IgnoreCtrlCGuard {
     fn drop(&mut self) {
         if self.active {
             restore_ctrl_c_for_parent_process();
-            restore_after_tui();
+            restore_platform_console_mode();
+            restore_ansi_state(ResetLine::Keep);
         }
     }
 }
 
+pub(crate) fn prepare_for_tui() {
+    restore_platform_console_mode();
+    restore_ansi_state(ResetLine::Keep);
+}
+
 pub(crate) fn restore_after_tui() {
     restore_platform_console_mode();
-    restore_ansi_state();
+    restore_ansi_state(ResetLine::FreshPrompt);
 }
 
 const ANSI_TUI_RESET: &str = concat!(
     "\x1b[0m",     // reset SGR attributes
     "\x1b(B",      // restore ASCII character set
+    "\x1b>",       // leave application keypad mode
     "\x1b[?25h",   // show cursor
     "\x1b[?7h",    // enable line wrap
     "\x1b[?12l",   // disable blinking cursor mode
     "\x1b[?1l",    // leave application cursor-key mode
+    "\x1b[?5l",    // disable reverse video
+    "\x1b[?6l",    // disable origin mode
+    "\x1b[?47l",   // leave legacy alternate screen
+    "\x1b[?69l",   // disable left/right margin mode
     "\x1b[?1000l", // disable X10 mouse
     "\x1b[?1002l", // disable button-event mouse
     "\x1b[?1003l", // disable any-event mouse
@@ -51,10 +62,18 @@ const ANSI_TUI_RESET: &str = concat!(
     "\x1b[?1048l", // restore cursor from older alt-screen flows
     "\x1b[?1047l", // leave older alternate screen
     "\x1b[?1049l", // leave alternate screen
-    "\r\x1b[0K",   // clear a partially drawn prompt line
+    "\x1b[r",      // reset top/bottom scroll margins
 );
 
-fn restore_ansi_state() {
+const ANSI_FRESH_PROMPT_LINE: &str = "\r\x1b[2K\r\n";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResetLine {
+    Keep,
+    FreshPrompt,
+}
+
+fn restore_ansi_state(reset_line: ResetLine) {
     let mut out = std::io::stdout();
     if !out.is_terminal() {
         return;
@@ -69,6 +88,9 @@ fn restore_ansi_state() {
         ResetColor
     );
     let _ = out.write_all(ANSI_TUI_RESET.as_bytes());
+    if reset_line == ResetLine::FreshPrompt {
+        let _ = out.write_all(ANSI_FRESH_PROMPT_LINE.as_bytes());
+    }
     let _ = out.flush();
 }
 
@@ -173,12 +195,22 @@ mod tests {
             "\x1b[?1015l",
             "\x1b[?2004l",
             "\x1b[?2026l",
+            "\x1b[?5l",
+            "\x1b[?6l",
+            "\x1b[?47l",
+            "\x1b[?69l",
             "\x1b[?1047l",
             "\x1b[?1048l",
             "\x1b[?1049l",
-            "\r\x1b[0K",
+            "\x1b[r",
+            "\x1b>",
         ] {
             assert!(ANSI_TUI_RESET.contains(mode), "{mode:?}");
         }
+    }
+
+    #[test]
+    fn after_tui_reset_moves_prompt_to_fresh_line() {
+        assert_eq!(ANSI_FRESH_PROMPT_LINE, "\r\x1b[2K\r\n");
     }
 }

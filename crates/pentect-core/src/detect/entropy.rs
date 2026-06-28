@@ -292,7 +292,7 @@ mod tests {
     fn source_identifiers_are_not_entropy_candidates() {
         for raw in [
             "fn codex_uses_unverified_headless_hook_path(tool_args: &[String]) -> bool {}",
-            "const PENTECT_AGENT_INSTRUCTIONS: &str = \"contract\";",
+            "const PENTECT_CONTRACT_INSTRUCTIONS: &str = \"contract\";",
             "--allow-unverified-hooks",
             "DASHBOARD_HEARTBEAT_MAX_AGE",
             "clientSecretIdentifierOnly",

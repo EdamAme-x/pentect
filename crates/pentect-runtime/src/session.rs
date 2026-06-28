@@ -1,6 +1,7 @@
 use crate::masking::{decode_env_alias_record, is_env_alias_placeholder};
+use crate::memory_vault::MemoryVaultClient;
 use crate::Result;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail};
 use pentect_core::{Config, Recovery};
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -9,39 +10,55 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroize;
 
-const VAULT_FILE: &str = "capability-vault.pnt";
-const VAULT_MAGIC: &[u8; 4] = b"PNV1";
-const VAULT_VERSION: u8 = 1;
 const PENTECT_DIR: &str = ".pentect";
 const AGENT_DIR: &str = "agent";
+
 #[derive(Clone)]
 pub(crate) struct Session {
     pub(crate) key: [u8; 32],
     pub(crate) recoveries: Arc<Mutex<Vec<Recovery>>>,
-    vault_path: Option<PathBuf>,
+    backend: SessionBackend,
+}
+
+#[derive(Clone)]
+enum SessionBackend {
+    Local,
+    MemoryVault(MemoryVaultClient),
 }
 
 impl Session {
     pub(crate) fn open(name: &str) -> Result<Self> {
-        let root = session_root(name)?;
-        let vault_path = root.join(VAULT_FILE);
-        if vault_path.exists() {
-            return Self::load_vault(vault_path);
-        }
-        Ok(Self::in_memory())
+        checked_session_name(name)?;
+        Self::open_active()
     }
 
     pub(crate) fn open_capability(name: &str) -> Result<Self> {
-        let root = session_root(name)?;
-        Self::open_capability_root(root)
+        checked_session_name(name)?;
+        Self::open_active()
     }
 
     fn in_memory() -> Self {
         Self {
             key: Config::generate().key,
             recoveries: Arc::new(Mutex::new(Vec::new())),
-            vault_path: None,
+            backend: SessionBackend::Local,
         }
+    }
+
+    fn open_active() -> Result<Self> {
+        let Some(client) = MemoryVaultClient::from_env() else {
+            return Ok(Self::in_memory());
+        };
+        let snapshot = client.snapshot()?;
+        Ok(Self {
+            key: snapshot.key,
+            recoveries: Arc::new(Mutex::new(if snapshot.recovery.is_empty() {
+                Vec::new()
+            } else {
+                vec![snapshot.recovery]
+            })),
+            backend: SessionBackend::MemoryVault(client),
+        })
     }
 
     #[cfg(test)]
@@ -53,7 +70,9 @@ impl Session {
 
     #[cfg(test)]
     pub(crate) fn open_capability_at(base: &Path, name: &str) -> Result<Self> {
-        Self::open_capability_root(base.join(checked_session_name(name)?))
+        let _ = base;
+        checked_session_name(name)?;
+        Ok(Self::in_memory())
     }
 
     #[cfg(test)]
@@ -86,6 +105,7 @@ impl Session {
         Ok(out)
     }
 
+    #[cfg(test)]
     fn recoveries(&self) -> Result<Vec<Recovery>> {
         Ok(self
             .recoveries
@@ -94,56 +114,11 @@ impl Session {
             .clone())
     }
 
-    fn open_capability_root(root: PathBuf) -> Result<Self> {
-        let vault_path = root.join(VAULT_FILE);
-        if vault_path.exists() {
-            return Self::load_vault(vault_path);
-        }
-        std::fs::create_dir_all(&root)
-            .with_context(|| format!("could not create '{}'", root.display()))?;
-        let session = Self {
-            key: Config::generate().key,
-            recoveries: Arc::new(Mutex::new(Vec::new())),
-            vault_path: Some(vault_path),
-        };
-        session.persist_recoveries()?;
-        Ok(session)
-    }
-
-    fn load_vault(path: PathBuf) -> Result<Self> {
-        let bytes =
-            std::fs::read(&path).with_context(|| format!("could not read '{}'", path.display()))?;
-        let (key, recovery) = decode_vault(&bytes)?;
-        Ok(Self {
-            key,
-            recoveries: Arc::new(Mutex::new(if recovery.is_empty() {
-                Vec::new()
-            } else {
-                vec![recovery]
-            })),
-            vault_path: Some(path),
-        })
-    }
-
-    fn persist_recoveries(&self) -> Result<()> {
-        let Some(path) = &self.vault_path else {
-            return Ok(());
-        };
-        let mut batch = Recovery::empty_for_key(&self.key);
-        for recovery in self.recoveries()? {
-            batch.extend_same_key(recovery);
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("could not create '{}'", parent.display()))?;
-        }
-        std::fs::write(path, encode_vault(&self.key, &batch))
-            .with_context(|| format!("could not write '{}'", path.display()))
-    }
-
-    pub(crate) fn vault_status(name: &str) -> Result<Option<PathBuf>> {
-        let path = session_root(name)?.join(VAULT_FILE);
-        Ok(path.exists().then_some(path))
+    pub(crate) fn vault_status(name: &str) -> Result<Option<String>> {
+        checked_session_name(name)?;
+        Ok(MemoryVaultClient::from_env()
+            .is_some()
+            .then_some("memory-only, active while parent Pentect process is running".to_string()))
     }
 }
 
@@ -226,10 +201,12 @@ impl RecoveryStore {
         if recovery.is_empty() {
             return Ok(());
         }
+        if let SessionBackend::MemoryVault(client) = &self.session.backend {
+            client.add_recovery(&self.session.key, &recovery)?;
+        }
         {
             self.lock()?.push(recovery);
         }
-        self.session.persist_recoveries()?;
         Ok(())
     }
 
@@ -258,54 +235,15 @@ fn is_reserved_child_env_name(name: &str) -> bool {
             | "lang"
             | "lc_all"
             | "tmpdir"
-            | "pentect_agent"
-            | "pentect_agent_home"
-            | "pentect_agent_session"
+            | "pentect_bin"
+            | "pentect_home"
+            | "pentect_session"
     )
-}
-
-fn encode_vault(key: &[u8; 32], recovery: &Recovery) -> Vec<u8> {
-    let recovery_blob = recovery.serialize(key);
-    let mut out = Vec::with_capacity(4 + 1 + 32 + 4 + recovery_blob.len());
-    out.extend_from_slice(VAULT_MAGIC);
-    out.push(VAULT_VERSION);
-    out.extend_from_slice(key);
-    out.extend_from_slice(&(recovery_blob.len() as u32).to_le_bytes());
-    out.extend_from_slice(&recovery_blob);
-    out
-}
-
-fn decode_vault(bytes: &[u8]) -> Result<([u8; 32], Recovery)> {
-    if bytes.len() < 4 + 1 + 32 + 4 {
-        bail!("capability vault is malformed");
-    }
-    if &bytes[..4] != VAULT_MAGIC {
-        bail!("capability vault has unknown magic");
-    }
-    if bytes[4] != VAULT_VERSION {
-        bail!("unsupported capability vault version: {}", bytes[4]);
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes[5..37]);
-    let len = u32::from_le_bytes(
-        bytes[37..41]
-            .try_into()
-            .map_err(|_| anyhow!("capability vault is malformed"))?,
-    ) as usize;
-    let end = 41usize
-        .checked_add(len)
-        .ok_or_else(|| anyhow!("capability vault is too large"))?;
-    if end != bytes.len() {
-        bail!("capability vault has trailing or truncated data");
-    }
-    let recovery = Recovery::load(&bytes[41..end], &key)
-        .map_err(|e| anyhow!("could not load capability vault recovery: {e}"))?;
-    Ok((key, recovery))
 }
 
 pub(crate) fn session_root(name: &str) -> Result<PathBuf> {
     let name = checked_session_name(name)?;
-    let base = std::env::var_os("PENTECT_AGENT_HOME")
+    let base = std::env::var_os("PENTECT_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(PENTECT_DIR).join(AGENT_DIR));
     Ok(base.join(name))

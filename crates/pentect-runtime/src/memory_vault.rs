@@ -1,0 +1,345 @@
+use crate::Result;
+use anyhow::{anyhow, bail, Context};
+use pentect_core::{Config, Recovery};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
+
+pub(crate) const ENV_ADDR: &str = "PENTECT_MEMORY_VAULT_ADDR";
+pub(crate) const ENV_TOKEN: &str = "PENTECT_MEMORY_VAULT_TOKEN";
+
+const TOKEN_BYTES: usize = 32;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryVaultClient {
+    addr: String,
+    token: String,
+}
+
+pub(crate) struct MemoryVaultSnapshot {
+    pub(crate) key: [u8; 32],
+    pub(crate) recovery: Recovery,
+}
+
+struct MemoryVaultState {
+    key: [u8; 32],
+    recoveries: Vec<Recovery>,
+    scripts: BTreeMap<String, Zeroizing<String>>,
+}
+
+impl Drop for MemoryVaultState {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl MemoryVaultClient {
+    pub(crate) fn from_env() -> Option<Self> {
+        let addr = std::env::var(ENV_ADDR).ok()?;
+        let token = std::env::var(ENV_TOKEN).ok()?;
+        if addr.is_empty() || token.is_empty() {
+            return None;
+        }
+        Some(Self { addr, token })
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<MemoryVaultSnapshot> {
+        let line = self.request("SNAPSHOT", "")?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 3 || fields[0] != "OK" {
+            bail!("memory vault snapshot response is malformed");
+        }
+        let key = decode_key_hex(fields[1])?;
+        let recovery_blob = data_encoding::BASE64
+            .decode(fields[2].as_bytes())
+            .context("memory vault snapshot is not valid base64")?;
+        let recovery = Recovery::load(&recovery_blob, &key)
+            .map_err(|e| anyhow!("memory vault snapshot is invalid: {e}"))?;
+        Ok(MemoryVaultSnapshot { key, recovery })
+    }
+
+    pub(crate) fn add_recovery(&self, key: &[u8; 32], recovery: &Recovery) -> Result<()> {
+        let payload = data_encoding::BASE64.encode(&recovery.serialize(key));
+        let line = self.request("ADD", &payload)?;
+        let fields = response_fields(&line)?;
+        if fields.as_slice() == ["OK"] {
+            Ok(())
+        } else {
+            bail!("memory vault add response is malformed")
+        }
+    }
+
+    pub(crate) fn put_script(&self, script: &str) -> Result<String> {
+        let payload = data_encoding::BASE64.encode(script.as_bytes());
+        let line = self.request("PUT_SCRIPT", &payload)?;
+        let fields = response_fields(&line)?;
+        if fields.len() == 2 && fields[0] == "OK" && !fields[1].is_empty() {
+            Ok(fields[1].to_string())
+        } else {
+            bail!("memory vault put-script response is malformed")
+        }
+    }
+
+    pub(crate) fn take_script(&self, id: &str) -> Result<String> {
+        let line = self.request("TAKE_SCRIPT", id)?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 2 || fields[0] != "OK" {
+            bail!("memory vault take-script response is malformed");
+        }
+        let bytes = data_encoding::BASE64
+            .decode(fields[1].as_bytes())
+            .context("memory vault script response is not valid base64")?;
+        String::from_utf8(bytes).context("memory vault script response is not UTF-8")
+    }
+
+    fn request(&self, command: &str, payload: &str) -> Result<String> {
+        let mut stream = TcpStream::connect(&self.addr)
+            .with_context(|| format!("could not connect to memory vault at {}", self.addr))?;
+        let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
+        writeln!(stream, "{}\t{}\t{}", self.token, command, payload)
+            .context("could not send memory vault request")?;
+        let _ = stream.shutdown(Shutdown::Write);
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .context("could not read memory vault response")?;
+        if line.is_empty() {
+            bail!("memory vault closed the connection");
+        }
+        if let Some(reason) = line.strip_prefix("ERR\t") {
+            bail!("memory vault rejected request: {}", reason.trim());
+        }
+        Ok(line)
+    }
+}
+
+pub(crate) fn serve_memory_vault() -> i32 {
+    match serve_memory_vault_inner() {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[pentect] {e}");
+            2
+        }
+    }
+}
+
+fn serve_memory_vault_inner() -> Result<()> {
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).context("could not bind memory vault listener")?;
+    let addr = listener
+        .local_addr()
+        .context("could not read vault address")?;
+    let token = random_token_hex()?;
+    let state = Arc::new(Mutex::new(MemoryVaultState {
+        key: Config::generate().key,
+        recoveries: Vec::new(),
+        scripts: BTreeMap::new(),
+    }));
+    println!(
+        "{}",
+        serde_json::json!({
+            "addr": addr.to_string(),
+            "token": token,
+        })
+    );
+    let _ = std::io::stdout().flush();
+
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            continue;
+        };
+        let state = state.clone();
+        let token = token.clone();
+        std::thread::spawn(move || {
+            let _ = handle_client(stream, &token, &state);
+        });
+    }
+    Ok(())
+}
+
+fn handle_client(
+    stream: TcpStream,
+    token: &str,
+    state: &Arc<Mutex<MemoryVaultState>>,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .context("could not read memory vault request")?;
+    let mut stream = reader.into_inner();
+    let fields = request_fields(&line);
+    let response = match fields.as_slice() {
+        [provided_token, "SNAPSHOT", ""] if *provided_token == token => snapshot_response(state),
+        [provided_token, "ADD", payload] if *provided_token == token => {
+            add_recovery_request(state, payload)
+        }
+        [provided_token, "PUT_SCRIPT", payload] if *provided_token == token => {
+            put_script_request(state, payload)
+        }
+        [provided_token, "TAKE_SCRIPT", payload] if *provided_token == token => {
+            take_script_request(state, payload)
+        }
+        [provided_token, ..] if *provided_token != token => Err(anyhow!("bad token")),
+        _ => Err(anyhow!("malformed request")),
+    };
+    match response {
+        Ok(line) => writeln!(stream, "{line}").context("could not write memory vault response")?,
+        Err(e) => writeln!(stream, "ERR\t{}", sanitize_field(&e.to_string()))
+            .context("could not write memory vault error")?,
+    }
+    Ok(())
+}
+
+fn snapshot_response(state: &Arc<Mutex<MemoryVaultState>>) -> Result<String> {
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory vault lock poisoned"))?;
+    let mut batch = Recovery::empty_for_key(&guard.key);
+    for recovery in &guard.recoveries {
+        batch.extend_same_key(recovery.clone());
+    }
+    Ok(format!(
+        "OK\t{}\t{}",
+        data_encoding::HEXLOWER.encode(&guard.key),
+        data_encoding::BASE64.encode(&batch.serialize(&guard.key))
+    ))
+}
+
+fn add_recovery_request(state: &Arc<Mutex<MemoryVaultState>>, payload: &str) -> Result<String> {
+    let bytes = data_encoding::BASE64
+        .decode(payload.as_bytes())
+        .context("recovery payload is not valid base64")?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory vault lock poisoned"))?;
+    let recovery = Recovery::load(&bytes, &guard.key)
+        .map_err(|e| anyhow!("recovery payload is invalid: {e}"))?;
+    if !recovery.is_empty() {
+        guard.recoveries.push(recovery);
+    }
+    Ok("OK".to_string())
+}
+
+fn put_script_request(state: &Arc<Mutex<MemoryVaultState>>, payload: &str) -> Result<String> {
+    let bytes = data_encoding::BASE64
+        .decode(payload.as_bytes())
+        .context("script payload is not valid base64")?;
+    let script = String::from_utf8(bytes).context("script payload is not UTF-8")?;
+    let id = random_token_hex()?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory vault lock poisoned"))?;
+    guard.scripts.insert(id.clone(), Zeroizing::new(script));
+    Ok(format!("OK\t{id}"))
+}
+
+fn take_script_request(state: &Arc<Mutex<MemoryVaultState>>, id: &str) -> Result<String> {
+    if id.is_empty() || id.chars().any(|ch| !ch.is_ascii_hexdigit()) {
+        bail!("script handle is malformed");
+    }
+    let mut guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory vault lock poisoned"))?;
+    let script = guard
+        .scripts
+        .remove(id)
+        .ok_or_else(|| anyhow!("unknown script handle"))?;
+    Ok(format!(
+        "OK\t{}",
+        data_encoding::BASE64.encode(script.as_bytes())
+    ))
+}
+
+fn request_fields(line: &str) -> Vec<&str> {
+    line.trim_end_matches(['\r', '\n']).split('\t').collect()
+}
+
+fn response_fields(line: &str) -> Result<Vec<&str>> {
+    let fields = request_fields(line);
+    if fields.first() == Some(&"ERR") {
+        let reason = fields.get(1).copied().unwrap_or("unknown error");
+        bail!("{reason}");
+    }
+    Ok(fields)
+}
+
+fn random_token_hex() -> Result<String> {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| anyhow!("could not generate memory vault token: {e}"))?;
+    Ok(data_encoding::HEXLOWER.encode(&bytes))
+}
+
+fn decode_key_hex(value: &str) -> Result<[u8; 32]> {
+    let bytes = data_encoding::HEXLOWER
+        .decode(value.as_bytes())
+        .context("memory vault key is not valid hex")?;
+    let key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("memory vault key has wrong length"))?;
+    Ok(key)
+}
+
+fn sanitize_field(value: &str) -> String {
+    value.replace(['\r', '\n', '\t'], " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pentect_core::{Engine, Input, Kind, Profile};
+
+    #[test]
+    fn client_round_trips_recovery_through_memory_vault_state() {
+        let token = "test-token".to_string();
+        let state = Arc::new(Mutex::new(MemoryVaultState {
+            key: Config::generate().key,
+            recoveries: Vec::new(),
+            scripts: BTreeMap::new(),
+        }));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server_state = state.clone();
+        let server_token = token.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(5) {
+                handle_client(stream.unwrap(), &server_token, &server_state).unwrap();
+            }
+        });
+
+        let client = MemoryVaultClient { addr, token };
+        let snapshot = client.snapshot().unwrap();
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Env,
+                data: "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n".to_string(),
+            },
+            &Config::new(snapshot.key),
+        );
+        let masked = result.masked.clone();
+        client
+            .add_recovery(&snapshot.key, &result.recovery)
+            .unwrap();
+
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(
+            snapshot.recovery.resolve(&masked),
+            "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
+        );
+
+        let script_id = client
+            .put_script("Get-Content -LiteralPath $env:USERPROFILE")
+            .unwrap();
+        assert_eq!(
+            client.take_script(&script_id).unwrap(),
+            "Get-Content -LiteralPath $env:USERPROFILE"
+        );
+        assert!(client.take_script(&script_id).is_err());
+    }
+}

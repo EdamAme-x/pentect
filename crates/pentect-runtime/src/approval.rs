@@ -1,4 +1,7 @@
 use crate::approve_ui::ApprovalDecision;
+use crate::config::{
+    approval_config_state, set_approval_config, ApprovalConfigScope, ApprovalConfigSource,
+};
 use crate::session::session_root;
 use anyhow::Context;
 use axum::{
@@ -316,6 +319,7 @@ impl ApprovalQueue {
         let app = Router::new()
             .route("/", get(web_index))
             .route("/decide", post(web_decide))
+            .route("/config", post(web_config))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
@@ -327,17 +331,24 @@ impl ApprovalQueue {
     }
 
     fn render_html(&self, session: &str, csrf: &str) -> Result<String, String> {
+        let config = approval_config_state()?;
         let pending = self.next_pending()?;
         let history = self.recent_history(8)?;
         let mut html = String::from(
             "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta http-equiv=refresh content=1><title>pentect</title>\
-             <style>body{font:15px system-ui;margin:24px;max-width:760px;color:#111;background:#fff}h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:24px 0 8px}p{margin:6px 0}pre{white-space:pre-wrap;background:#f6f6f6;padding:12px;border:1px solid #ddd}button{font:inherit;padding:6px 12px;margin:0 8px 8px 0;border:1px solid #999;background:#fff;color:#111}.muted{color:#666}</style>",
+             <style>body{font:15px system-ui;margin:24px;max-width:800px;color:#111;background:#fff}h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:24px 0 8px}p{margin:6px 0}pre{white-space:pre-wrap;background:#f6f6f6;padding:12px;border:1px solid #ddd}button{font:inherit;padding:6px 12px;margin:0 8px 8px 0;border:1px solid #999;background:#fff;color:#111}.muted{color:#666}.ok{color:#065f46}.warn{color:#92400e}.scope{margin:10px 0 14px;padding:10px;border:1px solid #ddd}</style>",
         );
         html.push_str(&format!(
             "<h1>pentect</h1><p class=muted>{}</p>",
             esc(session),
         ));
-        if let Some(ticket) = pending {
+        render_config_html(&mut html, csrf, &config);
+        if config.effective_no_approve {
+            html.push_str("<h2>approval</h2><p class=ok>No-approve is enabled. New materialization requests bypass approval prompts.</p>");
+            if pending.is_some() {
+                html.push_str("<p class=muted>Pending approval files are not shown while no-approve is effective.</p>");
+            }
+        } else if let Some(ticket) = pending {
             html.push_str("<h2>approval</h2><pre>");
             html.push_str(&esc(&ticket_summary(&ticket)));
             html.push_str("</pre>");
@@ -624,6 +635,68 @@ impl ApprovalQueue {
     }
 }
 
+fn render_config_html(html: &mut String, csrf: &str, config: &crate::config::ApprovalConfigState) {
+    let mode = if config.effective_no_approve {
+        "<span class=ok>no-approve</span>"
+    } else {
+        "<span class=warn>approval required</span>"
+    };
+    html.push_str("<h2>approval mode</h2>");
+    html.push_str(&format!(
+        "<p>effective: {} ({})</p>",
+        mode,
+        approval_source_label(config.effective_source)
+    ));
+    render_config_scope_html(html, csrf, "project", "Project", &config.project);
+    render_config_scope_html(html, csrf, "global", "This PC", &config.global);
+}
+
+fn render_config_scope_html(
+    html: &mut String,
+    csrf: &str,
+    scope_key: &str,
+    label: &str,
+    scope: &ApprovalConfigScope,
+) {
+    let state = match scope.no_approve {
+        Some(true) => "no-approve",
+        Some(false) => "approval required",
+        None => "unset",
+    };
+    html.push_str(&format!(
+        "<div class=scope><p><b>{}</b>: {} <span class=muted>{}</span></p>",
+        esc(label),
+        esc(state),
+        esc(&scope.display_path)
+    ));
+    for (button, mode) in [
+        ("No-approve", "no_approve"),
+        ("Require approval", "required"),
+        ("Unset", "unset"),
+    ] {
+        html.push_str(&format!(
+            "<form method=\"post\" action=\"/config\" style=\"display:inline\">\
+             <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+             <input type=\"hidden\" name=\"scope\" value=\"{}\">\
+             <input type=\"hidden\" name=\"mode\" value=\"{}\">\
+             <button>{}</button></form>",
+            esc_attr(csrf),
+            esc_attr(scope_key),
+            esc_attr(mode),
+            esc(button)
+        ));
+    }
+    html.push_str("</div>");
+}
+
+fn approval_source_label(source: ApprovalConfigSource) -> &'static str {
+    match source {
+        ApprovalConfigSource::Project => "project",
+        ApprovalConfigSource::Global => "this PC",
+        ApprovalConfigSource::Default => "default",
+    }
+}
+
 async fn web_index(State(state): State<WebState>) -> Response {
     with_security_headers(
         match state
@@ -657,6 +730,34 @@ async fn web_decide(
             .pending_by_id(id)?
             .ok_or_else(|| WebRouteError::not_found("approval request not found"))?;
         state.queue.decide(&ticket, decision, "web")?;
+        Ok(())
+    })();
+    redirect_or_error(result)
+}
+
+async fn web_config(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let result = (|| {
+        require_local_web_request(&headers, state.port)?;
+        require_csrf(&form, state.csrf.as_ref())?;
+        let scope = form
+            .get("scope")
+            .map(String::as_str)
+            .ok_or_else(|| WebRouteError::bad_request("missing config scope"))?;
+        let mode = form
+            .get("mode")
+            .map(String::as_str)
+            .ok_or_else(|| WebRouteError::bad_request("missing config mode"))?;
+        let no_approve = match mode {
+            "no_approve" => Some(true),
+            "required" => Some(false),
+            "unset" => None,
+            _ => return Err(WebRouteError::bad_request("invalid config mode")),
+        };
+        set_approval_config(scope, no_approve)?;
         Ok(())
     })();
     redirect_or_error(result)

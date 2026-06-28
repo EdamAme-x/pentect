@@ -1185,27 +1185,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pentect-agent"
-version = "0.0.1"
-dependencies = [
- "anstream",
- "anyhow",
- "axum",
- "data-encoding",
- "ed25519-dalek",
- "getrandom 0.2.17",
- "jiff",
- "pdf-extract",
- "pentect-core",
- "serde_json",
- "sha2",
- "simd-json",
- "tokio",
- "toml",
- "zeroize",
-]
-
-[[package]]
 name = "pentect-cli"
 version = "0.0.1"
 dependencies = [
@@ -1213,6 +1192,7 @@ dependencies = [
  "crossterm",
  "pdf-extract",
  "pentect-core",
+ "pentect-runtime",
  "serde_json",
  "toml",
  "windows-sys 0.61.2",
@@ -1239,6 +1219,27 @@ dependencies = [
  "sha3",
  "toml",
  "unicode-normalization",
+ "zeroize",
+]
+
+[[package]]
+name = "pentect-runtime"
+version = "0.0.1"
+dependencies = [
+ "anstream",
+ "anyhow",
+ "axum",
+ "data-encoding",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "jiff",
+ "pdf-extract",
+ "pentect-core",
+ "serde_json",
+ "sha2",
+ "simd-json",
+ "tokio",
+ "toml",
  "zeroize",
 ]
 

@@ -1,13 +1,14 @@
 [package]
-name = "pentect-agent"
+name = "pentect-runtime"
 version = "0.0.1"
-description = "Pentect agent tool-boundary adapter"
+description = "Pentect tool-boundary runtime"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+autobins = false
 
-[[bin]]
-name = "pentect-agent"
+[lib]
+name = "pentect_agent"
 path = "src/main.rs"
 
 [features]
