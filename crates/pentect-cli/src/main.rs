@@ -158,9 +158,6 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
     } else {
         Some(MemoryVaultGuard::start(&pentect).unwrap_or_else(|e| die(&e)))
     };
-    if !opts.dry_run {
-        terminal::prepare_for_tui();
-    }
     let status = match tool {
         AgentTool::Codex => run_codex(&opts, &pentect, memory_vault.as_ref()),
         AgentTool::Claude => run_claude(&opts, &pentect, memory_vault.as_ref()),
@@ -609,10 +606,14 @@ fn run_claude(
 }
 
 fn run_interactive_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
-    terminal::prepare_for_tui();
-    let mut child = cmd
-        .spawn()
-        .unwrap_or_else(|e| die(format!("could not start '{}': {e}", display.display())));
+    let mut terminal_guard = terminal::TuiSessionGuard::enter();
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            terminal_guard.restore_without_prompt();
+            die(format!("could not start '{}': {e}", display.display()));
+        }
+    };
     // Set this after spawn so child TUIs still receive Ctrl+C; the parent
     // stays alive long enough to restore terminal state after the child exits.
     let ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
@@ -620,12 +621,12 @@ fn run_interactive_command(mut cmd: Command, display: &Path) -> std::process::Ex
         Ok(status) => status,
         Err(e) => {
             drop(ctrl_c_guard);
-            terminal::restore_after_tui();
+            terminal_guard.restore_after_tui();
             die(format!("could not wait for '{}': {e}", display.display()))
         }
     };
     drop(ctrl_c_guard);
-    terminal::restore_after_tui();
+    terminal_guard.restore_after_tui();
     status
 }
 
@@ -643,7 +644,7 @@ impl MemoryVaultGuard {
             .arg("--serve")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("could not start Pentect memory vault: {e}"))?;
         let stdout = child
