@@ -38,6 +38,8 @@ Scoring:
 - A positive is `tp` when a Pentect secret span overlaps the value range.
 - A detection on a positive line but outside the value range is `line_only`.
 - Detections outside labeled rows are reported as `unlabeled`, not counted as `fp`.
+- `--examples N` emits local diagnostic examples for `fn`, `line_only`, `fp`,
+  and `unlabeled` rows, capped at `N`.
 - Category summaries split CredData category strings on `:`.
 
 Previous baseline before the current false-positive hardening:
@@ -63,7 +65,8 @@ Elapsed: 153352 ms
 
 Current working result after structural false-positive reductions, source
 name/reference and fixture filtering, generic-key name filtering, and RFC
-documentation-value handling, and plaintext GitHub node-id entropy suppression:
+documentation-value handling, plaintext GitHub node-id entropy suppression, and
+C-family ternary syntax suppression:
 
 ```text
 CredData commit: 9a55c40
@@ -73,15 +76,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 7043
-FP: 15585
+FP: 15581
 FN: 8061
 Line only: 244
-Unlabeled: 78949
+Unlabeled: 78947
 Missing files: 0
 Precision: 0.311
 Recall: 0.466
 F1: 0.373
-Elapsed: 32123 ms
+Elapsed: 32515 ms
 ```
 
 Weak groups:

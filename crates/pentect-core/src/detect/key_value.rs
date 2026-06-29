@@ -173,6 +173,11 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     {
         return false;
     }
+    if separator.kind == Separator::Colon
+        && is_ternary_colon(ctx.text, ctx.line_start, separator.start)
+    {
+        return false;
+    }
     let kind = match if separator.kind == Separator::ImplicitQuote {
         trailing_sensitive_key_kind(semantic_key)
     } else {
@@ -736,6 +741,59 @@ fn is_cpp_range_for_left(left: &str) -> bool {
         || left.trim_start().starts_with("for(")
         || left.contains(" for (")
         || left.contains(" for(")
+}
+
+fn is_ternary_colon(text: &str, line_start: usize, colon_start: usize) -> bool {
+    // C-family ternaries use `condition ? value_a : value_b`; the value arms
+    // can contain sensitive words such as KEY or TOKEN while still being code
+    // constants. Look back into the current statement, including a wrapped
+    // previous line, and reject only when an unmatched `?` is visible.
+    let mut window_start = line_start.saturating_sub(160);
+    while window_start < colon_start && !text.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let current_before = &text[line_start..colon_start];
+    if let Some(question) = current_before.rfind('?') {
+        let statement_head = current_before[..question]
+            .rsplit([';', '{', '}'])
+            .next()
+            .unwrap_or_default();
+        return ternary_condition_head_is_code(statement_head)
+            && is_ternary_arm_expr(&current_before[question + 1..]);
+    }
+
+    let before = &text[window_start..line_start];
+    let Some(question) = before.rfind('?') else {
+        return false;
+    };
+    if !before[question + 1..].trim().is_empty() {
+        return false;
+    }
+    let statement_head = before[..question]
+        .rsplit(['\n', ';', '{', '}'])
+        .next()
+        .unwrap_or_default();
+    ternary_condition_head_is_code(statement_head) && is_ternary_arm_expr(current_before)
+}
+
+fn ternary_condition_head_is_code(statement_head: &str) -> bool {
+    statement_head
+        .bytes()
+        .any(|b| matches!(b, b'=' | b'(' | b')' | b'!' | b'<' | b'>' | b'&' | b'|'))
+}
+
+fn is_ternary_arm_expr(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 || value.contains("://") {
+        return false;
+    }
+    value.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'_' | b':' | b'.' | b'-' | b'+' | b'*' | b'/' | b'&' | b'|' | b'(' | b')'
+            )
+    })
 }
 
 fn declared_identifier_key(key: &str) -> Option<String> {
@@ -1524,6 +1582,8 @@ mod tests {
             r#"if(smtpc->state == SMTP_EHLO && len >= 5 && !memcmp(line, "AUTH ", 5)) {"#,
             "for (Key* key : m_keys) {",
             "for (const Key* key : *KeyboardShortcuts::instance()) {",
+            "keybit = (keytype == LIBSSH2_HOSTKEY_TYPE_RSA)?\n  LIBSSH2_KNOWNHOST_KEY_SSHRSA:LIBSSH2_KNOWNHOST_KEY_SSHDSS;",
+            "let choice = ok ? ACCESS_TOKEN:REFRESH_TOKEN;",
             "data->set.ssl.password = data->set.str[STRING_TLSAUTH_PASSWORD];",
             "private const string InstallManifestFileName = \"install-manifest.json\";",
             "private const int HResultEHANDLE = -2147024890;",
@@ -1614,6 +1674,15 @@ mod tests {
         ] {
             assert!(hits(raw).is_empty(), "{raw}: {:?}", hits(raw));
         }
+    }
+
+    #[test]
+    fn ternary_lookback_handles_utf8_before_line() {
+        let raw = format!(
+            "{}\nlet choice = ok ? ACCESS_TOKEN:REFRESH_TOKEN;",
+            "\u{4eba}".repeat(80)
+        );
+        assert!(hits(&raw).is_empty(), "{raw}: {:?}", hits(&raw));
     }
 
     #[test]

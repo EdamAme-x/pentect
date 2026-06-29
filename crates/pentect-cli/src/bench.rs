@@ -453,13 +453,25 @@ fn score_file(
             }
             Truth::True => {
                 report.fn_ += 1;
-                if line_only_hits.contains(&i) {
+                let line_only = line_only_hits.contains(&i);
+                if line_only {
                     report.line_only += 1;
                 }
+                maybe_push_example(
+                    report,
+                    example_limit,
+                    if line_only { "line_only" } else { "fn" },
+                    "missed",
+                    case.category.as_str(),
+                    case.path.as_path(),
+                    case.line_start,
+                    raw,
+                    case.strict_range,
+                );
                 for category in category_parts(&case.category) {
                     let metric = report.by_category.entry(category.to_string()).or_default();
                     metric.fn_ += 1;
-                    if line_only_hits.contains(&i) {
+                    if line_only {
                         metric.line_only += 1;
                     }
                 }
