@@ -1,9 +1,12 @@
 use std::sync::LazyLock;
 
+use super::documentation::is_documentation_value;
+
 const VALUE_PATTERNS: &str = include_str!("benign_value_patterns.txt");
 const KEY_PATTERNS: &str = include_str!("benign_key_patterns.txt");
 const METADATA_KEY_PATTERNS: &str = include_str!("metadata_key_patterns.txt");
 const CONSTANT_COMPONENT_PATTERNS: &str = include_str!("benign_constant_components.txt");
+const SOURCE_SECRET_NAME_PATTERNS: &str = include_str!("source_secret_name_patterns.txt");
 
 static VALUE_MATCHER: LazyLock<PatternSet> = LazyLock::new(|| PatternSet::parse(VALUE_PATTERNS));
 static KEY_MATCHER: LazyLock<PatternSet> = LazyLock::new(|| PatternSet::parse(KEY_PATTERNS));
@@ -11,6 +14,8 @@ static METADATA_KEY_MATCHER: LazyLock<PatternSet> =
     LazyLock::new(|| PatternSet::parse(METADATA_KEY_PATTERNS));
 static CONSTANT_COMPONENT_MATCHER: LazyLock<PatternSet> =
     LazyLock::new(|| PatternSet::parse(CONSTANT_COMPONENT_PATTERNS));
+static SOURCE_SECRET_NAME_MATCHER: LazyLock<SourceSecretNameSet> =
+    LazyLock::new(|| SourceSecretNameSet::parse(SOURCE_SECRET_NAME_PATTERNS));
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Pattern {
@@ -25,6 +30,13 @@ enum Pattern {
 #[derive(Clone, Debug, Default)]
 struct PatternSet {
     patterns: Vec<Pattern>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceSecretNameSet {
+    compact: Vec<String>,
+    allowed_components: Vec<String>,
+    sensitive_components: Vec<String>,
 }
 
 impl PatternSet {
@@ -64,13 +76,58 @@ impl PatternSet {
     }
 }
 
+impl SourceSecretNameSet {
+    fn parse(raw: &str) -> Self {
+        let mut set = Self::default();
+        for line in raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let Some((kind, pattern)) = line.split_once(':') else {
+                continue;
+            };
+            let pattern = normalize_identifier(pattern);
+            match kind.trim() {
+                "compact" => set.compact.push(pattern.replace('_', "")),
+                "allowed_component" => set.allowed_components.push(pattern),
+                "sensitive_component" => set.sensitive_components.push(pattern),
+                _ => {}
+            }
+        }
+        set
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        let name = normalize_identifier(value);
+        if self
+            .compact
+            .iter()
+            .any(|pattern| pattern == &name.replace('_', ""))
+        {
+            return true;
+        }
+        let parts = name
+            .split('_')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        !parts.is_empty()
+            && parts
+                .iter()
+                .any(|part| self.sensitive_components.iter().any(|known| known == part))
+            && parts
+                .iter()
+                .all(|part| self.allowed_components.iter().any(|known| known == part))
+    }
+}
+
 /// True only for explicit placeholder/doc-example values.
 ///
 /// Rationale: these markers say the value is intentionally not the real secret
 /// ("redacted", "removed", "your_*", "value1"). They are not entropy shortcuts
 /// and do not suppress arbitrary low-entropy values.
 pub(crate) fn is_placeholder_value(value: &str) -> bool {
-    VALUE_MATCHER.matches(&normalize_identifier(value))
+    VALUE_MATCHER.matches(&normalize_identifier(value)) || is_documentation_value(value)
 }
 
 /// True for key names that explicitly mark public/non-secret material.
@@ -108,6 +165,16 @@ pub(crate) fn is_non_secret_source_constant_value(value: &str) -> bool {
     has_non_secret_component && !has_sensitive_component
 }
 
+/// True for source string values that are identifier names for secret settings.
+///
+/// Rationale: source code and generated docs frequently store setting names such
+/// as `access_token` or `clientsecret`. The caller must already prove source
+/// context and identifier shape; this data-driven matcher only decides whether
+/// the identifier vocabulary is a placeholder/name rather than secret material.
+pub(crate) fn is_source_secret_name_reference_value(value: &str) -> bool {
+    SOURCE_SECRET_NAME_MATCHER.matches(value)
+}
+
 pub(crate) fn normalize_identifier(input: &str) -> String {
     let mut out = String::new();
     let mut prev_lower_or_digit = false;
@@ -139,11 +206,19 @@ mod tests {
         assert!(is_placeholder_value("CREATE_A_KEY"));
         assert!(is_placeholder_value("CLIENT-SECRET"));
         assert!(is_placeholder_value("OAUTH-TOKEN"));
+        assert!(is_placeholder_value("access_token"));
+        assert!(is_placeholder_value("my_password"));
+        assert!(is_placeholder_value("TestAuthToken"));
         assert!(is_placeholder_value("value42"));
         assert!(is_placeholder_value("/dev/null"));
         assert!(is_placeholder_value("api.example.com"));
+        assert!(is_placeholder_value("192.0.2.10"));
+        assert!(is_placeholder_value("https://example.org/path"));
         assert!(is_placeholder_value("<external-data-source>"));
         assert!(!is_placeholder_value("tenant-7-trial"));
+        assert!(!is_placeholder_value(
+            "https://example.org/path?token=abc123"
+        ));
         assert!(!is_placeholder_value("letmein123"));
         assert!(!is_placeholder_value("pass"));
         assert!(!is_placeholder_value("changeme"));
@@ -182,5 +257,17 @@ mod tests {
         assert!(!is_non_secret_source_constant_value(
             "GCM_OAUTH_CLIENTSECRET"
         ));
+    }
+
+    #[test]
+    fn source_secret_name_references_are_data_driven() {
+        assert!(is_source_secret_name_reference_value("access_token"));
+        assert!(is_source_secret_name_reference_value("ClientSecret"));
+        assert!(is_source_secret_name_reference_value("clientsecret"));
+        assert!(is_source_secret_name_reference_value("TestAuthToken"));
+        assert!(is_source_secret_name_reference_value("my_password"));
+        assert!(!is_source_secret_name_reference_value("CustomToken"));
+        assert!(!is_source_secret_name_reference_value("PROD_SECRET_VALUE"));
+        assert!(!is_source_secret_name_reference_value("tenant-7-trial"));
     }
 }

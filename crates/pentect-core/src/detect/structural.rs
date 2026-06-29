@@ -4,15 +4,10 @@ use super::benign::{
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
+use std::sync::LazyLock;
 
-/// Header names that carry credentials *by protocol definition* — a closed,
-/// RFC-defined, ASCII set, not an open-vocabulary guess. Compared lowercased.
-const SENSITIVE_HEADERS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-];
+static SENSITIVE_HEADERS: LazyLock<Vec<String>> =
+    LazyLock::new(|| parse_sensitive_headers(include_str!("sensitive_header_names.txt")));
 
 /// Masks values that are sensitive by protocol-defined structural position: a
 /// cookie value or a credential-bearing HTTP header. Bounded and protocol-
@@ -40,7 +35,7 @@ impl Detector for StructuralDetector {
                 .ctx
                 .key
                 .as_deref()
-                .is_some_and(|k| SENSITIVE_HEADERS.contains(&k.to_ascii_lowercase().as_str())),
+                .is_some_and(is_sensitive_header_name),
             _ => false,
         };
         if !fire {
@@ -56,6 +51,21 @@ impl Detector for StructuralDetector {
             source: DetectorId::Structural,
         }]
     }
+}
+
+fn parse_sensitive_headers(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_sensitive_header_name(header: &str) -> bool {
+    // Closed list loaded from sensitive_header_names.txt. These names are
+    // protocol-defined credential/cookie carriers, not arbitrary "token" words.
+    let header = header.trim().to_ascii_lowercase();
+    SENSITIVE_HEADERS.iter().any(|known| known == &header)
 }
 
 impl Detector for EnvValueDetector {
@@ -452,7 +462,19 @@ mod tests {
             Some("Authorization"),
             "Bearer x"
         ));
+        assert!(fires(
+            RegionKind::Header,
+            Kind::Har,
+            Some("Proxy-Authorization"),
+            "Basic dXNlcjpwYXNz"
+        ));
         assert!(fires(RegionKind::Header, Kind::Har, Some("cookie"), "a=b"));
+        assert!(fires(
+            RegionKind::Header,
+            Kind::Har,
+            Some("Set-Cookie"),
+            "sid=abc"
+        ));
         assert!(!fires(
             RegionKind::Header,
             Kind::Har,
@@ -460,6 +482,12 @@ mod tests {
             "application/json"
         ));
         assert!(!fires(RegionKind::Header, Kind::Har, Some("Accept"), "*/*"));
+        assert!(!fires(
+            RegionKind::Header,
+            Kind::Har,
+            Some("WWW-Authenticate"),
+            "Bearer realm=\"example\""
+        ));
     }
 
     #[test]

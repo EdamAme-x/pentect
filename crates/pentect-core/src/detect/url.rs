@@ -1,102 +1,14 @@
-use std::net::IpAddr;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
+use super::documentation::is_documentation_host;
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
 
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>()]*[^\s"'<>().,;:!?]"#).unwrap());
-static DOCUMENTATION_HOSTS: LazyLock<HostPatternSet> =
-    LazyLock::new(|| HostPatternSet::parse(include_str!("documentation_host_patterns.txt")));
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum HostPattern {
-    Exact(String),
-    Suffix(String),
-    Cidr(IpCidr),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct IpCidr {
-    network: IpAddr,
-    prefix_bits: u8,
-}
-
-#[derive(Clone, Debug, Default)]
-struct HostPatternSet {
-    patterns: Vec<HostPattern>,
-}
-
-impl HostPatternSet {
-    fn parse(raw: &str) -> Self {
-        let patterns = raw
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .filter_map(|line| {
-                let (kind, pattern) = line.split_once(':')?;
-                let pattern = normalize_host(pattern);
-                match kind.trim() {
-                    "exact" => Some(HostPattern::Exact(pattern)),
-                    "suffix" => Some(HostPattern::Suffix(pattern)),
-                    "cidr" => parse_ip_cidr(&pattern).map(HostPattern::Cidr),
-                    _ => None,
-                }
-            })
-            .collect();
-        Self { patterns }
-    }
-
-    fn matches(&self, host: &str) -> bool {
-        let host = normalize_host(host);
-        let ip = host.parse::<IpAddr>().ok();
-        self.patterns.iter().any(|pattern| match pattern {
-            HostPattern::Exact(pattern) => host == *pattern,
-            HostPattern::Suffix(pattern) => host.ends_with(pattern),
-            HostPattern::Cidr(cidr) => ip.is_some_and(|ip| cidr.contains(ip)),
-        })
-    }
-}
-
-impl IpCidr {
-    fn contains(&self, ip: IpAddr) -> bool {
-        match (ip, self.network) {
-            (IpAddr::V4(ip), IpAddr::V4(network)) => {
-                let mask = cidr_mask(32, self.prefix_bits);
-                (u32::from(ip) & mask as u32) == (u32::from(network) & mask as u32)
-            }
-            (IpAddr::V6(ip), IpAddr::V6(network)) => {
-                let mask = cidr_mask(128, self.prefix_bits);
-                (u128::from(ip) & mask) == (u128::from(network) & mask)
-            }
-            _ => false,
-        }
-    }
-}
-
-fn parse_ip_cidr(raw: &str) -> Option<IpCidr> {
-    let (network, prefix) = raw.split_once('/')?;
-    let network = network.parse::<IpAddr>().ok()?;
-    let prefix_bits = prefix.parse::<u8>().ok()?;
-    let max_bits = match network {
-        IpAddr::V4(_) => 32,
-        IpAddr::V6(_) => 128,
-    };
-    (prefix_bits <= max_bits).then_some(IpCidr {
-        network,
-        prefix_bits,
-    })
-}
-
-fn cidr_mask(total_bits: u8, prefix_bits: u8) -> u128 {
-    if prefix_bits == 0 {
-        return 0;
-    }
-    u128::MAX << (u32::from(total_bits - prefix_bits))
-}
 
 /// Preserves useful URL structure for internal systems:
 /// `http://local.jira.corp/api/issues/1234`
@@ -233,22 +145,6 @@ fn userinfo_token_like(userinfo: &str) -> bool {
     let has_digit = bytes.iter().any(u8::is_ascii_digit);
     let has_token_punct = bytes.iter().any(|b| matches!(b, b'_' | b'-' | b'.' | b'~'));
     has_alpha && (has_digit || has_token_punct)
-}
-
-fn is_documentation_host(host: &str) -> bool {
-    // Documentation hosts are the only place where URL userinfo is suppressed:
-    // RFC 2606/6761 names and RFC 5737/3849/9637 address ranges are reserved for
-    // examples, so `user:pass@` there is demonstrative text. `.localhost` is RFC
-    // special-use too, but deliberately excluded because local services can
-    // carry real credentials.
-    DOCUMENTATION_HOSTS.matches(host)
-}
-
-fn normalize_host(host: &str) -> String {
-    host.trim()
-        .trim_end_matches('.')
-        .trim_matches(|ch| matches!(ch, '[' | ']'))
-        .to_ascii_lowercase()
 }
 
 fn is_internal_host(host: &str) -> bool {

@@ -6,6 +6,7 @@ mod benign;
 mod bip39;
 mod card;
 mod decode;
+mod documentation;
 mod entropy;
 mod key_value;
 mod pattern;

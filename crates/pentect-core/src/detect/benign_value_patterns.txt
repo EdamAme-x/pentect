@@ -15,8 +15,9 @@
 # numbered_prefix:
 #   Synthetic sample values such as value1/value2.
 #
-# localhost/dev_null/example_com:
-#   Well-known non-secret sentinels and documentation domains.
+# RFC documentation hosts/IP ranges:
+#   Managed by documentation_host_patterns.txt so domain/IP CIDR rules stay in
+#   one place and carry their RFC basis.
 exact:example
 exact:sample
 exact:placeholder
@@ -29,7 +30,12 @@ exact:username
 # Action/parameter placeholders used in sample configuration and generated docs.
 exact:create_a_key
 exact:client_secret
+exact:clientsecret
 exact:oauth_token
+exact:access_token
+exact:my_password
+exact:my_token
+exact:test_auth_token
 
 # Public local/documentation sentinels.
 exact:localhost
@@ -39,8 +45,6 @@ exact:external_data_source
 prefix:your_
 prefix:example_
 suffix:_example
-contains:_example_
-contains:example_com
 contains:_removed
 contains:_redacted
 contains:_password_removed

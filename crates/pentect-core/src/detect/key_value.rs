@@ -1,5 +1,6 @@
 use super::benign::{
-    is_explicitly_non_sensitive_key_name, is_non_secret_source_constant_value, is_placeholder_value,
+    is_explicitly_non_sensitive_key_name, is_non_secret_source_constant_value,
+    is_placeholder_value, is_source_secret_name_reference_value,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
@@ -568,6 +569,7 @@ fn looks_like_secret_value(
         || is_file_extension_literal(value, key_name)
         || is_source_constant_reference_literal(value, source_key)
         || is_source_config_name_literal(value, source_key)
+        || is_source_sensitive_name_reference_literal(value, source_key)
         || is_source_code_fragment_literal(value)
         || is_arithmetic_expression_literal(value)
         || is_interpolated_string_template(value)
@@ -961,6 +963,28 @@ fn is_source_config_name_literal(value: &str, source_key: &str) -> bool {
     }
     let value = value.trim();
     is_lower_dotted_config_name(value) || is_lower_route_literal(value)
+}
+
+fn is_source_sensitive_name_reference_literal(value: &str, source_key: &str) -> bool {
+    // Source code often stores the *name* of a secret-bearing setting, not the
+    // secret itself: `Configuration["clientsecret"]`,
+    // `login_or_token="access_token"`, or docs placeholders like
+    // `oauth_token = "my_token"`. Only suppress compact identifier names under
+    // source-shaped left sides; arbitrary values such as `PROD_SECRET_VALUE`
+    // still detect.
+    if !source_key_has_code_shape(source_key) {
+        return false;
+    }
+    let value = value.trim();
+    if !(4..=64).contains(&value.len())
+        || value.bytes().any(|b| b.is_ascii_digit())
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    is_source_secret_name_reference_value(value)
 }
 
 fn is_lower_dotted_config_name(value: &str) -> bool {
@@ -1431,6 +1455,11 @@ mod tests {
             r#"private const string ApiKey = "PROD_SECRET_VALUE";"#,
             "PROD_SECRET_VALUE"
         ));
+        assert!(has(
+            r#"public const string ServicePrincipalSecret = "GCM_AZREPOS_SP_SECRET";"#,
+            "GCM_AZREPOS_SP_SECRET"
+        ));
+        assert!(has(r#"context.Token = "CustomToken";"#, "CustomToken"));
         assert!(has(r#"api_key="--real-secret-123""#, "--real-secret-123"));
         assert!(has(
             r#"private const string ApiKey = "abc12345";"#,
@@ -1524,6 +1553,11 @@ mod tests {
             r#"public const string PasswordStoreDirEnvar = "PASSWORD_STORE_DIR";"#,
             r#"public const string HttpSslCertPasswordProtected = "http.sslcertpasswordprotected";"#,
             r#"public const string DataCenterPasswordReset = "/passwordreset";"#,
+            r#"o.ClientSecret = Configuration["github-token:clientsecret"];"#,
+            r#"g = Github(base_url="https://host/api/v3", login_or_token="access_token")"#,
+            r#"password = "my_password"  # Can be left empty if not used"#,
+            r#"oauth_token = "my_token"  # Can be left empty if not used"#,
+            r#"access_token = "TestAuthToken""#,
         ] {
             assert!(hits(raw).is_empty(), "{raw}: {:?}", hits(raw));
         }

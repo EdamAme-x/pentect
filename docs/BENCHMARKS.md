@@ -59,8 +59,8 @@ F1: 0.280
 Elapsed: 153352 ms
 ```
 
-Current working result after structural false-positive reductions and recall
-hardening:
+Current working result after structural false-positive reductions, source
+name/reference filtering, and RFC documentation-value handling:
 
 ```text
 CredData commit: 9a55c40
@@ -70,15 +70,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 7043
-FP: 16324
+FP: 15912
 FN: 8061
 Line only: 254
-Unlabeled: 79368
+Unlabeled: 79261
 Missing files: 0
-Precision: 0.301
+Precision: 0.307
 Recall: 0.466
-F1: 0.366
-Elapsed: 185663 ms
+F1: 0.370
+Elapsed: 189179 ms
 ```
 
 Weak groups:
@@ -88,6 +88,7 @@ Weak groups:
 - `Token` and `Auth`: recall is strong, but precision still needs vendor/context validators.
 - `LIKELY_SECRET`: broad entropy recall still catches source identifiers and opaque non-secret blobs.
 - `URL_CREDENTIAL`: now keeps token-as-username recall; documentation hosts are suppressed only for RFC-reserved examples.
+- RFC 2606/6761 domains, RFC 5737 IPv4 ranges, and RFC 3849/9637 IPv6 ranges are shared by URL and placeholder suppression so sample hosts do not need ad hoc literals.
 - Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.
 - `UUID`: low recall.
 - `AWS S3 Bucket`, `Firebase Domain`, and `Tencent WeChat API App ID`: currently missed.
