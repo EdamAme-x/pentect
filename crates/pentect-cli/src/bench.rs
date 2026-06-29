@@ -47,6 +47,28 @@ pub(crate) fn cmd_bench(args: &[String]) {
             }
             println!("categories {}", parts.join(" "));
         }
+        if !report.by_detection.is_empty() {
+            let mut parts = report
+                .by_detection
+                .iter()
+                .map(|(label, metric)| {
+                    (
+                        metric.fp,
+                        format!("{}:{}/{}/{}", label, metric.tp, metric.fp, metric.unlabeled),
+                    )
+                })
+                .collect::<Vec<_>>();
+            parts.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            println!(
+                "detections {}",
+                parts
+                    .into_iter()
+                    .take(12)
+                    .map(|(_, part)| part)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
     }
     if let Some(min) = opts.min_precision {
         if report.precision < min {
@@ -67,6 +89,7 @@ struct BenchOpts {
     limit: Option<usize>,
     repo: Option<String>,
     ignore_x: bool,
+    examples: usize,
     min_precision: Option<f64>,
     min_recall: Option<f64>,
 }
@@ -95,6 +118,7 @@ impl BenchOpts {
         let mut limit = None;
         let mut repo = None;
         let mut ignore_x = false;
+        let mut examples = 0usize;
         let mut min_precision = None;
         let mut min_recall = None;
         let mut i = 4usize;
@@ -107,6 +131,9 @@ impl BenchOpts {
                 "--ignore-x" => {
                     ignore_x = true;
                     i += 1;
+                }
+                "--examples" => {
+                    examples = parse_usize_arg(args, &mut i, "--examples")?;
                 }
                 "--limit" => {
                     limit = Some(parse_usize_arg(args, &mut i, "--limit")?);
@@ -132,6 +159,7 @@ impl BenchOpts {
             limit,
             repo,
             ignore_x,
+            examples,
             min_precision,
             min_recall,
         })
@@ -237,13 +265,13 @@ fn run_creddata(root: &Path, opts: &BenchOpts) -> Result<BenchReport, String> {
         let spans = engine
             .analyze_spans(Input {
                 kind: infer_kind(&path),
-                data: raw,
+                data: raw.clone(),
             })
             .spans
             .into_iter()
             .filter(|span| span.category == Category::Secret)
             .collect::<Vec<_>>();
-        score_file(&cases, &spans, &mut report);
+        score_file(&raw, &cases, &spans, &mut report, opts.examples);
     }
 
     report.elapsed_ms = started.elapsed().as_millis();
@@ -326,18 +354,21 @@ fn dataset_file_path(root: &Path, file_path: &str) -> PathBuf {
     out
 }
 
-fn score_file(cases: &[BenchCase], spans: &[Span], report: &mut BenchReport) {
-    let mut true_hits = BTreeSet::new();
+fn score_file(
+    raw: &str,
+    cases: &[BenchCase],
+    spans: &[Span],
+    report: &mut BenchReport,
+    example_limit: usize,
+) {
+    let mut true_hits = BTreeMap::new();
     let mut line_only_hits = BTreeSet::new();
     for (i, case) in cases.iter().enumerate() {
         if case.truth != Truth::True {
             continue;
         }
-        if spans
-            .iter()
-            .any(|span| span.range.overlaps(&case.strict_range))
-        {
-            true_hits.insert(i);
+        if let Some(span) = strongest_overlap(spans, case.strict_range) {
+            true_hits.insert(i, detection_key(span));
         } else if spans
             .iter()
             .any(|span| span.range.overlaps(&case.line_range))
@@ -348,8 +379,10 @@ fn score_file(cases: &[BenchCase], spans: &[Span], report: &mut BenchReport) {
 
     for (i, case) in cases.iter().enumerate() {
         match case.truth {
-            Truth::True if true_hits.contains(&i) => {
+            Truth::True if true_hits.contains_key(&i) => {
                 report.tp += 1;
+                let key = &true_hits[&i];
+                report.by_detection.entry(key.clone()).or_default().tp += 1;
                 for category in category_parts(&case.category) {
                     report
                         .by_category
@@ -387,6 +420,19 @@ fn score_file(cases: &[BenchCase], spans: &[Span], report: &mut BenchReport) {
             .find(|case| case.truth == Truth::False && span.range.overlaps(&case.line_range))
         {
             report.fp += 1;
+            let key = detection_key(span);
+            report.by_detection.entry(key.clone()).or_default().fp += 1;
+            maybe_push_example(
+                report,
+                example_limit,
+                "fp",
+                &key,
+                case.category.as_str(),
+                case.path.as_path(),
+                case.line_start,
+                raw,
+                span.range,
+            );
             for category in category_parts(&case.category) {
                 report
                     .by_category
@@ -396,8 +442,93 @@ fn score_file(cases: &[BenchCase], spans: &[Span], report: &mut BenchReport) {
             }
         } else {
             report.unlabeled += 1;
+            let key = detection_key(span);
+            report
+                .by_detection
+                .entry(key.clone())
+                .or_default()
+                .unlabeled += 1;
+            maybe_push_example(
+                report,
+                example_limit,
+                "unlabeled",
+                &key,
+                "",
+                Path::new(""),
+                line_number(raw, span.range.start),
+                raw,
+                span.range,
+            );
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_push_example(
+    report: &mut BenchReport,
+    example_limit: usize,
+    kind: &str,
+    detection: &str,
+    category: &str,
+    path: &Path,
+    line: usize,
+    raw: &str,
+    range: ByteRange,
+) {
+    if report.examples.len() >= example_limit {
+        return;
+    }
+    report.examples.push(BenchExample {
+        kind: kind.to_string(),
+        detection: detection.to_string(),
+        category: category.to_string(),
+        path: path.display().to_string(),
+        line,
+        value: clipped(&raw[range.start..range.end], 120),
+        excerpt: excerpt(raw, range),
+    });
+}
+
+fn line_number(raw: &str, offset: usize) -> usize {
+    raw.as_bytes()[..offset.min(raw.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
+fn excerpt(raw: &str, range: ByteRange) -> String {
+    let line_start = raw[..range.start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let line_end = raw[range.end..]
+        .find('\n')
+        .map_or(raw.len(), |offset| range.end + offset);
+    let line = raw[line_start..line_end].trim();
+    clipped(line, 240)
+}
+
+fn clipped(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        value
+            .chars()
+            .take(max_chars.saturating_sub(3))
+            .chain("...".chars())
+            .collect()
+    }
+}
+
+fn strongest_overlap(spans: &[Span], range: ByteRange) -> Option<&Span> {
+    spans
+        .iter()
+        .filter(|span| span.range.overlaps(&range))
+        .max_by(|a, b| a.cmp_strength(b))
+}
+
+fn detection_key(span: &Span) -> String {
+    format!("{}:{}", span.source.as_str(), span.label)
 }
 
 fn category_parts(category: &str) -> impl Iterator<Item = &str> {
@@ -466,6 +597,8 @@ struct BenchCase {
     strict_range: ByteRange,
     line_range: ByteRange,
     category: String,
+    path: PathBuf,
+    line_start: usize,
 }
 
 impl BenchCase {
@@ -482,6 +615,8 @@ impl BenchCase {
             strict_range,
             line_range,
             category: row.category,
+            path: row.path,
+            line_start: row.line_start,
         })
     }
 }
@@ -570,6 +705,8 @@ struct BenchReport {
     f1: f64,
     elapsed_ms: u128,
     by_category: BTreeMap<String, CategoryMetric>,
+    by_detection: BTreeMap<String, DetectionMetric>,
+    examples: Vec<BenchExample>,
 }
 
 impl BenchReport {
@@ -582,6 +719,9 @@ impl BenchReport {
             2.0 * self.precision * self.recall / (self.precision + self.recall)
         };
         for metric in self.by_category.values_mut() {
+            metric.finish();
+        }
+        for metric in self.by_detection.values_mut() {
             metric.finish();
         }
     }
@@ -606,9 +746,22 @@ impl BenchReport {
             "f1": self.f1,
             "elapsed_ms": self.elapsed_ms,
             "by_category": self.by_category,
+            "by_detection": self.by_detection,
+            "examples": self.examples,
         })
         .to_string()
     }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct BenchExample {
+    kind: String,
+    detection: String,
+    category: String,
+    path: String,
+    line: usize,
+    value: String,
+    excerpt: String,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -622,6 +775,20 @@ struct CategoryMetric {
     precision: f64,
     recall: f64,
     f1: f64,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+struct DetectionMetric {
+    tp: usize,
+    fp: usize,
+    unlabeled: usize,
+    precision: f64,
+}
+
+impl DetectionMetric {
+    fn finish(&mut self) {
+        self.precision = ratio(self.tp, self.tp + self.fp);
+    }
 }
 
 impl CategoryMetric {
@@ -701,6 +868,8 @@ mod tests {
             "--repo".to_string(),
             "abc".to_string(),
             "--ignore-x".to_string(),
+            "--examples".to_string(),
+            "3".to_string(),
             "--min-precision".to_string(),
             "0.8".to_string(),
             "--min-recall".to_string(),
@@ -711,6 +880,7 @@ mod tests {
         assert_eq!(opts.limit, Some(10));
         assert_eq!(opts.repo.as_deref(), Some("abc"));
         assert!(opts.ignore_x);
+        assert_eq!(opts.examples, 3);
         assert_eq!(opts.min_precision, Some(0.8));
         assert_eq!(opts.min_recall, Some(0.7));
     }

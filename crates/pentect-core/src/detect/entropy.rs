@@ -1,3 +1,4 @@
+use super::benign::is_structured_metadata_key;
 use super::util::token_runs;
 use super::Detector;
 use crate::model::*;
@@ -80,18 +81,24 @@ impl EntropyDetector {
         out: &mut Vec<Span>,
     ) {
         let run = &text[start..end];
-        if run.len() >= self.min_len
-            && entropy_candidate(run, text, start, end)
-            && shannon(run.as_bytes()) >= self.threshold
+        if run.len() < self.min_len
+            || !entropy_candidate(run, text, start, end)
+            || shannon(run.as_bytes()) < self.threshold
         {
-            out.push(Span {
-                range: view.to_raw(ByteRange::new(start, end)),
-                category: Category::Secret,
-                label: labels::LIKELY_SECRET.to_string(),
-                confidence: Confidence::Low,
-                source: DetectorId::Entropy,
-            });
+            return;
         }
+        if is_structured_metadata_value(text, start, &view.region.ctx, run)
+            || is_public_ssh_key_context(text, start)
+        {
+            return;
+        }
+        out.push(Span {
+            range: view.to_raw(ByteRange::new(start, end)),
+            category: Category::Secret,
+            label: labels::LIKELY_SECRET.to_string(),
+            confidence: Confidence::Low,
+            source: DetectorId::Entropy,
+        });
     }
 }
 
@@ -120,8 +127,76 @@ fn assignment_parts(run: &str) -> Option<Assignment> {
 
 fn entropy_candidate(run: &str, text: &str, start: usize, end: usize) -> bool {
     has_opaque_mix(run)
-        && !is_source_identifier_like(run)
+        && !is_assignment_name_fragment(run)
+        && !is_operator_expression_fragment(run)
+        && !is_slash_separated_identifier_list(run)
+        && !is_code_arithmetic_constant(run)
+        && !is_uppercase_constant_identifier(run)
+        && !is_source_identifier_like(run, text, start, end)
         && !is_regex_character_class_fragment(text, start, end)
+}
+
+fn is_assignment_name_fragment(run: &str) -> bool {
+    // Tokenization includes `=` so source attributes like
+    // `horizontalHuggingPriority=` can look like one opaque run. Do not reject
+    // base64 padding globally; only suppress identifier-shaped names with a
+    // trailing assignment marker and no codec/digit evidence.
+    let Some(name) = run.strip_suffix('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.bytes().any(|b| b.is_ascii_digit())
+        && !name.bytes().any(|b| matches!(b, b'+' | b'/'))
+        && is_source_identifier_shape(name)
+}
+
+fn is_structured_metadata_value(text: &str, start: usize, ctx: &Context, value: &str) -> bool {
+    // This only retracts raw entropy guesses in structured JSON metadata fields.
+    // Rationale: fields like `node_id`, `sha`, and `etag` conventionally carry
+    // opaque identifiers/hashes. They are not credentials unless another
+    // detector can anchor them to a sensitive key or vendor pattern.
+    if !matches!(ctx.format, Kind::Json | Kind::ToolResult) {
+        return false;
+    }
+    if value.len() < 24 {
+        return false;
+    }
+    ctx.key.as_deref().is_some_and(is_structured_metadata_key)
+        || local_json_key_before_value(text, start)
+            .as_deref()
+            .is_some_and(is_structured_metadata_key)
+}
+
+fn local_json_key_before_value(text: &str, start: usize) -> Option<String> {
+    // Some JSON fixtures are scanned as a single text region, so the region
+    // context cannot expose every nested key. For entropy suppression only, read
+    // the immediate `"key": "value"` shape on the same line; this does not
+    // create detections and cannot suppress non-metadata keys.
+    let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let prefix = &text[line_start..start];
+    let colon = prefix.rfind(':')?;
+    let before = prefix[..colon].trim_end();
+    if !before.ends_with('"') {
+        return None;
+    }
+    let key_end = before.len() - 1;
+    let key_start = before[..key_end].rfind('"')? + 1;
+    let key = &before[key_start..key_end];
+    (!key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+    .then(|| key.to_string())
+}
+
+fn is_public_ssh_key_context(text: &str, start: usize) -> bool {
+    // OpenSSH authorized_keys/public-key lines start with an algorithm marker
+    // (`ssh-rsa`, `ssh-ed25519`, `ecdsa-sha2-*`) followed by a base64 blob.
+    // Entropy sees the blob as opaque, but it is public key material; private
+    // PEM/OpenSSH key blocks are handled separately.
+    let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let prefix = &text[line_start..start];
+    prefix.contains("ssh-rsa ") || prefix.contains("ssh-ed25519 ") || prefix.contains("ecdsa-sha2-")
 }
 
 fn has_opaque_mix(run: &str) -> bool {
@@ -160,7 +235,13 @@ fn is_word_path_segment(segment: &str) -> bool {
         && bytes.iter().any(u8::is_ascii_lowercase)
 }
 
-fn is_source_identifier_like(run: &str) -> bool {
+fn is_source_identifier_like(run: &str, text: &str, start: usize, end: usize) -> bool {
+    is_source_identifier_shape(run)
+        || (pascal_or_camel_identifier_like(run.as_bytes())
+            && source_identifier_context(text, start, end))
+}
+
+fn is_source_identifier_shape(run: &str) -> bool {
     let bytes = run.as_bytes();
     if bytes.is_empty()
         || !bytes
@@ -175,10 +256,158 @@ fn is_source_identifier_like(run: &str) -> bool {
     if has_alpha && !has_digit {
         return true;
     }
+    if wordlike_mixed_case_identifier(bytes) {
+        return true;
+    }
     if has_separator && identifier_like_with_few_digits(bytes) {
         return true;
     }
     false
+}
+
+fn wordlike_mixed_case_identifier(bytes: &[u8]) -> bool {
+    // Source identifiers such as `authenticationMD5Password` have a few case
+    // transitions and long lowercase word runs. Random base62 tokens usually
+    // alternate case more often and lack word-length lowercase stretches.
+    if !(16..=80).contains(&bytes.len()) || bytes.iter().any(|b| matches!(b, b'+' | b'/' | b'=')) {
+        return false;
+    }
+    let has_upper = bytes.iter().any(u8::is_ascii_uppercase);
+    let has_lower = bytes.iter().any(u8::is_ascii_lowercase);
+    let digit_count = bytes.iter().filter(|b| b.is_ascii_digit()).count();
+    if !has_upper || !has_lower || digit_count > 4 {
+        return false;
+    }
+    let mut transitions = 0usize;
+    let mut prev_case = None;
+    let mut lower_run = 0usize;
+    let mut max_lower_run = 0usize;
+    for b in bytes {
+        let case = if b.is_ascii_lowercase() {
+            lower_run += 1;
+            max_lower_run = max_lower_run.max(lower_run);
+            Some(false)
+        } else if b.is_ascii_uppercase() {
+            lower_run = 0;
+            Some(true)
+        } else {
+            lower_run = 0;
+            None
+        };
+        if let (Some(prev), Some(case)) = (prev_case, case) {
+            if prev != case {
+                transitions += 1;
+            }
+        }
+        if case.is_some() {
+            prev_case = case;
+        }
+    }
+    transitions <= 8 && max_lower_run >= 4
+}
+
+fn source_identifier_context(text: &str, start: usize, end: usize) -> bool {
+    // Digit-bearing PascalCase names (`X509Certificate2Collection`) overlap
+    // with base62 token shape. Suppress them only when nearby punctuation or
+    // keywords make the source-code role visible.
+    let line_start = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
+    let line_end = text[end..]
+        .find('\n')
+        .map_or(text.len(), |offset| end + offset);
+    let before = text[line_start..start].trim_end();
+    let after = text[end..line_end].trim_start();
+    before.ends_with("class")
+        || before.ends_with("struct")
+        || before.ends_with("enum")
+        || before.ends_with("type")
+        || before.ends_with("new")
+        || before.ends_with(':')
+        || before.ends_with("::")
+        || before.ends_with('<')
+        || after.starts_with(['(', '<', ':', ';', ',', '{', '=', '>'])
+}
+
+fn is_uppercase_constant_identifier(run: &str) -> bool {
+    // ALL_CAPS_WITH_UNDERSCORES is source-code constant syntax, not an opaque
+    // credential shape. This gate is deliberately disabled for codec markers
+    // (`+`, `/`, `=`) so base64-like secrets still reach entropy scoring.
+    let bytes = run.as_bytes();
+    if bytes.is_empty()
+        || bytes.iter().any(|b| matches!(b, b'+' | b'/' | b'='))
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+    {
+        return false;
+    }
+    bytes.iter().any(u8::is_ascii_alphabetic)
+        && bytes.contains(&b'_')
+        && bytes.iter().filter(|b| b.is_ascii_digit()).count() <= 12
+}
+
+fn is_operator_expression_fragment(run: &str) -> bool {
+    // Tokenization includes operator-adjacent text in some source lines. Runs
+    // containing comparison/increment operators are expressions, not values.
+    // Strip trailing `=` padding first so base64 values ending in `=`/`==` keep
+    // their entropy recall.
+    let run = run.trim_end_matches('=');
+    run.contains("==")
+        || run.contains("!=")
+        || run.contains("<=")
+        || run.contains(">=")
+        || run.contains("=>")
+        || run.contains("++")
+        || run.contains("--")
+}
+
+fn is_code_arithmetic_constant(run: &str) -> bool {
+    // Macro arithmetic such as `MAX_BITS-DCTSIZE2+1` is a source expression.
+    // It has separators and digits, but no credential alphabet markers.
+    let bytes = run.as_bytes();
+    if bytes.iter().any(|b| matches!(b, b'/' | b'=')) {
+        return false;
+    }
+    bytes.iter().any(|b| matches!(b, b'+' | b'-'))
+        && bytes.contains(&b'_')
+        && bytes.iter().any(u8::is_ascii_uppercase)
+        && bytes.iter().all(|b| {
+            b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'+')
+        })
+}
+
+fn is_slash_separated_identifier_list(run: &str) -> bool {
+    // Comments and enum lists often join protocol/identifier names with `/`
+    // (`HTTP/SOCKS5`). They are not paths or encoded values unless codec
+    // markers appear.
+    run.contains('/')
+        && !run.as_bytes().iter().any(|b| matches!(b, b'+' | b'='))
+        && run.split('/').filter(|part| !part.is_empty()).all(|part| {
+            is_source_identifier_shape(part)
+                || is_uppercase_constant_identifier(part)
+                || is_short_protocol_identifier(part)
+        })
+}
+
+fn is_short_protocol_identifier(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    (2..=24).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        && bytes.iter().any(u8::is_ascii_alphabetic)
+}
+
+fn pascal_or_camel_identifier_like(bytes: &[u8]) -> bool {
+    // Long PascalCase/camelCase runs with digits also overlap base62 tokens, so
+    // the caller must prove source context before suppressing them.
+    if !(16..=80).contains(&bytes.len()) || bytes.iter().any(|b| matches!(b, b'+' | b'/' | b'=')) {
+        return false;
+    }
+    let has_upper = bytes.iter().any(u8::is_ascii_uppercase);
+    let has_lower = bytes.iter().any(u8::is_ascii_lowercase);
+    let digit_count = bytes.iter().filter(|b| b.is_ascii_digit()).count();
+    let sep_count = bytes.iter().filter(|b| matches!(b, b'_' | b'-')).count();
+    has_upper && has_lower && (digit_count > 0 || sep_count <= 1)
 }
 
 fn identifier_like_with_few_digits(bytes: &[u8]) -> bool {
@@ -272,6 +501,20 @@ mod tests {
     }
 
     #[test]
+    fn base64_padding_is_still_entropy_candidate() {
+        let raw = "SECRET_BLOB=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB==";
+        let reg = region(raw);
+        let v = NormalizedView::build(&reg, raw);
+        let spans = EntropyDetector::with(24, 2.0).detect(&v);
+        assert!(
+            spans
+                .iter()
+                .any(|span| raw[span.range.start..span.range.end].ends_with("==")),
+            "base64 padding must not suppress entropy: {spans:?}"
+        );
+    }
+
+    #[test]
     fn benign_assignments_do_not_mask_whole_key_value_run() {
         for raw in [
             "sha=356a192b7913b04c54574d18c28d46e6395428ab",
@@ -296,11 +539,37 @@ mod tests {
             "--allow-unverified-hooks",
             "DASHBOARD_HEARTBEAT_MAX_AGE",
             "clientSecretIdentifierOnly",
+            "SSL_RSA_WITH_RC4_128_MD5",
+            "TLS_RSA_EXPORT1024_WITH_RC4_56_SHA",
+            "ssl_connect_done==connssl->connecting_state",
+            "MAX_CORR_BITS-DCTSIZE2+1",
+            "++current_file_system_version",
+            "customObjectInstantitationMethod=",
+            "allowsToolTipsWhenApplicationIsInactive=",
+            "horizontalHuggingPriority=",
+            "type X509Certificate2Collection;",
+            "HTTP/HTTP_1_0/SOCKS4/SOCKS4a/SOCKS5/SOCKS5_HOSTNAME",
+            "defaultChecked/defaultSelected",
+            "addEventListener/attachEvent",
         ] {
             let reg = region(raw);
             let v = NormalizedView::build(&reg, raw);
             assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
         }
+    }
+
+    #[test]
+    fn unanchored_base62_like_runs_are_entropy_candidates() {
+        let raw = "AbCdEfGhIjKlMnOp1234";
+        let reg = region(raw);
+        let v = NormalizedView::build(&reg, raw);
+        assert!(
+            EntropyDetector::with(16, 2.0)
+                .detect(&v)
+                .iter()
+                .any(|span| &raw[span.range.start..span.range.end] == raw),
+            "mixed-case alphanumeric token should not be suppressed as a source identifier"
+        );
     }
 
     #[test]
@@ -345,5 +614,52 @@ mod tests {
             }),
             "{spans:?}"
         );
+    }
+
+    #[test]
+    fn github_metadata_json_values_are_not_entropy_candidates() {
+        let raw =
+            "MDY6Q29tbWl0Mjc5MDE1Mjg2OjgxM2RhNTI4ZGE0NmVmNGNiYjI4ZDIwMThlYWE2ZDRiM2Q1NmY0MGY=";
+        let region = Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: Context {
+                path: None,
+                key: Some("node_id".to_string()),
+                hints: Vec::new(),
+                kind: RegionKind::JsonValue,
+                format: Kind::Json,
+            },
+        };
+        let view = NormalizedView::build(&region, raw);
+        assert!(EntropyDetector::default().detect(&view).is_empty());
+    }
+
+    #[test]
+    fn local_json_metadata_keys_are_not_entropy_candidates() {
+        for raw in [
+            r#"{"node_id":"MDY6Q29tbWl0MjQ2NjQ4MjY4OmU0NGQxMWQ1NjVjMDIyNDk2NTQ0ZGQ2ZWQxZjE5YThkNzE4YzJiMGM="}"#,
+            r#"{"x5c":["MIIDBTCCAe2gAwIBAgIQHJ7yHxNEM7tBeqcRTMBhhTANBgkqhkiG9w0BAQsFADAtMSswKQYDVQQDEyJhY2NvdW50cy5leGFtcGxl"]}"#,
+        ] {
+            let region = Region {
+                span: ByteRange::new(0, raw.len()),
+                ctx: Context {
+                    path: None,
+                    key: None,
+                    hints: Vec::new(),
+                    kind: RegionKind::JsonValue,
+                    format: Kind::Json,
+                },
+            };
+            let view = NormalizedView::build(&region, raw);
+            assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn public_ssh_key_blobs_are_not_entropy_candidates() {
+        let raw = r#"{"key":"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDLOoLSVPwG1OSgVSeEXNbfIofYdxR5zs3u4PryhnamfFPYwi2vZW3ZxeI1oRcDh2VEdwGvlN5VUduKJ"}"#;
+        let reg = region(raw);
+        let view = NormalizedView::build(&reg, raw);
+        assert!(EntropyDetector::default().detect(&view).is_empty());
     }
 }

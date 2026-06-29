@@ -1,3 +1,6 @@
+use super::benign::{
+    is_explicitly_non_sensitive_key_name, is_non_secret_source_constant_value, is_placeholder_value,
+};
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
 use crate::normalize::NormalizedView;
@@ -132,6 +135,9 @@ fn scan_line(
         } else if matches!(bytes[i], b'"' | b'\'' | b'`')
             && i > 0
             && bytes[i - 1].is_ascii_whitespace()
+            && bytes
+                .get(i + 1)
+                .is_some_and(|b| !matches!(b, b',' | b';' | b')' | b']' | b'}'))
         {
             try_push(
                 &mut ctx,
@@ -155,10 +161,21 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
         return false;
     };
     let key = trim_key_edge(&ctx.text[key_start..left_end]);
+    let semantic_key = declared_identifier_key(key).unwrap_or_else(|| key.to_string());
+    let semantic_key = semantic_key.as_str();
+    let key_name = normalize_key(semantic_key);
+    if is_xml_key_attribute(ctx.text, ctx.line_start, separator.start, &key_name) {
+        return false;
+    }
+    if separator.kind == Separator::Colon
+        && (is_cpp_range_for_key(key) || is_cpp_range_for_left(&ctx.text[ctx.line_start..left_end]))
+    {
+        return false;
+    }
     let kind = match if separator.kind == Separator::ImplicitQuote {
-        trailing_sensitive_key_kind(key)
+        trailing_sensitive_key_kind(semantic_key)
     } else {
-        sensitive_key_kind(key)
+        sensitive_key_kind(semantic_key)
     } {
         Some(kind) => kind,
         None => return false,
@@ -174,8 +191,7 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
         return false;
     };
     let raw_value = &ctx.text[value.start..value.end];
-    let key_name = normalize_key(key);
-    if is_self_reference_code_value(key, raw_value) {
+    if is_self_reference_code_value(semantic_key, raw_value) {
         return false;
     }
     if !value.quoted && is_camel_case_code_reference(raw_value) {
@@ -184,7 +200,14 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     if !value.quoted && is_code_type_or_expression(raw_value, &key_name, kind) {
         return false;
     }
-    if !looks_like_secret_value(raw_value, kind, value.quoted, separator.kind, &key_name) {
+    if !looks_like_secret_value(
+        raw_value,
+        kind,
+        value.quoted,
+        separator.kind,
+        &key_name,
+        &ctx.text[ctx.line_start..left_end],
+    ) {
         return false;
     }
 
@@ -208,7 +231,12 @@ fn is_assignment_separator(bytes: &[u8], i: usize) -> bool {
     if bytes.get(i + 1) == Some(&b'=') {
         return false;
     }
-    if i > 0 && matches!(bytes[i - 1], b'=' | b'!' | b'<' | b'>') {
+    if i > 0
+        && matches!(
+            bytes[i - 1],
+            b'=' | b'!' | b'<' | b'>' | b'&' | b'|' | b'+' | b'-' | b'*' | b'/' | b'%' | b'^'
+        )
+    {
         return false;
     }
     true
@@ -283,11 +311,8 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
             "auth_token",
             "bearer_token",
             "session_token",
-            "session",
-            "cookie",
-            "jwt",
         ],
-    ) || name == "token"
+    ) || matches!(name.as_str(), "token" | "session" | "cookie" | "jwt")
         || name.ends_with("_token")
         || name.contains("_token_")
         || name == "authorization"
@@ -446,9 +471,30 @@ fn scan_unquoted_token_end(text: &str, start: usize, line_end: usize) -> usize {
         if ch.is_ascii_whitespace() || matches!(ch, ',' | ';' | ')' | ']' | '}') {
             break;
         }
+        if ch == '&' && starts_form_param_at(text, start + offset + ch.len_utf8(), line_end) {
+            break;
+        }
         end = start + offset + ch.len_utf8();
     }
     end
+}
+
+fn starts_form_param_at(text: &str, start: usize, line_end: usize) -> bool {
+    // In query/form bodies, `&name=` starts the next parameter. Stopping here
+    // prevents `token=value&state=...` from being treated as one oversized
+    // secret while still allowing the current parameter value to be judged.
+    let mut pos = start;
+    let bytes = text.as_bytes();
+    if pos >= line_end || !bytes[pos].is_ascii_alphabetic() {
+        return false;
+    }
+    pos += 1;
+    while pos < line_end
+        && (bytes[pos].is_ascii_alphanumeric() || matches!(bytes[pos], b'_' | b'-' | b'.'))
+    {
+        pos += 1;
+    }
+    pos < line_end && bytes[pos] == b'='
 }
 
 fn trim_unquoted_value_end(text: &str, start: usize, mut end: usize) -> usize {
@@ -495,6 +541,7 @@ fn looks_like_secret_value(
     quoted: bool,
     separator: Separator,
     key_name: &str,
+    source_key: &str,
 ) -> bool {
     let value = value.trim();
     if value.is_empty() || is_rendered_placeholder(value) || is_benign_literal(value) {
@@ -516,6 +563,25 @@ fn looks_like_secret_value(
         return chars >= 8;
     }
 
+    if is_format_template_literal(value, key_name)
+        || is_cli_option_literal(value, key_name)
+        || is_file_extension_literal(value, key_name)
+        || is_source_constant_reference_literal(value, source_key)
+        || is_source_code_fragment_literal(value)
+        || is_arithmetic_expression_literal(value)
+        || is_interpolated_string_template(value)
+        || is_public_key_literal(value)
+        || is_license_identifier_literal(value, key_name)
+        || is_dunder_identifier_literal(value)
+        || is_uppercase_constant_literal_for_generic_key(value, key_name)
+        || is_plain_prose_literal_for_generic_key(value, key_name)
+        || is_locator_literal_for_key(value, key_name)
+    {
+        return false;
+    }
+    if is_auth_scheme_literal(value) {
+        return false;
+    }
     let has_alpha = value.chars().any(|ch| ch.is_ascii_alphabetic());
     let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
     let has_symbol = value
@@ -528,6 +594,9 @@ fn looks_like_secret_value(
             return has_digit || has_symbol;
         }
         return has_digit || has_symbol || key_allows_low_entropy_literal(key_name, kind);
+    }
+    if !quoted && is_plain_code_identifier(value) && !has_digit {
+        return false;
     }
     if chars >= 4 && has_alpha && has_digit {
         if is_plain_code_identifier(value) {
@@ -572,20 +641,13 @@ fn is_rendered_placeholder(v: &str) -> bool {
 }
 
 fn is_benign_literal(value: &str) -> bool {
+    if is_placeholder_value(value) {
+        return true;
+    }
     let normalized = normalize_key(value);
     matches!(
         normalized.as_str(),
-        "" | "true"
-            | "false"
-            | "null"
-            | "none"
-            | "nil"
-            | "undefined"
-            | "example"
-            | "sample"
-            | "placeholder"
-            | "redacted"
-            | "masked"
+        "" | "true" | "false" | "null" | "none" | "nil" | "undefined"
     )
 }
 
@@ -594,7 +656,18 @@ fn is_code_type_or_expression(value: &str, key_name: &str, kind: KeyKind) -> boo
     if value.is_empty() || value.chars().any(char::is_whitespace) {
         return false;
     }
+    if value.starts_with(['~', '+', '-', '*', '&'])
+        || value.ends_with('(')
+        || value.contains('?')
+        || value.contains('[')
+        || value.contains(']')
+    {
+        return true;
+    }
     if value.starts_with(['{', '[', '(']) {
+        return true;
+    }
+    if is_member_or_pointer_reference(value) {
         return true;
     }
     if is_plain_code_identifier(value) && !key_allows_low_entropy_literal(key_name, kind) {
@@ -633,11 +706,482 @@ fn is_code_type_or_expression(value: &str, key_name: &str, kind: KeyKind) -> boo
     let has_type_punctuation = bytes
         .iter()
         .any(|b| matches!(b, b'<' | b'>' | b':' | b'[' | b']' | b'&' | b';'));
-    let starts_like_type = value
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_uppercase());
-    has_type_punctuation || starts_like_type
+    has_type_punctuation
+}
+
+fn is_cpp_range_for_key(key: &str) -> bool {
+    // C++ range-for uses `:` as syntax (`for (T x : xs)`), not as a
+    // key/value separator. This rejects only lines whose left side is clearly a
+    // `for` header.
+    key.trim_start().starts_with("for ")
+        || key.trim_start().starts_with("for(")
+        || key.contains(" for ")
+}
+
+fn is_cpp_range_for_left(left: &str) -> bool {
+    // Same rationale as `is_cpp_range_for_key`, but uses the full left side
+    // because the compact key-window may start after `for (`.
+    left.trim_start().starts_with("for (")
+        || left.trim_start().starts_with("for(")
+        || left.contains(" for (")
+        || left.contains(" for(")
+}
+
+fn declared_identifier_key(key: &str) -> Option<String> {
+    // Declarations put modifiers/types before the actual variable
+    // (`private const string ApiKey = ...`). The declaration syntax itself is
+    // neither secret nor benign; only the declared identifier should drive the
+    // sensitive-key decision. This preserves recall for `ApiKey` while avoiding
+    // false positives on non-sensitive declarations such as
+    // `InstallManifestFileName`.
+    let tokens = key
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let has_declaration_word = tokens[..tokens.len() - 1]
+        .iter()
+        .any(|token| is_declaration_word(token));
+    if !has_declaration_word {
+        return None;
+    }
+    let ident = tokens[tokens.len() - 1];
+    (!is_declaration_word(ident)).then(|| ident.to_string())
+}
+
+fn is_declaration_word(token: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "private",
+        "public",
+        "protected",
+        "internal",
+        "static",
+        "const",
+        "readonly",
+        "final",
+        "let",
+        "var",
+        "val",
+        "auto",
+        "constexpr",
+        "override",
+        "string",
+        "str",
+        "int",
+        "uint",
+        "long",
+        "ulong",
+        "short",
+        "ushort",
+        "bool",
+        "boolean",
+        "char",
+        "double",
+        "float",
+        "decimal",
+        "object",
+    ];
+    WORDS.iter().any(|word| token.eq_ignore_ascii_case(word))
+}
+
+fn is_xml_key_attribute(
+    text: &str,
+    line_start: usize,
+    separator_start: usize,
+    key_name: &str,
+) -> bool {
+    // XML attributes named `key` describe configuration identifiers, and
+    // `publicKeyToken` is public assembly identity metadata. Treating these as
+    // secret-bearing key/value assignments turns ordinary manifests into noise.
+    if key_name != "key" && !key_name.ends_with("_key") && key_name != "public_key_token" {
+        return false;
+    }
+    let left = &text[line_start..separator_start];
+    let trimmed = left.trim_start();
+    trimmed.starts_with('<') && !trimmed.starts_with("</")
+}
+
+fn is_auth_scheme_literal(value: &str) -> bool {
+    // Authentication scheme names are protocol identifiers. They become secret
+    // only when followed by credentials, which URL/header/rule detectors handle.
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "basic"
+            | "digest"
+            | "ntlm"
+            | "negotiate"
+            | "gss-negotiate"
+            | "gssapi"
+            | "bearer"
+            | "oauth"
+            | "oauth2"
+            | "scram-sha-256"
+    )
+}
+
+fn is_format_template_literal(value: &str, key_name: &str) -> bool {
+    // Format templates are code fragments waiting for substitution, not the
+    // substituted credential (`"%s"`, `"Basic {}"`, `${token}`). The detector
+    // should see the runtime value or a concrete fixture value before masking.
+    // Suppress only when the key/value context itself says template/format; a
+    // real password may contain `%` or braces.
+    let value = value.trim();
+    let has_template_syntax = contains_printf_directive(value)
+        || value.contains("{}")
+        || value.contains("{0}")
+        || value.contains("${");
+    if !has_template_syntax {
+        return false;
+    }
+    key_name_indicates_template_context(key_name) || auth_template_value(key_name, value)
+}
+
+fn contains_printf_directive(value: &str) -> bool {
+    // printf-style directives are syntax, not data. Parse the directive shape
+    // instead of enumerating `%s`, `%d`, `%q`, etc., so new language-specific
+    // conversion letters do not become detector exceptions.
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i + 1 < bytes.len() && bytes[i].is_ascii_hexdigit() && bytes[i + 1].is_ascii_hexdigit() {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'%' {
+            i += 1;
+            continue;
+        }
+        while i < bytes.len() && matches!(bytes[i], b'#' | b'0' | b'-' | b'+' | b' ' | b'.') {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_cli_option_literal(value: &str, key_name: &str) -> bool {
+    // Values beginning with CLI option syntax (`--timeout 300`) configure a
+    // command, but only when the key name itself describes command/options
+    // storage. This avoids globally suppressing real secrets that happen to
+    // start with two hyphens.
+    (has_identifier_component(key_name, "option")
+        || has_identifier_component(key_name, "options")
+        || has_identifier_component(key_name, "arg")
+        || has_identifier_component(key_name, "args")
+        || has_identifier_component(key_name, "flag")
+        || has_identifier_component(key_name, "flags")
+        || has_identifier_component(key_name, "command"))
+        && value.trim_start().starts_with("--")
+}
+
+fn is_file_extension_literal(value: &str, key_name: &str) -> bool {
+    // A lone file extension (`.gpg`, `.pem`) describes storage format. It can be
+    // adjacent to credential-related key names, so require an explicit
+    // extension/suffix/format key before suppressing it.
+    if !(has_identifier_component(key_name, "extension")
+        || has_identifier_component(key_name, "suffix")
+        || has_identifier_component(key_name, "format"))
+    {
+        return false;
+    }
+    let value = value.trim();
+    value.len() > 1
+        && value.starts_with('.')
+        && value[1..]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn is_source_constant_reference_literal(value: &str, source_key: &str) -> bool {
+    // C-family/Rust/C# assignments often put enum constants or environment
+    // variable names in sensitive-looking fields:
+    // `gss_buffer_desc token = GSS_C_EMPTY_BUFFER` or
+    // `const string OAuthClientSecret = "GCM_OAUTH_CLIENTSECRET"`.
+    // Only suppress valid all-caps identifier constants when the left side is
+    // source-like and the value names a non-secret sentinel component. Plain
+    // config such as `api_key=ABC_DEF_123` and source constants such as
+    // `ApiKey = "PROD_SECRET_VALUE"` still detect.
+    let value = value.trim();
+    if !is_uppercase_identifier_constant(value) || !source_key_has_code_shape(source_key) {
+        return false;
+    }
+    is_non_secret_source_constant_value(value)
+}
+
+fn is_uppercase_identifier_constant(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (4..=96).contains(&bytes.len())
+        && bytes.iter().any(u8::is_ascii_alphabetic)
+        && bytes.contains(&b'_')
+        && !bytes.iter().any(u8::is_ascii_digit)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+fn source_key_has_code_shape(source_key: &str) -> bool {
+    let key = source_key.trim();
+    key.contains("->")
+        || key.contains("::")
+        || key.contains('.')
+        || key.contains('*')
+        || key.contains('[')
+        || key.split_whitespace().count() >= 2
+}
+
+fn key_name_indicates_template_context(key_name: &str) -> bool {
+    has_identifier_component(key_name, "template")
+        || has_identifier_component(key_name, "format")
+        || has_identifier_component(key_name, "message")
+        || has_identifier_component(key_name, "header")
+}
+
+fn auth_template_value(key_name: &str, value: &str) -> bool {
+    if !(has_identifier_component(key_name, "auth")
+        || has_identifier_component(key_name, "authorization"))
+    {
+        return false;
+    }
+    let lower = value.trim_start().to_ascii_lowercase();
+    lower.starts_with("basic ") || lower.starts_with("bearer ")
+}
+
+fn is_source_code_fragment_literal(value: &str) -> bool {
+    // A separator inside source text can leave the "value" as a dangling code
+    // fragment (`+ expr`, `, i);`, escaped interpolation placeholders). Those
+    // fragments are syntax around a future value, not the value itself.
+    let value = value.trim();
+    value.starts_with(',')
+        || value.starts_with(';')
+        || value.starts_with("\\\"{")
+        || is_escaped_format_fragment(value)
+        || value
+            .strip_prefix('+')
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
+fn is_escaped_format_fragment(value: &str) -> bool {
+    // Source strings often split logging format bodies after prose
+    // (`"Decrypted secret:\n\t%q"`). Escaped whitespace plus a printf directive
+    // is syntax around a future value, not the value itself.
+    let value = value.trim_start();
+    (value.starts_with("\\n") || value.starts_with("\\r") || value.starts_with("\\t"))
+        && contains_printf_directive(value)
+}
+
+fn is_arithmetic_expression_literal(value: &str) -> bool {
+    // Numeric/key-size expressions (`128+L*64`) are source code initializers.
+    // Requiring every operand to be an identifier or number keeps base64-like
+    // secrets with `+` or `/` from being rejected by this code-shape rule.
+    let value = value.trim();
+    if value.is_empty()
+        || value.contains('=')
+        || value.chars().any(char::is_whitespace)
+        || !value.chars().any(|ch| matches!(ch, '+' | '*' | '/'))
+    {
+        return false;
+    }
+    let mut saw_operand = false;
+    for part in value.split(['+', '-', '*', '/']) {
+        if part.is_empty() {
+            return false;
+        }
+        let bytes = part.as_bytes();
+        let is_number = bytes.iter().all(u8::is_ascii_digit);
+        let is_ident = bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        if !is_number && !is_ident {
+            return false;
+        }
+        saw_operand = true;
+    }
+    saw_operand
+}
+
+fn is_interpolated_string_template(value: &str) -> bool {
+    // Language interpolation prefixes (`f"Bearer {jwt}"`, `rf"..."`) mean the
+    // literal is a template around runtime data. Masking the prefix would not
+    // remove the actual credential and creates noisy partial spans.
+    let value = value.trim_start().to_ascii_lowercase();
+    ["f\"", "f'", "rf\"", "rf'", "fr\"", "fr'"]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+}
+
+fn is_public_key_literal(value: &str) -> bool {
+    // OpenSSH public-key values are identifiers/public material. Private keys
+    // are handled by the PEM detector; masking public key blobs as KEYED_SECRET
+    // makes API responses and fixtures unusably noisy.
+    let value = value.trim_start();
+    value.starts_with("ssh-rsa ")
+        || value.starts_with("ssh-ed25519 ")
+        || value.starts_with("ecdsa-sha2-")
+}
+
+fn is_license_identifier_literal(value: &str, key_name: &str) -> bool {
+    // JSON APIs often use `"license": {"key": "lgpl-3.0"}`. SPDX-style
+    // license identifiers are metadata, not cryptographic keys; limit this to
+    // generic/license key names so real `api_key` values are unaffected.
+    if key_name != "key" && !has_identifier_component(key_name, "license") {
+        return false;
+    }
+    let value = normalize_key(value);
+    let first = value.split('_').next().unwrap_or_default();
+    matches!(
+        first,
+        "mit" | "apache" | "gpl" | "lgpl" | "agpl" | "bsd" | "mpl" | "cc0" | "unlicense"
+    ) && value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn is_dunder_identifier_literal(value: &str) -> bool {
+    // Double-underscore strings such as `__vlist__` are framework/internal
+    // identifiers. They contain punctuation but have no credential structure.
+    let value = value.trim();
+    value.len() >= 4
+        && (value.starts_with("__") || value.ends_with("__"))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn is_uppercase_constant_literal_for_generic_key(value: &str, key_name: &str) -> bool {
+    // Generic `key` fields are also used for enum/constant names. An all-caps
+    // identifier with no digits (`DEBUG_FRAME`) is source metadata; concrete
+    // sensitive names such as `api_key` still use the normal detector path.
+    if !is_generic_metadata_key_name(key_name) {
+        return false;
+    }
+    let value = value.trim();
+    (4..=64).contains(&value.len())
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+        && !value.bytes().any(|b| b.is_ascii_digit())
+        && value.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+}
+
+fn is_plain_prose_literal_for_generic_key(value: &str, key_name: &str) -> bool {
+    // Generic keys in messages (`FAILED_TO_RETRIEVE_GENERATED_KEY =
+    // "Failed to retrieve the generated key."`) describe UI/prose text. Real
+    // secrets normally have compact token/password structure; phrase detectors
+    // handle seed phrases before this function is reached.
+    if !is_generic_metadata_key_name(key_name) {
+        return false;
+    }
+    let value = value.trim();
+    value.split_whitespace().count() >= 3
+        && !value.chars().any(|ch| ch.is_ascii_digit())
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphabetic()
+                || ch.is_ascii_whitespace()
+                || matches!(ch, '\'' | '"' | '.' | ',' | ':' | ';' | '!' | '?' | '-')
+        })
+}
+
+fn is_generic_metadata_key_name(key_name: &str) -> bool {
+    key_name == "key"
+        || has_identifier_phrase(key_name, &["generated", "key"])
+        || has_identifier_phrase(key_name, &["header", "key"])
+        || has_identifier_phrase(key_name, &["license", "key"])
+        || has_identifier_phrase(key_name, &["public", "key"])
+}
+
+fn is_locator_literal_for_key(value: &str, key_name: &str) -> bool {
+    // Endpoint/url/uri/path/host keys normally name where to ask for a token,
+    // not the token. Suppress only locator-shaped values without password
+    // userinfo; password-bearing URLs remain visible to URL_CREDENTIAL rules.
+    if !key_name_indicates_locator(key_name) {
+        return false;
+    }
+    let value = value.trim();
+    is_path_literal(value) || is_uri_literal_without_password_userinfo(value)
+}
+
+fn key_name_indicates_locator(key_name: &str) -> bool {
+    has_identifier_component(key_name, "endpoint")
+        || has_identifier_component(key_name, "url")
+        || has_identifier_component(key_name, "uri")
+        || has_identifier_component(key_name, "path")
+        || has_identifier_component(key_name, "host")
+}
+
+fn is_path_literal(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with('\\')
+        || value.as_bytes().get(..3).is_some_and(|prefix| {
+            prefix[0].is_ascii_alphabetic() && prefix[1] == b':' && prefix[2] == b'\\'
+        })
+        || is_relative_path_literal(value)
+}
+
+fn is_relative_path_literal(value: &str) -> bool {
+    // Relative API endpoints (`_apis/token/...`) are locators too, but require a
+    // slash and no whitespace so ordinary prose or templated strings are not
+    // hidden by this path rule.
+    value.contains('/')
+        && !value.chars().any(char::is_whitespace)
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+fn is_uri_literal_without_password_userinfo(value: &str) -> bool {
+    if !(value.contains("://") || value.starts_with("git:")) {
+        return false;
+    }
+    !uri_has_password_userinfo(value)
+}
+
+fn uri_has_password_userinfo(value: &str) -> bool {
+    let Some((_, rest)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let Some((userinfo, _)) = authority.rsplit_once('@') else {
+        return false;
+    };
+    userinfo.contains(':') || userinfo.to_ascii_lowercase().contains("%3a")
+}
+
+fn is_member_or_pointer_reference(value: &str) -> bool {
+    // `conn->passwd`, `obj.token`, and similar member references point at
+    // program state; they are not the credential value itself.
+    if !(value.contains("->") || value.contains('.')) {
+        return false;
+    }
+    value
+        .split("->")
+        .flat_map(|part| part.split('.'))
+        .all(is_code_reference_segment)
+}
+
+fn is_code_reference_segment(segment: &str) -> bool {
+    let segment = segment.trim_matches(|ch: char| matches!(ch, '&' | '*' | '(' | ')' | '[' | ']'));
+    let bytes = segment.as_bytes();
+    !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        && bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
 }
 
 fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
@@ -742,36 +1286,45 @@ fn normalize_key(input: &str) -> String {
 }
 
 fn is_explicitly_non_sensitive_key(name: &str) -> bool {
-    name == "nonsecret"
-        || name == "non_secret"
-        || name == "notsecret"
-        || name == "not_secret"
-        || name == "public"
-        || name.starts_with("public_")
-        || name.ends_with("_public")
+    is_explicitly_non_sensitive_key_name(name)
 }
 
 fn is_otp_key_name(name: &str) -> bool {
-    contains_any(
-        name,
-        &[
-            "otp",
-            "totp",
-            "mfa",
-            "2fa",
-            "passcode",
-            "verification_code",
-            "verificationcode",
-            "security_code",
-            "securitycode",
-            "login_code",
-            "logincode",
-            "signin_code",
-            "signincode",
-            "one_time",
-            "onetime",
-        ],
-    )
+    // `otp` is too short for substring matching: ordinary identifiers such as
+    // `hotpink` contain those bytes. Require an identifier component or a known
+    // auth-code phrase so color names and unrelated words do not become secrets.
+    has_identifier_component(name, "otp")
+        || has_identifier_component(name, "totp")
+        || has_identifier_component(name, "mfa")
+        || has_identifier_component(name, "2fa")
+        || has_identifier_component(name, "passcode")
+        || has_identifier_phrase(name, &["verification", "code"])
+        || has_identifier_phrase(name, &["security", "code"])
+        || has_identifier_phrase(name, &["login", "code"])
+        || has_identifier_phrase(name, &["signin", "code"])
+        || has_identifier_phrase(name, &["sign", "in", "code"])
+        || has_identifier_phrase(name, &["one", "time"])
+        || matches!(
+            name,
+            "verificationcode" | "securitycode" | "logincode" | "signincode" | "onetime"
+        )
+}
+
+fn has_identifier_component(name: &str, component: &str) -> bool {
+    name.split('_').any(|part| part == component)
+}
+
+fn has_identifier_phrase(name: &str, phrase: &[&str]) -> bool {
+    let parts = name
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if phrase.is_empty() || parts.len() < phrase.len() {
+        return false;
+    }
+    parts
+        .windows(phrase.len())
+        .any(|window| window.iter().zip(phrase).all(|(part, word)| part == word))
 }
 
 fn contains_any(value: &str, needles: &[&str]) -> bool {
@@ -829,7 +1382,22 @@ mod tests {
         assert!(has("client_secret: tenant7trial", "tenant7trial"));
         assert!(has("password=letmein123", "letmein123"));
         assert!(has("api_key=abc12345", "abc12345"));
+        assert!(has("api_key=ABCDEF123456", "ABCDEF123456"));
+        assert!(has(r#"api_key="%s-real-123""#, "%s-real-123"));
+        assert!(has(r#"password="SECRET""#, "SECRET"));
+        assert!(has(r#"password="PROD_SECRET""#, "PROD_SECRET"));
+        assert!(has(r#"client_secret="OLD_SECRET""#, "OLD_SECRET"));
+        assert!(has(
+            r#"private const string ApiKey = "PROD_SECRET_VALUE";"#,
+            "PROD_SECRET_VALUE"
+        ));
+        assert!(has(r#"api_key="--real-secret-123""#, "--real-secret-123"));
+        assert!(has(
+            r#"private const string ApiKey = "abc12345";"#,
+            "abc12345"
+        ));
         assert!(has("otp=100482 expires soon", "100482"));
+        assert!(has("verification_code=100482", "100482"));
         assert!(has(
             "k8s secret data api-key: abcDEF123456+/==",
             "abcDEF123456+/=="
@@ -839,6 +1407,7 @@ mod tests {
             "eyJabcdefghijklmnop123456"
         ));
         assert!(has("Authorization: Bearer abcdefgh123", "abcdefgh123"));
+        assert!(has("body=\"access_token=abc12345&state=ok\"", "abc12345"));
         assert!(has("dbPassword = \"hunter2\"", "hunter2"));
         assert!(has(
             "OAuth app client_secret 'tenant-7-trial'",
@@ -856,14 +1425,70 @@ mod tests {
             r#"natural language such as "secret capability" or "token budget"."#,
             r#"The secret "capability" mode is documented here."#,
             "secret: capability",
+            "hotpink: 16738740,",
             "token_budget=30000",
             "public_token_label=docs",
             "port=5432 workers=4 timeout_ms=30000 status=200",
             "Authorization: Bearer docs",
             "jwt_like=aaa.bbb.ccc",
+            "Authorization: Basic login_and_password_removed",
+            "password=start_pass_downsample",
+            "client_secret=tenant_trial",
+            "struct SessionHandle *data = conn->data;",
+            "neg_ctx->output_token_length = out_sec_buff.cbBuffer;",
+            "key = app_data->perthreadkey;",
+            "spnegoTokenLength = input_token.length;",
+            "pwd = conn->passwd;",
+            r#"auth="GSS-Negotiate";"#,
+            r#"auth &= ~CURLAUTH_NTLM;"#,
+            r#"if(smtpc->state == SMTP_EHLO && len >= 5 && !memcmp(line, "AUTH ", 5)) {"#,
+            "for (Key* key : m_keys) {",
+            "for (const Key* key : *KeyboardShortcuts::instance()) {",
+            "data->set.ssl.password = data->set.str[STRING_TLSAUTH_PASSWORD];",
+            "private const string InstallManifestFileName = \"install-manifest.json\";",
+            "private const int HResultEHANDLE = -2147024890;",
+            r#"<add key="Microsoft and .NET" value="true" />"#,
+            r#"<assemblyIdentity name="nunit.framework" publicKeyToken="2638cd05610744eb" culture="neutral" />"#,
+            "section.key=value1",
+            "conn->bits.user_passwd = data->set.userpwd?1:0;",
+            "*m_key = *m_keyOrig;",
+            r#"self.basic_auth = "Basic {}".format(user, password)"#,
+            r#"auth_header_template = "Bearer ${token}""#,
+            r#"secret_format = "%s""#,
+            r#"export GCM_CREDENTIAL_CACHE_OPTIONS="--timeout 300""#,
+            r#"protected override string CredentialFileExtension => ".gpg";"#,
+            r#"var tokenValue = "OAUTH-TOKEN";"#,
+            r#"const string servicePrincipalSecret = "CLIENT-SECRET";"#,
+            "gss_buffer_desc token = GSS_C_EMPTY_BUFFER;",
+            "gss_buffer_desc* gss_token = GSS_C_NO_BUFFER;",
+            "module_ctx->module_pwdump_column = MODULE_DEFAULT;",
+            r#"TRACE(PREFIX_I "Key %i missing:", i);"#,
+            r#""Git could not get credentials: " + gitCredentialOutput.Errors,"#,
+            r#"uint KeyLength=128+L*64;"#,
+            r#""Decrypted secret:\n\t%q","#,
+            r#"string tokenEndpoint = "/oauth/token";"#,
+            r#"const string sessionTokenUrl = "_apis/token/sessiontokens?api-version=1.0";"#,
+            r#"authorization_uri=https://login.microsoftonline.com/tenant1"#,
+            r#"var response = "id_token=my_id_token&state=protected_state&code=my_code";"#,
+            r#"val FAILED_TO_RETRIEVE_GENERATED_KEY = "Failed to retrieve the generated key.""#,
+            r#"POSTGRES_HOST_AUTH_METHOD: scram-sha-256"#,
+            r#"c.key = "__vlist__" + nestedIndex;"#,
+            r#"DEBUG_HEADER_KEY = "DEBUG_FRAME""#,
+            r#"self.__authorizationHeader = f"Bearer {jwt}""#,
+            r#"{"license": {"key": "lgpl-3.0"}}"#,
+            r#"{"key":"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCexample"}"#,
         ] {
             assert!(hits(raw).is_empty(), "{raw}: {:?}", hits(raw));
         }
+    }
+
+    #[test]
+    fn keeps_plain_config_uppercase_secret_candidates() {
+        assert!(has("api_key=ABC_DEF_123", "ABC_DEF_123"));
+        assert!(has(
+            r#"private const string ApiKey = "ABC_DEF_123";"#,
+            "ABC_DEF_123"
+        ));
     }
 
     #[test]

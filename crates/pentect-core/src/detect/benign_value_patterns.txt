@@ -1,0 +1,49 @@
+# Non-secret value patterns.
+#
+# Format: kind:pattern
+# Matching is done after identifier normalization: case-insensitive, punctuation
+# collapsed to underscores, then trimmed. Keep this list small and generic.
+#
+# exact:
+#   Conventional documentation placeholders. These values are stand-ins used in
+#   examples and templates; they are not usable credentials by themselves.
+#
+# prefix/suffix/contains:
+#   Placeholder markers that explicitly say the value was removed, redacted, or
+#   supplied by the reader.
+#
+# numbered_prefix:
+#   Synthetic sample values such as value1/value2.
+#
+# localhost/dev_null/example_com:
+#   Well-known non-secret sentinels and documentation domains.
+exact:example
+exact:sample
+exact:placeholder
+exact:redacted
+exact:removed
+exact:deleted
+exact:masked
+exact:username
+
+# Action/parameter placeholders used in sample configuration and generated docs.
+exact:create_a_key
+exact:client_secret
+exact:oauth_token
+
+# Public local/documentation sentinels.
+exact:localhost
+exact:dev_null
+exact:room_name_or_id
+exact:external_data_source
+prefix:your_
+prefix:example_
+suffix:_example
+contains:_example_
+contains:example_com
+contains:_removed
+contains:_redacted
+contains:_password_removed
+contains:_token_removed
+contains:_secret_removed
+numbered_prefix:value

@@ -14,6 +14,8 @@ struct PatternRule {
     confidence: Confidence,
     /// Checksum gate applied to each match before it becomes a span.
     validator: Validator,
+    /// Optional line/context gate for rules whose regex alphabet overlaps public metadata.
+    context: MatchContextPolicy,
     /// 0 masks the full regex match; N masks capture group N.
     capture: usize,
 }
@@ -25,8 +27,16 @@ pub struct PatternSpec {
     pub label: String,
     pub confidence: Confidence,
     pub validator: Validator,
+    pub context: MatchContextPolicy,
     pub capture: usize,
     pub prefilter: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MatchContextPolicy {
+    #[default]
+    Any,
+    NotPublicSshKeyLine,
 }
 
 /// Generic pattern matcher for deterministic regex-style recognizers.
@@ -91,6 +101,7 @@ impl PatternMatchDetector {
                 label: s.label,
                 confidence: s.confidence,
                 validator: s.validator,
+                context: s.context,
                 capture: s.capture,
             });
         }
@@ -176,7 +187,10 @@ fn push_match(
     value: &str,
     out: &mut Vec<Span>,
 ) {
-    if value.is_empty() || !rule.validator.accepts(value) {
+    if value.is_empty()
+        || !rule.validator.accepts(value)
+        || !rule.context.accepts(view.text(), start)
+    {
         return;
     }
     out.push(Span {
@@ -186,4 +200,23 @@ fn push_match(
         confidence: rule.confidence,
         source: DetectorId::Rule,
     });
+}
+
+impl MatchContextPolicy {
+    fn accepts(self, text: &str, start: usize) -> bool {
+        match self {
+            MatchContextPolicy::Any => true,
+            MatchContextPolicy::NotPublicSshKeyLine => !is_public_ssh_key_context(text, start),
+        }
+    }
+}
+
+fn is_public_ssh_key_context(text: &str, start: usize) -> bool {
+    // OpenSSH authorized_keys/public-key lines are public metadata. Some
+    // vendor-token alphabets overlap their base64 payloads; rules that opt into
+    // this policy keep their regex recall but reject matches on a line already
+    // identified as public key material.
+    let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let prefix = &text[line_start..start];
+    prefix.contains("ssh-rsa ") || prefix.contains("ssh-ed25519 ") || prefix.contains("ecdsa-sha2-")
 }

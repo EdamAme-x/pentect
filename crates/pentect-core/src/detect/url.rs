@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -8,6 +9,94 @@ use crate::normalize::NormalizedView;
 
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>()]*[^\s"'<>().,;:!?]"#).unwrap());
+static DOCUMENTATION_HOSTS: LazyLock<HostPatternSet> =
+    LazyLock::new(|| HostPatternSet::parse(include_str!("documentation_host_patterns.txt")));
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostPattern {
+    Exact(String),
+    Suffix(String),
+    Cidr(IpCidr),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IpCidr {
+    network: IpAddr,
+    prefix_bits: u8,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HostPatternSet {
+    patterns: Vec<HostPattern>,
+}
+
+impl HostPatternSet {
+    fn parse(raw: &str) -> Self {
+        let patterns = raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| {
+                let (kind, pattern) = line.split_once(':')?;
+                let pattern = normalize_host(pattern);
+                match kind.trim() {
+                    "exact" => Some(HostPattern::Exact(pattern)),
+                    "suffix" => Some(HostPattern::Suffix(pattern)),
+                    "cidr" => parse_ip_cidr(&pattern).map(HostPattern::Cidr),
+                    _ => None,
+                }
+            })
+            .collect();
+        Self { patterns }
+    }
+
+    fn matches(&self, host: &str) -> bool {
+        let host = normalize_host(host);
+        let ip = host.parse::<IpAddr>().ok();
+        self.patterns.iter().any(|pattern| match pattern {
+            HostPattern::Exact(pattern) => host == *pattern,
+            HostPattern::Suffix(pattern) => host.ends_with(pattern),
+            HostPattern::Cidr(cidr) => ip.is_some_and(|ip| cidr.contains(ip)),
+        })
+    }
+}
+
+impl IpCidr {
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (ip, self.network) {
+            (IpAddr::V4(ip), IpAddr::V4(network)) => {
+                let mask = cidr_mask(32, self.prefix_bits);
+                (u32::from(ip) & mask as u32) == (u32::from(network) & mask as u32)
+            }
+            (IpAddr::V6(ip), IpAddr::V6(network)) => {
+                let mask = cidr_mask(128, self.prefix_bits);
+                (u128::from(ip) & mask) == (u128::from(network) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn parse_ip_cidr(raw: &str) -> Option<IpCidr> {
+    let (network, prefix) = raw.split_once('/')?;
+    let network = network.parse::<IpAddr>().ok()?;
+    let prefix_bits = prefix.parse::<u8>().ok()?;
+    let max_bits = match network {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    (prefix_bits <= max_bits).then_some(IpCidr {
+        network,
+        prefix_bits,
+    })
+}
+
+fn cidr_mask(total_bits: u8, prefix_bits: u8) -> u128 {
+    if prefix_bits == 0 {
+        return 0;
+    }
+    u128::MAX << (u32::from(total_bits - prefix_bits))
+}
 
 /// Preserves useful URL structure for internal systems:
 /// `http://local.jira.corp/api/issues/1234`
@@ -37,21 +126,24 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
 
     let authority = &url[scheme_end..authority_end];
     let userinfo_end = authority.rfind('@');
-    if let Some(at) = userinfo_end.filter(|&at| at > 0) {
-        push_span(
-            view,
-            out,
-            base + scheme_end,
-            base + scheme_end + at,
-            Category::Secret,
-            labels::URL_CREDENTIAL,
-        );
-    }
     let host_start_in_authority = userinfo_end.map_or(0, |i| i + 1);
     let host_port = &authority[host_start_in_authority..];
     let Some(host) = host_without_port(host_port) else {
         return;
     };
+    if let Some(at) = userinfo_end.filter(|&at| at > 0) {
+        let userinfo = &authority[..at];
+        if userinfo_is_credential(userinfo) && !is_documentation_host(host) {
+            push_span(
+                view,
+                out,
+                base + scheme_end,
+                base + scheme_end + at,
+                Category::Secret,
+                labels::URL_CREDENTIAL,
+            );
+        }
+    }
     if !is_internal_host(host) {
         return;
     }
@@ -119,6 +211,44 @@ fn host_without_port(host_port: &str) -> Option<&str> {
             .split_once(':')
             .map_or(host_port, |(host, _)| host),
     )
+}
+
+fn userinfo_is_credential(userinfo: &str) -> bool {
+    // URL userinfo grammar allows a username without a password
+    // (`https://alice@example.com`). That is identity metadata, not a secret.
+    // A credential-bearing authority either has an explicit password separator
+    // or uses a token as the username (`https://ghp_...@github.com`).
+    userinfo.contains(':')
+        || userinfo.to_ascii_lowercase().contains("%3a")
+        || userinfo_token_like(userinfo)
+}
+
+fn userinfo_token_like(userinfo: &str) -> bool {
+    let userinfo = userinfo.trim();
+    let bytes = userinfo.as_bytes();
+    if bytes.len() < 12 || bytes.iter().any(u8::is_ascii_whitespace) {
+        return false;
+    }
+    let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_token_punct = bytes.iter().any(|b| matches!(b, b'_' | b'-' | b'.' | b'~'));
+    has_alpha && (has_digit || has_token_punct)
+}
+
+fn is_documentation_host(host: &str) -> bool {
+    // Documentation hosts are the only place where URL userinfo is suppressed:
+    // RFC 2606/6761 names and RFC 5737/3849/9637 address ranges are reserved for
+    // examples, so `user:pass@` there is demonstrative text. `.localhost` is RFC
+    // special-use too, but deliberately excluded because local services can
+    // carry real credentials.
+    DOCUMENTATION_HOSTS.matches(host)
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_end_matches('.')
+        .trim_matches(|ch| matches!(ch, '[' | ']'))
+        .to_ascii_lowercase()
 }
 
 fn is_internal_host(host: &str) -> bool {
@@ -417,6 +547,54 @@ mod tests {
                 ("RESOURCE_ID".to_string(), "comment-456".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn username_only_userinfo_is_not_a_url_credential() {
+        assert!(!labels("https://alice@example.com/repo.git")
+            .iter()
+            .any(|(label, _)| label == "URL_CREDENTIAL"));
+        assert!(
+            labels("https://ghp_abcdefghijklmnopqrstuvwxyz@github.com/repo.git")
+                .iter()
+                .any(|(label, value)| label == "URL_CREDENTIAL"
+                    && value == "ghp_abcdefghijklmnopqrstuvwxyz")
+        );
+        assert!(labels("https://alice:letmein@example.com/repo.git")
+            .iter()
+            .all(|(label, _)| label != "URL_CREDENTIAL"));
+        assert!(labels("https://alice:letmein@service.internal/repo.git")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
+    }
+
+    #[test]
+    fn rfc_documentation_hosts_do_not_emit_url_credentials() {
+        for raw in [
+            "https://alice:letmein@service.example/repo.git",
+            "https://alice:letmein@service.test/repo.git",
+            "https://alice:letmein@service.invalid/repo.git",
+            "https://alice:letmein@192.0.2.10/repo.git",
+            "https://alice:letmein@198.51.100.10/repo.git",
+            "https://alice:letmein@203.0.113.10/repo.git",
+            "https://alice:letmein@[2001:db8::1]/repo.git",
+            "https://alice:letmein@[3fff::1]/repo.git",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|(label, _)| label != "URL_CREDENTIAL"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn localhost_userinfo_stays_sensitive() {
+        assert!(labels("https://alice:letmein@localhost/repo.git")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
     }
 
     #[test]

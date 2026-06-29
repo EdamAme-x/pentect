@@ -38,7 +38,7 @@ Scoring:
 - Detections outside labeled rows are reported as `unlabeled`, not counted as `fp`.
 - Category summaries split CredData category strings on `:`.
 
-Current baseline:
+Previous baseline before the current false-positive hardening:
 
 ```text
 CredData commit: 9a55c40
@@ -59,12 +59,37 @@ F1: 0.280
 Elapsed: 153352 ms
 ```
 
+Current working result after structural false-positive reductions and recall
+hardening:
+
+```text
+CredData commit: 9a55c40
+Pentect command: ~/pentect-linux-target/release/pentect bench creddata ~/pentect-creddata/CredData --json
+Rows: 66898
+Files: 10865
+True rows: 15104
+False rows: 51794
+TP: 7068
+FP: 18611
+FN: 8036
+Line only: 258
+Unlabeled: 129341
+Missing files: 0
+Precision: 0.275
+Recall: 0.468
+F1: 0.347
+Elapsed: 221426 ms
+```
+
 Weak groups:
 
-- `Key`: low precision and low recall.
-- `Password`: many false positives.
-- `API`: many false positives.
+- `Key`: low precision and low recall; mostly `KEYED_SECRET` and source/config metadata collisions.
+- `Password`: many false positives from weak fixture/default-looking values that are still real credentials in production.
+- `Token` and `Auth`: recall is strong, but precision still needs vendor/context validators.
+- `LIKELY_SECRET`: broad entropy recall still catches source identifiers and opaque non-secret blobs.
+- `URL_CREDENTIAL`: now keeps token-as-username recall; documentation hosts are suppressed only for RFC-reserved examples.
 - `UUID`: low recall.
 - `AWS S3 Bucket`, `Firebase Domain`, and `Tencent WeChat API App ID`: currently missed.
+- Identity sweep intentionally does not propagate very short `KEYED_SECRET` values; this avoids widespread false positives but can miss repeated weak credentials outside their anchored assignment.
 
 CredData source: https://github.com/Samsung/CredData

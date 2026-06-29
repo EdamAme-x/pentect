@@ -23,6 +23,9 @@ pub fn identity_sweep(
     // specific High AWS_AKID is not overwritten by a generic Low LIKELY_SECRET).
     let mut rep: BTreeMap<String, Span> = BTreeMap::new();
     for s in &accepted {
+        if !is_sweepable_identity(s) {
+            continue;
+        }
         let id = n_id(&raw[s.range.start..s.range.end]);
         rep.entry(id)
             .and_modify(|e| {
@@ -100,6 +103,23 @@ pub fn identity_sweep(
 
     all.sort_by_key(|s| s.range.start);
     all
+}
+
+fn is_sweepable_identity(span: &Span) -> bool {
+    // OTP/passcode values are short and time-bound. A repeated `123456` elsewhere
+    // is not evidence of the same credential unless the local line has OTP
+    // context, so the detector hit is masked but global identity propagation is
+    // intentionally disabled for this label.
+    if span.label.as_str() == labels::OTP {
+        return false;
+    }
+    // Key/value hits may legitimately be short (`password="secret"`), but a
+    // context-free repeat of a short string is weak evidence. Keep the anchored
+    // detector hit and sweep only values distinctive enough to be global.
+    if span.label.as_str() == labels::KEYED_SECRET && span.range.len() < 12 {
+        return false;
+    }
+    true
 }
 
 /// True if the byte at `i` is part of the same token (would make a match a mere
@@ -211,6 +231,40 @@ mod tests {
         assert_eq!(
             swept[0].label, "AWS_AKID",
             "must inherit the stronger label"
+        );
+    }
+
+    #[test]
+    fn otp_values_are_not_identity_swept() {
+        let raw = "Your login code is 123456. Build number 123456 appears later.";
+        let first = span(
+            raw,
+            "123456",
+            labels::OTP,
+            Category::Secret,
+            Confidence::High,
+        );
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "short OTP values require local auth context, not global sweep: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn short_keyed_values_are_not_identity_swept() {
+        let raw = r#"password="secret" prose says secret later"#;
+        let first = span(
+            raw,
+            "secret",
+            labels::KEYED_SECRET,
+            Category::Secret,
+            Confidence::Medium,
+        );
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "short keyed values need local context, not global sweep: {swept:?}"
         );
     }
 }

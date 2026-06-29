@@ -1,0 +1,35 @@
+# Documentation/test host patterns.
+#
+# Format: kind:pattern
+# Matching is case-insensitive after trimming a trailing dot.
+#
+# RFC basis:
+# - RFC 2606 reserves .test, .example, .invalid, .localhost and the second-level
+#   names example.com, example.net, example.org.
+# - RFC 6761 records those names as special-use domain names.
+#
+# Policy:
+# - .localhost is intentionally not listed. It is RFC special-use, but real local
+#   development services can carry real credentials; suppressing URL userinfo on
+#   localhost would hide those.
+exact:example
+exact:test
+exact:invalid
+exact:example.com
+exact:example.net
+exact:example.org
+suffix:.example
+suffix:.test
+suffix:.invalid
+suffix:.example.com
+suffix:.example.net
+suffix:.example.org
+
+# RFC 5737 TEST-NET ranges reserved for IPv4 examples.
+cidr:192.0.2.0/24
+cidr:198.51.100.0/24
+cidr:203.0.113.0/24
+
+# RFC 3849 and RFC 9637 IPv6 documentation prefixes.
+cidr:2001:db8::/32
+cidr:3fff::/20

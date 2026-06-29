@@ -1,3 +1,4 @@
+use super::benign::{is_explicitly_non_sensitive_key_name, is_placeholder_value};
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -61,6 +62,7 @@ impl Detector for EnvValueDetector {
         if region.span.is_empty()
             || region.ctx.format != Kind::Env
             || is_rendered_placeholder(view.text())
+            || is_documentation_placeholder(view.text())
         {
             return vec![];
         }
@@ -156,13 +158,7 @@ fn is_sensitive_key_name(key: &str) -> bool {
 }
 
 fn is_explicitly_non_sensitive_key(name: &str) -> bool {
-    name == "nonsecret"
-        || name == "non_secret"
-        || name == "notsecret"
-        || name == "not_secret"
-        || name == "public"
-        || name.starts_with("public_")
-        || name.ends_with("_public")
+    is_explicitly_non_sensitive_key_name(name)
 }
 
 fn sensitive_label_for_key(key: &str) -> String {
@@ -233,6 +229,14 @@ fn is_benign_value(v: &str) -> bool {
         || matches!(t, "true" | "false" | "null")
         || is_rendered_placeholder(t)
         || is_version_literal(t)
+        || is_documentation_placeholder(t)
+}
+
+fn is_documentation_placeholder(value: &str) -> bool {
+    // Structural masking protects broad boundaries such as `.env`. We still
+    // spare values that explicitly identify themselves as examples or redacted
+    // placeholders; otherwise every sample config becomes a false positive wall.
+    is_placeholder_value(value)
 }
 
 fn is_version_literal(value: &str) -> bool {
@@ -432,5 +436,8 @@ mod tests {
         ));
         assert_eq!(sensitive_key_fires(Some("cookie-signature"), "1.2.2"), None);
         assert_eq!(sensitive_key_fires(Some("pbkdf2-password"), "^1.0.0"), None);
+        assert!(!env_fires(Some("HIPCHAT_API_KEY"), "your_hipchat_api_key"));
+        assert!(!env_fires(Some("GRAPHITE_USER"), "username"));
+        assert!(!env_fires(Some("LOG_FILE"), "/dev/null"));
     }
 }

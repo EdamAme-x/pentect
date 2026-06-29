@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use super::pattern::{PatternMatchDetector, PatternSpec};
+use super::pattern::{MatchContextPolicy, PatternMatchDetector, PatternSpec};
 use super::validate::Validator;
 use super::Detector;
 use crate::model::*;
@@ -428,6 +428,7 @@ impl RuleDetector {
                 label: label.to_string(),
                 confidence,
                 validator: V::None,
+                context: builtin_context_policy(label),
                 capture: 0,
                 prefilter: builtin_prefilter(label, pattern),
             })
@@ -439,6 +440,7 @@ impl RuleDetector {
                         label: label.to_string(),
                         confidence,
                         validator,
+                        context: builtin_context_policy(label),
                         capture: 0,
                         prefilter: builtin_prefilter(label, pattern),
                     },
@@ -451,6 +453,7 @@ impl RuleDetector {
                     label: label.to_string(),
                     confidence,
                     validator,
+                    context: builtin_context_policy(label),
                     capture,
                     prefilter: builtin_prefilter(label, pattern),
                 },
@@ -552,6 +555,16 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         _ => &[],
     };
     literals.iter().map(|s| (*s).to_string()).collect()
+}
+
+fn builtin_context_policy(label: &str) -> MatchContextPolicy {
+    match label {
+        // The `EAAA...` Square prefix collides with OpenSSH public-key base64.
+        // Keep the vendor rule itself, but reject matches on lines already
+        // shaped as public SSH keys. Private key material is handled elsewhere.
+        "SQUARE_TOKEN" => MatchContextPolicy::NotPublicSshKeyLine,
+        _ => MatchContextPolicy::Any,
+    }
 }
 
 #[cfg(test)]
@@ -708,6 +721,22 @@ mod tests {
     }
 
     #[test]
+    fn square_rule_ignores_public_ssh_key_context() {
+        let det = RuleDetector::builtin();
+        let has_square = |s: &str| {
+            let reg = region(s);
+            let v = NormalizedView::build(&reg, s);
+            det.detect(&v).iter().any(|sp| sp.label == "SQUARE_TOKEN")
+        };
+        assert!(has_square(
+            "token=EAAAabcdefghijklmnopqrstuvwxyzABCDEF123456"
+        ));
+        assert!(!has_square(
+            r#"{"key":"ssh-rsa AAAAB3NzaC1yc2EAAAabcdefghijklmnopqrstuvwxyzABCDEF123456"}"#
+        ));
+    }
+
+    #[test]
     fn url_rule_keeps_sentence_punctuation_literal() {
         let det = RuleDetector::builtin();
         let raw = "see https://example.com/api/issues/1234. next";
@@ -842,6 +871,7 @@ mod tests {
             label: "API_KEY".into(),
             confidence: Confidence::High,
             validator: Validator::None,
+            context: Default::default(),
             capture: 1,
             prefilter: Vec::new(),
         }])
@@ -863,6 +893,7 @@ mod tests {
             label: "API_KEY".into(),
             confidence: Confidence::High,
             validator: Validator::None,
+            context: Default::default(),
             capture: 1,
             prefilter: Vec::new(),
         }])
@@ -877,6 +908,7 @@ mod tests {
             label: "ACME_TOKEN".into(),
             confidence: Confidence::High,
             validator: Validator::None,
+            context: Default::default(),
             capture: 1,
             prefilter: vec!["acme".into()],
         }])
@@ -902,6 +934,7 @@ mod tests {
                 label: "URL".into(),
                 confidence: Confidence::Medium,
                 validator: Validator::None,
+                context: Default::default(),
                 capture: 0,
                 prefilter: Vec::new(),
             },
@@ -911,6 +944,7 @@ mod tests {
                 label: "SLACK_WEBHOOK".into(),
                 confidence: Confidence::High,
                 validator: Validator::None,
+                context: Default::default(),
                 capture: 0,
                 prefilter: Vec::new(),
             },
@@ -935,6 +969,7 @@ mod tests {
                 label: "SHORT_PREFIX".into(),
                 confidence: Confidence::Medium,
                 validator: Validator::None,
+                context: Default::default(),
                 capture: 0,
                 prefilter: vec!["abc".into()],
             },
@@ -944,6 +979,7 @@ mod tests {
                 label: "LONG_PREFIX".into(),
                 confidence: Confidence::High,
                 validator: Validator::None,
+                context: Default::default(),
                 capture: 0,
                 prefilter: vec!["abcd".into()],
             },

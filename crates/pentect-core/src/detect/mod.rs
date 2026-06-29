@@ -2,6 +2,7 @@ use crate::model::Span;
 use crate::normalize::NormalizedView;
 
 mod auth_code;
+mod benign;
 mod bip39;
 mod card;
 mod decode;
