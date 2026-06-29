@@ -72,7 +72,10 @@ part, while source constants that name their own environment/config keys and
 generic JSON `"key"` values that name public fields/headers remain metadata:
 Unquoted code type annotations such as `secret: Base32SecretKey` and
 Jinja/Ansible env lookups such as `{{ lookup('env', 'OS_PASSWORD') }}` are also
-treated as references rather than concrete credential values.
+treated as references rather than concrete credential values. Protobuf struct
+tags, ISO timestamp bucket keys, public key fingerprints, key algorithm labels,
+and command/mock call fragments are likewise handled as metadata or source
+syntax rather than credential values.
 
 ```text
 CredData commit: 9a55c40
@@ -82,15 +85,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 7067
-FP: 15406
+FP: 15109
 FN: 8037
 Line only: 243
-Unlabeled: 78772
+Unlabeled: 78499
 Missing files: 0
-Precision: 0.314
+Precision: 0.319
 Recall: 0.468
-F1: 0.376
-Elapsed: 31816 ms
+F1: 0.379
+Elapsed: 32125 ms
 ```
 
 Weak groups:
@@ -105,6 +108,7 @@ Weak groups:
 - Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.
 - Generic JSON `"key"` values that are identifier names such as `smtpDomain`, `Authorization`, or `grant_type` are treated as metadata; digit/symbol-bearing key material and sensitive single words still fire.
 - Code/reference literals under sensitive-looking keys are suppressed only when syntax proves they are not values: PascalCase type annotations require a code delimiter, and env lookups require explicit Jinja/Ansible `lookup('env', ...)` shape.
+- Additional source/metadata literals are shape-gated: protobuf tag descriptors require `protobuf_key` context, key algorithm labels require known algorithm-size syntax, fingerprints require explicit fingerprint keys and colon-hex shape, and command/mock fragments require invocation syntax.
 - Source fixture literals require both source-code shape and fixture key context, so `expectedPassword = "pass"` is skipped while plain `password = "pass"` still fires.
 - `UUID`: low recall.
 - `AWS S3 Bucket`, `Firebase Domain`, and `Tencent WeChat API App ID`: currently missed.

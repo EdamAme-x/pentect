@@ -206,6 +206,11 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     {
         return false;
     }
+    if !value.quoted
+        && is_shell_command_invocation_literal(raw_value, ctx.text, value.end, ctx.line_end)
+    {
+        return false;
+    }
     if !value.quoted && is_camel_case_code_reference(raw_value) {
         return false;
     }
@@ -597,6 +602,9 @@ fn looks_like_secret_value(
         || is_env_lookup_template_literal(value)
         || is_cli_option_literal(value, key_name)
         || is_file_extension_literal(value, key_name)
+        || is_protobuf_tag_literal(value, key_name)
+        || is_key_algorithm_literal(value)
+        || is_fingerprint_literal(value, key_name)
         || is_source_constant_reference_literal(value, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
         || is_source_config_name_literal(value, source_key)
@@ -686,11 +694,33 @@ fn is_benign_literal(value: &str) -> bool {
     if is_placeholder_value(value) {
         return true;
     }
+    if is_iso8601_timestamp_literal(value) {
+        return true;
+    }
     let normalized = normalize_key(value);
     matches!(
         normalized.as_str(),
         "" | "true" | "false" | "null" | "none" | "nil" | "undefined"
     )
+}
+
+fn is_iso8601_timestamp_literal(value: &str) -> bool {
+    // Timestamp bucket keys and metadata dates can sit under fields containing
+    // `key`, but a timestamp is not credential material. Keep this to the
+    // common complete UTC form instead of treating arbitrary dates as benign.
+    let value = value.trim();
+    let b = value.as_bytes();
+    b.len() == 24
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'.'
+        && b[23] == b'Z'
+        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22]
+            .iter()
+            .all(|idx| b[*idx].is_ascii_digit())
 }
 
 fn is_code_type_or_expression(value: &str, key_name: &str, kind: KeyKind) -> bool {
@@ -769,6 +799,32 @@ fn is_unquoted_type_annotation_literal(
         .chars()
         .next()
         .is_some_and(|ch| matches!(ch, ',' | ')' | ';' | '{' | '=' | '>'))
+}
+
+fn is_shell_command_invocation_literal(
+    value: &str,
+    text: &str,
+    value_end: usize,
+    line_end: usize,
+) -> bool {
+    // PowerShell commands use Verb-Noun names followed by options. Assigning
+    // `$token = Get-NtToken -Primary` names a command invocation, not a token.
+    if !is_powershell_command_name(value.trim()) {
+        return false;
+    }
+    text[value_end..line_end].trim_start().starts_with('-')
+}
+
+fn is_powershell_command_name(value: &str) -> bool {
+    let Some((verb, noun)) = value.split_once('-') else {
+        return false;
+    };
+    !verb.is_empty()
+        && !noun.is_empty()
+        && verb.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && noun.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && verb.bytes().all(|b| b.is_ascii_alphabetic())
+        && noun.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 fn is_pascal_case_type_name(value: &str) -> bool {
@@ -1041,6 +1097,59 @@ fn is_file_extension_literal(value: &str, key_name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
+fn is_protobuf_tag_literal(value: &str, key_name: &str) -> bool {
+    // Go protobuf struct tags encode field metadata, e.g.
+    // `protobuf_key:"bytes,1,opt,name=key,proto3"`. The `name=key` token is a
+    // schema field name, not key material.
+    if !(has_identifier_component(key_name, "protobuf")
+        && has_identifier_component(key_name, "key"))
+    {
+        return false;
+    }
+    let mut parts = value.split(',');
+    let Some(wire_type) = parts.next() else {
+        return false;
+    };
+    matches!(
+        wire_type,
+        "bytes" | "varint" | "fixed32" | "fixed64" | "sfixed32" | "sfixed64"
+    ) && value.contains(",name=key,")
+        && (value.ends_with(",proto2") || value.ends_with(",proto3"))
+}
+
+fn is_key_algorithm_literal(value: &str) -> bool {
+    // Algorithm/size labels such as `RSA-2048` describe how a key should be
+    // generated or interpreted. They are not the private/public key bytes.
+    let value = value.trim();
+    let Some((algorithm, bits)) = value.split_once('-') else {
+        return false;
+    };
+    if !matches!(
+        algorithm.to_ascii_lowercase().as_str(),
+        "rsa" | "dsa" | "dh"
+    ) {
+        return false;
+    }
+    let Ok(bits) = bits.parse::<u32>() else {
+        return false;
+    };
+    (128..=16384).contains(&bits)
+}
+
+fn is_fingerprint_literal(value: &str, key_name: &str) -> bool {
+    // Fingerprints identify public key material. They are useful metadata but
+    // are not the underlying credential, so suppress only explicit fingerprint
+    // fields and a strict colon-separated hex shape.
+    if !has_identifier_component(key_name, "fingerprint") {
+        return false;
+    }
+    let parts = value.split(':').collect::<Vec<_>>();
+    parts.len() >= 8
+        && parts
+            .iter()
+            .all(|part| part.len() == 2 && part.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 fn is_source_constant_reference_literal(value: &str, source_key: &str) -> bool {
     // C-family/Rust/C# assignments often put enum constants or environment
     // variable names in sensitive-looking fields:
@@ -1183,10 +1292,19 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
     value.starts_with(',')
         || value.starts_with(';')
         || value.starts_with("\\\"{")
+        || is_object_method_call_fragment(value)
         || is_escaped_format_fragment(value)
         || value
             .strip_prefix('+')
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
+fn is_object_method_call_fragment(value: &str) -> bool {
+    // A parsed value like `$this->createMock(TokenInterface::class` is a method
+    // call fragment. The runtime return value may be sensitive, but the source
+    // expression itself is not.
+    let value = value.trim();
+    value.starts_with('$') && value.contains("->") && value.contains('(')
 }
 
 fn is_escaped_format_fragment(value: &str) -> bool {
@@ -1622,6 +1740,7 @@ mod tests {
             "abc12345"
         ));
         assert!(has("api_key: Abc123Secret", "Abc123Secret"));
+        assert!(has("api_key=Abc-2048", "Abc-2048"));
         assert!(has(r#"password="{{secret123}}""#, "{{secret123}}"));
         assert!(has("otp=100482 expires soon", "100482"));
         assert!(has("verification_code=100482", "100482"));
@@ -1764,6 +1883,14 @@ mod tests {
             "secret: Base32SecretKey,",
             ">(secret: Base32SecretKey, options: Readonly<T>): Promise<HexString> {",
             "public decode(secret: Base32SecretKey): SecretKey {",
+            r#"Attributes map[string]string `protobuf_key:"bytes,1,opt,name=key,proto3"`"#,
+            r#"Level map[uint32]string `protobuf_key:"varint,1,opt,name=key,proto3"`"#,
+            r#"PrivateKey = RSA-2048"#,
+            r#"Key = RSA-2048"#,
+            r#"aggregations.histo.buckets.3.key_as_string: "2017-01-01T08:00:00.000Z""#,
+            r#"EnvPubKeyFingerprint: "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00","#,
+            r#"$token = Get-NtToken -Primary -Duplicate"#,
+            r#"$token = $this->createMock(TokenInterface::class);"#,
             r#"key: Some("password".to_string()),"#,
             r#"path: Some("structured.password".to_string()),"#,
             r#"prompt: "Use secret?","#,
