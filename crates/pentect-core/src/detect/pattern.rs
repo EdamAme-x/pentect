@@ -144,10 +144,11 @@ impl Detector for PatternMatchDetector {
             }
         }
         if let Some(prefiltered) = &self.prefiltered {
-            let mut seen = vec![false; self.rules.len()];
+            let mut seen = None;
             let mut candidates = Vec::new();
             for m in prefiltered.ac.find_overlapping_iter(s) {
                 for &rule_index in &prefiltered.rules_by_pattern[m.pattern().as_usize()] {
+                    let seen = seen.get_or_insert_with(|| vec![false; self.rules.len()]);
                     if !seen[rule_index] {
                         seen[rule_index] = true;
                         candidates.push(rule_index);

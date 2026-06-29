@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 761baef3fc2ab96717afe2cbef9223f00711c2da06ccae807ea923825e707501 # shrinks to s = "_@0.aA0/a0_A/aa00_aabAbc/BC_DE"
 cc dd447064ca7f0a433363e988f12a3bd353c348ab519449db89bb75da57c6b505 # shrinks to s = "<::"
+cc 3824aa4ba6baa9f1129d94a2d2effe03730d5debb934db80f4f328a0b93f6ccd # shrinks to s = "a::__aA00_aaaA/aABB-_CDba1c"

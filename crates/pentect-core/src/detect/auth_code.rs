@@ -23,30 +23,30 @@ fn specs() -> Vec<PatternSpec> {
     use Validator as V;
 
     #[rustfmt::skip]
-    let patterns: &[(&str, usize)] = &[
+    let patterns: &[(&str, usize, &[&str])] = &[
         // Literal OTP / verification wording.
-        (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])(?:$|[\s<>"',;).!])"#, 1),
-        (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])"#, 1),
+        (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])(?:$|[\s<>"',;).!])"#, 1, &["otp", "one-time", "one time", "one_time", "verification", "security", "login", "sign", "2fa", "mfa"]),
+        (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n0-9]{0,32}([0-9][0-9 -]{2,10}[0-9])"#, 1, &["認証コード", "確認コード", "ワンタイム", "二段階認証"]),
         // Wider prose between the auth word and a numeric code.
-        (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n]{0,160}\b([0-9]{6,8})\b"#, 1),
-        (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n]{0,160}\b([0-9]{6,8})\b"#, 1),
+        (r#"(?i)\b(?:otp|one[-_ ]?time(?:[-_ ]?(?:password|passcode|code))?|verification[-_ ]?code|security[-_ ]?code|login[-_ ]?code|sign[-_ ]?in[-_ ]?code|2fa|mfa)\b[^\r\n]{0,160}\b([0-9]{6,8})\b"#, 1, &["otp", "one-time", "one time", "one_time", "verification", "security", "login", "sign", "2fa", "mfa"]),
+        (r#"(?:認証コード|確認コード|ワンタイム(?:パスワード|コード)|二段階認証)[^\r\n]{0,160}\b([0-9]{6,8})\b"#, 1, &["認証コード", "確認コード", "ワンタイム", "二段階認証"]),
         // Auth flows may use short or alphanumeric codes without saying "OTP".
-        (r#"(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account|security|two[-_ ]?step|two[-_ ]?factor|2fa|mfa)\b)[^.\r\n]{0,120}(?i:\b(?:code|passcode)\b)[^.\r\n]{0,80}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b"#, 1),
-        (r#"(?i:\b(?:code|passcode)\b)[^.\r\n]{0,80}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b[^.\r\n]{0,120}(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account|security|two[-_ ]?step|two[-_ ]?factor|2fa|mfa)\b)"#, 1),
-        (r#"(?i:\b(?:enter|use|input|type|paste)\b)[^.\r\n]{0,32}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b[^.\r\n]{0,120}(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account)\b)"#, 1),
-        (r#"(?:ログイン|サインイン|認証|本人確認|二段階認証)[^\r\n]{0,120}([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})"#, 1),
+        (r#"(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account|security|two[-_ ]?step|two[-_ ]?factor|2fa|mfa)\b)[^.\r\n]{0,120}(?i:\b(?:code|passcode)\b)[^.\r\n]{0,80}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b"#, 1, &["sign", "log", "login", "authenticate", "authentication", "verify", "account", "security", "two-step", "two step", "two_factor", "two factor", "2fa", "mfa"]),
+        (r#"(?i:\b(?:code|passcode)\b)[^.\r\n]{0,80}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b[^.\r\n]{0,120}(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account|security|two[-_ ]?step|two[-_ ]?factor|2fa|mfa)\b)"#, 1, &["sign", "log", "login", "authenticate", "authentication", "verify", "account", "security", "two-step", "two step", "two_factor", "two factor", "2fa", "mfa"]),
+        (r#"(?i:\b(?:enter|use|input|type|paste)\b)[^.\r\n]{0,32}\b([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})\b[^.\r\n]{0,120}(?i:\b(?:sign[-_ ]?in|log[-_ ]?in|login|authenticate|authentication|verify|account)\b)"#, 1, &["enter", "use", "input", "type", "paste"]),
+        (r#"(?:ログイン|サインイン|認証|本人確認|二段階認証)[^\r\n]{0,120}([0-9]{4,10}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{3,9}|[A-Z0-9]{0,6}[0-9][A-Z0-9]{1,6}[- ][A-Z0-9]{2,6}|[A-Z0-9]{2,6}[- ][A-Z0-9]{0,6}[0-9][A-Z0-9]{0,6})"#, 1, &["ログイン", "サインイン", "認証", "本人確認", "二段階認証"]),
     ];
 
     patterns
         .iter()
-        .map(|&(pattern, capture)| PatternSpec {
+        .map(|&(pattern, capture, prefilter)| PatternSpec {
             pattern: pattern.to_string(),
             category: Category::Secret,
             label: labels::OTP.to_string(),
             confidence: High,
             validator: V::None,
             capture,
-            prefilter: Vec::new(),
+            prefilter: prefilter.iter().map(|s| (*s).to_string()).collect(),
         })
         .collect()
 }

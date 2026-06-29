@@ -21,6 +21,7 @@ use regex::Regex;
 use render::render;
 pub use render::RenderSegment;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 use sweep::identity_sweep;
@@ -107,6 +108,14 @@ pub struct MaskResult {
     pub summary: Summary,
 }
 
+/// Value-free scan output. It runs the same detectors, policy, merge, and sweep
+/// as `mask`, but skips rendering placeholders and building a recovery map.
+pub struct AnalysisResult {
+    pub items: Vec<MaskedItem>,
+    pub residual: Vec<ResidualNote>,
+    pub parser_fallback: bool,
+}
+
 /// Composition root. Holds the injected roles (parsers, detectors, policy); the
 /// merge -> sweep -> render core is fixed because it carries the invariants.
 pub struct Engine {
@@ -178,6 +187,16 @@ impl Engine {
         result
     }
 
+    pub fn analyze(&self, input: Input) -> AnalysisResult {
+        let (ir, fell_back) = self.parse(input);
+        let (spans, residual) = self.masked_spans(&ir);
+        AnalysisResult {
+            items: masked_items(spans),
+            residual,
+            parser_fallback: fell_back,
+        }
+    }
+
     /// Mask a single adapter-supplied region with explicit structural context.
     /// This is for adapters that already decoded an outer container (for example
     /// serde_json `Value`) and need the core detectors/policy/rendering to handle
@@ -214,6 +233,27 @@ impl Engine {
 
     /// An adapter can build the same `Ir` and call this directly.
     pub fn mask_ir(&self, ir: Ir, config: &Config) -> MaskResult {
+        let (swept, residual) = self.masked_spans(&ir);
+        let rendered = render(&ir.raw, &config.key, swept.clone(), config.disclose_length);
+
+        // parser_fallback is set by mask(); mask_ir takes a ready-made Ir.
+        let summary = Summary {
+            masked_count: rendered.map.len(),
+            residual,
+            collisions: rendered.collisions,
+            parser_fallback: false,
+        };
+        let items = masked_items(swept);
+        MaskResult {
+            masked: rendered.masked,
+            recovery: Recovery::seal(rendered.map, &config.key),
+            segments: rendered.segments,
+            items,
+            summary,
+        }
+    }
+
+    fn masked_spans(&self, ir: &Ir) -> (Vec<Span>, Vec<ResidualNote>) {
         // Detect to a bounded fixpoint. When a found span sits against an
         // alphanumeric neighbour (two distinct secrets concatenated with no
         // separator, e.g. a card directly followed by an IBAN), the trailing
@@ -223,11 +263,11 @@ impl Engine {
         // after one pass.
         let mut spans: Vec<Span> = Vec::new();
         let mut seen_ranges: HashSet<ByteRange> = HashSet::new();
-        let mut work = ir.raw.clone();
+        let mut work = Cow::Borrowed(ir.raw.as_str());
         for _ in 0..4 {
             let mut found = Vec::new();
             for region in &ir.regions {
-                let view = NormalizedView::build(region, &work);
+                let view = NormalizedView::build(region, work.as_ref());
                 for d in &self.detectors {
                     found.extend(d.detect(&view));
                 }
@@ -236,20 +276,22 @@ impl Engine {
             if found.is_empty() {
                 break;
             }
-            let b = work.as_bytes();
-            let more = found.iter().any(|s| {
-                let before = s
-                    .range
-                    .start
-                    .checked_sub(1)
-                    .is_some_and(|i| b[i].is_ascii_alphanumeric());
-                let after = b.get(s.range.end).is_some_and(u8::is_ascii_alphanumeric);
-                before || after
-            });
+            let more = {
+                let b = work.as_bytes();
+                found.iter().any(|s| {
+                    let before = s
+                        .range
+                        .start
+                        .checked_sub(1)
+                        .is_some_and(|i| b[i].is_ascii_alphanumeric());
+                    let after = b.get(s.range.end).is_some_and(u8::is_ascii_alphanumeric);
+                    before || after
+                })
+            };
             if more {
                 // SAFETY: writing ASCII spaces over any byte range keeps the
                 // string valid UTF-8, and same length keeps span offsets correct.
-                let bytes = unsafe { work.as_bytes_mut() };
+                let bytes = unsafe { work.to_mut().as_bytes_mut() };
                 for s in &found {
                     bytes[s.range.start..s.range.end].fill(b' ');
                 }
@@ -290,31 +332,7 @@ impl Engine {
 
         let merged = merge(to_mask, &ir.protected);
         let swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
-        let rendered = render(&ir.raw, &config.key, swept.clone(), config.disclose_length);
-
-        // parser_fallback is set by mask(); mask_ir takes a ready-made Ir.
-        let summary = Summary {
-            masked_count: rendered.map.len(),
-            residual,
-            collisions: rendered.collisions,
-            parser_fallback: false,
-        };
-        let items = swept
-            .into_iter()
-            .map(|s| MaskedItem {
-                category: s.category,
-                label: s.label,
-                confidence: s.confidence,
-                source: s.source,
-            })
-            .collect();
-        MaskResult {
-            masked: rendered.masked,
-            recovery: Recovery::seal(rendered.map, &config.key),
-            segments: rendered.segments,
-            items,
-            summary,
-        }
+        (swept, residual)
     }
 
     /// Returns the Ir and whether a *requested* format parser failed (so we fell
@@ -339,6 +357,18 @@ impl Engine {
             fell_back,
         )
     }
+}
+
+fn masked_items(spans: Vec<Span>) -> Vec<MaskedItem> {
+    spans
+        .into_iter()
+        .map(|s| MaskedItem {
+            category: s.category,
+            label: s.label,
+            confidence: s.confidence,
+            source: s.source,
+        })
+        .collect()
 }
 
 impl Default for Engine {
@@ -1603,6 +1633,12 @@ mod tests {
         let input = "key AKIAIOSFODNN7EXAMPLE and a@b.com and Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
         let r = mp(Profile::Strict, input);
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn placeholder_adjacent_endpoint_artifact_is_idempotent() {
+        let once = m("a::__aA00_aaaA/aABB-_CDba1c").masked;
+        assert_eq!(m(&once).masked, once);
     }
 
     proptest! {

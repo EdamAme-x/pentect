@@ -4,7 +4,7 @@ mod walk;
 
 use crate::{die, infer_kind, load_packs};
 use options::ScanOpts;
-use pentect_core::{Category, Config, Engine, Input, MaskedItem, Profile};
+use pentect_core::{Category, Engine, Input, MaskedItem, Profile};
 use report::{print_report, report_json, FileFinding, ScanReport, ScanScope, SkippedFile};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -107,7 +107,6 @@ fn scan_files(
 struct ScanWorker {
     packs: Option<Vec<pentect_core::Pack>>,
     engine: Option<Engine>,
-    cfg: Option<Config>,
 }
 
 impl ScanWorker {
@@ -115,7 +114,6 @@ impl ScanWorker {
         Self {
             packs: Some(packs),
             engine: None,
-            cfg: None,
         }
     }
 
@@ -147,13 +145,10 @@ impl ScanWorker {
         };
         let kind = infer_kind(path);
         self.ensure_engine();
-        let result = self.engine.as_ref().unwrap().mask(
-            Input {
-                kind: kind.clone(),
-                data,
-            },
-            self.cfg.as_ref().unwrap(),
-        );
+        let result = self.engine.as_ref().unwrap().analyze(Input {
+            kind: kind.clone(),
+            data,
+        });
         let secret_items = result
             .items
             .iter()
@@ -161,12 +156,10 @@ impl ScanWorker {
             .collect::<Vec<_>>();
         let findings = secret_items.len();
         let warnings = result
-            .summary
             .residual
             .iter()
             .filter(|note| note.category == Category::Secret)
-            .count()
-            + result.summary.collisions.len();
+            .count();
         if findings == 0 && warnings == 0 {
             return Ok(ScanFile::Clean);
         }
@@ -178,7 +171,7 @@ impl ScanWorker {
             warnings,
             labels: label_counts(&secret_items),
             categories: category_counts(&secret_items),
-            parser_fallback: result.summary.parser_fallback,
+            parser_fallback: result.parser_fallback,
         }))
     }
 
@@ -192,7 +185,6 @@ impl ScanWorker {
             packs,
             false,
         ));
-        self.cfg = Some(Config::generate());
     }
 }
 

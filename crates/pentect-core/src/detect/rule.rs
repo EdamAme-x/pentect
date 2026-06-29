@@ -429,7 +429,7 @@ impl RuleDetector {
                 confidence,
                 validator: V::None,
                 capture: 0,
-                prefilter: Vec::new(),
+                prefilter: builtin_prefilter(label, pattern),
             })
             .chain(
                 checked.iter().map(
@@ -440,7 +440,7 @@ impl RuleDetector {
                         confidence,
                         validator,
                         capture: 0,
-                        prefilter: Vec::new(),
+                        prefilter: builtin_prefilter(label, pattern),
                     },
                 ),
             )
@@ -452,7 +452,7 @@ impl RuleDetector {
                     confidence,
                     validator,
                     capture,
-                    prefilter: Vec::new(),
+                    prefilter: builtin_prefilter(label, pattern),
                 },
             ))
             .collect();
@@ -464,6 +464,94 @@ impl Detector for RuleDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         self.inner.detect(view)
     }
+}
+
+fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
+    let literals: &[&str] = match label {
+        "JWT_SECRET" => &["eyJ"],
+        "AWS_AKID" => &["AKIA"],
+        "ANTHROPIC_API_KEY" => &["sk-ant-"],
+        "OPENAI_API_KEY" if pattern.contains(r"[ \t]+") => &["sk ", "sk\t"],
+        "OPENAI_API_KEY" => &["sk-"],
+        "RUNPOD_API_KEY" => &["rpa_"],
+        "HUGGINGFACE_TOKEN" => &["hf_"],
+        "SLACK_TOKEN" => &["xox"],
+        "SLACK_WEBHOOK" => &["hooks.slack.com/services/"],
+        "DISCORD_WEBHOOK" => &["discord.com/api/webhooks/", "discordapp.com/api/webhooks/"],
+        "STRIPE_SECRET_KEY" => &["_live_", "_test_"],
+        "GOOGLE_API_KEY" => &["AIza"],
+        "GOOGLE_OAUTH_SECRET" => &["GOCSPX-"],
+        "GOOGLE_OAUTH_TOKEN" => &["ya29."],
+        "GITHUB_PAT" => &["github_pat_"],
+        "GITHUB_TOKEN" => &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"],
+        "SENDGRID_KEY" => &["SG."],
+        "NPM_TOKEN" => &["npm_"],
+        "DIGITALOCEAN_TOKEN" => &["dop_v1_", "doo_v1_", "dor_v1_"],
+        "SHOPIFY_TOKEN" => &["shpat_", "shpca_", "shppa_", "shpss_"],
+        "SQUARE_TOKEN" => &["EAAA", "sq0atp-", "sq0csp-"],
+        "GCP_PRIVATE_KEY_ID" => &["private_key_id"],
+        "DATADOG_API_KEY" => &[
+            "datadog",
+            "dd_api",
+            "dd-api",
+            "dd_app",
+            "dd-app",
+            "dd_client_token",
+        ],
+        "POSTMARK_SERVER_TOKEN" => &["postmark"],
+        "HEROKU_API_KEY" => &["heroku"],
+        "SESSION_TOKEN" => &[
+            "session", "sid", "jwt", "cookie", "auth", "access", "refresh",
+        ],
+        "DB_CONNECTION_STRING" => &[
+            "postgres://",
+            "postgresql://",
+            "mysql://",
+            "mongodb://",
+            "mongodb+srv://",
+            "redis://",
+            "rediss://",
+            "amqp://",
+            "amqps://",
+        ],
+        "URL" => &["://"],
+        "US_PASSPORT" | "UK_PASSPORT" | "ES_PASSPORT" | "IT_PASSPORT" | "IN_PASSPORT" => &[
+            "passport",
+            "pasaporte",
+            "passeport",
+            "passaporto",
+            "reisepass",
+            "パスポート",
+            "旅券",
+        ],
+        "SWIFT_BIC" => &["swift", "bic"],
+        "CA_SIN" => &["social insurance"],
+        "UK_NHS" => &["nhs"],
+        "PL_PESEL" => &["pesel"],
+        "AU_TFN" => &["tfn", "tax file"],
+        "NL_BSN" => &["bsn"],
+        "AU_MEDICARE" => &["medicare"],
+        "AU_ACN" => &["acn", "company number"],
+        "US_BANK_ACCOUNT" => &[
+            "account", "acct", "acc", "konto", "compte", "cuenta", "口座",
+        ],
+        "IN_VOTER" => &["voter", "epic"],
+        "SG_UEN" => &["uen"],
+        "AZURE_STORAGE_ACCOUNT_KEY" => &["AccountKey"],
+        "KUBE_CLIENT_KEY_DATA" => &[
+            "clientkeydata",
+            "client-keydata",
+            "client_keydata",
+            "clientkey-data",
+            "clientkey_data",
+            "client-key-data",
+            "client-key_data",
+            "client_key-data",
+            "client_key_data",
+        ],
+        _ => &[],
+    };
+    literals.iter().map(|s| (*s).to_string()).collect()
 }
 
 #[cfg(test)]

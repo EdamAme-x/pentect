@@ -1,22 +1,30 @@
 use crate::model::*;
 use crate::policy::is_context_free;
+use std::collections::HashSet;
 
 use super::interval::RangeIndex;
 
 /// Resolve overlapping candidates into a non-overlapping set.
 pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
     let protected_index = RangeIndex::new(protected.to_vec());
+    let protected_edges = (!protected.is_empty()).then(|| {
+        protected
+            .iter()
+            .flat_map(|p| [p.start, p.end])
+            .collect::<HashSet<_>>()
+    });
 
-    // Drop empties and anything overlapping a frozen placeholder. Context-free
-    // lower-confidence spans that only touch a placeholder are also dropped to
-    // avoid idempotency artifacts, but high-confidence anchored/vendor spans
-    // must still be masked; otherwise `<<X_hash>>AKIA...` leaks the adjacent
-    // real secret.
+    // Drop empties and anything overlapping a frozen placeholder. Spans that
+    // only touch a placeholder are normally idempotency artifacts. Keep only
+    // high-confidence, non-context-free secrets there; otherwise
+    // `<<X_hash>>AKIA...` would leak the adjacent real secret.
     spans.retain(|s| {
         !s.range.is_empty()
             && !protected_index.overlaps(&s.range)
-            && !((is_context_free(s) || s.confidence != Confidence::High)
-                && touches_protected(&s.range, protected))
+            && (protected_edges
+                .as_ref()
+                .is_none_or(|edges| !touches_protected(&s.range, edges))
+                || can_touch_protected(s))
     });
 
     // Strongest first (Span::cmp_strength is the one canonical ordering).
@@ -68,10 +76,14 @@ fn subtract(p: ByteRange, a: &ByteRange) -> Vec<ByteRange> {
     out
 }
 
-fn touches_protected(range: &ByteRange, protected: &[ByteRange]) -> bool {
-    protected
-        .iter()
-        .any(|p| range.start == p.end || range.end == p.start)
+fn touches_protected(range: &ByteRange, protected_edges: &HashSet<usize>) -> bool {
+    protected_edges.contains(&range.start) || protected_edges.contains(&range.end)
+}
+
+fn can_touch_protected(span: &Span) -> bool {
+    span.category == Category::Secret
+        && span.confidence == Confidence::High
+        && !is_context_free(span)
 }
 
 #[cfg(test)]
@@ -139,6 +151,21 @@ mod tests {
             &[ByteRange::new(0, 5), ByteRange::new(16, 20)],
         );
         assert_eq!(out.len(), 2, "{out:?}");
+    }
+
+    #[test]
+    fn non_secret_placeholder_adjacent_spans_are_dropped() {
+        let out = merge(
+            vec![Span {
+                range: ByteRange::new(0, 3),
+                category: Category::Endpoint,
+                label: "IP_ADDRESS_V6".into(),
+                confidence: Confidence::High,
+                source: DetectorId::Rule,
+            }],
+            &[ByteRange::new(3, 40)],
+        );
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use super::{validate, Detector};
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
 use crate::normalize::NormalizedView;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use std::sync::LazyLock;
 
 #[derive(Default)]
 pub struct Bip39Detector;
@@ -12,9 +14,27 @@ struct WordToken {
     language_mask: u16,
 }
 
+static MNEMONIC_KEYWORDS: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .build([
+            "secret recovery phrase",
+            "recovery phrase",
+            "seed phrase",
+            "wallet seed",
+            "wallet mnemonic",
+            "mnemonic",
+            "wallet",
+        ])
+        .expect("mnemonic keyword prefilter compiles")
+});
+
 impl Detector for Bip39Detector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let text = view.text();
+        if !has_mnemonic_evidence_hint(text) {
+            return Vec::new();
+        }
         let tokens = word_tokens(text);
         if looks_like_reference_wordlist(text, &tokens) {
             return Vec::new();
@@ -62,6 +82,50 @@ impl Detector for Bip39Detector {
 
         out
     }
+}
+
+fn has_mnemonic_evidence_hint(text: &str) -> bool {
+    has_any_mnemonic_keyword(text) || may_be_standalone_phrase(text) || may_be_numbered_phrase(text)
+}
+
+fn has_any_mnemonic_keyword(text: &str) -> bool {
+    MNEMONIC_KEYWORDS.find(text).is_some()
+}
+
+fn may_be_standalone_phrase(text: &str) -> bool {
+    let mut word_count = 0usize;
+    for segment in text.split_whitespace() {
+        if !segment.chars().all(char::is_alphabetic) {
+            return false;
+        }
+        word_count += 1;
+        if word_count > 24 {
+            return false;
+        }
+    }
+    matches!(word_count, 12 | 15 | 18 | 21 | 24)
+}
+
+fn may_be_numbered_phrase(text: &str) -> bool {
+    let mut expected = 1usize;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let number = expected.to_string();
+        let Some(rest) = trimmed.strip_prefix(&number) else {
+            continue;
+        };
+        if !matches!(
+            rest.trim_start().chars().next(),
+            Some('.' | ')' | ':' | '-')
+        ) {
+            continue;
+        }
+        expected += 1;
+        if expected > 12 {
+            return true;
+        }
+    }
+    false
 }
 
 fn word_tokens(text: &str) -> Vec<WordToken> {
