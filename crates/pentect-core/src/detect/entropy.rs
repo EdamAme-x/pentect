@@ -3,6 +3,7 @@ use super::util::token_runs;
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
+use data_encoding::{BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
 
 /// Default minimum run length before a token is entropy-eligible. Long enough to
 /// skip short benign tokens (UUID segments, short ids) while catching real keys.
@@ -88,6 +89,7 @@ impl EntropyDetector {
             return;
         }
         if is_structured_metadata_value(text, start, &view.region.ctx, run)
+            || is_encoded_public_metadata_value(run)
             || is_public_ssh_key_context(text, start)
         {
             return;
@@ -165,6 +167,76 @@ fn is_structured_metadata_value(text: &str, start: usize, ctx: &Context, value: 
         || local_json_key_before_value(text, start)
             .as_deref()
             .is_some_and(is_structured_metadata_key)
+}
+
+fn is_encoded_public_metadata_value(value: &str) -> bool {
+    // GitHub GraphQL/REST `node_id` values are Base64-encoded public metadata
+    // identifiers such as `010:Repository246648268` or
+    // `06:Commit...:<sha>`. They often appear in saved API responses that are
+    // scanned as `.txt`, outside the JSON parser's `node_id` key context. This
+    // gate accepts only short printable ASCII records with GitHub's typed
+    // metadata prefix shape; arbitrary Base64 secrets still reach entropy.
+    let value = value.trim();
+    if !(24..=128).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_' | b'='))
+    {
+        return false;
+    }
+    let Some(decoded) = decode_base64ish(value) else {
+        return false;
+    };
+    is_github_node_id_payload(&decoded)
+}
+
+fn decode_base64ish(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    BASE64
+        .decode(bytes)
+        .or_else(|_| BASE64URL.decode(bytes))
+        .or_else(|_| BASE64_NOPAD.decode(bytes))
+        .or_else(|_| BASE64URL_NOPAD.decode(bytes))
+        .ok()
+}
+
+fn is_github_node_id_payload(decoded: &[u8]) -> bool {
+    if !(8..=160).contains(&decoded.len())
+        || decoded
+            .iter()
+            .any(|b| !matches!(*b, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b':' | b'_' | b'-'))
+    {
+        return false;
+    }
+    let payload = match std::str::from_utf8(decoded) {
+        Ok(payload) => payload,
+        Err(_) => return false,
+    };
+    let mut parts = payload.split(':');
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+    let Some(kind_and_id) = parts.next() else {
+        return false;
+    };
+    if !(2..=3).contains(&prefix.len()) || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some(first) = kind_and_id.bytes().next() else {
+        return false;
+    };
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    let alpha_prefix_len = kind_and_id
+        .bytes()
+        .take_while(u8::is_ascii_alphabetic)
+        .count();
+    alpha_prefix_len >= 3
+        && kind_and_id
+            .bytes()
+            .skip(alpha_prefix_len)
+            .any(|b| b.is_ascii_digit())
 }
 
 fn local_json_key_before_value(text: &str, start: usize) -> Option<String> {
@@ -653,6 +725,32 @@ mod tests {
             let view = NormalizedView::build(&region, raw);
             assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
         }
+    }
+
+    #[test]
+    fn github_node_ids_in_plaintext_are_not_entropy_candidates() {
+        for raw in [
+            "node_id MDEwOlJlcG9zaXRvcnkyNDY2NDgyNjg=",
+            "node_id MDY6Q29tbWl0MjQ2NjQ4MjY4OmU0NGQxMWQ1NjVjMDIyNDk2NTQ0ZGQ2ZWQxZjE5YThkNzE4YzJiMGM=",
+            "node_id MDEyOk9yZ2FuaXphdGlvbjExMjg4OTk2",
+        ] {
+            let encoded = raw.split_whitespace().last().unwrap();
+            assert!(is_encoded_public_metadata_value(encoded), "{encoded}");
+            let reg = region(raw);
+            let view = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn arbitrary_base64_secret_still_entropy_candidate() {
+        let raw = "SECRET_BLOB=QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdA==";
+        let reg = region(raw);
+        let view = NormalizedView::build(&reg, raw);
+        assert!(
+            !EntropyDetector::default().detect(&view).is_empty(),
+            "non-metadata base64 must still detect"
+        );
     }
 
     #[test]

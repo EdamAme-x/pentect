@@ -61,7 +61,7 @@ Elapsed: 153352 ms
 
 Current working result after structural false-positive reductions, source
 name/reference and fixture filtering, generic-key name filtering, and RFC
-documentation-value handling:
+documentation-value handling, and plaintext GitHub node-id entropy suppression:
 
 ```text
 CredData commit: 9a55c40
@@ -71,15 +71,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 7043
-FP: 15872
+FP: 15585
 FN: 8061
-Line only: 254
-Unlabeled: 79205
+Line only: 244
+Unlabeled: 78949
 Missing files: 0
-Precision: 0.307
+Precision: 0.311
 Recall: 0.466
-F1: 0.370
-Elapsed: 185961 ms
+F1: 0.373
+Elapsed: 186571 ms
 ```
 
 Weak groups:
@@ -88,6 +88,7 @@ Weak groups:
 - `Password`: many false positives from weak fixture/default-looking values that are still real credentials in production.
 - `Token` and `Auth`: recall is strong, but precision still needs vendor/context validators.
 - `LIKELY_SECRET`: broad entropy recall still catches source identifiers and opaque non-secret blobs.
+- Plaintext GitHub API captures now suppress Base64 `node_id` metadata after validating the decoded `type:id` shape; arbitrary Base64 secrets still fire.
 - `URL_CREDENTIAL`: now keeps token-as-username recall; documentation hosts are suppressed only for RFC-reserved examples.
 - RFC 2606/6761 domains, RFC 5737 IPv4 ranges, and RFC 3849/9637 IPv6 ranges are shared by URL and placeholder suppression so sample hosts do not need ad hoc literals.
 - Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.
