@@ -7,7 +7,9 @@ It is tracked as a Git submodule, but generated data is not vendored.
 
 On Windows, generate and run the dataset inside WSL. CredData's downloader
 requires Linux-compatible paths, and copying the generated data to NTFS can
-trigger Defender quarantine or path handling differences.
+trigger Defender quarantine or path handling differences. The benchmark runner
+scores files in parallel with deterministic path-order merging, so repeated runs
+keep the same metrics and example order while finishing much faster.
 
 ```powershell
 git submodule update --init --depth 1 benchmarks/CredData
@@ -79,7 +81,7 @@ Missing files: 0
 Precision: 0.311
 Recall: 0.466
 F1: 0.373
-Elapsed: 186571 ms
+Elapsed: 32123 ms
 ```
 
 Weak groups:

@@ -4,6 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 pub(crate) fn cmd_bench(args: &[String]) {
@@ -218,64 +220,122 @@ fn run_creddata(root: &Path, opts: &BenchOpts) -> Result<BenchReport, String> {
         by_file.entry(row.path.clone()).or_default().push(row);
     }
 
-    let engine = Engine::with_profile(Profile::Strict);
     let mut report = BenchReport {
         files: by_file.len(),
         ..BenchReport::default()
     };
+    let files = by_file.into_iter().collect::<Vec<_>>();
 
-    for (path, rows) in by_file {
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => normalize_newlines(raw),
-            Err(_) => {
-                report.missing_files += 1;
-                report.skipped_rows += rows.len();
-                continue;
-            }
-        };
-        let line_index = LineIndex::new(&raw);
-        let mut cases = Vec::new();
-        for row in rows {
-            match BenchCase::from_row(row, &line_index) {
-                Some(case) => {
-                    report.rows += 1;
-                    for category in category_parts(&case.category) {
-                        report
-                            .by_category
-                            .entry(category.to_string())
-                            .or_default()
-                            .total_rows += 1;
-                    }
-                    if case.truth == Truth::True {
-                        report.true_rows += 1;
-                    } else {
-                        report.false_rows += 1;
-                    }
-                    cases.push(case);
-                }
-                None => {
-                    report.invalid_rows += 1;
-                }
-            }
-        }
-        if cases.is_empty() {
-            continue;
-        }
-
-        let spans = engine
-            .analyze_spans(Input {
-                kind: infer_kind(&path),
-                data: raw.clone(),
-            })
-            .spans
-            .into_iter()
-            .filter(|span| span.category == Category::Secret)
-            .collect::<Vec<_>>();
-        score_file(&raw, &cases, &spans, &mut report, opts.examples);
+    for file_report in score_creddata_files(files, opts.examples)? {
+        report.merge(file_report, opts.examples);
     }
 
     report.elapsed_ms = started.elapsed().as_millis();
     report.finish();
+    Ok(report)
+}
+
+fn score_creddata_files(
+    files: Vec<(PathBuf, Vec<CredRow>)>,
+    example_limit: usize,
+) -> Result<Vec<BenchReport>, String> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(files.len());
+    let files = Arc::new(files);
+    let next = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let files = Arc::clone(&files);
+            let next = Arc::clone(&next);
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let mut engine = Engine::with_profile(Profile::Strict);
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((path, rows)) = files.get(index) else {
+                        break;
+                    };
+                    let result = score_creddata_file(path, rows, &mut engine, example_limit);
+                    if tx.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut reports = rx.into_iter().collect::<Vec<_>>();
+        reports.sort_by_key(|(index, _)| *index);
+        reports
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<Result<Vec<_>, _>>()
+    })
+}
+
+fn score_creddata_file(
+    path: &Path,
+    rows: &[CredRow],
+    engine: &mut Engine,
+    example_limit: usize,
+) -> Result<BenchReport, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => normalize_newlines(raw),
+        Err(_) => {
+            return Ok(BenchReport {
+                missing_files: 1,
+                skipped_rows: rows.len(),
+                ..BenchReport::default()
+            });
+        }
+    };
+    let line_index = LineIndex::new(&raw);
+    let mut cases = Vec::new();
+    let mut report = BenchReport::default();
+    for row in rows.iter().cloned() {
+        match BenchCase::from_row(row, &line_index) {
+            Some(case) => {
+                report.rows += 1;
+                for category in category_parts(&case.category) {
+                    report
+                        .by_category
+                        .entry(category.to_string())
+                        .or_default()
+                        .total_rows += 1;
+                }
+                if case.truth == Truth::True {
+                    report.true_rows += 1;
+                } else {
+                    report.false_rows += 1;
+                }
+                cases.push(case);
+            }
+            None => {
+                report.invalid_rows += 1;
+            }
+        }
+    }
+    if cases.is_empty() {
+        return Ok(report);
+    }
+
+    let spans = engine
+        .analyze_spans(Input {
+            kind: infer_kind(path),
+            data: raw.clone(),
+        })
+        .spans
+        .into_iter()
+        .filter(|span| span.category == Category::Secret)
+        .collect::<Vec<_>>();
+    score_file(&raw, &cases, &spans, &mut report, example_limit);
     Ok(report)
 }
 
@@ -710,6 +770,34 @@ struct BenchReport {
 }
 
 impl BenchReport {
+    fn merge(&mut self, other: BenchReport, example_limit: usize) {
+        self.rows += other.rows;
+        self.true_rows += other.true_rows;
+        self.false_rows += other.false_rows;
+        self.tp += other.tp;
+        self.fp += other.fp;
+        self.fn_ += other.fn_;
+        self.line_only += other.line_only;
+        self.unlabeled += other.unlabeled;
+        self.missing_files += other.missing_files;
+        self.invalid_rows += other.invalid_rows;
+        self.skipped_rows += other.skipped_rows;
+        for (category, metric) in other.by_category {
+            self.by_category.entry(category).or_default().add(metric);
+        }
+        for (detection, metric) in other.by_detection {
+            self.by_detection.entry(detection).or_default().add(metric);
+        }
+        if self.examples.len() < example_limit {
+            self.examples.extend(
+                other
+                    .examples
+                    .into_iter()
+                    .take(example_limit - self.examples.len()),
+            );
+        }
+    }
+
     fn finish(&mut self) {
         self.precision = ratio(self.tp, self.tp + self.fp);
         self.recall = ratio(self.tp, self.tp + self.fn_);
@@ -786,12 +874,26 @@ struct DetectionMetric {
 }
 
 impl DetectionMetric {
+    fn add(&mut self, other: DetectionMetric) {
+        self.tp += other.tp;
+        self.fp += other.fp;
+        self.unlabeled += other.unlabeled;
+    }
+
     fn finish(&mut self) {
         self.precision = ratio(self.tp, self.tp + self.fp);
     }
 }
 
 impl CategoryMetric {
+    fn add(&mut self, other: CategoryMetric) {
+        self.total_rows += other.total_rows;
+        self.tp += other.tp;
+        self.fp += other.fp;
+        self.fn_ += other.fn_;
+        self.line_only += other.line_only;
+    }
+
     fn finish(&mut self) {
         self.precision = ratio(self.tp, self.tp + self.fp);
         self.recall = ratio(self.tp, self.tp + self.fn_);
