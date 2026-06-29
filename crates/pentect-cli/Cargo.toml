@@ -22,6 +22,7 @@ pentect-runtime = { path = "../pentect-runtime" }
 anyhow = { workspace = true }
 ignore = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 crossterm = { workspace = true }
 toml = { workspace = true }

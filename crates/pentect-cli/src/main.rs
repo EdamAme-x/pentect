@@ -1,6 +1,9 @@
 //! Pentect CLI: local secret-capability tool boundary for AI agents.
 
+mod doctor;
+mod eval;
 mod extensions;
+mod extensions_cmd;
 mod input;
 mod scan;
 mod terminal;
@@ -53,6 +56,9 @@ fn main() {
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
+        Some("doctor") => doctor::cmd_doctor(&args),
+        Some("extensions") => extensions_cmd::cmd_extensions(&args),
+        Some("eval") => eval::cmd_eval(&args),
         Some("scan") => scan::cmd_scan(&args),
         Some("exec" | "resolve" | "approve" | "hook" | "purge") => cmd_agent_from(1, &args),
         Some("agent") => cmd_agent_from(2, &args),
@@ -67,12 +73,17 @@ fn usage() {
         "pentect\n\
          pentect codex|claude\n\
          pentect exec \"<command>\"\n\
-         pentect scan [--exclude PATTERN] [PATH...]\n\
+         pentect doctor\n\
+         pentect extensions list|inspect|test [NAME]\n\
+         pentect eval [--json]\n\
+         pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          pentect help\n\
          \n\
          exec runs commands with masked output.\n\
+         doctor checks local readiness.\n\
+         eval reports local precision/recall metrics.\n\
          scan reports files that contain likely secrets.\n\
          view handle metadata.\n\
          resolve rewrites files containing handles, or resolves stdin when no path is given."
@@ -92,24 +103,21 @@ fn help_text() -> &'static str {
         "  pentect codex|claude [--extensions NAME|PATH.toml]\n",
         "  pentect agent exec \"<command>\"\n",
         "  pentect exec \"<command>\"\n\n",
-        "  pentect scan [--exclude PATTERN] [PATH...]\n\n",
+        "  pentect doctor [--json]\n",
+        "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
+        "  pentect eval [--json]\n\n",
+        "  pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
-        "`pentect` opens the approval dashboard.\n",
-        "Set `no_approve = true` in `.pentect/config.toml` to bypass approval prompts for this project.\n",
-        "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
-        "`pentect scan` reports likely secret files without printing secret values.\n",
-        "`pentect scan` respects `.gitignore`, `.pentectignore`, and repeated `--exclude PATTERN` entries.\n",
-        "`--extensions NAME` uses .pentect/extensions/NAME or examples/extensions/NAME.\n",
-        "Extensions can contain rules packs (`pack.toml`) and local model adapters (`adapter.toml`).\n",
-        "Default extensions can be listed in `.pentect/config.toml` as `extensions = [...]`.\n",
-        "Extension spec: docs/EXTENSIONS.md.\n",
-        "Masked handles resolve only while the same Pentect-launched agent session is running.\n",
-        "`pentect view '<HANDLE>'`: label, hash, length.\n",
-        "Every handle also becomes a `PENTECT_...` env var for later execs.\n",
-        "Masked env lines become env vars in later execs: `$env:KEY` on PowerShell, `$KEY` on Unix.\n",
-        "Masked output and referenced local files register in-memory capabilities for later execs in that running session.\n",
-        "Use normal commands and let Pentect return masked handles.\n",
-        "Use `pentect resolve <path>` only when a local file must be materialized with real values.\n",
+        "dashboard: approval\n",
+        "exec: masked stdout/stderr\n",
+        "read: masked file preview\n",
+        "view: handle metadata\n",
+        "resolve: local materialize\n",
+        "scan: broad by default; narrow with --exclude, --gitignore, .pentectignore\n",
+        "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
+        "doctor: readiness\n",
+        "extensions: list, inspect, test\n",
+        "eval: precision, recall\n",
     )
 }
 
@@ -1438,15 +1446,16 @@ mod tests {
     }
 
     #[test]
-    fn help_text_explains_agent_handle_reuse() {
+    fn help_text_is_compact() {
         let help = help_text();
         assert!(help.contains("pentect exec"), "{help}");
-        assert!(help.contains("$env:KEY"), "{help}");
-        assert!(help.contains("$KEY"), "{help}");
-        assert!(help.contains("PENTECT_"), "{help}");
-        assert!(help.contains("pentect resolve"), "{help}");
+        assert!(help.contains("doctor: readiness"), "{help}");
+        assert!(help.contains("extensions: list, inspect, test"), "{help}");
+        assert!(help.contains("eval: precision, recall"), "{help}");
+        assert!(help.contains("scan: broad by default"), "{help}");
         assert!(!help.contains("pentect materialize"), "{help}");
         assert!(!help.contains("pentect purge"), "{help}");
+        assert!(!help.contains("authenticated browser/API/MCP"), "{help}");
     }
 
     #[test]

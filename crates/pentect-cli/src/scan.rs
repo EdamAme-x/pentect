@@ -1,5 +1,6 @@
 mod options;
 mod report;
+mod rules;
 mod walk;
 
 use crate::{die, infer_kind, load_packs};
@@ -41,7 +42,12 @@ fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
         roots: opts.paths.clone(),
         ..ScanReport::default()
     };
-    let files = collect_scan_roots(&opts.paths, &opts.excludes, &mut report.skipped)?;
+    let files = collect_scan_roots(
+        &opts.paths,
+        &opts.excludes,
+        opts.gitignore,
+        &mut report.skipped,
+    )?;
     for result in scan_files(files, packs)? {
         match result {
             ScanFile::Clean => report.files_scanned += 1,
@@ -212,6 +218,7 @@ mod tests {
         assert_eq!(opts.paths, vec![PathBuf::from(".")]);
         assert!(!opts.json);
         assert!(!opts.no_fail);
+        assert!(!opts.gitignore);
     }
 
     #[test]
@@ -221,12 +228,14 @@ mod tests {
             "scan".into(),
             "--json".into(),
             "--no-fail".into(),
+            "--gitignore".into(),
             "app.env".into(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
         assert_eq!(opts.paths, vec![PathBuf::from("app.env")]);
         assert!(opts.json);
         assert!(opts.no_fail);
+        assert!(opts.gitignore);
         assert!(opts.excludes.is_empty());
     }
 
@@ -285,7 +294,7 @@ mod tests {
             "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\nNOTE=hello\n",
         )
         .unwrap();
-        std::fs::write(root.join("target").join("ignored.env"), "SECRET=ignored\n").unwrap();
+        std::fs::write(root.join("target").join("note.txt"), "plain text\n").unwrap();
 
         let args = vec![
             "pentect".into(),
@@ -295,7 +304,7 @@ mod tests {
         let opts = ScanOpts::parse(&args).unwrap();
         let report = run_scan(&args, &opts).unwrap();
         let rendered = report_json(&report);
-        assert_eq!(report.files_scanned, 1);
+        assert_eq!(report.files_scanned, 2);
         assert_eq!(report.files.len(), 1);
         assert!(report.findings >= 2, "{rendered}");
         assert!(rendered.contains("RUNPOD_API_KEY"), "{rendered}");
@@ -371,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_gitignore_removes_files_from_fallback_walk() {
+    fn scan_ignores_gitignore_by_default() {
         let root = temp_scan_root("pentect-scan-gitignore");
         std::fs::write(root.join(".gitignore"), "ignored.env\n").unwrap();
         std::fs::write(
@@ -393,11 +402,111 @@ mod tests {
         let opts = ScanOpts::parse(&args).unwrap();
         let report = run_scan(&args, &opts).unwrap();
 
-        assert_eq!(report.files_scanned, 2, "{}", report_json(&report));
+        assert!(report
+            .files
+            .iter()
+            .any(|file| file.path.file_name().unwrap() == "ignored.env"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_gitignore_flag_removes_files_from_walk() {
+        let root = temp_scan_root("pentect-scan-gitignore-flag");
+        std::fs::write(root.join(".gitignore"), "ignored.env\n").unwrap();
+        std::fs::write(
+            root.join(".env"),
+            "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("ignored.env"),
+            "RUNPOD_API_KEY=rpa_IGNOREDPENTECTSCAN1234567890abcd\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--gitignore".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+
         assert!(report
             .files
             .iter()
             .all(|file| file.path.file_name().unwrap() != "ignored.env"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_includes_vcs_dirs_by_default() {
+        let root = temp_scan_root("pentect-scan-vcs-default");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join(".git").join("config"),
+            "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+
+        assert!(report
+            .files
+            .iter()
+            .any(|file| has_path_segment(&file.path, ".git")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_named_exclude_groups_can_be_restored() {
+        let root = temp_scan_root("pentect-scan-vcs-restore");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join(".git").join("config"),
+            "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--exclude".into(),
+            "~vcs".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+        assert!(report
+            .files
+            .iter()
+            .all(|file| !has_path_segment(&file.path, ".git")));
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--exclude".into(),
+            "~vcs".into(),
+            "--exclude".into(),
+            "!~vcs".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+        assert!(report
+            .files
+            .iter()
+            .any(|file| has_path_segment(&file.path, ".git")));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -431,6 +540,7 @@ mod tests {
         let args = vec![
             "pentect".into(),
             "scan".into(),
+            "--gitignore".into(),
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
@@ -505,5 +615,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn has_path_segment(path: &Path, segment: &str) -> bool {
+        path.components()
+            .any(|component| component.as_os_str() == segment)
     }
 }

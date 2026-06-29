@@ -18,6 +18,14 @@ pub(crate) struct ActiveExtensions {
 }
 
 impl ActiveExtensions {
+    pub(crate) fn pack_paths(&self) -> &[PathBuf] {
+        &self.pack_paths
+    }
+
+    pub(crate) fn adapter_paths(&self) -> &[PathBuf] {
+        &self.adapter_paths
+    }
+
     pub(crate) fn pack_env_value(&self) -> Result<Option<OsString>> {
         if self.pack_paths.is_empty() {
             return Ok(None);
@@ -162,6 +170,13 @@ pub(crate) fn active_from_specs(
 ) -> Result<ActiveExtensions> {
     let mut specs = config_specs()?;
     extend_unique(&mut specs, explicit_specs);
+    active_from_explicit_specs(specs, create_named)
+}
+
+pub(crate) fn active_from_explicit_specs(
+    specs: Vec<String>,
+    create_named: bool,
+) -> Result<ActiveExtensions> {
     let (pack_paths, adapter_paths) = extension_paths_for_specs(&specs, create_named)?;
     Ok(ActiveExtensions {
         pack_paths,
