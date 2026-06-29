@@ -20,8 +20,8 @@ static SOURCE_SECRET_NAME_MATCHER: LazyLock<SourceSecretNameSet> =
     LazyLock::new(|| SourceSecretNameSet::parse(SOURCE_SECRET_NAME_PATTERNS));
 static SOURCE_FIXTURE_SECRET_MATCHER: LazyLock<SourceFixtureSecretSet> =
     LazyLock::new(|| SourceFixtureSecretSet::parse(SOURCE_FIXTURE_SECRET_PATTERNS));
-static STRUCTURED_KEY_NAME_COMPONENT_MATCHER: LazyLock<PatternSet> =
-    LazyLock::new(|| PatternSet::parse(STRUCTURED_KEY_NAME_COMPONENTS));
+static STRUCTURED_KEY_NAME_MATCHER: LazyLock<StructuredKeyNameSet> =
+    LazyLock::new(|| StructuredKeyNameSet::parse(STRUCTURED_KEY_NAME_COMPONENTS));
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Pattern {
@@ -49,6 +49,12 @@ struct SourceSecretNameSet {
 struct SourceFixtureSecretSet {
     key_components: Vec<String>,
     values: Vec<FixtureValuePattern>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StructuredKeyNameSet {
+    components: Vec<String>,
+    names: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +99,38 @@ impl PatternSet {
                 .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())),
             Pattern::Component(pattern) => normalized.split('_').any(|part| part == pattern),
         })
+    }
+}
+
+impl StructuredKeyNameSet {
+    fn parse(raw: &str) -> Self {
+        let mut set = Self::default();
+        for line in raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let Some((kind, pattern)) = line.split_once(':') else {
+                continue;
+            };
+            let pattern = normalize_identifier(pattern);
+            match kind.trim() {
+                "component" => set.components.push(pattern),
+                "name" => set.names.push(pattern),
+                _ => {}
+            }
+        }
+        set
+    }
+
+    fn matches_name(&self, normalized: &str) -> bool {
+        self.names.iter().any(|known| known == normalized)
+    }
+
+    fn matches_components(&self, parts: &[&str]) -> bool {
+        parts
+            .iter()
+            .all(|part| self.components.iter().any(|known| known == part))
     }
 }
 
@@ -250,9 +288,9 @@ pub(crate) fn is_source_fixture_secret_value(key_name: &str, value: &str) -> boo
 /// True when a generic JSON `"key"` value names another field/config key.
 ///
 /// Rationale: many JSON schemas use objects like `{ "key": "smtpUser" }`.
-/// The value is a public identifier, not credential material. Single words and
-/// digit/symbol-bearing values are deliberately kept out so real keys still
-/// detect under generic `key`.
+/// The value is a public identifier, not credential material. Full single-name
+/// references are allowed only from the curated data file; digit/symbol-bearing
+/// values remain detectable because real key material usually has that shape.
 pub(crate) fn is_structured_key_name_reference_value(value: &str) -> bool {
     let value = value.trim();
     if !(3..=64).contains(&value.len())
@@ -268,10 +306,8 @@ pub(crate) fn is_structured_key_name_reference_value(value: &str) -> bool {
         .split('_')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
-    parts.len() >= 2
-        && parts
-            .iter()
-            .all(|part| STRUCTURED_KEY_NAME_COMPONENT_MATCHER.matches(part))
+    STRUCTURED_KEY_NAME_MATCHER.matches_name(&normalized)
+        || (parts.len() >= 2 && STRUCTURED_KEY_NAME_MATCHER.matches_components(&parts))
 }
 
 pub(crate) fn normalize_identifier(input: &str) -> String {
@@ -395,7 +431,16 @@ mod tests {
         assert!(is_structured_key_name_reference_value("seedUser"));
         assert!(is_structured_key_name_reference_value("smtpDomain"));
         assert!(is_structured_key_name_reference_value("apiKey"));
+        assert!(is_structured_key_name_reference_value("Authorization"));
+        assert!(is_structured_key_name_reference_value("Content-Type"));
+        assert!(is_structured_key_name_reference_value("grant_type"));
+        assert!(is_structured_key_name_reference_value("scope"));
+        assert!(is_structured_key_name_reference_value("firstName"));
+        assert!(is_structured_key_name_reference_value("phoneNumber"));
         assert!(!is_structured_key_name_reference_value("password"));
+        assert!(!is_structured_key_name_reference_value("secret"));
+        assert!(!is_structured_key_name_reference_value("Token"));
+        assert!(!is_structured_key_name_reference_value("refresh_token"));
         assert!(!is_structured_key_name_reference_value("abcDEF123456"));
         assert!(!is_structured_key_name_reference_value("sk-test-token"));
     }

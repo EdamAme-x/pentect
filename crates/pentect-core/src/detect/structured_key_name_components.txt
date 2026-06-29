@@ -1,14 +1,18 @@
 # Components that identify a structured JSON `"key": "nameOfThing"` value as a
 # field/configuration name rather than secret material.
 #
-# Format: component:word
+# Format:
+# - component:word
+# - name:full_identifier
 #
 # Policy:
 # - Used only for generic JSON key fields whose key name is exactly `key`.
-# - The value must be an identifier with no digits and at least two normalized
-#   components, e.g. `seedUser`, `smtpDomain`, or `apiKey`.
-# - Single words such as `password`, and concrete values containing digits or
-#   token punctuation, remain detectable.
+# - `component:` entries are combined only when the value has at least two
+#   normalized parts, e.g. `seedUser`, `smtpDomain`, or `apiKey`.
+# - `name:` entries are full public field/header/parameter names that can stand
+#   alone as metadata values.
+# - Sensitive single words such as `password`, and concrete values containing
+#   digits or token punctuation, remain detectable.
 component:account
 component:api
 component:auth
@@ -41,3 +45,30 @@ component:type
 component:uri
 component:url
 component:user
+name:address
+name:area
+name:authorization
+name:birthdate
+name:content_type
+name:description
+name:device_id
+name:first_name
+name:grant_type
+name:house
+name:last_name
+name:make
+name:mobile
+name:model
+name:name
+name:page
+name:phone_number
+name:redirect_uri
+name:response_type
+name:rooms
+name:scope
+name:single_family
+name:size
+name:submit
+name:type
+name:vehicles
+name:year
