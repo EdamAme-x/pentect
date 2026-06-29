@@ -282,6 +282,31 @@ mod tests {
     }
 
     #[test]
+    fn scan_reports_generated_files_as_explicit_scope() {
+        let root = temp_scan_root("pentect-scan-generated-scope");
+        std::fs::write(
+            root.join("package-lock.json"),
+            r#"{"env":"RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef"}"#,
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+        assert_eq!(report.files_scanned, 1);
+        assert!(report.skipped.is_empty(), "{}", report_json(&report));
+        assert_eq!(report.files.len(), 1, "{}", report_json(&report));
+        assert_eq!(report.files[0].scope, ScanScope::Generated);
+        assert!(report.files[0].findings >= 1, "{}", report_json(&report));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn scan_uses_core_on_keywordless_entropy() {
         let root = temp_scan_root("pentect-scan-keywordless-entropy");
         let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";

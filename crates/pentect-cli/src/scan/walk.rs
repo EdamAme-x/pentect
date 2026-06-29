@@ -20,12 +20,6 @@ pub(super) fn collect_scan_roots(
 }
 
 pub(super) fn ignored_file_reason(path: &Path) -> Option<&'static str> {
-    if has_file_name(path, GENERATED_LOCK_FILES) {
-        return Some("generated lockfile");
-    }
-    if has_extension(path, GENERATED_ASSET_EXTENSIONS) {
-        return Some("generated asset");
-    }
     has_extension(path, IGNORED_FILE_EXTENSIONS).then_some("binary extension")
 }
 
@@ -59,7 +53,6 @@ const IGNORED_FILE_EXTENSIONS: &[&str] = &[
     "jpeg",
     "jpg",
     "lib",
-    "lock",
     "lz4",
     "mkv",
     "mov",
@@ -96,18 +89,6 @@ const IGNORED_FILE_EXTENSIONS: &[&str] = &[
     "zst",
 ];
 
-const GENERATED_ASSET_EXTENSIONS: &[&str] = &["svg"];
-
-const GENERATED_LOCK_FILES: &[&str] = &[
-    "bun.lockb",
-    "go.sum",
-    "go.work.sum",
-    "npm-shrinkwrap.json",
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "pnpm-lock.yml",
-];
-
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -115,16 +96,6 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
             extensions
                 .iter()
                 .any(|candidate| ext.eq_ignore_ascii_case(candidate))
-        })
-}
-
-fn has_file_name(path: &Path, names: &[&str]) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            names
-                .iter()
-                .any(|candidate| name.eq_ignore_ascii_case(candidate))
         })
 }
 
@@ -240,34 +211,4 @@ fn is_ignored_dir(path: &Path) -> bool {
             .and_then(|parent| parent.file_name())
             .and_then(|parent| parent.to_str())
             == Some(".pentect"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_dependency_files_are_ignored() {
-        for file in [
-            "package-lock.json",
-            "pnpm-lock.yaml",
-            "go.sum",
-            "go.work.sum",
-            "bun.lockb",
-        ] {
-            assert_eq!(
-                ignored_file_reason(Path::new(file)),
-                Some("generated lockfile"),
-                "{file}"
-            );
-        }
-    }
-
-    #[test]
-    fn svg_assets_are_ignored() {
-        assert_eq!(
-            ignored_file_reason(Path::new("docs/logo.svg")),
-            Some("generated asset")
-        );
-    }
 }

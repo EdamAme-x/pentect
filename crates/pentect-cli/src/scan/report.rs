@@ -27,6 +27,7 @@ pub(super) struct FileFinding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ScanScope {
+    Generated,
     Runtime,
     ApplicationSource,
     DetectorSource,
@@ -43,6 +44,9 @@ impl ScanScope {
             .and_then(|name| name.to_str())
             .unwrap_or("");
         let file_name_lower = file_name.to_ascii_lowercase();
+        if is_generated_file(path) {
+            return Self::Generated;
+        }
         if normalized.contains("/proptest-regressions/")
             || file_name == "tests.rs"
             || file_name.ends_with("_test.rs")
@@ -111,6 +115,7 @@ impl ScanScope {
 
     pub(super) fn as_str(self) -> &'static str {
         match self {
+            Self::Generated => "generated",
             Self::Runtime => "runtime",
             Self::ApplicationSource => "application_source",
             Self::DetectorSource => "detector_source",
@@ -119,6 +124,46 @@ impl ScanScope {
             Self::DocsExamples => "docs_examples",
         }
     }
+}
+
+fn is_generated_file(path: &Path) -> bool {
+    has_file_name(
+        path,
+        &[
+            "bun.lockb",
+            "cargo.lock",
+            "go.sum",
+            "go.work.sum",
+            "npm-shrinkwrap.json",
+            "package-lock.json",
+            "pipfile.lock",
+            "pnpm-lock.yaml",
+            "pnpm-lock.yml",
+            "poetry.lock",
+            "uv.lock",
+            "yarn.lock",
+        ],
+    ) || has_extension(path, &["svg"])
+}
+
+fn has_file_name(path: &Path, names: &[&str]) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            names
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        })
+}
+
+fn has_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            extensions
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
 }
 
 fn path_has_segment(path: &str, segments: &[&str]) -> bool {
@@ -176,6 +221,19 @@ mod tests {
             "snapshots/register.bash",
         ] {
             assert_eq!(ScanScope::classify(Path::new(path)), ScanScope::TestFixture);
+        }
+    }
+
+    #[test]
+    fn generated_files_are_explicit_scope() {
+        for path in [
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "go.sum",
+            "Cargo.lock",
+            "docs/logo.svg",
+        ] {
+            assert_eq!(ScanScope::classify(Path::new(path)), ScanScope::Generated);
         }
     }
 
