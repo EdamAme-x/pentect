@@ -567,6 +567,7 @@ fn looks_like_secret_value(
         || is_cli_option_literal(value, key_name)
         || is_file_extension_literal(value, key_name)
         || is_source_constant_reference_literal(value, source_key)
+        || is_source_config_name_literal(value, source_key)
         || is_source_code_fragment_literal(value)
         || is_arithmetic_expression_literal(value)
         || is_interpolated_string_template(value)
@@ -588,6 +589,13 @@ fn looks_like_secret_value(
         .chars()
         .any(|ch| !ch.is_ascii_alphanumeric() && !ch.is_ascii_whitespace());
     let has_space = value.chars().any(char::is_whitespace);
+
+    if matches!(kind, KeyKind::Token) && has_space {
+        // Bearer/API/session token syntaxes are compact credentials. Values
+        // with whitespace such as "Test Access Token" are names or fixture
+        // prose, not usable token material.
+        return false;
+    }
 
     if quoted && chars >= 4 {
         if separator == Separator::ImplicitQuote {
@@ -939,6 +947,38 @@ fn source_key_has_code_shape(source_key: &str) -> bool {
         || key.contains('*')
         || key.contains('[')
         || key.split_whitespace().count() >= 2
+}
+
+fn is_source_config_name_literal(value: &str, source_key: &str) -> bool {
+    // Constants in source code often store public config/property names or
+    // routes, even when those names contain sensitive words:
+    // `HttpSslCertPasswordProtected = "http.sslcertpasswordprotected"` and
+    // `DataCenterPasswordReset = "/passwordreset"`. Restrict this to source-
+    // shaped left sides and name/path syntax without digits or credential
+    // material so real compact secrets still pass through.
+    if !source_key_has_code_shape(source_key) {
+        return false;
+    }
+    let value = value.trim();
+    is_lower_dotted_config_name(value) || is_lower_route_literal(value)
+}
+
+fn is_lower_dotted_config_name(value: &str) -> bool {
+    value.contains('.')
+        && !value.contains("://")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || matches!(b, b'.' | b'_' | b'-'))
+        && value.bytes().any(|b| b.is_ascii_lowercase())
+}
+
+fn is_lower_route_literal(value: &str) -> bool {
+    value.starts_with('/')
+        && (2..=80).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || matches!(b, b'/' | b'_' | b'-'))
+        && value.bytes().any(|b| b.is_ascii_lowercase())
 }
 
 fn key_name_indicates_template_context(key_name: &str) -> bool {
@@ -1470,6 +1510,8 @@ mod tests {
             r#"const string sessionTokenUrl = "_apis/token/sessiontokens?api-version=1.0";"#,
             r#"authorization_uri=https://login.microsoftonline.com/tenant1"#,
             r#"var response = "id_token=my_id_token&state=protected_state&code=my_code";"#,
+            r#"access_token = "Test Access Token","#,
+            r#"refresh_token = "Test Refresh Token""#,
             r#"val FAILED_TO_RETRIEVE_GENERATED_KEY = "Failed to retrieve the generated key.""#,
             r#"POSTGRES_HOST_AUTH_METHOD: scram-sha-256"#,
             r#"c.key = "__vlist__" + nestedIndex;"#,
@@ -1477,6 +1519,11 @@ mod tests {
             r#"self.__authorizationHeader = f"Bearer {jwt}""#,
             r#"{"license": {"key": "lgpl-3.0"}}"#,
             r#"{"key":"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCexample"}"#,
+            r#"var correlationKey = ".xsrf";"#,
+            r#"public const string IsW365EnvironmentKeyName = "IsW365Environment";"#,
+            r#"public const string PasswordStoreDirEnvar = "PASSWORD_STORE_DIR";"#,
+            r#"public const string HttpSslCertPasswordProtected = "http.sslcertpasswordprotected";"#,
+            r#"public const string DataCenterPasswordReset = "/passwordreset";"#,
         ] {
             assert!(hits(raw).is_empty(), "{raw}: {:?}", hits(raw));
         }

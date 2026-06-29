@@ -12,6 +12,10 @@ exact:non_secret
 exact:notsecret
 exact:not_secret
 exact:public
+exact:correlation_key
 prefix:public_
 suffix:_public
+suffix:_key_name
+suffix:_envar
+suffix:_env_var
 contains:public_key_token

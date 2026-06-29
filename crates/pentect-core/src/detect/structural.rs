@@ -1,4 +1,6 @@
-use super::benign::{is_explicitly_non_sensitive_key_name, is_placeholder_value};
+use super::benign::{
+    is_explicitly_non_sensitive_key_name, is_placeholder_value, normalize_identifier,
+};
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -85,6 +87,12 @@ impl Detector for SensitiveKeyDetector {
         if region.ctx.kind != RegionKind::JsonValue {
             return vec![];
         }
+        if region.ctx.key.as_deref().is_some_and(|key| {
+            is_ui_copy_sensitive_key(key, view.text())
+                || is_structured_token_prose(key, view.text())
+        }) {
+            return vec![];
+        }
         let Some(label) = sensitive_context_label(&region.ctx) else {
             return vec![];
         };
@@ -113,7 +121,7 @@ fn sensitive_context_label(ctx: &Context) -> Option<String> {
 }
 
 fn is_sensitive_key_name(key: &str) -> bool {
-    let name = normalize_key(key);
+    let name = normalize_identifier(key);
     if is_explicitly_non_sensitive_key(&name) {
         return false;
     }
@@ -155,6 +163,80 @@ fn is_sensitive_key_name(key: &str) -> bool {
         ]
         .iter()
         .any(|needle| name.contains(needle))
+}
+
+fn is_ui_copy_sensitive_key(key: &str, value: &str) -> bool {
+    // Translation/resource JSON often uses password/token words in UI message
+    // identifiers (`incorrectPassword`, `tokenAuthFailed`,
+    // `passwordNotSupportedTitle`). Those values are prose, not credentials.
+    // Require both a UI-state/action component in the key and prose/localization
+    // shape in the value so compact real secrets under `password` still detect.
+    let name = normalize_identifier(key);
+    if !name.split('_').any(|part| {
+        matches!(
+            part,
+            "password" | "passwords" | "token" | "auth" | "authentication" | "credential"
+        )
+    }) {
+        return false;
+    }
+    let has_ui_component = [
+        "broken",
+        "category",
+        "add",
+        "cancel",
+        "current",
+        "forgot",
+        "failed",
+        "incorrect",
+        "invalid",
+        "label",
+        "length",
+        "lock",
+        "mandatory",
+        "message",
+        "new",
+        "no",
+        "not",
+        "only",
+        "prompt",
+        "remove",
+        "removed",
+        "required",
+        "room",
+        "set",
+        "supported",
+        "text",
+        "title",
+        "advice",
+        "uppercase",
+        "digits",
+        "matching",
+    ]
+    .iter()
+    .any(|component| name.split('_').any(|part| part == *component));
+    has_ui_component && is_prose_or_localization_value(value)
+}
+
+fn is_prose_or_localization_value(value: &str) -> bool {
+    let value = value.trim();
+    value.contains("$t(")
+        || value.split_whitespace().count() >= 2
+        || !value.is_ascii()
+        || value.ends_with(['.', ':', '!', '?'])
+}
+
+fn is_structured_token_prose(key: &str, value: &str) -> bool {
+    // Structured token fields must contain compact token material. Fixture/UI
+    // prose such as "Test Access Token" is not a usable bearer/session token.
+    let name = normalize_identifier(key);
+    let is_token_key = name == "token"
+        || name.ends_with("_token")
+        || name.contains("_token_")
+        || name == "access_token"
+        || name == "refresh_token"
+        || name == "id_token";
+    is_token_key && value.chars().any(char::is_whitespace)
 }
 
 fn is_explicitly_non_sensitive_key(name: &str) -> bool {
@@ -422,6 +504,76 @@ mod tests {
         assert_eq!(
             sensitive_key_fires(Some("public_token_label"), "visible docs"),
             None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("incorrectPassword"), "Name or password is wrong"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("tokenAuthFailedTitle"), "Authentication failed"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(
+                Some("passwordSetRemotely"),
+                "$t(lockRoomPassword) was set remotely"
+            ),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("lockRoomPassword"), "Meeting password"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("noPassword"), "No password is set"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("passwordDigitsOnly"), "Digits only"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("authDropboxText"), "Connect your Dropbox account"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("mandatoryNewPassword"), "New password is required"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("showPasswordAdvice"), "Show password advice"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("forgotPassword"), "Forgot your password?"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("invalidPasswordLength"), "Password length is invalid"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("passwordsNotMatching"), "Passwords do not match"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(
+                Some("categoryBrokenAuthentication"),
+                "Broken authentication"
+            ),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("access_token"), "Test Access Token"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("access_token"), "abcDEF123456"),
+            Some("ACCESS_TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("password"), "correct horse battery staple"),
+            Some("PASSWORD".to_string())
         );
     }
 

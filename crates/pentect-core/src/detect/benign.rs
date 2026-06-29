@@ -156,6 +156,11 @@ mod tests {
     fn non_secret_keys_are_explicit_only() {
         assert!(is_explicitly_non_sensitive_key_name("publicKeyToken"));
         assert!(is_explicitly_non_sensitive_key_name("non_secret"));
+        assert!(is_explicitly_non_sensitive_key_name("correlationKey"));
+        assert!(is_explicitly_non_sensitive_key_name("apiKeyName"));
+        assert!(is_explicitly_non_sensitive_key_name(
+            "PasswordStoreDirEnvar"
+        ));
         assert!(!is_explicitly_non_sensitive_key_name("api_key"));
         assert!(!is_explicitly_non_sensitive_key_name("client_secret"));
     }
