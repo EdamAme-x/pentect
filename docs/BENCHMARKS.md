@@ -60,7 +60,8 @@ Elapsed: 153352 ms
 ```
 
 Current working result after structural false-positive reductions, source
-name/reference filtering, and RFC documentation-value handling:
+name/reference and fixture filtering, generic-key name filtering, and RFC
+documentation-value handling:
 
 ```text
 CredData commit: 9a55c40
@@ -70,15 +71,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 7043
-FP: 15912
+FP: 15872
 FN: 8061
 Line only: 254
-Unlabeled: 79261
+Unlabeled: 79205
 Missing files: 0
 Precision: 0.307
 Recall: 0.466
 F1: 0.370
-Elapsed: 189179 ms
+Elapsed: 185961 ms
 ```
 
 Weak groups:
@@ -90,6 +91,8 @@ Weak groups:
 - `URL_CREDENTIAL`: now keeps token-as-username recall; documentation hosts are suppressed only for RFC-reserved examples.
 - RFC 2606/6761 domains, RFC 5737 IPv4 ranges, and RFC 3849/9637 IPv6 ranges are shared by URL and placeholder suppression so sample hosts do not need ad hoc literals.
 - Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.
+- Generic JSON `"key"` values that are identifier names such as `smtpDomain` are treated as metadata; digit/symbol-bearing key material still fires.
+- Source fixture literals require both source-code shape and fixture key context, so `expectedPassword = "pass"` is skipped while plain `password = "pass"` still fires.
 - `UUID`: low recall.
 - `AWS S3 Bucket`, `Firebase Domain`, and `Tencent WeChat API App ID`: currently missed.
 - Identity sweep intentionally does not propagate very short `KEYED_SECRET` values; this avoids widespread false positives but can miss repeated weak credentials outside their anchored assignment.

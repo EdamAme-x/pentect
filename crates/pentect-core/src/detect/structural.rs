@@ -1,5 +1,6 @@
 use super::benign::{
-    is_explicitly_non_sensitive_key_name, is_placeholder_value, normalize_identifier,
+    is_explicitly_non_sensitive_key_name, is_placeholder_value,
+    is_structured_key_name_reference_value, normalize_identifier,
 };
 use super::Detector;
 use crate::model::*;
@@ -100,6 +101,7 @@ impl Detector for SensitiveKeyDetector {
         if region.ctx.key.as_deref().is_some_and(|key| {
             is_ui_copy_sensitive_key(key, view.text())
                 || is_structured_token_prose(key, view.text())
+                || is_structured_generic_key_name_reference(key, view.text())
         }) {
             return vec![];
         }
@@ -266,6 +268,13 @@ fn is_structured_token_prose(key: &str, value: &str) -> bool {
         || name == "refresh_token"
         || name == "id_token";
     is_token_key && value.chars().any(char::is_whitespace)
+}
+
+fn is_structured_generic_key_name_reference(key: &str, value: &str) -> bool {
+    // Generic JSON `"key"` fields often contain another field/config name
+    // (`smtpUser`, `databaseName`). Concrete key values usually contain digits,
+    // token punctuation, or entropy and remain eligible for masking.
+    normalize_identifier(key) == "key" && is_structured_key_name_reference_value(value)
 }
 
 fn is_explicitly_non_sensitive_key(name: &str) -> bool {
@@ -536,6 +545,13 @@ mod tests {
         );
         assert_eq!(sensitive_key_fires(Some("note"), "hello"), None);
         assert_eq!(sensitive_key_fires(None, "hunter2"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "seedUser"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "smtpDomain"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "apiKey"), None);
+        assert_eq!(
+            sensitive_key_fires(Some("key"), "abcDEF123456"),
+            Some("KEY".to_string())
+        );
         assert_eq!(
             sensitive_key_fires_with_path(Some("structured.credentials.id"), Some("id"), "abc123"),
             Some("CREDENTIALS".to_string())

@@ -1,6 +1,6 @@
 use super::benign::{
     is_explicitly_non_sensitive_key_name, is_non_secret_source_constant_value,
-    is_placeholder_value, is_source_secret_name_reference_value,
+    is_placeholder_value, is_source_fixture_secret_value, is_source_secret_name_reference_value,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
@@ -570,6 +570,7 @@ fn looks_like_secret_value(
         || is_source_constant_reference_literal(value, source_key)
         || is_source_config_name_literal(value, source_key)
         || is_source_sensitive_name_reference_literal(value, source_key)
+        || is_source_fixture_secret_literal(value, key_name, source_key)
         || is_source_code_fragment_literal(value)
         || is_arithmetic_expression_literal(value)
         || is_interpolated_string_template(value)
@@ -985,6 +986,13 @@ fn is_source_sensitive_name_reference_literal(value: &str, source_key: &str) -> 
         return false;
     }
     is_source_secret_name_reference_value(value)
+}
+
+fn is_source_fixture_secret_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Test fixtures often assign deliberately weak credentials to variables
+    // named `expectedPassword`, `MOCK_ACCESS_TOKEN`, or similar. Do not suppress
+    // weak values by value alone; require source syntax plus a fixture key name.
+    source_key_has_code_shape(source_key) && is_source_fixture_secret_value(key_name, value)
 }
 
 fn is_lower_dotted_config_name(value: &str) -> bool {
@@ -1460,6 +1468,9 @@ mod tests {
             "GCM_AZREPOS_SP_SECRET"
         ));
         assert!(has(r#"context.Token = "CustomToken";"#, "CustomToken"));
+        assert!(has(r#"password = "pass""#, "pass"));
+        assert!(has(r#"password = "secret""#, "secret"));
+        assert!(has(r#"password = "letmein123""#, "letmein123"));
         assert!(has(r#"api_key="--real-secret-123""#, "--real-secret-123"));
         assert!(has(
             r#"private const string ApiKey = "abc12345";"#,
@@ -1558,6 +1569,11 @@ mod tests {
             r#"password = "my_password"  # Can be left empty if not used"#,
             r#"oauth_token = "my_token"  # Can be left empty if not used"#,
             r#"access_token = "TestAuthToken""#,
+            r#"const string expectedAccessToken = "LET_ME_IN";"#,
+            r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
+            r#"private const string MOCK_ACCESS_TOKEN = "at-0987654321";"#,
+            r#"private const string MOCK_REFRESH_TOKEN = "rt-1234567809";"#,
+            r#"const string expectedPassword = "letmein123";"#,
         ] {
             assert!(hits(raw).is_empty(), "{raw}: {:?}", hits(raw));
         }

@@ -7,6 +7,8 @@ const KEY_PATTERNS: &str = include_str!("benign_key_patterns.txt");
 const METADATA_KEY_PATTERNS: &str = include_str!("metadata_key_patterns.txt");
 const CONSTANT_COMPONENT_PATTERNS: &str = include_str!("benign_constant_components.txt");
 const SOURCE_SECRET_NAME_PATTERNS: &str = include_str!("source_secret_name_patterns.txt");
+const SOURCE_FIXTURE_SECRET_PATTERNS: &str = include_str!("source_fixture_secret_patterns.txt");
+const STRUCTURED_KEY_NAME_COMPONENTS: &str = include_str!("structured_key_name_components.txt");
 
 static VALUE_MATCHER: LazyLock<PatternSet> = LazyLock::new(|| PatternSet::parse(VALUE_PATTERNS));
 static KEY_MATCHER: LazyLock<PatternSet> = LazyLock::new(|| PatternSet::parse(KEY_PATTERNS));
@@ -16,6 +18,10 @@ static CONSTANT_COMPONENT_MATCHER: LazyLock<PatternSet> =
     LazyLock::new(|| PatternSet::parse(CONSTANT_COMPONENT_PATTERNS));
 static SOURCE_SECRET_NAME_MATCHER: LazyLock<SourceSecretNameSet> =
     LazyLock::new(|| SourceSecretNameSet::parse(SOURCE_SECRET_NAME_PATTERNS));
+static SOURCE_FIXTURE_SECRET_MATCHER: LazyLock<SourceFixtureSecretSet> =
+    LazyLock::new(|| SourceFixtureSecretSet::parse(SOURCE_FIXTURE_SECRET_PATTERNS));
+static STRUCTURED_KEY_NAME_COMPONENT_MATCHER: LazyLock<PatternSet> =
+    LazyLock::new(|| PatternSet::parse(STRUCTURED_KEY_NAME_COMPONENTS));
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Pattern {
@@ -37,6 +43,20 @@ struct SourceSecretNameSet {
     compact: Vec<String>,
     allowed_components: Vec<String>,
     sensitive_components: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceFixtureSecretSet {
+    key_components: Vec<String>,
+    values: Vec<FixtureValuePattern>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FixtureValuePattern {
+    Exact(String),
+    Prefix(String),
+    Suffix(String),
+    Contains(String),
 }
 
 impl PatternSet {
@@ -72,6 +92,48 @@ impl PatternSet {
                 .strip_prefix(pattern)
                 .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())),
             Pattern::Component(pattern) => normalized.split('_').any(|part| part == pattern),
+        })
+    }
+}
+
+impl SourceFixtureSecretSet {
+    fn parse(raw: &str) -> Self {
+        let mut set = Self::default();
+        for line in raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let Some((kind, pattern)) = line.split_once(':') else {
+                continue;
+            };
+            let pattern = normalize_identifier(pattern);
+            match kind.trim() {
+                "key_component" => set.key_components.push(pattern),
+                "value_exact" => set.values.push(FixtureValuePattern::Exact(pattern)),
+                "value_prefix" => set.values.push(FixtureValuePattern::Prefix(pattern)),
+                "value_suffix" => set.values.push(FixtureValuePattern::Suffix(pattern)),
+                "value_contains" => set.values.push(FixtureValuePattern::Contains(pattern)),
+                _ => {}
+            }
+        }
+        set
+    }
+
+    fn matches(&self, key_name: &str, value: &str) -> bool {
+        let key = normalize_identifier(key_name);
+        if !key
+            .split('_')
+            .any(|part| self.key_components.iter().any(|known| known == part))
+        {
+            return false;
+        }
+        let value = normalize_identifier(value);
+        self.values.iter().any(|pattern| match pattern {
+            FixtureValuePattern::Exact(pattern) => value == *pattern,
+            FixtureValuePattern::Prefix(pattern) => value.starts_with(pattern),
+            FixtureValuePattern::Suffix(pattern) => value.ends_with(pattern),
+            FixtureValuePattern::Contains(pattern) => value.contains(pattern),
         })
     }
 }
@@ -175,6 +237,43 @@ pub(crate) fn is_source_secret_name_reference_value(value: &str) -> bool {
     SOURCE_SECRET_NAME_MATCHER.matches(value)
 }
 
+/// True for weak/synthetic credentials only when the source key says fixture.
+///
+/// Rationale: values such as `pass`, `secret`, and `letmein123` can be real
+/// production credentials, so they are never globally benign. They are skipped
+/// only when paired with source identifiers like `expectedPassword`,
+/// `MOCK_ACCESS_TOKEN`, or `fake_secret`.
+pub(crate) fn is_source_fixture_secret_value(key_name: &str, value: &str) -> bool {
+    SOURCE_FIXTURE_SECRET_MATCHER.matches(key_name, value)
+}
+
+/// True when a generic JSON `"key"` value names another field/config key.
+///
+/// Rationale: many JSON schemas use objects like `{ "key": "smtpUser" }`.
+/// The value is a public identifier, not credential material. Single words and
+/// digit/symbol-bearing values are deliberately kept out so real keys still
+/// detect under generic `key`.
+pub(crate) fn is_structured_key_name_reference_value(value: &str) -> bool {
+    let value = value.trim();
+    if !(3..=64).contains(&value.len())
+        || value.bytes().any(|b| b.is_ascii_digit())
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    let normalized = normalize_identifier(value);
+    let parts = normalized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.len() >= 2
+        && parts
+            .iter()
+            .all(|part| STRUCTURED_KEY_NAME_COMPONENT_MATCHER.matches(part))
+}
+
 pub(crate) fn normalize_identifier(input: &str) -> String {
     let mut out = String::new();
     let mut prev_lower_or_digit = false;
@@ -269,5 +368,35 @@ mod tests {
         assert!(!is_source_secret_name_reference_value("CustomToken"));
         assert!(!is_source_secret_name_reference_value("PROD_SECRET_VALUE"));
         assert!(!is_source_secret_name_reference_value("tenant-7-trial"));
+    }
+
+    #[test]
+    fn source_fixture_secret_values_are_key_contextual() {
+        assert!(is_source_fixture_secret_value("expectedPassword", "pass"));
+        assert!(is_source_fixture_secret_value(
+            "MOCK_ACCESS_TOKEN",
+            "at-0987654321"
+        ));
+        assert!(is_source_fixture_secret_value(
+            "expected_access_token",
+            "LET_ME_IN-1"
+        ));
+        assert!(is_source_fixture_secret_value("fake_secret", "secret"));
+        assert!(!is_source_fixture_secret_value("password", "pass"));
+        assert!(!is_source_fixture_secret_value("access_token", "LET_ME_IN"));
+        assert!(!is_source_fixture_secret_value(
+            "expectedPassword",
+            "hunter2"
+        ));
+    }
+
+    #[test]
+    fn structured_key_name_references_require_identifier_shape() {
+        assert!(is_structured_key_name_reference_value("seedUser"));
+        assert!(is_structured_key_name_reference_value("smtpDomain"));
+        assert!(is_structured_key_name_reference_value("apiKey"));
+        assert!(!is_structured_key_name_reference_value("password"));
+        assert!(!is_structured_key_name_reference_value("abcDEF123456"));
+        assert!(!is_structured_key_name_reference_value("sk-test-token"));
     }
 }

@@ -1,0 +1,43 @@
+# Components that identify a structured JSON `"key": "nameOfThing"` value as a
+# field/configuration name rather than secret material.
+#
+# Format: component:word
+#
+# Policy:
+# - Used only for generic JSON key fields whose key name is exactly `key`.
+# - The value must be an identifier with no digits and at least two normalized
+#   components, e.g. `seedUser`, `smtpDomain`, or `apiKey`.
+# - Single words such as `password`, and concrete values containing digits or
+#   token punctuation, remain detectable.
+component:account
+component:api
+component:auth
+component:client
+component:config
+component:credential
+component:database
+component:db
+component:domain
+component:email
+component:file
+component:host
+component:id
+component:key
+component:name
+component:namespace
+component:oauth
+component:password
+component:path
+component:private
+component:public
+component:seed
+component:secret
+component:server
+component:service
+component:setting
+component:smtp
+component:token
+component:type
+component:uri
+component:url
+component:user
