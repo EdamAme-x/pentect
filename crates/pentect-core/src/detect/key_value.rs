@@ -200,6 +200,12 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     if is_self_reference_code_value(semantic_key, raw_value) {
         return false;
     }
+    if !value.quoted
+        && separator.kind == Separator::Colon
+        && is_unquoted_type_annotation_literal(raw_value, ctx.text, value.end, ctx.line_end)
+    {
+        return false;
+    }
     if !value.quoted && is_camel_case_code_reference(raw_value) {
         return false;
     }
@@ -588,6 +594,7 @@ fn looks_like_secret_value(
     }
 
     if is_format_template_literal(value, key_name)
+        || is_env_lookup_template_literal(value)
         || is_cli_option_literal(value, key_name)
         || is_file_extension_literal(value, key_name)
         || is_source_constant_reference_literal(value, source_key)
@@ -742,6 +749,36 @@ fn is_code_type_or_expression(value: &str, key_name: &str, kind: KeyKind) -> boo
         .iter()
         .any(|b| matches!(b, b'<' | b'>' | b':' | b'[' | b']' | b'&' | b';'));
     has_type_punctuation
+}
+
+fn is_unquoted_type_annotation_literal(
+    value: &str,
+    text: &str,
+    value_end: usize,
+    line_end: usize,
+) -> bool {
+    // Type annotations can use sensitive parameter names (`secret:
+    // Base32SecretKey`) without assigning a secret value. Require an unquoted
+    // PascalCase identifier and a code delimiter after it so YAML-like
+    // `api_key: Abc123Secret` still remains a candidate.
+    if !is_pascal_case_type_name(value.trim()) {
+        return false;
+    }
+    text[value_end..line_end]
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, ',' | ')' | ';' | '{' | '=' | '>'))
+}
+
+fn is_pascal_case_type_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (3..=96).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_uppercase)
+        && bytes.iter().any(u8::is_ascii_lowercase)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
 fn is_cpp_range_for_key(key: &str) -> bool {
@@ -924,6 +961,18 @@ fn is_format_template_literal(value: &str, key_name: &str) -> bool {
         return false;
     }
     key_name_indicates_template_context(key_name) || auth_template_value(key_name, value)
+}
+
+fn is_env_lookup_template_literal(value: &str) -> bool {
+    // Ansible/Jinja env lookups name where a credential will be read from:
+    // `{{ lookup('env', 'OS_PASSWORD') }}`. They are not the credential value,
+    // and the runtime secret remains visible to the env detector when present.
+    let value = value.trim();
+    if !(value.starts_with("{{") && value.ends_with("}}")) {
+        return false;
+    }
+    let inner = value[2..value.len() - 2].trim().to_ascii_lowercase();
+    inner.contains("lookup(") && (inner.contains("'env'") || inner.contains("\"env\""))
 }
 
 fn contains_printf_directive(value: &str) -> bool {
@@ -1572,6 +1621,8 @@ mod tests {
             r#"private const string ApiKey = "abc12345";"#,
             "abc12345"
         ));
+        assert!(has("api_key: Abc123Secret", "Abc123Secret"));
+        assert!(has(r#"password="{{secret123}}""#, "{{secret123}}"));
         assert!(has("otp=100482 expires soon", "100482"));
         assert!(has("verification_code=100482", "100482"));
         assert!(has(
@@ -1678,6 +1729,8 @@ mod tests {
             r#"g = Github(base_url="https://host/api/v3", login_or_token="access_token")"#,
             r#"password = "my_password"  # Can be left empty if not used"#,
             r#"oauth_token = "my_token"  # Can be left empty if not used"#,
+            r#"openstack_password: "{{ lookup('env','OS_PASSWORD') }}""#,
+            r#"vsphere_password: '{{ lookup("env", "VSPHERE_PASSWORD") }}'"#,
             r#"access_token = "TestAuthToken""#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
@@ -1708,6 +1761,9 @@ mod tests {
             "child_scope = {_FASTAPI_SCOPE_KEY: {_FASTAPI_FRONTEND_PATH_KEY: frontend_path}}",
             "cancelToken: defaultToConfig2,",
             "withCredentials: defaultToConfig2,",
+            "secret: Base32SecretKey,",
+            ">(secret: Base32SecretKey, options: Readonly<T>): Promise<HexString> {",
+            "public decode(secret: Base32SecretKey): SecretKey {",
             r#"key: Some("password".to_string()),"#,
             r#"path: Some("structured.password".to_string()),"#,
             r#"prompt: "Use secret?","#,
