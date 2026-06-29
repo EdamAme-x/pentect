@@ -116,6 +116,14 @@ pub struct AnalysisResult {
     pub parser_fallback: bool,
 }
 
+/// Local evaluator output with raw byte ranges. This is intentionally not used
+/// by scan/report UI paths; callers must not print raw slices from these spans.
+pub struct SpanAnalysisResult {
+    pub spans: Vec<Span>,
+    pub residual: Vec<ResidualNote>,
+    pub parser_fallback: bool,
+}
+
 /// Composition root. Holds the injected roles (parsers, detectors, policy); the
 /// merge -> sweep -> render core is fixed because it carries the invariants.
 pub struct Engine {
@@ -192,6 +200,16 @@ impl Engine {
         let (spans, residual) = self.masked_spans(&ir);
         AnalysisResult {
             items: masked_items(spans),
+            residual,
+            parser_fallback: fell_back,
+        }
+    }
+
+    pub fn analyze_spans(&self, input: Input) -> SpanAnalysisResult {
+        let (ir, fell_back) = self.parse(input);
+        let (spans, residual) = self.masked_spans(&ir);
+        SpanAnalysisResult {
+            spans,
             residual,
             parser_fallback: fell_back,
         }

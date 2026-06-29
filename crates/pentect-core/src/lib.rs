@@ -42,7 +42,8 @@ pub use model::{
 pub use pack::{load_pack, Pack};
 pub use parse::{EnvParser, JsonParser, Parser, TextParser, ToolResultParser};
 pub use pipeline::{
-    Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote, Summary,
+    Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote,
+    SpanAnalysisResult, Summary,
 };
 pub use placeholder::{parse_placeholder, LengthHint, PlaceholderParts};
 pub use policy::guard::{OverMaskGuard, ShapeGuard};

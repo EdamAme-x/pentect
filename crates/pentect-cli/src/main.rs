@@ -1,5 +1,6 @@
 //! Pentect CLI: local secret-capability tool boundary for AI agents.
 
+mod bench;
 mod doctor;
 mod eval;
 mod extensions;
@@ -56,6 +57,7 @@ fn main() {
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
+        Some("bench") => bench::cmd_bench(&args),
         Some("doctor") => doctor::cmd_doctor(&args),
         Some("extensions") => extensions_cmd::cmd_extensions(&args),
         Some("eval") => eval::cmd_eval(&args),
@@ -74,6 +76,7 @@ fn usage() {
          pentect codex|claude\n\
          pentect exec \"<command>\"\n\
          pentect doctor\n\
+         pentect bench creddata PATH\n\
          pentect extensions list|inspect|test [NAME]\n\
          pentect eval [--json]\n\
          pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\
@@ -82,6 +85,7 @@ fn usage() {
          pentect help\n\
          \n\
          exec runs commands with masked output.\n\
+         bench runs local precision/recall benchmarks.\n\
          doctor checks local readiness.\n\
          eval reports local precision/recall metrics.\n\
          scan reports files that contain likely secrets.\n\
@@ -104,6 +108,7 @@ fn help_text() -> &'static str {
         "  pentect agent exec \"<command>\"\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect doctor [--json]\n",
+        "  pentect bench creddata PATH [--json]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
         "  pentect eval [--json]\n\n",
         "  pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\n",
@@ -116,6 +121,7 @@ fn help_text() -> &'static str {
         "scan: broad by default; narrow with --exclude, --gitignore, .pentectignore\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness\n",
+        "bench: creddata\n",
         "extensions: list, inspect, test\n",
         "eval: precision, recall\n",
     )
@@ -1449,6 +1455,7 @@ mod tests {
     fn help_text_is_compact() {
         let help = help_text();
         assert!(help.contains("pentect exec"), "{help}");
+        assert!(help.contains("bench: creddata"), "{help}");
         assert!(help.contains("doctor: readiness"), "{help}");
         assert!(help.contains("extensions: list, inspect, test"), "{help}");
         assert!(help.contains("eval: precision, recall"), "{help}");
