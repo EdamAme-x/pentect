@@ -46,7 +46,9 @@ pub fn identity_hash(key: &[u8; 32], n_id_value: &str) -> String {
     let out = mac.finalize().into_bytes();
     let mut s = String::with_capacity(HASH_HEX_WIDTH);
     for b in out.iter().take(HASH_HEX_WIDTH / 2) {
-        s.push_str(&format!("{:02x}", b));
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
 }

@@ -89,17 +89,17 @@ fn mask_input_into_memory_vault_client(
     packs: Vec<Pack>,
     disclose_length: bool,
 ) -> Result<MaskResult, String> {
-    let snapshot = client.snapshot().map_err(|e| e.to_string())?;
+    let key = client.key().map_err(|e| e.to_string())?;
     let engine = Engine::with_profile_and_packs(profile, packs, false);
     let cfg = Config {
         disclose_length,
-        ..Config::new(snapshot.key)
+        ..Config::new(key)
     };
     let result = engine.mask(input, &cfg);
     let mut recovery = result.recovery.clone();
-    recovery.extend_same_key(env_alias_recovery(&result.masked, &snapshot.key));
+    recovery.extend_same_key(env_alias_recovery(&result.masked, &key));
     client
-        .add_recovery(&snapshot.key, &recovery)
+        .add_recovery(&key, &recovery)
         .map_err(|e| e.to_string())?;
     Ok(result)
 }
@@ -1082,15 +1082,7 @@ fn cmd_hook(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let session = match if opts.cli {
-        Session::open_capability(&session_name)
-    } else {
-        Session::open(&session_name)
-    } {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
-    let output = match handle_hook(opts.provider, &session_name, &session, input) {
+    let output = match handle_hook_lazy(opts.provider, &session_name, opts.cli, input) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
@@ -1101,6 +1093,15 @@ fn cmd_hook(args: &[String]) -> i32 {
         }
         Err(e) => die(format!("could not serialize hook output: {e}")),
     }
+}
+
+fn open_hook_session(cli: bool, session_name: &str) -> Result<Session, String> {
+    if cli {
+        Session::open_capability(session_name)
+    } else {
+        Session::open(session_name)
+    }
+    .map_err(|e| e.to_string())
 }
 
 fn run_resolved_command(
@@ -2118,6 +2119,7 @@ fn directory_session_name_for(path: &Path) -> Result<String, String> {
     ))
 }
 
+#[cfg(test)]
 fn handle_hook(
     provider: HookProvider,
     session_name: &str,
@@ -2166,6 +2168,56 @@ fn handle_hook(
     }
 }
 
+fn handle_hook_lazy(
+    provider: HookProvider,
+    session_name: &str,
+    cli: bool,
+    input: Value,
+) -> Result<Value, String> {
+    match hook_phase(provider, &input) {
+        HookPhase::BeforeTool => {
+            let Some(tool_input) = hook_field(&input, &["tool_input"]) else {
+                return Ok(json!({}));
+            };
+            let tool_name = hook_field(&input, &["tool_name"])
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (updated, changed) = match before_tool_updated_input_lazy(
+                provider,
+                session_name,
+                cli,
+                tool_name,
+                tool_input,
+            ) {
+                Ok(result) => result,
+                Err(reason) => return Ok(before_tool_block_output(provider, &reason)),
+            };
+            if changed {
+                Ok(before_tool_output(provider, updated))
+            } else {
+                Ok(json!({}))
+            }
+        }
+        HookPhase::AfterTool => {
+            let session = open_hook_session(cli, session_name)?;
+            let Some(tool_response) = hook_tool_result(&input) else {
+                return Ok(json!({}));
+            };
+            let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
+            let mut masker = OutputMasker::new_deferred(store)?;
+            let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
+            masker.flush()?;
+            if changed {
+                Ok(after_tool_output(provider, updated))
+            } else {
+                Ok(json!({}))
+            }
+        }
+        HookPhase::Other => Ok(json!({})),
+    }
+}
+
+#[cfg(test)]
 fn before_tool_updated_input(
     provider: HookProvider,
     session_name: &str,
@@ -2178,6 +2230,38 @@ fn before_tool_updated_input(
     }
     if let Some(reason) =
         maybe_materialize_masked_write(session_name, session, tool_name, tool_input)?
+    {
+        return Err(reason);
+    }
+    if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
+        if let Some(reason) = pentect_human_only_command_reason(command) {
+            return Err(reason);
+        }
+        let command = canonical_hook_shell_command(command)?;
+        let mut updated = tool_input.clone();
+        if let Some(object) = updated.as_object_mut() {
+            object.insert(
+                "command".to_string(),
+                Value::String(wrap_shell_command(provider, session_name, &command)?),
+            );
+            return Ok((updated, true));
+        }
+    }
+    Ok((tool_input.clone(), false))
+}
+
+fn before_tool_updated_input_lazy(
+    provider: HookProvider,
+    session_name: &str,
+    cli: bool,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Result<(Value, bool), String> {
+    if is_read_like_tool_name(tool_name) {
+        return Err(read_tool_block_reason(tool_name));
+    }
+    if let Some(reason) =
+        maybe_materialize_masked_write_lazy(session_name, cli, tool_name, tool_input)?
     {
         return Err(reason);
     }
@@ -2211,6 +2295,7 @@ fn canonical_hook_shell_command(command: &str) -> Result<String, String> {
     }
 }
 
+#[cfg(test)]
 fn maybe_materialize_masked_write(
     session_name: &str,
     session: &Session,
@@ -2226,6 +2311,34 @@ fn maybe_materialize_masked_write(
     if !content.contains("<<") {
         return Ok(None);
     }
+    materialize_masked_write_content(session_name, session, path, content)
+}
+
+fn maybe_materialize_masked_write_lazy(
+    session_name: &str,
+    cli: bool,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Result<Option<String>, String> {
+    if !is_write_like_tool_name(tool_name) {
+        return Ok(None);
+    }
+    let Some((path, content)) = write_path_and_content(tool_input) else {
+        return Ok(None);
+    };
+    if !content.contains("<<") {
+        return Ok(None);
+    }
+    let session = open_hook_session(cli, session_name)?;
+    materialize_masked_write_content(session_name, &session, path, content)
+}
+
+fn materialize_masked_write_content(
+    session_name: &str,
+    session: &Session,
+    path: &str,
+    content: &str,
+) -> Result<Option<String>, String> {
     let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if resolved == content {

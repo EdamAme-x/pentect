@@ -62,13 +62,14 @@ pub fn identity_sweep(
             .chain(protected.iter().copied())
             .collect(),
     );
+    let region_index = RangeIndex::new(regions.iter().map(|rg| rg.span).collect());
     let mut candidates: Vec<(usize, ByteRange)> = Vec::new();
     let bytes = raw.as_bytes();
     for m in ac.find_overlapping_iter(raw) {
         let range = ByteRange::new(m.start(), m.end());
         let on_boundary = !continues_token(bytes, range.start.wrapping_sub(1))
             && !continues_token(bytes, range.end);
-        let in_region = regions.iter().any(|rg| rg.span.contains(&range));
+        let in_region = region_index.contains(&range);
         if on_boundary && in_region && !occupied.overlaps(&range) {
             candidates.push((m.pattern().as_usize(), range));
         }

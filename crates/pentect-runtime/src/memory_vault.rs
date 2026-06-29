@@ -27,7 +27,7 @@ pub(crate) struct MemoryVaultSnapshot {
 
 struct MemoryVaultState {
     key: [u8; 32],
-    recoveries: Vec<Recovery>,
+    recovery: Recovery,
     scripts: BTreeMap<String, Zeroizing<String>>,
 }
 
@@ -60,6 +60,15 @@ impl MemoryVaultClient {
         let recovery = Recovery::load(&recovery_blob, &key)
             .map_err(|e| anyhow!("memory vault snapshot is invalid: {e}"))?;
         Ok(MemoryVaultSnapshot { key, recovery })
+    }
+
+    pub(crate) fn key(&self) -> Result<[u8; 32]> {
+        let line = self.request("KEY", "")?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 2 || fields[0] != "OK" {
+            bail!("memory vault key response is malformed");
+        }
+        decode_key_hex(fields[1])
     }
 
     pub(crate) fn add_recovery(&self, key: &[u8; 32], recovery: &Recovery) -> Result<()> {
@@ -135,9 +144,10 @@ fn serve_memory_vault_inner() -> Result<()> {
         .local_addr()
         .context("could not read vault address")?;
     let token = random_token_hex()?;
+    let key = Config::generate().key;
     let state = Arc::new(Mutex::new(MemoryVaultState {
-        key: Config::generate().key,
-        recoveries: Vec::new(),
+        key,
+        recovery: Recovery::empty_for_key(&key),
         scripts: BTreeMap::new(),
     }));
     println!(
@@ -175,6 +185,7 @@ fn handle_client(
     let mut stream = reader.into_inner();
     let fields = request_fields(&line);
     let response = match fields.as_slice() {
+        [provided_token, "KEY", ""] if *provided_token == token => key_response(state),
         [provided_token, "SNAPSHOT", ""] if *provided_token == token => snapshot_response(state),
         [provided_token, "ADD", payload] if *provided_token == token => {
             add_recovery_request(state, payload)
@@ -196,18 +207,24 @@ fn handle_client(
     Ok(())
 }
 
+fn key_response(state: &Arc<Mutex<MemoryVaultState>>) -> Result<String> {
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory vault lock poisoned"))?;
+    Ok(format!(
+        "OK\t{}",
+        data_encoding::HEXLOWER.encode(&guard.key)
+    ))
+}
+
 fn snapshot_response(state: &Arc<Mutex<MemoryVaultState>>) -> Result<String> {
     let guard = state
         .lock()
         .map_err(|_| anyhow!("memory vault lock poisoned"))?;
-    let mut batch = Recovery::empty_for_key(&guard.key);
-    for recovery in &guard.recoveries {
-        batch.extend_same_key(recovery.clone());
-    }
     Ok(format!(
         "OK\t{}\t{}",
         data_encoding::HEXLOWER.encode(&guard.key),
-        data_encoding::BASE64.encode(&batch.serialize(&guard.key))
+        data_encoding::BASE64.encode(&guard.recovery.serialize(&guard.key))
     ))
 }
 
@@ -221,7 +238,7 @@ fn add_recovery_request(state: &Arc<Mutex<MemoryVaultState>>, payload: &str) -> 
     let recovery = Recovery::load(&bytes, &guard.key)
         .map_err(|e| anyhow!("recovery payload is invalid: {e}"))?;
     if !recovery.is_empty() {
-        guard.recoveries.push(recovery);
+        guard.recovery.extend_same_key(recovery);
     }
     Ok("OK".to_string())
 }
@@ -298,9 +315,10 @@ mod tests {
     #[test]
     fn client_round_trips_recovery_through_memory_vault_state() {
         let token = "test-token".to_string();
+        let key = Config::generate().key;
         let state = Arc::new(Mutex::new(MemoryVaultState {
-            key: Config::generate().key,
-            recoveries: Vec::new(),
+            key,
+            recovery: Recovery::empty_for_key(&key),
             scripts: BTreeMap::new(),
         }));
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -308,12 +326,13 @@ mod tests {
         let server_state = state.clone();
         let server_token = token.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming().take(5) {
+            for stream in listener.incoming().take(8) {
                 handle_client(stream.unwrap(), &server_token, &server_state).unwrap();
             }
         });
 
         let client = MemoryVaultClient { addr, token };
+        assert_eq!(client.key().unwrap(), client.snapshot().unwrap().key);
         let snapshot = client.snapshot().unwrap();
         let result = Engine::with_profile(Profile::Strict).mask(
             Input {
@@ -346,9 +365,10 @@ mod tests {
     #[test]
     fn read_style_masking_registers_recovery_and_env_aliases_in_memory_vault() {
         let token = "test-token-read".to_string();
+        let key = Config::generate().key;
         let state = Arc::new(Mutex::new(MemoryVaultState {
-            key: Config::generate().key,
-            recoveries: Vec::new(),
+            key,
+            recovery: Recovery::empty_for_key(&key),
             scripts: BTreeMap::new(),
         }));
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();

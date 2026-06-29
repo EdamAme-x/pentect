@@ -21,6 +21,7 @@ use regex::Regex;
 use render::render;
 pub use render::RenderSegment;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::LazyLock;
 use sweep::identity_sweep;
 
@@ -221,6 +222,7 @@ impl Engine {
         // The common case (separated secrets) finds nothing adjacent and stops
         // after one pass.
         let mut spans: Vec<Span> = Vec::new();
+        let mut seen_ranges: HashSet<ByteRange> = HashSet::new();
         let mut work = ir.raw.clone();
         for _ in 0..4 {
             let mut found = Vec::new();
@@ -230,7 +232,7 @@ impl Engine {
                     found.extend(d.detect(&view));
                 }
             }
-            found.retain(|s| !spans.iter().any(|e| e.range == s.range));
+            found.retain(|s| !seen_ranges.contains(&s.range));
             if found.is_empty() {
                 break;
             }
@@ -252,6 +254,7 @@ impl Engine {
                     bytes[s.range.start..s.range.end].fill(b' ');
                 }
             }
+            seen_ranges.extend(found.iter().map(|s| s.range));
             spans.extend(found);
             if !more {
                 break;
