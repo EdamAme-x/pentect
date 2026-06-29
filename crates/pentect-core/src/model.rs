@@ -199,6 +199,8 @@ mod tests {
 /// label is kept (e.g. OPAQUE_BLOB over a generic LIKELY_SECRET).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DetectorId {
+    /// Span supplied by an extension adapter outside deterministic core.
+    Extension,
     Rule,
     /// A plaintext key/value assignment whose key and value features are secret-like.
     KeyValue,
@@ -217,6 +219,7 @@ pub enum DetectorId {
 impl DetectorId {
     pub fn as_str(self) -> &'static str {
         match self {
+            DetectorId::Extension => "extension",
             DetectorId::Rule => "rule",
             DetectorId::KeyValue => "key_value",
             DetectorId::Entropy => "entropy",

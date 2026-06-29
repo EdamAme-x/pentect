@@ -21,6 +21,7 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
 sha2 = { workspace = true }

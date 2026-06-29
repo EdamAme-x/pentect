@@ -253,6 +253,33 @@ impl Engine {
         }
     }
 
+    /// Mask externally supplied spans with the same merge, policy, guard,
+    /// identity sweep, renderer, and recovery-map invariants as built-ins.
+    ///
+    /// Model/NER adapters should use this instead of implementing `Detector`:
+    /// the adapter owns the external process, and core owns deterministic
+    /// rendering/recovery behavior.
+    pub fn mask_spans(&self, input: Input, spans: Vec<Span>, config: &Config) -> MaskResult {
+        let (ir, fell_back) = self.parse(input);
+        let (swept, residual) = self.mask_supplied_spans(&ir, spans);
+        let rendered = render(&ir.raw, &config.key, swept.clone(), config.disclose_length);
+
+        let summary = Summary {
+            masked_count: rendered.map.len(),
+            residual,
+            collisions: rendered.collisions,
+            parser_fallback: fell_back,
+        };
+        let items = masked_items(swept);
+        MaskResult {
+            masked: rendered.masked,
+            recovery: Recovery::seal(rendered.map, &config.key),
+            segments: rendered.segments,
+            items,
+            summary,
+        }
+    }
+
     fn masked_spans(&self, ir: &Ir) -> (Vec<Span>, Vec<ResidualNote>) {
         // Detect to a bounded fixpoint. When a found span sits against an
         // alphanumeric neighbour (two distinct secrets concatenated with no
@@ -309,6 +336,43 @@ impl Engine {
         // Classify per span. The guard may retract a context-free candidate
         // (benign shape), but never an anchored one, so an anchored Mask
         // overlapping a benign-shaped value is never suppressed before merge.
+        let mut to_mask = Vec::new();
+        let mut residual = Vec::new();
+        for s in spans {
+            let ctx_free = is_context_free(&s);
+            if ctx_free {
+                if let Some(g) = &self.guard {
+                    if g.benign(&ir.raw[s.range.start..s.range.end]) {
+                        continue;
+                    }
+                }
+            }
+            match self.policy.classify(&s) {
+                Action::Mask => to_mask.push(s),
+                Action::Warn => residual.push(ResidualNote {
+                    category: s.category,
+                    source: s.source,
+                }),
+                Action::Keep | Action::Drop => {}
+            }
+        }
+
+        let merged = merge(to_mask, &ir.protected);
+        let swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
+        (swept, residual)
+    }
+
+    fn mask_supplied_spans(&self, ir: &Ir, mut spans: Vec<Span>) -> (Vec<Span>, Vec<ResidualNote>) {
+        spans.retain(|s| {
+            s.range.start <= s.range.end
+                && s.range.end <= ir.raw.len()
+                && ir.raw.is_char_boundary(s.range.start)
+                && ir.raw.is_char_boundary(s.range.end)
+        });
+        if !self.disabled.is_empty() {
+            spans.retain(|s| !self.disabled.contains(&s.label));
+        }
+
         let mut to_mask = Vec::new();
         let mut residual = Vec::new();
         for s in spans {
@@ -621,6 +685,30 @@ mod tests {
 
         let r2 = m(&input);
         assert!(!r2.masked.contains("_length_"), "{}", r2.masked);
+    }
+
+    #[test]
+    fn external_spans_use_core_render_and_identity_sweep() {
+        let input = "Alice Smith met Alice Smith";
+        let result = Engine::with_profile(Profile::Strict).mask_spans(
+            Input::text(input),
+            vec![Span {
+                range: ByteRange::new(0, 11),
+                category: Category::Pii,
+                label: "PERSON_NAME".into(),
+                confidence: Confidence::High,
+                source: DetectorId::Extension,
+            }],
+            &Config::insecure_testing(),
+        );
+        assert!(!result.masked.contains("Alice Smith"), "{}", result.masked);
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+        assert_eq!(result.summary.masked_count, 1);
+        assert!(
+            result.masked.contains("<<PERSON_NAME_"),
+            "{}",
+            result.masked
+        );
     }
 
     #[test]

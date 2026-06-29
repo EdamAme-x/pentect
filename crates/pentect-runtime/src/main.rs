@@ -10,6 +10,7 @@
 mod approval;
 mod approve_ui;
 mod config;
+mod extension_adapter;
 mod masking;
 mod memory_vault;
 mod session;

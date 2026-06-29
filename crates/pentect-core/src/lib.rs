@@ -36,7 +36,9 @@ pub use detect::{
     KeyValueDetector, PatternMatchDetector, PatternSpec, PemDetector, RuleDetector, RuleSpec,
     SensitiveKeyDetector, StructuralDetector, UrlDetector,
 };
-pub use model::{ByteRange, Category, Confidence, Context, Input, Kind, Region, RegionKind, Span};
+pub use model::{
+    ByteRange, Category, Confidence, Context, DetectorId, Input, Kind, Region, RegionKind, Span,
+};
 pub use pack::{load_pack, Pack};
 pub use parse::{EnvParser, JsonParser, Parser, TextParser, ToolResultParser};
 pub use pipeline::{

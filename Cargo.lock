@@ -1300,6 +1300,7 @@ dependencies = [
  "jiff",
  "pdf-extract",
  "pentect-core",
+ "serde",
  "serde_json",
  "sha2",
  "simd-json",

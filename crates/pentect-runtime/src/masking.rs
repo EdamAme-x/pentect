@@ -1,3 +1,4 @@
+use crate::extension_adapter::ModelAdapters;
 use crate::session::RecoveryStore;
 #[cfg(test)]
 use crate::session::Session;
@@ -30,6 +31,7 @@ pub(crate) struct ToolScalarInput {
 pub(crate) struct OutputMasker {
     store: RecoveryStore,
     engine: Engine,
+    model_adapters: ModelAdapters,
     mode: OutputMaskerMode,
     pending: Recovery,
 }
@@ -45,6 +47,7 @@ impl OutputMasker {
         Ok(Self {
             store,
             engine: tool_boundary_engine()?,
+            model_adapters: ModelAdapters::from_env()?,
             mode: OutputMaskerMode::Shared,
             pending: Recovery::empty_for_key(&key),
         })
@@ -56,6 +59,7 @@ impl OutputMasker {
         Ok(Self {
             store,
             engine: tool_boundary_engine()?,
+            model_adapters: ModelAdapters::from_env()?,
             mode: OutputMaskerMode::Deferred { remask_recoveries },
             pending: Recovery::empty_for_key(&key),
         })
@@ -82,6 +86,7 @@ impl OutputMasker {
     pub(crate) fn mask_text(&mut self, text: &str, kind: Kind) -> Result<String, String> {
         let redacted = redact_env_derivative_lines(text);
         let remasked = self.remask_all(&redacted)?;
+        let remasked = self.mask_model_adapter_input(remasked, kind.clone(), None)?;
         let needs_text_pass = !matches!(kind, Kind::Text | Kind::ToolResult);
         let cfg = Config {
             disclose_length: true,
@@ -122,21 +127,20 @@ impl OutputMasker {
     ) -> Result<String, String> {
         let redacted = redact_env_derivative_lines(text);
         let remasked = self.remask_all(&redacted)?;
+        let context = Context {
+            path: path.map(str::to_string),
+            key: key.map(str::to_string),
+            hints: hints.to_vec(),
+            kind: region_kind,
+            format: Kind::ToolResult,
+        };
+        let remasked =
+            self.mask_model_adapter_input(remasked, Kind::ToolResult, Some(context.clone()))?;
         let cfg = Config {
             disclose_length: true,
             ..Config::new(self.store.session.key)
         };
-        let result = self.engine.mask_context(
-            remasked,
-            Context {
-                path: path.map(str::to_string),
-                key: key.map(str::to_string),
-                hints: hints.to_vec(),
-                kind: region_kind,
-                format: Kind::ToolResult,
-            },
-            &cfg,
-        );
+        let result = self.engine.mask_context(remasked, context, &cfg);
         self.record_mask_result(result)
     }
 
@@ -207,6 +211,31 @@ impl OutputMasker {
         recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
         self.record_recovery(recovery)?;
         Ok(masked)
+    }
+
+    fn mask_model_adapter_input(
+        &mut self,
+        data: String,
+        kind: Kind,
+        context: Option<Context>,
+    ) -> Result<String, String> {
+        if self.model_adapters.is_empty() {
+            return Ok(data);
+        }
+        let unchanged = data.clone();
+        let cfg = Config {
+            disclose_length: true,
+            ..Config::new(self.store.session.key)
+        };
+        match self.model_adapters.mask(
+            &self.engine,
+            Input { kind, data },
+            context.as_ref(),
+            &cfg,
+        )? {
+            Some(result) => self.record_mask_result(result),
+            None => Ok(unchanged),
+        }
     }
 
     fn record_recovery(&mut self, recovery: Recovery) -> Result<(), String> {

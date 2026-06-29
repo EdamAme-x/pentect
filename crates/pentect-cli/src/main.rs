@@ -99,8 +99,10 @@ fn help_text() -> &'static str {
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
         "`pentect scan` reports likely secret files without printing secret values.\n",
         "`pentect scan` respects `.gitignore`, `.pentectignore`, and repeated `--exclude PATTERN` entries.\n",
-        "`--extensions NAME` uses .pentect/extensions/NAME; `--extensions PATH.toml` uses a rule-pack file.\n",
+        "`--extensions NAME` uses .pentect/extensions/NAME or examples/extensions/NAME.\n",
+        "Extensions can contain rules packs (`pack.toml`) and local model adapters (`adapter.toml`).\n",
         "Default extensions can be listed in `.pentect/config.toml` as `extensions = [...]`.\n",
+        "Extension spec: docs/EXTENSIONS.md.\n",
         "Masked handles resolve only while the same Pentect-launched agent session is running.\n",
         "`pentect view '<HANDLE>'`: label, hash, length.\n",
         "Every handle also becomes a `PENTECT_...` env var for later execs.\n",
@@ -125,11 +127,17 @@ fn cmd_agent_from(start: usize, args: &[String]) {
         Ok(active) => active,
         Err(e) => die(&e),
     };
-    if let Some(value) = match active_extensions.env_value() {
+    if let Some(value) = match active_extensions.pack_env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     } {
         std::env::set_var(extensions::PACKS_ENV, value);
+    }
+    if let Some(value) = match active_extensions.adapter_env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    } {
+        std::env::set_var(extensions::ADAPTERS_ENV, value);
     }
     let mut agent_args = Vec::with_capacity(forward_args.len() + 1);
     agent_args.push(
@@ -729,11 +737,17 @@ fn parse_memory_vault_startup(line: &str) -> Result<(String, String), String> {
 }
 
 fn apply_extension_env(cmd: &mut Command, active: &extensions::ActiveExtensions) {
-    if let Some(value) = match active.env_value() {
+    if let Some(value) = match active.pack_env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     } {
         cmd.env(extensions::PACKS_ENV, value);
+    }
+    if let Some(value) = match active.adapter_env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    } {
+        cmd.env(extensions::ADAPTERS_ENV, value);
     }
 }
 

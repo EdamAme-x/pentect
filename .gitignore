@@ -26,6 +26,7 @@ sandbox/
 # it is the public audit trail for detector responsibility and benchmark debt.
 docs/*
 !docs/DETECTOR_DEBT.md
+!docs/EXTENSIONS.md
 
 # Local agent recovery/session state
 .pentect-agent/

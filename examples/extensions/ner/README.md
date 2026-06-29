@@ -1,12 +1,19 @@
-# NER extension
+# NER Adapter
 
-External NER belongs outside core.
+This directory is a model-adapter example.
 
-Expected shape:
+Run it through an agent boundary:
 
-- agent hook or wrapper calls a local NER process
-- output is converted to Pentect spans
-- raw values stay local
-- masked output returns through Pentect
+```powershell
+pentect exec --extensions ner "Write-Output 'Alice Smith opened CASE-20260101'"
+```
 
-Do not promote generated NER results into built-in regex rules.
+Files:
+
+- `adapter.toml`: Pentect adapter declaration
+- `adapter.py`: minimal local process using the adapter JSON protocol
+
+`adapter.py` is not production NER. Replace `detect()` with a local model call
+and keep stdout limited to `{ "spans": [...] }`.
+
+Rules packs are for stable patterns. Model adapters are for language-heavy PII.

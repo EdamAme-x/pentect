@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub(crate) const PACKS_ENV: &str = "PENTECT_EXTENSION_PACKS";
+pub(crate) const ADAPTERS_ENV: &str = "PENTECT_EXTENSION_ADAPTERS";
 
 const PENTECT_DIR: &str = ".pentect";
 const EXTENSIONS_DIR: &str = "extensions";
@@ -13,16 +14,26 @@ const CONFIG_FILE: &str = "config.toml";
 #[derive(Debug, Default)]
 pub(crate) struct ActiveExtensions {
     pack_paths: Vec<PathBuf>,
+    adapter_paths: Vec<PathBuf>,
 }
 
 impl ActiveExtensions {
-    pub(crate) fn env_value(&self) -> Result<Option<OsString>> {
+    pub(crate) fn pack_env_value(&self) -> Result<Option<OsString>> {
         if self.pack_paths.is_empty() {
             return Ok(None);
         }
         std::env::join_paths(&self.pack_paths)
             .map(Some)
             .context("could not encode extension pack paths")
+    }
+
+    pub(crate) fn adapter_env_value(&self) -> Result<Option<OsString>> {
+        if self.adapter_paths.is_empty() {
+            return Ok(None);
+        }
+        std::env::join_paths(&self.adapter_paths)
+            .map(Some)
+            .context("could not encode extension adapter paths")
     }
 }
 
@@ -151,8 +162,11 @@ pub(crate) fn active_from_specs(
 ) -> Result<ActiveExtensions> {
     let mut specs = config_specs()?;
     extend_unique(&mut specs, explicit_specs);
-    let pack_paths = pack_paths_for_specs(&specs, create_named)?;
-    Ok(ActiveExtensions { pack_paths })
+    let (pack_paths, adapter_paths) = extension_paths_for_specs(&specs, create_named)?;
+    Ok(ActiveExtensions {
+        pack_paths,
+        adapter_paths,
+    })
 }
 
 pub(crate) fn load_packs_from_args(args: &[String], create_named: bool) -> Result<Vec<Pack>> {
@@ -165,6 +179,11 @@ pub(crate) fn load_packs_from_specs(
 ) -> Result<Vec<Pack>> {
     let active = active_from_specs(explicit_specs, create_named)?;
     let mut packs = Vec::new();
+    if !active.adapter_paths.is_empty() {
+        bail!(
+            "model adapter extensions are only used by agent tool-boundary commands; use a rules pack for this command"
+        );
+    }
     for path in active.pack_paths {
         let display = path.display();
         let src = std::fs::read_to_string(&path)
@@ -212,21 +231,37 @@ fn parse_config_extensions(value: &toml::Value) -> Result<Vec<String>> {
     }
 }
 
-fn pack_paths_for_specs(specs: &[String], create_named: bool) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
+fn extension_paths_for_specs(
+    specs: &[String],
+    create_named: bool,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut packs = Vec::new();
+    let mut adapters = Vec::new();
     for spec in specs {
         if is_path_spec(spec) {
-            paths.extend(pack_paths_for_path(Path::new(spec))?);
+            let found = extension_paths_for_path(Path::new(spec))?;
+            packs.extend(found.pack_paths);
+            adapters.extend(found.adapter_paths);
         } else {
-            paths.extend(pack_paths_for_named(spec, create_named)?);
+            let found = extension_paths_for_named(spec, create_named)?;
+            packs.extend(found.pack_paths);
+            adapters.extend(found.adapter_paths);
         }
     }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    packs.sort();
+    packs.dedup();
+    adapters.sort();
+    adapters.dedup();
+    Ok((packs, adapters))
 }
 
-fn pack_paths_for_named(name: &str, _create: bool) -> Result<Vec<PathBuf>> {
+#[derive(Debug, Default)]
+struct ExtensionPaths {
+    pack_paths: Vec<PathBuf>,
+    adapter_paths: Vec<PathBuf>,
+}
+
+fn extension_paths_for_named(name: &str, _create: bool) -> Result<ExtensionPaths> {
     validate_extension_name(name)?;
     let project_dir = extensions_root().join(name);
     let example_dir = examples_extensions_root().join(name);
@@ -241,45 +276,71 @@ fn pack_paths_for_named(name: &str, _create: bool) -> Result<Vec<PathBuf>> {
             example_dir.display()
         );
     };
-    let mut paths = pack_paths_in_extension_dir(&dir)?;
+    let mut paths = extension_paths_in_dir(&dir)?;
     if paths.is_empty() && dir != example_dir && example_dir.exists() {
-        paths = pack_paths_in_extension_dir(&example_dir)?;
+        paths = extension_paths_in_dir(&example_dir)?;
     }
     if paths.is_empty() {
         bail!(
-            "extension '{name}' has no rule packs; add '{}' or '{}'",
+            "extension '{name}' has no packs or adapters; add '{}', '{}', '{}', or '{}'",
             dir.join("pack.toml").display(),
-            dir.join("packs").display()
+            dir.join("packs").display(),
+            dir.join("adapter.toml").display(),
+            dir.join("adapters").display()
         );
     }
     Ok(paths)
 }
 
-fn pack_paths_for_path(path: &Path) -> Result<Vec<PathBuf>> {
+fn extension_paths_for_path(path: &Path) -> Result<ExtensionPaths> {
     if path.is_file() {
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
             bail!("extension pack must be a .toml file: {}", path.display());
         }
-        return canonical_file(path).map(|path| vec![path]);
+        let mut paths = ExtensionPaths::default();
+        let file = canonical_file(path)?;
+        if looks_like_adapter_file(path) {
+            paths.adapter_paths.push(file);
+        } else {
+            paths.pack_paths.push(file);
+        }
+        return Ok(paths);
     }
     if path.is_dir() {
-        return pack_paths_in_extension_dir(path);
+        return extension_paths_in_dir(path);
     }
     bail!("extension path does not exist: {}", path.display())
 }
 
-fn pack_paths_in_extension_dir(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
+fn extension_paths_in_dir(dir: &Path) -> Result<ExtensionPaths> {
+    let mut paths = ExtensionPaths::default();
     let pack = dir.join("pack.toml");
     if pack.exists() {
-        paths.push(canonical_file(&pack)?);
+        paths.pack_paths.push(canonical_file(&pack)?);
     }
     let packs_dir = dir.join("packs");
     if packs_dir.exists() {
-        paths.extend(toml_files_in_dir(&packs_dir)?);
+        paths.pack_paths.extend(toml_files_in_dir(&packs_dir)?);
     }
-    paths.sort();
+    let adapter = dir.join("adapter.toml");
+    if adapter.exists() {
+        paths.adapter_paths.push(canonical_file(&adapter)?);
+    }
+    let adapters_dir = dir.join("adapters");
+    if adapters_dir.exists() {
+        paths
+            .adapter_paths
+            .extend(toml_files_in_dir(&adapters_dir)?);
+    }
+    paths.pack_paths.sort();
+    paths.adapter_paths.sort();
     Ok(paths)
+}
+
+impl ExtensionPaths {
+    fn is_empty(&self) -> bool {
+        self.pack_paths.is_empty() && self.adapter_paths.is_empty()
+    }
 }
 
 fn canonical_file(path: &Path) -> Result<PathBuf> {
@@ -293,6 +354,15 @@ fn extensions_root() -> PathBuf {
 
 fn examples_extensions_root() -> PathBuf {
     PathBuf::from("examples").join(EXTENSIONS_DIR)
+}
+
+fn looks_like_adapter_file(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("adapter.toml")
+        || path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("adapters")
 }
 
 fn validate_extension_spec(spec: &str) -> Result<()> {
@@ -450,7 +520,48 @@ mod tests {
                 .unwrap()
                 .as_millis()
         );
-        let err = pack_paths_for_named(&name, true).unwrap_err().to_string();
+        let err = extension_paths_for_named(&name, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("was not found"), "{err}");
+    }
+
+    #[test]
+    fn directory_extensions_can_contain_packs_and_adapters() {
+        let root =
+            std::env::temp_dir().join(format!("pentect-extension-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("pack.toml"), "").unwrap();
+        std::fs::write(root.join("adapter.toml"), "").unwrap();
+
+        let paths = extension_paths_for_path(&root).unwrap();
+        assert_eq!(
+            paths.pack_paths,
+            vec![root.join("pack.toml").canonicalize().unwrap()]
+        );
+        assert_eq!(
+            paths.adapter_paths,
+            vec![root.join("adapter.toml").canonicalize().unwrap()]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn adapter_only_extensions_are_rejected_for_pack_only_loading() {
+        let root =
+            std::env::temp_dir().join(format!("pentect-adapter-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("adapter.toml"), "").unwrap();
+
+        let err = match load_packs_from_specs(vec![root.display().to_string()], true) {
+            Ok(_) => panic!("expected adapter-only extension to be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("model adapter extensions"), "{err}");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
