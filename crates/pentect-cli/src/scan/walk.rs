@@ -1,17 +1,36 @@
 use super::report::SkippedFile;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(super) fn collect_scan_roots(
     roots: &[PathBuf],
+    excludes: &[String],
     skipped: &mut Vec<SkippedFile>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     for root in roots {
-        if let Some(git_files) = git_files_for_root(root) {
-            files.extend(git_files);
+        if let Some((base, git_files)) = git_files_for_root(root) {
+            let matcher = ExcludeMatcher::new(&base, excludes)?;
+            let mut matchers_by_dir: BTreeMap<PathBuf, ExcludeMatcher> = BTreeMap::new();
+            for path in git_files {
+                let parent = path.parent().unwrap_or(&base).to_path_buf();
+                let file_matcher = if let Some(cached) = matchers_by_dir.get(&parent) {
+                    cached.clone()
+                } else {
+                    let built = matcher.with_ancestors(&path)?;
+                    matchers_by_dir.insert(parent, built.clone());
+                    built
+                };
+                if !file_matcher.is_excluded(&path, false) {
+                    files.push(path);
+                }
+            }
         } else {
-            collect_files(root, &mut files, skipped)?;
+            let base = scan_base(root);
+            let matcher = ExcludeMatcher::new(&base, excludes)?;
+            collect_files(root, &mut files, skipped, &matcher)?;
         }
     }
     files.sort();
@@ -103,6 +122,7 @@ fn collect_files(
     path: &Path,
     out: &mut Vec<PathBuf>,
     skipped: &mut Vec<SkippedFile>,
+    matcher: &ExcludeMatcher,
 ) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(path)
         .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
@@ -111,6 +131,9 @@ fn collect_files(
         return Ok(());
     }
     if meta.is_file() {
+        if matcher.is_excluded(path, false) {
+            return Ok(());
+        }
         out.push(path.to_path_buf());
         return Ok(());
     }
@@ -118,9 +141,13 @@ fn collect_files(
         skipped.push(SkippedFile::new(path, "not a regular file"));
         return Ok(());
     }
+    if matcher.is_excluded(path, true) {
+        return Ok(());
+    }
     if is_ignored_dir(path) {
         return Ok(());
     }
+    let matcher = matcher.with_directory(path)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(path)
         .map_err(|e| format!("could not read directory '{}': {e}", path.display()))?
@@ -131,12 +158,12 @@ fn collect_files(
     }
     entries.sort();
     for entry in entries {
-        collect_files(&entry, out, skipped)?;
+        collect_files(&entry, out, skipped, &matcher)?;
     }
     Ok(())
 }
 
-fn git_files_for_root(root: &Path) -> Option<Vec<PathBuf>> {
+fn git_files_for_root(root: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
     let root_abs = root.canonicalize().ok()?;
     let git_cwd = if root_abs.is_file() {
         root_abs.parent()?
@@ -178,11 +205,164 @@ fn git_files_for_root(root: &Path) -> Option<Vec<PathBuf>> {
         let rel = String::from_utf8_lossy(raw);
         files.push(top.join(rel.as_ref()));
     }
-    Some(files)
+    Some((top, files))
 }
 
 fn git_pathspec(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn scan_base(root: &Path) -> PathBuf {
+    let absolute = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if absolute.is_file() {
+        absolute.parent().map(Path::to_path_buf).unwrap_or(absolute)
+    } else {
+        absolute
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExcludeMatcher {
+    root: PathBuf,
+    layers: Vec<ExcludeLayer>,
+    cli_layer: Option<ExcludeLayer>,
+}
+
+impl ExcludeMatcher {
+    fn new(base: &Path, excludes: &[String]) -> Result<Self, String> {
+        let root = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+        let mut layers = Vec::new();
+        if let Some(layer) = ExcludeLayer::from_directory(&root)? {
+            layers.push(layer);
+        }
+        let cli_layer = ExcludeLayer::from_cli(&root, excludes)?;
+        Ok(Self {
+            root,
+            layers,
+            cli_layer,
+        })
+    }
+
+    fn with_directory(&self, dir: &Path) -> Result<Self, String> {
+        let mut next = self.clone();
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if dir != self.root {
+            next.push_directory(&dir)?;
+        }
+        Ok(next)
+    }
+
+    fn with_ancestors(&self, path: &Path) -> Result<Self, String> {
+        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let Some(parent) = target.parent() else {
+            return Ok(self.clone());
+        };
+        let mut dirs = Vec::new();
+        let mut current = Some(parent);
+        while let Some(dir) = current {
+            if !dir.starts_with(&self.root) {
+                break;
+            }
+            if dir != self.root {
+                dirs.push(dir.to_path_buf());
+            }
+            if dir == self.root {
+                break;
+            }
+            current = dir.parent();
+        }
+        dirs.reverse();
+
+        let mut next = self.clone();
+        for dir in dirs {
+            next.push_directory(&dir)?;
+        }
+        Ok(next)
+    }
+
+    fn push_directory(&mut self, dir: &Path) -> Result<(), String> {
+        if let Some(layer) = ExcludeLayer::from_directory(dir)? {
+            self.layers.push(layer);
+        }
+        Ok(())
+    }
+
+    fn is_excluded(&self, path: &Path, is_dir: bool) -> bool {
+        let mut ignored = false;
+        for layer in self.layers.iter().chain(self.cli_layer.iter()) {
+            match layer.matched(path, is_dir) {
+                Some(true) => ignored = true,
+                Some(false) => ignored = false,
+                None => {}
+            }
+        }
+        ignored
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExcludeLayer {
+    base: PathBuf,
+    matcher: Gitignore,
+}
+
+impl ExcludeLayer {
+    fn from_directory(base: &Path) -> Result<Option<Self>, String> {
+        let mut builder = GitignoreBuilder::new(base);
+        let mut loaded = false;
+        for name in [".gitignore", ".pentectignore"] {
+            let path = base.join(name);
+            if path.is_file() {
+                if let Some(err) = builder.add(&path) {
+                    return Err(format!(
+                        "could not read ignore file '{}': {err}",
+                        path.display()
+                    ));
+                }
+                loaded = true;
+            }
+        }
+        if !loaded {
+            return Ok(None);
+        }
+        Self::build(base, builder).map(Some)
+    }
+
+    fn from_cli(base: &Path, excludes: &[String]) -> Result<Option<Self>, String> {
+        if excludes.is_empty() {
+            return Ok(None);
+        }
+        let mut builder = GitignoreBuilder::new(base);
+        for pattern in excludes {
+            builder
+                .add_line(None, pattern)
+                .map_err(|e| format!("invalid exclude pattern '{pattern}': {e}"))?;
+        }
+        Self::build(base, builder).map(Some)
+    }
+
+    fn build(base: &Path, builder: GitignoreBuilder) -> Result<Self, String> {
+        let matcher = builder
+            .build()
+            .map_err(|e| format!("could not build scan exclude matcher: {e}"))?;
+        Ok(Self {
+            base: base.to_path_buf(),
+            matcher,
+        })
+    }
+
+    fn matched(&self, path: &Path, is_dir: bool) -> Option<bool> {
+        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let rel = target.strip_prefix(&self.base).ok()?;
+        let matched = self.matcher.matched_path_or_any_parents(rel, is_dir);
+        if matched.is_ignore() {
+            Some(true)
+        } else if matched.is_whitelist() {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 fn is_ignored_dir(path: &Path) -> bool {

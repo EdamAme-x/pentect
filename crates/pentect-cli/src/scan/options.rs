@@ -5,6 +5,7 @@ pub(super) struct ScanOpts {
     pub(super) paths: Vec<PathBuf>,
     pub(super) json: bool,
     pub(super) no_fail: bool,
+    pub(super) excludes: Vec<String>,
 }
 
 impl ScanOpts {
@@ -12,6 +13,7 @@ impl ScanOpts {
         let mut paths = Vec::new();
         let mut json = false;
         let mut no_fail = false;
+        let mut excludes = Vec::new();
         let mut i = 2usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -22,6 +24,11 @@ impl ScanOpts {
                 "--no-fail" => {
                     no_fail = true;
                     i += 1;
+                }
+                "--exclude" => {
+                    let flag = args[i].clone();
+                    let value = required_value(args, &mut i, &flag)?;
+                    excludes.push(value);
                 }
                 "--pack" | "--pack-dir" | "--extensions" => {
                     let flag = args[i].clone();
@@ -43,6 +50,7 @@ impl ScanOpts {
             paths,
             json,
             no_fail,
+            excludes,
         })
     }
 }

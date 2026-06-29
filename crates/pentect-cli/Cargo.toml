@@ -20,6 +20,7 @@ pdf = ["dep:pdf-extract"]
 pentect-core = { path = "../pentect-core" }
 pentect-runtime = { path = "../pentect-runtime" }
 anyhow = { workspace = true }
+ignore = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 serde_json = { workspace = true }
 crossterm = { workspace = true }

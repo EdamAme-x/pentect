@@ -67,7 +67,7 @@ fn usage() {
         "pentect\n\
          pentect codex|claude\n\
          pentect exec \"<command>\"\n\
-         pentect scan [PATH...]\n\
+         pentect scan [--exclude PATTERN] [PATH...]\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          pentect help\n\
@@ -92,12 +92,13 @@ fn help_text() -> &'static str {
         "  pentect codex|claude [--extensions NAME|PATH.toml]\n",
         "  pentect agent exec \"<command>\"\n",
         "  pentect exec \"<command>\"\n\n",
-        "  pentect scan [PATH...]\n\n",
+        "  pentect scan [--exclude PATTERN] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
         "`pentect` opens the approval dashboard.\n",
         "Set `no_approve = true` in `.pentect/config.toml` to bypass approval prompts for this project.\n",
         "`pentect exec` returns normal stdout/stderr with secrets masked.\n",
         "`pentect scan` reports likely secret files without printing secret values.\n",
+        "`pentect scan` respects `.gitignore`, `.pentectignore`, and repeated `--exclude PATTERN` entries.\n",
         "`--extensions NAME` uses .pentect/extensions/NAME; `--extensions PATH.toml` uses a rule-pack file.\n",
         "Default extensions can be listed in `.pentect/config.toml` as `extensions = [...]`.\n",
         "Masked handles resolve only while the same Pentect-launched agent session is running.\n",

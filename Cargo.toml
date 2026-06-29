@@ -26,6 +26,7 @@ bs58 = "0.5"
 bip39 = { version = "2.2.2", features = ["all-languages"] }
 flate2 = "1"
 getrandom = "0.2"
+ignore = "0.4"
 jiff = "0.2"
 toml = "0.8"
 phonenumber = "0.3"

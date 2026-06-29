@@ -41,7 +41,7 @@ fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
         roots: opts.paths.clone(),
         ..ScanReport::default()
     };
-    let files = collect_scan_roots(&opts.paths, &mut report.skipped)?;
+    let files = collect_scan_roots(&opts.paths, &opts.excludes, &mut report.skipped)?;
     for result in scan_files(files, packs)? {
         match result {
             ScanFile::Clean => report.files_scanned += 1,
@@ -227,6 +227,30 @@ mod tests {
         assert_eq!(opts.paths, vec![PathBuf::from("app.env")]);
         assert!(opts.json);
         assert!(opts.no_fail);
+        assert!(opts.excludes.is_empty());
+    }
+
+    #[test]
+    fn scan_parse_accepts_repeated_excludes() {
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--exclude".into(),
+            "package-lock.json".into(),
+            "--exclude".into(),
+            "fixtures/**".into(),
+            "app.env".into(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        assert_eq!(opts.paths, vec![PathBuf::from("app.env")]);
+        assert_eq!(opts.excludes, vec!["package-lock.json", "fixtures/**"]);
+    }
+
+    #[test]
+    fn scan_parse_rejects_missing_exclude_value() {
+        let args = vec!["pentect".into(), "scan".into(), "--exclude".into()];
+        let err = ScanOpts::parse(&args).unwrap_err();
+        assert!(err.contains("--exclude requires a value"), "{err}");
     }
 
     #[test]
@@ -277,6 +301,149 @@ mod tests {
         assert!(rendered.contains("RUNPOD_API_KEY"), "{rendered}");
         assert!(!rendered.contains("rpa_FAKEPENTECTSCAN"), "{rendered}");
         assert!(!rendered.contains("hello"), "{rendered}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_exclude_removes_files_from_scan_set() {
+        let root = temp_scan_root("pentect-scan-exclude");
+        std::fs::write(
+            root.join(".env"),
+            "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package-lock.json"),
+            r#"{"env":"RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef"}"#,
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--exclude".into(),
+            "package-lock.json".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+
+        assert_eq!(report.files_scanned, 1, "{}", report_json(&report));
+        assert!(report
+            .files
+            .iter()
+            .all(|file| file.path.file_name().unwrap() != "package-lock.json"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_pentectignore_removes_files_from_scan_set() {
+        let root = temp_scan_root("pentect-scan-pentectignore");
+        std::fs::write(root.join(".pentectignore"), "ignored.env\n").unwrap();
+        std::fs::write(
+            root.join(".env"),
+            "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("ignored.env"),
+            "RUNPOD_API_KEY=rpa_IGNOREDPENTECTSCAN1234567890abcd\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+
+        assert_eq!(report.files_scanned, 2, "{}", report_json(&report));
+        assert!(report
+            .files
+            .iter()
+            .all(|file| file.path.file_name().unwrap() != "ignored.env"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_gitignore_removes_files_from_fallback_walk() {
+        let root = temp_scan_root("pentect-scan-gitignore");
+        std::fs::write(root.join(".gitignore"), "ignored.env\n").unwrap();
+        std::fs::write(
+            root.join(".env"),
+            "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("ignored.env"),
+            "RUNPOD_API_KEY=rpa_IGNOREDPENTECTSCAN1234567890abcd\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+
+        assert_eq!(report.files_scanned, 2, "{}", report_json(&report));
+        assert!(report
+            .files
+            .iter()
+            .all(|file| file.path.file_name().unwrap() != "ignored.env"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_nested_ignore_files_remove_files_from_fallback_walk() {
+        let root = temp_scan_root("pentect-scan-nested-ignore");
+        std::fs::create_dir_all(root.join("sub").join("child")).unwrap();
+        std::fs::write(root.join("sub").join(".pentectignore"), "ignored.env\n").unwrap();
+        std::fs::write(
+            root.join("sub").join("child").join(".gitignore"),
+            "also.env\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".env"),
+            "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sub").join("ignored.env"),
+            "RUNPOD_API_KEY=rpa_IGNOREDPENTECTSCAN1234567890abcd\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sub").join("child").join("also.env"),
+            "RUNPOD_API_KEY=rpa_IGNOREDPENTECTSCAN2234567890abcd\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+
+        assert!(report
+            .files
+            .iter()
+            .all(|file| file.path.file_name().unwrap() != "ignored.env"));
+        assert!(report
+            .files
+            .iter()
+            .all(|file| file.path.file_name().unwrap() != "also.env"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
