@@ -66,7 +66,10 @@ Elapsed: 153352 ms
 Current working result after structural false-positive reductions, source
 name/reference and fixture filtering, generic-key name filtering, and RFC
 documentation-value handling, plaintext GitHub node-id entropy suppression, and
-C-family ternary syntax suppression:
+C-family ternary syntax suppression. Quoted `Authorization` values with
+credential schemes such as `Basic` and `ApiKey` are now scored on the credential
+part, while source constants that name their own environment/config keys remain
+metadata:
 
 ```text
 CredData commit: 9a55c40
@@ -75,16 +78,16 @@ Rows: 66898
 Files: 10865
 True rows: 15104
 False rows: 51794
-TP: 7043
-FP: 15581
-FN: 8061
-Line only: 244
-Unlabeled: 78947
+TP: 7067
+FP: 15567
+FN: 8037
+Line only: 243
+Unlabeled: 78972
 Missing files: 0
-Precision: 0.311
-Recall: 0.466
-F1: 0.373
-Elapsed: 32515 ms
+Precision: 0.312
+Recall: 0.468
+F1: 0.375
+Elapsed: 31924 ms
 ```
 
 Weak groups:

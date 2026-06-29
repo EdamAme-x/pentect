@@ -444,6 +444,20 @@ fn parse_value(text: &str, start: usize, line_end: usize, kind: KeyKind) -> Opti
         let end = find_quote_or_line_end(text, pos, line_end, quote);
         let start = trim_ascii_ws_start(text, pos, end);
         let end = trim_ascii_ws_end(text, start, end);
+        if matches!(kind, KeyKind::Token | KeyKind::Strong) {
+            let first_end = scan_unquoted_token_end(text, start, end);
+            let first = &text[start..first_end];
+            if is_auth_credential_scheme(first) {
+                let credential_start = trim_ascii_ws_start(text, first_end, end);
+                if credential_start < end {
+                    return Some(ValueCandidate {
+                        start: credential_start,
+                        end,
+                        quoted: false,
+                    });
+                }
+            }
+        }
         return (start < end).then_some(ValueCandidate {
             start,
             end,
@@ -454,7 +468,7 @@ fn parse_value(text: &str, start: usize, line_end: usize, kind: KeyKind) -> Opti
     if matches!(kind, KeyKind::Token | KeyKind::Strong) {
         let first_end = scan_unquoted_token_end(text, pos, line_end);
         let first = &text[pos..first_end];
-        if matches_ignore_ascii_case(first, &["bearer", "basic", "token"]) {
+        if is_auth_credential_scheme(first) {
             pos = trim_ascii_ws_start(text, first_end, line_end);
             if pos >= line_end {
                 return None;
@@ -483,6 +497,10 @@ fn scan_unquoted_token_end(text: &str, start: usize, line_end: usize) -> usize {
         end = start + offset + ch.len_utf8();
     }
     end
+}
+
+fn is_auth_credential_scheme(value: &str) -> bool {
+    matches_ignore_ascii_case(value, &["bearer", "basic", "token", "apikey", "api-key"])
 }
 
 fn starts_form_param_at(text: &str, start: usize, line_end: usize) -> bool {
@@ -573,6 +591,7 @@ fn looks_like_secret_value(
         || is_cli_option_literal(value, key_name)
         || is_file_extension_literal(value, key_name)
         || is_source_constant_reference_literal(value, source_key)
+        || is_source_declared_name_literal(value, key_name, source_key)
         || is_source_config_name_literal(value, source_key)
         || is_source_sensitive_name_reference_literal(value, source_key)
         || is_source_fixture_secret_literal(value, key_name, source_key)
@@ -987,6 +1006,25 @@ fn is_source_constant_reference_literal(value: &str, source_key: &str) -> bool {
         return false;
     }
     is_non_secret_source_constant_value(value)
+}
+
+fn is_source_declared_name_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Source constants often publish the name of an environment/config setting,
+    // including setting names with secret words:
+    // `GcmTraceSecrets = "GCM_TRACE_SECRETS"` or
+    // `MsAuthFlow = "GCM_MSAUTH_FLOW"`. That string is public lookup metadata,
+    // not the runtime credential. Keep this structural: require source syntax,
+    // an ALL_CAPS identifier value with no digits, and a compact value name that
+    // is the declared identifier or that identifier with a namespace prefix.
+    if !source_key_has_code_shape(source_key) || !is_uppercase_identifier_constant(value) {
+        return false;
+    }
+    let key_compact = key_name.replace('_', "");
+    if key_compact.len() < 4 {
+        return false;
+    }
+    let value_compact = normalize_key(value).replace('_', "");
+    value_compact == key_compact || value_compact.ends_with(&key_compact)
 }
 
 fn is_uppercase_identifier_constant(value: &str) -> bool {
@@ -1545,6 +1583,14 @@ mod tests {
             "eyJabcdefghijklmnop123456"
         ));
         assert!(has("Authorization: Bearer abcdefgh123", "abcdefgh123"));
+        assert!(has(
+            r#"authorization: 'Basic Wv0dTjLryp=='"#,
+            "Wv0dTjLryp=="
+        ));
+        assert!(has(
+            r#"authorization: 'ApiKey Fy0ySzEbqm=='"#,
+            "Fy0ySzEbqm=="
+        ));
         assert!(has("body=\"access_token=abc12345&state=ok\"", "abc12345"));
         assert!(has("dbPassword = \"hunter2\"", "hunter2"));
         assert!(has(
@@ -1568,6 +1614,8 @@ mod tests {
             "public_token_label=docs",
             "port=5432 workers=4 timeout_ms=30000 status=200",
             "Authorization: Bearer docs",
+            r#"authorization: "Basic docs""#,
+            r#"authorization: "ApiKey docs""#,
             "jwt_like=aaa.bbb.ccc",
             "Authorization: Basic login_and_password_removed",
             "password=start_pass_downsample",
@@ -1622,6 +1670,8 @@ mod tests {
             r#"var correlationKey = ".xsrf";"#,
             r#"public const string IsW365EnvironmentKeyName = "IsW365Environment";"#,
             r#"public const string PasswordStoreDirEnvar = "PASSWORD_STORE_DIR";"#,
+            r#"public const string GcmTraceSecrets = "GCM_TRACE_SECRETS";"#,
+            r#"public const string MsAuthFlow = "GCM_MSAUTH_FLOW";"#,
             r#"public const string HttpSslCertPasswordProtected = "http.sslcertpasswordprotected";"#,
             r#"public const string DataCenterPasswordReset = "/passwordreset";"#,
             r#"o.ClientSecret = Configuration["github-token:clientsecret"];"#,
