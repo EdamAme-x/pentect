@@ -229,7 +229,25 @@ fn normalize_key(key: &str) -> String {
 /// literals, or an already-rendered placeholder (idempotency).
 fn is_benign_value(v: &str) -> bool {
     let t = v.trim();
-    t.is_empty() || matches!(t, "true" | "false" | "null") || is_rendered_placeholder(t)
+    t.is_empty()
+        || matches!(t, "true" | "false" | "null")
+        || is_rendered_placeholder(t)
+        || is_version_literal(t)
+}
+
+fn is_version_literal(value: &str) -> bool {
+    let t = value
+        .trim_start_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '^' | '~'))
+        .trim();
+    if matches!(t, "*" | "latest") {
+        return true;
+    }
+    if !(3..=64).contains(&t.len()) || !t.as_bytes()[0].is_ascii_digit() {
+        return false;
+    }
+    t.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'*' | b'x' | b'X'))
+        && t.bytes().filter(|b| *b == b'.').count() >= 1
 }
 
 fn is_rendered_placeholder(v: &str) -> bool {
@@ -412,5 +430,7 @@ mod tests {
             None,
             "<<SECRET_0123456789abcdef>>"
         ));
+        assert_eq!(sensitive_key_fires(Some("cookie-signature"), "1.2.2"), None);
+        assert_eq!(sensitive_key_fires(Some("pbkdf2-password"), "^1.0.0"), None);
     }
 }

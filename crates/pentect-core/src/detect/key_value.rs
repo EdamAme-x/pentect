@@ -175,7 +175,10 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     };
     let raw_value = &ctx.text[value.start..value.end];
     let key_name = normalize_key(key);
-    if !value.quoted && is_self_reference_code_value(key, raw_value) {
+    if is_self_reference_code_value(key, raw_value) {
+        return false;
+    }
+    if !value.quoted && is_camel_case_code_reference(raw_value) {
         return false;
     }
     if !value.quoted && is_code_type_or_expression(raw_value, &key_name, kind) {
@@ -591,6 +594,9 @@ fn is_code_type_or_expression(value: &str, key_name: &str, kind: KeyKind) -> boo
     if value.is_empty() || value.chars().any(char::is_whitespace) {
         return false;
     }
+    if value.starts_with(['{', '[', '(']) {
+        return true;
+    }
     if is_plain_code_identifier(value) && !key_allows_low_entropy_literal(key_name, kind) {
         return true;
     }
@@ -684,8 +690,35 @@ fn is_plain_code_identifier(value: &str) -> bool {
 fn is_self_reference_code_value(key: &str, value: &str) -> bool {
     let key_name = normalize_key(key);
     let value_name = normalize_key(value);
-    !value_name.is_empty()
-        && (key_name == value_name || key_name.ends_with(&format!("_{value_name}")))
+    if value_name.is_empty() {
+        return false;
+    }
+    key_name == value_name
+        || key_name.ends_with(&format!("_{value_name}"))
+        || key_name.strip_suffix("_key").is_some_and(|prefix| {
+            prefix == value_name || prefix.ends_with(&format!("_{value_name}"))
+        })
+}
+
+fn is_camel_case_code_reference(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if !(4..=64).contains(&bytes.len())
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+        || !bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'$'))
+    {
+        return false;
+    }
+    let has_lower = bytes.iter().any(u8::is_ascii_lowercase);
+    let has_upper = bytes.iter().any(u8::is_ascii_uppercase);
+    let starts_lower_or_symbol = bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase() || matches!(b, b'_' | b'$'));
+    let digit_count = bytes.iter().filter(|b| b.is_ascii_digit()).count();
+    starts_lower_or_symbol && has_lower && has_upper && digit_count <= 2
 }
 
 fn normalize_key(input: &str) -> String {
@@ -839,6 +872,10 @@ mod tests {
             "session: Option<String>,",
             "csrf: [u8; 32],",
             "env_names: BTreeSet<String>,",
+            r#"_FASTAPI_INCLUDED_ROUTER_KEY = "included_router""#,
+            "child_scope = {_FASTAPI_SCOPE_KEY: {_FASTAPI_FRONTEND_PATH_KEY: frontend_path}}",
+            "cancelToken: defaultToConfig2,",
+            "withCredentials: defaultToConfig2,",
             r#"key: Some("password".to_string()),"#,
             r#"path: Some("structured.password".to_string()),"#,
             r#"prompt: "Use secret?","#,

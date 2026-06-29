@@ -42,12 +42,38 @@ impl ScanScope {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
+        let file_name_lower = file_name.to_ascii_lowercase();
         if normalized.contains("/proptest-regressions/")
             || file_name == "tests.rs"
             || file_name.ends_with("_test.rs")
             || file_name.ends_with("_tests.rs")
+            || file_name.ends_with("_test.go")
             || file_name.starts_with("test_")
+            || file_name_lower.ends_with(".test.js")
+            || file_name_lower.ends_with(".test.jsx")
+            || file_name_lower.ends_with(".test.ts")
+            || file_name_lower.ends_with(".test.tsx")
+            || file_name_lower.ends_with(".spec.js")
+            || file_name_lower.ends_with(".spec.jsx")
+            || file_name_lower.ends_with(".spec.ts")
+            || file_name_lower.ends_with(".spec.tsx")
+            || file_name_lower == "conftest.py"
             || file_name.contains("fixture")
+            || path_has_segment(
+                &normalized,
+                &[
+                    "test",
+                    "tests",
+                    "testdata",
+                    "__tests__",
+                    "__tests_dts__",
+                    "playground",
+                ],
+            )
+            || path_has_segment(
+                &normalized,
+                &["fixture", "fixtures", "snapshot", "snapshots"],
+            )
             || file_name == "bip39_english.txt"
         {
             return Self::TestFixture;
@@ -64,9 +90,16 @@ impl ScanScope {
         }
         if normalized.starts_with("docs/")
             || normalized.contains("/docs/")
+            || normalized.starts_with("docs_src/")
+            || normalized.contains("/docs_src/")
             || normalized.starts_with("examples/")
             || normalized.contains("/examples/")
+            || normalized.starts_with("_examples/")
+            || normalized.contains("/_examples/")
             || file_name.eq_ignore_ascii_case("README.md")
+            || file_name.eq_ignore_ascii_case("CHANGELOG.md")
+            || file_name.eq_ignore_ascii_case("CHANGES.md")
+            || file_name.eq_ignore_ascii_case("CHANGES.rst")
         {
             return Self::DocsExamples;
         }
@@ -86,6 +119,14 @@ impl ScanScope {
             Self::DocsExamples => "docs_examples",
         }
     }
+}
+
+fn path_has_segment(path: &str, segments: &[&str]) -> bool {
+    path.split('/').any(|part| {
+        segments
+            .iter()
+            .any(|segment| part.eq_ignore_ascii_case(segment))
+    })
 }
 
 fn is_source_file(path: &Path) -> bool {
@@ -117,6 +158,41 @@ fn is_source_file(path: &Path) -> bool {
                     | "json"
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_test_paths_are_test_fixture_scope() {
+        for path in [
+            "tests/unit/http.test.js",
+            "test/res.location.js",
+            "pkg/testdata/key.pem",
+            "src/__tests__/client.spec.ts",
+            "src/__tests_dts__/utils.ts",
+            "playground/env/.env",
+            "snapshots/register.bash",
+        ] {
+            assert_eq!(ScanScope::classify(Path::new(path)), ScanScope::TestFixture);
+        }
+    }
+
+    #[test]
+    fn common_docs_and_examples_are_docs_scope() {
+        for path in [
+            "README.md",
+            "CHANGELOG.md",
+            "_examples/rest/main.go",
+            "docs_src/security/tutorial.py",
+        ] {
+            assert_eq!(
+                ScanScope::classify(Path::new(path)),
+                ScanScope::DocsExamples
+            );
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

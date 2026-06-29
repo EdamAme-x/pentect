@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
-use walk::{collect_scan_roots, is_ignored_file};
+use walk::{collect_scan_roots, ignored_file_reason};
 
 const MAX_SCAN_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -118,11 +118,8 @@ impl ScanWorker {
     }
 
     fn scan_file(&mut self, path: &Path) -> Result<ScanFile, String> {
-        if is_ignored_file(path) {
-            return Ok(ScanFile::Skipped(SkippedFile::new(
-                path,
-                "binary extension",
-            )));
+        if let Some(reason) = ignored_file_reason(path) {
+            return Ok(ScanFile::Skipped(SkippedFile::new(path, reason)));
         }
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
