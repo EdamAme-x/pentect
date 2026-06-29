@@ -172,12 +172,13 @@ fn is_ui_copy_sensitive_key(key: &str, value: &str) -> bool {
     // Require both a UI-state/action component in the key and prose/localization
     // shape in the value so compact real secrets under `password` still detect.
     let name = normalize_identifier(key);
-    if !name.split('_').any(|part| {
+    let has_sensitive_word = name.split('_').any(|part| {
         matches!(
             part,
             "password" | "passwords" | "token" | "auth" | "authentication" | "credential"
         )
-    }) {
+    }) || name.contains("token");
+    if !has_sensitive_word {
         return false;
     }
     let has_ui_component = [
@@ -185,9 +186,12 @@ fn is_ui_copy_sensitive_key(key: &str, value: &str) -> bool {
         "category",
         "add",
         "cancel",
+        "changed",
         "current",
+        "dialog",
         "forgot",
         "failed",
+        "field",
         "incorrect",
         "invalid",
         "label",
@@ -205,9 +209,11 @@ fn is_ui_copy_sensitive_key(key: &str, value: &str) -> bool {
         "required",
         "room",
         "set",
+        "successfully",
         "supported",
         "text",
         "title",
+        "button",
         "advice",
         "uppercase",
         "digits",
@@ -224,6 +230,19 @@ fn is_prose_or_localization_value(value: &str) -> bool {
         || value.split_whitespace().count() >= 2
         || !value.is_ascii()
         || value.ends_with(['.', ':', '!', '?'])
+        || is_short_ui_label_value(value)
+}
+
+fn is_short_ui_label_value(value: &str) -> bool {
+    // Button/field/label/title keys often map to a single visible word such as
+    // "Password". A real token/password can be low entropy too, so this helper
+    // is only reached after the key has explicit UI/action components.
+    (2..=32).contains(&value.len())
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+        && !value.bytes().any(|b| b.is_ascii_digit())
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphabetic() || ch.is_whitespace() || matches!(ch, '-' | '\'' | '_')
+        })
 }
 
 fn is_structured_token_prose(key: &str, value: &str) -> bool {
@@ -525,6 +544,18 @@ mod tests {
             None
         );
         assert_eq!(
+            sensitive_key_fires(Some("lockRoomPassword"), "Password"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("enableDialogPasswordField"), "Password"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("enterPasswordButton"), "Join"),
+            None
+        );
+        assert_eq!(
             sensitive_key_fires(Some("noPassword"), "No password is set"),
             None
         );
@@ -545,6 +576,13 @@ mod tests {
             None
         );
         assert_eq!(
+            sensitive_key_fires(
+                Some("passwordSuccessfullyChanged"),
+                "Password successfully changed"
+            ),
+            None
+        );
+        assert_eq!(
             sensitive_key_fires(Some("forgotPassword"), "Forgot your password?"),
             None
         );
@@ -561,6 +599,10 @@ mod tests {
                 Some("categoryBrokenAuthentication"),
                 "Broken authentication"
             ),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("title_tokensale"), "Token sale"),
             None
         );
         assert_eq!(

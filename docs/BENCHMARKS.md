@@ -70,15 +70,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 7043
-FP: 16992
+FP: 16324
 FN: 8061
-Line only: 259
-Unlabeled: 133090
+Line only: 254
+Unlabeled: 79368
 Missing files: 0
-Precision: 0.293
+Precision: 0.301
 Recall: 0.466
-F1: 0.360
-Elapsed: 219429 ms
+F1: 0.366
+Elapsed: 185663 ms
 ```
 
 Weak groups:
@@ -88,7 +88,7 @@ Weak groups:
 - `Token` and `Auth`: recall is strong, but precision still needs vendor/context validators.
 - `LIKELY_SECRET`: broad entropy recall still catches source identifiers and opaque non-secret blobs.
 - `URL_CREDENTIAL`: now keeps token-as-username recall; documentation hosts are suppressed only for RFC-reserved examples.
-- Structured JSON now suppresses UI/localization prose for password/token message keys, but compact values under real secret keys still fire.
+- Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.
 - `UUID`: low recall.
 - `AWS S3 Bucket`, `Firebase Domain`, and `Tencent WeChat API App ID`: currently missed.
 - Identity sweep intentionally does not propagate very short `KEYED_SECRET` values; this avoids widespread false positives but can miss repeated weak credentials outside their anchored assignment.

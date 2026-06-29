@@ -23,7 +23,7 @@ pub fn identity_sweep(
     // specific High AWS_AKID is not overwritten by a generic Low LIKELY_SECRET).
     let mut rep: BTreeMap<String, Span> = BTreeMap::new();
     for s in &accepted {
-        if !is_sweepable_identity(s) {
+        if !is_sweepable_identity(raw, s) {
             continue;
         }
         let id = n_id(&raw[s.range.start..s.range.end]);
@@ -105,7 +105,7 @@ pub fn identity_sweep(
     all
 }
 
-fn is_sweepable_identity(span: &Span) -> bool {
+fn is_sweepable_identity(raw: &str, span: &Span) -> bool {
     // OTP/passcode values are short and time-bound. A repeated `123456` elsewhere
     // is not evidence of the same credential unless the local line has OTP
     // context, so the detector hit is masked but global identity propagation is
@@ -119,7 +119,34 @@ fn is_sweepable_identity(span: &Span) -> bool {
     if span.label.as_str() == labels::KEYED_SECRET && span.range.len() < 12 {
         return false;
     }
+    // Structural JSON detections are anchored by local key context. Generated
+    // labels such as `LOCKROOMPASSWORD`, `LABEL_PASSWORD`, or
+    // `CREATEAUTHORIZERREQUEST` often come from UI/resource strings; seeing the
+    // same prose elsewhere is not evidence of the same credential. Keep the
+    // anchored structural span, but sweep only values with distinctive token
+    // shape. Canonical labels alone are not enough: `PASSWORD: "Password"` in
+    // localization JSON is a label, while `PASSWORD: "s3cr3t-prod-token"` has
+    // enough identity evidence to propagate.
+    if span.source == DetectorId::Structural && !is_structural_sweepable_identity(raw, span) {
+        return false;
+    }
     true
+}
+
+fn is_structural_sweepable_identity(raw: &str, span: &Span) -> bool {
+    distinctive_secret_shape(&raw[span.range.start..span.range.end])
+}
+
+fn distinctive_secret_shape(value: &str) -> bool {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    bytes.len() >= 16
+        && !bytes.iter().any(u8::is_ascii_whitespace)
+        && bytes.iter().any(u8::is_ascii_alphabetic)
+        && bytes.iter().any(u8::is_ascii_digit)
+        && bytes
+            .iter()
+            .any(|b| matches!(b, b'_' | b'-' | b'.' | b'+' | b'/' | b'='))
 }
 
 /// True if the byte at `i` is part of the same token (would make a match a mere
@@ -265,6 +292,42 @@ mod tests {
         assert!(
             swept.is_empty(),
             "short keyed values need local context, not global sweep: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn structural_ui_labels_are_not_identity_swept() {
+        let raw = r#"{"lockRoomPassword":"Password","label":"Password"}"#;
+        let first_start = raw.find("Password").unwrap();
+        let first = Span {
+            range: ByteRange::new(first_start, first_start + "Password".len()),
+            category: Category::Secret,
+            label: "LOCKROOMPASSWORD".into(),
+            confidence: Confidence::High,
+            source: DetectorId::Structural,
+        };
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "structural UI labels have only local key context: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn structural_short_password_values_are_not_identity_swept() {
+        let raw = r#"{"password":"Password","label":"Password"}"#;
+        let first_start = raw.find("Password").unwrap();
+        let first = Span {
+            range: ByteRange::new(first_start, first_start + "Password".len()),
+            category: Category::Secret,
+            label: "PASSWORD".into(),
+            confidence: Confidence::High,
+            source: DetectorId::Structural,
+        };
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "canonical structural labels still need distinctive value shape: {swept:?}"
         );
     }
 }
