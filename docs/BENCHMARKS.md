@@ -66,7 +66,9 @@ Elapsed: 153352 ms
 Current working result after structural false-positive reductions, source
 name/reference and fixture filtering, generic-key name filtering, RFC
 documentation-value handling, plaintext GitHub node-id entropy suppression, and
-C-family ternary syntax suppression. Keyed detection now recovers unquoted
+C-family ternary syntax suppression. Entropy detection suppresses RFC 7468
+public PEM bodies, OpenSSH public-key blobs, and `public_key`-style fields while
+leaving private-key and ordinary opaque blobs detectable. Keyed detection now recovers unquoted
 hex-like values under `*_key`, `*_secret`, and explicit `hex*` fields by
 structure rather than by a vendor/corpus regex. Canonical cryptographic fixture
 hex patterns such as sequential bytes, repeated bytes, and visual
@@ -91,15 +93,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 11443
+FP: 11184
 FN: 4828
 Line only: 227
-Unlabeled: 67837
+Unlabeled: 60243
 Missing files: 0
-Precision: 0.473
+Precision: 0.479
 Recall: 0.680
-F1: 0.558
-Elapsed: 28197 ms
+F1: 0.562
+Elapsed: 28070 ms
 ```
 
 Weak groups:
@@ -109,6 +111,7 @@ Weak groups:
 - `Token` and `Auth`: recall is strong, but precision still needs vendor/context validators.
 - `LIKELY_SECRET`: broad entropy recall still catches source identifiers and opaque non-secret blobs.
 - Plaintext GitHub API captures now suppress Base64 `node_id` metadata after validating the decoded `type:id` shape; arbitrary Base64 secrets still fire.
+- Public key material is suppressed only when the public role is structurally visible: OpenSSH key prefixes, RFC 7468 public/certificate armor, or `public_key`-style field names. Private-key contexts still fire.
 - `URL_CREDENTIAL`: now keeps token-as-username recall; documentation hosts are suppressed only for RFC-reserved examples.
 - RFC 2606/6761 domains, RFC 5737 IPv4 ranges, and RFC 3849/9637 IPv6 ranges are shared by URL and placeholder suppression so sample hosts do not need ad hoc literals.
 - Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.

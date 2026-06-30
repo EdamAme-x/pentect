@@ -90,7 +90,7 @@ impl EntropyDetector {
         }
         if is_structured_metadata_value(text, start, &view.region.ctx, run)
             || is_encoded_public_metadata_value(run)
-            || is_public_ssh_key_context(text, start)
+            || is_public_key_context(text, start, &view.region.ctx)
         {
             return;
         }
@@ -261,6 +261,12 @@ fn local_json_key_before_value(text: &str, start: usize) -> Option<String> {
     .then(|| key.to_string())
 }
 
+fn is_public_key_context(text: &str, start: usize, ctx: &Context) -> bool {
+    is_public_ssh_key_context(text, start)
+        || is_public_pem_body_context(text, start)
+        || has_public_key_name_before_value(text, start, ctx)
+}
+
 fn is_public_ssh_key_context(text: &str, start: usize) -> bool {
     // OpenSSH authorized_keys/public-key lines start with an algorithm marker
     // (`ssh-rsa`, `ssh-ed25519`, `ecdsa-sha2-*`) followed by a base64 blob.
@@ -269,6 +275,93 @@ fn is_public_ssh_key_context(text: &str, start: usize) -> bool {
     let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
     let prefix = &text[line_start..start];
     prefix.contains("ssh-rsa ") || prefix.contains("ssh-ed25519 ") || prefix.contains("ecdsa-sha2-")
+}
+
+fn is_public_pem_body_context(text: &str, start: usize) -> bool {
+    // RFC 7468 textual encodings use `-----BEGIN ...-----` armor. Base64 inside
+    // PUBLIC KEY / CERTIFICATE blocks is public material; PRIVATE KEY blocks
+    // must remain detectable by the PEM detector and entropy fallback.
+    let mut window_start = start.saturating_sub(8192);
+    while !text.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let before = &text[window_start..start];
+    let Some(begin) = before.rfind("-----BEGIN ") else {
+        return false;
+    };
+    if before.rfind("-----END ").is_some_and(|end| end > begin) {
+        return false;
+    }
+    let header = &before[begin..];
+    let header_end = header
+        .find("-----")
+        .and_then(|first| {
+            header[first + 5..]
+                .find("-----")
+                .map(|second| first + 5 + second + 5)
+        })
+        .unwrap_or(header.len());
+    let header = &header[..header_end.min(header.len())];
+    !header.contains("PRIVATE") && (header.contains("PUBLIC KEY") || header.contains("CERTIFICATE"))
+}
+
+fn has_public_key_name_before_value(text: &str, start: usize, ctx: &Context) -> bool {
+    if ctx.key.as_deref().is_some_and(is_public_key_name) {
+        return true;
+    }
+    if local_json_key_before_value(text, start)
+        .as_deref()
+        .is_some_and(is_public_key_name)
+    {
+        return true;
+    }
+    local_assignment_key_before_value(text, start).is_some_and(is_public_key_name)
+}
+
+fn local_assignment_key_before_value(text: &str, start: usize) -> Option<&str> {
+    let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let prefix = &text[line_start..start];
+    let sep = prefix.rfind([':', '='])?;
+    let before = prefix[..sep].trim_end();
+    let key_end = before
+        .rfind(|ch: char| ch.is_ascii_alphanumeric())
+        .map(|pos| pos + 1)?;
+    let key_start = before[..key_end]
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+        .map_or(0, |pos| pos + 1);
+    let key = &before[key_start..key_end];
+    (!key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
+    .then_some(key)
+}
+
+fn is_public_key_name(key: &str) -> bool {
+    let normalized = normalize_identifier(key);
+    normalized == "pubkey"
+        || normalized == "public_key"
+        || normalized.contains("_public_key")
+        || normalized.contains("public_key_")
+        || normalized.ends_with("_pubkey")
+}
+
+fn normalize_identifier(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut prev_sep = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if ch.is_ascii_uppercase() && !out.is_empty() && !prev_sep {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if !prev_sep {
+            out.push('_');
+            prev_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn has_opaque_mix(run: &str) -> bool {
@@ -759,5 +852,68 @@ mod tests {
         let reg = region(raw);
         let view = NormalizedView::build(&reg, raw);
         assert!(EntropyDetector::default().detect(&view).is_empty());
+    }
+
+    #[test]
+    fn public_pem_blocks_are_not_entropy_candidates() {
+        let raw = concat!(
+            "-----BEGIN PUBLIC KEY-----\n",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD\n",
+            "-----END PUBLIC KEY-----"
+        );
+        let reg = region(raw);
+        let view = NormalizedView::build(&reg, raw);
+        assert!(EntropyDetector::default().detect(&view).is_empty());
+    }
+
+    #[test]
+    fn public_pem_context_handles_utf8_before_window() {
+        let raw = format!(
+            "{}\n-----BEGIN PUBLIC KEY-----\nABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD\n-----END PUBLIC KEY-----",
+            "日本語".repeat(3000)
+        );
+        let reg = region(&raw);
+        let view = NormalizedView::build(&reg, &raw);
+        assert!(EntropyDetector::default().detect(&view).is_empty());
+    }
+
+    #[test]
+    fn private_pem_blocks_still_reach_entropy_fallback() {
+        let raw = concat!(
+            "-----BEGIN PRIVATE KEY-----\n",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD\n",
+            "-----END PRIVATE KEY-----"
+        );
+        let reg = region(raw);
+        let view = NormalizedView::build(&reg, raw);
+        assert!(
+            !EntropyDetector::default().detect(&view).is_empty(),
+            "private-key bodies must not use public-key suppression"
+        );
+    }
+
+    #[test]
+    fn public_key_fields_are_not_entropy_candidates() {
+        for raw in [
+            r#"{"public_key":"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD"}"#,
+            r#"publicKey = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD""#,
+            "PublicKey=KAS-ECC-CDH_P-192_C10-Peer-PUBLIC",
+        ] {
+            let reg = region(raw);
+            let view = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn non_public_key_blob_still_entropy_candidate() {
+        let raw =
+            r#"private_key = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD""#;
+        let reg = region(raw);
+        let view = NormalizedView::build(&reg, raw);
+        assert!(
+            !EntropyDetector::default().detect(&view).is_empty(),
+            "ordinary or private key material must still detect"
+        );
     }
 }
