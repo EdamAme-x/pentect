@@ -319,7 +319,7 @@ pub(crate) fn is_crypto_test_vector_identifier_value(value: &str) -> bool {
 
 fn is_crypto_test_vector_identifier_part(value: &str) -> bool {
     let value = value.trim();
-    if !(6..=96).contains(&value.len())
+    if !(5..=96).contains(&value.len())
         || value.contains("://")
         || value
             .bytes()
@@ -330,6 +330,7 @@ fn is_crypto_test_vector_identifier_part(value: &str) -> bool {
     let base = strip_crypto_test_vector_public_suffix(value);
     is_nist_kas_ecc_test_case_id(base)
         || is_role_named_curve_test_case_id(base)
+        || is_standalone_named_curve_test_case_id(base)
         || is_edwards_test_case_id(base)
 }
 
@@ -341,6 +342,8 @@ fn strip_crypto_test_vector_public_suffix(value: &str) -> &str {
         "-public-raw",
         "-PUBLIC",
         "-public",
+        "-Peer",
+        "-peer",
         "_PUB",
         "_pub",
         "-Raw",
@@ -382,6 +385,15 @@ fn is_role_named_curve_test_case_id(value: &str) -> bool {
         return is_named_curve_test_case_suffix(rest);
     }
     false
+}
+
+fn is_standalone_named_curve_test_case_id(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if let Some(bits) = lower.strip_prefix("p-") {
+        return !bits.is_empty() && bits.bytes().all(|b| b.is_ascii_digit());
+    }
+    is_named_curve_test_case_suffix(&lower)
+        && (lower.contains("_rfc") || lower.contains("rfc") || lower.contains("brainpool"))
 }
 
 fn is_named_curve_test_case_suffix(value: &str) -> bool {
@@ -684,6 +696,14 @@ mod tests {
         ));
         assert!(is_crypto_test_vector_identifier_value(
             "ED25519-1-PUBLIC-Raw"
+        ));
+        assert!(is_crypto_test_vector_identifier_value("P-256"));
+        assert!(is_crypto_test_vector_identifier_value("P-256-Peer"));
+        assert!(is_crypto_test_vector_identifier_value(
+            "PRIME192V1_RFC5114:PRIME192V1_RFC5114-PUBLIC"
+        ));
+        assert!(is_crypto_test_vector_identifier_value(
+            "SECP224R1_RFC5114-Peer"
         ));
         assert!(!is_crypto_test_vector_identifier_value("tenant-7-trial"));
         assert!(!is_crypto_test_vector_identifier_value(

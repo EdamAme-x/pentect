@@ -105,6 +105,10 @@ and enum-style names such as `resource-groups:Name`, `NAME_PREFIX`, and
 `OBJECT_EXTENSION`, while keeping credential-shaped doc samples visible.
 Placeholder matching treats explicit `fake_*` values as non-secret examples,
 without suppressing weak real-world values such as `pass` or `secret`.
+Default keyed detection also suppresses public ASN.1 object identifier DER
+bodies in `OBJ_*` tables, standalone NIST/RFC curve/test-case labels such as
+`P-256` and `SECP224R1_RFC5114`, RSA mode labels such as `RSA-PSS`, and
+localized UI password copy only when the key name is a UI text/message field.
 
 ```text
 CredData commit: 9a55c40
@@ -114,15 +118,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 7533
+FP: 7304
 FN: 4828
 Line only: 227
-Unlabeled: 59491
+Unlabeled: 59448
 Missing files: 0
-Precision: 0.577
+Precision: 0.585
 Recall: 0.680
-F1: 0.624
-Elapsed: 27710 ms
+F1: 0.629
+Elapsed: 27535 ms
 ```
 
 Weak groups:
@@ -142,6 +146,9 @@ Weak groups:
 - UI/i18n suppression is syntax-gated: `$t(...)`/`i18n.t(...)` references and setup/instruction prose under auth/2FA keys are skipped; ordinary weak password/token literals still fire.
 - Source-template suppression is syntax-gated: whole-value printf templates and method-chain fragments are skipped, but mixed literal values such as `abc%[3]s` still fire.
 - Public crypto test-vector identifiers are shape-gated: NIST KAS-ECC P/K/B case IDs, role+named-curve labels, and ED25519/ED448 test case labels are skipped; operational handles such as `tenant-7-trial` and `ALICE_prod_key_2026` still fire.
+- Public crypto metadata now also covers standalone named-curve/RFC test-case labels and RSA mode labels used in published vector tables; actual hex/scalar/key bytes remain detectable.
+- ASN.1 OID tables are suppressed only for `OBJ_*`/OID key context and DER-body octet syntax; arbitrary escaped binary under ordinary secret keys still fires.
+- Localized UI password/token prose is suppressed only when the key name also carries UI text context such as label/error/invalid/message; ordinary `password = "..."` and compact credential values still fire.
 - Generated documentation fragments and Go struct tag values are syntax-gated: HTML doc fragments require documentation/HTML on the left side, and struct tags require backtick-delimited `key` metadata.
 - Documentation metadata names are shape-gated: public namespaced condition keys, uppercase enum names, inline `key=value` help text, shell command substitutions, and source prefix constants are skipped; `sk-test-token</p>` and `secret:` still fire.
 - Explicit placeholder markers include `fake_*`; weak literals such as `pass`, `secret`, `abc123`, and `changeme` remain detectable unless a separate fixture/source context proves they are examples.

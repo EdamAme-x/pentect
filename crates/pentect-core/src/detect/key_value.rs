@@ -616,7 +616,9 @@ fn looks_like_secret_value(
         || is_file_extension_literal(value, key_name)
         || is_protobuf_tag_literal(value, key_name)
         || is_key_algorithm_literal(value)
+        || is_asn1_oid_der_literal(value, key_name, source_key)
         || is_crypto_test_vector_identifier_literal(value, key_name)
+        || is_localized_ui_text_literal(value, key_name)
         || is_html_code_metadata_literal(value)
         || is_html_documentation_fragment_literal(value, key_name, source_key)
         || is_fingerprint_literal(value, key_name)
@@ -1399,6 +1401,16 @@ fn is_key_algorithm_literal(value: &str) -> bool {
         // protocol metadata, not the HMAC signing key.
         return true;
     }
+    let lower = value.to_ascii_lowercase();
+    if matches!(lower.as_str(), "rsa-pss" | "rsa-oaep") {
+        return true;
+    }
+    if lower
+        .strip_prefix("rsa-oaep-")
+        .is_some_and(|case| !case.is_empty() && case.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return true;
+    }
     let Some((algorithm, bits)) = value.split_once('-') else {
         return false;
     };
@@ -1414,6 +1426,52 @@ fn is_key_algorithm_literal(value: &str) -> bool {
     (128..=16384).contains(&bits)
 }
 
+fn is_asn1_oid_der_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // OpenSSL-style generated object tables use `OBJ_*` identifiers whose value
+    // is the DER body of an ASN.1 OBJECT IDENTIFIER, written as `\xHH` octets.
+    // The octets identify a public algorithm/attribute OID, not key material.
+    if !(key_name.starts_with("obj_")
+        || has_identifier_component(key_name, "oid")
+        || source_key.trim_start().starts_with("OBJ_"))
+    {
+        return false;
+    }
+    let Some(octets) = parse_mixed_hex_escape_octets(value.trim()) else {
+        return false;
+    };
+    // Require a multi-octet arc to avoid treating arbitrary escaped test strings
+    // as metadata. Some leading ASCII control bytes are already decoded and
+    // trimmed by the normalized view, so the `OBJ_*` key contract carries the
+    // ASN.1 OID evidence instead of trusting the first byte alone.
+    octets.len() >= 3 && octets.iter().any(|byte| *byte >= 0x80)
+}
+
+fn parse_mixed_hex_escape_octets(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'\\' {
+            if pos + 3 >= bytes.len() || !matches!(bytes[pos + 1], b'x' | b'X') {
+                return None;
+            }
+            let hi = hex_nibble(bytes[pos + 2])?;
+            let lo = hex_nibble(bytes[pos + 3])?;
+            out.push((hi << 4) | lo);
+            pos += 4;
+        } else if bytes[pos].is_ascii() {
+            out.push(bytes[pos]);
+            pos += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 fn is_crypto_test_vector_identifier_literal(value: &str, key_name: &str) -> bool {
     // Published crypto test-vector files often put named test-case handles in
     // fields named `PrivateKey`, `PeerKey`, or `PrivPubKeyPair`. Values such as
@@ -1425,6 +1483,87 @@ fn is_crypto_test_vector_identifier_literal(value: &str, key_name: &str) -> bool
         return false;
     }
     is_crypto_test_vector_identifier_value(value)
+}
+
+fn is_localized_ui_text_literal(value: &str, key_name: &str) -> bool {
+    // Translation tables and UI copy often use sensitive words in message IDs:
+    // `passwordEnteredInvalid = "Invalid password for room \"%s\"."`. The
+    // rendered sentence is not a password. Keep this anchored to UI-message key
+    // components so real passphrases under `password` still detect.
+    if !key_name_has_sensitive_component(key_name) || !key_name_has_ui_text_component(key_name) {
+        return false;
+    }
+    let value = value.trim();
+    if !(3..=240).contains(&value.len())
+        || value.contains("://")
+        || value.contains('=')
+        || value.contains('<')
+        || value.contains('>')
+    {
+        return false;
+    }
+    let has_word_boundary = value.chars().any(char::is_whitespace)
+        || value.ends_with(':')
+        || value.contains("%s")
+        || value.contains("&thinsp;");
+    has_word_boundary
+        && value.chars().all(|ch| {
+            ch.is_alphabetic()
+                || ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ':' | ';'
+                        | ','
+                        | '.'
+                        | '!'
+                        | '?'
+                        | '"'
+                        | '\''
+                        | '-'
+                        | '_'
+                        | '%'
+                        | '&'
+                        | '/'
+                        | '\\'
+                        | '('
+                        | ')'
+                )
+        })
+}
+
+fn key_name_has_sensitive_component(key_name: &str) -> bool {
+    key_name.split('_').any(|part| {
+        matches!(
+            part,
+            "secret" | "password" | "passwd" | "pwd" | "credential" | "token" | "auth" | "key"
+        )
+    })
+}
+
+fn key_name_has_ui_text_component(key_name: &str) -> bool {
+    key_name.split('_').any(|part| {
+        matches!(
+            part,
+            "label"
+                | "message"
+                | "msg"
+                | "title"
+                | "text"
+                | "placeholder"
+                | "prompt"
+                | "description"
+                | "desc"
+                | "error"
+                | "invalid"
+                | "entered"
+                | "enter"
+                | "protected"
+                | "required"
+                | "warning"
+                | "hint"
+                | "help"
+        )
+    })
 }
 
 fn is_html_code_metadata_literal(value: &str) -> bool {
@@ -2659,6 +2798,11 @@ mod tests {
         ));
         assert!(has(r#"password_prefix = "secret:""#, "secret:"));
         assert!(has(r#"api_key = "$(secret_command""#, "$(secret_command"));
+        assert!(has(
+            r#"password = "Correct horse battery staple!""#,
+            "Correct horse battery staple!"
+        ));
+        assert!(has(r#"passwordLabel = "tenant-7-trial""#, "tenant-7-trial"));
     }
 
     #[test]
@@ -2678,12 +2822,22 @@ mod tests {
             r#"Level map[uint32]string `protobuf_key:"varint,1,opt,name=key,proto3"`"#,
             r#"PrivateKey = RSA-2048"#,
             r#"Key = RSA-2048"#,
+            r#"PrivateKey = RSA-PSS"#,
+            r#"PrivateKey=RSA-OAEP-1"#,
             r#"PrivateKey=KAS-ECC-CDH_P-192_C0"#,
             r#"PrivPubKeyPair = KAS-ECC-CDH_P-192_C0:KAS-ECC-CDH_P-192_C0-PUBLIC"#,
             r#"PeerKey=ALICE_secp112r1_PUB"#,
             r#"PrivateKey=BOB_cf_brainpoolP160r1"#,
             r#"PrivPubKeyPair = Alice-25519:Alice-25519-PUBLIC"#,
             r#"PeerKey=ED25519-1-PUBLIC-Raw"#,
+            r#"PrivateKey=P-256"#,
+            r#"PrivateKey=PRIME192V1_RFC5114-Peer"#,
+            r#"PrivPubKeyPair = SECP224R1_RFC5114:SECP224R1_RFC5114-PUBLIC"#,
+            r#"OBJ_dhKeyAgreement="\x2A\x86\x48\x86\xF7\x0D\x01\x03\x01""#,
+            r#"OBJ_pkcs9_challengePassword="\x2A\x86\x48\x86\xF7\x0D\x01\x09\x07""#,
+            r#"passwordEnteredInvalid: "Invalid password for room \"%s\".""#,
+            r#"labelPassword: "Mot de passe&thinsp;:""#,
+            r#"enterRoomPassword: "Raum \"%s\" ist durch ein Passwort geschützt.""#,
             r#"Authorization algorithm = "AWS4-HMAC-SHA256""#,
             r#"documentation: "<code>12345678-1234-1234-1234-123456789012</code>""#,
             r#"documentation: "<code>alias/aws/kinesis</code>""#,
