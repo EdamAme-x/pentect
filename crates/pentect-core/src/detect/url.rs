@@ -290,7 +290,17 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
         fragment_or_query_path_end(url, authority_end),
         out,
     );
+    let query_at = url[authority_end..].find('?').map(|i| authority_end + i);
+    let fragment_at = url[authority_end..].find('#').map(|i| authority_end + i);
+    let query_at = query_at.filter(|&q| fragment_at.is_none_or(|f| q < f));
     if !is_internal_host(host) {
+        if let Some(q) = query_at {
+            let query_end = fragment_at.unwrap_or(url.len());
+            inspect_query_values(view, base, url, q + 1, query_end, false, out);
+        }
+        if let Some(f) = fragment_at {
+            inspect_external_fragment_query(view, base, url, f + 1, url.len(), out);
+        }
         return;
     }
 
@@ -303,9 +313,6 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
         labels::INTERNAL_ENDPOINT,
     );
 
-    let query_at = url[authority_end..].find('?').map(|i| authority_end + i);
-    let fragment_at = url[authority_end..].find('#').map(|i| authority_end + i);
-    let query_at = query_at.filter(|&q| fragment_at.is_none_or(|f| q < f));
     let path_end = [query_at, fragment_at]
         .into_iter()
         .flatten()
@@ -321,6 +328,22 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
     }
     if let Some(f) = fragment_at {
         inspect_fragment(view, base, url, f + 1, url.len(), out);
+    }
+}
+
+fn inspect_external_fragment_query(
+    view: &NormalizedView,
+    base: usize,
+    url: &str,
+    fragment_start: usize,
+    fragment_end: usize,
+    out: &mut Vec<Span>,
+) {
+    if fragment_start >= fragment_end {
+        return;
+    }
+    if url[fragment_start..fragment_end].contains('=') {
+        inspect_query_values(view, base, url, fragment_start, fragment_end, false, out);
     }
 }
 
@@ -775,7 +798,8 @@ fn inspect_query_values(
             let value_end = pos;
             let key = &part[..eq];
             let value = &part[eq + 1..];
-            if query_secret_kind(key).is_some_and(|kind| query_secret_value_has_signal(kind, value))
+            if query_secret_kind(key)
+                .is_some_and(|kind| query_secret_value_has_signal(kind, value, mask_plain_values))
             {
                 push_span(
                     view,
@@ -903,13 +927,18 @@ fn normalized_query_key(value: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
-fn query_secret_value_has_signal(kind: QuerySecretKind, value: &str) -> bool {
+fn query_secret_value_has_signal(
+    kind: QuerySecretKind,
+    value: &str,
+    allow_short_token: bool,
+) -> bool {
     // The key supplies context; the value still needs to look material rather
     // than like generated docs (`$Base32String`, `FFF...`) or placeholders.
     let value = value.trim();
     if value.is_empty() || query_value_is_template_or_redaction(value) {
         return false;
     }
+    let is_name_reference = query_value_is_name_reference(value);
     let len = value.len();
     let has_digit = value.bytes().any(|b| b.is_ascii_digit());
     let has_alpha = value.bytes().any(|b| b.is_ascii_alphabetic());
@@ -919,12 +948,34 @@ fn query_secret_value_has_signal(kind: QuerySecretKind, value: &str) -> bool {
     match kind {
         QuerySecretKind::Password => len >= 4,
         QuerySecretKind::Token => {
-            len >= 6 && (len >= 16 || (has_alpha && has_digit) || has_token_punct)
+            !is_name_reference
+                && len >= if allow_short_token { 6 } else { 8 }
+                && (len >= 24 || (has_alpha && has_digit) || has_token_punct)
         }
         QuerySecretKind::Secret => {
-            len >= 6 && (len >= 12 || (has_alpha && has_digit) || has_token_punct)
+            !is_name_reference
+                && len >= 6
+                && (len >= 12 || (has_alpha && has_digit) || has_token_punct)
         }
     }
+}
+
+fn query_value_is_name_reference(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    let compact = normalized_userinfo_component(value).replace('_', "");
+    compact.contains("token")
+        || compact.contains("secret")
+        || compact.contains("password")
+        || compact.contains("passwd")
+        || compact.contains("apikey")
+        || compact.ends_with("key")
 }
 
 fn query_value_is_template_or_redaction(value: &str) -> bool {
@@ -1051,6 +1102,22 @@ mod tests {
     #[test]
     fn external_url_is_not_granularly_masked() {
         assert!(labels("https://example.com/api/issues/1234").is_empty());
+    }
+
+    #[test]
+    fn external_url_masks_sensitive_query_values_only() {
+        assert_eq!(
+            labels("https://service.example/path?pass=ieejo&state=ok#access_token=abc12345"),
+            [
+                ("URL_CREDENTIAL".to_string(), "ieejo".to_string()),
+                ("URL_CREDENTIAL".to_string(), "abc12345".to_string()),
+            ]
+        );
+        assert!(
+            labels("https://service.example/build?token=112233&password={password}")
+                .iter()
+                .all(|(label, _)| label != "URL_CREDENTIAL")
+        );
     }
 
     #[test]
@@ -1191,6 +1258,10 @@ mod tests {
             "otpauth://hotp/user@example.com?secret=FFF...&counter=123",
             "app://callback?access_token=abc",
             "app://callback?token=112233",
+            "app://callback?access_token=github_token",
+            "app://callback?refresh_token=refreshtokentest",
+            "app://callback?api_key=apikeyvaluehere",
+            "app://callback?client_secret=TESTSECRET",
         ] {
             assert!(
                 labels(raw)
