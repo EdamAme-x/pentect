@@ -554,6 +554,8 @@ mod tests {
         assert_eq!(sensitive_key_fires(Some("key"), "scope"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "firstName"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "phoneNumber"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "panel1"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "dataGrid12"), None);
         assert_eq!(
             sensitive_key_fires(Some("key"), "abcDEF123456"),
             Some("KEY".to_string())

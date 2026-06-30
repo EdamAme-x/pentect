@@ -1,6 +1,7 @@
 use super::benign::{
     is_explicitly_non_sensitive_key_name, is_non_secret_source_constant_value,
     is_placeholder_value, is_source_fixture_secret_value, is_source_secret_name_reference_value,
+    is_structured_key_name_reference_value,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
@@ -617,6 +618,7 @@ fn looks_like_secret_value(
         || is_license_identifier_literal(value, key_name)
         || is_dunder_identifier_literal(value)
         || is_uppercase_constant_literal_for_generic_key(value, key_name)
+        || is_structured_key_name_reference_literal(value, key_name)
         || is_plain_prose_literal_for_generic_key(value, key_name)
         || is_locator_literal_for_key(value, key_name)
     {
@@ -697,6 +699,9 @@ fn is_benign_literal(value: &str) -> bool {
     if is_iso8601_timestamp_literal(value) {
         return true;
     }
+    if is_sequential_hex_test_vector_literal(value) {
+        return true;
+    }
     let normalized = normalize_key(value);
     matches!(
         normalized.as_str(),
@@ -721,6 +726,43 @@ fn is_iso8601_timestamp_literal(value: &str) -> bool {
         && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22]
             .iter()
             .all(|idx| b[*idx].is_ascii_digit())
+}
+
+fn is_sequential_hex_test_vector_literal(value: &str) -> bool {
+    // Sequential byte strings such as 000102...0F and 404142...5F are standard
+    // cryptographic test-vector inputs, not live key material. Suppress only a
+    // strict ascending byte sequence so arbitrary hex secrets still fire.
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() < 32
+        || bytes.len() > 256
+        || !bytes.len().is_multiple_of(2)
+        || !bytes.iter().all(|b| b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let Some(high) = hex_nibble(pair[0]) else {
+            return false;
+        };
+        let Some(low) = hex_nibble(pair[1]) else {
+            return false;
+        };
+        decoded.push((high << 4) | low);
+    }
+    decoded
+        .windows(2)
+        .all(|window| window[1] == window[0].saturating_add(1))
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn is_code_type_or_expression(value: &str, key_name: &str, kind: KeyKind) -> bool {
@@ -1293,6 +1335,7 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
         || value.starts_with(';')
         || value.starts_with("\\\"{")
         || is_object_method_call_fragment(value)
+        || is_braced_type_initializer_fragment(value)
         || is_escaped_format_fragment(value)
         || value
             .strip_prefix('+')
@@ -1305,6 +1348,23 @@ fn is_object_method_call_fragment(value: &str) -> bool {
     // expression itself is not.
     let value = value.trim();
     value.starts_with('$') && value.contains("->") && value.contains('(')
+}
+
+fn is_braced_type_initializer_fragment(value: &str) -> bool {
+    // C/Go-style source fragments such as `yaml_token_t{` are type
+    // initializers. The future object may hold a token, but the type name is not
+    // the token value.
+    let value = value.trim();
+    let Some(stem) = value.strip_suffix('{') else {
+        return false;
+    };
+    (3..=80).contains(&stem.len())
+        && stem.bytes().any(|b| b == b'_')
+        && stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && stem
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
 }
 
 fn is_escaped_format_fragment(value: &str) -> bool {
@@ -1409,6 +1469,13 @@ fn is_uppercase_constant_literal_for_generic_key(value: &str, key_name: &str) ->
         && value.bytes().any(|b| b.is_ascii_alphabetic())
         && !value.bytes().any(|b| b.is_ascii_digit())
         && value.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+}
+
+fn is_structured_key_name_reference_literal(value: &str, key_name: &str) -> bool {
+    // Keep generic `key` semantics aligned with StructuralDetector: JSON/YAML
+    // schema objects often store another field/widget name under a property
+    // literally called `key`.
+    is_generic_metadata_key_name(key_name) && is_structured_key_name_reference_value(value)
 }
 
 fn is_plain_prose_literal_for_generic_key(value: &str, key_name: &str) -> bool {
@@ -1718,6 +1785,11 @@ mod tests {
         assert!(has("password=letmein123", "letmein123"));
         assert!(has("api_key=abc12345", "abc12345"));
         assert!(has("api_key=ABCDEF123456", "ABCDEF123456"));
+        assert!(has(
+            "Key = 00112233445566778899AABBCCDDEEFF",
+            "00112233445566778899AABBCCDDEEFF"
+        ));
+        assert!(has(r#"key: "abcDEF123456""#, "abcDEF123456"));
         assert!(has(r#"api_key="%s-real-123""#, "%s-real-123"));
         assert!(has(r#"password="SECRET""#, "SECRET"));
         assert!(has(r#"password="PROD_SECRET""#, "PROD_SECRET"));
@@ -1887,10 +1959,17 @@ mod tests {
             r#"Level map[uint32]string `protobuf_key:"varint,1,opt,name=key,proto3"`"#,
             r#"PrivateKey = RSA-2048"#,
             r#"Key = RSA-2048"#,
+            r#"Key = 000102030405060708090A0B0C0D0E0F"#,
+            r#"Key = 404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F"#,
             r#"aggregations.histo.buckets.3.key_as_string: "2017-01-01T08:00:00.000Z""#,
+            r#"key: "Authorization""#,
+            r#"key: "grant_type""#,
+            r#"key: "panel1""#,
+            r#"key: "dataGrid12""#,
             r#"EnvPubKeyFingerprint: "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00","#,
             r#"$token = Get-NtToken -Primary -Duplicate"#,
             r#"$token = $this->createMock(TokenInterface::class);"#,
+            r#"*token = yaml_token_t{}"#,
             r#"key: Some("password".to_string()),"#,
             r#"path: Some("structured.password".to_string()),"#,
             r#"prompt: "Use secret?","#,

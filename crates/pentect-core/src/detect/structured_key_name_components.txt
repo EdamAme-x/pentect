@@ -4,6 +4,7 @@
 # Format:
 # - component:word
 # - name:full_identifier
+# - numbered_name:identifier_prefix
 #
 # Policy:
 # - Used only for generic JSON key fields whose key name is exactly `key`.
@@ -11,6 +12,8 @@
 #   normalized parts, e.g. `seedUser`, `smtpDomain`, or `apiKey`.
 # - `name:` entries are full public field/header/parameter names that can stand
 #   alone as metadata values.
+# - `numbered_name:` entries are public UI/reference identifiers with a numeric
+#   suffix, e.g. `panel1`.
 # - Sensitive single words such as `password`, and concrete values containing
 #   digits or token punctuation, remain detectable.
 component:account
@@ -72,3 +75,10 @@ name:submit
 name:type
 name:vehicles
 name:year
+numbered_name:columns
+numbered_name:container
+numbered_name:data_grid
+numbered_name:datagrid
+numbered_name:fieldset
+numbered_name:panel
+numbered_name:well

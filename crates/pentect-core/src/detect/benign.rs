@@ -55,6 +55,7 @@ struct SourceFixtureSecretSet {
 struct StructuredKeyNameSet {
     components: Vec<String>,
     names: Vec<String>,
+    numbered_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,6 +118,7 @@ impl StructuredKeyNameSet {
             match kind.trim() {
                 "component" => set.components.push(pattern),
                 "name" => set.names.push(pattern),
+                "numbered_name" => set.numbered_names.push(pattern),
                 _ => {}
             }
         }
@@ -125,6 +127,14 @@ impl StructuredKeyNameSet {
 
     fn matches_name(&self, normalized: &str) -> bool {
         self.names.iter().any(|known| known == normalized)
+    }
+
+    fn matches_numbered_name(&self, normalized: &str) -> bool {
+        self.numbered_names.iter().any(|known| {
+            normalized
+                .strip_prefix(known)
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
     }
 
     fn matches_components(&self, parts: &[&str]) -> bool {
@@ -289,12 +299,12 @@ pub(crate) fn is_source_fixture_secret_value(key_name: &str, value: &str) -> boo
 ///
 /// Rationale: many JSON schemas use objects like `{ "key": "smtpUser" }`.
 /// The value is a public identifier, not credential material. Full single-name
-/// references are allowed only from the curated data file; digit/symbol-bearing
-/// values remain detectable because real key material usually has that shape.
+/// and numbered UI/reference names are allowed only from the curated data file;
+/// other digit/symbol-bearing values remain detectable because real key
+/// material usually has that shape.
 pub(crate) fn is_structured_key_name_reference_value(value: &str) -> bool {
     let value = value.trim();
     if !(3..=64).contains(&value.len())
-        || value.bytes().any(|b| b.is_ascii_digit())
         || !value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
@@ -306,6 +316,9 @@ pub(crate) fn is_structured_key_name_reference_value(value: &str) -> bool {
         .split('_')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
+    if value.bytes().any(|b| b.is_ascii_digit()) {
+        return STRUCTURED_KEY_NAME_MATCHER.matches_numbered_name(&normalized);
+    }
     STRUCTURED_KEY_NAME_MATCHER.matches_name(&normalized)
         || (parts.len() >= 2 && STRUCTURED_KEY_NAME_MATCHER.matches_components(&parts))
 }
@@ -437,6 +450,9 @@ mod tests {
         assert!(is_structured_key_name_reference_value("scope"));
         assert!(is_structured_key_name_reference_value("firstName"));
         assert!(is_structured_key_name_reference_value("phoneNumber"));
+        assert!(is_structured_key_name_reference_value("panel1"));
+        assert!(is_structured_key_name_reference_value("fieldset1"));
+        assert!(is_structured_key_name_reference_value("dataGrid12"));
         assert!(!is_structured_key_name_reference_value("password"));
         assert!(!is_structured_key_name_reference_value("secret"));
         assert!(!is_structured_key_name_reference_value("Token"));
