@@ -2937,10 +2937,7 @@ fn escaped_html_code_reference_literal(value: &str) -> bool {
     if value.starts_with("@\"") || value.starts_with("];") || value.starts_with(").") {
         return true;
     }
-    value
-        .strip_prefix("l_")
-        .or_else(|| value.strip_prefix("m_"))
-        .is_some_and(is_simple_code_reference_name)
+    is_c_family_prefixed_source_identifier(value)
 }
 
 fn is_simple_code_reference_name(value: &str) -> bool {
@@ -3352,6 +3349,18 @@ fn source_key_has_code_shape(source_key: &str) -> bool {
         || key.contains('*')
         || key.contains('[')
         || key.split_whitespace().count() >= 2
+        || is_c_family_prefixed_source_identifier(key)
+}
+
+fn is_c_family_prefixed_source_identifier(value: &str) -> bool {
+    // C-family codebases commonly use `m_` for members and `l_` for locals.
+    // When such a name is on the left side and the right side is an unquoted
+    // identifier, the match is a reference assignment (`m_password = state`),
+    // not the credential bytes.
+    value
+        .strip_prefix("m_")
+        .or_else(|| value.strip_prefix("l_"))
+        .is_some_and(is_simple_code_reference_name)
 }
 
 fn is_source_config_name_literal(value: &str, source_key: &str) -> bool {
@@ -5628,6 +5637,7 @@ mod tests {
             r#"nonce: "placeholder""#,
             r#"String NONCE = "oauth_nonce";"#,
             "pwd = conn->passwd;",
+            "m_password = state;",
             r#"auth="GSS-Negotiate";"#,
             r#"auth &= ~CURLAUTH_NTLM;"#,
             r#"if(smtpc->state == SMTP_EHLO && len >= 5 && !memcmp(line, "AUTH ", 5)) {"#,
