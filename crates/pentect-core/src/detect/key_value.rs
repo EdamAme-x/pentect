@@ -1246,7 +1246,9 @@ fn is_format_template_literal(value: &str, key_name: &str) -> bool {
     if !has_template_syntax {
         return false;
     }
-    key_name_indicates_template_context(key_name) || auth_template_value(key_name, value)
+    is_pure_printf_template_literal(value)
+        || key_name_indicates_template_context(key_name)
+        || auth_template_value(key_name, value)
 }
 
 fn is_env_lookup_template_literal(value: &str) -> bool {
@@ -1272,26 +1274,60 @@ fn contains_printf_directive(value: &str) -> bool {
             i += 1;
             continue;
         }
-        i += 1;
-        if i + 1 < bytes.len() && bytes[i].is_ascii_hexdigit() && bytes[i + 1].is_ascii_hexdigit() {
-            i += 2;
-            continue;
-        }
-        if bytes[i] == b'%' {
-            i += 1;
-            continue;
-        }
-        while i < bytes.len() && matches!(bytes[i], b'#' | b'0' | b'-' | b'+' | b' ' | b'.') {
-            i += 1;
-        }
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        if parse_printf_directive(bytes, i).is_some() {
             return true;
         }
+        i += 1;
     }
     false
+}
+
+fn is_pure_printf_template_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'%' {
+        return false;
+    }
+    parse_printf_directive(bytes, 0).is_some_and(|end| end == bytes.len())
+}
+
+fn parse_printf_directive(bytes: &[u8], percent: usize) -> Option<usize> {
+    if bytes.get(percent) != Some(&b'%') {
+        return None;
+    }
+    let mut i = percent + 1;
+    if i + 1 < bytes.len() && bytes[i].is_ascii_hexdigit() && bytes[i + 1].is_ascii_hexdigit() {
+        return None;
+    }
+    if bytes.get(i) == Some(&b'%') {
+        return None;
+    }
+    i = consume_printf_index(bytes, i);
+    while i < bytes.len() && matches!(bytes[i], b'#' | b'0' | b'-' | b'+' | b' ' | b'.') {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    i = consume_printf_index(bytes, i);
+    if i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        return Some(i + 1);
+    }
+    None
+}
+
+fn consume_printf_index(bytes: &[u8], start: usize) -> usize {
+    if bytes.get(start) != Some(&b'[') {
+        return start;
+    }
+    let mut i = start + 1;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > start + 1 && bytes.get(i) == Some(&b']') {
+        i + 1
+    } else {
+        start
+    }
 }
 
 fn is_cli_option_literal(value: &str, key_name: &str) -> bool {
@@ -1568,6 +1604,7 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
         || is_braced_field_initializer_fragment(value)
         || is_minified_js_descriptor_fragment(value)
         || is_escaped_format_fragment(value)
+        || is_method_chain_suffix_fragment(value)
         || value
             .strip_prefix('+')
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
@@ -1644,6 +1681,30 @@ fn is_escaped_format_fragment(value: &str) -> bool {
     let value = value.trim_start();
     (value.starts_with("\\n") || value.starts_with("\\r") || value.starts_with("\\t"))
         && contains_printf_directive(value)
+}
+
+fn is_method_chain_suffix_fragment(value: &str) -> bool {
+    // Java/C# builder chains can be cut after a sensitive-looking label inside
+    // a string, yielding fragments such as `).append(getApiKey()).append(`.
+    // Require method-call punctuation so hyphenated string values stay eligible.
+    let value = value.trim();
+    let Some(rest) = value.strip_prefix(").").or_else(|| value.strip_prefix('.')) else {
+        return false;
+    };
+    if !rest.contains('(') {
+        return false;
+    }
+    rest.split('.').all(|part| {
+        let Some(name_end) = part.find('(') else {
+            return false;
+        };
+        let name = &part[..name_end];
+        !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && part[name_end + 1..]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b'('))
+    })
 }
 
 fn is_arithmetic_expression_literal(value: &str) -> bool {
@@ -2376,6 +2437,7 @@ mod tests {
             r#"password: "<code>sk-test-token</code>""#,
             "<code>sk-test-token</code>"
         ));
+        assert!(has(r#"password = "abc%[3]s""#, "abc%[3]s"));
     }
 
     #[test]
@@ -2399,6 +2461,9 @@ mod tests {
             r#"documentation: "<code>12345678-1234-1234-1234-123456789012</code>""#,
             r#"documentation: "<code>alias/aws/kinesis</code>""#,
             r#"TopologyKey: "k8s.io/zone""#,
+            r#"private_key = "%[3]s""#,
+            r#"sb.append("DbPassword: ").append("***Sensitive Data Redacted***").append(",");"#,
+            r#"sb.append("ApiKey: ").append(getApiKey()).append(",");"#,
             r#"Key = 000102030405060708090A0B0C0D0E0F"#,
             r#"Key = 404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F"#,
             r#"Key = 00112233445566778899AABBCCDDEEFF"#,

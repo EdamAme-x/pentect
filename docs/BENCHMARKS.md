@@ -92,6 +92,9 @@ documentation `<code>` samples only when the code value is a UUID or non-secret
 resource name, and treats Kubernetes `TopologyKey` as public topology metadata.
 Structured/keyed detection suppresses narrow i18n lookup references such as
 `$t(passwordLabel):`, and UI setup/instruction prose for 2FA/auth fields.
+Keyed detection treats whole-value printf templates such as `%[3]s` and Java
+builder-chain tails such as `).append(getApiKey()).append(` as source syntax,
+not credential bytes.
 
 ```text
 CredData commit: 9a55c40
@@ -101,15 +104,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 10442
+FP: 10320
 FN: 4828
 Line only: 227
-Unlabeled: 60079
+Unlabeled: 60062
 Missing files: 0
-Precision: 0.496
+Precision: 0.499
 Recall: 0.680
-F1: 0.574
-Elapsed: 28824 ms
+F1: 0.576
+Elapsed: 28667 ms
 ```
 
 Weak groups:
@@ -127,6 +130,7 @@ Weak groups:
 - Generic `"key"` metadata also suppresses public schema/tag names such as `offset`, `host`, `cost-center`, display labels such as `Dev Gateway Region`, and file references such as `HappyFace.jpg`; credential-shaped values such as `sk-test-token` still fire.
 - Protocol/documentation metadata suppression is shape-gated: AWS SigV4 algorithm labels, Kubernetes `TopologyKey` values, and HTML `<code>` UUID/resource-name samples are skipped, but credential-shaped code samples still fire.
 - UI/i18n suppression is syntax-gated: `$t(...)`/`i18n.t(...)` references and setup/instruction prose under auth/2FA keys are skipped; ordinary weak password/token literals still fire.
+- Source-template suppression is syntax-gated: whole-value printf templates and method-chain fragments are skipped, but mixed literal values such as `abc%[3]s` still fire.
 - Code/reference literals under sensitive-looking keys are suppressed only when syntax proves they are not values: PascalCase type annotations require a code delimiter, and env lookups require explicit Jinja/Ansible `lookup('env', ...)` shape.
 - Additional source/metadata literals are shape-gated: protobuf tag descriptors require `protobuf_key` context, key algorithm labels require known algorithm-size syntax, fingerprints require explicit fingerprint keys and colon-hex shape, and command/mock fragments require invocation syntax.
 - Generic `key` code-member names and parser-cut source fragments are suppressed only when source syntax proves they are metadata, keeping concrete key material under `api_key`/`client_secret` unaffected.
