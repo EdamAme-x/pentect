@@ -65,6 +65,10 @@ impl EntropyDetector {
     ) {
         let run = &text[start..end];
         if is_slash_delimited_path_like(run) {
+            if path_contains_uuid_segment(run) {
+                self.push_single_entropy_span(text, start, end, view, out);
+                return;
+            }
             for (seg_start, seg_end) in slash_segments(run, start) {
                 self.push_single_entropy_span(text, seg_start, seg_end, view, out);
             }
@@ -516,11 +520,47 @@ fn slash_segments(run: &str, base: usize) -> impl Iterator<Item = (usize, usize)
 
 fn is_word_path_segment(segment: &str) -> bool {
     let bytes = segment.as_bytes();
+    if !(2..=48).contains(&bytes.len())
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        || !bytes.iter().any(u8::is_ascii_alphabetic)
+    {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || matches!(b, b'_' | b'-'))
+        || is_short_uppercase_route_segment(bytes)
+        || is_title_case_route_segment(bytes)
+        || wordlike_mixed_case_identifier(bytes)
+}
+
+fn is_short_uppercase_route_segment(bytes: &[u8]) -> bool {
+    (2..=8).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_uppercase)
+}
+
+fn is_title_case_route_segment(bytes: &[u8]) -> bool {
     (3..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_uppercase()
+        && bytes[1..].iter().all(u8::is_ascii_lowercase)
+}
+
+fn path_contains_uuid_segment(run: &str) -> bool {
+    // A bare UUID is normally spared by policy, but a UUID embedded as a path
+    // segment is part of a concrete local/resource locator. Keep that local
+    // context intact instead of splitting it into a guard-suppressed UUID.
+    run.split('/').any(is_uuid_segment)
+}
+
+fn is_uuid_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23].iter().all(|&i| bytes[i] == b'-')
         && bytes
             .iter()
-            .all(|b| b.is_ascii_lowercase() || matches!(b, b'_' | b'-'))
-        && bytes.iter().any(u8::is_ascii_lowercase)
+            .enumerate()
+            .all(|(i, b)| [8, 13, 18, 23].contains(&i) || b.is_ascii_hexdigit())
 }
 
 fn is_source_identifier_like(run: &str, text: &str, start: usize, end: usize) -> bool {
@@ -933,6 +973,33 @@ mod tests {
             let v = NormalizedView::build(&reg, raw);
             assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
         }
+    }
+
+    #[test]
+    fn api_route_paths_are_not_entropy_candidates() {
+        for raw in [
+            "\"authorized_connect_apps\": \"/2010-04-01/Accounts/ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/AuthorizedConnectApps.json\"",
+            "\"uri\": \"/2010-04-01/Accounts/ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/SIP/Domains/SDaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Auth/Calls/CredentialListMappings.json?PageSize=50\"",
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn uuid_path_segments_keep_path_context() {
+        let raw = "/Users/eln/Library/Application/Simulator/5/Applications/5172D1BB-AAB2-1124-C5AD-061D1DD22290/Documents/weatherForecast";
+        let reg = region(raw);
+        let v = NormalizedView::build(&reg, raw);
+        let spans = EntropyDetector::default().detect(&v);
+        assert!(
+            spans
+                .iter()
+                .any(|span| raw[span.range.start..span.range.end]
+                    .contains("5172D1BB-AAB2-1124-C5AD-061D1DD22290")),
+            "{spans:?}"
+        );
     }
 
     #[test]
