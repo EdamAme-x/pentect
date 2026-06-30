@@ -1015,9 +1015,9 @@ pub fn bearer_token(s: &str) -> bool {
     let token = s.trim();
     if !(20..=4096).contains(&token.len())
         || token.bytes().any(|b| b.is_ascii_whitespace())
-        || !token
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'~' | b'+' | b'/' | b'='))
+        || !token.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'~' | b'+' | b'/' | b'=')
+        })
     {
         return false;
     }

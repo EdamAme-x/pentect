@@ -775,7 +775,9 @@ mod tests {
             "redis://***:***@localhost:6379",
         ] {
             assert!(
-                labels(raw).iter().all(|label| label != "DB_CONNECTION_STRING"),
+                labels(raw)
+                    .iter()
+                    .all(|label| label != "DB_CONNECTION_STRING"),
                 "{raw}: {:?}",
                 labels(raw)
             );
@@ -824,7 +826,10 @@ mod tests {
             "- Bearer 0a000aa0a0a0000000a000a0a0a00000a0a000aaaa0a000aa0aaa000a0a0a000",
             "BEARER_TOKEN"
         ));
-        assert!(!has("Authorization: Bearer YOUR_ACCESS_TOKEN_VALUE", "BEARER_TOKEN"));
+        assert!(!has(
+            "Authorization: Bearer YOUR_ACCESS_TOKEN_VALUE",
+            "BEARER_TOKEN"
+        ));
         assert!(!has("Bearer abcdefghijklmnopqrstuv", "BEARER_TOKEN"));
         assert!(has(
             r#"if auth != "Basic bnJna2w6dmdycWpz" {"#,

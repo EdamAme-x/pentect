@@ -135,13 +135,13 @@ fn entropy_candidate(run: &str, text: &str, start: usize, end: usize) -> bool {
     has_opaque_mix(run)
         && (is_jwk_private_parameter_context(text, start)
             || (!is_assignment_name_fragment(run)
-        && !is_operator_expression_fragment(run)
-        && !is_slash_separated_identifier_list(run)
-        && !is_code_arithmetic_constant(run)
-        && !is_uppercase_constant_identifier(run)
-        && !is_public_oid_assignment_name_fragment(run)
-        && !is_source_identifier_like(run, text, start, end)
-        && !is_regex_character_class_fragment(text, start, end)))
+                && !is_operator_expression_fragment(run)
+                && !is_slash_separated_identifier_list(run)
+                && !is_code_arithmetic_constant(run)
+                && !is_uppercase_constant_identifier(run)
+                && !is_public_oid_assignment_name_fragment(run)
+                && !is_source_identifier_like(run, text, start, end)
+                && !is_regex_character_class_fragment(text, start, end)))
 }
 
 fn is_assignment_name_fragment(run: &str) -> bool {
@@ -396,7 +396,10 @@ fn is_jwk_public_parameter_context(text: &str, start: usize, ctx: &Context) -> b
     let Some(key) = key else {
         return false;
     };
-    if !matches!(normalize_identifier(&key).as_str(), "kid" | "n" | "e" | "x" | "y") {
+    if !matches!(
+        normalize_identifier(&key).as_str(),
+        "kid" | "n" | "e" | "x" | "y"
+    ) {
         return false;
     }
     has_nearby_jwk_kty(text, start)
@@ -447,10 +450,7 @@ fn local_assignment_key_before_value(text: &str, start: usize) -> Option<&str> {
     let key_start = before[..key_end]
         .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
         .map_or(0, |pos| {
-            pos + before[pos..]
-                .chars()
-                .next()
-                .map_or(1, char::len_utf8)
+            pos + before[pos..].chars().next().map_or(1, char::len_utf8)
         });
     let key = &before[key_start..key_end];
     (!key.is_empty()
@@ -1027,7 +1027,10 @@ mod tests {
         ] {
             let reg = region(raw);
             let view = NormalizedView::build(&reg, raw);
-            assert!(!EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+            assert!(
+                !EntropyDetector::default().detect(&view).is_empty(),
+                "{raw}"
+            );
         }
     }
 

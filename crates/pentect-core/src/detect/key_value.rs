@@ -1789,9 +1789,12 @@ fn escaped_html_fragment_has_markup_or_code_syntax(value: &str) -> bool {
         return true;
     }
     value.chars().any(char::is_whitespace)
-        && value
-            .bytes()
-            .any(|b| matches!(b, b'{' | b'}' | b'[' | b']' | b'(' | b')' | b';' | b',' | b'='))
+        && value.bytes().any(|b| {
+            matches!(
+                b,
+                b'{' | b'}' | b'[' | b']' | b'(' | b')' | b';' | b',' | b'='
+            )
+        })
 }
 
 fn escaped_html_code_reference_literal(value: &str) -> bool {
@@ -1813,9 +1816,9 @@ fn escaped_html_code_reference_literal(value: &str) -> bool {
 
 fn is_simple_code_reference_name(value: &str) -> bool {
     !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'>' | b'[' | b']'))
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'>' | b'[' | b']')
+        })
 }
 
 fn is_uuid_literal(value: &str) -> bool {
