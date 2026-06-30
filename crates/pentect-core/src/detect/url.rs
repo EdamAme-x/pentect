@@ -13,6 +13,9 @@ static URI_USERINFO_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b[a-z][a-z0-9+.-]{0,31}://[^\s"'<>()/?#@]+@[^\s"'<>()]*[^\s"'<>().,;:!?]"#)
         .unwrap()
 });
+static CLOUD_HOST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b[a-z0-9][a-z0-9.-]{1,180}\.(?:amazonaws\.com|firebaseio\.com)\b"#).unwrap()
+});
 
 /// Preserves useful URL structure for internal systems:
 /// `http://local.jira.corp/api/issues/1234`
@@ -30,6 +33,9 @@ impl Detector for UrlDetector {
                 continue;
             }
             inspect_uri_userinfo(view, m.start(), m.as_str(), &mut out);
+        }
+        for m in CLOUD_HOST_RE.find_iter(view.text()) {
+            inspect_cloud_host(view, m.start(), m.as_str(), &mut out);
         }
         out
     }
@@ -138,6 +144,15 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
             );
         }
     }
+    inspect_s3_path_style_url(
+        view,
+        base,
+        url,
+        authority_end,
+        host,
+        fragment_or_query_path_end(url, authority_end),
+        out,
+    );
     if !is_internal_host(host) {
         return;
     }
@@ -183,8 +198,15 @@ fn push_span(
     if start >= end {
         return;
     }
+    let range = view.to_raw(ByteRange::new(start, end));
+    if out
+        .iter()
+        .any(|span| span.range == range && span.category == category && span.label == label)
+    {
+        return;
+    }
     out.push(Span {
-        range: view.to_raw(ByteRange::new(start, end)),
+        range,
         category,
         label: label.to_string(),
         confidence: Confidence::High,
@@ -361,6 +383,190 @@ fn parse_ipv4(host: &str) -> Option<(u8, u8, u8, u8)> {
         return None;
     }
     Some((a, b, c, d))
+}
+
+fn inspect_cloud_host(view: &NormalizedView, host_start: usize, host: &str, out: &mut Vec<Span>) {
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return;
+    }
+    if let Some(bucket_end) = s3_virtual_hosted_bucket_end(host) {
+        push_span(
+            view,
+            out,
+            host_start,
+            host_start + bucket_end,
+            Category::Secret,
+            labels::AWS_S3_BUCKET,
+        );
+        return;
+    }
+    if let Some(project_end) = firebase_project_end(host) {
+        push_span(
+            view,
+            out,
+            host_start,
+            host_start + project_end,
+            Category::Secret,
+            labels::FIREBASE_PROJECT_ID,
+        );
+    }
+}
+
+fn inspect_s3_path_style_url(
+    view: &NormalizedView,
+    base: usize,
+    url: &str,
+    authority_end: usize,
+    host: &str,
+    path_end: usize,
+    out: &mut Vec<Span>,
+) {
+    if !s3_path_style_host(host) || url.as_bytes().get(authority_end) != Some(&b'/') {
+        return;
+    }
+    let bucket_start = authority_end + 1;
+    let bucket_end = url[bucket_start..path_end]
+        .find('/')
+        .map_or(path_end, |i| bucket_start + i);
+    if bucket_start >= bucket_end {
+        return;
+    }
+    let bucket = &url[bucket_start..bucket_end];
+    if s3_bucket_name_is_valid(bucket) {
+        push_span(
+            view,
+            out,
+            base + bucket_start,
+            base + bucket_end,
+            Category::Secret,
+            labels::AWS_S3_BUCKET,
+        );
+    }
+}
+
+fn fragment_or_query_path_end(url: &str, authority_end: usize) -> usize {
+    let query_at = url[authority_end..].find('?').map(|i| authority_end + i);
+    let fragment_at = url[authority_end..].find('#').map(|i| authority_end + i);
+    [query_at, fragment_at]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(url.len())
+}
+
+fn s3_virtual_hosted_bucket_end(host: &str) -> Option<usize> {
+    let lower = host.to_ascii_lowercase();
+    for suffix in [".s3.amazonaws.com", ".s3-accelerate.amazonaws.com"] {
+        if lower.ends_with(suffix) {
+            let bucket_end = host.len().checked_sub(suffix.len())?;
+            return s3_bucket_name_is_valid(&host[..bucket_end]).then_some(bucket_end);
+        }
+    }
+    for marker in [".s3.dualstack.", ".s3.", ".s3-"] {
+        let Some(marker_start) = lower.rfind(marker) else {
+            continue;
+        };
+        let region_start = marker_start + marker.len();
+        let Some(region) = lower[region_start..].strip_suffix(".amazonaws.com") else {
+            continue;
+        };
+        if aws_region_label_like(region) && s3_bucket_name_is_valid(&host[..marker_start]) {
+            return Some(marker_start);
+        }
+    }
+    None
+}
+
+fn s3_path_style_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "s3.amazonaws.com" || host == "s3-accelerate.amazonaws.com" {
+        return true;
+    }
+    if let Some(region) = host
+        .strip_prefix("s3.")
+        .and_then(|rest| rest.strip_suffix(".amazonaws.com"))
+    {
+        return aws_region_label_like(region);
+    }
+    if let Some(region) = host
+        .strip_prefix("s3-")
+        .and_then(|rest| rest.strip_suffix(".amazonaws.com"))
+    {
+        return aws_region_label_like(region);
+    }
+    false
+}
+
+fn s3_bucket_name_is_valid(bucket: &str) -> bool {
+    // S3 general-purpose bucket names are DNS-shaped: 3-63 bytes, lowercase
+    // letters/digits/dot/hyphen, starts and ends alphanumeric, no adjacent dot
+    // pairs, and not IPv4-shaped. The host suffix supplies service context.
+    let bytes = bucket.as_bytes();
+    if !(3..=63).contains(&bytes.len()) {
+        return false;
+    }
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    if !bytes[bytes.len() - 1].is_ascii_lowercase() && !bytes[bytes.len() - 1].is_ascii_digit() {
+        return false;
+    }
+    if bucket.contains("..") || bucket.contains(".-") || bucket.contains("-.") {
+        return false;
+    }
+    if bucket.starts_with("xn--")
+        || bucket.starts_with("sthree-")
+        || bucket.starts_with("amzn-s3-demo-")
+    {
+        return false;
+    }
+    if bucket.ends_with("-s3alias")
+        || bucket.ends_with("--ol-s3")
+        || bucket.ends_with(".mrap")
+        || bucket.ends_with("--x-s3")
+        || bucket.ends_with("--table-s3")
+    {
+        return false;
+    }
+    if parse_ipv4(bucket).is_some() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+}
+
+fn aws_region_label_like(region: &str) -> bool {
+    let bytes = region.as_bytes();
+    (6..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes.iter().any(u8::is_ascii_digit)
+        && bytes.contains(&b'-')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+fn firebase_project_end(host: &str) -> Option<usize> {
+    let suffix = ".firebaseio.com";
+    let lower = host.to_ascii_lowercase();
+    if !lower.ends_with(suffix) {
+        return None;
+    }
+    let project_end = host.len().checked_sub(suffix.len())?;
+    firebase_project_id_is_valid(&host[..project_end]).then_some(project_end)
+}
+
+fn firebase_project_id_is_valid(project: &str) -> bool {
+    let bytes = project.as_bytes();
+    (6..=30).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
 fn inspect_path_ids(
@@ -567,6 +773,53 @@ mod tests {
     #[test]
     fn external_url_is_not_granularly_masked() {
         assert!(labels("https://example.com/api/issues/1234").is_empty());
+    }
+
+    #[test]
+    fn cloud_resource_hosts_mask_service_identifier_only() {
+        assert_eq!(
+            labels("download from tenant-7-builds.s3.amazonaws.com/releases/app.zip"),
+            [("AWS_S3_BUCKET".to_string(), "tenant-7-builds".to_string())]
+        );
+        assert_eq!(
+            labels("https://media.assets-prod.s3.us-west-2.amazonaws.com/a.zip"),
+            [("AWS_S3_BUCKET".to_string(), "media.assets-prod".to_string())]
+        );
+        assert_eq!(
+            labels(r#""firebase_url":"https://tenant-7.firebaseio.com""#),
+            [("FIREBASE_PROJECT_ID".to_string(), "tenant-7".to_string())]
+        );
+    }
+
+    #[test]
+    fn s3_path_style_url_masks_bucket_name() {
+        assert_eq!(
+            labels("https://s3.us-west-2.amazonaws.com/tenant-7-builds/releases/app.zip"),
+            [("AWS_S3_BUCKET".to_string(), "tenant-7-builds".to_string())]
+        );
+    }
+
+    #[test]
+    fn cloud_resource_hosts_require_valid_service_names() {
+        for raw in [
+            "https://s3.amazonaws.com",
+            "https://Bad_Name.s3.amazonaws.com",
+            "https://192.168.0.1.s3.amazonaws.com",
+            "https://tenant..prod.s3.amazonaws.com",
+            "https://xn--tenant.s3.amazonaws.com",
+            "https://tenant-s3alias.s3.amazonaws.com",
+            "https://firebaseio.com",
+            "https://abc.firebaseio.com",
+            "https://Tenant_7.firebaseio.com",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|(label, _)| label != "AWS_S3_BUCKET" && label != "FIREBASE_PROJECT_ID"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
     }
 
     #[test]

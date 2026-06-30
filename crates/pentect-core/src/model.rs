@@ -28,6 +28,10 @@ pub mod labels {
     pub const RESOURCE_ID: &str = "RESOURCE_ID";
     /// User-info credential portion of a URL authority.
     pub const URL_CREDENTIAL: &str = "URL_CREDENTIAL";
+    /// Bucket name in an Amazon S3 hostname.
+    pub const AWS_S3_BUCKET: &str = "AWS_S3_BUCKET";
+    /// Firebase project/database prefix in a Realtime Database hostname.
+    pub const FIREBASE_PROJECT_ID: &str = "FIREBASE_PROJECT_ID";
     /// Query parameter value in an internal URL.
     pub const URL_QUERY_VALUE: &str = "URL_QUERY_VALUE";
     /// Fragment value in an internal URL.
