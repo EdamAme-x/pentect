@@ -628,6 +628,7 @@ fn looks_like_secret_value(
         || is_license_identifier_literal(value, key_name)
         || is_dunder_identifier_literal(value)
         || is_uppercase_constant_literal_for_generic_key(value, key_name)
+        || is_generic_code_member_name_literal(value, key_name)
         || is_structured_key_name_reference_literal(value, key_name)
         || is_plain_prose_literal_for_generic_key(value, key_name)
         || is_locator_literal_for_key(value, key_name)
@@ -728,19 +729,53 @@ fn is_benign_literal(value: &str) -> bool {
 
 fn is_iso8601_timestamp_literal(value: &str) -> bool {
     // Timestamp bucket keys and metadata dates can sit under fields containing
-    // `key`, but a timestamp is not credential material. Keep this to the
-    // common complete UTC form instead of treating arbitrary dates as benign.
+    // `key`, but a timestamp is not credential material. Keep this to strict
+    // ISO calendar/date-time shapes instead of treating arbitrary dates as benign.
     let value = value.trim();
     let b = value.as_bytes();
-    b.len() == 24
+    is_iso8601_date_literal_bytes(b) || is_iso8601_datetime_literal_bytes(b)
+}
+
+fn is_iso8601_date_literal_bytes(b: &[u8]) -> bool {
+    b.len() == 10
         && b[4] == b'-'
         && b[7] == b'-'
-        && b[10] == b'T'
-        && b[13] == b':'
-        && b[16] == b':'
-        && b[19] == b'.'
-        && b[23] == b'Z'
-        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22]
+        && [0, 1, 2, 3, 5, 6, 8, 9]
+            .iter()
+            .all(|idx| b[*idx].is_ascii_digit())
+}
+
+fn is_iso8601_datetime_literal_bytes(b: &[u8]) -> bool {
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || ![0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+            .iter()
+            .all(|idx| b[*idx].is_ascii_digit())
+    {
+        return false;
+    }
+    let mut pos = 19;
+    if b.get(pos) == Some(&b'.') {
+        pos += 1;
+        let fraction_start = pos;
+        while b.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        if pos == fraction_start {
+            return false;
+        }
+    }
+    if b.get(pos) == Some(&b'Z') {
+        return pos + 1 == b.len();
+    }
+    b.len() == pos + 6
+        && matches!(b[pos], b'+' | b'-')
+        && b[pos + 3] == b':'
+        && [pos + 1, pos + 2, pos + 4, pos + 5]
             .iter()
             .all(|idx| b[*idx].is_ascii_digit())
 }
@@ -1486,6 +1521,8 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
         || value.starts_with("\\\"{")
         || is_object_method_call_fragment(value)
         || is_braced_type_initializer_fragment(value)
+        || is_braced_field_initializer_fragment(value)
+        || is_minified_js_descriptor_fragment(value)
         || is_escaped_format_fragment(value)
         || value
             .strip_prefix('+')
@@ -1508,13 +1545,52 @@ fn is_braced_type_initializer_fragment(value: &str) -> bool {
     let Some(stem) = value.strip_suffix('{') else {
         return false;
     };
-    (3..=80).contains(&stem.len())
-        && stem.bytes().any(|b| b == b'_')
-        && stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    is_source_type_name_fragment(stem)
+}
+
+fn is_braced_field_initializer_fragment(value: &str) -> bool {
+    // Go/C#/JS object snippets can be cut at a nested `Key:` separator:
+    // `jose.JSONWebKey{Key:` or `PublicKey{KeyID:`. That is syntax, not data.
+    let value = value.trim();
+    let Some(stem) = value.strip_suffix(':') else {
+        return false;
+    };
+    let Some((ty, field)) = stem.rsplit_once('{') else {
+        return false;
+    };
+    is_source_type_name_fragment(ty)
+        && (2..=64).contains(&field.len())
+        && field
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn is_source_type_name_fragment(stem: &str) -> bool {
+    let stem = stem.trim();
+    (3..=100).contains(&stem.len())
         && stem
             .bytes()
             .next()
             .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))
+        && (stem.bytes().any(|b| b == b'_')
+            || stem.bytes().any(|b| b.is_ascii_uppercase())
+            || stem.contains('.'))
+}
+
+fn is_minified_js_descriptor_fragment(value: &str) -> bool {
+    // When a long minified object descriptor has several `{key:"...", value:...}`
+    // pairs on one line, a later `key:` can make the previous tail look like a
+    // credential. Function descriptor syntax proves this is source code.
+    let value = value.trim();
+    value.contains("value:function")
+        && (value.contains("},{key:") || value.contains("},{key=\"") || value.contains("},{key:\""))
 }
 
 fn is_escaped_format_fragment(value: &str) -> bool {
@@ -1619,6 +1695,51 @@ fn is_uppercase_constant_literal_for_generic_key(value: &str, key_name: &str) ->
         && value.bytes().any(|b| b.is_ascii_alphabetic())
         && !value.bytes().any(|b| b.is_ascii_digit())
         && value.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+}
+
+fn is_generic_code_member_name_literal(value: &str, key_name: &str) -> bool {
+    // Transpiled/minified object descriptors use generic `key` fields to name
+    // methods and private members (`{key:"_onClose", value:function...}`).
+    // Suppress only identifier-shaped member names under generic key metadata;
+    // concrete `api_key`/`client_secret` values still use the normal path.
+    if !is_generic_metadata_key_name(key_name) {
+        return false;
+    }
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if !(3..=80).contains(&bytes.len())
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'@'))
+        || !bytes.iter().any(u8::is_ascii_alphabetic)
+    {
+        return false;
+    }
+    if value.starts_with("@@") {
+        return bytes[2..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    }
+    if bytes.first().is_some_and(|b| matches!(b, b'_' | b'$'))
+        && !bytes.iter().any(u8::is_ascii_digit)
+    {
+        return true;
+    }
+    if is_camel_case_code_reference(value) {
+        return true;
+    }
+    let mut parts = value.split('_');
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+    let Some(rest) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && prefix.len() >= 2
+        && prefix.bytes().all(|b| b.is_ascii_uppercase())
+        && rest.bytes().any(|b| b.is_ascii_lowercase())
+        && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn is_structured_key_name_reference_literal(value: &str, key_name: &str) -> bool {
@@ -2124,11 +2245,19 @@ mod tests {
             r#"Key = 00112233445566778899AABBCCDDEEFF"#,
             r#"Key = 0123456789ABCDEFFEDCBA9876543210"#,
             r#"Key = E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0"#,
+            r#"key_as_string: "2017-01-01""#,
+            r#"key_as_string: "2018-07-10T05:20:00.000-06:00""#,
+            r#"key_as_string: "2018-07-10T05:20:00Z""#,
             r#"aggregations.histo.buckets.3.key_as_string: "2017-01-01T08:00:00.000Z""#,
             r#"key: "Authorization""#,
             r#"key: "grant_type""#,
             r#"key: "panel1""#,
             r#"key: "dataGrid12""#,
+            r#"{key:"_onClose",value:function(){}}"#,
+            r#"{key:"_reset",value:function(){}}"#,
+            r#"{key:"UNSAFE_componentWillReceiveProps",value:function(){}}"#,
+            r#"{key:"getBase64ForTag",value:function(){}}"#,
+            r#"{key:"@@iterator",value:Symbol.iterator}"#,
             r#"EnvPubKeyFingerprint: "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00","#,
             r#"$token = Get-NtToken -Primary -Duplicate"#,
             r#"$token = $this->createMock(TokenInterface::class);"#,
@@ -2145,6 +2274,9 @@ mod tests {
             r#"canonical_field(&mut out, "key", key_hex);"#,
             r#"let session = unique_session("forged-heartbeat-key");"#,
             "hexkey=not-a-hex-123",
+            "PasswordCredentials: internal.PasswordCredentials{",
+            "Key: jose.JSONWebKey{Key: j.privKey, KeyID: j.kid},",
+            r#"{key:"linear",value:function(n){return n}},{key:"cubic",value:function(n){return n*n*n}}"#,
             "/// Bitcoin address: base58check, P2PKH (0x00, '1') or P2SH (0x05, '3').",
             "/// Bitcoin WIF private key: base58check, version 0x80.",
         ] {

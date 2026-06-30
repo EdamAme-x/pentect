@@ -73,6 +73,9 @@ hex patterns such as sequential bytes, repeated bytes, and visual
 `012345...`/`001122...` test vectors stay negative. `KEYED_SECRET` identity
 sweep is disabled: key-value detections require local key context, while
 stronger rule/entropy/structural detections still drive global identity sweep.
+Generic `key` fields that name code members and parser-cut source fragments
+(`Type{Field:`, minified `{key:"...", value:function...}` tails, strict ISO date
+bucket keys) are treated as metadata/source syntax, not credential values.
 
 ```text
 CredData commit: 9a55c40
@@ -82,15 +85,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10294
-FP: 13280
+FP: 12812
 FN: 4810
 Line only: 220
-Unlabeled: 69500
+Unlabeled: 69452
 Missing files: 0
-Precision: 0.437
+Precision: 0.446
 Recall: 0.682
-F1: 0.532
-Elapsed: 29026 ms
+F1: 0.539
+Elapsed: 28633 ms
 ```
 
 Weak groups:
@@ -106,6 +109,7 @@ Weak groups:
 - Generic JSON `"key"` values that are identifier names such as `smtpDomain`, `Authorization`, or `grant_type` are treated as metadata; digit/symbol-bearing key material and sensitive single words still fire.
 - Code/reference literals under sensitive-looking keys are suppressed only when syntax proves they are not values: PascalCase type annotations require a code delimiter, and env lookups require explicit Jinja/Ansible `lookup('env', ...)` shape.
 - Additional source/metadata literals are shape-gated: protobuf tag descriptors require `protobuf_key` context, key algorithm labels require known algorithm-size syntax, fingerprints require explicit fingerprint keys and colon-hex shape, and command/mock fragments require invocation syntax.
+- Generic `key` code-member names and parser-cut source fragments are suppressed only when source syntax proves they are metadata, keeping concrete key material under `api_key`/`client_secret` unaffected.
 - Synthetic hex fixture strings are suppressed when the whole value is built from canonical visual patterns, sequential byte runs, or repeated bytes; arbitrary hex under sensitive key context still fires.
 - `KEYED_SECRET` identity sweep keeps anchored detections only. Context-free propagation is left to stronger rule, entropy, and structural detections.
 - Source fixture literals require both source-code shape and fixture key context, so `expectedPassword = "pass"` is skipped while plain `password = "pass"` still fires.
