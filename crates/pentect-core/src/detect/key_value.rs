@@ -626,6 +626,9 @@ fn looks_like_secret_value(
         || is_source_sensitive_name_reference_literal(value, source_key)
         || is_source_fixture_secret_literal(value, key_name, source_key)
         || is_source_struct_tag_literal(value, key_name, source_key)
+        || is_source_prefix_constant_literal(value, key_name)
+        || is_shell_command_substitution_literal(value, source_key)
+        || is_inline_code_key_value_tail_literal(value, key_name, source_key)
         || is_source_code_fragment_literal(value)
         || is_arithmetic_expression_literal(value)
         || is_localization_template_reference(value)
@@ -1445,30 +1448,15 @@ fn is_html_documentation_fragment_literal(value: &str, key_name: &str, source_ke
     // Generated API docs often include prose like `<p>Key: CreatedTime</p>`
     // inside long documentation strings. The scanner can see the inner `Key:`
     // as a key/value pair; the value is an HTML fragment naming a public field.
-    // Require both generic-key context and documentation/HTML syntax on the left.
-    if !is_generic_metadata_key_name(key_name)
+    // Require both key-name context and documentation/HTML syntax on the left.
+    if !has_identifier_component(key_name, "key")
         || !source_key_has_html_documentation_shape(source_key)
     {
         return false;
     }
     let value = value.trim();
-    let lower = value.to_ascii_lowercase();
-    let Some(tag_start) = lower.rfind("</") else {
-        return false;
-    };
-    let Some(tag) = lower[tag_start + 2..].strip_suffix('>') else {
-        return false;
-    };
-    if !matches!(tag, "p" | "code" | "i" | "li") {
-        return false;
-    }
-    let head = &value[..tag_start];
-    !head.is_empty()
-        && head.bytes().any(|b| b.is_ascii_alphanumeric())
-        && head.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'_' | b'-' | b':' | b'.' | b'*' | b'/' | b'<' | b'>')
-        })
+    let (head, had_html_tail) = strip_trailing_html_tag(value);
+    is_documentation_metadata_key_name(head, had_html_tail)
 }
 
 fn source_key_has_html_documentation_shape(source_key: &str) -> bool {
@@ -1478,6 +1466,94 @@ fn source_key_has_html_documentation_shape(source_key: &str) -> bool {
         || lower.contains("<li>")
         || lower.contains("<code>")
         || lower.contains("<i>")
+}
+
+fn strip_trailing_html_tag(value: &str) -> (&str, bool) {
+    let lower = value.to_ascii_lowercase();
+    let Some(tag_start) = lower.rfind("</") else {
+        return (value, false);
+    };
+    let Some(tag) = lower[tag_start + 2..].strip_suffix('>') else {
+        return (value, false);
+    };
+    if !matches!(tag, "p" | "code" | "i" | "li") {
+        return (value, false);
+    }
+    (&value[..tag_start], true)
+}
+
+fn is_documentation_metadata_key_name(value: &str, had_html_tail: bool) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.contains("://") {
+        return false;
+    }
+    let cleaned = value
+        .replace("<code>", "")
+        .replace("</code>", "")
+        .replace("<i>", "")
+        .replace("</i>", "");
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty()
+        || cleaned
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || matches!(b, b'=' | b'@' | b'{' | b'}'))
+        || contains_dangerous_secret_component(cleaned)
+    {
+        return false;
+    }
+    is_uppercase_public_doc_identifier(cleaned)
+        || is_namespaced_public_doc_key(cleaned)
+        || is_public_doc_field_name(cleaned, had_html_tail)
+}
+
+fn contains_dangerous_secret_component(value: &str) -> bool {
+    normalize_key(value).split('_').any(|part| {
+        matches!(
+            part,
+            "secret" | "password" | "passwd" | "credential" | "token" | "auth" | "private"
+        )
+    })
+}
+
+fn is_uppercase_public_doc_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (3..=96).contains(&bytes.len())
+        && bytes.iter().any(u8::is_ascii_alphabetic)
+        && bytes.contains(&b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+fn is_namespaced_public_doc_key(value: &str) -> bool {
+    let Some((namespace, name)) = value.split_once(':') else {
+        return false;
+    };
+    (2..=48).contains(&namespace.len())
+        && !name.is_empty()
+        && namespace
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn is_public_doc_field_name(value: &str, had_html_tail: bool) -> bool {
+    if !(2..=96).contains(&value.len()) {
+        return false;
+    }
+    let valid = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'*' | b'/'));
+    if !valid || !value.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    had_html_tail
+        || value.contains('-')
+        || value.contains('_')
+        || value.bytes().any(|b| b.is_ascii_uppercase())
 }
 
 fn is_uuid_literal(value: &str) -> bool {
@@ -1637,6 +1713,55 @@ fn source_key_has_struct_tag_key(source_key: &str) -> bool {
         return false;
     };
     normalize_key(tail) == "key"
+}
+
+fn is_source_prefix_constant_literal(value: &str, key_name: &str) -> bool {
+    // Prefix constants (`FSCRYPT_KEY_DESC_PREFIX = "fscrypt:"`) name a public
+    // namespace prefix. They are adjacent to key words but do not carry key
+    // material.
+    if !has_identifier_component(key_name, "prefix") {
+        return false;
+    }
+    let value = value.trim();
+    let Some(prefix) = value.strip_suffix(':') else {
+        return false;
+    };
+    (2..=48).contains(&prefix.len())
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !contains_dangerous_secret_component(prefix)
+}
+
+fn is_shell_command_substitution_literal(value: &str, source_key: &str) -> bool {
+    // Shell completions/config scripts assign keys from command substitutions:
+    // `local key=$(__docker_map_key_of_current_option ...)`. The captured
+    // value is the command expression, not the generated key.
+    if !source_key_has_code_shape(source_key) {
+        return false;
+    }
+    let value = value.trim();
+    let Some(body) = value.strip_prefix("$(") else {
+        return false;
+    };
+    (3..=96).contains(&body.len())
+        && body
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn is_inline_code_key_value_tail_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Help text commonly documents `key=value` inside backticks. Splitting at
+    // `=` leaves `value`` as a fake credential; keep this to generic key
+    // context and inline-code syntax.
+    if !is_generic_metadata_key_name(key_name) || !source_key.contains('`') {
+        return false;
+    }
+    value.trim() == "value`"
 }
 
 fn is_lower_dotted_config_name(value: &str) -> bool {
@@ -2528,6 +2653,12 @@ mod tests {
         ));
         assert!(has(r#"key: "abc123</p>""#, "abc123</p>"));
         assert!(has(r#"api_key = "abc123,def456""#, "abc123,def456"));
+        assert!(has(
+            r#""documentation": "<p>Key: sk-test-token</p>""#,
+            "sk-test-token</p>"
+        ));
+        assert!(has(r#"password_prefix = "secret:""#, "secret:"));
+        assert!(has(r#"api_key = "$(secret_command""#, "$(secret_command"));
     }
 
     #[test]
@@ -2562,9 +2693,15 @@ mod tests {
             r#"sb.append("ApiKey: ").append(getApiKey()).append(",");"#,
             r#""fluentSetterDocumentation": "/**<p>Key: CreatedTime</p>""#,
             r#""fluentSetterDocumentation": "<p>Key: tag:<i>my-tag-key</i>""#,
+            r#""documentation": "<p>Allowed condition Key: resource-groups:ResourceTypeFilters""#,
+            r#""documentation": "<p>If the value for the key property is OBJECT_EXTENSION or OBJECT_KEY""#,
+            r#""documentation": "<p>Valid filter keys include <code>NAME_PREFIX</code>: a name prefix""#,
             r#"TrueFromOne bool `key:"yesone,string"`"#,
             r#"Mode string `key:"value,options=first|second"`"#,
             r#"Amount int `key:"value3,range=(1:5]"`"#,
+            r#"FSCRYPT_KEY_DESC_PREFIX = "fscrypt:""#,
+            r#"local key=$(__docker_map_key_of_current_option '--filter|-f')"#,
+            r#"cmd.Flags().StringArrayVarP(&opts.RawFields, "raw-field", "f", nil, "Add a string parameter in `key=value` format")"#,
             r#"Key = 000102030405060708090A0B0C0D0E0F"#,
             r#"Key = 404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F"#,
             r#"Key = 00112233445566778899AABBCCDDEEFF"#,
