@@ -44,6 +44,7 @@ exact:room_name_or_id
 exact:external_data_source
 prefix:your_
 prefix:example_
+prefix:fake_
 suffix:_example
 contains:_removed
 contains:_redacted

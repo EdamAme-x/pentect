@@ -100,6 +100,8 @@ Core benign gating treats public crypto test-vector identifiers such as
 `ED25519-1-PUBLIC` as case/curve labels, not key material.
 Keyed detection also skips generated documentation fragments such as
 `Key: CreatedTime</p>` and Go struct tag metadata such as `key:"name,string"`.
+Placeholder matching treats explicit `fake_*` values as non-secret examples,
+without suppressing weak real-world values such as `pass` or `secret`.
 
 ```text
 CredData commit: 9a55c40
@@ -109,15 +111,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 7956
+FP: 7708
 FN: 4828
 Line only: 227
-Unlabeled: 60025
+Unlabeled: 60014
 Missing files: 0
-Precision: 0.564
+Precision: 0.571
 Recall: 0.680
-F1: 0.617
-Elapsed: 27993 ms
+F1: 0.621
+Elapsed: 27527 ms
 ```
 
 Weak groups:
@@ -138,6 +140,7 @@ Weak groups:
 - Source-template suppression is syntax-gated: whole-value printf templates and method-chain fragments are skipped, but mixed literal values such as `abc%[3]s` still fire.
 - Public crypto test-vector identifiers are shape-gated: NIST KAS-ECC P/K/B case IDs, role+named-curve labels, and ED25519/ED448 test case labels are skipped; operational handles such as `tenant-7-trial` and `ALICE_prod_key_2026` still fire.
 - Generated documentation fragments and Go struct tag values are syntax-gated: HTML doc fragments require documentation/HTML on the left side, and struct tags require backtick-delimited `key` metadata.
+- Explicit placeholder markers include `fake_*`; weak literals such as `pass`, `secret`, `abc123`, and `changeme` remain detectable unless a separate fixture/source context proves they are examples.
 - Code/reference literals under sensitive-looking keys are suppressed only when syntax proves they are not values: PascalCase type annotations require a code delimiter, and env lookups require explicit Jinja/Ansible `lookup('env', ...)` shape.
 - Additional source/metadata literals are shape-gated: protobuf tag descriptors require `protobuf_key` context, key algorithm labels require known algorithm-size syntax, fingerprints require explicit fingerprint keys and colon-hex shape, and command/mock fragments require invocation syntax.
 - Generic `key` code-member names and parser-cut source fragments are suppressed only when source syntax proves they are metadata, keeping concrete key material under `api_key`/`client_secret` unaffected.
