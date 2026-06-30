@@ -778,6 +778,7 @@ fn looks_like_secret_value(
         || is_escaped_control_placeholder_literal(value, key_name)
         || is_escaped_plain_source_line_literal(value, source_key)
         || is_escaped_source_payload_fragment_literal(value, source_key)
+        || is_source_env_fallback_name_literal(value, key_name, source_key)
         || is_source_constant_reference_literal(value, key_name, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
         || is_source_config_name_literal(value, source_key)
@@ -790,7 +791,7 @@ fn looks_like_secret_value(
         || is_runtime_template_reference_literal(value, key_name, source_key)
         || is_source_string_fragment_literal(value, source_key)
         || is_source_concatenation_template_literal(value)
-        || is_shell_command_substitution_literal(value, source_key)
+        || is_shell_command_substitution_literal(value, key_name, source_key)
         || is_inline_code_key_value_tail_literal(value, key_name, source_key)
         || is_source_code_fragment_literal(value)
         || is_arithmetic_expression_literal(value)
@@ -2496,6 +2497,40 @@ fn is_payload_fragment_head(head: &str) -> bool {
         || is_uppercase_identifier_constant(head)
 }
 
+fn is_source_env_fallback_name_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Source config commonly falls back from an environment lookup to the public
+    // setting name (`clientSecret: process.env.FOO_SECRET || "APP_SECRET"`).
+    // That RHS is lookup metadata, not credential bytes. Keep this narrow:
+    // require a sensitive key, explicit env/fallback syntax on the left, and an
+    // ALL_CAPS identifier with a sensitive component but no digits.
+    if !(key_name_has_sensitive_component(key_name)
+        || key_name_indicates_sensitive_material(key_name))
+    {
+        return false;
+    }
+    let source = source_key.trim();
+    if !(source.contains("process.env")
+        || source.contains("os.environ")
+        || source.contains("ENV[")
+        || source.contains("getenv"))
+    {
+        return false;
+    }
+    if !(source.contains("||") || source.contains("??") || source.contains(" or ")) {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !is_uppercase_identifier_constant(value) {
+        return false;
+    }
+    normalize_key(value)
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .any(is_sensitive_setting_name_component)
+}
+
 fn is_source_constant_reference_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // C-family/Rust/C# assignments often put enum constants or environment
     // variable names in sensitive-looking fields:
@@ -2934,25 +2969,86 @@ fn is_source_string_fragment_literal(value: &str, source_key: &str) -> bool {
     value.starts_with("@\\\"") && (value.contains("\\n") || value.ends_with('\\'))
 }
 
-fn is_shell_command_substitution_literal(value: &str, source_key: &str) -> bool {
+fn is_shell_command_substitution_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // Shell completions/config scripts assign keys from command substitutions:
-    // `local key=$(__docker_map_key_of_current_option ...)`. The captured
-    // value is the command expression, not the generated key.
-    if !source_key_has_code_shape(source_key) {
+    // `local key=$(__docker_map_key_of_current_option ...)` or
+    // `ADMIN_PASSWORD=$(rand_pwd)`. The captured value is the command
+    // expression, not the generated key. Do not suppress quoted echo/printf
+    // calls carrying a literal secret (`"$(echo hunter2)"`).
+    if !(source_key_has_code_shape(source_key)
+        || key_name_has_sensitive_component(key_name)
+        || is_upper_env_secret_key(source_key))
+    {
         return false;
     }
-    let value = value.trim();
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
     let Some(body) = value.strip_prefix("$(") else {
         return false;
     };
-    (3..=96).contains(&body.len())
-        && body
+    let body = body.trim().trim_end_matches(')').trim();
+    if !(2..=256).contains(&body.len()) {
+        return false;
+    }
+    let command = body.split_ascii_whitespace().next().unwrap_or(body);
+    let rest = body[command.len()..].trim();
+    if rest.is_empty() && !source_key_has_code_shape(source_key) {
+        return false;
+    }
+    is_shell_command_name(command) && !shell_literal_argument_looks_secret(body, command)
+}
+
+fn is_shell_command_name(command: &str) -> bool {
+    let command = command.trim();
+    (2..=96).contains(&command.len())
+        && command
             .bytes()
             .next()
-            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        && body
+            .is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'.' | b'/'))
+        && command
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':'))
+}
+
+fn shell_literal_argument_looks_secret(body: &str, command: &str) -> bool {
+    let command_name = command
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+    if !matches!(command_name.as_str(), "echo" | "printf") {
+        return false;
+    }
+    let rest = body[command.len()..].trim();
+    if rest.is_empty()
+        || rest.bytes().any(|b| {
+            matches!(
+                b,
+                b'$' | b'/'
+                    | b'\\'
+                    | b'|'
+                    | b'<'
+                    | b'>'
+                    | b'*'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b'\''
+                    | b'"'
+                    | b'%'
+            )
+        })
+    {
+        return false;
+    }
+    rest.split_ascii_whitespace().any(|part| {
+        let part = part.trim_matches(|ch| matches!(ch, ')' | ';' | ','));
+        part.len() >= 6
+            && part.bytes().any(|b| b.is_ascii_alphabetic())
+            && part.bytes().any(|b| b.is_ascii_digit())
+    })
 }
 
 fn is_inline_code_key_value_tail_literal(value: &str, key_name: &str, source_key: &str) -> bool {
@@ -3375,12 +3471,12 @@ fn is_resource_name_literal(value: &str) -> bool {
             || bytes.last().is_some_and(|b| !b.is_ascii_alphanumeric())
             || !bytes
                 .iter()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(*b, b'-' | b'_'))
         {
             return false;
         }
         has_name_char |= bytes.iter().any(|b| b.is_ascii_lowercase());
-        has_separator |= bytes.contains(&b'-');
+        has_separator |= bytes.contains(&b'-') || bytes.contains(&b'_');
     }
     has_name_char && (has_separator || value.contains('/') || value.contains('.'))
 }
@@ -4195,6 +4291,10 @@ mod tests {
             r#"secret: GetSecretValue</p>"#,
             r#"token: "from_admin\n""#,
             r#"key: "\u003c/p\u003e\n\n\u003cpre\u003e\u003ccode\u003e""#,
+            r#"PRIVATE_KEY="$(cat ~/Downloads/*.private-key.pem)""#,
+            r#"clientSecret: process.env.FACEBOOK_SECRET || 'APP_SECRET',"#,
+            r#"clientSecret: process.env.TWITTER_SECRET || 'CONSUMER_SECRET',"#,
+            r#"SecretName: "cool_secret","#,
             r#"access_token = "TestAuthToken""#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
@@ -4253,6 +4353,8 @@ mod tests {
         assert!(has(r#"passwordLabel = "tenant-7-trial""#, "tenant-7-trial"));
         assert!(has(r#"password = "abc\tdef123""#, "abc\\tdef123"));
         assert!(has(r#"password = "hunter\n""#, "hunter\\n"));
+        assert!(has(r#"password = "$(echo hunter2)""#, "$(echo hunter2)"));
+        assert!(has(r#"clientSecret: "APP_SECRET_2026""#, "APP_SECRET_2026"));
         assert!(has(
             r#"private_key = "LINE_1\nA2secret""#,
             "LINE_1\\nA2secret"
