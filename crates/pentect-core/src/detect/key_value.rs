@@ -897,7 +897,6 @@ fn is_c_style_hex_u32(value: &str) -> bool {
         && bytes[0] == b'0'
         && matches!(bytes[1], b'x' | b'X')
         && bytes[2..].iter().all(u8::is_ascii_hexdigit)
-        && bytes[2..].iter().any(u8::is_ascii_digit)
 }
 
 fn is_hex_material_key_name(name: &str) -> bool {
@@ -3341,6 +3340,7 @@ mod tests {
         assert!(has(r#"password = "secret""#, "secret"));
         assert!(has(r#"password = "letmein123""#, "letmein123"));
         assert!(has(r#"password = "0xC000006A""#, "0xC000006A"));
+        assert!(has(r#"password = "0xFFFFFFFF""#, "0xFFFFFFFF"));
         assert!(has(r#"api_key="--real-secret-123""#, "--real-secret-123"));
         assert!(has(
             r#"private const string ApiKey = "abc12345";"#,
@@ -3602,6 +3602,7 @@ mod tests {
             r#"private_key = "%[3]s""#,
             "STATUS_WRONG_PASSWORD = 0xC000006A,",
             "STATUS_NO_USER_SESSION_KEY = 0xC0000202,",
+            "STATUS_AUTH_TOKEN = 0xFFFFFFFF,",
             "SEC_E_INVALID_TOKEN = 0x80090308,",
             "SEC_E_NO_CREDENTIALS = 0x8009030E,",
             r#"sb.append("DbPassword: ").append("***Sensitive Data Redacted***").append(",");"#,
