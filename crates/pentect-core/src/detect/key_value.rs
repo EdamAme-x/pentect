@@ -618,12 +618,14 @@ fn looks_like_secret_value(
         || is_key_algorithm_literal(value)
         || is_crypto_test_vector_identifier_literal(value, key_name)
         || is_html_code_metadata_literal(value)
+        || is_html_documentation_fragment_literal(value, key_name, source_key)
         || is_fingerprint_literal(value, key_name)
         || is_source_constant_reference_literal(value, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
         || is_source_config_name_literal(value, source_key)
         || is_source_sensitive_name_reference_literal(value, source_key)
         || is_source_fixture_secret_literal(value, key_name, source_key)
+        || is_source_struct_tag_literal(value, key_name, source_key)
         || is_source_code_fragment_literal(value)
         || is_arithmetic_expression_literal(value)
         || is_localization_template_reference(value)
@@ -1439,6 +1441,45 @@ fn is_html_code_metadata_literal(value: &str) -> bool {
         || (!contains_sensitive_identifier_component(inner) && is_resource_name_literal(inner))
 }
 
+fn is_html_documentation_fragment_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Generated API docs often include prose like `<p>Key: CreatedTime</p>`
+    // inside long documentation strings. The scanner can see the inner `Key:`
+    // as a key/value pair; the value is an HTML fragment naming a public field.
+    // Require both generic-key context and documentation/HTML syntax on the left.
+    if !is_generic_metadata_key_name(key_name)
+        || !source_key_has_html_documentation_shape(source_key)
+    {
+        return false;
+    }
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let Some(tag_start) = lower.rfind("</") else {
+        return false;
+    };
+    let Some(tag) = lower[tag_start + 2..].strip_suffix('>') else {
+        return false;
+    };
+    if !matches!(tag, "p" | "code" | "i" | "li") {
+        return false;
+    }
+    let head = &value[..tag_start];
+    !head.is_empty()
+        && head.bytes().any(|b| b.is_ascii_alphanumeric())
+        && head.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'_' | b'-' | b':' | b'.' | b'*' | b'/' | b'<' | b'>')
+        })
+}
+
+fn source_key_has_html_documentation_shape(source_key: &str) -> bool {
+    let lower = source_key.to_ascii_lowercase();
+    lower.contains("documentation")
+        || lower.contains("<p>")
+        || lower.contains("<li>")
+        || lower.contains("<code>")
+        || lower.contains("<i>")
+}
+
 fn is_uuid_literal(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 36
@@ -1569,6 +1610,33 @@ fn is_source_fixture_secret_literal(value: &str, key_name: &str, source_key: &st
     // named `expectedPassword`, `MOCK_ACCESS_TOKEN`, or similar. Do not suppress
     // weak values by value alone; require source syntax plus a fixture key name.
     source_key_has_code_shape(source_key) && is_source_fixture_secret_value(key_name, value)
+}
+
+fn is_source_struct_tag_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Go-style struct tags can contain generic `key:"name,option"` metadata.
+    // The backtick-delimited tag syntax proves this is a field mapping, not
+    // credential material.
+    if key_name != "key" || !source_key_has_struct_tag_key(source_key) {
+        return false;
+    }
+    let value = value.trim();
+    (3..=96).contains(&value.len())
+        && value.contains(',')
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'-' | b',' | b'=' | b'|' | b'(' | b')' | b'[' | b']' | b':'
+                )
+        })
+}
+
+fn source_key_has_struct_tag_key(source_key: &str) -> bool {
+    let Some((_, tail)) = source_key.rsplit_once('`') else {
+        return false;
+    };
+    normalize_key(tail) == "key"
 }
 
 fn is_lower_dotted_config_name(value: &str) -> bool {
@@ -2458,6 +2526,8 @@ mod tests {
             r#"private_key = "ALICE_prod_key_2026""#,
             "ALICE_prod_key_2026"
         ));
+        assert!(has(r#"key: "abc123</p>""#, "abc123</p>"));
+        assert!(has(r#"api_key = "abc123,def456""#, "abc123,def456"));
     }
 
     #[test]
@@ -2490,6 +2560,11 @@ mod tests {
             r#"private_key = "%[3]s""#,
             r#"sb.append("DbPassword: ").append("***Sensitive Data Redacted***").append(",");"#,
             r#"sb.append("ApiKey: ").append(getApiKey()).append(",");"#,
+            r#""fluentSetterDocumentation": "/**<p>Key: CreatedTime</p>""#,
+            r#""fluentSetterDocumentation": "<p>Key: tag:<i>my-tag-key</i>""#,
+            r#"TrueFromOne bool `key:"yesone,string"`"#,
+            r#"Mode string `key:"value,options=first|second"`"#,
+            r#"Amount int `key:"value3,range=(1:5]"`"#,
             r#"Key = 000102030405060708090A0B0C0D0E0F"#,
             r#"Key = 404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F"#,
             r#"Key = 00112233445566778899AABBCCDDEEFF"#,
