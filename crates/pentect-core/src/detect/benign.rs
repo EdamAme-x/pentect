@@ -450,13 +450,16 @@ mod tests {
         assert!(is_structured_key_name_reference_value("scope"));
         assert!(is_structured_key_name_reference_value("firstName"));
         assert!(is_structured_key_name_reference_value("phoneNumber"));
+        assert!(is_structured_key_name_reference_value("Token"));
+        assert!(is_structured_key_name_reference_value("refresh_token"));
+        assert!(is_structured_key_name_reference_value("smsCode"));
+        assert!(is_structured_key_name_reference_value("signature"));
+        assert!(is_structured_key_name_reference_value("unknown"));
         assert!(is_structured_key_name_reference_value("panel1"));
         assert!(is_structured_key_name_reference_value("fieldset1"));
         assert!(is_structured_key_name_reference_value("dataGrid12"));
         assert!(!is_structured_key_name_reference_value("password"));
         assert!(!is_structured_key_name_reference_value("secret"));
-        assert!(!is_structured_key_name_reference_value("Token"));
-        assert!(!is_structured_key_name_reference_value("refresh_token"));
         assert!(!is_structured_key_name_reference_value("abcDEF123456"));
         assert!(!is_structured_key_name_reference_value("sk-test-token"));
     }

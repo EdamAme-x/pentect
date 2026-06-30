@@ -554,6 +554,11 @@ mod tests {
         assert_eq!(sensitive_key_fires(Some("key"), "scope"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "firstName"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "phoneNumber"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "Token"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "refresh_token"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "smsCode"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "signature"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "unknown"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "panel1"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "dataGrid12"), None);
         assert_eq!(

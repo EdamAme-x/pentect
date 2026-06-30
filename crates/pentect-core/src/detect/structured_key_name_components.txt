@@ -14,8 +14,9 @@
 #   alone as metadata values.
 # - `numbered_name:` entries are public UI/reference identifiers with a numeric
 #   suffix, e.g. `panel1`.
-# - Sensitive single words such as `password`, and concrete values containing
-#   digits or token punctuation, remain detectable.
+# - High-risk material words such as `password` and `secret`, and concrete
+#   values containing digits or token punctuation, remain detectable. Public
+#   schema names such as `token` or `code` may be listed explicitly.
 component:account
 component:api
 component:auth
@@ -52,6 +53,7 @@ name:address
 name:area
 name:authorization
 name:birthdate
+name:code
 name:content_type
 name:description
 name:device_id
@@ -66,13 +68,18 @@ name:name
 name:page
 name:phone_number
 name:redirect_uri
+name:refresh_token
 name:response_type
 name:rooms
 name:scope
+name:signature
+name:sms_code
 name:single_family
 name:size
 name:submit
+name:token
 name:type
+name:unknown
 name:vehicles
 name:year
 numbered_name:columns

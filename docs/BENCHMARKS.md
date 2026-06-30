@@ -80,7 +80,8 @@ bucket keys) are treated as metadata/source syntax, not credential values. RFC
 to `user:password` shape. Identity sweep now rejects short syntax-only
 representatives, and keyed locator/resource metadata suppresses values such as
 `secretName`, `secret.type`, and URL/path references only when the value is not
-credential-bearing.
+credential-bearing. Generic `"key"` values now include common public field names
+such as `token`, `code`, `signature`, and `unknown` as metadata-only names.
 
 ```text
 CredData commit: 9a55c40
@@ -90,15 +91,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 11491
+FP: 11443
 FN: 4828
 Line only: 227
-Unlabeled: 67841
+Unlabeled: 67837
 Missing files: 0
-Precision: 0.472
+Precision: 0.473
 Recall: 0.680
-F1: 0.557
-Elapsed: 28877 ms
+F1: 0.558
+Elapsed: 28197 ms
 ```
 
 Weak groups:
@@ -115,6 +116,7 @@ Weak groups:
 - Code/reference literals under sensitive-looking keys are suppressed only when syntax proves they are not values: PascalCase type annotations require a code delimiter, and env lookups require explicit Jinja/Ansible `lookup('env', ...)` shape.
 - Additional source/metadata literals are shape-gated: protobuf tag descriptors require `protobuf_key` context, key algorithm labels require known algorithm-size syntax, fingerprints require explicit fingerprint keys and colon-hex shape, and command/mock fragments require invocation syntax.
 - Generic `key` code-member names and parser-cut source fragments are suppressed only when source syntax proves they are metadata, keeping concrete key material under `api_key`/`client_secret` unaffected.
+- Generic `"key"` field values such as `token`, `code`, `signature`, and `unknown` are metadata names only in that generic-key context; `password` and `secret` still fire.
 - Synthetic hex fixture strings are suppressed when the whole value is built from canonical visual patterns, sequential byte runs, or repeated bytes; arbitrary hex under sensitive key context still fires.
 - `KEYED_SECRET` identity sweep keeps anchored detections only. Context-free propagation is left to stronger rule, entropy, and structural detections.
 - `BASIC_AUTH` is RFC 7617-gated: the captured token68 must decode to a non-empty `user:password` pair, so `Basic something` style prose is not counted.
