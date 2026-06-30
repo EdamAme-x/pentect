@@ -770,7 +770,8 @@ fn looks_like_secret_value(
         || is_public_numeric_code_constant_literal(value, key_name, source_key, quoted)
         || is_asn1_oid_der_literal(value, key_name, source_key)
         || is_crypto_test_vector_identifier_literal(value, key_name)
-        || is_localized_ui_text_literal(value, key_name)
+        || is_localized_ui_text_literal(value, key_name, source_key)
+        || is_missing_credential_name_literal(value, key_name, source_key)
         || is_html_code_metadata_literal(value)
         || is_html_documentation_fragment_literal(value, key_name, source_key)
         || is_markup_syntax_fragment_literal(value, key_name)
@@ -1893,15 +1894,21 @@ fn is_crypto_test_vector_identifier_literal(value: &str, key_name: &str) -> bool
     is_crypto_test_vector_identifier_value(value)
 }
 
-fn is_localized_ui_text_literal(value: &str, key_name: &str) -> bool {
+fn is_localized_ui_text_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // Translation tables and UI copy often use sensitive words in message IDs:
     // `passwordEnteredInvalid = "Invalid password for room \"%s\"."`. The
     // rendered sentence is not a password. Keep this anchored to UI-message key
     // components so real passphrases under `password` still detect. Resource
     // bundles also store escaped Unicode (`\uXXXX`) and numbered keys
     // (`ENTER_KEY_HELP#0`); treat those as display text when the key carries a
-    // UI component such as `help` or `saved`.
-    if !key_name_has_sensitive_component(key_name) || !key_name_has_ui_text_component(key_name) {
+    // UI component such as `help` or `saved`. Test assertions also put field
+    // error messages under sensitive field names (`errors.password =
+    // "Email Taken"`); require an error/validation context for that broader
+    // shape so ordinary `password = "Correct horse..."` still detects.
+    if !key_name_has_sensitive_component(key_name)
+        || !(key_name_has_ui_text_component(key_name)
+            || source_key_has_validation_text_context(source_key))
+    {
         return false;
     }
     let value = value.trim();
@@ -1909,6 +1916,30 @@ fn is_localized_ui_text_literal(value: &str, key_name: &str) -> bool {
         return false;
     }
     localized_ui_text_has_boundary(value) && localized_ui_text_chars_are_display_safe(value)
+}
+
+fn is_missing_credential_name_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Error strings commonly enumerate missing credential setting names:
+    // `credentials information are missing: AWS_ACCESS_KEY_ID`. The captured
+    // value is the public env/config key that needs to be supplied, not the
+    // secret bytes. Keep this anchored to missing-credential prose plus an
+    // ALL_CAPS identifier so normal config assignments still detect.
+    if !(key_name_has_sensitive_component(key_name)
+        || source_key
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .map(|part| part.to_ascii_lowercase())
+            .any(|part| matches!(part.as_str(), "credential" | "credentials")))
+    {
+        return false;
+    }
+    let source = source_key.to_ascii_lowercase();
+    if !source.contains("missing") {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | ':' | ';'));
+    is_uppercase_identifier_constant(value)
 }
 
 fn localized_ui_text_has_boundary(value: &str) -> bool {
@@ -1980,6 +2011,30 @@ fn is_localized_ui_boundary_punctuation(ch: char) -> bool {
     )
 }
 
+fn source_key_has_validation_text_context(source_key: &str) -> bool {
+    let normalized = normalize_key(source_key);
+    let mut parts = normalized.split('_').filter(|part| !part.is_empty());
+    parts.any(|part| {
+        matches!(
+            part,
+            "error"
+                | "errors"
+                | "expected"
+                | "actual"
+                | "validation"
+                | "validate"
+                | "message"
+                | "messages"
+                | "translation"
+                | "translations"
+                | "locale"
+                | "locales"
+                | "lang"
+                | "i18n"
+        )
+    })
+}
+
 fn key_name_has_sensitive_component(key_name: &str) -> bool {
     key_name.split('_').any(|part| {
         matches!(
@@ -2012,6 +2067,20 @@ fn key_name_has_ui_text_component(key_name: &str) -> bool {
                 | "hint"
                 | "help"
                 | "saved"
+                | "blank"
+                | "cannot"
+                | "confirmation"
+                | "confirm"
+                | "forgot"
+                | "request"
+                | "reset"
+                | "change"
+                | "strength"
+                | "short"
+                | "long"
+                | "longer"
+                | "enough"
+                | "taken"
         )
     })
 }
@@ -4456,6 +4525,10 @@ mod tests {
             r#"ENTER_KEY_HELP#0="Adja meg titkos kulcs\u00e1t a k\u00e9tl\u00e9pcs\u0151s azonos\u00edt\u00e1s be\u00e1ll\u00edt\u00f3 oldal\u00e1r\u00f3l.";"#,
             r#"ENTER_KEY_VALUE_TOO_SHORT#0="The key value is too short.";"#,
             r#"SECRET_SAVED#0="Secret saved.";"#,
+            r#"export const passwordNotLongEnough = "Password must be 6 characters or longer.";"#,
+            r#"assert.deepStrictEqual(error.errors, { email: 'Email Taken', password: 'Email Taken' });"#,
+            r#"'Password cannot be blank.' => 'Password cannot be blank.'"#,
+            r#"expected: "oraclecloud: some credentials information are missing: OCI_TENANCY_OCID,OCI_USER_OCID""#,
             r#"access_token = "TestAuthToken""#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
@@ -4520,6 +4593,14 @@ mod tests {
         assert!(has(r#"token: "1234""#, "1234"));
         assert!(has(r#"PASSWORD=`echo hunter2`"#, "echo hunter2"));
         assert!(has(r#"password_help="hunter2""#, "hunter2"));
+        assert!(has(
+            r#"password_request="tenant-7-trial""#,
+            "tenant-7-trial"
+        ));
+        assert!(has(
+            r#"password_reset_token="tenant-7-trial""#,
+            "tenant-7-trial"
+        ));
         assert!(has(
             r#"private_key = "LINE_1\nA2secret""#,
             "LINE_1\\nA2secret"
