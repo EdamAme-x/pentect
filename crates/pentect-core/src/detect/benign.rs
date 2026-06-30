@@ -670,6 +670,12 @@ mod tests {
         assert!(is_placeholder_value("https://example.org/path"));
         assert!(is_placeholder_value("<external-data-source>"));
         assert!(is_placeholder_value("fake_token"));
+        assert!(is_placeholder_value("x-pack-test-password"));
+        assert!(is_placeholder_value("avoid-plaintext-passwords"));
+        assert!(is_placeholder_value("tftest-new-password"));
+        assert!(is_placeholder_value("foo-bar"));
+        assert!(is_placeholder_value("s3krit-password"));
+        assert!(is_placeholder_value("t0k3n"));
         assert!(!is_placeholder_value("tenant-7-trial"));
         assert!(!is_placeholder_value(
             "https://example.org/path?token=abc123"
@@ -677,6 +683,8 @@ mod tests {
         assert!(!is_placeholder_value("letmein123"));
         assert!(!is_placeholder_value("pass"));
         assert!(!is_placeholder_value("changeme"));
+        assert!(!is_placeholder_value("admin123"));
+        assert!(!is_placeholder_value("Password1"));
         assert!(!is_placeholder_value("Test Access Token"));
         assert!(!is_placeholder_value("PROD_SECRET"));
         assert!(!is_placeholder_value("OLD_LET_ME_IN-1"));

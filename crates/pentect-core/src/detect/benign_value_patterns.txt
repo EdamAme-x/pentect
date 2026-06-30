@@ -42,6 +42,16 @@ exact:localhost
 exact:dev_null
 exact:room_name_or_id
 exact:external_data_source
+
+# Explicit test/example placeholders. These carry their own non-production
+# marker and are too weak/synthetic to be useful credential evidence.
+exact:avoid_plaintext_passwords
+exact:foo_bar
+exact:s3krit_password
+exact:t0k3n
+exact:x_pack_test_password
+prefix:tftest
+
 prefix:your_
 prefix:example_
 prefix:fake_

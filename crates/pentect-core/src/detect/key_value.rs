@@ -767,13 +767,16 @@ fn looks_like_secret_value(
         || is_protobuf_tag_literal(value, key_name)
         || is_key_algorithm_literal(value)
         || is_status_code_constant_literal(value, key_name)
+        || is_numeric_metadata_key_literal(value, key_name, quoted)
         || is_public_numeric_code_constant_literal(value, key_name, source_key, quoted)
         || is_asn1_oid_der_literal(value, key_name, source_key)
+        || is_asn1_obj_name_literal(value, key_name, source_key)
         || is_crypto_test_vector_identifier_literal(value, key_name)
         || is_crypto_test_vector_record_literal(value, key_name, source_key)
         || is_localized_ui_text_literal(value, key_name, source_key)
         || is_missing_credential_name_literal(value, key_name, source_key)
         || is_xaml_key_time_literal(value, source_key)
+        || is_url_query_metadata_literal(value, key_name, source_key)
         || is_html_code_metadata_literal(value)
         || is_html_documentation_fragment_literal(value, key_name, source_key)
         || is_markup_syntax_fragment_literal(value, key_name)
@@ -1065,6 +1068,14 @@ fn is_public_numeric_code_constant_literal(
     !quoted
         && is_all_caps_source_constant_name(source_key)
         && (is_small_c_style_int_literal(value) || is_small_decimal_code_literal(value))
+}
+
+fn is_numeric_metadata_key_literal(value: &str, key_name: &str, quoted: bool) -> bool {
+    // UI trees and schemas often use a property literally named `key` for a
+    // stable numeric node identifier (`key: '1001'`). Numeric-only generic keys
+    // carry weak secret evidence; keep this away from `api_key`, `password`,
+    // `token`, and other material fields.
+    quoted && key_name == "key" && is_small_decimal_code_literal(value)
 }
 
 fn is_sqlstate_error_constant_name(key_name: &str, source_key: &str) -> bool {
@@ -1855,7 +1866,34 @@ fn is_asn1_oid_der_literal(value: &str, key_name: &str, source_key: &str) -> boo
     // as metadata. Some leading ASCII control bytes are already decoded and
     // trimmed by the normalized view, so the `OBJ_*` key contract carries the
     // ASN.1 OID evidence instead of trusting the first byte alone.
-    octets.len() >= 3 && octets.iter().any(|byte| *byte >= 0x80)
+    octets.len() >= 3
+        && (source_key.trim_start().starts_with("OBJ_") || octets.iter().any(|byte| *byte >= 0x80))
+}
+
+fn is_asn1_obj_name_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // OpenSSL object tables also map `OBJ_*` constants to public short names:
+    // `OBJ_setct_AuthTokenTBS = "AuthTokenTBS"`. These are identifiers for
+    // ASN.1 objects, not auth tokens. Require the explicit `OBJ_` table shape
+    // and a normalized suffix match so ordinary `token = "AuthTokenTBS"` still
+    // detects.
+    if !(key_name.starts_with("obj_") || source_key.trim_start().starts_with("OBJ_")) {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_end_matches("\\n")
+        .trim_end_matches("\\r")
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !(3..=64).contains(&value.len())
+        || value
+            .bytes()
+            .any(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    let normalized_value = normalize_key(value);
+    let normalized_key = normalize_key(source_key);
+    !normalized_value.is_empty() && normalized_key.ends_with(&normalized_value)
 }
 
 fn parse_mixed_hex_escape_octets(value: &str) -> Option<Vec<u8>> {
@@ -2175,6 +2213,58 @@ fn is_xaml_key_time_literal(value: &str, source_key: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || matches!(b, b':' | b'.'))
+}
+
+fn is_url_query_metadata_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Query strings often contain pagination and listing controls such as
+    // `nextPageToken`, `pageToken`, `prefix`, and `maxResults`. These are API
+    // navigation metadata, not bearer/API tokens. Keep auth-like parameters
+    // (`access_token`, `id_token`, `refresh_token`) out of this path and
+    // require visible URL-query syntax in the source fragment.
+    if !(source_key.contains('&') || source_key.contains('?') || source_key.contains("%2")) {
+        return false;
+    }
+    let key = normalize_key(key_name);
+    if !is_url_query_navigation_key(&key) {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_end_matches("\\n")
+        .trim_end_matches("\\r")
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    (1..=64).contains(&value.len())
+        && value.bytes().any(|b| b.is_ascii_alphanumeric())
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b'%' | b'=')
+        })
+}
+
+fn is_url_query_navigation_key(key: &str) -> bool {
+    let parts = key
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.windows(2).any(|window| {
+        matches!(
+            window,
+            ["access", "token"]
+                | ["id", "token"]
+                | ["refresh", "token"]
+                | ["auth", "token"]
+                | ["bearer", "token"]
+        )
+    }) {
+        return false;
+    }
+    matches!(
+        key,
+        "prefix" | "page_token" | "next_page_token" | "max_results" | "maxresults"
+    ) || key.ends_with("_prefix")
+        || key.ends_with("_page_token")
+        || key.ends_with("_next_page_token")
+        || key.ends_with("_max_results")
+        || key.ends_with("_maxresults")
 }
 
 fn is_html_documentation_fragment_literal(value: &str, key_name: &str, source_key: &str) -> bool {
@@ -4159,7 +4249,10 @@ fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
             | "webhook_secret"
             | "shared_secret"
             | "credential"
-    )
+    ) || name.ends_with("_password")
+        || name.ends_with("_passwd")
+        || name.ends_with("_pwd")
+        || name.ends_with("_passphrase")
 }
 
 fn is_config_slot_low_entropy_literal(value: &str, key_name: &str, source_key: &str) -> bool {
@@ -4465,6 +4558,14 @@ mod tests {
             "6nA7WEJ/bBBCY06IrWwAlks7"
         ));
         assert!(has(r#"password = Some("owlknh")"#, "owlknh"));
+        assert!(has(
+            r#"private const string CertificatePassword = "VozkqqWcexxxle";"#,
+            "VozkqqWcexxxle"
+        ));
+        assert!(has(
+            r#"const string testPassword = "vqemxShhe";"#,
+            "vqemxShhe"
+        ));
         assert!(has(r#"api_token = Some("tok-12345")"#, "tok-12345"));
         assert!(has(
             r#"authorization: 'Basic Wv0dTjLryp=='"#,
@@ -4590,6 +4691,7 @@ mod tests {
             r#"self.__authorizationHeader = f"Bearer {jwt}""#,
             r#"{"license": {"key": "lgpl-3.0"}}"#,
             r#"{"key":"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCexample"}"#,
+            r#"key: '1001',"#,
             r#"var correlationKey = ".xsrf";"#,
             r#"public const string IsW365EnvironmentKeyName = "IsW365Environment";"#,
             r#"public const string PasswordStoreDirEnvar = "PASSWORD_STORE_DIR";"#,
@@ -4751,6 +4853,14 @@ mod tests {
             r#"PeerKey=ffdhe3072-2-pub"#,
             r#"PrivPubKeyPair=ffdhe4096-1:ffdhe4096-1-pub"#,
             r#"<DiscreteObjectKeyFrame KeyTime="0:0:0.2" Value="{x:Static Visibility.Visible}" />"#,
+            r#""fields=items%2Fname%2CnextPageToken&prefix=public/path""#,
+            r#""fields=items%2Fname%2CnextPageToken&prefix=path%2Fsubfolder%2F""#,
+            r#""fields=items%2Fname%2CnextPageToken&prefix=path%2F\n""#,
+            r#""name%2CnextPageToken&maxResults=100 Token: fake_token\n""#,
+            r#""&pageToken=NEXT_PAGE_1""#,
+            r#""&pageToken=ABCD==\n""#,
+            r#"OBJ_setct_AuthTokenTBS="AuthTokenTBS""#,
+            r#"OBJ_setct_AuthResBaggage="\x67\x2A\x00\x08""#,
             r#"OBJ_dhKeyAgreement="\x2A\x86\x48\x86\xF7\x0D\x01\x03\x01""#,
             r#"OBJ_pkcs9_challengePassword="\x2A\x86\x48\x86\xF7\x0D\x01\x09\x07""#,
             r#"passwordEnteredInvalid: "Invalid password for room \"%s\".""#,
