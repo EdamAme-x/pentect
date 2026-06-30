@@ -1897,46 +1897,87 @@ fn is_localized_ui_text_literal(value: &str, key_name: &str) -> bool {
     // Translation tables and UI copy often use sensitive words in message IDs:
     // `passwordEnteredInvalid = "Invalid password for room \"%s\"."`. The
     // rendered sentence is not a password. Keep this anchored to UI-message key
-    // components so real passphrases under `password` still detect.
+    // components so real passphrases under `password` still detect. Resource
+    // bundles also store escaped Unicode (`\uXXXX`) and numbered keys
+    // (`ENTER_KEY_HELP#0`); treat those as display text when the key carries a
+    // UI component such as `help` or `saved`.
     if !key_name_has_sensitive_component(key_name) || !key_name_has_ui_text_component(key_name) {
         return false;
     }
     let value = value.trim();
-    if !(3..=240).contains(&value.len())
-        || value.contains("://")
-        || value.contains('=')
-        || value.contains('<')
-        || value.contains('>')
-    {
+    if !(3..=240).contains(&value.len()) || value.contains("://") {
         return false;
     }
-    let has_word_boundary = value.chars().any(char::is_whitespace)
-        || value.ends_with(':')
+    localized_ui_text_has_boundary(value) && localized_ui_text_chars_are_display_safe(value)
+}
+
+fn localized_ui_text_has_boundary(value: &str) -> bool {
+    value.chars().any(char::is_whitespace)
+        || value.contains("\\u")
         || value.contains("%s")
-        || value.contains("&thinsp;");
-    has_word_boundary
-        && value.chars().all(|ch| {
-            ch.is_alphabetic()
+        || value.contains("&thinsp;")
+        || value.chars().any(is_localized_ui_boundary_punctuation)
+}
+
+fn localized_ui_text_chars_are_display_safe(value: &str) -> bool {
+    value.chars().all(|ch| {
+        !ch.is_control()
+            && (ch.is_alphanumeric()
                 || ch.is_whitespace()
-                || matches!(
-                    ch,
-                    ':' | ';'
-                        | ','
-                        | '.'
-                        | '!'
-                        | '?'
-                        | '"'
-                        | '\''
-                        | '-'
-                        | '_'
-                        | '%'
-                        | '&'
-                        | '/'
-                        | '\\'
-                        | '('
-                        | ')'
-                )
-        })
+                || ch == '\\'
+                || ch == '%'
+                || ch == '&'
+                || is_localized_ui_sentence_punctuation(ch))
+    })
+}
+
+fn is_localized_ui_sentence_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        ':' | ';'
+            | ','
+            | '.'
+            | '!'
+            | '?'
+            | '"'
+            | '\''
+            | '-'
+            | '_'
+            | '/'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '\u{00a1}'
+            | '\u{00bf}'
+            | '\u{3001}'
+            | '\u{3002}'
+            | '\u{ff01}'
+            | '\u{ff1f}'
+            | '\u{ff1a}'
+            | '\u{ff1b}'
+    )
+}
+
+fn is_localized_ui_boundary_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        ':' | ';'
+            | ','
+            | '.'
+            | '!'
+            | '?'
+            | '\u{00a1}'
+            | '\u{00bf}'
+            | '\u{3001}'
+            | '\u{3002}'
+            | '\u{ff01}'
+            | '\u{ff1f}'
+            | '\u{ff1a}'
+            | '\u{ff1b}'
+    )
 }
 
 fn key_name_has_sensitive_component(key_name: &str) -> bool {
@@ -1970,6 +2011,7 @@ fn key_name_has_ui_text_component(key_name: &str) -> bool {
                 | "warning"
                 | "hint"
                 | "help"
+                | "saved"
         )
     })
 }
@@ -4411,6 +4453,9 @@ mod tests {
             r#"ER_TOO_LONG_KEY: "42000","#,
             r#"APP_PASSWORD=`echo $AZURE_CREDENTIALS | jq -r -c ".clientSecret"`"#,
             r#"PASS=`awk '{print $1}' $SEC_PROPERTIES_FILE | grep password | cut -d "=" -f2`"#,
+            r#"ENTER_KEY_HELP#0="Adja meg titkos kulcs\u00e1t a k\u00e9tl\u00e9pcs\u0151s azonos\u00edt\u00e1s be\u00e1ll\u00edt\u00f3 oldal\u00e1r\u00f3l.";"#,
+            r#"ENTER_KEY_VALUE_TOO_SHORT#0="The key value is too short.";"#,
+            r#"SECRET_SAVED#0="Secret saved.";"#,
             r#"access_token = "TestAuthToken""#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
@@ -4474,6 +4519,7 @@ mod tests {
         assert!(has(r#"password = "123456""#, "123456"));
         assert!(has(r#"token: "1234""#, "1234"));
         assert!(has(r#"PASSWORD=`echo hunter2`"#, "echo hunter2"));
+        assert!(has(r#"password_help="hunter2""#, "hunter2"));
         assert!(has(
             r#"private_key = "LINE_1\nA2secret""#,
             "LINE_1\\nA2secret"
