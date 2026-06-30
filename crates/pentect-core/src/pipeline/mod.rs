@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn internal_url_does_not_leak_userinfo_query_or_fragment() {
-        let input = "open http://user:pass@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456.";
+        let input = "open http://svc:p4ss@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456.";
         let r = m(input);
         assert!(
             r.masked.starts_with("open http://<<URL_CREDENTIAL_"),
@@ -907,7 +907,7 @@ mod tests {
         );
         assert!(r.masked.contains("#<<RESOURCE_ID_"), "{}", r.masked);
         for leaked in [
-            "user:pass",
+            "svc:p4ss",
             "local.jira.corp",
             "ABC-123",
             "s3cr3t",

@@ -226,6 +226,50 @@ fn userinfo_is_template_or_redaction(userinfo: &str) -> bool {
     userinfo
         .bytes()
         .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
+        || userinfo.split(':').all(userinfo_part_is_placeholder)
+}
+
+fn userinfo_part_is_placeholder(part: &str) -> bool {
+    // Placeholder words in URL userinfo are public examples, not credentials.
+    // Keep this to the userinfo grammar: `pass` by itself can be a real weak
+    // password elsewhere, but `https://user:pass@example` is conventional docs.
+    let normalized = part
+        .split('%')
+        .next()
+        .unwrap_or(part)
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | '`'));
+    if normalized.is_empty() {
+        return true;
+    }
+    let folded = normalized
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    matches!(
+        folded.trim_matches('_'),
+        "user"
+            | "username"
+            | "userid"
+            | "my_user"
+            | "my_username"
+            | "password"
+            | "pass"
+            | "my_password"
+            | "apitoken"
+            | "api_token"
+            | "token"
+            | "x_oauth_token"
+            | "secret"
+            | "foo"
+            | "bar"
+    )
 }
 
 fn userinfo_token_like(userinfo: &str) -> bool {
@@ -523,9 +567,9 @@ mod tests {
     #[test]
     fn masks_userinfo_port_query_and_fragment_without_losing_route_shape() {
         assert_eq!(
-            labels("http://user:pass@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456"),
+            labels("http://svc:p4ss@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456"),
             [
-                ("URL_CREDENTIAL".to_string(), "user:pass".to_string()),
+                ("URL_CREDENTIAL".to_string(), "svc:p4ss".to_string()),
                 (
                     "INTERNAL_ENDPOINT".to_string(),
                     "local.jira.corp:8080".to_string()
@@ -585,6 +629,8 @@ mod tests {
             "https://[user[:password]@]service.internal/path",
             "https://***:***@service.internal/path",
             "https://{user}:{password}@service.internal/path",
+            "https://user:pass@service.internal/path",
+            "https://USERID:APITOKEN@service.internal/path",
         ] {
             assert!(
                 labels(raw)

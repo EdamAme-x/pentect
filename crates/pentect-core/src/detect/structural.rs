@@ -104,6 +104,9 @@ impl Detector for SensitiveKeyDetector {
         if region.ctx.key.as_deref().is_some_and(|key| {
             is_ui_copy_sensitive_key(key, view.text())
                 || is_structured_token_prose(key, view.text())
+                || is_structured_placeholder_value(key, view.text())
+                || is_structured_secret_identifier_name(key, view.text())
+                || is_structured_generic_key_weak_value(key, view.text())
                 || is_structured_generic_key_name_reference(key, view.text())
         }) {
             return vec![];
@@ -137,7 +140,7 @@ fn sensitive_context_label(ctx: &Context) -> Option<String> {
 
 fn is_sensitive_key_name(key: &str) -> bool {
     let name = normalize_identifier(key);
-    if is_explicitly_non_sensitive_key(&name) {
+    if is_explicitly_non_sensitive_key(&name) || is_non_credential_sensitive_word_name(&name) {
         return false;
     }
     name == "key"
@@ -178,6 +181,104 @@ fn is_sensitive_key_name(key: &str) -> bool {
         ]
         .iter()
         .any(|needle| name.contains(needle))
+}
+
+fn is_non_credential_sensitive_word_name(name: &str) -> bool {
+    // Some technical names contain sensitive substrings but identify public
+    // concepts: parsers/tokenizers, UI labels/tooltips, or API operation names.
+    // Reject them before broad key-name matching so `tokenizer` does not become
+    // `token`, while actual fields such as `access_token` still pass.
+    let parts = name
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return false;
+    }
+    if parts
+        .iter()
+        .any(|part| matches!(*part, "tokenizer" | "tokenizers"))
+        || has_structural_phrase(&parts, &["token", "sale"])
+        || parts.last().is_some_and(|part| *part == "arn")
+        || is_last_used_metadata_name(&parts)
+        || has_structural_phrase(&parts, &["password", "cannot", "be", "empty"])
+        || parts
+            .iter()
+            .any(|part| matches!(*part, "tooltip" | "label" | "title"))
+    {
+        return true;
+    }
+    is_sentence_like_key_name(&parts) || is_api_operation_name(&parts)
+}
+
+fn is_sentence_like_key_name(parts: &[&str]) -> bool {
+    // Translation/test names can be whole sentences:
+    // `log_in_with_the_admin_user_credentials_without...`. Long prose-like keys
+    // are not storage fields, even if they contain `password` or `credentials`.
+    parts.len() >= 8
+        && parts.iter().any(|part| {
+            matches!(
+                *part,
+                "with"
+                    | "without"
+                    | "the"
+                    | "this"
+                    | "about"
+                    | "via"
+                    | "before"
+                    | "after"
+                    | "should"
+                    | "challenge"
+            )
+        })
+}
+
+fn is_api_operation_name(parts: &[&str]) -> bool {
+    // AWS/OpenAPI model names such as `GetSecretValue`,
+    // `AdminResetUserPassword`, and `ListSecrets` name operations. A concrete
+    // response field under those operations can still be caught by its own key.
+    let Some(first) = parts.first().copied() else {
+        return false;
+    };
+    let verb = if first == "admin" && parts.len() >= 2 {
+        parts[1]
+    } else {
+        first
+    };
+    matches!(
+        verb,
+        "get"
+            | "list"
+            | "create"
+            | "delete"
+            | "describe"
+            | "put"
+            | "update"
+            | "set"
+            | "reset"
+            | "restore"
+            | "rotate"
+            | "cancel"
+            | "initiate"
+            | "respond"
+    ) && parts
+        .iter()
+        .any(|part| matches!(*part, "secret" | "secrets" | "password" | "auth" | "token"))
+}
+
+fn is_last_used_metadata_name(parts: &[&str]) -> bool {
+    parts.iter().any(|part| matches!(*part, "last"))
+        && parts
+            .iter()
+            .any(|part| matches!(*part, "used" | "authenticated" | "time"))
+}
+
+fn has_structural_phrase(parts: &[&str], phrase: &[&str]) -> bool {
+    !phrase.is_empty()
+        && parts.len() >= phrase.len()
+        && parts
+            .windows(phrase.len())
+            .any(|window| window.iter().zip(phrase).all(|(part, word)| part == word))
 }
 
 fn is_ui_copy_sensitive_key(key: &str, value: &str) -> bool {
@@ -274,6 +375,125 @@ fn is_structured_token_prose(key: &str, value: &str) -> bool {
         || name == "refresh_token"
         || name == "id_token";
     is_token_key && value.chars().any(char::is_whitespace)
+}
+
+fn is_structured_placeholder_value(key: &str, value: &str) -> bool {
+    // JSON/YAML schemas and fixtures commonly put type names or weak examples
+    // under sensitive-looking fields (`token: string`, `token: abcde`). Those
+    // are not usable credentials. Keep this mostly token-scoped; `password:
+    // correct horse battery staple` remains detectable.
+    let name = normalize_identifier(key);
+    if is_schema_type_placeholder(value) {
+        return true;
+    }
+    is_token_key_name(&name) && !token_value_has_secret_shape(value)
+}
+
+fn is_structured_secret_identifier_name(key: &str, value: &str) -> bool {
+    // `SecretId`/`secret_id` in cloud APIs identifies a secret resource. The
+    // resource name (`MyTestDatabaseSecret`) is sensitive metadata at most, not
+    // the secret bytes. Concrete secret values still fire under `secret`,
+    // `secret_key`, or keyed detectors.
+    let name = normalize_identifier(key);
+    matches!(name.as_str(), "secret_id" | "secretid") && is_public_resource_identifier_value(value)
+}
+
+fn is_public_resource_identifier_value(value: &str) -> bool {
+    let value = value.trim();
+    (3..=128).contains(&value.len())
+        && !value.contains("://")
+        && !value.chars().any(char::is_whitespace)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':'))
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+fn is_structured_generic_key_weak_value(key: &str, value: &str) -> bool {
+    // A literal JSON `"key"` often means "field name" or "keyboard shortcut".
+    // Do not let the generic word alone mask low-shape names; values with token
+    // punctuation, digits plus mixed case, or sufficient length remain visible.
+    if normalize_identifier(key) != "key" {
+        return false;
+    }
+    let value = value.trim();
+    is_keyboard_shortcut_value(value) || !generic_key_value_has_secret_shape(value)
+}
+
+fn is_keyboard_shortcut_value(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let parts = normalized.split('+').collect::<Vec<_>>();
+    (2..=4).contains(&parts.len())
+        && parts.iter().all(|part| {
+            matches!(
+                part.trim(),
+                "ctrl"
+                    | "control"
+                    | "shift"
+                    | "alt"
+                    | "option"
+                    | "cmd"
+                    | "command"
+                    | "meta"
+                    | "win"
+                    | "enter"
+                    | "return"
+                    | "tab"
+                    | "esc"
+                    | "escape"
+            ) || part.trim().len() == 1 && part.trim().bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+}
+
+fn generic_key_value_has_secret_shape(value: &str) -> bool {
+    let value = value.trim();
+    let len = value.chars().count();
+    let has_upper = value.chars().any(|ch| ch.is_ascii_uppercase());
+    let has_lower = value.chars().any(|ch| ch.is_ascii_lowercase());
+    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
+    let has_symbol = value
+        .chars()
+        .any(|ch| !ch.is_ascii_alphanumeric() && !ch.is_ascii_whitespace());
+    len >= 24 || (len >= 8 && ((has_upper && has_lower && has_digit) || has_symbol))
+}
+
+fn is_schema_type_placeholder(value: &str) -> bool {
+    matches!(
+        normalize_identifier(value).as_str(),
+        "string"
+            | "str"
+            | "number"
+            | "integer"
+            | "int"
+            | "boolean"
+            | "bool"
+            | "object"
+            | "array"
+            | "null"
+    )
+}
+
+fn is_token_key_name(name: &str) -> bool {
+    name == "token"
+        || name.ends_with("_token")
+        || name.contains("_token_")
+        || name == "access_token"
+        || name == "refresh_token"
+        || name == "id_token"
+}
+
+fn token_value_has_secret_shape(value: &str) -> bool {
+    let value = value.trim();
+    let len = value.chars().count();
+    if len >= 24 && !value.chars().any(char::is_whitespace) {
+        return true;
+    }
+    let has_alpha = value.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
+    let has_symbol = value
+        .chars()
+        .any(|ch| !ch.is_ascii_alphanumeric() && !ch.is_ascii_whitespace());
+    len >= 6 && has_alpha && (has_digit || has_symbol)
 }
 
 fn is_structured_generic_key_name_reference(key: &str, value: &str) -> bool {
@@ -567,6 +787,9 @@ mod tests {
         assert_eq!(sensitive_key_fires(Some("key"), "unknown"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "offset"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "host"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "path"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "Team"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "shift+ctrl+i"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "Vary"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "Dev Gateway Region"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "HappyFace.jpg"), None);
@@ -693,9 +916,52 @@ mod tests {
             sensitive_key_fires(Some("access_token"), "Test Access Token"),
             None
         );
+        assert_eq!(sensitive_key_fires(Some("token"), "string"), None);
+        assert_eq!(sensitive_key_fires(Some("token"), "abcde"), None);
+        assert_eq!(sensitive_key_fires(Some("tokenizer"), "standard"), None);
+        assert_eq!(
+            sensitive_key_fires(Some("learn_about_the_token_sale"), "Learn more"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("AdminResetUserPassword"), "ResetUserPassword"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("GetSecretValue"), "GetSecretValue"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("SecretId"), "MyTestDatabaseSecret"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("SessionLoggerArn"), "arn:aws:logs:region:acct:log/x"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("passwordCannotBeEmpty"), "Password cannot be empty"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("passwordLastUsed"), "2026-01-01T00:00:00Z"),
+            None
+        );
         assert_eq!(
             sensitive_key_fires(Some("access_token"), "abcDEF123456"),
             Some("ACCESS_TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("refresh_token"), "refresh12345"),
+            Some("REFRESH_TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("refresh_token"), "refresh-123"),
+            Some("REFRESH_TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("token"), "hunter2"),
+            Some("TOKEN".to_string())
         );
         assert_eq!(
             sensitive_key_fires(Some("password"), "correct horse battery staple"),

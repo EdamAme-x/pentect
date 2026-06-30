@@ -623,7 +623,9 @@ fn looks_like_secret_value(
         || is_html_documentation_fragment_literal(value, key_name, source_key)
         || is_escaped_html_source_fragment_literal(value, source_key)
         || is_fingerprint_literal(value, key_name)
-        || is_source_constant_reference_literal(value, source_key)
+        || is_escaped_control_placeholder_literal(value, key_name)
+        || is_escaped_source_payload_fragment_literal(value, source_key)
+        || is_source_constant_reference_literal(value, key_name, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
         || is_source_config_name_literal(value, source_key)
         || is_source_sensitive_name_reference_literal(value, source_key)
@@ -1854,7 +1856,118 @@ fn is_fingerprint_literal(value: &str, key_name: &str) -> bool {
             .all(|part| part.len() == 2 && part.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-fn is_source_constant_reference_literal(value: &str, source_key: &str) -> bool {
+fn is_escaped_control_placeholder_literal(value: &str, key_name: &str) -> bool {
+    // Test fixtures often keep table-shaped placeholder values in escaped
+    // string form, e.g. `LINE_1\nLINE_2` for a private key column or
+    // `password_1\t\t` for a decrypted sample. Require literal escaped
+    // control characters plus placeholder grammar; real escaped binary or
+    // base64 material is not affected.
+    let value = value.trim();
+    if !(value.contains("\\n") || value.contains("\\t")) {
+        return false;
+    }
+    is_numbered_line_placeholder_literal(value)
+        || is_key_named_tab_placeholder_literal(value, key_name)
+        || is_escaped_sensitive_key_name_fragment(value)
+}
+
+fn is_numbered_line_placeholder_literal(value: &str) -> bool {
+    let parts = value.split("\\n").collect::<Vec<_>>();
+    (2..=32).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|part| is_numbered_placeholder(part, "line"))
+}
+
+fn is_numbered_placeholder(value: &str, prefix: &str) -> bool {
+    let normalized = normalize_key(value);
+    normalized
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_key_named_tab_placeholder_literal(value: &str, key_name: &str) -> bool {
+    let mut body = value;
+    let mut tabs = 0usize;
+    while let Some(rest) = body.strip_suffix("\\t") {
+        body = rest;
+        tabs += 1;
+    }
+    if tabs < 2 {
+        return false;
+    }
+    let body = normalize_key(body);
+    let key = normalize_key(key_name);
+    body == key || is_numbered_placeholder(&body, &key)
+}
+
+fn is_escaped_sensitive_key_name_fragment(value: &str) -> bool {
+    let Some((head, tail)) = value.split_once("\\n") else {
+        return false;
+    };
+    let head = normalize_key(head);
+    !head.is_empty()
+        && head.split('_').any(is_sensitive_setting_name_component)
+        && tail
+            .split("\\t")
+            .all(|part| part.is_empty() || matches!(part, "+" | "if"))
+}
+
+fn is_escaped_source_payload_fragment_literal(value: &str, source_key: &str) -> bool {
+    // Saved API responses and replay files can embed source code inside JSON
+    // strings. A colon inside that escaped code may make the scanner split a
+    // code fragment as `password: \"Basic` or `token: client_secret\n\t`.
+    // Suppress only when the left side already proves escaped payload context
+    // and the captured value carries escaped string/control syntax.
+    if !source_key_has_escaped_payload_shape(source_key) {
+        return false;
+    }
+    let value = value.trim().trim_matches('"');
+    if value.starts_with("\\\"") && value.len() <= 96 {
+        return true;
+    }
+    if !(value.contains("\\n") || value.contains("\\t")) {
+        return false;
+    }
+    let head = value
+        .split("\\n")
+        .next()
+        .unwrap_or(value)
+        .split("\\t")
+        .next()
+        .unwrap_or(value)
+        .trim_matches(|ch: char| matches!(ch, '+' | '\\' | '"' | '\'' | '`' | ' '));
+    is_payload_fragment_head(head)
+}
+
+fn source_key_has_escaped_payload_shape(source_key: &str) -> bool {
+    let lower = source_key.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "\\n",
+            "\\t",
+            "\\\"",
+            "\"content\"",
+            "\"patch\"",
+            "\"files\"",
+        ],
+    )
+}
+
+fn is_payload_fragment_head(head: &str) -> bool {
+    let normalized = normalize_key(head);
+    normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "basic" | "bearer" | "class" | "instance"
+        )
+        || is_source_secret_name_reference_value(&normalized)
+        || is_uppercase_identifier_constant(head)
+}
+
+fn is_source_constant_reference_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // C-family/Rust/C# assignments often put enum constants or environment
     // variable names in sensitive-looking fields:
     // `gss_buffer_desc token = GSS_C_EMPTY_BUFFER` or
@@ -1867,7 +1980,58 @@ fn is_source_constant_reference_literal(value: &str, source_key: &str) -> bool {
     if !is_uppercase_identifier_constant(value) || !source_key_has_code_shape(source_key) {
         return false;
     }
-    is_non_secret_source_constant_value(value)
+    is_non_secret_source_constant_value(value) || is_source_sensitive_setting_name(value, key_name)
+}
+
+fn is_source_sensitive_setting_name(value: &str, key_name: &str) -> bool {
+    // Source declarations also store the public *name* of a credential setting,
+    // e.g. `expectedTokenValue = "GITHUB_TOKEN_VALUE"` or
+    // `OAuthClientSecret = "GCM_BITBUCKET_CLOUD_CLIENTSECRET"`. This is not
+    // value-list based: require an ALL_CAPS identifier, a sensitive suffix, and
+    // a suffix that matches the declared identifier once case/separators are
+    // normalized. Short one-word suffixes like `_SECRET` are deliberately not
+    // enough, because `PROD_SECRET_VALUE` can still be real config material.
+    let key_compact = normalize_key(key_name).replace('_', "");
+    if key_compact.len() < 8 {
+        return false;
+    }
+    let parts = normalize_key(value)
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if parts.len() < 2
+        || !parts
+            .iter()
+            .any(|part| is_sensitive_setting_name_component(part))
+    {
+        return false;
+    }
+    (0..parts.len()).any(|idx| {
+        let suffix = parts[idx..].join("");
+        suffix.len() >= 8
+            && key_compact.ends_with(&suffix)
+            && parts[idx..]
+                .iter()
+                .any(|part| is_sensitive_setting_name_component(part))
+    })
+}
+
+fn is_sensitive_setting_name_component(part: &str) -> bool {
+    matches!(
+        part,
+        "secret"
+            | "secrets"
+            | "clientsecret"
+            | "token"
+            | "tokens"
+            | "password"
+            | "passwd"
+            | "credential"
+            | "credentials"
+            | "auth"
+            | "key"
+    )
 }
 
 fn is_source_declared_name_literal(value: &str, key_name: &str, source_key: &str) -> bool {
@@ -2488,6 +2652,7 @@ fn key_name_indicates_sensitive_material(key_name: &str) -> bool {
                 | "pwd"
                 | "pass"
                 | "secret"
+                | "secrets"
                 | "token"
                 | "credential"
                 | "credentials"
@@ -2919,6 +3084,15 @@ mod tests {
             r#"var response = "id_token=my_id_token&state=protected_state&code=my_code";"#,
             r#"access_token = "Test Access Token","#,
             r#"refresh_token = "Test Refresh Token""#,
+            r#"const string expectedTokenValue = "GITHUB_TOKEN_VALUE";"#,
+            r#"public const string OAuthClientSecret = "GCM_BITBUCKET_CLOUD_CLIENTSECRET";"#,
+            r#""privateKey": "LINE_1\nLINE_2\nLINE_2","#,
+            r#""password": "password_1\t\t\t\t","#,
+            r#""passphrase": "passphrase\t\t\t\t","#,
+            r#"{"files":{"fail.py":{"content":"login = \"\"\npassword = \"\"\norgName = \"\""}}}"#,
+            r#"{"patch":"@@ -0,0 +1,2 @@\n+client_secret\n\t\t"}"#,
+            r#"{"patch":"@@ -0,0 +1 @@\n+Authorization: BEARER\n\tif token"}"#,
+            r#"// User-Secrets: https://docs.asp.net/en/latest/security/app-secrets.html"#,
             r#"val FAILED_TO_RETRIEVE_GENERATED_KEY = "Failed to retrieve the generated key.""#,
             r#"POSTGRES_HOST_AUTH_METHOD: scram-sha-256"#,
             r#"c.key = "__vlist__" + nestedIndex;"#,
@@ -2988,6 +3162,11 @@ mod tests {
             "Correct horse battery staple!"
         ));
         assert!(has(r#"passwordLabel = "tenant-7-trial""#, "tenant-7-trial"));
+        assert!(has(r#"password = "abc\tdef123""#, "abc\\tdef123"));
+        assert!(has(
+            r#"private_key = "LINE_1\nA2secret""#,
+            "LINE_1\\nA2secret"
+        ));
     }
 
     #[test]
