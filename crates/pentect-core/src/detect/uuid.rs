@@ -135,10 +135,32 @@ fn has_uuid_anchor_name(value: &str) -> bool {
     ) || compact.contains("uuid")
         || compact.contains("guid")
         || compact.contains("clsid")
+        // A UUID may be the value of a larger same-line slot such as
+        // `name="client_id" value="..."` or `authorization_uri=.../<uuid>`.
+        // Require established identifier/URI slot phrases rather than masking
+        // arbitrary UUID-looking prose.
+        || has_identifier_phrase(&normalized, &["client", "id"])
+        || has_identifier_phrase(&normalized, &["tenant", "id"])
+        || has_identifier_phrase(&normalized, &["resource", "id"])
+        || has_identifier_phrase(&normalized, &["external", "id"])
+        || has_identifier_phrase(&normalized, &["session", "id"])
+        || has_identifier_phrase(&normalized, &["access", "policy", "id"])
+        || has_identifier_phrase(&normalized, &["authorization", "uri"])
+        || has_identifier_phrase(&normalized, &["authorization", "url"])
+        || has_identifier_phrase(&normalized, &["metadata", "address"])
+        || has_identifier_phrase(&normalized, &["metadata", "url"])
         || normalized
             .split('_')
             .any(|part| matches!(part, "uuid" | "guid" | "clsid"))
         || has_identifier_slot_name(&normalized)
+}
+
+fn has_identifier_phrase(name: &str, phrase: &[&str]) -> bool {
+    let parts = name
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    phrase.len() <= parts.len() && parts.windows(phrase.len()).any(|window| window == phrase)
 }
 
 fn has_identifier_slot_name(value: &str) -> bool {
@@ -192,6 +214,8 @@ mod tests {
             format!(r#""tenant_id": "{uuid}""#),
             format!(r#"external_id: {uuid}"#),
             format!(r#"#define MYPC_CLSID "::{{{uuid}}}""#),
+            format!(r#"authorization_uri=https://login.example/{uuid}"#),
+            format!(r#"<input type=\"hidden\" name=\"client_id\" value=\"{uuid}\" />"#),
         ] {
             assert_eq!(hits(&raw), vec![uuid.to_string()], "{raw}");
         }
