@@ -25,6 +25,7 @@ exact:redacted
 exact:removed
 exact:deleted
 exact:masked
+exact:ignored
 exact:username
 exact:value
 exact:dummy

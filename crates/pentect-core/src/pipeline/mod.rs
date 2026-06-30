@@ -914,7 +914,7 @@ mod tests {
             r.masked
         );
         assert!(
-            r.masked.contains("?token=<<URL_QUERY_VALUE_"),
+            r.masked.contains("?token=<<URL_CREDENTIAL_"),
             "{}",
             r.masked
         );

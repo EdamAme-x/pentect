@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use super::benign::is_placeholder_value;
 use super::documentation::is_documentation_host;
 use super::{shell, Detector};
 use crate::model::*;
@@ -9,6 +10,9 @@ use crate::normalize::NormalizedView;
 
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>()]*[^\s"'<>().,;:!?]"#).unwrap());
+static URI_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b[a-z][a-z0-9+.-]{0,31}://[^\s"'<>()]*[^\s"'<>().,;:!?]"#).unwrap()
+});
 static URI_USERINFO_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b[a-z][a-z0-9+.-]{0,31}://[^\s"'<>()/?#@]+@[^\s"'<>()]*[^\s"'<>().,;:!?]"#)
         .unwrap()
@@ -29,6 +33,12 @@ impl Detector for UrlDetector {
         for m in URL_RE.find_iter(view.text()) {
             inspect_url(view, m.start(), m.as_str(), &mut out);
         }
+        for m in URI_RE.find_iter(view.text()) {
+            if is_http_url(m.as_str()) {
+                continue;
+            }
+            inspect_uri_query(view, m.start(), m.as_str(), &mut out);
+        }
         for m in URI_USERINFO_RE.find_iter(view.text()) {
             if is_http_url(m.as_str()) {
                 continue;
@@ -45,6 +55,22 @@ impl Detector for UrlDetector {
 fn is_http_url(url: &str) -> bool {
     let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
     scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+}
+
+fn inspect_uri_query(view: &NormalizedView, base: usize, uri: &str, out: &mut Vec<Span>) {
+    let Some(scheme_end) = uri.find("://").map(|i| i + 3) else {
+        return;
+    };
+    let authority_end = uri[scheme_end..]
+        .find(['/', '?', '#'])
+        .map_or(uri.len(), |i| scheme_end + i);
+    let query_at = uri[authority_end..].find('?').map(|i| authority_end + i);
+    let fragment_at = uri[authority_end..].find('#').map(|i| authority_end + i);
+    let Some(q) = query_at.filter(|&q| fragment_at.is_none_or(|f| q < f)) else {
+        return;
+    };
+    let query_end = fragment_at.unwrap_or(uri.len());
+    inspect_query_values(view, base, uri, q + 1, query_end, false, out);
 }
 
 fn inspect_curl_user_credentials(view: &NormalizedView, out: &mut Vec<Span>) {
@@ -291,7 +317,7 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
     }
     if let Some(q) = query_at {
         let query_end = fragment_at.unwrap_or(url.len());
-        inspect_query_values(view, base, url, q + 1, query_end, out);
+        inspect_query_values(view, base, url, q + 1, query_end, true, out);
     }
     if let Some(f) = fragment_at {
         inspect_fragment(view, base, url, f + 1, url.len(), out);
@@ -731,6 +757,7 @@ fn inspect_query_values(
     url: &str,
     query_start: usize,
     query_end: usize,
+    mask_plain_values: bool,
     out: &mut Vec<Span>,
 ) {
     let mut pos = query_start;
@@ -746,23 +773,39 @@ fn inspect_query_values(
         if let Some(eq) = part.find('=') {
             let value_start = part_start + eq + 1;
             let value_end = pos;
-            push_span(
-                view,
-                out,
-                base + value_start,
-                base + value_end,
-                Category::Identifier,
-                labels::URL_QUERY_VALUE,
-            );
-        } else if let Some((trim_start, trim_end)) = resource_id_bounds(part) {
-            push_span(
-                view,
-                out,
-                base + part_start + trim_start,
-                base + part_start + trim_end,
-                Category::Identifier,
-                labels::RESOURCE_ID,
-            );
+            let key = &part[..eq];
+            let value = &part[eq + 1..];
+            if query_secret_kind(key).is_some_and(|kind| query_secret_value_has_signal(kind, value))
+            {
+                push_span(
+                    view,
+                    out,
+                    base + value_start,
+                    base + value_end,
+                    Category::Secret,
+                    labels::URL_CREDENTIAL,
+                );
+            } else if mask_plain_values {
+                push_span(
+                    view,
+                    out,
+                    base + value_start,
+                    base + value_end,
+                    Category::Identifier,
+                    labels::URL_QUERY_VALUE,
+                );
+            }
+        } else if mask_plain_values {
+            if let Some((trim_start, trim_end)) = resource_id_bounds(part) {
+                push_span(
+                    view,
+                    out,
+                    base + part_start + trim_start,
+                    base + part_start + trim_end,
+                    Category::Identifier,
+                    labels::RESOURCE_ID,
+                );
+            }
         }
     }
 }
@@ -780,7 +823,7 @@ fn inspect_fragment(
     }
     let fragment = &url[fragment_start..fragment_end];
     if fragment.contains('=') {
-        inspect_query_values(view, base, url, fragment_start, fragment_end, out);
+        inspect_query_values(view, base, url, fragment_start, fragment_end, true, out);
         return;
     }
     let mut any_resource = false;
@@ -801,6 +844,117 @@ fn inspect_fragment(
             labels::URL_FRAGMENT,
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuerySecretKind {
+    Password,
+    Token,
+    Secret,
+}
+
+fn query_secret_kind(key: &str) -> Option<QuerySecretKind> {
+    // URI query parameters have no schema, so only credential-bearing field
+    // names move into Secret. Route/id fields stay in URL_QUERY_VALUE.
+    let key = normalized_query_key(key);
+    if key.is_empty() {
+        return None;
+    }
+    let compact = key.replace('_', "");
+    if matches!(
+        compact.as_str(),
+        "password" | "pass" | "passwd" | "pwd" | "passphrase"
+    ) || compact.ends_with("password")
+        || compact.ends_with("passwd")
+        || compact.ends_with("passphrase")
+    {
+        return Some(QuerySecretKind::Password);
+    }
+    if matches!(
+        compact.as_str(),
+        "token" | "accesstoken" | "refreshtoken" | "idtoken" | "authtoken" | "bearertoken"
+    ) || compact.ends_with("token")
+    {
+        return Some(QuerySecretKind::Token);
+    }
+    if matches!(
+        compact.as_str(),
+        "secret" | "clientsecret" | "sharedsecret" | "totpsecret" | "apikey"
+    ) || compact.ends_with("secret")
+        || compact.ends_with("apikey")
+    {
+        return Some(QuerySecretKind::Secret);
+    }
+    None
+}
+
+fn normalized_query_key(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_sep = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            previous_sep = false;
+        } else if !previous_sep {
+            out.push('_');
+            previous_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn query_secret_value_has_signal(kind: QuerySecretKind, value: &str) -> bool {
+    // The key supplies context; the value still needs to look material rather
+    // than like generated docs (`$Base32String`, `FFF...`) or placeholders.
+    let value = value.trim();
+    if value.is_empty() || query_value_is_template_or_redaction(value) {
+        return false;
+    }
+    let len = value.len();
+    let has_digit = value.bytes().any(|b| b.is_ascii_digit());
+    let has_alpha = value.bytes().any(|b| b.is_ascii_alphabetic());
+    let has_token_punct = value
+        .bytes()
+        .any(|b| matches!(b, b'-' | b'_' | b'.' | b'~' | b'%' | b'='));
+    match kind {
+        QuerySecretKind::Password => len >= 4,
+        QuerySecretKind::Token => {
+            len >= 6 && (len >= 16 || (has_alpha && has_digit) || has_token_punct)
+        }
+        QuerySecretKind::Secret => {
+            len >= 6 && (len >= 12 || (has_alpha && has_digit) || has_token_punct)
+        }
+    }
+}
+
+fn query_value_is_template_or_redaction(value: &str) -> bool {
+    let value = value.trim();
+    value
+        .bytes()
+        .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
+        || value.starts_with('$')
+        || value.contains("...")
+        || is_placeholder_value(value)
+        || userinfo_component_is_env_reference(value)
+        || matches!(
+            normalized_userinfo_component(value).as_str(),
+            "password"
+                | "passwd"
+                | "pass"
+                | "pwd"
+                | "secret"
+                | "token"
+                | "api_key"
+                | "apikey"
+                | "access_token"
+                | "refresh_token"
+                | "your_password"
+                | "your_secret"
+                | "your_token"
+                | "example_password"
+                | "example_secret"
+                | "example_token"
+        )
 }
 
 fn resource_id_bounds(segment: &str) -> Option<(usize, usize)> {
@@ -986,7 +1140,7 @@ mod tests {
                     "local.jira.corp:8080".to_string()
                 ),
                 ("RESOURCE_ID".to_string(), "ABC-123".to_string()),
-                ("URL_QUERY_VALUE".to_string(), "s3cr3t".to_string()),
+                ("URL_CREDENTIAL".to_string(), "s3cr3t".to_string()),
                 ("URL_QUERY_VALUE".to_string(), "OPS".to_string()),
                 ("RESOURCE_ID".to_string(), "comment-456".to_string()),
             ]
@@ -1006,6 +1160,46 @@ mod tests {
                 ("URL_CREDENTIAL".to_string(), "ruser:rpass2026".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn non_http_uri_query_masks_sensitive_values_only() {
+        let got = labels(
+            "tcp://127.0.0.1:5381?role=sentinel&password=pjriln \
+             redis://:@10.10.10.10/5?username=predis&password=qqcfpe \
+             otpauth://totp/Example:alice@google.com?secret=SBVFH5KVSROV2TMO&issuer=Example \
+             nats://host?token=OPS",
+        );
+        assert_eq!(
+            got,
+            [
+                ("URL_CREDENTIAL".to_string(), "pjriln".to_string()),
+                ("URL_CREDENTIAL".to_string(), "qqcfpe".to_string()),
+                ("URL_CREDENTIAL".to_string(), "SBVFH5KVSROV2TMO".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn uri_query_credentials_ignore_templates() {
+        for raw in [
+            "tcp://127.0.0.1:5381?password={password}",
+            "redis://localhost/0?password=PASSWORD",
+            "redis://localhost/0?password=ignored",
+            "otpauth://totp/Example?secret=***",
+            "otpauth://totp/Example?secret=$Base32String",
+            "otpauth://hotp/user@example.com?secret=FFF...&counter=123",
+            "app://callback?access_token=abc",
+            "app://callback?token=112233",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|(label, _)| label != "URL_CREDENTIAL"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
     }
 
     #[test]
@@ -1180,7 +1374,7 @@ mod tests {
             labels("http://jira.corp/#access_token=abc12345&state=xyz"),
             [
                 ("INTERNAL_ENDPOINT".to_string(), "jira.corp".to_string()),
-                ("URL_QUERY_VALUE".to_string(), "abc12345".to_string()),
+                ("URL_CREDENTIAL".to_string(), "abc12345".to_string()),
                 ("URL_QUERY_VALUE".to_string(), "xyz".to_string()),
             ]
         );
