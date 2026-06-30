@@ -103,6 +103,7 @@ impl Detector for SensitiveKeyDetector {
         }
         if region.ctx.key.as_deref().is_some_and(|key| {
             is_ui_copy_sensitive_key(key, view.text())
+                || is_structured_localization_label_value(key, view.text())
                 || is_structured_token_prose(key, view.text())
                 || is_structured_placeholder_value(key, view.text())
                 || is_structured_secret_identifier_name(key, view.text())
@@ -384,6 +385,75 @@ fn is_short_ui_label_value(value: &str) -> bool {
         })
 }
 
+fn is_structured_localization_label_value(key: &str, value: &str) -> bool {
+    // Translation JSON often has bare label keys such as `token`,
+    // `userPassword`, and `sessionToken`. Their values are displayed labels in
+    // many languages, not credentials. This is deliberately narrower than
+    // `is_ui_copy_sensitive_key`: require a label-shaped key and either a value
+    // that normalizes back to the key words or a short non-ASCII display label.
+    let name = normalize_identifier(key);
+    if !is_localization_label_key(&name) {
+        return false;
+    }
+    let value = value.trim();
+    is_key_equivalent_display_label(&name, value) || is_short_non_ascii_display_label(value)
+}
+
+fn is_localization_label_key(name: &str) -> bool {
+    let parts = identifier_parts(name);
+    if parts.is_empty() {
+        return false;
+    }
+    let has_sensitive = parts.iter().any(|part| {
+        matches!(
+            *part,
+            "password"
+                | "passwords"
+                | "token"
+                | "tokens"
+                | "credential"
+                | "credentials"
+                | "auth"
+                | "authentication"
+        )
+    });
+    has_sensitive
+        && (matches!(
+            name,
+            "password" | "token" | "user_password" | "session_token" | "lock_room_password"
+        ) || parts.iter().any(|part| {
+            matches!(
+                *part,
+                "user" | "session" | "room" | "meeting" | "lock" | "label" | "title"
+            )
+        }))
+}
+
+fn is_key_equivalent_display_label(key_name: &str, value: &str) -> bool {
+    let value_name = normalize_identifier(value);
+    if value_name.is_empty() {
+        return false;
+    }
+    let key_parts = identifier_parts(key_name);
+    let value_parts = identifier_parts(&value_name);
+    !value_parts.is_empty()
+        && value_parts
+            .iter()
+            .all(|part| key_parts.iter().any(|key_part| key_part == part))
+}
+
+fn is_short_non_ascii_display_label(value: &str) -> bool {
+    let value = value.trim().trim_end_matches(':');
+    (1..=72).contains(&value.chars().count())
+        && !value.is_ascii()
+        && !value.chars().any(|ch| ch.is_ascii_digit())
+        && value.chars().all(|ch| {
+            ch.is_alphabetic()
+                || ch.is_whitespace()
+                || matches!(ch, '-' | '\'' | ':' | '\u{200f}' | '\u{200e}')
+        })
+}
+
 fn is_structured_token_prose(key: &str, value: &str) -> bool {
     // Structured token fields must contain compact token material. Fixture/UI
     // prose such as "Test Access Token" is not a usable bearer/session token.
@@ -586,12 +656,31 @@ fn is_version_literal(value: &str) -> bool {
     if matches!(t, "*" | "latest") {
         return true;
     }
-    if !(3..=64).contains(&t.len()) || !t.as_bytes()[0].is_ascii_digit() {
+    if !(3..=96).contains(&t.len()) {
         return false;
     }
-    t.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'*' | b'x' | b'X'))
-        && t.bytes().filter(|b| *b == b'.').count() >= 1
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+    for token in t.split_whitespace() {
+        if matches!(token, "||" | "|" | "&&") {
+            continue;
+        }
+        let token = token.trim_start_matches(['^', '~', '=', '<', '>']);
+        if token.is_empty() || token == "*" || token.eq_ignore_ascii_case("latest") {
+            continue;
+        }
+        if !token.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        saw_digit = true;
+        saw_dot |= token.contains('.');
+        if !token.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'*' | b'x' | b'X')
+        }) {
+            return false;
+        }
+    }
+    saw_digit && saw_dot
 }
 
 fn is_rendered_placeholder(v: &str) -> bool {
@@ -914,7 +1003,28 @@ mod tests {
             sensitive_key_fires(Some("access_token"), "Test Access Token"),
             None
         );
+        assert_eq!(sensitive_key_fires(Some("token"), "Token"), None);
+        assert_eq!(
+            sensitive_key_fires(Some("userPassword"), "user password"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("sessionToken"), "Token de la session"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(
+                Some("userPassword"),
+                "\u{30e6}\u{30fc}\u{30b6}\u{30fc}\u{30d1}\u{30b9}\u{30ef}\u{30fc}\u{30c9}"
+            ),
+            None
+        );
         assert_eq!(sensitive_key_fires(Some("token"), "string"), None);
+        assert_eq!(
+            sensitive_key_fires(Some("js-tokens"), "^3.0.0 || ^4.0.0"),
+            None
+        );
+        assert_eq!(sensitive_key_fires(Some("parse-passwd"), "~1.0.0"), None);
         assert_eq!(sensitive_key_fires(Some("tokenizer"), "standard"), None);
         assert_eq!(
             sensitive_key_fires(Some("learn_about_the_token_sale"), "Learn more"),
@@ -955,6 +1065,10 @@ mod tests {
         assert_eq!(
             sensitive_key_fires(Some("access_token"), "abcDEF123456"),
             Some("ACCESS_TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("userPassword"), "hunter2"),
+            Some("USERPASSWORD".to_string())
         );
         assert_eq!(
             sensitive_key_fires(Some("token"), "abcde"),

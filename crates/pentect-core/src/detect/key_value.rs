@@ -220,6 +220,9 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     if !value.quoted && is_code_type_or_expression(raw_value, &key_name, kind) {
         return false;
     }
+    if is_analysis_token_result_literal(ctx.text, ctx.line_end, &key_name, raw_value) {
+        return false;
+    }
     if !looks_like_secret_value(
         raw_value,
         kind,
@@ -634,6 +637,7 @@ fn looks_like_secret_value(
         || is_source_prefix_constant_literal(value, key_name)
         || is_source_variable_reference_literal(value, source_key)
         || is_source_string_fragment_literal(value, source_key)
+        || is_source_concatenation_template_literal(value)
         || is_shell_command_substitution_literal(value, source_key)
         || is_inline_code_key_value_tail_literal(value, key_name, source_key)
         || is_source_code_fragment_literal(value)
@@ -649,6 +653,7 @@ fn looks_like_secret_value(
         || is_plain_prose_literal_for_generic_key(value, key_name)
         || is_locator_literal_for_key(value, key_name)
         || is_secret_resource_metadata_literal(value, key_name)
+        || is_package_dependency_coordinate_literal(value, source_key)
     {
         return false;
     }
@@ -2643,6 +2648,131 @@ fn is_resource_name_literal(value: &str) -> bool {
     has_name_char && (has_separator || value.contains('/') || value.contains('.'))
 }
 
+fn is_package_dependency_coordinate_literal(value: &str, source_key: &str) -> bool {
+    // Maven/Gradle coordinates are `group:artifact:version`. The key/value
+    // scanner sees the first colon and may treat `com.google.auth` as an auth
+    // key. Suppress only when the left side is a dotted package group and the
+    // right side is an artifact plus a version range.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let Some((artifact, version)) = value.rsplit_once(':') else {
+        return false;
+    };
+    is_package_group_prefix(source_key)
+        && is_package_artifact_name(artifact)
+        && is_semverish_version_literal(version)
+}
+
+fn is_package_group_prefix(source_key: &str) -> bool {
+    let Some(candidate) = source_key
+        .split_whitespace()
+        .next_back()
+        .map(|part| part.trim_matches(|ch| matches!(ch, '"' | '\'' | '`')))
+    else {
+        return false;
+    };
+    let parts = candidate.split('.').collect::<Vec<_>>();
+    parts.len() >= 2
+        && parts.iter().all(|part| {
+            (1..=64).contains(&part.len())
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && part.bytes().any(|b| b.is_ascii_lowercase())
+        })
+}
+
+fn is_package_artifact_name(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn is_semverish_version_literal(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 96 {
+        return false;
+    }
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+    for token in value.split_whitespace() {
+        if matches!(token, "||" | "|" | "&&") {
+            continue;
+        }
+        let token = token.trim_start_matches(['^', '~', '=', '<', '>']);
+        if token.is_empty() || token == "*" || token.eq_ignore_ascii_case("latest") {
+            continue;
+        }
+        if !token.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        saw_digit = true;
+        saw_dot |= token.contains('.');
+        if !token.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'*' | b'x' | b'X')
+        }) {
+            return false;
+        }
+    }
+    saw_digit && saw_dot
+}
+
+fn is_source_concatenation_template_literal(value: &str) -> bool {
+    // Source snippets can build JSON credential fixtures with runtime
+    // expressions: `"private_key_id": "` + UUID.randomUUID() or a PEM wrapper
+    // around `encodedKey`. Those fragments are templates; the runtime value is
+    // not present in the file. Require explicit concatenation syntax so base64
+    // values containing `+` are unaffected.
+    let value = value.trim();
+    if !value.contains('+') || value.matches('+').count() < 2 {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    contains_any(&lower, &["uuid.", "randomuuid", ".tostring()"])
+        || (value.contains("-----BEGIN ")
+            && value.contains("-----END ")
+            && value
+                .split('+')
+                .any(|part| is_code_reference_segment(part.trim())))
+}
+
+fn is_analysis_token_result_literal(
+    text: &str,
+    line_end: usize,
+    key_name: &str,
+    value: &str,
+) -> bool {
+    // Search/analyzer docs emit objects like
+    // `{ "token": "quick", "start_offset": 0, ... }`. Here `token` means a
+    // parsed word, not an auth token. Require the neighboring analyzer metadata
+    // fields in the same small window so ordinary `token: abcde` still masks.
+    if key_name != "token" || !is_plain_analyzer_token_text(value) {
+        return false;
+    }
+    let after = &text[line_end..];
+    let mut window_end = after.len().min(512);
+    while !after.is_char_boundary(window_end) {
+        window_end -= 1;
+    }
+    let window = &after[..window_end];
+    contains_any(window, &["\"start_offset\"", "\"end_offset\""])
+        && contains_any(window, &["\"position\"", "\"type\""])
+}
+
+fn is_plain_analyzer_token_text(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ','));
+    (1..=64).contains(&value.len())
+        && !value.chars().any(|ch| ch.is_ascii_digit())
+        && value
+            .chars()
+            .all(|ch| ch.is_alphabetic() || matches!(ch, '_' | '-'))
+}
+
 fn key_name_indicates_locator(key_name: &str) -> bool {
     has_identifier_component(key_name, "endpoint")
         || has_identifier_component(key_name, "url")
@@ -3029,6 +3159,8 @@ mod tests {
             "OAuth app client_secret 'tenant-7-trial'",
             "tenant-7-trial"
         ));
+        assert!(has(r#"credential: "hunter2""#, "hunter2"));
+        assert!(has(r#"token: "quick-token-123""#, "quick-token-123"));
     }
 
     #[test]
@@ -3297,6 +3429,22 @@ mod tests {
             r#"{"body":"\u003cpre\u003e\u003ccode\u003ecredentials: @\"apiURL\\n];\u003c/code\u003e\u003c/pre\u003e"}"#,
             "/// Bitcoin address: base58check, P2PKH (0x00, '1') or P2SH (0x05, '3').",
             "/// Bitcoin WIF private key: base58check, version 0x80.",
+            r#"api 'com.google.auth:google-auth-library-credentials:0.20.0'"#,
+            r#"'  "private_key_id": "' + UUID.randomUUID().toString() + '","\n' +"#,
+            r#"'  "private_key": "-----BEGIN PRIVATE KEY-----\n' + encodedKey + '\n-----END PRIVATE KEY-----\n","\n' +"#,
+            r#"
+{
+  "tokens": [
+    {
+      "token": "quick",
+      "start_offset": 0,
+      "end_offset": 5,
+      "type": "<ALPHANUM>",
+      "position": 0
+    }
+  ]
+}
+"#,
         ] {
             assert!(hits(raw).is_empty(), "{raw}: {:?}", hits(raw));
         }
