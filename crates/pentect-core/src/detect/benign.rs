@@ -323,6 +323,81 @@ pub(crate) fn is_structured_key_name_reference_value(value: &str) -> bool {
         || (parts.len() >= 2 && STRUCTURED_KEY_NAME_MATCHER.matches_components(&parts))
 }
 
+/// True when a generic JSON `"key"` value is schema/UI metadata.
+///
+/// Rationale: some APIs use `"Key"` for tag labels, file names, or displayed
+/// field names. Those are not credential bytes, but this is only safe for a
+/// property literally named `key`; callers must prove that context first.
+pub(crate) fn is_structured_generic_key_metadata_value(value: &str) -> bool {
+    is_structured_key_name_reference_value(value)
+        || is_generic_key_label_value(value)
+        || is_generic_key_file_reference_value(value)
+}
+
+fn is_generic_key_label_value(value: &str) -> bool {
+    let value = value.trim();
+    if !(3..=80).contains(&value.len()) || value.split_whitespace().count() < 2 {
+        return false;
+    }
+    let normalized = normalize_identifier(value);
+    if normalized.split('_').any(|part| {
+        matches!(
+            part,
+            "secret" | "password" | "passwd" | "credential" | "token" | "auth" | "private" | "key"
+        )
+    }) {
+        return false;
+    }
+    value.chars().all(|ch| {
+        ch.is_ascii_alphabetic() || ch.is_ascii_whitespace() || matches!(ch, '-' | '\'' | '.')
+    })
+}
+
+fn is_generic_key_file_reference_value(value: &str) -> bool {
+    let value = value.trim();
+    if !(5..=128).contains(&value.len())
+        || value.contains("://")
+        || value
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || matches!(b, b'@' | b'=' | b'?' | b'#'))
+    {
+        return false;
+    }
+    let Some((stem, ext)) = value.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty()
+        || stem.contains('/')
+        || !stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "webp"
+            | "svg"
+            | "ico"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "txt"
+            | "md"
+            | "html"
+            | "css"
+            | "js"
+            | "ts"
+            | "map"
+    )
+}
+
 pub(crate) fn normalize_identifier(input: &str) -> String {
     let mut out = String::new();
     let mut prev_lower_or_digit = false;
@@ -455,6 +530,9 @@ mod tests {
         assert!(is_structured_key_name_reference_value("smsCode"));
         assert!(is_structured_key_name_reference_value("signature"));
         assert!(is_structured_key_name_reference_value("unknown"));
+        assert!(is_structured_key_name_reference_value("offset"));
+        assert!(is_structured_key_name_reference_value("host"));
+        assert!(is_structured_key_name_reference_value("Vary"));
         assert!(is_structured_key_name_reference_value("panel1"));
         assert!(is_structured_key_name_reference_value("fieldset1"));
         assert!(is_structured_key_name_reference_value("dataGrid12"));
@@ -462,5 +540,19 @@ mod tests {
         assert!(!is_structured_key_name_reference_value("secret"));
         assert!(!is_structured_key_name_reference_value("abcDEF123456"));
         assert!(!is_structured_key_name_reference_value("sk-test-token"));
+    }
+
+    #[test]
+    fn generic_key_metadata_values_require_plain_metadata_shape() {
+        assert!(is_structured_generic_key_metadata_value(
+            "Dev Gateway Region"
+        ));
+        assert!(is_structured_generic_key_metadata_value("HappyFace.jpg"));
+        assert!(is_structured_generic_key_metadata_value("access-project"));
+        assert!(is_structured_generic_key_metadata_value("cost-center"));
+        assert!(!is_structured_generic_key_metadata_value("API Key"));
+        assert!(!is_structured_generic_key_metadata_value("secret token"));
+        assert!(!is_structured_generic_key_metadata_value("sk-test-token"));
+        assert!(!is_structured_generic_key_metadata_value("abcDEF123456"));
     }
 }

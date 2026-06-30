@@ -1,7 +1,7 @@
 use super::benign::{
     is_explicitly_non_sensitive_key_name, is_non_secret_source_constant_value,
     is_placeholder_value, is_source_fixture_secret_value, is_source_secret_name_reference_value,
-    is_structured_key_name_reference_value,
+    is_structured_generic_key_metadata_value,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
@@ -1747,7 +1747,7 @@ fn is_structured_key_name_reference_literal(value: &str, key_name: &str) -> bool
     // Keep generic `key` semantics aligned with StructuralDetector: JSON/YAML
     // schema objects often store another field/widget name under a property
     // literally called `key`.
-    is_generic_metadata_key_name(key_name) && is_structured_key_name_reference_value(value)
+    is_generic_metadata_key_name(key_name) && is_structured_generic_key_metadata_value(value)
 }
 
 fn is_plain_prose_literal_for_generic_key(value: &str, key_name: &str) -> bool {
@@ -2326,6 +2326,7 @@ mod tests {
             r#"private const string ApiKey = "ABC_DEF_123";"#,
             "ABC_DEF_123"
         ));
+        assert!(has(r#"key: "sk-test-token""#, "sk-test-token"));
     }
 
     #[test]
@@ -2356,6 +2357,12 @@ mod tests {
             r#"aggregations.histo.buckets.3.key_as_string: "2017-01-01T08:00:00.000Z""#,
             r#"key: "Authorization""#,
             r#"key: "grant_type""#,
+            r#"key: "offset""#,
+            r#"key: "host""#,
+            r#"key: "Vary""#,
+            r#"key: "Dev Gateway Region""#,
+            r#"key: "HappyFace.jpg""#,
+            r#"key: "cost-center""#,
             r#"key: "panel1""#,
             r#"key: "dataGrid12""#,
             r#"secretName: kube-ovn-tls"#,

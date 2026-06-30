@@ -1,6 +1,6 @@
 use super::benign::{
     is_explicitly_non_sensitive_key_name, is_placeholder_value,
-    is_structured_key_name_reference_value, normalize_identifier,
+    is_structured_generic_key_metadata_value, normalize_identifier,
 };
 use super::Detector;
 use crate::model::*;
@@ -274,7 +274,7 @@ fn is_structured_generic_key_name_reference(key: &str, value: &str) -> bool {
     // Generic JSON `"key"` fields often contain another field/config name
     // (`smtpUser`, `databaseName`). Concrete key values usually contain digits,
     // token punctuation, or entropy and remain eligible for masking.
-    normalize_identifier(key) == "key" && is_structured_key_name_reference_value(value)
+    normalize_identifier(key) == "key" && is_structured_generic_key_metadata_value(value)
 }
 
 fn is_explicitly_non_sensitive_key(name: &str) -> bool {
@@ -559,10 +559,20 @@ mod tests {
         assert_eq!(sensitive_key_fires(Some("key"), "smsCode"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "signature"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "unknown"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "offset"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "host"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "Vary"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "Dev Gateway Region"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "HappyFace.jpg"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "cost-center"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "panel1"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "dataGrid12"), None);
         assert_eq!(
             sensitive_key_fires(Some("key"), "abcDEF123456"),
+            Some("KEY".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("key"), "sk-test-token"),
             Some("KEY".to_string())
         );
         assert_eq!(

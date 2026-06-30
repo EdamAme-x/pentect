@@ -84,6 +84,9 @@ representatives, and keyed locator/resource metadata suppresses values such as
 `secretName`, `secret.type`, and URL/path references only when the value is not
 credential-bearing. Generic `"key"` values now include common public field names
 such as `token`, `code`, `signature`, and `unknown` as metadata-only names.
+Generic `"key"` metadata also covers common public schema/tag names,
+human-readable tag labels, and file-name references while preserving
+credential-shaped values such as `sk-test-token`.
 
 ```text
 CredData commit: 9a55c40
@@ -93,15 +96,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 11184
+FP: 10975
 FN: 4828
 Line only: 227
-Unlabeled: 60243
+Unlabeled: 60227
 Missing files: 0
-Precision: 0.479
+Precision: 0.484
 Recall: 0.680
-F1: 0.562
-Elapsed: 28070 ms
+F1: 0.565
+Elapsed: 27556 ms
 ```
 
 Weak groups:
@@ -116,6 +119,7 @@ Weak groups:
 - RFC 2606/6761 domains, RFC 5737 IPv4 ranges, and RFC 3849/9637 IPv6 ranges are shared by URL and placeholder suppression so sample hosts do not need ad hoc literals.
 - Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.
 - Generic JSON `"key"` values that are identifier names such as `smtpDomain`, `Authorization`, or `grant_type` are treated as metadata; digit/symbol-bearing key material and sensitive single words still fire.
+- Generic `"key"` metadata also suppresses public schema/tag names such as `offset`, `host`, `cost-center`, display labels such as `Dev Gateway Region`, and file references such as `HappyFace.jpg`; credential-shaped values such as `sk-test-token` still fire.
 - Code/reference literals under sensitive-looking keys are suppressed only when syntax proves they are not values: PascalCase type annotations require a code delimiter, and env lookups require explicit Jinja/Ansible `lookup('env', ...)` shape.
 - Additional source/metadata literals are shape-gated: protobuf tag descriptors require `protobuf_key` context, key algorithm labels require known algorithm-size syntax, fingerprints require explicit fingerprint keys and colon-hex shape, and command/mock fragments require invocation syntax.
 - Generic `key` code-member names and parser-cut source fragments are suppressed only when source syntax proves they are metadata, keeping concrete key material under `api_key`/`client_secret` unaffected.
