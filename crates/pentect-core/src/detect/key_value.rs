@@ -251,6 +251,12 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     if is_analysis_token_result_literal(ctx.text, ctx.line_end, &key_name, raw_value) {
         return false;
     }
+    if !value.quoted
+        && (is_documented_scalar_type_literal(raw_value, &ctx.text[ctx.line_start..left_end])
+            || is_unquoted_alpha_prose_continuation(raw_value, ctx.text, value.end, ctx.line_end))
+    {
+        return false;
+    }
     if !looks_like_secret_value(
         raw_value,
         kind,
@@ -312,6 +318,9 @@ fn key_context_start(text: &str, line_start: usize, left_end: usize) -> Option<u
     if left_end <= line_start {
         return None;
     }
+    if let Some(start) = bracketed_string_key_context_start(text, line_start, left_end) {
+        return Some(start);
+    }
     let mut min = left_end
         .saturating_sub(MAX_KEY_CONTEXT_BYTES)
         .max(line_start);
@@ -326,6 +335,32 @@ fn key_context_start(text: &str, line_start: usize, left_end: usize) -> Option<u
     });
     let start = trim_ascii_ws_start(text, hard, left_end);
     (start < left_end).then_some(start)
+}
+
+fn bracketed_string_key_context_start(
+    text: &str,
+    line_start: usize,
+    left_end: usize,
+) -> Option<usize> {
+    let end = trim_ascii_ws_end(text, line_start, left_end);
+    if end <= line_start || text.as_bytes().get(end - 1) != Some(&b']') {
+        return None;
+    }
+    let mut min = end.saturating_sub(MAX_KEY_CONTEXT_BYTES).max(line_start);
+    while min < end && !text.is_char_boundary(min) {
+        min += 1;
+    }
+    let open = text[min..end].rfind('[').map(|offset| min + offset)?;
+    let inner = text[open + 1..end - 1].trim();
+    if inner.len() < 3 {
+        return None;
+    }
+    let quote = inner.as_bytes()[0];
+    if !matches!(quote, b'"' | b'\'' | b'`') || inner.as_bytes().last() != Some(&quote) {
+        return None;
+    }
+    let key = &inner[1..inner.len() - 1];
+    sensitive_key_kind(key).map(|_| open)
 }
 
 fn typed_declaration_context_start(window: &str, min: usize) -> Option<usize> {
@@ -350,7 +385,7 @@ fn is_key_context_delimiter(ch: char) -> bool {
 
 fn trim_key_edge(value: &str) -> &str {
     value.trim_matches(|ch: char| {
-        ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | '-' | '>')
+        ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | '-' | '>' | '[' | ']')
     })
 }
 
@@ -380,6 +415,7 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
         &name,
         &[
             "access_token",
+            "apitoken",
             "refresh_token",
             "id_token",
             "auth_token",
@@ -388,6 +424,7 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
         ],
     ) || matches!(name.as_str(), "token" | "session" | "cookie" | "jwt")
         || name.ends_with("_token")
+        || name.ends_with("_apitoken")
         || name.contains("_token_")
         || name == "authorization"
         || name.ends_with("_authorization")
@@ -875,7 +912,8 @@ fn looks_like_secret_value(
         && !has_digit
         && !has_symbol
         && !has_space
-        && is_config_slot_low_entropy_literal(value, key_name, source_key)
+        && (is_config_slot_low_entropy_literal(value, key_name, source_key)
+            || is_explicit_slot_low_entropy_literal(value, key_name, kind))
     {
         return true;
     }
@@ -963,14 +1001,23 @@ fn is_repeated_placeholder_literal(value: &str) -> bool {
     }
     let mut marker_count = 0usize;
     let mut separator_count = 0usize;
+    let mut repeated_alpha = None;
     for byte in value.bytes() {
         match byte {
             b'x' | b'X' => marker_count += 1,
             b'-' | b'_' | b'.' => separator_count += 1,
+            b if b.is_ascii_alphabetic() => match repeated_alpha {
+                Some(previous) if previous == b.to_ascii_lowercase() => {}
+                None => repeated_alpha = Some(b.to_ascii_lowercase()),
+                _ => return false,
+            },
             _ => return false,
         }
     }
-    marker_count >= 4 && (separator_count > 0 || marker_count == value.len())
+    if marker_count >= 4 && (separator_count > 0 || marker_count == value.len()) {
+        return true;
+    }
+    separator_count == 0 && marker_count == 0 && repeated_alpha.is_some() && value.len() >= 4
 }
 
 fn is_nil_uuid_literal(value: &str) -> bool {
@@ -1315,14 +1362,15 @@ fn is_unquoted_type_annotation_literal(
     // Base32SecretKey`) without assigning a secret value. Require an unquoted
     // PascalCase identifier and a code delimiter after it so YAML-like
     // `api_key: Abc123Secret` still remains a candidate.
-    if !is_pascal_case_type_name(value.trim()) {
+    let value = value.trim();
+    if !(is_pascal_case_type_name(value) || is_common_scalar_type_name(value)) {
         return false;
     }
     text[value_end..line_end]
         .trim_start()
         .chars()
         .next()
-        .is_some_and(|ch| matches!(ch, ',' | ')' | ';' | '{' | '=' | '>'))
+        .is_some_and(|ch| matches!(ch, ',' | ')' | ';' | '{' | '=' | '>' | '|'))
 }
 
 fn is_shell_command_invocation_literal(
@@ -1337,6 +1385,77 @@ fn is_shell_command_invocation_literal(
         return false;
     }
     text[value_end..line_end].trim_start().starts_with('-')
+}
+
+fn is_common_scalar_type_name(value: &str) -> bool {
+    matches!(
+        value,
+        "str"
+            | "string"
+            | "String"
+            | "bool"
+            | "boolean"
+            | "Boolean"
+            | "number"
+            | "Number"
+            | "int"
+            | "uint"
+            | "long"
+            | "float"
+            | "double"
+            | "byte"
+            | "bytes"
+            | "Bytes"
+            | "Buffer"
+            | "object"
+            | "Object"
+    )
+}
+
+fn is_documented_scalar_type_literal(value: &str, source_key: &str) -> bool {
+    if !is_common_scalar_type_name(value.trim()) {
+        return false;
+    }
+    let key = normalize_key(source_key);
+    key.split('_').any(|part| {
+        matches!(
+            part,
+            "param"
+                | "parameter"
+                | "type"
+                | "typedef"
+                | "property"
+                | "attribute"
+                | "field"
+                | "column"
+                | "schema"
+        )
+    }) || source_key.trim_start().starts_with('#')
+        || source_key.trim_start().starts_with("//")
+}
+
+fn is_unquoted_alpha_prose_continuation(
+    value: &str,
+    text: &str,
+    value_end: usize,
+    line_end: usize,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let rest = text[value_end..line_end].trim_start();
+    if rest.is_empty()
+        || rest.starts_with('#')
+        || rest.starts_with("//")
+        || rest.starts_with("/*")
+        || rest.starts_with('\\')
+    {
+        return false;
+    }
+    rest.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic())
 }
 
 fn is_powershell_command_name(value: &str) -> bool {
@@ -3048,6 +3167,10 @@ fn is_self_describing_key_value_placeholder(value: &str, key_name: &str, source_
     // `my_key: "my_value"` or `opt_key: "opt_value"` to prove option plumbing.
     // Require source-shaped context and identical stems so `api_key="abc123"`
     // or `client_secret="tenant-7-trial"` still detect normally.
+    let value = normalize_key(value);
+    if is_compact_key_value_here_placeholder(&value, key_name) {
+        return true;
+    }
     if !source_key_has_code_shape(source_key) {
         return false;
     }
@@ -3059,8 +3182,44 @@ fn is_self_describing_key_value_placeholder(value: &str, key_name: &str, source_
     {
         return false;
     }
-    let value = normalize_key(value);
-    value.strip_suffix("_value") == Some(stem)
+    value.strip_suffix("_value") == Some(stem) || value.strip_suffix("_value_here") == Some(stem)
+}
+
+fn is_compact_key_value_here_placeholder(value: &str, key_name: &str) -> bool {
+    let key_compact = key_name.replace('_', "");
+    if compact_key_stem_matches_value_here(value, &key_compact) {
+        return true;
+    }
+    for (suffix, suffix_compact) in [
+        ("api_key", "apikey"),
+        ("access_key", "accesskey"),
+        ("secret_key", "secretkey"),
+        ("client_secret", "clientsecret"),
+        ("access_token", "accesstoken"),
+        ("refresh_token", "refreshtoken"),
+        ("auth_token", "authtoken"),
+        ("token", "token"),
+        ("secret", "secret"),
+        ("password", "password"),
+    ] {
+        if (key_name == suffix
+            || key_name
+                .strip_suffix(suffix)
+                .is_some_and(|head| head.ends_with('_')))
+            && compact_key_stem_matches_value_here(value, suffix_compact)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn compact_key_stem_matches_value_here(value: &str, key_compact: &str) -> bool {
+    key_compact.len() >= 4
+        && matches!(
+            value.strip_prefix(key_compact),
+            Some("valuehere" | "_value_here")
+        )
 }
 
 fn is_source_sensitive_name_reference_literal(value: &str, source_key: &str) -> bool {
@@ -4698,17 +4857,20 @@ fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
             "authorization"
                 | "auth_token"
                 | "access_token"
+                | "apitoken"
                 | "refresh_token"
                 | "id_token"
                 | "bearer_token"
                 | "session_token"
                 | "token"
-        ) || name.ends_with("_token");
+        ) || name.ends_with("_token")
+            || name.ends_with("_apitoken");
     }
     matches!(
         name,
         "api_key"
             | "apikey"
+            | "oauth_key"
             | "access_key"
             | "account_key"
             | "client_secret"
@@ -4736,6 +4898,31 @@ fn is_config_slot_low_entropy_literal(value: &str, key_name: &str, source_key: &
     // values in env/dotted-config key slots as credentials; prose labels,
     // type annotations, and source variables stay rejected.
     is_compact_alpha_literal(value) && is_config_secret_slot_key(key_name, source_key)
+}
+
+fn is_explicit_slot_low_entropy_literal(value: &str, key_name: &str, kind: KeyKind) -> bool {
+    // Plain YAML/TOML/shell snippets often leave low-entropy sample credentials
+    // unquoted (`admin_password: abcdef`). Once the key name explicitly names
+    // material and the value survived source/prose suppressors, the slot is
+    // stronger evidence than entropy alone.
+    is_compact_alpha_literal(value) && is_qualified_low_entropy_material_slot(key_name, kind)
+}
+
+fn is_qualified_low_entropy_material_slot(key_name: &str, kind: KeyKind) -> bool {
+    key_allows_low_entropy_literal(key_name, kind)
+        && matches!(kind, KeyKind::Token)
+        && key_name.contains('_')
+        || key_name.ends_with("_password")
+        || key_name.ends_with("_pass")
+        || key_name.ends_with("_passwd")
+        || key_name.ends_with("_pwd")
+        || key_name.ends_with("_passphrase")
+        || key_name.ends_with("_secret")
+        || key_name.ends_with("_credential")
+        || key_name.ends_with("_api_key")
+        || key_name.ends_with("_oauth_key")
+        || key_name.ends_with("_access_key")
+        || key_name.ends_with("_account_key")
 }
 
 fn is_compact_alpha_literal(value: &str) -> bool {
@@ -5048,6 +5235,13 @@ mod tests {
             "6nA7WEJ/bBBCY06IrWwAlks7"
         ));
         assert!(has(r#"password = Some("owlknh")"#, "owlknh"));
+        assert!(has(r#"["password"] = "alpha12345""#, "alpha12345"));
+        assert!(has("admin_password: alphabetic", "alphabetic"));
+        assert!(has("EXOSCALE_API_KEY=alphabeticsecret", "alphabeticsecret"));
+        assert!(has(
+            r#""Apitoken": "{\"nonce\":\"ok\",\"token\":\"abc123456789\"}""#,
+            r#"{\"nonce\":\"ok\",\"token\":\"abc123456789\"}"#
+        ));
         assert!(has(
             r#"private const string CertificatePassword = "VozkqqWcexxxle";"#,
             "VozkqqWcexxxle"
@@ -5218,6 +5412,15 @@ mod tests {
             r#"g = Github(base_url="https://host/api/v3", login_or_token="access_token")"#,
             r#"password = "my_password"  # Can be left empty if not used"#,
             r#"oauth_token = "my_token"  # Can be left empty if not used"#,
+            r#":param password: string"#,
+            r#":type aws_secret_access_key: string"#,
+            r#"repeat_password: Repeat Password"#,
+            r#"current_password: Current password"#,
+            r#"NAMESILO_API_KEY = "Client ID""#,
+            r#"ZONEEE_API_KEY=yyyyy \"#,
+            r#"Query: "action=SET&api_key=apikeyvaluehere&name=example.com""#,
+            r#"tmp_password:bytes = InputPaymentCredentials;"#,
+            r#"bot_token = value"#,
             r#"password: "$t(lockRoomPasswordUppercase):""#,
             r#"password: "i18n.t(auth.setup.instructions)""#,
             r#"openstack_password: "{{ lookup('env','OS_PASSWORD') }}""#,

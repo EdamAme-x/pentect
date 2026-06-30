@@ -26,6 +26,8 @@ exact:removed
 exact:deleted
 exact:masked
 exact:username
+exact:value
+exact:dummy
 
 # Action/parameter placeholders used in sample configuration and generated docs.
 exact:create_a_key
