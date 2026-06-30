@@ -113,14 +113,11 @@ fn is_sweepable_identity(raw: &str, span: &Span) -> bool {
     if span.label.as_str() == labels::OTP {
         return false;
     }
-    // Key/value hits may legitimately be short (`password="secret"`), but a
-    // context-free repeat of a short string is weak evidence. Keep the anchored
-    // detector hit and sweep only values distinctive enough to be global.
-    if span.label.as_str() == labels::KEYED_SECRET && span.range.len() < 12 {
-        return false;
-    }
-    if span.label.as_str() == labels::KEYED_SECRET && !is_keyed_secret_sweepable_identity(raw, span)
-    {
+    // KeyValueDetector hits are anchored by local key syntax. Repeating the same
+    // bytes elsewhere without a key boundary is not enough evidence: code names,
+    // fixtures, and public test labels collide heavily with keyed values. Keep
+    // the anchored hit and let stronger detectors drive identity propagation.
+    if span.label.as_str() == labels::KEYED_SECRET {
         return false;
     }
     // Structural JSON detections are anchored by local key context. Generated
@@ -135,29 +132,6 @@ fn is_sweepable_identity(raw: &str, span: &Span) -> bool {
         return false;
     }
     true
-}
-
-fn is_keyed_secret_sweepable_identity(raw: &str, span: &Span) -> bool {
-    // KeyValueDetector is anchored by local key syntax. Repeating a long source
-    // identifier or fixture-looking no-digit password elsewhere is weak
-    // evidence; repeating a compact value with digits and token punctuation or
-    // mixed case is much stronger identity evidence.
-    let value = raw[span.range.start..span.range.end].trim();
-    let bytes = value.as_bytes();
-    if bytes.len() < 12 || bytes.iter().any(u8::is_ascii_whitespace) {
-        return false;
-    }
-    let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
-    let has_digit = bytes.iter().any(u8::is_ascii_digit);
-    if !has_alpha || !has_digit {
-        return false;
-    }
-    let has_token_symbol = bytes
-        .iter()
-        .any(|b| matches!(b, b'_' | b'-' | b'.' | b'+' | b'/' | b'='));
-    let has_mixed_case =
-        bytes.iter().any(u8::is_ascii_lowercase) && bytes.iter().any(u8::is_ascii_uppercase);
-    has_token_symbol || has_mixed_case
 }
 
 fn is_structural_sweepable_identity(raw: &str, span: &Span) -> bool {
@@ -329,6 +303,9 @@ mod tests {
             r#"key="_selectLength" code _selectLength"#,
             r#"password="x-pack-test-password" docs x-pack-test-password"#,
             r#"secret="secret_key_base" docs secret_key_base"#,
+            r#"api_key="abcDEF123456" docs abcDEF123456"#,
+            r#"password="tenant-7-trial" docs tenant-7-trial"#,
+            r#"key="ALICE_secp256k1_PUB" docs ALICE_secp256k1_PUB"#,
         ] {
             let value = raw.split('"').nth(1).unwrap();
             let first = span(
@@ -347,26 +324,21 @@ mod tests {
     }
 
     #[test]
-    fn keyed_distinctive_values_are_identity_swept() {
-        for raw in [
-            r#"api_key="abcDEF123456" later abcDEF123456"#,
-            r#"password="tenant-7-trial" later tenant-7-trial"#,
-        ] {
-            let value = raw.split('"').nth(1).unwrap();
-            let first = span(
-                raw,
-                value,
-                labels::KEYED_SECRET,
-                Category::Secret,
-                Confidence::Medium,
-            );
-            let swept = swept_ranges(raw, vec![first]);
-            assert_eq!(
-                swept.len(),
-                1,
-                "distinctive keyed values should still sweep: {raw} {swept:?}"
-            );
-        }
+    fn keyed_values_are_not_identity_swept_without_local_context() {
+        let raw = r#"api_key="sk-live-Abc1234567890" later sk-live-Abc1234567890"#;
+        let value = raw.split('"').nth(1).unwrap();
+        let first = span(
+            raw,
+            value,
+            labels::KEYED_SECRET,
+            Category::Secret,
+            Confidence::Medium,
+        );
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "keyed values require local key context, not global sweep: {raw} {swept:?}"
+        );
     }
 
     #[test]

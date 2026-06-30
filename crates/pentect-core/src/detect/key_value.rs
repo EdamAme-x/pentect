@@ -15,6 +15,7 @@ enum KeyKind {
     Token,
     Otp,
     Phrase,
+    EncodedHex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,7 +242,10 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
 
 impl KeyKind {
     fn allows_is_separator(self) -> bool {
-        matches!(self, KeyKind::Strong | KeyKind::Otp | KeyKind::Phrase)
+        matches!(
+            self,
+            KeyKind::Strong | KeyKind::Otp | KeyKind::Phrase | KeyKind::EncodedHex
+        )
     }
 }
 
@@ -305,6 +309,9 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
     let name = normalize_key(key);
     if name.is_empty() || is_explicitly_non_sensitive_key(&name) {
         return None;
+    }
+    if is_hex_encoded_sensitive_key_name(&name) {
+        return Some(KeyKind::EncodedHex);
     }
     if is_otp_key_name(&name) {
         return Some(KeyKind::Otp);
@@ -393,6 +400,9 @@ fn trailing_sensitive_key_kind(key: &str) -> Option<KeyKind> {
 fn implicit_key_name_kind(name: &str) -> Option<KeyKind> {
     if name.is_empty() || is_explicitly_non_sensitive_key(name) {
         return None;
+    }
+    if is_hex_encoded_sensitive_key_name(name) {
+        return Some(KeyKind::EncodedHex);
     }
     if is_otp_key_name(name) {
         return Some(KeyKind::Otp);
@@ -634,6 +644,13 @@ fn looks_like_secret_value(
         .any(|ch| !ch.is_ascii_alphanumeric() && !ch.is_ascii_whitespace());
     let has_space = value.chars().any(char::is_whitespace);
 
+    if matches!(kind, KeyKind::EncodedHex) {
+        return is_keyed_hex_secret_literal(value, key_name, kind);
+    }
+    if is_keyed_hex_secret_literal(value, key_name, kind) {
+        return true;
+    }
+
     if matches!(kind, KeyKind::Token) && has_space {
         // Bearer/API/session token syntaxes are compact credentials. Values
         // with whitespace such as "Test Access Token" are names or fixture
@@ -699,7 +716,7 @@ fn is_benign_literal(value: &str) -> bool {
     if is_iso8601_timestamp_literal(value) {
         return true;
     }
-    if is_sequential_hex_test_vector_literal(value) {
+    if is_synthetic_hex_test_vector_literal(value) {
         return true;
     }
     let normalized = normalize_key(value);
@@ -728,32 +745,162 @@ fn is_iso8601_timestamp_literal(value: &str) -> bool {
             .all(|idx| b[*idx].is_ascii_digit())
 }
 
-fn is_sequential_hex_test_vector_literal(value: &str) -> bool {
-    // Sequential byte strings such as 000102...0F and 404142...5F are standard
-    // cryptographic test-vector inputs, not live key material. Suppress only a
-    // strict ascending byte sequence so arbitrary hex secrets still fire.
+fn is_synthetic_hex_test_vector_literal(value: &str) -> bool {
     let value = value.trim();
+    if is_canonical_hex_fixture_literal(value) {
+        return true;
+    }
+    let Some(bytes) = decode_hex_literal(value) else {
+        return false;
+    };
+    if bytes.len() < 8 {
+        return false;
+    }
+    is_segmented_hex_fixture_bytes(&bytes)
+}
+
+fn is_keyed_hex_secret_literal(value: &str, key_name: &str, kind: KeyKind) -> bool {
+    // Unquoted hex-looking secret material is syntactically indistinguishable
+    // from a lower-case identifier, so it must be recovered by structure: a
+    // sensitive field name plus compact hex shape. Explicit `hex*` fields and
+    // key material require byte alignment; opaque `*_secret` tokens may be odd.
+    let key_allows_hex = match kind {
+        KeyKind::EncodedHex => is_hex_encoded_sensitive_key_name(key_name),
+        KeyKind::Strong => is_hex_material_key_name(key_name),
+        KeyKind::Token | KeyKind::Otp | KeyKind::Phrase => false,
+    };
+    if !key_allows_hex {
+        return false;
+    }
+    let min_len = if matches!(kind, KeyKind::EncodedHex) || is_hex_encoded_salt_key_name(key_name) {
+        8
+    } else {
+        16
+    };
+    let bytes = value.trim().as_bytes();
+    if bytes.len() < min_len
+        || bytes.len() > 128
+        || !bytes.iter().all(|b| b.is_ascii_hexdigit())
+        || !bytes.iter().any(u8::is_ascii_digit)
+        || !bytes.iter().any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
+    {
+        return false;
+    }
+    let requires_even_hex =
+        matches!(kind, KeyKind::EncodedHex) || !has_identifier_component(key_name, "secret");
+    if requires_even_hex && !bytes.len().is_multiple_of(2) {
+        return false;
+    }
+    !is_synthetic_hex_test_vector_literal(value)
+}
+
+fn is_hex_material_key_name(name: &str) -> bool {
+    name == "key"
+        || has_identifier_component(name, "key")
+        || has_identifier_component(name, "secret")
+        || has_identifier_component(name, "credential")
+        || has_identifier_component(name, "private")
+}
+
+fn is_hex_encoded_sensitive_key_name(name: &str) -> bool {
+    name.split('_').any(is_hex_encoded_sensitive_component)
+        || has_identifier_phrase(name, &["hex", "key"])
+        || has_identifier_phrase(name, &["hex", "secret"])
+        || has_identifier_phrase(name, &["hex", "salt"])
+        || has_identifier_phrase(name, &["hex", "password"])
+        || has_identifier_phrase(name, &["hex", "token"])
+}
+
+fn is_hex_encoded_salt_key_name(name: &str) -> bool {
+    name.split('_').any(|part| part == "hexsalt") || has_identifier_phrase(name, &["hex", "salt"])
+}
+
+fn is_hex_encoded_sensitive_component(component: &str) -> bool {
+    let Some(role) = component.strip_prefix("hex") else {
+        return false;
+    };
+    matches!(
+        role,
+        "key" | "secret" | "salt" | "password" | "passwd" | "pwd" | "token" | "credential"
+    )
+}
+
+fn decode_hex_literal(value: &str) -> Option<Vec<u8>> {
     let bytes = value.as_bytes();
-    if bytes.len() < 32
+    if bytes.len() < 16
         || bytes.len() > 256
         || !bytes.len().is_multiple_of(2)
         || !bytes.iter().all(|b| b.is_ascii_hexdigit())
     {
-        return false;
+        return None;
     }
     let mut decoded = Vec::with_capacity(bytes.len() / 2);
     for pair in bytes.chunks_exact(2) {
-        let Some(high) = hex_nibble(pair[0]) else {
-            return false;
-        };
-        let Some(low) = hex_nibble(pair[1]) else {
-            return false;
-        };
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
         decoded.push((high << 4) | low);
     }
-    decoded
-        .windows(2)
-        .all(|window| window[1] == window[0].saturating_add(1))
+    Some(decoded)
+}
+
+fn is_segmented_hex_fixture_bytes(bytes: &[u8]) -> bool {
+    // Standard crypto test vectors often use obvious byte runs: 000102..., the
+    // reverse, or repeated bytes like e0e0e0. Real generated keys can contain
+    // these locally, but not as the whole value split into such runs.
+    let mut pos = 0;
+    let mut segments = 0;
+    while pos < bytes.len() {
+        let repeated = same_byte_run_len(&bytes[pos..]);
+        if repeated >= 4 {
+            pos += repeated;
+            segments += 1;
+            continue;
+        }
+        let stepped = byte_step_run_len(&bytes[pos..], 1).max(byte_step_run_len(&bytes[pos..], -1));
+        if stepped >= 8 {
+            pos += stepped;
+            segments += 1;
+            continue;
+        }
+        return false;
+    }
+    segments > 0
+}
+
+fn same_byte_run_len(bytes: &[u8]) -> usize {
+    let Some(first) = bytes.first() else {
+        return 0;
+    };
+    bytes.iter().take_while(|byte| *byte == first).count()
+}
+
+fn byte_step_run_len(bytes: &[u8], step: i16) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut len = 1;
+    for pair in bytes.windows(2) {
+        if i16::from(pair[1]) - i16::from(pair[0]) != step {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+fn is_canonical_hex_fixture_literal(value: &str) -> bool {
+    // These visual byte/nibble patterns are common in RFC examples and
+    // cryptographic fixtures; random key generation does not create them.
+    let lower = value.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "0123456789abcdef",
+            "fedcba9876543210",
+            "00112233445566778899aabbccddeeff",
+            "ffeeddccbbaa99887766554433221100",
+        ],
+    )
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -784,7 +931,10 @@ fn is_code_type_or_expression(value: &str, key_name: &str, kind: KeyKind) -> boo
     if is_member_or_pointer_reference(value) {
         return true;
     }
-    if is_plain_code_identifier(value) && !key_allows_low_entropy_literal(key_name, kind) {
+    if is_plain_code_identifier(value)
+        && !key_allows_low_entropy_literal(key_name, kind)
+        && !is_keyed_hex_secret_literal(value, key_name, kind)
+    {
         return true;
     }
     let starts_like_call = value
@@ -1786,9 +1936,19 @@ mod tests {
         assert!(has("api_key=abc12345", "abc12345"));
         assert!(has("api_key=ABCDEF123456", "ABCDEF123456"));
         assert!(has(
-            "Key = 00112233445566778899AABBCCDDEEFF",
-            "00112233445566778899AABBCCDDEEFF"
+            "Key = 7f20a9c44e5d32b8c91f0a6e2db74c18",
+            "7f20a9c44e5d32b8c91f0a6e2db74c18"
         ));
+        assert!(has(
+            "kubeadm_certificate_key: 2508f90d8b140454cdd0295e5dd7eca3fb1e7fbcae48b40ac62aa84fec9ad829",
+            "2508f90d8b140454cdd0295e5dd7eca3fb1e7fbcae48b40ac62aa84fec9ad829"
+        ));
+        assert!(has(
+            "OVH_APPLICATION_SECRET=a0996701ccf106b90376bbead9a671140",
+            "a0996701ccf106b90376bbead9a671140"
+        ));
+        assert!(has("-kdfopt hexkey:f19b759b190126", "f19b759b190126"));
+        assert!(has("Ctrl.hexsalt = hexsalt:2c86362d", "2c86362d"));
         assert!(has(r#"key: "abcDEF123456""#, "abcDEF123456"));
         assert!(has(r#"api_key="%s-real-123""#, "%s-real-123"));
         assert!(has(r#"password="SECRET""#, "SECRET"));
@@ -1961,6 +2121,9 @@ mod tests {
             r#"Key = RSA-2048"#,
             r#"Key = 000102030405060708090A0B0C0D0E0F"#,
             r#"Key = 404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F"#,
+            r#"Key = 00112233445566778899AABBCCDDEEFF"#,
+            r#"Key = 0123456789ABCDEFFEDCBA9876543210"#,
+            r#"Key = E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0E0"#,
             r#"aggregations.histo.buckets.3.key_as_string: "2017-01-01T08:00:00.000Z""#,
             r#"key: "Authorization""#,
             r#"key: "grant_type""#,
@@ -1981,6 +2144,7 @@ mod tests {
             "fn heartbeat_payload(time_ms: u128, key_hex: &str, port: Option<u16>) -> String {",
             r#"canonical_field(&mut out, "key", key_hex);"#,
             r#"let session = unique_session("forged-heartbeat-key");"#,
+            "hexkey=not-a-hex-123",
             "/// Bitcoin address: base58check, P2PKH (0x00, '1') or P2SH (0x05, '3').",
             "/// Bitcoin WIF private key: base58check, version 0x80.",
         ] {

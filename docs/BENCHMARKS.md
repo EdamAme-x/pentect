@@ -64,23 +64,15 @@ Elapsed: 153352 ms
 ```
 
 Current working result after structural false-positive reductions, source
-name/reference and fixture filtering, generic-key name filtering, and RFC
+name/reference and fixture filtering, generic-key name filtering, RFC
 documentation-value handling, plaintext GitHub node-id entropy suppression, and
-C-family ternary syntax suppression. Quoted `Authorization` values with
-credential schemes such as `Basic` and `ApiKey` are now scored on the credential
-part, while source constants that name their own environment/config keys and
-generic JSON `"key"` values that name public fields/headers remain metadata:
-Unquoted code type annotations such as `secret: Base32SecretKey` and
-Jinja/Ansible env lookups such as `{{ lookup('env', 'OS_PASSWORD') }}` are also
-treated as references rather than concrete credential values. Protobuf struct
-tags, ISO timestamp bucket keys, public key fingerprints, key algorithm labels,
-and command/mock call fragments are likewise handled as metadata or source
-syntax rather than credential values. Generic `key` fields share the same
-field-name metadata filter across structural and key-value detection, including
-curated numbered UI/reference identifiers such as `panel1`.
-Keyed identity sweep now propagates only distinctive compact values with digits
-and token punctuation or mixed case, keeping local `password="secret"` style
-masking without spreading source identifiers or fixture-looking passwords.
+C-family ternary syntax suppression. Keyed detection now recovers unquoted
+hex-like values under `*_key`, `*_secret`, and explicit `hex*` fields by
+structure rather than by a vendor/corpus regex. Canonical cryptographic fixture
+hex patterns such as sequential bytes, repeated bytes, and visual
+`012345...`/`001122...` test vectors stay negative. `KEYED_SECRET` identity
+sweep is disabled: key-value detections require local key context, while
+stronger rule/entropy/structural detections still drive global identity sweep.
 
 ```text
 CredData commit: 9a55c40
@@ -89,21 +81,21 @@ Rows: 66898
 Files: 10865
 True rows: 15104
 False rows: 51794
-TP: 7067
-FP: 14010
-FN: 8037
-Line only: 235
-Unlabeled: 72169
+TP: 10294
+FP: 13280
+FN: 4810
+Line only: 220
+Unlabeled: 69500
 Missing files: 0
-Precision: 0.335
-Recall: 0.468
-F1: 0.391
-Elapsed: 31981 ms
+Precision: 0.437
+Recall: 0.682
+F1: 0.532
+Elapsed: 29026 ms
 ```
 
 Weak groups:
 
-- `Key`: low precision and low recall; mostly `KEYED_SECRET` and source/config metadata collisions.
+- `Key`: recall improved substantially from hex material detection; remaining precision work is mostly `KEYED_SECRET` source/config metadata collisions.
 - `Password`: many false positives from weak fixture/default-looking values that are still real credentials in production.
 - `Token` and `Auth`: recall is strong, but precision still needs vendor/context validators.
 - `LIKELY_SECRET`: broad entropy recall still catches source identifiers and opaque non-secret blobs.
@@ -114,11 +106,10 @@ Weak groups:
 - Generic JSON `"key"` values that are identifier names such as `smtpDomain`, `Authorization`, or `grant_type` are treated as metadata; digit/symbol-bearing key material and sensitive single words still fire.
 - Code/reference literals under sensitive-looking keys are suppressed only when syntax proves they are not values: PascalCase type annotations require a code delimiter, and env lookups require explicit Jinja/Ansible `lookup('env', ...)` shape.
 - Additional source/metadata literals are shape-gated: protobuf tag descriptors require `protobuf_key` context, key algorithm labels require known algorithm-size syntax, fingerprints require explicit fingerprint keys and colon-hex shape, and command/mock fragments require invocation syntax.
-- Sequential hex byte strings are suppressed only when every decoded byte increments by one, matching cryptographic test-vector material rather than arbitrary hex secrets.
-- `KEYED_SECRET` identity sweep keeps anchored detections but no longer propagates long no-digit source identifiers such as lifecycle method names or fixture-looking passwords across the file.
+- Synthetic hex fixture strings are suppressed when the whole value is built from canonical visual patterns, sequential byte runs, or repeated bytes; arbitrary hex under sensitive key context still fires.
+- `KEYED_SECRET` identity sweep keeps anchored detections only. Context-free propagation is left to stronger rule, entropy, and structural detections.
 - Source fixture literals require both source-code shape and fixture key context, so `expectedPassword = "pass"` is skipped while plain `password = "pass"` still fires.
 - `UUID`: low recall.
 - `AWS S3 Bucket`, `Firebase Domain`, and `Tencent WeChat API App ID`: currently missed.
-- Identity sweep intentionally does not propagate very short `KEYED_SECRET` values; this avoids widespread false positives but can miss repeated weak credentials outside their anchored assignment.
 
 CredData source: https://github.com/Samsung/CredData
