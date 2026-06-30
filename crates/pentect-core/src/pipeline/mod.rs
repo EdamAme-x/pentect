@@ -842,6 +842,15 @@ mod tests {
     }
 
     #[test]
+    fn typescript_password_const_masks_low_entropy_value() {
+        let input = r#"const PASSWORD: string = "helloworld1234";"#;
+        let r = m(input);
+        assert!(!r.masked.contains("helloworld1234"), "{}", r.masked);
+        assert!(r.masked.contains("<<KEYED_SECRET_"), "{}", r.masked);
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
     fn har_kind_uses_json_parser_with_name_value_hints() {
         let input = r#"{"headers":[{"name":"Authorization","value":"Bearer abc123"}],"password":"hunter2"}"#;
         let r = Engine::with_profile(Profile::Strict).mask(
