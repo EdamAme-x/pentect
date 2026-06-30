@@ -793,13 +793,16 @@ mod tests {
         assert!(is_placeholder_value("192.0.2.10"));
         assert!(is_placeholder_value("https://example.org/path"));
         assert!(is_placeholder_value("<external-data-source>"));
+        assert!(is_placeholder_value("something"));
         assert!(is_placeholder_value("value"));
+        assert!(is_placeholder_value("whatever"));
         assert!(is_placeholder_value("dummy"));
         assert!(is_placeholder_value("ignored"));
         assert!(is_placeholder_value("fake_token"));
         assert!(is_placeholder_value("x-pack-test-password"));
         assert!(is_placeholder_value("avoid-plaintext-passwords"));
         assert!(is_placeholder_value("tftest-new-password"));
+        assert!(is_placeholder_value("foobar"));
         assert!(is_placeholder_value("foo-bar"));
         assert!(is_placeholder_value("s3krit-password"));
         assert!(!is_placeholder_value("s3krit-password2"));
