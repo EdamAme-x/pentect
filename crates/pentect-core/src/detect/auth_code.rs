@@ -20,6 +20,7 @@ impl Detector for AuthCodeDetector {
             .filter(|span| {
                 !is_header_name_only_otp_context(view.text(), span.range.start)
                     && !is_git_file_mode_context(view.text(), span.range.start)
+                    && !is_json_numeric_metadata_context(view.text(), span.range.start)
             })
             .collect()
     }
@@ -66,8 +67,71 @@ fn is_git_file_mode_context(text: &str, value_start: usize) -> bool {
     let Some(colon) = prefix.rfind(':') else {
         return false;
     };
+    if !prefix[colon + 1..].chars().all(char::is_whitespace) {
+        return false;
+    }
     let before = prefix[..colon].trim_end();
     before.ends_with("\"mode\"") || before.ends_with("'mode'") || before.ends_with("\\\"mode\\\"")
+}
+
+fn is_json_numeric_metadata_context(text: &str, value_start: usize) -> bool {
+    // Saved API responses put many numeric ids/counts on the same long line as
+    // auth-related field names (`login`, `X-GitHub-OTP`). A local JSON key such
+    // as `"id": 327146` proves the number is metadata, not an OTP.
+    if value_start > text.len() {
+        return false;
+    }
+    let line_start = text[..value_start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let prefix = &text[line_start..value_start];
+    let Some(colon) = prefix.rfind(':') else {
+        return false;
+    };
+    let before = prefix[..colon].trim_end();
+    let Some(key) = quoted_key_suffix(before) else {
+        return false;
+    };
+    let normalized = normalize_key_name(key);
+    matches!(
+        normalized.as_str(),
+        "id" | "node_id"
+            | "size"
+            | "count"
+            | "total_count"
+            | "watchers_count"
+            | "forks_count"
+            | "open_issues_count"
+            | "network_count"
+            | "comments"
+            | "additions"
+            | "deletions"
+            | "changes"
+    ) || normalized.ends_with("_id")
+        || normalized.ends_with("_count")
+}
+
+fn quoted_key_suffix(value: &str) -> Option<&str> {
+    let quote = value.as_bytes().last().copied()?;
+    if !matches!(quote, b'"' | b'\'') {
+        return None;
+    }
+    let key_end = value.len() - 1;
+    let key_start = value[..key_end].rfind(quote as char)? + 1;
+    let key = &value[key_start..key_end];
+    (!key.is_empty()).then_some(key)
+}
+
+fn normalize_key_name(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn specs() -> Vec<PatternSpec> {
@@ -162,6 +226,18 @@ mod tests {
             r#"Create code object with {\"mode\": \"100644\", \"path\": \"foo.py\"}"#
         )
         .is_empty());
+        assert!(values_for(
+            r#"{"headers":"X-GitHub-OTP, Accept-Encoding","actor":{"id":327146,"login":"octo"}}"#
+        )
+        .is_empty());
+        assert!(values_for(
+            r#"{"title":"login code help","comments":42754194,"total_count":813448}"#
+        )
+        .is_empty());
+        assert!(has_value(
+            r#"{"headers":"X-GitHub-OTP","id":123,"otp":327146}"#,
+            "327146"
+        ));
         assert!(!has_value(
             "Enter 7QK4P on the login page. Order code AB12-CD ships tomorrow.",
             "AB12-CD"

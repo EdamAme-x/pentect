@@ -523,9 +523,9 @@ mod tests {
     #[test]
     fn masks_userinfo_port_query_and_fragment_without_losing_route_shape() {
         assert_eq!(
-            labels("http://user:pass@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456"),
+            labels("http://svc:p4ss@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456"),
             [
-                ("URL_CREDENTIAL".to_string(), "user:pass".to_string()),
+                ("URL_CREDENTIAL".to_string(), "svc:p4ss".to_string()),
                 (
                     "INTERNAL_ENDPOINT".to_string(),
                     "local.jira.corp:8080".to_string()
@@ -594,9 +594,18 @@ mod tests {
                 labels(raw)
             );
         }
+        assert!(labels("https://user:pass@service.internal/path")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "user:pass"));
+        assert!(labels("https://USERID:APITOKEN@service.internal/path")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "USERID:APITOKEN"));
         assert!(labels("https://alice:letmein@service.internal/path")
             .iter()
             .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
+        assert!(labels("https://user%3Asecret@service.internal/path")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "user%3Asecret"));
     }
 
     #[test]

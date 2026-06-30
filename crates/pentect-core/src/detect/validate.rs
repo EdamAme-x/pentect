@@ -1231,7 +1231,11 @@ mod tests {
     fn db_connection_strings_reject_uri_templates_only() {
         vectors!(db_connection_string,
             "postgresql://admin:s3cr3t@db.host:5432/sales" => true,
+            "mysql://svc:p4ss@localhost" => true,
+            "mysql://user:secret@localhost" => true,
             "mysql://user:pass@localhost" => true,
+            "postgresql://username:password@localhost" => true,
+            "postgresql://testuser:testpwd@localhost" => true,
             "mysql://ofh:ab12c!?@db.example.internal/name" => true,
             "postgresql://[user[:password]@][host][:port][" => false,
             "mongodb://username:<password>@cluster0.example.com:27017" => false,

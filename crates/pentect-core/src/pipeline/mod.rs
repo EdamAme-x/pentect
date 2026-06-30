@@ -821,14 +821,21 @@ mod tests {
 
     #[test]
     fn json_sensitive_key_values_mask_low_entropy_without_masking_public_keys() {
-        let input =
-            r#"{"password":"hunter2","token":"abc12345","public_key":"visible","note":"ok"}"#;
+        let input = r#"{"password":"hunter2","token":"abcdef","access_token":"abcdefghijk","refresh_token":"refresh","public_key":"visible","note":"ok"}"#;
         let r = mj(input);
         let v: serde_json::Value =
             serde_json::from_str(&r.masked).expect("masked output is valid JSON");
         let o = v.as_object().unwrap();
         assert!(o["password"].as_str().unwrap().starts_with("<<PASSWORD_"));
         assert!(o["token"].as_str().unwrap().starts_with("<<TOKEN_"));
+        assert!(o["access_token"]
+            .as_str()
+            .unwrap()
+            .starts_with("<<ACCESS_TOKEN_"));
+        assert!(o["refresh_token"]
+            .as_str()
+            .unwrap()
+            .starts_with("<<REFRESH_TOKEN_"));
         assert_eq!(o["public_key"].as_str().unwrap(), "visible");
         assert_eq!(o["note"].as_str().unwrap(), "ok");
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
