@@ -57,42 +57,16 @@ fn is_git_file_mode_context(text: &str, value_start: usize) -> bool {
     // Git tree APIs and fixtures use mode values such as `100644`. They are
     // six-digit numbers near words like "code", but the immediate key is
     // filesystem metadata, not an authentication code.
-    if value_start > text.len() {
-        return false;
-    }
-    let line_start = text[..value_start]
-        .rfind('\n')
-        .map_or(0, |offset| offset + 1);
-    let prefix = &text[line_start..value_start];
-    let Some(colon) = prefix.rfind(':') else {
-        return false;
-    };
-    if !prefix[colon + 1..].chars().all(char::is_whitespace) {
-        return false;
-    }
-    let before = prefix[..colon].trim_end();
-    before.ends_with("\"mode\"") || before.ends_with("'mode'") || before.ends_with("\\\"mode\\\"")
+    immediate_jsonish_key_before_value(text, value_start).is_some_and(|key| key == "mode")
 }
 
 fn is_json_numeric_metadata_context(text: &str, value_start: usize) -> bool {
     // Saved API responses put many numeric ids/counts on the same long line as
     // auth-related field names (`login`, `X-GitHub-OTP`). A local JSON key such
     // as `"id": 327146` proves the number is metadata, not an OTP.
-    if value_start > text.len() {
-        return false;
-    }
-    let line_start = text[..value_start]
-        .rfind('\n')
-        .map_or(0, |offset| offset + 1);
-    let prefix = &text[line_start..value_start];
-    let Some(colon) = prefix.rfind(':') else {
+    let Some(normalized) = immediate_jsonish_key_before_value(text, value_start) else {
         return false;
     };
-    let before = prefix[..colon].trim_end();
-    let Some(key) = quoted_key_suffix(before) else {
-        return false;
-    };
-    let normalized = normalize_key_name(key);
     matches!(
         normalized.as_str(),
         "id" | "node_id"
@@ -111,6 +85,35 @@ fn is_json_numeric_metadata_context(text: &str, value_start: usize) -> bool {
         || normalized.ends_with("_count")
 }
 
+fn immediate_jsonish_key_before_value(text: &str, value_start: usize) -> Option<String> {
+    if value_start > text.len() {
+        return None;
+    }
+    let line_start = text[..value_start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let prefix = &text[line_start..value_start];
+    let mut end = prefix.len();
+    while end > 0 && prefix.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end > 0 && matches!(prefix.as_bytes()[end - 1], b'"' | b'\'') {
+        end -= 1;
+        while end > 0 && prefix.as_bytes()[end - 1] == b'\\' {
+            end -= 1;
+        }
+    }
+    while end > 0 && prefix.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 || prefix.as_bytes()[end - 1] != b':' {
+        return None;
+    }
+    let before = prefix[..end - 1].trim_end();
+    let key = quoted_key_suffix(before)?;
+    Some(normalize_key_name(key))
+}
+
 fn quoted_key_suffix(value: &str) -> Option<&str> {
     let quote = value.as_bytes().last().copied()?;
     if !matches!(quote, b'"' | b'\'') {
@@ -118,7 +121,7 @@ fn quoted_key_suffix(value: &str) -> Option<&str> {
     }
     let key_end = value.len() - 1;
     let key_start = value[..key_end].rfind(quote as char)? + 1;
-    let key = &value[key_start..key_end];
+    let key = value[key_start..key_end].trim_end_matches('\\');
     (!key.is_empty()).then_some(key)
 }
 
@@ -227,7 +230,19 @@ mod tests {
         )
         .is_empty());
         assert!(values_for(
+            r#"{"headers":"X-GitHub-OTP","content":"{\"mode\": \"100644\", \"path\": \"foo.py\"}"}"#
+        )
+        .is_empty());
+        assert!(values_for(
             r#"{"headers":"X-GitHub-OTP, Accept-Encoding","actor":{"id":327146,"login":"octo"}}"#
+        )
+        .is_empty());
+        assert!(values_for(
+            r#"{"headers":"X-GitHub-OTP, Accept-Encoding","content":"{\"actor\":{\"id\":327146,\"login\":\"octo\"}}"}"#
+        )
+        .is_empty());
+        assert!(values_for(
+            r#"[{"id":"1823555573","type":"DeleteEvent","actor":{"id":327146,"login":"octo"},"repo":{"id":3544490,"url":"https://api.example.com/repositories/3544490/events"}}]"#
         )
         .is_empty());
         assert!(values_for(

@@ -911,6 +911,7 @@ pub enum Validator {
     DbConnectionString,
     BearerToken,
     SqlPasswordValue,
+    TwilioApiKey,
 }
 
 impl Validator {
@@ -960,6 +961,7 @@ impl Validator {
             "db_connection_string" => Validator::DbConnectionString,
             "bearer_token" => Validator::BearerToken,
             "sql_password_value" => Validator::SqlPasswordValue,
+            "twilio_api_key" => Validator::TwilioApiKey,
             _ => return None,
         })
     }
@@ -1007,8 +1009,23 @@ impl Validator {
             Validator::DbConnectionString => db_connection_string(s),
             Validator::BearerToken => bearer_token(s),
             Validator::SqlPasswordValue => sql_password_value(s),
+            Validator::TwilioApiKey => twilio_api_key(s),
         }
     }
+}
+
+pub fn twilio_api_key(s: &str) -> bool {
+    // Twilio API keys are `SK` plus 32 hex characters. Repeated-body examples
+    // such as `SKaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` are documentation/test
+    // placeholders, not issued random key material.
+    let Some(body) = s.strip_prefix("SK") else {
+        return false;
+    };
+    body.len() == 32
+        && body.bytes().all(|b| b.is_ascii_hexdigit())
+        && body
+            .bytes()
+            .any(|b| !b.eq_ignore_ascii_case(&body.as_bytes()[0]))
 }
 
 pub fn sql_password_value(s: &str) -> bool {
@@ -1213,6 +1230,19 @@ mod tests {
             "example-bearer-token-value" => false,
             "abcdefghijklmnopqrstuv" => false,
             "short123" => false);
+    }
+
+    #[test]
+    fn twilio_api_key_rejects_repeated_placeholders() {
+        let real_shape = format!("SK{}", "0123456789abcdef".repeat(2));
+        let lower_placeholder = format!("SK{}", "a".repeat(32));
+        let upper_placeholder = format!("SK{}", "A".repeat(32));
+        let account_sid = format!("AC{}", "0123456789abcdef".repeat(2));
+
+        assert!(twilio_api_key(&real_shape));
+        assert!(!twilio_api_key(&lower_placeholder));
+        assert!(!twilio_api_key(&upper_placeholder));
+        assert!(!twilio_api_key(&account_sid));
     }
 
     #[test]

@@ -109,7 +109,6 @@ impl RuleDetector {
             (r"github_pat_[A-Za-z0-9_]{22,}", Secret, "GITHUB_PAT", High),
             // Classic GitHub token family (p/o/u/s/r) is one format, so one rule.
             (r"gh[oprsu]_[A-Za-z0-9]{36}", Secret, "GITHUB_TOKEN", High),
-            (r"SK[0-9a-fA-F]{32}", Secret, "TWILIO_API_KEY", Medium),
             (
                 r"AC[0-9a-fA-F]{32}",
                 Identifier,
@@ -354,6 +353,7 @@ impl RuleDetector {
             (r"\b\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4}\b", Pii, "CARD", High, V::Luhn),
             (r"\b\d{4}[ -]\d{6}[ -]\d{5}\b", Pii, "CARD", High, V::Luhn),
             (r"\b\d{4}[ -]\d{6}[ -]\d{4}\b", Pii, "CARD", High, V::Luhn),
+            (r"SK[0-9a-fA-F]{32}", Secret, "TWILIO_API_KEY", Medium, V::TwilioApiKey),
             (r"\b[12][0-9]{3}[- ]?[0-9]{3}[- ]?[0-9]{3}\b", Identifier, "US_NPI", High, V::UsNpi),
             (r"\bIT[0-9]{11}\b", Identifier, "IT_VAT_CODE", High, V::Luhn),
             (r"(?i)social insurance[^\n]{0,15}?\b[1-79]\d{2}[ -]?\d{3}[ -]?\d{3}\b", Pii, "CA_SIN", High, V::CaSin),

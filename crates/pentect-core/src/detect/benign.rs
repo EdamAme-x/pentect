@@ -318,6 +318,27 @@ pub(crate) fn is_crypto_test_vector_identifier_value(value: &str) -> bool {
         && is_crypto_test_vector_identifier_part(second)
 }
 
+/// True for byte-pattern fixtures such as `000102...` or repeated-byte blocks.
+///
+/// Rationale: published crypto fixtures and RFC examples often use visual byte
+/// sequences, repeated sentinels, or canonical nibble patterns to make expected
+/// values auditable. Generated secrets can contain these locally, but not as
+/// the whole value split into obvious runs. This is used only to suppress raw
+/// entropy/keyed guesses; specific private-key and vendor validators still run.
+pub(crate) fn is_synthetic_hex_test_vector_value(value: &str) -> bool {
+    let value = value.trim();
+    if is_canonical_hex_fixture_literal(value) {
+        return true;
+    }
+    let Some(bytes) = decode_hex_literal(value) else {
+        return false;
+    };
+    if bytes.len() < 8 {
+        return false;
+    }
+    is_segmented_hex_fixture_bytes(&bytes)
+}
+
 fn is_crypto_test_vector_identifier_part(value: &str) -> bool {
     let value = value.trim();
     if !(5..=96).contains(&value.len())
@@ -334,6 +355,88 @@ fn is_crypto_test_vector_identifier_part(value: &str) -> bool {
         || is_role_named_curve_test_case_id(base)
         || is_standalone_named_curve_test_case_id(base)
         || is_edwards_test_case_id(base)
+}
+
+fn decode_hex_literal(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 16
+        || bytes.len() > 1024
+        || !bytes.len().is_multiple_of(2)
+        || !bytes.iter().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        decoded.push((high << 4) | low);
+    }
+    Some(decoded)
+}
+
+fn is_segmented_hex_fixture_bytes(bytes: &[u8]) -> bool {
+    let mut pos = 0;
+    let mut segments = 0;
+    while pos < bytes.len() {
+        let repeated = same_byte_run_len(&bytes[pos..]);
+        if repeated >= 4 {
+            pos += repeated;
+            segments += 1;
+            continue;
+        }
+        let stepped = byte_step_run_len(&bytes[pos..], 1).max(byte_step_run_len(&bytes[pos..], -1));
+        if stepped >= 8 {
+            pos += stepped;
+            segments += 1;
+            continue;
+        }
+        return false;
+    }
+    segments > 0
+}
+
+fn same_byte_run_len(bytes: &[u8]) -> usize {
+    let Some(first) = bytes.first() else {
+        return 0;
+    };
+    bytes.iter().take_while(|byte| *byte == first).count()
+}
+
+fn byte_step_run_len(bytes: &[u8], step: i16) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut len = 1;
+    for pair in bytes.windows(2) {
+        if i16::from(pair[1]) - i16::from(pair[0]) != step {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+fn is_canonical_hex_fixture_literal(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "0123456789abcdef",
+            "fedcba9876543210",
+            "00112233445566778899aabbccddeeff",
+            "ffeeddccbbaa99887766554433221100",
+        ],
+    )
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn strip_crypto_test_vector_public_suffix(value: &str) -> &str {
@@ -666,6 +769,10 @@ pub(crate) fn normalize_identifier(input: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,6 +930,26 @@ mod tests {
         assert!(!is_crypto_test_vector_identifier_value(
             "ffdhe2048-prod-key"
         ));
+    }
+
+    #[test]
+    fn synthetic_hex_test_vectors_are_shape_gated() {
+        assert!(is_synthetic_hex_test_vector_value(
+            "000102030405060708090A0B0C0D0E0F"
+        ));
+        assert!(is_synthetic_hex_test_vector_value(
+            "00112233445566778899AABBCCDDEEFF"
+        ));
+        assert!(is_synthetic_hex_test_vector_value(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+        ));
+        assert!(!is_synthetic_hex_test_vector_value(
+            "000000000000000036E5F6B5C5E06070F0EFCA96227A863E"
+        ));
+        assert!(!is_synthetic_hex_test_vector_value(
+            "A3F19C80E4B27D51F09A6C33D8E74215"
+        ));
+        assert!(!is_synthetic_hex_test_vector_value("tenant-7-trial"));
     }
 
     #[test]

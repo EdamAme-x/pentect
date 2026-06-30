@@ -1,4 +1,7 @@
-use super::benign::{is_crypto_test_vector_identifier_value, is_structured_metadata_key};
+use super::benign::{
+    is_crypto_test_vector_identifier_value, is_structured_metadata_key,
+    is_synthetic_hex_test_vector_value,
+};
 use super::util::token_runs;
 use super::Detector;
 use crate::model::*;
@@ -99,6 +102,9 @@ impl EntropyDetector {
             || is_jose_protected_header_value(text, start, &view.region.ctx, run)
             || is_encoded_public_metadata_value(run)
             || is_crypto_test_vector_identifier_value(run)
+            || is_synthetic_hex_test_vector_value(run)
+            || is_api_route_fragment(run)
+            || is_release_artifact_identifier(run)
             || is_jwk_public_parameter_context(text, start, &view.region.ctx)
             || is_public_key_context(text, start, &view.region.ctx)
         {
@@ -537,11 +543,14 @@ fn local_assignment_key_before_value(text: &str, start: usize) -> Option<&str> {
 
 fn is_public_key_name(key: &str) -> bool {
     let normalized = normalize_identifier(key);
+    let compact = normalized.replace('_', "");
     normalized == "pubkey"
         || normalized == "public_key"
         || normalized.contains("_public_key")
         || normalized.contains("public_key_")
         || normalized.ends_with("_pubkey")
+        || compact.contains("publickey")
+        || compact.ends_with("pubkey")
 }
 
 fn normalize_identifier(value: &str) -> String {
@@ -605,6 +614,129 @@ fn is_word_path_segment(segment: &str) -> bool {
         || is_short_uppercase_route_segment(bytes)
         || is_title_case_route_segment(bytes)
         || wordlike_mixed_case_identifier(bytes)
+}
+
+fn is_api_route_fragment(run: &str) -> bool {
+    // REST API response paths such as `/repos/owner/name` and
+    // `/users/name/following/other` are public resource locators. They can be
+    // clipped out of a larger URL or diff fragment (`n+/repos/...`) and then
+    // no longer pass the ordinary path gate because of the leading `+`.
+    if !run.contains('/') || run.as_bytes().contains(&b'=') {
+        return false;
+    }
+    let mut segments = 0usize;
+    let mut route_word = false;
+    for raw in run.split('/').filter(|part| !part.is_empty()) {
+        let segment = raw.trim_matches(|ch: char| matches!(ch, '+' | '-' | '_' | '.'));
+        if segment.is_empty() || !is_api_route_segment(segment) {
+            return false;
+        }
+        route_word |= is_common_api_route_collection(segment);
+        segments += 1;
+    }
+    segments >= 3 && route_word
+}
+
+fn is_api_route_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+'))
+        && bytes.iter().any(|b| b.is_ascii_alphanumeric())
+}
+
+fn is_common_api_route_collection(segment: &str) -> bool {
+    if !segment
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    matches!(
+        normalize_identifier(segment).as_str(),
+        "repos"
+            | "repositories"
+            | "users"
+            | "orgs"
+            | "organizations"
+            | "projects"
+            | "issues"
+            | "pulls"
+            | "commits"
+            | "branches"
+            | "events"
+            | "hooks"
+            | "following"
+            | "followers"
+            | "teams"
+            | "members"
+            | "labels"
+            | "milestones"
+            | "notifications"
+            | "threads"
+            | "tests"
+    )
+}
+
+fn is_release_artifact_identifier(run: &str) -> bool {
+    // Build/release artifact names combine readable channel/version/platform
+    // components (`preRelease_v007_linux64`). They have high Shannon entropy
+    // only because they mix case, digits, and separators; they are not opaque.
+    let bytes = run.as_bytes();
+    if !(12..=96).contains(&bytes.len())
+        || bytes.iter().any(|b| matches!(b, b'+' | b'/' | b'='))
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        || !bytes.iter().any(|b| matches!(b, b'_' | b'-' | b'.'))
+    {
+        return false;
+    }
+    let mut has_release_word = false;
+    let mut has_platform_word = false;
+    for part in run.split(['_', '-', '.']).filter(|part| !part.is_empty()) {
+        let normalized = normalize_identifier(part);
+        has_release_word |= is_release_component(&normalized);
+        has_platform_word |= is_platform_component(&normalized);
+    }
+    has_release_word && has_platform_word
+}
+
+fn is_release_component(component: &str) -> bool {
+    component == "release"
+        || component == "pre_release"
+        || component == "prerelease"
+        || component == "snapshot"
+        || component == "nightly"
+        || component == "beta"
+        || component == "alpha"
+        || component == "preview"
+        || component == "canary"
+        || component == "rc"
+        || (component.len() >= 2
+            && component.starts_with('v')
+            && component[1..].bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_platform_component(component: &str) -> bool {
+    component == "linux"
+        || component == "linux64"
+        || component == "windows"
+        || component == "win"
+        || component == "win32"
+        || component == "win64"
+        || component == "macos"
+        || component == "darwin"
+        || component == "osx"
+        || component == "android"
+        || component == "ios"
+        || component == "x64"
+        || component == "x86"
+        || component == "x86_64"
+        || component == "amd64"
+        || component == "arm64"
+        || component == "aarch64"
 }
 
 fn is_short_uppercase_route_segment(bytes: &[u8]) -> bool {
@@ -1081,11 +1213,35 @@ mod tests {
         for raw in [
             "\"authorized_connect_apps\": \"/2010-04-01/Accounts/ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/AuthorizedConnectApps.json\"",
             "\"uri\": \"/2010-04-01/Accounts/ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/SIP/Domains/SDaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Auth/Calls/CredentialListMappings.json?PageSize=50\"",
+            "n+/repos/akfish/PyGithub",
+            "n+/repos/jacquev6/PyGithub/hooks/257993/tests",
+            "n+/users/jacquev6/following/nvie",
         ] {
             let reg = region(raw);
             let v = NormalizedView::build(&reg, raw);
             assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
         }
+    }
+
+    #[test]
+    fn release_artifact_identifiers_are_not_entropy_candidates() {
+        for raw in [
+            "of_preRelease_v007_linux64",
+            "toolkit-beta-v12-win64",
+            "desktop_preview_2026_arm64",
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
+
+        let secret = "SECRET_TOKEN=AbCdEfGhIjKlMnOpQrStUvWxYz1234";
+        let reg = region(secret);
+        let v = NormalizedView::build(&reg, secret);
+        assert!(
+            !EntropyDetector::default().detect(&v).is_empty(),
+            "random-looking assignment remains entropy-eligible"
+        );
     }
 
     #[test]
@@ -1114,6 +1270,22 @@ mod tests {
             let v = NormalizedView::build(&reg, raw);
             assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
         }
+    }
+
+    #[test]
+    fn synthetic_hex_test_vectors_are_not_entropy_candidates() {
+        let fixture = "Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+        let fixture_region = region(fixture);
+        let fixture_view = NormalizedView::build(&fixture_region, fixture);
+        assert!(EntropyDetector::default().detect(&fixture_view).is_empty());
+
+        let realish = "SECRET_HEX=A3F19C80E4B27D51F09A6C33D8E74215B6C94F2A01D8EE77";
+        let realish_region = region(realish);
+        let realish_view = NormalizedView::build(&realish_region, realish);
+        assert!(
+            !EntropyDetector::default().detect(&realish_view).is_empty(),
+            "random-looking hex should remain entropy-eligible"
+        );
     }
 
     #[test]
@@ -1182,7 +1354,8 @@ mod tests {
         ] {
             let reg = region(raw);
             let view = NormalizedView::build(&reg, raw);
-            assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+            let spans = EntropyDetector::default().detect(&view);
+            assert!(spans.is_empty(), "{raw}: {spans:?}");
         }
     }
 
@@ -1279,11 +1452,13 @@ mod tests {
         for raw in [
             r#"{"public_key":"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD"}"#,
             r#"publicKey = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD""#,
+            r#"public static final String DEFAULT_PUBLIC_KEY_STRING = "MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAKHGwq7q2RmwuRgKxBypQHw0mYu4BQZ3eMsTrdK8E6igRcxsobUC7uT0SoxIjl1WveWniCASejoQtn/BY6hVKWsCAwEAAQ==";"#,
             "PublicKey=KAS-ECC-CDH_P-192_C10-Peer-PUBLIC",
         ] {
             let reg = region(raw);
             let view = NormalizedView::build(&reg, raw);
-            assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+            let spans = EntropyDetector::default().detect(&view);
+            assert!(spans.is_empty(), "{raw}: {spans:?}");
         }
     }
 

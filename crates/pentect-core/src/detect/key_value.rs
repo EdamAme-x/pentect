@@ -2,11 +2,12 @@ use super::benign::{
     is_crypto_test_vector_identifier_value, is_explicitly_non_sensitive_key_name,
     is_localization_template_reference, is_non_secret_source_constant_value, is_placeholder_value,
     is_source_fixture_secret_value, is_source_secret_name_reference_value,
-    is_structured_generic_key_metadata_value,
+    is_structured_generic_key_metadata_value, is_synthetic_hex_test_vector_value,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
 use crate::normalize::NormalizedView;
+use data_encoding::BASE64;
 
 const MAX_KEY_CONTEXT_BYTES: usize = 72;
 
@@ -813,7 +814,7 @@ fn looks_like_secret_value(
         || is_localization_template_reference(value)
         || is_interpolated_string_template(value)
         || is_typed_sql_fragment_literal(value, key_name, source_key)
-        || is_public_key_literal(value)
+        || is_public_key_literal(value, key_name)
         || is_license_identifier_literal(value, key_name)
         || is_dunder_identifier_literal(value)
         || is_uppercase_constant_literal_for_generic_key(value, key_name)
@@ -1054,17 +1055,7 @@ fn is_iso8601_datetime_literal_bytes(b: &[u8]) -> bool {
 }
 
 fn is_synthetic_hex_test_vector_literal(value: &str) -> bool {
-    let value = value.trim();
-    if is_canonical_hex_fixture_literal(value) {
-        return true;
-    }
-    let Some(bytes) = decode_hex_literal(value) else {
-        return false;
-    };
-    if bytes.len() < 8 {
-        return false;
-    }
-    is_segmented_hex_fixture_bytes(&bytes)
+    is_synthetic_hex_test_vector_value(value)
 }
 
 fn is_keyed_hex_secret_literal(value: &str, key_name: &str, kind: KeyKind) -> bool {
@@ -1238,84 +1229,6 @@ fn is_hex_encoded_sensitive_component(component: &str) -> bool {
     matches!(
         role,
         "key" | "secret" | "salt" | "password" | "passwd" | "pwd" | "token" | "credential"
-    )
-}
-
-fn decode_hex_literal(value: &str) -> Option<Vec<u8>> {
-    let bytes = value.as_bytes();
-    if bytes.len() < 16
-        || bytes.len() > 256
-        || !bytes.len().is_multiple_of(2)
-        || !bytes.iter().all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    let mut decoded = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let high = hex_nibble(pair[0])?;
-        let low = hex_nibble(pair[1])?;
-        decoded.push((high << 4) | low);
-    }
-    Some(decoded)
-}
-
-fn is_segmented_hex_fixture_bytes(bytes: &[u8]) -> bool {
-    // Standard crypto test vectors often use obvious byte runs: 000102..., the
-    // reverse, or repeated bytes like e0e0e0. Real generated keys can contain
-    // these locally, but not as the whole value split into such runs.
-    let mut pos = 0;
-    let mut segments = 0;
-    while pos < bytes.len() {
-        let repeated = same_byte_run_len(&bytes[pos..]);
-        if repeated >= 4 {
-            pos += repeated;
-            segments += 1;
-            continue;
-        }
-        let stepped = byte_step_run_len(&bytes[pos..], 1).max(byte_step_run_len(&bytes[pos..], -1));
-        if stepped >= 8 {
-            pos += stepped;
-            segments += 1;
-            continue;
-        }
-        return false;
-    }
-    segments > 0
-}
-
-fn same_byte_run_len(bytes: &[u8]) -> usize {
-    let Some(first) = bytes.first() else {
-        return 0;
-    };
-    bytes.iter().take_while(|byte| *byte == first).count()
-}
-
-fn byte_step_run_len(bytes: &[u8], step: i16) -> usize {
-    if bytes.is_empty() {
-        return 0;
-    }
-    let mut len = 1;
-    for pair in bytes.windows(2) {
-        if i16::from(pair[1]) - i16::from(pair[0]) != step {
-            break;
-        }
-        len += 1;
-    }
-    len
-}
-
-fn is_canonical_hex_fixture_literal(value: &str) -> bool {
-    // These visual byte/nibble patterns are common in RFC examples and
-    // cryptographic fixtures; random key generation does not create them.
-    let lower = value.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        &[
-            "0123456789abcdef",
-            "fedcba9876543210",
-            "00112233445566778899aabbccddeeff",
-            "ffeeddccbbaa99887766554433221100",
-        ],
     )
 }
 
@@ -3153,7 +3066,9 @@ fn is_source_fixture_secret_literal(value: &str, key_name: &str, source_key: &st
     // Test fixtures often assign deliberately weak credentials to variables
     // named `expectedPassword`, `MOCK_ACCESS_TOKEN`, or similar. Do not suppress
     // weak values by value alone; require source syntax plus a fixture key name.
-    source_key_has_code_shape(source_key) && is_source_fixture_secret_value(key_name, value)
+    source_key_has_code_shape(source_key)
+        && (is_source_fixture_secret_value(key_name, value)
+            || is_source_fixture_secret_value(source_key, value))
 }
 
 fn is_source_struct_tag_literal(value: &str, _key_name: &str, source_key: &str) -> bool {
@@ -3999,14 +3914,59 @@ fn is_typed_sql_fragment_literal(value: &str, key_name: &str, source_key: &str) 
     value.starts_with("sqls\"") || value.starts_with("sqls'")
 }
 
-fn is_public_key_literal(value: &str) -> bool {
+fn is_public_key_literal(value: &str, key_name: &str) -> bool {
     // OpenSSH public-key values are identifiers/public material. Private keys
     // are handled by the PEM detector; masking public key blobs as KEYED_SECRET
     // makes API responses and fixtures unusably noisy.
     let value = value.trim_start();
-    value.starts_with("ssh-rsa ")
+    if value.starts_with("ssh-rsa ")
         || value.starts_with("ssh-ed25519 ")
         || value.starts_with("ecdsa-sha2-")
+    {
+        return true;
+    }
+    // RFC 5280 SubjectPublicKeyInfo is public key material. DER-encoded SPKI
+    // often appears as a bare base64 string in constants named `publicKey`.
+    // Require the key name to say public key so arbitrary base64 secrets remain
+    // masked by KEYED_SECRET/entropy detectors.
+    key_name_indicates_public_key(key_name) && is_der_subject_public_key_info_base64(value)
+}
+
+fn key_name_indicates_public_key(key_name: &str) -> bool {
+    key_name == "pubkey"
+        || key_name == "publickey"
+        || has_identifier_phrase(key_name, &["public", "key"])
+        || has_identifier_phrase(key_name, &["pub", "key"])
+}
+
+fn is_der_subject_public_key_info_base64(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !(32..=2048).contains(&value.len())
+        || !value.len().is_multiple_of(4)
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        return false;
+    }
+    let Ok(der) = BASE64.decode(value.as_bytes()) else {
+        return false;
+    };
+    der.first() == Some(&0x30) && contains_der_public_key_oid(&der) && der.contains(&0x03)
+}
+
+fn contains_der_public_key_oid(der: &[u8]) -> bool {
+    const RSA_ENCRYPTION: &[u8] = &[
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01,
+    ];
+    const EC_PUBLIC_KEY: &[u8] = &[0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+    const ED25519: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x70];
+    const X25519: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x6E];
+    [RSA_ENCRYPTION, EC_PUBLIC_KEY, ED25519, X25519]
+        .iter()
+        .any(|oid| der.windows(oid.len()).any(|window| window == *oid))
 }
 
 fn is_license_identifier_literal(value: &str, key_name: &str) -> bool {
@@ -4291,7 +4251,7 @@ fn is_web_credentials_mode_literal(value: &str, key_name: &str) -> bool {
     // inclusion behavior, not credential material. Keep this to the exact
     // plural field name and standard enum values so singular `credential`
     // assignments and arbitrary secrets still flow through.
-    if key_name != "credentials" {
+    if key_name != "credentials" && !has_identifier_component(key_name, "credentials") {
         return false;
     }
     matches!(
@@ -5086,6 +5046,7 @@ mod tests {
             r#"credentials: "same-origin""#,
             r#"credentials: "include""#,
             r#"credentials: "omit""#,
+            r#"it(`should set credentials: 'same-origin' on the precaching requests`, async function() {"#,
             "routing_key=task_queue",
             r#"foreign_key: "owner_id""#,
             r#"const string expectedTokenValue = "GITHUB_TOKEN_VALUE";"#,
@@ -5157,6 +5118,7 @@ mod tests {
             r#"'Password cannot be blank.' => 'Password cannot be blank.'"#,
             r#"expected: "oraclecloud: some credentials information are missing: OCI_TENANCY_OCID,OCI_USER_OCID""#,
             r#"access_token = "TestAuthToken""#,
+            r#"const string testPassword = "basicPass";"#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
             r#"private const string MOCK_ACCESS_TOKEN = "at-0987654321";"#,
@@ -5166,6 +5128,7 @@ mod tests {
             r#"txtLUPassword.Enabled = !radioLUS4U.Checked;"#,
             r##"<div class="copy-pass" :title="'Password:' + file.passwd""##,
             r#"EnvPrivKeyPass = envPrivKey + "_PASS""#,
+            r#"public static final String DEFAULT_PUBLIC_KEY_STRING = "MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAKHGwq7q2RmwuRgKxBypQHw0mYu4BQZ3eMsTrdK8E6igRcxsobUC7uT0SoxIjl1WveWniCASejoQtn/BY6hVKWsCAwEAAQ==";"#,
         ] {
             assert!(hits(raw).is_empty(), "{raw}: {:?}", hits(raw));
         }
