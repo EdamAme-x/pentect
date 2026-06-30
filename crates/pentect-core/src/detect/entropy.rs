@@ -89,6 +89,8 @@ impl EntropyDetector {
             return;
         }
         if is_structured_metadata_value(text, start, &view.region.ctx, run)
+            || is_embedded_media_data_value(&view.region.ctx)
+            || is_subresource_integrity_value(text, start, &view.region.ctx, run)
             || is_encoded_public_metadata_value(run)
             || is_crypto_test_vector_identifier_value(run)
             || is_public_key_context(text, start, &view.region.ctx)
@@ -135,6 +137,7 @@ fn entropy_candidate(run: &str, text: &str, start: usize, end: usize) -> bool {
         && !is_slash_separated_identifier_list(run)
         && !is_code_arithmetic_constant(run)
         && !is_uppercase_constant_identifier(run)
+        && !is_public_oid_assignment_name_fragment(run)
         && !is_source_identifier_like(run, text, start, end)
         && !is_regex_character_class_fragment(text, start, end)
 }
@@ -153,6 +156,19 @@ fn is_assignment_name_fragment(run: &str) -> bool {
         && is_source_identifier_shape(name)
 }
 
+fn is_public_oid_assignment_name_fragment(run: &str) -> bool {
+    // OpenSSL generated object tables contain source identifiers such as
+    // `OBJ_X9_62_id_ecPublicKey=` immediately before an escaped ASN.1 OID
+    // value. The identifier itself can look high-entropy because it mixes
+    // abbreviations and digits, but it is public source syntax.
+    let Some(name) = run.strip_suffix('=') else {
+        return false;
+    };
+    name.starts_with("OBJ_")
+        && (8..=96).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 fn is_structured_metadata_value(text: &str, start: usize, ctx: &Context, value: &str) -> bool {
     // This only retracts raw entropy guesses in structured JSON metadata fields.
     // Rationale: fields like `node_id`, `sha`, and `etag` conventionally carry
@@ -168,6 +184,50 @@ fn is_structured_metadata_value(text: &str, start: usize, ctx: &Context, value: 
         || local_json_key_before_value(text, start)
             .as_deref()
             .is_some_and(is_structured_metadata_key)
+}
+
+fn is_embedded_media_data_value(ctx: &Context) -> bool {
+    // Jupyter notebooks and browser/tool payloads store base64 assets under MIME
+    // keys such as `image/png`. Those bytes are embedded media, not a
+    // credential. Keep this key-scoped so arbitrary base64 blobs still fire.
+    if !matches!(ctx.format, Kind::Json | Kind::ToolResult) {
+        return false;
+    }
+    ctx.key.as_deref().is_some_and(|key| {
+        let key = key.to_ascii_lowercase();
+        key.starts_with("image/")
+            || key.starts_with("audio/")
+            || key.starts_with("video/")
+            || key.starts_with("font/")
+    })
+}
+
+fn is_subresource_integrity_value(text: &str, start: usize, ctx: &Context, value: &str) -> bool {
+    // W3C Subresource Integrity and npm lockfiles use `sha256-...`,
+    // `sha384-...`, or `sha512-...` digests under an `integrity` field.
+    // These authenticate public package/media bytes; they are not secrets.
+    if !matches!(ctx.format, Kind::Json | Kind::ToolResult) {
+        return false;
+    }
+    let keyed_as_integrity = ctx
+        .key
+        .as_deref()
+        .is_some_and(|key| key.eq_ignore_ascii_case("integrity"))
+        || local_json_key_before_value(text, start)
+            .as_deref()
+            .is_some_and(|key| key.eq_ignore_ascii_case("integrity"));
+    keyed_as_integrity && is_sri_digest_value(value)
+}
+
+fn is_sri_digest_value(value: &str) -> bool {
+    let Some((alg, digest)) = value.split_once('-') else {
+        return false;
+    };
+    matches!(alg, "sha256" | "sha384" | "sha512")
+        && digest.len() >= 32
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
 }
 
 fn is_encoded_public_metadata_value(value: &str) -> bool {
@@ -632,6 +692,20 @@ fn shannon(bytes: &[u8]) -> f64 {
 mod tests {
     use super::*;
     use crate::detect::region;
+    use crate::model::{ByteRange, Context, Kind, Region, RegionKind};
+
+    fn json_value_region(key: &str, raw: &str) -> Region {
+        Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: Context {
+                path: None,
+                key: Some(key.to_string()),
+                hints: Vec::new(),
+                kind: RegionKind::JsonValue,
+                format: Kind::Json,
+            },
+        }
+    }
 
     // Token runs are ASCII-only, so CJK prose never forms an entropy run even at
     // a lowered threshold.
@@ -681,6 +755,28 @@ mod tests {
     }
 
     #[test]
+    fn embedded_media_and_integrity_hashes_are_metadata() {
+        let image = "iVBORw0KGgoAAAANSUhEUgAAAV0AAADtCAYAAAAcNaZ2AAAABHNCSVQICAgIfAhkiAAAAAlwSFlz";
+        let image_region = json_value_region("image/png", image);
+        let image_view = NormalizedView::build(&image_region, image);
+        assert!(EntropyDetector::with(24, 2.0)
+            .detect(&image_view)
+            .is_empty());
+
+        let blob_region = json_value_region("blob", image);
+        let blob_view = NormalizedView::build(&blob_region, image);
+        assert!(!EntropyDetector::with(24, 2.0).detect(&blob_view).is_empty());
+
+        let integrity =
+            "sha512-f9JqSQoOtfTFJqNdVLNKRzFQ1ldlQ8mAFLS/33DWWfQ7DbOq1fnG083LHOKN2tDSCpw/zqfkf/zUgguBCnHNNA==";
+        let integrity_region = json_value_region("integrity", integrity);
+        let integrity_view = NormalizedView::build(&integrity_region, integrity);
+        assert!(EntropyDetector::with(24, 2.0)
+            .detect(&integrity_view)
+            .is_empty());
+    }
+
+    #[test]
     fn benign_assignments_do_not_mask_whole_key_value_run() {
         for raw in [
             "sha=356a192b7913b04c54574d18c28d46e6395428ab",
@@ -713,6 +809,7 @@ mod tests {
             "customObjectInstantitationMethod=",
             "allowsToolTipsWhenApplicationIsInactive=",
             "horizontalHuggingPriority=",
+            "OBJ_X9_62_id_ecPublicKey=",
             "type X509Certificate2Collection;",
             "HTTP/HTTP_1_0/SOCKS4/SOCKS4a/SOCKS5/SOCKS5_HOSTNAME",
             "defaultChecked/defaultSelected",

@@ -48,12 +48,6 @@ impl RuleDetector {
         //   non-secret could plausibly hit (e.g. Twilio's `AC`+32hex).
         // - labels are UPPER_SNAKE (asserted in tests) so they render cleanly.
         let table: &[(&str, Category, &str, Confidence)] = &[
-            (
-                r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*",
-                Secret,
-                "JWT_SECRET",
-                High,
-            ),
             (r"AKIA[A-Z0-9]{16}", Secret, "AWS_AKID", High),
             (
                 r"sk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_-]{20,}",
@@ -401,6 +395,10 @@ impl RuleDetector {
         ];
         #[rustfmt::skip]
         let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
+            // JWT compact serialization has exactly three base64url segments.
+            // JWE compact serialization has five; do not mask the first three
+            // segments as a JWT just because the protected header starts `eyJ`.
+            (r#"(?i)(?:^|[^A-Za-z0-9_.-])(eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*)(?:$|[^A-Za-z0-9_.-])"#, Secret, "JWT_SECRET", High, 1, V::None),
             // Session/JWT-like values need context. A bare aaa.bbb.ccc is common
             // test/noise; a long three-segment token after session/jwt/cookie is
             // credential-bearing even if the header is opaque or not JSON.
@@ -793,6 +791,14 @@ mod tests {
         assert!(has(
             r#"if auth != "Basic bnJna2w6dmdycWpz" {"#,
             "BASIC_AUTH"
+        ));
+        assert!(has(
+            "jwt=eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop.abcdefghijklmnop",
+            "JWT_SECRET"
+        ));
+        assert!(!has(
+            "jwe=eyJhbGciOiJSU0EtT0FFUCJ9.abcdefghijklmnop.abcdefghijklmnop.abcdefghijklmnop.abcdefghijklmnop",
+            "JWT_SECRET"
         ));
         assert!(!has(
             "port=5432 workers=4 timeout_ms=30000 status=200",

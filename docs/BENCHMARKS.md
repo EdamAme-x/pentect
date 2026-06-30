@@ -113,6 +113,10 @@ Generic JSON `"key"` metadata covers public schema names, CORS header names,
 metasyntactic numbered names, and dotted config paths such as
 `idle_timeout.timeout_seconds` while rejecting dotted paths with sensitive
 components such as `secret.value`.
+Entropy detection suppresses embedded media blobs under MIME keys such as
+`image/png`, W3C/npm `integrity` digests, and OpenSSL `OBJ_*=` assignment-name
+fragments. JWT detection requires a three-segment compact token boundary so a
+five-segment JWE is not cut into a fake JWT.
 
 ```text
 CredData commit: 9a55c40
@@ -122,15 +126,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 7227
+FP: 7187
 FN: 4828
 Line only: 227
-Unlabeled: 59037
+Unlabeled: 56674
 Missing files: 0
-Precision: 0.587
+Precision: 0.588
 Recall: 0.680
-F1: 0.630
-Elapsed: 28281 ms
+F1: 0.631
+Elapsed: 27759 ms
 ```
 
 Weak groups:
@@ -153,6 +157,9 @@ Weak groups:
 - Public crypto test-vector identifiers are shape-gated: NIST KAS-ECC P/K/B case IDs, role+named-curve labels, and ED25519/ED448 test case labels are skipped; operational handles such as `tenant-7-trial` and `ALICE_prod_key_2026` still fire.
 - Public crypto metadata now also covers standalone named-curve/RFC test-case labels and RSA mode labels used in published vector tables; actual hex/scalar/key bytes remain detectable.
 - ASN.1 OID tables are suppressed only for `OBJ_*`/OID key context and DER-body octet syntax; arbitrary escaped binary under ordinary secret keys still fires.
+- Entropy suppression also treats `OBJ_*=` as source assignment syntax, so the identifier before an escaped OID body is not masked as an opaque value.
+- Entropy suppression for embedded media and SRI/package integrity is key-scoped: media requires MIME keys such as `image/png`, and SRI requires `integrity` plus `sha256`/`sha384`/`sha512` digest syntax.
+- JWT rule matching is compact-serialization bounded: three-segment JWTs still fire, while five-segment JWEs are not partially captured as JWTs.
 - Localized UI password/token prose is suppressed only when the key name also carries UI text context such as label/error/invalid/message; ordinary `password = "..."` and compact credential values still fire.
 - Generated documentation fragments and Go struct tag values are syntax-gated: HTML doc fragments require documentation/HTML on the left side, and struct tags require backtick-delimited `key` metadata.
 - Documentation metadata names are shape-gated: public namespaced condition keys, uppercase enum names, inline `key=value` help text, shell command substitutions, and source prefix constants are skipped; `sk-test-token</p>` and `secret:` still fire.
