@@ -767,6 +767,7 @@ fn looks_like_secret_value(
         || is_protobuf_tag_literal(value, key_name)
         || is_key_algorithm_literal(value)
         || is_status_code_constant_literal(value, key_name)
+        || is_public_numeric_code_constant_literal(value, key_name, source_key, quoted)
         || is_asn1_oid_der_literal(value, key_name, source_key)
         || is_crypto_test_vector_identifier_literal(value, key_name)
         || is_localized_ui_text_literal(value, key_name)
@@ -1038,6 +1039,70 @@ fn is_status_code_key_name(key_name: &str) -> bool {
         || key_name.starts_with("sec_i_")
         || key_name.starts_with("trust_e_")
         || key_name.starts_with("trust_s_")
+}
+
+fn is_public_numeric_code_constant_literal(
+    value: &str,
+    key_name: &str,
+    source_key: &str,
+    quoted: bool,
+) -> bool {
+    // Generated enum/error tables often contain identifiers with `key`,
+    // `token`, or `password` in the public constant name:
+    // `KEYCTL_CAPS0_BIG_KEY = 0x10` and `ER_TOO_LONG_KEY: "42000"`.
+    // These small numeric codes are not secret material. Keep the decimal
+    // quoted case to SQLSTATE-style error names only, so `password = "123456"`
+    // and JSON token samples still detect.
+    let value = value.trim();
+    if is_sqlstate_error_constant_name(key_name, source_key) && is_sqlstate_literal(value) {
+        return true;
+    }
+    !quoted
+        && is_all_caps_source_constant_name(source_key)
+        && (is_small_c_style_int_literal(value) || is_small_decimal_code_literal(value))
+}
+
+fn is_sqlstate_error_constant_name(key_name: &str, source_key: &str) -> bool {
+    let key = source_key.trim();
+    key.starts_with("ER_")
+        || key_name.starts_with("er_")
+        || key.starts_with("SQLSTATE_")
+        || key_name.starts_with("sqlstate_")
+}
+
+fn is_sqlstate_literal(value: &str) -> bool {
+    let value = value.trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    value.len() == 5 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_all_caps_source_constant_name(source_key: &str) -> bool {
+    let key = source_key
+        .trim()
+        .trim_end_matches(',')
+        .trim_end_matches(':')
+        .trim();
+    (4..=96).contains(&key.len())
+        && key.contains('_')
+        && key.bytes().any(|b| b.is_ascii_alphabetic())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn is_small_c_style_int_literal(value: &str) -> bool {
+    let value = value.trim();
+    let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    else {
+        return false;
+    };
+    (1..=8).contains(&hex.len()) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_small_decimal_code_literal(value: &str) -> bool {
+    let bytes = value.trim().as_bytes();
+    (1..=6).contains(&bytes.len()) && bytes.iter().all(|b| b.is_ascii_digit())
 }
 
 fn is_c_style_hex_u32(value: &str) -> bool {
@@ -4295,6 +4360,9 @@ mod tests {
             r#"clientSecret: process.env.FACEBOOK_SECRET || 'APP_SECRET',"#,
             r#"clientSecret: process.env.TWITTER_SECRET || 'CONSUMER_SECRET',"#,
             r#"SecretName: "cool_secret","#,
+            r#"KEYCTL_CAPS0_BIG_KEY = 0x10"#,
+            r#"TCP_FASTOPEN_KEY = 0x21"#,
+            r#"ER_TOO_LONG_KEY: "42000","#,
             r#"access_token = "TestAuthToken""#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
@@ -4355,6 +4423,8 @@ mod tests {
         assert!(has(r#"password = "hunter\n""#, "hunter\\n"));
         assert!(has(r#"password = "$(echo hunter2)""#, "$(echo hunter2)"));
         assert!(has(r#"clientSecret: "APP_SECRET_2026""#, "APP_SECRET_2026"));
+        assert!(has(r#"password = "123456""#, "123456"));
+        assert!(has(r#"token: "1234""#, "1234"));
         assert!(has(
             r#"private_key = "LINE_1\nA2secret""#,
             "LINE_1\\nA2secret"
