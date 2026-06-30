@@ -35,6 +35,12 @@ struct ValueCandidate {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct ParsedValueItem {
+    value: ValueCandidate,
+    next: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct SeparatorCandidate {
     start: usize,
     end: usize,
@@ -165,7 +171,16 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
         return false;
     };
     let key = trim_key_edge(&ctx.text[key_start..left_end]);
-    let semantic_key = declared_identifier_key(key).unwrap_or_else(|| key.to_string());
+    let mut semantic_key = declared_identifier_key(key).unwrap_or_else(|| key.to_string());
+    let mut tuple_target = None;
+    if separator.kind == Separator::Assignment {
+        if let Some(targets) = tuple_assignment_targets(&ctx.text[ctx.line_start..left_end]) {
+            if let Some((index, target)) = tuple_assignment_sensitive_target(&targets) {
+                semantic_key = target;
+                tuple_target = Some((index, targets.len()));
+            }
+        }
+    }
     let semantic_key = semantic_key.as_str();
     let key_name = normalize_key(semantic_key);
     if is_xml_key_attribute(ctx.text, ctx.line_start, separator.start, &key_name) {
@@ -196,9 +211,21 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
         return false;
     }
 
-    let Some(value) = parse_value(ctx.text, separator.end, ctx.line_end, kind) else {
+    let Some(mut value) = parse_value(ctx.text, separator.end, ctx.line_end, kind) else {
         return false;
     };
+    if let Some((index, target_count)) = tuple_target {
+        if let Some(tuple_value) = parse_tuple_assignment_value(
+            ctx.text,
+            separator.end,
+            ctx.line_end,
+            kind,
+            index,
+            target_count,
+        ) {
+            value = tuple_value;
+        }
+    }
     let raw_value = &ctx.text[value.start..value.end];
     if is_self_reference_code_value(semantic_key, raw_value) {
         return false;
@@ -472,6 +499,15 @@ fn implicit_key_name_kind(name: &str) -> Option<KeyKind> {
 }
 
 fn parse_value(text: &str, start: usize, line_end: usize, kind: KeyKind) -> Option<ValueCandidate> {
+    parse_value_item(text, start, line_end, kind).map(|item| item.value)
+}
+
+fn parse_value_item(
+    text: &str,
+    start: usize,
+    line_end: usize,
+    kind: KeyKind,
+) -> Option<ParsedValueItem> {
     let mut pos = trim_ascii_ws_start(text, start, line_end);
     if pos >= line_end {
         return None;
@@ -493,18 +529,24 @@ fn parse_value(text: &str, start: usize, line_end: usize, kind: KeyKind) -> Opti
             if is_auth_credential_scheme(first) {
                 let credential_start = trim_ascii_ws_start(text, first_end, end);
                 if credential_start < end {
-                    return Some(ValueCandidate {
-                        start: credential_start,
-                        end,
-                        quoted: false,
+                    return Some(ParsedValueItem {
+                        value: ValueCandidate {
+                            start: credential_start,
+                            end,
+                            quoted: false,
+                        },
+                        next: (end + 1).min(line_end),
                     });
                 }
             }
         }
-        return (start < end).then_some(ValueCandidate {
-            start,
-            end,
-            quoted: true,
+        return (start < end).then_some(ParsedValueItem {
+            value: ValueCandidate {
+                start,
+                end,
+                quoted: true,
+            },
+            next: (end + 1).min(line_end),
         });
     }
 
@@ -521,11 +563,37 @@ fn parse_value(text: &str, start: usize, line_end: usize, kind: KeyKind) -> Opti
 
     let end = scan_unquoted_token_end(text, pos, line_end);
     let end = trim_unquoted_value_end(text, pos, end);
-    (pos < end).then_some(ValueCandidate {
-        start: pos,
-        end,
-        quoted: false,
+    (pos < end).then_some(ParsedValueItem {
+        value: ValueCandidate {
+            start: pos,
+            end,
+            quoted: false,
+        },
+        next: end,
     })
+}
+
+fn parse_tuple_assignment_value(
+    text: &str,
+    start: usize,
+    line_end: usize,
+    kind: KeyKind,
+    target_index: usize,
+    target_count: usize,
+) -> Option<ValueCandidate> {
+    let mut pos = start;
+    for index in 0..target_count {
+        let item = parse_value_item(text, pos, line_end, kind)?;
+        if index == target_index {
+            return Some(item.value);
+        }
+        pos = trim_ascii_ws_start(text, item.next, line_end);
+        if text.as_bytes().get(pos) != Some(&b',') {
+            return None;
+        }
+        pos += 1;
+    }
+    None
 }
 
 fn scan_unquoted_token_end(text: &str, start: usize, line_end: usize) -> usize {
@@ -1214,6 +1282,53 @@ fn declared_identifier_key(key: &str) -> Option<String> {
     // `InstallManifestFileName`.
     let key = strip_declared_type_annotation(key).unwrap_or(key);
     declared_identifier_key_without_type(key).map(str::to_string)
+}
+
+fn tuple_assignment_targets(left: &str) -> Option<Vec<String>> {
+    // Python/Ruby-style tuple assignments bind each left-side identifier to the
+    // value at the same right-side position. If `login, password = "u", "p"`
+    // is treated as one key, the detector masks the username and misses the
+    // actual password. Keep this to a plain comma-separated identifier list so
+    // calls, indexes, and expressions are handled by the normal parser.
+    let left = left.rsplit([';', '{', '}']).next().unwrap_or(left).trim();
+    if !left.contains(',') || left.len() > 160 {
+        return None;
+    }
+    if !left
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b',' | b' ' | b'\t'))
+    {
+        return None;
+    }
+
+    let mut targets = Vec::new();
+    for segment in left.split(',') {
+        let ident = trailing_identifier(segment.trim())?;
+        if ident.is_empty() || is_declaration_word(ident) {
+            return None;
+        }
+        targets.push(ident.to_string());
+    }
+    ((2..=8).contains(&targets.len())).then_some(targets)
+}
+
+fn tuple_assignment_sensitive_target(targets: &[String]) -> Option<(usize, String)> {
+    let mut found = None;
+    for (index, target) in targets.iter().enumerate() {
+        if sensitive_key_kind(target).is_some() {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((index, target.clone()));
+        }
+    }
+    found
+}
+
+fn trailing_identifier(segment: &str) -> Option<&str> {
+    segment
+        .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .find(|part| !part.is_empty())
 }
 
 fn strip_declared_type_annotation(key: &str) -> Option<&str> {
@@ -3729,5 +3844,20 @@ mod tests {
             .iter()
             .all(|(_, value)| !value.contains("client_secret")));
         assert!(got.iter().all(|(_, value)| !value.contains("api_key")));
+    }
+
+    #[test]
+    fn tuple_assignment_maps_value_to_sensitive_identifier() {
+        let got = hits(r#"login, password = 'python@vk.com', 'xooxeudiqi'"#);
+        assert!(got.iter().any(|(_, value)| value == "xooxeudiqi"));
+        assert!(got.iter().all(|(_, value)| value != "python@vk.com"));
+
+        let got = hits(r#"password, login = 'xooxeudiqi', 'python@vk.com'"#);
+        assert!(got.iter().any(|(_, value)| value == "xooxeudiqi"));
+        assert!(got.iter().all(|(_, value)| value != "python@vk.com"));
+
+        let got = hits(r#"name, api_token = "service", "tok-12345""#);
+        assert!(got.iter().any(|(_, value)| value == "tok-12345"));
+        assert!(got.iter().all(|(_, value)| value != "service"));
     }
 }
