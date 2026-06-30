@@ -799,6 +799,7 @@ mod tests {
         assert!(is_placeholder_value("tftest-new-password"));
         assert!(is_placeholder_value("foo-bar"));
         assert!(is_placeholder_value("s3krit-password"));
+        assert!(!is_placeholder_value("s3krit-password2"));
         assert!(is_placeholder_value("t0k3n"));
         assert!(!is_placeholder_value("tenant-7-trial"));
         assert!(!is_placeholder_value(
@@ -1015,6 +1016,11 @@ mod tests {
         assert!(is_structured_generic_key_metadata_value("string"));
         assert!(is_structured_generic_key_metadata_value("FirstTag"));
         assert!(is_structured_generic_key_metadata_value("foo2"));
+        assert!(is_structured_generic_key_metadata_value("item1"));
+        assert!(is_structured_generic_key_metadata_value("step0"));
+        assert!(is_structured_generic_key_metadata_value("remote_cluster"));
+        assert!(!is_structured_generic_key_metadata_value("remote_token"));
+        assert!(!is_structured_generic_key_metadata_value("cluster_secret"));
         assert!(!is_structured_generic_key_metadata_value("API Key"));
         assert!(!is_structured_generic_key_metadata_value("secret token"));
         assert!(!is_structured_generic_key_metadata_value("sk-test-token"));

@@ -796,6 +796,7 @@ fn looks_like_secret_value(
         || is_source_constant_reference_literal(value, key_name, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
         || is_source_config_name_literal(value, source_key)
+        || is_self_describing_key_value_placeholder(value, key_name, source_key)
         || is_source_sensitive_name_reference_literal(value, source_key)
         || is_source_fixture_secret_literal(value, key_name, source_key)
         || is_source_struct_tag_literal(value, key_name, source_key)
@@ -804,6 +805,7 @@ fn looks_like_secret_value(
         || is_source_variable_reference_literal(value, key_name, source_key, quoted)
         || is_shell_parameter_reference_literal(value, key_name, source_key)
         || is_runtime_template_reference_literal(value, key_name, source_key)
+        || is_jsonpath_template_selector_literal(value, key_name)
         || is_source_string_fragment_literal(value, source_key)
         || is_source_concatenation_template_literal(value)
         || is_shell_command_substitution_literal(value, key_name, source_key)
@@ -815,6 +817,7 @@ fn looks_like_secret_value(
         || is_interpolated_string_template(value)
         || is_typed_sql_fragment_literal(value, key_name, source_key)
         || is_public_key_literal(value, key_name)
+        || is_private_key_documentation_placeholder_literal(value, key_name)
         || is_license_identifier_literal(value, key_name)
         || is_dunder_identifier_literal(value)
         || is_uppercase_constant_literal_for_generic_key(value, key_name)
@@ -3040,6 +3043,26 @@ fn is_source_config_name_literal(value: &str, source_key: &str) -> bool {
     is_lower_dotted_config_name(value) || is_lower_route_literal(value)
 }
 
+fn is_self_describing_key_value_placeholder(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Test/config hashes often use paired placeholder names such as
+    // `my_key: "my_value"` or `opt_key: "opt_value"` to prove option plumbing.
+    // Require source-shaped context and identical stems so `api_key="abc123"`
+    // or `client_secret="tenant-7-trial"` still detect normally.
+    if !source_key_has_code_shape(source_key) {
+        return false;
+    }
+    let Some(stem) = key_name.strip_suffix("_key") else {
+        return false;
+    };
+    if !(2..=32).contains(&stem.len())
+        || !stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return false;
+    }
+    let value = normalize_key(value);
+    value.strip_suffix("_value") == Some(stem)
+}
+
 fn is_source_sensitive_name_reference_literal(value: &str, source_key: &str) -> bool {
     // Source code often stores the *name* of a secret-bearing setting, not the
     // secret itself: `Configuration["clientsecret"]`,
@@ -3312,6 +3335,57 @@ fn is_runtime_template_reference_literal(value: &str, key_name: &str, source_key
         || contains_erb_template_reference(value)
         || contains_percent_brace_template_reference(value)
         || contains_dollar_template_reference(value)
+}
+
+fn is_jsonpath_template_selector_literal(value: &str, key_name: &str) -> bool {
+    // Query/selector/path fields can store JSONPath-like selectors that point at
+    // a secret field (`resources[*]...keys[0].secret`) while the credential is
+    // still elsewhere. Require selector syntax plus a runtime template marker;
+    // a plain `secret.path.value` string remains detectable.
+    if !key_name_indicates_selector_context(key_name) {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !(8..=512).contains(&value.len())
+        || value.contains("://")
+        || value.chars().any(char::is_whitespace)
+        || !value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'_' | b'-' | b'[' | b']' | b'*' | b'{' | b'}')
+        })
+    {
+        return false;
+    }
+    has_jsonpath_selector(value) && contains_mustache_template_reference(value)
+}
+
+fn key_name_indicates_selector_context(key_name: &str) -> bool {
+    has_identifier_component(key_name, "query")
+        || has_identifier_component(key_name, "selector")
+        || has_identifier_component(key_name, "jsonpath")
+        || has_identifier_component(key_name, "path")
+}
+
+fn has_jsonpath_selector(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        if bytes[pos] != b'[' {
+            pos += 1;
+            continue;
+        }
+        let Some(close_rel) = value[pos + 1..].find(']') else {
+            return false;
+        };
+        let body = &value[pos + 1..pos + 1 + close_rel];
+        if body == "*" || (!body.is_empty() && body.bytes().all(|b| b.is_ascii_digit())) {
+            return true;
+        }
+        pos += close_rel + 2;
+    }
+    false
 }
 
 fn contains_mustache_template_reference(value: &str) -> bool {
@@ -3698,7 +3772,11 @@ fn is_method_chain_suffix_fragment(value: &str) -> bool {
     // a string, yielding fragments such as `).append(getApiKey()).append(`.
     // Require method-call punctuation so hyphenated string values stay eligible.
     let value = value.trim();
-    let Some(rest) = value.strip_prefix(").").or_else(|| value.strip_prefix('.')) else {
+    let Some(rest) = value
+        .strip_prefix('.')
+        .or_else(|| value.strip_prefix(")."))
+        .or_else(|| value.trim_start_matches(')').strip_prefix('.'))
+    else {
         return false;
     };
     if !rest.contains('(') {
@@ -3937,6 +4015,52 @@ fn key_name_indicates_public_key(key_name: &str) -> bool {
         || key_name == "publickey"
         || has_identifier_phrase(key_name, &["public", "key"])
         || has_identifier_phrase(key_name, &["pub", "key"])
+}
+
+fn is_private_key_documentation_placeholder_literal(value: &str, key_name: &str) -> bool {
+    // Private-key material has a PEM/base64 envelope. Phrase-shaped values that
+    // explicitly say they are dummy/example file contents are documentation or
+    // setup placeholders, not key bytes. Keep the gate on private-key slots so
+    // ordinary weak passwords/passphrases are not hidden.
+    if !key_name_indicates_private_key_slot(key_name) {
+        return false;
+    }
+    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    if !(8..=180).contains(&value.len())
+        || value.contains("-----BEGIN")
+        || value.bytes().any(|b| matches!(b, b'\r' | b'\n'))
+        || value.split_whitespace().count() < 3
+        || !value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || ch.is_ascii_whitespace()
+                || matches!(ch, '.' | ',' | '*' | '#' | '-' | '_' | '/')
+        })
+    {
+        return false;
+    }
+    let normalized = normalize_key(value);
+    let parts = normalized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let has_placeholder_marker = parts.iter().any(|part| {
+        matches!(
+            *part,
+            "your" | "dummy" | "placeholder" | "sample" | "example" | "setup" | "here"
+        )
+    });
+    let has_key_file_marker = parts
+        .iter()
+        .any(|part| matches!(*part, "pem" | "file" | "content"));
+    let has_value_marker = parts.contains(&"value");
+    has_placeholder_marker && (has_key_file_marker || has_value_marker)
+}
+
+fn key_name_indicates_private_key_slot(key_name: &str) -> bool {
+    key_name == "private_key"
+        || key_name == "privatekey"
+        || has_adjacent_identifier_components(key_name, "private", "key")
+        || has_adjacent_identifier_components(key_name, "key", "pair")
 }
 
 fn is_der_subject_public_key_info_base64(value: &str) -> bool {
@@ -4783,6 +4907,17 @@ fn has_identifier_component(name: &str, component: &str) -> bool {
     name.split('_').any(|part| part == component)
 }
 
+fn has_adjacent_identifier_components(name: &str, first: &str, second: &str) -> bool {
+    let mut prev = "";
+    for part in name.split('_').filter(|part| !part.is_empty()) {
+        if prev == first && part == second {
+            return true;
+        }
+        prev = part;
+    }
+    false
+}
+
 fn has_identifier_phrase(name: &str, phrase: &[&str]) -> bool {
     let parts = name
         .split('_')
@@ -4923,8 +5058,12 @@ mod tests {
         ));
         assert!(has(r#"api_token = Some("tok-12345")"#, "tok-12345"));
         assert!(has(
-            r#"authorization: 'Basic Wv0dTjLryp=='"#,
-            "Wv0dTjLryp=="
+            r#"authorization: 'Basic YWxpY2U6cGEzcw=='"#,
+            "YWxpY2U6cGEzcw=="
+        ));
+        assert!(has(
+            r#"headers = {"Authorization": "Basic YWxpY2U6cGEzcw=="}"#,
+            "YWxpY2U6cGEzcw=="
         ));
         assert!(has(
             r#"authorization: 'ApiKey Fy0ySzEbqm=='"#,
@@ -5061,6 +5200,8 @@ mod tests {
             r#"val FAILED_TO_RETRIEVE_GENERATED_KEY = "Failed to retrieve the generated key.""#,
             r#"POSTGRES_HOST_AUTH_METHOD: scram-sha-256"#,
             r#"c.key = "__vlist__" + nestedIndex;"#,
+            r#"s3.fog_options = { my_key: "my_value" }"#,
+            r#"connection_options: { opt_key: "opt_value" }"#,
             r#"DEBUG_HEADER_KEY = "DEBUG_FRAME""#,
             r#"self.__authorizationHeader = f"Bearer {jwt}""#,
             r#"{"license": {"key": "lgpl-3.0"}}"#,
@@ -5082,6 +5223,7 @@ mod tests {
             r#"openstack_password: "{{ lookup('env','OS_PASSWORD') }}""#,
             r#"vsphere_password: '{{ lookup("env", "VSPHERE_PASSWORD") }}'"#,
             r#"password: "{{DB_PASS}}""#,
+            r#"secrets_encryption_query: "resources[*].providers[0].{{kube_encryption_algorithm}}.keys[0].secret""#,
             r#"mariadb-password: "{{ .Values.db.password | b64enc }}""#,
             r#"key: "dist-${{ hashFiles('src/**/*.ts') }}-${{ runner.os }}""#,
             r#"apiKey: "<%= ShopifyApp.configuration.api_key %>""#,
@@ -5353,6 +5495,9 @@ mod tests {
             "/// Bitcoin WIF private key: base58check, version 0x80.",
             r#"* <li>token=1234</li>"#,
             r#"The format is `password=value` pairs."#,
+            r#"privateKey: "content of your *.pem file here","#,
+            r#"privateKey: "dummy value for setup, see #1512","#,
+            r#"when(testTerminal.readPassword("password: ")).thenReturn("password");"#,
             r#"echo "password=${PASS}" >> ${DOMAIN_HOME}/boot.properties"#,
             r#"SEED_PASSWORD=#{Shellwords.escape Shellwords.escape(seed_password)}"#,
             r##"path_key = "#{key}_path""##,

@@ -106,6 +106,7 @@ name:role
 name:purpose
 name:redirect_uri
 name:refresh_token
+name:remote_cluster
 name:response_type
 name:rooms
 name:scope
@@ -133,6 +134,8 @@ numbered_name:datagrid
 numbered_name:fieldset
 numbered_name:panel
 numbered_name:foo
+numbered_name:item
 numbered_name:sample_key
 numbered_name:source
+numbered_name:step
 numbered_name:well
