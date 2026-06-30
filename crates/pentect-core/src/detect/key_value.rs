@@ -783,7 +783,7 @@ fn looks_like_secret_value(
         || is_source_fixture_secret_literal(value, key_name, source_key)
         || is_source_struct_tag_literal(value, key_name, source_key)
         || is_source_prefix_constant_literal(value, key_name)
-        || is_source_variable_reference_literal(value, source_key)
+        || is_source_variable_reference_literal(value, key_name, source_key, quoted)
         || is_source_string_fragment_literal(value, source_key)
         || is_source_concatenation_template_literal(value)
         || is_shell_command_substitution_literal(value, source_key)
@@ -837,7 +837,20 @@ fn looks_like_secret_value(
         if separator == Separator::ImplicitQuote {
             return has_digit || has_symbol;
         }
-        return has_digit || has_symbol || key_allows_low_entropy_literal(key_name, kind);
+        return has_digit
+            || has_symbol
+            || key_allows_low_entropy_literal(key_name, kind)
+            || is_config_slot_low_entropy_literal(value, key_name, source_key);
+    }
+    if !quoted
+        && chars >= 5
+        && has_alpha
+        && !has_digit
+        && !has_symbol
+        && !has_space
+        && is_config_slot_low_entropy_literal(value, key_name, source_key)
+    {
+        return true;
     }
     if !quoted && is_plain_code_identifier(value) && !has_digit {
         return false;
@@ -2489,13 +2502,35 @@ fn is_source_prefix_constant_literal(value: &str, key_name: &str) -> bool {
         && !contains_dangerous_secret_component(prefix)
 }
 
-fn is_source_variable_reference_literal(value: &str, source_key: &str) -> bool {
+fn is_source_variable_reference_literal(
+    value: &str,
+    key_name: &str,
+    source_key: &str,
+    quoted: bool,
+) -> bool {
     // Source code often assigns a sensitive-looking argument from a variable,
     // e.g. `Authorization = l_auth` or `$token = $this->token`. The variable
     // name is not the credential bytes. Keep this to source-shaped left sides
     // and identifier/member-reference syntax; quoted strings such as
     // `password = "hunter2"` still pass through.
-    source_key_has_code_shape(source_key) && is_variable_reference_literal(value.trim())
+    if is_dotted_config_secret_key(source_key, key_name) {
+        return false;
+    }
+    if is_variable_reference_literal(value.trim()) {
+        return source_key_has_code_shape(source_key);
+    }
+    !quoted
+        && source_key_has_reference_shape(source_key)
+        && is_plain_source_identifier_reference(value.trim())
+}
+
+fn source_key_has_reference_shape(source_key: &str) -> bool {
+    let key = source_key.trim();
+    key.contains("->")
+        || key.contains("::")
+        || key.contains('.')
+        || key.contains('*')
+        || key.contains('[')
 }
 
 fn is_variable_reference_literal(value: &str) -> bool {
@@ -2517,6 +2552,17 @@ fn is_variable_reference_literal(value: &str) -> bool {
         && value.split('.').all(is_simple_code_reference_name)
         && value.bytes().any(|b| b.is_ascii_lowercase())
         && !value.bytes().any(|b| b.is_ascii_digit())
+}
+
+fn is_plain_source_identifier_reference(value: &str) -> bool {
+    (3..=96).contains(&value.len())
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn is_source_string_fragment_literal(value: &str, source_key: &str) -> bool {
@@ -3334,6 +3380,82 @@ fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
     )
 }
 
+fn is_config_slot_low_entropy_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Env/config files often use service-qualified secret keys with deliberately
+    // weak sample values: `SMTP_PASSWORD=abcdef` or
+    // `prod.db.default.password="abcdef"`. Treat only compact alphabetic
+    // values in env/dotted-config key slots as credentials; prose labels,
+    // type annotations, and source variables stay rejected.
+    is_compact_alpha_literal(value) && is_config_secret_slot_key(key_name, source_key)
+}
+
+fn is_compact_alpha_literal(value: &str) -> bool {
+    let value = value.trim();
+    (5..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+fn is_config_secret_slot_key(key_name: &str, source_key: &str) -> bool {
+    let source_key = source_key.trim();
+    is_upper_env_secret_key(source_key) || is_dotted_config_secret_key(source_key, key_name)
+}
+
+fn is_dotted_config_secret_key(source_key: &str, key_name: &str) -> bool {
+    let source_key = source_key.trim();
+    source_key.matches('.').count() >= 2
+        && qualified_low_entropy_secret_key_name(key_name)
+        && source_key.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'_' | b'-')
+                || matches!(b, b'"' | b'\'' | b'`')
+        })
+}
+
+fn is_upper_env_secret_key(source_key: &str) -> bool {
+    let tokens = source_key.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() > 1
+        && !tokens[..tokens.len() - 1]
+            .iter()
+            .any(|token| is_env_assignment_prefix(token))
+    {
+        return false;
+    }
+    let candidate = tokens
+        .last()
+        .copied()
+        .unwrap_or(source_key)
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let candidate = candidate.strip_prefix("-e").unwrap_or(candidate).trim();
+    let bytes = candidate.as_bytes();
+    if bytes.is_empty()
+        || !bytes.iter().any(u8::is_ascii_alphabetic)
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+    {
+        return false;
+    }
+    let normalized = normalize_key(candidate);
+    normalized.contains("password")
+        || normalized.contains("passwd")
+        || normalized.contains("passphrase")
+        || normalized.contains("secret")
+        || normalized.contains("credential")
+}
+
+fn is_env_assignment_prefix(token: &str) -> bool {
+    matches_ignore_ascii_case(token, &["export", "env", "arg", "-e", "--env"])
+        || token.eq_ignore_ascii_case("config:set")
+}
+
+fn qualified_low_entropy_secret_key_name(name: &str) -> bool {
+    name.ends_with("_password")
+        || name.ends_with("_passwd")
+        || name.ends_with("_pwd")
+        || name.ends_with("_passphrase")
+        || name.ends_with("_secret")
+        || name.ends_with("_credential")
+}
+
 fn is_plain_code_identifier(value: &str) -> bool {
     let bytes = value.as_bytes();
     if !(8..=64).contains(&bytes.len())
@@ -3576,6 +3698,9 @@ mod tests {
             "0abc0d.xyz123abc456def"
         ));
         assert!(has("dbPassword = \"hunter2\"", "hunter2"));
+        assert!(has("SMTP_PASSWORD=dbynbelpgliq", "dbynbelpgliq"));
+        assert!(has(r#"prod.db.default.password="gecrpy""#, "gecrpy"));
+        assert!(has(r#"APP_WEBHOOK_SECRET="abcdefghijkl""#, "abcdefghijkl"));
         assert!(has(
             r#"const PASSWORD: string = "helloworld1234";"#,
             "helloworld1234"
@@ -3665,6 +3790,8 @@ mod tests {
             r#"credentials: "same-origin""#,
             r#"credentials: "include""#,
             r#"credentials: "omit""#,
+            "routing_key=task_queue",
+            r#"foreign_key: "owner_id""#,
             r#"const string expectedTokenValue = "GITHUB_TOKEN_VALUE";"#,
             r#"public const string OAuthClientSecret = "GCM_BITBUCKET_CLOUD_CLIENTSECRET";"#,
             r#""privateKey": "LINE_1\nLINE_2\nLINE_2","#,
