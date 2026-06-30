@@ -785,6 +785,7 @@ fn looks_like_secret_value(
         || is_source_prefix_constant_literal(value, key_name)
         || is_source_variable_reference_literal(value, key_name, source_key, quoted)
         || is_shell_parameter_reference_literal(value, key_name, source_key)
+        || is_runtime_template_reference_literal(value, key_name, source_key)
         || is_source_string_fragment_literal(value, source_key)
         || is_source_concatenation_template_literal(value)
         || is_shell_command_substitution_literal(value, source_key)
@@ -2634,6 +2635,123 @@ fn is_shell_parameter_name(name: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
+fn is_runtime_template_reference_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // CI, Helm/Jinja/ERB, and i18n templates can assign sensitive-looking
+    // fields from runtime expressions (`password: "{{DB_PASS}}"`,
+    // `key: dist-${{ hashFiles(...) }}`, `apiKey: "<%= config.api_key %>"`).
+    // The literal is a reference/template, not the credential bytes. Keep this
+    // to assignment-shaped contexts and require recognizable template syntax so
+    // concrete values such as `password="{{secret123}}"` still detect.
+    if !(source_key_has_code_shape(source_key)
+        || is_generic_metadata_key_name(key_name)
+        || key_name_has_sensitive_component(key_name))
+    {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !(4..=512).contains(&value.len()) {
+        return false;
+    }
+    contains_mustache_template_reference(value)
+        || contains_erb_template_reference(value)
+        || contains_percent_brace_template_reference(value)
+        || contains_dollar_template_reference(value)
+}
+
+fn contains_mustache_template_reference(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut search = 0usize;
+    while search + 1 < bytes.len() {
+        let Some(rel) = value[search..].find("{{") else {
+            return false;
+        };
+        let start = search + rel + 2;
+        let end = value[start..]
+            .find("}}")
+            .map_or(value.len(), |offset| start + offset);
+        let body = value[start..end].trim();
+        if body.is_empty() {
+            return true;
+        }
+        if is_runtime_template_expression_body(body) {
+            return true;
+        }
+        search = start;
+    }
+    false
+}
+
+fn contains_erb_template_reference(value: &str) -> bool {
+    let Some(start) = value.find("<%") else {
+        return false;
+    };
+    let body_start = start + 2;
+    let end = value[body_start..]
+        .find("%>")
+        .map_or(value.len(), |offset| body_start + offset);
+    let body = value[body_start..end]
+        .trim_start_matches('=')
+        .trim_start_matches('#')
+        .trim();
+    body.is_empty() || is_runtime_template_expression_body(body)
+}
+
+fn contains_percent_brace_template_reference(value: &str) -> bool {
+    let Some(start) = value.find("%{") else {
+        return false;
+    };
+    let body_start = start + 2;
+    let end = value[body_start..]
+        .find('}')
+        .map_or(value.len(), |offset| body_start + offset);
+    let body = value[body_start..end].trim();
+    !body.is_empty() && is_runtime_template_expression_body(body)
+}
+
+fn contains_dollar_template_reference(value: &str) -> bool {
+    let Some(start) = value.find("${") else {
+        return false;
+    };
+    let body_start = start + 2;
+    let end = value[body_start..]
+        .find('}')
+        .map_or(value.len(), |offset| body_start + offset);
+    let body = value[body_start..end]
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim();
+    body.is_empty() || is_runtime_template_expression_body(body)
+}
+
+fn is_runtime_template_expression_body(body: &str) -> bool {
+    if body.is_empty() || body.len() > 256 {
+        return false;
+    }
+    if body.contains("://") {
+        return false;
+    }
+    let has_template_operator = body.bytes().any(|b| {
+        matches!(
+            b,
+            b'.' | b'|' | b'(' | b')' | b'/' | b'*' | b'\'' | b'"' | b':' | b'-' | b' '
+        )
+    });
+    if has_template_operator {
+        return body
+            .bytes()
+            .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace());
+    }
+    if is_shell_parameter_name(body) {
+        return true;
+    }
+    let normalized = normalize_key(body);
+    !normalized.bytes().any(|b| b.is_ascii_digit())
+        && (is_source_secret_name_reference_value(&normalized)
+            || is_plain_source_identifier_reference(&normalized))
+}
+
 fn is_source_string_fragment_literal(value: &str, source_key: &str) -> bool {
     // Objective-C and generated code can expose partial string syntax when an
     // embedded line is scanned from the middle, e.g. `apiURL: @\"...\\n`.
@@ -3894,6 +4012,12 @@ mod tests {
             r#"password: "i18n.t(auth.setup.instructions)""#,
             r#"openstack_password: "{{ lookup('env','OS_PASSWORD') }}""#,
             r#"vsphere_password: '{{ lookup("env", "VSPHERE_PASSWORD") }}'"#,
+            r#"password: "{{DB_PASS}}""#,
+            r#"mariadb-password: "{{ .Values.db.password | b64enc }}""#,
+            r#"key: "dist-${{ hashFiles('src/**/*.ts') }}-${{ runner.os }}""#,
+            r#"apiKey: "<%= ShopifyApp.configuration.api_key %>""#,
+            r#"password: valid_<%= schema.singular %>_password()"#,
+            r#"msgs login_api_key: "Authenticating with api key %{api_key}""#,
             r#"access_token = "TestAuthToken""#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
