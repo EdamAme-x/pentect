@@ -298,7 +298,8 @@ pub(crate) fn is_source_fixture_secret_value(key_name: &str, value: &str) -> boo
 /// True for public cryptographic test-vector identifiers, not key material.
 ///
 /// Rationale: NIST/SEC-style test vectors often label cases with values such as
-/// `KAS-ECC-CDH_P-192_C0`, `ALICE_secp112r1_PUB`, and `ED25519-1-PUBLIC`.
+/// `KAS-ECC-CDH_P-192_C0`, `ALICE_secp112r1_PUB`, `ED25519-1-PUBLIC`, and
+/// RFC 7919 FFDHE group test-case names such as `ffdhe2048-1-pub`.
 /// Those strings name a curve/test-case record; the actual private scalar or
 /// public point appears elsewhere as bytes. The accepted syntax is deliberately
 /// tied to known test-vector prefixes and named-curve families, so operational
@@ -329,6 +330,7 @@ fn is_crypto_test_vector_identifier_part(value: &str) -> bool {
     }
     let base = strip_crypto_test_vector_public_suffix(value);
     is_nist_kas_ecc_test_case_id(base)
+        || is_ffdhe_test_case_id(base)
         || is_role_named_curve_test_case_id(base)
         || is_standalone_named_curve_test_case_id(base)
         || is_edwards_test_case_id(base)
@@ -342,6 +344,8 @@ fn strip_crypto_test_vector_public_suffix(value: &str) -> &str {
         "-public-raw",
         "-PUBLIC",
         "-public",
+        "-PUB",
+        "-pub",
         "-Peer",
         "-peer",
         "_PUB",
@@ -374,6 +378,18 @@ fn contains_nist_curve_family_marker(value: &str) -> bool {
     // KAS-ECC CAVP identifiers use P/K/B curve family markers for prime,
     // Koblitz, and binary curves (`_P-256`, `_K-163`, `_B-233`).
     value.contains("_P-") || value.contains("_K-") || value.contains("_B-")
+}
+
+fn is_ffdhe_test_case_id(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("ffdhe") else {
+        return false;
+    };
+    let (bits, case) = rest.split_once('-').unwrap_or((rest, ""));
+    if !matches!(bits, "2048" | "3072" | "4096" | "6144" | "8192") {
+        return false;
+    }
+    case.is_empty() || ((1..=3).contains(&case.len()) && case.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn is_role_named_curve_test_case_id(value: &str) -> bool {
@@ -757,6 +773,12 @@ mod tests {
         assert!(is_crypto_test_vector_identifier_value(
             "ED25519-1-PUBLIC-Raw"
         ));
+        assert!(is_crypto_test_vector_identifier_value("ffdhe2048-1"));
+        assert!(is_crypto_test_vector_identifier_value("ffdhe3072-2-pub"));
+        assert!(is_crypto_test_vector_identifier_value(
+            "ffdhe4096-1:ffdhe4096-1-pub"
+        ));
+        assert!(is_crypto_test_vector_identifier_value("ffdhe8192"));
         assert!(is_crypto_test_vector_identifier_value("P-256"));
         assert!(is_crypto_test_vector_identifier_value("P-256-Peer"));
         assert!(is_crypto_test_vector_identifier_value(
@@ -771,6 +793,10 @@ mod tests {
         ));
         assert!(!is_crypto_test_vector_identifier_value(
             "KAS-ECC-CDH_P-192_SECRET"
+        ));
+        assert!(!is_crypto_test_vector_identifier_value("ffdhe1234-1"));
+        assert!(!is_crypto_test_vector_identifier_value(
+            "ffdhe2048-prod-key"
         ));
     }
 
