@@ -62,18 +62,23 @@ fn has_uuid_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
 }
 
 fn is_placeholder_uuid(value: &str) -> bool {
-    let mut first = None;
-    let mut saw_hex = false;
+    // Nil and near-nil UUIDs are conventional sentinels in fixtures and tests,
+    // not issued credential-adjacent identifiers.
+    let mut counts = [0usize; 16];
+    let mut total = 0usize;
     for b in value.bytes().filter(|b| *b != b'-') {
-        saw_hex = true;
         let normalized = b.to_ascii_lowercase();
-        match first {
-            Some(first) if first != normalized => return false,
-            Some(_) => {}
-            None => first = Some(normalized),
-        }
+        let idx = match normalized {
+            b'0'..=b'9' => (normalized - b'0') as usize,
+            b'a'..=b'f' => (normalized - b'a' + 10) as usize,
+            _ => return false,
+        };
+        counts[idx] += 1;
+        total += 1;
     }
-    saw_hex
+    let unique = counts.iter().filter(|count| **count > 0).count();
+    let dominant = counts.iter().copied().max().unwrap_or(0);
+    unique == 1 || (total == 32 && dominant >= 30)
 }
 
 fn is_uuid_anchored(text: &str, start: usize, ctx: &crate::model::Context) -> bool {
@@ -203,6 +208,8 @@ mod tests {
         for uuid in [
             "00000000-0000-0000-0000-000000000000",
             "11111111-1111-1111-1111-111111111111",
+            "00000000-0000-0000-0000-000000000001",
+            "10000000-0000-0000-0000-000000000000",
         ] {
             assert!(hits(&format!("client_id = {uuid}")).is_empty(), "{uuid}");
         }
