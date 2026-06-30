@@ -291,30 +291,33 @@ fn key_context_start(text: &str, line_start: usize, left_end: usize) -> Option<u
         min += 1;
     }
     let window = &text[min..left_end];
-    let hard_offset = window.rfind(|ch: char| {
-        matches!(
-            ch,
-            ':' | '=' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
-        )
-    });
-    let hard = hard_offset.map_or(min, |offset| {
-        let delimiter = window.as_bytes()[offset];
-        if delimiter == b':'
-            && is_declared_type_annotation_context(&window[..offset], &window[offset + 1..])
-        {
-            return window[..offset]
-                .rfind(|ch: char| {
-                    matches!(
-                        ch,
-                        ':' | '=' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
-                    )
-                })
-                .map_or(min, |previous| min + previous + 1);
-        }
-        min + offset + 1
+    let hard = typed_declaration_context_start(window, min).unwrap_or_else(|| {
+        window
+            .rfind(is_key_context_delimiter)
+            .map_or(min, |offset| min + offset + 1)
     });
     let start = trim_ascii_ws_start(text, hard, left_end);
     (start < left_end).then_some(start)
+}
+
+fn typed_declaration_context_start(window: &str, min: usize) -> Option<usize> {
+    for (offset, _) in window.match_indices(':').rev() {
+        let prefix_start = window[..offset]
+            .rfind(is_key_context_delimiter)
+            .map_or(0, |previous| previous + 1);
+        if is_declared_type_annotation_context(&window[prefix_start..offset], &window[offset + 1..])
+        {
+            return Some(min + prefix_start);
+        }
+    }
+    None
+}
+
+fn is_key_context_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        ':' | '=' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+    )
 }
 
 fn trim_key_edge(value: &str) -> &str {
@@ -658,6 +661,7 @@ fn looks_like_secret_value(
         || is_arithmetic_expression_literal(value)
         || is_localization_template_reference(value)
         || is_interpolated_string_template(value)
+        || is_typed_sql_fragment_literal(value, key_name, source_key)
         || is_public_key_literal(value)
         || is_license_identifier_literal(value, key_name)
         || is_dunder_identifier_literal(value)
@@ -1181,26 +1185,17 @@ fn declared_identifier_key(key: &str) -> Option<String> {
     // false positives on non-sensitive declarations such as
     // `InstallManifestFileName`.
     let key = strip_declared_type_annotation(key).unwrap_or(key);
-    let tokens = key
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>();
-    if tokens.len() < 2 {
-        return None;
-    }
-    let has_declaration_word = tokens[..tokens.len() - 1]
-        .iter()
-        .any(|token| is_declaration_word(token));
-    if !has_declaration_word {
-        return None;
-    }
-    let ident = tokens[tokens.len() - 1];
-    (!is_declaration_word(ident)).then(|| ident.to_string())
+    declared_identifier_key_without_type(key).map(str::to_string)
 }
 
 fn strip_declared_type_annotation(key: &str) -> Option<&str> {
     let (prefix, type_annotation) = key.rsplit_once(':')?;
     is_declared_type_annotation_context(prefix, type_annotation).then_some(prefix)
+}
+
+fn declared_type_annotation(key: &str) -> Option<&str> {
+    let (prefix, type_annotation) = key.rsplit_once(':')?;
+    is_declared_type_annotation_context(prefix, type_annotation).then_some(type_annotation.trim())
 }
 
 fn is_declared_type_annotation_context(prefix: &str, type_annotation: &str) -> bool {
@@ -2541,6 +2536,24 @@ fn is_interpolated_string_template(value: &str) -> bool {
         .any(|prefix| value.starts_with(prefix))
 }
 
+fn is_typed_sql_fragment_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Scala SQL builders commonly declare generic `key` fragments as
+    // `SQLSyntax`, e.g. `val key: SQLSyntax = sqls"column_name"`. The quoted
+    // text names a SQL fragment, not credential material. Keep this tied to the
+    // declared type so `api_key = "..."` and string-typed secrets still detect.
+    if !is_generic_metadata_key_name(key_name) {
+        return false;
+    }
+    let Some(type_annotation) = declared_type_annotation(source_key) else {
+        return false;
+    };
+    if normalize_key(type_annotation) != "sqlsyntax" {
+        return false;
+    }
+    let value = value.trim_start();
+    value.starts_with("sqls\"") || value.starts_with("sqls'")
+}
+
 fn is_public_key_literal(value: &str) -> bool {
     // OpenSSH public-key values are identifiers/public material. Private keys
     // are handled by the PEM detector; masking public key blobs as KEYED_SECRET
@@ -3322,6 +3335,14 @@ mod tests {
             "helloworld1234"
         ));
         assert!(has(
+            r#"const PASSWORDS: string[] = "helloworld1234";"#,
+            "helloworld1234"
+        ));
+        assert!(has(
+            r#"let apiToken: Array<string> = "abc12345";"#,
+            "abc12345"
+        ));
+        assert!(has(
             "OAuth app client_secret 'tenant-7-trial'",
             "tenant-7-trial"
         ));
@@ -3602,6 +3623,7 @@ mod tests {
             r#""phpunit/php-token-stream": "^3.0","#,
             r#"config.reset_password_within = 6.hours"#,
             r#"RESET_PASSWORD_WITHIN=6.hours"#,
+            r#"val key: SQLSyntax = sqls"column_name""#,
             r#"'  "private_key_id": "' + UUID.randomUUID().toString() + '","\n' +"#,
             r#"'  "private_key": "-----BEGIN PRIVATE KEY-----\n' + encodedKey + '\n-----END PRIVATE KEY-----\n","\n' +"#,
             r#"
