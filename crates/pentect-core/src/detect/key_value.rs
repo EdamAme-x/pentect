@@ -793,6 +793,7 @@ fn looks_like_secret_value(
         || is_source_string_fragment_literal(value, source_key)
         || is_source_concatenation_template_literal(value)
         || is_shell_command_substitution_literal(value, key_name, source_key)
+        || is_shell_command_fragment_literal(value, key_name, source_key)
         || is_inline_code_key_value_tail_literal(value, key_name, source_key)
         || is_source_code_fragment_literal(value)
         || is_arithmetic_expression_literal(value)
@@ -3116,6 +3117,51 @@ fn shell_literal_argument_looks_secret(body: &str, command: &str) -> bool {
     })
 }
 
+fn is_shell_command_fragment_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Backtick command substitutions are runtime reads/generators, not stored
+    // credential bytes: `APP_PASSWORD=`echo $JSON | jq ...``. Separators inside
+    // those commands can also leave tail fragments such as `-f2`` from
+    // `cut -d "=" -f2`. Keep literal generators like `echo hunter2` detectable.
+    if !(source_key_has_code_shape(source_key)
+        || key_name_has_sensitive_component(key_name)
+        || is_upper_env_secret_key(source_key))
+    {
+        return false;
+    }
+    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    is_shell_cut_option_tail_fragment(value, source_key) || is_shell_command_body_literal(value)
+}
+
+fn is_shell_cut_option_tail_fragment(value: &str, source_key: &str) -> bool {
+    if !(source_key.contains('`') || source_key.contains("$(")) || !source_key.contains("cut") {
+        return false;
+    }
+    let body = value.trim().trim_end_matches(['`', ')']).trim();
+    (2..=16).contains(&body.len())
+        && body.starts_with('-')
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b' '))
+}
+
+fn is_shell_command_body_literal(value: &str) -> bool {
+    let body = value.trim().trim_matches('`').trim();
+    if !(3..=256).contains(&body.len()) || !has_shell_expression_syntax(body) {
+        return false;
+    }
+    let command = body.split_ascii_whitespace().next().unwrap_or(body);
+    is_shell_command_name(command) && !shell_literal_argument_looks_secret(body, command)
+}
+
+fn has_shell_expression_syntax(body: &str) -> bool {
+    body.contains('|')
+        || body.contains('$')
+        || body
+            .split_ascii_whitespace()
+            .skip(1)
+            .any(|part| part.starts_with('-') || part.contains('/'))
+}
+
 fn is_inline_code_key_value_tail_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // Help text commonly documents `key=value` inside backticks. Splitting at
     // `=` leaves `value`` as a fake credential; keep this to generic key
@@ -4363,6 +4409,8 @@ mod tests {
             r#"KEYCTL_CAPS0_BIG_KEY = 0x10"#,
             r#"TCP_FASTOPEN_KEY = 0x21"#,
             r#"ER_TOO_LONG_KEY: "42000","#,
+            r#"APP_PASSWORD=`echo $AZURE_CREDENTIALS | jq -r -c ".clientSecret"`"#,
+            r#"PASS=`awk '{print $1}' $SEC_PROPERTIES_FILE | grep password | cut -d "=" -f2`"#,
             r#"access_token = "TestAuthToken""#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
@@ -4425,6 +4473,7 @@ mod tests {
         assert!(has(r#"clientSecret: "APP_SECRET_2026""#, "APP_SECRET_2026"));
         assert!(has(r#"password = "123456""#, "123456"));
         assert!(has(r#"token: "1234""#, "1234"));
+        assert!(has(r#"PASSWORD=`echo hunter2`"#, "echo hunter2"));
         assert!(has(
             r#"private_key = "LINE_1\nA2secret""#,
             "LINE_1\\nA2secret"
