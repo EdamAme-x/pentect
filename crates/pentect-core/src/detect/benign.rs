@@ -362,9 +362,15 @@ fn is_nist_kas_ecc_test_case_id(value: &str) -> bool {
         return false;
     };
     !family.is_empty()
-        && family.contains("_P-")
+        && contains_nist_curve_family_marker(family)
         && !case.is_empty()
         && case.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn contains_nist_curve_family_marker(value: &str) -> bool {
+    // KAS-ECC CAVP identifiers use P/K/B curve family markers for prime,
+    // Koblitz, and binary curves (`_P-256`, `_K-163`, `_B-233`).
+    value.contains("_P-") || value.contains("_K-") || value.contains("_B-")
 }
 
 fn is_role_named_curve_test_case_id(value: &str) -> bool {
@@ -656,6 +662,12 @@ mod tests {
     fn crypto_test_vector_identifiers_are_shape_gated() {
         assert!(is_crypto_test_vector_identifier_value(
             "KAS-ECC-CDH_P-192_C0"
+        ));
+        assert!(is_crypto_test_vector_identifier_value(
+            "KAS-ECC-CDH_K-163_C0"
+        ));
+        assert!(is_crypto_test_vector_identifier_value(
+            "KAS-ECC-CDH_B-233_C0"
         ));
         assert!(is_crypto_test_vector_identifier_value(
             "KAS-ECC-CDH_P-192_C0:KAS-ECC-CDH_P-192_C0-PUBLIC"
