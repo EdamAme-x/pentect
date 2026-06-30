@@ -636,6 +636,7 @@ fn looks_like_secret_value(
         || is_file_extension_literal(value, key_name)
         || is_protobuf_tag_literal(value, key_name)
         || is_key_algorithm_literal(value)
+        || is_status_code_constant_literal(value, key_name)
         || is_asn1_oid_der_literal(value, key_name, source_key)
         || is_crypto_test_vector_identifier_literal(value, key_name)
         || is_localized_ui_text_literal(value, key_name)
@@ -869,6 +870,34 @@ fn is_keyed_hex_secret_literal(value: &str, key_name: &str, kind: KeyKind) -> bo
         return false;
     }
     !is_synthetic_hex_test_vector_literal(value)
+}
+
+fn is_status_code_constant_literal(value: &str, key_name: &str) -> bool {
+    // Windows/COM error constants often include sensitive words in the public
+    // enum name (`STATUS_WRONG_PASSWORD = 0xC000006A`). A fixed-width numeric
+    // status/HRESULT value is not credential material. Keep this bound to
+    // well-known status-code prefixes so ordinary keyed hex secrets still flow
+    // through `is_keyed_hex_secret_literal`.
+    is_status_code_key_name(key_name) && is_c_style_hex_u32(value.trim())
+}
+
+fn is_status_code_key_name(key_name: &str) -> bool {
+    matches!(
+        key_name.split('_').next().unwrap_or_default(),
+        "status" | "error" | "hresult" | "nte" | "crypt"
+    ) || key_name.starts_with("sec_e_")
+        || key_name.starts_with("sec_i_")
+        || key_name.starts_with("trust_e_")
+        || key_name.starts_with("trust_s_")
+}
+
+fn is_c_style_hex_u32(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[0] == b'0'
+        && matches!(bytes[1], b'x' | b'X')
+        && bytes[2..].iter().all(u8::is_ascii_hexdigit)
+        && bytes[2..].iter().any(u8::is_ascii_digit)
 }
 
 fn is_hex_material_key_name(name: &str) -> bool {
@@ -3311,6 +3340,7 @@ mod tests {
         assert!(has(r#"password = "pass""#, "pass"));
         assert!(has(r#"password = "secret""#, "secret"));
         assert!(has(r#"password = "letmein123""#, "letmein123"));
+        assert!(has(r#"password = "0xC000006A""#, "0xC000006A"));
         assert!(has(r#"api_key="--real-secret-123""#, "--real-secret-123"));
         assert!(has(
             r#"private const string ApiKey = "abc12345";"#,
@@ -3570,6 +3600,10 @@ mod tests {
             r#"documentation: "<code>alias/aws/kinesis</code>""#,
             r#"TopologyKey: "k8s.io/zone""#,
             r#"private_key = "%[3]s""#,
+            "STATUS_WRONG_PASSWORD = 0xC000006A,",
+            "STATUS_NO_USER_SESSION_KEY = 0xC0000202,",
+            "SEC_E_INVALID_TOKEN = 0x80090308,",
+            "SEC_E_NO_CREDENTIALS = 0x8009030E,",
             r#"sb.append("DbPassword: ").append("***Sensitive Data Redacted***").append(",");"#,
             r#"sb.append("ApiKey: ").append(getApiKey()).append(",");"#,
             r#""fluentSetterDocumentation": "/**<p>Key: CreatedTime</p>""#,
