@@ -3,6 +3,7 @@ use super::benign::{
     is_localization_template_reference, is_non_secret_source_constant_value, is_placeholder_value,
     is_source_fixture_secret_value, is_source_secret_name_reference_value,
     is_structured_generic_key_metadata_value, is_synthetic_hex_test_vector_value,
+    normalize_identifier,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
@@ -10,6 +11,19 @@ use crate::normalize::NormalizedView;
 use data_encoding::BASE64;
 
 const MAX_KEY_CONTEXT_BYTES: usize = 72;
+const MAX_HEX_MATERIAL_BYTES: usize = 128;
+const MAX_PREFIXED_HEX_MATERIAL_BYTES: usize = 512;
+const HEX_MATERIAL_PREFIXES: &[&str] = &[
+    "hexkey",
+    "hexsecret",
+    "hexpass",
+    "hexpassword",
+    "hexpasswd",
+    "hexpwd",
+    "hextoken",
+    "hexcredential",
+    "hexsalt",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyKind {
@@ -171,6 +185,65 @@ fn scan_line(
 
         i += if matched { 2 } else { 1 };
     }
+
+    scan_prefixed_hex_materials(&mut ctx);
+}
+
+fn scan_prefixed_hex_materials(ctx: &mut ScanCtx<'_, '_, '_>) {
+    let line = &ctx.text[ctx.line_start..ctx.line_end];
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len() {
+        if !matches!(bytes[i], b'h' | b'H') || !is_hex_prefix_start_boundary(bytes, i) {
+            continue;
+        }
+        for prefix in HEX_MATERIAL_PREFIXES {
+            let prefix_end = i + prefix.len();
+            if prefix_end >= bytes.len()
+                || bytes.get(prefix_end) != Some(&b':')
+                || !ascii_bytes_eq_ignore_case(&bytes[i..prefix_end], prefix.as_bytes())
+            {
+                continue;
+            }
+            let material_start = prefix_end + 1;
+            let mut material_end = material_start;
+            while material_end < bytes.len() && bytes[material_end].is_ascii_hexdigit() {
+                material_end += 1;
+            }
+            if !is_hex_material_end_boundary(bytes, material_end) {
+                continue;
+            }
+            let material = &line[material_start..material_end];
+            if !is_explicit_hex_material(material, MAX_PREFIXED_HEX_MATERIAL_BYTES) {
+                continue;
+            }
+            ctx.out.push(Span {
+                range: ctx.view.to_raw(ByteRange::new(
+                    ctx.line_start + i,
+                    ctx.line_start + material_end,
+                )),
+                category: Category::Secret,
+                label: labels::KEYED_SECRET.to_string(),
+                confidence: Confidence::Medium,
+                source: DetectorId::KeyValue,
+            });
+        }
+    }
+}
+
+fn is_hex_prefix_start_boundary(bytes: &[u8], pos: usize) -> bool {
+    pos == 0 || !bytes[pos - 1].is_ascii_alphanumeric() && !matches!(bytes[pos - 1], b'_')
+}
+
+fn is_hex_material_end_boundary(bytes: &[u8], pos: usize) -> bool {
+    pos == bytes.len() || !bytes[pos].is_ascii_alphanumeric()
+}
+
+fn ascii_bytes_eq_ignore_case(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(l, r)| l.eq_ignore_ascii_case(r))
 }
 
 fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> bool {
@@ -253,7 +326,12 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
         return false;
     }
     if !value.quoted
-        && !is_prefixed_material_literal(raw_value, kind)
+        && !is_prefixed_material_literal(raw_value, &key_name, kind)
+        && !is_upper_env_compact_secret_identifier(
+            raw_value,
+            &key_name,
+            &ctx.text[ctx.line_start..left_end],
+        )
         && is_code_type_or_expression(raw_value, &key_name, kind)
     {
         return false;
@@ -413,7 +491,7 @@ fn is_key_context_delimiter(ch: char) -> bool {
 
 fn trim_key_edge(value: &str) -> &str {
     value.trim_matches(|ch: char| {
-        ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | '-' | '>' | '[' | ']')
+        ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | '-' | '>' | '[' | ']' | '#')
     })
 }
 
@@ -946,6 +1024,9 @@ fn looks_like_secret_value(
     if is_keyed_hex_secret_literal(value, key_name, kind) {
         return true;
     }
+    if !quoted && is_upper_env_compact_secret_identifier(value, key_name, source_key) {
+        return true;
+    }
 
     if matches!(kind, KeyKind::Token) && has_space {
         // Bearer/API/session token syntaxes are compact credentials. Values
@@ -960,7 +1041,8 @@ fn looks_like_secret_value(
         }
         return has_digit
             || has_symbol
-            || key_allows_low_entropy_literal(key_name, kind)
+            || (is_quoted_low_entropy_literal_shape(value)
+                && key_context_allows_low_entropy_literal(key_name, source_key, kind))
             || is_config_slot_low_entropy_literal(value, key_name, source_key);
     }
     if !quoted
@@ -1017,10 +1099,11 @@ fn looks_like_salt_material(value: &str, key_name: &str) -> bool {
     has_alpha && (has_digit || has_symbol)
 }
 
-fn is_prefixed_material_literal(value: &str, kind: KeyKind) -> bool {
+fn is_prefixed_material_literal(value: &str, key_name: &str, kind: KeyKind) -> bool {
     let value = value.trim();
     (matches!(kind, KeyKind::Salt) && value.starts_with("salt:"))
         || (matches!(kind, KeyKind::Nonce) && value.starts_with("nonce:"))
+        || is_prefixed_hex_secret_literal(value, key_name, kind)
 }
 
 fn looks_like_nonce_material(value: &str, key_name: &str) -> bool {
@@ -1257,21 +1340,60 @@ fn is_keyed_hex_secret_literal(value: &str, key_name: &str, kind: KeyKind) -> bo
     } else {
         16
     };
-    let bytes = value.trim().as_bytes();
-    if bytes.len() < min_len
-        || bytes.len() > 128
-        || !bytes.iter().all(|b| b.is_ascii_hexdigit())
-        || !bytes.iter().any(u8::is_ascii_digit)
-        || !bytes.iter().any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
-    {
+    let value = value.trim();
+    let prefixed = strip_hex_material_prefix(value);
+    let material = prefixed.unwrap_or(value);
+    let max_len = if prefixed.is_some() {
+        MAX_PREFIXED_HEX_MATERIAL_BYTES
+    } else {
+        MAX_HEX_MATERIAL_BYTES
+    };
+    if !is_explicit_hex_material_with_min(material, min_len, max_len) {
         return false;
     }
+    let bytes = material.as_bytes();
     let requires_even_hex =
         matches!(kind, KeyKind::EncodedHex) || !has_identifier_component(key_name, "secret");
     if requires_even_hex && !bytes.len().is_multiple_of(2) {
         return false;
     }
-    !is_synthetic_hex_test_vector_literal(value)
+    !is_synthetic_hex_test_vector_literal(material)
+}
+
+fn is_prefixed_hex_secret_literal(value: &str, key_name: &str, kind: KeyKind) -> bool {
+    let Some(material) = strip_hex_material_prefix(value) else {
+        return false;
+    };
+    is_keyed_hex_secret_literal(material, key_name, kind)
+}
+
+fn strip_hex_material_prefix(value: &str) -> Option<&str> {
+    let (prefix, material) = value.split_once(':')?;
+    if !is_hex_material_prefix(prefix.trim()) {
+        return None;
+    }
+    let material = material.trim();
+    (!material.is_empty()).then_some(material)
+}
+
+fn is_hex_material_prefix(prefix: &str) -> bool {
+    HEX_MATERIAL_PREFIXES
+        .iter()
+        .any(|known| prefix.eq_ignore_ascii_case(known))
+}
+
+fn is_explicit_hex_material(value: &str, max_len: usize) -> bool {
+    is_explicit_hex_material_with_min(value, 8, max_len)
+}
+
+fn is_explicit_hex_material_with_min(value: &str, min_len: usize, max_len: usize) -> bool {
+    let bytes = value.trim().as_bytes();
+    bytes.len() >= min_len
+        && bytes.len() <= max_len
+        && bytes.iter().all(|b| b.is_ascii_hexdigit())
+        && bytes.iter().any(u8::is_ascii_digit)
+        && bytes.iter().any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
+        && !is_synthetic_hex_test_vector_literal(value)
 }
 
 fn is_status_code_constant_literal(value: &str, key_name: &str) -> bool {
@@ -1386,6 +1508,10 @@ fn is_hex_material_key_name(name: &str) -> bool {
     name == "key"
         || has_identifier_component(name, "key")
         || has_identifier_component(name, "secret")
+        || has_identifier_component(name, "password")
+        || has_identifier_component(name, "passwd")
+        || has_identifier_component(name, "pwd")
+        || has_identifier_component(name, "pass")
         || has_identifier_component(name, "credential")
         || has_identifier_component(name, "private")
 }
@@ -1409,7 +1535,7 @@ fn is_hex_encoded_sensitive_component(component: &str) -> bool {
     };
     matches!(
         role,
-        "key" | "secret" | "salt" | "password" | "passwd" | "pwd" | "token" | "credential"
+        "key" | "secret" | "salt" | "pass" | "password" | "passwd" | "pwd" | "token" | "credential"
     )
 }
 
@@ -5106,6 +5232,68 @@ fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
         || name.ends_with("_passphrase")
 }
 
+fn key_context_allows_low_entropy_literal(key_name: &str, source_key: &str, kind: KeyKind) -> bool {
+    if key_allows_low_entropy_literal(key_name, kind)
+        || is_qualified_low_entropy_material_slot(key_name, kind)
+        || compact_key_context_allows_low_entropy_literal(key_name, kind)
+    {
+        return true;
+    }
+    let source_name = normalize_identifier(strip_assignment_comment_prefix(source_key));
+    !source_name.is_empty()
+        && source_name != key_name
+        && (key_allows_low_entropy_literal(&source_name, kind)
+            || is_qualified_low_entropy_material_slot(&source_name, kind)
+            || compact_key_context_allows_low_entropy_literal(&source_name, kind))
+}
+
+fn compact_key_context_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
+    let compact = name.replace('_', "");
+    if compact.len() < 4 {
+        return false;
+    }
+    if matches!(kind, KeyKind::Token) {
+        return matches!(
+            compact.as_str(),
+            "authorization"
+                | "authtoken"
+                | "accesstoken"
+                | "apitoken"
+                | "refreshtoken"
+                | "idtoken"
+                | "bearertoken"
+                | "sessiontoken"
+                | "token"
+        ) || compact.ends_with("token");
+    }
+    matches!(
+        compact.as_str(),
+        "apikey"
+            | "oauthkey"
+            | "accesskey"
+            | "accountkey"
+            | "clientsecret"
+            | "password"
+            | "passwd"
+            | "pwd"
+            | "passphrase"
+            | "secret"
+            | "signingsecret"
+            | "webhooksecret"
+            | "sharedsecret"
+            | "credential"
+    ) || compact.ends_with("password")
+        || compact.ends_with("passwd")
+        || compact.ends_with("passphrase")
+        || compact.ends_with("secret")
+        || compact.ends_with("credential")
+        || compact.ends_with("apikey")
+        || compact.ends_with("oauthkey")
+        || compact.ends_with("accesskey")
+        || compact.ends_with("accountkey")
+        || compact.ends_with("keypass")
+}
+
 fn is_config_slot_low_entropy_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // Env/config files often use service-qualified secret keys with deliberately
     // weak sample values: `SMTP_PASSWORD=abcdef` or
@@ -5159,6 +5347,11 @@ fn is_compact_alpha_literal(value: &str) -> bool {
     (5..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
+fn is_quoted_low_entropy_literal_shape(value: &str) -> bool {
+    let value = value.trim();
+    (4..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
 fn is_lowercase_compact_alpha_literal(value: &str) -> bool {
     let value = value.trim();
     (5..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_lowercase())
@@ -5181,6 +5374,7 @@ fn is_dotted_config_secret_key(source_key: &str, key_name: &str) -> bool {
 }
 
 fn is_upper_env_secret_key(source_key: &str) -> bool {
+    let source_key = strip_assignment_comment_prefix(source_key);
     let tokens = source_key.split_whitespace().collect::<Vec<_>>();
     if tokens.len() > 1
         && !tokens[..tokens.len() - 1]
@@ -5213,6 +5407,89 @@ fn is_upper_env_secret_key(source_key: &str) -> bool {
         || normalized.contains("passphrase")
         || normalized.contains("secret")
         || normalized.contains("credential")
+}
+
+fn is_upper_env_compact_secret_identifier(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Source identifiers and env payloads can both look like lowercase
+    // alphanumeric words. A shell/env assignment with an ALL_CAPS sensitive key
+    // is stronger local evidence than a source identifier reference, so recover
+    // long compact values here without widening ordinary `foo_secret = var123`.
+    if !is_compact_env_secret_material(value) || !is_upper_env_material_key(source_key, key_name) {
+        return false;
+    }
+    true
+}
+
+fn is_compact_env_secret_material(value: &str) -> bool {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    ((16..=96).contains(&bytes.len())
+        && bytes.iter().any(u8::is_ascii_lowercase)
+        && bytes.iter().any(u8::is_ascii_digit)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+        || ((16..=32).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_digit))
+}
+
+fn is_upper_env_material_key(source_key: &str, key_name: &str) -> bool {
+    let Some(candidate) = upper_env_key_candidate(source_key) else {
+        return false;
+    };
+    if !is_upper_env_identifier(candidate) {
+        return false;
+    }
+    let normalized = normalize_key(candidate);
+    if normalized.is_empty() || is_explicitly_non_sensitive_key(&normalized) {
+        return false;
+    }
+    is_upper_env_secret_key(source_key)
+        || matches!(
+            normalized.as_str(),
+            "key" | "api_key" | "apikey" | "access_key"
+        )
+        || normalized.ends_with("_key")
+        || normalized.contains("_key_")
+        || key_name.ends_with("_key")
+        || key_name.contains("_key_")
+}
+
+fn upper_env_key_candidate(source_key: &str) -> Option<&str> {
+    let source_key = strip_assignment_comment_prefix(source_key);
+    let tokens = source_key.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() > 1
+        && !tokens[..tokens.len() - 1]
+            .iter()
+            .any(|token| is_env_assignment_prefix(token))
+    {
+        return None;
+    }
+    let candidate = tokens
+        .last()
+        .copied()
+        .unwrap_or(source_key)
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    Some(candidate.strip_prefix("-e").unwrap_or(candidate).trim())
+}
+
+fn strip_assignment_comment_prefix(source_key: &str) -> &str {
+    let source_key = source_key.trim();
+    if let Some(rest) = source_key.strip_prefix('#') {
+        return rest.trim_start();
+    }
+    if let Some(rest) = source_key.strip_prefix("//") {
+        return rest.trim_start();
+    }
+    source_key
+}
+
+fn is_upper_env_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.iter().any(u8::is_ascii_alphabetic)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
 }
 
 fn is_env_assignment_prefix(token: &str) -> bool {
@@ -5455,6 +5732,31 @@ mod tests {
             "OVH_APPLICATION_SECRET=a0996701ccf106b90376bbead9a671140",
             "a0996701ccf106b90376bbead9a671140"
         ));
+        assert!(has(
+            "Ctrl.hexkey = hexkey:bea20b4e75a538b87d7cb48b23550e1be7946919db963f08",
+            "hexkey:bea20b4e75a538b87d7cb48b23550e1be7946919db963f08"
+        ));
+        assert!(has(
+            "Ctrl.hexsecret = hexsecret:ce84582f98ee04c6df3a6dff132c28e1ba9f16b8628ff0c0",
+            "hexsecret:ce84582f98ee04c6df3a6dff132c28e1ba9f16b8628ff0c0"
+        ));
+        assert!(has(
+            "Ctrl.hexpass = hexpass:88476859103f8069",
+            "hexpass:88476859103f8069"
+        ));
+        assert!(has(
+            "Ctrl.IKM = hexkey:af6b5b03b2ff84409ee3b1a8c608679bf7a27c21",
+            "hexkey:af6b5b03b2ff84409ee3b1a8c608679bf7a27c21"
+        ));
+        assert!(has(
+            "{ cmd => [qw{openssl kdf -keylen 16 -mac HMAC -digest SHA256 -kdfopt hexkey:d83a244d858166c3b26f63ce5ae6 -kdfopt hexinfo:348a37a27ef1282f5f020dcc -kdfopt hexsalt:1068463fbe30b63de48cfbec02eb3f38 SSKDF}]",
+            "hexkey:d83a244d858166c3b26f63ce5ae6"
+        ));
+        let long_hex_secret = "48af2ef18e60f281bd52efddd112714c41f20056e172cca2fb1e8adb375649f39753302e5c64bbacc8d3da0234b2db9f71a25e2e12d6236607b6b2b888f36de44f4a";
+        assert!(has(
+            &format!("Ctrl.hexsecret = hexsecret:{long_hex_secret}"),
+            &format!("hexsecret:{long_hex_secret}")
+        ));
         assert!(has("-kdfopt hexkey:f19b759b190126", "f19b759b190126"));
         assert!(has("Ctrl.hexsalt = hexsalt:2c86362d", "2c86362d"));
         assert!(has(r#"key: "abcDEF123456""#, "abcDEF123456"));
@@ -5557,6 +5859,28 @@ mod tests {
         assert!(has("dbPassword = \"hunter2\"", "hunter2"));
         assert!(has("SMTP_PASSWORD=dbynbelpgliq", "dbynbelpgliq"));
         assert!(has("GRAPHITE_PASS=rwwjfwpb", "rwwjfwpb"));
+        assert!(has(r#"APIPassword: "ocuegu""#, "ocuegu"));
+        assert!(has(r#"config.APIPassword = "khhuvfuy""#, "khhuvfuy"));
+        assert!(has(
+            r#"EnvClientSecret: "xitnwuihawkrefsbvrqldbqgpjojntrnxspwvhuzeedz""#,
+            "xitnwuihawkrefsbvrqldbqgpjojntrnxspwvhuzeedz"
+        ));
+        assert!(has(
+            "OVH_APPLICATION_KEY=6502241089672483",
+            "6502241089672483"
+        ));
+        assert!(has(
+            "# AUTH_GITHUB_ORG_CLIENT_SECRET=85k4p0i05w7k718rp2t2nu07x1s1p5i0xzhjk2860",
+            "85k4p0i05w7k718rp2t2nu07x1s1p5i0xzhjk2860"
+        ));
+        assert!(has(
+            "# GITHUB_ENTERPRISE_ORG_KEY=mdrzfpyodu7do894h296m5",
+            "mdrzfpyodu7do894h296m5"
+        ));
+        assert!(has(
+            "GITHUB_ENTERPRISE_ORG_SECRET=vyqyswzeoedeatllsv1edmnib86q31pj2362293497",
+            "vyqyswzeoedeatllsv1edmnib86q31pj2362293497"
+        ));
         assert!(has(r#"const string proxyPass = "czplsfj";"#, "czplsfj"));
         assert!(has(r#"prod.db.default.password="gecrpy""#, "gecrpy"));
         assert!(has(r#"APP_WEBHOOK_SECRET="abcdefghijkl""#, "abcdefghijkl"));
@@ -5603,6 +5927,9 @@ mod tests {
             "hotpink: 16738740,",
             "token_budget=30000",
             "public_token_label=docs",
+            "# password field docs",
+            "PUBLIC_KEY=abc1234567890123",
+            "PUBLIC_KEY=1234567890123456",
             "port=5432 workers=4 timeout_ms=30000 status=200",
             "compass=abcdef",
             "Authorization: Bearer docs",
@@ -5998,6 +6325,7 @@ mod tests {
             r#"canonical_field(&mut out, "key", key_hex);"#,
             r#"let session = unique_session("forged-heartbeat-key");"#,
             "hexkey=not-a-hex-123",
+            "Ctrl.hexinfo = hexinfo:348a37a27ef1282f5f020dcc",
             "PasswordCredentials: internal.PasswordCredentials{",
             "Key: jose.JSONWebKey{Key: j.privKey, KeyID: j.kid},",
             r#"{key:"linear",value:function(n){return n}},{key:"cubic",value:function(n){return n*n*n}}"#,

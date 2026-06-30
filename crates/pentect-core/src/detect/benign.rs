@@ -237,7 +237,115 @@ impl SourceSecretNameSet {
 /// ("redacted", "removed", "your_*", "value1"). They are not entropy shortcuts
 /// and do not suppress arbitrary low-entropy values.
 pub(crate) fn is_placeholder_value(value: &str) -> bool {
-    VALUE_MATCHER.matches(&normalize_identifier(value)) || is_documentation_value(value)
+    VALUE_MATCHER.matches(&normalize_identifier(value))
+        || is_documentation_value(value)
+        || is_compositional_placeholder_secret_name(value)
+        || is_repeated_marker_placeholder_value(value)
+}
+
+fn is_compositional_placeholder_secret_name(value: &str) -> bool {
+    // Placeholder secret names often describe the slot instead of carrying the
+    // credential: `my_api_key`, `some-password`, or `test-user-password`.
+    // Require an explicit placeholder owner plus a credential component so
+    // ordinary values such as `tenant-7-trial` and `secret1` still detect.
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let normalized = normalize_identifier(value);
+    let compact = normalized.replace('_', "");
+    if compact.starts_with("notareal")
+        && contains_any(
+            &compact,
+            &["password", "passwd", "secret", "token", "key", "credential"],
+        )
+    {
+        return true;
+    }
+
+    let parts = normalized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2
+        || !parts
+            .iter()
+            .any(|part| is_placeholder_secret_component(part))
+    {
+        return false;
+    }
+    let Some(first) = parts.first().copied() else {
+        return false;
+    };
+    is_placeholder_owner_component(first)
+        && parts
+            .iter()
+            .all(|part| is_placeholder_secret_name_component(part))
+}
+
+fn is_placeholder_owner_component(part: &str) -> bool {
+    matches!(
+        part,
+        "my" | "some" | "test" | "sample" | "fake" | "dummy" | "example" | "notareal"
+    )
+}
+
+fn is_placeholder_secret_component(part: &str) -> bool {
+    matches!(
+        part,
+        "password" | "passwd" | "pass" | "secret" | "token" | "key" | "credential"
+    )
+}
+
+fn is_placeholder_secret_name_component(part: &str) -> bool {
+    is_placeholder_owner_component(part)
+        || is_placeholder_secret_component(part)
+        || matches!(
+            part,
+            "api"
+                | "auth"
+                | "oauth"
+                | "access"
+                | "consumer"
+                | "client"
+                | "private"
+                | "public"
+                | "db"
+                | "database"
+                | "user"
+                | "value"
+                | "url"
+        )
+}
+
+fn is_repeated_marker_placeholder_value(value: &str) -> bool {
+    // Repeated marker payloads (`xxxx`, `AAAA/AAA=AAAA`) are fixture/doc
+    // sentinels. The whole value must be one repeated alphabetic marker plus
+    // harmless separators, so mixed or random-looking tokens remain visible.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !(4..=128).contains(&value.len()) {
+        return false;
+    }
+    let mut marker = None;
+    let mut marker_count = 0usize;
+    let mut separator_count = 0usize;
+    for byte in value.bytes() {
+        if byte.is_ascii_alphabetic() {
+            let normalized = byte.to_ascii_lowercase();
+            match marker {
+                Some(previous) if previous == normalized => {}
+                None => marker = Some(normalized),
+                _ => return false,
+            }
+            marker_count += 1;
+        } else if matches!(byte, b'-' | b'_' | b'.' | b'+' | b'/' | b'=') {
+            separator_count += 1;
+        } else {
+            return false;
+        }
+    }
+    marker_count >= 4 && (separator_count > 0 || marker_count == value.len())
 }
 
 /// True for key names that explicitly mark public/non-secret material.
@@ -807,6 +915,11 @@ mod tests {
         assert!(is_placeholder_value("s3krit-password"));
         assert!(!is_placeholder_value("s3krit-password2"));
         assert!(is_placeholder_value("t0k3n"));
+        assert!(is_placeholder_value("notarealpassword"));
+        assert!(is_placeholder_value("my_api_key"));
+        assert!(is_placeholder_value("some-password"));
+        assert!(is_placeholder_value("test-user-password"));
+        assert!(is_placeholder_value("AAAA/AAA=AAAAAAAA"));
         assert!(!is_placeholder_value("tenant-7-trial"));
         assert!(!is_placeholder_value(
             "https://example.org/path?token=abc123"
@@ -819,6 +932,8 @@ mod tests {
         assert!(!is_placeholder_value("Test Access Token"));
         assert!(!is_placeholder_value("PROD_SECRET"));
         assert!(!is_placeholder_value("OLD_LET_ME_IN-1"));
+        assert!(!is_placeholder_value("secret1"));
+        assert!(!is_placeholder_value("my-service-token-2026"));
     }
 
     #[test]

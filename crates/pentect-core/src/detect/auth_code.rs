@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use super::pattern::{PatternMatchDetector, PatternSpec};
 use super::validate::Validator;
 use super::Detector;
-use crate::model::{labels, Category, Confidence};
+use crate::model::{labels, Category, Confidence, Span};
 use crate::normalize::NormalizedView;
 
 #[derive(Clone, Default)]
@@ -17,13 +17,27 @@ impl Detector for AuthCodeDetector {
         AUTH_CODE_PATTERNS
             .detect(view)
             .into_iter()
-            .filter(|span| {
-                !is_header_name_only_otp_context(view.text(), span.range.start)
-                    && !is_git_file_mode_context(view.text(), span.range.start)
-                    && !is_json_numeric_metadata_context(view.text(), span.range.start)
-            })
+            .filter(|span| !is_non_otp_context(view, span))
             .collect()
     }
+}
+
+fn is_non_otp_context(view: &NormalizedView, span: &Span) -> bool {
+    let Some(norm) = view.to_norm(span.range) else {
+        return false;
+    };
+    if norm.start > view.text().len()
+        || norm.end > view.text().len()
+        || !view.text().is_char_boundary(norm.start)
+        || !view.text().is_char_boundary(norm.end)
+        || norm.start > norm.end
+    {
+        return false;
+    }
+    is_header_name_only_otp_context(view.text(), norm.start)
+        || is_git_file_mode_context(view.text(), norm.start)
+        || is_json_numeric_metadata_context(view.text(), norm.start)
+        || is_large_json_numeric_dump_context(view.text(), norm.start, norm.end)
 }
 
 fn is_header_name_only_otp_context(text: &str, value_start: usize) -> bool {
@@ -67,8 +81,37 @@ fn is_json_numeric_metadata_context(text: &str, value_start: usize) -> bool {
     let Some(normalized) = immediate_jsonish_key_before_value(text, value_start) else {
         return false;
     };
+    is_json_numeric_metadata_key(&normalized)
+}
+
+fn is_large_json_numeric_dump_context(text: &str, value_start: usize, value_end: usize) -> bool {
+    let value = &text[value_start..value_end];
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let line_start = text[..value_start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let line_end = text[value_end..]
+        .find('\n')
+        .map_or(text.len(), |offset| value_end + offset);
+    let line = &text[line_start..line_end];
+    if line.len() < 2048 || json_key_marker_count(line) < 16 {
+        return false;
+    }
+    let Some(key) = immediate_jsonish_key_before_value(text, value_start) else {
+        return false;
+    };
+    !is_otp_numeric_key(&key)
+}
+
+fn json_key_marker_count(line: &str) -> usize {
+    line.match_indices("\":").take(32).count()
+}
+
+fn is_json_numeric_metadata_key(normalized: &str) -> bool {
     matches!(
-        normalized.as_str(),
+        normalized,
         "id" | "node_id"
             | "size"
             | "count"
@@ -83,6 +126,24 @@ fn is_json_numeric_metadata_context(text: &str, value_start: usize) -> bool {
             | "changes"
     ) || normalized.ends_with("_id")
         || normalized.ends_with("_count")
+}
+
+fn is_otp_numeric_key(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "otp"
+            | "totp"
+            | "mfa"
+            | "2fa"
+            | "passcode"
+            | "verification_code"
+            | "security_code"
+            | "login_code"
+            | "signin_code"
+            | "sign_in_code"
+            | "one_time_code"
+            | "one_time_password"
+    )
 }
 
 fn immediate_jsonish_key_before_value(text: &str, value_start: usize) -> Option<String> {
@@ -238,6 +299,10 @@ mod tests {
         )
         .is_empty());
         assert!(values_for(
+            r#"[{"type":"DeleteEvent","actor":{"id":327146,"login":"octo"},"avatar_url":"https://example.test/a?d=https%3A%2F%2Fassets.example.test%2Fuser.png"},{"type":"DeleteEvent","actor":{"id":327146,"login":"octo"}}]"#
+        )
+        .is_empty());
+        assert!(values_for(
             r#"{"headers":"X-GitHub-OTP, Accept-Encoding","content":"{\"actor\":{\"id\":327146,\"login\":\"octo\"}}"}"#
         )
         .is_empty());
@@ -251,6 +316,10 @@ mod tests {
         .is_empty());
         assert!(has_value(
             r#"{"headers":"X-GitHub-OTP","id":123,"otp":327146}"#,
+            "327146"
+        ));
+        assert!(has_value(
+            r#"{"url":"https%3A%2F%2Fexample.test","otp":327146,"login":"octo"}"#,
             "327146"
         ));
         assert!(!has_value(

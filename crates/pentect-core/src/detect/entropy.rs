@@ -802,8 +802,16 @@ fn is_uuid_segment(segment: &str) -> bool {
 
 fn is_source_identifier_like(run: &str, text: &str, start: usize, end: usize) -> bool {
     is_source_identifier_shape(run)
+        || is_operator_adjacent_source_identifier(run, text, start, end)
         || (pascal_or_camel_identifier_like(run.as_bytes())
             && source_identifier_context(text, start, end))
+}
+
+fn is_operator_adjacent_source_identifier(run: &str, text: &str, start: usize, end: usize) -> bool {
+    let trimmed = run.trim_end_matches('+');
+    trimmed.len() + 1 == run.len()
+        && is_source_identifier_shape(trimmed)
+        && source_identifier_context(text, start, end)
 }
 
 fn is_source_identifier_shape(run: &str) -> bool {
@@ -888,8 +896,18 @@ fn source_identifier_context(text: &str, start: usize, end: usize) -> bool {
         || before.ends_with("new")
         || before.ends_with(':')
         || before.ends_with("::")
+        || before.ends_with('.')
         || before.ends_with('<')
         || after.starts_with(['(', '<', ':', ';', ',', '{', '=', '>'])
+        || (after.starts_with('.') && source_identifier_member_access_context(before))
+}
+
+fn source_identifier_member_access_context(before: &str) -> bool {
+    before.is_empty()
+        || before
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '(' | '[' | '{' | '=' | ',' | ';' | '<' | '>'))
 }
 
 fn is_uppercase_constant_identifier(run: &str) -> bool {
@@ -1190,6 +1208,8 @@ mod tests {
             "horizontalHuggingPriority=",
             "OBJ_X9_62_id_ecPublicKey=",
             "type X509Certificate2Collection;",
+            "PermissionsV2EndToEndTestHelper.setPassword(mockMvc, credentialName, passwordValue);",
+            r#""Cannot use '"+this._nativeEventEmitterName+"' module""#,
             "HTTP/HTTP_1_0/SOCKS4/SOCKS4a/SOCKS5/SOCKS5_HOSTNAME",
             "defaultChecked/defaultSelected",
             "addEventListener/attachEvent",
