@@ -790,6 +790,7 @@ fn looks_like_secret_value(
         || is_escaped_control_placeholder_literal(value, key_name)
         || is_escaped_plain_source_line_literal(value, source_key)
         || is_escaped_source_payload_fragment_literal(value, source_key)
+        || is_documented_env_var_name_literal(value, key_name, source_key)
         || is_source_env_fallback_name_literal(value, key_name, source_key)
         || is_source_constant_reference_literal(value, key_name, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
@@ -923,6 +924,12 @@ fn is_benign_literal(value: &str) -> bool {
     if is_placeholder_value(value) {
         return true;
     }
+    if is_repeated_placeholder_literal(value) {
+        return true;
+    }
+    if is_nil_uuid_literal(value) {
+        return true;
+    }
     if is_escaped_null_literal(value) {
         return true;
     }
@@ -937,6 +944,38 @@ fn is_benign_literal(value: &str) -> bool {
         normalized.as_str(),
         "" | "true" | "false" | "null" | "none" | "nil" | "undefined"
     )
+}
+
+fn is_repeated_placeholder_literal(value: &str) -> bool {
+    // Example configs commonly use `xxxx`, `x-xxxx`, or an all-x UUID-shaped
+    // string to show where the reader should paste a secret. The repeated
+    // marker itself is not credential material; require every non-separator
+    // byte to be the placeholder marker so real mixed tokens still detect.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !(4..=128).contains(&value.len()) {
+        return false;
+    }
+    let mut marker_count = 0usize;
+    let mut separator_count = 0usize;
+    for byte in value.bytes() {
+        match byte {
+            b'x' | b'X' => marker_count += 1,
+            b'-' | b'_' | b'.' => separator_count += 1,
+            _ => return false,
+        }
+    }
+    marker_count >= 4 && (separator_count > 0 || marker_count == value.len())
+}
+
+fn is_nil_uuid_literal(value: &str) -> bool {
+    // RFC 4122 defines the all-zero UUID as the nil UUID. It is a sentinel or
+    // placeholder value, not an issued token.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    is_uuid_literal(value) && value.bytes().all(|byte| byte == b'0' || byte == b'-')
 }
 
 fn is_escaped_null_literal(value: &str) -> bool {
@@ -2900,6 +2939,39 @@ fn is_payload_fragment_head(head: &str) -> bool {
         || is_uppercase_identifier_constant(head)
 }
 
+fn is_documented_env_var_name_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Documentation often says "credentials are passed in environment variable:
+    // FOO_API_KEY". The captured RHS is the public variable name, not the secret
+    // value. Require explicit env-var prose on the left plus an ALL_CAPS
+    // identifier-shaped RHS so ordinary config assignments keep detecting.
+    let source = source_key.to_ascii_lowercase();
+    if !(source.contains("environment variable")
+        || source.contains("environment variables")
+        || source.contains("env var")
+        || source.contains("env vars"))
+    {
+        return false;
+    }
+    if !(key_name_has_sensitive_component(key_name)
+        || key_name_indicates_sensitive_material(key_name)
+        || source.contains("credential")
+        || source.contains("credentials"))
+    {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '<' | '>'))
+        .trim_end_matches(['.', ',', ';', ':', ')', ']']);
+    if !is_uppercase_public_doc_identifier(value) {
+        return false;
+    }
+    let normalized = normalize_key(value);
+    normalized
+        .split('_')
+        .any(|part| is_sensitive_setting_name_component(part) || matches!(part, "user" | "name"))
+}
+
 fn is_source_env_fallback_name_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // Source config commonly falls back from an environment lookup to the public
     // setting name (`clientSecret: process.env.FOO_SECRET || "APP_SECRET"`).
@@ -3173,8 +3245,12 @@ fn is_source_variable_reference_literal(
     if is_dotted_config_secret_key(source_key, key_name) {
         return false;
     }
-    if is_variable_reference_literal(value.trim()) {
-        return source_key_has_code_shape(source_key);
+    if is_variable_reference_literal(value.trim())
+        || is_namespaced_variable_reference_literal(value.trim())
+    {
+        return source_key_has_code_shape(source_key)
+            || key_name_has_sensitive_component(key_name)
+            || key_name_indicates_sensitive_material(key_name);
     }
     !quoted
         && source_key_has_reference_shape(source_key)
@@ -3209,6 +3285,31 @@ fn is_variable_reference_literal(value: &str) -> bool {
         && value.split('.').all(is_simple_code_reference_name)
         && value.bytes().any(|b| b.is_ascii_lowercase())
         && !value.bytes().any(|b| b.is_ascii_digit())
+}
+
+fn is_namespaced_variable_reference_literal(value: &str) -> bool {
+    let value = value.trim_end_matches('\\').trim_matches('"');
+    if !(5..=96).contains(&value.len()) {
+        return false;
+    }
+    let Some(rest) = value.strip_prefix('$') else {
+        return false;
+    };
+    let mut parts = rest.split("::");
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let mut count = 1usize;
+    if !is_simple_code_reference_name(first) {
+        return false;
+    }
+    for part in parts {
+        count += 1;
+        if !is_simple_code_reference_name(part) {
+            return false;
+        }
+    }
+    count >= 2
 }
 
 fn is_plain_source_identifier_reference(value: &str) -> bool {
@@ -3597,6 +3698,8 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
         || is_html_attribute_binding_fragment(value)
         || is_unary_member_access_fragment(value)
         || is_uppercase_suffix_fragment(value)
+        || is_concatenation_tail_fragment(value)
+        || is_assembly_register_or_address_fragment(value)
         || value
             .strip_prefix('+')
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
@@ -3782,6 +3885,57 @@ fn is_uppercase_suffix_fragment(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn is_concatenation_tail_fragment(value: &str) -> bool {
+    // A key/value parser can split source concatenation such as
+    // `key+"="+val` or `field+Operator+" "` at the embedded `=`. Suppress only
+    // dangling source-expression tails, not complete mixed secret strings.
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('+') {
+        let rest = rest.trim_end_matches([')', ';', ',']);
+        return is_plain_source_identifier_reference(rest);
+    }
+    if !value.ends_with('+') || value.matches('+').count() < 2 {
+        return false;
+    }
+    let body = value.trim_end_matches('+');
+    let mut has_source_signal = false;
+    let mut part_count = 0usize;
+    for part in body.split('+') {
+        part_count += 1;
+        let part = part.trim();
+        if part == r#"" ""# || part == "''" || part == "\"\"" {
+            has_source_signal = true;
+            continue;
+        }
+        if part.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            has_source_signal = true;
+        }
+        if !is_plain_source_identifier_reference(part) {
+            return false;
+        }
+    }
+    part_count >= 2 && has_source_signal
+}
+
+fn is_assembly_register_or_address_fragment(value: &str) -> bool {
+    // Assembly templates and generated compiler tests include register names
+    // and stack-address fragments in key-like rows. These are machine operands,
+    // not credential material.
+    let value = value.trim();
+    if let Some(register) = value.strip_prefix('%') {
+        return (2..=5).contains(&register.len())
+            && register.bytes().any(|byte| byte.is_ascii_digit())
+            && register.bytes().all(|b| b.is_ascii_alphanumeric());
+    }
+    let Some(offset) = value
+        .strip_suffix("(%rsp)")
+        .or_else(|| value.strip_suffix("(%rbp)"))
+    else {
+        return false;
+    };
+    (1..=5).contains(&offset.len()) && offset.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn is_arithmetic_expression_literal(value: &str) -> bool {
@@ -4086,10 +4240,19 @@ fn key_name_indicates_secret_metadata(key_name: &str) -> bool {
         || has_identifier_phrase(key_name, &["secret", "reference"])
         || has_identifier_phrase(key_name, &["cert", "secret", "name"])
         || has_identifier_phrase(key_name, &["certificate", "secret", "name"])
+        || is_provisioner_secret_resource_key(key_name)
         || matches!(
             key_name,
             "secretname" | "secretnamespace" | "secrettype" | "secretref" | "secretreference"
         )
+}
+
+fn is_provisioner_secret_resource_key(key_name: &str) -> bool {
+    // Storage provisioner config frequently uses fields like
+    // `rbd_provisioner_user_secret` to point at a Kubernetes Secret object. The
+    // key shape says "secret resource name"; actual secret material fields
+    // such as `client_secret` do not include the provisioner component.
+    has_identifier_component(key_name, "provisioner") && key_name.ends_with("_secret")
 }
 
 fn is_resource_name_literal(value: &str) -> bool {
@@ -4895,6 +5058,21 @@ mod tests {
             "gss_buffer_desc token = GSS_C_EMPTY_BUFFER;",
             "gss_buffer_desc* gss_token = GSS_C_NO_BUFFER;",
             "module_ctx->module_pwdump_column = MODULE_DEFAULT;",
+            r#"CONSTELLIX_SECRET_KEY=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"#,
+            r#"DESEC_TOKEN=x-xxxxxxxxxxxxxxxxxxxxxxxxxx"#,
+            r#"PORKBUN_SECRET_API_KEY=xxxxxx"#,
+            r#"token: "00000000-0000-0000-0000-000000000000""#,
+            r#"RFC2136_TSIG_KEY="$keyname""#,
+            r#"key = $insta::newkey # insta.priv.pem"#,
+            r#"secret = $insta::secret"#,
+            r#"// Credentials must be passed in the environment variable: ARVANCLOUD_API_KEY."#,
+            r#"// Credentials must be passed in the environment variables: OTC_USER_NAME"#,
+            r#"rbd_provisioner_secret: ceph-key-admin"#,
+            r#"rbd_provisioner_user_secret: ceph-key-user"#,
+            r#"key=field+Operator+" "+key;"#,
+            r#"*e = append(*e, key+"="+val)"#,
+            r#"Token = "%r14""#,
+            r#"Token = "0(%rsp)""#,
             r#"TRACE(PREFIX_I "Key %i missing:", i);"#,
             r#""Git could not get credentials: " + gitCredentialOutput.Errors,"#,
             r#"uint KeyLength=128+L*64;"#,
