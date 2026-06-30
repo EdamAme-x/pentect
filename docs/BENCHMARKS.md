@@ -130,6 +130,10 @@ token names stay negative.
 Standalone RFC 7617 `Basic <token68>` values use the same decoder validator as
 contexted Authorization headers, so YAML/JSON header values are caught while
 prose and values that do not decode to `user:password` stay negative.
+Generic RFC 3986-style `scheme://userinfo@host` credentials are detected for
+non-HTTP URI schemes without broadening endpoint masking. The generic fallback
+requires token-as-username shape or extra password material signal, so weak
+fixture forms such as `nats://user:pass@localhost` do not inflate recall.
 
 ```text
 CredData commit: 9a55c40
@@ -138,16 +142,16 @@ Rows: 66898
 Files: 10865
 True rows: 15104
 False rows: 51794
-TP: 10364
-FP: 6704
-FN: 4740
+TP: 10450
+FP: 6726
+FN: 4654
 Line only: 227
-Unlabeled: 54129
+Unlabeled: 54140
 Missing files: 0
-Precision: 0.607
-Recall: 0.686
-F1: 0.644
-Elapsed: 28381 ms
+Precision: 0.608
+Recall: 0.692
+F1: 0.647
+Elapsed: 27861 ms
 ```
 
 Weak groups:
@@ -158,7 +162,7 @@ Weak groups:
 - `LIKELY_SECRET`: broad entropy recall still catches source identifiers and opaque non-secret blobs.
 - Plaintext GitHub API captures now suppress Base64 `node_id` metadata after validating the decoded `type:id` shape; arbitrary Base64 secrets still fire.
 - Public key material is suppressed only when the public role is structurally visible: OpenSSH key prefixes, RFC 7468 public/certificate armor, or `public_key`-style field names. Private-key contexts still fire.
-- `URL_CREDENTIAL`: now keeps token-as-username recall; documentation hosts are suppressed only for RFC-reserved examples.
+- `URL_CREDENTIAL`: now keeps token-as-username recall and non-HTTP URI userinfo recall; documentation hosts are suppressed only for RFC-reserved examples.
 - RFC 2606/6761 domains, RFC 5737 IPv4 ranges, and RFC 3849/9637 IPv6 ranges are shared by URL and placeholder suppression so sample hosts do not need ad hoc literals.
 - Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.
 - Generic JSON `"key"` values that are identifier names such as `smtpDomain`, `Authorization`, or `grant_type` are treated as metadata; digit/symbol-bearing key material and sensitive single words still fire.
@@ -175,7 +179,7 @@ Weak groups:
 - JWT rule matching is compact-serialization bounded: three-segment JWTs still fire, while five-segment JWEs are not partially captured as JWTs.
 - JWK handling follows RFC 7517/7518 member roles: public key IDs/coordinates are suppressed as metadata, but private/symmetric members are treated as secret-bearing values.
 - Bearer token handling follows RFC 6750 auth-scheme structure: standalone `Bearer <opaque>` values are detected only when a compact token validator confirms material shape and rejects placeholders.
-- URI userinfo template suppression is marker-gated: bracket/brace/angle and literal `*` redactions are skipped, while concrete `user:password@host` connection strings still fire.
+- URI userinfo template suppression is marker-gated: bracket/brace/angle and literal `*` redactions are skipped, while concrete HTTP/DB `user:password@host` connection strings still fire. Generic non-HTTP URI userinfo is fallback-gated by token username shape or password material signal to avoid broad weak fixture pairs.
 - JSON-escaped HTML/source snippets are suppressed only when escaped markup/source syntax proves the captured value is a parser fragment; compact credential-shaped examples still fire.
 - Localized UI password/token prose is suppressed only when the key name also carries UI text context such as label/error/invalid/message; ordinary `password = "..."` and compact credential values still fire.
 - Generated documentation fragments and Go struct tag values are syntax-gated: HTML doc fragments require documentation/HTML on the left side, and struct tags require backtick-delimited `key` metadata.
