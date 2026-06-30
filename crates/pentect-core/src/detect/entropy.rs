@@ -1,4 +1,4 @@
-use super::benign::is_structured_metadata_key;
+use super::benign::{is_crypto_test_vector_identifier_value, is_structured_metadata_key};
 use super::util::token_runs;
 use super::Detector;
 use crate::model::*;
@@ -90,6 +90,7 @@ impl EntropyDetector {
         }
         if is_structured_metadata_value(text, start, &view.region.ctx, run)
             || is_encoded_public_metadata_value(run)
+            || is_crypto_test_vector_identifier_value(run)
             || is_public_key_context(text, start, &view.region.ctx)
         {
             return;
@@ -756,6 +757,19 @@ mod tests {
             "core detectors/policy/rendering pipeline",
             "const BECH32_CHARSET: &[u8] = b\"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";",
             "const CTRL: &[u8] = b\"023456789acdefghjklmnpqrstuvwxyz\";",
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn crypto_test_vector_ids_are_not_entropy_candidates() {
+        for raw in [
+            "KAS-ECC-CDH_P-192_C0-Peer-PUBLIC",
+            "ALICE_cf_brainpoolP160r1_PUB",
+            "ED25519-1-PUBLIC-Raw",
         ] {
             let reg = region(raw);
             let v = NormalizedView::build(&reg, raw);

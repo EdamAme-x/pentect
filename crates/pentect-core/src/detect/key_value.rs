@@ -1,7 +1,8 @@
 use super::benign::{
-    is_explicitly_non_sensitive_key_name, is_localization_template_reference,
-    is_non_secret_source_constant_value, is_placeholder_value, is_source_fixture_secret_value,
-    is_source_secret_name_reference_value, is_structured_generic_key_metadata_value,
+    is_crypto_test_vector_identifier_value, is_explicitly_non_sensitive_key_name,
+    is_localization_template_reference, is_non_secret_source_constant_value, is_placeholder_value,
+    is_source_fixture_secret_value, is_source_secret_name_reference_value,
+    is_structured_generic_key_metadata_value,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
@@ -615,6 +616,7 @@ fn looks_like_secret_value(
         || is_file_extension_literal(value, key_name)
         || is_protobuf_tag_literal(value, key_name)
         || is_key_algorithm_literal(value)
+        || is_crypto_test_vector_identifier_literal(value, key_name)
         || is_html_code_metadata_literal(value)
         || is_fingerprint_literal(value, key_name)
         || is_source_constant_reference_literal(value, source_key)
@@ -1405,6 +1407,19 @@ fn is_key_algorithm_literal(value: &str) -> bool {
         return false;
     };
     (128..=16384).contains(&bits)
+}
+
+fn is_crypto_test_vector_identifier_literal(value: &str, key_name: &str) -> bool {
+    // Published crypto test-vector files often put named test-case handles in
+    // fields named `PrivateKey`, `PeerKey`, or `PrivPubKeyPair`. Values such as
+    // `KAS-ECC-CDH_P-192_C0` and `ALICE_secp112r1_PUB` identify curve/test-case
+    // records; they are not the private scalar or public-key bytes. Keep this
+    // anchored to key-material fields and known curve/test-vector syntax so
+    // operational handles such as `private_key=tenant-7-trial` still detect.
+    if !has_identifier_component(key_name, "key") {
+        return false;
+    }
+    is_crypto_test_vector_identifier_value(value)
 }
 
 fn is_html_code_metadata_literal(value: &str) -> bool {
@@ -2438,6 +2453,11 @@ mod tests {
             "<code>sk-test-token</code>"
         ));
         assert!(has(r#"password = "abc%[3]s""#, "abc%[3]s"));
+        assert!(has(r#"private_key = "tenant-7-trial""#, "tenant-7-trial"));
+        assert!(has(
+            r#"private_key = "ALICE_prod_key_2026""#,
+            "ALICE_prod_key_2026"
+        ));
     }
 
     #[test]
@@ -2457,6 +2477,12 @@ mod tests {
             r#"Level map[uint32]string `protobuf_key:"varint,1,opt,name=key,proto3"`"#,
             r#"PrivateKey = RSA-2048"#,
             r#"Key = RSA-2048"#,
+            r#"PrivateKey=KAS-ECC-CDH_P-192_C0"#,
+            r#"PrivPubKeyPair = KAS-ECC-CDH_P-192_C0:KAS-ECC-CDH_P-192_C0-PUBLIC"#,
+            r#"PeerKey=ALICE_secp112r1_PUB"#,
+            r#"PrivateKey=BOB_cf_brainpoolP160r1"#,
+            r#"PrivPubKeyPair = Alice-25519:Alice-25519-PUBLIC"#,
+            r#"PeerKey=ED25519-1-PUBLIC-Raw"#,
             r#"Authorization algorithm = "AWS4-HMAC-SHA256""#,
             r#"documentation: "<code>12345678-1234-1234-1234-123456789012</code>""#,
             r#"documentation: "<code>alias/aws/kinesis</code>""#,

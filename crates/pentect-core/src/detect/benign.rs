@@ -295,6 +295,117 @@ pub(crate) fn is_source_fixture_secret_value(key_name: &str, value: &str) -> boo
     SOURCE_FIXTURE_SECRET_MATCHER.matches(key_name, value)
 }
 
+/// True for public cryptographic test-vector identifiers, not key material.
+///
+/// Rationale: NIST/SEC-style test vectors often label cases with values such as
+/// `KAS-ECC-CDH_P-192_C0`, `ALICE_secp112r1_PUB`, and `ED25519-1-PUBLIC`.
+/// Those strings name a curve/test-case record; the actual private scalar or
+/// public point appears elsewhere as bytes. The accepted syntax is deliberately
+/// tied to known test-vector prefixes and named-curve families, so operational
+/// names like `tenant-7-trial` and `ALICE_prod_key_2026` remain detectable.
+pub(crate) fn is_crypto_test_vector_identifier_value(value: &str) -> bool {
+    let value = value.trim();
+    let mut parts = value.split(':');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(second) = parts.next() else {
+        return is_crypto_test_vector_identifier_part(first);
+    };
+    parts.next().is_none()
+        && is_crypto_test_vector_identifier_part(first)
+        && is_crypto_test_vector_identifier_part(second)
+}
+
+fn is_crypto_test_vector_identifier_part(value: &str) -> bool {
+    let value = value.trim();
+    if !(6..=96).contains(&value.len())
+        || value.contains("://")
+        || value
+            .bytes()
+            .any(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    let base = strip_crypto_test_vector_public_suffix(value);
+    is_nist_kas_ecc_test_case_id(base)
+        || is_role_named_curve_test_case_id(base)
+        || is_edwards_test_case_id(base)
+}
+
+fn strip_crypto_test_vector_public_suffix(value: &str) -> &str {
+    for suffix in [
+        "-Peer-PUBLIC",
+        "-peer-public",
+        "-PUBLIC-Raw",
+        "-public-raw",
+        "-PUBLIC",
+        "-public",
+        "_PUB",
+        "_pub",
+        "-Raw",
+        "-raw",
+    ] {
+        if let Some(base) = value.strip_suffix(suffix) {
+            return base;
+        }
+    }
+    value
+}
+
+fn is_nist_kas_ecc_test_case_id(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    let Some(rest) = upper.strip_prefix("KAS-ECC-") else {
+        return false;
+    };
+    let Some((family, case)) = rest.rsplit_once("_C") else {
+        return false;
+    };
+    !family.is_empty()
+        && family.contains("_P-")
+        && !case.is_empty()
+        && case.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_role_named_curve_test_case_id(value: &str) -> bool {
+    for prefix in ["ALICE_", "BOB_", "MALICE_", "Alice-", "Bob-", "Malice-"] {
+        let Some(rest) = value.strip_prefix(prefix) else {
+            continue;
+        };
+        let rest = rest.strip_prefix("cf_").unwrap_or(rest);
+        return is_named_curve_test_case_suffix(rest);
+    }
+    false
+}
+
+fn is_named_curve_test_case_suffix(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let known_prefix = [
+        "secp",
+        "sect",
+        "prime",
+        "c2pnb",
+        "c2tnb",
+        "brainpoolp",
+        "wap-wsg-idm-ecid-wtls",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+    (known_prefix || lower == "25519" || lower == "448")
+        && lower.bytes().any(|b| b.is_ascii_digit())
+}
+
+fn is_edwards_test_case_id(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(case) = lower
+        .strip_prefix("ed25519-")
+        .or_else(|| lower.strip_prefix("ed448-"))
+    else {
+        return false;
+    };
+    !case.is_empty() && case.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// True when a generic JSON `"key"` value names another field/config key.
 ///
 /// Rationale: many JSON schemas use objects like `{ "key": "smtpUser" }`.
@@ -538,6 +649,35 @@ mod tests {
         assert!(!is_source_fixture_secret_value(
             "expectedPassword",
             "hunter2"
+        ));
+    }
+
+    #[test]
+    fn crypto_test_vector_identifiers_are_shape_gated() {
+        assert!(is_crypto_test_vector_identifier_value(
+            "KAS-ECC-CDH_P-192_C0"
+        ));
+        assert!(is_crypto_test_vector_identifier_value(
+            "KAS-ECC-CDH_P-192_C0:KAS-ECC-CDH_P-192_C0-PUBLIC"
+        ));
+        assert!(is_crypto_test_vector_identifier_value(
+            "ALICE_secp112r1_PUB"
+        ));
+        assert!(is_crypto_test_vector_identifier_value(
+            "BOB_cf_brainpoolP160r1"
+        ));
+        assert!(is_crypto_test_vector_identifier_value(
+            "Alice-25519:Alice-25519-PUBLIC"
+        ));
+        assert!(is_crypto_test_vector_identifier_value(
+            "ED25519-1-PUBLIC-Raw"
+        ));
+        assert!(!is_crypto_test_vector_identifier_value("tenant-7-trial"));
+        assert!(!is_crypto_test_vector_identifier_value(
+            "ALICE_prod_key_2026"
+        ));
+        assert!(!is_crypto_test_vector_identifier_value(
+            "KAS-ECC-CDH_P-192_SECRET"
         ));
     }
 
