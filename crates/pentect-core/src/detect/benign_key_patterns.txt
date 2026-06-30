@@ -13,6 +13,7 @@ exact:notsecret
 exact:not_secret
 exact:public
 exact:correlation_key
+exact:topology_key
 prefix:public_
 suffix:_public
 suffix:_key_name

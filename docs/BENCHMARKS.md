@@ -86,7 +86,10 @@ credential-bearing. Generic `"key"` values now include common public field names
 such as `token`, `code`, `signature`, and `unknown` as metadata-only names.
 Generic `"key"` metadata also covers common public schema/tag names,
 human-readable tag labels, and file-name references while preserving
-credential-shaped values such as `sk-test-token`.
+credential-shaped values such as `sk-test-token`. Keyed detection also treats
+AWS SigV4's `AWS4-HMAC-SHA256` as a public algorithm identifier, suppresses
+documentation `<code>` samples only when the code value is a UUID or non-secret
+resource name, and treats Kubernetes `TopologyKey` as public topology metadata.
 
 ```text
 CredData commit: 9a55c40
@@ -96,15 +99,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 10975
+FP: 10499
 FN: 4828
 Line only: 227
-Unlabeled: 60227
+Unlabeled: 60096
 Missing files: 0
-Precision: 0.484
+Precision: 0.495
 Recall: 0.680
-F1: 0.565
-Elapsed: 27556 ms
+F1: 0.573
+Elapsed: 29268 ms
 ```
 
 Weak groups:
@@ -120,6 +123,7 @@ Weak groups:
 - Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.
 - Generic JSON `"key"` values that are identifier names such as `smtpDomain`, `Authorization`, or `grant_type` are treated as metadata; digit/symbol-bearing key material and sensitive single words still fire.
 - Generic `"key"` metadata also suppresses public schema/tag names such as `offset`, `host`, `cost-center`, display labels such as `Dev Gateway Region`, and file references such as `HappyFace.jpg`; credential-shaped values such as `sk-test-token` still fire.
+- Protocol/documentation metadata suppression is shape-gated: AWS SigV4 algorithm labels, Kubernetes `TopologyKey` values, and HTML `<code>` UUID/resource-name samples are skipped, but credential-shaped code samples still fire.
 - Code/reference literals under sensitive-looking keys are suppressed only when syntax proves they are not values: PascalCase type annotations require a code delimiter, and env lookups require explicit Jinja/Ansible `lookup('env', ...)` shape.
 - Additional source/metadata literals are shape-gated: protobuf tag descriptors require `protobuf_key` context, key algorithm labels require known algorithm-size syntax, fingerprints require explicit fingerprint keys and colon-hex shape, and command/mock fragments require invocation syntax.
 - Generic `key` code-member names and parser-cut source fragments are suppressed only when source syntax proves they are metadata, keeping concrete key material under `api_key`/`client_secret` unaffected.

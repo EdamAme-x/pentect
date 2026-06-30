@@ -455,6 +455,7 @@ mod tests {
         assert!(is_explicitly_non_sensitive_key_name("publicKeyToken"));
         assert!(is_explicitly_non_sensitive_key_name("non_secret"));
         assert!(is_explicitly_non_sensitive_key_name("correlationKey"));
+        assert!(is_explicitly_non_sensitive_key_name("TopologyKey"));
         assert!(is_explicitly_non_sensitive_key_name("apiKeyName"));
         assert!(is_explicitly_non_sensitive_key_name(
             "PasswordStoreDirEnvar"

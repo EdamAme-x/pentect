@@ -615,6 +615,7 @@ fn looks_like_secret_value(
         || is_file_extension_literal(value, key_name)
         || is_protobuf_tag_literal(value, key_name)
         || is_key_algorithm_literal(value)
+        || is_html_code_metadata_literal(value)
         || is_fingerprint_literal(value, key_name)
         || is_source_constant_reference_literal(value, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
@@ -1349,6 +1350,11 @@ fn is_key_algorithm_literal(value: &str) -> bool {
     // Algorithm/size labels such as `RSA-2048` describe how a key should be
     // generated or interpreted. They are not the private/public key bytes.
     let value = value.trim();
+    if value.eq_ignore_ascii_case("AWS4-HMAC-SHA256") {
+        // AWS Signature Version 4's signing algorithm identifier is public
+        // protocol metadata, not the HMAC signing key.
+        return true;
+    }
     let Some((algorithm, bits)) = value.split_once('-') else {
         return false;
     };
@@ -1362,6 +1368,42 @@ fn is_key_algorithm_literal(value: &str) -> bool {
         return false;
     };
     (128..=16384).contains(&bits)
+}
+
+fn is_html_code_metadata_literal(value: &str) -> bool {
+    // Generated documentation often embeds public examples as `<code>...</code>`
+    // inside prose stored under sensitive-looking words such as "key". Do not
+    // suppress arbitrary code-tag contents; only UUIDs and non-sensitive
+    // resource-name shapes are metadata here.
+    let value = value.trim();
+    let Some(inner) = value
+        .strip_prefix("<code>")
+        .and_then(|rest| rest.strip_suffix("</code>"))
+    else {
+        return false;
+    };
+    let inner = inner.trim();
+    is_uuid_literal(inner)
+        || (!contains_sensitive_identifier_component(inner) && is_resource_name_literal(inner))
+}
+
+fn is_uuid_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23].iter().all(|idx| bytes[*idx] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(idx, byte)| [8, 13, 18, 23].contains(&idx) || byte.is_ascii_hexdigit())
+}
+
+fn contains_sensitive_identifier_component(value: &str) -> bool {
+    normalize_key(value).split('_').any(|part| {
+        matches!(
+            part,
+            "secret" | "password" | "passwd" | "credential" | "token" | "auth" | "private" | "key"
+        )
+    })
 }
 
 fn is_fingerprint_literal(value: &str, key_name: &str) -> bool {
@@ -2327,6 +2369,10 @@ mod tests {
             "ABC_DEF_123"
         ));
         assert!(has(r#"key: "sk-test-token""#, "sk-test-token"));
+        assert!(has(
+            r#"password: "<code>sk-test-token</code>""#,
+            "<code>sk-test-token</code>"
+        ));
     }
 
     #[test]
@@ -2346,6 +2392,10 @@ mod tests {
             r#"Level map[uint32]string `protobuf_key:"varint,1,opt,name=key,proto3"`"#,
             r#"PrivateKey = RSA-2048"#,
             r#"Key = RSA-2048"#,
+            r#"Authorization algorithm = "AWS4-HMAC-SHA256""#,
+            r#"documentation: "<code>12345678-1234-1234-1234-123456789012</code>""#,
+            r#"documentation: "<code>alias/aws/kinesis</code>""#,
+            r#"TopologyKey: "k8s.io/zone""#,
             r#"Key = 000102030405060708090A0B0C0D0E0F"#,
             r#"Key = 404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F"#,
             r#"Key = 00112233445566778899AABBCCDDEEFF"#,
