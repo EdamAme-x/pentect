@@ -910,6 +910,7 @@ pub enum Validator {
     BasicAuthToken68,
     DbConnectionString,
     BearerToken,
+    SqlPasswordValue,
 }
 
 impl Validator {
@@ -958,6 +959,7 @@ impl Validator {
             "basic_auth_token68" => Validator::BasicAuthToken68,
             "db_connection_string" => Validator::DbConnectionString,
             "bearer_token" => Validator::BearerToken,
+            "sql_password_value" => Validator::SqlPasswordValue,
             _ => return None,
         })
     }
@@ -1004,8 +1006,54 @@ impl Validator {
             Validator::BasicAuthToken68 => basic_auth_token68(s),
             Validator::DbConnectionString => db_connection_string(s),
             Validator::BearerToken => bearer_token(s),
+            Validator::SqlPasswordValue => sql_password_value(s),
         }
     }
+}
+
+pub fn sql_password_value(s: &str) -> bool {
+    // SQL DDL `PASSWORD` / `IDENTIFIED BY` clauses can legitimately contain
+    // weak default-looking passwords. Only reject syntax placeholders and
+    // clause keywords that are not password material.
+    let value = s.trim();
+    if !(1..=512).contains(&value.len()) || value.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
+        return false;
+    }
+    let normalized = value
+        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | '`'))
+        .trim();
+    if normalized.is_empty()
+        || normalized
+            .bytes()
+            .any(|b| matches!(b, b'<' | b'>' | b'{' | b'}' | b'[' | b']' | b'*'))
+        || !normalized.bytes().any(|b| b.is_ascii_alphanumeric())
+        || normalized.contains('`')
+        || normalized.contains(" + ")
+        || normalized.starts_with('+')
+        || normalized.ends_with('+')
+        || matches!(normalized, "%s" | "%v" | "%q" | "%d")
+        || (normalized.starts_with("%%") && normalized.ends_with("%%"))
+    {
+        return false;
+    }
+    !matches!(
+        normalized.to_ascii_lowercase().as_str(),
+        "null"
+            | "none"
+            | "default"
+            | "password"
+            | "expire"
+            | "expired"
+            | "lock"
+            | "locked"
+            | "unlock"
+            | "unlocked"
+            | "required"
+            | "optional"
+            | "temporary"
+            | "tablespace"
+            | "users"
+    )
 }
 
 pub fn bearer_token(s: &str) -> bool {
@@ -1165,6 +1213,18 @@ mod tests {
             "example-bearer-token-value" => false,
             "abcdefghijklmnopqrstuv" => false,
             "short123" => false);
+    }
+
+    #[test]
+    fn sql_password_value_rejects_clause_keywords_and_placeholders() {
+        vectors!(sql_password_value,
+            "hunter2" => true,
+            "p4ss" => true,
+            "password" => false,
+            "NULL" => false,
+            "<password>" => false,
+            "***" => false,
+            "temporary" => false);
     }
 
     #[test]
