@@ -334,6 +334,32 @@ pub(crate) fn is_structured_generic_key_metadata_value(value: &str) -> bool {
         || is_generic_key_file_reference_value(value)
 }
 
+/// True for i18n lookup expressions such as `$t(passwordLabel):`.
+///
+/// Rationale: these are localization keys rendered later by the application,
+/// not credential material. The accepted syntax is deliberately narrow so
+/// arbitrary `$...` passwords remain detectable.
+pub(crate) fn is_localization_template_reference(value: &str) -> bool {
+    let value = value.trim();
+    let rest = value
+        .strip_prefix("$t(")
+        .or_else(|| value.strip_prefix("i18n.t("));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let Some(close) = rest.find(')') else {
+        return false;
+    };
+    let key = &rest[..close];
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && rest[close + 1..]
+            .chars()
+            .all(|ch| ch.is_ascii_whitespace() || matches!(ch, ':' | '.'))
+}
+
 fn is_generic_key_label_value(value: &str) -> bool {
     let value = value.trim();
     if !(3..=80).contains(&value.len()) || value.split_whitespace().count() < 2 {
@@ -555,5 +581,17 @@ mod tests {
         assert!(!is_structured_generic_key_metadata_value("secret token"));
         assert!(!is_structured_generic_key_metadata_value("sk-test-token"));
         assert!(!is_structured_generic_key_metadata_value("abcDEF123456"));
+    }
+
+    #[test]
+    fn localization_template_references_are_syntactic() {
+        assert!(is_localization_template_reference(
+            "$t(lockRoomPasswordUppercase):"
+        ));
+        assert!(is_localization_template_reference(
+            "i18n.t(auth.setup.instructions)"
+        ));
+        assert!(!is_localization_template_reference("$topsecret123"));
+        assert!(!is_localization_template_reference("$t(secret) + suffix"));
     }
 }

@@ -1,5 +1,5 @@
 use super::benign::{
-    is_explicitly_non_sensitive_key_name, is_placeholder_value,
+    is_explicitly_non_sensitive_key_name, is_localization_template_reference, is_placeholder_value,
     is_structured_generic_key_metadata_value, normalize_identifier,
 };
 use super::Detector;
@@ -96,6 +96,9 @@ impl Detector for SensitiveKeyDetector {
             return vec![];
         }
         if region.ctx.kind != RegionKind::JsonValue {
+            return vec![];
+        }
+        if is_localization_template_reference(view.text()) {
             return vec![];
         }
         if region.ctx.key.as_deref().is_some_and(|key| {
@@ -221,8 +224,11 @@ fn is_ui_copy_sensitive_key(key: &str, value: &str) -> bool {
         "required",
         "room",
         "set",
+        "setup",
         "successfully",
         "supported",
+        "instruction",
+        "instructions",
         "text",
         "title",
         "button",
@@ -670,6 +676,17 @@ mod tests {
         );
         assert_eq!(
             sensitive_key_fires(Some("title_tokensale"), "Token sale"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("password"), "$t(lockRoomPasswordUppercase):"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(
+                Some("2FA_AUTH_SETUP_INSTRUCTIONS"),
+                "Secure your account with an additional factor. Scan the QR code."
+            ),
             None
         );
         assert_eq!(

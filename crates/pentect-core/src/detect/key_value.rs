@@ -1,7 +1,7 @@
 use super::benign::{
-    is_explicitly_non_sensitive_key_name, is_non_secret_source_constant_value,
-    is_placeholder_value, is_source_fixture_secret_value, is_source_secret_name_reference_value,
-    is_structured_generic_key_metadata_value,
+    is_explicitly_non_sensitive_key_name, is_localization_template_reference,
+    is_non_secret_source_constant_value, is_placeholder_value, is_source_fixture_secret_value,
+    is_source_secret_name_reference_value, is_structured_generic_key_metadata_value,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
@@ -624,6 +624,7 @@ fn looks_like_secret_value(
         || is_source_fixture_secret_literal(value, key_name, source_key)
         || is_source_code_fragment_literal(value)
         || is_arithmetic_expression_literal(value)
+        || is_localization_template_reference(value)
         || is_interpolated_string_template(value)
         || is_public_key_literal(value)
         || is_license_identifier_literal(value, key_name)
@@ -2348,6 +2349,8 @@ mod tests {
             r#"g = Github(base_url="https://host/api/v3", login_or_token="access_token")"#,
             r#"password = "my_password"  # Can be left empty if not used"#,
             r#"oauth_token = "my_token"  # Can be left empty if not used"#,
+            r#"password: "$t(lockRoomPasswordUppercase):""#,
+            r#"password: "i18n.t(auth.setup.instructions)""#,
             r#"openstack_password: "{{ lookup('env','OS_PASSWORD') }}""#,
             r#"vsphere_password: '{{ lookup("env", "VSPHERE_PASSWORD") }}'"#,
             r#"access_token = "TestAuthToken""#,
