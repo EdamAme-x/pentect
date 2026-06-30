@@ -405,6 +405,10 @@ impl RuleDetector {
             // Require nearby Authorization/auth wording so prose like
             // `Basic docs` or unrelated base64 samples do not become secrets.
             (r#"(?i)\b(?:proxy-authorization|authorization|auth)\b[^\r\n]{0,40}?\bbasic[ \t]+([A-Za-z0-9+/]{8,}={0,2})(?:$|[\s"',;)])"#, Secret, "BASIC_AUTH", Medium, 1, V::BasicAuthToken68),
+            // RFC 6750 bearer credentials can appear as standalone auth-scheme
+            // lines in OpenAPI/YAML examples. The validator rejects prose and
+            // placeholder token names.
+            (r#"(?i)(?:^|[^A-Za-z0-9_-])bearer[ \t]+([A-Za-z0-9._~+/=-]{20,})(?:$|[\s"',;)])"#, Secret, "BEARER_TOKEN", Medium, 1, V::BearerToken),
             // Preserve path structure for debugging, but hide the local account
             // segment that frequently leaks in stack traces and tool output.
             (r#"(?i)\bAccountKey\b[ \t]*=[ \t]*([A-Za-z0-9+/=]{40,})(?:;|$|[\s"',)])"#, Secret, "AZURE_STORAGE_ACCOUNT_KEY", High, 1, V::None),
@@ -811,6 +815,12 @@ mod tests {
             r#"'header' => 'Proxy-Authorization: Basic d3p3bTpqQGNs',"#,
             "BASIC_AUTH"
         ));
+        assert!(has(
+            "- Bearer 0a000aa0a0a0000000a000a0a0a00000a0a000aaaa0a000aa0aaa000a0a0a000",
+            "BEARER_TOKEN"
+        ));
+        assert!(!has("Authorization: Bearer YOUR_ACCESS_TOKEN_VALUE", "BEARER_TOKEN"));
+        assert!(!has("Bearer abcdefghijklmnopqrstuv", "BEARER_TOKEN"));
         assert!(has(
             r#"if auth != "Basic bnJna2w6dmdycWpz" {"#,
             "BASIC_AUTH"

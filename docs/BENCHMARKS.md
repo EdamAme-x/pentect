@@ -123,7 +123,10 @@ template/redaction userinfo such as `[user[:password]@]` or `***:***` while
 keeping concrete URL/DB credentials. Entropy handling is RFC 7517/7518-aware
 for JWK: public `kid`/`n`/`e`/`x`/`y` members are metadata, while private or
 symmetric `d`/`k`/`p`/`q`/`dp`/`dq`/`qi` members are allowed through even when
-their base64url shape resembles a source identifier.
+their base64url shape resembles a source identifier. Standalone RFC 6750
+`Bearer <token>` lines now use a validator-gated captured rule, so opaque
+Bearer credentials in YAML/OpenAPI-style examples are caught while placeholder
+token names stay negative.
 
 ```text
 CredData commit: 9a55c40
@@ -132,16 +135,16 @@ Rows: 66898
 Files: 10865
 True rows: 15104
 False rows: 51794
-TP: 10285
+TP: 10351
 FP: 6704
-FN: 4819
+FN: 4753
 Line only: 227
 Unlabeled: 54129
 Missing files: 0
-Precision: 0.605
-Recall: 0.681
-F1: 0.641
-Elapsed: 27838 ms
+Precision: 0.607
+Recall: 0.685
+F1: 0.644
+Elapsed: 28206 ms
 ```
 
 Weak groups:
@@ -168,6 +171,7 @@ Weak groups:
 - Entropy suppression for embedded media and SRI/package integrity is key-scoped: media requires MIME keys such as `image/png`, and SRI requires `integrity` plus `sha256`/`sha384`/`sha512` digest syntax.
 - JWT rule matching is compact-serialization bounded: three-segment JWTs still fire, while five-segment JWEs are not partially captured as JWTs.
 - JWK handling follows RFC 7517/7518 member roles: public key IDs/coordinates are suppressed as metadata, but private/symmetric members are treated as secret-bearing values.
+- Bearer token handling follows RFC 6750 auth-scheme structure: standalone `Bearer <opaque>` values are detected only when a compact token validator confirms material shape and rejects placeholders.
 - URI userinfo template suppression is marker-gated: bracket/brace/angle and literal `*` redactions are skipped, while concrete `user:password@host` connection strings still fire.
 - JSON-escaped HTML/source snippets are suppressed only when escaped markup/source syntax proves the captured value is a parser fragment; compact credential-shaped examples still fire.
 - Localized UI password/token prose is suppressed only when the key name also carries UI text context such as label/error/invalid/message; ordinary `password = "..."` and compact credential values still fire.
