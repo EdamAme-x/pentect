@@ -89,7 +89,7 @@ impl EntropyDetector {
             return;
         }
         if is_structured_metadata_value(text, start, &view.region.ctx, run)
-            || is_embedded_media_data_value(&view.region.ctx)
+            || is_embedded_media_data_value(text, start, &view.region.ctx)
             || is_subresource_integrity_value(text, start, &view.region.ctx, run)
             || is_encoded_public_metadata_value(run)
             || is_crypto_test_vector_identifier_value(run)
@@ -186,33 +186,34 @@ fn is_structured_metadata_value(text: &str, start: usize, ctx: &Context, value: 
             .is_some_and(is_structured_metadata_key)
 }
 
-fn is_embedded_media_data_value(ctx: &Context) -> bool {
+fn is_embedded_media_data_value(text: &str, start: usize, ctx: &Context) -> bool {
     // Jupyter notebooks and browser/tool payloads store base64 assets under MIME
     // keys such as `image/png`. Those bytes are embedded media, not a
     // credential. Keep this key-scoped so arbitrary base64 blobs still fire.
-    if !matches!(ctx.format, Kind::Json | Kind::ToolResult) {
-        return false;
-    }
-    ctx.key.as_deref().is_some_and(|key| {
-        let key = key.to_ascii_lowercase();
-        key.starts_with("image/")
-            || key.starts_with("audio/")
-            || key.starts_with("video/")
-            || key.starts_with("font/")
-    })
+    (matches!(ctx.format, Kind::Json | Kind::ToolResult)
+        && ctx.key.as_deref().is_some_and(is_embedded_media_key))
+        || local_json_key_before_value(text, start)
+            .as_deref()
+            .is_some_and(is_embedded_media_key)
+}
+
+fn is_embedded_media_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.starts_with("image/")
+        || key.starts_with("audio/")
+        || key.starts_with("video/")
+        || key.starts_with("font/")
 }
 
 fn is_subresource_integrity_value(text: &str, start: usize, ctx: &Context, value: &str) -> bool {
     // W3C Subresource Integrity and npm lockfiles use `sha256-...`,
     // `sha384-...`, or `sha512-...` digests under an `integrity` field.
     // These authenticate public package/media bytes; they are not secrets.
-    if !matches!(ctx.format, Kind::Json | Kind::ToolResult) {
-        return false;
-    }
-    let keyed_as_integrity = ctx
-        .key
-        .as_deref()
-        .is_some_and(|key| key.eq_ignore_ascii_case("integrity"))
+    let keyed_as_integrity = (matches!(ctx.format, Kind::Json | Kind::ToolResult)
+        && ctx
+            .key
+            .as_deref()
+            .is_some_and(|key| key.eq_ignore_ascii_case("integrity")))
         || local_json_key_before_value(text, start)
             .as_deref()
             .is_some_and(|key| key.eq_ignore_ascii_case("integrity"));
@@ -318,7 +319,7 @@ fn local_json_key_before_value(text: &str, start: usize) -> Option<String> {
     (!key.is_empty()
         && key
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'/')))
     .then(|| key.to_string())
 }
 
@@ -762,6 +763,16 @@ mod tests {
         assert!(EntropyDetector::with(24, 2.0)
             .detect(&image_view)
             .is_empty());
+        let raw_image_json = format!(r#""image/png": "{image}""#);
+        let raw_image_region = region(&raw_image_json);
+        let raw_image_view = NormalizedView::build(&raw_image_region, &raw_image_json);
+        let raw_image_spans = EntropyDetector::with(24, 2.0).detect(&raw_image_view);
+        assert!(
+            raw_image_spans.is_empty(),
+            "local key: {:?}, spans: {:?}",
+            local_json_key_before_value(&raw_image_json, raw_image_json.find(image).unwrap()),
+            raw_image_spans
+        );
 
         let blob_region = json_value_region("blob", image);
         let blob_view = NormalizedView::build(&blob_region, image);

@@ -126,15 +126,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 7187
+FP: 7018
 FN: 4828
 Line only: 227
-Unlabeled: 56674
+Unlabeled: 54411
 Missing files: 0
-Precision: 0.588
+Precision: 0.594
 Recall: 0.680
-F1: 0.631
-Elapsed: 27759 ms
+F1: 0.634
+Elapsed: 28671 ms
 ```
 
 Weak groups:
