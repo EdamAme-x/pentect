@@ -4,7 +4,6 @@ Masked handles can be reused inside `pentect exec` as local env capabilities, wi
 Extensions:
 - Rules packs for company-specific literals and syntax: `examples/extensions/company/pack.toml`
 - Model adapters for local NER/classifier spans: `examples/extensions/ner/adapter.toml`
-- Spec: `docs/EXTENSIONS.md`
 
 TODO
 - dirty log

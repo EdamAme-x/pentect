@@ -22,11 +22,8 @@ archive/
 # Scratch space — slides, drafts, experiments
 sandbox/
 
-# Local planning / positioning notes. Keep the detector debt inventory tracked;
-# it is the public audit trail for detector responsibility and benchmark debt.
-docs/*
-!docs/DETECTOR_DEBT.md
-!docs/EXTENSIONS.md
+# Local planning / positioning notes
+docs/
 
 # Local agent recovery/session state
 .pentect-agent/
