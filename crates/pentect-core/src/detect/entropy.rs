@@ -95,6 +95,8 @@ impl EntropyDetector {
         if is_structured_metadata_value(text, start, &view.region.ctx, run)
             || is_embedded_media_data_value(text, start, &view.region.ctx)
             || is_subresource_integrity_value(text, start, &view.region.ctx, run)
+            || is_public_pgp_signature_context(text, start, &view.region.ctx)
+            || is_jose_protected_header_value(text, start, &view.region.ctx, run)
             || is_encoded_public_metadata_value(run)
             || is_crypto_test_vector_identifier_value(run)
             || is_jwk_public_parameter_context(text, start, &view.region.ctx)
@@ -235,6 +237,75 @@ fn is_sri_digest_value(value: &str) -> bool {
         && digest
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+fn is_public_pgp_signature_context(text: &str, start: usize, ctx: &Context) -> bool {
+    // OpenPGP signatures are public verification material. GitHub replay
+    // fixtures and API responses store them under `signature`; their armor body
+    // is high-entropy-looking but is not private key or token material.
+    let key = ctx
+        .key
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| local_json_key_before_value(text, start))
+        .or_else(|| local_assignment_key_before_value(text, start).map(str::to_string));
+    let Some(key) = key else {
+        return false;
+    };
+    matches!(
+        normalize_identifier(&key).as_str(),
+        "signature" | "pgp_signature"
+    ) && has_open_pgp_signature_armor_before(text, start)
+}
+
+fn has_open_pgp_signature_armor_before(text: &str, start: usize) -> bool {
+    let mut window_start = start.saturating_sub(16 * 1024);
+    while !text.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let before = &text[window_start..start];
+    let Some(begin) = before.rfind("-----BEGIN PGP SIGNATURE-----") else {
+        return false;
+    };
+    before
+        .rfind("-----END PGP SIGNATURE-----")
+        .is_none_or(|end| end <= begin)
+}
+
+fn is_jose_protected_header_value(text: &str, start: usize, ctx: &Context, value: &str) -> bool {
+    // RFC 7515/7516 JOSE compact serializations carry a base64url-encoded
+    // protected header. The header names the algorithm and parameters; it is
+    // public metadata, unlike the signed/encrypted compact object or a JWK
+    // private member.
+    let key = ctx
+        .key
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| local_json_key_before_value(text, start))
+        .or_else(|| local_assignment_key_before_value(text, start).map(str::to_string));
+    let Some(key) = key else {
+        return false;
+    };
+    if !matches!(
+        normalize_identifier(&key).as_str(),
+        "protected" | "protected_header"
+    ) || value.contains('.')
+    {
+        return false;
+    }
+    let Some(decoded) = decode_base64ish(value) else {
+        return false;
+    };
+    let Ok(decoded) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let decoded = decoded.trim();
+    decoded.starts_with('{')
+        && decoded.ends_with('}')
+        && decoded.contains("\"alg\"")
+        && decoded
+            .bytes()
+            .all(|b| b.is_ascii() && !matches!(b, 0..=8 | 11 | 12 | 14..=31))
 }
 
 fn is_encoded_public_metadata_value(value: &str) -> bool {
@@ -886,6 +957,36 @@ mod tests {
         assert!(EntropyDetector::with(24, 2.0)
             .detect(&integrity_view)
             .is_empty());
+    }
+
+    #[test]
+    fn pgp_signature_armor_is_public_verification_material() {
+        let body = "nwsBcBAABCAAQBQJeaEGJCRBK7hj4Ov3rIwAAdHIIAKRwMPF9NPpoGqyLFouFL9os";
+        let raw = format!(
+            r#""verification":{{"signature":"-----BEGIN PGP SIGNATURE-----\n\n{body}\n-----END PGP SIGNATURE-----"}}"#
+        );
+        let reg = region(&raw);
+        let view = NormalizedView::build(&reg, &raw);
+        assert!(EntropyDetector::with(24, 2.0).detect(&view).is_empty());
+
+        let raw = format!(r#""signature":"{body}""#);
+        let reg = region(&raw);
+        let view = NormalizedView::build(&reg, &raw);
+        assert!(!EntropyDetector::with(24, 2.0).detect(&view).is_empty());
+    }
+
+    #[test]
+    fn jose_protected_headers_are_public_metadata() {
+        let header = "eyJhbGciOiJSU0EtT0FFUC0yNTYiLCJlbmMiOiJBMjU2R0NNIn0";
+        let raw = format!(r#""protected": "{header}""#);
+        let reg = region(&raw);
+        let view = NormalizedView::build(&reg, &raw);
+        assert!(EntropyDetector::with(24, 2.0).detect(&view).is_empty());
+
+        let raw = format!(r#""token": "{header}""#);
+        let reg = region(&raw);
+        let view = NormalizedView::build(&reg, &raw);
+        assert!(!EntropyDetector::with(24, 2.0).detect(&view).is_empty());
     }
 
     #[test]

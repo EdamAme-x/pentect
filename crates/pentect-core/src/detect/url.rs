@@ -223,9 +223,87 @@ fn userinfo_is_template_or_redaction(userinfo: &str) -> bool {
     // Brackets are template grammar, not URL userinfo. Literal `*` is treated
     // as a redaction marker here; real passwords with `*` should be
     // percent-encoded in URLs and remain covered after decoding elsewhere.
+    // Placeholder pairs such as `username:password` or `token:MY_TOKEN` are
+    // also template grammar. They do not expose reusable credential bytes.
     userinfo
         .bytes()
         .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
+        || split_userinfo_password(userinfo)
+            .is_some_and(|(user, password)| userinfo_password_is_placeholder(user, password))
+}
+
+fn split_userinfo_password(userinfo: &str) -> Option<(&str, &str)> {
+    userinfo.split_once(':').or_else(|| {
+        let lower = userinfo.to_ascii_lowercase();
+        lower
+            .find("%3a")
+            .map(|colon| (&userinfo[..colon], &userinfo[colon + 3..]))
+    })
+}
+
+fn userinfo_password_is_placeholder(user: &str, password: &str) -> bool {
+    let user = user.trim();
+    let password = password.trim();
+    if password.is_empty() {
+        return true;
+    }
+    if userinfo_component_is_env_reference(password) {
+        return true;
+    }
+    if userinfo_component_is_oauth_marker(password) {
+        return !userinfo_token_like(user) || is_short_hex_userinfo_component(user);
+    }
+    userinfo_component_is_placeholder_user(user)
+        && matches!(
+            normalized_userinfo_component(password).as_str(),
+            "password" | "passwd"
+        )
+}
+
+fn userinfo_component_is_placeholder_user(value: &str) -> bool {
+    matches!(
+        normalized_userinfo_component(value).as_str(),
+        "user" | "username" | "login"
+    )
+}
+
+fn userinfo_component_is_oauth_marker(value: &str) -> bool {
+    matches!(
+        normalized_userinfo_component(value).as_str(),
+        "x_oauth_token" | "x_oauth_basic"
+    )
+}
+
+fn is_short_hex_userinfo_component(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value.len() < 32 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn userinfo_component_is_env_reference(value: &str) -> bool {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+        && value
+            .split('_')
+            .any(|part| matches!(part, "TOKEN" | "PASSWORD" | "PASSWD" | "SECRET" | "KEY"))
+}
+
+fn normalized_userinfo_component(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_sep = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            previous_sep = false;
+        } else if !previous_sep {
+            out.push('_');
+            previous_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn userinfo_token_like(userinfo: &str) -> bool {
@@ -585,6 +663,10 @@ mod tests {
             "https://[user[:password]@]service.internal/path",
             "https://***:***@service.internal/path",
             "https://{user}:{password}@service.internal/path",
+            "https://git:@github.com/org/repo.git",
+            "https://username:password@proxyserver.net:3128/",
+            "https://token:MY_GITHUB_TOKEN@github.com/acme/repo.git",
+            "https://abcdef1234567890234578:x-oauth-token@github.com/",
         ] {
             assert!(
                 labels(raw)

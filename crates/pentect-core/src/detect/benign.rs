@@ -531,17 +531,17 @@ fn is_generic_key_config_path_value(value: &str) -> bool {
 
 fn is_generic_key_resource_name_value(value: &str) -> bool {
     // Generic JSON `key` fields commonly store public label/header/resource
-    // names in kebab syntax. Digits and sensitive components are excluded so
-    // low-entropy real values such as `tenant-7-trial` and `sk-test-token` stay
-    // detectable.
+    // names in kebab syntax. Pure numeric parts and sensitive components are
+    // excluded so low-entropy real values such as `tenant-7-trial` and
+    // `sk-test-token` stay detectable. Digit-bearing platform acronyms such as
+    // `k8s-app` remain metadata because they name infrastructure labels.
     let value = value.trim();
     if !(5..=96).contains(&value.len()) || !value.contains('-') {
         return false;
     }
-    if value.bytes().any(|b| b.is_ascii_digit())
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || matches!(b, b'-' | b'/' | b':'))
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'/' | b':'))
     {
         return false;
     }
@@ -558,11 +558,28 @@ fn is_generic_key_resource_name_value(value: &str) -> bool {
         .split(['-', '/', ':'])
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
+    let has_digit = parts
+        .iter()
+        .any(|part| part.bytes().any(|b| b.is_ascii_digit()));
     parts.len() >= 2
+        && (!has_digit
+            || parts
+                .iter()
+                .any(|part| is_public_resource_digit_component(part)))
         && parts.iter().enumerate().all(|(idx, part)| {
             (part == &"x" && idx == 0 || (2..=32).contains(&part.len()))
-                && part.bytes().all(|b| b.is_ascii_lowercase())
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                && part.bytes().any(|b| b.is_ascii_lowercase())
         })
+}
+
+fn is_public_resource_digit_component(part: &str) -> bool {
+    matches!(
+        part,
+        "k8s" | "ipv4" | "ipv6" | "http2" | "s3" | "ec2" | "rds"
+    )
 }
 
 fn is_generic_key_label_value(value: &str) -> bool {
@@ -827,6 +844,11 @@ mod tests {
         assert!(is_structured_key_name_reference_value("offset"));
         assert!(is_structured_key_name_reference_value("host"));
         assert!(is_structured_key_name_reference_value("Vary"));
+        assert!(is_structured_key_name_reference_value("Proxy-Connection"));
+        assert!(is_structured_key_name_reference_value("X-Correlation-Id"));
+        assert!(is_structured_key_name_reference_value("product_id"));
+        assert!(is_structured_key_name_reference_value("user_ids"));
+        assert!(is_structured_key_name_reference_value("source1"));
         assert!(is_structured_key_name_reference_value("panel1"));
         assert!(is_structured_key_name_reference_value("fieldset1"));
         assert!(is_structured_key_name_reference_value("dataGrid12"));
@@ -858,6 +880,10 @@ mod tests {
         ));
         assert!(is_structured_generic_key_metadata_value(
             "Access-Control-Allow-Headers"
+        ));
+        assert!(is_structured_generic_key_metadata_value("k8s-app"));
+        assert!(is_structured_generic_key_metadata_value(
+            "ovn4nfv-k8s-plugin"
         ));
         assert!(is_structured_generic_key_metadata_value("string"));
         assert!(is_structured_generic_key_metadata_value("FirstTag"));

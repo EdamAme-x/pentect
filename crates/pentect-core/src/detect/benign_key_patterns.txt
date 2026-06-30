@@ -23,4 +23,9 @@ suffix:_routing_key
 suffix:_key_name
 suffix:_envar
 suffix:_env_var
+suffix:_expiration
+suffix:_expires
+suffix:_expires_at
+suffix:_expiry
+suffix:_ttl
 contains:public_key_token

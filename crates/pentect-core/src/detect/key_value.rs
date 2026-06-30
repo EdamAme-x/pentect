@@ -421,6 +421,9 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
                 "client_secret",
             ],
         )
+        || name == "pass"
+        || name.ends_with("_pass")
+        || name.contains("_pass_")
     {
         return Some(KeyKind::Strong);
     }
@@ -478,6 +481,8 @@ fn implicit_key_name_kind(name: &str) -> Option<KeyKind> {
         || name.ends_with("_key")
         || name == "auth"
         || name.ends_with("_auth")
+        || name == "pass"
+        || name.ends_with("_pass")
         || name == "password"
         || name.ends_with("_password")
         || name == "passwd"
@@ -812,7 +817,10 @@ fn looks_like_secret_value(
         || is_dunder_identifier_literal(value)
         || is_uppercase_constant_literal_for_generic_key(value, key_name)
         || is_generic_code_member_name_literal(value, key_name)
+        || is_checksum_metadata_digest_literal(value, key_name, source_key)
         || is_structured_key_name_reference_literal(value, key_name)
+        || is_password_validation_message_literal(value, key_name)
+        || is_password_documentation_literal(value, key_name)
         || is_plain_prose_literal_for_generic_key(value, key_name)
         || is_locator_literal_for_key(value, key_name)
         || is_secret_resource_metadata_literal(value, key_name)
@@ -915,6 +923,9 @@ fn is_benign_literal(value: &str) -> bool {
     if is_placeholder_value(value) {
         return true;
     }
+    if is_escaped_null_literal(value) {
+        return true;
+    }
     if is_iso8601_timestamp_literal(value) {
         return true;
     }
@@ -926,6 +937,28 @@ fn is_benign_literal(value: &str) -> bool {
         normalized.as_str(),
         "" | "true" | "false" | "null" | "none" | "nil" | "undefined"
     )
+}
+
+fn is_escaped_null_literal(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let head = value
+        .split("\\n")
+        .next()
+        .unwrap_or(value)
+        .split("\\r")
+        .next()
+        .unwrap_or(value)
+        .split("\\t")
+        .next()
+        .unwrap_or(value)
+        .trim();
+    head.len() < value.len()
+        && matches!(
+            normalize_key(head).as_str(),
+            "none" | "null" | "nil" | "undefined"
+        )
 }
 
 fn is_iso8601_timestamp_literal(value: &str) -> bool {
@@ -1072,10 +1105,14 @@ fn is_public_numeric_code_constant_literal(
 
 fn is_numeric_metadata_key_literal(value: &str, key_name: &str, quoted: bool) -> bool {
     // UI trees and schemas often use a property literally named `key` for a
-    // stable numeric node identifier (`key: '1001'`). Numeric-only generic keys
-    // carry weak secret evidence; keep this away from `api_key`, `password`,
-    // `token`, and other material fields.
-    quoted && key_name == "key" && is_small_decimal_code_literal(value)
+    // stable numeric node identifier (`key: '1001'`). Key-id fields likewise
+    // carry public identifiers (`ssh_key_id: "6536865"`), not key material.
+    // Keep this away from `api_key`, `password`, `token`, and other material
+    // fields.
+    quoted
+        && ((key_name == "key" && is_small_decimal_code_literal(value))
+            || (has_identifier_phrase(key_name, &["key", "id"])
+                && is_decimal_key_id_literal(value)))
 }
 
 fn is_sqlstate_error_constant_name(key_name: &str, source_key: &str) -> bool {
@@ -1119,6 +1156,11 @@ fn is_small_c_style_int_literal(value: &str) -> bool {
 fn is_small_decimal_code_literal(value: &str) -> bool {
     let bytes = value.trim().as_bytes();
     (1..=6).contains(&bytes.len()) && bytes.iter().all(|b| b.is_ascii_digit())
+}
+
+fn is_decimal_key_id_literal(value: &str) -> bool {
+    let bytes = value.trim().as_bytes();
+    (1..=20).contains(&bytes.len()) && bytes.iter().all(|b| b.is_ascii_digit())
 }
 
 fn is_c_style_hex_u32(value: &str) -> bool {
@@ -2683,6 +2725,25 @@ fn is_fingerprint_literal(value: &str, key_name: &str) -> bool {
             .all(|part| part.len() == 2 && part.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+fn is_checksum_metadata_digest_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // `*_checksum` fields conventionally store verification digests. A key can
+    // still contain a sensitive word (`harvester-token-checksum`), but the
+    // digest verifies another object and is not the token itself. Keep this
+    // strict to hex digest widths so arbitrary `token`/`password` values still
+    // detect.
+    if !(has_identifier_component(key_name, "checksum")
+        || has_identifier_component(&normalize_key(source_key), "checksum"))
+    {
+        return false;
+    }
+    is_hex_digest_literal(value)
+}
+
+fn is_hex_digest_literal(value: &str) -> bool {
+    let value = value.trim();
+    matches!(value.len(), 32 | 40 | 64 | 96 | 128) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn is_escaped_control_placeholder_literal(value: &str, key_name: &str) -> bool {
     // Test fixtures often keep table-shaped placeholder values in escaped
     // string form, e.g. `LINE_1\nLINE_2` for a private key column or
@@ -3530,6 +3591,12 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
         || is_escaped_format_fragment(value)
         || is_method_chain_suffix_fragment(value)
         || is_incomplete_objc_string_fragment(value)
+        || is_ruby_interpolation_fragment(value)
+        || is_member_access_tail_fragment(value)
+        || is_backtick_command_method_tail_fragment(value)
+        || is_html_attribute_binding_fragment(value)
+        || is_unary_member_access_fragment(value)
+        || is_uppercase_suffix_fragment(value)
         || value
             .strip_prefix('+')
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
@@ -3637,6 +3704,84 @@ fn is_incomplete_objc_string_fragment(value: &str) -> bool {
     // fragments, not complete literals such as `@"hunter2"`.
     let value = value.trim();
     value.starts_with("@\\\"") && (value.contains("\\n") || value.ends_with('\\'))
+}
+
+fn is_ruby_interpolation_fragment(value: &str) -> bool {
+    // Splitting a Ruby string at `auth:`/`password:` inside interpolation can
+    // leave `#{Shellwords.escape` or `#{key}_path`. That is executable syntax,
+    // not the credential bytes.
+    let Some(body) = value.trim().strip_prefix("#{") else {
+        return false;
+    };
+    (2..=120).contains(&body.len())
+        && body.bytes().any(|b| b.is_ascii_alphabetic())
+        && body.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'_' | b'.' | b':' | b'(' | b')' | b' ' | b'`' | b'}')
+        })
+}
+
+fn is_member_access_tail_fragment(value: &str) -> bool {
+    // Concatenated header builders can split after a sensitive header label:
+    // `'PRIVATE-TOKEN: '.$auth['username']` yields `.$auth[`.
+    let value = value.trim();
+    value.starts_with(".$")
+        && (4..=96).contains(&value.len())
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'$' | b'_' | b'[' | b']' | b'\'' | b'"')
+        })
+}
+
+fn is_backtick_command_method_tail_fragment(value: &str) -> bool {
+    // Ruby command interpolation such as `` `heroku auth:whoami`.strip `` may
+    // be split at `auth:` and leave the command tail as a fake value.
+    let value = value.trim();
+    let Some(command) = value.strip_suffix("`.strip") else {
+        return false;
+    };
+    (2..=96).contains(&command.len())
+        && command
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':'))
+        && command
+            .split([':', '/', '.'])
+            .next_back()
+            .is_some_and(is_shell_command_name)
+}
+
+fn is_html_attribute_binding_fragment(value: &str) -> bool {
+    // Vue/HTML snippets can split at `passwd` inside attribute bindings,
+    // leaving `title="'...` as the captured value.
+    let value = value.trim_start();
+    (value.starts_with("title=") || value.starts_with(":title="))
+        && value.contains(['"', '\''])
+        && value.len() <= 160
+}
+
+fn is_unary_member_access_fragment(value: &str) -> bool {
+    // UI state expressions such as `!radioLUS4U.Checked` are boolean code, not
+    // password material.
+    let Some(body) = value.trim().strip_prefix('!') else {
+        return false;
+    };
+    (4..=120).contains(&body.len())
+        && body.contains('.')
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'(' | b')'))
+}
+
+fn is_uppercase_suffix_fragment(value: &str) -> bool {
+    // Concatenating environment-variable names can leave suffix literals such as
+    // `_PASS` or `_FILE`. These are name fragments, not values.
+    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    (3..=40).contains(&value.len())
+        && value.starts_with('_')
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
 fn is_arithmetic_expression_literal(value: &str) -> bool {
@@ -3827,7 +3972,87 @@ fn is_generic_metadata_key_name(key_name: &str) -> bool {
         || has_identifier_phrase(key_name, &["generated", "key"])
         || has_identifier_phrase(key_name, &["header", "key"])
         || has_identifier_phrase(key_name, &["license", "key"])
+        || has_identifier_phrase(key_name, &["original", "key"])
         || has_identifier_phrase(key_name, &["public", "key"])
+        || has_identifier_phrase(key_name, &["target", "key"])
+}
+
+fn is_password_validation_message_literal(value: &str, key_name: &str) -> bool {
+    // UI/errors often put validation messages under `password` fields in tests
+    // and locale files (`Invalid Password`, `wrong password`). Suppress only
+    // short phrase-shaped messages that explicitly contain both a password word
+    // and a validation/error word, so real passphrases such as
+    // `Correct horse battery staple!` remain detectable.
+    if !(has_identifier_component(key_name, "password")
+        || has_identifier_component(key_name, "passwd")
+        || has_identifier_component(key_name, "passphrase"))
+    {
+        return false;
+    }
+    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    if !(8..=96).contains(&value.len())
+        || value.bytes().any(|b| b.is_ascii_digit())
+        || !value.chars().all(|ch| {
+            ch.is_ascii_alphabetic()
+                || ch.is_ascii_whitespace()
+                || matches!(ch, '_' | '-' | '.' | ',' | '\'' | '"')
+        })
+    {
+        return false;
+    }
+    let normalized = normalize_key(value);
+    let mut has_password_word = false;
+    let mut has_validation_word = false;
+    for part in normalized.split('_').filter(|part| !part.is_empty()) {
+        has_password_word |= matches!(part, "password" | "passwd" | "passphrase");
+        has_validation_word |= matches!(
+            part,
+            "bad"
+                | "blank"
+                | "expired"
+                | "incorrect"
+                | "invalid"
+                | "missing"
+                | "mismatch"
+                | "required"
+                | "wrong"
+        );
+    }
+    has_password_word && has_validation_word
+}
+
+fn is_password_documentation_literal(value: &str, key_name: &str) -> bool {
+    // Provider examples often store human instructions in password slots:
+    // `BLUECAT_PASSWORD = "API password"` or
+    // `WEDOS_WAPI_PASSWORD = "Password needs to be generated..."`.
+    // Suppress only phrase-shaped values that themselves contain a password
+    // word. Compact passphrases without that word remain detectable.
+    if !key_name_indicates_password_slot(key_name) {
+        return false;
+    }
+    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    if !(8..=160).contains(&value.len())
+        || value.bytes().any(|b| b.is_ascii_digit())
+        || value.split_whitespace().count() < 2
+        || !value.chars().all(|ch| {
+            ch.is_ascii_alphabetic()
+                || ch.is_ascii_whitespace()
+                || matches!(ch, '.' | ',' | '\'' | '"' | '-' | '/')
+        })
+    {
+        return false;
+    }
+    normalize_key(value)
+        .split('_')
+        .any(|part| matches!(part, "pass" | "password" | "passwd" | "passphrase"))
+}
+
+fn key_name_indicates_password_slot(key_name: &str) -> bool {
+    key_name == "pass"
+        || key_name.ends_with("_pass")
+        || has_identifier_component(key_name, "password")
+        || has_identifier_component(key_name, "passwd")
+        || has_identifier_component(key_name, "passphrase")
 }
 
 fn is_locator_literal_for_key(value: &str, key_name: &str) -> bool {
@@ -4240,6 +4465,7 @@ fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
             | "access_key"
             | "account_key"
             | "client_secret"
+            | "pass"
             | "password"
             | "passwd"
             | "pwd"
@@ -4250,6 +4476,7 @@ fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
             | "shared_secret"
             | "credential"
     ) || name.ends_with("_password")
+        || name.ends_with("_pass")
         || name.ends_with("_passwd")
         || name.ends_with("_pwd")
         || name.ends_with("_passphrase")
@@ -4310,7 +4537,10 @@ fn is_upper_env_secret_key(source_key: &str) -> bool {
         return false;
     }
     let normalized = normalize_key(candidate);
-    normalized.contains("password")
+    normalized == "pass"
+        || normalized.ends_with("_pass")
+        || normalized.contains("_pass_")
+        || normalized.contains("password")
         || normalized.contains("passwd")
         || normalized.contains("passphrase")
         || normalized.contains("secret")
@@ -4323,7 +4553,9 @@ fn is_env_assignment_prefix(token: &str) -> bool {
 }
 
 fn qualified_low_entropy_secret_key_name(name: &str) -> bool {
-    name.ends_with("_password")
+    name == "pass"
+        || name.ends_with("_pass")
+        || name.ends_with("_password")
         || name.ends_with("_passwd")
         || name.ends_with("_pwd")
         || name.ends_with("_passphrase")
@@ -4582,6 +4814,8 @@ mod tests {
         ));
         assert!(has("dbPassword = \"hunter2\"", "hunter2"));
         assert!(has("SMTP_PASSWORD=dbynbelpgliq", "dbynbelpgliq"));
+        assert!(has("GRAPHITE_PASS=rwwjfwpb", "rwwjfwpb"));
+        assert!(has(r#"const string proxyPass = "czplsfj";"#, "czplsfj"));
         assert!(has(r#"prod.db.default.password="gecrpy""#, "gecrpy"));
         assert!(has(r#"APP_WEBHOOK_SECRET="abcdefghijkl""#, "abcdefghijkl"));
         assert!(has(
@@ -4623,6 +4857,7 @@ mod tests {
             "token_budget=30000",
             "public_token_label=docs",
             "port=5432 workers=4 timeout_ms=30000 status=200",
+            "compass=abcdef",
             "Authorization: Bearer docs",
             r#"authorization: "Basic docs""#,
             r#"authorization: "ApiKey docs""#,
@@ -4733,6 +4968,13 @@ mod tests {
             r#"ENTER_KEY_VALUE_TOO_SHORT#0="The key value is too short.";"#,
             r#"SECRET_SAVED#0="Secret saved.";"#,
             r#"export const passwordNotLongEnough = "Password must be 6 characters or longer.";"#,
+            r#"password: "Invalid Password""#,
+            r#"password: "wrong password""#,
+            r#"password: "None\n""#,
+            r#"BLUECAT_PASSWORD = "API password""#,
+            r#"WEDOS_WAPI_PASSWORD = "Password needs to be generated and IP allowed in the admin interface""#,
+            r#"JOKER_PASSWORD = "Joker.com password""#,
+            r#"AUTODNS_API_PASSWORD = "User Password""#,
             r#"assert.deepStrictEqual(error.errors, { email: 'Email Taken', password: 'Email Taken' });"#,
             r#"'Password cannot be blank.' => 'Password cannot be blank.'"#,
             r#"expected: "oraclecloud: some credentials information are missing: OCI_TENANCY_OCID,OCI_USER_OCID""#,
@@ -4742,6 +4984,10 @@ mod tests {
             r#"private const string MOCK_ACCESS_TOKEN = "at-0987654321";"#,
             r#"private const string MOCK_REFRESH_TOKEN = "rt-1234567809";"#,
             r#"const string expectedPassword = "letmein123";"#,
+            r#"'access-token-expiration' => $this->time + 1800"#,
+            r#"txtLUPassword.Enabled = !radioLUS4U.Checked;"#,
+            r##"<div class="copy-pass" :title="'Password:' + file.passwd""##,
+            r#"EnvPrivKeyPass = envPrivKey + "_PASS""#,
         ] {
             assert!(hits(raw).is_empty(), "{raw}: {:?}", hits(raw));
         }
@@ -4886,6 +5132,8 @@ mod tests {
             r#"TrueFromOne bool `key:"yesone,string"`"#,
             r#"Mode string `key:"value,options=first|second"`"#,
             r#"Amount int `key:"value3,range=(1:5]"`"#,
+            r#"ssh_key_id: "6536865""#,
+            r#"'access_key_id' => '32343242'"#,
             r#"FSCRYPT_KEY_DESC_PREFIX = "fscrypt:""#,
             r#"local key=$(__docker_map_key_of_current_option '--filter|-f')"#,
             r#"cmd.Flags().StringArrayVarP(&opts.RawFields, "raw-field", "f", nil, "Add a string parameter in `key=value` format")"#,
@@ -4903,9 +5151,20 @@ mod tests {
             r#"key: "offset""#,
             r#"key: "host""#,
             r#"key: "Vary""#,
+            r#"Key: "Proxy-Connection""#,
+            r#"Key: "Proxy-Authenticate""#,
+            r#"key: "X-Correlation-Id""#,
+            r#""target_key": "product_id""#,
+            r#""target_key": "cart_id""#,
+            r#""original_key": "product_id""#,
+            r#"key='user_ids'"#,
+            r#"def get_include_dirs(self, key='include_dirs')"#,
+            r#"'key:source1'"#,
             r#"key: "Dev Gateway Region""#,
             r#"key: "HappyFace.jpg""#,
             r#"key: "cost-center""#,
+            r#"key: "k8s-app""#,
+            r#"key: "ovn4nfv-k8s-plugin""#,
             r#"key: "clean-cilium-state""#,
             r#"key: "x-amazon-apigateway-authtype""#,
             r#"key: "panel1""#,
@@ -4946,6 +5205,7 @@ mod tests {
             r#"{key:"linear",value:function(n){return n}},{key:"cubic",value:function(n){return n*n*n}}"#,
             r#"{"body":"\u003cpre\u003e\u003ccode\u003econfig(httpheader = c(\"Authorization\" = l_auth))\u003c/code\u003e\u003c/pre\u003e"}"#,
             r#"private const string Header = auth.value;"#,
+            r#"$headers[] = 'PRIVATE-TOKEN: '.$auth['username'];"#,
             r#"{"body":"\u003cpre\u003e\u003ccode\u003e'GET /signup': {view:'signup'}\u003c/code\u003e\u003c/pre\u003e"}"#,
             r#"{"body":"\u003cpre\u003e\u003ccode\u003ecredentials: @\"apiURL\\n];\u003c/code\u003e\u003c/pre\u003e"}"#,
             "/// Bitcoin address: base58check, P2PKH (0x00, '1') or P2SH (0x05, '3').",
@@ -4953,6 +5213,9 @@ mod tests {
             r#"* <li>token=1234</li>"#,
             r#"The format is `password=value` pairs."#,
             r#"echo "password=${PASS}" >> ${DOMAIN_HOME}/boot.properties"#,
+            r#"SEED_PASSWORD=#{Shellwords.escape Shellwords.escape(seed_password)}"#,
+            r##"path_key = "#{key}_path""##,
+            r##"puts "Welcome #{`heroku auth:whoami`.strip}!""##,
             r#"- ADMIN_PASSWORD=${DC_ADMIN_PWD}"#,
             r#"KEY=rolling/${APP_NAME}/stable/id"#,
             r#"api 'com.google.auth:google-auth-library-credentials:0.20.0'"#,
@@ -5003,6 +5266,21 @@ mod tests {
             .iter()
             .all(|(_, value)| !value.contains("client_secret")));
         assert!(got.iter().all(|(_, value)| !value.contains("api_key")));
+    }
+
+    #[test]
+    fn checksum_digest_fields_are_public_metadata() {
+        let digest = "8c9a257f54763d4f3a1b02c148d9faf505c3be7f5726b27f17df5063c6fbcd7f";
+        assert!(hits(&format!(
+            r#""management.cattle.io/harvester-token-checksum": "{digest}""#
+        ))
+        .is_empty());
+
+        let got = hits(&format!(r#""access_token": "{digest}""#));
+        assert!(
+            got.iter().any(|(_, value)| value == digest),
+            "non-checksum token fields must still detect: {got:?}"
+        );
     }
 
     #[test]
