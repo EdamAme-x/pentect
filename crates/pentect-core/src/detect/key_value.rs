@@ -770,8 +770,10 @@ fn looks_like_secret_value(
         || is_public_numeric_code_constant_literal(value, key_name, source_key, quoted)
         || is_asn1_oid_der_literal(value, key_name, source_key)
         || is_crypto_test_vector_identifier_literal(value, key_name)
+        || is_crypto_test_vector_record_literal(value, key_name, source_key)
         || is_localized_ui_text_literal(value, key_name, source_key)
         || is_missing_credential_name_literal(value, key_name, source_key)
+        || is_xaml_key_time_literal(value, source_key)
         || is_html_code_metadata_literal(value)
         || is_html_documentation_fragment_literal(value, key_name, source_key)
         || is_markup_syntax_fragment_literal(value, key_name)
@@ -787,6 +789,7 @@ fn looks_like_secret_value(
         || is_source_sensitive_name_reference_literal(value, source_key)
         || is_source_fixture_secret_literal(value, key_name, source_key)
         || is_source_struct_tag_literal(value, key_name, source_key)
+        || is_objc_dictionary_key_literal(value, source_key)
         || is_source_prefix_constant_literal(value, key_name)
         || is_source_variable_reference_literal(value, key_name, source_key, quoted)
         || is_shell_parameter_reference_literal(value, key_name, source_key)
@@ -1894,6 +1897,63 @@ fn is_crypto_test_vector_identifier_literal(value: &str, key_name: &str) -> bool
     is_crypto_test_vector_identifier_value(value)
 }
 
+fn is_crypto_test_vector_record_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // CAVP/SEC/RFC crypto vector files label records with fields such as
+    // `PrivateKey`, `PeerKey`, and `PrivPubKeyPair`. In those files the value
+    // can be an algorithm/curve/case identifier (`Alice-secp256r1`,
+    // `RSA-2048`, or `prime192v1:...`) rather than the key bytes. Keep this
+    // structural: require a key-vector field, compact identifier syntax, and a
+    // known public curve/algorithm marker. Operational names like
+    // `ALICE_prod_key_2026` stay detectable because they lack those markers or
+    // contain sensitive setting-name components.
+    if !is_crypto_test_vector_record_key(key_name, source_key) {
+        return false;
+    }
+    let value = value.trim();
+    if !(4..=128).contains(&value.len())
+        || value.contains("://")
+        || value.chars().any(char::is_whitespace)
+        || value
+            .bytes()
+            .any(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'_' | b'-' | b':'))
+    {
+        return false;
+    }
+    if normalize_key(value)
+        .split('_')
+        .any(|part| matches!(part, "secret" | "token" | "password" | "credential" | "key"))
+    {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    value.bytes().any(|b| b.is_ascii_digit())
+        && contains_any(
+            &lower,
+            &[
+                "secp",
+                "sect",
+                "brainpool",
+                "prime",
+                "c2pnb",
+                "c2tnb",
+                "wtls",
+                "rsa",
+                "dsa",
+            ],
+        )
+}
+
+fn is_crypto_test_vector_record_key(key_name: &str, source_key: &str) -> bool {
+    let key = normalize_key(key_name);
+    let source = normalize_key(source_key);
+    [key.as_str(), source.as_str()].iter().any(|name| {
+        matches!(
+            *name,
+            "private_key" | "privatekey" | "peer_key" | "peerkey" | "priv_pub_key_pair"
+        )
+    })
+}
+
 fn is_localized_ui_text_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // Translation tables and UI copy often use sensitive words in message IDs:
     // `passwordEnteredInvalid = "Invalid password for room \"%s\"."`. The
@@ -2100,6 +2160,21 @@ fn is_html_code_metadata_literal(value: &str) -> bool {
     let inner = inner.trim();
     is_uuid_literal(inner)
         || (!contains_sensitive_identifier_component(inner) && is_resource_name_literal(inner))
+}
+
+fn is_xaml_key_time_literal(value: &str, source_key: &str) -> bool {
+    // XAML animation timelines use `KeyTime="0:0:0.2"` to schedule keyframes.
+    // The word "key" is part of the animation API, not credential material.
+    let source = normalize_key(source_key);
+    if !(source == "key_time" || source.ends_with("_key_time")) {
+        return false;
+    }
+    let value = value.trim();
+    (1..=24).contains(&value.len())
+        && value.contains(':')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b':' | b'.'))
 }
 
 fn is_html_documentation_fragment_literal(value: &str, key_name: &str, source_key: &str) -> bool {
@@ -2858,16 +2933,17 @@ fn is_source_fixture_secret_literal(value: &str, key_name: &str, source_key: &st
     source_key_has_code_shape(source_key) && is_source_fixture_secret_value(key_name, value)
 }
 
-fn is_source_struct_tag_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+fn is_source_struct_tag_literal(value: &str, _key_name: &str, source_key: &str) -> bool {
     // Go-style struct tags can contain generic `key:"name,option"` metadata.
     // The backtick-delimited tag syntax proves this is a field mapping, not
-    // credential material.
-    if key_name != "key" || !source_key_has_struct_tag_key(source_key) {
+    // credential material. Tags also appear as simple mappings such as
+    // `key:"int8_from_str"` without options; those are still schema names, not
+    // secret bytes.
+    if !source_key_has_struct_tag_key(source_key) {
         return false;
     }
     let value = value.trim();
     (3..=96).contains(&value.len())
-        && value.contains(',')
         && value.bytes().any(|b| b.is_ascii_alphabetic())
         && value.bytes().all(|b| {
             b.is_ascii_alphanumeric()
@@ -2883,6 +2959,35 @@ fn source_key_has_struct_tag_key(source_key: &str) -> bool {
         return false;
     };
     normalize_key(tail) == "key"
+}
+
+fn is_objc_dictionary_key_literal(value: &str, source_key: &str) -> bool {
+    // Objective-C collection/KVC APIs use selector fragments such as
+    // `objectForKey:@"Host"` and `setObject:... forKey:@"Port"`. The string is
+    // a public lookup field name, not credential material, even when the
+    // surrounding object stores credentials. Keep this to compact identifier
+    // keys under explicit Objective-C selector syntax.
+    if !contains_any(
+        source_key,
+        &[
+            "objectForKey",
+            "forKey",
+            "valueForKey",
+            "willChangeValueForKey",
+            "didChangeValueForKey",
+        ],
+    ) {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_start_matches('@')
+        .trim_matches(|ch| matches!(ch, '"' | '\''));
+    (3..=64).contains(&value.len())
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
 fn is_source_prefix_constant_literal(value: &str, key_name: &str) -> bool {
@@ -4622,6 +4727,11 @@ mod tests {
             "public decode(secret: Base32SecretKey): SecretKey {",
             r#"Attributes map[string]string `protobuf_key:"bytes,1,opt,name=key,proto3"`"#,
             r#"Level map[uint32]string `protobuf_key:"varint,1,opt,name=key,proto3"`"#,
+            r#"Int8FromStr int8 `key:"int8_from_str"`"#,
+            r#"Float64Str float64 `key:"float64_from_str"`"#,
+            r#"[credentials objectForKey:@"AuthenticationScheme"]"#,
+            r#"[sessionCredentials setObject:[self proxyHost] forKey:@"Host"]"#,
+            r#"[self willChangeValueForKey:@"credentials"]"#,
             r#"PrivateKey = RSA-2048"#,
             r#"Key = RSA-2048"#,
             r#"PrivateKey = RSA-PSS"#,
@@ -4635,9 +4745,12 @@ mod tests {
             r#"PrivateKey=P-256"#,
             r#"PrivateKey=PRIME192V1_RFC5114-Peer"#,
             r#"PrivPubKeyPair = SECP224R1_RFC5114:SECP224R1_RFC5114-PUBLIC"#,
+            r#"PrivPubKeyPair = Alice-secp256r1:Bob-secp256r1"#,
+            r#"PeerKey=Bob-prime192v1"#,
             r#"PrivateKey=ffdhe2048-1"#,
             r#"PeerKey=ffdhe3072-2-pub"#,
             r#"PrivPubKeyPair=ffdhe4096-1:ffdhe4096-1-pub"#,
+            r#"<DiscreteObjectKeyFrame KeyTime="0:0:0.2" Value="{x:Static Visibility.Visible}" />"#,
             r#"OBJ_dhKeyAgreement="\x2A\x86\x48\x86\xF7\x0D\x01\x03\x01""#,
             r#"OBJ_pkcs9_challengePassword="\x2A\x86\x48\x86\xF7\x0D\x01\x09\x07""#,
             r#"passwordEnteredInvalid: "Invalid password for room \"%s\".""#,
