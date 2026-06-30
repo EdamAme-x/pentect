@@ -18,6 +18,8 @@ enum KeyKind {
     Otp,
     Phrase,
     EncodedHex,
+    Salt,
+    Nonce,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,7 +247,10 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     if !value.quoted && is_camel_case_code_reference(raw_value) {
         return false;
     }
-    if !value.quoted && is_code_type_or_expression(raw_value, &key_name, kind) {
+    if !value.quoted
+        && !is_prefixed_material_literal(raw_value, kind)
+        && is_code_type_or_expression(raw_value, &key_name, kind)
+    {
         return false;
     }
     if is_analysis_token_result_literal(ctx.text, ctx.line_end, &key_name, raw_value) {
@@ -282,7 +287,12 @@ impl KeyKind {
     fn allows_is_separator(self) -> bool {
         matches!(
             self,
-            KeyKind::Strong | KeyKind::Otp | KeyKind::Phrase | KeyKind::EncodedHex
+            KeyKind::Strong
+                | KeyKind::Otp
+                | KeyKind::Phrase
+                | KeyKind::EncodedHex
+                | KeyKind::Salt
+                | KeyKind::Nonce
         )
     }
 }
@@ -400,6 +410,12 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
     if is_otp_key_name(&name) {
         return Some(KeyKind::Otp);
     }
+    if is_salt_key_name(&name) {
+        return Some(KeyKind::Salt);
+    }
+    if is_nonce_key_name(&name) {
+        return Some(KeyKind::Nonce);
+    }
     if contains_any(
         &name,
         &[
@@ -495,6 +511,12 @@ fn implicit_key_name_kind(name: &str) -> Option<KeyKind> {
     }
     if is_otp_key_name(name) {
         return Some(KeyKind::Otp);
+    }
+    if is_salt_key_name(name) {
+        return Some(KeyKind::Salt);
+    }
+    if is_nonce_key_name(name) {
+        return Some(KeyKind::Nonce);
     }
     if matches!(
         name,
@@ -799,6 +821,14 @@ fn looks_like_secret_value(
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ' '));
     }
 
+    if matches!(kind, KeyKind::Salt) {
+        return looks_like_salt_material(value, key_name);
+    }
+
+    if matches!(kind, KeyKind::Nonce) {
+        return looks_like_nonce_material(value, key_name);
+    }
+
     if matches!(kind, KeyKind::Phrase) {
         return chars >= 8;
     }
@@ -933,6 +963,70 @@ fn looks_like_secret_value(
         return chars >= 12 && !has_space;
     }
     false
+}
+
+fn looks_like_salt_material(value: &str, key_name: &str) -> bool {
+    if has_material_metadata_modifier(key_name) {
+        return false;
+    }
+    let material = value.trim().strip_prefix("salt:").unwrap_or(value).trim();
+    if is_keyed_hex_secret_literal(material, key_name, KeyKind::Salt) {
+        return true;
+    }
+    let bytes = material.as_bytes();
+    if !(8..=128).contains(&bytes.len())
+        || bytes.iter().any(u8::is_ascii_whitespace)
+        || bytes.iter().all(u8::is_ascii_digit)
+        || is_material_name_reference(material, "salt")
+        || !bytes.iter().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'.')
+        })
+    {
+        return false;
+    }
+    let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_symbol = bytes.iter().any(|b| !b.is_ascii_alphanumeric());
+    has_alpha && (has_digit || has_symbol)
+}
+
+fn is_prefixed_material_literal(value: &str, kind: KeyKind) -> bool {
+    let value = value.trim();
+    (matches!(kind, KeyKind::Salt) && value.starts_with("salt:"))
+        || (matches!(kind, KeyKind::Nonce) && value.starts_with("nonce:"))
+}
+
+fn looks_like_nonce_material(value: &str, key_name: &str) -> bool {
+    if has_material_metadata_modifier(key_name) {
+        return false;
+    }
+    let material = value.trim().strip_prefix("nonce:").unwrap_or(value).trim();
+    let bytes = material.as_bytes();
+    if !(8..=128).contains(&bytes.len())
+        || bytes.iter().any(u8::is_ascii_whitespace)
+        || is_material_name_reference(material, "nonce")
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+    {
+        return false;
+    }
+    if bytes.iter().all(u8::is_ascii_digit) {
+        return bytes.len() <= 32;
+    }
+    let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_symbol = bytes.iter().any(|b| !b.is_ascii_alphanumeric());
+    has_alpha && (has_digit || has_symbol || has_mixed_ascii_case(bytes))
+}
+
+fn is_material_name_reference(value: &str, component: &str) -> bool {
+    let name = normalize_key(value);
+    !name.is_empty() && name.split('_').any(|part| part == component)
+}
+
+fn has_mixed_ascii_case(bytes: &[u8]) -> bool {
+    bytes.iter().any(u8::is_ascii_lowercase) && bytes.iter().any(u8::is_ascii_uppercase)
 }
 
 fn is_short_dotted_triplet(value: &str) -> bool {
@@ -1116,7 +1210,8 @@ fn is_keyed_hex_secret_literal(value: &str, key_name: &str, kind: KeyKind) -> bo
     let key_allows_hex = match kind {
         KeyKind::EncodedHex => is_hex_encoded_sensitive_key_name(key_name),
         KeyKind::Strong => is_hex_material_key_name(key_name),
-        KeyKind::Token | KeyKind::Otp | KeyKind::Phrase => false,
+        KeyKind::Salt => is_salt_key_name(key_name),
+        KeyKind::Token | KeyKind::Otp | KeyKind::Phrase | KeyKind::Nonce => false,
     };
     if !key_allows_hex {
         return false;
@@ -5090,6 +5185,41 @@ fn is_otp_key_name(name: &str) -> bool {
         )
 }
 
+fn is_salt_key_name(name: &str) -> bool {
+    has_identifier_component(name, "salt") && !has_material_metadata_modifier(name)
+}
+
+fn is_nonce_key_name(name: &str) -> bool {
+    has_identifier_component(name, "nonce") && !has_material_metadata_modifier(name)
+}
+
+fn has_material_metadata_modifier(name: &str) -> bool {
+    name.split('_').any(|part| {
+        matches!(
+            part,
+            "bits"
+                | "byte"
+                | "bytes"
+                | "count"
+                | "counter"
+                | "default"
+                | "index"
+                | "len"
+                | "length"
+                | "limit"
+                | "max"
+                | "maximum"
+                | "min"
+                | "minimum"
+                | "round"
+                | "rounds"
+                | "size"
+                | "ttl"
+                | "version"
+        )
+    })
+}
+
 fn has_identifier_component(name: &str, component: &str) -> bool {
     name.split('_').any(|part| part == component)
 }
@@ -5242,6 +5372,20 @@ mod tests {
             r#""Apitoken": "{\"nonce\":\"ok\",\"token\":\"abc123456789\"}""#,
             r#"{\"nonce\":\"ok\",\"token\":\"abc123456789\"}"#
         ));
+        assert!(has("Salt = 6D80AE51823B457A", "6D80AE51823B457A"));
+        assert!(has(
+            r#"salt: "2G7ZwuppkK7gpuSd8VWwTF""#,
+            "2G7ZwuppkK7gpuSd8VWwTF"
+        ));
+        assert!(has(r#"nonce="4811859511""#, "4811859511"));
+        assert!(has(
+            r#"nonce="AdWNR7IiDBoR2AGjOiDTsgtQjCRQrnr1y8LiHd6XIJY""#,
+            "AdWNR7IiDBoR2AGjOiDTsgtQjCRQrnr1y8LiHd6XIJY"
+        ));
+        assert!(has(
+            r#"private final byte[] NONCE = "eznu-EMEPG""#,
+            "eznu-EMEPG"
+        ));
         assert!(has(
             r#"private const string CertificatePassword = "VozkqqWcexxxle";"#,
             "VozkqqWcexxxle"
@@ -5325,6 +5469,15 @@ mod tests {
             "neg_ctx->output_token_length = out_sec_buff.cbBuffer;",
             "key = app_data->perthreadkey;",
             "spnegoTokenLength = input_token.length;",
+            "MAX_NONCE: 5524839971, // Max nonce value",
+            "salt_rounds = 12",
+            "nonce_size = 16",
+            "salt: password",
+            "Salt = \"SodiumChloride\"",
+            "Ctrl.salt = salt:saltSALTsaltSALTsaltSALTsaltSALTsalt",
+            "error_code:int new_server_salt:long = BadMsgNotification;",
+            r#"nonce: "placeholder""#,
+            r#"String NONCE = "oauth_nonce";"#,
             "pwd = conn->passwd;",
             r#"auth="GSS-Negotiate";"#,
             r#"auth &= ~CURLAUTH_NTLM;"#,
