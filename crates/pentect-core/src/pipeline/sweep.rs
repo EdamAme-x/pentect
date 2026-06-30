@@ -119,6 +119,10 @@ fn is_sweepable_identity(raw: &str, span: &Span) -> bool {
     if span.label.as_str() == labels::KEYED_SECRET && span.range.len() < 12 {
         return false;
     }
+    if span.label.as_str() == labels::KEYED_SECRET && !is_keyed_secret_sweepable_identity(raw, span)
+    {
+        return false;
+    }
     // Structural JSON detections are anchored by local key context. Generated
     // labels such as `LOCKROOMPASSWORD`, `LABEL_PASSWORD`, or
     // `CREATEAUTHORIZERREQUEST` often come from UI/resource strings; seeing the
@@ -131,6 +135,29 @@ fn is_sweepable_identity(raw: &str, span: &Span) -> bool {
         return false;
     }
     true
+}
+
+fn is_keyed_secret_sweepable_identity(raw: &str, span: &Span) -> bool {
+    // KeyValueDetector is anchored by local key syntax. Repeating a long source
+    // identifier or fixture-looking no-digit password elsewhere is weak
+    // evidence; repeating a compact value with digits and token punctuation or
+    // mixed case is much stronger identity evidence.
+    let value = raw[span.range.start..span.range.end].trim();
+    let bytes = value.as_bytes();
+    if bytes.len() < 12 || bytes.iter().any(u8::is_ascii_whitespace) {
+        return false;
+    }
+    let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    if !has_alpha || !has_digit {
+        return false;
+    }
+    let has_token_symbol = bytes
+        .iter()
+        .any(|b| matches!(b, b'_' | b'-' | b'.' | b'+' | b'/' | b'='));
+    let has_mixed_case =
+        bytes.iter().any(u8::is_ascii_lowercase) && bytes.iter().any(u8::is_ascii_uppercase);
+    has_token_symbol || has_mixed_case
 }
 
 fn is_structural_sweepable_identity(raw: &str, span: &Span) -> bool {
@@ -293,6 +320,53 @@ mod tests {
             swept.is_empty(),
             "short keyed values need local context, not global sweep: {swept:?}"
         );
+    }
+
+    #[test]
+    fn keyed_source_identifiers_are_not_identity_swept() {
+        for raw in [
+            r#"key="UNSAFE_componentWillMount" code UNSAFE_componentWillMount"#,
+            r#"key="_selectLength" code _selectLength"#,
+            r#"password="x-pack-test-password" docs x-pack-test-password"#,
+            r#"secret="secret_key_base" docs secret_key_base"#,
+        ] {
+            let value = raw.split('"').nth(1).unwrap();
+            let first = span(
+                raw,
+                value,
+                labels::KEYED_SECRET,
+                Category::Secret,
+                Confidence::Medium,
+            );
+            let swept = swept_ranges(raw, vec![first]);
+            assert!(
+                swept.is_empty(),
+                "no-digit keyed values need local context, not global sweep: {raw} {swept:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyed_distinctive_values_are_identity_swept() {
+        for raw in [
+            r#"api_key="abcDEF123456" later abcDEF123456"#,
+            r#"password="tenant-7-trial" later tenant-7-trial"#,
+        ] {
+            let value = raw.split('"').nth(1).unwrap();
+            let first = span(
+                raw,
+                value,
+                labels::KEYED_SECRET,
+                Category::Secret,
+                Confidence::Medium,
+            );
+            let swept = swept_ranges(raw, vec![first]);
+            assert_eq!(
+                swept.len(),
+                1,
+                "distinctive keyed values should still sweep: {raw} {swept:?}"
+            );
+        }
     }
 
     #[test]

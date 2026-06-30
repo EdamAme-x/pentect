@@ -78,6 +78,9 @@ and command/mock call fragments are likewise handled as metadata or source
 syntax rather than credential values. Generic `key` fields share the same
 field-name metadata filter across structural and key-value detection, including
 curated numbered UI/reference identifiers such as `panel1`.
+Keyed identity sweep now propagates only distinctive compact values with digits
+and token punctuation or mixed case, keeping local `password="secret"` style
+masking without spreading source identifiers or fixture-looking passwords.
 
 ```text
 CredData commit: 9a55c40
@@ -87,15 +90,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 7067
-FP: 14946
+FP: 14010
 FN: 8037
-Line only: 243
-Unlabeled: 78162
+Line only: 235
+Unlabeled: 72169
 Missing files: 0
-Precision: 0.321
+Precision: 0.335
 Recall: 0.468
-F1: 0.381
-Elapsed: 32100 ms
+F1: 0.391
+Elapsed: 31981 ms
 ```
 
 Weak groups:
@@ -112,6 +115,7 @@ Weak groups:
 - Code/reference literals under sensitive-looking keys are suppressed only when syntax proves they are not values: PascalCase type annotations require a code delimiter, and env lookups require explicit Jinja/Ansible `lookup('env', ...)` shape.
 - Additional source/metadata literals are shape-gated: protobuf tag descriptors require `protobuf_key` context, key algorithm labels require known algorithm-size syntax, fingerprints require explicit fingerprint keys and colon-hex shape, and command/mock fragments require invocation syntax.
 - Sequential hex byte strings are suppressed only when every decoded byte increments by one, matching cryptographic test-vector material rather than arbitrary hex secrets.
+- `KEYED_SECRET` identity sweep keeps anchored detections but no longer propagates long no-digit source identifiers such as lifecycle method names or fixture-looking passwords across the file.
 - Source fixture literals require both source-code shape and fixture key context, so `expectedPassword = "pass"` is skipped while plain `password = "pass"` still fires.
 - `UUID`: low recall.
 - `AWS S3 Bucket`, `Firebase Domain`, and `Tencent WeChat API App ID`: currently missed.
