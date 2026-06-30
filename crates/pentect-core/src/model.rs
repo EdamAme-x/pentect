@@ -30,6 +30,8 @@ pub mod labels {
     pub const URL_CREDENTIAL: &str = "URL_CREDENTIAL";
     /// Password-like value passed through a shell or PowerShell command option.
     pub const CMD_PASSWORD: &str = "CMD_PASSWORD";
+    /// UUID/GUID value in an identifier-bearing slot.
+    pub const UUID: &str = "UUID";
     /// Bucket name in an Amazon S3 hostname.
     pub const AWS_S3_BUCKET: &str = "AWS_S3_BUCKET";
     /// Firebase project/database prefix in a Realtime Database hostname.
@@ -215,6 +217,8 @@ pub enum DetectorId {
     Decode,
     /// A value sensitive by structural position (cookie value, auth header).
     Structural,
+    /// A UUID/GUID value anchored by identifier context.
+    Uuid,
     /// A codec-decoded blob that only "looks encrypted" (no inner secret found).
     DecodeOpaque,
     Entropy,
@@ -233,6 +237,7 @@ impl DetectorId {
             DetectorId::DecodeOpaque => "decode_opaque",
             DetectorId::Pem => "pem",
             DetectorId::Structural => "structural",
+            DetectorId::Uuid => "uuid",
             DetectorId::Sweep => "sweep",
         }
     }

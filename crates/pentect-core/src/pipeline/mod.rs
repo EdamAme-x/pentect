@@ -6,7 +6,7 @@ mod sweep;
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector, DecodeDetector, Detector,
     EntropyDetector, EnvValueDetector, KeyValueDetector, PemDetector, PhoneDetector, RuleDetector,
-    SensitiveKeyDetector, StructuralDetector, UrlDetector,
+    SensitiveKeyDetector, StructuralDetector, UrlDetector, UuidDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -491,6 +491,7 @@ impl EngineBuilder {
             .detector(Box::new(CliCredentialDetector))
             .detector(Box::new(RuleDetector::builtin()))
             .detector(Box::new(KeyValueDetector))
+            .detector(Box::new(UuidDetector))
             .detector(Box::new(AuthCodeDetector))
             .detector(Box::new(Bip39Detector))
             .detector(Box::new(CardDetector))

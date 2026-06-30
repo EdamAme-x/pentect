@@ -18,6 +18,7 @@ mod shell;
 mod structural;
 mod url;
 mod util;
+mod uuid;
 mod validate;
 
 pub use auth_code::AuthCodeDetector;
@@ -33,6 +34,7 @@ pub use phone::PhoneDetector;
 pub use rule::{RuleDetector, RuleSpec};
 pub use structural::{EnvValueDetector, SensitiveKeyDetector, StructuralDetector};
 pub use url::UrlDetector;
+pub use uuid::UuidDetector;
 pub use validate::Validator;
 
 pub(crate) use util::is_token_byte;
