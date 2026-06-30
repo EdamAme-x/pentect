@@ -784,6 +784,7 @@ fn looks_like_secret_value(
         || is_source_struct_tag_literal(value, key_name, source_key)
         || is_source_prefix_constant_literal(value, key_name)
         || is_source_variable_reference_literal(value, key_name, source_key, quoted)
+        || is_shell_parameter_reference_literal(value, key_name, source_key)
         || is_source_string_fragment_literal(value, source_key)
         || is_source_concatenation_template_literal(value)
         || is_shell_command_substitution_literal(value, source_key)
@@ -1921,18 +1922,21 @@ fn is_html_code_metadata_literal(value: &str) -> bool {
 }
 
 fn is_html_documentation_fragment_literal(value: &str, key_name: &str, source_key: &str) -> bool {
-    // Generated API docs often include prose like `<p>Key: CreatedTime</p>`
-    // inside long documentation strings. The scanner can see the inner `Key:`
-    // as a key/value pair; the value is an HTML fragment naming a public field.
-    // Require both key-name context and documentation/HTML syntax on the left.
-    if !has_identifier_component(key_name, "key")
-        || !source_key_has_html_documentation_shape(source_key)
-    {
+    // Generated API docs often include prose like `<p>Key: CreatedTime</p>` or
+    // `<li>token=1234</li>` inside long documentation strings. The scanner can
+    // see the inner key/value text as a credential. Require documentation/HTML
+    // syntax on the left, then keep generic `key` fields to public metadata
+    // names and sensitive fields to short numeric examples.
+    if !source_key_has_html_documentation_shape(source_key) {
         return false;
     }
     let value = value.trim();
     let (head, had_html_tail) = strip_trailing_html_tag(value);
-    is_documentation_metadata_key_name(head, had_html_tail)
+    (has_identifier_component(key_name, "key")
+        && is_documentation_metadata_key_name(head, had_html_tail))
+        || (had_html_tail
+            && key_name_has_non_key_secret_component(key_name)
+            && is_short_numeric_doc_example(head))
 }
 
 fn source_key_has_html_documentation_shape(source_key: &str) -> bool {
@@ -1993,6 +1997,20 @@ fn contains_dangerous_secret_component(value: &str) -> bool {
             "secret" | "password" | "passwd" | "credential" | "token" | "auth" | "private"
         )
     })
+}
+
+fn key_name_has_non_key_secret_component(key_name: &str) -> bool {
+    normalize_key(key_name).split('_').any(|part| {
+        matches!(
+            part,
+            "secret" | "password" | "passwd" | "pwd" | "credential" | "token" | "auth"
+        )
+    })
+}
+
+fn is_short_numeric_doc_example(value: &str) -> bool {
+    let value = value.trim();
+    (3..=12).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn is_uppercase_public_doc_identifier(value: &str) -> bool {
@@ -2565,6 +2583,57 @@ fn is_plain_source_identifier_reference(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+fn is_shell_parameter_reference_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Shell/YAML snippets often assign secret-looking fields from environment
+    // variables: `password=${PASS}` or `KEY=rolling/${APP_NAME}/stable/id`.
+    // The variable reference is not the credential bytes. Keep the gate to
+    // assignment-like contexts and a shell parameter grammar, not value names.
+    if !(source_key_has_code_shape(source_key)
+        || is_generic_metadata_key_name(key_name)
+        || key_name_has_sensitive_component(key_name))
+    {
+        return false;
+    }
+    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    if !(4..=160).contains(&value.len()) || !value.contains("${") {
+        return false;
+    }
+    value.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b'$' | b'{' | b'}')
+    }) && contains_shell_parameter_reference(value)
+}
+
+fn contains_shell_parameter_reference(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        let Some(rel) = value[i..].find("${") else {
+            return false;
+        };
+        let start = i + rel + 2;
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != b'}' {
+            end += 1;
+        }
+        if is_shell_parameter_name(&value[start..end]) {
+            return true;
+        }
+        i = start;
+    }
+    false
+}
+
+fn is_shell_parameter_name(name: &str) -> bool {
+    (2..=64).contains(&name.len())
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
 fn is_source_string_fragment_literal(value: &str, source_key: &str) -> bool {
     // Objective-C and generated code can expose partial string syntax when an
     // embedded line is scanned from the middle, e.g. `apiURL: @\"...\\n`.
@@ -2602,7 +2671,9 @@ fn is_inline_code_key_value_tail_literal(value: &str, key_name: &str, source_key
     // Help text commonly documents `key=value` inside backticks. Splitting at
     // `=` leaves `value`` as a fake credential; keep this to generic key
     // context and inline-code syntax.
-    if !is_generic_metadata_key_name(key_name) || !source_key.contains('`') {
+    if !(is_generic_metadata_key_name(key_name) || key_name_has_sensitive_component(key_name))
+        || !source_key.contains('`')
+    {
         return false;
     }
     value.trim() == "value`"
@@ -4006,6 +4077,11 @@ mod tests {
             r#"{"body":"\u003cpre\u003e\u003ccode\u003ecredentials: @\"apiURL\\n];\u003c/code\u003e\u003c/pre\u003e"}"#,
             "/// Bitcoin address: base58check, P2PKH (0x00, '1') or P2SH (0x05, '3').",
             "/// Bitcoin WIF private key: base58check, version 0x80.",
+            r#"* <li>token=1234</li>"#,
+            r#"The format is `password=value` pairs."#,
+            r#"echo "password=${PASS}" >> ${DOMAIN_HOME}/boot.properties"#,
+            r#"- ADMIN_PASSWORD=${DC_ADMIN_PWD}"#,
+            r#"KEY=rolling/${APP_NAME}/stable/id"#,
             r#"api 'com.google.auth:google-auth-library-credentials:0.20.0'"#,
             r#""illuminate/auth": "^5.5","#,
             r#""tymon/jwt-auth": "1.0.*""#,
