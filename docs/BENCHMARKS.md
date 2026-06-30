@@ -75,7 +75,12 @@ sweep is disabled: key-value detections require local key context, while
 stronger rule/entropy/structural detections still drive global identity sweep.
 Generic `key` fields that name code members and parser-cut source fragments
 (`Type{Field:`, minified `{key:"...", value:function...}` tails, strict ISO date
-bucket keys) are treated as metadata/source syntax, not credential values.
+bucket keys) are treated as metadata/source syntax, not credential values. RFC
+7617 Basic Authorization is captured through a token68 validator that decodes
+to `user:password` shape. Identity sweep now rejects short syntax-only
+representatives, and keyed locator/resource metadata suppresses values such as
+`secretName`, `secret.type`, and URL/path references only when the value is not
+credential-bearing.
 
 ```text
 CredData commit: 9a55c40
@@ -84,16 +89,16 @@ Rows: 66898
 Files: 10865
 True rows: 15104
 False rows: 51794
-TP: 10294
-FP: 12812
-FN: 4810
-Line only: 220
-Unlabeled: 69452
+TP: 10276
+FP: 11491
+FN: 4828
+Line only: 227
+Unlabeled: 67841
 Missing files: 0
-Precision: 0.446
-Recall: 0.682
-F1: 0.539
-Elapsed: 28633 ms
+Precision: 0.472
+Recall: 0.680
+F1: 0.557
+Elapsed: 28877 ms
 ```
 
 Weak groups:
@@ -112,6 +117,8 @@ Weak groups:
 - Generic `key` code-member names and parser-cut source fragments are suppressed only when source syntax proves they are metadata, keeping concrete key material under `api_key`/`client_secret` unaffected.
 - Synthetic hex fixture strings are suppressed when the whole value is built from canonical visual patterns, sequential byte runs, or repeated bytes; arbitrary hex under sensitive key context still fires.
 - `KEYED_SECRET` identity sweep keeps anchored detections only. Context-free propagation is left to stronger rule, entropy, and structural detections.
+- `BASIC_AUTH` is RFC 7617-gated: the captured token68 must decode to a non-empty `user:password` pair, so `Basic something` style prose is not counted.
+- Locator/resource metadata suppression is policy-gated: secret object names and URL/path references are skipped only when no userinfo/query/fragment or webhook/signed-url key suggests the locator itself carries a credential. This improves precision with a small recall tradeoff on path-like positive labels.
 - Source fixture literals require both source-code shape and fixture key context, so `expectedPassword = "pass"` is skipped while plain `password = "pass"` still fires.
 - `UUID`: low recall.
 - `AWS S3 Bucket`, `Firebase Domain`, and `Tencent WeChat API App ID`: currently missed.

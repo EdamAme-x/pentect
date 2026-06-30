@@ -106,6 +106,13 @@ pub fn identity_sweep(
 }
 
 fn is_sweepable_identity(raw: &str, span: &Span) -> bool {
+    // Identity sweep is propagation, not the original detection decision. Very
+    // short or punctuation-only representatives such as `=` are almost always
+    // syntax around a detected value; sweeping them creates noisy standalone
+    // masks while the original detector hit remains masked.
+    if !has_distinctive_sweep_identity_shape(&raw[span.range.start..span.range.end]) {
+        return false;
+    }
     // OTP/passcode values are short and time-bound. A repeated `123456` elsewhere
     // is not evidence of the same credential unless the local line has OTP
     // context, so the detector hit is masked but global identity propagation is
@@ -132,6 +139,11 @@ fn is_sweepable_identity(raw: &str, span: &Span) -> bool {
         return false;
     }
     true
+}
+
+fn has_distinctive_sweep_identity_shape(value: &str) -> bool {
+    let value = value.trim();
+    value.len() >= 4 && value.bytes().any(|b| b.is_ascii_alphanumeric())
 }
 
 fn is_structural_sweepable_identity(raw: &str, span: &Span) -> bool {
@@ -293,6 +305,23 @@ mod tests {
         assert!(
             swept.is_empty(),
             "short keyed values need local context, not global sweep: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn punctuation_syntax_is_not_identity_swept() {
+        let raw = "PrivPubKeyPair = A:B\nPrivPubKeyPair = C:D";
+        let first = span(
+            raw,
+            "=",
+            labels::LIKELY_SECRET,
+            Category::Secret,
+            Confidence::Low,
+        );
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "syntax-only identities must not be propagated: {swept:?}"
         );
     }
 

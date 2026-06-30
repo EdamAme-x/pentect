@@ -4,6 +4,7 @@
 //! Every function is covered by reference test vectors below.
 
 use bip39::{Language, Mnemonic};
+use data_encoding::BASE64;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -838,6 +839,34 @@ pub fn local_username(s: &str) -> bool {
     )
 }
 
+/// RFC 7617 Basic credentials are base64(user-id ":" password). Token68 allows
+/// omitted padding, so normalize before decoding. Requiring a non-edge colon
+/// removes prose and arbitrary base64-looking samples without hardcoding values.
+fn basic_auth_token68(s: &str) -> bool {
+    let token = s.trim();
+    if token.len() < 8
+        || token.len() % 4 == 1
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        return false;
+    }
+    let padded = match token.len() % 4 {
+        0 => Cow::Borrowed(token),
+        2 => Cow::Owned(format!("{token}==")),
+        3 => Cow::Owned(format!("{token}=")),
+        _ => return false,
+    };
+    let Ok(decoded) = BASE64.decode(padded.as_bytes()) else {
+        return false;
+    };
+    let Some(colon) = decoded.iter().position(|b| *b == b':') else {
+        return false;
+    };
+    colon > 0 && colon + 1 < decoded.len()
+}
+
 /// A checksum gate applied to a regex match before it becomes a span.
 #[derive(Clone, Copy, Debug)]
 pub enum Validator {
@@ -878,6 +907,7 @@ pub enum Validator {
     AuAcn,
     InGstin,
     LocalUsername,
+    BasicAuthToken68,
 }
 
 impl Validator {
@@ -923,6 +953,7 @@ impl Validator {
             "au_acn" => Validator::AuAcn,
             "in_gstin" => Validator::InGstin,
             "local_username" => Validator::LocalUsername,
+            "basic_auth_token68" => Validator::BasicAuthToken68,
             _ => return None,
         })
     }
@@ -966,6 +997,7 @@ impl Validator {
             Validator::AuAcn => au_acn(s),
             Validator::InGstin => in_gstin(s),
             Validator::LocalUsername => local_username(s),
+            Validator::BasicAuthToken68 => basic_auth_token68(s),
         }
     }
 }
@@ -1013,6 +1045,18 @@ mod tests {
         vectors!(fr_nir, "180047509112541" => true, "180047509112556" => false);
         vectors!(au_acn, "004085616" => true, "004085617" => false);
         vectors!(in_gstin, "27AAPFU0939F1ZV" => true, "27AAPFU0939F1ZX" => false);
+    }
+
+    #[test]
+    fn basic_auth_token68_requires_decoded_user_pass() {
+        vectors!(basic_auth_token68,
+            "dXNlcjpwYXNz" => true,
+            "d3p3bTpqQGNs" => true,
+            "eXc6ZXR1ZW1vWA==" => true,
+            "p4ssw0rd" => false,
+            "something" => false,
+            "dXNlcm9ubHk=" => false,
+            "OnBhc3M=" => false);
     }
 
     #[test]

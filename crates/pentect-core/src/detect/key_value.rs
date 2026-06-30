@@ -632,6 +632,7 @@ fn looks_like_secret_value(
         || is_structured_key_name_reference_literal(value, key_name)
         || is_plain_prose_literal_for_generic_key(value, key_name)
         || is_locator_literal_for_key(value, key_name)
+        || is_secret_resource_metadata_literal(value, key_name)
     {
         return false;
     }
@@ -1779,11 +1780,68 @@ fn is_locator_literal_for_key(value: &str, key_name: &str) -> bool {
     // Endpoint/url/uri/path/host keys normally name where to ask for a token,
     // not the token. Suppress only locator-shaped values without password
     // userinfo; password-bearing URLs remain visible to URL_CREDENTIAL rules.
-    if !key_name_indicates_locator(key_name) {
+    let value = value.trim();
+    if key_name_indicates_locator(key_name) {
+        return is_path_literal(value) || is_uri_literal_without_password_userinfo(value);
+    }
+    key_name_indicates_sensitive_material(key_name) && is_non_secret_locator_value(value, key_name)
+}
+
+fn is_secret_resource_metadata_literal(value: &str, key_name: &str) -> bool {
+    // Orchestrators and deployment manifests use `secretName`, `secret.type`,
+    // and `*_secret_ref` fields to name a secret object, not to store its bytes.
+    // Keep this anchored to explicit name/type/ref/namespace key phrases so
+    // material fields like `client_secret` and `password` still detect weak
+    // values such as `tenant-7-trial` or `pass`.
+    if !key_name_indicates_secret_metadata(key_name) {
         return false;
     }
+    is_resource_name_literal(value)
+}
+
+fn key_name_indicates_secret_metadata(key_name: &str) -> bool {
+    has_identifier_phrase(key_name, &["secret", "name"])
+        || has_identifier_phrase(key_name, &["secret", "namespace"])
+        || has_identifier_phrase(key_name, &["secret", "type"])
+        || has_identifier_phrase(key_name, &["secret", "ref"])
+        || has_identifier_phrase(key_name, &["secret", "reference"])
+        || has_identifier_phrase(key_name, &["cert", "secret", "name"])
+        || has_identifier_phrase(key_name, &["certificate", "secret", "name"])
+        || matches!(
+            key_name,
+            "secretname" | "secretnamespace" | "secrettype" | "secretref" | "secretreference"
+        )
+}
+
+fn is_resource_name_literal(value: &str) -> bool {
     let value = value.trim();
-    is_path_literal(value) || is_uri_literal_without_password_userinfo(value)
+    if !(3..=253).contains(&value.len())
+        || value.contains("://")
+        || value
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || matches!(b, b'@' | b'=' | b'{' | b'}'))
+    {
+        return false;
+    }
+    let mut has_name_char = false;
+    let mut has_separator = false;
+    for label in value.split(['/', '.']) {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        let bytes = label.as_bytes();
+        if bytes.first().is_some_and(|b| !b.is_ascii_alphanumeric())
+            || bytes.last().is_some_and(|b| !b.is_ascii_alphanumeric())
+            || !bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        {
+            return false;
+        }
+        has_name_char |= bytes.iter().any(|b| b.is_ascii_lowercase());
+        has_separator |= bytes.contains(&b'-');
+    }
+    has_name_char && (has_separator || value.contains('/') || value.contains('.'))
 }
 
 fn key_name_indicates_locator(key_name: &str) -> bool {
@@ -1794,13 +1852,51 @@ fn key_name_indicates_locator(key_name: &str) -> bool {
         || has_identifier_component(key_name, "host")
 }
 
+fn key_name_indicates_sensitive_material(key_name: &str) -> bool {
+    key_name.split('_').any(|part| {
+        matches!(
+            part,
+            "password"
+                | "passwd"
+                | "pwd"
+                | "pass"
+                | "secret"
+                | "token"
+                | "credential"
+                | "credentials"
+                | "key"
+        )
+    })
+}
+
+fn is_non_secret_locator_value(value: &str, key_name: &str) -> bool {
+    // A path or URL stored under a sensitive-looking key can name where a secret
+    // lives (`credential_list_mappings`, `token: /oauth/token`) rather than the
+    // secret itself. Do not suppress webhook/signed-url keys, URLs with
+    // userinfo, or query/fragment-bearing URLs where the credential may be in
+    // the locator itself.
+    if has_identifier_component(key_name, "webhook")
+        || has_identifier_component(key_name, "hook")
+        || has_identifier_component(key_name, "signed")
+    {
+        return false;
+    }
+    if is_absolute_path_literal(value) && !value.bytes().any(|b| matches!(b, b'+' | b'=' | b'@')) {
+        return true;
+    }
+    is_uri_literal_without_password_userinfo(value) && !value.contains(['?', '#'])
+}
+
 fn is_path_literal(value: &str) -> bool {
+    is_absolute_path_literal(value) || is_relative_path_literal(value)
+}
+
+fn is_absolute_path_literal(value: &str) -> bool {
     value.starts_with('/')
         || value.starts_with('\\')
         || value.as_bytes().get(..3).is_some_and(|prefix| {
             prefix[0].is_ascii_alphabetic() && prefix[1] == b':' && prefix[2] == b'\\'
         })
-        || is_relative_path_literal(value)
 }
 
 fn is_relative_path_literal(value: &str) -> bool {
@@ -1808,6 +1904,7 @@ fn is_relative_path_literal(value: &str) -> bool {
     // slash and no whitespace so ordinary prose or templated strings are not
     // hidden by this path rule.
     value.contains('/')
+        && !value.contains("://")
         && !value.chars().any(char::is_whitespace)
         && value
             .as_bytes()
@@ -2095,6 +2192,10 @@ mod tests {
         assert!(has("api_key: Abc123Secret", "Abc123Secret"));
         assert!(has("api_key=Abc-2048", "Abc-2048"));
         assert!(has(r#"password="{{secret123}}""#, "{{secret123}}"));
+        assert!(has(
+            r#"password="redis://:secret@localhost:6379/1""#,
+            "redis://:secret@localhost:6379/1"
+        ));
         assert!(has("otp=100482 expires soon", "100482"));
         assert!(has("verification_code=100482", "100482"));
         assert!(has(
@@ -2106,6 +2207,10 @@ mod tests {
             "eyJabcdefghijklmnop123456"
         ));
         assert!(has("Authorization: Bearer abcdefgh123", "abcdefgh123"));
+        assert!(has(
+            r#"refresh_token="6nA7WEJ/bBBCY06IrWwAlks7""#,
+            "6nA7WEJ/bBBCY06IrWwAlks7"
+        ));
         assert!(has(
             r#"authorization: 'Basic Wv0dTjLryp=='"#,
             "Wv0dTjLryp=="
@@ -2253,6 +2358,15 @@ mod tests {
             r#"key: "grant_type""#,
             r#"key: "panel1""#,
             r#"key: "dataGrid12""#,
+            r#"secretName: kube-ovn-tls"#,
+            r#"adminSecretName: cephfs-provisioner"#,
+            r#"rbd_provisioner_user_secret_namespace: rbd-provisioner"#,
+            r#"secret.type = "kubernetes.io/tls""#,
+            r#"- "--hubble-ca-secret-name=hubble-ca-secret""#,
+            r#"password: https://secrets.elastic.co:8200"#,
+            r#""token": "/one/two/three""#,
+            r#""credential_list_mappings": "/2010-04-01/Accounts/ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/CredentialListMappings.json""#,
+            r#"$privateKey = 'file://' . __DIR__ . '/../private.key';"#,
             r#"{key:"_onClose",value:function(){}}"#,
             r#"{key:"_reset",value:function(){}}"#,
             r#"{key:"UNSAFE_componentWillReceiveProps",value:function(){}}"#,

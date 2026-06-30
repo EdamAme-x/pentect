@@ -405,6 +405,10 @@ impl RuleDetector {
             // test/noise; a long three-segment token after session/jwt/cookie is
             // credential-bearing even if the header is opaque or not JSON.
             (r#"(?i)\b(?:session|sid|jwt|cookie|auth[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token)\b[^\r\n]{0,16}?(?:=|:)[ \t'"]{0,3}([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})(?:$|[\s"',;)])"#, Secret, "SESSION_TOKEN", Medium, 1, V::None),
+            // RFC 7617 Basic credentials use token68 after the `Basic` scheme.
+            // Require nearby Authorization/auth wording so prose like
+            // `Basic docs` or unrelated base64 samples do not become secrets.
+            (r#"(?i)\b(?:proxy-authorization|authorization|auth)\b[^\r\n]{0,40}?\bbasic[ \t]+([A-Za-z0-9+/]{8,}={0,2})(?:$|[\s"',;)])"#, Secret, "BASIC_AUTH", Medium, 1, V::BasicAuthToken68),
             // Preserve path structure for debugging, but hide the local account
             // segment that frequently leaks in stack traces and tool output.
             (r#"(?i)\bAccountKey\b[ \t]*=[ \t]*([A-Za-z0-9+/=]{40,})(?:;|$|[\s"',)])"#, Secret, "AZURE_STORAGE_ACCOUNT_KEY", High, 1, V::None),
@@ -506,6 +510,7 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         "SESSION_TOKEN" => &[
             "session", "sid", "jwt", "cookie", "auth", "access", "refresh",
         ],
+        "BASIC_AUTH" => &["Basic ", "Basic\t"],
         "DB_CONNECTION_STRING" => &[
             "postgres://",
             "postgresql://",
@@ -781,11 +786,21 @@ mod tests {
             ),
             "KUBE_CLIENT_KEY_DATA"
         ));
+        assert!(has(
+            r#"'header' => 'Proxy-Authorization: Basic d3p3bTpqQGNs',"#,
+            "BASIC_AUTH"
+        ));
+        assert!(has(
+            r#"if auth != "Basic bnJna2w6dmdycWpz" {"#,
+            "BASIC_AUTH"
+        ));
         assert!(!has(
             "port=5432 workers=4 timeout_ms=30000 status=200",
             "KEYED_SECRET"
         ));
         assert!(!has("jwt_like=aaa.bbb.ccc css=#aabbcc", "SESSION_TOKEN"));
+        assert!(!has("documentation says Basic docs", "BASIC_AUTH"));
+        assert!(!has(r#""value": "Basic d3p3bTpqQGNs""#, "BASIC_AUTH"));
     }
 
     #[test]
