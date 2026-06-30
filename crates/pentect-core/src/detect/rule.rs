@@ -151,8 +151,12 @@ impl RuleDetector {
                 "SQUARE_TOKEN",
                 Medium,
             ),
+            // Mailgun private API keys are prefix-anchored (`key-`) and use a
+            // lowercase alphanumeric body; requiring hex drops valid keys.
+            // Keep the historical `pubkey-` branch narrower because public
+            // validation keys are less clearly secret material.
             (
-                r"(?:key|pubkey)-[a-f0-9]{32}",
+                r"(?:key-[a-z0-9]{32}|pubkey-[a-f0-9]{32})",
                 Secret,
                 "MAILGUN_API_KEY",
                 Medium,
@@ -507,6 +511,7 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         "DIGITALOCEAN_TOKEN" => &["dop_v1_", "doo_v1_", "dor_v1_"],
         "SHOPIFY_TOKEN" => &["shpat_", "shpca_", "shppa_", "shpss_"],
         "SQUARE_TOKEN" => &["EAAA", "sq0atp-", "sq0csp-"],
+        "MAILGUN_API_KEY" => &["key-", "pubkey-"],
         "GCP_PRIVATE_KEY_ID" => &["private_key_id"],
         "DATADOG_API_KEY" => &[
             "datadog",
@@ -685,6 +690,10 @@ mod tests {
             (
                 concat!("shp", "at_0123456789abcdef0123456789abcdef"),
                 "SHOPIFY_TOKEN",
+            ),
+            (
+                concat!("key", "-5as9xrzs30zd2guj9vn767bkpthbvgo9"),
+                "MAILGUN_API_KEY",
             ),
             (
                 "postgresql://admin:s3cr3t@db.host:5432/sales",

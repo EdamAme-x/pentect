@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::documentation::is_documentation_host;
-use super::Detector;
+use super::{shell, Detector};
 use crate::model::*;
 use crate::normalize::NormalizedView;
 
@@ -25,6 +25,7 @@ pub struct UrlDetector;
 impl Detector for UrlDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let mut out = Vec::new();
+        inspect_curl_user_credentials(view, &mut out);
         for m in URL_RE.find_iter(view.text()) {
             inspect_url(view, m.start(), m.as_str(), &mut out);
         }
@@ -44,6 +45,116 @@ impl Detector for UrlDetector {
 fn is_http_url(url: &str) -> bool {
     let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
     scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+}
+
+fn inspect_curl_user_credentials(view: &NormalizedView, out: &mut Vec<Span>) {
+    let text = view.text();
+    if !text.as_bytes().contains(&b'-') || !shell::contains_ascii_ci(text, "curl") {
+        return;
+    }
+
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        inspect_curl_line(view, out, line_start, line.trim_end_matches(['\r', '\n']));
+        line_start += line.len();
+    }
+    if !text.ends_with('\n') && line_start < text.len() {
+        inspect_curl_line(view, out, line_start, &text[line_start..]);
+    }
+}
+
+fn inspect_curl_line(view: &NormalizedView, out: &mut Vec<Span>, line_start: usize, line: &str) {
+    if !shell::contains_ascii_ci(line, "curl") || !line.contains("-u") {
+        return;
+    }
+
+    let tokens = shell::tokens(line, line_start);
+    let Some(curl_index) = tokens
+        .iter()
+        .position(|token| shell_token_is_curl(&token.value))
+    else {
+        return;
+    };
+
+    let mut i = curl_index + 1;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if matches!(token.value.as_str(), "-u" | "--user" | "--proxy-user") {
+            if let Some(next) = tokens.get(i + 1) {
+                inspect_curl_user_value(view, out, next, 0);
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value_start) = token
+            .value
+            .strip_prefix("--user=")
+            .map(|_| "--user=".len())
+            .or_else(|| {
+                token
+                    .value
+                    .strip_prefix("--proxy-user=")
+                    .map(|_| "--proxy-user=".len())
+            })
+        {
+            inspect_curl_user_value(view, out, token, value_start);
+        } else if token.value.starts_with("-u") && token.value.len() > 2 {
+            inspect_curl_user_value(view, out, token, 2);
+        }
+        i += 1;
+    }
+}
+
+fn shell_token_is_curl(value: &str) -> bool {
+    let basename = shell::basename(value);
+    basename.eq_ignore_ascii_case("curl")
+}
+
+fn inspect_curl_user_value(
+    view: &NormalizedView,
+    out: &mut Vec<Span>,
+    token: &shell::Token,
+    value_start: usize,
+) {
+    if value_start >= token.value.len() || value_start >= token.byte_to_raw.len() {
+        return;
+    }
+    let value = &token.value[value_start..];
+    let Some((_user, password)) = split_userinfo_password(value) else {
+        return;
+    };
+    if userinfo_is_template_or_redaction(value) || !generic_uri_password_has_signal(password) {
+        return;
+    }
+    let Some(colon) = value.find(':') else {
+        return;
+    };
+    let mut password_start = value_start + colon + 1;
+    let mut password_end = token.value.len();
+    while password_start < password_end
+        && token.value.as_bytes()[password_start].is_ascii_whitespace()
+    {
+        password_start += 1;
+    }
+    while password_end > password_start
+        && matches!(
+            token.value.as_bytes()[password_end - 1],
+            b'.' | b',' | b')' | b']'
+        )
+    {
+        password_end -= 1;
+    }
+    if password_start >= password_end {
+        return;
+    }
+    push_span(
+        view,
+        out,
+        token.byte_to_raw[password_start],
+        token.byte_to_raw[password_end - 1] + 1,
+        Category::Secret,
+        labels::URL_CREDENTIAL,
+    );
 }
 
 fn inspect_uri_userinfo(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span>) {
@@ -275,11 +386,24 @@ fn userinfo_password_is_placeholder(user: &str, password: &str) -> bool {
     if userinfo_component_is_oauth_marker(password) {
         return !userinfo_token_like(user) || is_short_hex_userinfo_component(user);
     }
-    userinfo_component_is_placeholder_user(user)
-        && matches!(
-            normalized_userinfo_component(password).as_str(),
-            "password" | "passwd"
-        )
+    let normalized_user = normalized_userinfo_component(user);
+    let normalized_password = normalized_userinfo_component(password);
+    password_derives_from_user_placeholder(&normalized_user, &normalized_password)
+        || (userinfo_component_is_placeholder_user(user)
+            && matches!(normalized_password.as_str(), "password" | "passwd"))
+}
+
+fn password_derives_from_user_placeholder(user: &str, password: &str) -> bool {
+    if user.len() < 3 || password.len() <= user.len() {
+        return false;
+    }
+    let Some(suffix) = password.strip_prefix(user) else {
+        return false;
+    };
+    matches!(
+        suffix.trim_start_matches('_'),
+        "pwd" | "password" | "passwd"
+    )
 }
 
 fn userinfo_component_is_placeholder_user(value: &str) -> bool {
@@ -885,6 +1009,53 @@ mod tests {
     }
 
     #[test]
+    fn curl_user_option_masks_password_only() {
+        assert_eq!(
+            labels(
+                r#"curl -X PUT -u "ff20f250a7b3a414781d1abe11cd8cee:eb895631e87331236180e3ab28c98374" https://api.service.com"#
+            ),
+            [(
+                "URL_CREDENTIAL".to_string(),
+                "eb895631e87331236180e3ab28c98374".to_string()
+            )]
+        );
+        assert_eq!(
+            labels("curl --user jacknich:b9dd-a5us9t-z@dgy1wd https://api.service.com"),
+            [(
+                "URL_CREDENTIAL".to_string(),
+                "b9dd-a5us9t-z@dgy1wd".to_string()
+            )]
+        );
+        assert_eq!(
+            labels(
+                r#"C:\Windows\System32\curl.exe -ujacknich:b9dd-a5us9t-z@dgy1wd https://api.service.com"#
+            ),
+            [(
+                "URL_CREDENTIAL".to_string(),
+                "b9dd-a5us9t-z@dgy1wd".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn curl_user_option_ignores_templates() {
+        for raw in [
+            "curl -u username:password https://api.service.com",
+            "curl -u idp_admin:idp_admin_pwd https://api.service.com",
+            r#"curl --user "$USER:$PASSWORD" https://api.service.com"#,
+            "notcurl -u jacknich:b9dd-a5us9t-z@dgy1wd https://api.service.com",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|(label, _)| label != "URL_CREDENTIAL"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
+    }
+
+    #[test]
     fn generic_uri_userinfo_stays_shape_gated() {
         assert!(labels("s3://bucket/key").is_empty());
         assert!(labels("nats://user:pass@localhost").is_empty());
@@ -918,6 +1089,7 @@ mod tests {
             "https://{user}:{password}@service.internal/path",
             "https://git:@github.com/org/repo.git",
             "https://username:password@proxyserver.net:3128/",
+            "https://idp_admin:idp_admin_pwd@service.internal/path",
             "https://token:MY_GITHUB_TOKEN@github.com/acme/repo.git",
             "https://abcdef1234567890234578:x-oauth-token@github.com/",
         ] {
