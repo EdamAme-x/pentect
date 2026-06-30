@@ -1137,7 +1137,6 @@ fn userinfo_is_template_or_redaction(userinfo: &str) -> bool {
         || userinfo
             .split(':')
             .any(userinfo_part_is_template_or_redaction)
-        || userinfo.split(':').all(userinfo_part_is_placeholder_name)
 }
 
 fn userinfo_part_is_template_or_redaction(part: &str) -> bool {
@@ -1146,49 +1145,6 @@ fn userinfo_part_is_template_or_redaction(part: &str) -> bool {
         || part
             .bytes()
             .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
-}
-
-fn userinfo_part_is_placeholder_name(part: &str) -> bool {
-    // RFC 3986 userinfo examples conventionally use `user:pass`,
-    // `username:password`, or API-token placeholders. In a URI authority that
-    // pair is documentation syntax, while concrete values such as
-    // `admin:s3cr3t` and `svc_42:pAss-rotated` still pass.
-    let part = part
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | '`'));
-    if part.is_empty() {
-        return true;
-    }
-    let normalized = part
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    matches!(
-        normalized.trim_matches('_'),
-        "user"
-            | "username"
-            | "userid"
-            | "my_user"
-            | "my_username"
-            | "testuser"
-            | "password"
-            | "pass"
-            | "my_password"
-            | "testpwd"
-            | "apitoken"
-            | "api_token"
-            | "token"
-            | "x_oauth_token"
-            | "secret"
-            | "foo"
-            | "bar"
-    )
 }
 
 #[cfg(test)]
@@ -1276,9 +1232,10 @@ mod tests {
         vectors!(db_connection_string,
             "postgresql://admin:s3cr3t@db.host:5432/sales" => true,
             "mysql://svc:p4ss@localhost" => true,
-            "mysql://user:pass@localhost" => false,
-            "postgresql://username:password@localhost" => false,
-            "postgresql://testuser:testpwd@localhost" => false,
+            "mysql://user:secret@localhost" => true,
+            "mysql://user:pass@localhost" => true,
+            "postgresql://username:password@localhost" => true,
+            "postgresql://testuser:testpwd@localhost" => true,
             "mysql://ofh:ab12c!?@db.example.internal/name" => true,
             "postgresql://[user[:password]@][host][:port][" => false,
             "mongodb://username:<password>@cluster0.example.com:27017" => false,

@@ -1924,21 +1924,29 @@ fn is_escaped_source_payload_fragment_literal(value: &str, source_key: &str) -> 
         return false;
     }
     let value = value.trim().trim_matches('"');
-    if value.starts_with("\\\"") && value.len() <= 96 {
-        return true;
+    if let Some(head) = escaped_quoted_payload_head(value) {
+        return is_payload_fragment_head(head);
     }
     if !(value.contains("\\n") || value.contains("\\t")) {
         return false;
     }
-    let head = value
+    let head = payload_fragment_head(value);
+    is_payload_fragment_head(head)
+}
+
+fn escaped_quoted_payload_head(value: &str) -> Option<&str> {
+    value.strip_prefix("\\\"").map(payload_fragment_head)
+}
+
+fn payload_fragment_head(value: &str) -> &str {
+    value
         .split("\\n")
         .next()
         .unwrap_or(value)
         .split("\\t")
         .next()
         .unwrap_or(value)
-        .trim_matches(|ch: char| matches!(ch, '+' | '\\' | '"' | '\'' | '`' | ' '));
-    is_payload_fragment_head(head)
+        .trim_matches(|ch: char| matches!(ch, '+' | '\\' | '"' | '\'' | '`' | ' '))
 }
 
 fn source_key_has_escaped_payload_shape(source_key: &str) -> bool {
@@ -3124,6 +3132,15 @@ mod tests {
         ] {
             assert!(hits(raw).is_empty(), "{raw}: {:?}", hits(raw));
         }
+        let source_payload = r#"{"files":{"app.rs":{"content":"password: \"sk-live-123\""}}}"#;
+        assert!(is_escaped_source_payload_fragment_literal(
+            r#"\"Basic"#,
+            source_payload
+        ));
+        assert!(!is_escaped_source_payload_fragment_literal(
+            r#"\"sk-live-123"#,
+            source_payload
+        ));
     }
 
     #[test]

@@ -108,6 +108,7 @@ impl Detector for SensitiveKeyDetector {
                 || is_structured_secret_identifier_name(key, view.text())
                 || is_structured_generic_key_weak_value(key, view.text())
                 || is_structured_generic_key_name_reference(key, view.text())
+                || is_structured_api_operation_value(key, view.text())
         }) {
             return vec![];
         }
@@ -208,7 +209,7 @@ fn is_non_credential_sensitive_word_name(name: &str) -> bool {
     {
         return true;
     }
-    is_sentence_like_key_name(&parts) || is_api_operation_name(&parts)
+    is_sentence_like_key_name(&parts)
 }
 
 fn is_sentence_like_key_name(parts: &[&str]) -> bool {
@@ -264,6 +265,25 @@ fn is_api_operation_name(parts: &[&str]) -> bool {
     ) && parts
         .iter()
         .any(|part| matches!(*part, "secret" | "secrets" | "password" | "auth" | "token"))
+}
+
+fn is_structured_api_operation_value(key: &str, value: &str) -> bool {
+    // Operation/model names can contain credential words (`GetSecretValue`,
+    // `AdminResetUserPassword`) without carrying the secret itself. This is
+    // value-aware on purpose: a field named `set_auth_token` still masks a
+    // concrete value such as `hunter2`.
+    let key_name = normalize_identifier(key);
+    let key_parts = identifier_parts(&key_name);
+    if !is_api_operation_name(&key_parts) {
+        return false;
+    }
+    let value_name = normalize_identifier(value);
+    let value_parts = identifier_parts(&value_name);
+    !value_parts.is_empty() && is_api_operation_name(&value_parts)
+}
+
+fn identifier_parts(name: &str) -> Vec<&str> {
+    name.split('_').filter(|part| !part.is_empty()).collect()
 }
 
 fn is_last_used_metadata_name(parts: &[&str]) -> bool {
@@ -377,16 +397,12 @@ fn is_structured_token_prose(key: &str, value: &str) -> bool {
     is_token_key && value.chars().any(char::is_whitespace)
 }
 
-fn is_structured_placeholder_value(key: &str, value: &str) -> bool {
-    // JSON/YAML schemas and fixtures commonly put type names or weak examples
-    // under sensitive-looking fields (`token: string`, `token: abcde`). Those
-    // are not usable credentials. Keep this mostly token-scoped; `password:
-    // correct horse battery staple` remains detectable.
-    let name = normalize_identifier(key);
-    if is_schema_type_placeholder(value) {
-        return true;
-    }
-    is_token_key_name(&name) && !token_value_has_secret_shape(value)
+fn is_structured_placeholder_value(_key: &str, value: &str) -> bool {
+    // JSON/YAML schemas commonly put type names under sensitive-looking fields
+    // (`token: string`). Do not apply a general shape gate here: explicit
+    // credential keys can hold weak but usable values (`token: abcdef`,
+    // `refresh_token: refresh`, `user:pass`).
+    is_schema_type_placeholder(value)
 }
 
 fn is_structured_secret_identifier_name(key: &str, value: &str) -> bool {
@@ -450,11 +466,12 @@ fn generic_key_value_has_secret_shape(value: &str) -> bool {
     let len = value.chars().count();
     let has_upper = value.chars().any(|ch| ch.is_ascii_uppercase());
     let has_lower = value.chars().any(|ch| ch.is_ascii_lowercase());
+    let has_alpha = has_upper || has_lower;
     let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
     let has_symbol = value
         .chars()
         .any(|ch| !ch.is_ascii_alphanumeric() && !ch.is_ascii_whitespace());
-    len >= 24 || (len >= 8 && ((has_upper && has_lower && has_digit) || has_symbol))
+    len >= 24 || (len >= 6 && has_alpha && (has_digit || has_symbol))
 }
 
 fn is_schema_type_placeholder(value: &str) -> bool {
@@ -471,29 +488,6 @@ fn is_schema_type_placeholder(value: &str) -> bool {
             | "array"
             | "null"
     )
-}
-
-fn is_token_key_name(name: &str) -> bool {
-    name == "token"
-        || name.ends_with("_token")
-        || name.contains("_token_")
-        || name == "access_token"
-        || name == "refresh_token"
-        || name == "id_token"
-}
-
-fn token_value_has_secret_shape(value: &str) -> bool {
-    let value = value.trim();
-    let len = value.chars().count();
-    if len >= 24 && !value.chars().any(char::is_whitespace) {
-        return true;
-    }
-    let has_alpha = value.chars().any(|ch| ch.is_ascii_alphabetic());
-    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
-    let has_symbol = value
-        .chars()
-        .any(|ch| !ch.is_ascii_alphanumeric() && !ch.is_ascii_whitespace());
-    len >= 6 && has_alpha && (has_digit || has_symbol)
 }
 
 fn is_structured_generic_key_name_reference(key: &str, value: &str) -> bool {
@@ -790,6 +784,10 @@ mod tests {
         assert_eq!(sensitive_key_fires(Some("key"), "path"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "Team"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "shift+ctrl+i"), None);
+        assert_eq!(
+            sensitive_key_fires(Some("key"), "hunter2"),
+            Some("KEY".to_string())
+        );
         assert_eq!(sensitive_key_fires(Some("key"), "Vary"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "Dev Gateway Region"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "HappyFace.jpg"), None);
@@ -917,7 +915,6 @@ mod tests {
             None
         );
         assert_eq!(sensitive_key_fires(Some("token"), "string"), None);
-        assert_eq!(sensitive_key_fires(Some("token"), "abcde"), None);
         assert_eq!(sensitive_key_fires(Some("tokenizer"), "standard"), None);
         assert_eq!(
             sensitive_key_fires(Some("learn_about_the_token_sale"), "Learn more"),
@@ -930,6 +927,14 @@ mod tests {
         assert_eq!(
             sensitive_key_fires(Some("GetSecretValue"), "GetSecretValue"),
             None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("set_auth_token"), "hunter2"),
+            Some("SET_AUTH_TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("rotate_password"), "letmein123"),
+            Some("ROTATE_PASSWORD".to_string())
         );
         assert_eq!(
             sensitive_key_fires(Some("SecretId"), "MyTestDatabaseSecret"),
@@ -950,6 +955,18 @@ mod tests {
         assert_eq!(
             sensitive_key_fires(Some("access_token"), "abcDEF123456"),
             Some("ACCESS_TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("token"), "abcde"),
+            Some("TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("access_token"), "abcdefghijk"),
+            Some("ACCESS_TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("refresh_token"), "refresh"),
+            Some("REFRESH_TOKEN".to_string())
         );
         assert_eq!(
             sensitive_key_fires(Some("refresh_token"), "refresh12345"),

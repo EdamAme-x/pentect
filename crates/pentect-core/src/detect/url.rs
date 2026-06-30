@@ -226,50 +226,6 @@ fn userinfo_is_template_or_redaction(userinfo: &str) -> bool {
     userinfo
         .bytes()
         .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
-        || userinfo.split(':').all(userinfo_part_is_placeholder)
-}
-
-fn userinfo_part_is_placeholder(part: &str) -> bool {
-    // Placeholder words in URL userinfo are public examples, not credentials.
-    // Keep this to the userinfo grammar: `pass` by itself can be a real weak
-    // password elsewhere, but `https://user:pass@example` is conventional docs.
-    let normalized = part
-        .split('%')
-        .next()
-        .unwrap_or(part)
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | '`'));
-    if normalized.is_empty() {
-        return true;
-    }
-    let folded = normalized
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    matches!(
-        folded.trim_matches('_'),
-        "user"
-            | "username"
-            | "userid"
-            | "my_user"
-            | "my_username"
-            | "password"
-            | "pass"
-            | "my_password"
-            | "apitoken"
-            | "api_token"
-            | "token"
-            | "x_oauth_token"
-            | "secret"
-            | "foo"
-            | "bar"
-    )
 }
 
 fn userinfo_token_like(userinfo: &str) -> bool {
@@ -629,8 +585,6 @@ mod tests {
             "https://[user[:password]@]service.internal/path",
             "https://***:***@service.internal/path",
             "https://{user}:{password}@service.internal/path",
-            "https://user:pass@service.internal/path",
-            "https://USERID:APITOKEN@service.internal/path",
         ] {
             assert!(
                 labels(raw)
@@ -640,9 +594,18 @@ mod tests {
                 labels(raw)
             );
         }
+        assert!(labels("https://user:pass@service.internal/path")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "user:pass"));
+        assert!(labels("https://USERID:APITOKEN@service.internal/path")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "USERID:APITOKEN"));
         assert!(labels("https://alice:letmein@service.internal/path")
             .iter()
             .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
+        assert!(labels("https://user%3Asecret@service.internal/path")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "user%3Asecret"));
     }
 
     #[test]

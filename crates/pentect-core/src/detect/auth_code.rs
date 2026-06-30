@@ -67,6 +67,9 @@ fn is_git_file_mode_context(text: &str, value_start: usize) -> bool {
     let Some(colon) = prefix.rfind(':') else {
         return false;
     };
+    if !prefix[colon + 1..].chars().all(char::is_whitespace) {
+        return false;
+    }
     let before = prefix[..colon].trim_end();
     before.ends_with("\"mode\"") || before.ends_with("'mode'") || before.ends_with("\\\"mode\\\"")
 }
@@ -231,6 +234,10 @@ mod tests {
             r#"{"title":"login code help","comments":42754194,"total_count":813448}"#
         )
         .is_empty());
+        assert!(has_value(
+            r#"{"headers":"X-GitHub-OTP","id":123,"otp":327146}"#,
+            "327146"
+        ));
         assert!(!has_value(
             "Enter 7QK4P on the login page. Order code AB12-CD ships tomorrow.",
             "AB12-CD"
