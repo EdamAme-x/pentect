@@ -459,6 +459,7 @@ pub(crate) fn is_structured_key_name_reference_value(value: &str) -> bool {
 /// property literally named `key`; callers must prove that context first.
 pub(crate) fn is_structured_generic_key_metadata_value(value: &str) -> bool {
     is_structured_key_name_reference_value(value)
+        || is_generic_key_config_path_value(value)
         || is_generic_key_label_value(value)
         || is_generic_key_file_reference_value(value)
 }
@@ -487,6 +488,28 @@ pub(crate) fn is_localization_template_reference(value: &str) -> bool {
         && rest[close + 1..]
             .chars()
             .all(|ch| ch.is_ascii_whitespace() || matches!(ch, ':' | '.'))
+}
+
+fn is_generic_key_config_path_value(value: &str) -> bool {
+    let value = value.trim();
+    if !(5..=128).contains(&value.len()) || !value.contains('.') || value.contains("://") {
+        return false;
+    }
+    if normalize_identifier(value).split('_').any(|part| {
+        matches!(
+            part,
+            "secret" | "password" | "passwd" | "credential" | "token" | "auth" | "private" | "key"
+        )
+    }) {
+        return false;
+    }
+    value.split('.').all(|part| {
+        (2..=48).contains(&part.len())
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+            && part.bytes().any(|b| b.is_ascii_lowercase())
+    })
 }
 
 fn is_generic_key_label_value(value: &str) -> bool {
@@ -750,10 +773,23 @@ mod tests {
         assert!(is_structured_generic_key_metadata_value("HappyFace.jpg"));
         assert!(is_structured_generic_key_metadata_value("access-project"));
         assert!(is_structured_generic_key_metadata_value("cost-center"));
+        assert!(is_structured_generic_key_metadata_value(
+            "idle_timeout.timeout_seconds"
+        ));
+        assert!(is_structured_generic_key_metadata_value(
+            "access_logs.s3.bucket"
+        ));
+        assert!(is_structured_generic_key_metadata_value(
+            "Access-Control-Allow-Headers"
+        ));
+        assert!(is_structured_generic_key_metadata_value("string"));
+        assert!(is_structured_generic_key_metadata_value("FirstTag"));
+        assert!(is_structured_generic_key_metadata_value("foo2"));
         assert!(!is_structured_generic_key_metadata_value("API Key"));
         assert!(!is_structured_generic_key_metadata_value("secret token"));
         assert!(!is_structured_generic_key_metadata_value("sk-test-token"));
         assert!(!is_structured_generic_key_metadata_value("abcDEF123456"));
+        assert!(!is_structured_generic_key_metadata_value("secret.value"));
     }
 
     #[test]

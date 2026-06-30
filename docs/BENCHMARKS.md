@@ -109,6 +109,10 @@ Default keyed detection also suppresses public ASN.1 object identifier DER
 bodies in `OBJ_*` tables, standalone NIST/RFC curve/test-case labels such as
 `P-256` and `SECP224R1_RFC5114`, RSA mode labels such as `RSA-PSS`, and
 localized UI password copy only when the key name is a UI text/message field.
+Generic JSON `"key"` metadata covers public schema names, CORS header names,
+metasyntactic numbered names, and dotted config paths such as
+`idle_timeout.timeout_seconds` while rejecting dotted paths with sensitive
+components such as `secret.value`.
 
 ```text
 CredData commit: 9a55c40
@@ -118,15 +122,15 @@ Files: 10865
 True rows: 15104
 False rows: 51794
 TP: 10276
-FP: 7304
+FP: 7227
 FN: 4828
 Line only: 227
-Unlabeled: 59448
+Unlabeled: 59037
 Missing files: 0
-Precision: 0.585
+Precision: 0.587
 Recall: 0.680
-F1: 0.629
-Elapsed: 27535 ms
+F1: 0.630
+Elapsed: 28281 ms
 ```
 
 Weak groups:
@@ -142,6 +146,7 @@ Weak groups:
 - Structured JSON now suppresses UI/localization prose for password/token message keys and avoids sweeping low-information UI labels, but compact values under real secret keys still fire.
 - Generic JSON `"key"` values that are identifier names such as `smtpDomain`, `Authorization`, or `grant_type` are treated as metadata; digit/symbol-bearing key material and sensitive single words still fire.
 - Generic `"key"` metadata also suppresses public schema/tag names such as `offset`, `host`, `cost-center`, display labels such as `Dev Gateway Region`, and file references such as `HappyFace.jpg`; credential-shaped values such as `sk-test-token` still fire.
+- Generic `"key"` metadata also covers public CORS header names, schema type names such as `string`, numbered metasyntactic names such as `foo2`, and dotted config paths without sensitive components.
 - Protocol/documentation metadata suppression is shape-gated: AWS SigV4 algorithm labels, Kubernetes `TopologyKey` values, and HTML `<code>` UUID/resource-name samples are skipped, but credential-shaped code samples still fire.
 - UI/i18n suppression is syntax-gated: `$t(...)`/`i18n.t(...)` references and setup/instruction prose under auth/2FA keys are skipped; ordinary weak password/token literals still fire.
 - Source-template suppression is syntax-gated: whole-value printf templates and method-chain fragments are skipped, but mixed literal values such as `abc%[3]s` still fire.
