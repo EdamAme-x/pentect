@@ -15,6 +15,7 @@ exact:public
 exact:correlation_key
 exact:foreign_key
 exact:routing_key
+exact:token_vocab
 exact:topology_key
 prefix:public_
 suffix:_public
@@ -29,3 +30,4 @@ suffix:_expires_at
 suffix:_expiry
 suffix:_ttl
 contains:public_key_token
+contains:token_toolbar

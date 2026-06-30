@@ -107,6 +107,7 @@ impl EntropyDetector {
             || is_release_artifact_identifier(run)
             || is_jwk_public_parameter_context(text, start, &view.region.ctx)
             || is_public_key_context(text, start, &view.region.ctx)
+            || is_hashed_token_derivative_context(text, start)
         {
             return;
         }
@@ -539,6 +540,39 @@ fn local_assignment_key_before_value(text: &str, start: usize) -> Option<&str> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
     .then_some(key)
+}
+
+fn is_hashed_token_derivative_context(text: &str, start: usize) -> bool {
+    assignment_key_before_entropy_value(text, start)
+        .as_deref()
+        .is_some_and(|key| {
+            let normalized = normalize_identifier(key);
+            has_identifier_component(&normalized, "token")
+                && (has_identifier_component(&normalized, "hash")
+                    || has_identifier_component(&normalized, "hashed")
+                    || has_identifier_component(&normalized, "digest"))
+        })
+}
+
+fn assignment_key_before_entropy_value(text: &str, start: usize) -> Option<String> {
+    let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let prefix = &text[line_start..start];
+    let sep = prefix.find('=').or_else(|| prefix.rfind(':'))?;
+    let before = prefix[..sep].trim_end().trim_end_matches(':').trim_end();
+    let key_end = before
+        .rfind(|ch: char| ch.is_ascii_alphanumeric())
+        .map(|pos| pos + 1)?;
+    let key_start = before[..key_end]
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+        .map_or(0, |pos| {
+            pos + before[pos..].chars().next().map_or(1, char::len_utf8)
+        });
+    let key = &before[key_start..key_end];
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+fn has_identifier_component(name: &str, component: &str) -> bool {
+    name.split('_').any(|part| part == component)
 }
 
 fn is_public_key_name(key: &str) -> bool {
@@ -1242,6 +1276,18 @@ mod tests {
             !EntropyDetector::default().detect(&v).is_empty(),
             "random-looking assignment remains entropy-eligible"
         );
+    }
+
+    #[test]
+    fn hashed_token_derivatives_are_not_entropy_candidates() {
+        for raw in [
+            r#"hashedTokenKey = "$3:1:GepdvExsvzA:JXMHpXDZqtU5zNh5y5HB8KmLKbHc2VdeuxQo6CTlLhyNifaYhJTnb+4Rf+xpnbsfd8tIlQ0ZgIi2edJrm9CpoA""#,
+            r#"hashedTokenKey := "$3:1:GepdvExsvzA:JXMHpXDZqtU5zNh5y5HB8KmLKbHc2VdeuxQo6CTlLhyNifaYhJTnb+4Rf+xpnbsfd8tIlQ0ZgIi2edJrm9CpoA""#,
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
     }
 
     #[test]

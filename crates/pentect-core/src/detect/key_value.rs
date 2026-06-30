@@ -106,6 +106,11 @@ fn scan_line(
     while i < bytes.len() {
         let abs = ctx.line_start + i;
         let matched = if bytes[i] == b'=' {
+            let sep_start = if i > 0 && bytes[i - 1] == b':' {
+                abs - 1
+            } else {
+                abs
+            };
             let sep_end = if bytes.get(i + 1) == Some(&b'>') {
                 abs + 2
             } else {
@@ -115,7 +120,7 @@ fn scan_line(
                 try_push(
                     &mut ctx,
                     SeparatorCandidate {
-                        start: abs,
+                        start: sep_start,
                         end: sep_end,
                         kind: Separator::Assignment,
                     },
@@ -441,6 +446,7 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
     ) || matches!(name.as_str(), "token" | "session" | "cookie" | "jwt")
         || name.ends_with("_token")
         || name.ends_with("_apitoken")
+        || (name.starts_with("token_") && !has_material_metadata_modifier(&name))
         || name.contains("_token_")
         || name == "authorization"
         || name.ends_with("_authorization")
@@ -526,6 +532,7 @@ fn implicit_key_name_kind(name: &str) -> Option<KeyKind> {
     }
     if name == "token"
         || name.ends_with("_token")
+        || (name.starts_with("token_") && !has_material_metadata_modifier(name))
         || name == "authorization"
         || name.ends_with("_authorization")
         || name == "session"
@@ -900,10 +907,14 @@ fn looks_like_secret_value(
         || is_package_dependency_coordinate_literal(value, source_key)
         || is_package_dependency_version_literal(value, source_key)
         || is_password_reset_duration_literal(value, key_name)
+        || is_hashed_token_derivative_literal(value, key_name)
     {
         return false;
     }
     if is_auth_scheme_literal(value) {
+        return false;
+    }
+    if !quoted && is_uppercase_constant_reference(value) {
         return false;
     }
     let has_alpha = value.chars().any(|ch| ch.is_ascii_alphabetic());
@@ -912,6 +923,9 @@ fn looks_like_secret_value(
         .chars()
         .any(|ch| !ch.is_ascii_alphanumeric() && !ch.is_ascii_whitespace());
     let has_space = value.chars().any(char::is_whitespace);
+    if matches!(kind, KeyKind::Token) && value.contains('\'') && !has_digit {
+        return false;
+    }
 
     if matches!(kind, KeyKind::EncodedHex) {
         return is_keyed_hex_secret_literal(value, key_name, kind);
@@ -1080,6 +1094,15 @@ fn is_benign_literal(value: &str) -> bool {
         normalized.as_str(),
         "" | "true" | "false" | "null" | "none" | "nil" | "undefined"
     )
+}
+
+fn is_uppercase_constant_reference(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (4..=96).contains(&bytes.len())
+        && bytes.contains(&b'_')
+        && bytes.iter().any(u8::is_ascii_uppercase)
+        && !bytes.iter().any(u8::is_ascii_digit)
+        && bytes.iter().all(|b| b.is_ascii_uppercase() || *b == b'_')
 }
 
 fn is_repeated_placeholder_literal(value: &str) -> bool {
@@ -2911,6 +2934,28 @@ fn is_checksum_metadata_digest_literal(value: &str, key_name: &str, source_key: 
 fn is_hex_digest_literal(value: &str) -> bool {
     let value = value.trim();
     matches!(value.len(), 32 | 40 | 64 | 96 | 128) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_hashed_token_derivative_literal(value: &str, key_name: &str) -> bool {
+    if !has_identifier_component(key_name, "token")
+        || !(has_identifier_component(key_name, "hash")
+            || has_identifier_component(key_name, "hashed")
+            || has_identifier_component(key_name, "digest"))
+    {
+        return false;
+    }
+    let value = value.trim();
+    if is_hex_digest_literal(value) {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    (6..=160).contains(&bytes.len())
+        && bytes[0] == b'$'
+        && bytes.iter().filter(|b| **b == b':').count() >= 2
+        && bytes.iter().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'$' | b':' | b'+' | b'/' | b'=' | b'.' | b'_' | b'-')
+        })
 }
 
 fn is_escaped_control_placeholder_literal(value: &str, key_name: &str) -> bool {
@@ -5435,6 +5480,11 @@ mod tests {
             "helloworld1234"
         ));
         assert!(has(
+            r#"tokenValue := "opu1hymphgupryt72ryrdwkmnncvj4gxty10uab32uf9yh32khh98i""#,
+            "opu1hymphgupryt72ryrdwkmnncvj4gxty10uab32uf9yh32khh98i"
+        ));
+        assert!(has(r#"passwordValue := "hunter2""#, "hunter2"));
+        assert!(has(
             "OAuth app client_secret 'tenant-7-trial'",
             "tenant-7-trial"
         ));
@@ -5469,6 +5519,13 @@ mod tests {
             "neg_ctx->output_token_length = out_sec_buff.cbBuffer;",
             "key = app_data->perthreadkey;",
             "spnegoTokenLength = input_token.length;",
+            "passwordValue := conn.passwd",
+            "tokenValue := GSS_C_EMPTY_BUFFER",
+            r#"hashedTokenKey := "$3:1:uFrxm43ggfw:zsN1zEFC7SvABTdR58o7yjIqfrI4cQ/HSYz3jBwwVnx5X+/ph4etGDIU9dvIYuy1IvnYUVe6a/Ar95xE+gfjhA""#,
+            r#"invalidHashToken := "$-1:111:111""#,
+            "token. For example: `O'Neil's` -> [ `O`, `Neil` ]. Defaults to `true`.",
+            "options { tokenVocab=PainlessLexer; }",
+            r#"Token.Toolbar.Arg: "arg-toolbar","#,
             "MAX_NONCE: 5524839971, // Max nonce value",
             "salt_rounds = 12",
             "nonce_size = 16",
