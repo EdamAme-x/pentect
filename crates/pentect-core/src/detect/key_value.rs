@@ -267,6 +267,19 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     {
         return false;
     }
+    if !value.quoted
+        && is_unquoted_code_identifier_reference_literal(
+            raw_value,
+            ctx.text,
+            value.end,
+            ctx.line_end,
+            &key_name,
+            &ctx.text[ctx.line_start..left_end],
+            separator.kind,
+        )
+    {
+        return false;
+    }
     if !looks_like_secret_value(
         raw_value,
         kind,
@@ -1488,7 +1501,7 @@ fn is_unquoted_type_annotation_literal(
         .trim_start()
         .chars()
         .next()
-        .is_some_and(|ch| matches!(ch, ',' | ')' | ';' | '{' | '=' | '>' | '|'))
+        .is_some_and(|ch| matches!(ch, ',' | ')' | '}' | ';' | '{' | '=' | '>' | '|'))
 }
 
 fn is_shell_command_invocation_literal(
@@ -1586,6 +1599,59 @@ fn is_powershell_command_name(value: &str) -> bool {
         && noun.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
         && verb.bytes().all(|b| b.is_ascii_alphabetic())
         && noun.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn is_unquoted_code_identifier_reference_literal(
+    value: &str,
+    text: &str,
+    value_end: usize,
+    line_end: usize,
+    key_name: &str,
+    source_key: &str,
+    separator: Separator,
+) -> bool {
+    // Unquoted identifiers followed by source delimiters are type names,
+    // variables, struct fields, or arrow-function parameters. They name where a
+    // value comes from; they are not the credential bytes themselves.
+    let value = value.trim();
+    if !is_source_identifier_token(value) {
+        return false;
+    }
+    let rest = text[value_end..line_end].trim_start();
+    if rest.starts_with("=>") {
+        return true;
+    }
+    if separator == Separator::Assignment
+        && (source_key_has_code_shape(source_key)
+            || is_exact_password_low_entropy_slot(key_name, KeyKind::Strong))
+        && rest
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, ',' | ';' | ')' | '}' | ']'))
+    {
+        return true;
+    }
+    separator == Separator::Colon
+        && source_key
+            .trim_start()
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_uppercase())
+        && rest
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, ',' | ')' | '}'))
+}
+
+fn is_source_identifier_token(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first == '$' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+        && value.chars().any(|ch| ch.is_ascii_alphabetic())
+        && value.chars().count() <= 64
 }
 
 fn is_pascal_case_type_name(value: &str) -> bool {
@@ -5045,14 +5111,28 @@ fn is_explicit_slot_low_entropy_literal(value: &str, key_name: &str, kind: KeyKi
     // unquoted (`admin_password: abcdef`). Once the key name explicitly names
     // material and the value survived source/prose suppressors, the slot is
     // stronger evidence than entropy alone.
+    if is_exact_password_low_entropy_slot(key_name, kind) {
+        return is_lowercase_compact_alpha_literal(value);
+    }
     is_compact_alpha_literal(value) && is_qualified_low_entropy_material_slot(key_name, kind)
 }
 
+fn is_exact_password_low_entropy_slot(key_name: &str, kind: KeyKind) -> bool {
+    // Plain config files commonly use the exact key `password` with short
+    // generated values. Keep this narrower than `_password` suffix handling so
+    // `secret: capability` and token prose stay rejected.
+    !matches!(kind, KeyKind::Token)
+        && matches!(
+            key_name,
+            "pass" | "password" | "passwd" | "pwd" | "passphrase"
+        )
+}
+
 fn is_qualified_low_entropy_material_slot(key_name: &str, kind: KeyKind) -> bool {
-    key_allows_low_entropy_literal(key_name, kind)
-        && matches!(kind, KeyKind::Token)
-        && key_name.contains('_')
-        || key_name.ends_with("_password")
+    if matches!(kind, KeyKind::Token) {
+        return key_allows_low_entropy_literal(key_name, kind) && key_name.contains('_');
+    }
+    key_name.ends_with("_password")
         || key_name.ends_with("_pass")
         || key_name.ends_with("_passwd")
         || key_name.ends_with("_pwd")
@@ -5068,6 +5148,11 @@ fn is_qualified_low_entropy_material_slot(key_name: &str, kind: KeyKind) -> bool
 fn is_compact_alpha_literal(value: &str) -> bool {
     let value = value.trim();
     (5..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+fn is_lowercase_compact_alpha_literal(value: &str) -> bool {
+    let value = value.trim();
+    (5..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 fn is_config_secret_slot_key(key_name: &str, source_key: &str) -> bool {
@@ -5412,6 +5497,9 @@ mod tests {
         assert!(has(r#"password = Some("owlknh")"#, "owlknh"));
         assert!(has(r#"["password"] = "alpha12345""#, "alpha12345"));
         assert!(has("admin_password: alphabetic", "alphabetic"));
+        assert!(has("password: zling", "zling"));
+        assert!(has("password: secret", "secret"));
+        assert!(has("passwd: abcde", "abcde"));
         assert!(has("EXOSCALE_API_KEY=alphabeticsecret", "alphabeticsecret"));
         assert!(has(
             r#""Apitoken": "{\"nonce\":\"ok\",\"token\":\"abc123456789\"}""#,
@@ -5521,6 +5609,10 @@ mod tests {
             "spnegoTokenLength = input_token.length;",
             "passwordValue := conn.passwd",
             "tokenValue := GSS_C_EMPTY_BUFFER",
+            r#"}: { provider: string, email: string, password: string }) => {"#,
+            r#"const Pass = props => <span>{props.value}</span>;"#,
+            "pass = empty;",
+            "Passwd: password,",
             r#"hashedTokenKey := "$3:1:uFrxm43ggfw:zsN1zEFC7SvABTdR58o7yjIqfrI4cQ/HSYz3jBwwVnx5X+/ph4etGDIU9dvIYuy1IvnYUVe6a/Ar95xE+gfjhA""#,
             r#"invalidHashToken := "$-1:111:111""#,
             "token. For example: `O'Neil's` -> [ `O`, `Neil` ]. Defaults to `true`.",
