@@ -908,6 +908,7 @@ pub enum Validator {
     InGstin,
     LocalUsername,
     BasicAuthToken68,
+    DbConnectionString,
 }
 
 impl Validator {
@@ -954,6 +955,7 @@ impl Validator {
             "in_gstin" => Validator::InGstin,
             "local_username" => Validator::LocalUsername,
             "basic_auth_token68" => Validator::BasicAuthToken68,
+            "db_connection_string" => Validator::DbConnectionString,
             _ => return None,
         })
     }
@@ -998,8 +1000,48 @@ impl Validator {
             Validator::InGstin => in_gstin(s),
             Validator::LocalUsername => local_username(s),
             Validator::BasicAuthToken68 => basic_auth_token68(s),
+            Validator::DbConnectionString => db_connection_string(s),
         }
     }
+}
+
+pub fn db_connection_string(s: &str) -> bool {
+    // RFC 3986 userinfo can be concrete credentials, but documentation often
+    // spells optional userinfo with bracket/angle/template markers. The regex
+    // finds URI-shaped candidates; this validator rejects only those public
+    // template/redaction forms and keeps ordinary `user:password@host` strings.
+    let Some((_, rest)) = s.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default().trim();
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+        return false;
+    };
+    if host.is_empty() || userinfo_is_template_or_redaction(userinfo) {
+        return false;
+    }
+    let Some((user, password)) = userinfo.split_once(':') else {
+        return false;
+    };
+    !user.is_empty()
+        && !password.is_empty()
+        && !userinfo_part_is_template_or_redaction(user)
+        && !userinfo_part_is_template_or_redaction(password)
+}
+
+fn userinfo_is_template_or_redaction(userinfo: &str) -> bool {
+    userinfo_part_is_template_or_redaction(userinfo)
+        || userinfo
+            .split(':')
+            .any(userinfo_part_is_template_or_redaction)
+}
+
+fn userinfo_part_is_template_or_redaction(part: &str) -> bool {
+    let part = part.trim();
+    part.is_empty()
+        || part
+            .bytes()
+            .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
 }
 
 #[cfg(test)]
@@ -1057,6 +1099,17 @@ mod tests {
             "something" => false,
             "dXNlcm9ubHk=" => false,
             "OnBhc3M=" => false);
+    }
+
+    #[test]
+    fn db_connection_strings_reject_uri_templates_only() {
+        vectors!(db_connection_string,
+            "postgresql://admin:s3cr3t@db.host:5432/sales" => true,
+            "mysql://user:pass@localhost" => true,
+            "mysql://ofh:ab12c!?@db.example.internal/name" => true,
+            "postgresql://[user[:password]@][host][:port][" => false,
+            "mongodb://username:<password>@cluster0.example.com:27017" => false,
+            "redis://***:***@localhost:6379" => false);
     }
 
     #[test]

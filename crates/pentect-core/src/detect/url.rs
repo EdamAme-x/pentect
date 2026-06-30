@@ -130,9 +130,18 @@ fn userinfo_is_credential(userinfo: &str) -> bool {
     // (`https://alice@example.com`). That is identity metadata, not a secret.
     // A credential-bearing authority either has an explicit password separator
     // or uses a token as the username (`https://ghp_...@github.com`).
-    userinfo.contains(':')
+    !userinfo_is_template_or_redaction(userinfo)
+        && (userinfo.contains(':')
         || userinfo.to_ascii_lowercase().contains("%3a")
-        || userinfo_token_like(userinfo)
+        || userinfo_token_like(userinfo))
+}
+
+fn userinfo_is_template_or_redaction(userinfo: &str) -> bool {
+    // URI docs commonly show userinfo as `[user[:password]@]` or `***:***`.
+    // Brackets are template grammar, not URL userinfo. Literal `*` is treated
+    // as a redaction marker here; real passwords with `*` should be
+    // percent-encoded in URLs and remain covered after decoding elsewhere.
+    userinfo.bytes().any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
 }
 
 fn userinfo_token_like(userinfo: &str) -> bool {
@@ -460,6 +469,26 @@ mod tests {
             .iter()
             .all(|(label, _)| label != "URL_CREDENTIAL"));
         assert!(labels("https://alice:letmein@service.internal/repo.git")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
+    }
+
+    #[test]
+    fn uri_template_userinfo_is_not_a_url_credential() {
+        for raw in [
+            "https://[user[:password]@]service.internal/path",
+            "https://***:***@service.internal/path",
+            "https://{user}:{password}@service.internal/path",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|(label, _)| label != "URL_CREDENTIAL"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
+        assert!(labels("https://alice:letmein@service.internal/path")
             .iter()
             .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
     }

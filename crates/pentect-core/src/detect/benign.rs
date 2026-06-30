@@ -460,6 +460,7 @@ pub(crate) fn is_structured_key_name_reference_value(value: &str) -> bool {
 pub(crate) fn is_structured_generic_key_metadata_value(value: &str) -> bool {
     is_structured_key_name_reference_value(value)
         || is_generic_key_config_path_value(value)
+        || is_generic_key_resource_name_value(value)
         || is_generic_key_label_value(value)
         || is_generic_key_file_reference_value(value)
 }
@@ -510,6 +511,42 @@ fn is_generic_key_config_path_value(value: &str) -> bool {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
             && part.bytes().any(|b| b.is_ascii_lowercase())
     })
+}
+
+fn is_generic_key_resource_name_value(value: &str) -> bool {
+    // Generic JSON `key` fields commonly store public label/header/resource
+    // names in kebab syntax. Digits and sensitive components are excluded so
+    // low-entropy real values such as `tenant-7-trial` and `sk-test-token` stay
+    // detectable.
+    let value = value.trim();
+    if !(5..=96).contains(&value.len()) || !value.contains('-') {
+        return false;
+    }
+    if value.bytes().any(|b| b.is_ascii_digit())
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || matches!(b, b'-' | b'/' | b':'))
+    {
+        return false;
+    }
+    let normalized = normalize_identifier(value);
+    if normalized.split('_').any(|part| {
+        matches!(
+            part,
+            "secret" | "password" | "passwd" | "credential" | "token" | "auth" | "private" | "key"
+        )
+    }) {
+        return false;
+    }
+    let parts = value
+        .split(['-', '/', ':'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.len() >= 2
+        && parts.iter().enumerate().all(|(idx, part)| {
+            (part == &"x" && idx == 0 || (2..=32).contains(&part.len()))
+                && part.bytes().all(|b| b.is_ascii_lowercase())
+        })
 }
 
 fn is_generic_key_label_value(value: &str) -> bool {
@@ -774,6 +811,12 @@ mod tests {
         assert!(is_structured_generic_key_metadata_value("access-project"));
         assert!(is_structured_generic_key_metadata_value("cost-center"));
         assert!(is_structured_generic_key_metadata_value(
+            "clean-cilium-state"
+        ));
+        assert!(is_structured_generic_key_metadata_value(
+            "x-amazon-apigateway-authtype"
+        ));
+        assert!(is_structured_generic_key_metadata_value(
             "idle_timeout.timeout_seconds"
         ));
         assert!(is_structured_generic_key_metadata_value(
@@ -788,6 +831,7 @@ mod tests {
         assert!(!is_structured_generic_key_metadata_value("API Key"));
         assert!(!is_structured_generic_key_metadata_value("secret token"));
         assert!(!is_structured_generic_key_metadata_value("sk-test-token"));
+        assert!(!is_structured_generic_key_metadata_value("tenant-7-trial"));
         assert!(!is_structured_generic_key_metadata_value("abcDEF123456"));
         assert!(!is_structured_generic_key_metadata_value("secret.value"));
     }

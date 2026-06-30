@@ -93,6 +93,7 @@ impl EntropyDetector {
             || is_subresource_integrity_value(text, start, &view.region.ctx, run)
             || is_encoded_public_metadata_value(run)
             || is_crypto_test_vector_identifier_value(run)
+            || is_jwk_public_parameter_context(text, start, &view.region.ctx)
             || is_public_key_context(text, start, &view.region.ctx)
         {
             return;
@@ -132,14 +133,15 @@ fn assignment_parts(run: &str) -> Option<Assignment> {
 
 fn entropy_candidate(run: &str, text: &str, start: usize, end: usize) -> bool {
     has_opaque_mix(run)
-        && !is_assignment_name_fragment(run)
+        && (is_jwk_private_parameter_context(text, start)
+            || (!is_assignment_name_fragment(run)
         && !is_operator_expression_fragment(run)
         && !is_slash_separated_identifier_list(run)
         && !is_code_arithmetic_constant(run)
         && !is_uppercase_constant_identifier(run)
         && !is_public_oid_assignment_name_fragment(run)
         && !is_source_identifier_like(run, text, start, end)
-        && !is_regex_character_class_fragment(text, start, end)
+        && !is_regex_character_class_fragment(text, start, end)))
 }
 
 fn is_assignment_name_fragment(run: &str) -> bool {
@@ -380,6 +382,60 @@ fn has_public_key_name_before_value(text: &str, start: usize, ctx: &Context) -> 
     local_assignment_key_before_value(text, start).is_some_and(is_public_key_name)
 }
 
+fn is_jwk_public_parameter_context(text: &str, start: usize, ctx: &Context) -> bool {
+    // RFC 7517/7518 JWK public members include `kid` (key id), RSA `n`/`e`,
+    // and EC/OKP `x`/`y`. They are identifiers or public key coordinates, not
+    // private key material. Do not include `d`, `p`, `q`, `dp`, `dq`, `qi`, or
+    // symmetric `k`.
+    let key = ctx
+        .key
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| local_json_key_before_value(text, start))
+        .or_else(|| local_assignment_key_before_value(text, start).map(str::to_string));
+    let Some(key) = key else {
+        return false;
+    };
+    if !matches!(normalize_identifier(&key).as_str(), "kid" | "n" | "e" | "x" | "y") {
+        return false;
+    }
+    has_nearby_jwk_kty(text, start)
+}
+
+fn is_jwk_private_parameter_context(text: &str, start: usize) -> bool {
+    // RFC 7517/7518 private/symmetric JWK members carry secret material. Let
+    // them through even when their base64url shape resembles a source
+    // identifier; public members are suppressed later by
+    // `is_jwk_public_parameter_context`.
+    let Some(key) = local_json_key_before_value(text, start)
+        .or_else(|| local_assignment_key_before_value(text, start).map(str::to_string))
+    else {
+        return false;
+    };
+    matches!(
+        normalize_identifier(&key).as_str(),
+        "d" | "k" | "p" | "q" | "dp" | "dq" | "qi"
+    ) && has_nearby_jwk_kty(text, start)
+}
+
+fn has_nearby_jwk_kty(text: &str, start: usize) -> bool {
+    let mut window_start = start.saturating_sub(512);
+    while !text.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let mut window_end = (start + 512).min(text.len());
+    while window_end > start && !text.is_char_boundary(window_end) {
+        window_end -= 1;
+    }
+    let window = text[window_start..window_end].to_ascii_lowercase();
+    ["\"kty\"", "'kty'", "kty:"]
+        .iter()
+        .any(|needle| window.contains(needle))
+        && ["rsa", "ec", "okp", "oct"]
+            .iter()
+            .any(|needle| window.contains(needle))
+}
+
 fn local_assignment_key_before_value(text: &str, start: usize) -> Option<&str> {
     let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
     let prefix = &text[line_start..start];
@@ -390,7 +446,12 @@ fn local_assignment_key_before_value(text: &str, start: usize) -> Option<&str> {
         .map(|pos| pos + 1)?;
     let key_start = before[..key_end]
         .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
-        .map_or(0, |pos| pos + 1);
+        .map_or(0, |pos| {
+            pos + before[pos..]
+                .chars()
+                .next()
+                .map_or(1, char::len_utf8)
+        });
     let key = &before[key_start..key_end];
     (!key.is_empty()
         && key
@@ -865,6 +926,8 @@ mod tests {
             "core detectors/policy/rendering pipeline",
             "const BECH32_CHARSET: &[u8] = b\"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";",
             "const CTRL: &[u8] = b\"023456789acdefghjklmnpqrstuvwxyz\";",
+            "     * 2.把appSecret夹在字符串的两端,例如",
+            "          φ0",
         ] {
             let reg = region(raw);
             let v = NormalizedView::build(&reg, raw);
@@ -939,6 +1002,32 @@ mod tests {
             };
             let view = NormalizedView::build(&region, raw);
             assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn jwk_public_parameters_are_not_entropy_candidates() {
+        for raw in [
+            r#"{ kty: 'RSA', kid: 'ZuLUAgyr6RQV3ERjDukHzOO_90rVbrPiE1vD_HtPFuM' }"#,
+            r#"{ kty: 'RSA', n: '0PjQVV2ZAT27Y0h7hfAWWcnPetORCvR1_gHvEUxtlrlnhZia7utHl7BCJH9HP17YHMMBeeE' }"#,
+            r#"{ kty: 'EC', x: 'fqCXPnWs3sSfwztvwYU9SthmRdoT4WCXxS8eD8icF6U', y: 'nP6GIc42c61hoKqPcZqkvzhzIJkBV3Jw3g8sGG7UeP8' }"#,
+        ] {
+            let reg = region(raw);
+            let view = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn jwk_private_parameters_still_detect() {
+        for raw in [
+            r#"{ kty: 'EC', d: 'XikZvoy8ayRpOnuz7ont2DkgMxp_kmmg1EKcuIJWX_E' }"#,
+            r#"{ kty: 'EC', d: 'XikZvoy8ayRpOnuz7ont2DkgMxp_kmmg1EKcuIJWX_E-123' }"#,
+            r#"{ kty: 'oct', k: 'GZy6sIZ6wl9NJOKB-jnmVpi1cLf6xNA2T9Uu77EeH4uY' }"#,
+        ] {
+            let reg = region(raw);
+            let view = NormalizedView::build(&reg, raw);
+            assert!(!EntropyDetector::default().detect(&view).is_empty(), "{raw}");
         }
     }
 

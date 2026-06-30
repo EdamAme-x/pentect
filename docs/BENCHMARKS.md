@@ -117,6 +117,13 @@ Entropy detection suppresses embedded media blobs under MIME keys such as
 `image/png`, W3C/npm `integrity` digests, and OpenSSL `OBJ_*=` assignment-name
 fragments. JWT detection requires a three-segment compact token boundary so a
 five-segment JWE is not cut into a fake JWT.
+Keyed detection also suppresses JSON-escaped HTML/source fragments, generic
+`key` resource-name metadata such as lower-kebab public labels, and URI
+template/redaction userinfo such as `[user[:password]@]` or `***:***` while
+keeping concrete URL/DB credentials. Entropy handling is RFC 7517/7518-aware
+for JWK: public `kid`/`n`/`e`/`x`/`y` members are metadata, while private or
+symmetric `d`/`k`/`p`/`q`/`dp`/`dq`/`qi` members are allowed through even when
+their base64url shape resembles a source identifier.
 
 ```text
 CredData commit: 9a55c40
@@ -125,16 +132,16 @@ Rows: 66898
 Files: 10865
 True rows: 15104
 False rows: 51794
-TP: 10276
-FP: 7018
-FN: 4828
+TP: 10285
+FP: 6704
+FN: 4819
 Line only: 227
-Unlabeled: 54411
+Unlabeled: 54129
 Missing files: 0
-Precision: 0.594
-Recall: 0.680
-F1: 0.634
-Elapsed: 28671 ms
+Precision: 0.605
+Recall: 0.681
+F1: 0.641
+Elapsed: 27838 ms
 ```
 
 Weak groups:
@@ -160,6 +167,9 @@ Weak groups:
 - Entropy suppression also treats `OBJ_*=` as source assignment syntax, so the identifier before an escaped OID body is not masked as an opaque value.
 - Entropy suppression for embedded media and SRI/package integrity is key-scoped: media requires MIME keys such as `image/png`, and SRI requires `integrity` plus `sha256`/`sha384`/`sha512` digest syntax.
 - JWT rule matching is compact-serialization bounded: three-segment JWTs still fire, while five-segment JWEs are not partially captured as JWTs.
+- JWK handling follows RFC 7517/7518 member roles: public key IDs/coordinates are suppressed as metadata, but private/symmetric members are treated as secret-bearing values.
+- URI userinfo template suppression is marker-gated: bracket/brace/angle and literal `*` redactions are skipped, while concrete `user:password@host` connection strings still fire.
+- JSON-escaped HTML/source snippets are suppressed only when escaped markup/source syntax proves the captured value is a parser fragment; compact credential-shaped examples still fire.
 - Localized UI password/token prose is suppressed only when the key name also carries UI text context such as label/error/invalid/message; ordinary `password = "..."` and compact credential values still fire.
 - Generated documentation fragments and Go struct tag values are syntax-gated: HTML doc fragments require documentation/HTML on the left side, and struct tags require backtick-delimited `key` metadata.
 - Documentation metadata names are shape-gated: public namespaced condition keys, uppercase enum names, inline `key=value` help text, shell command substitutions, and source prefix constants are skipped; `sk-test-token</p>` and `secret:` still fire.

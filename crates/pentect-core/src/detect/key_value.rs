@@ -621,6 +621,7 @@ fn looks_like_secret_value(
         || is_localized_ui_text_literal(value, key_name)
         || is_html_code_metadata_literal(value)
         || is_html_documentation_fragment_literal(value, key_name, source_key)
+        || is_escaped_html_source_fragment_literal(value, source_key)
         || is_fingerprint_literal(value, key_name)
         || is_source_constant_reference_literal(value, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
@@ -629,6 +630,8 @@ fn looks_like_secret_value(
         || is_source_fixture_secret_literal(value, key_name, source_key)
         || is_source_struct_tag_literal(value, key_name, source_key)
         || is_source_prefix_constant_literal(value, key_name)
+        || is_source_variable_reference_literal(value, source_key)
+        || is_source_string_fragment_literal(value, source_key)
         || is_shell_command_substitution_literal(value, source_key)
         || is_inline_code_key_value_tail_literal(value, key_name, source_key)
         || is_source_code_fragment_literal(value)
@@ -1605,6 +1608,10 @@ fn source_key_has_html_documentation_shape(source_key: &str) -> bool {
         || lower.contains("<li>")
         || lower.contains("<code>")
         || lower.contains("<i>")
+        || lower.contains("\\u003cp")
+        || lower.contains("\\u003cli")
+        || lower.contains("\\u003ccode")
+        || lower.contains("\\u003cpre")
 }
 
 fn strip_trailing_html_tag(value: &str) -> (&str, bool) {
@@ -1693,6 +1700,122 @@ fn is_public_doc_field_name(value: &str, had_html_tail: bool) -> bool {
         || value.contains('-')
         || value.contains('_')
         || value.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+fn is_escaped_html_source_fragment_literal(value: &str, source_key: &str) -> bool {
+    // Saved Q&A/docs/API payloads often keep HTML as JSON-escaped strings. A
+    // colon inside an embedded code block can make the scanner split a source
+    // fragment as if it were `key: value`. Keep this structural: require escaped
+    // HTML on the left and reject compact secret-looking payloads such as
+    // `api_key: sk-test-token`.
+    if !source_key_has_escaped_html_shape(source_key) {
+        return false;
+    }
+    let value = value.trim();
+    if value.is_empty() || escaped_html_value_keeps_secret_shape(value) {
+        return false;
+    }
+    escaped_html_fragment_has_markup_or_code_syntax(value)
+        || escaped_html_code_reference_literal(value)
+}
+
+fn source_key_has_escaped_html_shape(source_key: &str) -> bool {
+    let lower = source_key.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "\\u003cp",
+            "\\u003c/p",
+            "\\u003cpre",
+            "\\u003ccode",
+            "\\u003c/code",
+            "\\u003cli",
+            "\\u0026lt",
+            "&lt;",
+        ],
+    )
+}
+
+fn escaped_html_value_keeps_secret_shape(value: &str) -> bool {
+    let candidate = strip_trailing_escaped_html_tags(value).trim();
+    if !(4..=160).contains(&candidate.len()) || candidate.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let bytes = candidate.as_bytes();
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+' | b'/' | b'='))
+    {
+        return false;
+    }
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_credential_punctuation = bytes
+        .iter()
+        .any(|b| matches!(b, b'-' | b'.' | b'+' | b'/' | b'='));
+    has_digit || has_credential_punctuation
+}
+
+fn strip_trailing_escaped_html_tags(mut value: &str) -> &str {
+    loop {
+        let lower = value.to_ascii_lowercase();
+        let Some(tag_start) = lower.rfind("\\u003c/") else {
+            return value;
+        };
+        let tag = &lower[tag_start + "\\u003c/".len()..];
+        let Some(tag) = tag.strip_suffix("\\u003e") else {
+            return value;
+        };
+        if !matches!(tag, "p" | "code" | "pre" | "li" | "span" | "strong" | "em") {
+            return value;
+        }
+        value = &value[..tag_start];
+    }
+}
+
+fn escaped_html_fragment_has_markup_or_code_syntax(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if contains_any(
+        &lower,
+        &[
+            "\\u003c",
+            "\\u003e",
+            "\\u0026lt",
+            "\\u0026gt",
+            "\\n",
+            "\\r",
+            "\\t",
+        ],
+    ) {
+        return true;
+    }
+    value.chars().any(char::is_whitespace)
+        && value
+            .bytes()
+            .any(|b| matches!(b, b'{' | b'}' | b'[' | b']' | b'(' | b')' | b';' | b',' | b'='))
+}
+
+fn escaped_html_code_reference_literal(value: &str) -> bool {
+    let value = value.trim().trim_end_matches('\\').trim_matches('"');
+    if value.is_empty() || value.len() > 96 {
+        return false;
+    }
+    if let Some(rest) = value.strip_prefix('$') {
+        return is_simple_code_reference_name(rest);
+    }
+    if value.starts_with("@\"") || value.starts_with("];") || value.starts_with(").") {
+        return true;
+    }
+    value
+        .strip_prefix("l_")
+        .or_else(|| value.strip_prefix("m_"))
+        .is_some_and(is_simple_code_reference_name)
+}
+
+fn is_simple_code_reference_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'>' | b'[' | b']'))
 }
 
 fn is_uuid_literal(value: &str) -> bool {
@@ -1872,6 +1995,48 @@ fn is_source_prefix_constant_literal(value: &str, key_name: &str) -> bool {
         && !contains_dangerous_secret_component(prefix)
 }
 
+fn is_source_variable_reference_literal(value: &str, source_key: &str) -> bool {
+    // Source code often assigns a sensitive-looking argument from a variable,
+    // e.g. `Authorization = l_auth` or `$token = $this->token`. The variable
+    // name is not the credential bytes. Keep this to source-shaped left sides
+    // and identifier/member-reference syntax; quoted strings such as
+    // `password = "hunter2"` still pass through.
+    source_key_has_code_shape(source_key) && is_variable_reference_literal(value.trim())
+}
+
+fn is_variable_reference_literal(value: &str) -> bool {
+    let value = value.trim_end_matches('\\').trim_matches('"');
+    if !(3..=96).contains(&value.len()) {
+        return false;
+    }
+    if let Some(rest) = value.strip_prefix('$') {
+        return is_simple_code_reference_name(rest);
+    }
+    if value
+        .strip_prefix("l_")
+        .or_else(|| value.strip_prefix("m_"))
+        .is_some_and(is_simple_code_reference_name)
+    {
+        return true;
+    }
+    value.contains('.')
+        && value.split('.').all(is_simple_code_reference_name)
+        && value.bytes().any(|b| b.is_ascii_lowercase())
+        && !value.bytes().any(|b| b.is_ascii_digit())
+}
+
+fn is_source_string_fragment_literal(value: &str, source_key: &str) -> bool {
+    // Objective-C and generated code can expose partial string syntax when an
+    // embedded line is scanned from the middle, e.g. `apiURL: @\"...\\n`.
+    // A complete `@"hunter2"` can be a real hardcoded secret, so require
+    // source context plus escaped line/continuation evidence.
+    if !source_key_has_code_shape(source_key) {
+        return false;
+    }
+    let value = value.trim();
+    value.starts_with("@\\\"") && (value.contains("\\n") || value.ends_with('\\'))
+}
+
 fn is_shell_command_substitution_literal(value: &str, source_key: &str) -> bool {
     // Shell completions/config scripts assign keys from command substitutions:
     // `local key=$(__docker_map_key_of_current_option ...)`. The captured
@@ -1952,6 +2117,7 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
         || is_minified_js_descriptor_fragment(value)
         || is_escaped_format_fragment(value)
         || is_method_chain_suffix_fragment(value)
+        || is_incomplete_objc_string_fragment(value)
         || value
             .strip_prefix('+')
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
@@ -2052,6 +2218,13 @@ fn is_method_chain_suffix_fragment(value: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b'('))
     })
+}
+
+fn is_incomplete_objc_string_fragment(value: &str) -> bool {
+    // `@"..."` is Objective-C string syntax. Suppress only escaped line
+    // fragments, not complete literals such as `@"hunter2"`.
+    let value = value.trim();
+    value.starts_with("@\\\"") && (value.contains("\\n") || value.ends_with('\\'))
 }
 
 fn is_arithmetic_expression_literal(value: &str) -> bool {
@@ -2671,6 +2844,10 @@ mod tests {
             "Fy0ySzEbqm=="
         ));
         assert!(has("body=\"access_token=abc12345&state=ok\"", "abc12345"));
+        assert!(has(
+            r#"token = "0abc0d.xyz123abc456def""#,
+            "0abc0d.xyz123abc456def"
+        ));
         assert!(has("dbPassword = \"hunter2\"", "hunter2"));
         assert!(has(
             "OAuth app client_secret 'tenant-7-trial'",
@@ -2780,6 +2957,7 @@ mod tests {
             "ABC_DEF_123"
         ));
         assert!(has(r#"key: "sk-test-token""#, "sk-test-token"));
+        assert!(has(r#"key: "tenant-7-trial""#, "tenant-7-trial"));
         assert!(has(
             r#"password: "<code>sk-test-token</code>""#,
             "<code>sk-test-token</code>"
@@ -2795,6 +2973,10 @@ mod tests {
         assert!(has(
             r#""documentation": "<p>Key: sk-test-token</p>""#,
             "sk-test-token</p>"
+        ));
+        assert!(has(
+            r#"{"body":"\u003cp\u003eapi_key: sk-test-token\u003c/p\u003e"}"#,
+            "sk-test-token\\u003c/p\\u003e"
         ));
         assert!(has(r#"password_prefix = "secret:""#, "secret:"));
         assert!(has(r#"api_key = "$(secret_command""#, "$(secret_command"));
@@ -2873,6 +3055,8 @@ mod tests {
             r#"key: "Dev Gateway Region""#,
             r#"key: "HappyFace.jpg""#,
             r#"key: "cost-center""#,
+            r#"key: "clean-cilium-state""#,
+            r#"key: "x-amazon-apigateway-authtype""#,
             r#"key: "panel1""#,
             r#"key: "dataGrid12""#,
             r#"secretName: kube-ovn-tls"#,
@@ -2908,6 +3092,10 @@ mod tests {
             "PasswordCredentials: internal.PasswordCredentials{",
             "Key: jose.JSONWebKey{Key: j.privKey, KeyID: j.kid},",
             r#"{key:"linear",value:function(n){return n}},{key:"cubic",value:function(n){return n*n*n}}"#,
+            r#"{"body":"\u003cpre\u003e\u003ccode\u003econfig(httpheader = c(\"Authorization\" = l_auth))\u003c/code\u003e\u003c/pre\u003e"}"#,
+            r#"private const string Header = auth.value;"#,
+            r#"{"body":"\u003cpre\u003e\u003ccode\u003e'GET /signup': {view:'signup'}\u003c/code\u003e\u003c/pre\u003e"}"#,
+            r#"{"body":"\u003cpre\u003e\u003ccode\u003ecredentials: @\"apiURL\\n];\u003c/code\u003e\u003c/pre\u003e"}"#,
             "/// Bitcoin address: base58check, P2PKH (0x00, '1') or P2SH (0x05, '3').",
             "/// Bitcoin WIF private key: base58check, version 0x80.",
         ] {
