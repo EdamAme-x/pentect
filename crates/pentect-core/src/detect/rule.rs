@@ -414,6 +414,12 @@ impl RuleDetector {
             // lines in OpenAPI/YAML examples. The validator rejects prose and
             // placeholder token names.
             (r#"(?i)(?:^|[^A-Za-z0-9_-])bearer[ \t]+([A-Za-z0-9._~+/=-]{20,})(?:$|[\s"',;)])"#, Secret, "BEARER_TOKEN", Medium, 1, V::BearerToken),
+            // SQL DDL password clauses are grammar-level credential material
+            // across PostgreSQL/MySQL/Oracle/SQL Server style statements. Split
+            // quoted/bare values so only the password bytes are masked.
+            (r#"(?i)\b(?:create|alter)\s+(?:user|role|login)\b[^\r\n;]{0,180}?\b(?:identified\s+(?:with\s+(?:'[^'\r\n]{1,64}'|[A-Za-z0-9_]+)\s+)?(?:by|as)|password)\s*=?\s*'([^'\r\n]{1,160})'"#, Secret, "SQL_PASSWORD", Medium, 1, V::SqlPasswordValue),
+            (r#"(?i)\b(?:create|alter)\s+(?:user|role|login)\b[^\r\n;]{0,180}?\b(?:identified\s+(?:with\s+(?:"[^"\r\n]{1,64}"|[A-Za-z0-9_]+)\s+)?(?:by|as)|password)\s*=?\s*"([^"\r\n]{1,160})""#, Secret, "SQL_PASSWORD", Medium, 1, V::SqlPasswordValue),
+            (r#"(?i)\b(?:create|alter)\s+(?:user|role|login)\b[^\r\n;]{0,180}?\b(?:identified\s+(?:with\s+[A-Za-z0-9_]+\s+)?(?:by|as)|password)\s*=?\s*([^\s;,)'"`]{1,160})(?:$|[\s;,)])"#, Secret, "SQL_PASSWORD", Medium, 1, V::SqlPasswordValue),
             // Preserve path structure for debugging, but hide the local account
             // segment that frequently leaks in stack traces and tool output.
             (r#"(?i)\bAccountKey\b[ \t]*=[ \t]*([A-Za-z0-9+/=]{40,})(?:;|$|[\s"',)])"#, Secret, "AZURE_STORAGE_ACCOUNT_KEY", High, 1, V::None),
@@ -826,6 +832,22 @@ mod tests {
             "- Bearer 0a000aa0a0a0000000a000a0a0a00000a0a000aaaa0a000aa0aaa000a0a0a000",
             "BEARER_TOKEN"
         ));
+        assert!(has(
+            "CREATE ROLE app WITH LOGIN PASSWORD 's3cret';",
+            "SQL_PASSWORD"
+        ));
+        assert!(has(
+            "CREATE USER root@'host' IDENTIFIED BY \"p4ssw0rd\";",
+            "SQL_PASSWORD"
+        ));
+        assert!(has(
+            "ALTER USER root IDENTIFIED WITH mysql_native_password BY hunter2;",
+            "SQL_PASSWORD"
+        ));
+        assert!(has(
+            "ALTER LOGIN bob WITH PASSWORD = 'Adm1nPass';",
+            "SQL_PASSWORD"
+        ));
         assert!(!has(
             "Authorization: Bearer YOUR_ACCESS_TOKEN_VALUE",
             "BEARER_TOKEN"
@@ -852,6 +874,11 @@ mod tests {
         assert!(!has("documentation says Basic docs", "BASIC_AUTH"));
         assert!(!has(r#"header: "Basic something""#, "BASIC_AUTH"));
         assert!(!has(r#"header: "Basic dXNlcm9ubHk=""#, "BASIC_AUTH"));
+        assert!(!has("password field docs", "SQL_PASSWORD"));
+        assert!(!has(
+            "CREATE ROLE app WITH LOGIN PASSWORD NULL;",
+            "SQL_PASSWORD"
+        ));
     }
 
     #[test]
