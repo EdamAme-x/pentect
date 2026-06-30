@@ -550,6 +550,10 @@ fn parse_value_item(
         });
     }
 
+    if let Some(item) = parse_option_wrapper_value(text, pos, line_end) {
+        return Some(item);
+    }
+
     if matches!(kind, KeyKind::Token | KeyKind::Strong) {
         let first_end = scan_unquoted_token_end(text, pos, line_end);
         let first = &text[pos..first_end];
@@ -571,6 +575,64 @@ fn parse_value_item(
         },
         next: end,
     })
+}
+
+fn parse_option_wrapper_value(
+    text: &str,
+    start: usize,
+    line_end: usize,
+) -> Option<ParsedValueItem> {
+    // Scala/Rust Option wrappers such as `Some("secret")` are transparent
+    // containers: the string literal is the credential value, while `Some` is
+    // just source syntax. Only unwrap a single quoted argument followed by the
+    // closing parenthesis so calls and expressions stay with the normal parser.
+    let name_end = scan_ascii_identifier_end(text, start, line_end);
+    if &text[start..name_end] != "Some" {
+        return None;
+    }
+    let mut pos = trim_ascii_ws_start(text, name_end, line_end);
+    if text.as_bytes().get(pos) != Some(&b'(') {
+        return None;
+    }
+    pos += 1;
+    pos = trim_ascii_ws_start(text, pos, line_end);
+    let quote = text
+        .as_bytes()
+        .get(pos)
+        .copied()
+        .filter(|b| matches!(b, b'"' | b'\'' | b'`'))?;
+    pos += 1;
+    let end = find_quote_or_line_end(text, pos, line_end, quote);
+    let value_start = trim_ascii_ws_start(text, pos, end);
+    let value_end = trim_ascii_ws_end(text, value_start, end);
+    if value_start >= value_end {
+        return None;
+    }
+    let next = (end + 1).min(line_end);
+    let after_quote = trim_ascii_ws_start(text, next, line_end);
+    if text.as_bytes().get(after_quote) != Some(&b')') {
+        return None;
+    }
+    Some(ParsedValueItem {
+        value: ValueCandidate {
+            start: value_start,
+            end: value_end,
+            quoted: true,
+        },
+        next: (after_quote + 1).min(line_end),
+    })
+}
+
+fn scan_ascii_identifier_end(text: &str, start: usize, line_end: usize) -> usize {
+    let mut end = start;
+    while end < line_end {
+        let b = text.as_bytes()[end];
+        if !(b.is_ascii_alphanumeric() || b == b'_') {
+            break;
+        }
+        end += 1;
+    }
+    end
 }
 
 fn parse_tuple_assignment_value(
@@ -740,6 +802,7 @@ fn looks_like_secret_value(
         || is_plain_prose_literal_for_generic_key(value, key_name)
         || is_locator_literal_for_key(value, key_name)
         || is_secret_resource_metadata_literal(value, key_name)
+        || is_web_credentials_mode_literal(value, key_name)
         || is_package_dependency_coordinate_literal(value, source_key)
         || is_package_dependency_version_literal(value, source_key)
         || is_password_reset_duration_literal(value, key_name)
@@ -2917,6 +2980,20 @@ fn is_resource_name_literal(value: &str) -> bool {
     has_name_char && (has_separator || value.contains('/') || value.contains('.'))
 }
 
+fn is_web_credentials_mode_literal(value: &str, key_name: &str) -> bool {
+    // The Fetch API `credentials` field is an enum controlling cookie/auth
+    // inclusion behavior, not credential material. Keep this to the exact
+    // plural field name and standard enum values so singular `credential`
+    // assignments and arbitrary secrets still flow through.
+    if key_name != "credentials" {
+        return false;
+    }
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "same-origin" | "include" | "omit"
+    )
+}
+
 fn is_package_dependency_coordinate_literal(value: &str, source_key: &str) -> bool {
     // Maven/Gradle coordinates are `group:artifact:version`. The key/value
     // scanner sees the first colon and may treat `com.google.auth` as an auth
@@ -3483,6 +3560,8 @@ mod tests {
             r#"refresh_token="6nA7WEJ/bBBCY06IrWwAlks7""#,
             "6nA7WEJ/bBBCY06IrWwAlks7"
         ));
+        assert!(has(r#"password = Some("owlknh")"#, "owlknh"));
+        assert!(has(r#"api_token = Some("tok-12345")"#, "tok-12345"));
         assert!(has(
             r#"authorization: 'Basic Wv0dTjLryp=='"#,
             "Wv0dTjLryp=="
@@ -3583,6 +3662,9 @@ mod tests {
             r#"var response = "id_token=my_id_token&state=protected_state&code=my_code";"#,
             r#"access_token = "Test Access Token","#,
             r#"refresh_token = "Test Refresh Token""#,
+            r#"credentials: "same-origin""#,
+            r#"credentials: "include""#,
+            r#"credentials: "omit""#,
             r#"const string expectedTokenValue = "GITHUB_TOKEN_VALUE";"#,
             r#"public const string OAuthClientSecret = "GCM_BITBUCKET_CLOUD_CLIENTSECRET";"#,
             r#""privateKey": "LINE_1\nLINE_2\nLINE_2","#,
@@ -3775,6 +3857,7 @@ mod tests {
             r#"$token = Get-NtToken -Primary -Duplicate"#,
             r#"$token = $this->createMock(TokenInterface::class);"#,
             r#"*token = yaml_token_t{}"#,
+            r#"password = Some(password_value)"#,
             r#"key: Some("password".to_string()),"#,
             r#"path: Some("structured.password".to_string()),"#,
             r#"prompt: "Use secret?","#,
