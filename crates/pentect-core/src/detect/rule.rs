@@ -405,6 +405,11 @@ impl RuleDetector {
             // Require nearby Authorization/auth wording so prose like
             // `Basic docs` or unrelated base64 samples do not become secrets.
             (r#"(?i)\b(?:proxy-authorization|authorization|auth)\b[^\r\n]{0,40}?\bbasic[ \t]+([A-Za-z0-9+/]{8,}={0,2})(?:$|[\s"',;)])"#, Secret, "BASIC_AUTH", Medium, 1, V::BasicAuthToken68),
+            // The same RFC 7617 scheme also appears as a standalone header
+            // value in structured YAML/JSON. The validator must decode a
+            // concrete `user:password` pair, so placeholder/prose token68 stays
+            // negative.
+            (r#"(?i)(?:^|[^A-Za-z0-9+/=])basic[ \t]+([A-Za-z0-9+/]{8,}={0,2})(?:$|[\s"',;)])"#, Secret, "BASIC_AUTH", Medium, 1, V::BasicAuthToken68),
             // RFC 6750 bearer credentials can appear as standalone auth-scheme
             // lines in OpenAPI/YAML examples. The validator rejects prose and
             // placeholder token names.
@@ -825,6 +830,7 @@ mod tests {
             r#"if auth != "Basic bnJna2w6dmdycWpz" {"#,
             "BASIC_AUTH"
         ));
+        assert!(has(r#"header: "Basic dXNlcjpwYXNz""#, "BASIC_AUTH"));
         assert!(has(
             "jwt=eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop.abcdefghijklmnop",
             "JWT_SECRET"
@@ -839,7 +845,8 @@ mod tests {
         ));
         assert!(!has("jwt_like=aaa.bbb.ccc css=#aabbcc", "SESSION_TOKEN"));
         assert!(!has("documentation says Basic docs", "BASIC_AUTH"));
-        assert!(!has(r#""value": "Basic d3p3bTpqQGNs""#, "BASIC_AUTH"));
+        assert!(!has(r#"header: "Basic something""#, "BASIC_AUTH"));
+        assert!(!has(r#"header: "Basic dXNlcm9ubHk=""#, "BASIC_AUTH"));
     }
 
     #[test]

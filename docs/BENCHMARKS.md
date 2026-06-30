@@ -127,6 +127,9 @@ their base64url shape resembles a source identifier. Standalone RFC 6750
 `Bearer <token>` lines now use a validator-gated captured rule, so opaque
 Bearer credentials in YAML/OpenAPI-style examples are caught while placeholder
 token names stay negative.
+Standalone RFC 7617 `Basic <token68>` values use the same decoder validator as
+contexted Authorization headers, so YAML/JSON header values are caught while
+prose and values that do not decode to `user:password` stay negative.
 
 ```text
 CredData commit: 9a55c40
@@ -135,16 +138,16 @@ Rows: 66898
 Files: 10865
 True rows: 15104
 False rows: 51794
-TP: 10351
+TP: 10364
 FP: 6704
-FN: 4753
+FN: 4740
 Line only: 227
 Unlabeled: 54129
 Missing files: 0
 Precision: 0.607
-Recall: 0.685
+Recall: 0.686
 F1: 0.644
-Elapsed: 28206 ms
+Elapsed: 28381 ms
 ```
 
 Weak groups:
@@ -184,7 +187,7 @@ Weak groups:
 - Generic `"key"` field values such as `token`, `code`, `signature`, and `unknown` are metadata names only in that generic-key context; `password` and `secret` still fire.
 - Synthetic hex fixture strings are suppressed when the whole value is built from canonical visual patterns, sequential byte runs, or repeated bytes; arbitrary hex under sensitive key context still fires.
 - `KEYED_SECRET` identity sweep keeps anchored detections only. Context-free propagation is left to stronger rule, entropy, and structural detections.
-- `BASIC_AUTH` is RFC 7617-gated: the captured token68 must decode to a non-empty `user:password` pair, so `Basic something` style prose is not counted.
+- `BASIC_AUTH` is RFC 7617-gated: contexted and standalone structured values both require captured token68 to decode to a non-empty `user:password` pair, so `Basic something` style prose and `useronly` decodes are not counted.
 - Locator/resource metadata suppression is policy-gated: secret object names and URL/path references are skipped only when no userinfo/query/fragment or webhook/signed-url key suggests the locator itself carries a credential. This improves precision with a small recall tradeoff on path-like positive labels.
 - Source fixture literals require both source-code shape and fixture key context, so `expectedPassword = "pass"` is skipped while plain `password = "pass"` still fires.
 - `UUID`: low recall.
