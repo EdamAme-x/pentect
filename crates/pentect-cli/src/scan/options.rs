@@ -5,6 +5,7 @@ pub(super) struct ScanOpts {
     pub(super) paths: Vec<PathBuf>,
     pub(super) json: bool,
     pub(super) no_fail: bool,
+    pub(super) gitignore: bool,
     pub(super) excludes: Vec<String>,
 }
 
@@ -13,6 +14,7 @@ impl ScanOpts {
         let mut paths = Vec::new();
         let mut json = false;
         let mut no_fail = false;
+        let mut gitignore = false;
         let mut excludes = Vec::new();
         let mut i = 2usize;
         while i < args.len() {
@@ -23,6 +25,10 @@ impl ScanOpts {
                 }
                 "--no-fail" => {
                     no_fail = true;
+                    i += 1;
+                }
+                "--gitignore" => {
+                    gitignore = true;
                     i += 1;
                 }
                 "--exclude" => {
@@ -50,6 +56,7 @@ impl ScanOpts {
             paths,
             json,
             no_fail,
+            gitignore,
             excludes,
         })
     }

@@ -1,0 +1,22 @@
+# Non-secret source constant components.
+#
+# Format: component:word
+# Matching is done against ALL_CAPS source-code identifier components after
+# identifier normalization. This list is only consulted when the left side is
+# source-shaped; it never suppresses plain config assignments.
+#
+# Rationale:
+# - empty/default/null/none/no/true/false are conventional sentinel constants.
+# - enabled/disabled/unknown/invalid/unset are state markers, not credentials.
+component:empty
+component:default
+component:null
+component:none
+component:no
+component:true
+component:false
+component:enabled
+component:disabled
+component:unknown
+component:invalid
+component:unset

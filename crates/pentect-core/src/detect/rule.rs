@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use super::pattern::{PatternMatchDetector, PatternSpec};
+use super::pattern::{MatchContextPolicy, PatternMatchDetector, PatternSpec};
 use super::validate::Validator;
 use super::Detector;
 use crate::model::*;
@@ -48,12 +48,6 @@ impl RuleDetector {
         //   non-secret could plausibly hit (e.g. Twilio's `AC`+32hex).
         // - labels are UPPER_SNAKE (asserted in tests) so they render cleanly.
         let table: &[(&str, Category, &str, Confidence)] = &[
-            (
-                r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*",
-                Secret,
-                "JWT_SECRET",
-                High,
-            ),
             (r"AKIA[A-Z0-9]{16}", Secret, "AWS_AKID", High),
             (
                 r"sk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_-]{20,}",
@@ -169,12 +163,6 @@ impl RuleDetector {
                 Secret,
                 "GCP_PRIVATE_KEY_ID",
                 Medium,
-            ),
-            (
-                r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?)://[^\s:/@]+:[^\s:/@]+@[^\s/?#]+",
-                Secret,
-                "DB_CONNECTION_STRING",
-                High,
             ),
             (
                 r"\b[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}\b",
@@ -398,13 +386,34 @@ impl RuleDetector {
             (r"\b[12][0-9]{4}(?:[0-9]{2}|2[AB])[0-9]{8}\b", Identifier, "FR_NIR_INSEE", High, V::FrNir),
             (r"(?i)(?:acn|company number)[^\n]{0,12}?\b\d{3}[ ]?\d{3}[ ]?\d{3}\b", Identifier, "AU_ACN", High, V::AuAcn),
             (r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b", Identifier, "IN_GSTIN", High, V::InGstin),
+            // Connection strings are credential-bearing only when the userinfo
+            // is concrete. Docs/templates such as `[user[:password]@]` and
+            // `<password>` are filtered by the validator.
+            (r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?)://[^\s:/@]+:[^\s:/@]+@[^\s/?#]+", Secret, "DB_CONNECTION_STRING", High, V::DbConnectionString),
         ];
         #[rustfmt::skip]
         let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
+            // JWT compact serialization has exactly three base64url segments.
+            // JWE compact serialization has five; do not mask the first three
+            // segments as a JWT just because the protected header starts `eyJ`.
+            (r#"(?i)(?:^|[^A-Za-z0-9_.-])(eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*)(?:$|[^A-Za-z0-9_.-])"#, Secret, "JWT_SECRET", High, 1, V::None),
             // Session/JWT-like values need context. A bare aaa.bbb.ccc is common
             // test/noise; a long three-segment token after session/jwt/cookie is
             // credential-bearing even if the header is opaque or not JSON.
             (r#"(?i)\b(?:session|sid|jwt|cookie|auth[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token)\b[^\r\n]{0,16}?(?:=|:)[ \t'"]{0,3}([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})(?:$|[\s"',;)])"#, Secret, "SESSION_TOKEN", Medium, 1, V::None),
+            // RFC 7617 Basic credentials use token68 after the `Basic` scheme.
+            // Require nearby Authorization/auth wording so prose like
+            // `Basic docs` or unrelated base64 samples do not become secrets.
+            (r#"(?i)\b(?:proxy-authorization|authorization|auth)\b[^\r\n]{0,40}?\bbasic[ \t]+([A-Za-z0-9+/]{8,}={0,2})(?:$|[\s"',;)])"#, Secret, "BASIC_AUTH", Medium, 1, V::BasicAuthToken68),
+            // The same RFC 7617 scheme also appears as a standalone header
+            // value in structured YAML/JSON. The validator must decode a
+            // concrete `user:password` pair, so placeholder/prose token68 stays
+            // negative.
+            (r#"(?i)(?:^|[^A-Za-z0-9+/=])basic[ \t]+([A-Za-z0-9+/]{8,}={0,2})(?:$|[\s"',;)])"#, Secret, "BASIC_AUTH", Medium, 1, V::BasicAuthToken68),
+            // RFC 6750 bearer credentials can appear as standalone auth-scheme
+            // lines in OpenAPI/YAML examples. The validator rejects prose and
+            // placeholder token names.
+            (r#"(?i)(?:^|[^A-Za-z0-9_-])bearer[ \t]+([A-Za-z0-9._~+/=-]{20,})(?:$|[\s"',;)])"#, Secret, "BEARER_TOKEN", Medium, 1, V::BearerToken),
             // Preserve path structure for debugging, but hide the local account
             // segment that frequently leaks in stack traces and tool output.
             (r#"(?i)\bAccountKey\b[ \t]*=[ \t]*([A-Za-z0-9+/=]{40,})(?:;|$|[\s"',)])"#, Secret, "AZURE_STORAGE_ACCOUNT_KEY", High, 1, V::None),
@@ -428,6 +437,7 @@ impl RuleDetector {
                 label: label.to_string(),
                 confidence,
                 validator: V::None,
+                context: builtin_context_policy(label),
                 capture: 0,
                 prefilter: builtin_prefilter(label, pattern),
             })
@@ -439,6 +449,7 @@ impl RuleDetector {
                         label: label.to_string(),
                         confidence,
                         validator,
+                        context: builtin_context_policy(label),
                         capture: 0,
                         prefilter: builtin_prefilter(label, pattern),
                     },
@@ -451,6 +462,7 @@ impl RuleDetector {
                     label: label.to_string(),
                     confidence,
                     validator,
+                    context: builtin_context_policy(label),
                     capture,
                     prefilter: builtin_prefilter(label, pattern),
                 },
@@ -503,6 +515,7 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         "SESSION_TOKEN" => &[
             "session", "sid", "jwt", "cookie", "auth", "access", "refresh",
         ],
+        "BASIC_AUTH" => &["Basic ", "Basic\t"],
         "DB_CONNECTION_STRING" => &[
             "postgres://",
             "postgresql://",
@@ -552,6 +565,16 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         _ => &[],
     };
     literals.iter().map(|s| (*s).to_string()).collect()
+}
+
+fn builtin_context_policy(label: &str) -> MatchContextPolicy {
+    match label {
+        // The `EAAA...` Square prefix collides with OpenSSH public-key base64.
+        // Keep the vendor rule itself, but reject matches on lines already
+        // shaped as public SSH keys. Private key material is handled elsewhere.
+        "SQUARE_TOKEN" => MatchContextPolicy::NotPublicSshKeyLine,
+        _ => MatchContextPolicy::Any,
+    }
 }
 
 #[cfg(test)]
@@ -708,6 +731,22 @@ mod tests {
     }
 
     #[test]
+    fn square_rule_ignores_public_ssh_key_context() {
+        let det = RuleDetector::builtin();
+        let has_square = |s: &str| {
+            let reg = region(s);
+            let v = NormalizedView::build(&reg, s);
+            det.detect(&v).iter().any(|sp| sp.label == "SQUARE_TOKEN")
+        };
+        assert!(has_square(
+            "token=EAAAabcdefghijklmnopqrstuvwxyzABCDEF123456"
+        ));
+        assert!(!has_square(
+            r#"{"key":"ssh-rsa AAAAB3NzaC1yc2EAAAabcdefghijklmnopqrstuvwxyzABCDEF123456"}"#
+        ));
+    }
+
+    #[test]
     fn url_rule_keeps_sentence_punctuation_literal() {
         let det = RuleDetector::builtin();
         let raw = "see https://example.com/api/issues/1234. next";
@@ -719,6 +758,33 @@ mod tests {
             &raw[span.range.start..span.range.end],
             "https://example.com/api/issues/1234"
         );
+    }
+
+    #[test]
+    fn db_connection_string_rejects_uri_templates() {
+        let det = RuleDetector::builtin();
+        let labels = |s: &str| {
+            det.detect(&NormalizedView::build(&region(s), s))
+                .into_iter()
+                .map(|span| span.label)
+                .collect::<Vec<_>>()
+        };
+        for raw in [
+            "postgresql://[user[:password]@][host][:port][",
+            "mongodb://username:<password>@cluster0.example.com:27017",
+            "redis://***:***@localhost:6379",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|label| label != "DB_CONNECTION_STRING"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
+        assert!(labels("postgresql://admin:s3cr3t@db.host:5432/sales")
+            .iter()
+            .any(|label| label == "DB_CONNECTION_STRING"));
     }
 
     #[test]
@@ -752,11 +818,40 @@ mod tests {
             ),
             "KUBE_CLIENT_KEY_DATA"
         ));
+        assert!(has(
+            r#"'header' => 'Proxy-Authorization: Basic d3p3bTpqQGNs',"#,
+            "BASIC_AUTH"
+        ));
+        assert!(has(
+            "- Bearer 0a000aa0a0a0000000a000a0a0a00000a0a000aaaa0a000aa0aaa000a0a0a000",
+            "BEARER_TOKEN"
+        ));
+        assert!(!has(
+            "Authorization: Bearer YOUR_ACCESS_TOKEN_VALUE",
+            "BEARER_TOKEN"
+        ));
+        assert!(!has("Bearer abcdefghijklmnopqrstuv", "BEARER_TOKEN"));
+        assert!(has(
+            r#"if auth != "Basic bnJna2w6dmdycWpz" {"#,
+            "BASIC_AUTH"
+        ));
+        assert!(has(r#"header: "Basic dXNlcjpwYXNz""#, "BASIC_AUTH"));
+        assert!(has(
+            "jwt=eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop.abcdefghijklmnop",
+            "JWT_SECRET"
+        ));
+        assert!(!has(
+            "jwe=eyJhbGciOiJSU0EtT0FFUCJ9.abcdefghijklmnop.abcdefghijklmnop.abcdefghijklmnop.abcdefghijklmnop",
+            "JWT_SECRET"
+        ));
         assert!(!has(
             "port=5432 workers=4 timeout_ms=30000 status=200",
             "KEYED_SECRET"
         ));
         assert!(!has("jwt_like=aaa.bbb.ccc css=#aabbcc", "SESSION_TOKEN"));
+        assert!(!has("documentation says Basic docs", "BASIC_AUTH"));
+        assert!(!has(r#"header: "Basic something""#, "BASIC_AUTH"));
+        assert!(!has(r#"header: "Basic dXNlcm9ubHk=""#, "BASIC_AUTH"));
     }
 
     #[test]
@@ -842,6 +937,7 @@ mod tests {
             label: "API_KEY".into(),
             confidence: Confidence::High,
             validator: Validator::None,
+            context: Default::default(),
             capture: 1,
             prefilter: Vec::new(),
         }])
@@ -863,6 +959,7 @@ mod tests {
             label: "API_KEY".into(),
             confidence: Confidence::High,
             validator: Validator::None,
+            context: Default::default(),
             capture: 1,
             prefilter: Vec::new(),
         }])
@@ -877,6 +974,7 @@ mod tests {
             label: "ACME_TOKEN".into(),
             confidence: Confidence::High,
             validator: Validator::None,
+            context: Default::default(),
             capture: 1,
             prefilter: vec!["acme".into()],
         }])
@@ -902,6 +1000,7 @@ mod tests {
                 label: "URL".into(),
                 confidence: Confidence::Medium,
                 validator: Validator::None,
+                context: Default::default(),
                 capture: 0,
                 prefilter: Vec::new(),
             },
@@ -911,6 +1010,7 @@ mod tests {
                 label: "SLACK_WEBHOOK".into(),
                 confidence: Confidence::High,
                 validator: Validator::None,
+                context: Default::default(),
                 capture: 0,
                 prefilter: Vec::new(),
             },
@@ -935,6 +1035,7 @@ mod tests {
                 label: "SHORT_PREFIX".into(),
                 confidence: Confidence::Medium,
                 validator: Validator::None,
+                context: Default::default(),
                 capture: 0,
                 prefilter: vec!["abc".into()],
             },
@@ -944,6 +1045,7 @@ mod tests {
                 label: "LONG_PREFIX".into(),
                 confidence: Confidence::High,
                 validator: Validator::None,
+                context: Default::default(),
                 capture: 0,
                 prefilter: vec!["abcd".into()],
             },

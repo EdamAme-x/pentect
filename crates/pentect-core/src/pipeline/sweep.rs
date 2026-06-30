@@ -23,6 +23,9 @@ pub fn identity_sweep(
     // specific High AWS_AKID is not overwritten by a generic Low LIKELY_SECRET).
     let mut rep: BTreeMap<String, Span> = BTreeMap::new();
     for s in &accepted {
+        if !is_sweepable_identity(raw, s) {
+            continue;
+        }
         let id = n_id(&raw[s.range.start..s.range.end]);
         rep.entry(id)
             .and_modify(|e| {
@@ -100,6 +103,63 @@ pub fn identity_sweep(
 
     all.sort_by_key(|s| s.range.start);
     all
+}
+
+fn is_sweepable_identity(raw: &str, span: &Span) -> bool {
+    // Identity sweep is propagation, not the original detection decision. Very
+    // short or punctuation-only representatives such as `=` are almost always
+    // syntax around a detected value; sweeping them creates noisy standalone
+    // masks while the original detector hit remains masked.
+    if !has_distinctive_sweep_identity_shape(&raw[span.range.start..span.range.end]) {
+        return false;
+    }
+    // OTP/passcode values are short and time-bound. A repeated `123456` elsewhere
+    // is not evidence of the same credential unless the local line has OTP
+    // context, so the detector hit is masked but global identity propagation is
+    // intentionally disabled for this label.
+    if span.label.as_str() == labels::OTP {
+        return false;
+    }
+    // KeyValueDetector hits are anchored by local key syntax. Repeating the same
+    // bytes elsewhere without a key boundary is not enough evidence: code names,
+    // fixtures, and public test labels collide heavily with keyed values. Keep
+    // the anchored hit and let stronger detectors drive identity propagation.
+    if span.label.as_str() == labels::KEYED_SECRET {
+        return false;
+    }
+    // Structural JSON detections are anchored by local key context. Generated
+    // labels such as `LOCKROOMPASSWORD`, `LABEL_PASSWORD`, or
+    // `CREATEAUTHORIZERREQUEST` often come from UI/resource strings; seeing the
+    // same prose elsewhere is not evidence of the same credential. Keep the
+    // anchored structural span, but sweep only values with distinctive token
+    // shape. Canonical labels alone are not enough: `PASSWORD: "Password"` in
+    // localization JSON is a label, while `PASSWORD: "s3cr3t-prod-token"` has
+    // enough identity evidence to propagate.
+    if span.source == DetectorId::Structural && !is_structural_sweepable_identity(raw, span) {
+        return false;
+    }
+    true
+}
+
+fn has_distinctive_sweep_identity_shape(value: &str) -> bool {
+    let value = value.trim();
+    value.len() >= 4 && value.bytes().any(|b| b.is_ascii_alphanumeric())
+}
+
+fn is_structural_sweepable_identity(raw: &str, span: &Span) -> bool {
+    distinctive_secret_shape(&raw[span.range.start..span.range.end])
+}
+
+fn distinctive_secret_shape(value: &str) -> bool {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    bytes.len() >= 16
+        && !bytes.iter().any(u8::is_ascii_whitespace)
+        && bytes.iter().any(u8::is_ascii_alphabetic)
+        && bytes.iter().any(u8::is_ascii_digit)
+        && bytes
+            .iter()
+            .any(|b| matches!(b, b'_' | b'-' | b'.' | b'+' | b'/' | b'='))
 }
 
 /// True if the byte at `i` is part of the same token (would make a match a mere
@@ -211,6 +271,138 @@ mod tests {
         assert_eq!(
             swept[0].label, "AWS_AKID",
             "must inherit the stronger label"
+        );
+    }
+
+    #[test]
+    fn otp_values_are_not_identity_swept() {
+        let raw = "Your login code is 123456. Build number 123456 appears later.";
+        let first = span(
+            raw,
+            "123456",
+            labels::OTP,
+            Category::Secret,
+            Confidence::High,
+        );
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "short OTP values require local auth context, not global sweep: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn short_keyed_values_are_not_identity_swept() {
+        let raw = r#"password="secret" prose says secret later"#;
+        let first = span(
+            raw,
+            "secret",
+            labels::KEYED_SECRET,
+            Category::Secret,
+            Confidence::Medium,
+        );
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "short keyed values need local context, not global sweep: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn punctuation_syntax_is_not_identity_swept() {
+        let raw = "PrivPubKeyPair = A:B\nPrivPubKeyPair = C:D";
+        let first = span(
+            raw,
+            "=",
+            labels::LIKELY_SECRET,
+            Category::Secret,
+            Confidence::Low,
+        );
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "syntax-only identities must not be propagated: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn keyed_source_identifiers_are_not_identity_swept() {
+        for raw in [
+            r#"key="UNSAFE_componentWillMount" code UNSAFE_componentWillMount"#,
+            r#"key="_selectLength" code _selectLength"#,
+            r#"password="x-pack-test-password" docs x-pack-test-password"#,
+            r#"secret="secret_key_base" docs secret_key_base"#,
+            r#"api_key="abcDEF123456" docs abcDEF123456"#,
+            r#"password="tenant-7-trial" docs tenant-7-trial"#,
+            r#"key="ALICE_secp256k1_PUB" docs ALICE_secp256k1_PUB"#,
+        ] {
+            let value = raw.split('"').nth(1).unwrap();
+            let first = span(
+                raw,
+                value,
+                labels::KEYED_SECRET,
+                Category::Secret,
+                Confidence::Medium,
+            );
+            let swept = swept_ranges(raw, vec![first]);
+            assert!(
+                swept.is_empty(),
+                "no-digit keyed values need local context, not global sweep: {raw} {swept:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyed_values_are_not_identity_swept_without_local_context() {
+        let raw = r#"api_key="sk-live-Abc1234567890" later sk-live-Abc1234567890"#;
+        let value = raw.split('"').nth(1).unwrap();
+        let first = span(
+            raw,
+            value,
+            labels::KEYED_SECRET,
+            Category::Secret,
+            Confidence::Medium,
+        );
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "keyed values require local key context, not global sweep: {raw} {swept:?}"
+        );
+    }
+
+    #[test]
+    fn structural_ui_labels_are_not_identity_swept() {
+        let raw = r#"{"lockRoomPassword":"Password","label":"Password"}"#;
+        let first_start = raw.find("Password").unwrap();
+        let first = Span {
+            range: ByteRange::new(first_start, first_start + "Password".len()),
+            category: Category::Secret,
+            label: "LOCKROOMPASSWORD".into(),
+            confidence: Confidence::High,
+            source: DetectorId::Structural,
+        };
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "structural UI labels have only local key context: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn structural_short_password_values_are_not_identity_swept() {
+        let raw = r#"{"password":"Password","label":"Password"}"#;
+        let first_start = raw.find("Password").unwrap();
+        let first = Span {
+            range: ByteRange::new(first_start, first_start + "Password".len()),
+            category: Category::Secret,
+            label: "PASSWORD".into(),
+            confidence: Confidence::High,
+            source: DetectorId::Structural,
+        };
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "canonical structural labels still need distinctive value shape: {swept:?}"
         );
     }
 }

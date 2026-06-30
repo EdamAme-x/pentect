@@ -82,6 +82,18 @@ fn exec_parse_accepts_live_and_approve_without_env_flags() {
 }
 
 #[test]
+fn protected_child_env_does_not_inherit_memory_vault_credentials() {
+    let mut cmd = Command::new("echo");
+    apply_protected_child_env(&mut cmd, &[], "demo");
+    let envs: Vec<_> = cmd
+        .get_envs()
+        .map(|(name, _)| name.to_string_lossy().to_string())
+        .collect();
+    assert!(!envs.iter().any(|name| name == "PENTECT_MEMORY_VAULT_ADDR"));
+    assert!(!envs.iter().any(|name| name == "PENTECT_MEMORY_VAULT_TOKEN"));
+}
+
+#[test]
 fn exec_parse_accepts_stdin_mode_without_shell_text() {
     let args = strings(["pentect", "exec", "--stdin"]);
     let opts = ExecOpts::parse(&args).unwrap();

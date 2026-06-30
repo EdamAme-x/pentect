@@ -1,39 +1,31 @@
 use super::report::SkippedFile;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use std::collections::BTreeMap;
+use super::rules;
+use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 
 pub(super) fn collect_scan_roots(
     roots: &[PathBuf],
     excludes: &[String],
+    use_gitignore: bool,
     skipped: &mut Vec<SkippedFile>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     for root in roots {
-        if let Some((base, git_files)) = git_files_for_root(root) {
-            let matcher = ExcludeMatcher::new(&base, excludes)?;
-            let mut matchers_by_dir: BTreeMap<PathBuf, ExcludeMatcher> = BTreeMap::new();
-            for path in git_files {
-                let parent = path.parent().unwrap_or(&base).to_path_buf();
-                let file_matcher = if let Some(cached) = matchers_by_dir.get(&parent) {
-                    cached.clone()
-                } else {
-                    let built = matcher.with_ancestors(&path)?;
-                    matchers_by_dir.insert(parent, built.clone());
-                    built
-                };
-                if !file_matcher.is_excluded(&path, false) {
-                    files.push(path);
-                }
+        if use_gitignore {
+            if let Some((base, git_files)) = git_files_for_root(root) {
+                let filtered = filter_git_files(base, git_files, excludes)?;
+                files.extend(filtered);
+                continue;
             }
-        } else {
-            let base = scan_base(root);
-            let matcher = ExcludeMatcher::new(&base, excludes)?;
-            collect_files(root, &mut files, skipped, &matcher)?;
         }
+        let root = normalize_root(root);
+        let mut builder = WalkBuilder::new(&root);
+        configure_walker(&mut builder, &scan_base(&root), excludes, use_gitignore)?;
+        collect_with_walker(builder, &mut files, skipped)?;
     }
-    files.sort();
+    files.sort_unstable();
     files.dedup();
     Ok(files)
 }
@@ -108,6 +100,159 @@ const IGNORED_FILE_EXTENSIONS: &[&str] = &[
     "zst",
 ];
 
+fn configure_walker(
+    builder: &mut WalkBuilder,
+    base: &Path,
+    excludes: &[String],
+    use_gitignore: bool,
+) -> Result<(), String> {
+    builder
+        .hidden(false)
+        .parents(true)
+        .ignore(false)
+        .git_ignore(use_gitignore)
+        .git_global(use_gitignore)
+        .git_exclude(use_gitignore)
+        .require_git(false)
+        .follow_links(false)
+        .threads(walk_threads())
+        .add_custom_ignore_filename(".pentectignore");
+    if let Some(overrides) = rules::build_overrides(base, excludes)? {
+        builder.overrides(overrides);
+    }
+    Ok(())
+}
+
+fn collect_with_walker(
+    builder: WalkBuilder,
+    files: &mut Vec<PathBuf>,
+    skipped: &mut Vec<SkippedFile>,
+) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    let mut visitor = WalkCollectorBuilder { tx };
+    builder.build_parallel().visit(&mut visitor);
+    drop(visitor);
+    for batch in rx {
+        if let Some(error) = batch.error {
+            return Err(error);
+        }
+        files.extend(batch.files);
+        skipped.extend(batch.skipped);
+    }
+    Ok(())
+}
+
+struct WalkCollectorBuilder {
+    tx: mpsc::Sender<WalkBatch>,
+}
+
+impl<'s> ParallelVisitorBuilder<'s> for WalkCollectorBuilder {
+    fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
+        Box::new(WalkCollector {
+            tx: self.tx.clone(),
+            files: Vec::new(),
+            skipped: Vec::new(),
+            error: None,
+        })
+    }
+}
+
+struct WalkCollector {
+    tx: mpsc::Sender<WalkBatch>,
+    files: Vec<PathBuf>,
+    skipped: Vec<SkippedFile>,
+    error: Option<String>,
+}
+
+impl ParallelVisitor for WalkCollector {
+    fn visit(&mut self, entry: Result<DirEntry, ignore::Error>) -> WalkState {
+        match collect_entry(entry, &mut self.files, &mut self.skipped) {
+            Ok(()) => WalkState::Continue,
+            Err(e) => {
+                self.error = Some(e);
+                WalkState::Quit
+            }
+        }
+    }
+}
+
+impl Drop for WalkCollector {
+    fn drop(&mut self) {
+        let _ = self.tx.send(WalkBatch {
+            files: std::mem::take(&mut self.files),
+            skipped: std::mem::take(&mut self.skipped),
+            error: self.error.take(),
+        });
+    }
+}
+
+struct WalkBatch {
+    files: Vec<PathBuf>,
+    skipped: Vec<SkippedFile>,
+    error: Option<String>,
+}
+
+fn collect_entry(
+    entry: Result<DirEntry, ignore::Error>,
+    files: &mut Vec<PathBuf>,
+    skipped: &mut Vec<SkippedFile>,
+) -> Result<(), String> {
+    let entry = entry.map_err(|e| e.to_string())?;
+    let path = entry.path().to_path_buf();
+    if let Some(err) = entry.error() {
+        return Err(format!("could not walk '{}': {err}", path.display()));
+    }
+    if entry.path_is_symlink() {
+        skipped.push(SkippedFile::new(&path, "symlink"));
+        return Ok(());
+    }
+    let Some(file_type) = entry.file_type() else {
+        skipped.push(SkippedFile::new(&path, "not a regular file"));
+        return Ok(());
+    };
+    if file_type.is_file() {
+        files.push(path);
+    } else if !file_type.is_dir() {
+        skipped.push(SkippedFile::new(&path, "not a regular file"));
+    }
+    Ok(())
+}
+
+fn filter_git_files(
+    base: PathBuf,
+    git_files: Vec<PathBuf>,
+    excludes: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    if !has_pentectignore(&git_files) {
+        let Some(overrides) = rules::build_overrides(&base, excludes)? else {
+            return Ok(git_files);
+        };
+        return Ok(git_files
+            .into_iter()
+            .filter(|path| !overrides.matched(path, false).is_ignore())
+            .collect());
+    }
+    let mut builder = WalkBuilder::new(&base);
+    configure_walker(&mut builder, &base, excludes, true)?;
+    let mut allowed = Vec::new();
+    let mut skipped = Vec::new();
+    collect_with_walker(builder, &mut allowed, &mut skipped)?;
+    allowed.sort_unstable();
+    let mut filtered = Vec::with_capacity(git_files.len());
+    for path in git_files {
+        if allowed.binary_search(&path).is_ok() {
+            filtered.push(path);
+        }
+    }
+    Ok(filtered)
+}
+
+fn has_pentectignore(paths: &[PathBuf]) -> bool {
+    paths
+        .iter()
+        .any(|path| path.file_name().and_then(|name| name.to_str()) == Some(".pentectignore"))
+}
+
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -116,51 +261,6 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
                 .iter()
                 .any(|candidate| ext.eq_ignore_ascii_case(candidate))
         })
-}
-
-fn collect_files(
-    path: &Path,
-    out: &mut Vec<PathBuf>,
-    skipped: &mut Vec<SkippedFile>,
-    matcher: &ExcludeMatcher,
-) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    if meta.file_type().is_symlink() {
-        skipped.push(SkippedFile::new(path, "symlink"));
-        return Ok(());
-    }
-    if meta.is_file() {
-        if matcher.is_excluded(path, false) {
-            return Ok(());
-        }
-        out.push(path.to_path_buf());
-        return Ok(());
-    }
-    if !meta.is_dir() {
-        skipped.push(SkippedFile::new(path, "not a regular file"));
-        return Ok(());
-    }
-    if matcher.is_excluded(path, true) {
-        return Ok(());
-    }
-    if is_ignored_dir(path) {
-        return Ok(());
-    }
-    let matcher = matcher.with_directory(path)?;
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(path)
-        .map_err(|e| format!("could not read directory '{}': {e}", path.display()))?
-    {
-        let entry =
-            entry.map_err(|e| format!("could not read directory '{}': {e}", path.display()))?;
-        entries.push(entry.path());
-    }
-    entries.sort();
-    for entry in entries {
-        collect_files(&entry, out, skipped, &matcher)?;
-    }
-    Ok(())
 }
 
 fn git_files_for_root(root: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
@@ -213,182 +313,22 @@ fn git_pathspec(path: &Path) -> String {
 }
 
 fn scan_base(root: &Path) -> PathBuf {
-    let absolute = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    if absolute.is_file() {
-        absolute.parent().map(Path::to_path_buf).unwrap_or(absolute)
+    if root.is_file() {
+        root.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(root.to_path_buf())
     } else {
-        absolute
+        root.to_path_buf()
     }
 }
 
-#[derive(Clone, Debug)]
-struct ExcludeMatcher {
-    root: PathBuf,
-    layers: Vec<ExcludeLayer>,
-    cli_layer: Option<ExcludeLayer>,
+fn normalize_root(root: &Path) -> PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
-impl ExcludeMatcher {
-    fn new(base: &Path, excludes: &[String]) -> Result<Self, String> {
-        let root = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-        let mut layers = Vec::new();
-        if let Some(layer) = ExcludeLayer::from_directory(&root)? {
-            layers.push(layer);
-        }
-        let cli_layer = ExcludeLayer::from_cli(&root, excludes)?;
-        Ok(Self {
-            root,
-            layers,
-            cli_layer,
-        })
-    }
-
-    fn with_directory(&self, dir: &Path) -> Result<Self, String> {
-        let mut next = self.clone();
-        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        if dir != self.root {
-            next.push_directory(&dir)?;
-        }
-        Ok(next)
-    }
-
-    fn with_ancestors(&self, path: &Path) -> Result<Self, String> {
-        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let Some(parent) = target.parent() else {
-            return Ok(self.clone());
-        };
-        let mut dirs = Vec::new();
-        let mut current = Some(parent);
-        while let Some(dir) = current {
-            if !dir.starts_with(&self.root) {
-                break;
-            }
-            if dir != self.root {
-                dirs.push(dir.to_path_buf());
-            }
-            if dir == self.root {
-                break;
-            }
-            current = dir.parent();
-        }
-        dirs.reverse();
-
-        let mut next = self.clone();
-        for dir in dirs {
-            next.push_directory(&dir)?;
-        }
-        Ok(next)
-    }
-
-    fn push_directory(&mut self, dir: &Path) -> Result<(), String> {
-        if let Some(layer) = ExcludeLayer::from_directory(dir)? {
-            self.layers.push(layer);
-        }
-        Ok(())
-    }
-
-    fn is_excluded(&self, path: &Path, is_dir: bool) -> bool {
-        let mut ignored = false;
-        for layer in self.layers.iter().chain(self.cli_layer.iter()) {
-            match layer.matched(path, is_dir) {
-                Some(true) => ignored = true,
-                Some(false) => ignored = false,
-                None => {}
-            }
-        }
-        ignored
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ExcludeLayer {
-    base: PathBuf,
-    matcher: Gitignore,
-}
-
-impl ExcludeLayer {
-    fn from_directory(base: &Path) -> Result<Option<Self>, String> {
-        let mut builder = GitignoreBuilder::new(base);
-        let mut loaded = false;
-        for name in [".gitignore", ".pentectignore"] {
-            let path = base.join(name);
-            if path.is_file() {
-                if let Some(err) = builder.add(&path) {
-                    return Err(format!(
-                        "could not read ignore file '{}': {err}",
-                        path.display()
-                    ));
-                }
-                loaded = true;
-            }
-        }
-        if !loaded {
-            return Ok(None);
-        }
-        Self::build(base, builder).map(Some)
-    }
-
-    fn from_cli(base: &Path, excludes: &[String]) -> Result<Option<Self>, String> {
-        if excludes.is_empty() {
-            return Ok(None);
-        }
-        let mut builder = GitignoreBuilder::new(base);
-        for pattern in excludes {
-            builder
-                .add_line(None, pattern)
-                .map_err(|e| format!("invalid exclude pattern '{pattern}': {e}"))?;
-        }
-        Self::build(base, builder).map(Some)
-    }
-
-    fn build(base: &Path, builder: GitignoreBuilder) -> Result<Self, String> {
-        let matcher = builder
-            .build()
-            .map_err(|e| format!("could not build scan exclude matcher: {e}"))?;
-        Ok(Self {
-            base: base.to_path_buf(),
-            matcher,
-        })
-    }
-
-    fn matched(&self, path: &Path, is_dir: bool) -> Option<bool> {
-        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let rel = target.strip_prefix(&self.base).ok()?;
-        let matched = self.matcher.matched_path_or_any_parents(rel, is_dir);
-        if matched.is_ignore() {
-            Some(true)
-        } else if matched.is_whitelist() {
-            Some(false)
-        } else {
-            None
-        }
-    }
-}
-
-fn is_ignored_dir(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    matches!(
-        name,
-        ".git"
-            | ".hg"
-            | ".svn"
-            | "target"
-            | "node_modules"
-            | ".venv"
-            | "venv"
-            | "__pycache__"
-            | ".pytest_cache"
-            | ".mypy_cache"
-            | ".ruff_cache"
-            | ".next"
-            | "dist"
-            | "build"
-    ) || (name == "agent"
-        && path
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .and_then(|parent| parent.to_str())
-            == Some(".pentect"))
+fn walk_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8)
 }

@@ -1,0 +1,130 @@
+# Components that identify a structured JSON `"key": "nameOfThing"` value as a
+# field/configuration name rather than secret material.
+#
+# Format:
+# - component:word
+# - name:full_identifier
+# - numbered_name:identifier_prefix
+#
+# Policy:
+# - Used only for generic JSON key fields whose key name is exactly `key`.
+# - `component:` entries are combined only when the value has at least two
+#   normalized parts, e.g. `seedUser`, `smtpDomain`, or `apiKey`.
+# - `name:` entries are full public field/header/parameter names that can stand
+#   alone as metadata values.
+# - `numbered_name:` entries are public UI/reference identifiers with a numeric
+#   suffix, e.g. `panel1`.
+# - High-risk material words such as `password` and `secret`, and concrete
+#   values containing digits or token punctuation, remain detectable. Public
+#   schema names such as `token` or `code` may be listed explicitly.
+component:account
+component:access
+component:api
+component:auth
+component:client
+component:config
+component:cost
+component:credential
+component:database
+component:db
+component:domain
+component:email
+component:file
+component:host
+component:id
+component:key
+component:name
+component:namespace
+component:oauth
+component:password
+component:path
+component:private
+component:public
+component:project
+component:seed
+component:secret
+component:server
+component:service
+component:setting
+component:smtp
+component:team
+component:tag
+component:token
+component:type
+component:uri
+component:url
+component:user
+component:first
+component:second
+name:account
+name:address
+name:area
+name:access_control_allow_credentials
+name:access_control_allow_headers
+name:access_control_allow_methods
+name:access_control_allow_origin
+name:authorization
+name:answer
+name:apex
+name:acme
+name:birthdate
+name:code
+name:cost_center
+name:content_type
+name:date
+name:department
+name:dept
+name:description
+name:device_id
+name:device
+name:etag
+name:first_name
+name:grant_type
+name:host
+name:house
+name:last_name
+name:limit
+name:make
+name:mobile
+name:model
+name:name
+name:nonce
+name:offset
+name:opaque
+name:order
+name:page
+name:partition
+name:phone_number
+name:pool
+name:project
+name:role
+name:purpose
+name:redirect_uri
+name:refresh_token
+name:response_type
+name:rooms
+name:scope
+name:signature
+name:sms_code
+name:single_family
+name:size
+name:stack
+name:staging
+name:string
+name:submit
+name:token
+name:type
+name:unknown
+name:value
+name:vary
+name:vehicles
+name:year
+numbered_name:columns
+numbered_name:container
+numbered_name:data_grid
+numbered_name:datagrid
+numbered_name:fieldset
+numbered_name:panel
+numbered_name:foo
+numbered_name:sample_key
+numbered_name:well

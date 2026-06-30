@@ -4,6 +4,7 @@
 //! Every function is covered by reference test vectors below.
 
 use bip39::{Language, Mnemonic};
+use data_encoding::BASE64;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -838,6 +839,34 @@ pub fn local_username(s: &str) -> bool {
     )
 }
 
+/// RFC 7617 Basic credentials are base64(user-id ":" password). Token68 allows
+/// omitted padding, so normalize before decoding. Requiring a non-edge colon
+/// removes prose and arbitrary base64-looking samples without hardcoding values.
+fn basic_auth_token68(s: &str) -> bool {
+    let token = s.trim();
+    if token.len() < 8
+        || token.len() % 4 == 1
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        return false;
+    }
+    let padded = match token.len() % 4 {
+        0 => Cow::Borrowed(token),
+        2 => Cow::Owned(format!("{token}==")),
+        3 => Cow::Owned(format!("{token}=")),
+        _ => return false,
+    };
+    let Ok(decoded) = BASE64.decode(padded.as_bytes()) else {
+        return false;
+    };
+    let Some(colon) = decoded.iter().position(|b| *b == b':') else {
+        return false;
+    };
+    colon > 0 && colon + 1 < decoded.len()
+}
+
 /// A checksum gate applied to a regex match before it becomes a span.
 #[derive(Clone, Copy, Debug)]
 pub enum Validator {
@@ -878,6 +907,9 @@ pub enum Validator {
     AuAcn,
     InGstin,
     LocalUsername,
+    BasicAuthToken68,
+    DbConnectionString,
+    BearerToken,
 }
 
 impl Validator {
@@ -923,6 +955,9 @@ impl Validator {
             "au_acn" => Validator::AuAcn,
             "in_gstin" => Validator::InGstin,
             "local_username" => Validator::LocalUsername,
+            "basic_auth_token68" => Validator::BasicAuthToken68,
+            "db_connection_string" => Validator::DbConnectionString,
+            "bearer_token" => Validator::BearerToken,
             _ => return None,
         })
     }
@@ -966,8 +1001,102 @@ impl Validator {
             Validator::AuAcn => au_acn(s),
             Validator::InGstin => in_gstin(s),
             Validator::LocalUsername => local_username(s),
+            Validator::BasicAuthToken68 => basic_auth_token68(s),
+            Validator::DbConnectionString => db_connection_string(s),
+            Validator::BearerToken => bearer_token(s),
         }
     }
+}
+
+pub fn bearer_token(s: &str) -> bool {
+    // RFC 6750 bearer credentials are opaque compact tokens after the `Bearer`
+    // auth scheme. This validator is deliberately stricter than token68 grammar
+    // so prose/examples like `Bearer YOUR_ACCESS_TOKEN` do not inflate recall.
+    let token = s.trim();
+    if !(20..=4096).contains(&token.len())
+        || token.bytes().any(|b| b.is_ascii_whitespace())
+        || !token.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'~' | b'+' | b'/' | b'=')
+        })
+    {
+        return false;
+    }
+    let has_alpha = token.bytes().any(|b| b.is_ascii_alphabetic());
+    let has_digit = token.bytes().any(|b| b.is_ascii_digit());
+    let has_token_punct = token
+        .bytes()
+        .any(|b| matches!(b, b'.' | b'_' | b'-' | b'~' | b'+' | b'/' | b'='));
+    if !has_alpha || !(has_digit || has_token_punct) {
+        return false;
+    }
+    !is_placeholder_bearer_token(token)
+}
+
+fn is_placeholder_bearer_token(token: &str) -> bool {
+    let normalized = token
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let parts = normalized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return false;
+    }
+    parts.iter().any(|part| {
+        matches!(
+            *part,
+            "your" | "example" | "placeholder" | "redacted" | "dummy" | "sample"
+        )
+    }) || parts
+        .iter()
+        .all(|part| matches!(*part, "x" | "token" | "access" | "bearer" | "value"))
+}
+
+pub fn db_connection_string(s: &str) -> bool {
+    // RFC 3986 userinfo can be concrete credentials, but documentation often
+    // spells optional userinfo with bracket/angle/template markers. The regex
+    // finds URI-shaped candidates; this validator rejects only those public
+    // template/redaction forms and keeps ordinary `user:password@host` strings.
+    let Some((_, rest)) = s.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default().trim();
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+        return false;
+    };
+    if host.is_empty() || userinfo_is_template_or_redaction(userinfo) {
+        return false;
+    }
+    let Some((user, password)) = userinfo.split_once(':') else {
+        return false;
+    };
+    !user.is_empty()
+        && !password.is_empty()
+        && !userinfo_part_is_template_or_redaction(user)
+        && !userinfo_part_is_template_or_redaction(password)
+}
+
+fn userinfo_is_template_or_redaction(userinfo: &str) -> bool {
+    userinfo_part_is_template_or_redaction(userinfo)
+        || userinfo
+            .split(':')
+            .any(userinfo_part_is_template_or_redaction)
+}
+
+fn userinfo_part_is_template_or_redaction(part: &str) -> bool {
+    let part = part.trim();
+    part.is_empty()
+        || part
+            .bytes()
+            .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
 }
 
 #[cfg(test)]
@@ -1013,6 +1142,40 @@ mod tests {
         vectors!(fr_nir, "180047509112541" => true, "180047509112556" => false);
         vectors!(au_acn, "004085616" => true, "004085617" => false);
         vectors!(in_gstin, "27AAPFU0939F1ZV" => true, "27AAPFU0939F1ZX" => false);
+    }
+
+    #[test]
+    fn basic_auth_token68_requires_decoded_user_pass() {
+        vectors!(basic_auth_token68,
+            "dXNlcjpwYXNz" => true,
+            "d3p3bTpqQGNs" => true,
+            "eXc6ZXR1ZW1vWA==" => true,
+            "p4ssw0rd" => false,
+            "something" => false,
+            "dXNlcm9ubHk=" => false,
+            "OnBhc3M=" => false);
+    }
+
+    #[test]
+    fn bearer_token_requires_opaque_material_shape() {
+        vectors!(bearer_token,
+            "0a000aa0a0a0000000a000a0a0a00000a0a000aaaa0a000aa0aaa000a0a0a000" => true,
+            "eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop.abcdefghijklmnop" => true,
+            "YOUR_ACCESS_TOKEN_VALUE" => false,
+            "example-bearer-token-value" => false,
+            "abcdefghijklmnopqrstuv" => false,
+            "short123" => false);
+    }
+
+    #[test]
+    fn db_connection_strings_reject_uri_templates_only() {
+        vectors!(db_connection_string,
+            "postgresql://admin:s3cr3t@db.host:5432/sales" => true,
+            "mysql://user:pass@localhost" => true,
+            "mysql://ofh:ab12c!?@db.example.internal/name" => true,
+            "postgresql://[user[:password]@][host][:port][" => false,
+            "mongodb://username:<password>@cluster0.example.com:27017" => false,
+            "redis://***:***@localhost:6379" => false);
     }
 
     #[test]

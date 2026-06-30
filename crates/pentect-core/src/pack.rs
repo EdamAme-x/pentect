@@ -47,6 +47,7 @@ pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
             label,
             confidence: parse_confidence(&d.confidence)?,
             validator,
+            context: Default::default(),
             capture: d.capture.unwrap_or(0),
             prefilter: d.prefilter.unwrap_or_default(),
         });

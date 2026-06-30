@@ -1,0 +1,14 @@
+# HTTP header values sensitive by protocol-defined position.
+#
+# Format: one header field name per line, lower-case.
+#
+# Rationale:
+# - Authorization and Proxy-Authorization carry credentials in RFC 9110.
+# - Cookie / Set-Cookie carry cookie state defined by RFC 6265 and its updates.
+# - Challenge headers such as WWW-Authenticate and Proxy-Authenticate are not
+#   listed because they normally describe schemes/realms rather than presenting
+#   client credentials.
+authorization
+proxy-authorization
+cookie
+set-cookie

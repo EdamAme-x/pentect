@@ -162,6 +162,7 @@ impl ModelAdapter {
 
     fn run(&self, request: &str) -> Result<String, String> {
         let mut cmd = Command::new(&self.command[0]);
+        apply_adapter_child_env(&mut cmd);
         cmd.args(&self.command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -229,6 +230,34 @@ impl ModelAdapter {
                 self.name
             )
         })
+    }
+}
+
+fn apply_adapter_child_env(command: &mut Command) {
+    command.env_clear();
+    for name in safe_adapter_env_names() {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+fn safe_adapter_env_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[
+            "Path",
+            "PATH",
+            "PATHEXT",
+            "SystemRoot",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+        ]
+    } else {
+        &["PATH", "HOME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR"]
     }
 }
 
@@ -401,6 +430,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("invalid byte span"), "{err}");
+    }
+
+    #[test]
+    fn adapter_env_does_not_inherit_memory_vault_credentials() {
+        let mut command = Command::new("echo");
+        apply_adapter_child_env(&mut command);
+        let names = command
+            .get_envs()
+            .map(|(name, _)| name.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|name| name == "PENTECT_MEMORY_VAULT_ADDR"));
+        assert!(!names
+            .iter()
+            .any(|name| name == "PENTECT_MEMORY_VAULT_TOKEN"));
     }
 
     #[cfg(windows)]

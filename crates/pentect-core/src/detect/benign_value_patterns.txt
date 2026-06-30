@@ -1,0 +1,54 @@
+# Non-secret value patterns.
+#
+# Format: kind:pattern
+# Matching is done after identifier normalization: case-insensitive, punctuation
+# collapsed to underscores, then trimmed. Keep this list small and generic.
+#
+# exact:
+#   Conventional documentation placeholders. These values are stand-ins used in
+#   examples and templates; they are not usable credentials by themselves.
+#
+# prefix/suffix/contains:
+#   Placeholder markers that explicitly say the value was removed, redacted, or
+#   supplied by the reader.
+#
+# numbered_prefix:
+#   Synthetic sample values such as value1/value2.
+#
+# RFC documentation hosts/IP ranges:
+#   Managed by documentation_host_patterns.txt so domain/IP CIDR rules stay in
+#   one place and carry their RFC basis.
+exact:example
+exact:sample
+exact:placeholder
+exact:redacted
+exact:removed
+exact:deleted
+exact:masked
+exact:username
+
+# Action/parameter placeholders used in sample configuration and generated docs.
+exact:create_a_key
+exact:client_secret
+exact:clientsecret
+exact:oauth_token
+exact:access_token
+exact:my_password
+exact:my_token
+exact:test_auth_token
+
+# Public local/documentation sentinels.
+exact:localhost
+exact:dev_null
+exact:room_name_or_id
+exact:external_data_source
+prefix:your_
+prefix:example_
+prefix:fake_
+suffix:_example
+contains:_removed
+contains:_redacted
+contains:_password_removed
+contains:_token_removed
+contains:_secret_removed
+numbered_prefix:value

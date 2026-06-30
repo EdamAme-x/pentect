@@ -2,12 +2,17 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use super::documentation::is_documentation_host;
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
 
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>()]*[^\s"'<>().,;:!?]"#).unwrap());
+static URI_USERINFO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b[a-z][a-z0-9+.-]{0,31}://[^\s"'<>()/?#@]+@[^\s"'<>()]*[^\s"'<>().,;:!?]"#)
+        .unwrap()
+});
 
 /// Preserves useful URL structure for internal systems:
 /// `http://local.jira.corp/api/issues/1234`
@@ -20,8 +25,86 @@ impl Detector for UrlDetector {
         for m in URL_RE.find_iter(view.text()) {
             inspect_url(view, m.start(), m.as_str(), &mut out);
         }
+        for m in URI_USERINFO_RE.find_iter(view.text()) {
+            if is_http_url(m.as_str()) {
+                continue;
+            }
+            inspect_uri_userinfo(view, m.start(), m.as_str(), &mut out);
+        }
         out
     }
+}
+
+fn is_http_url(url: &str) -> bool {
+    let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+}
+
+fn inspect_uri_userinfo(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span>) {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return;
+    };
+    let authority_end = url[scheme_end..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| scheme_end + i);
+    if authority_end <= scheme_end {
+        return;
+    }
+
+    let authority = &url[scheme_end..authority_end];
+    let Some(at) = authority.rfind('@').filter(|&at| at > 0) else {
+        return;
+    };
+    let host_port = &authority[at + 1..];
+    let Some(host) = host_without_port(host_port) else {
+        return;
+    };
+    let userinfo = &authority[..at];
+    if generic_uri_userinfo_is_credential(userinfo) && !is_documentation_host(host) {
+        push_span(
+            view,
+            out,
+            base + scheme_end,
+            base + scheme_end + at,
+            Category::Secret,
+            labels::URL_CREDENTIAL,
+        );
+    }
+}
+
+fn generic_uri_userinfo_is_credential(userinfo: &str) -> bool {
+    // The generic non-HTTP URI path has much less context than the HTTP and DB
+    // handlers, so it needs one extra material-shape signal. This keeps
+    // fixture prose like `nats://user:pass@localhost` out of the fallback while
+    // preserving stronger passwords and token-as-username forms.
+    if userinfo_is_template_or_redaction(userinfo) {
+        return false;
+    }
+    if userinfo_token_like(userinfo) {
+        return true;
+    }
+    userinfo
+        .split_once(':')
+        .map(|(_, password)| generic_uri_password_has_signal(password))
+        .or_else(|| {
+            let lower = userinfo.to_ascii_lowercase();
+            lower
+                .find("%3a")
+                .map(|colon| generic_uri_password_has_signal(&userinfo[colon + 3..]))
+        })
+        .unwrap_or(false)
+}
+
+fn generic_uri_password_has_signal(password: &str) -> bool {
+    let password = password.trim();
+    if password.is_empty() {
+        return false;
+    }
+    password.chars().count() >= 8
+        || password.bytes().any(|b| b.is_ascii_digit())
+        || password
+            .bytes()
+            .any(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'%' | b'-' | b'_'))
 }
 
 fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span>) {
@@ -37,21 +120,24 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
 
     let authority = &url[scheme_end..authority_end];
     let userinfo_end = authority.rfind('@');
-    if let Some(at) = userinfo_end.filter(|&at| at > 0) {
-        push_span(
-            view,
-            out,
-            base + scheme_end,
-            base + scheme_end + at,
-            Category::Secret,
-            labels::URL_CREDENTIAL,
-        );
-    }
     let host_start_in_authority = userinfo_end.map_or(0, |i| i + 1);
     let host_port = &authority[host_start_in_authority..];
     let Some(host) = host_without_port(host_port) else {
         return;
     };
+    if let Some(at) = userinfo_end.filter(|&at| at > 0) {
+        let userinfo = &authority[..at];
+        if userinfo_is_credential(userinfo) && !is_documentation_host(host) {
+            push_span(
+                view,
+                out,
+                base + scheme_end,
+                base + scheme_end + at,
+                Category::Secret,
+                labels::URL_CREDENTIAL,
+            );
+        }
+    }
     if !is_internal_host(host) {
         return;
     }
@@ -119,6 +205,39 @@ fn host_without_port(host_port: &str) -> Option<&str> {
             .split_once(':')
             .map_or(host_port, |(host, _)| host),
     )
+}
+
+fn userinfo_is_credential(userinfo: &str) -> bool {
+    // URL userinfo grammar allows a username without a password
+    // (`https://alice@example.com`). That is identity metadata, not a secret.
+    // A credential-bearing authority either has an explicit password separator
+    // or uses a token as the username (`https://ghp_...@github.com`).
+    !userinfo_is_template_or_redaction(userinfo)
+        && (userinfo.contains(':')
+            || userinfo.to_ascii_lowercase().contains("%3a")
+            || userinfo_token_like(userinfo))
+}
+
+fn userinfo_is_template_or_redaction(userinfo: &str) -> bool {
+    // URI docs commonly show userinfo as `[user[:password]@]` or `***:***`.
+    // Brackets are template grammar, not URL userinfo. Literal `*` is treated
+    // as a redaction marker here; real passwords with `*` should be
+    // percent-encoded in URLs and remain covered after decoding elsewhere.
+    userinfo
+        .bytes()
+        .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
+}
+
+fn userinfo_token_like(userinfo: &str) -> bool {
+    let userinfo = userinfo.trim();
+    let bytes = userinfo.as_bytes();
+    if bytes.len() < 12 || bytes.iter().any(u8::is_ascii_whitespace) {
+        return false;
+    }
+    let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_token_punct = bytes.iter().any(|b| matches!(b, b'_' | b'-' | b'.' | b'~'));
+    has_alpha && (has_digit || has_token_punct)
 }
 
 fn is_internal_host(host: &str) -> bool {
@@ -417,6 +536,96 @@ mod tests {
                 ("RESOURCE_ID".to_string(), "comment-456".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn non_http_uri_userinfo_masks_credentials_only() {
+        let got = labels(
+            "ftp://user:p4ss@files.internal/path redis://:p4ssw0rd@localhost/0 nats-route://ruser:rpass2026@127.0.0.1:6222/",
+        );
+        assert_eq!(
+            got,
+            [
+                ("URL_CREDENTIAL".to_string(), "user:p4ss".to_string()),
+                ("URL_CREDENTIAL".to_string(), ":p4ssw0rd".to_string()),
+                ("URL_CREDENTIAL".to_string(), "ruser:rpass2026".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_uri_userinfo_stays_shape_gated() {
+        assert!(labels("s3://bucket/key").is_empty());
+        assert!(labels("nats://user:pass@localhost").is_empty());
+        assert!(labels("ftp://alice:letmein@example.com/repo.git").is_empty());
+    }
+
+    #[test]
+    fn username_only_userinfo_is_not_a_url_credential() {
+        assert!(!labels("https://alice@example.com/repo.git")
+            .iter()
+            .any(|(label, _)| label == "URL_CREDENTIAL"));
+        assert!(
+            labels("https://ghp_abcdefghijklmnopqrstuvwxyz@github.com/repo.git")
+                .iter()
+                .any(|(label, value)| label == "URL_CREDENTIAL"
+                    && value == "ghp_abcdefghijklmnopqrstuvwxyz")
+        );
+        assert!(labels("https://alice:letmein@example.com/repo.git")
+            .iter()
+            .all(|(label, _)| label != "URL_CREDENTIAL"));
+        assert!(labels("https://alice:letmein@service.internal/repo.git")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
+    }
+
+    #[test]
+    fn uri_template_userinfo_is_not_a_url_credential() {
+        for raw in [
+            "https://[user[:password]@]service.internal/path",
+            "https://***:***@service.internal/path",
+            "https://{user}:{password}@service.internal/path",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|(label, _)| label != "URL_CREDENTIAL"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
+        assert!(labels("https://alice:letmein@service.internal/path")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
+    }
+
+    #[test]
+    fn rfc_documentation_hosts_do_not_emit_url_credentials() {
+        for raw in [
+            "https://alice:letmein@service.example/repo.git",
+            "https://alice:letmein@service.test/repo.git",
+            "https://alice:letmein@service.invalid/repo.git",
+            "https://alice:letmein@192.0.2.10/repo.git",
+            "https://alice:letmein@198.51.100.10/repo.git",
+            "https://alice:letmein@203.0.113.10/repo.git",
+            "https://alice:letmein@[2001:db8::1]/repo.git",
+            "https://alice:letmein@[3fff::1]/repo.git",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|(label, _)| label != "URL_CREDENTIAL"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn localhost_userinfo_stays_sensitive() {
+        assert!(labels("https://alice:letmein@localhost/repo.git")
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
     }
 
     #[test]

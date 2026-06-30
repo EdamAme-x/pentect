@@ -14,8 +14,60 @@ static AUTH_CODE_PATTERNS: LazyLock<PatternMatchDetector> =
 
 impl Detector for AuthCodeDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<crate::model::Span> {
-        AUTH_CODE_PATTERNS.detect(view)
+        AUTH_CODE_PATTERNS
+            .detect(view)
+            .into_iter()
+            .filter(|span| {
+                !is_header_name_only_otp_context(view.text(), span.range.start)
+                    && !is_git_file_mode_context(view.text(), span.range.start)
+            })
+            .collect()
     }
+}
+
+fn is_header_name_only_otp_context(text: &str, value_start: usize) -> bool {
+    // Header names such as `X-GitHub-OTP` can appear in `Vary`/response header
+    // lists next to unrelated numbers. Treat a hyphenated `*-OTP` name as OTP
+    // context only when the candidate value follows a direct `:`/`=` assignment.
+    if value_start > text.len() {
+        return false;
+    }
+    let line_start = text[..value_start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let prefix = &text[line_start..value_start];
+    let lower = prefix.to_ascii_lowercase();
+    let Some(otp_at) = lower.rfind("otp") else {
+        return false;
+    };
+    let before = &lower[..otp_at];
+    let headerish = before
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '-' | '_'));
+    if !headerish {
+        return false;
+    }
+    let after = lower[otp_at + 3..].trim_start();
+    !(after.starts_with(':') || after.starts_with('='))
+}
+
+fn is_git_file_mode_context(text: &str, value_start: usize) -> bool {
+    // Git tree APIs and fixtures use mode values such as `100644`. They are
+    // six-digit numbers near words like "code", but the immediate key is
+    // filesystem metadata, not an authentication code.
+    if value_start > text.len() {
+        return false;
+    }
+    let line_start = text[..value_start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let prefix = &text[line_start..value_start];
+    let Some(colon) = prefix.rfind(':') else {
+        return false;
+    };
+    let before = prefix[..colon].trim_end();
+    before.ends_with("\"mode\"") || before.ends_with("'mode'") || before.ends_with("\\\"mode\\\"")
 }
 
 fn specs() -> Vec<PatternSpec> {
@@ -45,6 +97,7 @@ fn specs() -> Vec<PatternSpec> {
             label: labels::OTP.to_string(),
             confidence: High,
             validator: V::None,
+            context: Default::default(),
             capture,
             prefilter: prefilter.iter().map(|s| (*s).to_string()).collect(),
         })
@@ -97,6 +150,18 @@ mod tests {
         assert!(values_for("order code 100482 remains visible").is_empty());
         assert!(values_for("Use SAVE10 to continue checkout").is_empty());
         assert!(values_for("Order code AB12-CD ships tomorrow").is_empty());
+        assert!(values_for(
+            "vary: Accept, Authorization, Cookie, X-GitHub-OTP, Accept-Encoding; mode 100644"
+        )
+        .is_empty());
+        assert!(
+            values_for(r#"Create code object with {"mode": "100644", "path": "foo.py"}"#)
+                .is_empty()
+        );
+        assert!(values_for(
+            r#"Create code object with {\"mode\": \"100644\", \"path\": \"foo.py\"}"#
+        )
+        .is_empty());
         assert!(!has_value(
             "Enter 7QK4P on the login page. Order code AB12-CD ships tomorrow.",
             "AB12-CD"
@@ -105,5 +170,10 @@ mod tests {
             "Login page loaded. Order code 1234 ships tomorrow.",
             "1234"
         ));
+    }
+
+    #[test]
+    fn accepts_direct_otp_header_values() {
+        assert!(has_value("X-GitHub-OTP: 837291", "837291"));
     }
 }

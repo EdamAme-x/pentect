@@ -1,15 +1,14 @@
+use super::benign::{
+    is_explicitly_non_sensitive_key_name, is_localization_template_reference, is_placeholder_value,
+    is_structured_generic_key_metadata_value, normalize_identifier,
+};
 use super::Detector;
 use crate::model::*;
 use crate::normalize::NormalizedView;
+use std::sync::LazyLock;
 
-/// Header names that carry credentials *by protocol definition* — a closed,
-/// RFC-defined, ASCII set, not an open-vocabulary guess. Compared lowercased.
-const SENSITIVE_HEADERS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-];
+static SENSITIVE_HEADERS: LazyLock<Vec<String>> =
+    LazyLock::new(|| parse_sensitive_headers(include_str!("sensitive_header_names.txt")));
 
 /// Masks values that are sensitive by protocol-defined structural position: a
 /// cookie value or a credential-bearing HTTP header. Bounded and protocol-
@@ -37,7 +36,7 @@ impl Detector for StructuralDetector {
                 .ctx
                 .key
                 .as_deref()
-                .is_some_and(|k| SENSITIVE_HEADERS.contains(&k.to_ascii_lowercase().as_str())),
+                .is_some_and(is_sensitive_header_name),
             _ => false,
         };
         if !fire {
@@ -55,12 +54,28 @@ impl Detector for StructuralDetector {
     }
 }
 
+fn parse_sensitive_headers(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_sensitive_header_name(header: &str) -> bool {
+    // Closed list loaded from sensitive_header_names.txt. These names are
+    // protocol-defined credential/cookie carriers, not arbitrary "token" words.
+    let header = header.trim().to_ascii_lowercase();
+    SENSITIVE_HEADERS.iter().any(|known| known == &header)
+}
+
 impl Detector for EnvValueDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let region = view.region;
         if region.span.is_empty()
             || region.ctx.format != Kind::Env
             || is_rendered_placeholder(view.text())
+            || is_documentation_placeholder(view.text())
         {
             return vec![];
         }
@@ -81,6 +96,16 @@ impl Detector for SensitiveKeyDetector {
             return vec![];
         }
         if region.ctx.kind != RegionKind::JsonValue {
+            return vec![];
+        }
+        if is_localization_template_reference(view.text()) {
+            return vec![];
+        }
+        if region.ctx.key.as_deref().is_some_and(|key| {
+            is_ui_copy_sensitive_key(key, view.text())
+                || is_structured_token_prose(key, view.text())
+                || is_structured_generic_key_name_reference(key, view.text())
+        }) {
             return vec![];
         }
         let Some(label) = sensitive_context_label(&region.ctx) else {
@@ -111,7 +136,7 @@ fn sensitive_context_label(ctx: &Context) -> Option<String> {
 }
 
 fn is_sensitive_key_name(key: &str) -> bool {
-    let name = normalize_key(key);
+    let name = normalize_identifier(key);
     if is_explicitly_non_sensitive_key(&name) {
         return false;
     }
@@ -155,14 +180,111 @@ fn is_sensitive_key_name(key: &str) -> bool {
         .any(|needle| name.contains(needle))
 }
 
+fn is_ui_copy_sensitive_key(key: &str, value: &str) -> bool {
+    // Translation/resource JSON often uses password/token words in UI message
+    // identifiers (`incorrectPassword`, `tokenAuthFailed`,
+    // `passwordNotSupportedTitle`). Those values are prose, not credentials.
+    // Require both a UI-state/action component in the key and prose/localization
+    // shape in the value so compact real secrets under `password` still detect.
+    let name = normalize_identifier(key);
+    let has_sensitive_word = name.split('_').any(|part| {
+        matches!(
+            part,
+            "password" | "passwords" | "token" | "auth" | "authentication" | "credential"
+        )
+    }) || name.contains("token");
+    if !has_sensitive_word {
+        return false;
+    }
+    let has_ui_component = [
+        "broken",
+        "category",
+        "add",
+        "cancel",
+        "changed",
+        "current",
+        "dialog",
+        "forgot",
+        "failed",
+        "field",
+        "incorrect",
+        "invalid",
+        "label",
+        "length",
+        "lock",
+        "mandatory",
+        "message",
+        "new",
+        "no",
+        "not",
+        "only",
+        "prompt",
+        "remove",
+        "removed",
+        "required",
+        "room",
+        "set",
+        "setup",
+        "successfully",
+        "supported",
+        "instruction",
+        "instructions",
+        "text",
+        "title",
+        "button",
+        "advice",
+        "uppercase",
+        "digits",
+        "matching",
+    ]
+    .iter()
+    .any(|component| name.split('_').any(|part| part == *component));
+    has_ui_component && is_prose_or_localization_value(value)
+}
+
+fn is_prose_or_localization_value(value: &str) -> bool {
+    let value = value.trim();
+    value.contains("$t(")
+        || value.split_whitespace().count() >= 2
+        || !value.is_ascii()
+        || value.ends_with(['.', ':', '!', '?'])
+        || is_short_ui_label_value(value)
+}
+
+fn is_short_ui_label_value(value: &str) -> bool {
+    // Button/field/label/title keys often map to a single visible word such as
+    // "Password". A real token/password can be low entropy too, so this helper
+    // is only reached after the key has explicit UI/action components.
+    (2..=32).contains(&value.len())
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+        && !value.bytes().any(|b| b.is_ascii_digit())
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphabetic() || ch.is_whitespace() || matches!(ch, '-' | '\'' | '_')
+        })
+}
+
+fn is_structured_token_prose(key: &str, value: &str) -> bool {
+    // Structured token fields must contain compact token material. Fixture/UI
+    // prose such as "Test Access Token" is not a usable bearer/session token.
+    let name = normalize_identifier(key);
+    let is_token_key = name == "token"
+        || name.ends_with("_token")
+        || name.contains("_token_")
+        || name == "access_token"
+        || name == "refresh_token"
+        || name == "id_token";
+    is_token_key && value.chars().any(char::is_whitespace)
+}
+
+fn is_structured_generic_key_name_reference(key: &str, value: &str) -> bool {
+    // Generic JSON `"key"` fields often contain another field/config name
+    // (`smtpUser`, `databaseName`). Concrete key values usually contain digits,
+    // token punctuation, or entropy and remain eligible for masking.
+    normalize_identifier(key) == "key" && is_structured_generic_key_metadata_value(value)
+}
+
 fn is_explicitly_non_sensitive_key(name: &str) -> bool {
-    name == "nonsecret"
-        || name == "non_secret"
-        || name == "notsecret"
-        || name == "not_secret"
-        || name == "public"
-        || name.starts_with("public_")
-        || name.ends_with("_public")
+    is_explicitly_non_sensitive_key_name(name)
 }
 
 fn sensitive_label_for_key(key: &str) -> String {
@@ -233,6 +355,14 @@ fn is_benign_value(v: &str) -> bool {
         || matches!(t, "true" | "false" | "null")
         || is_rendered_placeholder(t)
         || is_version_literal(t)
+        || is_documentation_placeholder(t)
+}
+
+fn is_documentation_placeholder(value: &str) -> bool {
+    // Structural masking protects broad boundaries such as `.env`. We still
+    // spare values that explicitly identify themselves as examples or redacted
+    // placeholders; otherwise every sample config becomes a false positive wall.
+    is_placeholder_value(value)
 }
 
 fn is_version_literal(value: &str) -> bool {
@@ -347,7 +477,19 @@ mod tests {
             Some("Authorization"),
             "Bearer x"
         ));
+        assert!(fires(
+            RegionKind::Header,
+            Kind::Har,
+            Some("Proxy-Authorization"),
+            "Basic dXNlcjpwYXNz"
+        ));
         assert!(fires(RegionKind::Header, Kind::Har, Some("cookie"), "a=b"));
+        assert!(fires(
+            RegionKind::Header,
+            Kind::Har,
+            Some("Set-Cookie"),
+            "sid=abc"
+        ));
         assert!(!fires(
             RegionKind::Header,
             Kind::Har,
@@ -355,6 +497,12 @@ mod tests {
             "application/json"
         ));
         assert!(!fires(RegionKind::Header, Kind::Har, Some("Accept"), "*/*"));
+        assert!(!fires(
+            RegionKind::Header,
+            Kind::Har,
+            Some("WWW-Authenticate"),
+            "Bearer realm=\"example\""
+        ));
     }
 
     #[test]
@@ -403,6 +551,36 @@ mod tests {
         );
         assert_eq!(sensitive_key_fires(Some("note"), "hello"), None);
         assert_eq!(sensitive_key_fires(None, "hunter2"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "seedUser"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "smtpDomain"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "apiKey"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "Authorization"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "Content-Type"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "grant_type"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "scope"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "firstName"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "phoneNumber"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "Token"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "refresh_token"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "smsCode"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "signature"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "unknown"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "offset"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "host"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "Vary"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "Dev Gateway Region"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "HappyFace.jpg"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "cost-center"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "panel1"), None);
+        assert_eq!(sensitive_key_fires(Some("key"), "dataGrid12"), None);
+        assert_eq!(
+            sensitive_key_fires(Some("key"), "abcDEF123456"),
+            Some("KEY".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("key"), "sk-test-token"),
+            Some("KEY".to_string())
+        );
         assert_eq!(
             sensitive_key_fires_with_path(Some("structured.credentials.id"), Some("id"), "abc123"),
             Some("CREDENTIALS".to_string())
@@ -419,6 +597,110 @@ mod tests {
             sensitive_key_fires(Some("public_token_label"), "visible docs"),
             None
         );
+        assert_eq!(
+            sensitive_key_fires(Some("incorrectPassword"), "Name or password is wrong"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("tokenAuthFailedTitle"), "Authentication failed"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(
+                Some("passwordSetRemotely"),
+                "$t(lockRoomPassword) was set remotely"
+            ),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("lockRoomPassword"), "Meeting password"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("lockRoomPassword"), "Password"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("enableDialogPasswordField"), "Password"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("enterPasswordButton"), "Join"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("noPassword"), "No password is set"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("passwordDigitsOnly"), "Digits only"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("authDropboxText"), "Connect your Dropbox account"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("mandatoryNewPassword"), "New password is required"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("showPasswordAdvice"), "Show password advice"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(
+                Some("passwordSuccessfullyChanged"),
+                "Password successfully changed"
+            ),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("forgotPassword"), "Forgot your password?"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("invalidPasswordLength"), "Password length is invalid"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("passwordsNotMatching"), "Passwords do not match"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(
+                Some("categoryBrokenAuthentication"),
+                "Broken authentication"
+            ),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("title_tokensale"), "Token sale"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("password"), "$t(lockRoomPasswordUppercase):"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(
+                Some("2FA_AUTH_SETUP_INSTRUCTIONS"),
+                "Secure your account with an additional factor. Scan the QR code."
+            ),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("access_token"), "Test Access Token"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("access_token"), "abcDEF123456"),
+            Some("ACCESS_TOKEN".to_string())
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("password"), "correct horse battery staple"),
+            Some("PASSWORD".to_string())
+        );
     }
 
     #[test]
@@ -432,5 +714,8 @@ mod tests {
         ));
         assert_eq!(sensitive_key_fires(Some("cookie-signature"), "1.2.2"), None);
         assert_eq!(sensitive_key_fires(Some("pbkdf2-password"), "^1.0.0"), None);
+        assert!(!env_fires(Some("HIPCHAT_API_KEY"), "your_hipchat_api_key"));
+        assert!(!env_fires(Some("GRAPHITE_USER"), "username"));
+        assert!(!env_fires(Some("LOG_FILE"), "/dev/null"));
     }
 }

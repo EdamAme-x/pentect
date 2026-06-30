@@ -1,0 +1,22 @@
+# Non-secret key-name patterns.
+#
+# Format: kind:pattern
+# Matching is done after identifier normalization: case-insensitive, punctuation
+# collapsed to underscores, then trimmed.
+#
+# These patterns describe keys that explicitly declare public/non-secret data.
+# They must not include broad words like "key" or "token"; those remain
+# sensitive unless a more specific public/non-secret marker is present.
+exact:nonsecret
+exact:non_secret
+exact:notsecret
+exact:not_secret
+exact:public
+exact:correlation_key
+exact:topology_key
+prefix:public_
+suffix:_public
+suffix:_key_name
+suffix:_envar
+suffix:_env_var
+contains:public_key_token
