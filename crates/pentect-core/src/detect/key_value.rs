@@ -1225,6 +1225,7 @@ fn is_source_type_annotation_segment(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty()
         || value.len() > 160
+        || has_top_level_type_annotation_delimiter(value)
         || value
             .bytes()
             .any(|b| matches!(b, b'=' | b'"' | b'\'' | b'`' | b'{' | b'}'))
@@ -1248,6 +1249,27 @@ fn is_source_type_annotation_segment(value: &str) -> bool {
         .bytes()
         .any(|b| matches!(b, b'<' | b'>' | b'[' | b']' | b'|' | b'&' | b'.'));
     has_type_token || has_custom_type || has_type_punctuation
+}
+
+fn has_top_level_type_annotation_delimiter(value: &str) -> bool {
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            ',' | ';' if angle_depth == 0 && bracket_depth == 0 && paren_depth == 0 => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_source_type_word(token: &str) -> bool {
@@ -3343,6 +3365,10 @@ mod tests {
             "abc12345"
         ));
         assert!(has(
+            r#"const PASSWORD: Record<string, string> = "helloworld1234";"#,
+            "helloworld1234"
+        ));
+        assert!(has(
             "OAuth app client_secret 'tenant-7-trial'",
             "tenant-7-trial"
         ));
@@ -3624,6 +3650,8 @@ mod tests {
             r#"config.reset_password_within = 6.hours"#,
             r#"RESET_PASSWORD_WITHIN=6.hours"#,
             r#"val key: SQLSyntax = sqls"column_name""#,
+            r#"const PASSWORD: string, other = "helloworld1234";"#,
+            r#"const PASSWORD: string; other = "helloworld1234";"#,
             r#"'  "private_key_id": "' + UUID.randomUUID().toString() + '","\n' +"#,
             r#"'  "private_key": "-----BEGIN PRIVATE KEY-----\n' + encodedKey + '\n-----END PRIVATE KEY-----\n","\n' +"#,
             r#"
