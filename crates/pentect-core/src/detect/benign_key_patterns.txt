@@ -13,9 +13,13 @@ exact:notsecret
 exact:not_secret
 exact:public
 exact:correlation_key
+exact:foreign_key
+exact:routing_key
 exact:topology_key
 prefix:public_
 suffix:_public
+suffix:_foreign_key
+suffix:_routing_key
 suffix:_key_name
 suffix:_envar
 suffix:_env_var
