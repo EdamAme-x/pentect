@@ -291,16 +291,33 @@ fn key_context_start(text: &str, line_start: usize, left_end: usize) -> Option<u
         min += 1;
     }
     let window = &text[min..left_end];
-    let hard = window
-        .rfind(|ch: char| {
-            matches!(
-                ch,
-                ':' | '=' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
-            )
-        })
-        .map_or(min, |offset| min + offset + 1);
+    let hard = typed_declaration_context_start(window, min).unwrap_or_else(|| {
+        window
+            .rfind(is_key_context_delimiter)
+            .map_or(min, |offset| min + offset + 1)
+    });
     let start = trim_ascii_ws_start(text, hard, left_end);
     (start < left_end).then_some(start)
+}
+
+fn typed_declaration_context_start(window: &str, min: usize) -> Option<usize> {
+    for (offset, _) in window.match_indices(':').rev() {
+        let prefix_start = window[..offset]
+            .rfind(is_key_context_delimiter)
+            .map_or(0, |previous| previous + 1);
+        if is_declared_type_annotation_context(&window[prefix_start..offset], &window[offset + 1..])
+        {
+            return Some(min + prefix_start);
+        }
+    }
+    None
+}
+
+fn is_key_context_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        ':' | '=' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+    )
 }
 
 fn trim_key_edge(value: &str) -> &str {
@@ -644,6 +661,7 @@ fn looks_like_secret_value(
         || is_arithmetic_expression_literal(value)
         || is_localization_template_reference(value)
         || is_interpolated_string_template(value)
+        || is_typed_sql_fragment_literal(value, key_name, source_key)
         || is_public_key_literal(value)
         || is_license_identifier_literal(value, key_name)
         || is_dunder_identifier_literal(value)
@@ -654,6 +672,8 @@ fn looks_like_secret_value(
         || is_locator_literal_for_key(value, key_name)
         || is_secret_resource_metadata_literal(value, key_name)
         || is_package_dependency_coordinate_literal(value, source_key)
+        || is_package_dependency_version_literal(value, source_key)
+        || is_password_reset_duration_literal(value, key_name)
     {
         return false;
     }
@@ -1164,6 +1184,26 @@ fn declared_identifier_key(key: &str) -> Option<String> {
     // sensitive-key decision. This preserves recall for `ApiKey` while avoiding
     // false positives on non-sensitive declarations such as
     // `InstallManifestFileName`.
+    let key = strip_declared_type_annotation(key).unwrap_or(key);
+    declared_identifier_key_without_type(key).map(str::to_string)
+}
+
+fn strip_declared_type_annotation(key: &str) -> Option<&str> {
+    let (prefix, type_annotation) = key.rsplit_once(':')?;
+    is_declared_type_annotation_context(prefix, type_annotation).then_some(prefix)
+}
+
+fn declared_type_annotation(key: &str) -> Option<&str> {
+    let (prefix, type_annotation) = key.rsplit_once(':')?;
+    is_declared_type_annotation_context(prefix, type_annotation).then_some(type_annotation.trim())
+}
+
+fn is_declared_type_annotation_context(prefix: &str, type_annotation: &str) -> bool {
+    declared_identifier_key_without_type(prefix).is_some()
+        && is_source_type_annotation_segment(type_annotation)
+}
+
+fn declared_identifier_key_without_type(key: &str) -> Option<&str> {
     let tokens = key
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .filter(|token| !token.is_empty())
@@ -1178,7 +1218,75 @@ fn declared_identifier_key(key: &str) -> Option<String> {
         return None;
     }
     let ident = tokens[tokens.len() - 1];
-    (!is_declaration_word(ident)).then(|| ident.to_string())
+    (!is_declaration_word(ident)).then_some(ident)
+}
+
+fn is_source_type_annotation_segment(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || has_top_level_type_annotation_delimiter(value)
+        || value
+            .bytes()
+            .any(|b| matches!(b, b'=' | b'"' | b'\'' | b'`' | b'{' | b'}'))
+    {
+        return false;
+    }
+    let tokens = value
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return false;
+    }
+    let has_type_token = tokens
+        .iter()
+        .any(|token| is_declaration_word(token) || is_source_type_word(token));
+    let has_custom_type = tokens
+        .iter()
+        .any(|token| token.bytes().next().is_some_and(|b| b.is_ascii_uppercase()));
+    let has_type_punctuation = value
+        .bytes()
+        .any(|b| matches!(b, b'<' | b'>' | b'[' | b']' | b'|' | b'&' | b'.'));
+    has_type_token || has_custom_type || has_type_punctuation
+}
+
+fn has_top_level_type_annotation_delimiter(value: &str) -> bool {
+    let mut angle_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            ',' | ';' if angle_depth == 0 && bracket_depth == 0 && paren_depth == 0 => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_source_type_word(token: &str) -> bool {
+    matches_ignore_ascii_case(
+        token,
+        &[
+            "any",
+            "bigint",
+            "never",
+            "null",
+            "number",
+            "symbol",
+            "undefined",
+            "unknown",
+            "void",
+        ],
+    )
 }
 
 fn is_declaration_word(token: &str) -> bool {
@@ -2450,6 +2558,24 @@ fn is_interpolated_string_template(value: &str) -> bool {
         .any(|prefix| value.starts_with(prefix))
 }
 
+fn is_typed_sql_fragment_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Scala SQL builders commonly declare generic `key` fragments as
+    // `SQLSyntax`, e.g. `val key: SQLSyntax = sqls"column_name"`. The quoted
+    // text names a SQL fragment, not credential material. Keep this tied to the
+    // declared type so `api_key = "..."` and string-typed secrets still detect.
+    if !is_generic_metadata_key_name(key_name) {
+        return false;
+    }
+    let Some(type_annotation) = declared_type_annotation(source_key) else {
+        return false;
+    };
+    if normalize_key(type_annotation) != "sqlsyntax" {
+        return false;
+    }
+    let value = value.trim_start();
+    value.starts_with("sqls\"") || value.starts_with("sqls'")
+}
+
 fn is_public_key_literal(value: &str) -> bool {
     // OpenSSH public-key values are identifiers/public material. Private keys
     // are handled by the PEM detector; masking public key blobs as KEYED_SECRET
@@ -2664,6 +2790,39 @@ fn is_package_dependency_coordinate_literal(value: &str, source_key: &str) -> bo
         && is_semverish_version_literal(version)
 }
 
+fn is_package_dependency_version_literal(value: &str, source_key: &str) -> bool {
+    // Composer/npm lockfiles use package names as JSON keys. Names such as
+    // `tymon/jwt-auth` and `phpunit/php-token-stream` contain auth/token words,
+    // but the value is a dependency constraint, not credential material.
+    is_package_name_literal(source_key) && is_semverish_version_literal(value)
+}
+
+fn is_package_name_literal(source_key: &str) -> bool {
+    let key = source_key
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let (scope, name) = if let Some(rest) = key.strip_prefix('@') {
+        let Some((scope, name)) = rest.split_once('/') else {
+            return false;
+        };
+        (Some(scope), name)
+    } else {
+        let Some((scope, name)) = key.split_once('/') else {
+            return false;
+        };
+        (Some(scope), name)
+    };
+    scope.is_some_and(is_package_name_segment) && is_package_name_segment(name)
+}
+
+fn is_package_name_segment(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value.bytes().any(|b| b.is_ascii_alphabetic())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 fn is_package_group_prefix(source_key: &str) -> bool {
     let Some(candidate) = source_key
         .split_whitespace()
@@ -2718,6 +2877,44 @@ fn is_semverish_version_literal(value: &str) -> bool {
         }
     }
     saw_digit && saw_dot
+}
+
+fn is_password_reset_duration_literal(value: &str, key_name: &str) -> bool {
+    // Framework config often stores reset-password expiry windows as duration
+    // expressions (`reset_password_within = 6.hours`). The duration is policy
+    // metadata, not the password. Require reset/within wording in the key so a
+    // literal `password = 6.hours` remains visible.
+    has_identifier_component(key_name, "password")
+        && (has_identifier_component(key_name, "within")
+            || has_identifier_component(key_name, "expiry")
+            || has_identifier_component(key_name, "expiration")
+            || has_identifier_component(key_name, "ttl"))
+        && key_name.contains("reset")
+        && is_duration_expression_literal(value)
+}
+
+fn is_duration_expression_literal(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let Some((amount, unit)) = value.split_once('.') else {
+        return false;
+    };
+    !amount.is_empty()
+        && amount.bytes().all(|b| b.is_ascii_digit())
+        && matches!(
+            unit,
+            "second"
+                | "seconds"
+                | "minute"
+                | "minutes"
+                | "hour"
+                | "hours"
+                | "day"
+                | "days"
+                | "week"
+                | "weeks"
+        )
 }
 
 fn is_source_concatenation_template_literal(value: &str) -> bool {
@@ -3156,11 +3353,28 @@ mod tests {
         ));
         assert!(has("dbPassword = \"hunter2\"", "hunter2"));
         assert!(has(
+            r#"const PASSWORD: string = "helloworld1234";"#,
+            "helloworld1234"
+        ));
+        assert!(has(
+            r#"const PASSWORDS: string[] = "helloworld1234";"#,
+            "helloworld1234"
+        ));
+        assert!(has(
+            r#"let apiToken: Array<string> = "abc12345";"#,
+            "abc12345"
+        ));
+        assert!(has(
+            r#"const PASSWORD: Record<string, string> = "helloworld1234";"#,
+            "helloworld1234"
+        ));
+        assert!(has(
             "OAuth app client_secret 'tenant-7-trial'",
             "tenant-7-trial"
         ));
         assert!(has(r#"credential: "hunter2""#, "hunter2"));
         assert!(has(r#"token: "quick-token-123""#, "quick-token-123"));
+        assert!(has(r#"password = "6.hours""#, "6.hours"));
     }
 
     #[test]
@@ -3430,6 +3644,14 @@ mod tests {
             "/// Bitcoin address: base58check, P2PKH (0x00, '1') or P2SH (0x05, '3').",
             "/// Bitcoin WIF private key: base58check, version 0x80.",
             r#"api 'com.google.auth:google-auth-library-credentials:0.20.0'"#,
+            r#""illuminate/auth": "^5.5","#,
+            r#""tymon/jwt-auth": "1.0.*""#,
+            r#""phpunit/php-token-stream": "^3.0","#,
+            r#"config.reset_password_within = 6.hours"#,
+            r#"RESET_PASSWORD_WITHIN=6.hours"#,
+            r#"val key: SQLSyntax = sqls"column_name""#,
+            r#"const PASSWORD: string, other = "helloworld1234";"#,
+            r#"const PASSWORD: string; other = "helloworld1234";"#,
             r#"'  "private_key_id": "' + UUID.randomUUID().toString() + '","\n' +"#,
             r#"'  "private_key": "-----BEGIN PRIVATE KEY-----\n' + encodedKey + '\n-----END PRIVATE KEY-----\n","\n' +"#,
             r#"
