@@ -772,9 +772,11 @@ fn looks_like_secret_value(
         || is_localized_ui_text_literal(value, key_name)
         || is_html_code_metadata_literal(value)
         || is_html_documentation_fragment_literal(value, key_name, source_key)
+        || is_markup_syntax_fragment_literal(value, key_name)
         || is_escaped_html_source_fragment_literal(value, source_key)
         || is_fingerprint_literal(value, key_name)
         || is_escaped_control_placeholder_literal(value, key_name)
+        || is_escaped_plain_source_line_literal(value, source_key)
         || is_escaped_source_payload_fragment_literal(value, source_key)
         || is_source_constant_reference_literal(value, key_name, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
@@ -1940,6 +1942,137 @@ fn is_html_documentation_fragment_literal(value: &str, key_name: &str, source_ke
             && is_short_numeric_doc_example(head))
 }
 
+fn is_markup_syntax_fragment_literal(value: &str, key_name: &str) -> bool {
+    // HTML/XML snippets can be split at labels and attributes named
+    // `password`, `key`, or `token`, leaving the "value" as a tag fragment
+    // such as `</label>` or `type='password`. Those fragments are markup
+    // syntax, not credential bytes. Keep concrete tag contents visible:
+    // `<code>sk-test-token</code>` is not tag-only syntax and still detects.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if value.is_empty() || value.contains("://") {
+        return false;
+    }
+    let compact_escaped_ws;
+    let tag_value = if value.contains("\\n") || value.contains("\\r") || value.contains("\\t") {
+        compact_escaped_ws = value
+            .replace("\\n", "")
+            .replace("\\r", "")
+            .replace("\\t", "");
+        compact_escaped_ws.as_str()
+    } else {
+        value
+    };
+    is_angle_bracket_placeholder_or_tag(value)
+        || is_html_tag_sequence_fragment(tag_value)
+        || is_html_attribute_fragment(value)
+        || is_html_trailing_tag_text_fragment(value, key_name)
+        || is_escaped_markup_syntax_fragment(value)
+}
+
+fn is_angle_bracket_placeholder_or_tag(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+    else {
+        return false;
+    };
+    if inner.is_empty()
+        || inner.contains(['<', '>'])
+        || inner.len() > 96
+        || inner.bytes().any(|b| matches!(b, b'=' | b'"' | b'\''))
+    {
+        return false;
+    }
+    let inner = inner.trim_start_matches('/');
+    !inner.is_empty()
+        && inner.bytes().any(|b| b.is_ascii_alphabetic())
+        && inner.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || b.is_ascii_whitespace()
+                || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'*')
+        })
+}
+
+fn is_html_tag_sequence_fragment(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if !(lower.starts_with("</") || lower.starts_with("<tr") || lower.starts_with("<td")) {
+        return false;
+    }
+    lower.contains('>')
+        && lower.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b'<' | b'>' | b'/' | b'-' | b'_' | b':' | b'=' | b'"' | b'\''
+                )
+        })
+}
+
+fn is_html_attribute_fragment(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some((name, rest)) = lower.split_once('=') else {
+        return false;
+    };
+    matches!(
+        name.trim(),
+        "type" | "class" | "for" | "name" | "id" | "value" | "href" | "data-uk-form-password"
+    ) && !rest.is_empty()
+        && rest.len() <= 96
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+}
+
+fn is_html_trailing_tag_text_fragment(value: &str, key_name: &str) -> bool {
+    let (head, had_html_tail) = strip_trailing_html_tag(value);
+    if !had_html_tail || head.is_empty() {
+        return false;
+    }
+    let head = head.trim();
+    if head.is_empty()
+        || head.bytes().any(|b| b.is_ascii_digit())
+        || head
+            .bytes()
+            .any(|b| matches!(b, b'-' | b'_' | b'/' | b'+' | b'='))
+    {
+        return false;
+    }
+    if has_identifier_component(key_name, "key") && head.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    head.bytes().all(|b| {
+        b.is_ascii_alphabetic() || b.is_ascii_whitespace() || matches!(b, b'.' | b':' | b';')
+    }) && (head.ends_with('.') || head.bytes().next().is_some_and(|b| b.is_ascii_uppercase()))
+}
+
+fn is_escaped_markup_syntax_fragment(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if !lower.starts_with("\\u003c") || !lower.contains("\\u003e") {
+        return false;
+    }
+    let compact = lower
+        .replace("\\n", "")
+        .replace("\\r", "")
+        .replace("\\t", "");
+    compact
+        .split("\\u003e")
+        .filter(|part| !part.is_empty())
+        .all(is_escaped_markup_tag_head)
+}
+
+fn is_escaped_markup_tag_head(value: &str) -> bool {
+    let Some(tag) = value.strip_prefix("\\u003c") else {
+        return false;
+    };
+    let tag = tag.trim_start_matches('/');
+    !tag.is_empty()
+        && tag.len() <= 32
+        && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 fn source_key_has_html_documentation_shape(source_key: &str) -> bool {
     let lower = source_key.to_ascii_lowercase();
     lower.contains("documentation")
@@ -2263,6 +2396,43 @@ fn is_escaped_sensitive_key_name_fragment(value: &str) -> bool {
         && tail
             .split("\\t")
             .all(|part| part.is_empty() || matches!(part, "+" | "if"))
+}
+
+fn is_escaped_plain_source_line_literal(value: &str, source_key: &str) -> bool {
+    // Embedded source/config payloads can leave a plain identifier followed by
+    // an escaped line break (`from_admin\n`, `$value\n`). A real secret with
+    // digits, punctuation, or sensitive words remains detectable.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !(value.contains("\\n") || value.contains("\\r") || value.contains("\\t")) {
+        return false;
+    }
+    let head = value
+        .split("\\n")
+        .next()
+        .unwrap_or(value)
+        .split("\\r")
+        .next()
+        .unwrap_or(value)
+        .split("\\t")
+        .next()
+        .unwrap_or(value)
+        .trim();
+    let reference_shaped = head.starts_with('$') || head.contains('_') || head.contains("->");
+    if !reference_shaped
+        || !(2..=80).contains(&head.len())
+        || head.bytes().any(|b| b.is_ascii_digit())
+        || contains_sensitive_identifier_component(head)
+    {
+        return false;
+    }
+    let body = head.trim_start_matches('$');
+    is_simple_code_reference_name(body)
+        && (source_key_has_code_shape(source_key)
+            || source_key_has_escaped_payload_shape(source_key)
+            || head.starts_with('$')
+            || head.contains('_'))
 }
 
 fn is_escaped_source_payload_fragment_literal(value: &str, source_key: &str) -> bool {
@@ -4018,6 +4188,13 @@ mod tests {
             r#"apiKey: "<%= ShopifyApp.configuration.api_key %>""#,
             r#"password: valid_<%= schema.singular %>_password()"#,
             r#"msgs login_api_key: "Authenticating with api key %{api_key}""#,
+            r#"<label>Password:</label>"#,
+            r#"<tr><td>Password:</td><td><input type='password'>"#,
+            r#"password: type='password"#,
+            r#"password: "</label>""#,
+            r#"secret: GetSecretValue</p>"#,
+            r#"token: "from_admin\n""#,
+            r#"key: "\u003c/p\u003e\n\n\u003cpre\u003e\u003ccode\u003e""#,
             r#"access_token = "TestAuthToken""#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
@@ -4075,6 +4252,7 @@ mod tests {
         ));
         assert!(has(r#"passwordLabel = "tenant-7-trial""#, "tenant-7-trial"));
         assert!(has(r#"password = "abc\tdef123""#, "abc\\tdef123"));
+        assert!(has(r#"password = "hunter\n""#, "hunter\\n"));
         assert!(has(
             r#"private_key = "LINE_1\nA2secret""#,
             "LINE_1\\nA2secret"
