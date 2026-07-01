@@ -5379,6 +5379,10 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
         || is_minified_js_expression_fragment(value)
         || is_function_expression_fragment(value)
         || is_source_concat_expression_fragment(value)
+        || is_interpolated_source_string_fragment(value)
+        || is_sql_source_string_prefix_fragment(value)
+        || is_unary_source_expression_fragment(value)
+        || is_format_call_source_fragment(value)
         || is_identifier_update_fragment(value)
         || is_unclosed_command_substitution_fragment(value)
         || is_method_call_expression_fragment(value)
@@ -5569,6 +5573,65 @@ fn is_source_concat_expression_fragment(value: &str) -> bool {
         return false;
     }
     parts >= 2 && source_signals > 0
+}
+
+fn is_interpolated_source_string_fragment(value: &str) -> bool {
+    // C#/JS/Ruby interpolated string captures can stop inside the expression
+    // body (`$"{Constants.Secret.Name`). That is source syntax, not a runtime
+    // secret value.
+    let value = value.trim();
+    (value.starts_with("$\"") || value.starts_with("$'") || value.starts_with("`"))
+        && value.contains('{')
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'$' | b'{' | b'}' | b'.' | b':' | b'"' | b'\'' | b'`' | b'-'
+                )
+        })
+}
+
+fn is_sql_source_string_prefix_fragment(value: &str) -> bool {
+    // Scala/Ruby-style SQL interpolators can be captured as `sql"select` when
+    // a sensitive-looking variable name appears on the left. Treat only the
+    // source prefix as benign; complete SQL password literals are handled by
+    // their own validators.
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    (lower.starts_with("sql\"") || lower.starts_with("sql'"))
+        && (lower.contains("select") || lower.contains("insert") || lower.contains("update"))
+}
+
+fn is_unary_source_expression_fragment(value: &str) -> bool {
+    let value = value.trim().trim_end_matches([';', ',']);
+    let Some(rest) = value.strip_prefix("!!") else {
+        return false;
+    };
+    is_source_reference_fragment(rest)
+}
+
+fn is_format_call_source_fragment(value: &str) -> bool {
+    let value = value.trim().trim_end_matches([';', ',']);
+    value.contains(".format(")
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'.'
+                        | b'('
+                        | b')'
+                        | b'{'
+                        | b'}'
+                        | b'/'
+                        | b'\\'
+                        | b':'
+                        | b'-'
+                        | b'"'
+                        | b'\''
+                        | b','
+                        | b' '
+                )
+        })
 }
 
 fn is_short_quoted_source_literal(value: &str) -> bool {
@@ -7920,6 +7983,14 @@ mod tests {
         assert!(has(r#"token: "1234""#, "1234"));
         assert!(has(r#"PASSWORD="test123""#, "test123"));
         assert!(has(r#"password: "test123""#, "test123"));
+        assert!(has(
+            r#"const API_KEY = "PROD_SECRET_VALUE""#,
+            "PROD_SECRET_VALUE"
+        ));
+        assert!(has(
+            r#"private static final String STRONG_PASSWORD = "myStrong(!)Password";"#,
+            "myStrong(!)Password"
+        ));
         assert!(has(r#"PASSWORD=`echo hunter2`"#, "echo hunter2"));
         assert!(has(r#"password_help="hunter2""#, "hunter2"));
         assert!(has(
@@ -8072,6 +8143,9 @@ mod tests {
             r#"key = $this.attr("class")"#,
             r#"hashed_token = :crypto.hash(@hash_algorithm, token)"#,
             r#"key = "'id:' + #p0""#,
+            r#"string credentialProxyKey = $"{Constants.GitConfiguration.Credential.SectionName}.{Constants.GitConfiguration.Credential.HttpProxy}";"#,
+            r#"val credentials: Seq[Option[String]] = sql"select config::jsonb#>'{credentials,api-2}' c from $tableName order by id""#,
+            r#"var needsKey = !!el.if;"#,
             r#"{"password": "test123"}"#,
             r#"{'password1': 'pwd2'}"#,
             r#"{'client_secret': 'bar123'}"#,

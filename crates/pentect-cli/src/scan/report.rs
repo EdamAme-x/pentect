@@ -1,3 +1,4 @@
+use super::engine::ScanHit;
 use pentect_core::Kind;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -6,6 +7,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Default)]
 pub(super) struct ScanReport {
     pub(super) roots: Vec<PathBuf>,
+    pub(super) engine: String,
     pub(super) files_scanned: usize,
     pub(super) findings: usize,
     pub(super) warnings: usize,
@@ -22,7 +24,9 @@ pub(super) struct FileFinding {
     pub(super) warnings: usize,
     pub(super) labels: BTreeMap<String, usize>,
     pub(super) categories: BTreeMap<String, usize>,
+    pub(super) engines: BTreeMap<String, usize>,
     pub(super) parser_fallback: bool,
+    pub(super) hits: Vec<ScanHit>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -270,7 +274,8 @@ impl SkippedFile {
 
 pub(super) fn print_report(report: &ScanReport) {
     println!(
-        "pentect scan findings={} files={} skipped={}",
+        "pentect scan engine={} findings={} files={} skipped={}",
+        report.engine,
         report.findings,
         report.files_scanned,
         report.skipped.len()
@@ -298,8 +303,9 @@ pub(super) fn print_report(report: &ScanReport) {
 
 pub(super) fn report_json(report: &ScanReport) -> String {
     json!({
-        "roots": report.roots.iter().map(|p| display_path(p)).collect::<Vec<_>>(),
-        "summary": {
+            "roots": report.roots.iter().map(|p| display_path(p)).collect::<Vec<_>>(),
+            "summary": {
+            "engine": report.engine,
             "findings": report.findings,
             "files_scanned": report.files_scanned,
             "files_with_findings": report.files.len(),
@@ -316,6 +322,7 @@ pub(super) fn report_json(report: &ScanReport) -> String {
             "warnings": file.warnings,
             "labels": file.labels,
             "categories": file.categories,
+            "engines": file.engines,
             "parser_fallback": file.parser_fallback,
         })).collect::<Vec<_>>(),
         "skipped": report.skipped.iter().map(|file| json!({

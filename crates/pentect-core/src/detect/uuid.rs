@@ -160,6 +160,8 @@ fn is_uuid_anchored(text: &str, start: usize, ctx: &crate::model::Context) -> bo
         || local_uuid_collection_context(text, start)
         || local_uuid_argument_list_context(text, start)
         || local_sql_insert_uuid_context(text, start)
+        || local_uri_query_uuid_context(text, start)
+        || local_yaml_identifier_list_context(text, start)
 }
 
 fn local_anchor_before_uuid(text: &str, start: usize) -> bool {
@@ -340,7 +342,7 @@ fn local_sql_insert_uuid_context(text: &str, start: usize) -> bool {
 
 fn is_uuid_sql_column_name(column: &str) -> bool {
     let name = normalize_identifier(column);
-    name == "id" || name.ends_with("_id") || name == "uuid" || name.ends_with("_uuid")
+    (name.len() <= 48 && name.ends_with("id")) || name == "uuid" || name.ends_with("_uuid")
 }
 
 fn nearby_line_window(
@@ -414,9 +416,111 @@ fn immediate_slot_name_before_value(prefix: &str) -> Option<&str> {
         .next_back()
         .is_some_and(|ch| !matches!(ch, '{' | '[' | '(' | ',' | '"' | '\'' | '`'))
     {
-        return None;
+        return source_declared_identifier_before_value(before_sep);
     }
     (!candidate.is_empty()).then_some(candidate)
+}
+
+fn source_declared_identifier_before_value(before_sep: &str) -> Option<&str> {
+    // Source declarations often include visibility/type words before the actual
+    // slot name (`public static final String resource = "..."`). The UUID
+    // belongs to the final identifier, not to the whole declaration prefix.
+    let before_sep = before_sep.trim_end().trim_end_matches(['"', '\'', '`']);
+    let start = before_sep
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+        .map_or(0, |pos| pos + 1);
+    let candidate = before_sep[start..].trim_matches(['"', '\'', '`']);
+    let head = before_sep[..start].trim_end();
+    if candidate.is_empty() || head.is_empty() || !source_declaration_prefix(head) {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn source_declaration_prefix(head: &str) -> bool {
+    let normalized = normalize_identifier(head);
+    normalized.split('_').any(|part| {
+        matches!(
+            part,
+            "const"
+                | "final"
+                | "let"
+                | "var"
+                | "val"
+                | "static"
+                | "readonly"
+                | "public"
+                | "private"
+                | "protected"
+                | "string"
+                | "str"
+        )
+    })
+}
+
+fn local_uri_query_uuid_context(text: &str, start: usize) -> bool {
+    let (line_start, line_end) = line_bounds(text, start);
+    let line = &text[line_start..line_end];
+    let uuid_pos = start - line_start;
+    let prefix = &line[..uuid_pos];
+    let Some(eq_pos) = prefix.rfind('=') else {
+        return false;
+    };
+    let name_start = prefix[..eq_pos]
+        .rfind(['?', '&', ';'])
+        .map_or(0, |pos| pos + 1);
+    let name = prefix[name_start..eq_pos].trim();
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return false;
+    }
+    has_uuid_anchor_name(name)
+}
+
+fn local_yaml_identifier_list_context(text: &str, start: usize) -> bool {
+    let (line_start, line_end) = line_bounds(text, start);
+    let line = &text[line_start..line_end];
+    if !line_is_uuid_list_item(line) {
+        return false;
+    }
+    let item_indent = line.bytes().take_while(|b| b.is_ascii_whitespace()).count();
+    let mut cursor = line_start;
+    for _ in 0..8 {
+        if cursor == 0 {
+            return false;
+        }
+        let prev_end = cursor - 1;
+        let prev_start = text[..prev_end].rfind('\n').map_or(0, |idx| idx + 1);
+        let prev = &text[prev_start..prev_end];
+        cursor = prev_start;
+        let trimmed = prev.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let prev_indent = prev.bytes().take_while(|b| b.is_ascii_whitespace()).count();
+        if prev_indent >= item_indent {
+            continue;
+        }
+        let Some(key) = trimmed.strip_suffix(':') else {
+            return false;
+        };
+        let key = key.trim_matches(['"', '\'']);
+        return has_uuid_anchor_name(key);
+    }
+    false
+}
+
+fn line_is_uuid_list_item(line: &str) -> bool {
+    let line = line.trim();
+    let Some(rest) = line.strip_prefix('-') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let value = rest.trim_end_matches(',').trim_matches(['"', '\'']);
+    value.len() == 36 && is_uuid_layout(value) && !is_placeholder_uuid(value)
 }
 
 fn has_uuid_anchor_name(value: &str) -> bool {
@@ -470,6 +574,7 @@ fn has_uuid_anchor_name(value: &str) -> bool {
         || has_identifier_phrase(&normalized, &["client", "id"])
         || has_identifier_phrase(&normalized, &["tenant", "id"])
         || has_identifier_phrase(&normalized, &["resource", "id"])
+        || has_identifier_phrase(&normalized, &["correlation", "id"])
         || has_identifier_phrase(&normalized, &["external", "id"])
         || has_identifier_phrase(&normalized, &["session", "id"])
         || has_identifier_phrase(&normalized, &["user", "id"])
@@ -487,7 +592,7 @@ fn has_uuid_anchor_name(value: &str) -> bool {
         || has_identifier_phrase(&normalized, &["j", "t", "i"])
         || normalized
             .split('_')
-            .any(|part| matches!(part, "uuid" | "guid" | "uid" | "jti" | "sid"))
+            .any(|part| matches!(part, "uuid" | "guid" | "uid" | "jti" | "sid" | "resource"))
         || has_identifier_slot_name(value)
 }
 
@@ -625,6 +730,13 @@ mod tests {
             format!(r#"task = "arn:aws:ecs:us-west-1:123456789123:task/{uuid}""#),
             format!(r#"<input type=\"hidden\" name=\"client_id\" value=\"{uuid}\" />"#),
             format!(r#"INSERT INTO users (name, user_id, role) VALUES ('a', {uuid}, 'admin');"#),
+            format!(r#"public static final String DefaultResource = "{uuid}";"#),
+            format!(
+                r#"Assert.assertEquals("https://login.example/authorize?resource={uuid}&response_type=code")"#
+            ),
+            format!(r#"INSERT INTO cycling.cyclist_mv (cid,name) VALUES ({uuid},'Alex');"#),
+            format!("headers:\n  X-Request-Id:\n    - {uuid}\n"),
+            format!("headers:\n  X-Correlation-Id:\n    - \"{uuid}\",\n"),
         ] {
             assert_eq!(hits(&raw), vec![uuid.to_string()], "{raw}");
         }
@@ -675,6 +787,8 @@ mod tests {
         assert!(hits(&format!(r#"Get-NdrComProxy -Clsid "{uuid}""#)).is_empty());
         assert!(hits(&format!(r#"KeyId = "{uuid}""#)).is_empty());
         assert!(hits(&format!(r#"TargetKeyId = "{uuid}""#)).is_empty());
+        assert!(hits(&format!("values:\n  - {uuid}\n")).is_empty());
+        assert!(hits(&format!("headers:\n  Etag:\n    - {uuid}\n")).is_empty());
         assert!(hits(&format!("[\"{uuid}\"]")).is_empty());
         assert!(hits(&format!(
             "[\n  \"{uuid}\",\n  \"650e8400-e29b-41d4-a716-446655440001\"\n]"

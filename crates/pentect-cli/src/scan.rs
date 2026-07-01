@@ -1,20 +1,15 @@
+mod engine;
 mod options;
 mod report;
 mod rules;
 mod walk;
 
-use crate::{die, infer_kind, load_packs};
+use crate::{die, load_packs};
+use engine::{scan_files, ScanFile};
 use options::ScanOpts;
-use pentect_core::{Category, Engine, Input, MaskedItem, Profile};
-use report::{print_report, report_json, FileFinding, ScanReport, ScanScope, SkippedFile};
-use std::collections::BTreeMap;
+use report::{print_report, report_json, ScanReport};
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
-use walk::{collect_scan_roots, ignored_file_reason};
-
-const MAX_SCAN_FILE_BYTES: u64 = 1024 * 1024;
+use walk::collect_scan_roots;
 
 pub(crate) fn cmd_scan(args: &[String]) {
     let opts = match ScanOpts::parse(args) {
@@ -40,6 +35,7 @@ fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
     let packs = load_packs(args)?;
     let mut report = ScanReport {
         roots: opts.paths.clone(),
+        engine: opts.engine.as_str().to_string(),
         ..ScanReport::default()
     };
     let files = collect_scan_roots(
@@ -48,9 +44,14 @@ fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
         opts.gitignore,
         &mut report.skipped,
     )?;
-    for result in scan_files(files, packs)? {
+    let (results, engine) = scan_files(files, packs, opts.engine)?;
+    report.engine = engine;
+    for result in results {
         match result {
-            ScanFile::Clean => report.files_scanned += 1,
+            ScanFile::Clean(path) => {
+                let _ = path.as_os_str();
+                report.files_scanned += 1;
+            }
             ScanFile::Finding(file) => {
                 report.files_scanned += 1;
                 report.findings += file.findings;
@@ -65,157 +66,18 @@ fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
     Ok(report)
 }
 
-enum ScanFile {
-    Clean,
-    Finding(FileFinding),
-    Skipped(SkippedFile),
-}
-
-fn scan_files(
-    files: Vec<PathBuf>,
-    packs: Vec<pentect_core::Pack>,
-) -> Result<Vec<ScanFile>, String> {
-    if files.is_empty() {
-        return Ok(Vec::new());
-    }
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(8)
-        .min(files.len());
-    let files = Arc::new(files);
-    let next = Arc::new(AtomicUsize::new(0));
-    let (tx, rx) = mpsc::channel();
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let files = Arc::clone(&files);
-            let next = Arc::clone(&next);
-            let packs = packs.clone();
-            let tx = tx.clone();
-            scope.spawn(move || {
-                let mut worker = ScanWorker::new(packs);
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(path) = files.get(index) else {
-                        break;
-                    };
-                    if tx.send(worker.scan_file(path)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(tx);
-        rx.into_iter().collect::<Result<Vec<_>, _>>()
-    })
-}
-
-struct ScanWorker {
-    packs: Option<Vec<pentect_core::Pack>>,
-    engine: Option<Engine>,
-}
-
-impl ScanWorker {
-    fn new(packs: Vec<pentect_core::Pack>) -> Self {
-        Self {
-            packs: Some(packs),
-            engine: None,
-        }
-    }
-
-    fn scan_file(&mut self, path: &Path) -> Result<ScanFile, String> {
-        if let Some(reason) = ignored_file_reason(path) {
-            return Ok(ScanFile::Skipped(SkippedFile::new(path, reason)));
-        }
-        let meta = match std::fs::metadata(path) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ScanFile::Skipped(SkippedFile::new(path, "missing")));
-            }
-            Err(e) => return Err(format!("could not read '{}': {e}", path.display())),
-        };
-        if meta.len() > MAX_SCAN_FILE_BYTES {
-            return Ok(ScanFile::Skipped(SkippedFile::new(path, "too large")));
-        }
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-        if bytes.contains(&0) {
-            return Ok(ScanFile::Skipped(SkippedFile::new(path, "binary content")));
-        }
-        let data = match String::from_utf8(bytes) {
-            Ok(data) => data,
-            Err(_) => return Ok(ScanFile::Skipped(SkippedFile::new(path, "non-utf8"))),
-        };
-        let kind = infer_kind(path);
-        self.ensure_engine();
-        let result = self.engine.as_ref().unwrap().analyze(Input {
-            kind: kind.clone(),
-            data,
-        });
-        let secret_items = result
-            .items
-            .iter()
-            .filter(|item| item.category == Category::Secret)
-            .collect::<Vec<_>>();
-        let findings = secret_items.len();
-        let warnings = result
-            .residual
-            .iter()
-            .filter(|note| note.category == Category::Secret)
-            .count();
-        if findings == 0 && warnings == 0 {
-            return Ok(ScanFile::Clean);
-        }
-        Ok(ScanFile::Finding(FileFinding {
-            path: path.to_path_buf(),
-            scope: ScanScope::classify(path),
-            kind,
-            findings,
-            warnings,
-            labels: label_counts(&secret_items),
-            categories: category_counts(&secret_items),
-            parser_fallback: result.parser_fallback,
-        }))
-    }
-
-    fn ensure_engine(&mut self) {
-        if self.engine.is_some() {
-            return;
-        }
-        let packs = self.packs.take().unwrap_or_default();
-        self.engine = Some(Engine::with_profile_and_packs(
-            Profile::Strict,
-            packs,
-            false,
-        ));
-    }
-}
-
-fn label_counts(items: &[&MaskedItem]) -> BTreeMap<String, usize> {
-    let mut out = BTreeMap::new();
-    for item in items {
-        *out.entry(item.label.clone()).or_insert(0) += 1;
-    }
-    out
-}
-
-fn category_counts(items: &[&MaskedItem]) -> BTreeMap<String, usize> {
-    let mut out = BTreeMap::new();
-    for item in items {
-        *out.entry(format!("{:?}", item.category)).or_insert(0) += 1;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    use super::report::ScanScope;
     use super::*;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn scan_parse_defaults_to_current_dir() {
         let args = vec!["pentect".into(), "scan".into()];
         let opts = ScanOpts::parse(&args).unwrap();
         assert_eq!(opts.paths, vec![PathBuf::from(".")]);
+        assert_eq!(opts.engine, options::ScanEngine::Auto);
         assert!(!opts.json);
         assert!(!opts.no_fail);
         assert!(!opts.gitignore);
@@ -226,6 +88,8 @@ mod tests {
         let args = vec![
             "pentect".into(),
             "scan".into(),
+            "--engine".into(),
+            "pentect".into(),
             "--json".into(),
             "--no-fail".into(),
             "--gitignore".into(),
@@ -233,10 +97,23 @@ mod tests {
         ];
         let opts = ScanOpts::parse(&args).unwrap();
         assert_eq!(opts.paths, vec![PathBuf::from("app.env")]);
+        assert_eq!(opts.engine, options::ScanEngine::Pentect);
         assert!(opts.json);
         assert!(opts.no_fail);
         assert!(opts.gitignore);
         assert!(opts.excludes.is_empty());
+    }
+
+    #[test]
+    fn scan_parse_rejects_unknown_engine() {
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--engine".into(),
+            "magic".into(),
+        ];
+        let err = ScanOpts::parse(&args).unwrap_err();
+        assert!(err.contains("unknown scan engine"), "{err}");
     }
 
     #[test]

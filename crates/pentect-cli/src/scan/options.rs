@@ -3,15 +3,36 @@ use std::path::PathBuf;
 #[derive(Clone, Debug)]
 pub(super) struct ScanOpts {
     pub(super) paths: Vec<PathBuf>,
+    pub(super) engine: ScanEngine,
     pub(super) json: bool,
     pub(super) no_fail: bool,
     pub(super) gitignore: bool,
     pub(super) excludes: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScanEngine {
+    Auto,
+    CredSweeper,
+    Pentect,
+    All,
+}
+
+impl ScanEngine {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CredSweeper => "credsweeper",
+            Self::Pentect => "pentect",
+            Self::All => "all",
+        }
+    }
+}
+
 impl ScanOpts {
     pub(super) fn parse(args: &[String]) -> Result<Self, String> {
         let mut paths = Vec::new();
+        let mut engine = ScanEngine::Auto;
         let mut json = false;
         let mut no_fail = false;
         let mut gitignore = false;
@@ -30,6 +51,11 @@ impl ScanOpts {
                 "--gitignore" => {
                     gitignore = true;
                     i += 1;
+                }
+                "--engine" => {
+                    let flag = args[i].clone();
+                    let value = required_value(args, &mut i, &flag)?;
+                    engine = parse_scan_engine(&value)?;
                 }
                 "--exclude" => {
                     let flag = args[i].clone();
@@ -54,6 +80,7 @@ impl ScanOpts {
         }
         Ok(Self {
             paths,
+            engine,
             json,
             no_fail,
             gitignore,
@@ -71,4 +98,16 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
     }
     *i += 2;
     Ok(value.clone())
+}
+
+fn parse_scan_engine(value: &str) -> Result<ScanEngine, String> {
+    match value {
+        "auto" => Ok(ScanEngine::Auto),
+        "credsweeper" => Ok(ScanEngine::CredSweeper),
+        "pentect" => Ok(ScanEngine::Pentect),
+        "all" => Ok(ScanEngine::All),
+        other => Err(format!(
+            "unknown scan engine: {other}; expected auto, credsweeper, pentect, or all"
+        )),
+    }
 }
