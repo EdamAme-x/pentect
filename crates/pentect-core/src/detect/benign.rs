@@ -987,6 +987,8 @@ mod tests {
         assert!(is_source_secret_name_reference_value("clientsecret"));
         assert!(is_source_secret_name_reference_value("TestAuthToken"));
         assert!(is_source_secret_name_reference_value("my_password"));
+        assert!(is_source_secret_name_reference_value("bot_api_token"));
+        assert!(is_source_secret_name_reference_value("private-token"));
         assert!(!is_source_secret_name_reference_value("CustomToken"));
         assert!(!is_source_secret_name_reference_value("PROD_SECRET_VALUE"));
         assert!(!is_source_secret_name_reference_value("tenant-7-trial"));
@@ -1003,6 +1005,7 @@ mod tests {
             "expected_access_token",
             "LET_ME_IN-1"
         ));
+        assert!(is_source_fixture_secret_value("dummyLocation", "testing"));
         assert!(is_source_fixture_secret_value("fake_secret", "secret"));
         assert!(!is_source_fixture_secret_value("password", "pass"));
         assert!(!is_source_fixture_secret_value("access_token", "LET_ME_IN"));

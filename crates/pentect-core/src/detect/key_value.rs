@@ -1085,6 +1085,7 @@ fn looks_like_secret_value(
         || is_crypto_test_vector_record_literal(value, key_name, source_key)
         || is_query_predicate_literal(value, key_name)
         || is_localized_ui_text_literal(value, key_name, source_key)
+        || is_single_word_localized_ui_label_literal(value, key_name, source_key)
         || is_sensitive_display_label_literal(value, key_name)
         || is_missing_credential_name_literal(value, key_name, source_key)
         || is_xaml_key_time_literal(value, source_key)
@@ -2584,6 +2585,29 @@ fn is_localized_ui_text_literal(value: &str, key_name: &str, source_key: &str) -
     localized_ui_text_has_boundary(value) && localized_ui_text_chars_are_display_safe(value)
 }
 
+fn is_single_word_localized_ui_label_literal(
+    value: &str,
+    key_name: &str,
+    source_key: &str,
+) -> bool {
+    // Locale tables can store a one-word translated label under field IDs such
+    // as `repeat_password: Powtórz`. Require sensitive UI-key context and a
+    // non-ASCII display word so plain credentials like `password: admin` or
+    // `confirm_password: hunter2` remain visible.
+    if !key_name_has_sensitive_component(key_name)
+        || !(key_name_has_ui_text_component(key_name)
+            || source_key_has_validation_text_context(source_key))
+    {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | ':' | ';'));
+    (2..=64).contains(&value.chars().count())
+        && !value.is_ascii()
+        && value.chars().all(char::is_alphabetic)
+}
+
 fn is_query_predicate_literal(value: &str, key_name: &str) -> bool {
     // ORM/API filters encode field predicates in the key
     // (`password__startswith=...`). Those values are search terms, not the
@@ -2815,6 +2839,7 @@ fn key_name_has_ui_text_component(key_name: &str) -> bool {
                 | "cannot"
                 | "confirmation"
                 | "confirm"
+                | "repeat"
                 | "forgot"
                 | "request"
                 | "reset"
@@ -6254,6 +6279,8 @@ mod tests {
             "jwt_like=aaa.bbb.ccc",
             "Authorization: Basic login_and_password_removed",
             r#""description": "Use `Authorization` header.\n\n> Authorization: Bearer abc123-EXAMPLE the `Authorization` header is required.""#,
+            "repeat_password: Powtórz hasło",
+            "confirm_password: Potwierdź moje konto",
             "password=start_pass_downsample",
             "client_secret=tenant_trial",
             "struct SessionHandle *data = conn->data;",
