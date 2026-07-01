@@ -368,6 +368,7 @@ fn kind_name(kind: &Kind) -> String {
     match kind {
         Kind::Text => "text".to_string(),
         Kind::Json => "json".to_string(),
+        Kind::Ndjson => "ndjson".to_string(),
         Kind::ToolResult => "tool_result".to_string(),
         Kind::Env => "env".to_string(),
         Kind::Har => "har".to_string(),

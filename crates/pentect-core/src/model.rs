@@ -72,6 +72,7 @@ impl ByteRange {
 pub enum Kind {
     Text,
     Json,
+    Ndjson,
     ToolResult,
     Env,
     Har,

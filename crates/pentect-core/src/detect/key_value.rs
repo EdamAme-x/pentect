@@ -1,9 +1,10 @@
 use super::benign::{
     is_crypto_test_vector_identifier_value, is_explicitly_non_sensitive_key_name,
     is_localization_template_reference, is_non_secret_source_constant_value, is_placeholder_value,
-    is_source_fixture_key_context, is_source_fixture_secret_value,
-    is_source_secret_name_reference_value, is_structured_generic_key_metadata_value,
-    is_synthetic_hex_test_vector_value, normalize_identifier,
+    is_source_fixture_key_context, is_source_fixture_secret_sample_value,
+    is_source_fixture_secret_value, is_source_secret_name_reference_value,
+    is_structured_generic_key_metadata_value, is_synthetic_hex_test_vector_value,
+    normalize_identifier,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
@@ -1654,6 +1655,7 @@ fn looks_like_secret_value(
         || is_structured_sensitive_name_reference_literal(value, key_name)
         || is_source_fixture_secret_literal(value, key_name, source_key)
         || is_source_fixture_low_entropy_literal(value, key_name, source_key)
+        || is_quoted_source_object_fixture_sample_literal(value, key_name, source_key, quoted)
         || is_source_struct_tag_literal(value, key_name, source_key)
         || is_objc_dictionary_key_literal(value, source_key)
         || is_source_prefix_constant_literal(value, key_name)
@@ -4718,6 +4720,44 @@ fn is_source_fixture_low_entropy_literal(value: &str, key_name: &str, source_key
         && is_weak_fixture_sample_literal(value)
 }
 
+fn is_quoted_source_object_fixture_sample_literal(
+    value: &str,
+    key_name: &str,
+    source_key: &str,
+    quoted: bool,
+) -> bool {
+    // Source object literals often use deliberately weak sample credentials:
+    // `{"password": "test123"}` or `{'password1': 'pwd2'}`. Do not apply this
+    // to .env/YAML/plain assignments; a quoted key on the left proves object
+    // literal/source shape, and the value vocabulary is kept data-driven.
+    quoted
+        && key_name_has_sensitive_component(key_name)
+        && source_key_has_quoted_object_key(source_key)
+        && is_source_fixture_secret_sample_value(value)
+}
+
+fn source_key_has_quoted_object_key(source_key: &str) -> bool {
+    let source_key = source_key.trim_end();
+    let Some(quote) = source_key.as_bytes().last().copied() else {
+        return false;
+    };
+    if !matches!(quote, b'"' | b'\'') {
+        return false;
+    }
+    let before = &source_key[..source_key.len() - 1];
+    let Some(start) = before.rfind(quote as char) else {
+        return false;
+    };
+    let candidate = source_key[start..].trim();
+    let bytes = candidate.as_bytes();
+    bytes.len() >= 3
+        && bytes[0] == quote
+        && bytes.last() == Some(&bytes[0])
+        && candidate[1..candidate.len() - 1]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
 fn is_weak_fixture_sample_literal(value: &str) -> bool {
     let value = value
         .trim()
@@ -5337,10 +5377,16 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
         || is_braced_field_initializer_fragment(value)
         || is_minified_js_descriptor_fragment(value)
         || is_minified_js_expression_fragment(value)
+        || is_function_expression_fragment(value)
+        || is_source_concat_expression_fragment(value)
+        || is_identifier_update_fragment(value)
+        || is_unclosed_command_substitution_fragment(value)
+        || is_method_call_expression_fragment(value)
         || is_escaped_format_fragment(value)
         || is_method_chain_suffix_fragment(value)
         || is_incomplete_objc_string_fragment(value)
         || is_ruby_interpolation_fragment(value)
+        || is_html_entity_member_access_prefix_fragment(value)
         || is_member_access_tail_fragment(value)
         || is_backtick_command_method_tail_fragment(value)
         || is_html_attribute_binding_fragment(value)
@@ -5358,7 +5404,19 @@ fn is_object_method_call_fragment(value: &str) -> bool {
     // call fragment. The runtime return value may be sensitive, but the source
     // expression itself is not.
     let value = value.trim();
-    value.starts_with('$') && value.contains("->") && value.contains('(')
+    value.starts_with('$')
+        && (value.contains("->") || value.contains("-&gt;"))
+        && value.contains('(')
+}
+
+fn is_html_entity_member_access_prefix_fragment(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with('$')
+        && value.ends_with("-&gt")
+        && value[..value.len() - "-&gt".len()]
+            .bytes()
+            .skip(1)
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn is_braced_type_initializer_fragment(value: &str) -> bool {
@@ -5432,6 +5490,7 @@ fn is_minified_js_expression_fragment(value: &str) -> bool {
                 || matches!(
                     b,
                     b'_' | b'$'
+                        | b'@'
                         | b'.'
                         | b'='
                         | b'!'
@@ -5469,6 +5528,181 @@ fn is_minified_js_expression_fragment(value: &str) -> bool {
         || value.contains("==")
 }
 
+fn is_function_expression_fragment(value: &str) -> bool {
+    // Function literals and generated descriptor tails are executable source,
+    // not the runtime secret value. Require function syntax so plain prose or
+    // punctuation-heavy passwords are not suppressed.
+    let value = value.trim();
+    (value.contains("function(") || value.contains("=>"))
+        && (value.contains('{') || value.contains("return") || value.contains("this."))
+}
+
+fn is_source_concat_expression_fragment(value: &str) -> bool {
+    // Source expressions such as `dbname+":"+hostname`, `#auth+#method`, or
+    // `p+':header` are cache/UI keys built from variables. Base64 and random
+    // material can contain `+`, so every concatenated part must be a short
+    // identifier/reference or a short quoted literal.
+    let value = value.trim().trim_end_matches([';', ',']);
+    if !(3..=180).contains(&value.len()) || !value.contains('+') || value.contains("://") {
+        return false;
+    }
+    let mut parts = 0usize;
+    let mut source_signals = 0usize;
+    for part in value.split('+') {
+        parts += 1;
+        let part = part.trim();
+        if part.is_empty() {
+            return false;
+        }
+        if is_short_quoted_source_literal(part) || is_short_quoted_source_fragment(part) {
+            source_signals += 1;
+            continue;
+        }
+        if is_source_reference_fragment(part) {
+            if part.contains(['.', '#', '$', '@', '[', ']'])
+                || part.bytes().any(|b| b.is_ascii_uppercase())
+            {
+                source_signals += 1;
+            }
+            continue;
+        }
+        return false;
+    }
+    parts >= 2 && source_signals > 0
+}
+
+fn is_short_quoted_source_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    let quote = bytes[0];
+    if !matches!(quote, b'\'' | b'"' | b'`') || bytes.last() != Some(&quote) {
+        return false;
+    }
+    let body = &value[1..value.len() - 1];
+    body.len() <= 32
+        && body.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'/' | b'.' | b' ')
+        })
+}
+
+fn is_short_quoted_source_fragment(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 || bytes.len() > 40 {
+        return false;
+    }
+    let starts_quoted = matches!(bytes[0], b'\'' | b'"' | b'`');
+    let ends_quoted = matches!(bytes[bytes.len() - 1], b'\'' | b'"' | b'`');
+    if starts_quoted == ends_quoted {
+        return false;
+    }
+    let body = if starts_quoted {
+        &value[1..]
+    } else {
+        &value[..value.len() - 1]
+    };
+    !body.is_empty()
+        && body.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'_' | b'-' | b':' | b'/' | b'.' | b' ' | b',' | b'{')
+        })
+}
+
+fn is_source_reference_fragment(value: &str) -> bool {
+    let value = value.trim();
+    if !(1..=96).contains(&value.len()) {
+        return false;
+    }
+    let head = value
+        .trim_start_matches('#')
+        .trim_start_matches('$')
+        .trim_start_matches('@');
+    !head.is_empty()
+        && head.bytes().any(|b| b.is_ascii_alphabetic())
+        && head.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'#' | b'$' | b'@' | b'[' | b']')
+        })
+}
+
+fn is_identifier_update_fragment(value: &str) -> bool {
+    let value = value.trim();
+    let Some(stem) = value
+        .strip_suffix("++")
+        .or_else(|| value.strip_suffix("--"))
+    else {
+        return false;
+    };
+    is_source_reference_fragment(stem)
+}
+
+fn is_unclosed_command_substitution_fragment(value: &str) -> bool {
+    // Captures can stop at shell punctuation and leave only `$(` plus a command
+    // name. A complete command substitution is left alone because existing
+    // policy treats it as user-visible material.
+    let value = value.trim();
+    let body = value
+        .strip_prefix("$(")
+        .or_else(|| value.strip_prefix("$$("));
+    let Some(body) = body else {
+        return false;
+    };
+    !body.contains(')')
+        && (2..=80).contains(&body.len())
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && !normalize_key(body).split('_').any(|part| {
+            matches!(
+                part,
+                "secret" | "token" | "key" | "password" | "passwd" | "credential" | "auth"
+            )
+        })
+        && is_shell_command_name(body)
+}
+
+fn is_method_call_expression_fragment(value: &str) -> bool {
+    // `$state.get(...)`, `Buffer.from(...)`, `:crypto.hash(...)`, and jQuery
+    // selector calls are code expressions. Require a method-call signal; this
+    // avoids hiding arbitrary passwords that merely contain parentheses.
+    let value = value.trim().trim_end_matches([';', ',']);
+    if !(4..=180).contains(&value.len()) || !value.contains('(') {
+        return false;
+    }
+    if value.starts_with("$(") {
+        return value.starts_with("$('")
+            || value.starts_with("$(\"")
+            || is_unclosed_command_substitution_fragment(value);
+    }
+    let has_call_receiver = value.starts_with("$.")
+        || value.starts_with("$")
+        || value.starts_with(':')
+        || value.contains(".")
+        || value.starts_with(").")
+        || value.starts_with(")).");
+    has_call_receiver
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'$'
+                        | b'@'
+                        | b'.'
+                        | b':'
+                        | b'('
+                        | b')'
+                        | b'['
+                        | b']'
+                        | b'\''
+                        | b'"'
+                        | b','
+                        | b' '
+                        | b'-'
+                        | b';'
+                )
+        })
+}
+
 fn is_escaped_format_fragment(value: &str) -> bool {
     // Source strings often split logging format bodies after prose
     // (`"Decrypted secret:\n\t%q"`). Escaped whitespace plus a printf directive
@@ -5502,7 +5736,7 @@ fn is_method_chain_suffix_fragment(value: &str) -> bool {
             && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
             && part[name_end + 1..]
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b'('))
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b'(' | b';'))
     })
 }
 
@@ -7684,6 +7918,8 @@ mod tests {
         assert!(has(r#"clientSecret: "APP_SECRET_2026""#, "APP_SECRET_2026"));
         assert!(has(r#"password = "123456""#, "123456"));
         assert!(has(r#"token: "1234""#, "1234"));
+        assert!(has(r#"PASSWORD="test123""#, "test123"));
+        assert!(has(r#"password: "test123""#, "test123"));
         assert!(has(r#"PASSWORD=`echo hunter2`"#, "echo hunter2"));
         assert!(has(r#"password_help="hunter2""#, "hunter2"));
         assert!(has(
@@ -7822,6 +8058,23 @@ mod tests {
             r#""token": "/one/two/three""#,
             r#""credential_list_mappings": "/2010-04-01/Accounts/ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/CredentialListMappings.json""#,
             r#"$privateKey = 'file://' . __DIR__ . '/../private.key';"#,
+            r#"secret: $client-&gt;getConfig()"#,
+            r#"secret: $client-&gt"#,
+            r#"credential_value: Agent.check = function() { this.log("ran it"); };"#,
+            r#"key = thread_local_key++;"#,
+            r#"password: )).thenThrow(ue);"#,
+            r#"key = " + val + ""#,
+            r#"secret: Buffer.from(secret, 'base64')"#,
+            r#"key: p+':header"#,
+            r#"key: ${x},${y}"#,
+            r#"password=$(printf"#,
+            r#"password = $('.basicModal"#,
+            r#"key = $this.attr("class")"#,
+            r#"hashed_token = :crypto.hash(@hash_algorithm, token)"#,
+            r#"key = "'id:' + #p0""#,
+            r#"{"password": "test123"}"#,
+            r#"{'password1': 'pwd2'}"#,
+            r#"{'client_secret': 'bar123'}"#,
             r#"{key:"_onClose",value:function(){}}"#,
             r#"{key:"_reset",value:function(){}}"#,
             r#"{key:"UNSAFE_componentWillReceiveProps",value:function(){}}"#,

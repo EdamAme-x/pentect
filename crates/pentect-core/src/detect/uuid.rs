@@ -158,6 +158,8 @@ fn is_uuid_anchored(text: &str, start: usize, ctx: &crate::model::Context) -> bo
     local_anchor_before_uuid(text, start)
         || local_example_slot_before_uuid(text, start)
         || local_uuid_collection_context(text, start)
+        || local_uuid_argument_list_context(text, start)
+        || local_sql_insert_uuid_context(text, start)
 }
 
 fn local_anchor_before_uuid(text: &str, start: usize) -> bool {
@@ -261,6 +263,84 @@ fn line_bounds(text: &str, pos: usize) -> (usize, usize) {
     let line_start = text[..pos].rfind('\n').map_or(0, |idx| idx + 1);
     let line_end = text[pos..].find('\n').map_or(text.len(), |idx| pos + idx);
     (line_start, line_end)
+}
+
+fn local_uuid_argument_list_context(text: &str, start: usize) -> bool {
+    let (line_start, line_end) = line_bounds(text, start);
+    let line = &text[line_start..line_end];
+    if !(line.contains(',') && (line.contains('(') || line.contains('['))) {
+        return false;
+    }
+    let mut count = 0usize;
+    let mut pos = 0usize;
+    while pos + 36 <= line.len() {
+        let end = pos + 36;
+        if line.is_char_boundary(pos)
+            && line.is_char_boundary(end)
+            && is_uuid_layout(&line[pos..end])
+            && has_uuid_boundary(line.as_bytes(), pos, end)
+            && !is_placeholder_uuid(&line[pos..end])
+        {
+            count += 1;
+            if count >= 2 {
+                return true;
+            }
+            pos = end;
+        } else {
+            pos += 1;
+        }
+    }
+    false
+}
+
+fn local_sql_insert_uuid_context(text: &str, start: usize) -> bool {
+    let (line_start, line_end) = line_bounds(text, start);
+    let line = &text[line_start..line_end];
+    let lower = line.to_ascii_lowercase();
+    let Some(insert_pos) = lower.find("insert into") else {
+        return false;
+    };
+    let Some(values_pos) = lower.find("values") else {
+        return false;
+    };
+    let uuid_pos = start - line_start;
+    if uuid_pos <= values_pos {
+        return false;
+    }
+    let Some(columns_open) = lower[insert_pos..values_pos]
+        .find('(')
+        .map(|pos| insert_pos + pos)
+    else {
+        return false;
+    };
+    let Some(columns_close) = lower[columns_open + 1..values_pos]
+        .rfind(')')
+        .map(|pos| columns_open + 1 + pos)
+    else {
+        return false;
+    };
+    let Some(values_open) = lower[values_pos..uuid_pos]
+        .find('(')
+        .map(|pos| values_pos + pos)
+    else {
+        return false;
+    };
+    let value_index = lower[values_open + 1..uuid_pos]
+        .bytes()
+        .filter(|b| *b == b',')
+        .count();
+    let columns = lower[columns_open + 1..columns_close]
+        .split(',')
+        .map(|column| column.trim().trim_matches(['"', '\'', '`', '[', ']']))
+        .collect::<Vec<_>>();
+    columns
+        .get(value_index)
+        .is_some_and(|column| is_uuid_sql_column_name(column))
+}
+
+fn is_uuid_sql_column_name(column: &str) -> bool {
+    let name = normalize_identifier(column);
+    name == "id" || name.ends_with("_id") || name == "uuid" || name.ends_with("_uuid")
 }
 
 fn nearby_line_window(
@@ -544,9 +624,15 @@ mod tests {
             format!(r#"KeyArn = "arn:aws:kms:us-east-2:111122223333:key/{uuid}""#),
             format!(r#"task = "arn:aws:ecs:us-west-1:123456789123:task/{uuid}""#),
             format!(r#"<input type=\"hidden\" name=\"client_id\" value=\"{uuid}\" />"#),
+            format!(r#"INSERT INTO users (name, user_id, role) VALUES ('a', {uuid}, 'admin');"#),
         ] {
             assert_eq!(hits(&raw), vec![uuid.to_string()], "{raw}");
         }
+        let uuid2 = "650e8400-e29b-41d4-a716-446655440001";
+        assert_eq!(
+            hits(&format!(r#"call("{uuid}", "{uuid2}", other)"#)),
+            vec![uuid.to_string(), uuid2.to_string()]
+        );
         let collection = r#"{
   "order": [
     "550e8400-e29b-41d4-a716-446655440000",

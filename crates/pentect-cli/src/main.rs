@@ -1112,6 +1112,7 @@ fn parse_kind(value: &str) -> Result<Kind, String> {
     match value {
         "text" => Ok(Kind::Text),
         "json" => Ok(Kind::Json),
+        "ndjson" | "jsonl" => Ok(Kind::Ndjson),
         "env" => Ok(Kind::Env),
         "har" => Ok(Kind::Har),
         other => Err(format!("unknown kind: {other}")),

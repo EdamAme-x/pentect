@@ -33,6 +33,14 @@ impl Parser for JsonParser {
     }
 }
 
+pub struct NdjsonParser;
+
+impl Parser for NdjsonParser {
+    fn parse(&self, raw: &str) -> Option<Vec<Region>> {
+        json::parse_ndjson_regions(raw)
+    }
+}
+
 pub struct ToolResultParser;
 
 impl Parser for ToolResultParser {

@@ -15,6 +15,36 @@ pub fn parse_json_regions(raw: &str) -> Option<Vec<Region>> {
     parse_json_regions_with(raw, JsonRegionMode::Json)
 }
 
+pub fn parse_ndjson_regions(raw: &str) -> Option<Vec<Region>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut saw_line = false;
+    while start <= raw.len() {
+        let line_end = raw[start..]
+            .find('\n')
+            .map_or(raw.len(), |offset| start + offset);
+        let end = line_end
+            .checked_sub(1)
+            .filter(|idx| raw.as_bytes().get(*idx) == Some(&b'\r'))
+            .unwrap_or(line_end);
+        let line = &raw[start..end];
+        if !line.trim().is_empty() {
+            saw_line = true;
+            let mut regions = parse_json_regions(line)?;
+            for region in &mut regions {
+                region.span.start += start;
+                region.span.end += start;
+            }
+            out.extend(regions);
+        }
+        if line_end == raw.len() {
+            break;
+        }
+        start = line_end + 1;
+    }
+    saw_line.then_some(out)
+}
+
 pub fn parse_tool_result_regions(raw: &str) -> Option<Vec<Region>> {
     parse_json_regions_with(raw, JsonRegionMode::ToolResult)
 }
@@ -75,7 +105,7 @@ impl Parser<'_> {
             b'{' => self.object(depth + 1),
             b'[' => self.array(key, hints, depth + 1),
             b'"' => {
-                let (range, _) = self.string()?;
+                let range = self.string_range()?;
                 self.out.push(Region {
                     span: range,
                     ctx: Context {
@@ -185,6 +215,13 @@ impl Parser<'_> {
     /// Returns the inner byte range and inner text. Assumes the current byte is `"`.
     /// Escapes are scanned but not decoded; the inner text is the raw slice.
     fn string(&mut self) -> Option<(ByteRange, String)> {
+        let range = self.string_range()?;
+        let raw = std::str::from_utf8(&self.b[range.start..range.end]).ok()?;
+        let text = decode_json_string(raw)?;
+        Some((range, text))
+    }
+
+    fn string_range(&mut self) -> Option<ByteRange> {
         self.i += 1; // opening quote
         let start = self.i;
         loop {
@@ -194,9 +231,7 @@ impl Parser<'_> {
                 b'"' => {
                     let end = self.i;
                     self.i += 1; // closing quote
-                    let raw = std::str::from_utf8(&self.b[start..end]).ok()?;
-                    let text = decode_json_string(raw)?;
-                    return Some((ByteRange::new(start, end), text));
+                    return Some(ByteRange::new(start, end));
                 }
                 b'\\' => self.skip_escape()?,
                 _ => unreachable!("memchr2 only returns quote or backslash"),
@@ -349,6 +384,20 @@ mod tests {
             .unwrap();
         assert_eq!(value.ctx.key.as_deref(), Some("value"));
         assert_eq!(value.ctx.hints, ["Authorization"]);
+    }
+
+    #[test]
+    fn ndjson_extracts_string_values_with_line_offsets() {
+        let raw = "{\"password\":\"hunter2\"}\r\n{\"token\":\"abc123\"}\n";
+        let regions = parse_ndjson_regions(raw).unwrap();
+        let got = regions
+            .iter()
+            .map(|r| (r.ctx.key.as_deref(), &raw[r.span.start..r.span.end]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            [(Some("password"), "hunter2"), (Some("token"), "abc123")]
+        );
     }
 
     #[test]

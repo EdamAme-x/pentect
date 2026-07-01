@@ -190,6 +190,10 @@ impl SourceFixtureSecretSet {
         if !self.matches_key_context(key_name) {
             return false;
         }
+        self.matches_value(value)
+    }
+
+    fn matches_value(&self, value: &str) -> bool {
         let value = normalize_identifier(value);
         self.values.iter().any(|pattern| match pattern {
             FixtureValuePattern::Exact(pattern) => value == *pattern,
@@ -518,6 +522,15 @@ pub(crate) fn is_source_secret_name_reference_value(value: &str) -> bool {
 /// `MOCK_ACCESS_TOKEN`, or `fake_secret`.
 pub(crate) fn is_source_fixture_secret_value(key_name: &str, value: &str) -> bool {
     SOURCE_FIXTURE_SECRET_MATCHER.matches(key_name, value)
+}
+
+/// True for weak/synthetic fixture values, independent of the key name.
+///
+/// Rationale: callers must prove source/object fixture shape before using this.
+/// The value list stays data-driven here so detectors do not grow ad hoc
+/// benchmark strings.
+pub(crate) fn is_source_fixture_secret_sample_value(value: &str) -> bool {
+    SOURCE_FIXTURE_SECRET_MATCHER.matches_value(value)
 }
 
 /// True when a source identifier explicitly marks fixture/test/example context.
@@ -1141,8 +1154,11 @@ mod tests {
         ));
         assert!(is_source_fixture_secret_value("dummyLocation", "testing"));
         assert!(is_source_fixture_secret_value("fake_secret", "secret"));
+        assert!(is_source_fixture_secret_sample_value("test123"));
+        assert!(is_source_fixture_secret_sample_value("default-password"));
         assert!(!is_source_fixture_secret_value("password", "pass"));
         assert!(!is_source_fixture_secret_value("access_token", "LET_ME_IN"));
+        assert!(!is_source_fixture_secret_sample_value("tenant-7-trial"));
         assert!(!is_source_fixture_secret_value(
             "expectedPassword",
             "hunter2"

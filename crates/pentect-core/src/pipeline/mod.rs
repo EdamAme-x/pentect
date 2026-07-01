@@ -10,7 +10,7 @@ use crate::detect::{
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
-use crate::parse::{EnvParser, JsonParser, Parser, TextParser};
+use crate::parse::{EnvParser, JsonParser, NdjsonParser, Parser, TextParser};
 use crate::policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
 use crate::policy::{
     is_context_free, Action, MaskAll, Policy, Profile, ProfileKnobs, ProfilePolicy,
@@ -485,6 +485,7 @@ impl EngineBuilder {
     /// can silently miss a parser or detector.
     pub fn standard_stack(self, knobs: ProfileKnobs) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
+            .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(UrlDetector))
@@ -603,6 +604,18 @@ mod tests {
             engine.mask(
                 Input {
                     kind: Kind::Json,
+                    data: s.to_string(),
+                },
+                &Config::insecure_testing(),
+            )
+        })
+    }
+
+    fn mn(s: &str) -> MaskResult {
+        with_default_engine(|engine| {
+            engine.mask(
+                Input {
+                    kind: Kind::Ndjson,
                     data: s.to_string(),
                 },
                 &Config::insecure_testing(),
@@ -840,6 +853,17 @@ mod tests {
             .starts_with("<<REFRESH_TOKEN_"));
         assert_eq!(o["public_key"].as_str().unwrap(), "visible");
         assert_eq!(o["note"].as_str().unwrap(), "ok");
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn ndjson_sensitive_values_are_parsed_per_line() {
+        let input = "{\"password\":\"hunter2\"}\n{\"token\":\"abcdef\"}\n";
+        let r = mn(input);
+        assert!(!r.masked.contains("hunter2"), "{}", r.masked);
+        assert!(!r.masked.contains("abcdef"), "{}", r.masked);
+        assert!(r.masked.contains("<<PASSWORD_"), "{}", r.masked);
+        assert!(r.masked.contains("<<TOKEN_"), "{}", r.masked);
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
     }
 
