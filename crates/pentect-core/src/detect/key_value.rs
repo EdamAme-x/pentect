@@ -191,6 +191,17 @@ fn scan_line(
     scan_c_hex_byte_key_arrays(&mut ctx);
 }
 
+fn sensitive_form_helper_with_key(left: &str) -> Option<String> {
+    let normalized = normalize_key(left);
+    if has_identifier_phrase(&normalized, &["fill", "in"])
+        && key_name_has_sensitive_component(&normalized)
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
 fn scan_prefixed_hex_materials(ctx: &mut ScanCtx<'_, '_, '_>) {
     let line = &ctx.text[ctx.line_start..ctx.line_end];
     let bytes = line.as_bytes();
@@ -394,8 +405,15 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
             }
         }
     }
+    if separator.kind == Separator::Colon && normalize_key(&semantic_key) == "with" {
+        if let Some(form_key) = sensitive_form_helper_with_key(&ctx.text[ctx.line_start..left_end])
+        {
+            semantic_key = form_key;
+        }
+    }
     let semantic_key = semantic_key.as_str();
     let key_name = normalize_key(semantic_key);
+    let mut value_key_name = key_name.clone();
     if is_xml_key_attribute(ctx.text, ctx.line_start, separator.start, &key_name) {
         return false;
     }
@@ -427,6 +445,23 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
     let Some(mut value) = parse_value(ctx.text, separator.end, ctx.line_end, kind) else {
         return false;
     };
+    let mut value_from_env_fallback = false;
+    if env_lookup_key_allows_literal_fallback(&key_name, kind) {
+        if let Some(fallback_value) =
+            parse_env_lookup_fallback_value(ctx.text, separator.end, ctx.line_end)
+        {
+            value = fallback_value;
+            value_from_env_fallback = true;
+        }
+    }
+    if !value_from_env_fallback {
+        if let Some((call_value, call_key_name)) =
+            parse_sensitive_call_literal_value(ctx.text, separator.end, ctx.line_end, &key_name)
+        {
+            value = call_value;
+            value_key_name = call_key_name;
+        }
+    }
     if let Some((index, target_count)) = tuple_target {
         if let Some(tuple_value) = parse_tuple_assignment_value(
             ctx.text,
@@ -503,7 +538,7 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
         kind,
         value.quoted,
         separator.kind,
-        &key_name,
+        &value_key_name,
         &ctx.text[ctx.line_start..left_end],
     ) {
         return false;
@@ -926,6 +961,183 @@ fn parse_option_wrapper_value(
     })
 }
 
+fn env_lookup_key_allows_literal_fallback(key_name: &str, kind: KeyKind) -> bool {
+    if !matches!(kind, KeyKind::Strong) {
+        return false;
+    }
+    key_name_indicates_password_slot(key_name)
+        || has_identifier_component(key_name, "secret")
+        || has_identifier_component(key_name, "secrets")
+        || has_identifier_component(key_name, "credential")
+        || has_identifier_component(key_name, "credentials")
+}
+
+fn parse_env_lookup_fallback_value(
+    text: &str,
+    start: usize,
+    line_end: usize,
+) -> Option<ValueCandidate> {
+    // Source often reads from an environment variable and then falls back to a
+    // literal default: `PASSWORD = os.environ.get("PASSWORD") or "secret"`.
+    // The env lookup expression is syntax; the fallback literal is the only
+    // concrete credential material on that line.
+    let window = text.get(start..line_end)?;
+    let env_pos = ["process.env", "os.environ", "ENV[", "getenv"]
+        .iter()
+        .filter_map(|needle| window.find(needle))
+        .min()?;
+    let after_env = start + env_pos;
+    let (op_end, _) = [
+        ("||", 2usize),
+        ("??", 2usize),
+        (" or ", 4usize),
+        (" OR ", 4usize),
+    ]
+    .iter()
+    .filter_map(|(op, len)| {
+        text[after_env..line_end]
+            .find(op)
+            .map(|idx| (after_env + idx + len, *op))
+    })
+    .min_by_key(|(end, _)| *end)?;
+    let pos = trim_ascii_ws_start(text, op_end, line_end);
+    let quote = text
+        .as_bytes()
+        .get(pos)
+        .copied()
+        .filter(|b| matches!(b, b'"' | b'\'' | b'`'))?;
+    let value_start = pos + 1;
+    let value_end = find_quote_or_line_end(text, value_start, line_end, quote);
+    if value_start >= value_end {
+        return None;
+    }
+    let trimmed_start = trim_ascii_ws_start(text, value_start, value_end);
+    let trimmed_end = trim_ascii_ws_end(text, trimmed_start, value_end);
+    if trimmed_start >= trimmed_end {
+        return None;
+    }
+    let value = &text[trimmed_start..trimmed_end];
+    if is_uppercase_identifier_constant(value)
+        && normalize_key(value)
+            .split('_')
+            .any(is_sensitive_setting_name_component)
+    {
+        return None;
+    }
+    Some(ValueCandidate {
+        start: trimmed_start,
+        end: trimmed_end,
+        quoted: true,
+    })
+}
+
+fn parse_sensitive_call_literal_value(
+    text: &str,
+    start: usize,
+    line_end: usize,
+    key_name: &str,
+) -> Option<(ValueCandidate, String)> {
+    let mut pos = trim_ascii_ws_start(text, start, line_end);
+    if text
+        .get(pos..line_end)
+        .is_some_and(|tail| tail.starts_with("new "))
+    {
+        pos = trim_ascii_ws_start(text, pos + 4, line_end);
+    }
+    let open = text.get(pos..line_end)?.find('(').map(|idx| pos + idx)?;
+    let head = text.get(pos..open)?.trim();
+    if head.is_empty() || head.contains('=') || head.contains(';') {
+        return None;
+    }
+    let call_key = normalize_key(last_call_identifier(head)?);
+    if !call_name_accepts_secret_literal(&call_key, key_name) {
+        return None;
+    }
+    let args = collect_quoted_call_arguments(text, open + 1, line_end);
+    if args.is_empty() {
+        return None;
+    }
+    let value = if call_prefers_last_secret_argument(&call_key, key_name) {
+        *args.last()?
+    } else {
+        args[0]
+    };
+    Some((value, call_key))
+}
+
+fn last_call_identifier(head: &str) -> Option<&str> {
+    head.rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .find(|part| !part.is_empty() && *part != "new")
+}
+
+fn call_name_accepts_secret_literal(call_key: &str, _key_name: &str) -> bool {
+    if call_name_is_prompt_or_lookup(call_key) {
+        return false;
+    }
+    has_identifier_component(call_key, "credential")
+        || has_identifier_component(call_key, "credentials")
+}
+
+fn call_name_is_prompt_or_lookup(call_key: &str) -> bool {
+    call_key.split('_').any(|part| {
+        matches!(
+            part,
+            "ask" | "get" | "lookup" | "prompt" | "read" | "request" | "scan"
+        )
+    })
+}
+
+fn call_prefers_last_secret_argument(call_key: &str, key_name: &str) -> bool {
+    has_identifier_component(call_key, "credential")
+        || has_identifier_component(key_name, "credential")
+}
+
+fn collect_quoted_call_arguments(
+    text: &str,
+    mut pos: usize,
+    line_end: usize,
+) -> Vec<ValueCandidate> {
+    let bytes = text.as_bytes();
+    let mut args = Vec::new();
+    let mut depth = 1usize;
+    while pos < line_end {
+        match bytes[pos] {
+            b'"' | b'\'' | b'`' => {
+                let quote = bytes[pos];
+                let value_start = pos + 1;
+                let value_end = find_quote_or_line_end(text, value_start, line_end, quote);
+                if value_start < value_end {
+                    let trimmed_start = trim_ascii_ws_start(text, value_start, value_end);
+                    let trimmed_end = trim_ascii_ws_end(text, trimmed_start, value_end);
+                    if trimmed_start < trimmed_end {
+                        args.push(ValueCandidate {
+                            start: trimmed_start,
+                            end: trimmed_end,
+                            quoted: true,
+                        });
+                    }
+                }
+                pos = (value_end + 1).min(line_end);
+            }
+            b'(' => {
+                depth += 1;
+                pos += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                pos += 1;
+            }
+            _ => {
+                pos += 1;
+            }
+        }
+    }
+    args
+}
+
 fn scan_ascii_identifier_end(text: &str, start: usize, line_end: usize) -> usize {
     let mut end = start;
     while end < line_end {
@@ -1077,9 +1289,11 @@ fn looks_like_secret_value(
         || is_file_extension_literal(value, key_name)
         || is_protobuf_tag_literal(value, key_name)
         || is_key_algorithm_literal(value)
+        || is_public_curve_algorithm_literal(value, key_name)
         || is_status_code_constant_literal(value, key_name)
         || is_numeric_metadata_key_literal(value, key_name, quoted)
         || is_public_numeric_code_constant_literal(value, key_name, source_key, quoted)
+        || is_crypto_vector_field_descriptor_literal(value, key_name)
         || is_asn1_oid_der_literal(value, key_name, source_key)
         || is_asn1_obj_name_literal(value, key_name, source_key)
         || is_crypto_test_vector_identifier_literal(value, key_name)
@@ -1094,6 +1308,7 @@ fn looks_like_secret_value(
         || is_html_code_metadata_literal(value)
         || is_html_documentation_fragment_literal(value, key_name, source_key)
         || is_markup_syntax_fragment_literal(value, key_name)
+        || is_generic_key_placeholder_literal(value, key_name)
         || is_escaped_html_source_fragment_literal(value, source_key)
         || is_fingerprint_literal(value, key_name)
         || is_escaped_control_placeholder_literal(value, key_name)
@@ -1106,6 +1321,7 @@ fn looks_like_secret_value(
         || is_source_config_name_literal(value, source_key)
         || is_self_describing_key_value_placeholder(value, key_name, source_key)
         || is_source_sensitive_name_reference_literal(value, source_key)
+        || is_structured_sensitive_name_reference_literal(value, key_name)
         || is_source_fixture_secret_literal(value, key_name, source_key)
         || is_source_fixture_low_entropy_literal(value, key_name, source_key)
         || is_source_struct_tag_literal(value, key_name, source_key)
@@ -1576,8 +1792,9 @@ fn is_public_numeric_code_constant_literal(
         return true;
     }
     !quoted
-        && is_all_caps_source_constant_name(source_key)
         && (is_small_c_style_int_literal(value) || is_small_decimal_code_literal(value))
+        && (is_all_caps_source_constant_name(source_key)
+            || is_pascal_case_sensitive_source_constant_name(source_key, key_name))
 }
 
 fn is_numeric_metadata_key_literal(value: &str, key_name: &str, quoted: bool) -> bool {
@@ -1617,6 +1834,24 @@ fn is_all_caps_source_constant_name(source_key: &str) -> bool {
         && key
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn is_pascal_case_sensitive_source_constant_name(source_key: &str, key_name: &str) -> bool {
+    if !(key_name_has_sensitive_component(key_name)
+        || key_name_indicates_sensitive_material(key_name))
+    {
+        return false;
+    }
+    let key = source_key
+        .trim()
+        .trim_end_matches(',')
+        .trim_end_matches(':')
+        .trim();
+    (6..=96).contains(&key.len())
+        && key.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && key.bytes().all(|b| b.is_ascii_alphanumeric())
+        && key.bytes().any(|b| b.is_ascii_lowercase())
+        && key.bytes().any(|b| b.is_ascii_uppercase())
 }
 
 fn is_small_c_style_int_literal(value: &str) -> bool {
@@ -2398,13 +2633,25 @@ fn is_key_algorithm_literal(value: &str) -> bool {
     if matches!(lower.as_str(), "rsa-pss" | "rsa-oaep") {
         return true;
     }
+    if let Some((left, right)) = lower.split_once(':') {
+        return is_key_algorithm_literal(left) && is_key_algorithm_literal(right);
+    }
+    if let Some((head, suffix)) = lower.rsplit_once('-') {
+        if matches!(suffix, "public" | "default") || suffix.starts_with("bad") {
+            return is_key_algorithm_literal(head);
+        }
+    }
     if lower
         .strip_prefix("rsa-oaep-")
         .is_some_and(|case| !case.is_empty() && case.bytes().all(|b| b.is_ascii_digit()))
     {
         return true;
     }
-    let Some((algorithm, bits)) = value.split_once('-') else {
+    let mut parts = value.split('-');
+    let Some(algorithm) = parts.next() else {
+        return false;
+    };
+    let Some(bits) = parts.next() else {
         return false;
     };
     if !matches!(
@@ -2416,7 +2663,41 @@ fn is_key_algorithm_literal(value: &str) -> bool {
     let Ok(bits) = bits.parse::<u32>() else {
         return false;
     };
-    (128..=16384).contains(&bits)
+    if !(128..=16384).contains(&bits) {
+        return false;
+    }
+    parts.all(|part| {
+        !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) && part.len() <= 5
+    })
+}
+
+fn is_public_curve_algorithm_literal(value: &str, key_name: &str) -> bool {
+    if !has_identifier_component(key_name, "key") {
+        return false;
+    }
+    let value = value.trim();
+    if !(3..=96).contains(&value.len())
+        || value.chars().any(char::is_whitespace)
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    if let Some((family, bits)) = lower.split_once('-') {
+        if matches!(family, "p" | "b" | "k")
+            && bits
+                .split('_')
+                .next()
+                .is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return true;
+        }
+    }
+    (lower.starts_with("alice-") || lower.starts_with("bob-"))
+        && lower.contains("-public")
+        && (lower.contains("raw") || lower.contains("canonical"))
 }
 
 fn is_asn1_oid_der_literal(value: &str, key_name: &str, source_key: &str) -> bool {
@@ -2560,6 +2841,32 @@ fn is_crypto_test_vector_record_key(key_name: &str, source_key: &str) -> bool {
             "private_key" | "privatekey" | "peer_key" | "peerkey" | "priv_pub_key_pair"
         )
     })
+}
+
+fn is_crypto_vector_field_descriptor_literal(value: &str, key_name: &str) -> bool {
+    // OpenSSL/NIST vector manifests describe transformed record columns with
+    // values such as `IV/ciphertext':plaintext:ciphertext:encdec`. In a
+    // `...:key:<descriptor>` sequence, the generic `key` token is the column
+    // name and the captured value is the following column descriptor, not key
+    // bytes. Require multiple crypto field names and the enc/dec marker so
+    // ordinary `key=tenant-7-trial` values remain visible.
+    if key_name != "key" {
+        return false;
+    }
+    let value = value.trim();
+    if !(12..=128).contains(&value.len())
+        || value.chars().any(char::is_whitespace)
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'/' | b':' | b'\''))
+    {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    lower.contains("plaintext")
+        && lower.contains("ciphertext")
+        && lower.contains("encdec")
+        && (lower.contains("iv/") || lower.contains("iv:") || lower.contains("output"))
 }
 
 fn is_localized_ui_text_literal(value: &str, key_name: &str, source_key: &str) -> bool {
@@ -3055,6 +3362,34 @@ fn is_angle_bracket_placeholder_or_tag(value: &str) -> bool {
                 || b.is_ascii_whitespace()
                 || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'*')
         })
+}
+
+fn is_generic_key_placeholder_literal(value: &str, key_name: &str) -> bool {
+    if !has_identifier_component(key_name, "key") {
+        return false;
+    }
+    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    is_pem_ellipsis_placeholder(value) || is_incomplete_angle_placeholder_literal(value)
+}
+
+fn is_incomplete_angle_placeholder_literal(value: &str) -> bool {
+    let Some(inner) = value.strip_prefix('<') else {
+        return false;
+    };
+    if inner.is_empty()
+        || inner.contains(['<', '>'])
+        || inner.len() > 96
+        || inner.bytes().any(|b| matches!(b, b'=' | b'"' | b'\''))
+    {
+        return false;
+    }
+    let normalized = normalize_key(inner);
+    normalized.split('_').any(|part| {
+        matches!(
+            part,
+            "base64" | "encoded" | "placeholder" | "sample" | "example" | "key"
+        )
+    }) && inner.bytes().any(|b| b.is_ascii_alphabetic())
 }
 
 fn is_html_tag_sequence_fragment(value: &str) -> bool {
@@ -3878,6 +4213,25 @@ fn is_source_sensitive_name_reference_literal(value: &str, source_key: &str) -> 
     is_source_secret_name_reference_value(value)
 }
 
+fn is_structured_sensitive_name_reference_literal(value: &str, key_name: &str) -> bool {
+    // Structured fixtures and API payloads can store the name of another secret
+    // field under a sensitive-looking slot: `token: "api_key"` or
+    // `password: "api_password"`. The vocabulary remains data-driven in
+    // `source_secret_name_patterns.txt`; this function only supplies the
+    // structural contract missing from simple hash/object keys.
+    if !key_name_has_sensitive_component(key_name) {
+        return false;
+    }
+    let value = value.trim();
+    (4..=64).contains(&value.len())
+        && value.bytes().any(|b| matches!(b, b'_' | b'-'))
+        && !value.bytes().any(|b| b.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        && is_source_secret_name_reference_value(value)
+}
+
 fn is_source_fixture_secret_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // Test fixtures often assign deliberately weak credentials to variables
     // named `expectedPassword`, `MOCK_ACCESS_TOKEN`, or similar. Do not suppress
@@ -4006,6 +4360,9 @@ fn is_source_variable_reference_literal(
     if is_dotted_config_secret_key(source_key, key_name) {
         return false;
     }
+    if is_instance_variable_reference_literal(value.trim()) {
+        return source_key_has_code_shape(source_key);
+    }
     if is_variable_reference_literal(value.trim())
         || is_namespaced_variable_reference_literal(value.trim())
     {
@@ -4046,6 +4403,14 @@ fn is_variable_reference_literal(value: &str) -> bool {
         && value.split('.').all(is_simple_code_reference_name)
         && value.bytes().any(|b| b.is_ascii_lowercase())
         && !value.bytes().any(|b| b.is_ascii_digit())
+}
+
+fn is_instance_variable_reference_literal(value: &str) -> bool {
+    let value = value.trim_matches(|ch| matches!(ch, '"' | '\''));
+    let Some(rest) = value.strip_prefix('@') else {
+        return false;
+    };
+    is_simple_code_reference_name(rest)
 }
 
 fn is_namespaced_variable_reference_literal(value: &str) -> bool {
@@ -5580,6 +5945,8 @@ fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
             | "shared_secret"
             | "credential"
     ) || name.ends_with("_password")
+        || has_identifier_phrase(name, &["password", "confirmation"])
+        || has_identifier_phrase(name, &["password", "confirm"])
         || name.ends_with("_pass")
         || name.ends_with("_passwd")
         || name.ends_with("_pwd")
@@ -6172,6 +6539,19 @@ mod tests {
             "6nA7WEJ/bBBCY06IrWwAlks7"
         ));
         assert!(has(r#"password = Some("owlknh")"#, "owlknh"));
+        assert!(has(
+            r#"PASSWORD = os.environ.get("PASSWORD") or "nx33zje""#,
+            "nx33zje"
+        ));
+        assert!(has(r#"password_confirmation: "rikufkoui""#, "rikufkoui"));
+        assert!(has(
+            r#"fill_in :signup_password_confirmation, with: "hvokal""#,
+            "hvokal"
+        ));
+        assert!(has(
+            r#"var newCredential = new GitCredential("alice", "frhkcwjt");"#,
+            "frhkcwjt"
+        ));
         assert!(has(r#"["password"] = "alpha12345""#, "alpha12345"));
         assert!(has("admin_password: alphabetic", "alphabetic"));
         assert!(has("password: zling", "zling"));
@@ -6314,6 +6694,23 @@ mod tests {
             "repeat_password: Powtórz hasło",
             "confirm_password: Potwierdź moje konto",
             r#""private_key": "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n""#,
+            r#"string key = CreateKey("contoso");"#,
+            r#"SetKey("fieldName")"#,
+            r#"fill_in :password_label, with: "Password""#,
+            r#"access_token = process.env.ACCESS_TOKEN || "token1""#,
+            r#"token: "api_key""#,
+            r#"password: "api_password""#,
+            r#"@user = create_user(password: @password, password_confirmation: @password)"#,
+            "DontExpirePassword = 0x00000200,",
+            "#   AES-bits-CBC:key:IV/ciphertext':plaintext:ciphertext:encdec",
+            "Key = RSA-PSS:RSA-PSS-DEFAULT",
+            "Key = RSA-2048-PUBLIC",
+            "Key = DSA-2048-224",
+            "Key = P-256_NAMED_CURVE_EXPLICIT",
+            "Key = B-163",
+            "Key = Bob-448-PUBLIC-Raw-NonCanonical",
+            "key = <base64-encoded",
+            r#"key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n""#,
             "password=start_pass_downsample",
             "client_secret=tenant_trial",
             "struct SessionHandle *data = conn->data;",
