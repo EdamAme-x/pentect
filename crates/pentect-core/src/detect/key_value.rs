@@ -285,8 +285,9 @@ fn c_hex_byte_array_left(line: &str, eq: usize) -> Option<(String, Option<usize>
     let before_bracket = close[..open].trim_end();
     let name_end = before_bracket.len();
     let name_start = before_bracket
-        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .map_or(0, |offset| offset + 1);
+        .char_indices()
+        .rfind(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '_'))
+        .map_or(0, |(offset, ch)| offset + ch.len_utf8());
     let name = before_bracket[name_start..name_end].trim();
     if name.is_empty() {
         return None;
@@ -4848,6 +4849,9 @@ fn is_private_key_documentation_placeholder_literal(value: &str, key_name: &str)
         return false;
     }
     let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    if is_pem_ellipsis_placeholder(value) {
+        return true;
+    }
     if !(8..=180).contains(&value.len())
         || value.contains("-----BEGIN")
         || value.bytes().any(|b| matches!(b, b'\r' | b'\n'))
@@ -4876,6 +4880,34 @@ fn is_private_key_documentation_placeholder_literal(value: &str, key_name: &str)
         .any(|part| matches!(*part, "pem" | "file" | "content"));
     let has_value_marker = parts.contains(&"value");
     has_placeholder_marker && (has_key_file_marker || has_value_marker)
+}
+
+fn is_pem_ellipsis_placeholder(value: &str) -> bool {
+    // PEM examples sometimes keep only the envelope and replace key bytes with
+    // `...`. That is not parseable key material, but a real PEM body should
+    // still be detected by the PEM detector and keyed-secret fallback.
+    let normalized = value
+        .replace("\\\\r\\\\n", "\n")
+        .replace("\\\\n", "\n")
+        .replace("\\\\r", "\n")
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n");
+    let lines = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() != 3 {
+        return false;
+    }
+    let [begin, body, end] = [lines[0], lines[1], lines[2]];
+    begin.starts_with("-----BEGIN ")
+        && begin.ends_with("PRIVATE KEY-----")
+        && end.starts_with("-----END ")
+        && end.ends_with("PRIVATE KEY-----")
+        && body.chars().count() >= 3
+        && body.chars().all(|ch| matches!(ch, '.' | '\u{2026}'))
 }
 
 fn key_name_indicates_private_key_slot(key_name: &str) -> bool {
@@ -6281,6 +6313,7 @@ mod tests {
             r#""description": "Use `Authorization` header.\n\n> Authorization: Bearer abc123-EXAMPLE the `Authorization` header is required.""#,
             "repeat_password: Powtórz hasło",
             "confirm_password: Potwierdź moje konto",
+            r#""private_key": "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n""#,
             "password=start_pass_downsample",
             "client_secret=tenant_trial",
             "struct SessionHandle *data = conn->data;",

@@ -55,6 +55,10 @@ exact:foobar
 exact:foo_bar
 exact:s3krit_password
 exact:t0k3n
+exact:testkey
+exact:testsecret
+exact:newtoken
+exact:privatetoken
 exact:x_pack_test_password
 prefix:tftest
 

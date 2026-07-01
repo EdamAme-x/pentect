@@ -287,7 +287,7 @@ fn is_compositional_placeholder_secret_name(value: &str) -> bool {
 fn is_placeholder_owner_component(part: &str) -> bool {
     matches!(
         part,
-        "my" | "some" | "test" | "sample" | "fake" | "dummy" | "example" | "notareal"
+        "my" | "some" | "test" | "sample" | "fake" | "dummy" | "example" | "not" | "notareal"
     )
 }
 
@@ -924,6 +924,11 @@ mod tests {
         assert!(is_placeholder_value("foobar"));
         assert!(is_placeholder_value("foo-bar"));
         assert!(is_placeholder_value("s3krit-password"));
+        assert!(is_placeholder_value("TESTKEY"));
+        assert!(is_placeholder_value("TESTSECRET"));
+        assert!(is_placeholder_value("NEWTOKEN"));
+        assert!(is_placeholder_value("privatetoken"));
+        assert!(is_placeholder_value("not_my_secret"));
         assert!(!is_placeholder_value("s3krit-password2"));
         assert!(is_placeholder_value("t0k3n"));
         assert!(is_placeholder_value("notarealpassword"));
