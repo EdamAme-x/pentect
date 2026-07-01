@@ -306,6 +306,7 @@ fn has_uuid_anchor_name(value: &str) -> bool {
         || has_identifier_phrase(&normalized, &["resource", "id"])
         || has_identifier_phrase(&normalized, &["external", "id"])
         || has_identifier_phrase(&normalized, &["session", "id"])
+        || has_identifier_phrase(&normalized, &["device", "code"])
         || has_identifier_phrase(&normalized, &["access", "policy", "id"])
         || has_identifier_phrase(&normalized, &["authorization", "uri"])
         || has_identifier_phrase(&normalized, &["authorization", "url"])
@@ -374,9 +375,18 @@ fn has_identifier_slot_name(value: &str) -> bool {
 fn normalize_identifier(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut prev_sep = false;
-    for ch in value.chars() {
+    let chars = value.chars().collect::<Vec<_>>();
+    for (idx, ch) in chars.iter().copied().enumerate() {
         if ch.is_ascii_alphanumeric() {
-            if ch.is_ascii_uppercase() && !out.is_empty() && !prev_sep {
+            let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+            let next = chars.get(idx + 1).copied();
+            let starts_word = ch.is_ascii_uppercase()
+                && !out.is_empty()
+                && !prev_sep
+                && (prev.is_some_and(|prev| prev.is_ascii_lowercase() || prev.is_ascii_digit())
+                    || (prev.is_some_and(|prev| prev.is_ascii_uppercase())
+                        && next.is_some_and(|next| next.is_ascii_lowercase())));
+            if starts_word {
                 out.push('_');
             }
             out.push(ch.to_ascii_lowercase());
@@ -428,7 +438,9 @@ mod tests {
             format!(r#"SERVICE_ACCOUNT_ID={uuid}"#),
             format!(r#"username: {uuid}"#),
             format!(r#"virtualHost: {uuid}"#),
+            format!(r#"domainID: "{uuid}""#),
             format!(r#"DEVICE_CODE = "{uuid}""#),
+            format!(r#"TEST_DEVICE_CODE = "{uuid}""#),
             format!(r#"authorization_uri=https://login.example/authorize?resource={uuid}&response_type=code"#),
             format!(r#"redirect_uri=https://example.test/cb&client_id={uuid}"#),
             format!(r#"mux.HandleFunc("/zones/{uuid}/records", handler)"#),
