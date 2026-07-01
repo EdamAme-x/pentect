@@ -1,11 +1,7 @@
 use super::report::{FileFinding, ScanScope, SkippedFile};
 use super::walk::ignored_file_reason;
 use crate::infer_kind;
-use pentect_core::normalize::NormalizedView;
-use pentect_core::{
-    ByteRange, Category, Context, CredSweeperNativeDetector, Detector, Engine, Input, Kind,
-    Profile, Region, RegionKind, Span,
-};
+use pentect_core::{ByteRange, Category, Engine, Input, Kind, Profile, Span};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,10 +51,7 @@ impl ScanPipeline {
     fn pentect(packs: Vec<pentect_core::Pack>) -> Result<Self, String> {
         Ok(Self {
             name: ENGINE_NAME,
-            backends: vec![
-                Box::new(NativeCredSweeperBackend::new()),
-                Box::new(CoreBackend::new(packs)),
-            ],
+            backends: vec![Box::new(CoreBackend::new(packs))],
         })
     }
 
@@ -247,104 +240,6 @@ impl SourceRange {
     }
 }
 
-struct NativeCredSweeperBackend {
-    detector: CredSweeperNativeDetector,
-}
-
-impl NativeCredSweeperBackend {
-    fn new() -> Self {
-        Self {
-            detector: CredSweeperNativeDetector::builtin(),
-        }
-    }
-
-    fn scan_file(&self, path: &Path) -> Result<Option<FileFinding>, String> {
-        let Some(data) = read_text_file(path)? else {
-            return Ok(None);
-        };
-        let kind = infer_kind(path);
-        let region = Region {
-            span: ByteRange::new(0, data.len()),
-            ctx: Context {
-                path: Some(path.to_string_lossy().to_string()),
-                key: None,
-                hints: Vec::new(),
-                kind: RegionKind::PlainText,
-                format: kind.clone(),
-            },
-        };
-        let view = NormalizedView::build(&region, &data);
-        let line_index = LineIndex::new(&data);
-        let hits = self
-            .detector
-            .detect(&view)
-            .iter()
-            .filter(|span| span.category == Category::Secret)
-            .filter_map(|span| hit_from_span(span, &line_index, "credsweeper"))
-            .collect::<Vec<_>>();
-        if hits.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(FileFinding {
-            path: path.to_path_buf(),
-            scope: ScanScope::classify(path),
-            kind,
-            findings: hits.len(),
-            warnings: 0,
-            labels: label_counts(&hits),
-            categories: category_counts(&hits),
-            engines: engine_counts(&hits),
-            parser_fallback: false,
-            hits,
-        }))
-    }
-}
-
-impl ScanBackend for NativeCredSweeperBackend {
-    fn name(&self) -> &'static str {
-        "credsweeper"
-    }
-
-    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String> {
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8)
-            .min(files.len());
-        let files = Arc::new(files.to_vec());
-        let next = Arc::new(AtomicUsize::new(0));
-        let detector = self.detector.clone();
-        let (tx, rx) = mpsc::channel();
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                let files = Arc::clone(&files);
-                let next = Arc::clone(&next);
-                let detector = detector.clone();
-                let tx = tx.clone();
-                scope.spawn(move || {
-                    let worker = NativeCredSweeperBackend { detector };
-                    loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(path) = files.get(index) else {
-                            break;
-                        };
-                        if tx.send(worker.scan_file(path)).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-            drop(tx);
-            rx.into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .map(|items| items.into_iter().flatten().collect())
-        })
-    }
-}
-
 struct CoreBackend {
     packs: Option<Vec<pentect_core::Pack>>,
     engine: Option<Engine>,
@@ -373,7 +268,7 @@ impl CoreBackend {
             .spans
             .iter()
             .filter(|span| span.category == Category::Secret)
-            .filter_map(|span| hit_from_span(span, &line_index, "core"))
+            .filter_map(|span| hit_from_span(span, &line_index))
             .collect::<Vec<_>>();
         let warnings = result
             .residual
@@ -402,10 +297,9 @@ impl CoreBackend {
             return;
         }
         let packs = self.packs.take().unwrap_or_default();
-        self.engine = Some(Engine::with_profile_and_packs(
+        self.engine = Some(Engine::secret_scan_with_profile_and_packs(
             Profile::Strict,
             packs,
-            false,
         ));
     }
 }
@@ -467,11 +361,11 @@ fn read_text_file(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
-fn hit_from_span(span: &Span, line_index: &LineIndex, engine: &str) -> Option<ScanHit> {
+fn hit_from_span(span: &Span, line_index: &LineIndex) -> Option<ScanHit> {
     Some(ScanHit {
         label: span.label.clone(),
         category: format!("{:?}", span.category),
-        engine: engine.to_string(),
+        engine: span.source.as_str().to_string(),
         range: line_index.range(span.range)?,
     })
 }

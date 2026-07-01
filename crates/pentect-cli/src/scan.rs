@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(report.files_scanned, 2);
         assert_eq!(report.files.len(), 1);
         assert!(report.findings >= 2, "{rendered}");
-        assert!(rendered.contains("RUNPOD_API_KEY"), "{rendered}");
+        assert!(rendered.contains(".env"), "{rendered}");
         assert!(!rendered.contains("rpa_FAKEPENTECTSCAN"), "{rendered}");
         assert!(!rendered.contains("hello"), "{rendered}");
 

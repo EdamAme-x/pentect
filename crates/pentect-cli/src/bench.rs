@@ -257,7 +257,8 @@ fn score_creddata_files(
             let next = Arc::clone(&next);
             let tx = tx.clone();
             scope.spawn(move || {
-                let mut engine = Engine::with_profile(Profile::Strict);
+                let mut engine =
+                    Engine::secret_scan_with_profile_and_packs(Profile::Strict, Vec::new());
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some((path, rows)) = files.get(index) else {
