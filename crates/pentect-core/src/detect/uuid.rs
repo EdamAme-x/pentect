@@ -152,6 +152,7 @@ fn has_uuid_anchor_name(value: &str) -> bool {
             | "guid"
             | "uid"
             | "jti"
+            | "sid"
             | "id"
             | "clientid"
             | "tenantid"
@@ -180,9 +181,11 @@ fn has_uuid_anchor_name(value: &str) -> bool {
         || has_identifier_phrase(&normalized, &["authorization", "url"])
         || has_identifier_phrase(&normalized, &["metadata", "address"])
         || has_identifier_phrase(&normalized, &["metadata", "url"])
+        || has_identifier_phrase(&normalized, &["u", "i", "d"])
+        || has_identifier_phrase(&normalized, &["j", "t", "i"])
         || normalized
             .split('_')
-            .any(|part| matches!(part, "uuid" | "guid" | "uid" | "jti"))
+            .any(|part| matches!(part, "uuid" | "guid" | "uid" | "jti" | "sid"))
         || has_identifier_slot_name(&normalized)
 }
 
@@ -257,7 +260,9 @@ mod tests {
             format!(r#"external_id: {uuid}"#),
             format!(r#"kid: '{uuid}'"#),
             format!(r#"uid: "{uuid}""#),
+            format!(r#"claimUID: "{uuid}""#),
             format!(r#"jti: "{uuid}""#),
+            format!(r#"sid: "{uuid}""#),
             format!(r#"state = "{uuid}""#),
             format!(r#"resource = "{uuid}""#),
             format!(r#"DEVICE_CODE = "{uuid}""#),
