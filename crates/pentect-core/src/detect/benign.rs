@@ -169,11 +169,7 @@ impl SourceFixtureSecretSet {
     }
 
     fn matches(&self, key_name: &str, value: &str) -> bool {
-        let key = normalize_identifier(key_name);
-        if !key
-            .split('_')
-            .any(|part| self.key_components.iter().any(|known| known == part))
-        {
+        if !self.matches_key_context(key_name) {
             return false;
         }
         let value = normalize_identifier(value);
@@ -183,6 +179,12 @@ impl SourceFixtureSecretSet {
             FixtureValuePattern::Suffix(pattern) => value.ends_with(pattern),
             FixtureValuePattern::Contains(pattern) => value.contains(pattern),
         })
+    }
+
+    fn matches_key_context(&self, key_name: &str) -> bool {
+        let key = normalize_identifier(key_name);
+        key.split('_')
+            .any(|part| self.key_components.iter().any(|known| known == part))
     }
 }
 
@@ -401,6 +403,15 @@ pub(crate) fn is_source_secret_name_reference_value(value: &str) -> bool {
 /// `MOCK_ACCESS_TOKEN`, or `fake_secret`.
 pub(crate) fn is_source_fixture_secret_value(key_name: &str, value: &str) -> bool {
     SOURCE_FIXTURE_SECRET_MATCHER.matches(key_name, value)
+}
+
+/// True when a source identifier explicitly marks fixture/test/example context.
+///
+/// Rationale: some fixture credentials are weak by shape rather than by an
+/// exact sentinel value. Keep the vocabulary in the shared pattern file so
+/// detector code can require fixture context without duplicating word lists.
+pub(crate) fn is_source_fixture_key_context(key_name: &str) -> bool {
+    SOURCE_FIXTURE_SECRET_MATCHER.matches_key_context(key_name)
 }
 
 /// True for public cryptographic test-vector identifiers, not key material.
@@ -999,6 +1010,11 @@ mod tests {
             "expectedPassword",
             "hunter2"
         ));
+        assert!(is_source_fixture_key_context("examplePassword"));
+        assert!(is_source_fixture_key_context("expectPassword"));
+        assert!(is_source_fixture_key_context("stubToken"));
+        assert!(is_source_fixture_key_context("requestSpecPassword"));
+        assert!(!is_source_fixture_key_context("access_token"));
     }
 
     #[test]

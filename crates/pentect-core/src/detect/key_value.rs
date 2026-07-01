@@ -1,9 +1,9 @@
 use super::benign::{
     is_crypto_test_vector_identifier_value, is_explicitly_non_sensitive_key_name,
     is_localization_template_reference, is_non_secret_source_constant_value, is_placeholder_value,
-    is_source_fixture_secret_value, is_source_secret_name_reference_value,
-    is_structured_generic_key_metadata_value, is_synthetic_hex_test_vector_value,
-    normalize_identifier,
+    is_source_fixture_key_context, is_source_fixture_secret_value,
+    is_source_secret_name_reference_value, is_structured_generic_key_metadata_value,
+    is_synthetic_hex_test_vector_value, normalize_identifier,
 };
 use super::Detector;
 use crate::model::{labels, ByteRange, Category, Confidence, DetectorId, Span};
@@ -487,6 +487,14 @@ fn try_push(ctx: &mut ScanCtx<'_, '_, '_>, separator: SeparatorCandidate) -> boo
             separator.kind,
         )
     {
+        return false;
+    }
+    if is_documentation_auth_header_example_literal(
+        raw_value,
+        &key_name,
+        &ctx.text[ctx.line_start..left_end],
+        &ctx.text[value.end..ctx.line_end],
+    ) {
         return false;
     }
     if !looks_like_secret_value(
@@ -1097,6 +1105,7 @@ fn looks_like_secret_value(
         || is_self_describing_key_value_placeholder(value, key_name, source_key)
         || is_source_sensitive_name_reference_literal(value, source_key)
         || is_source_fixture_secret_literal(value, key_name, source_key)
+        || is_source_fixture_low_entropy_literal(value, key_name, source_key)
         || is_source_struct_tag_literal(value, key_name, source_key)
         || is_objc_dictionary_key_literal(value, source_key)
         || is_source_prefix_constant_literal(value, key_name)
@@ -2922,6 +2931,53 @@ fn is_html_documentation_fragment_literal(value: &str, key_name: &str, source_ke
             && is_short_numeric_doc_example(head))
 }
 
+fn is_documentation_auth_header_example_literal(
+    value: &str,
+    key_name: &str,
+    source_key: &str,
+    tail: &str,
+) -> bool {
+    // API docs often embed Markdown such as
+    // `Authorization: Bearer <sample> the Authorization header...` inside a
+    // `description` field. A real header line usually ends after the token;
+    // require documentation field context and prose after the captured value.
+    if normalize_key(key_name) != "authorization" {
+        return false;
+    }
+    let source = source_key.to_ascii_lowercase();
+    if !(source.contains("description") || source.contains("documentation")) {
+        return false;
+    }
+    if !(source.contains("authorization")
+        && (source.contains("bearer") || source.contains("basic")))
+    {
+        return false;
+    }
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let tail = trim_documentation_auth_tail_prefix(tail);
+    let tail_lower = tail.to_ascii_lowercase();
+    tail_lower.contains("authorization")
+        || tail_lower.contains("header")
+        || tail_lower.contains("endpoint")
+        || tail_lower.contains("returns")
+}
+
+fn trim_documentation_auth_tail_prefix(mut tail: &str) -> &str {
+    loop {
+        tail = tail.trim_start_matches(['"', '\'', '`', ' ', '\t']);
+        let Some(rest) = tail
+            .strip_prefix("\\n")
+            .or_else(|| tail.strip_prefix("\\r"))
+        else {
+            return tail;
+        };
+        tail = rest;
+    }
+}
+
 fn is_markup_syntax_fragment_literal(value: &str, key_name: &str) -> bool {
     // HTML/XML snippets can be split at labels and attributes named
     // `password`, `key`, or `token`, leaving the "value" as a tag fragment
@@ -3803,6 +3859,36 @@ fn is_source_fixture_secret_literal(value: &str, key_name: &str, source_key: &st
     source_key_has_code_shape(source_key)
         && (is_source_fixture_secret_value(key_name, value)
             || is_source_fixture_secret_value(source_key, value))
+}
+
+fn is_source_fixture_low_entropy_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Test fixtures also use short sample credentials that are not explicit
+    // placeholders (`expectedPassword = "abc123"`). Suppress only when source
+    // syntax carries a fixture marker and the value has weak sample shape.
+    // Strong mixed values such as `helloworld1234` stay visible.
+    source_key_has_code_shape(source_key)
+        && (is_source_fixture_key_context(key_name) || is_source_fixture_key_context(source_key))
+        && is_weak_fixture_sample_literal(value)
+}
+
+fn is_weak_fixture_sample_literal(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | ';'));
+    let bytes = value.as_bytes();
+    if !(4..=16).contains(&bytes.len())
+        || bytes.iter().any(u8::is_ascii_whitespace)
+        || value.contains("://")
+    {
+        return false;
+    }
+    let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_symbol = bytes.iter().any(|b| !b.is_ascii_alphanumeric());
+    if has_symbol || !(has_alpha || has_digit) {
+        return false;
+    }
+    bytes.iter().all(u8::is_ascii_digit) || (has_alpha && has_digit && bytes.len() <= 9)
 }
 
 fn is_source_struct_tag_literal(value: &str, _key_name: &str, source_key: &str) -> bool {
@@ -6061,6 +6147,10 @@ mod tests {
             r#"const string testPassword = "vqemxShhe";"#,
             "vqemxShhe"
         ));
+        assert!(has(
+            r#"expected_password = "helloworld1234""#,
+            "helloworld1234"
+        ));
         assert!(has(r#"api_token = Some("tok-12345")"#, "tok-12345"));
         assert!(has(
             r#"authorization: 'Basic YWxpY2U6cGEzcw=='"#,
@@ -6163,6 +6253,7 @@ mod tests {
             r#"authorization: "ApiKey docs""#,
             "jwt_like=aaa.bbb.ccc",
             "Authorization: Basic login_and_password_removed",
+            r#""description": "Use `Authorization` header.\n\n> Authorization: Bearer abc123-EXAMPLE the `Authorization` header is required.""#,
             "password=start_pass_downsample",
             "client_secret=tenant_trial",
             "struct SessionHandle *data = conn->data;",
@@ -6338,6 +6429,8 @@ mod tests {
             r#"private const string MOCK_ACCESS_TOKEN = "at-0987654321";"#,
             r#"private const string MOCK_REFRESH_TOKEN = "rt-1234567809";"#,
             r#"const string expectedPassword = "letmein123";"#,
+            r#"const mockToken = "abc123";"#,
+            r#"const expectedPassword = "123456";"#,
             r#"'access-token-expiration' => $this->time + 1800"#,
             r#"txtLUPassword.Enabled = !radioLUS4U.Checked;"#,
             r##"<div class="copy-pass" :title="'Password:' + file.passwd""##,
