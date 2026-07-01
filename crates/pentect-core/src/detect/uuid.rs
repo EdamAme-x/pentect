@@ -95,7 +95,9 @@ fn is_uuid_anchored(text: &str, start: usize, ctx: &crate::model::Context) -> bo
     {
         return true;
     }
-    local_anchor_before_uuid(text, start) || local_example_slot_before_uuid(text, start)
+    local_anchor_before_uuid(text, start)
+        || local_example_slot_before_uuid(text, start)
+        || local_uuid_collection_context(text, start)
 }
 
 fn local_anchor_before_uuid(text: &str, start: usize) -> bool {
@@ -154,6 +156,84 @@ fn local_example_slot_before_uuid(text: &str, start: usize) -> bool {
         return false;
     };
     is_uuid_example_slot_name(slot)
+}
+
+fn local_uuid_collection_context(text: &str, start: usize) -> bool {
+    let (line_start, line_end) = line_bounds(text, start);
+    if !line_is_uuid_item(&text[line_start..line_end]) {
+        return false;
+    }
+    let (window_start, window_end) = nearby_line_window(text, line_start, line_end, 10);
+    let window = &text[window_start..window_end];
+    let uuid_item_lines = window
+        .lines()
+        .filter(|line| line_is_uuid_item(line))
+        .take(3)
+        .count();
+    uuid_item_lines >= 3 && window.lines().any(collection_boundary_line)
+}
+
+fn line_bounds(text: &str, pos: usize) -> (usize, usize) {
+    let line_start = text[..pos].rfind('\n').map_or(0, |idx| idx + 1);
+    let line_end = text[pos..]
+        .find('\n')
+        .map_or(text.len(), |idx| pos + idx);
+    (line_start, line_end)
+}
+
+fn nearby_line_window(
+    text: &str,
+    mut line_start: usize,
+    mut line_end: usize,
+    max_lines_each_side: usize,
+) -> (usize, usize) {
+    for _ in 0..max_lines_each_side {
+        if line_start == 0 {
+            break;
+        }
+        line_start = text[..line_start - 1]
+            .rfind('\n')
+            .map_or(0, |idx| idx + 1);
+    }
+    for _ in 0..max_lines_each_side {
+        if line_end >= text.len() {
+            break;
+        }
+        line_end = text[line_end + 1..]
+            .find('\n')
+            .map_or(text.len(), |idx| line_end + 1 + idx);
+    }
+    (line_start, line_end)
+}
+
+fn line_is_uuid_item(line: &str) -> bool {
+    let line = line.trim();
+    let quote = match line.as_bytes().first() {
+        Some(b'"') => '"',
+        Some(b'\'') => '\'',
+        _ => return false,
+    };
+    let Some(value_start) = line.char_indices().nth(1).map(|(idx, _)| idx) else {
+        return false;
+    };
+    let value_end = value_start + 36;
+    if value_end > line.len() || !line.is_char_boundary(value_end) {
+        return false;
+    }
+    if !is_uuid_layout(&line[value_start..value_end]) {
+        return false;
+    }
+    let rest = line[value_end..].trim_start();
+    let Some(rest) = rest.strip_prefix(quote) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.is_empty() || rest == ","
+}
+
+fn collection_boundary_line(line: &str) -> bool {
+    let line = line.trim();
+    line.ends_with('[') || line == "]" || line == "],"
 }
 
 fn immediate_slot_name_before_value(prefix: &str) -> Option<&str> {
@@ -357,6 +437,21 @@ mod tests {
         ] {
             assert_eq!(hits(&raw), vec![uuid.to_string()], "{raw}");
         }
+        let collection = r#"{
+  "order": [
+    "550e8400-e29b-41d4-a716-446655440000",
+    "650e8400-e29b-41d4-a716-446655440001",
+    "750e8400-e29b-41d4-a716-446655440002"
+  ]
+}"#;
+        assert_eq!(
+            hits(collection),
+            vec![
+                "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                "650e8400-e29b-41d4-a716-446655440001".to_string(),
+                "750e8400-e29b-41d4-a716-446655440002".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -369,6 +464,11 @@ mod tests {
         assert!(hits(&format!(r#"Get-NdrComProxy -Clsid "{uuid}""#)).is_empty());
         assert!(hits(&format!(r#"KeyId = "{uuid}""#)).is_empty());
         assert!(hits(&format!(r#"TargetKeyId = "{uuid}""#)).is_empty());
+        assert!(hits(&format!("[\"{uuid}\"]")).is_empty());
+        assert!(hits(&format!(
+            "[\n  \"{uuid}\",\n  \"650e8400-e29b-41d4-a716-446655440001\"\n]"
+        ))
+        .is_empty());
     }
 
     #[test]
