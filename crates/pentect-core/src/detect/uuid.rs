@@ -142,11 +142,16 @@ fn has_uuid_anchor_name(value: &str) -> bool {
     if normalized.is_empty() {
         return false;
     }
+    if is_public_key_identifier_slot(&normalized) {
+        return false;
+    }
     let compact = normalized.replace('_', "");
     matches!(
         compact.as_str(),
         "uuid"
             | "guid"
+            | "uid"
+            | "jti"
             | "id"
             | "clientid"
             | "tenantid"
@@ -155,7 +160,6 @@ fn has_uuid_anchor_name(value: &str) -> bool {
             | "externalid"
             | "sessionid"
             | "kid"
-            | "keyid"
             | "state"
             | "devicecode"
             | "accesspolicyid"
@@ -178,8 +182,19 @@ fn has_uuid_anchor_name(value: &str) -> bool {
         || has_identifier_phrase(&normalized, &["metadata", "url"])
         || normalized
             .split('_')
-            .any(|part| matches!(part, "uuid" | "guid"))
+            .any(|part| matches!(part, "uuid" | "guid" | "uid" | "jti"))
         || has_identifier_slot_name(&normalized)
+}
+
+fn is_public_key_identifier_slot(normalized: &str) -> bool {
+    // `key_id`/`KeyId` identifies a public key or managed-key resource. The
+    // associated UUID is lookup metadata, while the secret is the key material
+    // or token signed by that key. Keep JWT `kid` and client/tenant IDs on the
+    // positive path; this only covers the explicit key-id phrase.
+    normalized == "key_id"
+        || normalized.ends_with("_key_id")
+        || normalized.ends_with("_key_ids")
+        || normalized.contains("_key_id_")
 }
 
 fn has_identifier_phrase(name: &str, phrase: &[&str]) -> bool {
@@ -241,6 +256,8 @@ mod tests {
             format!(r#""tenant_id": "{uuid}""#),
             format!(r#"external_id: {uuid}"#),
             format!(r#"kid: '{uuid}'"#),
+            format!(r#"uid: "{uuid}""#),
+            format!(r#"jti: "{uuid}""#),
             format!(r#"state = "{uuid}""#),
             format!(r#"resource = "{uuid}""#),
             format!(r#"DEVICE_CODE = "{uuid}""#),
@@ -259,6 +276,8 @@ mod tests {
         assert!(hits(&format!(r#"link "/share/{uuid}""#)).is_empty());
         assert!(hits(&format!(r#""object": "clsid:{uuid}""#)).is_empty());
         assert!(hits(&format!(r#"Get-NdrComProxy -Clsid "{uuid}""#)).is_empty());
+        assert!(hits(&format!(r#"KeyId = "{uuid}""#)).is_empty());
+        assert!(hits(&format!(r#"TargetKeyId = "{uuid}""#)).is_empty());
     }
 
     #[test]

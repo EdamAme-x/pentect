@@ -1075,7 +1075,9 @@ fn looks_like_secret_value(
         || is_asn1_obj_name_literal(value, key_name, source_key)
         || is_crypto_test_vector_identifier_literal(value, key_name)
         || is_crypto_test_vector_record_literal(value, key_name, source_key)
+        || is_query_predicate_literal(value, key_name)
         || is_localized_ui_text_literal(value, key_name, source_key)
+        || is_sensitive_display_label_literal(value, key_name)
         || is_missing_credential_name_literal(value, key_name, source_key)
         || is_xaml_key_time_literal(value, source_key)
         || is_url_query_metadata_literal(value, key_name, source_key)
@@ -2571,6 +2573,84 @@ fn is_localized_ui_text_literal(value: &str, key_name: &str, source_key: &str) -
         return false;
     }
     localized_ui_text_has_boundary(value) && localized_ui_text_chars_are_display_safe(value)
+}
+
+fn is_query_predicate_literal(value: &str, key_name: &str) -> bool {
+    // ORM/API filters encode field predicates in the key
+    // (`password__startswith=...`). Those values are search terms, not the
+    // credential bytes. Keep exact equality out of this suppressor and do not
+    // hide token-shaped values that could be copied credentials.
+    if !key_name_has_sensitive_component(key_name)
+        || !key_name_has_query_predicate_component(key_name)
+    {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | ';'));
+    !value_has_strong_secret_shape(value)
+}
+
+fn key_name_has_query_predicate_component(key_name: &str) -> bool {
+    key_name.split('_').any(|part| {
+        matches!(
+            part,
+            "startswith"
+                | "endswith"
+                | "contains"
+                | "icontains"
+                | "regex"
+                | "iregex"
+                | "match"
+                | "matches"
+        )
+    })
+}
+
+fn is_sensitive_display_label_literal(value: &str, key_name: &str) -> bool {
+    // Form/i18n metadata often maps sensitive field IDs to the text shown to a
+    // user (`password_confirmation: Password`). Suppress only label-shaped text
+    // that repeats words already present in the key, so `password: hunter2`
+    // and `password_confirmation: hunter2` still mask.
+    if !key_name_has_sensitive_component(key_name) || !key_name_has_ui_text_component(key_name) {
+        return false;
+    }
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | ',' | ':' | ';'));
+    if !(2..=96).contains(&value.chars().count())
+        || value.bytes().any(|b| b.is_ascii_digit())
+        || !localized_ui_text_chars_are_display_safe(value)
+    {
+        return false;
+    }
+    let normalized_key = normalize_key(key_name);
+    let normalized_value = normalize_key(value);
+    let key_parts = normalized_key
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let value_parts = normalized_value
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    !value_parts.is_empty()
+        && value_parts
+            .iter()
+            .all(|part| key_parts.iter().any(|key_part| key_part == part))
+}
+
+fn value_has_strong_secret_shape(value: &str) -> bool {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    let has_alpha = bytes.iter().any(u8::is_ascii_alphabetic);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_symbol = bytes
+        .iter()
+        .any(|b| !b.is_ascii_alphanumeric() && !b.is_ascii_whitespace());
+    let has_space = bytes.iter().any(u8::is_ascii_whitespace);
+    (!has_space && bytes.len() >= 24)
+        || (!has_space && bytes.len() >= 12 && has_alpha && has_digit && has_symbol)
 }
 
 fn is_missing_credential_name_literal(value: &str, key_name: &str, source_key: &str) -> bool {
@@ -6201,6 +6281,10 @@ mod tests {
             r#":type aws_secret_access_key: string"#,
             r#"repeat_password: Repeat Password"#,
             r#"current_password: Current password"#,
+            r#"password_confirmation: Password"#,
+            r#"confirm_password: Confirm Password"#,
+            r#"password__startswith = "pass""#,
+            r#"token_regex = "bearer.*""#,
             r#"NAMESILO_API_KEY = "Client ID""#,
             r#"ZONEEE_API_KEY=yyyyy \"#,
             r#"Query: "action=SET&api_key=apikeyvaluehere&name=example.com""#,
@@ -6309,6 +6393,11 @@ mod tests {
             "Correct horse battery staple!"
         ));
         assert!(has(r#"passwordLabel = "tenant-7-trial""#, "tenant-7-trial"));
+        assert!(has(r#"password_confirmation = "hunter2""#, "hunter2"));
+        assert!(has(
+            r#"password__startswith = "Abc123!Longer""#,
+            "Abc123!Longer"
+        ));
         assert!(has(r#"password = "abc\tdef123""#, "abc\\tdef123"));
         assert!(has(r#"password = "hunter\n""#, "hunter\\n"));
         assert!(has(r#"password = "$(echo hunter2)""#, "$(echo hunter2)"));
