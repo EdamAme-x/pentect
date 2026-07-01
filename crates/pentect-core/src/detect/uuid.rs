@@ -175,9 +175,7 @@ fn local_uuid_collection_context(text: &str, start: usize) -> bool {
 
 fn line_bounds(text: &str, pos: usize) -> (usize, usize) {
     let line_start = text[..pos].rfind('\n').map_or(0, |idx| idx + 1);
-    let line_end = text[pos..]
-        .find('\n')
-        .map_or(text.len(), |idx| pos + idx);
+    let line_end = text[pos..].find('\n').map_or(text.len(), |idx| pos + idx);
     (line_start, line_end)
 }
 
@@ -191,9 +189,7 @@ fn nearby_line_window(
         if line_start == 0 {
             break;
         }
-        line_start = text[..line_start - 1]
-            .rfind('\n')
-            .map_or(0, |idx| idx + 1);
+        line_start = text[..line_start - 1].rfind('\n').map_or(0, |idx| idx + 1);
     }
     for _ in 0..max_lines_each_side {
         if line_end >= text.len() {
@@ -292,6 +288,10 @@ fn has_uuid_anchor_name(value: &str) -> bool {
             | "kid"
             | "state"
             | "code"
+            | "token"
+            | "authtoken"
+            | "refreshtoken"
+            | "accesstoken"
             | "devicecode"
             | "accesspolicyid"
             | "migrationguid"
@@ -306,7 +306,12 @@ fn has_uuid_anchor_name(value: &str) -> bool {
         || has_identifier_phrase(&normalized, &["resource", "id"])
         || has_identifier_phrase(&normalized, &["external", "id"])
         || has_identifier_phrase(&normalized, &["session", "id"])
+        || has_identifier_phrase(&normalized, &["user", "id"])
+        || has_identifier_phrase(&normalized, &["actor", "id"])
         || has_identifier_phrase(&normalized, &["device", "code"])
+        || has_identifier_phrase(&normalized, &["auth", "token"])
+        || has_identifier_phrase(&normalized, &["refresh", "token"])
+        || has_identifier_phrase(&normalized, &["access", "token"])
         || has_identifier_phrase(&normalized, &["access", "policy", "id"])
         || has_identifier_phrase(&normalized, &["authorization", "uri"])
         || has_identifier_phrase(&normalized, &["authorization", "url"])
@@ -437,11 +442,16 @@ mod tests {
             format!(r#"resource = "{uuid}""#),
             format!(r#"SERVICE_ACCOUNT_ID={uuid}"#),
             format!(r#"username: {uuid}"#),
+            format!(r#"// User ID: {uuid}"#),
+            format!(r#"// Actor ID: uaa-user:{uuid}"#),
             format!(r#"virtualHost: {uuid}"#),
             format!(r#"domainID: "{uuid}""#),
             format!(r#"DEVICE_CODE = "{uuid}""#),
             format!(r#"TEST_DEVICE_CODE = "{uuid}""#),
-            format!(r#"authorization_uri=https://login.example/authorize?resource={uuid}&response_type=code"#),
+            format!(r#"SetAuthToken("{uuid}")."#),
+            format!(
+                r#"authorization_uri=https://login.example/authorize?resource={uuid}&response_type=code"#
+            ),
             format!(r#"redirect_uri=https://example.test/cb&client_id={uuid}"#),
             format!(r#"mux.HandleFunc("/zones/{uuid}/records", handler)"#),
             format!(r#"authorization_uri=https://login.example/{uuid}"#),
