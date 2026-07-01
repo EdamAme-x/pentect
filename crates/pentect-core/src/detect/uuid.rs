@@ -113,7 +113,10 @@ fn local_anchor_before_uuid(text: &str, start: usize) -> bool {
         .next_back()
         .is_some_and(|ch| matches!(ch, '=' | ':' | '/' | '\\' | '"' | '\'' | '{' | '('))
         || prefix.rfind(['=', ':', '/', '\\']).is_some();
-    has_assignment && (has_uuid_anchor_name(prefix) || path_collection_anchor_before_uuid(prefix))
+    has_assignment
+        && (immediate_slot_name_before_value(prefix).is_some_and(has_uuid_anchor_name)
+            || has_uuid_anchor_name(prefix)
+            || path_collection_anchor_before_uuid(prefix))
 }
 
 fn path_collection_anchor_before_uuid(prefix: &str) -> bool {
@@ -199,6 +202,8 @@ fn has_uuid_anchor_name(value: &str) -> bool {
             | "resourceid"
             | "externalid"
             | "sessionid"
+            | "username"
+            | "virtualhost"
             | "folder"
             | "request"
             | "requestid"
@@ -231,7 +236,7 @@ fn has_uuid_anchor_name(value: &str) -> bool {
         || normalized
             .split('_')
             .any(|part| matches!(part, "uuid" | "guid" | "uid" | "jti" | "sid"))
-        || has_identifier_slot_name(&normalized)
+        || has_identifier_slot_name(value)
 }
 
 fn is_uuid_example_slot_name(value: &str) -> bool {
@@ -264,6 +269,19 @@ fn has_identifier_phrase(name: &str, phrase: &[&str]) -> bool {
 }
 
 fn has_identifier_slot_name(value: &str) -> bool {
+    let raw = value.trim().trim_matches(|ch: char| {
+        ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | ':' | '=')
+    });
+    if raw
+        .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .next()
+        .is_some_and(|slot| {
+            let upper = slot.to_ascii_uppercase();
+            upper.ends_with("_ID") || upper.ends_with("_IDS")
+        })
+    {
+        return true;
+    }
     let normalized = normalize_identifier(value);
     normalized == "id"
         || normalized.ends_with("_id")
@@ -327,7 +345,12 @@ mod tests {
             format!(r#"code={uuid}&grant_type=authorization_code"#),
             format!(r#"state = "{uuid}""#),
             format!(r#"resource = "{uuid}""#),
+            format!(r#"SERVICE_ACCOUNT_ID={uuid}"#),
+            format!(r#"username: {uuid}"#),
+            format!(r#"virtualHost: {uuid}"#),
             format!(r#"DEVICE_CODE = "{uuid}""#),
+            format!(r#"authorization_uri=https://login.example/authorize?resource={uuid}&response_type=code"#),
+            format!(r#"redirect_uri=https://example.test/cb&client_id={uuid}"#),
             format!(r#"mux.HandleFunc("/zones/{uuid}/records", handler)"#),
             format!(r#"authorization_uri=https://login.example/{uuid}"#),
             format!(r#"<input type=\"hidden\" name=\"client_id\" value=\"{uuid}\" />"#),
