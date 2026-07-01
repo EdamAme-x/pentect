@@ -31,6 +31,7 @@ pub struct CredSweeperNativeStats {
     pub compiled_patterns: usize,
     pub rust_regex_patterns: usize,
     pub fancy_regex_patterns: usize,
+    pub translated_patterns: usize,
     pub enabled_patterns: usize,
     pub ml_gated_patterns: usize,
     pub unsupported_patterns: usize,
@@ -48,6 +49,7 @@ struct NativeRule {
     min_line_len: usize,
     required_substrings: Vec<String>,
     filter_types: Vec<String>,
+    ml_validated: bool,
     patterns: Vec<NativePattern>,
 }
 
@@ -61,6 +63,30 @@ struct NativePattern {
 enum PatternMatcher {
     Rust(RustRegex),
     Fancy(FancyRegex),
+    Special(SpecialMatcher),
+}
+
+#[derive(Clone)]
+enum SpecialMatcher {
+    AwsMulti,
+    GoogleMulti,
+    Jwk,
+    PemPrivateKey,
+    Base64PrivateKey,
+    Keyword(KeywordMatcher),
+}
+
+#[derive(Clone, Copy)]
+enum KeywordMatcher {
+    Api,
+    Auth,
+    Credential,
+    Key,
+    Nonce,
+    Password,
+    Salt,
+    Secret,
+    Token,
 }
 
 impl CredSweeperNativeDetector {
@@ -79,8 +105,9 @@ impl CredSweeperNativeDetector {
         let mut compiled_patterns = 0usize;
         let mut rust_regex_patterns = 0usize;
         let mut fancy_regex_patterns = 0usize;
+        let mut translated_patterns = 0usize;
         let mut enabled_patterns = 0usize;
-        let mut ml_gated_patterns = 0usize;
+        let ml_gated_patterns = 0usize;
         let mut unsupported_patterns = 0usize;
         let mut rules = Vec::new();
         for raw in &raw_rules {
@@ -95,24 +122,41 @@ impl CredSweeperNativeDetector {
                             match &regex {
                                 PatternMatcher::Rust(_) => rust_regex_patterns += 1,
                                 PatternMatcher::Fancy(_) => fancy_regex_patterns += 1,
+                                PatternMatcher::Special(_) => translated_patterns += 1,
                             }
                             let value_capture = regex.has_capture_name("value");
-                            if use_ml {
-                                ml_gated_patterns += 1;
-                            } else {
-                                enabled_patterns += 1;
-                                patterns.push(NativePattern {
-                                    matcher: regex,
-                                    value_capture,
-                                });
-                            }
+                            enabled_patterns += 1;
+                            patterns.push(NativePattern {
+                                matcher: regex,
+                                value_capture,
+                            });
                             compiled_patterns += 1;
                         }
-                        Err(_) => unsupported_patterns += 1,
+                        Err(_) => match translated_pattern(&raw.name) {
+                            Some(matcher) => {
+                                translated_patterns += 1;
+                                enabled_patterns += 1;
+                                patterns.push(NativePattern {
+                                    matcher: PatternMatcher::Special(matcher),
+                                    value_capture: true,
+                                });
+                            }
+                            None => unsupported_patterns += 1,
+                        },
                     }
                 }
             } else {
-                unsupported_patterns += values.len();
+                match translated_rule(raw) {
+                    Some(matcher) => {
+                        translated_patterns += values.len();
+                        enabled_patterns += values.len();
+                        patterns.push(NativePattern {
+                            matcher: PatternMatcher::Special(matcher),
+                            value_capture: true,
+                        });
+                    }
+                    None => unsupported_patterns += values.len(),
+                }
             }
             if patterns.is_empty() {
                 continue;
@@ -133,6 +177,7 @@ impl CredSweeperNativeDetector {
                     .as_ref()
                     .map(FilterList::items)
                     .unwrap_or_default(),
+                ml_validated: use_ml,
                 patterns,
             });
         }
@@ -144,6 +189,7 @@ impl CredSweeperNativeDetector {
                 compiled_patterns,
                 rust_regex_patterns,
                 fancy_regex_patterns,
+                translated_patterns,
                 enabled_patterns,
                 ml_gated_patterns,
                 unsupported_patterns,
@@ -218,11 +264,18 @@ impl Detector for CredSweeperNativeDetector {
                                 );
                             }
                         }
+                        PatternMatcher::Special(matcher) => {
+                            for m in matcher.find(line_body) {
+                                push_match(
+                                    &mut out, view, rule, line_start, m.start, m.end, m.value,
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
-        out
+        dedupe_spans(out)
     }
 }
 
@@ -237,6 +290,78 @@ impl PatternMatcher {
                 .capture_names()
                 .flatten()
                 .any(|candidate| candidate == name),
+            Self::Special(_) => true,
+        }
+    }
+}
+
+struct Candidate<'a> {
+    start: usize,
+    end: usize,
+    value: &'a str,
+}
+
+impl SpecialMatcher {
+    fn find<'a>(&self, line: &'a str) -> Vec<Candidate<'a>> {
+        match self {
+            Self::AwsMulti => aws_multi_candidates(line),
+            Self::GoogleMulti => google_multi_candidates(line),
+            Self::Jwk => jwk_candidates(line),
+            Self::PemPrivateKey => pem_private_key_candidates(line),
+            Self::Base64PrivateKey => base64_private_key_candidates(line),
+            Self::Keyword(keyword) => keyword_candidates(line, *keyword),
+        }
+    }
+}
+
+fn translated_pattern(rule_name: &str) -> Option<SpecialMatcher> {
+    match rule_name {
+        "BASE64 Private Key" => Some(SpecialMatcher::Base64PrivateKey),
+        _ => None,
+    }
+}
+
+fn translated_rule(raw: &RawRule) -> Option<SpecialMatcher> {
+    match raw.kind.as_deref()? {
+        "multi" => match raw.name.as_str() {
+            "AWS Multi" => Some(SpecialMatcher::AwsMulti),
+            "Google Multi" => Some(SpecialMatcher::GoogleMulti),
+            "JWK" => Some(SpecialMatcher::Jwk),
+            _ => None,
+        },
+        "pem_key" => (raw.name == "PEM Private Key").then_some(SpecialMatcher::PemPrivateKey),
+        "keyword" => KeywordMatcher::from_rule_name(&raw.name).map(SpecialMatcher::Keyword),
+        _ => None,
+    }
+}
+
+impl KeywordMatcher {
+    fn from_rule_name(name: &str) -> Option<Self> {
+        match name {
+            "API" => Some(Self::Api),
+            "Auth" => Some(Self::Auth),
+            "Credential" => Some(Self::Credential),
+            "Key" => Some(Self::Key),
+            "Nonce" => Some(Self::Nonce),
+            "Password" => Some(Self::Password),
+            "Salt" => Some(Self::Salt),
+            "Secret" => Some(Self::Secret),
+            "Token" => Some(Self::Token),
+            _ => None,
+        }
+    }
+
+    fn needles(self) -> &'static [&'static str] {
+        match self {
+            Self::Api => &["api"],
+            Self::Auth => &["auth"],
+            Self::Credential => &["credential"],
+            Self::Key => &["key"],
+            Self::Nonce => &["nonce"],
+            Self::Password => &["password", "passwd", "pwd", "passphrase", "pass"],
+            Self::Salt => &["salt"],
+            Self::Secret => &["secret"],
+            Self::Token => &["token"],
         }
     }
 }
@@ -248,6 +373,188 @@ fn compile_pattern(pattern: &str) -> Result<PatternMatcher, ()> {
             .map(PatternMatcher::Fancy)
             .map_err(|_| ()),
     }
+}
+
+fn aws_multi_candidates(line: &str) -> Vec<Candidate<'_>> {
+    static AWS_ID: LazyLock<RustRegex> =
+        LazyLock::new(|| RustRegex::new(r"A(KIA|SIA)[0-9A-Z]{16}").expect("aws id regex"));
+    let ids = regex_candidates(line, &AWS_ID);
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut out = ids;
+    out.extend(token_runs(line).filter(|run| {
+        run.value.len() >= 40
+            && run.value.len() <= 44
+            && is_base64ish(run.value)
+            && has_upper_lower_digit(run.value)
+    }));
+    out
+}
+
+fn google_multi_candidates(line: &str) -> Vec<Candidate<'_>> {
+    static GOOGLE_CLIENT_ID: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r"[0-9]{3,80}-[0-9a-z_]{32}\.apps\.googleusercontent\.com")
+            .expect("google client id regex")
+    });
+    static GOOGLE_SECRET: LazyLock<RustRegex> =
+        LazyLock::new(|| RustRegex::new(r"GOCSPX-[0-9A-Za-z_-]{28}").expect("google secret"));
+    let clients = regex_candidates(line, &GOOGLE_CLIENT_ID);
+    if clients.is_empty() {
+        return Vec::new();
+    }
+    let mut out = clients;
+    out.extend(regex_candidates(line, &GOOGLE_SECRET));
+    out
+}
+
+fn jwk_candidates(line: &str) -> Vec<Candidate<'_>> {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains("kty")
+        || !(line.contains("RSA") || line.contains("EC") || line.contains("oct"))
+    {
+        return Vec::new();
+    }
+    static JWK_PRIVATE_VALUE: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r#"(?i)["']?[dk]["']?\s*[:=]\s*["'](?P<value>[0-9A-Za-z_-]{22,8000})["']"#)
+            .expect("jwk private value regex")
+    });
+    capture_value_candidates(line, &JWK_PRIVATE_VALUE)
+}
+
+fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
+    let Some(begin) = line.find("-----BEGIN") else {
+        return Vec::new();
+    };
+    let Some(end_rel) = line[begin..].find("KEY-----") else {
+        return Vec::new();
+    };
+    let end = begin + end_rel + "KEY-----".len();
+    let value = &line[begin..end];
+    if value.contains("PRIVATE") && !value.contains("ENCRYPTED") {
+        vec![Candidate {
+            start: begin,
+            end,
+            value,
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+fn base64_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
+    token_runs(line)
+        .filter(|run| {
+            run.value.len() >= 160
+                && run.value.starts_with("MII")
+                && is_base64ish(run.value)
+                && run.value.chars().all(|ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_')
+                })
+        })
+        .collect()
+}
+
+fn keyword_candidates(line: &str, keyword: KeywordMatcher) -> Vec<Candidate<'_>> {
+    let lower = line.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for needle in keyword.needles() {
+        for (idx, _) in lower.match_indices(needle) {
+            if !is_left_word_boundary(lower.as_bytes(), idx)
+                || !is_right_word_boundary(lower.as_bytes(), idx + needle.len())
+            {
+                continue;
+            }
+            let Some((start, end)) = assignment_value_after_keyword(line, idx + needle.len())
+            else {
+                continue;
+            };
+            let value = &line[start..end];
+            if is_credible_secret_value(value) {
+                out.push(Candidate { start, end, value });
+            }
+        }
+    }
+    out
+}
+
+fn assignment_value_after_keyword(line: &str, from: usize) -> Option<(usize, usize)> {
+    let tail = &line[from..line.len().min(from + 96)];
+    let eq = tail.find('=').map(|idx| from + idx);
+    let colon = tail.find(':').map(|idx| from + idx);
+    let sep = match (eq, colon) {
+        (Some(eq), Some(colon)) if colon < eq && line[colon + 1..eq].trim().len() <= 24 => eq,
+        (Some(eq), _) => eq,
+        (None, Some(colon)) => colon,
+        (None, None) => return None,
+    };
+    let mut start = sep + 1;
+    let bytes = line.as_bytes();
+    while start < line.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while start < line.len() && matches!(bytes[start], b'"' | b'\'' | b'`') {
+        start += 1;
+    }
+    if start >= line.len() || bytes[start] == b'-' {
+        return None;
+    }
+    let mut end = start;
+    while end < line.len() {
+        let b = bytes[end];
+        if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'`' | b',' | b';' | b')') {
+            break;
+        }
+        end += 1;
+    }
+    (end > start).then_some((start, end))
+}
+
+fn regex_candidates<'a>(line: &'a str, regex: &RustRegex) -> Vec<Candidate<'a>> {
+    regex
+        .find_iter(line)
+        .map(|m| Candidate {
+            start: m.start(),
+            end: m.end(),
+            value: m.as_str(),
+        })
+        .collect()
+}
+
+fn capture_value_candidates<'a>(line: &'a str, regex: &RustRegex) -> Vec<Candidate<'a>> {
+    regex
+        .captures_iter(line)
+        .filter_map(|captures| captures.name("value"))
+        .map(|m| Candidate {
+            start: m.start(),
+            end: m.end(),
+            value: m.as_str(),
+        })
+        .collect()
+}
+
+fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (idx, ch) in line.char_indices() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '/' | '=' | '.') {
+            start.get_or_insert(idx);
+        } else if let Some(s) = start.take() {
+            runs.push(Candidate {
+                start: s,
+                end: idx,
+                value: &line[s..idx],
+            });
+        }
+    }
+    if let Some(s) = start {
+        runs.push(Candidate {
+            start: s,
+            end: line.len(),
+            value: &line[s..],
+        });
+    }
+    runs.into_iter()
 }
 
 fn push_match(
@@ -263,7 +570,7 @@ fn push_match(
     if range.is_empty() {
         return;
     }
-    if !accept_value(value, &rule.filter_types) {
+    if !accept_value(value, rule) {
         return;
     }
     out.push(Span {
@@ -362,19 +669,159 @@ fn required_substring_present(required: &[String], line_lower: &LazyLower<'_>) -
     required.iter().any(|needle| lower.contains(needle))
 }
 
-fn accept_value(value: &str, filters: &[String]) -> bool {
+fn accept_value(value: &str, rule: &NativeRule) -> bool {
     let value = value.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
     if value.len() < 4 || is_obvious_placeholder(value) || is_repeated_symbol(value) {
         return false;
     }
-    if filters
+    if rule
+        .filter_types
         .iter()
         .any(|filter| filter.contains("ValueFilePathCheck"))
         && looks_like_file_path(value)
     {
         return false;
     }
+    if rule.ml_validated && !is_ml_replacement_accepted(&rule.label, value) {
+        return false;
+    }
     true
+}
+
+fn is_ml_replacement_accepted(label: &str, value: &str) -> bool {
+    match label {
+        "DOC_GET"
+        | "DOC_CREDENTIALS"
+        | "SECRET_PAIR"
+        | "PASSWD_PAIR"
+        | "IP_ID_PASSWORD_TRIPLE"
+        | "ID_PAIR_PASSWD_PAIR"
+        | "ID_PASSWD_PAIR"
+        | "API"
+        | "AUTH"
+        | "CREDENTIAL"
+        | "KEY"
+        | "NONCE"
+        | "PASSWORD"
+        | "SALT"
+        | "SECRET"
+        | "TOKEN" => is_credible_secret_value(value),
+        _ => value.len() >= 4 && !looks_like_file_path(value),
+    }
+}
+
+fn is_credible_secret_value(value: &str) -> bool {
+    let value = value.trim_matches(|ch: char| {
+        matches!(ch, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}')
+    });
+    if value.len() < 8 || value.contains(char::is_whitespace) || is_obvious_placeholder(value) {
+        return false;
+    }
+    if has_known_secret_prefix(value) {
+        return true;
+    }
+    let has_alpha = value.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
+    let has_symbol = value
+        .chars()
+        .any(|ch| ch.is_ascii_punctuation() && !matches!(ch, '_' | '-'));
+    let has_upper = value.chars().any(|ch| ch.is_ascii_uppercase());
+    let has_lower = value.chars().any(|ch| ch.is_ascii_lowercase());
+    (value.len() >= 8 && has_alpha && has_digit)
+        || (value.len() >= 12 && has_alpha && has_symbol)
+        || (value.len() >= 16 && has_upper && has_lower)
+        || (value.len() >= 20 && has_alpha)
+}
+
+fn has_known_secret_prefix(value: &str) -> bool {
+    [
+        "AKIA",
+        "ASIA",
+        "AIza",
+        "ghp_",
+        "github_pat_",
+        "glpat-",
+        "sk-",
+        "xox",
+        "GOCSPX-",
+        "hf_",
+        "sk-ant-",
+        "pplx-",
+        "tvly-",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+}
+
+fn is_left_word_boundary(bytes: &[u8], idx: usize) -> bool {
+    bytes
+        .get(idx.wrapping_sub(1))
+        .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+}
+
+fn is_right_word_boundary(bytes: &[u8], idx: usize) -> bool {
+    bytes
+        .get(idx)
+        .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+}
+
+fn has_upper_lower_digit(value: &str) -> bool {
+    value.chars().any(|ch| ch.is_ascii_uppercase())
+        && value.chars().any(|ch| ch.is_ascii_lowercase())
+        && value.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn is_base64ish(value: &str) -> bool {
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_'))
+}
+
+fn dedupe_spans(mut spans: Vec<Span>) -> Vec<Span> {
+    spans.sort_by(|a, b| b.cmp_strength(a));
+    let mut kept: Vec<Span> = Vec::new();
+    'span: for span in spans {
+        for existing in &kept {
+            if !ranges_overlap(span.range, existing.range) {
+                continue;
+            }
+            if is_generic_label(&span.label) && !is_generic_label(&existing.label) {
+                continue 'span;
+            }
+            if span.range == existing.range {
+                continue 'span;
+            }
+        }
+        kept.push(span);
+    }
+    kept.sort_by_key(|span| (span.range.start, span.range.end, span.label.clone()));
+    kept
+}
+
+fn ranges_overlap(a: ByteRange, b: ByteRange) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+fn is_generic_label(label: &str) -> bool {
+    matches!(
+        label,
+        "DOC_GET"
+            | "DOC_CREDENTIALS"
+            | "SECRET_PAIR"
+            | "PASSWD_PAIR"
+            | "IP_ID_PASSWORD_TRIPLE"
+            | "ID_PAIR_PASSWD_PAIR"
+            | "ID_PASSWD_PAIR"
+            | "API"
+            | "AUTH"
+            | "CREDENTIAL"
+            | "KEY"
+            | "NONCE"
+            | "PASSWORD"
+            | "SALT"
+            | "SECRET"
+            | "TOKEN"
+    )
 }
 
 fn is_obvious_placeholder(value: &str) -> bool {
@@ -461,16 +908,13 @@ mod tests {
         assert_eq!(stats.rust_regex_patterns, 37, "{stats:?}");
         assert_eq!(stats.fancy_regex_patterns, 71, "{stats:?}");
         assert_eq!(stats.compiled_patterns, 108, "{stats:?}");
-        assert_eq!(stats.enabled_patterns, 93, "{stats:?}");
-        assert_eq!(stats.ml_gated_patterns, 15, "{stats:?}");
-        assert_eq!(stats.unsupported_patterns, 17, "{stats:?}");
-        assert_eq!(
-            stats.compiled_patterns,
-            stats.enabled_patterns + stats.ml_gated_patterns
-        );
+        assert_eq!(stats.translated_patterns, 17, "{stats:?}");
+        assert_eq!(stats.enabled_patterns, 125, "{stats:?}");
+        assert_eq!(stats.ml_gated_patterns, 0, "{stats:?}");
+        assert_eq!(stats.unsupported_patterns, 0, "{stats:?}");
         assert_eq!(
             stats.total_patterns,
-            stats.compiled_patterns + stats.unsupported_patterns
+            stats.compiled_patterns + stats.translated_patterns + stats.unsupported_patterns
         );
     }
 
@@ -488,6 +932,52 @@ mod tests {
         assert!(spans
             .iter()
             .all(|span| span.source == DetectorId::CredSweeper));
+    }
+
+    #[test]
+    fn translated_credsweeper_rules_are_active() {
+        let aws_id = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
+        let aws_secret = ["Abcdefghij", "1234567890", "Abcdefghij", "1234567890"].concat();
+        let google_secret = format!("GOCSPX-{}", "A".repeat(28));
+        let jwk_secret = "Abcdefghij1234567890_abcd";
+        let base64_key = format!("MII{}", "A".repeat(180));
+        let raw = format!(
+            "aws {aws_id} {aws_secret}\n\
+             google 123-abcdeabcdeabcdeabcdeabcdeabcdeab.apps.googleusercontent.com {google_secret}\n\
+             jwk {{\"kty\":\"RSA\",\"d\":\"{jwk_secret}\"}}\n\
+             -----BEGIN OPENSSH PRIVATE KEY-----\n\
+             {base64_key}\n\
+             const PASSWORD: string = \"helloworld1234\";\n"
+        );
+        let region = region(&raw);
+        let view = NormalizedView::build(&region, &raw);
+        let labels = CredSweeperNativeDetector::builtin()
+            .detect(&view)
+            .into_iter()
+            .map(|span| span.label)
+            .collect::<Vec<_>>();
+        for label in [
+            "AWS_MULTI",
+            "GOOGLE_MULTI",
+            "JWK",
+            "PEM_PRIVATE_KEY",
+            "BASE64_PRIVATE_KEY",
+            "PASSWORD",
+        ] {
+            assert!(
+                labels.iter().any(|actual| actual == label),
+                "{label}: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn translated_keyword_rules_do_not_mask_plain_prose() {
+        let raw = "token budget and secret capability are API design notes\n";
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        let spans = CredSweeperNativeDetector::builtin().detect(&view);
+        assert!(spans.is_empty(), "{spans:?}");
     }
 
     #[test]
