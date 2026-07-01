@@ -6,13 +6,13 @@ use regex::Regex as RustRegex;
 use serde::Deserialize;
 use std::sync::LazyLock;
 
-const RULES_YAML: &str = include_str!("../../vendors/CredSweeper/credsweeper/rules/config.yaml");
+const RULES_YAML: &str = include_str!("../../vendors/credsweeper-assets/rules/config.yaml");
 const SECRET_CONFIG_JSON: &str =
-    include_str!("../../vendors/CredSweeper/credsweeper/secret/config.json");
+    include_str!("../../vendors/credsweeper-assets/secret/config.json");
 const ML_CONFIG_JSON: &str =
-    include_str!("../../vendors/CredSweeper/credsweeper/ml_model/ml_config.json");
+    include_str!("../../vendors/credsweeper-assets/ml_model/ml_config.json");
 const ML_MODEL_ONNX: &[u8] =
-    include_bytes!("../../vendors/CredSweeper/credsweeper/ml_model/ml_model.onnx");
+    include_bytes!("../../vendors/credsweeper-assets/ml_model/ml_model.onnx");
 
 static BUILTIN: LazyLock<CredSweeperNativeDetector> = LazyLock::new(|| {
     CredSweeperNativeDetector::compile_builtin().expect("embedded CredSweeper assets compile")
