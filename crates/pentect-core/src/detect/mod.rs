@@ -7,6 +7,7 @@ mod bip39;
 mod card;
 mod cli;
 mod credsweeper;
+mod credsweeper_ml;
 mod decode;
 mod documentation;
 mod entropy;
