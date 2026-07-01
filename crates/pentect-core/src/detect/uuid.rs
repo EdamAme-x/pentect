@@ -82,7 +82,10 @@ fn is_placeholder_uuid(value: &str) -> bool {
 }
 
 fn is_uuid_anchored(text: &str, start: usize, ctx: &crate::model::Context) -> bool {
-    if ctx.key.as_deref().is_some_and(has_uuid_anchor_name)
+    if ctx
+        .key
+        .as_deref()
+        .is_some_and(|key| has_uuid_anchor_name(key) || is_uuid_example_slot_name(key))
         || ctx.hints.iter().any(|hint| has_uuid_anchor_name(hint))
     {
         return true;
@@ -92,7 +95,7 @@ fn is_uuid_anchored(text: &str, start: usize, ctx: &crate::model::Context) -> bo
     {
         return true;
     }
-    local_anchor_before_uuid(text, start)
+    local_anchor_before_uuid(text, start) || local_example_slot_before_uuid(text, start)
 }
 
 fn local_anchor_before_uuid(text: &str, start: usize) -> bool {
@@ -137,6 +140,42 @@ fn path_collection_anchor_before_uuid(prefix: &str) -> bool {
         .is_some_and(|part| part.len() >= 3 && part.ends_with('s') && *part != "https")
 }
 
+fn local_example_slot_before_uuid(text: &str, start: usize) -> bool {
+    let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let mut window_start = start.saturating_sub(96).max(line_start);
+    while window_start < start && !text.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let prefix = text[window_start..start].trim_end();
+    let Some(slot) = immediate_slot_name_before_value(prefix) else {
+        return false;
+    };
+    is_uuid_example_slot_name(slot)
+}
+
+fn immediate_slot_name_before_value(prefix: &str) -> Option<&str> {
+    let prefix = prefix.trim_end();
+    let sep = prefix.rfind(['=', ':'])?;
+    let before_sep = prefix[..sep].trim_end();
+    if before_sep.is_empty() || before_sep.ends_with("://") {
+        return None;
+    }
+    let before_sep = before_sep.trim_end_matches(['"', '\'', '`']);
+    let start = before_sep
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+        .map_or(0, |pos| pos + 1);
+    let candidate = before_sep[start..].trim_matches(['"', '\'', '`']);
+    let head = before_sep[..start].trim_end();
+    if head
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !matches!(ch, '{' | '[' | '(' | ',' | '"' | '\'' | '`'))
+    {
+        return None;
+    }
+    (!candidate.is_empty()).then_some(candidate)
+}
+
 fn has_uuid_anchor_name(value: &str) -> bool {
     let normalized = normalize_identifier(value);
     if normalized.is_empty() {
@@ -160,8 +199,14 @@ fn has_uuid_anchor_name(value: &str) -> bool {
             | "resourceid"
             | "externalid"
             | "sessionid"
+            | "folder"
+            | "request"
+            | "requestid"
+            | "raceid"
+            | "volumehandle"
             | "kid"
             | "state"
+            | "code"
             | "devicecode"
             | "accesspolicyid"
             | "migrationguid"
@@ -187,6 +232,16 @@ fn has_uuid_anchor_name(value: &str) -> bool {
             .split('_')
             .any(|part| matches!(part, "uuid" | "guid" | "uid" | "jti" | "sid"))
         || has_identifier_slot_name(&normalized)
+}
+
+fn is_uuid_example_slot_name(value: &str) -> bool {
+    // Schema/OpenAPI examples commonly carry concrete sample identifiers under
+    // `example`/`examples`. Keep this out of `has_uuid_anchor_name`, because
+    // free-form documentation can contain the prose phrase "for example".
+    let normalized = normalize_identifier(value);
+    matches!(normalized.as_str(), "example" | "examples")
+        || normalized.ends_with("_example")
+        || normalized.ends_with("_examples")
 }
 
 fn is_public_key_identifier_slot(normalized: &str) -> bool {
@@ -263,6 +318,13 @@ mod tests {
             format!(r#"claimUID: "{uuid}""#),
             format!(r#"jti: "{uuid}""#),
             format!(r#"sid: "{uuid}""#),
+            format!(r#""example": "{uuid}""#),
+            format!(r#""schema_examples": ["{uuid}"]"#),
+            format!(r#"folder: "{uuid}""#),
+            format!(r#"request: "{uuid}""#),
+            format!(r#"VolumeHandle: "{uuid}""#),
+            format!(r#"RACE_ID = "{uuid}""#),
+            format!(r#"code={uuid}&grant_type=authorization_code"#),
             format!(r#"state = "{uuid}""#),
             format!(r#"resource = "{uuid}""#),
             format!(r#"DEVICE_CODE = "{uuid}""#),
@@ -279,6 +341,7 @@ mod tests {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         assert!(hits(&format!("see {uuid} later")).is_empty());
         assert!(hits(&format!(r#"link "/share/{uuid}""#)).is_empty());
+        assert!(hits(&format!(r#"For example: {uuid}"#)).is_empty());
         assert!(hits(&format!(r#""object": "clsid:{uuid}""#)).is_empty());
         assert!(hits(&format!(r#"Get-NdrComProxy -Clsid "{uuid}""#)).is_empty());
         assert!(hits(&format!(r#"KeyId = "{uuid}""#)).is_empty());
