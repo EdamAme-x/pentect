@@ -4,9 +4,10 @@ mod render;
 mod sweep;
 
 use crate::detect::{
-    AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector, DecodeDetector, Detector,
-    EntropyDetector, EnvValueDetector, KeyValueDetector, PemDetector, PhoneDetector, RuleDetector,
-    SensitiveKeyDetector, StructuralDetector, UrlDetector, UuidDetector,
+    AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector,
+    CredSweeperNativeDetector, DecodeDetector, Detector, EntropyDetector, EnvValueDetector,
+    KeyValueDetector, PemDetector, PhoneDetector, RuleDetector, SensitiveKeyDetector,
+    StructuralDetector, UrlDetector, UuidDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -185,6 +186,25 @@ impl Engine {
         builder
             .policy(Box::new(ProfilePolicy::new(profile)))
             .guard(guard)
+            .build()
+    }
+
+    /// Secret-scan stack used by repository scanning and external secret
+    /// benchmarks. CredSweeper owns vendor/token detection; Pentect only adds
+    /// deterministic gaps that are outside the line-oriented CredSweeper port.
+    pub fn secret_scan_with_profile_and_packs(
+        profile: Profile,
+        packs: Vec<crate::pack::Pack>,
+    ) -> Self {
+        let mut builder = Engine::builder().secret_scan_stack(profile.knobs());
+        for pack in packs {
+            builder = builder
+                .detector(Box::new(pack.rules))
+                .disable_labels(pack.disable);
+        }
+        builder
+            .policy(Box::new(ProfilePolicy::new(profile)))
+            .guard(Box::new(ShapeGuard::builtin()))
             .build()
     }
 
@@ -480,9 +500,9 @@ impl EngineBuilder {
             disabled: std::collections::HashSet::new(),
         }
     }
-    /// Register the canonical parser + detector set tuned for `knobs`. The single
-    /// definition of the standard stack, so no path
-    /// can silently miss a parser or detector.
+    /// Register the canonical parser + detector set used by masking commands.
+    /// It stays broad because masking local tool output has a different risk
+    /// profile than repository secret scanning.
     pub fn standard_stack(self, knobs: ProfileKnobs) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Ndjson, Box::new(NdjsonParser))
@@ -509,6 +529,24 @@ impl EngineBuilder {
             .detector(Box::new(EnvValueDetector))
             .detector(Box::new(StructuralDetector))
             .detector(Box::new(PhoneDetector))
+    }
+
+    pub fn secret_scan_stack(self, knobs: ProfileKnobs) -> Self {
+        self.parser(Kind::Json, Box::new(JsonParser))
+            .parser(Kind::Ndjson, Box::new(NdjsonParser))
+            .parser(Kind::Env, Box::new(EnvParser))
+            .parser(Kind::Har, Box::new(JsonParser))
+            .detector(Box::new(CredSweeperNativeDetector::builtin()))
+            .detector(Box::new(KeyValueDetector))
+            .detector(Box::new(PemDetector::default()))
+            .detector(Box::new(UrlDetector))
+            .detector(Box::new(Bip39Detector))
+            .detector(Box::new(EntropyDetector::with(
+                knobs.entropy_min_len,
+                knobs.entropy_threshold,
+            )))
+            .detector(Box::new(EnvValueDetector))
+            .detector(Box::new(SensitiveKeyDetector))
     }
     pub fn parser(mut self, kind: Kind, parser: Box<dyn Parser>) -> Self {
         self.parsers.push((kind, parser));
