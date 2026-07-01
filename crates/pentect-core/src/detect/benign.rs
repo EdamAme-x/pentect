@@ -261,6 +261,8 @@ pub(crate) fn is_placeholder_value(value: &str) -> bool {
         || is_documentation_value(value)
         || is_compositional_placeholder_secret_name(value)
         || is_repeated_marker_placeholder_value(value)
+        || is_masked_prefix_placeholder_value(value)
+        || is_delimited_identifier_placeholder_value(value)
 }
 
 fn is_compositional_placeholder_secret_name(value: &str) -> bool {
@@ -366,6 +368,101 @@ fn is_repeated_marker_placeholder_value(value: &str) -> bool {
         }
     }
     marker_count >= 4 && (separator_count > 0 || marker_count == value.len())
+}
+
+fn is_masked_prefix_placeholder_value(value: &str) -> bool {
+    // Logs and docs often show irrecoverable secret previews such as
+    // `ab********` or `i*******************`. They prove a value was already
+    // redacted, not that reusable material is present.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let bytes = value.as_bytes();
+    if !(8..=128).contains(&bytes.len()) {
+        return false;
+    }
+    let Some(first_star) = bytes.iter().position(|b| *b == b'*') else {
+        return false;
+    };
+    let prefix = &bytes[..first_star];
+    let stars = &bytes[first_star..];
+    !prefix.is_empty()
+        && prefix.len() <= 8
+        && prefix.iter().all(u8::is_ascii_alphanumeric)
+        && stars.len() >= 6
+        && stars.iter().all(|b| *b == b'*')
+        && stars.len() * 2 >= bytes.len()
+}
+
+fn is_delimited_identifier_placeholder_value(value: &str) -> bool {
+    // Template systems use visibly delimited replacement tokens:
+    // `###ORACLE_PWD###` or `__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__`.
+    // Require matching delimiter runs and an identifier-like body so real
+    // punctuation-heavy passwords are not hidden.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let bytes = value.as_bytes();
+    if !(8..=160).contains(&bytes.len()) {
+        return false;
+    }
+    let marker = bytes[0];
+    if marker.is_ascii_alphanumeric() || marker.is_ascii_whitespace() {
+        return false;
+    }
+    let leading = bytes.iter().take_while(|b| **b == marker).count();
+    let trailing = bytes.iter().rev().take_while(|b| **b == marker).count();
+    if leading < 2 || trailing < 2 || leading + trailing >= bytes.len() {
+        return false;
+    }
+    let body = &value[leading..value.len() - trailing];
+    if body.is_empty()
+        || body.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'.'))
+        })
+        || !body.bytes().any(|b| b.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    let normalized = normalize_identifier(body);
+    let parts = normalized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return false;
+    }
+    let has_placeholder_word = parts.iter().any(|part| {
+        matches!(
+            *part,
+            "todo"
+                | "your"
+                | "own"
+                | "generate"
+                | "generated"
+                | "placeholder"
+                | "replace"
+                | "replaced"
+                | "set"
+                | "change"
+                | "changeme"
+        )
+    });
+    let has_secret_word = parts.iter().any(|part| {
+        matches!(
+            *part,
+            "key" | "pwd" | "pass" | "password" | "passwd" | "secret" | "token" | "credential"
+        )
+    });
+    let has_placeholder_value_word = parts
+        .iter()
+        .any(|part| matches!(*part, "random" | "value" | "here"));
+    if marker == b'_' {
+        has_placeholder_word && (has_secret_word || has_placeholder_value_word)
+    } else {
+        has_placeholder_word || has_secret_word
+    }
 }
 
 /// True for key names that explicitly mark public/non-secret material.
@@ -954,6 +1051,12 @@ mod tests {
         assert!(is_placeholder_value("some-password"));
         assert!(is_placeholder_value("test-user-password"));
         assert!(is_placeholder_value("AAAA/AAA=AAAAAAAA"));
+        assert!(is_placeholder_value("i*******************"));
+        assert!(is_placeholder_value("ac******************"));
+        assert!(is_placeholder_value("###ORACLE_PWD###"));
+        assert!(is_placeholder_value(
+            "__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__"
+        ));
         assert!(!is_placeholder_value("tenant-7-trial"));
         assert!(!is_placeholder_value(
             "https://example.org/path?token=abc123"
@@ -968,6 +1071,9 @@ mod tests {
         assert!(!is_placeholder_value("OLD_LET_ME_IN-1"));
         assert!(!is_placeholder_value("secret1"));
         assert!(!is_placeholder_value("my-service-token-2026"));
+        assert!(!is_placeholder_value("abc***def123"));
+        assert!(!is_placeholder_value("__PROD_SECRET__"));
+        assert!(!is_placeholder_value("###tenant-7-trial###"));
     }
 
     #[test]

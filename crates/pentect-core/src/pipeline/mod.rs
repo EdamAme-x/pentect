@@ -1715,6 +1715,45 @@ mod tests {
     }
 
     #[test]
+    fn json_uuid_order_arrays_are_structural_identifiers() {
+        let raw = r#"{
+  "order": [
+    "a3c06711-df97-c6ce-ddc7-e7bc4fa3909b",
+    "fb6ee58b-8fe0-6dcd-91ff-664b7ad9c6e7",
+    "a4245388-8054-a8fe-36fc-4c5425003af2"
+  ],
+  "values": ["550e8400-e29b-41d4-a716-446655440000"]
+}"#;
+        let r = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Json,
+                data: raw.to_string(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(
+            !r.masked.contains("a3c06711-df97-c6ce-ddc7-e7bc4fa3909b"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            !r.masked.contains("fb6ee58b-8fe0-6dcd-91ff-664b7ad9c6e7"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            !r.masked.contains("a4245388-8054-a8fe-36fc-4c5425003af2"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            r.masked.contains("550e8400-e29b-41d4-a716-446655440000"),
+            "{}",
+            r.masked
+        );
+    }
+
+    #[test]
     fn encoded_entropy_blob_masks_under_default_profile() {
         use data_encoding::BASE64;
         let bytes: Vec<u8> = (0u8..24)

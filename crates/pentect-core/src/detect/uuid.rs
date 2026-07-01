@@ -90,16 +90,55 @@ fn is_patterned_placeholder_uuid(value: &str) -> bool {
     if groups.len() != 5 {
         return false;
     }
-    const ORDERED_HEX_MARKERS: [&str; 17] = [
-        "0123", "1234", "2345", "3456", "4567", "5678", "6789", "7890", "8765", "7654", "6543",
-        "5432", "4321", "3210", "2109", "abcd", "dcba",
-    ];
     let compact = groups.join("").to_ascii_lowercase();
-    let marker_hits = ORDERED_HEX_MARKERS
+    let repeated_group_chars = groups
         .iter()
-        .filter(|marker| compact.matches(**marker).count() > 0)
+        .filter(|group| group.len() >= 4 && group.bytes().all(|b| b == group.as_bytes()[0]))
+        .map(|group| group.len())
+        .sum::<usize>();
+    let repeated_group_count = groups
+        .iter()
+        .filter(|group| group.len() >= 4 && group.bytes().all(|b| b == group.as_bytes()[0]))
         .count();
-    marker_hits >= 4
+    let (sequence_total, sequence_longest) = monotonic_hex_sequence_score(&compact);
+    sequence_total >= 24
+        || (sequence_total >= 16 && sequence_longest >= 6)
+        || (repeated_group_count >= 3 && repeated_group_chars + sequence_total >= 24)
+}
+
+fn monotonic_hex_sequence_score(value: &str) -> (usize, usize) {
+    const ASC: &[u8] = b"0123456789abcdef";
+    const DESC: &[u8] = b"fedcba9876543210";
+    let asc = monotonic_hex_sequence_score_for(value.as_bytes(), ASC);
+    let desc = monotonic_hex_sequence_score_for(value.as_bytes(), DESC);
+    (asc.0 + desc.0, asc.1.max(desc.1))
+}
+
+fn monotonic_hex_sequence_score_for(value: &[u8], order: &[u8]) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut longest = 0usize;
+    let mut i = 0usize;
+    while i < value.len() {
+        let mut best = 0usize;
+        for start in 0..order.len() {
+            let mut len = 0usize;
+            while i + len < value.len()
+                && start + len < order.len()
+                && value[i + len] == order[start + len]
+            {
+                len += 1;
+            }
+            best = best.max(len);
+        }
+        if best >= 3 {
+            total += best;
+            longest = longest.max(best);
+            i += best;
+        } else {
+            i += 1;
+        }
+    }
+    (total, longest)
 }
 
 fn is_uuid_anchored(text: &str, start: usize, ctx: &crate::model::Context) -> bool {
@@ -333,6 +372,8 @@ fn has_uuid_anchor_name(value: &str) -> bool {
             | "kid"
             | "state"
             | "code"
+            | "order"
+            | "lineage"
             | "token"
             | "authtoken"
             | "refreshtoken"
@@ -521,6 +562,21 @@ mod tests {
                 "750e8400-e29b-41d4-a716-446655440002".to_string(),
             ]
         );
+        let random_collection = r#"{
+  "order": [
+    "a3c06711-df97-c6ce-ddc7-e7bc4fa3909b",
+    "fb6ee58b-8fe0-6dcd-91ff-664b7ad9c6e7",
+    "a4245388-8054-a8fe-36fc-4c5425003af2"
+  ]
+}"#;
+        assert_eq!(
+            hits(random_collection),
+            vec![
+                "a3c06711-df97-c6ce-ddc7-e7bc4fa3909b".to_string(),
+                "fb6ee58b-8fe0-6dcd-91ff-664b7ad9c6e7".to_string(),
+                "a4245388-8054-a8fe-36fc-4c5425003af2".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -550,8 +606,17 @@ mod tests {
             "1234abcd-12ab-34cd-56ef-1234567890ab",
             "12345678-1234-1234-1234-123456789012",
             "87654321-4321-4321-4321-210987654321",
+            "abcd1234-abcd-1234-abcd-1234abcd1234",
+            "abcdef66-7777-8888-9999-000000fedcba",
         ] {
             assert!(hits(&format!("client_id = {uuid}")).is_empty(), "{uuid}");
+        }
+        for uuid in [
+            "a3c06711-df97-c6ce-ddc7-e7bc4fa3909b",
+            "fb6ee58b-8fe0-6dcd-91ff-664b7ad9c6e7",
+            "abcd12f2-46da-4fdb-b8d5-fbd4c466928f",
+        ] {
+            assert_eq!(hits(&format!("client_id = {uuid}")), vec![uuid], "{uuid}");
         }
     }
 }
