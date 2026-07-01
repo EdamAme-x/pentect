@@ -1,0 +1,34 @@
+# Placeholder components for database/queue URI userinfo.
+#
+# Format: kind:pattern
+# Matching is done after identifier normalization. These are intentionally
+# generic example words; concrete-looking passwords are handled by shape.
+user:user
+user:username
+user:testuser
+user:root
+user:postgres
+user:guest
+user:dbuser
+user:foo
+user:bar
+user:baz
+
+password:pass
+password:password
+password:passwd
+password:pwd
+password:secret
+password:test
+password:testpwd
+password:root
+password:guest
+password:foo
+password:bar
+password:baz
+password:yeah
+password:mypass
+password:dbpassword
+
+password_contains:test
+password_prefix:password_

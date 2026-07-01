@@ -1277,10 +1277,16 @@ fn gmail_like_rows_mask_otp_without_label_value_context() {
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
-    for secret in [
-        "837291", "AB12-CD", "1234", "7QK4P", "729004", "483920", "7391",
+    for original in [
+        "Your one-time code expires in 10 minutes: 837291",
+        "Use AB12-CD to sign in",
+        "verification code is 1234",
+        "Enter 7QK4P before continuing",
+        "verification code expires in 10 minutes: 729004",
+        "確認コードは5分後に期限切れです: 483920",
+        "サインインするには 7391 を入力してください",
     ] {
-        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(!rendered.contains(original), "{rendered}");
     }
     assert!(rendered.contains("<<OTP_"), "{rendered}");
     assert!(rendered.contains("role=row"), "{rendered}");

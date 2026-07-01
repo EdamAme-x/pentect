@@ -911,6 +911,7 @@ pub enum Validator {
     DbConnectionString,
     BearerToken,
     SqlPasswordValue,
+    TwilioApiKey,
 }
 
 impl Validator {
@@ -960,6 +961,7 @@ impl Validator {
             "db_connection_string" => Validator::DbConnectionString,
             "bearer_token" => Validator::BearerToken,
             "sql_password_value" => Validator::SqlPasswordValue,
+            "twilio_api_key" => Validator::TwilioApiKey,
             _ => return None,
         })
     }
@@ -1007,8 +1009,23 @@ impl Validator {
             Validator::DbConnectionString => db_connection_string(s),
             Validator::BearerToken => bearer_token(s),
             Validator::SqlPasswordValue => sql_password_value(s),
+            Validator::TwilioApiKey => twilio_api_key(s),
         }
     }
+}
+
+pub fn twilio_api_key(s: &str) -> bool {
+    // Twilio API keys are `SK` plus 32 hex characters. Repeated-body examples
+    // such as `SKaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` are documentation/test
+    // placeholders, not issued random key material.
+    let Some(body) = s.strip_prefix("SK") else {
+        return false;
+    };
+    body.len() == 32
+        && body.bytes().all(|b| b.is_ascii_hexdigit())
+        && body
+            .bytes()
+            .any(|b| !b.eq_ignore_ascii_case(&body.as_bytes()[0]))
 }
 
 pub fn sql_password_value(s: &str) -> bool {
@@ -1110,9 +1127,10 @@ fn is_placeholder_bearer_token(token: &str) -> bool {
 
 pub fn db_connection_string(s: &str) -> bool {
     // RFC 3986 userinfo can be concrete credentials, but documentation often
-    // spells optional userinfo with bracket/angle/template markers. The regex
-    // finds URI-shaped candidates; this validator rejects only those public
-    // template/redaction forms and keeps ordinary `user:password@host` strings.
+    // spells optional userinfo with bracket/angle/template markers, or with
+    // placeholder user/password pairs against local/example hosts. The regex
+    // finds URI-shaped candidates; this validator rejects those public
+    // documentation forms and keeps concrete-looking credentials.
     let Some((_, rest)) = s.split_once("://") else {
         return false;
     };
@@ -1126,10 +1144,15 @@ pub fn db_connection_string(s: &str) -> bool {
     let Some((user, password)) = userinfo.split_once(':') else {
         return false;
     };
-    !user.is_empty()
-        && !password.is_empty()
-        && !userinfo_part_is_template_or_redaction(user)
-        && !userinfo_part_is_template_or_redaction(password)
+    if user.is_empty()
+        || password.is_empty()
+        || userinfo_part_is_template_or_redaction(user)
+        || userinfo_part_is_template_or_redaction(password)
+    {
+        return false;
+    }
+    !(db_host_is_documentation_target(host)
+        && userinfo_parts_are_documentation_placeholders(user, password))
 }
 
 fn userinfo_is_template_or_redaction(userinfo: &str) -> bool {
@@ -1145,6 +1168,106 @@ fn userinfo_part_is_template_or_redaction(part: &str) -> bool {
         || part
             .bytes()
             .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b'*'))
+}
+
+fn userinfo_parts_are_documentation_placeholders(user: &str, password: &str) -> bool {
+    db_user_is_placeholder(user) && db_password_is_placeholder(password)
+}
+
+fn db_user_is_placeholder(user: &str) -> bool {
+    let normalized = normalize_doc_db_token(user);
+    matches!(
+        normalized.as_str(),
+        "user"
+            | "username"
+            | "uname"
+            | "test"
+            | "testuser"
+            | "root"
+            | "admin"
+            | "my_user"
+            | "myuser"
+    )
+}
+
+fn db_password_is_placeholder(password: &str) -> bool {
+    let normalized = normalize_doc_db_token(password);
+    matches!(
+        normalized.as_str(),
+        "pass"
+            | "password"
+            | "passwd"
+            | "pwd"
+            | "secret"
+            | "test"
+            | "testpwd"
+            | "xxxx"
+            | "my_password"
+            | "mypassword"
+    )
+}
+
+fn normalize_doc_db_token(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn db_host_is_documentation_target(host: &str) -> bool {
+    host.split(',')
+        .map(db_host_without_port)
+        .all(db_single_host_is_documentation_target)
+}
+
+fn db_host_without_port(host: &str) -> &str {
+    let host = host
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let Some((without_port, port)) = host.rsplit_once(':') else {
+        return host;
+    };
+    if port.bytes().all(|b| b.is_ascii_digit()) && !without_port.contains(']') {
+        without_port
+    } else {
+        host
+    }
+}
+
+fn db_single_host_is_documentation_target(host: &str) -> bool {
+    let host = host
+        .trim()
+        .trim_matches(|ch| matches!(ch, '[' | ']'))
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    matches!(
+        host.as_str(),
+        "localhost"
+            | "127.0.0.1"
+            | "::1"
+            | "host"
+            | "server"
+            | "remotehost"
+            | "postgres"
+            | "postgreshost.com"
+            | "path.to.some-url"
+    ) || host.ends_with(".example.com")
+        || host.ends_with(".example.org")
+        || host.ends_with(".example.net")
+        || host == "example.com"
+        || host == "example.org"
+        || host == "example.net"
+        || host.ends_with(".test")
+        || host
+            .split('.')
+            .any(|label| label == "test" || label.starts_with("test-") || label.ends_with("-test"))
 }
 
 #[cfg(test)]
@@ -1216,6 +1339,19 @@ mod tests {
     }
 
     #[test]
+    fn twilio_api_key_rejects_repeated_placeholders() {
+        let real_shape = format!("SK{}", "0123456789abcdef".repeat(2));
+        let lower_placeholder = format!("SK{}", "a".repeat(32));
+        let upper_placeholder = format!("SK{}", "A".repeat(32));
+        let account_sid = format!("AC{}", "0123456789abcdef".repeat(2));
+
+        assert!(twilio_api_key(&real_shape));
+        assert!(!twilio_api_key(&lower_placeholder));
+        assert!(!twilio_api_key(&upper_placeholder));
+        assert!(!twilio_api_key(&account_sid));
+    }
+
+    #[test]
     fn sql_password_value_rejects_clause_keywords_and_placeholders() {
         vectors!(sql_password_value,
             "hunter2" => true,
@@ -1228,15 +1364,18 @@ mod tests {
     }
 
     #[test]
-    fn db_connection_strings_reject_uri_templates_only() {
+    fn db_connection_strings_reject_templates_and_doc_placeholders() {
         vectors!(db_connection_string,
             "postgresql://admin:s3cr3t@db.host:5432/sales" => true,
             "mysql://svc:p4ss@localhost" => true,
-            "mysql://user:secret@localhost" => true,
-            "mysql://user:pass@localhost" => true,
-            "postgresql://username:password@localhost" => true,
-            "postgresql://testuser:testpwd@localhost" => true,
             "mysql://ofh:ab12c!?@db.example.internal/name" => true,
+            "postgres://root:hunter2@localhost" => true,
+            "mysql://user:secret@localhost" => false,
+            "mysql://user:pass@localhost" => false,
+            "postgresql://username:password@localhost" => false,
+            "postgresql://testuser:testpwd@localhost" => false,
+            "postgres://my-user:my-password@example.com:5432" => false,
+            "postgres://user:password@host" => false,
             "postgresql://[user[:password]@][host][:port][" => false,
             "mongodb://username:<password>@cluster0.example.com:27017" => false,
             "redis://***:***@localhost:6379" => false);

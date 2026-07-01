@@ -138,9 +138,27 @@ impl StructuredKeyNameSet {
     }
 
     fn matches_components(&self, parts: &[&str]) -> bool {
-        parts
-            .iter()
-            .all(|part| self.components.iter().any(|known| known == part))
+        parts.iter().all(|part| self.matches_component(part))
+    }
+
+    fn matches_component(&self, part: &str) -> bool {
+        if self.components.iter().any(|known| known == part) {
+            return true;
+        }
+        if let Some(stem) = part.strip_suffix('s') {
+            if stem.len() >= 3 && self.components.iter().any(|known| known == stem) {
+                return true;
+            }
+        }
+        if let Some(stem) = part.strip_suffix("ies") {
+            if stem.len() >= 3 {
+                let singular = format!("{stem}y");
+                if self.components.iter().any(|known| known == &singular) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -169,13 +187,13 @@ impl SourceFixtureSecretSet {
     }
 
     fn matches(&self, key_name: &str, value: &str) -> bool {
-        let key = normalize_identifier(key_name);
-        if !key
-            .split('_')
-            .any(|part| self.key_components.iter().any(|known| known == part))
-        {
+        if !self.matches_key_context(key_name) {
             return false;
         }
+        self.matches_value(value)
+    }
+
+    fn matches_value(&self, value: &str) -> bool {
         let value = normalize_identifier(value);
         self.values.iter().any(|pattern| match pattern {
             FixtureValuePattern::Exact(pattern) => value == *pattern,
@@ -183,6 +201,12 @@ impl SourceFixtureSecretSet {
             FixtureValuePattern::Suffix(pattern) => value.ends_with(pattern),
             FixtureValuePattern::Contains(pattern) => value.contains(pattern),
         })
+    }
+
+    fn matches_key_context(&self, key_name: &str) -> bool {
+        let key = normalize_identifier(key_name);
+        key.split('_')
+            .any(|part| self.key_components.iter().any(|known| known == part))
     }
 }
 
@@ -237,7 +261,212 @@ impl SourceSecretNameSet {
 /// ("redacted", "removed", "your_*", "value1"). They are not entropy shortcuts
 /// and do not suppress arbitrary low-entropy values.
 pub(crate) fn is_placeholder_value(value: &str) -> bool {
-    VALUE_MATCHER.matches(&normalize_identifier(value)) || is_documentation_value(value)
+    VALUE_MATCHER.matches(&normalize_identifier(value))
+        || is_documentation_value(value)
+        || is_compositional_placeholder_secret_name(value)
+        || is_repeated_marker_placeholder_value(value)
+        || is_masked_prefix_placeholder_value(value)
+        || is_delimited_identifier_placeholder_value(value)
+}
+
+fn is_compositional_placeholder_secret_name(value: &str) -> bool {
+    // Placeholder secret names often describe the slot instead of carrying the
+    // credential: `my_api_key`, `some-password`, or `test-user-password`.
+    // Require an explicit placeholder owner plus a credential component so
+    // ordinary values such as `tenant-7-trial` and `secret1` still detect.
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let normalized = normalize_identifier(value);
+    let compact = normalized.replace('_', "");
+    if compact.starts_with("notareal")
+        && contains_any(
+            &compact,
+            &["password", "passwd", "secret", "token", "key", "credential"],
+        )
+    {
+        return true;
+    }
+
+    let parts = normalized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2
+        || !parts
+            .iter()
+            .any(|part| is_placeholder_secret_component(part))
+    {
+        return false;
+    }
+    let Some(first) = parts.first().copied() else {
+        return false;
+    };
+    is_placeholder_owner_component(first)
+        && parts
+            .iter()
+            .all(|part| is_placeholder_secret_name_component(part))
+}
+
+fn is_placeholder_owner_component(part: &str) -> bool {
+    matches!(
+        part,
+        "my" | "some" | "test" | "sample" | "fake" | "dummy" | "example" | "not" | "notareal"
+    )
+}
+
+fn is_placeholder_secret_component(part: &str) -> bool {
+    matches!(
+        part,
+        "password" | "passwd" | "pass" | "secret" | "token" | "key" | "credential"
+    )
+}
+
+fn is_placeholder_secret_name_component(part: &str) -> bool {
+    is_placeholder_owner_component(part)
+        || is_placeholder_secret_component(part)
+        || matches!(
+            part,
+            "api"
+                | "auth"
+                | "oauth"
+                | "access"
+                | "consumer"
+                | "client"
+                | "private"
+                | "public"
+                | "db"
+                | "database"
+                | "user"
+                | "value"
+                | "url"
+        )
+}
+
+fn is_repeated_marker_placeholder_value(value: &str) -> bool {
+    // Repeated marker payloads (`xxxx`, `AAAA/AAA=AAAA`) are fixture/doc
+    // sentinels. The whole value must be one repeated alphabetic marker plus
+    // harmless separators, so mixed or random-looking tokens remain visible.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !(4..=128).contains(&value.len()) {
+        return false;
+    }
+    let mut marker = None;
+    let mut marker_count = 0usize;
+    let mut separator_count = 0usize;
+    for byte in value.bytes() {
+        if byte.is_ascii_alphabetic() {
+            let normalized = byte.to_ascii_lowercase();
+            match marker {
+                Some(previous) if previous == normalized => {}
+                None => marker = Some(normalized),
+                _ => return false,
+            }
+            marker_count += 1;
+        } else if matches!(byte, b'-' | b'_' | b'.' | b'+' | b'/' | b'=') {
+            separator_count += 1;
+        } else {
+            return false;
+        }
+    }
+    marker_count >= 4 && (separator_count > 0 || marker_count == value.len())
+}
+
+fn is_masked_prefix_placeholder_value(value: &str) -> bool {
+    // Logs and docs often show irrecoverable secret previews such as
+    // `ab********` or `i*******************`. They prove a value was already
+    // redacted, not that reusable material is present.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let bytes = value.as_bytes();
+    if !(8..=128).contains(&bytes.len()) {
+        return false;
+    }
+    let Some(first_star) = bytes.iter().position(|b| *b == b'*') else {
+        return false;
+    };
+    let prefix = &bytes[..first_star];
+    let stars = &bytes[first_star..];
+    !prefix.is_empty()
+        && prefix.len() <= 8
+        && prefix.iter().all(u8::is_ascii_alphanumeric)
+        && stars.len() >= 6
+        && stars.iter().all(|b| *b == b'*')
+        && stars.len() * 2 >= bytes.len()
+}
+
+fn is_delimited_identifier_placeholder_value(value: &str) -> bool {
+    // Template systems use visibly delimited replacement tokens:
+    // `###ORACLE_PWD###` or `__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__`.
+    // Require matching delimiter runs and an identifier-like body so real
+    // punctuation-heavy passwords are not hidden.
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let bytes = value.as_bytes();
+    if !(8..=160).contains(&bytes.len()) {
+        return false;
+    }
+    let marker = bytes[0];
+    if marker.is_ascii_alphanumeric() || marker.is_ascii_whitespace() {
+        return false;
+    }
+    let leading = bytes.iter().take_while(|b| **b == marker).count();
+    let trailing = bytes.iter().rev().take_while(|b| **b == marker).count();
+    if leading < 2 || trailing < 2 || leading + trailing >= bytes.len() {
+        return false;
+    }
+    let body = &value[leading..value.len() - trailing];
+    if body.is_empty()
+        || body.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'.'))
+        })
+        || !body.bytes().any(|b| b.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    let normalized = normalize_identifier(body);
+    let parts = normalized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return false;
+    }
+    let has_placeholder_word = parts.iter().any(|part| {
+        matches!(
+            *part,
+            "todo"
+                | "your"
+                | "own"
+                | "generate"
+                | "generated"
+                | "placeholder"
+                | "replace"
+                | "replaced"
+                | "set"
+                | "change"
+                | "changeme"
+        )
+    });
+    let has_secret_word = parts.iter().any(|part| {
+        matches!(
+            *part,
+            "key" | "pwd" | "pass" | "password" | "passwd" | "secret" | "token" | "credential"
+        )
+    });
+    let has_placeholder_value_word = parts
+        .iter()
+        .any(|part| matches!(*part, "random" | "value" | "here"));
+    if marker == b'_' {
+        has_placeholder_word && (has_secret_word || has_placeholder_value_word)
+    } else {
+        has_placeholder_word || has_secret_word
+    }
 }
 
 /// True for key names that explicitly mark public/non-secret material.
@@ -295,6 +524,24 @@ pub(crate) fn is_source_fixture_secret_value(key_name: &str, value: &str) -> boo
     SOURCE_FIXTURE_SECRET_MATCHER.matches(key_name, value)
 }
 
+/// True for weak/synthetic fixture values, independent of the key name.
+///
+/// Rationale: callers must prove source/object fixture shape before using this.
+/// The value list stays data-driven here so detectors do not grow ad hoc
+/// benchmark strings.
+pub(crate) fn is_source_fixture_secret_sample_value(value: &str) -> bool {
+    SOURCE_FIXTURE_SECRET_MATCHER.matches_value(value)
+}
+
+/// True when a source identifier explicitly marks fixture/test/example context.
+///
+/// Rationale: some fixture credentials are weak by shape rather than by an
+/// exact sentinel value. Keep the vocabulary in the shared pattern file so
+/// detector code can require fixture context without duplicating word lists.
+pub(crate) fn is_source_fixture_key_context(key_name: &str) -> bool {
+    SOURCE_FIXTURE_SECRET_MATCHER.matches_key_context(key_name)
+}
+
 /// True for public cryptographic test-vector identifiers, not key material.
 ///
 /// Rationale: NIST/SEC-style test vectors often label cases with values such as
@@ -318,6 +565,27 @@ pub(crate) fn is_crypto_test_vector_identifier_value(value: &str) -> bool {
         && is_crypto_test_vector_identifier_part(second)
 }
 
+/// True for byte-pattern fixtures such as `000102...` or repeated-byte blocks.
+///
+/// Rationale: published crypto fixtures and RFC examples often use visual byte
+/// sequences, repeated sentinels, or canonical nibble patterns to make expected
+/// values auditable. Generated secrets can contain these locally, but not as
+/// the whole value split into obvious runs. This is used only to suppress raw
+/// entropy/keyed guesses; specific private-key and vendor validators still run.
+pub(crate) fn is_synthetic_hex_test_vector_value(value: &str) -> bool {
+    let value = value.trim();
+    if is_canonical_hex_fixture_literal(value) {
+        return true;
+    }
+    let Some(bytes) = decode_hex_literal(value) else {
+        return false;
+    };
+    if bytes.len() < 8 {
+        return false;
+    }
+    is_segmented_hex_fixture_bytes(&bytes)
+}
+
 fn is_crypto_test_vector_identifier_part(value: &str) -> bool {
     let value = value.trim();
     if !(5..=96).contains(&value.len())
@@ -334,6 +602,88 @@ fn is_crypto_test_vector_identifier_part(value: &str) -> bool {
         || is_role_named_curve_test_case_id(base)
         || is_standalone_named_curve_test_case_id(base)
         || is_edwards_test_case_id(base)
+}
+
+fn decode_hex_literal(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 16
+        || bytes.len() > 1024
+        || !bytes.len().is_multiple_of(2)
+        || !bytes.iter().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        decoded.push((high << 4) | low);
+    }
+    Some(decoded)
+}
+
+fn is_segmented_hex_fixture_bytes(bytes: &[u8]) -> bool {
+    let mut pos = 0;
+    let mut segments = 0;
+    while pos < bytes.len() {
+        let repeated = same_byte_run_len(&bytes[pos..]);
+        if repeated >= 4 {
+            pos += repeated;
+            segments += 1;
+            continue;
+        }
+        let stepped = byte_step_run_len(&bytes[pos..], 1).max(byte_step_run_len(&bytes[pos..], -1));
+        if stepped >= 8 {
+            pos += stepped;
+            segments += 1;
+            continue;
+        }
+        return false;
+    }
+    segments > 0
+}
+
+fn same_byte_run_len(bytes: &[u8]) -> usize {
+    let Some(first) = bytes.first() else {
+        return 0;
+    };
+    bytes.iter().take_while(|byte| *byte == first).count()
+}
+
+fn byte_step_run_len(bytes: &[u8], step: i16) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut len = 1;
+    for pair in bytes.windows(2) {
+        if i16::from(pair[1]) - i16::from(pair[0]) != step {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+fn is_canonical_hex_fixture_literal(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "0123456789abcdef",
+            "fedcba9876543210",
+            "00112233445566778899aabbccddeeff",
+            "ffeeddccbbaa99887766554433221100",
+        ],
+    )
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn strip_crypto_test_vector_public_suffix(value: &str) -> &str {
@@ -531,17 +881,17 @@ fn is_generic_key_config_path_value(value: &str) -> bool {
 
 fn is_generic_key_resource_name_value(value: &str) -> bool {
     // Generic JSON `key` fields commonly store public label/header/resource
-    // names in kebab syntax. Digits and sensitive components are excluded so
-    // low-entropy real values such as `tenant-7-trial` and `sk-test-token` stay
-    // detectable.
+    // names in kebab syntax. Pure numeric parts and sensitive components are
+    // excluded so low-entropy real values such as `tenant-7-trial` and
+    // `sk-test-token` stay detectable. Digit-bearing platform acronyms such as
+    // `k8s-app` remain metadata because they name infrastructure labels.
     let value = value.trim();
     if !(5..=96).contains(&value.len()) || !value.contains('-') {
         return false;
     }
-    if value.bytes().any(|b| b.is_ascii_digit())
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || matches!(b, b'-' | b'/' | b':'))
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'/' | b':'))
     {
         return false;
     }
@@ -558,11 +908,28 @@ fn is_generic_key_resource_name_value(value: &str) -> bool {
         .split(['-', '/', ':'])
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
+    let has_digit = parts
+        .iter()
+        .any(|part| part.bytes().any(|b| b.is_ascii_digit()));
     parts.len() >= 2
+        && (!has_digit
+            || parts
+                .iter()
+                .any(|part| is_public_resource_digit_component(part)))
         && parts.iter().enumerate().all(|(idx, part)| {
             (part == &"x" && idx == 0 || (2..=32).contains(&part.len()))
-                && part.bytes().all(|b| b.is_ascii_lowercase())
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                && part.bytes().any(|b| b.is_ascii_lowercase())
         })
+}
+
+fn is_public_resource_digit_component(part: &str) -> bool {
+    matches!(
+        part,
+        "k8s" | "ipv4" | "ipv6" | "http2" | "s3" | "ec2" | "rds"
+    )
 }
 
 fn is_generic_key_label_value(value: &str) -> bool {
@@ -649,6 +1016,10 @@ pub(crate) fn normalize_identifier(input: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,7 +1040,36 @@ mod tests {
         assert!(is_placeholder_value("192.0.2.10"));
         assert!(is_placeholder_value("https://example.org/path"));
         assert!(is_placeholder_value("<external-data-source>"));
+        assert!(is_placeholder_value("something"));
+        assert!(is_placeholder_value("value"));
+        assert!(is_placeholder_value("whatever"));
+        assert!(is_placeholder_value("dummy"));
+        assert!(is_placeholder_value("ignored"));
         assert!(is_placeholder_value("fake_token"));
+        assert!(is_placeholder_value("x-pack-test-password"));
+        assert!(is_placeholder_value("avoid-plaintext-passwords"));
+        assert!(is_placeholder_value("tftest-new-password"));
+        assert!(is_placeholder_value("foobar"));
+        assert!(is_placeholder_value("foo-bar"));
+        assert!(is_placeholder_value("s3krit-password"));
+        assert!(is_placeholder_value("TESTKEY"));
+        assert!(is_placeholder_value("TESTSECRET"));
+        assert!(is_placeholder_value("NEWTOKEN"));
+        assert!(is_placeholder_value("privatetoken"));
+        assert!(is_placeholder_value("not_my_secret"));
+        assert!(!is_placeholder_value("s3krit-password2"));
+        assert!(is_placeholder_value("t0k3n"));
+        assert!(is_placeholder_value("notarealpassword"));
+        assert!(is_placeholder_value("my_api_key"));
+        assert!(is_placeholder_value("some-password"));
+        assert!(is_placeholder_value("test-user-password"));
+        assert!(is_placeholder_value("AAAA/AAA=AAAAAAAA"));
+        assert!(is_placeholder_value("i*******************"));
+        assert!(is_placeholder_value("ac******************"));
+        assert!(is_placeholder_value("###ORACLE_PWD###"));
+        assert!(is_placeholder_value(
+            "__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__"
+        ));
         assert!(!is_placeholder_value("tenant-7-trial"));
         assert!(!is_placeholder_value(
             "https://example.org/path?token=abc123"
@@ -677,9 +1077,16 @@ mod tests {
         assert!(!is_placeholder_value("letmein123"));
         assert!(!is_placeholder_value("pass"));
         assert!(!is_placeholder_value("changeme"));
+        assert!(!is_placeholder_value("admin123"));
+        assert!(!is_placeholder_value("Password1"));
         assert!(!is_placeholder_value("Test Access Token"));
         assert!(!is_placeholder_value("PROD_SECRET"));
         assert!(!is_placeholder_value("OLD_LET_ME_IN-1"));
+        assert!(!is_placeholder_value("secret1"));
+        assert!(!is_placeholder_value("my-service-token-2026"));
+        assert!(!is_placeholder_value("abc***def123"));
+        assert!(!is_placeholder_value("__PROD_SECRET__"));
+        assert!(!is_placeholder_value("###tenant-7-trial###"));
     }
 
     #[test]
@@ -689,6 +1096,11 @@ mod tests {
         assert!(is_explicitly_non_sensitive_key_name("correlationKey"));
         assert!(is_explicitly_non_sensitive_key_name("TopologyKey"));
         assert!(is_explicitly_non_sensitive_key_name("apiKeyName"));
+        assert!(is_explicitly_non_sensitive_key_name("authMethod"));
+        assert!(is_explicitly_non_sensitive_key_name(
+            "serverHostKeyAlgorithm"
+        ));
+        assert!(is_explicitly_non_sensitive_key_name("passwordLastUsed"));
         assert!(is_explicitly_non_sensitive_key_name(
             "PasswordStoreDirEnvar"
         ));
@@ -722,6 +1134,8 @@ mod tests {
         assert!(is_source_secret_name_reference_value("clientsecret"));
         assert!(is_source_secret_name_reference_value("TestAuthToken"));
         assert!(is_source_secret_name_reference_value("my_password"));
+        assert!(is_source_secret_name_reference_value("bot_api_token"));
+        assert!(is_source_secret_name_reference_value("private-token"));
         assert!(!is_source_secret_name_reference_value("CustomToken"));
         assert!(!is_source_secret_name_reference_value("PROD_SECRET_VALUE"));
         assert!(!is_source_secret_name_reference_value("tenant-7-trial"));
@@ -738,13 +1152,22 @@ mod tests {
             "expected_access_token",
             "LET_ME_IN-1"
         ));
+        assert!(is_source_fixture_secret_value("dummyLocation", "testing"));
         assert!(is_source_fixture_secret_value("fake_secret", "secret"));
+        assert!(is_source_fixture_secret_sample_value("test123"));
+        assert!(is_source_fixture_secret_sample_value("default-password"));
         assert!(!is_source_fixture_secret_value("password", "pass"));
         assert!(!is_source_fixture_secret_value("access_token", "LET_ME_IN"));
+        assert!(!is_source_fixture_secret_sample_value("tenant-7-trial"));
         assert!(!is_source_fixture_secret_value(
             "expectedPassword",
             "hunter2"
         ));
+        assert!(is_source_fixture_key_context("examplePassword"));
+        assert!(is_source_fixture_key_context("expectPassword"));
+        assert!(is_source_fixture_key_context("stubToken"));
+        assert!(is_source_fixture_key_context("requestSpecPassword"));
+        assert!(!is_source_fixture_key_context("access_token"));
     }
 
     #[test]
@@ -801,6 +1224,26 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_hex_test_vectors_are_shape_gated() {
+        assert!(is_synthetic_hex_test_vector_value(
+            "000102030405060708090A0B0C0D0E0F"
+        ));
+        assert!(is_synthetic_hex_test_vector_value(
+            "00112233445566778899AABBCCDDEEFF"
+        ));
+        assert!(is_synthetic_hex_test_vector_value(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+        ));
+        assert!(!is_synthetic_hex_test_vector_value(
+            "000000000000000036E5F6B5C5E06070F0EFCA96227A863E"
+        ));
+        assert!(!is_synthetic_hex_test_vector_value(
+            "A3F19C80E4B27D51F09A6C33D8E74215"
+        ));
+        assert!(!is_synthetic_hex_test_vector_value("tenant-7-trial"));
+    }
+
+    #[test]
     fn structured_key_name_references_require_identifier_shape() {
         assert!(is_structured_key_name_reference_value("seedUser"));
         assert!(is_structured_key_name_reference_value("smtpDomain"));
@@ -819,9 +1262,23 @@ mod tests {
         assert!(is_structured_key_name_reference_value("offset"));
         assert!(is_structured_key_name_reference_value("host"));
         assert!(is_structured_key_name_reference_value("Vary"));
+        assert!(is_structured_key_name_reference_value("Proxy-Connection"));
+        assert!(is_structured_key_name_reference_value("X-Correlation-Id"));
+        assert!(is_structured_key_name_reference_value("product_id"));
+        assert!(is_structured_key_name_reference_value("user_ids"));
+        assert!(is_structured_key_name_reference_value("source1"));
         assert!(is_structured_key_name_reference_value("panel1"));
         assert!(is_structured_key_name_reference_value("fieldset1"));
         assert!(is_structured_key_name_reference_value("dataGrid12"));
+        assert!(is_structured_key_name_reference_value("field_values"));
+        assert!(is_structured_key_name_reference_value(
+            "connection_policies"
+        ));
+        assert!(is_structured_key_name_reference_value(
+            "task_queues_statistics"
+        ));
+        assert!(is_structured_key_name_reference_value("table1"));
+        assert!(is_structured_key_name_reference_value("checkbox2"));
         assert!(!is_structured_key_name_reference_value("password"));
         assert!(!is_structured_key_name_reference_value("secret"));
         assert!(!is_structured_key_name_reference_value("abcDEF123456"));
@@ -851,9 +1308,20 @@ mod tests {
         assert!(is_structured_generic_key_metadata_value(
             "Access-Control-Allow-Headers"
         ));
+        assert!(is_structured_generic_key_metadata_value("k8s-app"));
+        assert!(is_structured_generic_key_metadata_value(
+            "ovn4nfv-k8s-plugin"
+        ));
         assert!(is_structured_generic_key_metadata_value("string"));
         assert!(is_structured_generic_key_metadata_value("FirstTag"));
         assert!(is_structured_generic_key_metadata_value("foo2"));
+        assert!(is_structured_generic_key_metadata_value("item1"));
+        assert!(is_structured_generic_key_metadata_value("step0"));
+        assert!(is_structured_generic_key_metadata_value("remote_cluster"));
+        assert!(is_structured_generic_key_metadata_value("schema_versions"));
+        assert!(is_structured_generic_key_metadata_value("credential_lists"));
+        assert!(!is_structured_generic_key_metadata_value("remote_token"));
+        assert!(!is_structured_generic_key_metadata_value("cluster_secret"));
         assert!(!is_structured_generic_key_metadata_value("API Key"));
         assert!(!is_structured_generic_key_metadata_value("secret token"));
         assert!(!is_structured_generic_key_metadata_value("sk-test-token"));

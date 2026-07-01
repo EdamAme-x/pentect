@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use super::pattern::{PatternMatchDetector, PatternSpec};
 use super::validate::Validator;
 use super::Detector;
-use crate::model::{labels, Category, Confidence};
+use crate::model::{labels, Category, Confidence, Span};
 use crate::normalize::NormalizedView;
 
 #[derive(Clone, Default)]
@@ -17,13 +17,27 @@ impl Detector for AuthCodeDetector {
         AUTH_CODE_PATTERNS
             .detect(view)
             .into_iter()
-            .filter(|span| {
-                !is_header_name_only_otp_context(view.text(), span.range.start)
-                    && !is_git_file_mode_context(view.text(), span.range.start)
-                    && !is_json_numeric_metadata_context(view.text(), span.range.start)
-            })
+            .filter(|span| !is_non_otp_context(view, span))
             .collect()
     }
+}
+
+fn is_non_otp_context(view: &NormalizedView, span: &Span) -> bool {
+    let Some(norm) = view.to_norm(span.range) else {
+        return false;
+    };
+    if norm.start > view.text().len()
+        || norm.end > view.text().len()
+        || !view.text().is_char_boundary(norm.start)
+        || !view.text().is_char_boundary(norm.end)
+        || norm.start > norm.end
+    {
+        return false;
+    }
+    is_header_name_only_otp_context(view.text(), norm.start)
+        || is_git_file_mode_context(view.text(), norm.start)
+        || is_json_numeric_metadata_context(view.text(), norm.start)
+        || is_large_json_numeric_dump_context(view.text(), norm.start, norm.end)
 }
 
 fn is_header_name_only_otp_context(text: &str, value_start: usize) -> bool {
@@ -57,44 +71,47 @@ fn is_git_file_mode_context(text: &str, value_start: usize) -> bool {
     // Git tree APIs and fixtures use mode values such as `100644`. They are
     // six-digit numbers near words like "code", but the immediate key is
     // filesystem metadata, not an authentication code.
-    if value_start > text.len() {
-        return false;
-    }
-    let line_start = text[..value_start]
-        .rfind('\n')
-        .map_or(0, |offset| offset + 1);
-    let prefix = &text[line_start..value_start];
-    let Some(colon) = prefix.rfind(':') else {
-        return false;
-    };
-    if !prefix[colon + 1..].chars().all(char::is_whitespace) {
-        return false;
-    }
-    let before = prefix[..colon].trim_end();
-    before.ends_with("\"mode\"") || before.ends_with("'mode'") || before.ends_with("\\\"mode\\\"")
+    immediate_jsonish_key_before_value(text, value_start).is_some_and(|key| key == "mode")
 }
 
 fn is_json_numeric_metadata_context(text: &str, value_start: usize) -> bool {
     // Saved API responses put many numeric ids/counts on the same long line as
     // auth-related field names (`login`, `X-GitHub-OTP`). A local JSON key such
     // as `"id": 327146` proves the number is metadata, not an OTP.
-    if value_start > text.len() {
+    let Some(normalized) = immediate_jsonish_key_before_value(text, value_start) else {
+        return false;
+    };
+    is_json_numeric_metadata_key(&normalized)
+}
+
+fn is_large_json_numeric_dump_context(text: &str, value_start: usize, value_end: usize) -> bool {
+    let value = &text[value_start..value_end];
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
     let line_start = text[..value_start]
         .rfind('\n')
         .map_or(0, |offset| offset + 1);
-    let prefix = &text[line_start..value_start];
-    let Some(colon) = prefix.rfind(':') else {
+    let line_end = text[value_end..]
+        .find('\n')
+        .map_or(text.len(), |offset| value_end + offset);
+    let line = &text[line_start..line_end];
+    if line.len() < 2048 || json_key_marker_count(line) < 16 {
+        return false;
+    }
+    let Some(key) = immediate_jsonish_key_before_value(text, value_start) else {
         return false;
     };
-    let before = prefix[..colon].trim_end();
-    let Some(key) = quoted_key_suffix(before) else {
-        return false;
-    };
-    let normalized = normalize_key_name(key);
+    !is_otp_numeric_key(&key)
+}
+
+fn json_key_marker_count(line: &str) -> usize {
+    line.match_indices("\":").take(32).count()
+}
+
+fn is_json_numeric_metadata_key(normalized: &str) -> bool {
     matches!(
-        normalized.as_str(),
+        normalized,
         "id" | "node_id"
             | "size"
             | "count"
@@ -111,6 +128,53 @@ fn is_json_numeric_metadata_context(text: &str, value_start: usize) -> bool {
         || normalized.ends_with("_count")
 }
 
+fn is_otp_numeric_key(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "otp"
+            | "totp"
+            | "mfa"
+            | "2fa"
+            | "passcode"
+            | "verification_code"
+            | "security_code"
+            | "login_code"
+            | "signin_code"
+            | "sign_in_code"
+            | "one_time_code"
+            | "one_time_password"
+    )
+}
+
+fn immediate_jsonish_key_before_value(text: &str, value_start: usize) -> Option<String> {
+    if value_start > text.len() {
+        return None;
+    }
+    let line_start = text[..value_start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let prefix = &text[line_start..value_start];
+    let mut end = prefix.len();
+    while end > 0 && prefix.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end > 0 && matches!(prefix.as_bytes()[end - 1], b'"' | b'\'') {
+        end -= 1;
+        while end > 0 && prefix.as_bytes()[end - 1] == b'\\' {
+            end -= 1;
+        }
+    }
+    while end > 0 && prefix.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 || prefix.as_bytes()[end - 1] != b':' {
+        return None;
+    }
+    let before = prefix[..end - 1].trim_end();
+    let key = quoted_key_suffix(before)?;
+    Some(normalize_key_name(key))
+}
+
 fn quoted_key_suffix(value: &str) -> Option<&str> {
     let quote = value.as_bytes().last().copied()?;
     if !matches!(quote, b'"' | b'\'') {
@@ -118,7 +182,7 @@ fn quoted_key_suffix(value: &str) -> Option<&str> {
     }
     let key_end = value.len() - 1;
     let key_start = value[..key_end].rfind(quote as char)? + 1;
-    let key = &value[key_start..key_end];
+    let key = value[key_start..key_end].trim_end_matches('\\');
     (!key.is_empty()).then_some(key)
 }
 
@@ -227,7 +291,23 @@ mod tests {
         )
         .is_empty());
         assert!(values_for(
+            r#"{"headers":"X-GitHub-OTP","content":"{\"mode\": \"100644\", \"path\": \"foo.py\"}"}"#
+        )
+        .is_empty());
+        assert!(values_for(
             r#"{"headers":"X-GitHub-OTP, Accept-Encoding","actor":{"id":327146,"login":"octo"}}"#
+        )
+        .is_empty());
+        assert!(values_for(
+            r#"[{"type":"DeleteEvent","actor":{"id":327146,"login":"octo"},"avatar_url":"https://example.test/a?d=https%3A%2F%2Fassets.example.test%2Fuser.png"},{"type":"DeleteEvent","actor":{"id":327146,"login":"octo"}}]"#
+        )
+        .is_empty());
+        assert!(values_for(
+            r#"{"headers":"X-GitHub-OTP, Accept-Encoding","content":"{\"actor\":{\"id\":327146,\"login\":\"octo\"}}"}"#
+        )
+        .is_empty());
+        assert!(values_for(
+            r#"[{"id":"1823555573","type":"DeleteEvent","actor":{"id":327146,"login":"octo"},"repo":{"id":3544490,"url":"https://api.example.com/repositories/3544490/events"}}]"#
         )
         .is_empty());
         assert!(values_for(
@@ -236,6 +316,10 @@ mod tests {
         .is_empty());
         assert!(has_value(
             r#"{"headers":"X-GitHub-OTP","id":123,"otp":327146}"#,
+            "327146"
+        ));
+        assert!(has_value(
+            r#"{"url":"https%3A%2F%2Fexample.test","otp":327146,"login":"octo"}"#,
             "327146"
         ));
         assert!(!has_value(

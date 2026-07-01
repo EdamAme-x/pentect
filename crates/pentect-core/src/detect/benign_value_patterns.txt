@@ -25,7 +25,12 @@ exact:redacted
 exact:removed
 exact:deleted
 exact:masked
+exact:ignored
+exact:something
 exact:username
+exact:value
+exact:whatever
+exact:dummy
 
 # Action/parameter placeholders used in sample configuration and generated docs.
 exact:create_a_key
@@ -42,6 +47,22 @@ exact:localhost
 exact:dev_null
 exact:room_name_or_id
 exact:external_data_source
+
+# Explicit test/example placeholders. These carry their own non-production
+# marker and are too weak/synthetic to be useful credential evidence.
+exact:avoid_plaintext_passwords
+exact:foobar
+exact:foo_bar
+exact:s3krit_password
+exact:t0k3n
+exact:testkey
+exact:testsecret
+exact:newtoken
+exact:privatetoken
+exact:x_pack_test_password
+prefix:tftest
+contains:long_and_random
+
 prefix:your_
 prefix:example_
 prefix:fake_

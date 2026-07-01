@@ -120,6 +120,12 @@ fn is_sweepable_identity(raw: &str, span: &Span) -> bool {
     if span.label.as_str() == labels::OTP {
         return false;
     }
+    // UUID/GUID values are stable identifiers but not proof of credential
+    // material when repeated elsewhere. Require local ID-slot context for every
+    // occurrence instead of globally propagating one anchored hit.
+    if span.label.as_str() == labels::UUID {
+        return false;
+    }
     // KeyValueDetector hits are anchored by local key syntax. Repeating the same
     // bytes elsewhere without a key boundary is not enough evidence: code names,
     // fixtures, and public test labels collide heavily with keyed values. Keep
@@ -288,6 +294,23 @@ mod tests {
         assert!(
             swept.is_empty(),
             "short OTP values require local auth context, not global sweep: {swept:?}"
+        );
+    }
+
+    #[test]
+    fn uuid_values_are_not_identity_swept() {
+        let raw = "clientId=550e8400-e29b-41d4-a716-446655440000 later 550e8400-e29b-41d4-a716-446655440000";
+        let first = span(
+            raw,
+            "550e8400-e29b-41d4-a716-446655440000",
+            labels::UUID,
+            Category::Secret,
+            Confidence::Medium,
+        );
+        let swept = swept_ranges(raw, vec![first]);
+        assert!(
+            swept.is_empty(),
+            "UUID repeats need local ID-slot context, not global sweep: {swept:?}"
         );
     }
 

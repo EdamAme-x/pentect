@@ -167,6 +167,41 @@ impl<'a> NormalizedView<'a> {
         ByteRange::new(start, end.max(start))
     }
 
+    /// Map a raw byte range inside this region back to normalized coordinates.
+    ///
+    /// This is primarily for detectors that run through a shared matcher which
+    /// reports raw spans, but still need to inspect normalized local context.
+    /// Ranges produced by `to_raw` round-trip; ranges covering dropped controls
+    /// snap to the nearest normalized segment.
+    pub(crate) fn to_norm(&self, raw: ByteRange) -> Option<ByteRange> {
+        if raw.start < self.region.span.start
+            || raw.end > self.region.span.end
+            || raw.start > raw.end
+        {
+            return None;
+        }
+        if self.identity {
+            return Some(ByteRange::new(
+                raw.start - self.region.span.start,
+                raw.end - self.region.span.start,
+            ));
+        }
+
+        let start_idx = self.segs.partition_point(|s| s.raw.end <= raw.start);
+        let end_idx = self.segs.partition_point(|s| s.raw.start < raw.end);
+        let start = self
+            .segs
+            .get(start_idx)
+            .map(|s| s.norm.start)
+            .unwrap_or_else(|| self.norm.len());
+        let end = end_idx
+            .checked_sub(1)
+            .and_then(|idx| self.segs.get(idx))
+            .map(|s| s.norm.end)
+            .unwrap_or(start);
+        (start <= end).then_some(ByteRange::new(start, end))
+    }
+
     fn raw_start_at(&self, pos: usize) -> usize {
         let idx = self.segs.partition_point(|s| s.norm.end <= pos);
         self.segs
@@ -275,6 +310,33 @@ mod tests {
         assert_eq!(v.text(), "a-b.c");
         assert_eq!(v.to_raw(ByteRange::new(1, 2)), ByteRange::new(1, 7));
         assert_eq!(v.to_raw(ByteRange::new(3, 4)), ByteRange::new(8, 12));
+    }
+
+    #[test]
+    fn raw_ranges_round_trip_to_normalized_offsets() {
+        let raw = r#"a=https%3A%2F%2Fexample.test b=327146 c=x\u002dy"#;
+        let r = region(raw);
+        let v = NormalizedView::build(&r, raw);
+        let b_start = raw.find("327146").unwrap();
+        let raw_range = ByteRange::new(b_start, b_start + "327146".len());
+        assert_eq!(
+            v.to_norm(raw_range),
+            Some(ByteRange::new(
+                v.text().find("327146").unwrap(),
+                v.text().find("327146").unwrap() + "327146".len()
+            ))
+        );
+        let escaped = ByteRange::new(
+            raw.find(r"\u002d").unwrap(),
+            raw.find(r"\u002d").unwrap() + 6,
+        );
+        assert_eq!(
+            v.to_norm(escaped),
+            Some(ByteRange::new(
+                v.text().find("x-y").unwrap() + 1,
+                v.text().find("x-y").unwrap() + 2
+            ))
+        );
     }
 
     #[test]

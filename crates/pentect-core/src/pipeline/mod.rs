@@ -4,13 +4,13 @@ mod render;
 mod sweep;
 
 use crate::detect::{
-    AuthCodeDetector, Bip39Detector, CardDetector, DecodeDetector, Detector, EntropyDetector,
-    EnvValueDetector, KeyValueDetector, PemDetector, PhoneDetector, RuleDetector,
-    SensitiveKeyDetector, StructuralDetector, UrlDetector,
+    AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector, DecodeDetector, Detector,
+    EntropyDetector, EnvValueDetector, KeyValueDetector, PemDetector, PhoneDetector, RuleDetector,
+    SensitiveKeyDetector, StructuralDetector, UrlDetector, UuidDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
-use crate::parse::{EnvParser, JsonParser, Parser, TextParser};
+use crate::parse::{EnvParser, JsonParser, NdjsonParser, Parser, TextParser};
 use crate::policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
 use crate::policy::{
     is_context_free, Action, MaskAll, Policy, Profile, ProfileKnobs, ProfilePolicy,
@@ -485,11 +485,14 @@ impl EngineBuilder {
     /// can silently miss a parser or detector.
     pub fn standard_stack(self, knobs: ProfileKnobs) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
+            .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(UrlDetector))
+            .detector(Box::new(CliCredentialDetector))
             .detector(Box::new(RuleDetector::builtin()))
             .detector(Box::new(KeyValueDetector))
+            .detector(Box::new(UuidDetector))
             .detector(Box::new(AuthCodeDetector))
             .detector(Box::new(Bip39Detector))
             .detector(Box::new(CardDetector))
@@ -601,6 +604,18 @@ mod tests {
             engine.mask(
                 Input {
                     kind: Kind::Json,
+                    data: s.to_string(),
+                },
+                &Config::insecure_testing(),
+            )
+        })
+    }
+
+    fn mn(s: &str) -> MaskResult {
+        with_default_engine(|engine| {
+            engine.mask(
+                Input {
+                    kind: Kind::Ndjson,
                     data: s.to_string(),
                 },
                 &Config::insecure_testing(),
@@ -842,11 +857,32 @@ mod tests {
     }
 
     #[test]
+    fn ndjson_sensitive_values_are_parsed_per_line() {
+        let input = "{\"password\":\"hunter2\"}\n{\"token\":\"abcdef\"}\n";
+        let r = mn(input);
+        assert!(!r.masked.contains("hunter2"), "{}", r.masked);
+        assert!(!r.masked.contains("abcdef"), "{}", r.masked);
+        assert!(r.masked.contains("<<PASSWORD_"), "{}", r.masked);
+        assert!(r.masked.contains("<<TOKEN_"), "{}", r.masked);
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
     fn typescript_password_const_masks_low_entropy_value() {
         let input = r#"const PASSWORD: string = "helloworld1234";"#;
         let r = m(input);
         assert!(!r.masked.contains("helloworld1234"), "{}", r.masked);
         assert!(r.masked.contains("<<KEYED_SECRET_"), "{}", r.masked);
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn explicit_hex_material_masks_as_one_keyed_secret() {
+        let input = "Ctrl.hexpass = hexpass:3004953027298e3289";
+        let r = m(input);
+        assert!(!r.masked.contains("3004953027298e3289"), "{}", r.masked);
+        assert!(r.masked.contains("<<KEYED_SECRET_"), "{}", r.masked);
+        assert_eq!(r.masked.matches("<<").count(), 1, "{}", r.masked);
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
     }
 
@@ -897,6 +933,25 @@ mod tests {
     }
 
     #[test]
+    fn identity_authority_url_masks_tenant_segment() {
+        let input =
+            "see https://login.microsoftonline.com/77d0f286-f938-918d-b0ce-f5bb58ff02d7 now";
+        let r = m(input);
+        assert!(
+            r.masked
+                .contains("https://login.microsoftonline.com/<<UUID_"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            !r.masked.contains("77d0f286-f938-918d-b0ce-f5bb58ff02d7"),
+            "{}",
+            r.masked
+        );
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
     fn internal_url_does_not_leak_userinfo_query_or_fragment() {
         let input = "open http://user:pass@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456.";
         let r = m(input);
@@ -912,7 +967,7 @@ mod tests {
             r.masked
         );
         assert!(
-            r.masked.contains("?token=<<URL_QUERY_VALUE_"),
+            r.masked.contains("?token=<<URL_CREDENTIAL_"),
             "{}",
             r.masked
         );
@@ -1681,6 +1736,45 @@ mod tests {
             &Config::insecure_testing(),
         );
         assert!(!r.masked.contains(uuid), "{}", r.masked);
+    }
+
+    #[test]
+    fn json_uuid_order_arrays_are_structural_identifiers() {
+        let raw = r#"{
+  "order": [
+    "a3c06711-df97-c6ce-ddc7-e7bc4fa3909b",
+    "fb6ee58b-8fe0-6dcd-91ff-664b7ad9c6e7",
+    "a4245388-8054-a8fe-36fc-4c5425003af2"
+  ],
+  "values": ["550e8400-e29b-41d4-a716-446655440000"]
+}"#;
+        let r = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Json,
+                data: raw.to_string(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(
+            !r.masked.contains("a3c06711-df97-c6ce-ddc7-e7bc4fa3909b"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            !r.masked.contains("fb6ee58b-8fe0-6dcd-91ff-664b7ad9c6e7"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            !r.masked.contains("a4245388-8054-a8fe-36fc-4c5425003af2"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            r.masked.contains("550e8400-e29b-41d4-a716-446655440000"),
+            "{}",
+            r.masked
+        );
     }
 
     #[test]

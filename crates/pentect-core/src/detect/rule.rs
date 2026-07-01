@@ -105,11 +105,16 @@ impl RuleDetector {
                 "GOOGLE_OAUTH_TOKEN",
                 High,
             ),
+            (
+                r"glsa_[A-Za-z0-9_-]{32,}",
+                Secret,
+                "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+                High,
+            ),
             // Fine-grained PAT; distinct format from the classic gh*_ family.
             (r"github_pat_[A-Za-z0-9_]{22,}", Secret, "GITHUB_PAT", High),
             // Classic GitHub token family (p/o/u/s/r) is one format, so one rule.
             (r"gh[oprsu]_[A-Za-z0-9]{36}", Secret, "GITHUB_TOKEN", High),
-            (r"SK[0-9a-fA-F]{32}", Secret, "TWILIO_API_KEY", Medium),
             (
                 r"AC[0-9a-fA-F]{32}",
                 Identifier,
@@ -152,8 +157,12 @@ impl RuleDetector {
                 "SQUARE_TOKEN",
                 Medium,
             ),
+            // Mailgun private API keys are prefix-anchored (`key-`) and use a
+            // lowercase alphanumeric body; requiring hex drops valid keys.
+            // Keep the historical `pubkey-` branch narrower because public
+            // validation keys are less clearly secret material.
             (
-                r"(?:key|pubkey)-[a-f0-9]{32}",
+                r"(?:key-[a-z0-9]{32}|pubkey-[a-f0-9]{32})",
                 Secret,
                 "MAILGUN_API_KEY",
                 Medium,
@@ -354,6 +363,7 @@ impl RuleDetector {
             (r"\b\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{4}\b", Pii, "CARD", High, V::Luhn),
             (r"\b\d{4}[ -]\d{6}[ -]\d{5}\b", Pii, "CARD", High, V::Luhn),
             (r"\b\d{4}[ -]\d{6}[ -]\d{4}\b", Pii, "CARD", High, V::Luhn),
+            (r"SK[0-9a-fA-F]{32}", Secret, "TWILIO_API_KEY", Medium, V::TwilioApiKey),
             (r"\b[12][0-9]{3}[- ]?[0-9]{3}[- ]?[0-9]{3}\b", Identifier, "US_NPI", High, V::UsNpi),
             (r"\bIT[0-9]{11}\b", Identifier, "IT_VAT_CODE", High, V::Luhn),
             (r"(?i)social insurance[^\n]{0,15}?\b[1-79]\d{2}[ -]?\d{3}[ -]?\d{3}\b", Pii, "CA_SIN", High, V::CaSin),
@@ -386,10 +396,6 @@ impl RuleDetector {
             (r"\b[12][0-9]{4}(?:[0-9]{2}|2[AB])[0-9]{8}\b", Identifier, "FR_NIR_INSEE", High, V::FrNir),
             (r"(?i)(?:acn|company number)[^\n]{0,12}?\b\d{3}[ ]?\d{3}[ ]?\d{3}\b", Identifier, "AU_ACN", High, V::AuAcn),
             (r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b", Identifier, "IN_GSTIN", High, V::InGstin),
-            // Connection strings are credential-bearing only when the userinfo
-            // is concrete. Docs/templates such as `[user[:password]@]` and
-            // `<password>` are filtered by the validator.
-            (r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?)://[^\s:/@]+:[^\s:/@]+@[^\s/?#]+", Secret, "DB_CONNECTION_STRING", High, V::DbConnectionString),
         ];
         #[rustfmt::skip]
         let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
@@ -500,6 +506,7 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         "GOOGLE_API_KEY" => &["AIza"],
         "GOOGLE_OAUTH_SECRET" => &["GOCSPX-"],
         "GOOGLE_OAUTH_TOKEN" => &["ya29."],
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN" => &["glsa_"],
         "GITHUB_PAT" => &["github_pat_"],
         "GITHUB_TOKEN" => &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"],
         "SENDGRID_KEY" => &["SG."],
@@ -507,6 +514,7 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         "DIGITALOCEAN_TOKEN" => &["dop_v1_", "doo_v1_", "dor_v1_"],
         "SHOPIFY_TOKEN" => &["shpat_", "shpca_", "shppa_", "shpss_"],
         "SQUARE_TOKEN" => &["EAAA", "sq0atp-", "sq0csp-"],
+        "MAILGUN_API_KEY" => &["key-", "pubkey-"],
         "GCP_PRIVATE_KEY_ID" => &["private_key_id"],
         "DATADOG_API_KEY" => &[
             "datadog",
@@ -522,17 +530,6 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
             "session", "sid", "jwt", "cookie", "auth", "access", "refresh",
         ],
         "BASIC_AUTH" => &["Basic ", "Basic\t"],
-        "DB_CONNECTION_STRING" => &[
-            "postgres://",
-            "postgresql://",
-            "mysql://",
-            "mongodb://",
-            "mongodb+srv://",
-            "redis://",
-            "rediss://",
-            "amqp://",
-            "amqps://",
-        ],
         "URL" => &["://"],
         "US_PASSPORT" | "UK_PASSPORT" | "ES_PASSPORT" | "IT_PASSPORT" | "IN_PASSPORT" => &[
             "passport",
@@ -687,8 +684,8 @@ mod tests {
                 "SHOPIFY_TOKEN",
             ),
             (
-                "postgresql://admin:s3cr3t@db.host:5432/sales",
-                "DB_CONNECTION_STRING",
+                concat!("key", "-5as9xrzs30zd2guj9vn767bkpthbvgo9"),
+                "MAILGUN_API_KEY",
             ),
             ("00:1A:2B:3C:4D:5E", "MAC_ADDRESS"),
             ("192.168.1.1", "IP_ADDRESS_V4"),
@@ -767,33 +764,6 @@ mod tests {
     }
 
     #[test]
-    fn db_connection_string_rejects_uri_templates() {
-        let det = RuleDetector::builtin();
-        let labels = |s: &str| {
-            det.detect(&NormalizedView::build(&region(s), s))
-                .into_iter()
-                .map(|span| span.label)
-                .collect::<Vec<_>>()
-        };
-        for raw in [
-            "postgresql://[user[:password]@][host][:port][",
-            "mongodb://username:<password>@cluster0.example.com:27017",
-            "redis://***:***@localhost:6379",
-        ] {
-            assert!(
-                labels(raw)
-                    .iter()
-                    .all(|label| label != "DB_CONNECTION_STRING"),
-                "{raw}: {:?}",
-                labels(raw)
-            );
-        }
-        assert!(labels("postgresql://admin:s3cr3t@db.host:5432/sales")
-            .iter()
-            .any(|label| label == "DB_CONNECTION_STRING"));
-    }
-
-    #[test]
     fn captured_context_rules_mask_selected_values_without_masking_counters() {
         let det = RuleDetector::builtin();
         let labels = |s: &str| {
@@ -862,9 +832,21 @@ mod tests {
             "jwt=eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop.abcdefghijklmnop",
             "JWT_SECRET"
         ));
+        let grafana_service_account_token = format!(
+            "grafana_token={}{}",
+            "glsa_", "fnkR76owNDLNwoj5sT63UJrhzpJmM52J_f4537340"
+        );
+        assert!(has(
+            &grafana_service_account_token,
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN"
+        ));
         assert!(!has(
             "jwe=eyJhbGciOiJSU0EtT0FFUCJ9.abcdefghijklmnop.abcdefghijklmnop.abcdefghijklmnop.abcdefghijklmnop",
             "JWT_SECRET"
+        ));
+        assert!(!has(
+            "grafana_token=glsa_short",
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN"
         ));
         assert!(!has(
             "port=5432 workers=4 timeout_ms=30000 status=200",

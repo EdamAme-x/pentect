@@ -1,4 +1,7 @@
-use super::benign::{is_crypto_test_vector_identifier_value, is_structured_metadata_key};
+use super::benign::{
+    is_crypto_test_vector_identifier_value, is_structured_metadata_key,
+    is_synthetic_hex_test_vector_value,
+};
 use super::util::token_runs;
 use super::Detector;
 use crate::model::*;
@@ -66,6 +69,12 @@ impl EntropyDetector {
         let run = &text[start..end];
         if is_slash_delimited_path_like(run) {
             if path_contains_uuid_segment(run) {
+                if is_url_path_fragment_context(text, start) {
+                    for (seg_start, seg_end) in slash_segments(run, start) {
+                        self.push_single_entropy_span(text, seg_start, seg_end, view, out);
+                    }
+                    return;
+                }
                 self.push_single_entropy_span(text, start, end, view, out);
                 return;
             }
@@ -95,10 +104,16 @@ impl EntropyDetector {
         if is_structured_metadata_value(text, start, &view.region.ctx, run)
             || is_embedded_media_data_value(text, start, &view.region.ctx)
             || is_subresource_integrity_value(text, start, &view.region.ctx, run)
+            || is_public_pgp_signature_context(text, start, &view.region.ctx)
+            || is_jose_protected_header_value(text, start, &view.region.ctx, run)
             || is_encoded_public_metadata_value(run)
             || is_crypto_test_vector_identifier_value(run)
+            || is_synthetic_hex_test_vector_value(run)
+            || is_api_route_fragment(run)
+            || is_release_artifact_identifier(run)
             || is_jwk_public_parameter_context(text, start, &view.region.ctx)
             || is_public_key_context(text, start, &view.region.ctx)
+            || is_hashed_token_derivative_context(text, start)
         {
             return;
         }
@@ -222,7 +237,8 @@ fn is_subresource_integrity_value(text: &str, start: usize, ctx: &Context, value
             .is_some_and(|key| key.eq_ignore_ascii_case("integrity")))
         || local_json_key_before_value(text, start)
             .as_deref()
-            .is_some_and(|key| key.eq_ignore_ascii_case("integrity"));
+            .is_some_and(|key| key.eq_ignore_ascii_case("integrity"))
+        || local_integrity_word_before_value(text, start);
     keyed_as_integrity && is_sri_digest_value(value)
 }
 
@@ -235,6 +251,91 @@ fn is_sri_digest_value(value: &str) -> bool {
         && digest
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+fn local_integrity_word_before_value(text: &str, start: usize) -> bool {
+    let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let prefix = text[line_start..start]
+        .trim_end_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '"' | '\''));
+    let Some(word_end) = prefix.rfind(|ch: char| ch.is_ascii_alphanumeric()) else {
+        return false;
+    };
+    let word_end = word_end + prefix[word_end..].chars().next().map_or(1, char::len_utf8);
+    let word_start = prefix[..word_end]
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+        .map_or(0, |pos| {
+            pos + prefix[pos..].chars().next().map_or(1, char::len_utf8)
+        });
+    normalize_identifier(&prefix[word_start..word_end]) == "integrity"
+}
+
+fn is_public_pgp_signature_context(text: &str, start: usize, ctx: &Context) -> bool {
+    // OpenPGP signatures are public verification material. GitHub replay
+    // fixtures and API responses store them under `signature`; their armor body
+    // is high-entropy-looking but is not private key or token material.
+    let key = ctx
+        .key
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| local_json_key_before_value(text, start))
+        .or_else(|| local_assignment_key_before_value(text, start).map(str::to_string));
+    let Some(key) = key else {
+        return false;
+    };
+    matches!(
+        normalize_identifier(&key).as_str(),
+        "signature" | "pgp_signature"
+    ) && has_open_pgp_signature_armor_before(text, start)
+}
+
+fn has_open_pgp_signature_armor_before(text: &str, start: usize) -> bool {
+    let mut window_start = start.saturating_sub(16 * 1024);
+    while !text.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let before = &text[window_start..start];
+    let Some(begin) = before.rfind("-----BEGIN PGP SIGNATURE-----") else {
+        return false;
+    };
+    before
+        .rfind("-----END PGP SIGNATURE-----")
+        .is_none_or(|end| end <= begin)
+}
+
+fn is_jose_protected_header_value(text: &str, start: usize, ctx: &Context, value: &str) -> bool {
+    // RFC 7515/7516 JOSE compact serializations carry a base64url-encoded
+    // protected header. The header names the algorithm and parameters; it is
+    // public metadata, unlike the signed/encrypted compact object or a JWK
+    // private member.
+    let key = ctx
+        .key
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| local_json_key_before_value(text, start))
+        .or_else(|| local_assignment_key_before_value(text, start).map(str::to_string));
+    let Some(key) = key else {
+        return false;
+    };
+    if !matches!(
+        normalize_identifier(&key).as_str(),
+        "protected" | "protected_header"
+    ) || value.contains('.')
+    {
+        return false;
+    }
+    let Some(decoded) = decode_base64ish(value) else {
+        return false;
+    };
+    let Ok(decoded) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let decoded = decoded.trim();
+    decoded.starts_with('{')
+        && decoded.ends_with('}')
+        && decoded.contains("\"alg\"")
+        && decoded
+            .bytes()
+            .all(|b| b.is_ascii() && !matches!(b, 0..=8 | 11 | 12 | 14..=31))
 }
 
 fn is_encoded_public_metadata_value(value: &str) -> bool {
@@ -464,13 +565,49 @@ fn local_assignment_key_before_value(text: &str, start: usize) -> Option<&str> {
     .then_some(key)
 }
 
+fn is_hashed_token_derivative_context(text: &str, start: usize) -> bool {
+    assignment_key_before_entropy_value(text, start)
+        .as_deref()
+        .is_some_and(|key| {
+            let normalized = normalize_identifier(key);
+            has_identifier_component(&normalized, "token")
+                && (has_identifier_component(&normalized, "hash")
+                    || has_identifier_component(&normalized, "hashed")
+                    || has_identifier_component(&normalized, "digest"))
+        })
+}
+
+fn assignment_key_before_entropy_value(text: &str, start: usize) -> Option<String> {
+    let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let prefix = &text[line_start..start];
+    let sep = prefix.find('=').or_else(|| prefix.rfind(':'))?;
+    let before = prefix[..sep].trim_end().trim_end_matches(':').trim_end();
+    let key_end = before
+        .rfind(|ch: char| ch.is_ascii_alphanumeric())
+        .map(|pos| pos + 1)?;
+    let key_start = before[..key_end]
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+        .map_or(0, |pos| {
+            pos + before[pos..].chars().next().map_or(1, char::len_utf8)
+        });
+    let key = &before[key_start..key_end];
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+fn has_identifier_component(name: &str, component: &str) -> bool {
+    name.split('_').any(|part| part == component)
+}
+
 fn is_public_key_name(key: &str) -> bool {
     let normalized = normalize_identifier(key);
+    let compact = normalized.replace('_', "");
     normalized == "pubkey"
         || normalized == "public_key"
         || normalized.contains("_public_key")
         || normalized.contains("public_key_")
         || normalized.ends_with("_pubkey")
+        || compact.contains("publickey")
+        || compact.ends_with("pubkey")
 }
 
 fn normalize_identifier(value: &str) -> String {
@@ -536,6 +673,129 @@ fn is_word_path_segment(segment: &str) -> bool {
         || wordlike_mixed_case_identifier(bytes)
 }
 
+fn is_api_route_fragment(run: &str) -> bool {
+    // REST API response paths such as `/repos/owner/name` and
+    // `/users/name/following/other` are public resource locators. They can be
+    // clipped out of a larger URL or diff fragment (`n+/repos/...`) and then
+    // no longer pass the ordinary path gate because of the leading `+`.
+    if !run.contains('/') || run.as_bytes().contains(&b'=') {
+        return false;
+    }
+    let mut segments = 0usize;
+    let mut route_word = false;
+    for raw in run.split('/').filter(|part| !part.is_empty()) {
+        let segment = raw.trim_matches(|ch: char| matches!(ch, '+' | '-' | '_' | '.'));
+        if segment.is_empty() || !is_api_route_segment(segment) {
+            return false;
+        }
+        route_word |= is_common_api_route_collection(segment);
+        segments += 1;
+    }
+    segments >= 3 && route_word
+}
+
+fn is_api_route_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+'))
+        && bytes.iter().any(|b| b.is_ascii_alphanumeric())
+}
+
+fn is_common_api_route_collection(segment: &str) -> bool {
+    if !segment
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    matches!(
+        normalize_identifier(segment).as_str(),
+        "repos"
+            | "repositories"
+            | "users"
+            | "orgs"
+            | "organizations"
+            | "projects"
+            | "issues"
+            | "pulls"
+            | "commits"
+            | "branches"
+            | "events"
+            | "hooks"
+            | "following"
+            | "followers"
+            | "teams"
+            | "members"
+            | "labels"
+            | "milestones"
+            | "notifications"
+            | "threads"
+            | "tests"
+    )
+}
+
+fn is_release_artifact_identifier(run: &str) -> bool {
+    // Build/release artifact names combine readable channel/version/platform
+    // components (`preRelease_v007_linux64`). They have high Shannon entropy
+    // only because they mix case, digits, and separators; they are not opaque.
+    let bytes = run.as_bytes();
+    if !(12..=96).contains(&bytes.len())
+        || bytes.iter().any(|b| matches!(b, b'+' | b'/' | b'='))
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        || !bytes.iter().any(|b| matches!(b, b'_' | b'-' | b'.'))
+    {
+        return false;
+    }
+    let mut has_release_word = false;
+    let mut has_platform_word = false;
+    for part in run.split(['_', '-', '.']).filter(|part| !part.is_empty()) {
+        let normalized = normalize_identifier(part);
+        has_release_word |= is_release_component(&normalized);
+        has_platform_word |= is_platform_component(&normalized);
+    }
+    has_release_word && has_platform_word
+}
+
+fn is_release_component(component: &str) -> bool {
+    component == "release"
+        || component == "pre_release"
+        || component == "prerelease"
+        || component == "snapshot"
+        || component == "nightly"
+        || component == "beta"
+        || component == "alpha"
+        || component == "preview"
+        || component == "canary"
+        || component == "rc"
+        || (component.len() >= 2
+            && component.starts_with('v')
+            && component[1..].bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_platform_component(component: &str) -> bool {
+    component == "linux"
+        || component == "linux64"
+        || component == "windows"
+        || component == "win"
+        || component == "win32"
+        || component == "win64"
+        || component == "macos"
+        || component == "darwin"
+        || component == "osx"
+        || component == "android"
+        || component == "ios"
+        || component == "x64"
+        || component == "x86"
+        || component == "x86_64"
+        || component == "amd64"
+        || component == "arm64"
+        || component == "aarch64"
+}
+
 fn is_short_uppercase_route_segment(bytes: &[u8]) -> bool {
     (2..=8).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_uppercase)
 }
@@ -553,6 +813,17 @@ fn path_contains_uuid_segment(run: &str) -> bool {
     run.split('/').any(is_uuid_segment)
 }
 
+fn is_url_path_fragment_context(text: &str, start: usize) -> bool {
+    let line_start = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
+    let prefix = &text[line_start..start];
+    let token_start = prefix
+        .rfind(|ch: char| {
+            ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | '<' | '(' | '[' | '{')
+        })
+        .map_or(0, |offset| offset + 1);
+    prefix[token_start..].contains("://")
+}
+
 fn is_uuid_segment(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     bytes.len() == 36
@@ -565,8 +836,16 @@ fn is_uuid_segment(segment: &str) -> bool {
 
 fn is_source_identifier_like(run: &str, text: &str, start: usize, end: usize) -> bool {
     is_source_identifier_shape(run)
+        || is_operator_adjacent_source_identifier(run, text, start, end)
         || (pascal_or_camel_identifier_like(run.as_bytes())
             && source_identifier_context(text, start, end))
+}
+
+fn is_operator_adjacent_source_identifier(run: &str, text: &str, start: usize, end: usize) -> bool {
+    let trimmed = run.trim_end_matches('+');
+    trimmed.len() + 1 == run.len()
+        && is_source_identifier_shape(trimmed)
+        && source_identifier_context(text, start, end)
 }
 
 fn is_source_identifier_shape(run: &str) -> bool {
@@ -651,8 +930,18 @@ fn source_identifier_context(text: &str, start: usize, end: usize) -> bool {
         || before.ends_with("new")
         || before.ends_with(':')
         || before.ends_with("::")
+        || before.ends_with('.')
         || before.ends_with('<')
         || after.starts_with(['(', '<', ':', ';', ',', '{', '=', '>'])
+        || (after.starts_with('.') && source_identifier_member_access_context(before))
+}
+
+fn source_identifier_member_access_context(before: &str) -> bool {
+    before.is_empty()
+        || before
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '(' | '[' | '{' | '=' | ',' | ';' | '<' | '>'))
 }
 
 fn is_uppercase_constant_identifier(run: &str) -> bool {
@@ -886,6 +1175,50 @@ mod tests {
         assert!(EntropyDetector::with(24, 2.0)
             .detect(&integrity_view)
             .is_empty());
+
+        let raw_integrity = format!("integrity {integrity}");
+        let raw_integrity_region = region(&raw_integrity);
+        let raw_integrity_view = NormalizedView::build(&raw_integrity_region, &raw_integrity);
+        assert!(EntropyDetector::with(24, 2.0)
+            .detect(&raw_integrity_view)
+            .is_empty());
+
+        let token_raw = format!("token {integrity}");
+        let token_region = region(&token_raw);
+        let token_view = NormalizedView::build(&token_region, &token_raw);
+        assert!(!EntropyDetector::with(24, 2.0)
+            .detect(&token_view)
+            .is_empty());
+    }
+
+    #[test]
+    fn pgp_signature_armor_is_public_verification_material() {
+        let body = "nwsBcBAABCAAQBQJeaEGJCRBK7hj4Ov3rIwAAdHIIAKRwMPF9NPpoGqyLFouFL9os";
+        let raw = format!(
+            r#""verification":{{"signature":"-----BEGIN PGP SIGNATURE-----\n\n{body}\n-----END PGP SIGNATURE-----"}}"#
+        );
+        let reg = region(&raw);
+        let view = NormalizedView::build(&reg, &raw);
+        assert!(EntropyDetector::with(24, 2.0).detect(&view).is_empty());
+
+        let raw = format!(r#""signature":"{body}""#);
+        let reg = region(&raw);
+        let view = NormalizedView::build(&reg, &raw);
+        assert!(!EntropyDetector::with(24, 2.0).detect(&view).is_empty());
+    }
+
+    #[test]
+    fn jose_protected_headers_are_public_metadata() {
+        let header = "eyJhbGciOiJSU0EtT0FFUC0yNTYiLCJlbmMiOiJBMjU2R0NNIn0";
+        let raw = format!(r#""protected": "{header}""#);
+        let reg = region(&raw);
+        let view = NormalizedView::build(&reg, &raw);
+        assert!(EntropyDetector::with(24, 2.0).detect(&view).is_empty());
+
+        let raw = format!(r#""token": "{header}""#);
+        let reg = region(&raw);
+        let view = NormalizedView::build(&reg, &raw);
+        assert!(!EntropyDetector::with(24, 2.0).detect(&view).is_empty());
     }
 
     #[test]
@@ -923,6 +1256,8 @@ mod tests {
             "horizontalHuggingPriority=",
             "OBJ_X9_62_id_ecPublicKey=",
             "type X509Certificate2Collection;",
+            "PermissionsV2EndToEndTestHelper.setPassword(mockMvc, credentialName, passwordValue);",
+            r#""Cannot use '"+this._nativeEventEmitterName+"' module""#,
             "HTTP/HTTP_1_0/SOCKS4/SOCKS4a/SOCKS5/SOCKS5_HOSTNAME",
             "defaultChecked/defaultSelected",
             "addEventListener/attachEvent",
@@ -980,6 +1315,42 @@ mod tests {
         for raw in [
             "\"authorized_connect_apps\": \"/2010-04-01/Accounts/ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/AuthorizedConnectApps.json\"",
             "\"uri\": \"/2010-04-01/Accounts/ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/SIP/Domains/SDaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Auth/Calls/CredentialListMappings.json?PageSize=50\"",
+            "n+/repos/akfish/PyGithub",
+            "n+/repos/jacquev6/PyGithub/hooks/257993/tests",
+            "n+/users/jacquev6/following/nvie",
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn release_artifact_identifiers_are_not_entropy_candidates() {
+        for raw in [
+            "of_preRelease_v007_linux64",
+            "toolkit-beta-v12-win64",
+            "desktop_preview_2026_arm64",
+        ] {
+            let reg = region(raw);
+            let v = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
+        }
+
+        let secret = "SECRET_TOKEN=AbCdEfGhIjKlMnOpQrStUvWxYz1234";
+        let reg = region(secret);
+        let v = NormalizedView::build(&reg, secret);
+        assert!(
+            !EntropyDetector::default().detect(&v).is_empty(),
+            "random-looking assignment remains entropy-eligible"
+        );
+    }
+
+    #[test]
+    fn hashed_token_derivatives_are_not_entropy_candidates() {
+        for raw in [
+            r#"hashedTokenKey = "$3:1:GepdvExsvzA:JXMHpXDZqtU5zNh5y5HB8KmLKbHc2VdeuxQo6CTlLhyNifaYhJTnb+4Rf+xpnbsfd8tIlQ0ZgIi2edJrm9CpoA""#,
+            r#"hashedTokenKey := "$3:1:GepdvExsvzA:JXMHpXDZqtU5zNh5y5HB8KmLKbHc2VdeuxQo6CTlLhyNifaYhJTnb+4Rf+xpnbsfd8tIlQ0ZgIi2edJrm9CpoA""#,
         ] {
             let reg = region(raw);
             let v = NormalizedView::build(&reg, raw);
@@ -1003,6 +1374,14 @@ mod tests {
     }
 
     #[test]
+    fn url_authority_uuid_paths_are_not_split_by_entropy() {
+        let raw = "https://login.windows.net/fac157e6-e2e9-6986-584b-afa1936d5b85/FederationMetadata/2007-06/FederationMetadata.xml";
+        let reg = region(raw);
+        let v = NormalizedView::build(&reg, raw);
+        assert!(EntropyDetector::default().detect(&v).is_empty());
+    }
+
+    #[test]
     fn crypto_test_vector_ids_are_not_entropy_candidates() {
         for raw in [
             "KAS-ECC-CDH_P-192_C0-Peer-PUBLIC",
@@ -1013,6 +1392,22 @@ mod tests {
             let v = NormalizedView::build(&reg, raw);
             assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
         }
+    }
+
+    #[test]
+    fn synthetic_hex_test_vectors_are_not_entropy_candidates() {
+        let fixture = "Key = 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+        let fixture_region = region(fixture);
+        let fixture_view = NormalizedView::build(&fixture_region, fixture);
+        assert!(EntropyDetector::default().detect(&fixture_view).is_empty());
+
+        let realish = "SECRET_HEX=A3F19C80E4B27D51F09A6C33D8E74215B6C94F2A01D8EE77";
+        let realish_region = region(realish);
+        let realish_view = NormalizedView::build(&realish_region, realish);
+        assert!(
+            !EntropyDetector::default().detect(&realish_view).is_empty(),
+            "random-looking hex should remain entropy-eligible"
+        );
     }
 
     #[test]
@@ -1081,7 +1476,8 @@ mod tests {
         ] {
             let reg = region(raw);
             let view = NormalizedView::build(&reg, raw);
-            assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+            let spans = EntropyDetector::default().detect(&view);
+            assert!(spans.is_empty(), "{raw}: {spans:?}");
         }
     }
 
@@ -1178,11 +1574,13 @@ mod tests {
         for raw in [
             r#"{"public_key":"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD"}"#,
             r#"publicKey = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCD""#,
+            r#"public static final String DEFAULT_PUBLIC_KEY_STRING = "MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAKHGwq7q2RmwuRgKxBypQHw0mYu4BQZ3eMsTrdK8E6igRcxsobUC7uT0SoxIjl1WveWniCASejoQtn/BY6hVKWsCAwEAAQ==";"#,
             "PublicKey=KAS-ECC-CDH_P-192_C10-Peer-PUBLIC",
         ] {
             let reg = region(raw);
             let view = NormalizedView::build(&reg, raw);
-            assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+            let spans = EntropyDetector::default().detect(&view);
+            assert!(spans.is_empty(), "{raw}: {spans:?}");
         }
     }
 
