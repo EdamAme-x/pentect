@@ -1,4 +1,3 @@
-use super::options::ScanEngine;
 use super::report::{FileFinding, ScanScope, SkippedFile};
 use super::walk::ignored_file_reason;
 use crate::infer_kind;
@@ -17,14 +16,14 @@ const CREDSWEEPER_JOBS: &str = "8";
 pub(super) fn scan_files(
     files: Vec<PathBuf>,
     packs: Vec<pentect_core::Pack>,
-    requested: ScanEngine,
+    core_only: bool,
 ) -> Result<(Vec<ScanFile>, String), String> {
-    let plan = EnginePlan::resolve(requested)?;
+    let plan = ScanPlan::new(core_only);
     let mut out = Vec::new();
     let mut report = FindingSet::default();
     let mut scanned_paths = BTreeSet::new();
 
-    if plan.credsweeper {
+    if let Some(command) = plan.credsweeper_command.clone() {
         let mut eligible = Vec::new();
         for path in &files {
             match lightweight_precheck(path)? {
@@ -35,13 +34,13 @@ pub(super) fn scan_files(
                 Precheck::Skipped(skipped) => out.push(ScanFile::Skipped(skipped)),
             }
         }
-        for file in CredSweeperRunner::new()?.scan(&eligible)? {
+        for file in CredSweeperRunner::new(command).scan(&eligible)? {
             report.merge_file(file);
         }
     }
 
-    if plan.pentect {
-        for file in scan_pentect_files(files, packs)? {
+    if plan.core {
+        for file in scan_core_files(files, packs)? {
             match file {
                 ScanFile::Finding(file) => {
                     scanned_paths.insert(file.path.clone());
@@ -51,7 +50,7 @@ pub(super) fn scan_files(
                     scanned_paths.insert(path);
                 }
                 ScanFile::Skipped(skipped) => {
-                    if !plan.credsweeper {
+                    if plan.credsweeper_command.is_none() {
                         out.push(ScanFile::Skipped(skipped));
                     }
                 }
@@ -82,58 +81,29 @@ pub(super) enum ScanFile {
     Skipped(SkippedFile),
 }
 
-#[derive(Clone, Copy, Debug)]
-struct EnginePlan {
+#[derive(Clone, Debug)]
+struct ScanPlan {
     name: &'static str,
-    credsweeper: bool,
-    pentect: bool,
+    core: bool,
+    credsweeper_command: Option<CredSweeperCommand>,
 }
 
-impl EnginePlan {
-    fn resolve(requested: ScanEngine) -> Result<Self, String> {
-        match requested {
-            ScanEngine::Pentect => Ok(Self {
-                name: "pentect",
-                credsweeper: false,
-                pentect: true,
-            }),
-            ScanEngine::CredSweeper => {
-                CredSweeperCommand::discover().ok_or_else(credsweeper_missing)?;
-                Ok(Self {
-                    name: "credsweeper",
-                    credsweeper: true,
-                    pentect: false,
-                })
-            }
-            ScanEngine::All => {
-                CredSweeperCommand::discover().ok_or_else(credsweeper_missing)?;
-                Ok(Self {
-                    name: "all",
-                    credsweeper: true,
-                    pentect: true,
-                })
-            }
-            ScanEngine::Auto => {
-                if CredSweeperCommand::discover().is_some() {
-                    Ok(Self {
-                        name: "auto:credsweeper+pentect",
-                        credsweeper: true,
-                        pentect: true,
-                    })
-                } else {
-                    Ok(Self {
-                        name: "auto:pentect",
-                        credsweeper: false,
-                        pentect: true,
-                    })
-                }
-            }
+impl ScanPlan {
+    fn new(core_only: bool) -> Self {
+        if core_only {
+            return Self {
+                name: "core",
+                core: true,
+                credsweeper_command: None,
+            };
+        }
+        let credsweeper_command = CredSweeperCommand::discover();
+        Self {
+            name: "pentect",
+            core: true,
+            credsweeper_command,
         }
     }
-}
-
-fn credsweeper_missing() -> String {
-    "CredSweeper is not available; set PENTECT_CREDSWEEPER_PYTHON or install it in third_party/CredSweeper/.venv".to_string()
 }
 
 enum Precheck {
@@ -335,9 +305,8 @@ struct CredSweeperRunner {
 }
 
 impl CredSweeperRunner {
-    fn new() -> Result<Self, String> {
-        let command = CredSweeperCommand::discover().ok_or_else(credsweeper_missing)?;
-        Ok(Self { command })
+    fn new(command: CredSweeperCommand) -> Self {
+        Self { command }
     }
 
     fn scan(&self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String> {
@@ -516,7 +485,7 @@ fn normalize_label(rule: &str) -> String {
     }
 }
 
-fn scan_pentect_files(
+fn scan_core_files(
     files: Vec<PathBuf>,
     packs: Vec<pentect_core::Pack>,
 ) -> Result<Vec<ScanFile>, String> {
@@ -538,7 +507,7 @@ fn scan_pentect_files(
             let packs = packs.clone();
             let tx = tx.clone();
             scope.spawn(move || {
-                let mut worker = PentectWorker::new(packs);
+                let mut worker = CoreWorker::new(packs);
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(path) = files.get(index) else {
@@ -555,12 +524,12 @@ fn scan_pentect_files(
     })
 }
 
-struct PentectWorker {
+struct CoreWorker {
     packs: Option<Vec<pentect_core::Pack>>,
     engine: Option<Engine>,
 }
 
-impl PentectWorker {
+impl CoreWorker {
     fn new(packs: Vec<pentect_core::Pack>) -> Self {
         Self {
             packs: Some(packs),
@@ -643,7 +612,7 @@ fn hit_from_span(span: &Span, line_index: &LineIndex) -> Option<ScanHit> {
     Some(ScanHit {
         label: span.label.clone(),
         category: format!("{:?}", span.category),
-        engine: "pentect".to_string(),
+        engine: "core".to_string(),
         range: line_index.range(span.range)?,
     })
 }

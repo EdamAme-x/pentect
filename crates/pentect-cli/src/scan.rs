@@ -35,7 +35,7 @@ fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
     let packs = load_packs(args)?;
     let mut report = ScanReport {
         roots: opts.paths.clone(),
-        engine: opts.engine.as_str().to_string(),
+        engine: if opts.core_only { "core" } else { "pentect" }.to_string(),
         ..ScanReport::default()
     };
     let files = collect_scan_roots(
@@ -44,7 +44,7 @@ fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
         opts.gitignore,
         &mut report.skipped,
     )?;
-    let (results, engine) = scan_files(files, packs, opts.engine)?;
+    let (results, engine) = scan_files(files, packs, opts.core_only)?;
     report.engine = engine;
     for result in results {
         match result {
@@ -77,7 +77,7 @@ mod tests {
         let args = vec!["pentect".into(), "scan".into()];
         let opts = ScanOpts::parse(&args).unwrap();
         assert_eq!(opts.paths, vec![PathBuf::from(".")]);
-        assert_eq!(opts.engine, options::ScanEngine::Auto);
+        assert!(!opts.core_only);
         assert!(!opts.json);
         assert!(!opts.no_fail);
         assert!(!opts.gitignore);
@@ -88,8 +88,6 @@ mod tests {
         let args = vec![
             "pentect".into(),
             "scan".into(),
-            "--engine".into(),
-            "pentect".into(),
             "--json".into(),
             "--no-fail".into(),
             "--gitignore".into(),
@@ -97,7 +95,6 @@ mod tests {
         ];
         let opts = ScanOpts::parse(&args).unwrap();
         assert_eq!(opts.paths, vec![PathBuf::from("app.env")]);
-        assert_eq!(opts.engine, options::ScanEngine::Pentect);
         assert!(opts.json);
         assert!(opts.no_fail);
         assert!(opts.gitignore);
@@ -105,15 +102,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_parse_rejects_unknown_engine() {
+    fn scan_parse_accepts_core_mode() {
         let args = vec![
             "pentect".into(),
             "scan".into(),
-            "--engine".into(),
-            "magic".into(),
+            "--core".into(),
+            "app.env".into(),
         ];
-        let err = ScanOpts::parse(&args).unwrap_err();
-        assert!(err.contains("unknown scan engine"), "{err}");
+        let opts = ScanOpts::parse(&args).unwrap();
+        assert!(opts.core_only);
+        assert_eq!(opts.paths, vec![PathBuf::from("app.env")]);
     }
 
     #[test]

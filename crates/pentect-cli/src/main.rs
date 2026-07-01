@@ -79,7 +79,7 @@ fn usage() {
          pentect bench creddata PATH\n\
          pentect extensions list|inspect|test [NAME]\n\
          pentect eval [--json]\n\
-         pentect scan [--engine auto|credsweeper|pentect|all] [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\
+         pentect scan [--core] [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          pentect help\n\
@@ -111,7 +111,7 @@ fn help_text() -> &'static str {
         "  pentect bench creddata PATH [--json]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
         "  pentect eval [--json]\n\n",
-        "  pentect scan [--engine auto|credsweeper|pentect|all] [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\n",
+        "  pentect scan [--core] [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
         "dashboard: approval\n",
         "exec: masked stdout/stderr\n",
