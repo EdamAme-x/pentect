@@ -1,6 +1,7 @@
 use super::benign::{
     is_explicitly_non_sensitive_key_name, is_localization_template_reference, is_placeholder_value,
-    is_structured_generic_key_metadata_value, normalize_identifier,
+    is_source_secret_name_reference_value, is_structured_generic_key_metadata_value,
+    normalize_identifier,
 };
 use super::Detector;
 use crate::model::*;
@@ -107,6 +108,7 @@ impl Detector for SensitiveKeyDetector {
                 || is_structured_token_prose(key, view.text())
                 || is_structured_placeholder_value(key, view.text())
                 || is_structured_secret_identifier_name(key, view.text())
+                || is_structured_sensitive_name_reference(key, view.text())
                 || is_structured_generic_key_weak_value(key, view.text())
                 || is_structured_generic_key_name_reference(key, view.text())
                 || is_structured_api_operation_value(key, view.text())
@@ -482,6 +484,24 @@ fn is_structured_secret_identifier_name(key: &str, value: &str) -> bool {
     // `secret_key`, or keyed detectors.
     let name = normalize_identifier(key);
     matches!(name.as_str(), "secret_id" | "secretid") && is_public_resource_identifier_value(value)
+}
+
+fn is_structured_sensitive_name_reference(key: &str, value: &str) -> bool {
+    // Structured payloads sometimes contain the name of a credential field under
+    // a credential-looking key (`access_token: "secret-access-token"`). Reuse
+    // the source-name matcher so this stays vocabulary-driven, and require
+    // separator syntax/no digits so concrete token material remains visible.
+    if !is_sensitive_key_name(key) {
+        return false;
+    }
+    let value = value.trim();
+    (4..=96).contains(&value.len())
+        && value.bytes().any(|b| matches!(b, b'_' | b'-'))
+        && !value.bytes().any(|b| b.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        && is_source_secret_name_reference_value(value)
 }
 
 fn is_public_resource_identifier_value(value: &str) -> bool {
@@ -1007,6 +1027,14 @@ mod tests {
         );
         assert_eq!(
             sensitive_key_fires(Some("access_token"), "Test Access Token"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("access_token"), "secret-access-token"),
+            None
+        );
+        assert_eq!(
+            sensitive_key_fires(Some("refresh_token"), "secret-refresh-token"),
             None
         );
         assert_eq!(sensitive_key_fires(Some("token"), "Token"), None);

@@ -4703,19 +4703,18 @@ fn is_structured_sensitive_name_reference_literal(value: &str, key_name: &str) -
 fn is_source_fixture_secret_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // Test fixtures often assign deliberately weak credentials to variables
     // named `expectedPassword`, `MOCK_ACCESS_TOKEN`, or similar. Do not suppress
-    // weak values by value alone; require source syntax plus a fixture key name.
-    source_key_has_code_shape(source_key)
-        && (is_source_fixture_secret_value(key_name, value)
-            || is_source_fixture_secret_value(source_key, value))
+    // weak values by value alone; require a fixture key name. Strong material
+    // under `testPassword` still detects because the value matcher is narrow.
+    is_source_fixture_secret_value(key_name, value)
+        || is_source_fixture_secret_value(source_key, value)
 }
 
 fn is_source_fixture_low_entropy_literal(value: &str, key_name: &str, source_key: &str) -> bool {
     // Test fixtures also use short sample credentials that are not explicit
     // placeholders (`expectedPassword = "abc123"`). Suppress only when source
-    // syntax carries a fixture marker and the value has weak sample shape.
+    // context carries a fixture marker and the value has weak sample shape.
     // Strong mixed values such as `helloworld1234` stay visible.
-    source_key_has_code_shape(source_key)
-        && (is_source_fixture_key_context(key_name) || is_source_fixture_key_context(source_key))
+    (is_source_fixture_key_context(key_name) || is_source_fixture_key_context(source_key))
         && is_weak_fixture_sample_literal(value)
 }
 
@@ -7610,6 +7609,8 @@ mod tests {
             r#"expected: "oraclecloud: some credentials information are missing: OCI_TENANCY_OCID,OCI_USER_OCID""#,
             r#"access_token = "TestAuthToken""#,
             r#"const string testPassword = "basicPass";"#,
+            r#"fakeAPIKey = "asdf1234""#,
+            r#"DummyPostData(csrf_token="dummytoken")"#,
             r#"const string expectedAccessToken = "LET_ME_IN";"#,
             r#"const string expectedAccessToken1 = "LET_ME_IN-1";"#,
             r#"private const string MOCK_ACCESS_TOKEN = "at-0987654321";"#,
