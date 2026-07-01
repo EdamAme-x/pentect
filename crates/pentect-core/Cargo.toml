@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 fancy-regex = { workspace = true }
+tract-onnx = { workspace = true }
 regex = { workspace = true }
 memchr = { workspace = true }
 sha2 = { workspace = true }
@@ -31,6 +32,7 @@ flate2 = { workspace = true }
 getrandom = { workspace = true, optional = true }
 toml = { workspace = true }
 phonenumber = { workspace = true }
+prost = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

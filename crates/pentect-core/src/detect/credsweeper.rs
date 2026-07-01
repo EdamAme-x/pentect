@@ -1,3 +1,4 @@
+use super::credsweeper_ml::{self, MlInput, RuleSeverity};
 use super::Detector;
 use crate::model::{ByteRange, Category, Confidence, DetectorId, Span};
 use crate::normalize::NormalizedView;
@@ -44,7 +45,9 @@ pub struct CredSweeperNativeStats {
 
 #[derive(Clone)]
 struct NativeRule {
+    rule_name: String,
     label: String,
+    severity: RuleSeverity,
     confidence: Confidence,
     min_line_len: usize,
     required_substrings: Vec<String>,
@@ -162,7 +165,9 @@ impl CredSweeperNativeDetector {
                 continue;
             }
             rules.push(NativeRule {
+                rule_name: raw.name.clone(),
                 label: normalize_label(&raw.name),
+                severity: map_severity(raw.severity.as_deref()),
                 confidence: map_confidence(raw.confidence.as_deref()),
                 min_line_len: raw.min_line_len.unwrap_or(0),
                 required_substrings: raw
@@ -210,6 +215,14 @@ impl Detector for CredSweeperNativeDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let text = view.text();
         let mut out = Vec::new();
+        let mut ml_pending = Vec::new();
+        let ml_path = credsweeper_ml::ml_path(view.region.ctx.path.as_deref());
+        let ml_file_type = credsweeper_ml::ml_file_type(view.region.ctx.path.as_deref());
+        let push_ctx = PushMatchCtx {
+            view,
+            path: &ml_path,
+            file_type: &ml_file_type,
+        };
         for (line_start, line) in LineRanges::new(text) {
             let line_body = line.trim_end_matches(['\r', '\n']);
             let line_lower = LazyLower::new(line_body);
@@ -230,14 +243,23 @@ impl Detector for CredSweeperNativeDetector {
                                 }) else {
                                     continue;
                                 };
+                                let variable = captures.name("variable");
+                                let candidate = Candidate {
+                                    start: m.start(),
+                                    end: m.end(),
+                                    value: m.as_str(),
+                                    variable_start: variable.as_ref().map(|m| m.start()),
+                                    variable_end: variable.as_ref().map(|m| m.end()),
+                                    variable: variable.map(|m| m.as_str()),
+                                };
                                 push_match(
                                     &mut out,
-                                    view,
+                                    &mut ml_pending,
+                                    &push_ctx,
                                     rule,
                                     line_start,
-                                    m.start(),
-                                    m.end(),
-                                    m.as_str(),
+                                    line_body,
+                                    &candidate,
                                 );
                             }
                         }
@@ -253,21 +275,36 @@ impl Detector for CredSweeperNativeDetector {
                                 }) else {
                                     continue;
                                 };
+                                let variable = captures.name("variable");
+                                let candidate = Candidate {
+                                    start: m.start(),
+                                    end: m.end(),
+                                    value: m.as_str(),
+                                    variable_start: variable.as_ref().map(|m| m.start()),
+                                    variable_end: variable.as_ref().map(|m| m.end()),
+                                    variable: variable.map(|m| m.as_str()),
+                                };
                                 push_match(
                                     &mut out,
-                                    view,
+                                    &mut ml_pending,
+                                    &push_ctx,
                                     rule,
                                     line_start,
-                                    m.start(),
-                                    m.end(),
-                                    m.as_str(),
+                                    line_body,
+                                    &candidate,
                                 );
                             }
                         }
                         PatternMatcher::Special(matcher) => {
                             for m in matcher.find(line_body) {
                                 push_match(
-                                    &mut out, view, rule, line_start, m.start, m.end, m.value,
+                                    &mut out,
+                                    &mut ml_pending,
+                                    &push_ctx,
+                                    rule,
+                                    line_start,
+                                    line_body,
+                                    &m,
                                 );
                             }
                         }
@@ -275,6 +312,7 @@ impl Detector for CredSweeperNativeDetector {
                 }
             }
         }
+        push_ml_accepted(&mut out, &ml_pending);
         dedupe_spans(out)
     }
 }
@@ -299,6 +337,9 @@ struct Candidate<'a> {
     start: usize,
     end: usize,
     value: &'a str,
+    variable_start: Option<usize>,
+    variable_end: Option<usize>,
+    variable: Option<&'a str>,
 }
 
 impl SpecialMatcher {
@@ -436,6 +477,9 @@ fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
             start: begin,
             end,
             value,
+            variable_start: None,
+            variable_end: None,
+            variable: None,
         }]
     } else {
         Vec::new()
@@ -471,7 +515,14 @@ fn keyword_candidates(line: &str, keyword: KeywordMatcher) -> Vec<Candidate<'_>>
             };
             let value = &line[start..end];
             if is_credible_secret_value(value) {
-                out.push(Candidate { start, end, value });
+                out.push(Candidate {
+                    start,
+                    end,
+                    value,
+                    variable_start: Some(idx),
+                    variable_end: Some(idx + needle.len()),
+                    variable: Some(&line[idx..idx + needle.len()]),
+                });
             }
         }
     }
@@ -517,6 +568,9 @@ fn regex_candidates<'a>(line: &'a str, regex: &RustRegex) -> Vec<Candidate<'a>> 
             start: m.start(),
             end: m.end(),
             value: m.as_str(),
+            variable_start: None,
+            variable_end: None,
+            variable: None,
         })
         .collect()
 }
@@ -529,6 +583,9 @@ fn capture_value_candidates<'a>(line: &'a str, regex: &RustRegex) -> Vec<Candida
             start: m.start(),
             end: m.end(),
             value: m.as_str(),
+            variable_start: None,
+            variable_end: None,
+            variable: None,
         })
         .collect()
 }
@@ -544,6 +601,9 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
                 start: s,
                 end: idx,
                 value: &line[s..idx],
+                variable_start: None,
+                variable_end: None,
+                variable: None,
             });
         }
     }
@@ -552,39 +612,111 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
             start: s,
             end: line.len(),
             value: &line[s..],
+            variable_start: None,
+            variable_end: None,
+            variable: None,
         });
     }
     runs.into_iter()
 }
 
+struct PendingMlSpan {
+    span: Span,
+    input: MlInput,
+}
+
+struct PushMatchCtx<'view, 'data> {
+    view: &'view NormalizedView<'view>,
+    path: &'data str,
+    file_type: &'data str,
+}
+
 fn push_match(
     out: &mut Vec<Span>,
-    view: &NormalizedView,
+    ml_pending: &mut Vec<PendingMlSpan>,
+    ctx: &PushMatchCtx<'_, '_>,
     rule: &NativeRule,
     line_start: usize,
-    start: usize,
-    end: usize,
-    value: &str,
+    line: &str,
+    candidate: &Candidate<'_>,
 ) {
-    let range = view.to_raw(ByteRange::new(line_start + start, line_start + end));
+    let range = ctx.view.to_raw(ByteRange::new(
+        line_start + candidate.start,
+        line_start + candidate.end,
+    ));
     if range.is_empty() {
         return;
     }
-    if !accept_value(value, rule) {
+    if !accept_value(candidate.value, rule) {
         return;
     }
-    out.push(Span {
+    let span = Span {
         range,
         category: Category::Secret,
         label: rule.label.clone(),
         confidence: rule.confidence,
         source: DetectorId::CredSweeper,
-    });
+    };
+    if rule.ml_validated {
+        ml_pending.push(PendingMlSpan {
+            span,
+            input: MlInput {
+                line: line.to_string(),
+                value: candidate.value.to_string(),
+                variable: candidate.variable.unwrap_or_default().to_string(),
+                value_start: candidate.start,
+                value_end: candidate.end,
+                variable_start: candidate
+                    .variable_start
+                    .map(|start| start as isize)
+                    .unwrap_or(-2),
+                variable_end: candidate.variable_end.map(|end| end as isize).unwrap_or(-2),
+                path: ctx.path.to_string(),
+                file_type: ctx.file_type.to_string(),
+                rule_name: rule.rule_name.clone(),
+                severity: rule.severity,
+            },
+        });
+    } else {
+        out.push(span);
+    }
+}
+
+fn push_ml_accepted(out: &mut Vec<Span>, pending: &[PendingMlSpan]) {
+    let mut used = vec![false; pending.len()];
+    for i in 0..pending.len() {
+        if used[i] {
+            continue;
+        }
+        let mut group_indices = Vec::new();
+        let mut group_inputs = Vec::new();
+        for j in i..pending.len() {
+            if !used[j] && same_ml_group(&pending[i].input, &pending[j].input) {
+                used[j] = true;
+                group_indices.push(j);
+                group_inputs.push(&pending[j].input);
+            }
+        }
+        if credsweeper_ml::accept_group(&group_inputs) {
+            for idx in group_indices {
+                out.push(pending[idx].span.clone());
+            }
+        }
+    }
+}
+
+fn same_ml_group(a: &MlInput, b: &MlInput) -> bool {
+    a.path == b.path
+        && a.line == b.line
+        && a.value == b.value
+        && a.value_start == b.value_start
+        && a.value_end == b.value_end
 }
 
 #[derive(Deserialize)]
 struct RawRule {
     name: String,
+    severity: Option<String>,
     confidence: Option<String>,
     #[serde(rename = "type")]
     kind: Option<String>,
@@ -682,32 +814,7 @@ fn accept_value(value: &str, rule: &NativeRule) -> bool {
     {
         return false;
     }
-    if rule.ml_validated && !is_ml_replacement_accepted(&rule.label, value) {
-        return false;
-    }
     true
-}
-
-fn is_ml_replacement_accepted(label: &str, value: &str) -> bool {
-    match label {
-        "DOC_GET"
-        | "DOC_CREDENTIALS"
-        | "SECRET_PAIR"
-        | "PASSWD_PAIR"
-        | "IP_ID_PASSWORD_TRIPLE"
-        | "ID_PAIR_PASSWD_PAIR"
-        | "ID_PASSWD_PAIR"
-        | "API"
-        | "AUTH"
-        | "CREDENTIAL"
-        | "KEY"
-        | "NONCE"
-        | "PASSWORD"
-        | "SALT"
-        | "SECRET"
-        | "TOKEN" => is_credible_secret_value(value),
-        _ => value.len() >= 4 && !looks_like_file_path(value),
-    }
 }
 
 fn is_credible_secret_value(value: &str) -> bool {
@@ -865,6 +972,16 @@ fn map_confidence(confidence: Option<&str>) -> Confidence {
     }
 }
 
+fn map_severity(severity: Option<&str>) -> RuleSeverity {
+    match severity {
+        Some("critical") => RuleSeverity::Critical,
+        Some("high") => RuleSeverity::High,
+        Some("low") => RuleSeverity::Low,
+        Some("info") => RuleSeverity::Info,
+        _ => RuleSeverity::Medium,
+    }
+}
+
 fn normalize_label(rule: &str) -> String {
     let mut out = String::new();
     let mut last_was_sep = false;
@@ -919,6 +1036,11 @@ mod tests {
     }
 
     #[test]
+    fn embedded_ml_feature_vector_matches_model() {
+        assert!(credsweeper_ml::feature_width_matches_model_for_test());
+    }
+
+    #[test]
     fn detects_compatible_credsweeper_rule_without_python() {
         let token = format!("github_pat_{}", "A".repeat(80));
         let raw = format!("token={token}\n");
@@ -947,7 +1069,7 @@ mod tests {
              jwk {{\"kty\":\"RSA\",\"d\":\"{jwk_secret}\"}}\n\
              -----BEGIN OPENSSH PRIVATE KEY-----\n\
              {base64_key}\n\
-             const PASSWORD: string = \"helloworld1234\";\n"
+             const PASSWORD: string = \"A8f3Kp9Lm2Qx7Zt4\";\n"
         );
         let region = region(&raw);
         let view = NormalizedView::build(&region, &raw);
