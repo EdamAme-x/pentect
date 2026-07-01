@@ -642,17 +642,30 @@ fn inspect_url_uuid_path_segments(
             pos += 1;
         }
         let segment = &url[start..pos];
-        if looks_uuid(segment) {
+        if let Some((trim_start, trim_end)) = uuid_path_segment_bounds(segment) {
             push_span(
                 view,
                 out,
-                base + start,
-                base + pos,
+                base + start + trim_start,
+                base + start + trim_end,
                 Category::Secret,
                 labels::UUID,
             );
         }
     }
+}
+
+fn uuid_path_segment_bounds(segment: &str) -> Option<(usize, usize)> {
+    let start = segment
+        .find(|c: char| !matches!(c, '.' | ',' | ';' | ':' | '(' | '[' | '{'))
+        .unwrap_or(segment.len());
+    let end = segment
+        .rfind(|c: char| !matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '\\'))
+        .map_or(start, |i| {
+            i + segment[i..].chars().next().unwrap().len_utf8()
+        });
+    let candidate = &segment[start..end];
+    looks_uuid(candidate).then_some((start, end))
 }
 
 fn fragment_or_query_path_end(url: &str, authority_end: usize) -> usize {
@@ -1159,6 +1172,13 @@ mod tests {
         );
         assert_eq!(
             labels("https://example.com/550e8400-e29b-41d4-a716-446655440000"),
+            [(
+                "UUID".to_string(),
+                "550e8400-e29b-41d4-a716-446655440000".to_string()
+            )]
+        );
+        assert_eq!(
+            labels(r#""Bearer authorization_uri=https://login.example/550e8400-e29b-41d4-a716-446655440000\""#),
             [(
                 "UUID".to_string(),
                 "550e8400-e29b-41d4-a716-446655440000".to_string()
