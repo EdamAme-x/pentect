@@ -1352,6 +1352,7 @@ fn looks_like_secret_value(
         || is_structured_key_name_reference_literal(value, key_name)
         || is_password_validation_message_literal(value, key_name)
         || is_password_documentation_literal(value, key_name)
+        || is_sensitive_slot_documentation_literal(value, key_name)
         || is_plain_prose_literal_for_generic_key(value, key_name)
         || is_locator_literal_for_key(value, key_name)
         || is_secret_resource_metadata_literal(value, key_name)
@@ -5582,6 +5583,76 @@ fn is_password_documentation_literal(value: &str, key_name: &str) -> bool {
         .any(|part| matches!(part, "pass" | "password" | "passwd" | "passphrase"))
 }
 
+fn is_sensitive_slot_documentation_literal(value: &str, key_name: &str) -> bool {
+    // Provider env-var catalogs sometimes put the help text in the value column:
+    // `API_KEY = "API key (only with ...)"` or
+    // `CLIENT_SECRET = "Client secret, managed by ..."`. Those values describe
+    // the field, not reusable material. Require prose shape plus both a
+    // credential word and a documentation word so compact secrets and passphrases
+    // stay detectable.
+    if key_name_indicates_password_slot(key_name)
+        || !(key_name_indicates_sensitive_material(key_name)
+            || has_identifier_component(key_name, "api")
+            || has_identifier_component(key_name, "auth")
+            || has_identifier_component(key_name, "oauth"))
+    {
+        return false;
+    }
+    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    if !(8..=260).contains(&value.len())
+        || value.split_whitespace().count() < 2
+        || value.bytes().filter(|b| b.is_ascii_alphabetic()).count() < 6
+    {
+        return false;
+    }
+    if value.bytes().any(|b| b < 0x20 && b != b'\t') {
+        return false;
+    }
+    let normalized = normalize_key(value);
+    let mut has_credential_word = false;
+    let mut has_documentation_word = value.contains("://")
+        || value.contains('`')
+        || value.contains('<')
+        || value.contains('>');
+    for part in normalized.split('_').filter(|part| !part.is_empty()) {
+        has_credential_word |= matches!(
+            part,
+            "api"
+                | "auth"
+                | "authentication"
+                | "client"
+                | "credential"
+                | "credentials"
+                | "key"
+                | "password"
+                | "secret"
+                | "token"
+        );
+        has_documentation_word |= matches!(
+            part,
+            "admin"
+                | "alias"
+                | "defined"
+                | "disable"
+                | "endpoint"
+                | "field"
+                | "file"
+                | "generated"
+                | "interface"
+                | "managed"
+                | "mode"
+                | "name"
+                | "only"
+                | "payload"
+                | "related"
+                | "required"
+                | "supported"
+                | "unset"
+        );
+    }
+    has_credential_word && has_documentation_word
+}
+
 fn key_name_indicates_password_slot(key_name: &str) -> bool {
     key_name == "pass"
         || key_name.ends_with("_pass")
@@ -6924,6 +6995,11 @@ mod tests {
             r#"password__startswith = "pass""#,
             r#"token_regex = "bearer.*""#,
             r#"NAMESILO_API_KEY = "Client ID""#,
+            r#"SERVICE_API_KEY = "API key (only with managed mode)""#,
+            r#"SERVICE_CLIENT_SECRET = "Client secret, managed by the service client""#,
+            r#"SERVICE_SHARED_SECRET = "shared secret related to 2FA""#,
+            r#"SERVICE_AUTH_ENDPOINT = "The endpoint for service authentication""#,
+            r#"SERVICE_SECRET_ACCESS_KEY = "Managed by the client (`SERVICE_SECRET_ACCESS_KEY_FILE` is not supported)""#,
             r#"ZONEEE_API_KEY=yyyyy \"#,
             r#"Query: "action=SET&api_key=apikeyvaluehere&name=example.com""#,
             r#"tmp_password:bytes = InputPaymentCredentials;"#,
