@@ -9,6 +9,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 
+const ENGINE_NAME: &str = "pentect";
 const MAX_SCAN_FILE_BYTES: u64 = 1024 * 1024;
 const CREDSWEEPER_BATCH_SIZE: usize = 128;
 const CREDSWEEPER_JOBS: &str = "8";
@@ -16,62 +17,16 @@ const CREDSWEEPER_JOBS: &str = "8";
 pub(super) fn scan_files(
     files: Vec<PathBuf>,
     packs: Vec<pentect_core::Pack>,
-    core_only: bool,
 ) -> Result<(Vec<ScanFile>, String), String> {
-    let plan = ScanPlan::new(core_only);
-    let mut out = Vec::new();
-    let mut report = FindingSet::default();
-    let mut scanned_paths = BTreeSet::new();
+    ScanPipeline::pentect(packs)?.scan(files)
+}
 
-    if let Some(command) = plan.credsweeper_command.clone() {
-        let mut eligible = Vec::new();
-        for path in &files {
-            match lightweight_precheck(path)? {
-                Precheck::Eligible => {
-                    scanned_paths.insert(path.clone());
-                    eligible.push(path.clone());
-                }
-                Precheck::Skipped(skipped) => out.push(ScanFile::Skipped(skipped)),
-            }
-        }
-        for file in CredSweeperRunner::new(command).scan(&eligible)? {
-            report.merge_file(file);
-        }
-    }
-
-    if plan.core {
-        for file in scan_core_files(files, packs)? {
-            match file {
-                ScanFile::Finding(file) => {
-                    scanned_paths.insert(file.path.clone());
-                    report.merge_file(file);
-                }
-                ScanFile::Clean(path) => {
-                    scanned_paths.insert(path);
-                }
-                ScanFile::Skipped(skipped) => {
-                    if plan.credsweeper_command.is_none() {
-                        out.push(ScanFile::Skipped(skipped));
-                    }
-                }
-            }
-        }
-    }
-
-    let finding_files = report.into_files();
-    let finding_paths = finding_files
-        .iter()
-        .map(|file| file.path.clone())
-        .collect::<BTreeSet<_>>();
-    for path in scanned_paths {
-        if !finding_paths.contains(&path) {
-            out.push(ScanFile::Clean(path));
-        }
-    }
-    for file in finding_files {
-        out.push(ScanFile::Finding(file));
-    }
-    Ok((out, plan.name.to_string()))
+#[cfg(test)]
+pub(super) fn scan_files_core_for_tests(
+    files: Vec<PathBuf>,
+    packs: Vec<pentect_core::Pack>,
+) -> Result<(Vec<ScanFile>, String), String> {
+    ScanPipeline::core_for_tests(packs).scan(files)
 }
 
 #[derive(Clone, Debug)]
@@ -81,51 +36,100 @@ pub(super) enum ScanFile {
     Skipped(SkippedFile),
 }
 
-#[derive(Clone, Debug)]
-struct ScanPlan {
+/// One detector backend inside the Pentect scan engine.
+///
+/// Adding a new engine should mean implementing this trait and appending it in
+/// `ScanPipeline::pentect`. The pipeline owns path filtering, de-duplication,
+/// value-free reporting, and final scan counts.
+trait ScanBackend {
+    fn name(&self) -> &'static str;
+    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String>;
+}
+
+struct ScanPipeline {
     name: &'static str,
-    core: bool,
-    credsweeper_command: Option<CredSweeperCommand>,
+    backends: Vec<Box<dyn ScanBackend>>,
 }
 
-impl ScanPlan {
-    fn new(core_only: bool) -> Self {
-        if core_only {
-            return Self {
-                name: "core",
-                core: true,
-                credsweeper_command: None,
-            };
-        }
-        let credsweeper_command = CredSweeperCommand::discover();
+impl ScanPipeline {
+    fn pentect(packs: Vec<pentect_core::Pack>) -> Result<Self, String> {
+        Ok(Self {
+            name: ENGINE_NAME,
+            backends: vec![
+                Box::new(CredSweeperBackend::new()?),
+                Box::new(CoreBackend::new(packs)),
+            ],
+        })
+    }
+
+    #[cfg(test)]
+    fn core_for_tests(packs: Vec<pentect_core::Pack>) -> Self {
         Self {
-            name: "pentect",
-            core: true,
-            credsweeper_command,
+            name: "core",
+            backends: vec![Box::new(CoreBackend::new(packs))],
         }
+    }
+
+    fn scan(&mut self, files: Vec<PathBuf>) -> Result<(Vec<ScanFile>, String), String> {
+        let (eligible, skipped) = precheck_files(&files)?;
+        let mut out = skipped
+            .into_iter()
+            .map(ScanFile::Skipped)
+            .collect::<Vec<_>>();
+        let mut scanned_paths = eligible.iter().cloned().collect::<BTreeSet<_>>();
+        let mut findings = FindingSet::default();
+
+        for backend in &mut self.backends {
+            let backend_name = backend.name();
+            for file in backend
+                .scan(&eligible)
+                .map_err(|e| format!("{backend_name}: {e}"))?
+            {
+                scanned_paths.insert(file.path.clone());
+                findings.merge_file(file);
+            }
+        }
+
+        let finding_files = findings.into_files();
+        let finding_paths = finding_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<BTreeSet<_>>();
+        for path in scanned_paths {
+            if !finding_paths.contains(&path) {
+                out.push(ScanFile::Clean(path));
+            }
+        }
+        for file in finding_files {
+            out.push(ScanFile::Finding(file));
+        }
+        Ok((out, self.name.to_string()))
     }
 }
 
-enum Precheck {
-    Eligible,
-    Skipped(SkippedFile),
-}
-
-fn lightweight_precheck(path: &Path) -> Result<Precheck, String> {
-    if let Some(reason) = ignored_file_reason(path) {
-        return Ok(Precheck::Skipped(SkippedFile::new(path, reason)));
-    }
-    let meta = match std::fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Precheck::Skipped(SkippedFile::new(path, "missing")));
+fn precheck_files(files: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<SkippedFile>), String> {
+    let mut eligible = Vec::new();
+    let mut skipped = Vec::new();
+    for path in files {
+        if let Some(reason) = ignored_file_reason(path) {
+            skipped.push(SkippedFile::new(path, reason));
+            continue;
         }
-        Err(e) => return Err(format!("could not read '{}': {e}", path.display())),
-    };
-    if meta.len() > MAX_SCAN_FILE_BYTES {
-        return Ok(Precheck::Skipped(SkippedFile::new(path, "too large")));
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                skipped.push(SkippedFile::new(path, "missing"));
+                continue;
+            }
+            Err(e) => return Err(format!("could not read '{}': {e}", path.display())),
+        };
+        if meta.len() > MAX_SCAN_FILE_BYTES {
+            skipped.push(SkippedFile::new(path, "too large"));
+            continue;
+        }
+        eligible.push(path.clone());
     }
-    Ok(Precheck::Eligible)
+    Ok((eligible, skipped))
 }
 
 #[derive(Default)]
@@ -243,6 +247,81 @@ impl SourceRange {
     }
 }
 
+struct CredSweeperBackend {
+    command: CredSweeperCommand,
+}
+
+impl CredSweeperBackend {
+    fn new() -> Result<Self, String> {
+        let command = CredSweeperCommand::discover().ok_or_else(credsweeper_required)?;
+        Ok(Self { command })
+    }
+
+    fn run_batch(&self, files: &[PathBuf], output_path: &Path) -> Result<(), String> {
+        let mut command = Command::new(&self.command.python);
+        command
+            .args(["-m", "credsweeper", "--jobs", CREDSWEEPER_JOBS])
+            .arg("--save-json")
+            .arg(output_path)
+            .args([
+                "--sort",
+                "--subtext",
+                "--no-stdout",
+                "--no-color",
+                "--hashed",
+                "--no-error",
+                "--path",
+            ]);
+        for file in files {
+            command.arg(file);
+        }
+        let output = command
+            .output()
+            .map_err(|_| "failed to launch CredSweeper".to_string())?;
+        if !output.status.success() {
+            return Err("CredSweeper failed".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl ScanBackend for CredSweeperBackend {
+    fn name(&self) -> &'static str {
+        "credsweeper"
+    }
+
+    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut by_file: BTreeMap<PathBuf, FileAccumulator> = BTreeMap::new();
+        for (batch_index, batch) in files.chunks(CREDSWEEPER_BATCH_SIZE).enumerate() {
+            let output_path = temp_json_path(batch_index);
+            self.run_batch(batch, &output_path)?;
+            let hits = parse_credsweeper_output(&output_path);
+            let _ = std::fs::remove_file(&output_path);
+            for hit in hits? {
+                let path = hit.path.clone();
+                by_file
+                    .entry(path.clone())
+                    .or_insert_with(|| FileAccumulator {
+                        path: path.clone(),
+                        scope: ScanScope::classify(&path),
+                        kind: infer_kind(&path),
+                        warnings: 0,
+                        parser_fallback: false,
+                        hits: Vec::new(),
+                    })
+                    .push_hit_with_path(hit);
+            }
+        }
+        Ok(by_file
+            .into_values()
+            .filter_map(FileAccumulator::into_file)
+            .collect())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CredSweeperCommand {
     python: PathBuf,
@@ -268,11 +347,20 @@ impl CredSweeperCommand {
     }
 }
 
+fn credsweeper_required() -> String {
+    "CredSweeper is required for `pentect scan`; set PENTECT_CREDSWEEPER_PYTHON or install it in crates/pentect-core/vendors/CredSweeper/.venv".to_string()
+}
+
 fn bundled_venv_candidates() -> Vec<PathBuf> {
     let Some(root) = repo_root() else {
         return Vec::new();
     };
-    let base = root.join("third_party").join("CredSweeper").join(".venv");
+    let base = root
+        .join("crates")
+        .join("pentect-core")
+        .join("vendors")
+        .join("CredSweeper")
+        .join(".venv");
     if cfg!(windows) {
         vec![base.join("Scripts").join("python.exe")]
     } else {
@@ -283,7 +371,13 @@ fn bundled_venv_candidates() -> Vec<PathBuf> {
 fn repo_root() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        if dir.join(".gitmodules").is_file() && dir.join("third_party").join("CredSweeper").exists()
+        if dir.join(".gitmodules").is_file()
+            && dir
+                .join("crates")
+                .join("pentect-core")
+                .join("vendors")
+                .join("CredSweeper")
+                .exists()
         {
             return Some(dir);
         }
@@ -298,73 +392,6 @@ fn module_available(python: &Path) -> bool {
         .args(["-m", "credsweeper", "--version"])
         .output()
         .is_ok_and(|output| output.status.success())
-}
-
-struct CredSweeperRunner {
-    command: CredSweeperCommand,
-}
-
-impl CredSweeperRunner {
-    fn new(command: CredSweeperCommand) -> Self {
-        Self { command }
-    }
-
-    fn scan(&self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String> {
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut by_file: BTreeMap<PathBuf, FileAccumulator> = BTreeMap::new();
-        for (batch_index, batch) in files.chunks(CREDSWEEPER_BATCH_SIZE).enumerate() {
-            let output_path = temp_json_path(batch_index);
-            self.run_batch(batch, &output_path)?;
-            for hit in parse_credsweeper_output(&output_path)? {
-                let path = hit.path.clone();
-                by_file
-                    .entry(path.clone())
-                    .or_insert_with(|| FileAccumulator {
-                        path: path.clone(),
-                        scope: ScanScope::classify(&path),
-                        kind: infer_kind(&path),
-                        warnings: 0,
-                        parser_fallback: false,
-                        hits: Vec::new(),
-                    })
-                    .push_hit_with_path(hit);
-            }
-            let _ = std::fs::remove_file(&output_path);
-        }
-        Ok(by_file
-            .into_values()
-            .filter_map(FileAccumulator::into_file)
-            .collect())
-    }
-
-    fn run_batch(&self, files: &[PathBuf], output_path: &Path) -> Result<(), String> {
-        let mut command = Command::new(&self.command.python);
-        command
-            .args(["-m", "credsweeper", "--jobs", CREDSWEEPER_JOBS])
-            .arg("--save-json")
-            .arg(output_path)
-            .args([
-                "--sort",
-                "--subtext",
-                "--no-stdout",
-                "--no-color",
-                "--hashed",
-                "--no-error",
-                "--path",
-            ]);
-        for file in files {
-            command.arg(file);
-        }
-        let output = command
-            .output()
-            .map_err(|_| "failed to launch CredSweeper".to_string())?;
-        if !output.status.success() {
-            return Err("CredSweeper failed; check the Python environment and try `python -m credsweeper --version`".to_string());
-        }
-        Ok(())
-    }
 }
 
 fn temp_json_path(batch_index: usize) -> PathBuf {
@@ -485,51 +512,12 @@ fn normalize_label(rule: &str) -> String {
     }
 }
 
-fn scan_core_files(
-    files: Vec<PathBuf>,
-    packs: Vec<pentect_core::Pack>,
-) -> Result<Vec<ScanFile>, String> {
-    if files.is_empty() {
-        return Ok(Vec::new());
-    }
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(8)
-        .min(files.len());
-    let files = Arc::new(files);
-    let next = Arc::new(AtomicUsize::new(0));
-    let (tx, rx) = mpsc::channel();
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let files = Arc::clone(&files);
-            let next = Arc::clone(&next);
-            let packs = packs.clone();
-            let tx = tx.clone();
-            scope.spawn(move || {
-                let mut worker = CoreWorker::new(packs);
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(path) = files.get(index) else {
-                        break;
-                    };
-                    if tx.send(worker.scan_file(path)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(tx);
-        rx.into_iter().collect::<Result<Vec<_>, _>>()
-    })
-}
-
-struct CoreWorker {
+struct CoreBackend {
     packs: Option<Vec<pentect_core::Pack>>,
     engine: Option<Engine>,
 }
 
-impl CoreWorker {
+impl CoreBackend {
     fn new(packs: Vec<pentect_core::Pack>) -> Self {
         Self {
             packs: Some(packs),
@@ -537,28 +525,15 @@ impl CoreWorker {
         }
     }
 
-    fn scan_file(&mut self, path: &Path) -> Result<ScanFile, String> {
-        if let Some(reason) = ignored_file_reason(path) {
-            return Ok(ScanFile::Skipped(SkippedFile::new(path, reason)));
-        }
-        let meta = match std::fs::metadata(path) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ScanFile::Skipped(SkippedFile::new(path, "missing")));
-            }
-            Err(e) => return Err(format!("could not read '{}': {e}", path.display())),
-        };
-        if meta.len() > MAX_SCAN_FILE_BYTES {
-            return Ok(ScanFile::Skipped(SkippedFile::new(path, "too large")));
-        }
+    fn scan_file(&mut self, path: &Path) -> Result<Option<FileFinding>, String> {
         let bytes =
             std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
         if bytes.contains(&0) {
-            return Ok(ScanFile::Skipped(SkippedFile::new(path, "binary content")));
+            return Ok(None);
         }
         let data = match String::from_utf8(bytes) {
             Ok(data) => data,
-            Err(_) => return Ok(ScanFile::Skipped(SkippedFile::new(path, "non-utf8"))),
+            Err(_) => return Ok(None),
         };
         let kind = infer_kind(path);
         self.ensure_engine();
@@ -579,9 +554,9 @@ impl CoreWorker {
             .filter(|note| note.category == Category::Secret)
             .count();
         if hits.is_empty() && warnings == 0 {
-            return Ok(ScanFile::Clean(path.to_path_buf()));
+            return Ok(None);
         }
-        Ok(ScanFile::Finding(FileFinding {
+        Ok(Some(FileFinding {
             path: path.to_path_buf(),
             scope: ScanScope::classify(path),
             kind,
@@ -605,6 +580,51 @@ impl CoreWorker {
             packs,
             false,
         ));
+    }
+}
+
+impl ScanBackend for CoreBackend {
+    fn name(&self) -> &'static str {
+        "core"
+    }
+
+    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8)
+            .min(files.len());
+        let files = Arc::new(files.to_vec());
+        let next = Arc::new(AtomicUsize::new(0));
+        let packs = self.packs.take().unwrap_or_default();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let files = Arc::clone(&files);
+                let next = Arc::clone(&next);
+                let packs = packs.clone();
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let mut worker = CoreBackend::new(packs);
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(path) = files.get(index) else {
+                            break;
+                        };
+                        if tx.send(worker.scan_file(path)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            rx.into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .map(|items| items.into_iter().flatten().collect())
+        })
     }
 }
 

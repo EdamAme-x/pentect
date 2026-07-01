@@ -33,9 +33,26 @@ pub(crate) fn cmd_scan(args: &[String]) {
 
 fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
     let packs = load_packs(args)?;
+    run_scan_with_engine(opts, packs, scan_files)
+}
+
+#[cfg(test)]
+fn run_scan_core_for_tests(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
+    let packs = load_packs(args)?;
+    run_scan_with_engine(opts, packs, engine::scan_files_core_for_tests)
+}
+
+fn run_scan_with_engine(
+    opts: &ScanOpts,
+    packs: Vec<pentect_core::Pack>,
+    scanner: impl FnOnce(
+        Vec<std::path::PathBuf>,
+        Vec<pentect_core::Pack>,
+    ) -> Result<(Vec<ScanFile>, String), String>,
+) -> Result<ScanReport, String> {
     let mut report = ScanReport {
         roots: opts.paths.clone(),
-        engine: if opts.core_only { "core" } else { "pentect" }.to_string(),
+        engine: "pentect".to_string(),
         ..ScanReport::default()
     };
     let files = collect_scan_roots(
@@ -44,7 +61,7 @@ fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
         opts.gitignore,
         &mut report.skipped,
     )?;
-    let (results, engine) = scan_files(files, packs, opts.core_only)?;
+    let (results, engine) = scanner(files, packs)?;
     report.engine = engine;
     for result in results {
         match result {
@@ -77,7 +94,6 @@ mod tests {
         let args = vec!["pentect".into(), "scan".into()];
         let opts = ScanOpts::parse(&args).unwrap();
         assert_eq!(opts.paths, vec![PathBuf::from(".")]);
-        assert!(!opts.core_only);
         assert!(!opts.json);
         assert!(!opts.no_fail);
         assert!(!opts.gitignore);
@@ -102,16 +118,15 @@ mod tests {
     }
 
     #[test]
-    fn scan_parse_accepts_core_mode() {
+    fn scan_parse_rejects_core_mode() {
         let args = vec![
             "pentect".into(),
             "scan".into(),
             "--core".into(),
             "app.env".into(),
         ];
-        let opts = ScanOpts::parse(&args).unwrap();
-        assert!(opts.core_only);
-        assert_eq!(opts.paths, vec![PathBuf::from("app.env")]);
+        let err = ScanOpts::parse(&args).unwrap_err();
+        assert!(err.contains("unknown option"), "{err}");
     }
 
     #[test]
@@ -177,7 +192,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
         let rendered = report_json(&report);
         assert_eq!(report.files_scanned, 2);
         assert_eq!(report.files.len(), 1);
@@ -211,7 +226,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
 
         assert_eq!(report.files_scanned, 1, "{}", report_json(&report));
         assert!(report
@@ -243,7 +258,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
 
         assert_eq!(report.files_scanned, 2, "{}", report_json(&report));
         assert!(report
@@ -275,7 +290,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
 
         assert!(report
             .files
@@ -307,7 +322,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
 
         assert!(report
             .files
@@ -333,7 +348,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
 
         assert!(report
             .files
@@ -361,7 +376,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
         assert!(report
             .files
             .iter()
@@ -377,7 +392,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
         assert!(report
             .files
             .iter()
@@ -387,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_nested_ignore_files_remove_files_from_fallback_walk() {
+    fn scan_nested_ignore_files_remove_files_from_walk() {
         let root = temp_scan_root("pentect-scan-nested-ignore");
         std::fs::create_dir_all(root.join("sub").join("child")).unwrap();
         std::fs::write(root.join("sub").join(".pentectignore"), "ignored.env\n").unwrap();
@@ -419,7 +434,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
 
         assert!(report
             .files
@@ -448,7 +463,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
         assert_eq!(report.files_scanned, 1);
         assert!(report.skipped.is_empty(), "{}", report_json(&report));
         assert_eq!(report.files.len(), 1, "{}", report_json(&report));
@@ -470,7 +485,7 @@ mod tests {
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
-        let report = run_scan(&args, &opts).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
         assert_eq!(report.files_scanned, 1);
         assert_eq!(report.files.len(), 1);
         assert!(report.findings >= 1, "{}", report_json(&report));

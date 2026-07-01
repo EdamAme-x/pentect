@@ -3,7 +3,6 @@ use std::path::PathBuf;
 #[derive(Clone, Debug)]
 pub(super) struct ScanOpts {
     pub(super) paths: Vec<PathBuf>,
-    pub(super) core_only: bool,
     pub(super) json: bool,
     pub(super) no_fail: bool,
     pub(super) gitignore: bool,
@@ -13,7 +12,6 @@ pub(super) struct ScanOpts {
 impl ScanOpts {
     pub(super) fn parse(args: &[String]) -> Result<Self, String> {
         let mut paths = Vec::new();
-        let mut core_only = false;
         let mut json = false;
         let mut no_fail = false;
         let mut gitignore = false;
@@ -31,10 +29,6 @@ impl ScanOpts {
                 }
                 "--gitignore" => {
                     gitignore = true;
-                    i += 1;
-                }
-                "--core" => {
-                    core_only = true;
                     i += 1;
                 }
                 "--exclude" => {
@@ -60,7 +54,6 @@ impl ScanOpts {
         }
         Ok(Self {
             paths,
-            core_only,
             json,
             no_fail,
             gitignore,
