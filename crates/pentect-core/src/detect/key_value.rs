@@ -1283,15 +1283,47 @@ fn parse_sensitive_call_literal_value(
 }
 
 fn last_call_identifier(head: &str) -> Option<&str> {
-    head.rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .find(|part| !part.is_empty() && *part != "new")
+    let head = head.trim_end();
+    let (start, end) = trailing_identifier_range(head)?;
+    let identifier = &head[start..end];
+    if identifier != "new" {
+        return Some(identifier);
+    }
+    let before_new = head[..start].trim_end();
+    let before_new = before_new
+        .strip_suffix('.')
+        .or_else(|| before_new.strip_suffix("::"))?
+        .trim_end();
+    let (start, end) = trailing_identifier_range(before_new)?;
+    Some(&before_new[start..end])
+}
+
+fn trailing_identifier_range(value: &str) -> Option<(usize, usize)> {
+    let end = value.len();
+    let mut chars = value.char_indices().rev();
+    let (last_start, last) = chars.next()?;
+    if !(last.is_ascii_alphanumeric() || last == '_') {
+        return None;
+    }
+    let mut start = last_start;
+    for (idx, ch) in chars {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            start = idx;
+        } else {
+            break;
+        }
+    }
+    Some((start, end))
 }
 
 fn call_name_accepts_secret_literal(call_key: &str, _key_name: &str) -> bool {
     if call_name_is_prompt_or_lookup(call_key) {
         return false;
     }
-    has_identifier_component(call_key, "credential")
+    has_identifier_component(call_key, "otp")
+        || has_identifier_component(call_key, "totp")
+        || has_identifier_component(call_key, "hotp")
+        || has_identifier_component(call_key, "credential")
         || has_identifier_component(call_key, "credentials")
         || (has_identifier_component(call_key, "token")
             && (has_identifier_component(call_key, "auth")
@@ -1560,10 +1592,11 @@ fn looks_like_secret_value(
 
     let chars = value.chars().count();
     if matches!(kind, KeyKind::Otp) {
-        return (4..=12).contains(&chars)
+        return ((4..=12).contains(&chars)
             && value
                 .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ' '));
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ' ')))
+            || is_base32_otp_seed_material(value);
     }
 
     if matches!(kind, KeyKind::Salt) {
@@ -1755,6 +1788,22 @@ fn looks_like_salt_material(value: &str, key_name: &str) -> bool {
     let has_digit = bytes.iter().any(u8::is_ascii_digit);
     let has_symbol = bytes.iter().any(|b| !b.is_ascii_alphanumeric());
     has_alpha && (has_digit || has_symbol)
+}
+
+fn is_base32_otp_seed_material(value: &str) -> bool {
+    // TOTP/HOTP provisioning secrets are RFC 4648 base32 strings. Requiring
+    // OTP-local key/call context elsewhere lets this accept real seed lengths
+    // without treating arbitrary uppercase prose as credentials.
+    let value = value.trim().trim_end_matches('=');
+    let bytes = value.as_bytes();
+    (16..=128).contains(&bytes.len())
+        && bytes.iter().all(|b| {
+            b.is_ascii_uppercase()
+                || b.is_ascii_digit() && matches!(*b, b'2' | b'3' | b'4' | b'5' | b'6' | b'7')
+        })
+        && bytes
+            .iter()
+            .any(|b| matches!(*b, b'2' | b'3' | b'4' | b'5' | b'6' | b'7'))
 }
 
 fn is_prefixed_material_literal(value: &str, key_name: &str, kind: KeyKind) -> bool {
@@ -7101,6 +7150,15 @@ mod tests {
         assert!(has("otp=100482 expires soon", "100482"));
         assert!(has("verification_code=100482", "100482"));
         assert!(has(
+            "otp = ROTP::TOTP.new('JBSWY3DPEHPK3PXP')",
+            "JBSWY3DPEHPK3PXP"
+        ));
+        assert!(has(
+            "otp = ROTP::HOTP.new('JBSWY3DPEHPK3PXP', counter: 7)",
+            "JBSWY3DPEHPK3PXP"
+        ));
+        assert!(has("totp_secret: JBSWY3DPEHPK3PXP", "JBSWY3DPEHPK3PXP"));
+        assert!(has(
             "k8s secret data api-key: abcDEF123456+/==",
             "abcDEF123456+/=="
         ));
@@ -7265,6 +7323,7 @@ mod tests {
             r#"authorization: "ApiKey docs""#,
             "jwt_like=aaa.bbb.ccc",
             "Authorization: Basic login_and_password_removed",
+            r#"[('Vary', 'Accept, Authorization, Cookie, X-GitHub-OTP'), ('ETag', 'W/"605a3ce7e4fb2cf76f450b75b1efd423"')]"#,
             r#""description": "Use `Authorization` header.\n\n> Authorization: Bearer abc123-EXAMPLE the `Authorization` header is required.""#,
             "repeat_password: Powtórz hasło",
             "confirm_password: Potwierdź moje konto",

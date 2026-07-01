@@ -105,6 +105,12 @@ impl RuleDetector {
                 "GOOGLE_OAUTH_TOKEN",
                 High,
             ),
+            (
+                r"glsa_[A-Za-z0-9_-]{32,}",
+                Secret,
+                "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+                High,
+            ),
             // Fine-grained PAT; distinct format from the classic gh*_ family.
             (r"github_pat_[A-Za-z0-9_]{22,}", Secret, "GITHUB_PAT", High),
             // Classic GitHub token family (p/o/u/s/r) is one format, so one rule.
@@ -500,6 +506,7 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         "GOOGLE_API_KEY" => &["AIza"],
         "GOOGLE_OAUTH_SECRET" => &["GOCSPX-"],
         "GOOGLE_OAUTH_TOKEN" => &["ya29."],
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN" => &["glsa_"],
         "GITHUB_PAT" => &["github_pat_"],
         "GITHUB_TOKEN" => &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"],
         "SENDGRID_KEY" => &["SG."],
@@ -825,9 +832,21 @@ mod tests {
             "jwt=eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop.abcdefghijklmnop",
             "JWT_SECRET"
         ));
+        let grafana_service_account_token = format!(
+            "grafana_token={}{}",
+            "glsa_", "fnkR76owNDLNwoj5sT63UJrhzpJmM52J_f4537340"
+        );
+        assert!(has(
+            &grafana_service_account_token,
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN"
+        ));
         assert!(!has(
             "jwe=eyJhbGciOiJSU0EtT0FFUCJ9.abcdefghijklmnop.abcdefghijklmnop.abcdefghijklmnop.abcdefghijklmnop",
             "JWT_SECRET"
+        ));
+        assert!(!has(
+            "grafana_token=glsa_short",
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN"
         ));
         assert!(!has(
             "port=5432 workers=4 timeout_ms=30000 status=200",
