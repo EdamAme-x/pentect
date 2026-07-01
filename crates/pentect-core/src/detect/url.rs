@@ -1317,7 +1317,9 @@ mod tests {
             )]
         );
         assert_eq!(
-            labels(r#""Bearer authorization_uri=https://login.example/550e8400-e29b-41d4-a716-446655440000\""#),
+            labels(
+                r#""Bearer authorization_uri=https://login.example/550e8400-e29b-41d4-a716-446655440000\""#
+            ),
             [(
                 "UUID".to_string(),
                 "550e8400-e29b-41d4-a716-446655440000".to_string()
@@ -1459,17 +1461,13 @@ mod tests {
              mysql://my-user:my-password@localhost/my-db \
              postgres://user:pass@localhost:5432",
         );
-        assert!(got.iter().any(|(label, value)| {
-            label == "URL_CREDENTIAL" && value == "admin:s3cr3t"
-        }));
+        assert!(got
+            .iter()
+            .any(|(label, value)| { label == "URL_CREDENTIAL" && value == "admin:s3cr3t" }));
         assert!(got
             .iter()
             .any(|(label, value)| label == "URL_CREDENTIAL" && value == "ctfd:qthn"));
-        for placeholder in [
-            "testuser:knextest",
-            "my-user:my-password",
-            "user:pass",
-        ] {
+        for placeholder in ["testuser:knextest", "my-user:my-password", "user:pass"] {
             assert!(
                 got.iter().all(|(_, value)| value != placeholder),
                 "{placeholder}: {got:?}"

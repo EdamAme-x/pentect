@@ -1144,8 +1144,12 @@ mod tests {
         assert!(is_structured_key_name_reference_value("fieldset1"));
         assert!(is_structured_key_name_reference_value("dataGrid12"));
         assert!(is_structured_key_name_reference_value("field_values"));
-        assert!(is_structured_key_name_reference_value("connection_policies"));
-        assert!(is_structured_key_name_reference_value("task_queues_statistics"));
+        assert!(is_structured_key_name_reference_value(
+            "connection_policies"
+        ));
+        assert!(is_structured_key_name_reference_value(
+            "task_queues_statistics"
+        ));
         assert!(is_structured_key_name_reference_value("table1"));
         assert!(is_structured_key_name_reference_value("checkbox2"));
         assert!(!is_structured_key_name_reference_value("password"));
