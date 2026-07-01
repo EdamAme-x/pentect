@@ -24,6 +24,7 @@ component:auth
 component:client
 component:config
 component:cost
+component:cookie
 component:credential
 component:database
 component:db
@@ -47,6 +48,7 @@ component:server
 component:service
 component:setting
 component:smtp
+component:store
 component:team
 component:tag
 component:token
@@ -126,6 +128,7 @@ name:value
 name:vary
 name:vehicles
 name:x_correlation_id
+name:x_forwarded_for
 name:year
 numbered_name:columns
 numbered_name:container
@@ -135,6 +138,7 @@ numbered_name:fieldset
 numbered_name:panel
 numbered_name:foo
 numbered_name:item
+numbered_name:key
 numbered_name:sample_key
 numbered_name:source
 numbered_name:step

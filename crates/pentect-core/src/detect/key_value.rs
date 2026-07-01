@@ -1318,6 +1318,7 @@ fn looks_like_secret_value(
         || is_source_env_fallback_name_literal(value, key_name, source_key)
         || is_source_constant_reference_literal(value, key_name, source_key)
         || is_source_declared_name_literal(value, key_name, source_key)
+        || is_source_declared_lower_name_literal(value, key_name, source_key)
         || is_source_config_name_literal(value, source_key)
         || is_self_describing_key_value_placeholder(value, key_name, source_key)
         || is_source_sensitive_name_reference_literal(value, source_key)
@@ -2624,6 +2625,9 @@ fn is_key_algorithm_literal(value: &str) -> bool {
     // Algorithm/size labels such as `RSA-2048` describe how a key should be
     // generated or interpreted. They are not the private/public key bytes.
     let value = value.trim();
+    if is_nid_algorithm_identifier(value) {
+        return true;
+    }
     if value.eq_ignore_ascii_case("AWS4-HMAC-SHA256") {
         // AWS Signature Version 4's signing algorithm identifier is public
         // protocol metadata, not the HMAC signing key.
@@ -2666,9 +2670,36 @@ fn is_key_algorithm_literal(value: &str) -> bool {
     if !(128..=16384).contains(&bits) {
         return false;
     }
-    parts.all(|part| {
-        !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) && part.len() <= 5
-    })
+    parts.all(is_public_algorithm_suffix_part)
+}
+
+fn is_public_algorithm_suffix_part(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= 10
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_'))
+        && (part.bytes().all(|b| b.is_ascii_digit())
+            || normalize_key(part)
+                .split('_')
+                .all(|word| matches!(word, "fips" | "fips186" | "public" | "default")))
+}
+
+fn is_nid_algorithm_identifier(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("nid_") else {
+        return false;
+    };
+    (4..=64).contains(&rest.len())
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_'))
+        && contains_any(
+            rest,
+            &[
+                "aes", "aria", "camellia", "des", "dh", "dsa", "ecdsa", "ed25519", "rsa", "sha",
+            ],
+        )
 }
 
 fn is_public_curve_algorithm_literal(value: &str, key_name: &str) -> bool {
@@ -3369,7 +3400,9 @@ fn is_generic_key_placeholder_literal(value: &str, key_name: &str) -> bool {
         return false;
     }
     let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
-    is_pem_ellipsis_placeholder(value) || is_incomplete_angle_placeholder_literal(value)
+    is_pem_ellipsis_placeholder(value)
+        || is_incomplete_angle_placeholder_literal(value)
+        || is_braced_template_placeholder_literal(value)
 }
 
 fn is_incomplete_angle_placeholder_literal(value: &str) -> bool {
@@ -3390,6 +3423,20 @@ fn is_incomplete_angle_placeholder_literal(value: &str) -> bool {
             "base64" | "encoded" | "placeholder" | "sample" | "example" | "key"
         )
     }) && inner.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+fn is_braced_template_placeholder_literal(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    (2..=48).contains(&inner.len())
+        && inner.bytes().any(|b| b.is_ascii_alphabetic())
+        && inner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
 fn is_html_tag_sequence_fragment(value: &str) -> bool {
@@ -4082,6 +4129,37 @@ fn is_source_declared_name_literal(value: &str, key_name: &str, source_key: &str
     }
     let value_compact = normalize_key(value).replace('_', "");
     value_compact == key_compact || value_compact.ends_with(&key_compact)
+}
+
+fn is_source_declared_lower_name_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // Source constants also publish lower-case setting/resource names:
+    // `CONSUMER_KEY = "oauth_consumer_key"` or
+    // `DELETE_KEY_SWIPE_LEFT = "gestures__delete_key_swipe_left"`.
+    // The RHS is metadata when its normalized suffix matches the declared
+    // identifier. Requiring source syntax, identifier separators, and no digits
+    // keeps real values such as `api_key="abc123"` or `secret="tenant-7-trial"`
+    // visible.
+    if !source_key_has_code_shape(source_key) {
+        return false;
+    }
+    if !(key_name_has_sensitive_component(key_name)
+        || key_name_indicates_sensitive_material(key_name))
+    {
+        return false;
+    }
+    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !(5..=128).contains(&value.len())
+        || value.bytes().any(|b| b.is_ascii_digit())
+        || !value.bytes().any(|b| matches!(b, b'_' | b'-' | b'.'))
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return false;
+    }
+    let declared = normalize_key(key_name).replace('_', "");
+    let value_name = normalize_key(value).replace('_', "");
+    declared.len() >= 6 && value_name.ends_with(&declared)
 }
 
 fn is_uppercase_identifier_constant(value: &str) -> bool {
@@ -6518,6 +6596,10 @@ mod tests {
         ));
         assert!(has("api_key: Abc123Secret", "Abc123Secret"));
         assert!(has("api_key=Abc-2048", "Abc-2048"));
+        assert!(has(
+            r#"const string CONSUMER_KEY = "prod_consumer_key_2026";"#,
+            "prod_consumer_key_2026"
+        ));
         assert!(has(r#"password="{{secret123}}""#, "{{secret123}}"));
         assert!(has(
             r#"password="redis://:secret@localhost:6379/1""#,
@@ -6709,8 +6791,16 @@ mod tests {
             "Key = P-256_NAMED_CURVE_EXPLICIT",
             "Key = B-163",
             "Key = Bob-448-PUBLIC-Raw-NonCanonical",
+            "Key = DSA-1024-FIPS186-2",
+            "nid_key = NID_aes_256_cbc;",
             "key = <base64-encoded",
+            "key = {BaseUrl}",
+            r#"key: "cookie_store_key""#,
+            r#"Key = "X-Forwarded-For""#,
             r#"key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n""#,
+            r#"{'Key': 'key1', 'Value': 'value1'}"#,
+            r#"String CONSUMER_KEY = "oauth_consumer_key";"#,
+            r#"const val DELETE_KEY_SWIPE_LEFT = "gestures__delete_key_swipe_left""#,
             "password=start_pass_downsample",
             "client_secret=tenant_trial",
             "struct SessionHandle *data = conn->data;",
