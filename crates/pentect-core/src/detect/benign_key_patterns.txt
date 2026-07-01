@@ -16,11 +16,17 @@ exact:correlation_key
 exact:foreign_key
 exact:routing_key
 exact:token_vocab
+exact:token_type
+exact:auth_type
+exact:authtype
+exact:filler_token
 exact:topology_key
 prefix:public_
 suffix:_public
 suffix:_foreign_key
 suffix:_routing_key
+suffix:_auth_type
+suffix:_authtype
 suffix:_key_name
 suffix:_envar
 suffix:_env_var

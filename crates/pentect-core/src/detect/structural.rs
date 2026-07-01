@@ -870,6 +870,12 @@ mod tests {
         assert_eq!(sensitive_key_fires(Some("key"), "unknown"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "offset"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "host"), None);
+        assert_eq!(sensitive_key_fires(Some("token_type"), "bearer"), None);
+        assert_eq!(
+            sensitive_key_fires(Some("x-amazon-apigateway-authtype"), "awsSigv4"),
+            None
+        );
+        assert_eq!(sensitive_key_fires(Some("filler_token"), "sentinel"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "path"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "Team"), None);
         assert_eq!(sensitive_key_fires(Some("key"), "shift+ctrl+i"), None);

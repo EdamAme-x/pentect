@@ -110,17 +110,7 @@ fn local_anchor_before_uuid(text: &str, start: usize) -> bool {
         .next_back()
         .is_some_and(|ch| matches!(ch, '=' | ':' | '/' | '\\' | '"' | '\'' | '{' | '('))
         || prefix.rfind(['=', ':', '/', '\\']).is_some();
-    has_assignment
-        && (has_uuid_anchor_name(prefix)
-            || path_collection_anchor_before_uuid(prefix)
-            || com_guid_syntax_before_uuid(prefix))
-}
-
-fn com_guid_syntax_before_uuid(prefix: &str) -> bool {
-    // COM monikers and CLSID-like constants often carry the GUID as `::{...}`.
-    // The syntax itself is the anchor, so this still catches misspelled local
-    // names without turning arbitrary bare UUIDs into secrets.
-    prefix.trim_end().ends_with("::{")
+    has_assignment && (has_uuid_anchor_name(prefix) || path_collection_anchor_before_uuid(prefix))
 }
 
 fn path_collection_anchor_before_uuid(prefix: &str) -> bool {
@@ -157,7 +147,6 @@ fn has_uuid_anchor_name(value: &str) -> bool {
         compact.as_str(),
         "uuid"
             | "guid"
-            | "clsid"
             | "id"
             | "clientid"
             | "tenantid"
@@ -173,7 +162,6 @@ fn has_uuid_anchor_name(value: &str) -> bool {
             | "migrationguid"
     ) || compact.contains("uuid")
         || compact.contains("guid")
-        || compact.contains("clsid")
         // A UUID may be the value of a larger same-line slot such as
         // `name="client_id" value="..."` or `authorization_uri=.../<uuid>`.
         // Require established identifier/URI slot phrases rather than masking
@@ -190,7 +178,7 @@ fn has_uuid_anchor_name(value: &str) -> bool {
         || has_identifier_phrase(&normalized, &["metadata", "url"])
         || normalized
             .split('_')
-            .any(|part| matches!(part, "uuid" | "guid" | "clsid"))
+            .any(|part| matches!(part, "uuid" | "guid"))
         || has_identifier_slot_name(&normalized)
 }
 
@@ -257,8 +245,6 @@ mod tests {
             format!(r#"resource = "{uuid}""#),
             format!(r#"DEVICE_CODE = "{uuid}""#),
             format!(r#"mux.HandleFunc("/zones/{uuid}/records", handler)"#),
-            format!(r#"#define MYPC_CSLID "::{{{uuid}}}""#),
-            format!(r#"#define MYPC_CLSID "::{{{uuid}}}""#),
             format!(r#"authorization_uri=https://login.example/{uuid}"#),
             format!(r#"<input type=\"hidden\" name=\"client_id\" value=\"{uuid}\" />"#),
         ] {
@@ -271,6 +257,8 @@ mod tests {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         assert!(hits(&format!("see {uuid} later")).is_empty());
         assert!(hits(&format!(r#"link "/share/{uuid}""#)).is_empty());
+        assert!(hits(&format!(r#""object": "clsid:{uuid}""#)).is_empty());
+        assert!(hits(&format!(r#"Get-NdrComProxy -Clsid "{uuid}""#)).is_empty());
     }
 
     #[test]
