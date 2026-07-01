@@ -21,6 +21,7 @@ exact:auth_type
 exact:auth_method
 exact:authtype
 exact:filler_token
+exact:event_key
 exact:topology_key
 prefix:public_
 suffix:_public

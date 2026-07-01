@@ -1679,6 +1679,7 @@ fn looks_like_secret_value(
         || is_generic_code_member_name_literal(value, key_name)
         || is_checksum_metadata_digest_literal(value, key_name, source_key)
         || is_structured_key_name_reference_literal(value, key_name)
+        || is_generic_key_identifier_metadata_literal(value, key_name)
         || is_password_validation_message_literal(value, key_name)
         || is_password_documentation_literal(value, key_name)
         || is_sensitive_slot_documentation_literal(value, key_name)
@@ -2175,7 +2176,8 @@ fn is_numeric_metadata_key_literal(value: &str, key_name: &str, quoted: bool) ->
     // Keep this away from `api_key`, `password`, `token`, and other material
     // fields.
     quoted
-        && ((key_name == "key" && is_small_decimal_code_literal(value))
+        && ((key_name == "key"
+            && (is_small_decimal_code_literal(value) || is_numeric_tree_key_path_literal(value)))
             || (has_identifier_phrase(key_name, &["key", "id"])
                 && is_decimal_key_id_literal(value)))
 }
@@ -2239,6 +2241,17 @@ fn is_small_c_style_int_literal(value: &str) -> bool {
 fn is_small_decimal_code_literal(value: &str) -> bool {
     let bytes = value.trim().as_bytes();
     (1..=6).contains(&bytes.len()) && bytes.iter().all(|b| b.is_ascii_digit())
+}
+
+fn is_numeric_tree_key_path_literal(value: &str) -> bool {
+    // Frontend tree/list controls commonly serialize node positions as
+    // `0-0-1`. Under a literal generic `key` this is a public UI identifier,
+    // while token/password fields still use the normal numeric secret path.
+    let parts = value.trim().split('-').collect::<Vec<_>>();
+    (2..=8).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|part| (1..=4).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn is_decimal_key_id_literal(value: &str) -> bool {
@@ -5917,6 +5930,38 @@ fn is_structured_key_name_reference_literal(value: &str, key_name: &str) -> bool
     is_generic_metadata_key_name(key_name) && is_structured_generic_key_metadata_value(value)
 }
 
+fn is_generic_key_identifier_metadata_literal(value: &str, key_name: &str) -> bool {
+    // Generic `key` fields also hold public enum/schema identifiers such as
+    // `contributor_covenant` or `short_codes`. Require a multi-component
+    // identifier and reject secret-bearing components so `key: sk-test-token`
+    // and digit-bearing key material stay on the detection path.
+    if !is_generic_metadata_key_name(key_name) {
+        return false;
+    }
+    let value = value.trim();
+    if !(5..=80).contains(&value.len())
+        || value.bytes().any(|b| b.is_ascii_digit())
+        || !value.bytes().any(|b| matches!(b, b'_' | b'-'))
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    let normalized = normalize_key(value);
+    let parts = normalized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.len() >= 2
+        && parts.iter().all(|part| {
+            !matches!(
+                *part,
+                "secret" | "password" | "passwd" | "credential" | "token" | "auth" | "private"
+            )
+        })
+}
+
 fn is_plain_prose_literal_for_generic_key(value: &str, key_name: &str) -> bool {
     // Generic keys in messages (`FAILED_TO_RETRIEVE_GENERATED_KEY =
     // "Failed to retrieve the generated key."`) describe UI/prose text. Real
@@ -7394,6 +7439,7 @@ mod tests {
             r#"invalidHashToken := "$-1:111:111""#,
             "token. For example: `O'Neil's` -> [ `O`, `Neil` ]. Defaults to `true`.",
             "options { tokenVocab=PainlessLexer; }",
+            r#"event_key="AGENT_ACTION","#,
             r#"Token.Toolbar.Arg: "arg-toolbar","#,
             "MAX_NONCE: 5524839971, // Max nonce value",
             "salt_rounds = 12",
@@ -7487,8 +7533,11 @@ mod tests {
             r#"DEBUG_HEADER_KEY = "DEBUG_FRAME""#,
             r#"self.__authorizationHeader = f"Bearer {jwt}""#,
             r#"{"license": {"key": "lgpl-3.0"}}"#,
+            r#"{"key": "contributor_covenant"}"#,
+            r#"{"key": "short_codes"}"#,
             r#"{"key":"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCexample"}"#,
             r#"key: '1001',"#,
+            r#"key: '0-0-1',"#,
             r#"var correlationKey = ".xsrf";"#,
             r#"public const string IsW365EnvironmentKeyName = "IsW365Environment";"#,
             r#"public const string PasswordStoreDirEnvar = "PASSWORD_STORE_DIR";"#,
