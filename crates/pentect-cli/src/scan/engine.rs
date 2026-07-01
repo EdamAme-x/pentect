@@ -1,18 +1,18 @@
 use super::report::{FileFinding, ScanScope, SkippedFile};
 use super::walk::ignored_file_reason;
 use crate::infer_kind;
-use pentect_core::{ByteRange, Category, Engine, Input, Kind, Profile, Span};
-use serde::Deserialize;
+use pentect_core::normalize::NormalizedView;
+use pentect_core::{
+    ByteRange, Category, Context, CredSweeperNativeDetector, Detector, Engine, Input, Kind,
+    Profile, Region, RegionKind, Span,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{mpsc, Arc};
 
 const ENGINE_NAME: &str = "pentect";
 const MAX_SCAN_FILE_BYTES: u64 = 1024 * 1024;
-const CREDSWEEPER_BATCH_SIZE: usize = 128;
-const CREDSWEEPER_JOBS: &str = "8";
 
 pub(super) fn scan_files(
     files: Vec<PathBuf>,
@@ -56,7 +56,7 @@ impl ScanPipeline {
         Ok(Self {
             name: ENGINE_NAME,
             backends: vec![
-                Box::new(CredSweeperBackend::new()?),
+                Box::new(NativeCredSweeperBackend::new()),
                 Box::new(CoreBackend::new(packs)),
             ],
         })
@@ -247,45 +247,60 @@ impl SourceRange {
     }
 }
 
-struct CredSweeperBackend {
-    command: CredSweeperCommand,
+struct NativeCredSweeperBackend {
+    detector: CredSweeperNativeDetector,
 }
 
-impl CredSweeperBackend {
-    fn new() -> Result<Self, String> {
-        let command = CredSweeperCommand::discover().ok_or_else(credsweeper_required)?;
-        Ok(Self { command })
+impl NativeCredSweeperBackend {
+    fn new() -> Self {
+        Self {
+            detector: CredSweeperNativeDetector::builtin(),
+        }
     }
 
-    fn run_batch(&self, files: &[PathBuf], output_path: &Path) -> Result<(), String> {
-        let mut command = Command::new(&self.command.python);
-        command
-            .args(["-m", "credsweeper", "--jobs", CREDSWEEPER_JOBS])
-            .arg("--save-json")
-            .arg(output_path)
-            .args([
-                "--sort",
-                "--subtext",
-                "--no-stdout",
-                "--no-color",
-                "--hashed",
-                "--no-error",
-                "--path",
-            ]);
-        for file in files {
-            command.arg(file);
+    fn scan_file(&self, path: &Path) -> Result<Option<FileFinding>, String> {
+        let Some(data) = read_text_file(path)? else {
+            return Ok(None);
+        };
+        let kind = infer_kind(path);
+        let region = Region {
+            span: ByteRange::new(0, data.len()),
+            ctx: Context {
+                path: Some(path.to_string_lossy().to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: RegionKind::PlainText,
+                format: kind.clone(),
+            },
+        };
+        let view = NormalizedView::build(&region, &data);
+        let line_index = LineIndex::new(&data);
+        let hits = self
+            .detector
+            .detect(&view)
+            .iter()
+            .filter(|span| span.category == Category::Secret)
+            .filter_map(|span| hit_from_span(span, &line_index, "credsweeper"))
+            .collect::<Vec<_>>();
+        if hits.is_empty() {
+            return Ok(None);
         }
-        let output = command
-            .output()
-            .map_err(|_| "failed to launch CredSweeper".to_string())?;
-        if !output.status.success() {
-            return Err("CredSweeper failed".to_string());
-        }
-        Ok(())
+        Ok(Some(FileFinding {
+            path: path.to_path_buf(),
+            scope: ScanScope::classify(path),
+            kind,
+            findings: hits.len(),
+            warnings: 0,
+            labels: label_counts(&hits),
+            categories: category_counts(&hits),
+            engines: engine_counts(&hits),
+            parser_fallback: false,
+            hits,
+        }))
     }
 }
 
-impl ScanBackend for CredSweeperBackend {
+impl ScanBackend for NativeCredSweeperBackend {
     fn name(&self) -> &'static str {
         "credsweeper"
     }
@@ -294,221 +309,39 @@ impl ScanBackend for CredSweeperBackend {
         if files.is_empty() {
             return Ok(Vec::new());
         }
-        let mut by_file: BTreeMap<PathBuf, FileAccumulator> = BTreeMap::new();
-        for (batch_index, batch) in files.chunks(CREDSWEEPER_BATCH_SIZE).enumerate() {
-            let output_path = temp_json_path(batch_index);
-            self.run_batch(batch, &output_path)?;
-            let hits = parse_credsweeper_output(&output_path);
-            let _ = std::fs::remove_file(&output_path);
-            for hit in hits? {
-                let path = hit.path.clone();
-                by_file
-                    .entry(path.clone())
-                    .or_insert_with(|| FileAccumulator {
-                        path: path.clone(),
-                        scope: ScanScope::classify(&path),
-                        kind: infer_kind(&path),
-                        warnings: 0,
-                        parser_fallback: false,
-                        hits: Vec::new(),
-                    })
-                    .push_hit_with_path(hit);
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8)
+            .min(files.len());
+        let files = Arc::new(files.to_vec());
+        let next = Arc::new(AtomicUsize::new(0));
+        let detector = self.detector.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let files = Arc::clone(&files);
+                let next = Arc::clone(&next);
+                let detector = detector.clone();
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let worker = NativeCredSweeperBackend { detector };
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(path) = files.get(index) else {
+                            break;
+                        };
+                        if tx.send(worker.scan_file(path)).is_err() {
+                            break;
+                        }
+                    }
+                });
             }
-        }
-        Ok(by_file
-            .into_values()
-            .filter_map(FileAccumulator::into_file)
-            .collect())
-    }
-}
-
-#[derive(Clone, Debug)]
-struct CredSweeperCommand {
-    python: PathBuf,
-}
-
-impl CredSweeperCommand {
-    fn discover() -> Option<Self> {
-        static CACHE: OnceLock<Option<CredSweeperCommand>> = OnceLock::new();
-        CACHE.get_or_init(Self::discover_uncached).clone()
-    }
-
-    fn discover_uncached() -> Option<Self> {
-        let mut candidates = Vec::new();
-        if let Some(path) = std::env::var_os("PENTECT_CREDSWEEPER_PYTHON") {
-            candidates.push(PathBuf::from(path));
-        }
-        candidates.extend(bundled_venv_candidates());
-        candidates.push(PathBuf::from("python"));
-        candidates.push(PathBuf::from("python3"));
-        candidates
-            .into_iter()
-            .find_map(|python| module_available(&python).then_some(Self { python }))
-    }
-}
-
-fn credsweeper_required() -> String {
-    "CredSweeper is required for `pentect scan`; set PENTECT_CREDSWEEPER_PYTHON or install it in crates/pentect-core/vendors/CredSweeper/.venv".to_string()
-}
-
-fn bundled_venv_candidates() -> Vec<PathBuf> {
-    let Some(root) = repo_root() else {
-        return Vec::new();
-    };
-    let base = root
-        .join("crates")
-        .join("pentect-core")
-        .join("vendors")
-        .join("CredSweeper")
-        .join(".venv");
-    if cfg!(windows) {
-        vec![base.join("Scripts").join("python.exe")]
-    } else {
-        vec![base.join("bin").join("python")]
-    }
-}
-
-fn repo_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if dir.join(".gitmodules").is_file()
-            && dir
-                .join("crates")
-                .join("pentect-core")
-                .join("vendors")
-                .join("CredSweeper")
-                .exists()
-        {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
-fn module_available(python: &Path) -> bool {
-    Command::new(python)
-        .args(["-m", "credsweeper", "--version"])
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn temp_json_path(batch_index: usize) -> PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!(
-        "pentect-credsweeper-{}-{nonce}-{batch_index}.json",
-        std::process::id()
-    ))
-}
-
-#[derive(Deserialize)]
-struct CredSweeperItem {
-    rule: String,
-    #[serde(default)]
-    line_data_list: Vec<CredSweeperLine>,
-}
-
-#[derive(Deserialize)]
-struct CredSweeperLine {
-    path: String,
-    line_num: usize,
-    value_start: Option<usize>,
-    value_end: Option<usize>,
-}
-
-fn parse_credsweeper_output(path: &Path) -> Result<Vec<ScanHitWithPath>, String> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("could not read CredSweeper output: {e}"))?;
-    let items: Vec<CredSweeperItem> = serde_json::from_str(&raw)
-        .map_err(|e| format!("could not parse CredSweeper output: {e}"))?;
-    let mut out = Vec::new();
-    for item in items {
-        let Some(first) = item.line_data_list.first() else {
-            continue;
-        };
-        let last = item.line_data_list.last().unwrap_or(first);
-        let Some(col_start) = first.value_start else {
-            continue;
-        };
-        let Some(col_end) = last.value_end else {
-            continue;
-        };
-        if first.line_num == last.line_num && col_end <= col_start {
-            continue;
-        }
-        let path = normalize_path(&first.path);
-        let label = normalize_label(&item.rule);
-        out.push(ScanHitWithPath {
-            path,
-            label,
-            category: "Secret".to_string(),
-            engine: "credsweeper".to_string(),
-            range: SourceRange {
-                line_start: first.line_num,
-                line_end: last.line_num,
-                col_start,
-                col_end,
-            },
-        });
-    }
-    Ok(out)
-}
-
-#[derive(Clone, Debug)]
-struct ScanHitWithPath {
-    path: PathBuf,
-    label: String,
-    category: String,
-    engine: String,
-    range: SourceRange,
-}
-
-impl From<ScanHitWithPath> for ScanHit {
-    fn from(hit: ScanHitWithPath) -> Self {
-        Self {
-            label: hit.label,
-            category: hit.category,
-            engine: hit.engine,
-            range: hit.range,
-        }
-    }
-}
-
-impl FileAccumulator {
-    fn push_hit_with_path(&mut self, hit: ScanHitWithPath) {
-        self.push_hit(hit.into());
-    }
-}
-
-fn normalize_path(raw: &str) -> PathBuf {
-    let path = PathBuf::from(raw);
-    path.canonicalize().unwrap_or(path)
-}
-
-fn normalize_label(rule: &str) -> String {
-    let mut out = String::new();
-    let mut last_was_sep = false;
-    for ch in rule.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_uppercase());
-            last_was_sep = false;
-        } else if !last_was_sep {
-            out.push('_');
-            last_was_sep = true;
-        }
-    }
-    let label = out.trim_matches('_');
-    if label.is_empty() {
-        "CREDSWEEPER".to_string()
-    } else {
-        label.to_string()
+            drop(tx);
+            rx.into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .map(|items| items.into_iter().flatten().collect())
+        })
     }
 }
 
@@ -526,14 +359,8 @@ impl CoreBackend {
     }
 
     fn scan_file(&mut self, path: &Path) -> Result<Option<FileFinding>, String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-        if bytes.contains(&0) {
+        let Some(data) = read_text_file(path)? else {
             return Ok(None);
-        }
-        let data = match String::from_utf8(bytes) {
-            Ok(data) => data,
-            Err(_) => return Ok(None),
         };
         let kind = infer_kind(path);
         self.ensure_engine();
@@ -546,7 +373,7 @@ impl CoreBackend {
             .spans
             .iter()
             .filter(|span| span.category == Category::Secret)
-            .filter_map(|span| hit_from_span(span, &line_index))
+            .filter_map(|span| hit_from_span(span, &line_index, "core"))
             .collect::<Vec<_>>();
         let warnings = result
             .residual
@@ -628,11 +455,23 @@ impl ScanBackend for CoreBackend {
     }
 }
 
-fn hit_from_span(span: &Span, line_index: &LineIndex) -> Option<ScanHit> {
+fn read_text_file(path: &Path) -> Result<Option<String>, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if bytes.contains(&0) {
+        return Ok(None);
+    }
+    match String::from_utf8(bytes) {
+        Ok(data) => Ok(Some(data)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn hit_from_span(span: &Span, line_index: &LineIndex, engine: &str) -> Option<ScanHit> {
     Some(ScanHit {
         label: span.label.clone(),
         category: format!("{:?}", span.category),
-        engine: "core".to_string(),
+        engine: engine.to_string(),
         range: line_index.range(span.range)?,
     })
 }
@@ -712,9 +551,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labels_are_sanitized() {
-        assert_eq!(normalize_label("API Key"), "API_KEY");
-        assert_eq!(normalize_label("OTP / 2FA Secret"), "OTP_2FA_SECRET");
+    fn scan_engine_does_not_shell_out_to_credsweeper() {
+        let source = include_str!("engine.rs");
+        for forbidden in [
+            concat!("PENTECT_", "CREDSWEEPER_", "PYTHON"),
+            concat!("Cred", "Sweeper", "Command"),
+            concat!("Command", "::", "new"),
+            concat!("python", " -m ", "credsweeper"),
+        ] {
+            assert!(!source.contains(forbidden), "{forbidden}");
+        }
     }
 
     #[test]

@@ -205,6 +205,32 @@ mod tests {
     }
 
     #[test]
+    fn scan_uses_native_credsweeper_without_python() {
+        let root = temp_scan_root("pentect-scan-native-credsweeper");
+        let token = format!("github_pat_{}", "A".repeat(80));
+        std::fs::write(root.join("token.txt"), format!("token={token}\n")).unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan(&args, &opts).unwrap();
+        let rendered = report_json(&report);
+
+        assert_eq!(report.files_scanned, 1, "{rendered}");
+        assert_eq!(report.files.len(), 1, "{rendered}");
+        assert!(
+            report.files[0].engines.contains_key("credsweeper"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&token), "{rendered}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn scan_exclude_removes_files_from_scan_set() {
         let root = temp_scan_root("pentect-scan-exclude");
         std::fs::write(
