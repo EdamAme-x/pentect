@@ -20,6 +20,7 @@ const HEX_MATERIAL_PREFIXES: &[&str] = &[
     "hexpassword",
     "hexpasswd",
     "hexpwd",
+    "hexseed",
     "hextoken",
     "hexcredential",
     "hexsalt",
@@ -187,6 +188,7 @@ fn scan_line(
     }
 
     scan_prefixed_hex_materials(&mut ctx);
+    scan_c_hex_byte_key_arrays(&mut ctx);
 }
 
 fn scan_prefixed_hex_materials(ctx: &mut ScanCtx<'_, '_, '_>) {
@@ -223,11 +225,140 @@ fn scan_prefixed_hex_materials(ctx: &mut ScanCtx<'_, '_, '_>) {
                 )),
                 category: Category::Secret,
                 label: labels::KEYED_SECRET.to_string(),
-                confidence: Confidence::Medium,
+                confidence: Confidence::High,
                 source: DetectorId::KeyValue,
             });
         }
     }
+}
+
+fn scan_c_hex_byte_key_arrays(ctx: &mut ScanCtx<'_, '_, '_>) {
+    let line = &ctx.text[ctx.line_start..ctx.line_end];
+    let bytes = line.as_bytes();
+    let mut search = 0usize;
+    while search < bytes.len() {
+        let Some(eq_rel) = line[search..].find('=') else {
+            break;
+        };
+        let eq = search + eq_rel;
+        let Some((name, declared_len)) = c_hex_byte_array_left(line, eq) else {
+            search = eq + 1;
+            continue;
+        };
+        if !c_hex_byte_array_key_name(&name) {
+            search = eq + 1;
+            continue;
+        }
+        let mut pos = skip_ascii_ws(bytes, eq + 1);
+        if bytes.get(pos) != Some(&b'{') {
+            search = eq + 1;
+            continue;
+        }
+        pos += 1;
+        let Some((value_start, value_end, count)) = parse_c_hex_byte_array(bytes, pos) else {
+            search = eq + 1;
+            continue;
+        };
+        if !matches!(count, 16 | 24 | 32) || declared_len.is_some_and(|len| len != count) {
+            search = eq + 1;
+            continue;
+        }
+        ctx.out.push(Span {
+            range: ctx.view.to_raw(ByteRange::new(
+                ctx.line_start + value_start,
+                ctx.line_start + value_end,
+            )),
+            category: Category::Secret,
+            label: labels::KEYED_SECRET.to_string(),
+            confidence: Confidence::High,
+            source: DetectorId::KeyValue,
+        });
+        search = value_end;
+    }
+}
+
+fn c_hex_byte_array_left(line: &str, eq: usize) -> Option<(String, Option<usize>)> {
+    let left = line[..eq].trim_end();
+    let close = left.strip_suffix(']')?;
+    let open = close.rfind('[')?;
+    let declared_len = close[open + 1..].trim().parse::<usize>().ok();
+    let before_bracket = close[..open].trim_end();
+    let name_end = before_bracket.len();
+    let name_start = before_bracket
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .map_or(0, |offset| offset + 1);
+    let name = before_bracket[name_start..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let type_context = normalize_key(&before_bracket[..name_start]);
+    if !c_byte_array_type_context(&type_context) {
+        return None;
+    }
+    Some((name.to_string(), declared_len))
+}
+
+fn c_byte_array_type_context(context: &str) -> bool {
+    has_identifier_component(context, "byte")
+        || has_identifier_component(context, "bytes")
+        || has_identifier_component(context, "uint8")
+        || has_identifier_component(context, "uint8_t")
+        || has_identifier_phrase(context, &["unsigned", "char"])
+}
+
+fn c_hex_byte_array_key_name(name: &str) -> bool {
+    let normalized = normalize_key(name);
+    is_hex_material_key_name(&normalized)
+        || normalized
+            .strip_prefix("key")
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn parse_c_hex_byte_array(bytes: &[u8], mut pos: usize) -> Option<(usize, usize, usize)> {
+    let mut first_start = None;
+    let mut last_end = 0usize;
+    let mut count = 0usize;
+    loop {
+        pos = skip_ascii_ws(bytes, pos);
+        if bytes.get(pos) == Some(&b'}') {
+            return first_start.map(|start| (start, last_end, count));
+        }
+        if count > 0 {
+            if bytes.get(pos) != Some(&b',') {
+                return None;
+            }
+            pos = skip_ascii_ws(bytes, pos + 1);
+        }
+        let start = pos;
+        let end = parse_c_hex_byte(bytes, pos)?;
+        first_start.get_or_insert(start);
+        last_end = end;
+        count += 1;
+        pos = skip_ascii_ws(bytes, end);
+        if bytes.get(pos) == Some(&b',') {
+            continue;
+        }
+        if bytes.get(pos) == Some(&b'}') {
+            return first_start.map(|start| (start, last_end, count));
+        }
+        return None;
+    }
+}
+
+fn parse_c_hex_byte(bytes: &[u8], pos: usize) -> Option<usize> {
+    if bytes.get(pos) != Some(&b'0') || !matches!(bytes.get(pos + 1), Some(b'x' | b'X')) {
+        return None;
+    }
+    let hi = *bytes.get(pos + 2)?;
+    let lo = *bytes.get(pos + 3)?;
+    (hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit()).then_some(pos + 4)
+}
+
+fn skip_ascii_ws(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    pos
 }
 
 fn is_hex_prefix_start_boundary(bytes: &[u8], pos: usize) -> bool {
@@ -5759,6 +5890,18 @@ mod tests {
         ));
         assert!(has("-kdfopt hexkey:f19b759b190126", "f19b759b190126"));
         assert!(has("Ctrl.hexsalt = hexsalt:2c86362d", "2c86362d"));
+        assert!(has(
+            "-pkeyopt hexseed:867386122b455df74b29af9692a96f",
+            "hexseed:867386122b455df74b29af9692a96f"
+        ));
+        assert!(has(
+            "byte Key128[16]={0x7a,0x8c,0x51,0x86,0x68,0xac,0xf5,0xe0,0xdd,0xe6,0x07,0x21,0x66,0xae,0x6d,0x8f};",
+            "0x7a,0x8c,0x51,0x86,0x68,0xac,0xf5,0xe0,0xdd,0xe6,0x07,0x21,0x66,0xae,0x6d,0x8f"
+        ));
+        assert!(has(
+            "unsigned char session_key[24] = { 0x2e, 0x49, 0xd5, 0xa0, 0xeb, 0x0f, 0x02, 0x05, 0xb6, 0x41, 0xc1, 0x1f, 0x09, 0x82, 0x77, 0xa5, 0x54, 0xc6, 0xfc, 0xf1, 0x55, 0x5e, 0x7a, 0x7d };",
+            "0x2e, 0x49, 0xd5, 0xa0, 0xeb, 0x0f, 0x02, 0x05, 0xb6, 0x41, 0xc1, 0x1f, 0x09, 0x82, 0x77, 0xa5, 0x54, 0xc6, 0xfc, 0xf1, 0x55, 0x5e, 0x7a, 0x7d"
+        ));
         assert!(has(r#"key: "abcDEF123456""#, "abcDEF123456"));
         assert!(has(r#"api_key="%s-real-123""#, "%s-real-123"));
         assert!(has(r#"password="SECRET""#, "SECRET"));
@@ -5921,6 +6064,9 @@ mod tests {
             "token budget",
             "api design",
             "password field docs",
+            r#"when(testTerminal.readPassword("password: ")).thenReturn("password");"#,
+            r#"DescribeSecret("prod/database");"#,
+            "byte Block128[16]={0x7a,0x8c,0x51,0x86,0x68,0xac,0xf5,0xe0,0xdd,0xe6,0x07,0x21,0x66,0xae,0x6d,0x8f};",
             r#"natural language such as "secret capability" or "token budget"."#,
             r#"The secret "capability" mode is documented here."#,
             "secret: capability",

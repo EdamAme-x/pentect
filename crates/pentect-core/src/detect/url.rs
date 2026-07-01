@@ -290,6 +290,8 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
         fragment_or_query_path_end(url, authority_end),
         out,
     );
+    let path_end = fragment_or_query_path_end(url, authority_end);
+    inspect_url_uuid_path_segments(view, base, url, authority_end, path_end, out);
     let query_at = url[authority_end..].find('?').map(|i| authority_end + i);
     let fragment_at = url[authority_end..].find('#').map(|i| authority_end + i);
     let query_at = query_at.filter(|&q| fragment_at.is_none_or(|f| q < f));
@@ -615,6 +617,41 @@ fn inspect_s3_path_style_url(
             Category::Secret,
             labels::AWS_S3_BUCKET,
         );
+    }
+}
+
+fn inspect_url_uuid_path_segments(
+    view: &NormalizedView,
+    base: usize,
+    url: &str,
+    authority_end: usize,
+    path_end: usize,
+    out: &mut Vec<Span>,
+) {
+    if url.as_bytes().get(authority_end) != Some(&b'/') {
+        return;
+    }
+    let mut pos = authority_end;
+    while pos < path_end {
+        if url.as_bytes()[pos] == b'/' {
+            pos += 1;
+            continue;
+        }
+        let start = pos;
+        while pos < path_end && url.as_bytes()[pos] != b'/' {
+            pos += 1;
+        }
+        let segment = &url[start..pos];
+        if looks_uuid(segment) {
+            push_span(
+                view,
+                out,
+                base + start,
+                base + pos,
+                Category::Secret,
+                labels::UUID,
+            );
+        }
     }
 }
 
@@ -1102,6 +1139,31 @@ mod tests {
     #[test]
     fn external_url_is_not_granularly_masked() {
         assert!(labels("https://example.com/api/issues/1234").is_empty());
+    }
+
+    #[test]
+    fn url_uuid_path_segments_are_resource_ids() {
+        assert_eq!(
+            labels("https://login.microsoftonline.com/77d0f286-f938-918d-b0ce-f5bb58ff02d7"),
+            [(
+                "UUID".to_string(),
+                "77d0f286-f938-918d-b0ce-f5bb58ff02d7".to_string()
+            )]
+        );
+        assert_eq!(
+            labels("https://idp.example.test/550e8400-e29b-41d4-a716-446655440000/metadata"),
+            [(
+                "UUID".to_string(),
+                "550e8400-e29b-41d4-a716-446655440000".to_string()
+            )]
+        );
+        assert_eq!(
+            labels("https://example.com/550e8400-e29b-41d4-a716-446655440000"),
+            [(
+                "UUID".to_string(),
+                "550e8400-e29b-41d4-a716-446655440000".to_string()
+            )]
+        );
     }
 
     #[test]

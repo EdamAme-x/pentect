@@ -69,6 +69,12 @@ impl EntropyDetector {
         let run = &text[start..end];
         if is_slash_delimited_path_like(run) {
             if path_contains_uuid_segment(run) {
+                if is_url_path_fragment_context(text, start) {
+                    for (seg_start, seg_end) in slash_segments(run, start) {
+                        self.push_single_entropy_span(text, seg_start, seg_end, view, out);
+                    }
+                    return;
+                }
                 self.push_single_entropy_span(text, start, end, view, out);
                 return;
             }
@@ -231,7 +237,8 @@ fn is_subresource_integrity_value(text: &str, start: usize, ctx: &Context, value
             .is_some_and(|key| key.eq_ignore_ascii_case("integrity")))
         || local_json_key_before_value(text, start)
             .as_deref()
-            .is_some_and(|key| key.eq_ignore_ascii_case("integrity"));
+            .is_some_and(|key| key.eq_ignore_ascii_case("integrity"))
+        || local_integrity_word_before_value(text, start);
     keyed_as_integrity && is_sri_digest_value(value)
 }
 
@@ -244,6 +251,22 @@ fn is_sri_digest_value(value: &str) -> bool {
         && digest
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+fn local_integrity_word_before_value(text: &str, start: usize) -> bool {
+    let line_start = text[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let prefix = text[line_start..start]
+        .trim_end_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '"' | '\''));
+    let Some(word_end) = prefix.rfind(|ch: char| ch.is_ascii_alphanumeric()) else {
+        return false;
+    };
+    let word_end = word_end + prefix[word_end..].chars().next().map_or(1, char::len_utf8);
+    let word_start = prefix[..word_end]
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+        .map_or(0, |pos| {
+            pos + prefix[pos..].chars().next().map_or(1, char::len_utf8)
+        });
+    normalize_identifier(&prefix[word_start..word_end]) == "integrity"
 }
 
 fn is_public_pgp_signature_context(text: &str, start: usize, ctx: &Context) -> bool {
@@ -790,6 +813,17 @@ fn path_contains_uuid_segment(run: &str) -> bool {
     run.split('/').any(is_uuid_segment)
 }
 
+fn is_url_path_fragment_context(text: &str, start: usize) -> bool {
+    let line_start = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
+    let prefix = &text[line_start..start];
+    let token_start = prefix
+        .rfind(|ch: char| {
+            ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | '<' | '(' | '[' | '{')
+        })
+        .map_or(0, |offset| offset + 1);
+    prefix[token_start..].contains("://")
+}
+
 fn is_uuid_segment(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     bytes.len() == 36
@@ -1141,6 +1175,20 @@ mod tests {
         assert!(EntropyDetector::with(24, 2.0)
             .detect(&integrity_view)
             .is_empty());
+
+        let raw_integrity = format!("integrity {integrity}");
+        let raw_integrity_region = region(&raw_integrity);
+        let raw_integrity_view = NormalizedView::build(&raw_integrity_region, &raw_integrity);
+        assert!(EntropyDetector::with(24, 2.0)
+            .detect(&raw_integrity_view)
+            .is_empty());
+
+        let token_raw = format!("token {integrity}");
+        let token_region = region(&token_raw);
+        let token_view = NormalizedView::build(&token_region, &token_raw);
+        assert!(!EntropyDetector::with(24, 2.0)
+            .detect(&token_view)
+            .is_empty());
     }
 
     #[test]
@@ -1323,6 +1371,14 @@ mod tests {
                     .contains("5172D1BB-AAB2-1124-C5AD-061D1DD22290")),
             "{spans:?}"
         );
+    }
+
+    #[test]
+    fn url_authority_uuid_paths_are_not_split_by_entropy() {
+        let raw = "https://login.windows.net/fac157e6-e2e9-6986-584b-afa1936d5b85/FederationMetadata/2007-06/FederationMetadata.xml";
+        let reg = region(raw);
+        let v = NormalizedView::build(&reg, raw);
+        assert!(EntropyDetector::default().detect(&v).is_empty());
     }
 
     #[test]

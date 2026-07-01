@@ -110,7 +110,41 @@ fn local_anchor_before_uuid(text: &str, start: usize) -> bool {
         .next_back()
         .is_some_and(|ch| matches!(ch, '=' | ':' | '/' | '\\' | '"' | '\'' | '{' | '('))
         || prefix.rfind(['=', ':', '/', '\\']).is_some();
-    has_assignment && has_uuid_anchor_name(prefix)
+    has_assignment
+        && (has_uuid_anchor_name(prefix)
+            || path_collection_anchor_before_uuid(prefix)
+            || com_guid_syntax_before_uuid(prefix))
+}
+
+fn com_guid_syntax_before_uuid(prefix: &str) -> bool {
+    // COM monikers and CLSID-like constants often carry the GUID as `::{...}`.
+    // The syntax itself is the anchor, so this still catches misspelled local
+    // names without turning arbitrary bare UUIDs into secrets.
+    prefix.trim_end().ends_with("::{")
+}
+
+fn path_collection_anchor_before_uuid(prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches(|ch: char| {
+        ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | '(' | '[' | '{')
+    });
+    if !(prefix.ends_with('/') || prefix.ends_with('\\')) {
+        return false;
+    }
+    let without_slash = &prefix[..prefix.len() - 1];
+    let segment_start = without_slash
+        .rfind(['/', '\\', '?', '&', '#'])
+        .map_or(0, |pos| pos + 1);
+    let segment = without_slash[segment_start..].trim_matches(|ch: char| {
+        ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | ':' | '=')
+    });
+    let normalized = normalize_identifier(segment);
+    let parts = normalized
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts
+        .last()
+        .is_some_and(|part| part.len() >= 3 && part.ends_with('s') && *part != "https")
 }
 
 fn has_uuid_anchor_name(value: &str) -> bool {
@@ -127,9 +161,14 @@ fn has_uuid_anchor_name(value: &str) -> bool {
             | "id"
             | "clientid"
             | "tenantid"
+            | "resource"
             | "resourceid"
             | "externalid"
             | "sessionid"
+            | "kid"
+            | "keyid"
+            | "state"
+            | "devicecode"
             | "accesspolicyid"
             | "migrationguid"
     ) || compact.contains("uuid")
@@ -213,6 +252,12 @@ mod tests {
             format!(r#"clientId = "{uuid}";"#),
             format!(r#""tenant_id": "{uuid}""#),
             format!(r#"external_id: {uuid}"#),
+            format!(r#"kid: '{uuid}'"#),
+            format!(r#"state = "{uuid}""#),
+            format!(r#"resource = "{uuid}""#),
+            format!(r#"DEVICE_CODE = "{uuid}""#),
+            format!(r#"mux.HandleFunc("/zones/{uuid}/records", handler)"#),
+            format!(r#"#define MYPC_CSLID "::{{{uuid}}}""#),
             format!(r#"#define MYPC_CLSID "::{{{uuid}}}""#),
             format!(r#"authorization_uri=https://login.example/{uuid}"#),
             format!(r#"<input type=\"hidden\" name=\"client_id\" value=\"{uuid}\" />"#),
@@ -225,6 +270,7 @@ mod tests {
     fn leaves_bare_uuid_unmasked() {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         assert!(hits(&format!("see {uuid} later")).is_empty());
+        assert!(hits(&format!(r#"link "/share/{uuid}""#)).is_empty());
     }
 
     #[test]

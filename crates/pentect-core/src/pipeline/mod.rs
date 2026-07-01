@@ -853,6 +853,16 @@ mod tests {
     }
 
     #[test]
+    fn explicit_hex_material_masks_as_one_keyed_secret() {
+        let input = "Ctrl.hexpass = hexpass:3004953027298e3289";
+        let r = m(input);
+        assert!(!r.masked.contains("3004953027298e3289"), "{}", r.masked);
+        assert!(r.masked.contains("<<KEYED_SECRET_"), "{}", r.masked);
+        assert_eq!(r.masked.matches("<<").count(), 1, "{}", r.masked);
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
     fn har_kind_uses_json_parser_with_name_value_hints() {
         let input = r#"{"headers":[{"name":"Authorization","value":"Bearer abc123"}],"password":"hunter2"}"#;
         let r = Engine::with_profile(Profile::Strict).mask(
@@ -896,6 +906,25 @@ mod tests {
         assert!(r.masked.contains("<<URL_"), "{}", r.masked);
         assert!(!r.masked.contains("example.com"), "{}", r.masked);
         assert!(!r.masked.contains("/api/issues/1234"), "{}", r.masked);
+    }
+
+    #[test]
+    fn identity_authority_url_masks_tenant_segment() {
+        let input =
+            "see https://login.microsoftonline.com/77d0f286-f938-918d-b0ce-f5bb58ff02d7 now";
+        let r = m(input);
+        assert!(
+            r.masked
+                .contains("https://login.microsoftonline.com/<<UUID_"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            !r.masked.contains("77d0f286-f938-918d-b0ce-f5bb58ff02d7"),
+            "{}",
+            r.masked
+        );
+        assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
     }
 
     #[test]
