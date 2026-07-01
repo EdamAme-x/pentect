@@ -62,8 +62,9 @@ fn has_uuid_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
 }
 
 fn is_placeholder_uuid(value: &str) -> bool {
-    // Nil and near-nil UUIDs are conventional sentinels in fixtures and tests,
-    // not issued credential-adjacent identifiers.
+    // Nil, near-nil, and obviously patterned UUIDs are conventional sentinels
+    // in fixtures and generated cloud docs, not issued credential-adjacent
+    // identifiers.
     let mut counts = [0usize; 16];
     let mut total = 0usize;
     for b in value.bytes().filter(|b| *b != b'-') {
@@ -78,7 +79,27 @@ fn is_placeholder_uuid(value: &str) -> bool {
     }
     let unique = counts.iter().filter(|count| **count > 0).count();
     let dominant = counts.iter().copied().max().unwrap_or(0);
-    unique == 1 || (total == 32 && dominant >= 30)
+    unique == 1 || (total == 32 && dominant >= 30) || is_patterned_placeholder_uuid(value)
+}
+
+fn is_patterned_placeholder_uuid(value: &str) -> bool {
+    let groups = value
+        .split('-')
+        .filter(|group| !group.is_empty())
+        .collect::<Vec<_>>();
+    if groups.len() != 5 {
+        return false;
+    }
+    const ORDERED_HEX_MARKERS: [&str; 17] = [
+        "0123", "1234", "2345", "3456", "4567", "5678", "6789", "7890", "8765", "7654", "6543",
+        "5432", "4321", "3210", "2109", "abcd", "dcba",
+    ];
+    let compact = groups.join("").to_ascii_lowercase();
+    let marker_hits = ORDERED_HEX_MARKERS
+        .iter()
+        .filter(|marker| compact.matches(**marker).count() > 0)
+        .count();
+    marker_hits >= 4
 }
 
 fn is_uuid_anchored(text: &str, start: usize, ctx: &crate::model::Context) -> bool {
@@ -118,7 +139,31 @@ fn local_anchor_before_uuid(text: &str, start: usize) -> bool {
     has_assignment
         && (immediate_slot_name_before_value(prefix).is_some_and(has_uuid_anchor_name)
             || has_uuid_anchor_name(prefix)
+            || arn_resource_anchor_before_uuid(prefix)
             || path_collection_anchor_before_uuid(prefix))
+}
+
+fn arn_resource_anchor_before_uuid(prefix: &str) -> bool {
+    // AWS ARNs encode resource identifiers after a resource type separator,
+    // e.g. `arn:aws:kms:...:key/<uuid>` or `...:task/<uuid>`. The UUID is a
+    // structured resource handle even when the surrounding JSON key is `KeyId`.
+    let prefix = prefix.trim_end_matches(|ch: char| {
+        ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | '(' | '[' | '{')
+    });
+    if !(prefix.ends_with('/') || prefix.ends_with(':')) {
+        return false;
+    }
+    let Some(arn_start) = prefix.rfind("arn:") else {
+        return false;
+    };
+    let arn_tail = &prefix[arn_start..prefix.len() - 1];
+    let segment_start = arn_tail.rfind(['/', ':']).map_or(0, |pos| pos + 1);
+    let segment = &arn_tail[segment_start..];
+    (2..=48).contains(&segment.len())
+        && segment.bytes().any(|b| b.is_ascii_alphabetic())
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 fn path_collection_anchor_before_uuid(prefix: &str) -> bool {
@@ -455,6 +500,8 @@ mod tests {
             format!(r#"redirect_uri=https://example.test/cb&client_id={uuid}"#),
             format!(r#"mux.HandleFunc("/zones/{uuid}/records", handler)"#),
             format!(r#"authorization_uri=https://login.example/{uuid}"#),
+            format!(r#"KeyArn = "arn:aws:kms:us-east-2:111122223333:key/{uuid}""#),
+            format!(r#"task = "arn:aws:ecs:us-west-1:123456789123:task/{uuid}""#),
             format!(r#"<input type=\"hidden\" name=\"client_id\" value=\"{uuid}\" />"#),
         ] {
             assert_eq!(hits(&raw), vec![uuid.to_string()], "{raw}");
@@ -500,6 +547,9 @@ mod tests {
             "11111111-1111-1111-1111-111111111111",
             "00000000-0000-0000-0000-000000000001",
             "10000000-0000-0000-0000-000000000000",
+            "1234abcd-12ab-34cd-56ef-1234567890ab",
+            "12345678-1234-1234-1234-123456789012",
+            "87654321-4321-4321-4321-210987654321",
         ] {
             assert!(hits(&format!("client_id = {uuid}")).is_empty(), "{uuid}");
         }
