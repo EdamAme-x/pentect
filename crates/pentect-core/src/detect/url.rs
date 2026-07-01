@@ -20,6 +20,80 @@ static URI_USERINFO_RE: LazyLock<Regex> = LazyLock::new(|| {
 static CLOUD_HOST_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b[a-z0-9][a-z0-9.-]{1,180}\.(?:amazonaws\.com|firebaseio\.com)\b"#).unwrap()
 });
+static DATABASE_URI_SCHEMES: LazyLock<LineSet> =
+    LazyLock::new(|| LineSet::parse(include_str!("database_uri_schemes.txt")));
+static DATABASE_URI_PLACEHOLDERS: LazyLock<DatabaseUriPlaceholders> = LazyLock::new(|| {
+    DatabaseUriPlaceholders::parse(include_str!("database_uri_placeholder_components.txt"))
+});
+
+#[derive(Clone, Debug, Default)]
+struct LineSet {
+    values: Vec<String>,
+}
+
+impl LineSet {
+    fn parse(raw: &str) -> Self {
+        let values = raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.to_ascii_lowercase())
+            .collect();
+        Self { values }
+    }
+
+    fn contains(&self, value: &str) -> bool {
+        self.values.iter().any(|known| known == value)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct DatabaseUriPlaceholders {
+    users: Vec<String>,
+    passwords: Vec<String>,
+    password_contains: Vec<String>,
+    password_prefixes: Vec<String>,
+}
+
+impl DatabaseUriPlaceholders {
+    fn parse(raw: &str) -> Self {
+        let mut set = Self::default();
+        for line in raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let Some((kind, pattern)) = line.split_once(':') else {
+                continue;
+            };
+            let pattern = pattern.trim().to_ascii_lowercase();
+            match kind.trim() {
+                "user" => set.users.push(pattern),
+                "password" => set.passwords.push(pattern),
+                "password_contains" => set.password_contains.push(pattern),
+                "password_prefix" => set.password_prefixes.push(pattern),
+                _ => {}
+            }
+        }
+        set
+    }
+
+    fn user(&self, value: &str) -> bool {
+        self.users.iter().any(|known| known == value)
+    }
+
+    fn password(&self, value: &str) -> bool {
+        self.passwords.iter().any(|known| known == value)
+            || self
+                .password_contains
+                .iter()
+                .any(|known| value.contains(known))
+            || self
+                .password_prefixes
+                .iter()
+                .any(|known| value.starts_with(known))
+    }
+}
 
 /// Preserves useful URL structure for internal systems:
 /// `http://local.jira.corp/api/issues/1234`
@@ -187,6 +261,7 @@ fn inspect_uri_userinfo(view: &NormalizedView, base: usize, url: &str, out: &mut
     let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
         return;
     };
+    let scheme = &url[..scheme_end - 3];
     let authority_end = url[scheme_end..]
         .find(['/', '?', '#'])
         .map_or(url.len(), |i| scheme_end + i);
@@ -203,7 +278,12 @@ fn inspect_uri_userinfo(view: &NormalizedView, base: usize, url: &str, out: &mut
         return;
     };
     let userinfo = &authority[..at];
-    if generic_uri_userinfo_is_credential(userinfo) && !is_documentation_host(host) {
+    let is_credential = if database_uri_scheme(scheme) {
+        database_uri_userinfo_is_credential(userinfo)
+    } else {
+        generic_uri_userinfo_is_credential(userinfo) && !is_documentation_host(host)
+    };
+    if is_credential {
         push_span(
             view,
             out,
@@ -213,6 +293,65 @@ fn inspect_uri_userinfo(view: &NormalizedView, base: usize, url: &str, out: &mut
             labels::URL_CREDENTIAL,
         );
     }
+}
+
+fn database_uri_scheme(scheme: &str) -> bool {
+    DATABASE_URI_SCHEMES.contains(&scheme.to_ascii_lowercase())
+}
+
+fn database_uri_userinfo_is_credential(userinfo: &str) -> bool {
+    if userinfo_is_template_or_redaction(userinfo) {
+        return false;
+    }
+    if let Some((user, password)) = split_userinfo_password(userinfo) {
+        return database_uri_password_has_signal(user, password);
+    }
+    userinfo_token_like(userinfo)
+}
+
+fn database_uri_password_has_signal(user: &str, password: &str) -> bool {
+    let password = password.trim();
+    if password.is_empty() || database_uri_placeholder_pair(user, password) {
+        return false;
+    }
+    if generic_uri_password_has_signal(password) {
+        return true;
+    }
+    database_uri_short_random_password(password)
+}
+
+fn database_uri_placeholder_pair(user: &str, password: &str) -> bool {
+    let normalized_user = normalized_userinfo_component(user);
+    let normalized_password = normalized_userinfo_component(password);
+    if is_placeholder_value(password) || userinfo_password_is_placeholder(user, password) {
+        return true;
+    }
+    if normalized_user == normalized_password {
+        return true;
+    }
+    DATABASE_URI_PLACEHOLDERS.user(&normalized_user)
+        && DATABASE_URI_PLACEHOLDERS.password(&normalized_password)
+}
+
+fn database_uri_short_random_password(password: &str) -> bool {
+    let bytes = password.as_bytes();
+    if !(4..=7).contains(&bytes.len()) || bytes.iter().any(|b| !b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut seen = [false; 26];
+    let mut distinct = 0usize;
+    for byte in bytes {
+        let lower = byte.to_ascii_lowercase();
+        if !lower.is_ascii_lowercase() {
+            return false;
+        }
+        let idx = usize::from(lower - b'a');
+        if !seen[idx] {
+            seen[idx] = true;
+            distinct += 1;
+        }
+    }
+    distinct >= 4
 }
 
 fn generic_uri_userinfo_is_credential(userinfo: &str) -> bool {
@@ -1309,6 +1448,33 @@ mod tests {
                 ("URL_CREDENTIAL".to_string(), "ruser:rpass2026".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn database_uri_userinfo_masks_concrete_credentials_only() {
+        let got = labels(
+            "postgresql://admin:s3cr3t@db.host:5432/sales \
+             mysql+pymysql://ctfd:qthn@db/ctfd \
+             postgres://testuser:knextest@postgres/knex_test \
+             mysql://my-user:my-password@localhost/my-db \
+             postgres://user:pass@localhost:5432",
+        );
+        assert!(got.iter().any(|(label, value)| {
+            label == "URL_CREDENTIAL" && value == "admin:s3cr3t"
+        }));
+        assert!(got
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "ctfd:qthn"));
+        for placeholder in [
+            "testuser:knextest",
+            "my-user:my-password",
+            "user:pass",
+        ] {
+            assert!(
+                got.iter().all(|(_, value)| value != placeholder),
+                "{placeholder}: {got:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,14 @@
+# Credential-bearing database and queue URI schemes.
+#
+# Keep this list to protocols whose authority userinfo conventionally carries
+# login material. Variants are protocol families, not benchmark examples.
+postgres
+postgresql
+mysql
+mysql+pymysql
+mongodb
+mongodb+srv
+redis
+rediss
+amqp
+amqps

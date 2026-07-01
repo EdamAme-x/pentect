@@ -390,10 +390,6 @@ impl RuleDetector {
             (r"\b[12][0-9]{4}(?:[0-9]{2}|2[AB])[0-9]{8}\b", Identifier, "FR_NIR_INSEE", High, V::FrNir),
             (r"(?i)(?:acn|company number)[^\n]{0,12}?\b\d{3}[ ]?\d{3}[ ]?\d{3}\b", Identifier, "AU_ACN", High, V::AuAcn),
             (r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b", Identifier, "IN_GSTIN", High, V::InGstin),
-            // Connection strings are credential-bearing only when the userinfo
-            // is concrete. Docs/templates such as `[user[:password]@]` and
-            // `<password>` are filtered by the validator.
-            (r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?)://[^\s:/@]+:[^\s:/@]+@[^\s/?#]+", Secret, "DB_CONNECTION_STRING", High, V::DbConnectionString),
         ];
         #[rustfmt::skip]
         let captured: &[(&str, Category, &str, Confidence, usize, Validator)] = &[
@@ -527,17 +523,6 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
             "session", "sid", "jwt", "cookie", "auth", "access", "refresh",
         ],
         "BASIC_AUTH" => &["Basic ", "Basic\t"],
-        "DB_CONNECTION_STRING" => &[
-            "postgres://",
-            "postgresql://",
-            "mysql://",
-            "mongodb://",
-            "mongodb+srv://",
-            "redis://",
-            "rediss://",
-            "amqp://",
-            "amqps://",
-        ],
         "URL" => &["://"],
         "US_PASSPORT" | "UK_PASSPORT" | "ES_PASSPORT" | "IT_PASSPORT" | "IN_PASSPORT" => &[
             "passport",
@@ -695,10 +680,6 @@ mod tests {
                 concat!("key", "-5as9xrzs30zd2guj9vn767bkpthbvgo9"),
                 "MAILGUN_API_KEY",
             ),
-            (
-                "postgresql://admin:s3cr3t@db.host:5432/sales",
-                "DB_CONNECTION_STRING",
-            ),
             ("00:1A:2B:3C:4D:5E", "MAC_ADDRESS"),
             ("192.168.1.1", "IP_ADDRESS_V4"),
             ("(415) 555-0132", "PHONE_NANP"),
@@ -773,33 +754,6 @@ mod tests {
             &raw[span.range.start..span.range.end],
             "https://example.com/api/issues/1234"
         );
-    }
-
-    #[test]
-    fn db_connection_string_rejects_uri_templates() {
-        let det = RuleDetector::builtin();
-        let labels = |s: &str| {
-            det.detect(&NormalizedView::build(&region(s), s))
-                .into_iter()
-                .map(|span| span.label)
-                .collect::<Vec<_>>()
-        };
-        for raw in [
-            "postgresql://[user[:password]@][host][:port][",
-            "mongodb://username:<password>@cluster0.example.com:27017",
-            "redis://***:***@localhost:6379",
-        ] {
-            assert!(
-                labels(raw)
-                    .iter()
-                    .all(|label| label != "DB_CONNECTION_STRING"),
-                "{raw}: {:?}",
-                labels(raw)
-            );
-        }
-        assert!(labels("postgresql://admin:s3cr3t@db.host:5432/sales")
-            .iter()
-            .any(|label| label == "DB_CONNECTION_STRING"));
     }
 
     #[test]
