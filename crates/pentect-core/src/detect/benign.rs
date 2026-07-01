@@ -138,9 +138,27 @@ impl StructuredKeyNameSet {
     }
 
     fn matches_components(&self, parts: &[&str]) -> bool {
-        parts
-            .iter()
-            .all(|part| self.components.iter().any(|known| known == part))
+        parts.iter().all(|part| self.matches_component(part))
+    }
+
+    fn matches_component(&self, part: &str) -> bool {
+        if self.components.iter().any(|known| known == part) {
+            return true;
+        }
+        if let Some(stem) = part.strip_suffix('s') {
+            if stem.len() >= 3 && self.components.iter().any(|known| known == stem) {
+                return true;
+            }
+        }
+        if let Some(stem) = part.strip_suffix("ies") {
+            if stem.len() >= 3 {
+                let singular = format!("{stem}y");
+                if self.components.iter().any(|known| known == &singular) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1125,6 +1143,11 @@ mod tests {
         assert!(is_structured_key_name_reference_value("panel1"));
         assert!(is_structured_key_name_reference_value("fieldset1"));
         assert!(is_structured_key_name_reference_value("dataGrid12"));
+        assert!(is_structured_key_name_reference_value("field_values"));
+        assert!(is_structured_key_name_reference_value("connection_policies"));
+        assert!(is_structured_key_name_reference_value("task_queues_statistics"));
+        assert!(is_structured_key_name_reference_value("table1"));
+        assert!(is_structured_key_name_reference_value("checkbox2"));
         assert!(!is_structured_key_name_reference_value("password"));
         assert!(!is_structured_key_name_reference_value("secret"));
         assert!(!is_structured_key_name_reference_value("abcDEF123456"));
@@ -1164,6 +1187,8 @@ mod tests {
         assert!(is_structured_generic_key_metadata_value("item1"));
         assert!(is_structured_generic_key_metadata_value("step0"));
         assert!(is_structured_generic_key_metadata_value("remote_cluster"));
+        assert!(is_structured_generic_key_metadata_value("schema_versions"));
+        assert!(is_structured_generic_key_metadata_value("credential_lists"));
         assert!(!is_structured_generic_key_metadata_value("remote_token"));
         assert!(!is_structured_generic_key_metadata_value("cluster_secret"));
         assert!(!is_structured_generic_key_metadata_value("API Key"));

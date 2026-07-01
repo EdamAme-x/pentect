@@ -4945,6 +4945,7 @@ fn is_source_code_fragment_literal(value: &str) -> bool {
         || is_braced_type_initializer_fragment(value)
         || is_braced_field_initializer_fragment(value)
         || is_minified_js_descriptor_fragment(value)
+        || is_minified_js_expression_fragment(value)
         || is_escaped_format_fragment(value)
         || is_method_chain_suffix_fragment(value)
         || is_incomplete_objc_string_fragment(value)
@@ -5023,6 +5024,60 @@ fn is_minified_js_descriptor_fragment(value: &str) -> bool {
     let value = value.trim();
     value.contains("value:function")
         && (value.contains("},{key:") || value.contains("},{key=\"") || value.contains("},{key:\""))
+}
+
+fn is_minified_js_expression_fragment(value: &str) -> bool {
+    // Minified JavaScript often chains assignments or boolean expressions on a
+    // single line. If the parser splits at a nested `key:`/`token:`, the tail can
+    // look like a compact credential (`this.x=this.y=0` or `a.b||0`). Require a
+    // member access plus operator syntax so ordinary `abc=def`-style values and
+    // dotted tokens remain eligible.
+    let value = value
+        .trim()
+        .trim_end_matches([',', ';', ')', '}']);
+    if !(4..=220).contains(&value.len())
+        || value.contains("://")
+        || value.chars().any(char::is_whitespace)
+        || !value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'$'
+                        | b'.'
+                        | b'='
+                        | b'!'
+                        | b'|'
+                        | b'&'
+                        | b'?'
+                        | b':'
+                        | b'('
+                        | b')'
+                        | b'['
+                        | b']'
+                        | b'{'
+                        | b'}'
+                        | b','
+                        | b';'
+                        | b'+'
+                        | b'-'
+                        | b'*'
+                        | b'/'
+                        | b'"'
+                        | b'\''
+                )
+        })
+    {
+        return false;
+    }
+    let has_member_access = value.contains('.') || value.starts_with("this");
+    if !has_member_access {
+        return false;
+    }
+    value.matches('=').count() >= 2
+        || value.contains("||")
+        || value.contains("&&")
+        || value.contains("!=")
+        || value.contains("==")
 }
 
 fn is_escaped_format_fragment(value: &str) -> bool {
@@ -6966,6 +7021,9 @@ mod tests {
             r#"{"patch":"@@ -0,0 +1 @@\n+Authorization: BEARER\n\tif token"}"#,
             r#"// User-Secrets: https://docs.asp.net/en/latest/security/app-secrets.html"#,
             r#"val FAILED_TO_RETRIEVE_GENERATED_KEY = "Failed to retrieve the generated key.""#,
+            "key=this.button=this.screenY=this.screenX=this.l=0",
+            "token=a.keyCode||0",
+            r#"key=0!=b.indexOf("gme-")"#,
             r#"POSTGRES_HOST_AUTH_METHOD: scram-sha-256"#,
             r#"c.key = "__vlist__" + nestedIndex;"#,
             r#"s3.fog_options = { my_key: "my_value" }"#,
@@ -7233,6 +7291,10 @@ mod tests {
             r#""target_key": "product_id""#,
             r#""target_key": "cart_id""#,
             r#""original_key": "product_id""#,
+            r#""key": "field_values""#,
+            r#""key": "credential_lists""#,
+            r#""key": "table1""#,
+            r#""key": "checkbox2""#,
             r#"key='user_ids'"#,
             r#"def get_include_dirs(self, key='include_dirs')"#,
             r#"'key:source1'"#,
