@@ -210,6 +210,8 @@ mod tests {
 pub enum DetectorId {
     /// Span supplied by an extension adapter outside deterministic core.
     Extension,
+    /// Native Rust port of embedded CredSweeper rule/model assets.
+    CredSweeper,
     Rule,
     /// A plaintext key/value assignment whose key and value features are secret-like.
     KeyValue,
@@ -231,6 +233,7 @@ impl DetectorId {
     pub fn as_str(self) -> &'static str {
         match self {
             DetectorId::Extension => "extension",
+            DetectorId::CredSweeper => "credsweeper",
             DetectorId::Rule => "rule",
             DetectorId::KeyValue => "key_value",
             DetectorId::Entropy => "entropy",

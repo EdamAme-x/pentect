@@ -1,3 +1,6 @@
 [submodule "benchmarks/CredData"]
 	path = benchmarks/CredData
 	url = https://github.com/Samsung/CredData.git
+[submodule "crates/pentect-core/vendors/CredSweeper"]
+	path = crates/pentect-core/vendors/CredSweeper
+	url = https://github.com/Samsung/CredSweeper.git

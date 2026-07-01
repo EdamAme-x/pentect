@@ -79,7 +79,7 @@ fn usage() {
          pentect bench creddata PATH\n\
          pentect extensions list|inspect|test [NAME]\n\
          pentect eval [--json]\n\
-         pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\
+         pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          pentect help\n\
@@ -111,14 +111,14 @@ fn help_text() -> &'static str {
         "  pentect bench creddata PATH [--json]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
         "  pentect eval [--json]\n\n",
-        "  pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [PATH...]\n\n",
+        "  pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
         "dashboard: approval\n",
         "exec: masked stdout/stderr\n",
         "read: masked file preview\n",
         "view: handle metadata\n",
         "resolve: local materialize\n",
-        "scan: broad by default; narrow with --exclude, --gitignore, .pentectignore\n",
+        "scan: CredSweeper + core; narrow with --exclude, --gitignore, .pentectignore\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness\n",
         "bench: creddata\n",
@@ -1460,7 +1460,7 @@ mod tests {
         assert!(help.contains("doctor: readiness"), "{help}");
         assert!(help.contains("extensions: list, inspect, test"), "{help}");
         assert!(help.contains("eval: precision, recall"), "{help}");
-        assert!(help.contains("scan: broad by default"), "{help}");
+        assert!(help.contains("scan: CredSweeper + core"), "{help}");
         assert!(!help.contains("pentect materialize"), "{help}");
         assert!(!help.contains("pentect purge"), "{help}");
         assert!(!help.contains("authenticated browser/API/MCP"), "{help}");
