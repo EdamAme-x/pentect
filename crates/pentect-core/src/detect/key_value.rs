@@ -2337,6 +2337,7 @@ fn is_code_type_or_expression(value: &str, key_name: &str, kind: KeyKind) -> boo
             || matches!(
                 b,
                 b'_' | b':'
+                    | b'|'
                     | b'<'
                     | b'>'
                     | b'['
@@ -2355,7 +2356,7 @@ fn is_code_type_or_expression(value: &str, key_name: &str, kind: KeyKind) -> boo
     }
     let has_type_punctuation = bytes
         .iter()
-        .any(|b| matches!(b, b'<' | b'>' | b':' | b'[' | b']' | b'&' | b';'));
+        .any(|b| matches!(b, b'<' | b'>' | b':' | b'|' | b'[' | b']' | b'&' | b';'));
     has_type_punctuation
 }
 
@@ -3515,10 +3516,11 @@ fn source_key_has_validation_text_context(source_key: &str) -> bool {
 
 fn key_name_has_sensitive_component(key_name: &str) -> bool {
     key_name.split('_').any(|part| {
-        matches!(
-            part,
-            "secret" | "password" | "passwd" | "pwd" | "credential" | "token" | "auth" | "key"
-        )
+        is_numbered_password_component(part)
+            || matches!(
+                part,
+                "secret" | "password" | "passwd" | "pwd" | "credential" | "token" | "auth" | "key"
+            )
     })
 }
 
@@ -5157,7 +5159,10 @@ fn is_shell_command_substitution_literal(value: &str, key_name: &str, source_key
     }
     let command = body.split_ascii_whitespace().next().unwrap_or(body);
     let rest = body[command.len()..].trim();
-    if rest.is_empty() && !source_key_has_code_shape(source_key) {
+    if rest.is_empty()
+        && !source_key_has_code_shape(source_key)
+        && !is_upper_env_secret_key(source_key)
+    {
         return false;
     }
     is_shell_command_name(command) && !shell_literal_argument_looks_secret(body, command)
@@ -6081,6 +6086,7 @@ fn is_sensitive_slot_documentation_literal(value: &str, key_name: &str) -> bool 
 fn key_name_indicates_password_slot(key_name: &str) -> bool {
     key_name == "pass"
         || key_name.ends_with("_pass")
+        || has_password_slot_component(key_name)
         || has_identifier_component(key_name, "password")
         || has_identifier_component(key_name, "passwd")
         || has_identifier_component(key_name, "passphrase")
@@ -6518,7 +6524,8 @@ fn key_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
             | "webhook_secret"
             | "shared_secret"
             | "credential"
-    ) || name.ends_with("_password")
+    ) || has_password_slot_component(name)
+        || name.ends_with("_password")
         || has_identifier_phrase(name, &["password", "confirmation"])
         || has_identifier_phrase(name, &["password", "confirm"])
         || name.ends_with("_pass")
@@ -6540,6 +6547,17 @@ fn key_context_allows_low_entropy_literal(key_name: &str, source_key: &str, kind
         && (key_allows_low_entropy_literal(&source_name, kind)
             || is_qualified_low_entropy_material_slot(&source_name, kind)
             || compact_key_context_allows_low_entropy_literal(&source_name, kind))
+}
+
+fn has_password_slot_component(name: &str) -> bool {
+    name.split('_').any(is_numbered_password_component)
+}
+
+fn is_numbered_password_component(component: &str) -> bool {
+    let Some(rest) = component.strip_prefix("password") else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn compact_key_context_allows_low_entropy_literal(name: &str, kind: KeyKind) -> bool {
@@ -6577,7 +6595,8 @@ fn compact_key_context_allows_low_entropy_literal(name: &str, kind: KeyKind) -> 
             | "webhooksecret"
             | "sharedsecret"
             | "credential"
-    ) || compact.ends_with("password")
+    ) || is_numbered_password_component(&compact)
+        || compact.ends_with("password")
         || compact.ends_with("passwd")
         || compact.ends_with("passphrase")
         || compact.ends_with("secret")
@@ -6611,20 +6630,24 @@ fn is_explicit_slot_low_entropy_literal(value: &str, key_name: &str, kind: KeyKi
 
 fn is_exact_password_low_entropy_slot(key_name: &str, kind: KeyKind) -> bool {
     // Plain config files commonly use the exact key `password` with short
-    // generated values. Keep this narrower than `_password` suffix handling so
-    // `secret: capability` and token prose stay rejected.
-    !matches!(kind, KeyKind::Token)
-        && matches!(
-            key_name,
-            "pass" | "password" | "passwd" | "pwd" | "passphrase"
-        )
+    // generated values. Numbered form slots (`password1`, `new_password2`) are
+    // the same material field in web forms; require the number to be attached
+    // to one password component so `passwordless` remains metadata.
+    if matches!(kind, KeyKind::Token) {
+        return false;
+    }
+    matches!(
+        key_name,
+        "pass" | "password" | "passwd" | "pwd" | "passphrase"
+    ) || has_password_slot_component(key_name)
 }
 
 fn is_qualified_low_entropy_material_slot(key_name: &str, kind: KeyKind) -> bool {
     if matches!(kind, KeyKind::Token) {
         return key_allows_low_entropy_literal(key_name, kind) && key_name.contains('_');
     }
-    key_name.ends_with("_password")
+    has_password_slot_component(key_name)
+        || key_name.ends_with("_password")
         || key_name.ends_with("_pass")
         || key_name.ends_with("_passwd")
         || key_name.ends_with("_pwd")
@@ -7295,6 +7318,8 @@ mod tests {
         assert!(has(r#"credential: "hunter2""#, "hunter2"));
         assert!(has(r#"token: "quick-token-123""#, "quick-token-123"));
         assert!(has(r#"password = "6.hours""#, "6.hours"));
+        assert!(has(r#"password1: "munpsmt""#, "munpsmt"));
+        assert!(has(r#"new_password2: "kmyhawmjaydc""#, "kmyhawmjaydc"));
     }
 
     #[test]
@@ -7394,6 +7419,11 @@ mod tests {
             r#"<add key="Microsoft and .NET" value="true" />"#,
             r#"<assemblyIdentity name="nunit.framework" publicKeyToken="2638cd05610744eb" culture="neutral" />"#,
             "section.key=value1",
+            "dropForeignKey(table: Table|string, foreignKeyOrName: TableForeignKey|string): Promise<void>",
+            "ADMIN_PASSWORD=$(rand_pwd)",
+            "GITLAB_SECRETS_SECRET_KEY_BASE=long-and-random-alphanumeric-string",
+            r#"passwordless: "abcdefgh""#,
+            r#"errors['password1'] = 'Forbidden value.'"#,
             "conn->bits.user_passwd = data->set.userpwd?1:0;",
             "*m_key = *m_keyOrig;",
             r#"self.basic_auth = "Basic {}".format(user, password)"#,
