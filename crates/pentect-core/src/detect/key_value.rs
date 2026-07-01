@@ -189,6 +189,7 @@ fn scan_line(
 
     scan_prefixed_hex_materials(&mut ctx);
     scan_c_hex_byte_key_arrays(&mut ctx);
+    scan_sensitive_call_literals(&mut ctx);
 }
 
 fn sensitive_form_helper_with_key(left: &str) -> Option<String> {
@@ -286,6 +287,81 @@ fn scan_c_hex_byte_key_arrays(ctx: &mut ScanCtx<'_, '_, '_>) {
         });
         search = value_end;
     }
+}
+
+fn scan_sensitive_call_literals(ctx: &mut ScanCtx<'_, '_, '_>) {
+    let line = &ctx.text[ctx.line_start..ctx.line_end];
+    let bytes = line.as_bytes();
+    let mut search = 0usize;
+    while search < bytes.len() {
+        let Some(open_rel) = line[search..].find('(') else {
+            break;
+        };
+        let open = search + open_rel;
+        let head = line[..open].trim_end();
+        let Some(call_id) = last_call_identifier(head) else {
+            search = open + 1;
+            continue;
+        };
+        let call_key = normalize_key(call_id);
+        if !call_name_accepts_secret_literal(&call_key, &call_key) {
+            search = open + 1;
+            continue;
+        }
+        let Some(kind) = sensitive_key_kind(&call_key) else {
+            search = open + 1;
+            continue;
+        };
+        let args = collect_top_level_quoted_call_arguments(
+            ctx.text,
+            ctx.line_start + open + 1,
+            ctx.line_end,
+        );
+        if args.is_empty() {
+            search = open + 1;
+            continue;
+        }
+        let value = if call_prefers_last_secret_argument(&call_key, &call_key) {
+            *args.last().unwrap()
+        } else {
+            args[0]
+        };
+        let raw_value = &ctx.text[value.start..value.end];
+        if looks_like_secret_value(
+            raw_value,
+            kind,
+            value.quoted,
+            Separator::Assignment,
+            &call_key,
+            head,
+        ) {
+            push_keyed_secret_span(ctx, value.start, value.end, Confidence::Medium);
+        }
+        search = open + 1;
+    }
+}
+
+fn push_keyed_secret_span(
+    ctx: &mut ScanCtx<'_, '_, '_>,
+    start: usize,
+    end: usize,
+    confidence: Confidence,
+) {
+    let range = ctx.view.to_raw(ByteRange::new(start, end));
+    if ctx.out.iter().any(|span| {
+        span.range == range
+            && span.source == DetectorId::KeyValue
+            && span.label == labels::KEYED_SECRET
+    }) {
+        return;
+    }
+    ctx.out.push(Span {
+        range,
+        category: Category::Secret,
+        label: labels::KEYED_SECRET.to_string(),
+        confidence,
+        source: DetectorId::KeyValue,
+    });
 }
 
 fn c_hex_byte_array_left(line: &str, eq: usize) -> Option<(String, Option<usize>)> {
@@ -705,6 +781,8 @@ fn sensitive_key_kind(key: &str) -> Option<KeyKind> {
             "apitoken",
             "refresh_token",
             "id_token",
+            "auth_code",
+            "authorization_code",
             "auth_token",
             "bearer_token",
             "session_token",
@@ -1076,6 +1154,16 @@ fn call_name_accepts_secret_literal(call_key: &str, _key_name: &str) -> bool {
     }
     has_identifier_component(call_key, "credential")
         || has_identifier_component(call_key, "credentials")
+        || (has_identifier_component(call_key, "token")
+            && (has_identifier_component(call_key, "auth")
+                || has_identifier_component(call_key, "oauth")
+                || has_identifier_component(call_key, "access")
+                || has_identifier_component(call_key, "refresh")
+                || has_identifier_component(call_key, "id")))
+        || (has_identifier_component(call_key, "secret")
+            && (has_identifier_component(call_key, "key")
+                || has_identifier_component(call_key, "token")
+                || has_identifier_component(call_key, "password")))
 }
 
 fn call_name_is_prompt_or_lookup(call_key: &str) -> bool {
@@ -1128,6 +1216,74 @@ fn collect_quoted_call_arguments(
                 if depth == 0 {
                     break;
                 }
+                pos += 1;
+            }
+            _ => {
+                pos += 1;
+            }
+        }
+    }
+    args
+}
+
+fn collect_top_level_quoted_call_arguments(
+    text: &str,
+    mut pos: usize,
+    line_end: usize,
+) -> Vec<ValueCandidate> {
+    let bytes = text.as_bytes();
+    let mut args = Vec::new();
+    let mut paren_depth = 1usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    while pos < line_end {
+        match bytes[pos] {
+            b'"' | b'\'' | b'`' => {
+                let quote = bytes[pos];
+                let value_start = pos + 1;
+                let value_end = find_quote_or_line_end(text, value_start, line_end, quote);
+                if paren_depth == 1
+                    && bracket_depth == 0
+                    && brace_depth == 0
+                    && value_start < value_end
+                {
+                    let trimmed_start = trim_ascii_ws_start(text, value_start, value_end);
+                    let trimmed_end = trim_ascii_ws_end(text, trimmed_start, value_end);
+                    if trimmed_start < trimmed_end {
+                        args.push(ValueCandidate {
+                            start: trimmed_start,
+                            end: trimmed_end,
+                            quoted: true,
+                        });
+                    }
+                }
+                pos = (value_end + 1).min(line_end);
+            }
+            b'(' => {
+                paren_depth += 1;
+                pos += 1;
+            }
+            b')' => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    break;
+                }
+                pos += 1;
+            }
+            b'[' => {
+                bracket_depth += 1;
+                pos += 1;
+            }
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                pos += 1;
+            }
+            b'{' => {
+                brace_depth += 1;
+                pos += 1;
+            }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
                 pos += 1;
             }
             _ => {
@@ -3400,7 +3556,9 @@ fn is_generic_key_placeholder_literal(value: &str, key_name: &str) -> bool {
     if !has_identifier_component(key_name, "key") {
         return false;
     }
-    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
     is_pem_ellipsis_placeholder(value)
         || is_incomplete_angle_placeholder_literal(value)
         || is_braced_template_placeholder_literal(value)
@@ -4148,7 +4306,9 @@ fn is_source_declared_lower_name_literal(value: &str, key_name: &str, source_key
     {
         return false;
     }
-    let value = value.trim().trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
     if !(5..=128).contains(&value.len())
         || value.bytes().any(|b| b.is_ascii_digit())
         || !value.bytes().any(|b| matches!(b, b'_' | b'-' | b'.'))
@@ -5032,9 +5192,7 @@ fn is_minified_js_expression_fragment(value: &str) -> bool {
     // look like a compact credential (`this.x=this.y=0` or `a.b||0`). Require a
     // member access plus operator syntax so ordinary `abc=def`-style values and
     // dotted tokens remain eligible.
-    let value = value
-        .trim()
-        .trim_end_matches([',', ';', ')', '}']);
+    let value = value.trim().trim_end_matches([',', ';', ')', '}']);
     if !(4..=220).contains(&value.len())
         || value.contains("://")
         || value.chars().any(char::is_whitespace)
@@ -5665,10 +5823,8 @@ fn is_sensitive_slot_documentation_literal(value: &str, key_name: &str) -> bool 
     }
     let normalized = normalize_key(value);
     let mut has_credential_word = false;
-    let mut has_documentation_word = value.contains("://")
-        || value.contains('`')
-        || value.contains('<')
-        || value.contains('>');
+    let mut has_documentation_word =
+        value.contains("://") || value.contains('`') || value.contains('<') || value.contains('>');
     for part in normalized.split('_').filter(|part| !part.is_empty()) {
         has_credential_word |= matches!(
             part,
@@ -6710,6 +6866,26 @@ mod tests {
             "GCM_AZREPOS_SP_SECRET"
         ));
         assert!(has(r#"context.Token = "CustomToken";"#, "CustomToken"));
+        assert!(has(
+            r#"const string authCode = "b18dc90098";"#,
+            "b18dc90098"
+        ));
+        assert!(has(
+            r#"final OAuth2AccessToken accessToken = new OAuth2AccessToken("k6wmh.435gxdn512994384e9e0a6h796d1i");"#,
+            "k6wmh.435gxdn512994384e9e0a6h796d1i"
+        ));
+        assert!(has(
+            r#"resty.SetAuthToken("DA916517168A7A2FBB23AA74F563E75CDE401138729A6C2BAD35BB94C568C33D");"#,
+            "DA916517168A7A2FBB23AA74F563E75CDE401138729A6C2BAD35BB94C568C33D"
+        ));
+        assert!(has(
+            r#"const secretKey = createSecretKey(Buffer.from('4d243dd6e4dc273d943d276d15485b66036a68fe2df85f508f474a5df03f22d1', 'hex'));"#,
+            "4d243dd6e4dc273d943d276d15485b66036a68fe2df85f508f474a5df03f22d1"
+        ));
+        assert!(!has(
+            r#"await auth.verifyAccessToken(validToken, { issuer: 'someonelse' });"#,
+            "someonelse"
+        ));
         assert!(has(r#"password = "pass""#, "pass"));
         assert!(has(r#"password = "secret""#, "secret"));
         assert!(has(r#"password = "letmein123""#, "letmein123"));
