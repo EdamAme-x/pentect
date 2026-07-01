@@ -190,6 +190,7 @@ fn scan_line(
     scan_prefixed_hex_materials(&mut ctx);
     scan_c_hex_byte_key_arrays(&mut ctx);
     scan_sensitive_call_literals(&mut ctx);
+    scan_sensitive_comparison_literals(&mut ctx);
 }
 
 fn sensitive_form_helper_with_key(left: &str) -> Option<String> {
@@ -362,6 +363,144 @@ fn push_keyed_secret_span(
         confidence,
         source: DetectorId::KeyValue,
     });
+}
+
+fn scan_sensitive_comparison_literals(ctx: &mut ScanCtx<'_, '_, '_>) {
+    let line = &ctx.text[ctx.line_start..ctx.line_end];
+    let bytes = line.as_bytes();
+    let mut search = 0usize;
+    while search < bytes.len() {
+        let Some(quote_rel) = line[search..].find(['"', '\'', '`']) else {
+            break;
+        };
+        let quote_pos = ctx.line_start + search + quote_rel;
+        let quote = ctx.text.as_bytes()[quote_pos];
+        let value_start = quote_pos + 1;
+        let value_end = find_quote_or_line_end(ctx.text, value_start, ctx.line_end, quote);
+        if let Some((op_start, _op_end)) =
+            comparison_operator_before(ctx.text, ctx.line_start, quote_pos)
+        {
+            if let Some((key_name, source_key)) =
+                comparison_left_sensitive_key(ctx.text, ctx.line_start, op_start)
+            {
+                if let Some(kind) = sensitive_key_kind(&key_name) {
+                    if !comparison_key_allows_secret_literal(&key_name, &source_key, kind) {
+                        search = (value_end + 1).saturating_sub(ctx.line_start);
+                        continue;
+                    }
+                    let value = ValueCandidate {
+                        start: trim_ascii_ws_start(ctx.text, value_start, value_end),
+                        end: trim_ascii_ws_end(
+                            ctx.text,
+                            trim_ascii_ws_start(ctx.text, value_start, value_end),
+                            value_end,
+                        ),
+                        quoted: true,
+                    };
+                    if value.start < value.end {
+                        let raw_value = &ctx.text[value.start..value.end];
+                        if !comparison_value_allows_secret_literal(
+                            raw_value,
+                            kind,
+                            ctx.text,
+                            ctx.line_start,
+                            op_start,
+                        ) {
+                            search = (value_end + 1).saturating_sub(ctx.line_start);
+                            continue;
+                        }
+                        if looks_like_secret_value(
+                            raw_value,
+                            kind,
+                            value.quoted,
+                            Separator::Assignment,
+                            &key_name,
+                            &source_key,
+                        ) {
+                            push_keyed_secret_span(ctx, value.start, value.end, Confidence::Medium);
+                        }
+                    }
+                }
+            }
+        }
+        search = (value_end + 1).saturating_sub(ctx.line_start);
+    }
+}
+
+fn comparison_operator_before(
+    text: &str,
+    line_start: usize,
+    quote_pos: usize,
+) -> Option<(usize, usize)> {
+    let op_end = trim_ascii_ws_end(text, line_start, quote_pos);
+    for op in ["!==", "===", "!=", "=="] {
+        if let Some(op_start) = op_end.checked_sub(op.len()) {
+            if text.get(op_start..op_end) == Some(op) {
+                return Some((op_start, op_end));
+            }
+        }
+    }
+    None
+}
+
+fn comparison_left_sensitive_key(
+    text: &str,
+    line_start: usize,
+    op_start: usize,
+) -> Option<(String, String)> {
+    let left_end = trim_ascii_ws_end(text, line_start, op_start);
+    let start = key_context_start(text, line_start, left_end)?;
+    let source_key = text[start..left_end].trim();
+    if source_key.is_empty() {
+        return None;
+    }
+    let semantic_key =
+        declared_identifier_key(source_key).unwrap_or_else(|| source_key.to_string());
+    let key_name = normalize_key(trim_key_edge(&semantic_key));
+    sensitive_key_kind(&key_name)?;
+    Some((key_name, source_key.to_string()))
+}
+
+fn comparison_key_allows_secret_literal(key_name: &str, source_key: &str, kind: KeyKind) -> bool {
+    if has_identifier_component(&normalize_key(source_key), "typeof") {
+        return false;
+    }
+    if matches!(kind, KeyKind::Strong) && !key_name_has_non_key_secret_component(key_name) {
+        return false;
+    }
+    true
+}
+
+fn comparison_value_allows_secret_literal(
+    value: &str,
+    kind: KeyKind,
+    text: &str,
+    line_start: usize,
+    op_start: usize,
+) -> bool {
+    if comparison_prefix_has_typeof(text, line_start, op_start)
+        && is_common_scalar_type_name(value.trim())
+    {
+        return false;
+    }
+    if matches!(kind, KeyKind::Token) {
+        return comparison_token_literal_has_material_shape(value);
+    }
+    true
+}
+
+fn comparison_prefix_has_typeof(text: &str, line_start: usize, op_start: usize) -> bool {
+    text.get(line_start..op_start)
+        .is_some_and(|prefix| has_identifier_component(&normalize_key(prefix), "typeof"))
+}
+
+fn comparison_token_literal_has_material_shape(value: &str) -> bool {
+    let bytes = value.trim().as_bytes();
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let has_symbol = bytes
+        .iter()
+        .any(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'-' | b'_'));
+    has_digit && (bytes.len() >= 12 || has_symbol)
 }
 
 fn c_hex_byte_array_left(line: &str, eq: usize) -> Option<(String, Option<usize>)> {
@@ -1447,6 +1586,7 @@ fn looks_like_secret_value(
         || is_key_algorithm_literal(value)
         || is_public_curve_algorithm_literal(value, key_name)
         || is_status_code_constant_literal(value, key_name)
+        || is_oauth_bearer_error_code_literal(value, key_name, source_key)
         || is_numeric_metadata_key_literal(value, key_name, quoted)
         || is_public_numeric_code_constant_literal(value, key_name, source_key, quoted)
         || is_crypto_vector_field_descriptor_literal(value, key_name)
@@ -1933,6 +2073,30 @@ fn is_status_code_key_name(key_name: &str) -> bool {
         || key_name.starts_with("trust_s_")
 }
 
+fn is_oauth_bearer_error_code_literal(value: &str, key_name: &str, source_key: &str) -> bool {
+    // RFC 6750 defines these as Bearer authentication error codes, not bearer
+    // token material. Keep the suppression gated on token/auth/error context so
+    // arbitrary underscored values under unrelated sensitive keys still flow
+    // through the normal shape checks.
+    let key = normalize_key(key_name);
+    let source = normalize_key(source_key);
+    let has_context = [&key, &source].iter().any(|name| {
+        name.split('_').any(|part| {
+            matches!(
+                part,
+                "token" | "auth" | "oauth" | "bearer" | "error" | "errors"
+            )
+        })
+    });
+    if !has_context {
+        return false;
+    }
+    matches!(
+        value.trim(),
+        "invalid_request" | "invalid_token" | "insufficient_scope"
+    )
+}
+
 fn is_public_numeric_code_constant_literal(
     value: &str,
     key_name: &str,
@@ -2201,6 +2365,7 @@ fn is_common_scalar_type_name(value: &str) -> bool {
             | "bytes"
             | "Bytes"
             | "Buffer"
+            | "function"
             | "object"
             | "Object"
     )
@@ -6885,6 +7050,32 @@ mod tests {
         assert!(!has(
             r#"await auth.verifyAccessToken(validToken, { issuer: 'someonelse' });"#,
             "someonelse"
+        ));
+        assert!(has(r#"if ($auth['password'] === 'pyicn4') {"#, "pyicn4"));
+        assert!(has(r#"assert cfg['password'] == 'phdown'"#, "phdown"));
+        assert!(has(
+            r#"if (username == "slowdive") and (password == "uwprbkfiw"):"#,
+            "uwprbkfiw"
+        ));
+        assert!(!has(
+            r#"if (username == "slowdive") and (password == "uwprbkfiw"):"#,
+            "slowdive"
+        ));
+        assert!(!has(r#"token == "invalid_token""#, "invalid_token"));
+        assert!(!has(r#"if (typeof password === "string") {"#, "string"));
+        assert!(!has(r#"if (typeof password === "function") {"#, "function"));
+        assert!(!has(r#"if (key === "v-text") {"#, "v-text"));
+        assert!(!has(
+            r#"if (auth_method == "gssapi-with-mic") {"#,
+            "gssapi-with-mic"
+        ));
+        assert!(!has(
+            r#"if (request.headers.token !== "unicorn") {"#,
+            "unicorn"
+        ));
+        assert!(has(
+            r#"assert token == "25320273898820##29764505m00czd7fg38107712t046dp812sjt0cc""#,
+            "25320273898820##29764505m00czd7fg38107712t046dp812sjt0cc"
         ));
         assert!(has(r#"password = "pass""#, "pass"));
         assert!(has(r#"password = "secret""#, "secret"));

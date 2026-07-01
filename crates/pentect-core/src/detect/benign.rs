@@ -977,6 +977,11 @@ mod tests {
         assert!(is_explicitly_non_sensitive_key_name("correlationKey"));
         assert!(is_explicitly_non_sensitive_key_name("TopologyKey"));
         assert!(is_explicitly_non_sensitive_key_name("apiKeyName"));
+        assert!(is_explicitly_non_sensitive_key_name("authMethod"));
+        assert!(is_explicitly_non_sensitive_key_name(
+            "serverHostKeyAlgorithm"
+        ));
+        assert!(is_explicitly_non_sensitive_key_name("passwordLastUsed"));
         assert!(is_explicitly_non_sensitive_key_name(
             "PasswordStoreDirEnvar"
         ));
