@@ -120,7 +120,7 @@ fn help_text() -> &'static str {
         "read: masked file preview\n",
         "view: handle metadata\n",
         "resolve: local materialize\n",
-        "scan: CredSweeper + core; binary skip|text; narrow with --exclude, --gitignore, .pentectignore\n",
+        "scan: CredSweeper + core; binary skip(default)|text(lossy); narrow with --exclude, --gitignore, .pentectignore\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness\n",
         "bench: creddata, parity\n",

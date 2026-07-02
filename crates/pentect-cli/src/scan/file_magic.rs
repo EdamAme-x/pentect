@@ -36,9 +36,6 @@ fn classify_prefix(prefix: &Prefix16) -> FileMagic {
     if b.starts_with(b"\x7FELF") {
         return FileMagic::Binary("elf header");
     }
-    if b.starts_with(b"MZ") {
-        return FileMagic::Binary("pe header");
-    }
     if b.starts_with(b"\xCA\xFE\xBA\xBE") {
         return FileMagic::Binary("java class header");
     }
@@ -61,7 +58,6 @@ fn classify_short_magic(bytes: &[u8]) -> Option<&'static str> {
     [
         (b"\x89PNG\r\n\x1A\n".as_slice(), "png header"),
         (b"\x7FELF".as_slice(), "elf header"),
-        (b"MZ".as_slice(), "pe header"),
         (b"\xFF\xD8\xFF".as_slice(), "jpeg header"),
         (b"GIF87a".as_slice(), "gif header"),
         (b"GIF89a".as_slice(), "gif header"),
@@ -99,6 +95,10 @@ mod tests {
         assert_eq!(
             FileMagic::TextCandidate,
             classify(b"const PASSWORD = \"helloworld1234\";\n")
+        );
+        assert_eq!(
+            FileMagic::TextCandidate,
+            classify(b"MZ\nconst PASSWORD = \"helloworld1234\";\n")
         );
         assert_eq!(
             FileMagic::TextCandidate,

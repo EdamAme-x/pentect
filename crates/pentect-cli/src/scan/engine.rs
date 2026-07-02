@@ -48,7 +48,7 @@ trait ScanBackend {
     fn binary_mode(&self) -> Option<BinaryMode> {
         None
     }
-    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String>;
+    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<ScanFile>, String>;
 }
 
 struct ScanPipeline {
@@ -78,17 +78,32 @@ impl ScanPipeline {
             .into_iter()
             .map(ScanFile::Skipped)
             .collect::<Vec<_>>();
-        let mut scanned_paths = eligible.iter().cloned().collect::<BTreeSet<_>>();
+        let mut scanned_paths = BTreeSet::new();
+        let mut skipped_paths = BTreeMap::new();
         let mut findings = FindingSet::default();
 
         for backend in &mut self.backends {
             let backend_name = backend.name();
-            for file in backend
+            for result in backend
                 .scan(&eligible)
                 .map_err(|e| format!("{backend_name}: {e}"))?
             {
-                scanned_paths.insert(file.path.clone());
-                findings.merge_file(file);
+                match result {
+                    ScanFile::Clean(path) => {
+                        skipped_paths.remove(&path);
+                        scanned_paths.insert(path);
+                    }
+                    ScanFile::Finding(file) => {
+                        skipped_paths.remove(&file.path);
+                        scanned_paths.insert(file.path.clone());
+                        findings.merge_file(file);
+                    }
+                    ScanFile::Skipped(skipped) => {
+                        if !scanned_paths.contains(&skipped.path) {
+                            skipped_paths.entry(skipped.path.clone()).or_insert(skipped);
+                        }
+                    }
+                }
             }
         }
 
@@ -105,6 +120,7 @@ impl ScanPipeline {
         for file in finding_files {
             out.push(ScanFile::Finding(file));
         }
+        out.extend(skipped_paths.into_values().map(ScanFile::Skipped));
         Ok((out, self.name.to_string()))
     }
 
@@ -299,9 +315,12 @@ impl CoreBackend {
         }
     }
 
-    fn scan_file(&mut self, path: &Path) -> Result<Option<FileFinding>, String> {
-        let Some(data) = read_text_file(path, self.binary)? else {
-            return Ok(None);
+    fn scan_file(&mut self, path: &Path) -> Result<ScanFile, String> {
+        let data = match read_text_file(path, self.binary)? {
+            ReadTextFile::Text(data) => data,
+            ReadTextFile::Skipped(reason) => {
+                return Ok(ScanFile::Skipped(SkippedFile::new(path, reason)));
+            }
         };
         let kind = infer_kind(path);
         self.ensure_engine();
@@ -322,9 +341,9 @@ impl CoreBackend {
             .filter(|note| note.category == Category::Secret)
             .count();
         if hits.is_empty() && warnings == 0 {
-            return Ok(None);
+            return Ok(ScanFile::Clean(path.to_path_buf()));
         }
-        Ok(Some(FileFinding {
+        Ok(ScanFile::Finding(FileFinding {
             path: path.to_path_buf(),
             scope: ScanScope::classify(path),
             kind,
@@ -359,7 +378,7 @@ impl ScanBackend for CoreBackend {
         Some(self.binary)
     }
 
-    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String> {
+    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<ScanFile>, String> {
         if files.is_empty() {
             return Ok(Vec::new());
         }
@@ -393,25 +412,28 @@ impl ScanBackend for CoreBackend {
                 });
             }
             drop(tx);
-            rx.into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .map(|items| items.into_iter().flatten().collect())
+            rx.into_iter().collect::<Result<Vec<_>, _>>()
         })
     }
 }
 
-fn read_text_file(path: &Path, binary: BinaryMode) -> Result<Option<String>, String> {
+enum ReadTextFile {
+    Text(String),
+    Skipped(&'static str),
+}
+
+fn read_text_file(path: &Path, binary: BinaryMode) -> Result<ReadTextFile, String> {
     let bytes =
         std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
     if binary == BinaryMode::Skip && memchr(0, &bytes).is_some() {
-        return Ok(None);
+        return Ok(ReadTextFile::Skipped("binary content"));
     }
     match String::from_utf8(bytes) {
-        Ok(data) => Ok(Some(data)),
-        Err(e) if binary == BinaryMode::Text => {
-            Ok(Some(String::from_utf8_lossy(e.as_bytes()).into_owned()))
-        }
-        Err(_) => Ok(None),
+        Ok(data) => Ok(ReadTextFile::Text(data)),
+        Err(e) if binary == BinaryMode::Text => Ok(ReadTextFile::Text(
+            String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        )),
+        Err(_) => Ok(ReadTextFile::Skipped("invalid utf-8")),
     }
 }
 
