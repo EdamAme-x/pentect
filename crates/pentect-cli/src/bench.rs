@@ -829,7 +829,37 @@ impl LineIndex {
         path: &str,
         finding: &CredSweeperNativeFinding,
     ) -> Option<Vec<CredSweeperJsonLineData>> {
-        let range = finding.range;
+        let mut out = Vec::new();
+        if !finding.line_data.is_empty() {
+            for line_data in &finding.line_data {
+                out.extend(self.credsweeper_line_data_part(
+                    path,
+                    line_data.range,
+                    line_data.variable.as_deref(),
+                    line_data.variable_start,
+                    line_data.variable_end,
+                )?);
+            }
+            return Some(out);
+        }
+        out.extend(self.credsweeper_line_data_part(
+            path,
+            finding.range,
+            finding.variable.as_deref(),
+            finding.variable_start,
+            finding.variable_end,
+        )?);
+        Some(out)
+    }
+
+    fn credsweeper_line_data_part(
+        &self,
+        path: &str,
+        range: ByteRange,
+        variable: Option<&str>,
+        variable_start: Option<usize>,
+        variable_end: Option<usize>,
+    ) -> Option<Vec<CredSweeperJsonLineData>> {
         let start_line = self.line_for_offset(range.start)?;
         let end_line = self.line_for_offset(range.end.saturating_sub(1))?;
         let mut out = Vec::new();
@@ -852,19 +882,17 @@ impl LineIndex {
             let line = self.text[line_start..line_end].to_string();
             let value = self.text[value_start_byte..value_end_byte].to_string();
             let (variable, variable_start, variable_end) = if line_num == start_line {
-                match (
-                    finding.variable.as_ref(),
-                    finding.variable_start,
-                    finding.variable_end,
-                ) {
-                    (Some(variable), Some(start), Some(end))
-                        if start < end && line_start + end <= line_end =>
-                    {
-                        (
-                            Some(variable.clone()),
-                            char_col_from_byte(&self.text[line_start..line_end], start) as isize,
-                            char_col_from_byte(&self.text[line_start..line_end], end) as isize,
-                        )
+                match (variable, variable_start, variable_end) {
+                    (Some(variable), Some(start), Some(end)) => {
+                        match local_line_offsets(line_start, line_end, start, end) {
+                            Some((start, end)) => (
+                                Some(variable.to_string()),
+                                char_col_from_byte(&self.text[line_start..line_end], start)
+                                    as isize,
+                                char_col_from_byte(&self.text[line_start..line_end], end) as isize,
+                            ),
+                            None => (None, -2, -2),
+                        }
                     }
                     _ => (None, -2, -2),
                 }
@@ -901,6 +929,25 @@ impl LineIndex {
         let idx = self.starts.partition_point(|start| *start <= offset);
         Some(idx.max(1))
     }
+}
+
+fn local_line_offsets(
+    line_start: usize,
+    line_end: usize,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    if start >= end {
+        return None;
+    }
+    let line_len = line_end.saturating_sub(line_start);
+    if end <= line_len {
+        return Some((start, end));
+    }
+    if line_start <= start && end <= line_end {
+        return Some((start - line_start, end - line_start));
+    }
+    None
 }
 
 fn char_col_to_byte(text: &str, col: usize) -> usize {
