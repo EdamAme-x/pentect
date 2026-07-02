@@ -49,6 +49,34 @@ pub struct CredSweeperNativeStats {
     pub ml_model_onnx_bytes: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct CredSweeperNativeFinding {
+    pub range: ByteRange,
+    pub rule_name: String,
+    pub label: String,
+    pub severity: String,
+    pub confidence: Confidence,
+    pub confidence_name: String,
+    pub value: String,
+    pub value_start: usize,
+    pub value_end: usize,
+    pub variable: Option<String>,
+    pub variable_start: Option<usize>,
+    pub variable_end: Option<usize>,
+}
+
+impl CredSweeperNativeFinding {
+    fn span(&self) -> Span {
+        Span {
+            range: self.range,
+            category: Category::Secret,
+            label: self.label.clone(),
+            confidence: self.confidence,
+            source: DetectorId::CredSweeper,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct NativeRule {
     rule_name: String,
@@ -82,20 +110,6 @@ enum SpecialMatcher {
     Jwk,
     PemPrivateKey,
     Base64PrivateKey,
-    Keyword(KeywordMatcher),
-}
-
-#[derive(Clone, Copy)]
-enum KeywordMatcher {
-    Api,
-    Auth,
-    Credential,
-    Key,
-    Nonce,
-    Password,
-    Salt,
-    Secret,
-    Token,
 }
 
 impl CredSweeperNativeDetector {
@@ -105,6 +119,13 @@ impl CredSweeperNativeDetector {
 
     pub fn builtin_stats() -> &'static CredSweeperNativeStats {
         &BUILTIN.stats
+    }
+
+    pub fn rule_name_for_label(&self, label: &str) -> Option<&str> {
+        self.rules
+            .iter()
+            .find(|rule| rule.label == label)
+            .map(|rule| rule.rule_name.as_str())
     }
 
     fn compile_builtin() -> Result<Self, String> {
@@ -152,6 +173,21 @@ impl CredSweeperNativeDetector {
                             }
                             None => unsupported_patterns += 1,
                         },
+                    }
+                }
+            } else if raw.kind.as_deref() == Some("keyword") {
+                for value in values {
+                    match compile_keyword_pattern(value) {
+                        Ok(regex) => {
+                            fancy_regex_patterns += 1;
+                            enabled_patterns += 1;
+                            patterns.push(NativePattern {
+                                matcher: PatternMatcher::Fancy(regex),
+                                value_capture: true,
+                            });
+                            compiled_patterns += 1;
+                        }
+                        Err(_) => unsupported_patterns += 1,
                     }
                 }
             } else {
@@ -220,8 +256,8 @@ impl CredSweeperNativeDetector {
     }
 }
 
-impl Detector for CredSweeperNativeDetector {
-    fn detect(&self, view: &NormalizedView) -> Vec<Span> {
+impl CredSweeperNativeDetector {
+    pub fn detect_findings(&self, view: &NormalizedView) -> Vec<CredSweeperNativeFinding> {
         let text = view.text();
         let mut out = Vec::new();
         let mut ml_pending = Vec::new();
@@ -232,6 +268,31 @@ impl Detector for CredSweeperNativeDetector {
             path: &ml_path,
             file_type: &ml_file_type,
         };
+        for rule in &self.rules {
+            if line_body_only_rule(rule) {
+                continue;
+            }
+            if text.len() < rule.min_line_len {
+                continue;
+            }
+            for pattern in &rule.patterns {
+                let PatternMatcher::Special(SpecialMatcher::PemPrivateKey) = &pattern.matcher
+                else {
+                    continue;
+                };
+                for candidate in pem_private_key_block_candidates(text) {
+                    push_match(
+                        &mut out,
+                        &mut ml_pending,
+                        &push_ctx,
+                        rule,
+                        0,
+                        text,
+                        &candidate,
+                    );
+                }
+            }
+        }
         for (line_start, line) in LineRanges::new(text) {
             let line_body = line.trim_end_matches(['\r', '\n']);
             let line_lower = LazyLower::new(line_body);
@@ -242,6 +303,12 @@ impl Detector for CredSweeperNativeDetector {
                     continue;
                 }
                 for pattern in &rule.patterns {
+                    if matches!(
+                        &pattern.matcher,
+                        PatternMatcher::Special(SpecialMatcher::PemPrivateKey)
+                    ) {
+                        continue;
+                    }
                     match &pattern.matcher {
                         PatternMatcher::Rust(regex) => {
                             for captures in regex.captures_iter(line_body) {
@@ -322,7 +389,18 @@ impl Detector for CredSweeperNativeDetector {
             }
         }
         push_ml_accepted(&mut out, &ml_pending);
-        dedupe_spans(out)
+        dedupe_findings(out)
+    }
+}
+
+impl Detector for CredSweeperNativeDetector {
+    fn detect(&self, view: &NormalizedView) -> Vec<Span> {
+        let spans = self
+            .detect_findings(view)
+            .into_iter()
+            .map(|finding| finding.span())
+            .collect();
+        dedupe_spans(spans)
     }
 }
 
@@ -359,9 +437,17 @@ impl SpecialMatcher {
             Self::Jwk => jwk_candidates(line),
             Self::PemPrivateKey => pem_private_key_candidates(line),
             Self::Base64PrivateKey => base64_private_key_candidates(line),
-            Self::Keyword(keyword) => keyword_candidates(line, *keyword),
         }
     }
+}
+
+fn line_body_only_rule(rule: &NativeRule) -> bool {
+    !rule.patterns.iter().any(|pattern| {
+        matches!(
+            &pattern.matcher,
+            PatternMatcher::Special(SpecialMatcher::PemPrivateKey)
+        )
+    })
 }
 
 fn translated_pattern(rule_name: &str) -> Option<SpecialMatcher> {
@@ -380,39 +466,7 @@ fn translated_rule(raw: &RawRule) -> Option<SpecialMatcher> {
             _ => None,
         },
         "pem_key" => (raw.name == "PEM Private Key").then_some(SpecialMatcher::PemPrivateKey),
-        "keyword" => KeywordMatcher::from_rule_name(&raw.name).map(SpecialMatcher::Keyword),
         _ => None,
-    }
-}
-
-impl KeywordMatcher {
-    fn from_rule_name(name: &str) -> Option<Self> {
-        match name {
-            "API" => Some(Self::Api),
-            "Auth" => Some(Self::Auth),
-            "Credential" => Some(Self::Credential),
-            "Key" => Some(Self::Key),
-            "Nonce" => Some(Self::Nonce),
-            "Password" => Some(Self::Password),
-            "Salt" => Some(Self::Salt),
-            "Secret" => Some(Self::Secret),
-            "Token" => Some(Self::Token),
-            _ => None,
-        }
-    }
-
-    fn needles(self) -> &'static [&'static str] {
-        match self {
-            Self::Api => &["api"],
-            Self::Auth => &["auth"],
-            Self::Credential => &["credential"],
-            Self::Key => &["key"],
-            Self::Nonce => &["nonce"],
-            Self::Password => &["password", "passwd", "pwd", "passphrase", "pass"],
-            Self::Salt => &["salt"],
-            Self::Secret => &["secret"],
-            Self::Token => &["token"],
-        }
     }
 }
 
@@ -423,6 +477,31 @@ fn compile_pattern(pattern: &str) -> Result<PatternMatcher, ()> {
             .map(PatternMatcher::Fancy)
             .map_err(|_| ()),
     }
+}
+
+fn compile_keyword_pattern(keyword: &str) -> Result<FancyRegex, ()> {
+    FancyRegex::new(&keyword_pattern(keyword)).map_err(|_| ())
+}
+
+fn keyword_pattern(keyword: &str) -> String {
+    [
+        r#"(?is)"#,
+        r#"(?P<directive>(?:(?:[#%]define|define(?=(\s|\\{1,8}[tnr])*\()|%global)(?:\s?\(|\s|\\{1,8}[tnr]){1,8}|\bset(?=\b|\w*(\s|\\{1,8}[tnr])*\()))?"#,
+        r#"(?:\\[nrt]|(\\\\*u00|%)[0-9a-f]{2}|\s)*"#,
+        r#"(?P<variable>((["'`]{1,8}[^:="'`}<>\\/&?]*|[^:="'`}<>\s()\\/&?;,%]*)"#,
+        &format!(r#"(?P<keyword>{keyword})"#),
+        r#"[^%:="'`<>({?!&;\n]{0,80})(&(quot|apos|#3[49]);|(\\\\*u00|%)[0-9a-f]{2}|["'`])*)"#,
+        r#"(?(directive)|(\s|\\{1,8}[tnr])*\]?(\s|\\{1,8}[tnr])*)"#,
+        r#"(?P<separator>:(\s[a-z]{3,9}[?]?\s)?=|:(?!:)|=(>|&gt;|(\\\\*u00|%)26gt;)|!==|!=|===|==|=~|=|(?(directive)(,|\\t|\s|\((?!\))){1,80}|%3d))"#,
+        r#"(\s|\\{1,8}[tnr])*"#,
+        r#"(?P<wrap>(((\s|\\{1,8}[tnr]|new|byte|char|string|\[\]){1,8})?(?P<get>([_a-z][0-9a-z_.\[\]]*\.)get|(os\.)?getenv)?([0-9a-z_.]|::|-(>|&gt;))*\s*(\[(?!\])|\((?!\))|\{(?!\}))(\s|\\{1,8}[tnr])*(?(get)('[^']{1,31}'|"[^"]{1,31}")\s*(,|\)\s*or)\s*|)([0-9a-z_]{1,32}\s*[:=]\s*)?){1,8})?"#,
+        r#"(((b|r|br|rb|u|t|f|rf|fr|l|@)(?=(\\*["'`])))?"#,
+        r#"(?P<value_leftquote>((?P<esq>\\{1,8})?(["'`]|&(quot|apos|#3[49]);)){1,4}))?"#,
+        r#"(\s?(oauth|bot|basic|bearer|apikey|accesskey|ssws|ntlm|token)\s)?"#,
+        r#"(?P<value>(?(value_leftquote)((?!(?P=value_leftquote))(?(esq)((?!(?P=esq)(["'`]|&(quot|apos|#3[49]);)).)|((?!(?P=value_leftquote)).)))|(?!&(quot|apos|#3[49]);)(\\{1,8}([ tnr]|[^\s"'`])|(?P<url_esc>%[0-9a-f]{2})|(?(url_esc)[^\s"'`,;\\&]|[^\s"'`,;\\]))){4,8000}|(<[^>]{4,8000}>)|(\$?\({1,3}[^)]{4,8000}\){1,3})|(\$?\{{1,3}[^}]{4,8000}\}{1,3})|(?(wrap)(?(value_leftquote)(?!\\(?P=value_leftquote))|[^\]\)\}]){16,8000}))"#,
+        r#"(?(value_leftquote)(?P<value_rightquote>(?<!\\)(?P=value_leftquote)|\\$|(?<=[0-9a-z+_/-])$)|(?(wrap)(\]|\)|\}|;|\\|$)))"#,
+    ]
+    .concat()
 }
 
 fn aws_multi_candidates(line: &str) -> Vec<Candidate<'_>> {
@@ -495,6 +574,167 @@ fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
     }
 }
 
+fn pem_private_key_block_candidates(text: &str) -> Vec<Candidate<'_>> {
+    const MAX_PEM_LENGTH: usize = 4 * 8000;
+
+    let mut out = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(begin_rel) = text[search_start..].find("-----BEGIN") {
+        let begin = search_start + begin_rel;
+        let header_search = begin + "-----BEGIN".len();
+        let header_window_end =
+            clamp_to_char_boundary(text, (header_search + MAX_PEM_LENGTH).min(text.len()));
+        let Some(header_close_rel) = text[header_search..header_window_end].find("-----") else {
+            break;
+        };
+        let header_end = header_search + header_close_rel + "-----".len();
+        let header = &text[begin..header_end];
+        if !header.contains("PRIVATE") || header.contains("ENCRYPTED") || !header.contains("KEY") {
+            search_start = header_end;
+            continue;
+        }
+
+        let end_limit = clamp_to_char_boundary(text, (begin + MAX_PEM_LENGTH).min(text.len()));
+        let Some(end_rel) = text[header_end..end_limit].find("-----END") else {
+            search_start = header_end;
+            continue;
+        };
+        let end_begin = header_end + end_rel;
+        let end_header_search = end_begin + "-----END".len();
+        let Some(end_close_rel) = text[end_header_search..end_limit].find("-----") else {
+            search_start = header_end;
+            continue;
+        };
+        let end = end_header_search + end_close_rel + "-----".len();
+        let block = &text[begin..end];
+        if valid_pem_private_key_block(block) {
+            out.push(Candidate {
+                start: begin,
+                end,
+                value: block,
+                variable_start: None,
+                variable_end: None,
+                variable: None,
+            });
+        }
+        search_start = end;
+    }
+    out
+}
+
+fn valid_pem_private_key_block(block: &str) -> bool {
+    let mut text = block.to_string();
+    while text.contains("\\\\") {
+        text = text.replace("\\\\", "\\");
+    }
+    text = text
+        .replace("\\r\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t");
+
+    let mut key_data = String::new();
+    let mut saw_end = false;
+    for line in text.lines() {
+        let line = sanitize_pem_line(line, 5);
+        if line.is_empty()
+            || line.contains("-----BEGIN")
+            || line.contains("Proc-Type")
+            || line.contains("Version")
+            || line.contains("DEK-Info")
+        {
+            continue;
+        }
+        if line.contains("-----END") {
+            saw_end = true;
+            break;
+        }
+        if !line
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        {
+            return false;
+        }
+        key_data.push_str(&line);
+    }
+    saw_end && decodes_as_pem_payload(&key_data)
+}
+
+fn sanitize_pem_line(line: &str, recurse: usize) -> String {
+    if recurse == 0 {
+        return line.to_string();
+    }
+    let mut line = line.trim().to_string();
+    while line.starts_with("// ") || line.starts_with("//\t") {
+        line = line[3..].to_string();
+    }
+    while line.starts_with("/// ") || line.starts_with("///\t") {
+        line = line[4..].to_string();
+    }
+    while line.starts_with("/*") {
+        line = line[2..].to_string();
+    }
+    while line.ends_with("*/") {
+        line.truncate(line.len().saturating_sub(2));
+    }
+    while line.ends_with('\\') {
+        line.pop();
+    }
+    if line.starts_with('+')
+        && line
+            .as_bytes()
+            .get(1)
+            .is_some_and(|b| !is_pem_base64_byte(*b))
+    {
+        line = line[1..].to_string();
+    }
+    if line.ends_with('+')
+        && line
+            .as_bytes()
+            .get(line.len().saturating_sub(2))
+            .is_some_and(|b| !is_pem_base64_byte(*b))
+    {
+        line.pop();
+    }
+    let trimmed = line
+        .trim_matches(|ch: char| ch.is_whitespace() || "\\'\"`;,[]#*!".contains(ch))
+        .to_string();
+    if trimmed != line
+        || trimmed.bytes().any(|b| {
+            matches!(
+                b,
+                b'\\' | b'\'' | b'"' | b'`' | b';' | b',' | b'[' | b']' | b'#' | b'*' | b'!'
+            )
+        })
+    {
+        return sanitize_pem_line(&trimmed, recurse - 1);
+    }
+    trimmed
+}
+
+fn decodes_as_pem_payload(value: &str) -> bool {
+    if value.len() < 64 {
+        return false;
+    }
+    let padded = match value.len() % 4 {
+        0 => Cow::Borrowed(value),
+        2 => Cow::Owned(format!("{value}==")),
+        3 => Cow::Owned(format!("{value}=")),
+        _ => return false,
+    };
+    BASE64
+        .decode(padded.as_bytes())
+        .or_else(|_| BASE64_NOPAD.decode(value.trim_end_matches('=').as_bytes()))
+        .map_or_else(
+            |_| shannon_entropy(value) >= 3.5,
+            |decoded| decoded.len() > 32,
+        )
+}
+
+fn is_pem_base64_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+}
+
 fn base64_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
     token_runs(line)
         .filter(|run| {
@@ -506,77 +746,6 @@ fn base64_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
                 })
         })
         .collect()
-}
-
-fn keyword_candidates(line: &str, keyword: KeywordMatcher) -> Vec<Candidate<'_>> {
-    let lower = line.to_ascii_lowercase();
-    let mut out = Vec::new();
-    for needle in keyword.needles() {
-        for (idx, _) in lower.match_indices(needle) {
-            if !is_left_word_boundary(lower.as_bytes(), idx)
-                || !is_right_word_boundary(lower.as_bytes(), idx + needle.len())
-            {
-                continue;
-            }
-            let Some((start, end)) = assignment_value_after_keyword(line, idx + needle.len())
-            else {
-                continue;
-            };
-            let value = &line[start..end];
-            if is_credible_secret_value(value) {
-                out.push(Candidate {
-                    start,
-                    end,
-                    value,
-                    variable_start: Some(idx),
-                    variable_end: Some(idx + needle.len()),
-                    variable: Some(&line[idx..idx + needle.len()]),
-                });
-            }
-        }
-    }
-    out
-}
-
-fn assignment_value_after_keyword(line: &str, from: usize) -> Option<(usize, usize)> {
-    let to = clamp_to_char_boundary(line, line.len().min(from + 96));
-    let tail = &line[from..to];
-    let eq = tail.find('=').map(|idx| from + idx);
-    let colon = tail.find(':').map(|idx| from + idx);
-    let sep = match (eq, colon) {
-        (Some(eq), Some(colon)) if colon < eq && line[colon + 1..eq].trim().len() <= 24 => eq,
-        (Some(eq), _) => eq,
-        (None, Some(colon)) => colon,
-        (None, None) => return None,
-    };
-    let mut start = sep + 1;
-    let bytes = line.as_bytes();
-    while start < line.len() && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while start < line.len() && matches!(bytes[start], b'"' | b'\'' | b'`') {
-        start += 1;
-    }
-    if start >= line.len() || bytes[start] == b'-' {
-        return None;
-    }
-    let mut end = start;
-    while end < line.len() {
-        let b = bytes[end];
-        if b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b'`' | b',' | b';' | b')') {
-            break;
-        }
-        end += 1;
-    }
-    (end > start).then_some((start, end))
-}
-
-fn clamp_to_char_boundary(text: &str, mut index: usize) -> usize {
-    index = index.min(text.len());
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 fn regex_candidates<'a>(line: &'a str, regex: &RustRegex) -> Vec<Candidate<'a>> {
@@ -606,6 +775,14 @@ fn capture_value_candidates<'a>(line: &'a str, regex: &RustRegex) -> Vec<Candida
             variable: None,
         })
         .collect()
+}
+
+fn clamp_to_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
@@ -638,8 +815,8 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
     runs.into_iter()
 }
 
-struct PendingMlSpan {
-    span: Span,
+struct PendingMlFinding {
+    finding: CredSweeperNativeFinding,
     input: MlInput,
 }
 
@@ -650,8 +827,8 @@ struct PushMatchCtx<'view, 'data> {
 }
 
 fn push_match(
-    out: &mut Vec<Span>,
-    ml_pending: &mut Vec<PendingMlSpan>,
+    out: &mut Vec<CredSweeperNativeFinding>,
+    ml_pending: &mut Vec<PendingMlFinding>,
     ctx: &PushMatchCtx<'_, '_>,
     rule: &NativeRule,
     line_start: usize,
@@ -668,16 +845,23 @@ fn push_match(
     if !accept_value(candidate.value, rule) {
         return;
     }
-    let span = Span {
+    let finding = CredSweeperNativeFinding {
         range,
-        category: Category::Secret,
+        rule_name: rule.rule_name.clone(),
         label: rule.label.clone(),
+        severity: severity_name(rule.severity).to_string(),
         confidence: rule.confidence,
-        source: DetectorId::CredSweeper,
+        confidence_name: confidence_name(rule.confidence).to_string(),
+        value: candidate.value.to_string(),
+        value_start: candidate.start,
+        value_end: candidate.end,
+        variable: candidate.variable.map(str::to_string),
+        variable_start: candidate.variable_start,
+        variable_end: candidate.variable_end,
     };
     if rule.ml_validated {
-        ml_pending.push(PendingMlSpan {
-            span,
+        ml_pending.push(PendingMlFinding {
+            finding,
             input: MlInput {
                 line: line.to_string(),
                 value: candidate.value.to_string(),
@@ -696,11 +880,11 @@ fn push_match(
             },
         });
     } else {
-        out.push(span);
+        out.push(finding);
     }
 }
 
-fn push_ml_accepted(out: &mut Vec<Span>, pending: &[PendingMlSpan]) {
+fn push_ml_accepted(out: &mut Vec<CredSweeperNativeFinding>, pending: &[PendingMlFinding]) {
     let mut used = vec![false; pending.len()];
     for i in 0..pending.len() {
         if used[i] {
@@ -717,7 +901,7 @@ fn push_ml_accepted(out: &mut Vec<Span>, pending: &[PendingMlSpan]) {
         }
         if credsweeper_ml::accept_group(&group_inputs) {
             for idx in group_indices {
-                out.push(pending[idx].span.clone());
+                out.push(pending[idx].finding.clone());
             }
         }
     }
@@ -1109,61 +1293,6 @@ fn value_sealed_secret_filtered(value: &str, context: &str) -> bool {
         && context.contains("bitnami")
 }
 
-fn is_credible_secret_value(value: &str) -> bool {
-    let value = value.trim_matches(|ch: char| {
-        matches!(ch, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}')
-    });
-    if value.len() < 8 || value.contains(char::is_whitespace) || is_obvious_placeholder(value) {
-        return false;
-    }
-    if has_known_secret_prefix(value) {
-        return true;
-    }
-    let has_alpha = value.chars().any(|ch| ch.is_ascii_alphabetic());
-    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
-    let has_symbol = value
-        .chars()
-        .any(|ch| ch.is_ascii_punctuation() && !matches!(ch, '_' | '-'));
-    let has_upper = value.chars().any(|ch| ch.is_ascii_uppercase());
-    let has_lower = value.chars().any(|ch| ch.is_ascii_lowercase());
-    (value.len() >= 8 && has_alpha && has_digit)
-        || (value.len() >= 12 && has_alpha && has_symbol)
-        || (value.len() >= 16 && has_upper && has_lower)
-        || (value.len() >= 20 && has_alpha)
-}
-
-fn has_known_secret_prefix(value: &str) -> bool {
-    [
-        "AKIA",
-        "ASIA",
-        "AIza",
-        "ghp_",
-        "github_pat_",
-        "glpat-",
-        "sk-",
-        "xox",
-        "GOCSPX-",
-        "hf_",
-        "sk-ant-",
-        "pplx-",
-        "tvly-",
-    ]
-    .iter()
-    .any(|prefix| value.starts_with(prefix))
-}
-
-fn is_left_word_boundary(bytes: &[u8], idx: usize) -> bool {
-    bytes
-        .get(idx.wrapping_sub(1))
-        .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
-}
-
-fn is_right_word_boundary(bytes: &[u8], idx: usize) -> bool {
-    bytes
-        .get(idx)
-        .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
-}
-
 fn has_upper_lower_digit(value: &str) -> bool {
     value.chars().any(|ch| ch.is_ascii_uppercase())
         && value.chars().any(|ch| ch.is_ascii_lowercase())
@@ -1174,6 +1303,38 @@ fn is_base64ish(value: &str) -> bool {
     value
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_'))
+}
+
+fn dedupe_findings(mut findings: Vec<CredSweeperNativeFinding>) -> Vec<CredSweeperNativeFinding> {
+    findings.sort_by(|a, b| {
+        (
+            a.range.start,
+            a.range.end,
+            a.rule_name.as_str(),
+            a.value_start,
+            a.value_end,
+            a.variable_start,
+            a.variable_end,
+        )
+            .cmp(&(
+                b.range.start,
+                b.range.end,
+                b.rule_name.as_str(),
+                b.value_start,
+                b.value_end,
+                b.variable_start,
+                b.variable_end,
+            ))
+    });
+    findings.dedup_by(|a, b| {
+        a.range == b.range
+            && a.rule_name == b.rule_name
+            && a.value_start == b.value_start
+            && a.value_end == b.value_end
+            && a.variable_start == b.variable_start
+            && a.variable_end == b.variable_end
+    });
+    findings
 }
 
 fn dedupe_spans(mut spans: Vec<Span>) -> Vec<Span> {
@@ -1264,6 +1425,14 @@ fn map_confidence(confidence: Option<&str>) -> Confidence {
     }
 }
 
+fn confidence_name(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::High => "strong",
+        Confidence::Medium => "moderate",
+        Confidence::Low => "weak",
+    }
+}
+
 fn map_severity(severity: Option<&str>) -> RuleSeverity {
     match severity {
         Some("critical") => RuleSeverity::Critical,
@@ -1271,6 +1440,16 @@ fn map_severity(severity: Option<&str>) -> RuleSeverity {
         Some("low") => RuleSeverity::Low,
         Some("info") => RuleSeverity::Info,
         _ => RuleSeverity::Medium,
+    }
+}
+
+fn severity_name(severity: RuleSeverity) -> &'static str {
+    match severity {
+        RuleSeverity::Critical => "critical",
+        RuleSeverity::High => "high",
+        RuleSeverity::Medium => "medium",
+        RuleSeverity::Low => "low",
+        RuleSeverity::Info => "info",
     }
 }
 
@@ -1315,9 +1494,9 @@ mod tests {
     fn migration_coverage_is_explicit() {
         let stats = CredSweeperNativeDetector::builtin_stats();
         assert_eq!(stats.rust_regex_patterns, 37, "{stats:?}");
-        assert_eq!(stats.fancy_regex_patterns, 71, "{stats:?}");
-        assert_eq!(stats.compiled_patterns, 108, "{stats:?}");
-        assert_eq!(stats.translated_patterns, 17, "{stats:?}");
+        assert_eq!(stats.fancy_regex_patterns, 80, "{stats:?}");
+        assert_eq!(stats.compiled_patterns, 117, "{stats:?}");
+        assert_eq!(stats.translated_patterns, 8, "{stats:?}");
         assert_eq!(stats.enabled_patterns, 125, "{stats:?}");
         assert_eq!(stats.ml_gated_patterns, 24, "{stats:?}");
         assert_eq!(stats.unsupported_patterns, 0, "{stats:?}");
@@ -1361,6 +1540,7 @@ mod tests {
              jwk {{\"kty\":\"RSA\",\"d\":\"{jwk_secret}\"}}\n\
              -----BEGIN OPENSSH PRIVATE KEY-----\n\
              {base64_key}\n\
+             -----END OPENSSH PRIVATE KEY-----\n\
              const PASSWORD: string = \"A8f3Kp9Lm2Qx7Zt4\";\n"
         );
         let region = region(&raw);
@@ -1383,6 +1563,31 @@ mod tests {
                 "{label}: {labels:?}"
             );
         }
+    }
+
+    #[test]
+    fn raw_findings_keep_parallel_keyword_rules() {
+        let raw =
+            "DJANGO_SECRET_KEY=8GS8FNrJgo1uN08yE4yHamlUJp3mtVrY30c4i511Ll2JiDyktZplm3p5cINPX97L\n";
+        let region = crate::model::Region {
+            span: ByteRange::new(0, raw.len()),
+            ctx: crate::model::Context {
+                path: Some("conf/settings.example".to_string()),
+                key: None,
+                hints: Vec::new(),
+                kind: crate::model::RegionKind::PlainText,
+                format: crate::model::Kind::Text,
+            },
+        };
+        let view = NormalizedView::build(&region, raw);
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        assert!(findings.iter().any(|finding| {
+            finding.rule_name == "Secret"
+                && finding.variable.as_deref() == Some("DJANGO_SECRET_KEY")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.rule_name == "Key" && finding.variable.as_deref() == Some("DJANGO_SECRET_KEY")
+        }));
     }
 
     #[test]
