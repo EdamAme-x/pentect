@@ -284,6 +284,79 @@ mod tests {
     }
 
     #[test]
+    fn binary_skip_reports_nul_files_as_skipped_not_clean() {
+        let root = temp_scan_root("pentect-scan-nul-skip");
+        std::fs::write(
+            root.join("payload.txt"),
+            b"const PASSWORD: string = \"helloworld1234\";\0\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
+
+        assert_eq!(0, report.files_scanned, "{}", report_json(&report));
+        assert_eq!(1, report.skipped.len(), "{}", report_json(&report));
+        assert_eq!("binary content", report.skipped[0].reason);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn binary_skip_reports_invalid_utf8_files_as_skipped_not_clean() {
+        let root = temp_scan_root("pentect-scan-invalid-utf8-skip");
+        let mut data = vec![0xFF, 0xFE];
+        data.extend_from_slice(b"const PASSWORD: string = \"helloworld1234\";\n");
+        std::fs::write(root.join("payload.txt"), data).unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
+
+        assert_eq!(0, report.files_scanned, "{}", report_json(&report));
+        assert_eq!(1, report.skipped.len(), "{}", report_json(&report));
+        assert_eq!("invalid utf-8", report.skipped[0].reason);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extensionless_text_starting_with_mz_is_scanned() {
+        let root = temp_scan_root("pentect-scan-extensionless-mz");
+        std::fs::write(
+            root.join("payload"),
+            "MZ\nconst PASSWORD: string = \"helloworld1234\";\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
+        let rendered = report_json(&report);
+
+        assert_eq!(1, report.files_scanned, "{rendered}");
+        assert!(report.skipped.is_empty(), "{rendered}");
+        assert_eq!(1, report.files.len(), "{rendered}");
+        assert!(report.findings >= 1, "{rendered}");
+        assert!(!rendered.contains("helloworld1234"), "{rendered}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn scan_exclude_removes_files_from_scan_set() {
         let root = temp_scan_root("pentect-scan-exclude");
         std::fs::write(
