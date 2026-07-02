@@ -99,6 +99,7 @@ struct NativeRule {
     min_line_len: usize,
     required_substrings: Vec<String>,
     filter_types: Vec<String>,
+    targets: Vec<String>,
     ml_validated: bool,
     patterns: Vec<NativePattern>,
 }
@@ -240,6 +241,7 @@ impl CredSweeperNativeDetector {
                     .as_ref()
                     .map(FilterList::items)
                     .unwrap_or_default(),
+                targets: raw.target.clone().unwrap_or_default(),
                 ml_validated: use_ml,
                 patterns,
             });
@@ -282,6 +284,9 @@ impl CredSweeperNativeDetector {
             file_type: &ml_file_type,
         };
         for rule in &self.rules {
+            if !rule_available_for_code_scan(rule) {
+                continue;
+            }
             if !has_whole_text_matcher(rule) {
                 continue;
             }
@@ -308,6 +313,9 @@ impl CredSweeperNativeDetector {
             let line_body = line.trim_end_matches(['\r', '\n']);
             let line_lower = LazyLower::new(line_body);
             for rule in &self.rules {
+                if !rule_available_for_code_scan(rule) {
+                    continue;
+                }
                 if line_body.len() < rule.min_line_len
                     || !required_substring_present(&rule.required_substrings, &line_lower)
                 {
@@ -1460,7 +1468,7 @@ fn push_match(
     if range.is_empty() {
         return;
     }
-    if !accept_value(sanitized_value.value, rule) {
+    if !accept_value(sanitized_value.value, rule, candidate) {
         return;
     }
     let sanitized_variable = candidate
@@ -1574,6 +1582,7 @@ struct RawRule {
     required_substrings: Option<Vec<String>>,
     filter_type: Option<FilterList>,
     use_ml: Option<bool>,
+    target: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1650,12 +1659,24 @@ fn required_substring_present(required: &[String], line_lower: &LazyLower<'_>) -
     required.iter().any(|needle| lower.contains(needle))
 }
 
-fn accept_value(value: &str, rule: &NativeRule) -> bool {
+fn rule_available_for_code_scan(rule: &NativeRule) -> bool {
+    rule.targets.iter().any(|target| target == "code")
+}
+
+fn accept_value(value: &str, rule: &NativeRule, candidate: &Candidate<'_>) -> bool {
     let value = value.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`');
     if value.len() < 4 || is_obvious_placeholder(value) || is_repeated_symbol(value) {
         return false;
     }
     for filter in &rule.filter_types {
+        if filter == "ValueAllowlistCheck"
+            && value_allowlist_filtered(value, candidate_is_well_quoted(candidate))
+        {
+            return false;
+        }
+        if filter == "ValueBlocklistCheck" && value_blocklist_filtered(value) {
+            return false;
+        }
         if filter == "ValueBasicAuthCheck" && !is_basic_auth_token68(value) {
             return false;
         }
@@ -1702,6 +1723,98 @@ fn accept_value(value: &str, rule: &NativeRule) -> bool {
         return false;
     }
     true
+}
+
+fn candidate_is_well_quoted(candidate: &Candidate<'_>) -> bool {
+    matches!(
+        (candidate.value_leftquote, candidate.value_rightquote),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
+fn value_allowlist_filtered(value: &str, is_well_quoted: bool) -> bool {
+    // Mirrors CredSweeper ValueAllowlistCheck: these are syntax/template
+    // expressions, not credential material.
+    if value_allowlist_common_patterns()
+        .iter()
+        .any(|pattern| pattern.is_match(value))
+    {
+        return true;
+    }
+    let patterns = if is_well_quoted {
+        value_allowlist_quoted_patterns()
+    } else {
+        value_allowlist_unquoted_patterns()
+    };
+    patterns.iter().any(|pattern| pattern.is_match(value))
+}
+
+fn value_allowlist_common_patterns() -> &'static [RustRegex] {
+    static PATTERNS: LazyLock<Vec<RustRegex>> = LazyLock::new(|| {
+        [
+            r"(?i)^ENC\(.*\)",
+            r"(?i)^ENC\[.*\]",
+            r"(?i)^\$\{(\*|[0-9]+|[a-z_].*)\}",
+            r"(?i)^\$[0-9]+(\s|$)",
+            r"(?i)^\$\$[a-z_]+(\^%[0-9a-z_]+)?",
+            r"(?i)^#\{.+\}",
+            r"(?i)^\{\{.+\}\}",
+            r"(?i)^.*@@@hl@@@.*@@@endhl@@@",
+        ]
+        .into_iter()
+        .map(|pattern| RustRegex::new(pattern).expect("static CredSweeper allowlist regex"))
+        .collect()
+    });
+    &PATTERNS
+}
+
+fn value_allowlist_quoted_patterns() -> &'static [RustRegex] {
+    static PATTERNS: LazyLock<Vec<RustRegex>> = LazyLock::new(|| {
+        [
+            r"(?i)^\$[a-z_][0-9a-z_]+((::|->|\.)[a-z_]|\[|$)",
+            r"(?i)^\$\([^)]+\)",
+            r"(?i)^.*\*\*\*\*",
+        ]
+        .into_iter()
+        .map(|pattern| RustRegex::new(pattern).expect("static CredSweeper quoted allowlist regex"))
+        .collect()
+    });
+    &PATTERNS
+}
+
+fn value_allowlist_unquoted_patterns() -> &'static [RustRegex] {
+    static PATTERNS: LazyLock<Vec<RustRegex>> = LazyLock::new(|| {
+        [
+            r"(?i)^[~a-z0-9_]+((\.|->)[a-z0-9_]+)+\(.*$",
+            r"(?i)^\$[a-z_][0-9a-z_]+((::|->|\.)[a-z_]|\[|$)",
+            r"(?i)^\$\([.0-9a-z_-]+",
+            r"(?i)^.*\*\*\*\*\*\*",
+        ]
+        .into_iter()
+        .map(|pattern| {
+            RustRegex::new(pattern).expect("static CredSweeper unquoted allowlist regex")
+        })
+        .collect()
+    });
+    &PATTERNS
+}
+
+fn value_blocklist_filtered(value: &str) -> bool {
+    const NOT_ALLOWED: &[&str] = &[
+        "true",
+        "false",
+        "null",
+        "none",
+        "bearer",
+        "string",
+        "value",
+        "undefined",
+        "uuid",
+    ];
+    let lower = value.to_ascii_lowercase();
+    NOT_ALLOWED
+        .iter()
+        .any(|word| lower.contains(word) && (*word).len() as f64 / lower.len().max(1) as f64 >= 0.7)
 }
 
 fn parse_filter_usize_arg(filter: &str) -> Option<usize> {
@@ -2265,6 +2378,29 @@ mod tests {
     #[test]
     fn embedded_ml_feature_vector_matches_model() {
         assert!(credsweeper_ml::feature_width_matches_model_for_test());
+    }
+
+    #[test]
+    fn value_allowlist_matches_credsweeper_code_expressions() {
+        assert!(value_allowlist_filtered(
+            "xmlKey->NextSiblingElement();",
+            false
+        ));
+        assert!(value_allowlist_filtered("config.secret.value()", false));
+        assert!(value_allowlist_filtered("${SECRET_NAME}", false));
+        assert!(!value_allowlist_filtered(
+            "opaqueCredentialValue1234567890",
+            false
+        ));
+    }
+
+    #[test]
+    fn doc_credentials_filters_method_call_values_like_credsweeper() {
+        let raw = "xmlKey = xmlKey->NextSiblingElement();\n";
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        let spans = CredSweeperNativeDetector::builtin().detect(&view);
+        assert!(!spans.iter().any(|span| span.label == "DOC_CREDENTIALS"));
     }
 
     #[test]
