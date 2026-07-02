@@ -22,6 +22,9 @@ archive/
 # Scratch space — slides, drafts, experiments
 sandbox/
 
+# Local run logs
+/log/
+
 # Local planning / positioning notes
 docs/
 
