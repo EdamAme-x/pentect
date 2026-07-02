@@ -1,8 +1,12 @@
+use super::file_magic::{classify, FileMagic};
+use super::options::BinaryMode;
 use super::report::{FileFinding, ScanScope, SkippedFile};
 use super::walk::ignored_file_reason;
 use crate::infer_kind;
+use memchr::memchr;
 use pentect_core::{ByteRange, Category, Engine, Input, Kind, Profile, Span};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -13,16 +17,18 @@ const MAX_SCAN_FILE_BYTES: u64 = 1024 * 1024;
 pub(super) fn scan_files(
     files: Vec<PathBuf>,
     packs: Vec<pentect_core::Pack>,
+    binary: BinaryMode,
 ) -> Result<(Vec<ScanFile>, String), String> {
-    ScanPipeline::pentect(packs)?.scan(files)
+    ScanPipeline::pentect(packs, binary)?.scan(files)
 }
 
 #[cfg(test)]
 pub(super) fn scan_files_core_for_tests(
     files: Vec<PathBuf>,
     packs: Vec<pentect_core::Pack>,
+    binary: BinaryMode,
 ) -> Result<(Vec<ScanFile>, String), String> {
-    ScanPipeline::core_for_tests(packs).scan(files)
+    ScanPipeline::core_for_tests(packs, binary).scan(files)
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +45,9 @@ pub(super) enum ScanFile {
 /// value-free reporting, and final scan counts.
 trait ScanBackend {
     fn name(&self) -> &'static str;
+    fn binary_mode(&self) -> Option<BinaryMode> {
+        None
+    }
     fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String>;
 }
 
@@ -48,23 +57,23 @@ struct ScanPipeline {
 }
 
 impl ScanPipeline {
-    fn pentect(packs: Vec<pentect_core::Pack>) -> Result<Self, String> {
+    fn pentect(packs: Vec<pentect_core::Pack>, binary: BinaryMode) -> Result<Self, String> {
         Ok(Self {
             name: ENGINE_NAME,
-            backends: vec![Box::new(CoreBackend::new(packs))],
+            backends: vec![Box::new(CoreBackend::new(packs, binary))],
         })
     }
 
     #[cfg(test)]
-    fn core_for_tests(packs: Vec<pentect_core::Pack>) -> Self {
+    fn core_for_tests(packs: Vec<pentect_core::Pack>, binary: BinaryMode) -> Self {
         Self {
             name: "core",
-            backends: vec![Box::new(CoreBackend::new(packs))],
+            backends: vec![Box::new(CoreBackend::new(packs, binary))],
         }
     }
 
     fn scan(&mut self, files: Vec<PathBuf>) -> Result<(Vec<ScanFile>, String), String> {
-        let (eligible, skipped) = precheck_files(&files)?;
+        let (eligible, skipped) = precheck_files(&files, self.binary_mode())?;
         let mut out = skipped
             .into_iter()
             .map(ScanFile::Skipped)
@@ -98,15 +107,27 @@ impl ScanPipeline {
         }
         Ok((out, self.name.to_string()))
     }
+
+    fn binary_mode(&self) -> BinaryMode {
+        self.backends
+            .iter()
+            .find_map(|backend| backend.binary_mode())
+            .unwrap_or(BinaryMode::Skip)
+    }
 }
 
-fn precheck_files(files: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<SkippedFile>), String> {
+fn precheck_files(
+    files: &[PathBuf],
+    binary: BinaryMode,
+) -> Result<(Vec<PathBuf>, Vec<SkippedFile>), String> {
     let mut eligible = Vec::new();
     let mut skipped = Vec::new();
     for path in files {
-        if let Some(reason) = ignored_file_reason(path) {
-            skipped.push(SkippedFile::new(path, reason));
-            continue;
+        if binary == BinaryMode::Skip {
+            if let Some(reason) = ignored_file_reason(path) {
+                skipped.push(SkippedFile::new(path, reason));
+                continue;
+            }
         }
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
@@ -120,9 +141,32 @@ fn precheck_files(files: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<SkippedFile>),
             skipped.push(SkippedFile::new(path, "too large"));
             continue;
         }
+        if binary == BinaryMode::Skip && should_sniff_magic(path) {
+            if let Some(reason) = binary_magic_reason(path)? {
+                skipped.push(SkippedFile::new(path, reason));
+                continue;
+            }
+        }
         eligible.push(path.clone());
     }
     Ok((eligible, skipped))
+}
+
+fn should_sniff_magic(path: &Path) -> bool {
+    path.extension().is_none()
+}
+
+fn binary_magic_reason(path: &Path) -> Result<Option<&'static str>, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    let mut buf = [0u8; 16];
+    let len = file
+        .read(&mut buf)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    match classify(&buf[..len]) {
+        FileMagic::TextCandidate => Ok(None),
+        FileMagic::Binary(reason) => Ok(Some(reason)),
+    }
 }
 
 #[derive(Default)]
@@ -243,27 +287,29 @@ impl SourceRange {
 struct CoreBackend {
     packs: Option<Vec<pentect_core::Pack>>,
     engine: Option<Engine>,
+    binary: BinaryMode,
 }
 
 impl CoreBackend {
-    fn new(packs: Vec<pentect_core::Pack>) -> Self {
+    fn new(packs: Vec<pentect_core::Pack>, binary: BinaryMode) -> Self {
         Self {
             packs: Some(packs),
             engine: None,
+            binary,
         }
     }
 
     fn scan_file(&mut self, path: &Path) -> Result<Option<FileFinding>, String> {
-        let Some(data) = read_text_file(path)? else {
+        let Some(data) = read_text_file(path, self.binary)? else {
             return Ok(None);
         };
         let kind = infer_kind(path);
         self.ensure_engine();
+        let line_index = LineIndex::new(&data);
         let result = self.engine.as_ref().unwrap().analyze_spans(Input {
             kind: kind.clone(),
             data: data.clone(),
         });
-        let line_index = LineIndex::new(&data);
         let hits = result
             .spans
             .iter()
@@ -309,6 +355,10 @@ impl ScanBackend for CoreBackend {
         "core"
     }
 
+    fn binary_mode(&self) -> Option<BinaryMode> {
+        Some(self.binary)
+    }
+
     fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<FileFinding>, String> {
         if files.is_empty() {
             return Ok(Vec::new());
@@ -328,8 +378,9 @@ impl ScanBackend for CoreBackend {
                 let next = Arc::clone(&next);
                 let packs = packs.clone();
                 let tx = tx.clone();
+                let binary = self.binary;
                 scope.spawn(move || {
-                    let mut worker = CoreBackend::new(packs);
+                    let mut worker = CoreBackend::new(packs, binary);
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(path) = files.get(index) else {
@@ -349,14 +400,17 @@ impl ScanBackend for CoreBackend {
     }
 }
 
-fn read_text_file(path: &Path) -> Result<Option<String>, String> {
+fn read_text_file(path: &Path, binary: BinaryMode) -> Result<Option<String>, String> {
     let bytes =
         std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    if bytes.contains(&0) {
+    if binary == BinaryMode::Skip && memchr(0, &bytes).is_some() {
         return Ok(None);
     }
     match String::from_utf8(bytes) {
         Ok(data) => Ok(Some(data)),
+        Err(e) if binary == BinaryMode::Text => {
+            Ok(Some(String::from_utf8_lossy(e.as_bytes()).into_owned()))
+        }
         Err(_) => Ok(None),
     }
 }

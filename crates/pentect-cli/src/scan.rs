@@ -1,4 +1,5 @@
 mod engine;
+mod file_magic;
 mod options;
 mod report;
 mod rules;
@@ -6,7 +7,7 @@ mod walk;
 
 use crate::{die, load_packs};
 use engine::{scan_files, ScanFile};
-use options::ScanOpts;
+use options::{BinaryMode, ScanOpts};
 use report::{print_report, report_json, ScanReport};
 use std::io::Write;
 use walk::collect_scan_roots;
@@ -48,6 +49,7 @@ fn run_scan_with_engine(
     scanner: impl FnOnce(
         Vec<std::path::PathBuf>,
         Vec<pentect_core::Pack>,
+        BinaryMode,
     ) -> Result<(Vec<ScanFile>, String), String>,
 ) -> Result<ScanReport, String> {
     let mut report = ScanReport {
@@ -61,7 +63,7 @@ fn run_scan_with_engine(
         opts.gitignore,
         &mut report.skipped,
     )?;
-    let (results, engine) = scanner(files, packs)?;
+    let (results, engine) = scanner(files, packs, opts.binary)?;
     report.engine = engine;
     for result in results {
         match result {
@@ -97,6 +99,7 @@ mod tests {
         assert!(!opts.json);
         assert!(!opts.no_fail);
         assert!(!opts.gitignore);
+        assert_eq!(opts.binary, BinaryMode::Skip);
     }
 
     #[test]
@@ -107,6 +110,8 @@ mod tests {
             "--json".into(),
             "--no-fail".into(),
             "--gitignore".into(),
+            "--binary".into(),
+            "text".into(),
             "app.env".into(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
@@ -114,7 +119,20 @@ mod tests {
         assert!(opts.json);
         assert!(opts.no_fail);
         assert!(opts.gitignore);
+        assert_eq!(opts.binary, BinaryMode::Text);
         assert!(opts.excludes.is_empty());
+    }
+
+    #[test]
+    fn scan_parse_rejects_invalid_binary_mode() {
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--binary".into(),
+            "raw".into(),
+        ];
+        let err = ScanOpts::parse(&args).unwrap_err();
+        assert!(err.contains("binary must be skip or text"), "{err}");
     }
 
     #[test]
@@ -226,6 +244,41 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains(&token), "{rendered}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn binary_text_mode_scans_magic_binary_files() {
+        let root = temp_scan_root("pentect-scan-binary-text");
+        let mut data = b"\x89PNG\r\n\x1A\n\0\0".to_vec();
+        data.extend_from_slice(b"const PASSWORD: string = \"helloworld1234\";\n");
+        std::fs::write(root.join("payload"), data).unwrap();
+
+        let default_args = vec![
+            "pentect".into(),
+            "scan".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let default_opts = ScanOpts::parse(&default_args).unwrap();
+        let default_report = run_scan_core_for_tests(&default_args, &default_opts).unwrap();
+        assert_eq!(0, default_report.files_scanned);
+        assert_eq!(1, default_report.skipped.len());
+
+        let text_args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--binary".into(),
+            "text".into(),
+            root.to_string_lossy().to_string(),
+        ];
+        let text_opts = ScanOpts::parse(&text_args).unwrap();
+        let text_report = run_scan_core_for_tests(&text_args, &text_opts).unwrap();
+        let rendered = report_json(&text_report);
+        assert_eq!(1, text_report.files_scanned, "{rendered}");
+        assert_eq!(1, text_report.files.len(), "{rendered}");
+        assert!(text_report.findings >= 1, "{rendered}");
+        assert!(!rendered.contains("helloworld1234"), "{rendered}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
