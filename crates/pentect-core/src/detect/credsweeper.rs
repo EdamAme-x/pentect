@@ -7,6 +7,7 @@ use fancy_regex::Regex as FancyRegex;
 use regex::Regex as RustRegex;
 use serde::Deserialize;
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::sync::LazyLock;
 
 const RULES_YAML: &str = include_str!("../../vendors/credsweeper-assets/rules/config.yaml");
@@ -63,6 +64,7 @@ pub struct CredSweeperNativeFinding {
     pub variable: Option<String>,
     pub variable_start: Option<usize>,
     pub variable_end: Option<usize>,
+    pub line_data: Vec<CredSweeperNativeRelatedFinding>,
 }
 
 impl CredSweeperNativeFinding {
@@ -75,6 +77,17 @@ impl CredSweeperNativeFinding {
             source: DetectorId::CredSweeper,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct CredSweeperNativeRelatedFinding {
+    pub range: ByteRange,
+    pub value: String,
+    pub value_start: usize,
+    pub value_end: usize,
+    pub variable: Option<String>,
+    pub variable_start: Option<usize>,
+    pub variable_end: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -269,27 +282,25 @@ impl CredSweeperNativeDetector {
             file_type: &ml_file_type,
         };
         for rule in &self.rules {
-            if line_body_only_rule(rule) {
+            if !has_whole_text_matcher(rule) {
                 continue;
             }
             if text.len() < rule.min_line_len {
                 continue;
             }
             for pattern in &rule.patterns {
-                let PatternMatcher::Special(SpecialMatcher::PemPrivateKey) = &pattern.matcher
-                else {
-                    continue;
-                };
-                for candidate in pem_private_key_block_candidates(text) {
-                    push_match(
-                        &mut out,
-                        &mut ml_pending,
-                        &push_ctx,
-                        rule,
-                        0,
-                        text,
-                        &candidate,
-                    );
+                if let PatternMatcher::Special(matcher) = &pattern.matcher {
+                    for candidate in matcher.find_whole_text(text) {
+                        push_match(
+                            &mut out,
+                            &mut ml_pending,
+                            &push_ctx,
+                            rule,
+                            0,
+                            text,
+                            &candidate,
+                        );
+                    }
                 }
             }
         }
@@ -305,7 +316,7 @@ impl CredSweeperNativeDetector {
                 for pattern in &rule.patterns {
                     if matches!(
                         &pattern.matcher,
-                        PatternMatcher::Special(SpecialMatcher::PemPrivateKey)
+                        PatternMatcher::Special(matcher) if matcher.is_whole_text()
                     ) {
                         continue;
                     }
@@ -327,6 +338,7 @@ impl CredSweeperNativeDetector {
                                     variable_start: variable.as_ref().map(|m| m.start()),
                                     variable_end: variable.as_ref().map(|m| m.end()),
                                     variable: variable.map(|m| m.as_str()),
+                                    line_data: Vec::new(),
                                 };
                                 push_match(
                                     &mut out,
@@ -359,6 +371,7 @@ impl CredSweeperNativeDetector {
                                     variable_start: variable.as_ref().map(|m| m.start()),
                                     variable_end: variable.as_ref().map(|m| m.end()),
                                     variable: variable.map(|m| m.as_str()),
+                                    line_data: Vec::new(),
                                 };
                                 push_match(
                                     &mut out,
@@ -427,6 +440,17 @@ struct Candidate<'a> {
     variable_start: Option<usize>,
     variable_end: Option<usize>,
     variable: Option<&'a str>,
+    line_data: Vec<CandidateLineData<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct CandidateLineData<'a> {
+    start: usize,
+    end: usize,
+    value: &'a str,
+    variable_start: Option<usize>,
+    variable_end: Option<usize>,
+    variable: Option<&'a str>,
 }
 
 impl SpecialMatcher {
@@ -434,18 +458,30 @@ impl SpecialMatcher {
         match self {
             Self::AwsMulti => aws_multi_candidates(line),
             Self::GoogleMulti => google_multi_candidates(line),
-            Self::Jwk => jwk_candidates(line),
+            Self::Jwk => Vec::new(),
             Self::PemPrivateKey => pem_private_key_candidates(line),
             Self::Base64PrivateKey => base64_private_key_candidates(line),
         }
     }
+
+    fn is_whole_text(&self) -> bool {
+        matches!(self, Self::Jwk | Self::PemPrivateKey)
+    }
+
+    fn find_whole_text<'a>(&self, text: &'a str) -> Vec<Candidate<'a>> {
+        match self {
+            Self::Jwk => jwk_multi_candidates(text),
+            Self::PemPrivateKey => pem_private_key_block_candidates(text),
+            _ => Vec::new(),
+        }
+    }
 }
 
-fn line_body_only_rule(rule: &NativeRule) -> bool {
-    !rule.patterns.iter().any(|pattern| {
+fn has_whole_text_matcher(rule: &NativeRule) -> bool {
+    rule.patterns.iter().any(|pattern| {
         matches!(
             &pattern.matcher,
-            PatternMatcher::Special(SpecialMatcher::PemPrivateKey)
+            PatternMatcher::Special(matcher) if matcher.is_whole_text()
         )
     })
 }
@@ -537,18 +573,160 @@ fn google_multi_candidates(line: &str) -> Vec<Candidate<'_>> {
     out
 }
 
-fn jwk_candidates(line: &str) -> Vec<Candidate<'_>> {
-    let lower = line.to_ascii_lowercase();
-    if !lower.contains("kty")
-        || !(line.contains("RSA") || line.contains("EC") || line.contains("oct"))
-    {
+fn jwk_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
+    static JWK_KTY: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r#"['"]?\b(?P<variable>kty)[^0-9A-Za-z_-]{1,8}(RSA|EC|oct)\b['"]?"#)
+            .expect("jwk kty regex")
+    });
+
+    let lines = LineRanges::new(text)
+        .map(|(start, line)| (start, line.trim_end_matches(['\r', '\n'])))
+        .collect::<Vec<_>>();
+    let kty_matches = lines
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, (line_start, line))| {
+            JWK_KTY.captures_iter(line).filter_map(move |captures| {
+                let value = captures.get(0)?;
+                let variable = captures.name("variable");
+                Some((
+                    idx,
+                    CandidateLineData {
+                        start: *line_start + value.start(),
+                        end: *line_start + value.end(),
+                        value: value.as_str(),
+                        variable_start: variable.as_ref().map(|m| *line_start + m.start()),
+                        variable_end: variable.as_ref().map(|m| *line_start + m.end()),
+                        variable: variable.map(|m| m.as_str()),
+                    },
+                ))
+            })
+        })
+        .collect::<Vec<_>>();
+    if kty_matches.is_empty() {
         return Vec::new();
     }
+
+    let mut out = Vec::new();
+    for (kty_idx, kty) in kty_matches {
+        for line_idx in jwk_multi_search_positions(kty_idx, &lines) {
+            let Some((line_start, line)) = lines.get(line_idx).copied() else {
+                continue;
+            };
+            let private_parts = jwk_private_line_data(line_start, line, kty.value);
+            let Some(main) = private_parts.first().copied() else {
+                continue;
+            };
+            let mut line_data = Vec::with_capacity(1 + private_parts.len());
+            line_data.push(kty);
+            line_data.extend(private_parts);
+            out.push(Candidate {
+                start: main.start,
+                end: main.end,
+                value: main.value,
+                variable_start: main.variable_start,
+                variable_end: main.variable_end,
+                variable: main.variable,
+                line_data,
+            });
+            break;
+        }
+    }
+    out
+}
+
+fn jwk_private_line_data<'a>(
+    line_start: usize,
+    line: &'a str,
+    anchor_value: &str,
+) -> Vec<CandidateLineData<'a>> {
     static JWK_PRIVATE_VALUE: LazyLock<RustRegex> = LazyLock::new(|| {
-        RustRegex::new(r#"(?i)["']?[dk]["']?\s*[:=]\s*["'](?P<value>[0-9A-Za-z_-]{22,8000})["']"#)
-            .expect("jwk private value regex")
+        RustRegex::new(
+            r#"(?P<variable>\b[dk])[^0-9A-Za-z_-]{1,8}(?P<value>[0-9A-Za-z_-]{22,8000})"#,
+        )
+        .expect("jwk private value regex")
     });
-    capture_value_candidates(line, &JWK_PRIVATE_VALUE)
+
+    JWK_PRIVATE_VALUE
+        .captures_iter(line)
+        .filter_map(|captures| {
+            let value = captures.name("value")?;
+            if line
+                .as_bytes()
+                .get(value.end())
+                .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'='))
+            {
+                return None;
+            }
+            if value_search_filtered(anchor_value, value.as_str())
+                || value_pattern_filtered(value.as_str(), None)
+                || morphemes_filtered(value.as_str(), None)
+            {
+                return None;
+            }
+            let variable = captures.name("variable");
+            Some(CandidateLineData {
+                start: line_start + value.start(),
+                end: line_start + value.end(),
+                value: value.as_str(),
+                variable_start: variable.as_ref().map(|m| line_start + m.start()),
+                variable_end: variable.as_ref().map(|m| line_start + m.end()),
+                variable: variable.map(|m| m.as_str()),
+            })
+        })
+        .collect()
+}
+
+fn value_search_filtered(anchor_value: &str, candidate_value: &str) -> bool {
+    if anchor_value.len() < candidate_value.len() {
+        candidate_value.contains(anchor_value)
+    } else {
+        anchor_value.contains(candidate_value)
+    }
+}
+
+fn jwk_multi_search_positions(line_idx: usize, lines: &[(usize, &str)]) -> Vec<usize> {
+    const MAX_SEARCH_MARGIN: usize = 10;
+
+    if line_idx >= lines.len() {
+        return Vec::new();
+    }
+    let mut priority_positions = vec![(0usize, line_idx)];
+    let mut priority_forward = MAX_SEARCH_MARGIN;
+    let mut priority_backward = MAX_SEARCH_MARGIN * 2;
+    for margin in 1..=MAX_SEARCH_MARGIN {
+        if let Some(forward_idx) = line_idx
+            .checked_add(margin)
+            .filter(|idx| *idx < lines.len())
+        {
+            let diff = curly_diff(lines[forward_idx].1, b'}', b'{');
+            priority_forward += MAX_SEARCH_MARGIN * (1 + diff);
+            priority_positions.push((priority_forward, forward_idx));
+        }
+        if let Some(backward_idx) = line_idx.checked_sub(margin) {
+            let diff = curly_diff(lines[backward_idx].1, b'{', b'}');
+            priority_backward += MAX_SEARCH_MARGIN * (1 + diff);
+            priority_positions.push((priority_backward, backward_idx));
+        }
+    }
+    priority_positions.sort();
+    priority_positions
+        .into_iter()
+        .map(|(_, line_idx)| line_idx)
+        .collect()
+}
+
+fn curly_diff(line: &str, positive: u8, negative: u8) -> usize {
+    const MAX_LINE_LENGTH: usize = 8000;
+    let mut diff = 0isize;
+    for byte in line.bytes().take(MAX_LINE_LENGTH) {
+        if byte == positive {
+            diff += 1;
+        } else if byte == negative {
+            diff -= 1;
+        }
+    }
+    diff.max(0) as usize
 }
 
 fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
@@ -568,6 +746,7 @@ fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
             variable_start: None,
             variable_end: None,
             variable: None,
+            line_data: Vec::new(),
         }]
     } else {
         Vec::new()
@@ -615,6 +794,7 @@ fn pem_private_key_block_candidates(text: &str) -> Vec<Candidate<'_>> {
                 variable_start: None,
                 variable_end: None,
                 variable: None,
+                line_data: Vec::new(),
             });
         }
         search_start = end;
@@ -758,21 +938,7 @@ fn regex_candidates<'a>(line: &'a str, regex: &RustRegex) -> Vec<Candidate<'a>> 
             variable_start: None,
             variable_end: None,
             variable: None,
-        })
-        .collect()
-}
-
-fn capture_value_candidates<'a>(line: &'a str, regex: &RustRegex) -> Vec<Candidate<'a>> {
-    regex
-        .captures_iter(line)
-        .filter_map(|captures| captures.name("value"))
-        .map(|m| Candidate {
-            start: m.start(),
-            end: m.end(),
-            value: m.as_str(),
-            variable_start: None,
-            variable_end: None,
-            variable: None,
+            line_data: Vec::new(),
         })
         .collect()
 }
@@ -799,6 +965,7 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
                 variable_start: None,
                 variable_end: None,
                 variable: None,
+                line_data: Vec::new(),
             });
         }
     }
@@ -810,6 +977,7 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
             variable_start: None,
             variable_end: None,
             variable: None,
+            line_data: Vec::new(),
         });
     }
     runs.into_iter()
@@ -858,6 +1026,22 @@ fn push_match(
         variable: candidate.variable.map(str::to_string),
         variable_start: candidate.variable_start,
         variable_end: candidate.variable_end,
+        line_data: candidate
+            .line_data
+            .iter()
+            .map(|line_data| CredSweeperNativeRelatedFinding {
+                range: ctx.view.to_raw(ByteRange::new(
+                    line_start + line_data.start,
+                    line_start + line_data.end,
+                )),
+                value: line_data.value.to_string(),
+                value_start: line_data.start,
+                value_end: line_data.end,
+                variable: line_data.variable.map(str::to_string),
+                variable_start: line_data.variable_start,
+                variable_end: line_data.variable_end,
+            })
+            .collect(),
     };
     if rule.ml_validated {
         ml_pending.push(PendingMlFinding {
@@ -1325,6 +1509,7 @@ fn dedupe_findings(mut findings: Vec<CredSweeperNativeFinding>) -> Vec<CredSweep
                 b.variable_start,
                 b.variable_end,
             ))
+            .then_with(|| compare_native_line_data(&a.line_data, &b.line_data))
     });
     findings.dedup_by(|a, b| {
         a.range == b.range
@@ -1333,8 +1518,51 @@ fn dedupe_findings(mut findings: Vec<CredSweeperNativeFinding>) -> Vec<CredSweep
             && a.value_end == b.value_end
             && a.variable_start == b.variable_start
             && a.variable_end == b.variable_end
+            && same_native_line_data(&a.line_data, &b.line_data)
     });
     findings
+}
+
+fn compare_native_line_data(
+    a: &[CredSweeperNativeRelatedFinding],
+    b: &[CredSweeperNativeRelatedFinding],
+) -> Ordering {
+    for (left, right) in a.iter().zip(b) {
+        let cmp = (
+            left.range.start,
+            left.range.end,
+            left.value_start,
+            left.value_end,
+            left.variable_start,
+            left.variable_end,
+        )
+            .cmp(&(
+                right.range.start,
+                right.range.end,
+                right.value_start,
+                right.value_end,
+                right.variable_start,
+                right.variable_end,
+            ));
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn same_native_line_data(
+    a: &[CredSweeperNativeRelatedFinding],
+    b: &[CredSweeperNativeRelatedFinding],
+) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(left, right)| {
+            left.range == right.range
+                && left.value_start == right.value_start
+                && left.value_end == right.value_end
+                && left.variable_start == right.variable_start
+                && left.variable_end == right.variable_end
+        })
 }
 
 fn dedupe_spans(mut spans: Vec<Span>) -> Vec<Span> {
