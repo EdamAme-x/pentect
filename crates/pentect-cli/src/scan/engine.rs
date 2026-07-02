@@ -6,7 +6,6 @@ use crate::infer_kind;
 use memchr::memchr;
 use pentect_core::{ByteRange, Category, Engine, Input, Kind, Profile, Span};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -157,12 +156,6 @@ fn precheck_files(
             skipped.push(SkippedFile::new(path, "too large"));
             continue;
         }
-        if binary == BinaryMode::Skip && should_sniff_magic(path) {
-            if let Some(reason) = binary_magic_reason(path)? {
-                skipped.push(SkippedFile::new(path, reason));
-                continue;
-            }
-        }
         eligible.push(path.clone());
     }
     Ok((eligible, skipped))
@@ -170,19 +163,6 @@ fn precheck_files(
 
 fn should_sniff_magic(path: &Path) -> bool {
     path.extension().is_none()
-}
-
-fn binary_magic_reason(path: &Path) -> Result<Option<&'static str>, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    let mut buf = [0u8; 16];
-    let len = file
-        .read(&mut buf)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    match classify(&buf[..len]) {
-        FileMagic::TextCandidate => Ok(None),
-        FileMagic::Binary(reason) => Ok(Some(reason)),
-    }
 }
 
 #[derive(Default)]
@@ -425,6 +405,11 @@ enum ReadTextFile {
 fn read_text_file(path: &Path, binary: BinaryMode) -> Result<ReadTextFile, String> {
     let bytes =
         std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if binary == BinaryMode::Skip && should_sniff_magic(path) {
+        if let FileMagic::Binary(reason) = classify(&bytes) {
+            return Ok(ReadTextFile::Skipped(reason));
+        }
+    }
     if binary == BinaryMode::Skip && memchr(0, &bytes).is_some() {
         return Ok(ReadTextFile::Skipped("binary content"));
     }

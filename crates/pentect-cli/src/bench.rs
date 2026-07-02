@@ -565,18 +565,16 @@ fn score_file(
     report: &mut BenchReport,
     example_limit: usize,
 ) {
+    let index = ScoreIndex::new(cases, spans);
     let mut true_hits = BTreeMap::new();
     let mut line_only_hits = BTreeSet::new();
     for (i, case) in cases.iter().enumerate() {
         if case.truth != Truth::True {
             continue;
         }
-        if let Some(span) = strongest_overlap(spans, case.strict_range) {
+        if let Some(span) = index.strongest_overlap(case.strict_range) {
             true_hits.insert(i, detection_key(span));
-        } else if spans
-            .iter()
-            .any(|span| span.range.overlaps(&case.line_range))
-        {
+        } else if index.any_span_overlap(case.line_range) {
             line_only_hits.insert(i);
         }
     }
@@ -625,16 +623,10 @@ fn score_file(
     }
 
     for span in spans {
-        if cases
-            .iter()
-            .any(|case| case.truth == Truth::True && span.range.overlaps(&case.strict_range))
-        {
+        if index.any_true_case_overlap(span.range) {
             continue;
         }
-        if let Some(case) = cases
-            .iter()
-            .find(|case| case.truth == Truth::False && span.range.overlaps(&case.line_range))
-        {
+        if let Some(case) = index.first_false_case_overlap(span.range) {
             report.fp += 1;
             let key = detection_key(span);
             report.by_detection.entry(key.clone()).or_default().fp += 1;
@@ -676,6 +668,98 @@ fn score_file(
                 span.range,
             );
         }
+    }
+}
+
+struct ScoreIndex<'a> {
+    cases: &'a [BenchCase],
+    spans: &'a [Span],
+    spans_by_start: Vec<usize>,
+    true_cases_by_start: Vec<usize>,
+    false_cases_by_start: Vec<usize>,
+}
+
+impl<'a> ScoreIndex<'a> {
+    fn new(cases: &'a [BenchCase], spans: &'a [Span]) -> Self {
+        let mut spans_by_start = (0..spans.len()).collect::<Vec<_>>();
+        spans_by_start.sort_by_key(|&i| (spans[i].range.start, i));
+
+        let mut true_cases_by_start = cases
+            .iter()
+            .enumerate()
+            .filter_map(|(i, case)| (case.truth == Truth::True).then_some(i))
+            .collect::<Vec<_>>();
+        true_cases_by_start.sort_by_key(|&i| (cases[i].strict_range.start, i));
+
+        let mut false_cases_by_start = cases
+            .iter()
+            .enumerate()
+            .filter_map(|(i, case)| (case.truth == Truth::False).then_some(i))
+            .collect::<Vec<_>>();
+        false_cases_by_start.sort_by_key(|&i| (cases[i].line_range.start, i));
+
+        Self {
+            cases,
+            spans,
+            spans_by_start,
+            true_cases_by_start,
+            false_cases_by_start,
+        }
+    }
+
+    fn strongest_overlap(&self, range: ByteRange) -> Option<&'a Span> {
+        let mut best = None;
+        for span_index in self.span_candidates(range) {
+            let span = &self.spans[span_index];
+            if !span.range.overlaps(&range) {
+                continue;
+            }
+            let replace = match best {
+                None => true,
+                Some(best_index) => match span.cmp_strength(&self.spans[best_index]) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => span_index > best_index,
+                    std::cmp::Ordering::Less => false,
+                },
+            };
+            if replace {
+                best = Some(span_index);
+            }
+        }
+        best.map(|i| &self.spans[i])
+    }
+
+    fn any_span_overlap(&self, range: ByteRange) -> bool {
+        self.span_candidates(range)
+            .any(|i| self.spans[i].range.overlaps(&range))
+    }
+
+    fn any_true_case_overlap(&self, range: ByteRange) -> bool {
+        let end = self
+            .true_cases_by_start
+            .partition_point(|&i| self.cases[i].strict_range.start < range.end);
+        self.true_cases_by_start[..end]
+            .iter()
+            .any(|&i| self.cases[i].strict_range.overlaps(&range))
+    }
+
+    fn first_false_case_overlap(&self, range: ByteRange) -> Option<&'a BenchCase> {
+        let end = self
+            .false_cases_by_start
+            .partition_point(|&i| self.cases[i].line_range.start < range.end);
+        self.false_cases_by_start[..end]
+            .iter()
+            .copied()
+            .filter(|&i| self.cases[i].line_range.overlaps(&range))
+            .min()
+            .map(|i| &self.cases[i])
+    }
+
+    fn span_candidates(&self, range: ByteRange) -> impl Iterator<Item = usize> + '_ {
+        let end = self
+            .spans_by_start
+            .partition_point(|&i| self.spans[i].range.start < range.end);
+        self.spans_by_start[..end].iter().copied()
     }
 }
 
@@ -817,13 +901,6 @@ fn clipped(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn strongest_overlap(spans: &[Span], range: ByteRange) -> Option<&Span> {
-    spans
-        .iter()
-        .filter(|span| span.range.overlaps(&range))
-        .max_by(|a, b| a.cmp_strength(b))
-}
-
 fn detection_key(span: &Span) -> String {
     format!("{}:{}", span.source.as_str(), span.label)
 }
@@ -925,23 +1002,20 @@ enum Truth {
 }
 
 #[derive(Clone, Debug)]
-struct LineIndex {
-    text: String,
+struct LineIndex<'a> {
+    text: &'a str,
     starts: Vec<usize>,
 }
 
-impl LineIndex {
-    fn new(text: &str) -> Self {
+impl<'a> LineIndex<'a> {
+    fn new(text: &'a str) -> Self {
         let mut starts = vec![0];
         for (i, byte) in text.bytes().enumerate() {
             if byte == b'\n' {
                 starts.push(i + 1);
             }
         }
-        Self {
-            text: text.to_string(),
-            starts,
-        }
+        Self { text, starts }
     }
 
     fn line_range(&self, line_start: usize, line_end: usize) -> Option<ByteRange> {

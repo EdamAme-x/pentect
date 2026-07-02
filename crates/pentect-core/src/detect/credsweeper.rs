@@ -2,12 +2,14 @@ use super::credsweeper_ml::{self, MlInput, RuleSeverity};
 use super::Detector;
 use crate::model::{ByteRange, Category, Confidence, DetectorId, Span};
 use crate::normalize::NormalizedView;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use data_encoding::{BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
 use fancy_regex::Regex as FancyRegex;
 use regex::Regex as RustRegex;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 const RULES_YAML: &str = include_str!("../../vendors/credsweeper-assets/rules/config.yaml");
@@ -29,6 +31,7 @@ static BUILTIN: LazyLock<CredSweeperNativeDetector> = LazyLock::new(|| {
 #[derive(Clone)]
 pub struct CredSweeperNativeDetector {
     rules: Vec<NativeRule>,
+    line_prefilter: LineRulePrefilter,
     stats: CredSweeperNativeStats,
 }
 
@@ -246,7 +249,9 @@ impl CredSweeperNativeDetector {
                 patterns,
             });
         }
+        let line_prefilter = LineRulePrefilter::build(&rules)?;
         Ok(Self {
+            line_prefilter,
             rules,
             stats: CredSweeperNativeStats {
                 total_rules: raw_rules.len(),
@@ -276,6 +281,8 @@ impl CredSweeperNativeDetector {
         let text = view.text();
         let mut out = Vec::new();
         let mut ml_pending = Vec::new();
+        let mut seen_rules = vec![false; self.rules.len()];
+        let mut rule_candidates = Vec::new();
         let ml_path = credsweeper_ml::ml_path(view.region.ctx.path.as_deref());
         let ml_file_type = credsweeper_ml::ml_file_type(view.region.ctx.path.as_deref());
         let push_ctx = PushMatchCtx {
@@ -312,13 +319,11 @@ impl CredSweeperNativeDetector {
         for (line_start, line) in LineRanges::new(text) {
             let line_body = line.trim_end_matches(['\r', '\n']);
             let line_lower = LazyLower::new(line_body);
-            for rule in &self.rules {
-                if !rule_available_for_code_scan(rule) {
-                    continue;
-                }
-                if line_body.len() < rule.min_line_len
-                    || !required_substring_present(&rule.required_substrings, &line_lower)
-                {
+            self.line_prefilter
+                .collect(&line_lower, &mut seen_rules, &mut rule_candidates);
+            for &rule_index in &rule_candidates {
+                let rule = &self.rules[rule_index];
+                if line_body.len() < rule.min_line_len {
                     continue;
                 }
                 for pattern in &rule.patterns {
@@ -420,6 +425,7 @@ impl CredSweeperNativeDetector {
                     }
                 }
             }
+            clear_seen_rules(&rule_candidates, &mut seen_rules);
         }
         push_ml_accepted(&mut out, &ml_pending);
         dedupe_findings(out)
@@ -466,6 +472,128 @@ struct Candidate<'a> {
     line_data: Vec<CandidateLineData<'a>>,
 }
 
+#[derive(Clone)]
+struct LineRulePrefilter {
+    always_rules: Vec<usize>,
+    ascii_ac: Option<AhoCorasick>,
+    ascii_rules_by_pattern: Vec<Vec<usize>>,
+    unicode_ac: Option<AhoCorasick>,
+    unicode_rules_by_pattern: Vec<Vec<usize>>,
+}
+
+impl LineRulePrefilter {
+    fn build(rules: &[NativeRule]) -> Result<Self, String> {
+        let mut always_rules = Vec::new();
+        let mut ascii_by_literal: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut unicode_by_literal: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (rule_index, rule) in rules.iter().enumerate() {
+            if !rule_available_for_code_scan(rule) || !has_line_matcher(rule) {
+                continue;
+            }
+            if rule.required_substrings.is_empty()
+                || rule.required_substrings.iter().any(String::is_empty)
+            {
+                always_rules.push(rule_index);
+                continue;
+            }
+            for literal in &rule.required_substrings {
+                let by_literal = if literal.is_ascii() {
+                    &mut ascii_by_literal
+                } else {
+                    &mut unicode_by_literal
+                };
+                by_literal
+                    .entry(literal.clone())
+                    .or_default()
+                    .push(rule_index);
+            }
+        }
+        let (ascii_ac, ascii_rules_by_pattern) = build_line_prefilter_ac(ascii_by_literal, true)?;
+        let (unicode_ac, unicode_rules_by_pattern) =
+            build_line_prefilter_ac(unicode_by_literal, false)?;
+        Ok(Self {
+            always_rules,
+            ascii_ac,
+            ascii_rules_by_pattern,
+            unicode_ac,
+            unicode_rules_by_pattern,
+        })
+    }
+
+    fn collect(&self, line_lower: &LazyLower<'_>, seen_rules: &mut [bool], out: &mut Vec<usize>) {
+        out.clear();
+        for &rule_index in &self.always_rules {
+            seen_rules[rule_index] = true;
+            out.push(rule_index);
+        }
+        if let Some(ac) = &self.ascii_ac {
+            collect_prefilter_matches(
+                ac,
+                &self.ascii_rules_by_pattern,
+                line_lower.original,
+                seen_rules,
+                out,
+            );
+        }
+        if !line_lower.original.is_ascii() {
+            if let Some(ac) = &self.unicode_ac {
+                collect_prefilter_matches(
+                    ac,
+                    &self.unicode_rules_by_pattern,
+                    line_lower.as_lower(),
+                    seen_rules,
+                    out,
+                );
+            }
+        }
+        out.sort_unstable();
+    }
+}
+
+fn build_line_prefilter_ac(
+    by_literal: BTreeMap<String, Vec<usize>>,
+    ascii_case_insensitive: bool,
+) -> Result<(Option<AhoCorasick>, Vec<Vec<usize>>), String> {
+    let mut patterns = Vec::new();
+    let mut rules_by_pattern = Vec::new();
+    for (literal, rules) in by_literal {
+        patterns.push(literal);
+        rules_by_pattern.push(rules);
+    }
+    if patterns.is_empty() {
+        return Ok((None, rules_by_pattern));
+    }
+    let ac = AhoCorasickBuilder::new()
+        .match_kind(MatchKind::Standard)
+        .ascii_case_insensitive(ascii_case_insensitive)
+        .build(&patterns)
+        .map_err(|e| format!("credsweeper line prefilter: {e}"))?;
+    Ok((Some(ac), rules_by_pattern))
+}
+
+fn collect_prefilter_matches(
+    ac: &AhoCorasick,
+    rules_by_pattern: &[Vec<usize>],
+    haystack: &str,
+    seen_rules: &mut [bool],
+    out: &mut Vec<usize>,
+) {
+    for m in ac.find_overlapping_iter(haystack) {
+        for &rule_index in &rules_by_pattern[m.pattern().as_usize()] {
+            if !seen_rules[rule_index] {
+                seen_rules[rule_index] = true;
+                out.push(rule_index);
+            }
+        }
+    }
+}
+
+fn clear_seen_rules(rule_indices: &[usize], seen_rules: &mut [bool]) {
+    for &rule_index in rule_indices {
+        seen_rules[rule_index] = false;
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CandidateLineData<'a> {
     start: usize,
@@ -506,6 +634,15 @@ impl SpecialMatcher {
 fn has_whole_text_matcher(rule: &NativeRule) -> bool {
     rule.patterns.iter().any(|pattern| {
         matches!(
+            &pattern.matcher,
+            PatternMatcher::Special(matcher) if matcher.is_whole_text()
+        )
+    })
+}
+
+fn has_line_matcher(rule: &NativeRule) -> bool {
+    rule.patterns.iter().any(|pattern| {
+        !matches!(
             &pattern.matcher,
             PatternMatcher::Special(matcher) if matcher.is_whole_text()
         )
@@ -1656,14 +1793,6 @@ impl<'a> LazyLower<'a> {
     }
 }
 
-fn required_substring_present(required: &[String], line_lower: &LazyLower<'_>) -> bool {
-    if required.is_empty() {
-        return true;
-    }
-    let lower = line_lower.as_lower();
-    required.iter().any(|needle| lower.contains(needle))
-}
-
 fn rule_available_for_code_scan(rule: &NativeRule) -> bool {
     rule.targets.iter().any(|target| target == "code")
 }
@@ -2488,6 +2617,41 @@ mod tests {
         assert!(findings.iter().any(|finding| {
             finding.rule_name == "Key" && finding.variable.as_deref() == Some("DJANGO_SECRET_KEY")
         }));
+    }
+
+    #[test]
+    fn line_prefilter_preserves_rule_order() {
+        let rules = vec![
+            test_native_rule("late", &["late"]),
+            test_native_rule("always", &[]),
+            test_native_rule("early", &["early"]),
+        ];
+        let prefilter = LineRulePrefilter::build(&rules).unwrap();
+        let line_lower = LazyLower::new("early late");
+        let mut seen_rules = vec![false; rules.len()];
+        let mut candidates = Vec::new();
+
+        prefilter.collect(&line_lower, &mut seen_rules, &mut candidates);
+
+        assert_eq!(candidates, vec![0, 1, 2]);
+    }
+
+    fn test_native_rule(name: &str, required_substrings: &[&str]) -> NativeRule {
+        NativeRule {
+            rule_name: name.to_string(),
+            label: normalize_label(name),
+            severity: RuleSeverity::Medium,
+            confidence: Confidence::Medium,
+            min_line_len: 0,
+            required_substrings: required_substrings.iter().map(|s| s.to_string()).collect(),
+            filter_types: Vec::new(),
+            targets: vec!["code".to_string()],
+            ml_validated: false,
+            patterns: vec![NativePattern {
+                matcher: PatternMatcher::Rust(RustRegex::new("value").unwrap()),
+                value_capture: true,
+            }],
+        }
     }
 
     #[test]
