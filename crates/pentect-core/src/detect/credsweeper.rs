@@ -1244,9 +1244,14 @@ fn sanitize_unicode_quotes(mut value: SanitizedValue<'_>) -> SanitizedValue<'_> 
         if !matching_single && !matching_double {
             break;
         }
-        value.start += first.len_utf8();
-        value.end -= last.len_utf8();
-        value.value = &value.value[first.len_utf8()..value.value.len() - last.len_utf8()];
+        let first_len = first.len_utf8();
+        let last_len = last.len_utf8();
+        if value.value.len() < first_len + last_len {
+            break;
+        }
+        value.start += first_len;
+        value.end -= last_len;
+        value.value = &value.value[first_len..value.value.len() - last_len];
     }
     value
 }
@@ -2563,6 +2568,29 @@ mod tests {
         let view = NormalizedView::build(&region, raw);
         let spans = CredSweeperNativeDetector::builtin().detect(&view);
         assert!(spans.is_empty(), "{spans:?}");
+    }
+
+    #[test]
+    fn unicode_quote_sanitizer_handles_single_quote_value() {
+        let single = "‘";
+        let sanitized = sanitize_unicode_quotes(SanitizedValue {
+            value: single,
+            start: 0,
+            end: single.len(),
+        });
+        assert_eq!("‘", sanitized.value);
+        assert_eq!(0, sanitized.start);
+        assert_eq!(single.len(), sanitized.end);
+
+        let quoted = "‘secret’";
+        let sanitized = sanitize_unicode_quotes(SanitizedValue {
+            value: quoted,
+            start: 0,
+            end: quoted.len(),
+        });
+        assert_eq!("secret", sanitized.value);
+        assert_eq!("‘".len(), sanitized.start);
+        assert_eq!("‘secret".len(), sanitized.end);
     }
 
     #[test]
