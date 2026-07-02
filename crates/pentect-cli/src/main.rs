@@ -77,6 +77,7 @@ fn usage() {
          pentect exec \"<command>\"\n\
          pentect doctor\n\
          pentect bench creddata PATH\n\
+         pentect bench credsweeper-parity RUST_JSON ORACLE_JSON\n\
          pentect extensions list|inspect|test [NAME]\n\
          pentect eval [--json]\n\
          pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\
@@ -109,6 +110,7 @@ fn help_text() -> &'static str {
         "  pentect exec \"<command>\"\n\n",
         "  pentect doctor [--json]\n",
         "  pentect bench creddata PATH [--json]\n",
+        "  pentect bench credsweeper-parity RUST_JSON ORACLE_JSON [--json]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
         "  pentect eval [--json]\n\n",
         "  pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\n",
@@ -121,7 +123,7 @@ fn help_text() -> &'static str {
         "scan: CredSweeper + core; narrow with --exclude, --gitignore, .pentectignore\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness\n",
-        "bench: creddata\n",
+        "bench: creddata, parity\n",
         "extensions: list, inspect, test\n",
         "eval: precision, recall\n",
     )
