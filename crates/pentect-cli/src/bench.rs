@@ -68,6 +68,11 @@ pub(crate) fn cmd_bench(args: &[String]) {
             die(e);
         }
     }
+    if let Some(path) = &opts.save_credsweeper_paths {
+        if let Err(e) = save_credsweeper_paths(path, &report.credsweeper_paths) {
+            die(e);
+        }
+    }
     if opts.json {
         println!("{}", report.to_json());
     } else {
@@ -143,6 +148,7 @@ struct BenchOpts {
     min_precision: Option<f64>,
     min_recall: Option<f64>,
     save_credsweeper_json: Option<PathBuf>,
+    save_credsweeper_paths: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +179,7 @@ impl BenchOpts {
         let mut min_precision = None;
         let mut min_recall = None;
         let mut save_credsweeper_json = None;
+        let mut save_credsweeper_paths = None;
         let mut i = 4usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -206,6 +213,13 @@ impl BenchOpts {
                         "--save-credsweeper-json",
                     )?));
                 }
+                "--save-credsweeper-paths" => {
+                    save_credsweeper_paths = Some(PathBuf::from(required_value(
+                        args,
+                        &mut i,
+                        "--save-credsweeper-paths",
+                    )?));
+                }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 value => return Err(format!("unexpected argument for bench: {value}")),
             }
@@ -222,6 +236,7 @@ impl BenchOpts {
             min_precision,
             min_recall,
             save_credsweeper_json,
+            save_credsweeper_paths,
         })
     }
 }
@@ -336,6 +351,10 @@ fn run_creddata(root: &Path, opts: &BenchOpts) -> Result<BenchReport, String> {
         ..BenchReport::default()
     };
     let files = by_file.into_iter().collect::<Vec<_>>();
+    report.credsweeper_paths = files
+        .iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect();
 
     for file_report in
         score_creddata_files(files, opts.examples, opts.save_credsweeper_json.is_some())?
@@ -701,6 +720,14 @@ fn save_credsweeper_json(
 ) -> Result<(), String> {
     let data = serde_json::to_vec_pretty(credentials)
         .map_err(|e| format!("could not serialize CredSweeper json: {e}"))?;
+    std::fs::write(path, data).map_err(|e| format!("could not write '{}': {e}", path.display()))
+}
+
+fn save_credsweeper_paths(path: &Path, paths: &[String]) -> Result<(), String> {
+    let mut data = paths.join("\n");
+    if !data.is_empty() {
+        data.push('\n');
+    }
     std::fs::write(path, data).map_err(|e| format!("could not write '{}': {e}", path.display()))
 }
 
@@ -1347,6 +1374,7 @@ struct BenchReport {
     by_detection: BTreeMap<String, DetectionMetric>,
     examples: Vec<BenchExample>,
     credsweeper_json: Vec<CredSweeperJsonCredential>,
+    credsweeper_paths: Vec<String>,
 }
 
 impl BenchReport {
@@ -1559,6 +1587,8 @@ mod tests {
             "0.7".to_string(),
             "--save-credsweeper-json".to_string(),
             "out.json".to_string(),
+            "--save-credsweeper-paths".to_string(),
+            "paths.txt".to_string(),
         ];
         let opts = BenchOpts::parse(&args).unwrap();
         assert!(opts.json);
@@ -1572,6 +1602,42 @@ mod tests {
             opts.save_credsweeper_json.as_deref(),
             Some(Path::new("out.json"))
         );
+        assert_eq!(
+            opts.save_credsweeper_paths.as_deref(),
+            Some(Path::new("paths.txt"))
+        );
+    }
+
+    #[test]
+    fn creddata_runner_records_credsweeper_paths() {
+        let root = temp_root("pentect-creddata-paths");
+        let meta = root.join("meta");
+        let data = root.join("data").join("repo").join("_");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("f.env"), "KEY=false-positive\n").unwrap();
+        std::fs::write(
+            meta.join("repo.csv"),
+            "Id,FileID,Domain,RepoName,FilePath,LineStart,LineEnd,GroundTruth,ValueStart,ValueEnd,CryptographyKey,PredefinedPattern,Category\n\
+             1,f,GitHub,repo,data/repo/_/f.env,1,1,F,4,18,,,Key\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".to_string(),
+            "bench".to_string(),
+            "creddata".to_string(),
+            root.to_string_lossy().to_string(),
+        ];
+        let opts = BenchOpts::parse(&args).unwrap();
+        let report = run_creddata(&root, &opts).unwrap();
+
+        assert_eq!(report.credsweeper_paths.len(), 1);
+        assert!(
+            report.credsweeper_paths[0].ends_with("data/repo/_/f.env")
+                || report.credsweeper_paths[0].ends_with("data\\repo\\_\\f.env")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

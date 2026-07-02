@@ -13,10 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -25,3 +30,54 @@ jobs:
         run: cargo test --all-features
       - name: Test (rules-only, no default features)
         run: cargo test -p pentect-core --no-default-features
+      - name: Install CredSweeper oracle dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tools/credsweeper-sidecar/runtime-requirements.txt
+      - name: Prepare CredData shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import binascii
+          import json
+          from pathlib import Path
+
+          root = Path("benchmarks/CredData")
+          snapshot_path = root / "snapshot.json"
+          snapshot = json.loads(snapshot_path.read_text())
+          shard = {
+              repo_id: url
+              for repo_id, url in snapshot.items()
+              if f"{binascii.crc32(bytes.fromhex(repo_id)):08x}" == "02dfa7ec"
+          }
+          if len(shard) != 1:
+              raise SystemExit(f"expected one CredData shard, got {len(shard)}")
+          snapshot_path.write_text(json.dumps(shard, indent=2) + "\n")
+          for meta_path in (root / "meta").glob("*.csv"):
+              if meta_path.name != "02dfa7ec.csv":
+                  meta_path.unlink()
+          PY
+          (cd benchmarks/CredData && python download_data.py --clean_data --jobs 1)
+      - name: CredSweeper parity shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/credsweeper-parity"
+          mkdir -p "$out"
+          cargo run --quiet -p pentect-cli -- bench creddata benchmarks/CredData \
+            --repo 02dfa7ec \
+            --limit 100 \
+            --ignore-x \
+            --save-credsweeper-json "$out/rust.json" \
+            --save-credsweeper-paths "$out/paths.txt" \
+            --json
+          mapfile -t paths < "$out/paths.txt"
+          PYTHONPATH="$PWD/crates/pentect-core/vendors/CredSweeper" \
+            python tools/credsweeper-sidecar/sidecar.py "${paths[@]}" --output "$out/oracle.json"
+          cargo run --quiet -p pentect-cli -- bench credsweeper-parity \
+            "$out/rust.json" \
+            "$out/oracle.json" \
+            --min-precision 1 \
+            --min-recall 1 \
+            --json
