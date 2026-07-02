@@ -1,6 +1,10 @@
 use crate::{die, infer_kind};
-use pentect_core::{ByteRange, Category, Engine, Input, Profile, Span};
-use serde::Deserialize;
+use pentect_core::normalize::NormalizedView;
+use pentect_core::{
+    ByteRange, Category, Context, CredSweeperNativeDetector, CredSweeperNativeFinding, Engine,
+    Input, Profile, Region, RegionKind, Span,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -20,6 +24,11 @@ pub(crate) fn cmd_bench(args: &[String]) {
         Ok(report) => report,
         Err(e) => die(e),
     };
+    if let Some(path) = &opts.save_credsweeper_json {
+        if let Err(e) = save_credsweeper_json(path, &report.credsweeper_json) {
+            die(e);
+        }
+    }
     if opts.json {
         println!("{}", report.to_json());
     } else {
@@ -94,6 +103,7 @@ struct BenchOpts {
     examples: usize,
     min_precision: Option<f64>,
     min_recall: Option<f64>,
+    save_credsweeper_json: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +133,7 @@ impl BenchOpts {
         let mut examples = 0usize;
         let mut min_precision = None;
         let mut min_recall = None;
+        let mut save_credsweeper_json = None;
         let mut i = 4usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -149,6 +160,13 @@ impl BenchOpts {
                 "--min-recall" => {
                     min_recall = Some(parse_f64_arg(args, &mut i, "--min-recall")?);
                 }
+                "--save-credsweeper-json" => {
+                    save_credsweeper_json = Some(PathBuf::from(required_value(
+                        args,
+                        &mut i,
+                        "--save-credsweeper-json",
+                    )?));
+                }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 value => return Err(format!("unexpected argument for bench: {value}")),
             }
@@ -164,6 +182,7 @@ impl BenchOpts {
             examples,
             min_precision,
             min_recall,
+            save_credsweeper_json,
         })
     }
 }
@@ -226,7 +245,9 @@ fn run_creddata(root: &Path, opts: &BenchOpts) -> Result<BenchReport, String> {
     };
     let files = by_file.into_iter().collect::<Vec<_>>();
 
-    for file_report in score_creddata_files(files, opts.examples)? {
+    for file_report in
+        score_creddata_files(files, opts.examples, opts.save_credsweeper_json.is_some())?
+    {
         report.merge(file_report, opts.examples);
     }
 
@@ -238,6 +259,7 @@ fn run_creddata(root: &Path, opts: &BenchOpts) -> Result<BenchReport, String> {
 fn score_creddata_files(
     files: Vec<(PathBuf, Vec<CredRow>)>,
     example_limit: usize,
+    export_credsweeper_json: bool,
 ) -> Result<Vec<BenchReport>, String> {
     if files.is_empty() {
         return Ok(Vec::new());
@@ -264,7 +286,13 @@ fn score_creddata_files(
                     let Some((path, rows)) = files.get(index) else {
                         break;
                     };
-                    let result = score_creddata_file(path, rows, &mut engine, example_limit);
+                    let result = score_creddata_file(
+                        path,
+                        rows,
+                        &mut engine,
+                        example_limit,
+                        export_credsweeper_json,
+                    );
                     if tx.send((index, result)).is_err() {
                         break;
                     }
@@ -286,6 +314,7 @@ fn score_creddata_file(
     rows: &[CredRow],
     engine: &mut Engine,
     example_limit: usize,
+    export_credsweeper_json: bool,
 ) -> Result<BenchReport, String> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => normalize_newlines(raw),
@@ -337,6 +366,9 @@ fn score_creddata_file(
         .filter(|span| span.category == Category::Secret)
         .collect::<Vec<_>>();
     score_file(&raw, &cases, &spans, &mut report, example_limit);
+    if export_credsweeper_json {
+        report.credsweeper_json = detect_credsweeper_json(path, &raw, &line_index);
+    }
     Ok(report)
 }
 
@@ -534,6 +566,50 @@ fn score_file(
             );
         }
     }
+}
+
+fn detect_credsweeper_json(
+    path: &Path,
+    raw: &str,
+    line_index: &LineIndex,
+) -> Vec<CredSweeperJsonCredential> {
+    let detector = CredSweeperNativeDetector::builtin();
+    let path_string = path.to_string_lossy().to_string();
+    let region = Region {
+        span: ByteRange::new(0, raw.len()),
+        ctx: Context {
+            path: Some(path_string.clone()),
+            key: None,
+            hints: Vec::new(),
+            kind: RegionKind::PlainText,
+            format: infer_kind(path),
+        },
+    };
+    let view = NormalizedView::build(&region, raw);
+    detector
+        .detect_findings(&view)
+        .into_iter()
+        .filter_map(|finding| {
+            let line_data_list =
+                line_index.credsweeper_line_data(path_string.as_str(), &finding)?;
+            Some(CredSweeperJsonCredential {
+                rule: finding.rule_name,
+                severity: finding.severity,
+                confidence: finding.confidence_name,
+                ml_probability: None,
+                line_data_list,
+            })
+        })
+        .collect()
+}
+
+fn save_credsweeper_json(
+    path: &Path,
+    credentials: &[CredSweeperJsonCredential],
+) -> Result<(), String> {
+    let data = serde_json::to_vec_pretty(credentials)
+        .map_err(|e| format!("could not serialize CredSweeper json: {e}"))?;
+    std::fs::write(path, data).map_err(|e| format!("could not write '{}': {e}", path.display()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -747,6 +823,84 @@ impl LineIndex {
             next > 0 && self.text.as_bytes()[next - 1] == b'\n',
         )))
     }
+
+    fn credsweeper_line_data(
+        &self,
+        path: &str,
+        finding: &CredSweeperNativeFinding,
+    ) -> Option<Vec<CredSweeperJsonLineData>> {
+        let range = finding.range;
+        let start_line = self.line_for_offset(range.start)?;
+        let end_line = self.line_for_offset(range.end.saturating_sub(1))?;
+        let mut out = Vec::new();
+        for line_num in start_line..=end_line {
+            let line_start = *self.starts.get(line_num.checked_sub(1)?)?;
+            let line_end = self.line_end(line_num)?;
+            let value_start_byte = if line_num == start_line {
+                range.start
+            } else {
+                line_start
+            };
+            let value_end_byte = if line_num == end_line {
+                range.end
+            } else {
+                line_end
+            };
+            if value_start_byte > value_end_byte || value_end_byte > line_end {
+                return None;
+            }
+            let line = self.text[line_start..line_end].to_string();
+            let value = self.text[value_start_byte..value_end_byte].to_string();
+            let (variable, variable_start, variable_end) = if line_num == start_line {
+                match (
+                    finding.variable.as_ref(),
+                    finding.variable_start,
+                    finding.variable_end,
+                ) {
+                    (Some(variable), Some(start), Some(end))
+                        if start < end && line_start + end <= line_end =>
+                    {
+                        (
+                            Some(variable.clone()),
+                            char_col_from_byte(&self.text[line_start..line_end], start) as isize,
+                            char_col_from_byte(&self.text[line_start..line_end], end) as isize,
+                        )
+                    }
+                    _ => (None, -2, -2),
+                }
+            } else {
+                (None, -2, -2)
+            };
+            out.push(CredSweeperJsonLineData {
+                line,
+                line_num,
+                path: path.to_string(),
+                info: String::new(),
+                variable,
+                variable_start,
+                variable_end,
+                value_start: char_col_from_byte(
+                    &self.text[line_start..line_end],
+                    value_start_byte - line_start,
+                ),
+                value_end: char_col_from_byte(
+                    &self.text[line_start..line_end],
+                    value_end_byte - line_start,
+                ),
+                entropy: shannon_entropy(&value),
+                value,
+            });
+        }
+        Some(out)
+    }
+
+    fn line_for_offset(&self, offset: usize) -> Option<usize> {
+        if offset > self.text.len() {
+            return None;
+        }
+        let idx = self.starts.partition_point(|start| *start <= offset);
+        Some(idx.max(1))
+    }
 }
 
 fn char_col_to_byte(text: &str, col: usize) -> usize {
@@ -757,6 +911,53 @@ fn char_col_to_byte(text: &str, col: usize) -> usize {
         .nth(col)
         .map(|(i, _)| i)
         .unwrap_or(text.len())
+}
+
+fn char_col_from_byte(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())].chars().count()
+}
+
+fn shannon_entropy(value: &str) -> f64 {
+    if value.is_empty() {
+        return 0.0;
+    }
+    let mut counts = BTreeMap::new();
+    for ch in value.chars() {
+        *counts.entry(ch).or_insert(0usize) += 1;
+    }
+    let len = value.chars().count() as f64;
+    let entropy = counts
+        .values()
+        .map(|count| {
+            let p = *count as f64 / len;
+            -p * p.log2()
+        })
+        .sum::<f64>();
+    (entropy * 100_000.0).round() / 100_000.0
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CredSweeperJsonCredential {
+    rule: String,
+    severity: String,
+    confidence: String,
+    ml_probability: Option<f64>,
+    line_data_list: Vec<CredSweeperJsonLineData>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CredSweeperJsonLineData {
+    line: String,
+    line_num: usize,
+    path: String,
+    info: String,
+    variable: Option<String>,
+    variable_start: isize,
+    variable_end: isize,
+    value: String,
+    value_start: usize,
+    value_end: usize,
+    entropy: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -780,6 +981,7 @@ struct BenchReport {
     by_category: BTreeMap<String, CategoryMetric>,
     by_detection: BTreeMap<String, DetectionMetric>,
     examples: Vec<BenchExample>,
+    credsweeper_json: Vec<CredSweeperJsonCredential>,
 }
 
 impl BenchReport {
@@ -801,6 +1003,7 @@ impl BenchReport {
         for (detection, metric) in other.by_detection {
             self.by_detection.entry(detection).or_default().add(metric);
         }
+        self.credsweeper_json.extend(other.credsweeper_json);
         if self.examples.len() < example_limit {
             self.examples.extend(
                 other
@@ -989,6 +1192,8 @@ mod tests {
             "0.8".to_string(),
             "--min-recall".to_string(),
             "0.7".to_string(),
+            "--save-credsweeper-json".to_string(),
+            "out.json".to_string(),
         ];
         let opts = BenchOpts::parse(&args).unwrap();
         assert!(opts.json);
@@ -998,6 +1203,10 @@ mod tests {
         assert_eq!(opts.examples, 3);
         assert_eq!(opts.min_precision, Some(0.8));
         assert_eq!(opts.min_recall, Some(0.7));
+        assert_eq!(
+            opts.save_credsweeper_json.as_deref(),
+            Some(Path::new("out.json"))
+        );
     }
 
     #[test]

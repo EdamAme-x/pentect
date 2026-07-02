@@ -27,7 +27,9 @@ pub use auth_code::AuthCodeDetector;
 pub use bip39::Bip39Detector;
 pub use card::CardDetector;
 pub use cli::CliCredentialDetector;
-pub use credsweeper::{CredSweeperNativeDetector, CredSweeperNativeStats};
+pub use credsweeper::{
+    CredSweeperNativeDetector, CredSweeperNativeFinding, CredSweeperNativeStats,
+};
 pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
 pub use key_value::KeyValueDetector;
