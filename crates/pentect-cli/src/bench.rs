@@ -6,13 +6,52 @@ use pentect_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 pub(crate) fn cmd_bench(args: &[String]) {
+    if args.get(2).map(String::as_str) == Some("credsweeper-parity") {
+        let opts = match CredSweeperParityOpts::parse(args) {
+            Ok(opts) => opts,
+            Err(e) => die(e),
+        };
+        let report = match run_credsweeper_parity(&opts) {
+            Ok(report) => report,
+            Err(e) => die(e),
+        };
+        if opts.json {
+            println!("{}", report.to_json());
+        } else {
+            println!(
+                "pentect bench credsweeper-parity rust={} oracle={} common={} missing={} extra={} precision={:.3} recall={:.3} f1={:.3}",
+                report.rust_count,
+                report.oracle_count,
+                report.common,
+                report.missing,
+                report.extra,
+                report.precision,
+                report.recall,
+                report.f1
+            );
+            for example in &report.missing_examples {
+                println!("missing {}", example);
+            }
+            for example in &report.extra_examples {
+                println!("extra {}", example);
+            }
+        }
+        if report.precision < opts.min_precision || report.recall < opts.min_recall {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let opts = match BenchOpts::parse(args) {
         Ok(opts) => opts,
         Err(e) => die(e),
@@ -183,6 +222,59 @@ impl BenchOpts {
             min_precision,
             min_recall,
             save_credsweeper_json,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CredSweeperParityOpts {
+    rust_json: PathBuf,
+    oracle_json: PathBuf,
+    json: bool,
+    examples: usize,
+    min_precision: f64,
+    min_recall: f64,
+}
+
+impl CredSweeperParityOpts {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let Some(rust_json) = args.get(3) else {
+            return Err("bench credsweeper-parity RUST_JSON ORACLE_JSON".to_string());
+        };
+        let Some(oracle_json) = args.get(4) else {
+            return Err("bench credsweeper-parity RUST_JSON ORACLE_JSON".to_string());
+        };
+        let mut json = false;
+        let mut examples = 10usize;
+        let mut min_precision = 1.0;
+        let mut min_recall = 1.0;
+        let mut i = 5usize;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => {
+                    json = true;
+                    i += 1;
+                }
+                "--examples" => {
+                    examples = parse_usize_arg(args, &mut i, "--examples")?;
+                }
+                "--min-precision" => {
+                    min_precision = parse_f64_arg(args, &mut i, "--min-precision")?;
+                }
+                "--min-recall" => {
+                    min_recall = parse_f64_arg(args, &mut i, "--min-recall")?;
+                }
+                flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
+                value => return Err(format!("unexpected argument for bench: {value}")),
+            }
+        }
+        Ok(Self {
+            rust_json: PathBuf::from(rust_json),
+            oracle_json: PathBuf::from(oracle_json),
+            json,
+            examples,
+            min_precision,
+            min_recall,
         })
     }
 }
@@ -612,6 +704,35 @@ fn save_credsweeper_json(
     std::fs::write(path, data).map_err(|e| format!("could not write '{}': {e}", path.display()))
 }
 
+fn run_credsweeper_parity(opts: &CredSweeperParityOpts) -> Result<CredSweeperParityReport, String> {
+    let rust_credentials = load_credsweeper_json(&opts.rust_json)?;
+    let oracle_credentials = load_credsweeper_json(&opts.oracle_json)?;
+    let rust = credsweeper_parity_multiset(&rust_credentials);
+    let oracle = credsweeper_parity_multiset(&oracle_credentials);
+    Ok(CredSweeperParityReport::build(rust, oracle, opts.examples))
+}
+
+fn load_credsweeper_json(path: &Path) -> Result<Vec<CredSweeperJsonCredential>, String> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    let data = data.strip_prefix('\u{feff}').unwrap_or(&data);
+    serde_json::from_str(data)
+        .map_err(|e| format!("could not parse CredSweeper json '{}': {e}", path.display()))
+}
+
+fn credsweeper_parity_multiset(
+    credentials: &[CredSweeperJsonCredential],
+) -> BTreeMap<CredSweeperParityKey, usize> {
+    let mut out = BTreeMap::new();
+    for credential in credentials {
+        for line_data in &credential.line_data_list {
+            *out.entry(CredSweeperParityKey::new(credential, line_data))
+                .or_insert(0) += 1;
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn maybe_push_example(
     report: &mut BenchReport,
@@ -983,27 +1104,224 @@ fn shannon_entropy(value: &str) -> f64 {
     (entropy * 100_000.0).round() / 100_000.0
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct CredSweeperJsonCredential {
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct CredSweeperParityKey {
     rule: String,
-    severity: String,
-    confidence: String,
-    ml_probability: Option<f64>,
-    line_data_list: Vec<CredSweeperJsonLineData>,
+    path: String,
+    line_num: usize,
+    value_start: usize,
+    value_end: usize,
+    variable_start: isize,
+    variable_end: isize,
+    variable: Option<String>,
+    value: String,
+}
+
+impl CredSweeperParityKey {
+    fn new(credential: &CredSweeperJsonCredential, line_data: &CredSweeperJsonLineData) -> Self {
+        Self {
+            rule: credential.rule.clone(),
+            path: normalize_parity_path(&line_data.path),
+            line_num: line_data.line_num,
+            value_start: line_data.value_start,
+            value_end: line_data.value_end,
+            variable_start: line_data.variable_start,
+            variable_end: line_data.variable_end,
+            variable: line_data.variable.clone(),
+            value: line_data.value.clone(),
+        }
+    }
+
+    fn to_example(&self, count: usize) -> CredSweeperParityExample {
+        CredSweeperParityExample {
+            count,
+            rule: self.rule.clone(),
+            path: self.path.clone(),
+            line_num: self.line_num,
+            value_start: self.value_start,
+            value_end: self.value_end,
+            variable_start: self.variable_start,
+            variable_end: self.variable_end,
+            value_len: self.value.chars().count(),
+            value_sha256: sha256_hex_prefix(&self.value, 16),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct CredSweeperJsonLineData {
-    line: String,
-    line_num: usize,
+struct CredSweeperParityExample {
+    count: usize,
+    rule: String,
     path: String,
-    info: String,
-    variable: Option<String>,
-    variable_start: isize,
-    variable_end: isize,
-    value: String,
+    line_num: usize,
     value_start: usize,
     value_end: usize,
+    variable_start: isize,
+    variable_end: isize,
+    value_len: usize,
+    value_sha256: String,
+}
+
+impl fmt::Display for CredSweeperParityExample {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "count={} rule={} path={} line={} cols={}-{} var_cols={}-{} len={} sha256={}",
+            self.count,
+            self.rule,
+            self.path,
+            self.line_num,
+            self.value_start,
+            self.value_end,
+            self.variable_start,
+            self.variable_end,
+            self.value_len,
+            self.value_sha256
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CredSweeperParityReport {
+    dataset: &'static str,
+    #[serde(rename = "rust")]
+    rust_count: usize,
+    #[serde(rename = "oracle")]
+    oracle_count: usize,
+    common: usize,
+    missing: usize,
+    extra: usize,
+    precision: f64,
+    recall: f64,
+    f1: f64,
+    missing_examples: Vec<CredSweeperParityExample>,
+    extra_examples: Vec<CredSweeperParityExample>,
+}
+
+impl CredSweeperParityReport {
+    fn build(
+        rust: BTreeMap<CredSweeperParityKey, usize>,
+        oracle: BTreeMap<CredSweeperParityKey, usize>,
+        example_limit: usize,
+    ) -> Self {
+        let rust_count = multiset_len(&rust);
+        let oracle_count = multiset_len(&oracle);
+        let mut common = 0usize;
+        let mut missing = 0usize;
+        let mut extra = 0usize;
+        let mut missing_examples = Vec::new();
+        let mut extra_examples = Vec::new();
+
+        for (key, oracle_seen) in &oracle {
+            let rust_seen = rust.get(key).copied().unwrap_or(0);
+            common += (*oracle_seen).min(rust_seen);
+            if *oracle_seen > rust_seen {
+                let count = *oracle_seen - rust_seen;
+                missing += count;
+                if missing_examples.len() < example_limit {
+                    missing_examples.push(key.to_example(count));
+                }
+            }
+        }
+
+        for (key, rust_seen) in &rust {
+            let oracle_seen = oracle.get(key).copied().unwrap_or(0);
+            if *rust_seen > oracle_seen {
+                let count = *rust_seen - oracle_seen;
+                extra += count;
+                if extra_examples.len() < example_limit {
+                    extra_examples.push(key.to_example(count));
+                }
+            }
+        }
+
+        let precision = ratio(common, rust_count);
+        let recall = ratio(common, oracle_count);
+        let f1 = if precision + recall == 0.0 {
+            0.0
+        } else {
+            2.0 * precision * recall / (precision + recall)
+        };
+        Self {
+            dataset: "credsweeper-parity",
+            rust_count,
+            oracle_count,
+            common,
+            missing,
+            extra,
+            precision,
+            recall,
+            f1,
+            missing_examples,
+            extra_examples,
+        }
+    }
+
+    fn to_json(&self) -> String {
+        match serde_json::to_string(self) {
+            Ok(data) => data,
+            Err(e) => json!({ "error": e.to_string() }).to_string(),
+        }
+    }
+}
+
+fn multiset_len<T: Ord>(values: &BTreeMap<T, usize>) -> usize {
+    values.values().sum()
+}
+
+fn normalize_parity_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn sha256_hex_prefix(value: &str, hex_chars: usize) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut out = String::with_capacity(hex_chars);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+        if out.len() >= hex_chars {
+            out.truncate(hex_chars);
+            break;
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CredSweeperJsonCredential {
+    rule: String,
+    #[serde(default)]
+    severity: String,
+    #[serde(default)]
+    confidence: String,
+    #[serde(default)]
+    ml_probability: Option<f64>,
+    #[serde(default)]
+    line_data_list: Vec<CredSweeperJsonLineData>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CredSweeperJsonLineData {
+    #[serde(default)]
+    line: String,
+    #[serde(default)]
+    line_num: usize,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    info: String,
+    #[serde(default)]
+    variable: Option<String>,
+    #[serde(default)]
+    variable_start: isize,
+    #[serde(default)]
+    variable_end: isize,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    value_start: usize,
+    #[serde(default)]
+    value_end: usize,
+    #[serde(default)]
     entropy: f64,
 }
 
@@ -1257,10 +1575,140 @@ mod tests {
     }
 
     #[test]
+    fn credsweeper_parity_args_parse() {
+        let args = vec![
+            "pentect".to_string(),
+            "bench".to_string(),
+            "credsweeper-parity".to_string(),
+            "rust.json".to_string(),
+            "oracle.json".to_string(),
+            "--json".to_string(),
+            "--examples".to_string(),
+            "4".to_string(),
+            "--min-precision".to_string(),
+            "0.999".to_string(),
+            "--min-recall".to_string(),
+            "0.998".to_string(),
+        ];
+        let opts = CredSweeperParityOpts::parse(&args).unwrap();
+        assert_eq!(opts.rust_json, PathBuf::from("rust.json"));
+        assert_eq!(opts.oracle_json, PathBuf::from("oracle.json"));
+        assert!(opts.json);
+        assert_eq!(opts.examples, 4);
+        assert_eq!(opts.min_precision, 0.999);
+        assert_eq!(opts.min_recall, 0.998);
+    }
+
+    #[test]
+    fn credsweeper_parity_matches_identical_multisets() {
+        let credentials = vec![sample_credsweeper_credential(
+            "api-key",
+            "src\\app.env",
+            7,
+            "RUNPOD_API_KEY",
+            "value-one",
+        )];
+        let rust = credsweeper_parity_multiset(&credentials);
+        let oracle = credsweeper_parity_multiset(&credentials);
+        let report = CredSweeperParityReport::build(rust, oracle, 10);
+
+        assert_eq!(report.rust_count, 1);
+        assert_eq!(report.oracle_count, 1);
+        assert_eq!(report.common, 1);
+        assert_eq!(report.missing, 0);
+        assert_eq!(report.extra, 0);
+        assert_eq!(report.precision, 1.0);
+        assert_eq!(report.recall, 1.0);
+    }
+
+    #[test]
+    fn credsweeper_parity_reports_diff_without_raw_values() {
+        let rust_credentials = vec![sample_credsweeper_credential(
+            "api-key",
+            "src/app.env",
+            7,
+            "RUNPOD_API_KEY",
+            "rust-only-value",
+        )];
+        let oracle_credentials = vec![sample_credsweeper_credential(
+            "api-key",
+            "src/app.env",
+            7,
+            "RUNPOD_API_KEY",
+            "oracle-only-value",
+        )];
+        let report = CredSweeperParityReport::build(
+            credsweeper_parity_multiset(&rust_credentials),
+            credsweeper_parity_multiset(&oracle_credentials),
+            10,
+        );
+
+        assert_eq!(report.common, 0);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.extra, 1);
+        let missing = report.missing_examples[0].to_string();
+        let extra = report.extra_examples[0].to_string();
+        assert!(!missing.contains("oracle-only-value"), "{missing}");
+        assert!(!extra.contains("rust-only-value"), "{extra}");
+        assert!(missing.contains("len=17"), "{missing}");
+        assert!(extra.contains("len=15"), "{extra}");
+        assert!(missing.contains("sha256="), "{missing}");
+    }
+
+    #[test]
+    fn credsweeper_parity_loads_utf8_bom_json() {
+        let root = temp_root("pentect-credsweeper-parity-json");
+        let path = root.join("oracle.json");
+        let credentials = vec![sample_credsweeper_credential(
+            "api-key",
+            "src/app.env",
+            1,
+            "KEY",
+            "value-one",
+        )];
+        let json = serde_json::to_string(&credentials).unwrap();
+        std::fs::write(&path, format!("\u{feff}{json}")).unwrap();
+
+        let loaded = load_credsweeper_json(&path).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].rule, "api-key");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn line_index_uses_zero_based_value_columns() {
         let text = "abc=secret\nnext";
         let lines = LineIndex::new(text);
         assert_eq!(lines.value_range(1, 4, 10), Some(ByteRange::new(4, 10)));
+    }
+
+    fn sample_credsweeper_credential(
+        rule: &str,
+        path: &str,
+        line_num: usize,
+        variable: &str,
+        value: &str,
+    ) -> CredSweeperJsonCredential {
+        CredSweeperJsonCredential {
+            rule: rule.to_string(),
+            severity: "medium".to_string(),
+            confidence: "moderate".to_string(),
+            ml_probability: None,
+            line_data_list: vec![CredSweeperJsonLineData {
+                line: format!("{variable}={value}"),
+                line_num,
+                path: path.to_string(),
+                info: String::new(),
+                variable: Some(variable.to_string()),
+                variable_start: 0,
+                variable_end: variable.len() as isize,
+                value: value.to_string(),
+                value_start: variable.len() + 1,
+                value_end: variable.len() + 1 + value.len(),
+                entropy: shannon_entropy(value),
+            }],
+        }
     }
 
     fn temp_root(prefix: &str) -> PathBuf {

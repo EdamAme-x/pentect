@@ -24,6 +24,7 @@ ignore = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 crossterm = { workspace = true }
 csv = { workspace = true }
 toml = { workspace = true }
