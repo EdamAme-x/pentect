@@ -1,0 +1,26 @@
+numpy
+onnxruntime
+humanfriendly
+PyYAML
+colorama
+lxml
+cryptography
+base58
+pybase62
+beautifulsoup4
+GitPython
+odfpy
+openpyxl
+pandas
+pdfminer.six
+pyjks
+python-dateutil
+python-docx
+python-pptx
+PySquashfsImage
+pyxlsb
+rpmfile
+striprtf
+whatthepatch
+xlrd
+zstandard; python_version < "3.14"
