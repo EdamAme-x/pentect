@@ -303,9 +303,16 @@ fn git_files_for_root(root: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
             continue;
         }
         let rel = String::from_utf8_lossy(raw);
-        files.push(top.join(rel.as_ref()));
+        push_git_regular_file(&top, rel.as_ref(), &mut files);
     }
     Some((top, files))
+}
+
+fn push_git_regular_file(top: &Path, rel: &str, files: &mut Vec<PathBuf>) {
+    let path = top.join(rel);
+    if path.is_file() {
+        files.push(path);
+    }
 }
 
 fn git_pathspec(path: &Path) -> String {
@@ -331,4 +338,37 @@ fn walk_threads() -> usize {
         .map(|n| n.get())
         .unwrap_or(1)
         .min(8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn git_listed_directories_are_not_scanned_as_files() {
+        let root = temp_root("pentect-git-listed-dir");
+        std::fs::create_dir_all(root.join("vendor-submodule")).unwrap();
+        std::fs::write(root.join("tracked.txt"), "ok").unwrap();
+
+        let mut files = Vec::new();
+        push_git_regular_file(&root, "vendor-submodule", &mut files);
+        push_git_regular_file(&root, "tracked.txt", &mut files);
+
+        assert_eq!(vec![root.join("tracked.txt")], files);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
