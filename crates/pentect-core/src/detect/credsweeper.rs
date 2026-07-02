@@ -456,20 +456,23 @@ struct CandidateLineData<'a> {
 impl SpecialMatcher {
     fn find<'a>(&self, line: &'a str) -> Vec<Candidate<'a>> {
         match self {
-            Self::AwsMulti => aws_multi_candidates(line),
-            Self::GoogleMulti => google_multi_candidates(line),
-            Self::Jwk => Vec::new(),
+            Self::AwsMulti | Self::GoogleMulti | Self::Jwk => Vec::new(),
             Self::PemPrivateKey => pem_private_key_candidates(line),
             Self::Base64PrivateKey => base64_private_key_candidates(line),
         }
     }
 
     fn is_whole_text(&self) -> bool {
-        matches!(self, Self::Jwk | Self::PemPrivateKey)
+        matches!(
+            self,
+            Self::AwsMulti | Self::GoogleMulti | Self::Jwk | Self::PemPrivateKey
+        )
     }
 
     fn find_whole_text<'a>(&self, text: &'a str) -> Vec<Candidate<'a>> {
         match self {
+            Self::AwsMulti => aws_multi_candidates(text),
+            Self::GoogleMulti => google_multi_candidates(text),
             Self::Jwk => jwk_multi_candidates(text),
             Self::PemPrivateKey => pem_private_key_block_candidates(text),
             _ => Vec::new(),
@@ -540,37 +543,166 @@ fn keyword_pattern(keyword: &str) -> String {
     .concat()
 }
 
-fn aws_multi_candidates(line: &str) -> Vec<Candidate<'_>> {
-    static AWS_ID: LazyLock<RustRegex> =
-        LazyLock::new(|| RustRegex::new(r"A(KIA|SIA)[0-9A-Z]{16}").expect("aws id regex"));
-    let ids = regex_candidates(line, &AWS_ID);
-    if ids.is_empty() {
+fn aws_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
+    static AWS_ID: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r"(?:^|/|[^\\0-9A-Za-z+_-]|\\[0abfnrtv]|(?:%|\\x)[0-9A-Fa-f]{2}|\\[0-7]{3}|\\[Uu][0-9A-Fa-f]{4}|\x1B\[[0-9;]{0,80}m)(?P<value>A(KIA|SIA)[0-9A-Z]{16})",
+        )
+        .expect("aws multi id regex")
+    });
+    static AWS_SECRET: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r"(?:^|/|[^\\0-9A-Za-z+_-]|\\[0abfnrtv]|(?:%|\\x)[0-9A-Fa-f]{2}|\\[0-7]{3}|\\[Uu][0-9A-Fa-f]{4}|\x1B\[[0-9;]{0,80}m)(?P<value>[0-9A-Za-z/+]{40,44})",
+        )
+        .expect("aws multi secret regex")
+    });
+
+    multi_pattern_candidates(
+        text,
+        &AWS_ID,
+        |line_start, line, anchor| {
+            let local_end = anchor.end - line_start;
+            !line
+                .as_bytes()
+                .get(local_end)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        },
+        |line_start, line, anchor| {
+            regex_line_data(line_start, line, &AWS_SECRET)
+                .into_iter()
+                .filter(|part| {
+                    let local_start = part.start - line_start;
+                    let local_end = part.end - line_start;
+                    has_upper_lower_digit_or_aws_symbol(part.value)
+                        && !line
+                            .as_bytes()
+                            .get(local_end)
+                            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'/' | b'+'))
+                        && !multi_value_filtered(line, part, anchor.value, local_start, local_end)
+                        && !base64_part_filtered(line, part.value, local_start, local_end)
+                })
+                .collect()
+        },
+    )
+}
+
+fn google_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
+    static GOOGLE_CLIENT_ID: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r"(?P<value>[0-9]{3,80}-[0-9a-z_]{32}\.apps\.googleusercontent\.com)")
+            .expect("google client id regex")
+    });
+    static GOOGLE_SECRET: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r"\b(?P<value>GOCSPX-[0-9A-Za-z_-]{28}|[0-9A-Za-z_-]{24,80})\b")
+            .expect("google multi secret regex")
+    });
+
+    multi_pattern_candidates(
+        text,
+        &GOOGLE_CLIENT_ID,
+        |_, _, _| true,
+        |line_start, line, anchor| {
+            regex_line_data(line_start, line, &GOOGLE_SECRET)
+                .into_iter()
+                .filter(|part| {
+                    let local_start = part.start - line_start;
+                    let local_end = part.end - line_start;
+                    (part.value.starts_with("GOCSPX-")
+                        || has_upper_lower_digit_or_google_symbol(part.value))
+                        && !multi_value_filtered(line, part, anchor.value, local_start, local_end)
+                })
+                .collect()
+        },
+    )
+}
+
+fn multi_pattern_candidates<'a>(
+    text: &'a str,
+    anchor_regex: &RustRegex,
+    anchor_accept: impl Fn(usize, &'a str, CandidateLineData<'a>) -> bool,
+    second_parts: impl Fn(usize, &'a str, CandidateLineData<'a>) -> Vec<CandidateLineData<'a>>,
+) -> Vec<Candidate<'a>> {
+    // Mirrors CredSweeper MultiPattern: anchor on the first pattern, then scan
+    // same/nearby lines for the second pattern and report the second value.
+    let lines = LineRanges::new(text)
+        .map(|(start, line)| (start, line.trim_end_matches(['\r', '\n'])))
+        .collect::<Vec<_>>();
+    let mut anchors = Vec::new();
+    for (idx, (line_start, line)) in lines.iter().enumerate() {
+        for part in regex_line_data(*line_start, line, anchor_regex) {
+            let local_start = part.start - *line_start;
+            let local_end = part.end - *line_start;
+            if anchor_accept(*line_start, line, part)
+                && !line_specific_key_filtered(line, local_start, local_end)
+            {
+                anchors.push((idx, part));
+            }
+        }
+    }
+    if anchors.is_empty() {
         return Vec::new();
     }
-    let mut out = ids;
-    out.extend(token_runs(line).filter(|run| {
-        run.value.len() >= 40
-            && run.value.len() <= 44
-            && is_base64ish(run.value)
-            && has_upper_lower_digit(run.value)
-    }));
+
+    let mut out = Vec::new();
+    for (anchor_idx, anchor) in anchors {
+        for line_idx in jwk_multi_search_positions(anchor_idx, &lines) {
+            let Some((line_start, line)) = lines.get(line_idx).copied() else {
+                continue;
+            };
+            let parts = second_parts(line_start, line, anchor);
+            let Some(main) = parts.first().copied() else {
+                continue;
+            };
+            let mut line_data = Vec::with_capacity(1 + parts.len());
+            line_data.push(anchor);
+            line_data.extend(parts);
+            out.push(Candidate {
+                start: main.start,
+                end: main.end,
+                value: main.value,
+                variable_start: main.variable_start,
+                variable_end: main.variable_end,
+                variable: main.variable,
+                line_data,
+            });
+            break;
+        }
+    }
     out
 }
 
-fn google_multi_candidates(line: &str) -> Vec<Candidate<'_>> {
-    static GOOGLE_CLIENT_ID: LazyLock<RustRegex> = LazyLock::new(|| {
-        RustRegex::new(r"[0-9]{3,80}-[0-9a-z_]{32}\.apps\.googleusercontent\.com")
-            .expect("google client id regex")
-    });
-    static GOOGLE_SECRET: LazyLock<RustRegex> =
-        LazyLock::new(|| RustRegex::new(r"GOCSPX-[0-9A-Za-z_-]{28}").expect("google secret"));
-    let clients = regex_candidates(line, &GOOGLE_CLIENT_ID);
-    if clients.is_empty() {
-        return Vec::new();
-    }
-    let mut out = clients;
-    out.extend(regex_candidates(line, &GOOGLE_SECRET));
-    out
+fn regex_line_data<'a>(
+    line_start: usize,
+    line: &'a str,
+    regex: &RustRegex,
+) -> Vec<CandidateLineData<'a>> {
+    regex
+        .captures_iter(line)
+        .filter_map(|captures| {
+            let value = captures.name("value")?;
+            let variable = captures.name("variable");
+            Some(CandidateLineData {
+                start: line_start + value.start(),
+                end: line_start + value.end(),
+                value: value.as_str(),
+                variable_start: variable.as_ref().map(|m| line_start + m.start()),
+                variable_end: variable.as_ref().map(|m| line_start + m.end()),
+                variable: variable.map(|m| m.as_str()),
+            })
+        })
+        .collect()
+}
+
+fn multi_value_filtered(
+    line: &str,
+    part: &CandidateLineData<'_>,
+    anchor_value: &str,
+    local_start: usize,
+    local_end: usize,
+) -> bool {
+    value_search_filtered(anchor_value, part.value)
+        || value_pattern_filtered(part.value, None)
+        || morphemes_filtered(part.value, None)
+        || line_specific_key_filtered(line, local_start, local_end)
 }
 
 fn jwk_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
@@ -928,21 +1060,6 @@ fn base64_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
         .collect()
 }
 
-fn regex_candidates<'a>(line: &'a str, regex: &RustRegex) -> Vec<Candidate<'a>> {
-    regex
-        .find_iter(line)
-        .map(|m| Candidate {
-            start: m.start(),
-            end: m.end(),
-            value: m.as_str(),
-            variable_start: None,
-            variable_end: None,
-            variable: None,
-            line_data: Vec::new(),
-        })
-        .collect()
-}
-
 fn clamp_to_char_boundary(text: &str, mut index: usize) -> usize {
     index = index.min(text.len());
     while index > 0 && !text.is_char_boundary(index) {
@@ -994,6 +1111,43 @@ struct PushMatchCtx<'view, 'data> {
     file_type: &'data str,
 }
 
+fn sanitize_variable_capture(
+    line: &str,
+    variable: &str,
+    start: usize,
+    end: usize,
+) -> Option<(String, usize, usize)> {
+    // Mirrors CredSweeper LineData.sanitize_variable so keyword rules compare
+    // against the same key text after syntax punctuation has been trimmed.
+    if start >= end {
+        return None;
+    }
+    let mut sanitized = variable.to_string();
+    let original = sanitized.clone();
+    let mut previous_len = 0usize;
+    while !sanitized.is_empty() && previous_len != sanitized.len() {
+        previous_len = sanitized.len();
+        sanitized = sanitized
+            .trim_matches(|ch: char| {
+                ch.is_whitespace() || matches!(ch, ',' | '\'' | '"' | '-' | ';')
+            })
+            .to_string();
+        if sanitized.ends_with('\\') {
+            sanitized.pop();
+        }
+        if sanitized.starts_with('{') && line.get(end..).is_some_and(|tail| tail.contains('}')) {
+            sanitized.remove(0);
+        }
+    }
+    if sanitized.is_empty() {
+        return None;
+    }
+    let offset = original.find(&sanitized)?;
+    let sanitized_start = start + offset;
+    let sanitized_end = sanitized_start + sanitized.len();
+    Some((sanitized, sanitized_start, sanitized_end))
+}
+
 fn push_match(
     out: &mut Vec<CredSweeperNativeFinding>,
     ml_pending: &mut Vec<PendingMlFinding>,
@@ -1013,6 +1167,10 @@ fn push_match(
     if !accept_value(candidate.value, rule) {
         return;
     }
+    let sanitized_variable = candidate
+        .variable
+        .zip(candidate.variable_start.zip(candidate.variable_end))
+        .and_then(|(variable, (start, end))| sanitize_variable_capture(line, variable, start, end));
     let finding = CredSweeperNativeFinding {
         range,
         rule_name: rule.rule_name.clone(),
@@ -1023,9 +1181,11 @@ fn push_match(
         value: candidate.value.to_string(),
         value_start: candidate.start,
         value_end: candidate.end,
-        variable: candidate.variable.map(str::to_string),
-        variable_start: candidate.variable_start,
-        variable_end: candidate.variable_end,
+        variable: sanitized_variable
+            .as_ref()
+            .map(|(variable, _, _)| variable.clone()),
+        variable_start: sanitized_variable.as_ref().map(|(_, start, _)| *start),
+        variable_end: sanitized_variable.as_ref().map(|(_, _, end)| *end),
         line_data: candidate
             .line_data
             .iter()
@@ -1044,19 +1204,26 @@ fn push_match(
             .collect(),
     };
     if rule.ml_validated {
+        let variable = sanitized_variable
+            .as_ref()
+            .map(|(variable, _, _)| variable.as_str())
+            .unwrap_or_default();
         ml_pending.push(PendingMlFinding {
             finding,
             input: MlInput {
                 line: line.to_string(),
                 value: candidate.value.to_string(),
-                variable: candidate.variable.unwrap_or_default().to_string(),
+                variable: variable.to_string(),
                 value_start: candidate.start,
                 value_end: candidate.end,
-                variable_start: candidate
-                    .variable_start
-                    .map(|start| start as isize)
+                variable_start: sanitized_variable
+                    .as_ref()
+                    .map(|(_, start, _)| *start as isize)
                     .unwrap_or(-2),
-                variable_end: candidate.variable_end.map(|end| end as isize).unwrap_or(-2),
+                variable_end: sanitized_variable
+                    .as_ref()
+                    .map(|(_, _, end)| *end as isize)
+                    .unwrap_or(-2),
                 path: ctx.path.to_string(),
                 file_type: ctx.file_type.to_string(),
                 rule_name: rule.rule_name.clone(),
@@ -1477,10 +1644,75 @@ fn value_sealed_secret_filtered(value: &str, context: &str) -> bool {
         && context.contains("bitnami")
 }
 
-fn has_upper_lower_digit(value: &str) -> bool {
+fn has_upper_lower_digit_or_aws_symbol(value: &str) -> bool {
     value.chars().any(|ch| ch.is_ascii_uppercase())
         && value.chars().any(|ch| ch.is_ascii_lowercase())
-        && value.chars().any(|ch| ch.is_ascii_digit())
+        && value
+            .chars()
+            .any(|ch| ch.is_ascii_digit() || matches!(ch, '/' | '+'))
+}
+
+fn has_upper_lower_digit_or_google_symbol(value: &str) -> bool {
+    value.chars().any(|ch| ch.is_ascii_uppercase())
+        && value.chars().any(|ch| ch.is_ascii_lowercase())
+        && value
+            .chars()
+            .any(|ch| ch.is_ascii_digit() || matches!(ch, '_' | '-'))
+}
+
+fn line_specific_key_filtered(line: &str, value_start: usize, value_end: usize) -> bool {
+    static NOT_ALLOWED: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r"(?i)example|\benc[\(\[]|\btrue\b|\bfalse\b")
+            .expect("line specific key regex")
+    });
+    const ML_HUNK: usize = 64;
+    let start = floor_char_boundary(line, value_start.saturating_sub(ML_HUNK));
+    let end = ceil_char_boundary(line, (value_end + ML_HUNK).min(line.len()));
+    NOT_ALLOWED.is_match(&line[start..end])
+}
+
+fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
+    idx = idx.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
+    idx = idx.min(text.len());
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn base64_part_filtered(line: &str, value: &str, value_start: usize, value_end: usize) -> bool {
+    if value_start == 0 && line.len() < 2 * value.len() {
+        return false;
+    }
+    let touches_base64_delimiter = value_start == 0
+        || line
+            .as_bytes()
+            .get(value_start.saturating_sub(1))
+            .is_some_and(|b| matches!(b, b'/' | b'+' | b'\\' | b'%'))
+        || (0 < value_end
+            && value_end < line.len()
+            && line
+                .as_bytes()
+                .get(value_end)
+                .is_some_and(|b| matches!(b, b'/' | b'+' | b'\\' | b'%')));
+    if !touches_base64_delimiter || value.contains(['-', '_']) {
+        return false;
+    }
+
+    let left_start = value_start.saturating_sub(value.len());
+    let right_end = (value_end + value.len()).min(line.len());
+    let hunk = &line[floor_char_boundary(line, left_start)..ceil_char_boundary(line, right_end)];
+    hunk.len() >= 2 * value.len()
+        && hunk
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'\\'))
 }
 
 fn is_base64ish(value: &str) -> bool {
@@ -1760,7 +1992,10 @@ mod tests {
         let aws_id = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
         let aws_secret = "mQ7zR2pL8vN4xY6cT9bH3sK5dF1gJ0aW2eU4rI6o".to_string();
         let google_secret = format!("GOCSPX-{}", "A".repeat(28));
-        let jwk_secret = "mQ7zR2pL8vN4xY6cT9bH3sK5dF1gJ0aW";
+        let jwk_secret = concat!(
+            "n7fzJc3_WG59VEOBTkayzuSMM780OJQuZjN_KbH8lOZG25ZoA7T4Bxcc0xQn5oZE5uSCI",
+            "wg91oCt0JvxPcpmqzaJZg1nirjcWZ-oBtVk7gCAWq-B3qhfF3izlbkosrzjHajIcY33HBh",
+        );
         let base64_key = format!("MII{}", "A".repeat(180));
         let raw = format!(
             "aws {aws_id} {aws_secret}\n\
@@ -1816,6 +2051,24 @@ mod tests {
         assert!(findings.iter().any(|finding| {
             finding.rule_name == "Key" && finding.variable.as_deref() == Some("DJANGO_SECRET_KEY")
         }));
+    }
+
+    #[test]
+    fn keyword_variables_are_sanitized_like_credsweeper_line_data() {
+        let raw = "oauthClientSecret = \"6FF2FD0652DCD53EA929\"\n";
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        let findings = CredSweeperNativeDetector::builtin().detect_findings(&view);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.value == "6FF2FD0652DCD53EA929"
+                    && finding.variable.as_deref() == Some("oauthClientSecret")),
+            "{findings:?}"
+        );
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.variable.as_deref() == Some("oauthClientSecret ")));
     }
 
     #[test]
