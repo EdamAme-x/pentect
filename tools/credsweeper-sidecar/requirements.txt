@@ -1,0 +1,11 @@
+pyinstaller>=6.21,<7
+numpy>=2.3,<3
+onnxruntime>=1.23,<2
+humanfriendly>=10,<11
+PyYAML>=6,<7
+colorama>=0.4,<0.5
+lxml>=6,<7
+cryptography>=46,<47
+base58>=2,<3
+pybase62>=1,<2
+beautifulsoup4>=4.13,<5

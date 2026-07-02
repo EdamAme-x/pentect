@@ -331,6 +331,9 @@ impl CredSweeperNativeDetector {
                                     continue;
                                 };
                                 let variable = captures.name("variable");
+                                let separator = captures.name("separator");
+                                let value_leftquote = captures.name("value_leftquote");
+                                let value_rightquote = captures.name("value_rightquote");
                                 let candidate = Candidate {
                                     start: m.start(),
                                     end: m.end(),
@@ -338,6 +341,9 @@ impl CredSweeperNativeDetector {
                                     variable_start: variable.as_ref().map(|m| m.start()),
                                     variable_end: variable.as_ref().map(|m| m.end()),
                                     variable: variable.map(|m| m.as_str()),
+                                    separator: separator.map(|m| m.as_str()),
+                                    value_leftquote: value_leftquote.map(|m| m.as_str()),
+                                    value_rightquote: value_rightquote.map(|m| m.as_str()),
                                     line_data: Vec::new(),
                                 };
                                 push_match(
@@ -364,6 +370,9 @@ impl CredSweeperNativeDetector {
                                     continue;
                                 };
                                 let variable = captures.name("variable");
+                                let separator = captures.name("separator");
+                                let value_leftquote = captures.name("value_leftquote");
+                                let value_rightquote = captures.name("value_rightquote");
                                 let candidate = Candidate {
                                     start: m.start(),
                                     end: m.end(),
@@ -371,6 +380,9 @@ impl CredSweeperNativeDetector {
                                     variable_start: variable.as_ref().map(|m| m.start()),
                                     variable_end: variable.as_ref().map(|m| m.end()),
                                     variable: variable.map(|m| m.as_str()),
+                                    separator: separator.map(|m| m.as_str()),
+                                    value_leftquote: value_leftquote.map(|m| m.as_str()),
+                                    value_rightquote: value_rightquote.map(|m| m.as_str()),
                                     line_data: Vec::new(),
                                 };
                                 push_match(
@@ -440,6 +452,9 @@ struct Candidate<'a> {
     variable_start: Option<usize>,
     variable_end: Option<usize>,
     variable: Option<&'a str>,
+    separator: Option<&'a str>,
+    value_leftquote: Option<&'a str>,
+    value_rightquote: Option<&'a str>,
     line_data: Vec<CandidateLineData<'a>>,
 }
 
@@ -662,6 +677,9 @@ fn multi_pattern_candidates<'a>(
                 variable_start: main.variable_start,
                 variable_end: main.variable_end,
                 variable: main.variable,
+                separator: None,
+                value_leftquote: None,
+                value_rightquote: None,
                 line_data,
             });
             break;
@@ -759,6 +777,9 @@ fn jwk_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
                 variable_start: main.variable_start,
                 variable_end: main.variable_end,
                 variable: main.variable,
+                separator: None,
+                value_leftquote: None,
+                value_rightquote: None,
                 line_data,
             });
             break;
@@ -878,6 +899,9 @@ fn pem_private_key_candidates(line: &str) -> Vec<Candidate<'_>> {
             variable_start: None,
             variable_end: None,
             variable: None,
+            separator: None,
+            value_leftquote: None,
+            value_rightquote: None,
             line_data: Vec::new(),
         }]
     } else {
@@ -926,6 +950,9 @@ fn pem_private_key_block_candidates(text: &str) -> Vec<Candidate<'_>> {
                 variable_start: None,
                 variable_end: None,
                 variable: None,
+                separator: None,
+                value_leftquote: None,
+                value_rightquote: None,
                 line_data: Vec::new(),
             });
         }
@@ -1082,6 +1109,9 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
                 variable_start: None,
                 variable_end: None,
                 variable: None,
+                separator: None,
+                value_leftquote: None,
+                value_rightquote: None,
                 line_data: Vec::new(),
             });
         }
@@ -1094,6 +1124,9 @@ fn token_runs(line: &str) -> impl Iterator<Item = Candidate<'_>> {
             variable_start: None,
             variable_end: None,
             variable: None,
+            separator: None,
+            value_leftquote: None,
+            value_rightquote: None,
             line_data: Vec::new(),
         });
     }
@@ -1148,6 +1181,268 @@ fn sanitize_variable_capture(
     Some((sanitized, sanitized_start, sanitized_end))
 }
 
+struct SanitizedValue<'a> {
+    value: &'a str,
+    start: usize,
+    end: usize,
+}
+
+fn sanitize_value_capture<'a>(
+    line: &'a str,
+    file_type: &str,
+    candidate: &Candidate<'a>,
+) -> SanitizedValue<'a> {
+    // Mirrors CredSweeper LineData.sanitize_value for regex captures whose
+    // value spans syntax around the actual secret.
+    let mut out = SanitizedValue {
+        value: candidate.value,
+        start: candidate.start,
+        end: candidate.end,
+    };
+    if out.value.is_empty() {
+        return out;
+    }
+
+    if candidate.value_leftquote.is_none() && candidate.value_rightquote.is_none() {
+        out = sanitize_unicode_quotes(out);
+    }
+
+    if candidate.variable.is_none()
+        || is_well_quoted_value(
+            candidate.value_leftquote,
+            candidate.value_rightquote,
+            out.value,
+            line,
+            file_type,
+        )
+    {
+        return out;
+    }
+
+    out = clean_url_parameters(line, candidate, out);
+    out = clean_bash_parameters(candidate, out);
+    out = clean_toml_parameters(line, out);
+    clean_tag_parameters(line, out)
+}
+
+fn sanitize_unicode_quotes(mut value: SanitizedValue<'_>) -> SanitizedValue<'_> {
+    while let (Some(first), Some(last)) = (value.value.chars().next(), value.value.chars().last()) {
+        let first_code = first as u32;
+        let last_code = last as u32;
+        let matching_single =
+            (0x2018..=0x201B).contains(&first_code) && (0x2018..=0x201B).contains(&last_code);
+        let matching_double =
+            (0x201C..=0x201F).contains(&first_code) && (0x201C..=0x201F).contains(&last_code);
+        if !matching_single && !matching_double {
+            break;
+        }
+        value.start += first.len_utf8();
+        value.end -= last.len_utf8();
+        value.value = &value.value[first.len_utf8()..value.value.len() - last.len_utf8()];
+    }
+    value
+}
+
+fn is_well_quoted_value(
+    left: Option<&str>,
+    right: Option<&str>,
+    value: &str,
+    line: &str,
+    file_type: &str,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) if left == right => true,
+        (Some(left), Some(right)) => {
+            let left_quote = quote_from_left_capture(left);
+            let right_quote = quote_from_right_capture(right);
+            left_quote.is_some_and(|left_quote| {
+                right_quote.is_some_and(|right_quote| left_quote == right_quote)
+                    || (right == "\\" && line.ends_with('\\'))
+            })
+        }
+        (Some(left), None) => {
+            ((value.ends_with('\\')) && line.ends_with('\\'))
+                || file_type == ".php"
+                || left.matches('"').count() == 3
+                || left.matches('\'').count() == 3
+        }
+        _ => false,
+    }
+}
+
+fn quote_from_left_capture(value: &str) -> Option<char> {
+    if value.chars().count() == 1 {
+        value.chars().next()
+    } else {
+        value
+            .chars()
+            .next_back()
+            .filter(|ch| matches!(ch, '"' | '\'' | '`'))
+    }
+}
+
+fn quote_from_right_capture(value: &str) -> Option<char> {
+    if value.chars().count() == 1 {
+        value.chars().next()
+    } else {
+        value.chars().find(|ch| matches!(ch, '"' | '\'' | '`'))
+    }
+}
+
+fn clean_url_parameters<'a>(
+    line: &'a str,
+    candidate: &Candidate<'a>,
+    mut value: SanitizedValue<'a>,
+) -> SanitizedValue<'a> {
+    let Some(variable) = candidate.variable else {
+        return value;
+    };
+    if variable.ends_with("://") || !is_url_part(line, candidate, value.value) {
+        return value;
+    }
+    let mut cut = value.value.len();
+    for delimiter in ['&', ';', '#'] {
+        if let Some(pos) = value.value[..cut].find(delimiter) {
+            cut = cut.min(pos);
+        }
+    }
+    static URL_UNICODE_SPLIT: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(r"(?i)\\u00(0000)?(21|23|24|26|27|28|29|2a|2b|2c|2f|3a|3b|3d|3f|40|5b|5d)")
+            .expect("url unicode split regex")
+    });
+    if let Some(m) = URL_UNICODE_SPLIT.find(&value.value[..cut]) {
+        cut = cut.min(m.start());
+    }
+    let escaped_separator = candidate
+        .separator
+        .is_some_and(|separator| separator.eq_ignore_ascii_case("%3D"));
+    if escaped_separator {
+        static URL_PERCENT_SPLIT: LazyLock<RustRegex> = LazyLock::new(|| {
+            RustRegex::new(r"(?i)%(21|23|24|26|27|28|29|2a|2b|2c|2f|3a|3b|3d|3f|40|5b|5d)")
+                .expect("url percent split regex")
+        });
+        if let Some(m) = URL_PERCENT_SPLIT.find(&value.value[..cut]) {
+            cut = cut.min(m.start());
+        }
+    }
+    value.end = value.start + cut;
+    value.value = &line[value.start..value.end];
+    value
+}
+
+fn is_url_part(line: &str, candidate: &Candidate<'_>, value: &str) -> bool {
+    let mut url_part = false;
+    if candidate.start <= line.len() {
+        let before_value = &line[..candidate.start];
+        let mut find_pos = 0usize;
+        let mut url_pos = None;
+        while let Some(rel) = before_value[find_pos..].find("://") {
+            let pos = find_pos + rel;
+            url_pos = Some(pos);
+            find_pos = pos + 3;
+        }
+        if let Some(pos) = url_pos.filter(|pos| 3 <= *pos) {
+            let scheme = &before_value[pos - 3..pos];
+            url_part = scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+                && !line[pos + 3..candidate.start].chars().any(|ch| {
+                    ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '"' | '<' | '>' | '[' | ']' | '^' | '~' | '`' | '{' | '|' | '}'
+                        )
+                });
+        }
+    }
+    if let Some(variable_start) = candidate.variable_start.filter(|start| *start > 0) {
+        url_part |= line
+            .as_bytes()
+            .get(variable_start - 1)
+            .is_some_and(|b| matches!(*b, b'?' | b'&'));
+    }
+    static URL_VALUE_PATTERN: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r#"^[^\s&;"<>\[\]^~`{|}]+[&;][^\s=;"<>\[\]^~`{|}]{3,80}=[^\s;&="<>\[\]^~`{|}]{1,80}"#,
+        )
+        .expect("url value pattern regex")
+    });
+    url_part
+        || URL_VALUE_PATTERN.is_match(value)
+        || candidate
+            .separator
+            .is_some_and(|separator| separator.eq_ignore_ascii_case("%3D"))
+}
+
+fn clean_bash_parameters<'a>(
+    candidate: &Candidate<'a>,
+    mut value: SanitizedValue<'a>,
+) -> SanitizedValue<'a> {
+    if candidate
+        .variable
+        .is_some_and(|variable| variable.starts_with('-'))
+    {
+        static BASH_PARAM_SPLIT: LazyLock<RustRegex> = LazyLock::new(|| {
+            RustRegex::new(r"\s+(\-|\||\>|\w+?\>|\&)").expect("bash parameter split regex")
+        });
+        if let Some(m) = BASH_PARAM_SPLIT.find(value.value) {
+            value.end = value.start + m.start();
+            value.value = &value.value[..m.start()];
+        }
+    }
+    if !value.value.contains(' ') && (value.value.contains("\\n") || value.value.contains("\\r")) {
+        static LINE_ENDINGS: LazyLock<RustRegex> =
+            LazyLock::new(|| RustRegex::new(r"\\{1,8}[nr]").expect("line ending split regex"));
+        if let Some(m) = LINE_ENDINGS.find(value.value) {
+            value.end = value.start + m.start();
+            value.value = &value.value[..m.start()];
+        }
+    }
+    value
+}
+
+fn clean_toml_parameters<'a>(line: &str, mut value: SanitizedValue<'a>) -> SanitizedValue<'a> {
+    loop {
+        let Some(last) = value.value.chars().next_back() else {
+            return value;
+        };
+        let Some(left) = (match last {
+            '}' => Some('{'),
+            ']' => Some('['),
+            ')' => Some('('),
+            _ => None,
+        }) else {
+            return value;
+        };
+        let line_before_value = line.get(..value.start).unwrap_or_default();
+        if value.value.contains(left)
+            || line_before_value.matches(left).count() <= line_before_value.matches(last).count()
+        {
+            return value;
+        }
+        value.end -= last.len_utf8();
+        value.value = &value.value[..value.value.len() - last.len_utf8()];
+    }
+}
+
+fn clean_tag_parameters<'a>(line: &str, mut value: SanitizedValue<'a>) -> SanitizedValue<'a> {
+    while value.value.ends_with('>') {
+        let Some(closing_tag_pos) = value.value.rfind("</") else {
+            break;
+        };
+        let tag = &value.value[closing_tag_pos + 2..value.value.len() - 1];
+        let opening_tag_prefix = format!("<{tag}");
+        if value.value.contains(&opening_tag_prefix)
+            || !line[..value.start].contains(&opening_tag_prefix)
+        {
+            break;
+        }
+        value.end = value.start + closing_tag_pos;
+        value.value = &value.value[..closing_tag_pos];
+    }
+    value
+}
+
 fn push_match(
     out: &mut Vec<CredSweeperNativeFinding>,
     ml_pending: &mut Vec<PendingMlFinding>,
@@ -1157,14 +1452,15 @@ fn push_match(
     line: &str,
     candidate: &Candidate<'_>,
 ) {
+    let sanitized_value = sanitize_value_capture(line, ctx.file_type, candidate);
     let range = ctx.view.to_raw(ByteRange::new(
-        line_start + candidate.start,
-        line_start + candidate.end,
+        line_start + sanitized_value.start,
+        line_start + sanitized_value.end,
     ));
     if range.is_empty() {
         return;
     }
-    if !accept_value(candidate.value, rule) {
+    if !accept_value(sanitized_value.value, rule) {
         return;
     }
     let sanitized_variable = candidate
@@ -1178,9 +1474,9 @@ fn push_match(
         severity: severity_name(rule.severity).to_string(),
         confidence: rule.confidence,
         confidence_name: confidence_name(rule.confidence).to_string(),
-        value: candidate.value.to_string(),
-        value_start: candidate.start,
-        value_end: candidate.end,
+        value: sanitized_value.value.to_string(),
+        value_start: sanitized_value.start,
+        value_end: sanitized_value.end,
         variable: sanitized_variable
             .as_ref()
             .map(|(variable, _, _)| variable.clone()),
@@ -1212,10 +1508,10 @@ fn push_match(
             finding,
             input: MlInput {
                 line: line.to_string(),
-                value: candidate.value.to_string(),
+                value: sanitized_value.value.to_string(),
                 variable: variable.to_string(),
-                value_start: candidate.start,
-                value_end: candidate.end,
+                value_start: sanitized_value.start,
+                value_end: sanitized_value.end,
                 variable_start: sanitized_variable
                     .as_ref()
                     .map(|(_, start, _)| *start as isize)
@@ -2069,6 +2365,59 @@ mod tests {
         assert!(!findings
             .iter()
             .any(|finding| finding.variable.as_deref() == Some("oauthClientSecret ")));
+    }
+
+    #[test]
+    fn keyword_values_are_sanitized_like_credsweeper_line_data() {
+        let line = concat!(
+            "final String responseBody = \"",
+            "oauth_token=vt2q56n7zhfksqaw&oauth_token_secret=lghm7395e8t6yv01",
+            "\";"
+        );
+        let variable_start = line.find("oauth_token").unwrap();
+        let value_start = variable_start + "oauth_token=".len();
+        let value_end = line.find("\";").unwrap();
+        let candidate = Candidate {
+            start: value_start,
+            end: value_end,
+            value: &line[value_start..value_end],
+            variable_start: Some(variable_start),
+            variable_end: Some(variable_start + "oauth_token".len()),
+            variable: Some("oauth_token"),
+            separator: Some("="),
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        };
+        let sanitized = sanitize_value_capture(line, ".java", &candidate);
+        assert_eq!("vt2q56n7zhfksqaw", sanitized.value);
+        assert_eq!(value_start, sanitized.start);
+        assert_eq!(value_start + sanitized.value.len(), sanitized.end);
+
+        let url = concat!(
+            "https://example.invalid/file?",
+            "X-Amz-Credential=AKIACSVC3FV5KQHYWH8A%2F70855094%2Ffd-oiik-3",
+            "&X-Amz-Signature=f4ea32fa4c9b3ca9ba96027c87d844c6152097b95e3f479c47054bfac1ce367f",
+        );
+        let variable_start = url.find("X-Amz-Credential").unwrap();
+        let value_start = variable_start + "X-Amz-Credential=".len();
+        let candidate = Candidate {
+            start: value_start,
+            end: url.len(),
+            value: &url[value_start..],
+            variable_start: Some(variable_start),
+            variable_end: Some(variable_start + "X-Amz-Credential".len()),
+            variable: Some("X-Amz-Credential"),
+            separator: Some("="),
+            value_leftquote: None,
+            value_rightquote: None,
+            line_data: Vec::new(),
+        };
+        let sanitized = sanitize_value_capture(url, ".json", &candidate);
+        assert_eq!(
+            "AKIACSVC3FV5KQHYWH8A%2F70855094%2Ffd-oiik-3",
+            sanitized.value
+        );
     }
 
     #[test]

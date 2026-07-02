@@ -1,0 +1,187 @@
+diff --git a/credsweeper/__init__.py b/credsweeper/__init__.py
+index 1cedfcf..e339c82 100644
+--- a/credsweeper/__init__.py
++++ b/credsweeper/__init__.py
+@@ -1,14 +1,3 @@
+-from credsweeper.app import CredSweeper
+-from credsweeper.common.constants import ThresholdPreset, Severity, Confidence
+-from credsweeper.file_handler.byte_content_provider import ByteContentProvider
+-from credsweeper.file_handler.content_provider import ContentProvider
+-from credsweeper.file_handler.data_content_provider import DataContentProvider
+-from credsweeper.file_handler.diff_content_provider import DiffContentProvider
+-from credsweeper.file_handler.string_content_provider import StringContentProvider
+-from credsweeper.file_handler.text_content_provider import TextContentProvider
+-
+-from credsweeper.ml_model.ml_validator import MlValidator
+-
+ __all__ = [
+     "ByteContentProvider",  #
+     "Confidence",  #
+@@ -25,3 +14,35 @@ __all__ = [
+ ]
+ 
+ __version__ = "1.17.0"
++
++
++def __getattr__(name):
++    """Load public symbols lazily so submodule imports do not pull the full CLI stack."""
++    if name == "CredSweeper":
++        from credsweeper.app import CredSweeper
++        return CredSweeper
++    if name in {"ThresholdPreset", "Severity", "Confidence"}:
++        from credsweeper.common.constants import ThresholdPreset, Severity, Confidence
++        return {"ThresholdPreset": ThresholdPreset, "Severity": Severity, "Confidence": Confidence}[name]
++    if name == "ByteContentProvider":
++        from credsweeper.file_handler.byte_content_provider import ByteContentProvider
++        return ByteContentProvider
++    if name == "ContentProvider":
++        from credsweeper.file_handler.content_provider import ContentProvider
++        return ContentProvider
++    if name == "DataContentProvider":
++        from credsweeper.file_handler.data_content_provider import DataContentProvider
++        return DataContentProvider
++    if name == "DiffContentProvider":
++        from credsweeper.file_handler.diff_content_provider import DiffContentProvider
++        return DiffContentProvider
++    if name == "StringContentProvider":
++        from credsweeper.file_handler.string_content_provider import StringContentProvider
++        return StringContentProvider
++    if name == "TextContentProvider":
++        from credsweeper.file_handler.text_content_provider import TextContentProvider
++        return TextContentProvider
++    if name == "MlValidator":
++        from credsweeper.ml_model.ml_validator import MlValidator
++        return MlValidator
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+diff --git a/credsweeper/app.py b/credsweeper/app.py
+index 0bf5def..713efa5 100644
+--- a/credsweeper/app.py
++++ b/credsweeper/app.py
+@@ -8,8 +8,7 @@ from typing import Any, List, Optional, Union, Dict, Sequence, Tuple
+ import pandas as pd
+ from colorama import Style
+ 
+-# Directory of credsweeper sources MUST be placed before imports to avoid circular import error
+-APP_PATH = Path(__file__).resolve().parent
++from credsweeper.paths import APP_PATH
+ 
+ from credsweeper.scanner.scanner import Scanner
+ from credsweeper.common.constants import Severity, ThresholdPreset, DiffRowType, DEFAULT_ENCODING
+diff --git a/credsweeper/common/keyword_checklist.py b/credsweeper/common/keyword_checklist.py
+index 928f140..dd21e6e 100644
+--- a/credsweeper/common/keyword_checklist.py
++++ b/credsweeper/common/keyword_checklist.py
+@@ -1,7 +1,7 @@
+ from functools import cached_property
+ from typing import Set, List
+ 
+-from credsweeper.app import APP_PATH
++from credsweeper.paths import APP_PATH
+ 
+ 
+ class KeywordChecklist:
+diff --git a/credsweeper/logger/logger.py b/credsweeper/logger/logger.py
+index fad5815..1d51eda 100644
+--- a/credsweeper/logger/logger.py
++++ b/credsweeper/logger/logger.py
+@@ -3,7 +3,7 @@ import logging.config
+ from pathlib import Path
+ from typing import Optional
+ 
+-from credsweeper.app import APP_PATH
++from credsweeper.paths import APP_PATH
+ from credsweeper.utils.util import Util
+ 
+ 
+diff --git a/credsweeper/scanner/scanner.py b/credsweeper/scanner/scanner.py
+index c84e093..ea7f410 100644
+--- a/credsweeper/scanner/scanner.py
++++ b/credsweeper/scanner/scanner.py
+@@ -3,7 +3,7 @@ import re
+ from pathlib import Path
+ from typing import List, Type, Tuple, Union, Dict, Generator, Set
+ 
+-from credsweeper.app import APP_PATH
++from credsweeper.paths import APP_PATH
+ from credsweeper.common.constants import RuleType, MIN_VARIABLE_LENGTH, MIN_SEPARATOR_LENGTH, MIN_VALUE_LENGTH, \
+     MAX_LINE_LENGTH, PEM_BEGIN_PATTERN
+ from credsweeper.config.config import Config
+diff --git a/credsweeper/utils/util.py b/credsweeper/utils/util.py
+index 77b72b2..b110d99 100644
+--- a/credsweeper/utils/util.py
++++ b/credsweeper/utils/util.py
+@@ -1,3 +1,5 @@
++from __future__ import annotations
++
+ import ast
+ import base64
+ import contextlib
+@@ -14,20 +16,6 @@ from typing import Any, Dict, List, Tuple, Optional, Union
+ 
+ import numpy as np
+ import yaml
+-from cryptography.hazmat.primitives import hashes
+-from cryptography.hazmat.primitives.asymmetric import padding
+-from cryptography.hazmat.primitives.asymmetric.dh import DHPrivateKey, DHPublicKey
+-from cryptography.hazmat.primitives.asymmetric.dsa import DSAPrivateKey, DSAPublicKey
+-from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey, EllipticCurvePublicKey
+-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+-from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey, Ed448PublicKey
+-from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+-from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
+-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey, X25519PrivateKey
+-from cryptography.hazmat.primitives.asymmetric.x448 import X448PublicKey, X448PrivateKey
+-from cryptography.hazmat.primitives.serialization import load_der_private_key
+-from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
+-from lxml import etree
+ 
+ from credsweeper.common.constants import AVAILABLE_ENCODINGS, \
+     DEFAULT_ENCODING, LATIN_1, CHUNK_SIZE, MAX_LINE_LENGTH, CHUNK_STEP_SIZE, ASCII, UTF_16_LE, UTF_16_BE
+@@ -336,6 +324,8 @@ class Util:
+             xml exception
+ 
+         """
++        from lxml import etree
++
+         lines = []
+         line_nums = []
+         tree = etree.fromstringlist(xml_lines)
+@@ -434,6 +424,10 @@ class Util:
+     @staticmethod
+     def load_pk(data: bytes, password: Optional[bytes] = None) -> Optional[PrivateKeyTypes]:
+         """Try to load private key from PKCS1, PKCS8 and PKCS12 formats"""
++        from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
++        from cryptography.hazmat.primitives.serialization import load_der_private_key
++        from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
++
+         with contextlib.suppress(Exception):
+             # PKCS1, PKCS8 probes
+             private_key = load_der_private_key(data, password)
+@@ -449,6 +443,17 @@ class Util:
+     @staticmethod
+     def check_pk(pkey: PrivateKeyTypes) -> bool:
+         """Check private key with encrypt-decrypt random data"""
++        from cryptography.hazmat.primitives import hashes
++        from cryptography.hazmat.primitives.asymmetric import padding
++        from cryptography.hazmat.primitives.asymmetric.dh import DHPrivateKey, DHPublicKey
++        from cryptography.hazmat.primitives.asymmetric.dsa import DSAPrivateKey, DSAPublicKey
++        from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey, EllipticCurvePublicKey
++        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
++        from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey, Ed448PublicKey
++        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
++        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey, X25519PrivateKey
++        from cryptography.hazmat.primitives.asymmetric.x448 import X448PublicKey, X448PrivateKey
++
+         if not pkey or isinstance(pkey, (EllipticCurvePublicKey, DSAPublicKey, Ed448PublicKey, Ed25519PublicKey,
+                                          DHPublicKey, X448PublicKey, X25519PublicKey)):
+             # These aren't the keys we're looking for
+diff --git a/credsweeper/paths.py b/credsweeper/paths.py
+new file mode 100644
+index 0000000..4b30699
+--- /dev/null
++++ b/credsweeper/paths.py
+@@ -0,0 +1,4 @@
++from pathlib import Path
++
++
++APP_PATH = Path(__file__).resolve().parent
