@@ -19,6 +19,7 @@ tract-onnx = "0.23.3"
 simd-json = "0.17"
 regex = "1"
 memchr = "2"
+zerocopy = { version = "0.8.52", features = ["derive"] }
 sha2 = "0.10"
 sha3 = "0.10"
 hmac = "0.12"

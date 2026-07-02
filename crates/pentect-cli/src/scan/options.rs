@@ -6,7 +6,24 @@ pub(super) struct ScanOpts {
     pub(super) json: bool,
     pub(super) no_fail: bool,
     pub(super) gitignore: bool,
+    pub(super) binary: BinaryMode,
     pub(super) excludes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BinaryMode {
+    Skip,
+    Text,
+}
+
+impl BinaryMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "skip" => Ok(Self::Skip),
+            "text" => Ok(Self::Text),
+            _ => Err("binary must be skip or text".to_string()),
+        }
+    }
 }
 
 impl ScanOpts {
@@ -15,6 +32,7 @@ impl ScanOpts {
         let mut json = false;
         let mut no_fail = false;
         let mut gitignore = false;
+        let mut binary = BinaryMode::Skip;
         let mut excludes = Vec::new();
         let mut i = 2usize;
         while i < args.len() {
@@ -30,6 +48,11 @@ impl ScanOpts {
                 "--gitignore" => {
                     gitignore = true;
                     i += 1;
+                }
+                "--binary" => {
+                    let flag = args[i].clone();
+                    let value = required_value(args, &mut i, &flag)?;
+                    binary = BinaryMode::parse(&value)?;
                 }
                 "--exclude" => {
                     let flag = args[i].clone();
@@ -57,6 +80,7 @@ impl ScanOpts {
             json,
             no_fail,
             gitignore,
+            binary,
             excludes,
         })
     }

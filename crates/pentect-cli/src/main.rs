@@ -80,7 +80,7 @@ fn usage() {
          pentect bench credsweeper-parity RUST_JSON ORACLE_JSON\n\
          pentect extensions list|inspect|test [NAME]\n\
          pentect eval [--json]\n\
-         pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\
+         pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          pentect help\n\
@@ -113,14 +113,14 @@ fn help_text() -> &'static str {
         "  pentect bench credsweeper-parity RUST_JSON ORACLE_JSON [--json]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
         "  pentect eval [--json]\n\n",
-        "  pentect scan [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\n",
+        "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
         "dashboard: approval\n",
         "exec: masked stdout/stderr\n",
         "read: masked file preview\n",
         "view: handle metadata\n",
         "resolve: local materialize\n",
-        "scan: CredSweeper + core; narrow with --exclude, --gitignore, .pentectignore\n",
+        "scan: CredSweeper + core; binary skip|text; narrow with --exclude, --gitignore, .pentectignore\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness\n",
         "bench: creddata, parity\n",

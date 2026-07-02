@@ -1551,6 +1551,7 @@ dependencies = [
  "crossterm",
  "csv",
  "ignore",
+ "memchr",
  "pdf-extract",
  "pentect-core",
  "pentect-runtime",
@@ -1559,6 +1560,7 @@ dependencies = [
  "sha2",
  "toml",
  "windows-sys 0.61.2",
+ "zerocopy",
 ]
 
 [[package]]
