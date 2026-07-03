@@ -1172,6 +1172,7 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
 fn apply_child_env_overlays(command: &mut Command, env: &[(String, String)], session: &str) {
     command.env_remove(ENV_ADDR);
     command.env_remove(ENV_TOKEN);
+    command.env_remove(PENTECT_AGENT_LAUNCHED_ENV);
     apply_env_bindings(command, env);
     apply_pentect_session(command, session);
 }

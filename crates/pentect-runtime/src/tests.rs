@@ -114,6 +114,14 @@ fn child_env_overlays_strip_memory_vault_credentials() {
     );
     assert!(
         matches!(
+            envs.iter()
+                .find(|(name, _)| name == "PENTECT_AGENT_LAUNCHED"),
+            Some((_, None))
+        ),
+        "{envs:?}"
+    );
+    assert!(
+        matches!(
             envs.iter().find(|(name, _)| name == "PENTECT_SESSION"),
             Some((_, Some(value))) if value == "demo"
         ),

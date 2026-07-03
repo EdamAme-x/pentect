@@ -585,12 +585,12 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         return Err(blocked_headless_codex_error());
     }
     let active_extensions = agent_tool_extensions(opts)?;
-    let memory_vault = start_memory_vault(pentect)?;
     let mut cmd = Command::new(&opts.command);
+    apply_extension_env(&mut cmd, &active_extensions)?;
+    let memory_vault = start_memory_vault(pentect)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_vault.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
     apply_memory_vault_env(&mut cmd, Some(&memory_vault));
-    apply_extension_env(&mut cmd, &active_extensions);
     cmd.args(codex_args(&configs, &opts.tool_args));
     run_interactive_command(cmd, &opts.command)
 }
@@ -603,12 +603,12 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
         return Ok(success_status());
     }
     let active_extensions = agent_tool_extensions(opts)?;
-    let memory_vault = start_memory_vault(pentect)?;
     let mut cmd = Command::new(&opts.command);
+    apply_extension_env(&mut cmd, &active_extensions)?;
+    let memory_vault = start_memory_vault(pentect)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_vault.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
     apply_memory_vault_env(&mut cmd, Some(&memory_vault));
-    apply_extension_env(&mut cmd, &active_extensions);
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
 }
@@ -748,19 +748,17 @@ fn parse_memory_vault_startup(line: &str) -> Result<(String, String), String> {
     Ok((addr, token))
 }
 
-fn apply_extension_env(cmd: &mut Command, active: &extensions::ActiveExtensions) {
-    if let Some(value) = match active.pack_env_value() {
-        Ok(value) => value,
-        Err(e) => die(&e),
-    } {
+fn apply_extension_env(
+    cmd: &mut Command,
+    active: &extensions::ActiveExtensions,
+) -> Result<(), String> {
+    if let Some(value) = active.pack_env_value().map_err(|e| e.to_string())? {
         cmd.env(extensions::PACKS_ENV, value);
     }
-    if let Some(value) = match active.adapter_env_value() {
-        Ok(value) => value,
-        Err(e) => die(&e),
-    } {
+    if let Some(value) = active.adapter_env_value().map_err(|e| e.to_string())? {
         cmd.env(extensions::ADAPTERS_ENV, value);
     }
+    Ok(())
 }
 
 fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
