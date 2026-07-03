@@ -82,9 +82,9 @@ fn exec_parse_accepts_live_and_approve_without_env_flags() {
 }
 
 #[test]
-fn protected_child_env_does_not_inherit_memory_vault_credentials() {
+fn child_env_overlays_do_not_add_memory_vault_credentials() {
     let mut cmd = Command::new("echo");
-    apply_protected_child_env(&mut cmd, &[], "demo");
+    apply_child_env_overlays(&mut cmd, &[], "demo");
     let envs: Vec<_> = cmd
         .get_envs()
         .map(|(name, _)| name.to_string_lossy().to_string())
@@ -290,25 +290,43 @@ fn read_dotenv_masks_all_values() {
 
 #[test]
 fn exec_allows_secret_file_reads_because_output_is_remasked() {
-    guard_shell_script_with_env(r"Get-Content .\.env", &EnvPolicy::default()).unwrap();
-    guard_shell_script_with_env("cat .env | Select-String RUNPOD", &EnvPolicy::default()).unwrap();
-    guard_shell_script_with_env(
-        r#"python -c "open('.env').read()" # pentect read"#,
-        &EnvPolicy::default(),
+    let root = temp_root("secret-file-read");
+    let secret = root.join(".env");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        &secret,
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
     )
     .unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+    let command = if cfg!(windows) {
+        format!("Get-Content -LiteralPath '{}'", secret.display())
+    } else {
+        format!("cat '{}'", secret.display())
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        approve: false,
+        mode: ExecMode::Shell(command),
+    };
+    let output = run_resolved_command(&store, &opts).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+        "{stdout}"
+    );
+    let masked = mask_tool_output(&session, &stdout).unwrap();
+    assert!(
+        !masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+        "{masked}"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn exec_registers_referenced_local_files_as_env_capabilities() {
-    guard_shell_script_with_env(
-        "tool --config secrets.json >/dev/null",
-        &EnvPolicy::default(),
-    )
-    .unwrap();
-    guard_shell_script_with_env("curl -H @headers.txt example.test", &EnvPolicy::default())
-        .unwrap();
-
     let root = temp_root("referenced-file-registers");
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -536,65 +554,24 @@ fn always_fingerprint_includes_capability_value_identity() {
 }
 
 #[test]
-fn exec_policy_blocks_environment_reads() {
-    let err = guard_shell_script_with_env("Get-ChildItem Env:", &EnvPolicy::default()).unwrap_err();
-    assert!(err.contains("environment variables"), "{err}");
-
-    let err =
-        guard_shell_script_with_env("printenv RUNPOD_API_KEY", &EnvPolicy::default()).unwrap_err();
-    assert!(err.contains("environment variables"), "{err}");
-
-    let err =
-        guard_shell_script_with_env("echo $RUNPOD_API_KEY", &EnvPolicy::default()).unwrap_err();
-    assert!(err.contains("environment variables"), "{err}");
-
-    let err = guard_shell_script_with_env("Write-Output %RUNPOD_API_KEY%", &EnvPolicy::default())
-        .unwrap_err();
-    assert!(err.contains("environment variables"), "{err}");
-}
-
-#[test]
-fn exec_policy_allows_auto_bound_environment_reads_only() {
-    let allowed = env_policy(&["RUNPOD_API_KEY"]);
-    guard_shell_script_with_env("printenv RUNPOD_API_KEY", &allowed).unwrap();
-    guard_shell_script_with_env("echo $RUNPOD_API_KEY", &allowed).unwrap();
-    guard_shell_script_with_env("Write-Output $env:RUNPOD_API_KEY", &allowed).unwrap();
-
-    let err = guard_shell_script_with_env("Write-Output $env:AWS_SECRET_ACCESS_KEY", &allowed)
-        .unwrap_err();
-    assert!(err.contains("environment variables"), "{err}");
-}
-
-#[test]
-fn exec_policy_does_not_block_regular_shell_state_changes() {
-    guard_shell_script_with_env("export PATH=/tmp:$PATH", &EnvPolicy::default()).unwrap();
-    guard_shell_script_with_env("Set-Content note.txt hello", &EnvPolicy::default()).unwrap();
-    guard_shell_script_with_env("echo $AUTHOR", &EnvPolicy::default()).unwrap();
-    guard_shell_script_with_env("Write-Output %USERNAME%", &EnvPolicy::default()).unwrap();
-    guard_shell_script_with_env("$key = 'name'; Write-Output $key", &EnvPolicy::default()).unwrap();
-}
-
-#[test]
-fn exec_does_not_inherit_parent_environment() {
-    let root = temp_root("env-clear");
+fn exec_inherits_parent_environment_and_masks_output() {
+    let root = temp_root("env-pass-through");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let store = RecoveryStore::load(&session).unwrap();
     let var = format!("PENTECT_PARENT_CANARY_{}", unix_millis());
-    let value = "rpa_SHOULD_NOT_LEAK_FROM_PARENT_ENV_1234567890abcdef";
+    let value = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
     std::env::set_var(&var, value);
     let mode = if cfg!(windows) {
         ExecMode::Program(vec![
             "cmd.exe".to_string(),
             "/C".to_string(),
-            format!("if defined {var} (echo %{var}%) else (echo missing)"),
+            format!("echo RUNPOD_API_KEY=%{var}%"),
         ])
     } else {
         ExecMode::Program(vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!(
-                "if [ -z \"${{{var}}}\" ]; then printf missing; else printf '%s' \"${{{var}}}\"; fi"
-            ),
+            format!("printf 'RUNPOD_API_KEY=%s' \"${{{var}}}\""),
         ])
     };
     let opts = ExecOpts {
@@ -607,8 +584,38 @@ fn exec_does_not_inherit_parent_environment() {
     std::env::remove_var(&var);
     let output = output.unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("missing"), "{stdout}");
-    assert!(!stdout.contains(value), "{stdout}");
+    assert!(stdout.contains(value), "{stdout}");
+    let masked = mask_tool_output(&session, &stdout).unwrap();
+    assert!(!masked.contains(value), "{masked}");
+    assert!(masked.contains("RUNPOD_API_KEY=<<"), "{masked}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_capability_env_overlays_parent_environment_when_referenced() {
+    let root = temp_root("env-overlay");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let value = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let _masked = mask_tool_output(&session, &format!("RUNPOD_API_KEY={value}\n")).unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+    std::env::set_var("RUNPOD_API_KEY", "parent-value");
+    let mode = if cfg!(windows) {
+        ExecMode::Shell("Write-Output $env:RUNPOD_API_KEY".to_string())
+    } else {
+        ExecMode::Shell("printf '%s' \"$RUNPOD_API_KEY\"".to_string())
+    };
+    let opts = ExecOpts {
+        session: DEFAULT_SESSION.to_string(),
+        live: false,
+        approve: false,
+        mode,
+    };
+    let output = run_resolved_command(&store, &opts);
+    std::env::remove_var("RUNPOD_API_KEY");
+    let output = output.unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(value), "{stdout}");
+    assert!(!stdout.contains("parent-value"), "{stdout}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2333,15 +2340,6 @@ fn temp_root(name: &str) -> PathBuf {
 
 fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {
     items.into_iter().map(str::to_string).collect()
-}
-
-fn env_policy(allowed: &[&str]) -> EnvPolicy {
-    EnvPolicy {
-        allowed: allowed
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect(),
-    }
 }
 
 fn masked_handle_from_assignment(masked: &str, key: &str) -> String {

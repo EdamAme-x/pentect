@@ -21,7 +21,7 @@ use approve_ui::{ApprovalDecision, ApprovalRequest};
 use config::{approval_bypassed_by_config, approval_config_state};
 use masking::{
     contains_unresolved_masked_handle, env_alias_recovery, is_ascii_word_char, is_env_name_byte,
-    is_sensitive_env_name, live_output_kind, OutputMasker, ToolScalarInput,
+    live_output_kind, OutputMasker, ToolScalarInput,
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
@@ -349,7 +349,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         Err(e) => return die(&e),
     };
     if opts.approve {
-        match request_approval(&store, &opts, &approval, false) {
+        match request_approval(&opts, &approval, false) {
             Ok(ApprovalDecision::Once) => {}
             Ok(ApprovalDecision::Always) => {
                 if let Err(e) = ApprovalQueue::open(&opts.session).and_then(|queue| {
@@ -582,7 +582,7 @@ fn cmd_approve(args: &[String]) -> i32 {
         Ok(approval) => approval,
         Err(e) => return die(&e),
     };
-    match request_approval(&store, &opts, &approval, true) {
+    match request_approval(&opts, &approval, true) {
         Ok(ApprovalDecision::Once) => 0,
         Ok(ApprovalDecision::Always) => match ApprovalQueue::open(&opts.session)
             .and_then(|queue| queue.record(&approval.ticket(), ApprovalDecision::Always, "local"))
@@ -622,7 +622,6 @@ fn cmd_vault(args: &[String]) -> i32 {
 }
 
 fn request_approval(
-    store: &RecoveryStore,
     opts: &ExecOpts,
     approval: &ExecApproval,
     preview: bool,
@@ -640,37 +639,13 @@ fn request_approval(
         approve_label: "once".to_string(),
         deny_label: "decline".to_string(),
         allow_always: true,
-        warnings: approval_warnings(store, opts, approval)?,
+        warnings: approval_warnings(opts, approval),
     };
     approve_ui::run(&request).map_err(|e| e.to_string())
 }
 
-fn approval_warnings(
-    store: &RecoveryStore,
-    opts: &ExecOpts,
-    approval: &ExecApproval,
-) -> Result<Vec<String>, String> {
+fn approval_warnings(opts: &ExecOpts, approval: &ExecApproval) -> Vec<String> {
     let mut warnings = Vec::new();
-    let env = requested_env_bindings(store, &opts.mode)?;
-    let policy = exec_env_policy(&env);
-    let guard = match &opts.mode {
-        ExecMode::Program(args) => {
-            let resolved_args = resolve_command_args(store, args)?;
-            let program = resolved_args
-                .first()
-                .map(String::as_str)
-                .unwrap_or_default();
-            guard_program_invocation_with_env(program, &resolved_args[1..], &policy)
-        }
-        ExecMode::Shell(_) => {
-            let command = resolve_command_text(store, &approval.command)?;
-            guard_shell_script_with_env(&command, &policy)
-        }
-        ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
-    };
-    if let Err(reason) = guard {
-        warnings.push(reason);
-    }
     if opts.live {
         warnings.push("live output is masked in chunks".to_string());
     }
@@ -683,7 +658,7 @@ fn approval_warnings(
     if approval.materialize_like && approval.requires_approval() {
         warnings.push("this command may write approved capabilities to local files".to_string());
     }
-    Ok(warnings)
+    warnings
 }
 
 fn approval_decision_for_exec(
@@ -1111,14 +1086,12 @@ fn run_resolved_command(
                 return Err("exec requires a program after `--`".to_string());
             }
             let env = requested_env_bindings(store, &opts.mode)?;
-            let env_policy = exec_env_policy(&env);
             let resolved_args = resolve_command_args(store, args)?;
             let program = &resolved_args[0];
             let command_args = &resolved_args[1..];
-            guard_program_invocation_with_env(program, command_args, &env_policy)?;
             let mut command = Command::new(program);
             command.args(command_args);
-            apply_protected_child_env(&mut command, &env, &opts.session);
+            apply_child_env_overlays(&mut command, &env, &opts.session);
             command
                 .output()
                 .map_err(|e| format!("could not execute command: {e}"))
@@ -1127,8 +1100,6 @@ fn run_resolved_command(
             let command = resolve_command_text(store, command)?;
             register_local_file_inputs(store, &command)?;
             let env = requested_env_bindings(store, &opts.mode)?;
-            let env_policy = exec_env_policy(&env);
-            guard_shell_script_with_env(&command, &env_policy)?;
             run_shell_script(&command, &env, &opts.session)
         }
         ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
@@ -1142,24 +1113,20 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
                 return Err("exec requires a program after `--`".to_string());
             }
             let env = requested_env_bindings(store, &opts.mode)?;
-            let env_policy = exec_env_policy(&env);
             let resolved_args = resolve_command_args(store, args)?;
             let program = &resolved_args[0];
             let command_args = &resolved_args[1..];
-            guard_program_invocation_with_env(program, command_args, &env_policy)?;
             let mut command = Command::new(program);
             command.args(command_args);
-            apply_protected_child_env(&mut command, &env, &opts.session);
+            apply_child_env_overlays(&mut command, &env, &opts.session);
             run_live_command(command, None, store.clone())
         }
         ExecMode::Shell(command) => {
             let command = resolve_command_text(store, command)?;
             register_local_file_inputs(store, &command)?;
             let env = requested_env_bindings(store, &opts.mode)?;
-            let env_policy = exec_env_policy(&env);
-            guard_shell_script_with_env(&command, &env_policy)?;
             let mut shell = shell_script_command();
-            apply_protected_child_env(&mut shell, &env, &opts.session);
+            apply_child_env_overlays(&mut shell, &env, &opts.session);
             run_live_command(shell, Some(&command), store.clone())
         }
         ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
@@ -1201,52 +1168,9 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
     Ok(())
 }
 
-fn apply_protected_child_env(command: &mut Command, env: &[(String, String)], session: &str) {
-    command.env_clear();
-    apply_safe_parent_env(command);
+fn apply_child_env_overlays(command: &mut Command, env: &[(String, String)], session: &str) {
     apply_env_bindings(command, env);
     apply_pentect_session(command, session);
-}
-
-fn apply_safe_parent_env(command: &mut Command) {
-    for name in safe_parent_env_names() {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-}
-
-fn safe_parent_env_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &[
-            "Path",
-            "PATH",
-            "PATHEXT",
-            "SystemRoot",
-            "SYSTEMROOT",
-            "WINDIR",
-            "COMSPEC",
-            "TEMP",
-            "TMP",
-            "USERPROFILE",
-            "PENTECT_BIN",
-            "PENTECT_HOME",
-            "PENTECT_SESSION",
-        ]
-    } else {
-        &[
-            "PATH",
-            "HOME",
-            "SHELL",
-            "TERM",
-            "LANG",
-            "LC_ALL",
-            "TMPDIR",
-            "PENTECT_BIN",
-            "PENTECT_HOME",
-            "PENTECT_SESSION",
-        ]
-    }
 }
 
 fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
@@ -1257,34 +1181,6 @@ fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
 
 fn apply_pentect_session(command: &mut Command, session: &str) {
     command.env("PENTECT_SESSION", session);
-}
-
-#[derive(Debug, Default)]
-struct EnvPolicy {
-    allowed: Vec<String>,
-}
-
-impl EnvPolicy {
-    fn allows_direct_read(&self, name: &str) -> bool {
-        self.is_allowed(name)
-    }
-
-    fn blocks_shell_var_read(&self, name: &str) -> bool {
-        is_sensitive_env_name(name) && !self.is_allowed(name)
-    }
-
-    fn is_allowed(&self, name: &str) -> bool {
-        let normalized = name.to_ascii_lowercase();
-        self.allowed.iter().any(|allowed| allowed == &normalized)
-    }
-}
-
-fn exec_env_policy(env: &[(String, String)]) -> EnvPolicy {
-    let mut allowed = Vec::new();
-    for (name, _) in env {
-        push_unique_env_name(&mut allowed, name);
-    }
-    EnvPolicy { allowed }
 }
 
 fn requested_env_bindings(
@@ -1414,44 +1310,6 @@ fn collect_printenv_refs(text: &str, out: &mut BTreeSet<String>) {
     }
 }
 
-fn push_unique_env_name(names: &mut Vec<String>, name: &str) {
-    let normalized = name.to_ascii_lowercase();
-    if !names.iter().any(|existing| existing == &normalized) {
-        names.push(normalized);
-    }
-}
-
-fn guard_program_invocation_with_env(
-    program: &str,
-    args: &[String],
-    env_policy: &EnvPolicy,
-) -> Result<(), String> {
-    let mut text = String::from(program);
-    for arg in args {
-        text.push(' ');
-        text.push_str(arg);
-    }
-    guard_sensitive_source_access_with_env(&text, env_policy)
-}
-
-fn guard_shell_script_with_env(script: &str, env_policy: &EnvPolicy) -> Result<(), String> {
-    guard_sensitive_source_access_with_env(script, env_policy)
-}
-
-fn guard_sensitive_source_access_with_env(
-    text: &str,
-    env_policy: &EnvPolicy,
-) -> Result<(), String> {
-    let normalized = normalize_policy_text(text);
-    if contains_env_read_reference(&normalized, env_policy) {
-        return Err(
-            "Pentect only exposes environment variables that came from prior masked output. Run the source command through `pentect exec`; if it prints `KEY=<<...>>`, use `$env:KEY` on PowerShell or `$KEY` on Unix in later `pentect exec` commands."
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
 fn register_local_file_inputs(store: &RecoveryStore, script: &str) -> Result<(), String> {
     let paths = local_file_input_paths(script);
     if paths.is_empty() {
@@ -1542,7 +1400,7 @@ fn run_shell_script(
     session: &str,
 ) -> Result<std::process::Output, String> {
     let mut command = shell_script_command();
-    apply_protected_child_env(&mut command, env, session);
+    apply_child_env_overlays(&mut command, env, session);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3164,93 +3022,12 @@ fn normalize_policy_text(text: &str) -> String {
     text.to_ascii_lowercase().replace('\\', "/")
 }
 
-fn contains_env_read_reference(normalized: &str, env_policy: &EnvPolicy) -> bool {
-    has_disallowed_powershell_env_ref(normalized, env_policy)
-        || normalized.contains(" env:")
-        || normalized.starts_with("env:")
-        || normalized.contains("[environment]::getenvironmentvariable")
-        || normalized.contains("[environment]::getenvironmentvariables")
-        || has_disallowed_printenv_reference(normalized, env_policy)
-        || references_sensitive_env_name(normalized, env_policy)
-}
-
-fn has_disallowed_powershell_env_ref(normalized: &str, env_policy: &EnvPolicy) -> bool {
-    let mut offset = 0usize;
-    while let Some(index) = normalized[offset..].find("$env:") {
-        let name_start = offset + index + "$env:".len();
-        let mut name_end = name_start;
-        let bytes = normalized.as_bytes();
-        while name_end < bytes.len() && is_env_name_byte(bytes[name_end]) {
-            name_end += 1;
-        }
-        if name_end == name_start {
-            return true;
-        }
-        if !env_policy.allows_direct_read(&normalized[name_start..name_end]) {
-            return true;
-        }
-        offset = name_end;
-    }
-    false
-}
-
-fn has_disallowed_printenv_reference(normalized: &str, env_policy: &EnvPolicy) -> bool {
-    let mut offset = 0usize;
-    while let Some(index) = normalized[offset..].find("printenv") {
-        let word_start = offset + index;
-        let word_end = word_start + "printenv".len();
-        let before = normalized[..word_start].chars().next_back();
-        let after = normalized[word_end..].chars().next();
-        if !is_ascii_word_char(before) && !is_ascii_word_char(after) {
-            let mut cursor = word_end;
-            let mut saw_name = false;
-            while let Some((word, _, next)) = next_shell_word(normalized, cursor) {
-                if is_shell_separator_word(&word) {
-                    break;
-                }
-                if word.starts_with('-') || !looks_like_env_name(&word) {
-                    return true;
-                }
-                saw_name = true;
-                if !env_policy.allows_direct_read(&word) {
-                    return true;
-                }
-                cursor = next;
-            }
-            if !saw_name {
-                return true;
-            }
-        }
-        offset = word_end;
-    }
-    false
-}
-
 fn is_shell_separator_word(word: &str) -> bool {
     matches!(word, "|" | ";" | "&&" | "||") || word.starts_with('<') || word.starts_with('>')
 }
 
 fn looks_like_env_name(name: &str) -> bool {
     !name.is_empty() && !name.as_bytes()[0].is_ascii_digit() && name.bytes().all(is_env_name_byte)
-}
-
-fn references_sensitive_env_name(normalized: &str, env_policy: &EnvPolicy) -> bool {
-    let bytes = normalized.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let marker = bytes[i] as char;
-        if marker == '$' || marker == '%' {
-            if let Some((name, next)) = env_name_after_marker(normalized, i + 1, marker) {
-                if env_policy.blocks_shell_var_read(name) {
-                    return true;
-                }
-                i = next;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    false
 }
 
 fn env_name_after_marker(text: &str, start: usize, marker: char) -> Option<(&str, usize)> {
