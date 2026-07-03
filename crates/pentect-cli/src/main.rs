@@ -27,9 +27,9 @@ pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
-    "- Use normal shell commands. Pentect hooks route stdout/stderr and tool results through masking.\n",
+    "- Use normal shell commands. Pentect hooks implicitly route stdout/stderr through `pentect exec \"<command>\"` and mask tool results.\n",
     "- You may read, fetch, transform, store, sync, and use user-authorized secrets. Pentect is the safety layer; raw secret values must not reach chat.\n",
-    "- Prefer one shell/Pentect command for secret work, e.g. `cat .env`, `pentect read .env`, service CLIs, or a command that reads a source and writes the exact requested destination.\n",
+    "- Prefer one normal shell command for secret work, e.g. `cat .env`, service CLIs, or a command that reads a source and writes the exact requested destination.\n",
     "- Masked handles like `<<NAME_hash>>` are in-memory capabilities for this running Pentect-launched session. Use `$env:NAME`/`$env:PENTECT_NAME_hash` on PowerShell or `$NAME`/`$PENTECT_NAME_hash` on Unix.\n",
     "- `pentect view '<handle>'` shows only label, hash, and length. Use handles/env capabilities instead of re-reading or printing raw values.\n",
     "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:NAME`; on Unix use POSIX commands and `$NAME`.\n",
@@ -98,7 +98,6 @@ fn help_text() -> &'static str {
         "  pentect\n",
         "  pentect --port 7331\n",
         "  pentect codex|claude [--extensions NAME|PATH.toml]\n",
-        "  pentect agent exec \"<command>\"\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect doctor [--json]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
@@ -909,7 +908,6 @@ fn claude_settings_json(agent: &Path, session: Option<&str>) -> String {
 
 fn hook_command_unix(_agent: &Path, provider: &str, session: Option<&str>) -> String {
     let mut words = vec![
-        "agent".to_string(),
         "hook".to_string(),
         "--cli".to_string(),
         provider.to_string(),
@@ -931,7 +929,6 @@ fn hook_command_unix(_agent: &Path, provider: &str, session: Option<&str>) -> St
 
 fn hook_command_windows(_agent: &Path, provider: &str, session: Option<&str>) -> String {
     let mut words = vec![
-        "agent".to_string(),
         "hook".to_string(),
         "--cli".to_string(),
         provider.to_string(),
@@ -955,7 +952,6 @@ fn hook_words(agent: &Path, provider: &str, session: Option<&str>) -> Vec<String
     let agent = agent_command_path(agent);
     let mut words = vec![
         agent.to_string_lossy().into_owned(),
-        "agent".to_string(),
         "hook".to_string(),
         "--cli".to_string(),
         provider.to_string(),
@@ -1432,6 +1428,7 @@ mod tests {
     fn help_text_is_compact() {
         let help = help_text();
         assert!(help.contains("pentect exec"), "{help}");
+        assert!(!help.contains("agent exec"), "{help}");
         assert!(!help.contains("bench"), "{help}");
         assert!(help.contains("doctor: readiness"), "{help}");
         assert!(help.contains("extensions: list, inspect, test"), "{help}");
@@ -1451,14 +1448,13 @@ mod tests {
     }
 
     #[test]
-    fn hook_words_use_pentect_agent_subcommand() {
+    fn hook_words_use_pentect_hook_subcommand() {
         let pentect = absolute_pentect_fixture_path();
         let words = hook_words(&pentect, "codex", Some("demo"));
         assert_eq!(words[0], pentect.to_string_lossy().as_ref());
         assert_eq!(
             words[1..].to_vec(),
             vec![
-                "agent".to_string(),
                 "hook".to_string(),
                 "--cli".to_string(),
                 "codex".to_string(),
@@ -1491,12 +1487,7 @@ mod tests {
         assert_eq!(words[0], pentect.to_string_lossy().as_ref());
         assert_eq!(
             words[1..].to_vec(),
-            vec![
-                "agent".to_string(),
-                "hook".to_string(),
-                "--cli".to_string(),
-                "codex".to_string()
-            ]
+            vec!["hook".to_string(), "--cli".to_string(), "codex".to_string()]
         );
     }
 
@@ -1528,7 +1519,11 @@ mod tests {
         assert!(rendered.contains("developer_instructions="), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
         assert!(rendered.contains("Use normal shell commands"), "{rendered}");
-        assert!(rendered.contains("route stdout/stderr"), "{rendered}");
+        assert!(
+            rendered.contains("implicitly route stdout/stderr"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("pentect exec"), "{rendered}");
         assert!(rendered.contains("tool results"), "{rendered}");
         assert!(rendered.contains("Masked handles"), "{rendered}");
         assert!(rendered.contains("$env:NAME"), "{rendered}");
@@ -1539,7 +1534,7 @@ mod tests {
         );
         assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(rendered.contains("pentect view"), "{rendered}");
-        assert!(rendered.contains("pentect read"), "{rendered}");
+        assert!(!rendered.contains("pentect read"), "{rendered}");
         assert!(rendered.contains("PowerShell"), "{rendered}");
         assert!(rendered.contains("Browser/MCP/connector"), "{rendered}");
         assert!(rendered.contains("storage/materialization"), "{rendered}");
@@ -1567,7 +1562,11 @@ mod tests {
         assert!(rendered.contains("--append-system-prompt"), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
         assert!(rendered.contains("Use normal shell commands"), "{rendered}");
-        assert!(rendered.contains("route stdout/stderr"), "{rendered}");
+        assert!(
+            rendered.contains("implicitly route stdout/stderr"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("pentect exec"), "{rendered}");
         assert!(rendered.contains("tool results"), "{rendered}");
         assert!(rendered.contains("$env:NAME"), "{rendered}");
         assert!(rendered.contains("user-authorized secrets"), "{rendered}");
@@ -1577,7 +1576,7 @@ mod tests {
         );
         assert!(rendered.contains("PENTECT_"), "{rendered}");
         assert!(rendered.contains("pentect view"), "{rendered}");
-        assert!(rendered.contains("pentect read"), "{rendered}");
+        assert!(!rendered.contains("pentect read"), "{rendered}");
         assert!(rendered.contains("PowerShell"), "{rendered}");
         assert!(rendered.contains("Browser/MCP/connector"), "{rendered}");
         assert!(rendered.contains("storage/materialization"), "{rendered}");

@@ -1923,7 +1923,7 @@ fn pretool_canonicalizes_pentect_exec_shell_commands() {
 }
 
 #[test]
-fn pretool_preserves_powershell_sensitive_regex_pipe_via_stdin_wrapper() {
+fn pretool_preserves_powershell_sensitive_regex_pipe_in_visible_exec() {
     let (root, session) = empty_session("hook-pre-powershell-regex-pipe");
     let input = json!({
         "hook_event_name": "PreToolUse",
@@ -1940,20 +1940,16 @@ fn pretool_preserves_powershell_sensitive_regex_pipe_via_stdin_wrapper() {
         command.contains("TOKEN_ALPHA|TOKEN_BETA|TOKEN_GAMMA"),
         "{command}"
     );
-    if cfg!(windows) {
-        assert!(command.contains("--stdin"), "{command}");
-        assert!(command.starts_with("$p=$env:PENTECT_BIN"), "{command}");
-        assert!(command.contains("\n@'\n"), "{command}");
-        assert!(
-            !command.contains("'rg -n \"TOKEN_ALPHA|TOKEN_BETA|TOKEN_GAMMA\" -S .'"),
-            "{command}"
-        );
-    }
+    assert!(command.starts_with("pentect exec "), "{command}");
+    assert!(!command.contains("agent exec"), "{command}");
+    assert!(!command.contains("--stdin"), "{command}");
+    assert!(!command.contains("$env:PENTECT_BIN"), "{command}");
+    assert!(!command.contains("\n@'\n"), "{command}");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn pretool_uses_base64_script_wrapper_for_non_ascii_powershell_payloads() {
+fn pretool_keeps_non_ascii_payloads_readable_in_visible_exec() {
     let (root, session) = empty_session("hook-pre-powershell-unicode");
     let input = json!({
         "hook_event_name": "PreToolUse",
@@ -1966,12 +1962,11 @@ fn pretool_uses_base64_script_wrapper_for_non_ascii_powershell_payloads() {
     let command = output["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .unwrap();
-    if cfg!(windows) {
-        assert!(command.contains("--script-b64"), "{command}");
-        assert!(!command.contains("--stdin --script-b64"), "{command}");
-        assert!(!command.contains("日本語"), "{command}");
-        assert!(!command.contains("@'\n"), "{command}");
-    }
+    assert!(command.starts_with("pentect exec "), "{command}");
+    assert!(command.contains("日本語|OK"), "{command}");
+    assert!(!command.contains("--script-b64"), "{command}");
+    assert!(!command.contains("--stdin"), "{command}");
+    assert!(!command.contains("@'\n"), "{command}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2029,49 +2024,18 @@ fn implicit_directory_session_is_not_rendered_in_wrapped_command() {
 }
 
 #[test]
-fn powershell_memory_script_command_hides_script_body_and_agent_path() {
-    let command = powershell_agent_env_command(&[
-        "agent".to_string(),
-        "exec".to_string(),
-        "--script-handle".to_string(),
-        "abcdef123456".to_string(),
-    ]);
-    assert!(command.contains("$env:PENTECT_BIN"), "{command}");
-    assert!(command.contains("--script-handle"), "{command}");
-    assert!(!command.contains("C:\\Users"), "{command}");
-    assert!(!command.contains("Get-Content"), "{command}");
-}
+fn visible_exec_wrapper_is_short_and_user_facing() {
+    let command = wrap_shell_command(HookProvider::Codex, DEFAULT_SESSION, "cat .env").unwrap();
+    assert_eq!(command, "pentect exec 'cat .env'");
+    assert!(!command.contains("agent exec"), "{command}");
+    assert!(!command.contains("PENTECT_BIN"), "{command}");
+    assert!(!command.contains("--stdin"), "{command}");
 
-#[test]
-fn powershell_stdin_wrapper_uses_env_launcher_not_exe_path() {
-    let command = powershell_stdin_exec_command(
-        &[
-            "agent".to_string(),
-            "exec".to_string(),
-            "--stdin".to_string(),
-        ],
-        "Get-Content -LiteralPath .env",
-    );
-    assert!(command.contains("$env:PENTECT_BIN"), "{command}");
-    assert!(command.contains("}\n@'"), "{command}");
-    assert!(command.contains("agent exec --stdin"), "{command}");
-    assert!(!command.contains("| $p="), "{command}");
-    assert!(!command.contains("C:\\Users"), "{command}");
-}
-
-#[test]
-fn unix_wrapper_uses_env_launcher_not_exe_path() {
-    let command = shell_agent_env_command(&[
-        "agent".to_string(),
-        "exec".to_string(),
-        "cat .env".to_string(),
-    ]);
-    assert!(
-        command.starts_with("${PENTECT_BIN:-pentect} agent exec"),
-        "{command}"
-    );
-    assert!(command.contains("'cat .env'"), "{command}");
-    assert!(!command.contains("/Users/"), "{command}");
+    let command = wrap_shell_command(HookProvider::Codex, DEFAULT_SESSION, "--version").unwrap();
+    assert_eq!(command, "pentect exec ' --version'");
+    let args = strings(["pentect", "exec", " --version"]);
+    let opts = ExecOpts::parse(&args).unwrap();
+    assert!(matches!(opts.mode, ExecMode::Shell(command) if command == " --version"));
 }
 
 #[test]
