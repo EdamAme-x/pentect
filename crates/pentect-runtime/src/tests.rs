@@ -2326,6 +2326,33 @@ fn pretool_blocks_read_many_when_any_file_needs_masking() {
 }
 
 #[test]
+fn pretool_allows_read_many_when_all_files_are_clean() {
+    let (root, session) = empty_session("hook-pre-read-many-clean");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-read-many-clean-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let first = project.join("README.txt");
+    let second = project.join("notes.txt");
+    std::fs::write(&first, "Settings\n").unwrap();
+    std::fs::write(&second, "No credentials here.\n").unwrap();
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "ReadManyFiles",
+        "tool_input": {
+            "paths": [first.to_string_lossy(), second.to_string_lossy()]
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn pretool_canonicalizes_quoted_pentect_exec_shell_command() {
     let (root, session) = empty_session("hook-pre-exec");
     let input = json!({

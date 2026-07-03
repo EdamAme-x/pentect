@@ -2240,13 +2240,10 @@ fn validate_read_before_tool(
 
 fn read_tool_has_detected_secret(session: &Session, tool_input: &Value) -> Result<bool, String> {
     for path in read_tool_paths(tool_input) {
-        if path == "-" {
-            continue;
-        }
         let path = Path::new(path);
-        let Ok(data) = read_input(path, InputFormat::Text) else {
-            continue;
-        };
+        let data = read_input(path, InputFormat::Text).map_err(|_| {
+            "read target could not be scanned; use `pentect read PATH`.".to_string()
+        })?;
         let result = Engine::with_profile(Profile::Strict).mask(
             Input {
                 kind: infer_kind(path),
