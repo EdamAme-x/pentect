@@ -1116,6 +1116,66 @@ fn generic_posttool_masks_payload_alias() {
 }
 
 #[test]
+fn posttool_blocks_image_output_until_media_adapter_exists() {
+    let (root, session) = empty_session("hook-post-image-block");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__chrome__screenshot",
+        "tool_response": {
+            "content": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+            }]
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output["decision"], "block");
+    let reason = output["reason"].as_str().unwrap();
+    assert!(reason.contains("non-text media"), "{reason}");
+    assert!(reason.contains("OCR"), "{reason}");
+    assert!(output.get("hookSpecificOutput").is_none(), "{output}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn posttool_blocks_data_uri_media_output() {
+    let (root, session) = empty_session("hook-post-media-uri-block");
+    let input = json!({
+        "hookEventName": "PostToolUse",
+        "toolName": "connector__browser__capture",
+        "toolResponse": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+        }
+    });
+    let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
+    assert_eq!(output["decision"], "block");
+    let reason = output["reason"].as_str().unwrap();
+    assert!(reason.contains("media"), "{reason}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn posttool_blocks_clipboard_and_download_side_effect_outputs() {
+    let (root, session) = empty_session("hook-post-side-effect-block");
+    for response in [
+        json!({"clipboardText": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"}),
+        json!({"downloadPath": "C:\\Users\\demo\\Downloads\\secret.txt"}),
+    ] {
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "connector__browser",
+            "tool_response": response
+        });
+        let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+        assert_eq!(output["decision"], "block", "{output}");
+        let reason = output["reason"].as_str().unwrap();
+        assert!(reason.contains("clipboard/download"), "{reason}");
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
     let (root, session) = empty_session("hook-post-mcp-env-use");
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
