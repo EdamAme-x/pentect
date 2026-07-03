@@ -2235,10 +2235,17 @@ fn before_tool_updated_input_lazy(
 }
 
 fn ensure_pentect_agent_launch(provider: HookProvider) -> Result<(), String> {
-    if !config::require_pentect_agent_by_config()? {
+    ensure_pentect_agent_launch_required(provider, config::require_pentect_agent_by_config()?)
+}
+
+fn ensure_pentect_agent_launch_required(
+    provider: HookProvider,
+    required: bool,
+) -> Result<(), String> {
+    if !required {
         return Ok(());
     }
-    if agent_env_bool(PENTECT_AGENT_LAUNCHED_ENV) {
+    if agent_launch_proof_valid() {
         return Ok(());
     }
     Err(format!(
@@ -2247,13 +2254,18 @@ fn ensure_pentect_agent_launch(provider: HookProvider) -> Result<(), String> {
     ))
 }
 
-fn agent_env_bool(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn agent_launch_proof_valid() -> bool {
+    let Ok(proof) = std::env::var(PENTECT_AGENT_LAUNCHED_ENV) else {
+        return false;
+    };
+    let Ok(token) = std::env::var(ENV_TOKEN) else {
+        return false;
+    };
+    agent_launch_proof_matches(&proof, &token)
+}
+
+fn agent_launch_proof_matches(proof: &str, token: &str) -> bool {
+    token.len() >= 32 && proof == token
 }
 
 fn canonical_hook_shell_command(command: &str) -> Result<String, String> {

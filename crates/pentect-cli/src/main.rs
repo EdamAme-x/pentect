@@ -585,7 +585,11 @@ fn run_codex(
         Err(e) => die(&e),
     };
     let mut cmd = Command::new(&opts.command);
-    apply_pentect_env(&mut cmd, pentect);
+    apply_pentect_env(
+        &mut cmd,
+        pentect,
+        memory_vault.map(|vault| vault.token.as_str()),
+    );
     apply_agent_auto_approve_env(&mut cmd);
     apply_memory_vault_env(&mut cmd, memory_vault);
     apply_extension_env(&mut cmd, &active_extensions);
@@ -609,7 +613,11 @@ fn run_claude(
         Err(e) => die(&e),
     };
     let mut cmd = Command::new(&opts.command);
-    apply_pentect_env(&mut cmd, pentect);
+    apply_pentect_env(
+        &mut cmd,
+        pentect,
+        memory_vault.map(|vault| vault.token.as_str()),
+    );
     apply_agent_auto_approve_env(&mut cmd);
     apply_memory_vault_env(&mut cmd, memory_vault);
     apply_extension_env(&mut cmd, &active_extensions);
@@ -710,9 +718,13 @@ impl Drop for MemoryVaultGuard {
     }
 }
 
-fn apply_pentect_env(cmd: &mut Command, pentect: &Path) {
+fn apply_pentect_env(cmd: &mut Command, pentect: &Path, launch_proof: Option<&str>) {
     cmd.env(PENTECT_BIN_ENV, pentect);
-    cmd.env(PENTECT_AGENT_LAUNCHED_ENV, "1");
+    if let Some(launch_proof) = launch_proof.filter(|value| !value.is_empty()) {
+        cmd.env(PENTECT_AGENT_LAUNCHED_ENV, launch_proof);
+    } else {
+        cmd.env_remove(PENTECT_AGENT_LAUNCHED_ENV);
+    }
 }
 
 fn apply_agent_auto_approve_env(cmd: &mut Command) {
@@ -1496,8 +1508,9 @@ mod tests {
     #[test]
     fn launched_agent_tools_export_pentect_path_for_hooks() {
         let pentect = Path::new(r"C:\repo\target\debug\pentect.exe");
+        let launch_proof = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let mut cmd = Command::new("codex");
-        apply_pentect_env(&mut cmd, pentect);
+        apply_pentect_env(&mut cmd, pentect, Some(launch_proof));
         apply_agent_auto_approve_env(&mut cmd);
         let actual = cmd
             .get_envs()
@@ -1510,7 +1523,7 @@ mod tests {
             .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_LAUNCHED_ENV))
             .and_then(|(_, value)| value)
             .unwrap();
-        assert_eq!(launched, std::ffi::OsStr::new("1"));
+        assert_eq!(launched, std::ffi::OsStr::new(launch_proof));
         let auto_approve = cmd
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_AUTO_APPROVE_ENV))

@@ -64,13 +64,13 @@ pub(crate) fn approval_bypassed_by_config() -> Result<bool, String> {
 }
 
 pub(crate) fn require_pentect_agent_by_config() -> Result<bool, String> {
-    if let Some(value) = read_agent_require_pentect(project_config_path())? {
-        return Ok(value);
-    }
-    if let Some(value) = read_agent_require_pentect(global_config_path()?)? {
-        return Ok(value);
-    }
-    Ok(false)
+    let project = read_agent_require_pentect(project_config_path())?;
+    let global = read_agent_require_pentect(global_config_path()?)?;
+    Ok(require_pentect_agent_effective(project, global))
+}
+
+fn require_pentect_agent_effective(project: Option<bool>, global: Option<bool>) -> bool {
+    project.unwrap_or(false) || global.unwrap_or(false)
 }
 
 fn approval_bypassed_with_state(state: &ApprovalConfigState, agent_auto_approve: bool) -> bool {
@@ -373,5 +373,15 @@ mod tests {
 
         let value = "[agent]\nrequired = false".parse::<toml::Value>().unwrap();
         assert_eq!(agent_require_pentect_value(&value).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn agent_require_pentect_is_monotonic_across_scopes() {
+        assert!(require_pentect_agent_effective(Some(false), Some(true)));
+        assert!(require_pentect_agent_effective(Some(true), Some(false)));
+        assert!(require_pentect_agent_effective(Some(true), None));
+        assert!(!require_pentect_agent_effective(Some(false), None));
+        assert!(!require_pentect_agent_effective(None, Some(false)));
+        assert!(!require_pentect_agent_effective(None, None));
     }
 }

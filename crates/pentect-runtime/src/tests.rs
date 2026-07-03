@@ -2190,61 +2190,37 @@ fn claude_pretool_wraps_plain_shell_command() {
 }
 
 #[test]
-fn pretool_require_pentect_blocks_unwrapped_agent_when_enabled() {
+fn require_pentect_blocks_unwrapped_agent_when_enabled() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
-    let root = temp_root("hook-require-pentect-block");
-    std::fs::create_dir_all(root.join(".pentect")).unwrap();
-    std::fs::write(
-        root.join(".pentect").join("config.toml"),
-        "[agent]\nrequire_pentect = true\n",
-    )
-    .unwrap();
-    let _cwd = CurrentDirGuard::enter(&root);
-    let session = Session::open_at(&root.join("agent-home"), "t").unwrap();
-    let input = json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "echo ok"
-        }
-    });
-    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-        .as_str()
-        .unwrap();
+    std::env::remove_var(ENV_TOKEN);
+    let reason = ensure_pentect_agent_launch_required(HookProvider::Claude, true).unwrap_err();
     assert!(reason.contains("pentect claude"), "{reason}");
-    std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
-    drop(_cwd);
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn pretool_require_pentect_allows_wrapped_agent_when_enabled() {
+fn require_pentect_rejects_boolean_marker_without_vault_proof() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, "1");
-    let root = temp_root("hook-require-pentect-allow");
-    std::fs::create_dir_all(root.join(".pentect")).unwrap();
-    std::fs::write(
-        root.join(".pentect").join("config.toml"),
-        "require_pentect = true\n",
-    )
-    .unwrap();
-    let _cwd = CurrentDirGuard::enter(&root);
-    let session = Session::open_at(&root.join("agent-home"), "t").unwrap();
-    let input = json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "echo ok"
-        }
-    });
-    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    std::env::set_var(
+        ENV_TOKEN,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+    let reason = ensure_pentect_agent_launch_required(HookProvider::Claude, true).unwrap_err();
+    assert!(reason.contains("pentect claude"), "{reason}");
     std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
-    drop(_cwd);
-    let _ = std::fs::remove_dir_all(root);
+    std::env::remove_var(ENV_TOKEN);
+}
+
+#[test]
+fn require_pentect_allows_wrapped_agent_with_vault_proof() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
+    std::env::set_var(ENV_TOKEN, token);
+    ensure_pentect_agent_launch_required(HookProvider::Claude, true).unwrap();
+    std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
+    std::env::remove_var(ENV_TOKEN);
 }
 
 #[test]
@@ -2849,24 +2825,6 @@ fn temp_root(name: &str) -> PathBuf {
         std::process::id(),
         unix_millis()
     ))
-}
-
-struct CurrentDirGuard {
-    original: PathBuf,
-}
-
-impl CurrentDirGuard {
-    fn enter(path: &Path) -> Self {
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(path).unwrap();
-        Self { original }
-    }
-}
-
-impl Drop for CurrentDirGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
 }
 
 fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {
