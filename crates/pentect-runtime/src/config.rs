@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
+const AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ApprovalConfigState {
@@ -49,12 +50,26 @@ pub(crate) fn approval_config_state() -> Result<ApprovalConfigState, String> {
 
 #[cfg(not(test))]
 pub(crate) fn approval_bypassed_by_config() -> Result<bool, String> {
-    Ok(approval_config_state()?.effective_no_approve)
+    let state = approval_config_state()?;
+    Ok(approval_bypassed_with_state(
+        &state,
+        env_bool(AUTO_APPROVE_ENV),
+    ))
 }
 
 #[cfg(test)]
 pub(crate) fn approval_bypassed_by_config() -> Result<bool, String> {
-    Ok(false)
+    Ok(env_bool(AUTO_APPROVE_ENV))
+}
+
+fn approval_bypassed_with_state(state: &ApprovalConfigState, agent_auto_approve: bool) -> bool {
+    if state.effective_no_approve {
+        return true;
+    }
+    if state.effective_source != ApprovalConfigSource::Default {
+        return false;
+    }
+    agent_auto_approve
 }
 
 pub(crate) fn set_approval_config(
@@ -189,6 +204,15 @@ fn approval_mode_bypasses(value: &str) -> bool {
     )
 }
 
+fn env_bool(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "no_approve" | "no-approve"
+        )
+    })
+}
+
 fn project_config_path() -> PathBuf {
     PathBuf::from(PENTECT_DIR).join(CONFIG_FILE)
 }
@@ -244,5 +268,36 @@ mod tests {
     fn approval_config_detects_explicit_required() {
         let value = "no_approve = false".parse::<toml::Value>().unwrap();
         assert_eq!(approval_config_override_value(&value).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn agent_auto_approve_respects_explicit_required_config() {
+        let explicit_required = ApprovalConfigState {
+            project: ApprovalConfigScope {
+                display_path: ".pentect/config.toml".to_string(),
+                no_approve: Some(false),
+            },
+            global: ApprovalConfigScope {
+                display_path: "$HOME/.pentect/config.toml".to_string(),
+                no_approve: None,
+            },
+            effective_no_approve: false,
+            effective_source: ApprovalConfigSource::Project,
+        };
+        assert!(!approval_bypassed_with_state(&explicit_required, true));
+
+        let default_required = ApprovalConfigState {
+            project: ApprovalConfigScope {
+                display_path: ".pentect/config.toml".to_string(),
+                no_approve: None,
+            },
+            global: ApprovalConfigScope {
+                display_path: "$HOME/.pentect/config.toml".to_string(),
+                no_approve: None,
+            },
+            effective_no_approve: false,
+            effective_source: ApprovalConfigSource::Default,
+        };
+        assert!(approval_bypassed_with_state(&default_required, true));
     }
 }

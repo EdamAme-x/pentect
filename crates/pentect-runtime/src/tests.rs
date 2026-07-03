@@ -405,7 +405,7 @@ fn network_like_exec_requires_approval_without_dashboard() {
     assert!(approval.requires_approval(), "{approval:?}");
     assert!(approval.network_like, "{approval:?}");
     let err = approval_decision_for_exec(&opts.session, &approval).unwrap_err();
-    assert!(err.contains("approval UI is not running"), "{err}");
+    assert!(err.contains("approval needed"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
     let _ = std::fs::remove_dir_all(root);
 }
@@ -463,7 +463,7 @@ fn resolve_file_materialization_requires_approval_without_dashboard() {
 
     let err = approval_decision_for_resolve(&approval_session, &[PathBuf::from(".env.prod")])
         .unwrap_err();
-    assert!(err.contains("approval UI is not running"), "{err}");
+    assert!(err.contains("approval needed"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
     let _ = std::fs::remove_dir_all(root);
 }
@@ -499,7 +499,7 @@ fn resolve_stdin_materialization_requires_approval_without_dashboard() {
     let input = "OPENAI_API_KEY=<<OPENAI_API_KEY_abcdef0123456789>>\n";
 
     let err = approval_decision_for_resolve_stdin(&approval_session, input).unwrap_err();
-    assert!(err.contains("approval UI is not running"), "{err}");
+    assert!(err.contains("approval needed"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
     let _ = std::fs::remove_dir_all(root);
 }
@@ -901,7 +901,7 @@ fn write_tool_materialization_requires_approval_without_dashboard() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("approval UI is not running"), "{reason}");
+    assert!(reason.contains("approval needed"), "{reason}");
     assert!(!reason.contains(raw), "{reason}");
     assert!(!config.exists());
     let _ = std::fs::remove_dir_all(project);
