@@ -65,7 +65,7 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/credsweeper-parity"
           mkdir -p "$out"
-          cargo run --quiet -p pentect-cli -- bench creddata benchmarks/CredData \
+          cargo run --quiet --manifest-path tools/pentect-bench/Cargo.toml -- creddata benchmarks/CredData \
             --repo 02dfa7ec \
             --limit 100 \
             --ignore-x \
@@ -75,7 +75,7 @@ jobs:
           mapfile -t paths < "$out/paths.txt"
           PYTHONPATH="$PWD/crates/pentect-core/vendors/CredSweeper" \
             python tools/credsweeper-sidecar/sidecar.py "${paths[@]}" --output "$out/oracle.json"
-          cargo run --quiet -p pentect-cli -- bench credsweeper-parity \
+          cargo run --quiet --manifest-path tools/pentect-bench/Cargo.toml -- credsweeper-parity \
             "$out/rust.json" \
             "$out/oracle.json" \
             --min-precision 1 \
