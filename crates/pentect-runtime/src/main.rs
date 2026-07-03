@@ -1664,6 +1664,14 @@ const WRITE_PATH_FIELDS: &[&str] = &[
     "filename",
     "fileName",
 ];
+const READ_PATH_LIST_FIELDS: &[&str] = &[
+    "paths",
+    "file_paths",
+    "filePaths",
+    "filenames",
+    "fileNames",
+    "files",
+];
 const WRITE_CONTENT_FIELDS: &[&str] = &[
     "content",
     "file_content",
@@ -2151,7 +2159,7 @@ fn before_tool_updated_input(
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
     if is_read_like_tool_name(tool_name) {
-        return Err(read_tool_block_reason(tool_name));
+        validate_read_before_tool(session, tool_name, tool_input)?;
     }
     validate_masked_write_before_tool(session, tool_name, tool_input)?;
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
@@ -2179,7 +2187,8 @@ fn before_tool_updated_input_lazy(
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
     if is_read_like_tool_name(tool_name) {
-        return Err(read_tool_block_reason(tool_name));
+        let session = open_hook_session(cli, session_name)?;
+        validate_read_before_tool(&session, tool_name, tool_input)?;
     }
     if is_write_or_edit_like_tool_name(tool_name) {
         let session = open_hook_session(cli, session_name)?;
@@ -2213,6 +2222,40 @@ fn canonical_hook_shell_command(command: &str) -> Result<String, String> {
         };
         command = payload;
     }
+}
+
+fn validate_read_before_tool(
+    session: &Session,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Result<(), String> {
+    if !is_read_like_tool_name(tool_name) {
+        return Ok(());
+    }
+    if read_tool_has_detected_secret(session, tool_input)? {
+        return Err(read_tool_block_reason(tool_name));
+    }
+    Ok(())
+}
+
+fn read_tool_has_detected_secret(session: &Session, tool_input: &Value) -> Result<bool, String> {
+    for path in read_tool_paths(tool_input) {
+        let path = Path::new(path);
+        let data = read_input(path, InputFormat::Text).map_err(|_| {
+            "read target could not be scanned; use `pentect read PATH`.".to_string()
+        })?;
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: infer_kind(path),
+                data,
+            },
+            &Config::new(session.key),
+        );
+        if result.summary.masked_count > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_masked_write_before_tool(
@@ -2397,6 +2440,21 @@ fn write_path_and_content(value: &Value) -> Option<(&str, &str)> {
     None
 }
 
+fn read_tool_paths(value: &Value) -> Vec<&str> {
+    let mut paths = Vec::new();
+    for candidate in write_input_candidates(value) {
+        if let Some(path) = string_field(candidate, WRITE_PATH_FIELDS) {
+            paths.push(path);
+        }
+        for field in READ_PATH_LIST_FIELDS {
+            if let Some(items) = candidate.get(*field).and_then(Value::as_array) {
+                paths.extend(items.iter().filter_map(Value::as_str));
+            }
+        }
+    }
+    paths
+}
+
 fn write_input_candidates(value: &Value) -> Vec<&Value> {
     let mut out = vec![value];
     for key in WRITE_INPUT_FIELDS {
@@ -2518,7 +2576,13 @@ fn is_read_like_tool_name(tool_name: &str) -> bool {
     let normalized = tool_name.to_ascii_lowercase().replace('-', "_");
     matches!(
         normalized.as_str(),
-        "read" | "read_file" | "read_many_files" | "multiread" | "notebookread" | "notebook_read"
+        "read"
+            | "read_file"
+            | "readmanyfiles"
+            | "read_many_files"
+            | "multiread"
+            | "notebookread"
+            | "notebook_read"
     ) || normalized.ends_with("__read_file")
         || normalized.ends_with("_read_file")
         || normalized.ends_with("__read_many_files")
@@ -2560,18 +2624,12 @@ fn extract_pentect_exec_shell_payload(command: &str) -> Option<String> {
 fn pentect_human_only_command_reason(command: &str) -> Option<String> {
     let invocation = parse_pentect_subcommand(command)?;
     match invocation.subcommand {
-        PentectSubcommand::Read => Some(
-            "use `pentect exec \"Get-Content ...\"` instead of `pentect read` from AI hooks"
-                .to_string(),
-        ),
-        PentectSubcommand::Exec | PentectSubcommand::Resolve => None,
+        PentectSubcommand::Exec | PentectSubcommand::Read | PentectSubcommand::Resolve => None,
     }
 }
 
 fn read_tool_block_reason(tool_name: &str) -> String {
-    format!(
-        "{tool_name} is human-only; use `pentect exec \"Get-Content ...\"` from AI hooks instead."
-    )
+    format!("{tool_name} found masked content; use `pentect read PATH`.")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -2190,7 +2190,7 @@ fn claude_pretool_wraps_plain_shell_command() {
 }
 
 #[test]
-fn pretool_blocks_pentect_read_from_ai_hooks() {
+fn pretool_wraps_pentect_read_from_ai_hooks() {
     let (root, session) = empty_session("hook-pre-read");
     let input = json!({
         "hook_event_name": "PreToolUse",
@@ -2200,11 +2200,13 @@ fn pretool_blocks_pentect_read_from_ai_hooks() {
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    assert!(reason.contains("pentect exec"), "{reason}");
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    assert!(command.contains("pentect"), "{command}");
+    assert!(command.contains("exec"), "{command}");
+    assert!(command.contains("read"), "{command}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2230,13 +2232,47 @@ fn pretool_wraps_pentect_resolve_for_approval() {
 }
 
 #[test]
-fn pretool_blocks_direct_read_tools() {
-    let (root, session) = empty_session("hook-pre-direct-read");
+fn pretool_allows_direct_read_tool_for_clean_file() {
+    let (root, session) = empty_session("hook-pre-direct-read-clean");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-read-clean-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let readme = project.join("README.txt");
+    std::fs::write(&readme, "Settings\nNo credentials here.\n").unwrap();
     let input = json!({
         "hook_event_name": "PreToolUse",
         "tool_name": "Read",
         "tool_input": {
-            "file_path": r".\.env"
+            "file_path": readme.to_string_lossy()
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pretool_blocks_direct_read_tool_when_file_needs_masking() {
+    let (root, session) = empty_session("hook-pre-direct-read-secret");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-read-secret-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let env = project.join(".env");
+    std::fs::write(&env, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": {
+            "file_path": env.to_string_lossy()
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
@@ -2244,8 +2280,75 @@ fn pretool_blocks_direct_read_tools() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("human-only"), "{reason}");
-    assert!(reason.contains("pentect exec"), "{reason}");
+    assert!(reason.contains("pentect read"), "{reason}");
+    assert!(!reason.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{reason}");
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pretool_blocks_read_many_when_any_file_needs_masking() {
+    let (root, session) = empty_session("hook-pre-read-many-secret");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-read-many-secret-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let readme = project.join("README.txt");
+    let env = project.join(".env");
+    std::fs::write(&readme, "Settings\n").unwrap();
+    std::fs::write(
+        &env,
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+    )
+    .unwrap();
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "ReadManyFiles",
+        "tool_input": {
+            "paths": [readme.to_string_lossy(), env.to_string_lossy()]
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("pentect read"), "{reason}");
+    assert!(
+        !reason.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
+        "{reason}"
+    );
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pretool_allows_read_many_when_all_files_are_clean() {
+    let (root, session) = empty_session("hook-pre-read-many-clean");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-read-many-clean-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let first = project.join("README.txt");
+    let second = project.join("notes.txt");
+    std::fs::write(&first, "Settings\n").unwrap();
+    std::fs::write(&second, "No credentials here.\n").unwrap();
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "ReadManyFiles",
+        "tool_input": {
+            "paths": [first.to_string_lossy(), second.to_string_lossy()]
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2359,7 +2462,7 @@ fn pretool_collapses_nested_pentect_exec_shell_commands() {
 }
 
 #[test]
-fn pretool_blocks_nested_pentect_read_escape() {
+fn pretool_collapses_nested_pentect_read_command() {
     let (root, session) = empty_session("hook-pre-nested-read");
     let input = json!({
         "hook_event_name": "PreToolUse",
@@ -2369,12 +2472,14 @@ fn pretool_blocks_nested_pentect_read_escape() {
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("pentect exec"), "{reason}");
-    assert!(reason.contains("pentect read"), "{reason}");
+    assert!(command.contains("pentect"), "{command}");
+    assert!(command.contains("exec"), "{command}");
+    assert!(command.contains("read"), "{command}");
+    assert_eq!(command.matches(" exec ").count(), 1, "{command}");
     let _ = std::fs::remove_dir_all(root);
 }
 
