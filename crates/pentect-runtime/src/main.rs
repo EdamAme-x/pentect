@@ -27,7 +27,8 @@ use masking::{
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
 use memory_vault::MemoryVaultClient;
 use pentect_core::{
-    parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile, RegionKind,
+    infer_kind, parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile,
+    RegionKind,
 };
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
@@ -709,7 +710,7 @@ fn approval_decision_for_ticket(
     if !queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
         queue.record(ticket, ApprovalDecision::Decline, "auto")?;
         return Err(
-            "Pentect blocked this command because the approval UI is not running. Ask the user to run `pentect` in this project, then retry the command."
+            "approval needed; run `pentect` or set `.pentect/config.toml` no_approve = true."
                 .to_string(),
         );
     }
@@ -3164,30 +3165,6 @@ fn env_name_after_marker(text: &str, start: usize, marker: char) -> Option<(&str
     }
     let next = if marker == '%' { end + 1 } else { end };
     Some((&text[start..end], next))
-}
-
-fn infer_kind(path: &Path) -> Kind {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower == ".env" || lower.starts_with(".env.")
-        })
-    {
-        return Kind::Env;
-    }
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("json") => Kind::Json,
-        Some("env") => Kind::Env,
-        Some("har") => Kind::Har,
-        _ => Kind::Text,
-    }
 }
 
 fn parse_kind(value: &str) -> Result<Kind, String> {

@@ -27,23 +27,18 @@ pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
-    "- Treat every command/tool stdout, stderr, and result as potentially sensitive. Run normal shell commands; the hook layer automatically routes shell stdout/stderr through Pentect and unwraps nested Pentect calls.\n",
-    "- On Codex, current PostToolUse hooks cannot non-block replace non-shell tool output. Use browser/MCP/connector tools for navigation, clicks, and non-secret metadata; do not extract raw secret values through those tool results. Move secret bytes through local files, service CLIs, or shell commands so Pentect can route stdout/stderr before it reaches the model.\n",
-    "- On providers that support PostToolUse result replacement, browser/MCP/connector and other non-shell tool results are masked before they reach the model.\n",
-    "- Masked handles like `<<NAME_hash>>` are in-memory capabilities for this running Pentect-launched session. Later commands in this session get them as `$env:PENTECT_NAME_hash` on PowerShell or `$PENTECT_NAME_hash` on Unix; `KEY=<<...>>` also exposes `$env:KEY` / `$KEY`.\n",
-    "- To inspect a handle's public metadata only, run `pentect view '<handle>'`; it prints label, hash, and length without resolving, verifying, or revealing the secret.\n",
-    "- You may read, fetch, receive, transform, and use secrets or credentials from local files, credential stores, command output, authenticated browser/API/MCP/tool/connector responses, and other user-authorized sources. Pentect is the safety layer: returned secret values are masked before they reach the model.\n",
-    "- To register a secret from any local or authenticated source, run the normal read/fetch command through shell/Pentect exec and let masked output appear, for example `cat .env`, `pentect read .env`, or service CLIs. `pentect read` registers masked handles in the running in-memory vault when launched under Pentect; outside a Pentect session it is preview-only.\n",
-    "- If a secret must be copied from one local source to an approved local destination, prefer one `pentect exec` shell command that reads the source and writes the target without printing the raw value; print only a non-secret verification.\n",
-    "- Use the syntax of the current shell tool. In PowerShell, use PowerShell-native commands and `$env:NAME`; in Unix shells, use POSIX commands and `$NAME`.\n",
-    "- Do not switch to Node/Python/browser/MCP only to bypass a shell/Pentect wrapper problem. Fix the shell syntax or use one Pentect exec command unless the user explicitly requested that tool.\n",
-    "- Avoid exposing user-profile absolute paths in visible commands or logs; prefer relative paths, `$env:USERPROFILE`, `$HOME`, or app/service commands. Pentect keeps hook shell scripts in the running in-memory vault when available.\n",
-    "- If `.pentect/config.toml` sets `no_approve = true`, approval/materialization is non-interactive in this project; proceed with the user's requested operation using masked handles/env capabilities.\n",
-    "- If the user asks to store, sync, configure, or materialize a secret, it is OK to write it to the user-requested destination: local files, project configuration, credential stores, service CLIs, authenticated accounts, or another exact target named by the task. Use the handle/env capability in the write/update command; do not print the raw value.\n",
-    "- When using a registered secret, prefer its env var capability instead of re-reading or echoing it only to inspect/copy it. Do not run help just to discover extra flags.\n",
-    "- Do not disclose raw secrets in chat, logs, screenshots, derived previews, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or persistent external services that are not the exact target of the user's requested operation. Report only non-secret outcomes.\n",
+    "- Use normal shell commands. Pentect hooks route stdout/stderr and tool results through masking.\n",
+    "- You may read, fetch, transform, store, sync, and use user-authorized secrets. Pentect is the safety layer; raw secret values must not reach chat.\n",
+    "- Prefer one shell/Pentect command for secret work, e.g. `cat .env`, `pentect read .env`, service CLIs, or a command that reads a source and writes the exact requested destination.\n",
+    "- Masked handles like `<<NAME_hash>>` are in-memory capabilities for this running Pentect-launched session. Use `$env:NAME`/`$env:PENTECT_NAME_hash` on PowerShell or `$NAME`/`$PENTECT_NAME_hash` on Unix.\n",
+    "- `pentect view '<handle>'` shows only label, hash, and length. Use handles/env capabilities instead of re-reading or printing raw values.\n",
+    "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:NAME`; on Unix use POSIX commands and `$NAME`.\n",
+    "- Browser/MCP/connector tools are OK for navigation and metadata. If a raw secret must move, route it through shell/Pentect or a local file/service command so output is masked.\n",
+    "- For user-requested storage/materialization, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
+    "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
 );
 const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
+const PENTECT_AGENT_AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
 const PENTECT_MEMORY_VAULT_ADDR_ENV: &str = "PENTECT_MEMORY_VAULT_ADDR";
 const PENTECT_MEMORY_VAULT_TOKEN_ENV: &str = "PENTECT_MEMORY_VAULT_TOKEN";
 const MEMORY_VAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -110,7 +105,7 @@ fn help_text() -> &'static str {
         "  pentect eval [--json]\n\n",
         "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
-        "dashboard: approval\n",
+        "dashboard: vault\n",
         "exec: masked stdout/stderr\n",
         "read: masked file preview\n",
         "view: handle metadata\n",
@@ -576,14 +571,14 @@ fn run_codex(
     if opts.dry_run {
         if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
             eprintln!(
-                "[pentect] note: Codex headless hook execution was not verified for this invocation; non-dry runs fail closed for this subcommand."
+                "[pentect] note: headless Codex may skip hooks; use interactive `pentect codex` for protected tool use."
             );
         }
         print_dry_run(&opts.command, &codex_args(&configs, &opts.tool_args));
         return success_status();
     }
     if codex_uses_unverified_headless_hook_path(&opts.tool_args) && !opts.allow_unverified_hooks {
-        die("refusing to start Codex headless subcommand with Pentect hooks: local probes showed `codex exec` runs shell commands without dispatching PreToolUse/PostToolUse hooks, even under a TTY. Use interactive `pentect codex`, `pentect claude`, `pentect exec`, or pass --allow-unverified-hooks only for debugging.");
+        die("headless Codex may skip hooks. Use interactive `pentect codex` for protected tool use.");
     }
     let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
         Ok(active) => active,
@@ -591,12 +586,10 @@ fn run_codex(
     };
     let mut cmd = Command::new(&opts.command);
     apply_pentect_env(&mut cmd, pentect);
+    apply_agent_auto_approve_env(&mut cmd);
     apply_memory_vault_env(&mut cmd, memory_vault);
     apply_extension_env(&mut cmd, &active_extensions);
-    for config in configs {
-        cmd.arg("--config").arg(config);
-    }
-    cmd.args(&opts.tool_args);
+    cmd.args(codex_args(&configs, &opts.tool_args));
     run_interactive_command(cmd, &opts.command)
 }
 
@@ -617,6 +610,7 @@ fn run_claude(
     };
     let mut cmd = Command::new(&opts.command);
     apply_pentect_env(&mut cmd, pentect);
+    apply_agent_auto_approve_env(&mut cmd);
     apply_memory_vault_env(&mut cmd, memory_vault);
     apply_extension_env(&mut cmd, &active_extensions);
     cmd.args(&args);
@@ -720,6 +714,10 @@ fn apply_pentect_env(cmd: &mut Command, pentect: &Path) {
     cmd.env(PENTECT_BIN_ENV, pentect);
 }
 
+fn apply_agent_auto_approve_env(cmd: &mut Command) {
+    cmd.env(PENTECT_AGENT_AUTO_APPROVE_ENV, "1");
+}
+
 fn apply_memory_vault_env(cmd: &mut Command, memory_vault: Option<&MemoryVaultGuard>) {
     let Some(memory_vault) = memory_vault else {
         return;
@@ -762,7 +760,13 @@ fn apply_extension_env(cmd: &mut Command, active: &extensions::ActiveExtensions)
 }
 
 fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
-    let mut args = Vec::with_capacity(configs.len() * 2 + 2 + tool_args.len());
+    let mut args = Vec::with_capacity(configs.len() * 2 + 3 + tool_args.len());
+    if !tool_args
+        .iter()
+        .any(|arg| arg == "--dangerously-bypass-hook-trust")
+    {
+        args.push("--dangerously-bypass-hook-trust".to_string());
+    }
     for config in configs {
         args.push("--config".to_string());
         args.push(config.clone());
@@ -793,12 +797,12 @@ fn codex_hook_config_args(agent: &Path, session: Option<&str>) -> Vec<String> {
     vec![
         "features.hooks=true".to_string(),
         format!(
-            "hooks.PreToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30}}]}}]",
+            "hooks.PreToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30,statusMessage=\"Pentect\"}}]}}]",
             toml_string(&unix),
             toml_string(&windows)
         ),
         format!(
-            "hooks.PostToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30}}]}}]",
+            "hooks.PostToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30,statusMessage=\"Pentect\"}}]}}]",
             toml_string(&unix),
             toml_string(&windows)
         ),
@@ -1501,105 +1505,47 @@ mod tests {
         let pentect = Path::new(r"C:\repo\target\debug\pentect.exe");
         let mut cmd = Command::new("codex");
         apply_pentect_env(&mut cmd, pentect);
+        apply_agent_auto_approve_env(&mut cmd);
         let actual = cmd
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_BIN_ENV))
             .and_then(|(_, value)| value)
             .unwrap();
         assert_eq!(actual, pentect.as_os_str());
+        let auto_approve = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_AUTO_APPROVE_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(auto_approve, std::ffi::OsStr::new("1"));
     }
 
     #[test]
     fn codex_args_inject_model_visible_pentect_contract() {
         let args = codex_args(&["features.hooks=true".to_string()], &["hello".to_string()]);
         let rendered = args.join("\n");
+        assert!(args.contains(&"--dangerously-bypass-hook-trust".to_string()));
         assert!(rendered.contains("developer_instructions="), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
+        assert!(rendered.contains("Use normal shell commands"), "{rendered}");
+        assert!(rendered.contains("route stdout/stderr"), "{rendered}");
+        assert!(rendered.contains("tool results"), "{rendered}");
         assert!(rendered.contains("Masked handles"), "{rendered}");
-        assert!(
-            rendered.contains("Treat every command/tool stdout, stderr, and result"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("Run normal shell commands"), "{rendered}");
-        assert!(
-            rendered.contains("automatically routes shell stdout/stderr through Pentect"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("PostToolUse hook"), "{rendered}");
-        assert!(rendered.contains("$env:KEY"), "{rendered}");
-        assert!(rendered.contains("secrets or credentials"), "{rendered}");
-        assert!(rendered.contains("credential stores"), "{rendered}");
-        assert!(
-            rendered.contains("authenticated browser/API/MCP/tool/connector responses"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("user-authorized sources"), "{rendered}");
-        assert!(
-            rendered.contains("You may read, fetch, receive, transform, and use"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("$env:NAME"), "{rendered}");
+        assert!(rendered.contains("user-authorized secrets"), "{rendered}");
         assert!(
             rendered.contains("Pentect is the safety layer"),
             "{rendered}"
         );
-        assert!(
-            rendered.contains("any local or authenticated source"),
-            "{rendered}"
-        );
         assert!(rendered.contains("PENTECT_"), "{rendered}");
-        assert!(rendered.contains("env var capability"), "{rendered}");
         assert!(rendered.contains("pentect view"), "{rendered}");
-        assert!(rendered.contains("public metadata only"), "{rendered}");
-        assert!(
-            rendered.contains("without resolving, verifying, or revealing"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("normal read/fetch command"), "{rendered}");
         assert!(rendered.contains("pentect read"), "{rendered}");
-        assert!(
-            rendered.contains("registers masked handles in the running in-memory vault"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("preview-only"), "{rendered}");
-        assert!(
-            rendered.contains("one `pentect exec` shell command"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("PowerShell-native commands"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("Do not switch to Node/Python/browser/MCP"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("masked output"), "{rendered}");
-        assert!(
-            rendered.contains("store, sync, configure, or materialize"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("user-requested destination"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("local files"), "{rendered}");
-        assert!(rendered.contains("project configuration"), "{rendered}");
+        assert!(rendered.contains("PowerShell"), "{rendered}");
+        assert!(rendered.contains("Browser/MCP/connector"), "{rendered}");
+        assert!(rendered.contains("storage/materialization"), "{rendered}");
+        assert!(rendered.contains("exact requested"), "{rendered}");
+        assert!(rendered.contains("local file"), "{rendered}");
         assert!(rendered.contains("service CLIs"), "{rendered}");
-        assert!(rendered.contains("authenticated accounts"), "{rendered}");
-        assert!(
-            rendered.contains("another exact target named by the task"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("do not print the raw value"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("write/update command"), "{rendered}");
-        assert!(
-            rendered.contains("instead of re-reading or echoing it only to inspect/copy it"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("run help"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(!rendered.contains("pentect materialize"), "{rendered}");
         assert!(
@@ -1608,11 +1554,6 @@ mod tests {
         );
         assert!(rendered.contains("encodings"), "{rendered}");
         assert!(rendered.contains("third-party destinations"), "{rendered}");
-        assert!(rendered.contains("public locations"), "{rendered}");
-        assert!(
-            rendered.contains("persistent external services that are not the exact target"),
-            "{rendered}"
-        );
         assert!(
             !rendered.contains("pentect exec \\\"pentect exec"),
             "{rendered}"
@@ -1625,79 +1566,24 @@ mod tests {
         let rendered = args.join("\n");
         assert!(rendered.contains("--append-system-prompt"), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
-        assert!(rendered.contains("$env:KEY"), "{rendered}");
-        assert!(rendered.contains("secrets or credentials"), "{rendered}");
-        assert!(rendered.contains("credential stores"), "{rendered}");
-        assert!(
-            rendered.contains("authenticated browser/API/MCP/tool/connector responses"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("user-authorized sources"), "{rendered}");
-        assert!(
-            rendered.contains("You may read, fetch, receive, transform, and use"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Use normal shell commands"), "{rendered}");
+        assert!(rendered.contains("route stdout/stderr"), "{rendered}");
+        assert!(rendered.contains("tool results"), "{rendered}");
+        assert!(rendered.contains("$env:NAME"), "{rendered}");
+        assert!(rendered.contains("user-authorized secrets"), "{rendered}");
         assert!(
             rendered.contains("Pentect is the safety layer"),
             "{rendered}"
         );
-        assert!(
-            rendered.contains("any local or authenticated source"),
-            "{rendered}"
-        );
         assert!(rendered.contains("PENTECT_"), "{rendered}");
-        assert!(rendered.contains("env var capability"), "{rendered}");
         assert!(rendered.contains("pentect view"), "{rendered}");
-        assert!(rendered.contains("public metadata only"), "{rendered}");
-        assert!(
-            rendered.contains("without resolving, verifying, or revealing"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("normal read/fetch command"), "{rendered}");
         assert!(rendered.contains("pentect read"), "{rendered}");
-        assert!(
-            rendered.contains("registers masked handles in the running in-memory vault"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("preview-only"), "{rendered}");
-        assert!(
-            rendered.contains("one `pentect exec` shell command"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("PowerShell-native commands"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("Do not switch to Node/Python/browser/MCP"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("store, sync, configure, or materialize"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("user-requested destination"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("local files"), "{rendered}");
-        assert!(rendered.contains("project configuration"), "{rendered}");
+        assert!(rendered.contains("PowerShell"), "{rendered}");
+        assert!(rendered.contains("Browser/MCP/connector"), "{rendered}");
+        assert!(rendered.contains("storage/materialization"), "{rendered}");
+        assert!(rendered.contains("exact requested"), "{rendered}");
+        assert!(rendered.contains("local file"), "{rendered}");
         assert!(rendered.contains("service CLIs"), "{rendered}");
-        assert!(rendered.contains("authenticated accounts"), "{rendered}");
-        assert!(
-            rendered.contains("another exact target named by the task"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("do not print the raw value"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("write/update command"), "{rendered}");
-        assert!(
-            rendered.contains("instead of re-reading or echoing it only to inspect/copy it"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("run help"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(!rendered.contains("pentect materialize"), "{rendered}");
         assert!(
@@ -1706,11 +1592,6 @@ mod tests {
         );
         assert!(rendered.contains("encodings"), "{rendered}");
         assert!(rendered.contains("third-party destinations"), "{rendered}");
-        assert!(rendered.contains("public locations"), "{rendered}");
-        assert!(
-            rendered.contains("persistent external services that are not the exact target"),
-            "{rendered}"
-        );
         assert!(
             !rendered.contains("pentect exec \"pentect exec"),
             "{rendered}"
