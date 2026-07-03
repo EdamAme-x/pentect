@@ -42,6 +42,7 @@ use std::time::Duration;
 
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
+const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
@@ -1598,6 +1599,16 @@ enum HookProvider {
     Generic,
 }
 
+impl HookProvider {
+    fn pentect_launch_command(self) -> &'static str {
+        match self {
+            HookProvider::Codex => "pentect codex",
+            HookProvider::Claude => "pentect claude",
+            HookProvider::Generic => "pentect codex|claude",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HookPhase {
     BeforeTool,
@@ -2037,6 +2048,9 @@ fn handle_hook(
 ) -> Result<Value, String> {
     match hook_phase(provider, &input) {
         HookPhase::BeforeTool => {
+            if let Err(reason) = ensure_pentect_agent_launch(provider) {
+                return Ok(before_tool_block_output(provider, &reason));
+            }
             let Some(tool_input) = hook_tool_input(&input) else {
                 return Ok(json!({}));
             };
@@ -2060,6 +2074,9 @@ fn handle_hook(
             }
         }
         HookPhase::AfterTool => {
+            if let Err(reason) = ensure_pentect_agent_launch(provider) {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             let tool_name = hook_tool_name(&input)
                 .and_then(Value::as_str)
                 .unwrap_or_default();
@@ -2097,6 +2114,9 @@ fn handle_hook_lazy(
 ) -> Result<Value, String> {
     match hook_phase(provider, &input) {
         HookPhase::BeforeTool => {
+            if let Err(reason) = ensure_pentect_agent_launch(provider) {
+                return Ok(before_tool_block_output(provider, &reason));
+            }
             let Some(tool_input) = hook_tool_input(&input) else {
                 return Ok(json!({}));
             };
@@ -2120,6 +2140,9 @@ fn handle_hook_lazy(
             }
         }
         HookPhase::AfterTool => {
+            if let Err(reason) = ensure_pentect_agent_launch(provider) {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             let session = open_hook_session(cli, session_name)?;
             let tool_name = hook_tool_name(&input)
                 .and_then(Value::as_str)
@@ -2209,6 +2232,28 @@ fn before_tool_updated_input_lazy(
         }
     }
     Ok((tool_input.clone(), false))
+}
+
+fn ensure_pentect_agent_launch(provider: HookProvider) -> Result<(), String> {
+    if !config::require_pentect_agent_by_config()? {
+        return Ok(());
+    }
+    if agent_env_bool(PENTECT_AGENT_LAUNCHED_ENV) {
+        return Ok(());
+    }
+    Err(format!(
+        "Pentect required; start with `{}`.",
+        provider.pentect_launch_command()
+    ))
+}
+
+fn agent_env_bool(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn canonical_hook_shell_command(command: &str) -> Result<String, String> {

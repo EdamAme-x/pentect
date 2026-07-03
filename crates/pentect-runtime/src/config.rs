@@ -63,6 +63,16 @@ pub(crate) fn approval_bypassed_by_config() -> Result<bool, String> {
     Ok(false)
 }
 
+pub(crate) fn require_pentect_agent_by_config() -> Result<bool, String> {
+    if let Some(value) = read_agent_require_pentect(project_config_path())? {
+        return Ok(value);
+    }
+    if let Some(value) = read_agent_require_pentect(global_config_path()?)? {
+        return Ok(value);
+    }
+    Ok(false)
+}
+
 fn approval_bypassed_with_state(state: &ApprovalConfigState, agent_auto_approve: bool) -> bool {
     if state.effective_no_approve {
         return true;
@@ -184,6 +194,40 @@ fn approval_config_override_value(value: &toml::Value) -> Result<Option<bool>, S
     Ok(None)
 }
 
+fn read_agent_require_pentect(path: PathBuf) -> Result<Option<bool>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let src = fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(None);
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    agent_require_pentect_value(&value)
+}
+
+fn agent_require_pentect_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    if let Some(raw) = value.get("require_pentect") {
+        return agent_config_bool(raw, "require_pentect").map(Some);
+    }
+    let Some(raw) = value.get("agent") else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("agent config must be a table".to_string());
+    };
+    if let Some(raw) = table.get("require_pentect") {
+        return agent_config_bool(raw, "agent.require_pentect").map(Some);
+    }
+    if let Some(raw) = table.get("required") {
+        return agent_config_bool(raw, "agent.required").map(Some);
+    }
+    Ok(None)
+}
+
 fn config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
     if let Some(value) = value.as_bool() {
         return Ok(value);
@@ -196,6 +240,20 @@ fn config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
         };
     }
     Err(format!("approval config {field} must be a boolean"))
+}
+
+fn agent_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
+    if let Some(value) = value.as_bool() {
+        return Ok(value);
+    }
+    if let Some(value) = value.as_str() {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(format!("agent config {field} must be boolean-like")),
+        };
+    }
+    Err(format!("agent config {field} must be a boolean"))
 }
 
 fn approval_mode_bypasses(value: &str) -> bool {
@@ -301,5 +359,19 @@ mod tests {
             effective_source: ApprovalConfigSource::Default,
         };
         assert!(approval_bypassed_with_state(&default_required, true));
+    }
+
+    #[test]
+    fn agent_require_pentect_accepts_top_level_and_table_forms() {
+        let value = "require_pentect = true".parse::<toml::Value>().unwrap();
+        assert_eq!(agent_require_pentect_value(&value).unwrap(), Some(true));
+
+        let value = "[agent]\nrequire_pentect = \"on\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(agent_require_pentect_value(&value).unwrap(), Some(true));
+
+        let value = "[agent]\nrequired = false".parse::<toml::Value>().unwrap();
+        assert_eq!(agent_require_pentect_value(&value).unwrap(), Some(false));
     }
 }

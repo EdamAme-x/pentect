@@ -38,6 +38,7 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
 );
 const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
+const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_AGENT_AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
 const PENTECT_MEMORY_VAULT_ADDR_ENV: &str = "PENTECT_MEMORY_VAULT_ADDR";
 const PENTECT_MEMORY_VAULT_TOKEN_ENV: &str = "PENTECT_MEMORY_VAULT_TOKEN";
@@ -711,6 +712,7 @@ impl Drop for MemoryVaultGuard {
 
 fn apply_pentect_env(cmd: &mut Command, pentect: &Path) {
     cmd.env(PENTECT_BIN_ENV, pentect);
+    cmd.env(PENTECT_AGENT_LAUNCHED_ENV, "1");
 }
 
 fn apply_agent_auto_approve_env(cmd: &mut Command) {
@@ -1503,6 +1505,12 @@ mod tests {
             .and_then(|(_, value)| value)
             .unwrap();
         assert_eq!(actual, pentect.as_os_str());
+        let launched = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_LAUNCHED_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(launched, std::ffi::OsStr::new("1"));
         let auto_approve = cmd
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_AUTO_APPROVE_ENV))
