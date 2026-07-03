@@ -2246,6 +2246,12 @@ fn materialize_masked_write_content(
 ) -> Result<Option<String>, String> {
     let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
+    if contains_pentect_masked_handle(&resolved) {
+        return Err(
+            "Pentect blocked Write because masked content needs resolve, but this session cannot resolve every handle. Re-read the source in this Pentect session, then retry."
+                .to_string(),
+        );
+    }
     if resolved == content {
         return Ok(None);
     }
@@ -2259,9 +2265,25 @@ fn materialize_masked_write_content(
     }
     materialize_file(&path, &resolved)?;
     Ok(Some(format!(
-        "Pentect wrote resolved masked content to '{}' locally. The original Write tool was blocked so plaintext never returns to the AI; treat this as success and do not retry.",
+        "Pentect resolved masked content and wrote '{}'. Original Write stopped to avoid writing masked handles.",
         path.display()
     )))
+}
+
+fn contains_pentect_masked_handle(text: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(start_rel) = text[offset..].find("<<") {
+        let start = offset + start_rel;
+        let Some(end_rel) = text[start + 2..].find(">>") else {
+            return false;
+        };
+        let end = start + 2 + end_rel + 2;
+        if parse_placeholder(&text[start..end]).is_ok() {
+            return true;
+        }
+        offset = end;
+    }
+    false
 }
 
 fn approval_decision_for_materialized_write(

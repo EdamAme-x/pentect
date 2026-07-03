@@ -929,6 +929,55 @@ fn write_tool_passes_through_regular_ui_content() {
 }
 
 #[test]
+fn write_tool_passes_through_non_pentect_templates() {
+    let (root, session) = empty_session("write-template-ui");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "templates/email.txt",
+            "content": "Hello <<customer_name>>, your order is ready.\n"
+        }
+    });
+
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_tool_blocks_unknown_masked_handles_that_need_resolve() {
+    let root = temp_root("write-unknown-handle");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-write-unknown-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let config = project.join("config.env");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "content": "RUNPOD_API_KEY=<<RUNPOD_API_KEY_0123456789abcdef>>\n"
+        }
+    });
+
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("needs resolve"), "{reason}");
+    assert!(!config.exists());
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn write_tool_materialization_requires_approval_without_dashboard() {
     let root = temp_root("capability-write-generic");
     let project = PathBuf::from("target").join(format!(
