@@ -2262,10 +2262,23 @@ fn agent_launch_proof_valid() -> bool {
         return false;
     };
     agent_launch_proof_matches(&proof, &token)
+        && memory_vault_env_addr_is_loopback()
+        && memory_vault_accepts_env_token()
 }
 
 fn agent_launch_proof_matches(proof: &str, token: &str) -> bool {
     token.len() >= 32 && proof == token
+}
+
+fn memory_vault_env_addr_is_loopback() -> bool {
+    std::env::var(ENV_ADDR)
+        .ok()
+        .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|addr| addr.ip().is_loopback())
+}
+
+fn memory_vault_accepts_env_token() -> bool {
+    MemoryVaultClient::from_env().is_some_and(|client| client.key().is_ok())
 }
 
 fn canonical_hook_shell_command(command: &str) -> Result<String, String> {

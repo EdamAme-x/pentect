@@ -2199,28 +2199,31 @@ fn require_pentect_blocks_unwrapped_agent_when_enabled() {
 }
 
 #[test]
-fn require_pentect_rejects_boolean_marker_without_vault_proof() {
+fn require_pentect_rejects_matching_env_without_live_vault() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, "1");
-    std::env::set_var(
-        ENV_TOKEN,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    );
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
+    std::env::set_var(ENV_TOKEN, token);
+    std::env::set_var(ENV_ADDR, "127.0.0.1:9");
     let reason = ensure_pentect_agent_launch_required(HookProvider::Claude, true).unwrap_err();
     assert!(reason.contains("pentect claude"), "{reason}");
     std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
     std::env::remove_var(ENV_TOKEN);
+    std::env::remove_var(ENV_ADDR);
 }
 
 #[test]
 fn require_pentect_allows_wrapped_agent_with_vault_proof() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let addr = memory_vault::spawn_test_memory_vault(token.to_string());
     std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
     std::env::set_var(ENV_TOKEN, token);
+    std::env::set_var(ENV_ADDR, addr);
     ensure_pentect_agent_launch_required(HookProvider::Claude, true).unwrap();
     std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
     std::env::remove_var(ENV_TOKEN);
+    std::env::remove_var(ENV_ADDR);
 }
 
 #[test]

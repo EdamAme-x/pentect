@@ -146,6 +146,23 @@ fn serve_memory_vault_inner() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn spawn_test_memory_vault(token: String) -> String {
+    let key = Config::generate().key;
+    let state = Arc::new(Mutex::new(MemoryVaultState {
+        key,
+        recovery: Recovery::empty_for_key(&key),
+    }));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            handle_client(stream.unwrap(), &token, &state).unwrap();
+        }
+    });
+    addr
+}
+
 fn handle_client(
     stream: TcpStream,
     token: &str,
@@ -253,22 +270,10 @@ mod tests {
     #[test]
     fn client_round_trips_recovery_through_memory_vault_state() {
         let token = "test-token".to_string();
-        let key = Config::generate().key;
-        let state = Arc::new(Mutex::new(MemoryVaultState {
-            key,
-            recovery: Recovery::empty_for_key(&key),
-        }));
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server_state = state.clone();
-        let server_token = token.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().take(8) {
-                handle_client(stream.unwrap(), &server_token, &server_state).unwrap();
-            }
-        });
-
-        let client = MemoryVaultClient { addr, token };
+        let client = MemoryVaultClient {
+            addr: spawn_test_memory_vault(token.clone()),
+            token,
+        };
         assert_eq!(client.key().unwrap(), client.snapshot().unwrap().key);
         let snapshot = client.snapshot().unwrap();
         let result = Engine::with_profile(Profile::Strict).mask(
@@ -293,22 +298,10 @@ mod tests {
     #[test]
     fn read_style_masking_registers_recovery_and_env_aliases_in_memory_vault() {
         let token = "test-token-read".to_string();
-        let key = Config::generate().key;
-        let state = Arc::new(Mutex::new(MemoryVaultState {
-            key,
-            recovery: Recovery::empty_for_key(&key),
-        }));
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server_state = state.clone();
-        let server_token = token.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().take(5) {
-                handle_client(stream.unwrap(), &server_token, &server_state).unwrap();
-            }
-        });
-
-        let client = MemoryVaultClient { addr, token };
+        let client = MemoryVaultClient {
+            addr: spawn_test_memory_vault(token.clone()),
+            token,
+        };
         let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n";
         let result = crate::mask_input_into_memory_vault_client(
             &client,
