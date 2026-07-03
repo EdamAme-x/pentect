@@ -2050,6 +2050,15 @@ fn handle_hook(
             }
         }
         HookPhase::AfterTool => {
+            let tool_name = hook_tool_name(&input)
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(tool_input) = hook_tool_input(&input) {
+                if let Err(reason) = repair_masked_write_after_tool(session, tool_name, tool_input)
+                {
+                    return Ok(after_tool_block_output(provider, &reason));
+                }
+            }
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
@@ -2102,6 +2111,15 @@ fn handle_hook_lazy(
         }
         HookPhase::AfterTool => {
             let session = open_hook_session(cli, session_name)?;
+            let tool_name = hook_tool_name(&input)
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(tool_input) = hook_tool_input(&input) {
+                if let Err(reason) = repair_masked_write_after_tool(&session, tool_name, tool_input)
+                {
+                    return Ok(after_tool_block_output(provider, &reason));
+                }
+            }
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
@@ -2133,11 +2151,7 @@ fn before_tool_updated_input(
     if is_read_like_tool_name(tool_name) {
         return Err(read_tool_block_reason(tool_name));
     }
-    if let Some(reason) =
-        maybe_materialize_masked_write(session_name, session, tool_name, tool_input)?
-    {
-        return Err(reason);
-    }
+    validate_masked_write_before_tool(session, tool_name, tool_input)?;
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
         if let Some(reason) = pentect_human_only_command_reason(command) {
             return Err(reason);
@@ -2165,10 +2179,9 @@ fn before_tool_updated_input_lazy(
     if is_read_like_tool_name(tool_name) {
         return Err(read_tool_block_reason(tool_name));
     }
-    if let Some(reason) =
-        maybe_materialize_masked_write_lazy(session_name, cli, tool_name, tool_input)?
-    {
-        return Err(reason);
+    if is_write_like_tool_name(tool_name) {
+        let session = open_hook_session(cli, session_name)?;
+        validate_masked_write_before_tool(&session, tool_name, tool_input)?;
     }
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
         if let Some(reason) = pentect_human_only_command_reason(command) {
@@ -2200,50 +2213,54 @@ fn canonical_hook_shell_command(command: &str) -> Result<String, String> {
     }
 }
 
-#[cfg(test)]
-fn maybe_materialize_masked_write(
-    session_name: &str,
+fn validate_masked_write_before_tool(
     session: &Session,
     tool_name: &str,
     tool_input: &Value,
-) -> Result<Option<String>, String> {
+) -> Result<(), String> {
     if !is_write_like_tool_name(tool_name) {
-        return Ok(None);
+        return Ok(());
     }
     let Some((path, content)) = write_path_and_content(tool_input) else {
-        return Ok(None);
+        return Ok(());
     };
-    if !content.contains("<<") {
-        return Ok(None);
+    if !contains_pentect_masked_handle(content) {
+        return Ok(());
     }
-    materialize_masked_write_content(session_name, session, path, content)
+    let (path, _) = resolved_write_parts(session, path, content)?;
+    ensure_materialize_path_within_cwd(&path)?;
+    Ok(())
 }
 
-fn maybe_materialize_masked_write_lazy(
-    session_name: &str,
-    cli: bool,
+fn repair_masked_write_after_tool(
+    session: &Session,
     tool_name: &str,
     tool_input: &Value,
-) -> Result<Option<String>, String> {
+) -> Result<bool, String> {
     if !is_write_like_tool_name(tool_name) {
-        return Ok(None);
+        return Ok(false);
     }
     let Some((path, content)) = write_path_and_content(tool_input) else {
-        return Ok(None);
+        return Ok(false);
     };
-    if !content.contains("<<") {
-        return Ok(None);
+    if !contains_pentect_masked_handle(content) {
+        return Ok(false);
     }
-    let session = open_hook_session(cli, session_name)?;
-    materialize_masked_write_content(session_name, &session, path, content)
+    let (path, resolved) = resolved_write_parts(session, path, content)?;
+    ensure_materialize_path_within_cwd(&path)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    std::fs::write(&path, resolved)
+        .map_err(|e| format!("could not repair '{}': {e}", path.display()))?;
+    Ok(true)
 }
 
-fn materialize_masked_write_content(
-    session_name: &str,
+fn resolved_write_parts(
     session: &Session,
     path: &str,
     content: &str,
-) -> Result<Option<String>, String> {
+) -> Result<(PathBuf, String), String> {
     let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if contains_pentect_masked_handle(&resolved) {
@@ -2253,18 +2270,10 @@ fn materialize_masked_write_content(
         );
     }
     if resolved == content {
-        return Ok(None);
+        return Err("resolve needed: no matching handle in this Pentect session.".to_string());
     }
     let path = checked_materialize_path(path)?;
-    ensure_materialize_path_within_cwd(&path)?;
-    match approval_decision_for_materialized_write(session_name, &path, content, &resolved)? {
-        ApprovalDecision::Once | ApprovalDecision::Always => {}
-        ApprovalDecision::Decline => {
-            return Err("Pentect declined masked file materialization".into())
-        }
-    }
-    materialize_file(&path, &resolved)?;
-    Ok(Some(format!("resolved write: {}", path.display())))
+    Ok((path, resolved))
 }
 
 fn contains_pentect_masked_handle(text: &str) -> bool {
@@ -2281,43 +2290,6 @@ fn contains_pentect_masked_handle(text: &str) -> bool {
         offset = end;
     }
     false
-}
-
-fn approval_decision_for_materialized_write(
-    session: &str,
-    path: &Path,
-    masked_content: &str,
-    resolved_content: &str,
-) -> Result<ApprovalDecision, String> {
-    let ticket = materialized_write_approval_ticket(path, masked_content, resolved_content);
-    if ApprovalQueue::open(session)?.always_granted(&ticket.fingerprint) {
-        return Ok(ApprovalDecision::Always);
-    }
-    approval_decision_for_ticket(session, &ticket)
-}
-
-fn materialized_write_approval_ticket(
-    path: &Path,
-    masked_content: &str,
-    resolved_content: &str,
-) -> ApprovalTicket {
-    let command = format!("write {}", shell_quote_path(path));
-    let mut material = String::from("write-materialize-v1\0");
-    material.push_str(&path.to_string_lossy());
-    material.push('\0');
-    material.push_str(&secret_value_hash(resolved_content));
-    material.push('\0');
-    let digest = Sha256::digest(material.as_bytes());
-    ApprovalTicket::new(ApprovalTicketDraft {
-        fingerprint: data_encoding::HEXLOWER.encode(&digest[..16]),
-        command,
-        env_names: Vec::new(),
-        secret_files: vec![path.to_string_lossy().to_string()],
-        direct_handles: masked_handles_in_text(masked_content).len(),
-        destinations: Vec::new(),
-        network_like: false,
-        materialize_like: true,
-    })
 }
 
 fn is_write_like_tool_name(tool_name: &str) -> bool {
@@ -2382,17 +2354,6 @@ fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
         return Err("Pentect refused to materialize masked content to an empty path".to_string());
     }
     Ok(clean)
-}
-
-fn materialize_file(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
-        }
-    }
-    ensure_materialize_path_within_cwd(path)?;
-    std::fs::write(path, content).map_err(|e| format!("could not write '{}': {e}", path.display()))
 }
 
 fn ensure_materialize_path_within_cwd(path: &Path) -> Result<(), String> {
