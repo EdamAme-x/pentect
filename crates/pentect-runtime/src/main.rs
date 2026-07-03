@@ -1778,6 +1778,7 @@ const HOOK_TOOL_RESULT_FIELDS: &[&str] = &[
     "mcp_tool_result",
     "mcpToolResult",
     "structured_content",
+    "structuredContent",
     "response",
     "result",
     "output",
@@ -1785,7 +1786,6 @@ const HOOK_TOOL_RESULT_FIELDS: &[&str] = &[
     "data",
     "body",
     "content",
-    "structuredContent",
 ];
 const WRITE_INPUT_FIELDS: &[&str] = &[
     "arguments",
@@ -1958,8 +1958,9 @@ impl HookOpts {
             }
         }
         Ok(Self {
-            provider: provider
-                .ok_or_else(|| "hook requires cli: codex, claude, or generic".to_string())?,
+            provider: provider.ok_or_else(|| {
+                "hook requires a provider after --cli: codex, claude, or generic".to_string()
+            })?,
             session,
             cli,
         })
