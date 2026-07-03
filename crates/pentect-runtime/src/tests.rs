@@ -978,7 +978,7 @@ fn write_tool_blocks_unknown_masked_handles_that_need_resolve() {
 }
 
 #[test]
-fn write_tool_materialization_requires_approval_without_dashboard() {
+fn write_tool_allows_resolvable_masked_content_before_tool() {
     let root = temp_root("capability-write-generic");
     let project = PathBuf::from("target").join(format!(
         "pentect-write-{}-{}",
@@ -1001,19 +1001,48 @@ fn write_tool_materialization_requires_approval_without_dashboard() {
         }
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-        .as_str()
-        .unwrap();
-    assert!(reason.contains("approval needed"), "{reason}");
-    assert!(!reason.contains(raw), "{reason}");
+    assert_eq!(output, json!({}));
     assert!(!config.exists());
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn write_tool_refuses_masked_materialization_outside_current_dir() {
+fn write_tool_repairs_masked_file_after_tool() {
+    let root = temp_root("capability-write-repair");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-write-repair-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    let config = project.join("config.txt");
+
+    std::fs::write(&config, &masked).unwrap();
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "content": masked
+        },
+        "tool_response": "Edited config.txt"
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(written.contains(raw), "{written}");
+    assert!(!written.contains("<<"), "{written}");
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_tool_refuses_masked_repair_outside_current_dir() {
     let root = temp_root("capability-write-outside");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
@@ -1038,7 +1067,7 @@ fn write_tool_refuses_masked_materialization_outside_current_dir() {
 }
 
 #[test]
-fn write_tool_accepts_camel_case_external_schema() {
+fn write_tool_repairs_camel_case_external_schema_after_tool() {
     let root = temp_root("capability-write-camel");
     let project = PathBuf::from("target").join(format!(
         "pentect-write-camel-{}-{}",
@@ -1060,21 +1089,26 @@ fn write_tool_accepts_camel_case_external_schema() {
             "fileContent": masked
         }
     });
-    let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-        .as_str()
-        .unwrap();
-    assert!(reason.contains("approval needed"), "{reason}");
-    assert!(!reason.contains(raw), "{reason}");
-    assert!(!config.exists());
+    let output = handle_hook(HookProvider::Generic, "t", &session, input.clone()).unwrap();
+    assert_eq!(output, json!({}));
+
+    std::fs::write(&config, &masked).unwrap();
+    let mut post = input;
+    let object = post.as_object_mut().unwrap();
+    object.insert("hookEventName".to_string(), json!("PostToolUse"));
+    object.insert("toolResponse".to_string(), json!("Edited config.txt"));
+    let output = handle_hook(HookProvider::Generic, "t", &session, post).unwrap();
+    assert_eq!(output, json!({}));
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(written.contains(raw), "{written}");
+    assert!(!written.contains("<<"), "{written}");
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
 #[test]
-fn write_tool_refuses_masked_materialization_through_symlink_dir() {
+fn write_tool_refuses_masked_repair_through_symlink_dir() {
     let root = temp_root("capability-write-symlink");
     let outside = temp_root("capability-write-symlink-outside");
     std::fs::create_dir_all(&outside).unwrap();
