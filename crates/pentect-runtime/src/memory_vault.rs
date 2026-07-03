@@ -156,6 +156,8 @@ pub(crate) fn spawn_test_memory_vault(token: String) -> String {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || {
+        // Unit tests open only a handful of requests; bound the helper server so
+        // finished tests do not keep an idle listener thread around forever.
         for stream in listener.incoming().take(8) {
             handle_client(stream.unwrap(), &token, &state).unwrap();
         }
