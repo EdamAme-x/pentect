@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
+#[cfg(not(test))]
 const AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,7 +60,7 @@ pub(crate) fn approval_bypassed_by_config() -> Result<bool, String> {
 
 #[cfg(test)]
 pub(crate) fn approval_bypassed_by_config() -> Result<bool, String> {
-    Ok(env_bool(AUTO_APPROVE_ENV))
+    Ok(false)
 }
 
 fn approval_bypassed_with_state(state: &ApprovalConfigState, agent_auto_approve: bool) -> bool {
@@ -204,6 +205,7 @@ fn approval_mode_bypasses(value: &str) -> bool {
     )
 }
 
+#[cfg(not(test))]
 fn env_bool(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {
         matches!(
