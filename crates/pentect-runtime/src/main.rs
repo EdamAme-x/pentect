@@ -2193,6 +2193,9 @@ fn handle_hook(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
+            if let Some(reason) = unsupported_tool_result_reason(tool_response) {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
             let mut masker = OutputMasker::new_deferred(store)?;
             let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
@@ -2242,6 +2245,9 @@ fn handle_hook_lazy(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
+            if let Some(reason) = unsupported_tool_result_reason(tool_response) {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
             let mut masker = OutputMasker::new_deferred(store)?;
             let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
@@ -2791,6 +2797,153 @@ fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
             "decision": "block",
             "reason": stringify_tool_output(&updated_output)
         }),
+    }
+}
+
+fn after_tool_block_output(_provider: HookProvider, reason: &str) -> Value {
+    json!({
+        "decision": "block",
+        "reason": reason
+    })
+}
+
+fn unsupported_tool_result_reason(value: &Value) -> Option<String> {
+    // TODO(media-adapters): replace these fail-closed blocks with OCR/QR/media
+    // extraction once adapters can prove the returned content was inspected.
+    if contains_unsupported_media_result(value) {
+        return Some(
+            "Pentect blocked non-text media output because OCR/media masking is not active yet."
+                .to_string(),
+        );
+    }
+    // TODO(side-effect-audit): replace this with explicit capability tracking
+    // for clipboard/download/GUI-save destinations when those surfaces exist.
+    if contains_unobserved_side_effect_result(value) {
+        return Some(
+            "Pentect blocked clipboard/download output because that side effect bypasses the hook boundary."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn contains_unsupported_media_result(value: &Value) -> bool {
+    match value {
+        Value::String(text) => looks_like_media_reference(text),
+        Value::Number(_) | Value::Bool(_) | Value::Null => false,
+        Value::Array(items) => items.iter().any(contains_unsupported_media_result),
+        Value::Object(map) => map.iter().any(|(key, item)| {
+            let key = normalized_json_key(key);
+            key_marks_media_value(&key, item)
+                || string_media_field(&key, item)
+                || contains_unsupported_media_result(item)
+        }),
+    }
+}
+
+fn contains_unobserved_side_effect_result(value: &Value) -> bool {
+    match value {
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => false,
+        Value::Array(items) => items.iter().any(contains_unobserved_side_effect_result),
+        Value::Object(map) => map.iter().any(|(key, item)| {
+            let key = normalized_json_key(key);
+            key_marks_unobserved_side_effect(&key, item)
+                || string_side_effect_field(&key, item)
+                || contains_unobserved_side_effect_result(item)
+        }),
+    }
+}
+
+fn normalized_json_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| *c != '_' && *c != '-' && !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn key_marks_media_value(key: &str, value: &Value) -> bool {
+    matches!(
+        key,
+        "image"
+            | "images"
+            | "imageurl"
+            | "screenshot"
+            | "screenshots"
+            | "thumbnail"
+            | "qrcode"
+            | "audio"
+            | "video"
+            | "media"
+            | "binary"
+            | "blob"
+    ) && !empty_json_value(value)
+}
+
+fn string_media_field(key: &str, value: &Value) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    match key {
+        "type" | "kind" => matches!(
+            normalized_json_key(text).as_str(),
+            "image" | "imageurl" | "screenshot" | "qrcode" | "audio" | "video"
+        ),
+        "mimetype" | "mediatype" | "contenttype" => is_unsupported_media_mime(text),
+        "url" | "uri" | "src" | "href" | "dataurl" => looks_like_media_reference(text),
+        _ => false,
+    }
+}
+
+fn looks_like_media_reference(text: &str) -> bool {
+    let value = text.trim().to_ascii_lowercase();
+    value.starts_with("data:image/")
+        || value.starts_with("data:audio/")
+        || value.starts_with("data:video/")
+        || value.starts_with("data:application/pdf")
+}
+
+fn is_unsupported_media_mime(text: &str) -> bool {
+    let value = text.trim().to_ascii_lowercase();
+    value.starts_with("image/")
+        || value.starts_with("audio/")
+        || value.starts_with("video/")
+        || value == "application/pdf"
+}
+
+fn key_marks_unobserved_side_effect(key: &str, value: &Value) -> bool {
+    matches!(
+        key,
+        "clipboard"
+            | "clipboardtext"
+            | "clipboardcontent"
+            | "download"
+            | "downloadpath"
+            | "downloadurl"
+            | "downloadedfile"
+            | "savedfile"
+            | "savedpath"
+    ) && !empty_json_value(value)
+}
+
+fn string_side_effect_field(key: &str, value: &Value) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    matches!(key, "type" | "kind")
+        && matches!(
+            normalized_json_key(text).as_str(),
+            "clipboard" | "download" | "guisave" | "savedfile"
+        )
+}
+
+fn empty_json_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        Value::Bool(false) => true,
+        Value::Bool(true) | Value::Number(_) => false,
     }
 }
 
