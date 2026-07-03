@@ -1,7 +1,7 @@
 use pentect_core::normalize::NormalizedView;
 use pentect_core::{
-    ByteRange, Category, Context, CredSweeperNativeDetector, CredSweeperNativeFinding, Engine,
-    Input, Profile, Region, RegionKind, Span,
+    infer_kind, ByteRange, Category, Context, CredSweeperNativeDetector, CredSweeperNativeFinding,
+    Engine, Input, Profile, Region, RegionKind, Span,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -15,8 +15,7 @@ use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 fn main() {
-    let mut args = std::env::args().collect::<Vec<_>>();
-    args.insert(1, "bench".to_string());
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
     cmd_bench(&args);
 }
 
@@ -25,32 +24,8 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(2);
 }
 
-fn infer_kind(path: &Path) -> pentect_core::Kind {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower == ".env" || lower.starts_with(".env.")
-        })
-    {
-        return pentect_core::Kind::Env;
-    }
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("json") => pentect_core::Kind::Json,
-        Some("env") => pentect_core::Kind::Env,
-        Some("har") => pentect_core::Kind::Har,
-        _ => pentect_core::Kind::Text,
-    }
-}
-
 fn cmd_bench(args: &[String]) {
-    if args.get(2).map(String::as_str) == Some("credsweeper-parity") {
+    if args.first().map(String::as_str) == Some("credsweeper-parity") {
         let opts = match CredSweeperParityOpts::parse(args) {
             Ok(opts) => opts,
             Err(e) => die(e),
@@ -192,7 +167,7 @@ enum Dataset {
 
 impl BenchOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
-        let Some(dataset) = args.get(2).map(String::as_str) else {
+        let Some(dataset) = args.first().map(String::as_str) else {
             return Err("pentect-bench creddata PATH".to_string());
         };
         match dataset {
@@ -202,7 +177,7 @@ impl BenchOpts {
     }
 
     fn parse_creddata(args: &[String]) -> Result<Self, String> {
-        let Some(path) = args.get(3) else {
+        let Some(path) = args.get(1) else {
             return Err("pentect-bench creddata PATH".to_string());
         };
         let mut json = false;
@@ -214,7 +189,7 @@ impl BenchOpts {
         let mut min_recall = None;
         let mut save_credsweeper_json = None;
         let mut save_credsweeper_paths = None;
-        let mut i = 4usize;
+        let mut i = 2usize;
         while i < args.len() {
             match args[i].as_str() {
                 "--json" => {
@@ -287,17 +262,17 @@ struct CredSweeperParityOpts {
 
 impl CredSweeperParityOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
-        let Some(rust_json) = args.get(3) else {
+        let Some(rust_json) = args.get(1) else {
             return Err("pentect-bench credsweeper-parity RUST_JSON ORACLE_JSON".to_string());
         };
-        let Some(oracle_json) = args.get(4) else {
+        let Some(oracle_json) = args.get(2) else {
             return Err("pentect-bench credsweeper-parity RUST_JSON ORACLE_JSON".to_string());
         };
         let mut json = false;
         let mut examples = 10usize;
         let mut min_precision = 1.0;
         let mut min_recall = 1.0;
-        let mut i = 5usize;
+        let mut i = 3usize;
         while i < args.len() {
             match args[i].as_str() {
                 "--json" => {
@@ -1656,12 +1631,7 @@ mod tests {
         )
         .unwrap();
 
-        let args = vec![
-            "pentect".to_string(),
-            "bench".to_string(),
-            "creddata".to_string(),
-            root.to_string_lossy().to_string(),
-        ];
+        let args = vec!["creddata".to_string(), root.to_string_lossy().to_string()];
         let opts = BenchOpts::parse(&args).unwrap();
         let report = run_creddata(&root, &opts).unwrap();
 
@@ -1677,8 +1647,6 @@ mod tests {
     #[test]
     fn bench_args_parse_thresholds() {
         let args = vec![
-            "pentect".to_string(),
-            "bench".to_string(),
             "creddata".to_string(),
             "CredData".to_string(),
             "--json".to_string(),
@@ -1731,12 +1699,7 @@ mod tests {
         )
         .unwrap();
 
-        let args = vec![
-            "pentect".to_string(),
-            "bench".to_string(),
-            "creddata".to_string(),
-            root.to_string_lossy().to_string(),
-        ];
+        let args = vec!["creddata".to_string(), root.to_string_lossy().to_string()];
         let opts = BenchOpts::parse(&args).unwrap();
         let report = run_creddata(&root, &opts).unwrap();
 
@@ -1751,8 +1714,6 @@ mod tests {
     #[test]
     fn credsweeper_parity_args_parse() {
         let args = vec![
-            "pentect".to_string(),
-            "bench".to_string(),
             "credsweeper-parity".to_string(),
             "rust.json".to_string(),
             "oracle.json".to_string(),

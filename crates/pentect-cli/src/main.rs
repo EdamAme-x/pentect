@@ -9,7 +9,9 @@ mod scan;
 mod terminal;
 
 use input::{decode_utf8_text, InputAdapter, TextInput};
-use pentect_core::{load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile};
+use pentect_core::{
+    infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
+};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1162,30 +1164,6 @@ fn pdf_text(bytes: &[u8]) -> Result<String, String> {
 #[cfg(not(feature = "pdf"))]
 fn pdf_text(_bytes: &[u8]) -> Result<String, String> {
     Err("PDF input requires a build with `--features pdf`".to_string())
-}
-
-fn infer_kind(path: &Path) -> Kind {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower == ".env" || lower.starts_with(".env.")
-        })
-    {
-        return Kind::Env;
-    }
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("json") => Kind::Json,
-        Some("env") => Kind::Env,
-        Some("har") => Kind::Har,
-        _ => Kind::Text,
-    }
 }
 
 #[cfg(feature = "pdf")]

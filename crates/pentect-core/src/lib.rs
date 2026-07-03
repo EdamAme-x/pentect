@@ -61,3 +61,28 @@ pub fn mask(input: Input, config: &Config) -> MaskResult {
 pub fn explain(result: &MaskResult) -> Summary {
     result.summary.clone()
 }
+
+/// Infer the parser kind from a path without reading the file.
+pub fn infer_kind(path: &std::path::Path) -> Kind {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower == ".env" || lower.starts_with(".env.")
+        })
+    {
+        return Kind::Env;
+    }
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("json") => Kind::Json,
+        Some("env") => Kind::Env,
+        Some("har") => Kind::Har,
+        _ => Kind::Text,
+    }
+}
