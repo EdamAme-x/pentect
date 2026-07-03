@@ -114,6 +114,14 @@ fn child_env_overlays_strip_memory_vault_credentials() {
     );
     assert!(
         matches!(
+            envs.iter()
+                .find(|(name, _)| name == "PENTECT_AGENT_LAUNCHED"),
+            Some((_, None))
+        ),
+        "{envs:?}"
+    );
+    assert!(
+        matches!(
             envs.iter().find(|(name, _)| name == "PENTECT_SESSION"),
             Some((_, Some(value))) if value == "demo"
         ),
@@ -2187,6 +2195,43 @@ fn claude_pretool_wraps_plain_shell_command() {
     assert!(command.contains(".\\.env"), "{command}");
     assert!(!command.contains("--shell-b64"), "{command}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn require_pentect_blocks_unwrapped_agent_when_enabled() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
+    std::env::remove_var(ENV_TOKEN);
+    let reason = ensure_pentect_agent_launch_required(HookProvider::Claude, true).unwrap_err();
+    assert!(reason.contains("pentect claude"), "{reason}");
+}
+
+#[test]
+fn require_pentect_rejects_matching_env_without_live_vault() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
+    std::env::set_var(ENV_TOKEN, token);
+    std::env::set_var(ENV_ADDR, "127.0.0.1:9");
+    let reason = ensure_pentect_agent_launch_required(HookProvider::Claude, true).unwrap_err();
+    assert!(reason.contains("pentect claude"), "{reason}");
+    std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
+    std::env::remove_var(ENV_TOKEN);
+    std::env::remove_var(ENV_ADDR);
+}
+
+#[test]
+fn require_pentect_allows_wrapped_agent_with_vault_proof() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let addr = memory_vault::spawn_test_memory_vault(token.to_string());
+    std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
+    std::env::set_var(ENV_TOKEN, token);
+    std::env::set_var(ENV_ADDR, addr);
+    ensure_pentect_agent_launch_required(HookProvider::Claude, true).unwrap();
+    std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
+    std::env::remove_var(ENV_TOKEN);
+    std::env::remove_var(ENV_ADDR);
 }
 
 #[test]

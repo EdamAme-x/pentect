@@ -42,6 +42,7 @@ use std::time::Duration;
 
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
+const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
@@ -1171,6 +1172,7 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
 fn apply_child_env_overlays(command: &mut Command, env: &[(String, String)], session: &str) {
     command.env_remove(ENV_ADDR);
     command.env_remove(ENV_TOKEN);
+    command.env_remove(PENTECT_AGENT_LAUNCHED_ENV);
     apply_env_bindings(command, env);
     apply_pentect_session(command, session);
 }
@@ -1596,6 +1598,16 @@ enum HookProvider {
     Codex,
     Claude,
     Generic,
+}
+
+impl HookProvider {
+    fn pentect_launch_command(self) -> &'static str {
+        match self {
+            HookProvider::Codex => "pentect codex",
+            HookProvider::Claude => "pentect claude",
+            HookProvider::Generic => "pentect codex|claude",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2035,8 +2047,24 @@ fn handle_hook(
     session: &Session,
     input: Value,
 ) -> Result<Value, String> {
+    handle_hook_with_launch_requirement(provider, session_name, session, input, false)
+}
+
+#[cfg(test)]
+fn handle_hook_with_launch_requirement(
+    provider: HookProvider,
+    session_name: &str,
+    session: &Session,
+    input: Value,
+    require_pentect_launch: bool,
+) -> Result<Value, String> {
     match hook_phase(provider, &input) {
         HookPhase::BeforeTool => {
+            if let Err(reason) =
+                ensure_pentect_agent_launch_required(provider, require_pentect_launch)
+            {
+                return Ok(before_tool_block_output(provider, &reason));
+            }
             let Some(tool_input) = hook_tool_input(&input) else {
                 return Ok(json!({}));
             };
@@ -2060,6 +2088,11 @@ fn handle_hook(
             }
         }
         HookPhase::AfterTool => {
+            if let Err(reason) =
+                ensure_pentect_agent_launch_required(provider, require_pentect_launch)
+            {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             let tool_name = hook_tool_name(&input)
                 .and_then(Value::as_str)
                 .unwrap_or_default();
@@ -2097,6 +2130,9 @@ fn handle_hook_lazy(
 ) -> Result<Value, String> {
     match hook_phase(provider, &input) {
         HookPhase::BeforeTool => {
+            if let Err(reason) = ensure_pentect_agent_launch(provider) {
+                return Ok(before_tool_block_output(provider, &reason));
+            }
             let Some(tool_input) = hook_tool_input(&input) else {
                 return Ok(json!({}));
             };
@@ -2120,6 +2156,9 @@ fn handle_hook_lazy(
             }
         }
         HookPhase::AfterTool => {
+            if let Err(reason) = ensure_pentect_agent_launch(provider) {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             let session = open_hook_session(cli, session_name)?;
             let tool_name = hook_tool_name(&input)
                 .and_then(Value::as_str)
@@ -2209,6 +2248,53 @@ fn before_tool_updated_input_lazy(
         }
     }
     Ok((tool_input.clone(), false))
+}
+
+fn ensure_pentect_agent_launch(provider: HookProvider) -> Result<(), String> {
+    ensure_pentect_agent_launch_required(provider, config::require_pentect_agent_by_config()?)
+}
+
+fn ensure_pentect_agent_launch_required(
+    provider: HookProvider,
+    required: bool,
+) -> Result<(), String> {
+    if !required {
+        return Ok(());
+    }
+    if agent_launch_proof_valid() {
+        return Ok(());
+    }
+    Err(format!(
+        "Pentect required; start with `{}`.",
+        provider.pentect_launch_command()
+    ))
+}
+
+fn agent_launch_proof_valid() -> bool {
+    let Ok(proof) = std::env::var(PENTECT_AGENT_LAUNCHED_ENV) else {
+        return false;
+    };
+    let Ok(token) = std::env::var(ENV_TOKEN) else {
+        return false;
+    };
+    agent_launch_proof_matches(&proof, &token)
+        && memory_vault_env_addr_is_loopback()
+        && memory_vault_accepts_env_token()
+}
+
+fn agent_launch_proof_matches(proof: &str, token: &str) -> bool {
+    token.len() >= 32 && proof == token
+}
+
+fn memory_vault_env_addr_is_loopback() -> bool {
+    std::env::var(ENV_ADDR)
+        .ok()
+        .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|addr| addr.ip().is_loopback())
+}
+
+fn memory_vault_accepts_env_token() -> bool {
+    MemoryVaultClient::from_env().is_some_and(|client| client.key().is_ok())
 }
 
 fn canonical_hook_shell_command(command: &str) -> Result<String, String> {

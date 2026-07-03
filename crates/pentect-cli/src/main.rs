@@ -38,6 +38,7 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
 );
 const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
+const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_AGENT_AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
 const PENTECT_MEMORY_VAULT_ADDR_ENV: &str = "PENTECT_MEMORY_VAULT_ADDR";
 const PENTECT_MEMORY_VAULT_TOKEN_ENV: &str = "PENTECT_MEMORY_VAULT_TOKEN";
@@ -165,18 +166,26 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
             pentect.display()
         ));
     }
-    let memory_vault = if opts.dry_run {
-        None
-    } else {
-        Some(MemoryVaultGuard::start(&pentect).unwrap_or_else(|e| die(&e)))
-    };
     let status = match tool {
-        AgentTool::Codex => run_codex(&opts, &pentect, memory_vault.as_ref()),
-        AgentTool::Claude => run_claude(&opts, &pentect, memory_vault.as_ref()),
-    };
+        AgentTool::Codex => run_codex(&opts, &pentect),
+        AgentTool::Claude => run_claude(&opts, &pentect),
+    }
+    .unwrap_or_else(|e| die(&e));
     let code = status.code().unwrap_or(1);
-    drop(memory_vault);
     std::process::exit(code);
+}
+
+fn start_memory_vault(pentect: &Path) -> Result<MemoryVaultGuard, String> {
+    MemoryVaultGuard::start(pentect)
+}
+
+fn agent_tool_extensions(opts: &AgentToolOpts) -> Result<extensions::ActiveExtensions, String> {
+    extensions::active_from_specs(opts.extensions.clone(), true).map_err(|e| e.to_string())
+}
+
+fn blocked_headless_codex_error() -> String {
+    "headless Codex may skip hooks. Use interactive `pentect codex` for protected tool use."
+        .to_string()
 }
 
 /// Read stdin as bytes (no panic on binary), cap the size, then delegate
@@ -561,11 +570,7 @@ impl AgentToolOpts {
     }
 }
 
-fn run_codex(
-    opts: &AgentToolOpts,
-    pentect: &Path,
-    memory_vault: Option<&MemoryVaultGuard>,
-) -> std::process::ExitStatus {
+fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
     let configs = codex_hook_config_args(pentect, opts.session.as_deref());
     if opts.dry_run {
         if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
@@ -574,55 +579,50 @@ fn run_codex(
             );
         }
         print_dry_run(&opts.command, &codex_args(&configs, &opts.tool_args));
-        return success_status();
+        return Ok(success_status());
     }
     if codex_uses_unverified_headless_hook_path(&opts.tool_args) && !opts.allow_unverified_hooks {
-        die("headless Codex may skip hooks. Use interactive `pentect codex` for protected tool use.");
+        return Err(blocked_headless_codex_error());
     }
-    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
-        Ok(active) => active,
-        Err(e) => die(&e),
-    };
+    let active_extensions = agent_tool_extensions(opts)?;
     let mut cmd = Command::new(&opts.command);
-    apply_pentect_env(&mut cmd, pentect);
+    apply_extension_env(&mut cmd, &active_extensions)?;
+    let memory_vault = start_memory_vault(pentect)?;
+    apply_pentect_env(&mut cmd, pentect, Some(memory_vault.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
-    apply_memory_vault_env(&mut cmd, memory_vault);
-    apply_extension_env(&mut cmd, &active_extensions);
+    apply_memory_vault_env(&mut cmd, Some(&memory_vault));
     cmd.args(codex_args(&configs, &opts.tool_args));
     run_interactive_command(cmd, &opts.command)
 }
 
-fn run_claude(
-    opts: &AgentToolOpts,
-    pentect: &Path,
-    memory_vault: Option<&MemoryVaultGuard>,
-) -> std::process::ExitStatus {
+fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
     let settings = claude_settings_json(pentect, opts.session.as_deref());
     let args = claude_args(&settings, &opts.tool_args);
     if opts.dry_run {
         print_dry_run(&opts.command, &args);
-        return success_status();
+        return Ok(success_status());
     }
-    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
-        Ok(active) => active,
-        Err(e) => die(&e),
-    };
+    let active_extensions = agent_tool_extensions(opts)?;
     let mut cmd = Command::new(&opts.command);
-    apply_pentect_env(&mut cmd, pentect);
+    apply_extension_env(&mut cmd, &active_extensions)?;
+    let memory_vault = start_memory_vault(pentect)?;
+    apply_pentect_env(&mut cmd, pentect, Some(memory_vault.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
-    apply_memory_vault_env(&mut cmd, memory_vault);
-    apply_extension_env(&mut cmd, &active_extensions);
+    apply_memory_vault_env(&mut cmd, Some(&memory_vault));
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
 }
 
-fn run_interactive_command(mut cmd: Command, display: &Path) -> std::process::ExitStatus {
+fn run_interactive_command(
+    mut cmd: Command,
+    display: &Path,
+) -> Result<std::process::ExitStatus, String> {
     let mut terminal_guard = terminal::TuiSessionGuard::enter();
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             terminal_guard.restore_without_prompt();
-            die(format!("could not start '{}': {e}", display.display()));
+            return Err(format!("could not start '{}': {e}", display.display()));
         }
     };
     // Set this after spawn so child TUIs still receive Ctrl+C; the parent
@@ -633,12 +633,12 @@ fn run_interactive_command(mut cmd: Command, display: &Path) -> std::process::Ex
         Err(e) => {
             drop(ctrl_c_guard);
             terminal_guard.restore_after_tui();
-            die(format!("could not wait for '{}': {e}", display.display()))
+            return Err(format!("could not wait for '{}': {e}", display.display()));
         }
     };
     drop(ctrl_c_guard);
     terminal_guard.restore_after_tui();
-    status
+    Ok(status)
 }
 
 struct MemoryVaultGuard {
@@ -709,8 +709,13 @@ impl Drop for MemoryVaultGuard {
     }
 }
 
-fn apply_pentect_env(cmd: &mut Command, pentect: &Path) {
+fn apply_pentect_env(cmd: &mut Command, pentect: &Path, launch_proof: Option<&str>) {
     cmd.env(PENTECT_BIN_ENV, pentect);
+    if let Some(launch_proof) = launch_proof.filter(|value| !value.is_empty()) {
+        cmd.env(PENTECT_AGENT_LAUNCHED_ENV, launch_proof);
+    } else {
+        cmd.env_remove(PENTECT_AGENT_LAUNCHED_ENV);
+    }
 }
 
 fn apply_agent_auto_approve_env(cmd: &mut Command) {
@@ -743,19 +748,17 @@ fn parse_memory_vault_startup(line: &str) -> Result<(String, String), String> {
     Ok((addr, token))
 }
 
-fn apply_extension_env(cmd: &mut Command, active: &extensions::ActiveExtensions) {
-    if let Some(value) = match active.pack_env_value() {
-        Ok(value) => value,
-        Err(e) => die(&e),
-    } {
+fn apply_extension_env(
+    cmd: &mut Command,
+    active: &extensions::ActiveExtensions,
+) -> Result<(), String> {
+    if let Some(value) = active.pack_env_value().map_err(|e| e.to_string())? {
         cmd.env(extensions::PACKS_ENV, value);
     }
-    if let Some(value) = match active.adapter_env_value() {
-        Ok(value) => value,
-        Err(e) => die(&e),
-    } {
+    if let Some(value) = active.adapter_env_value().map_err(|e| e.to_string())? {
         cmd.env(extensions::ADAPTERS_ENV, value);
     }
+    Ok(())
 }
 
 fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
@@ -1494,8 +1497,9 @@ mod tests {
     #[test]
     fn launched_agent_tools_export_pentect_path_for_hooks() {
         let pentect = Path::new(r"C:\repo\target\debug\pentect.exe");
+        let launch_proof = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let mut cmd = Command::new("codex");
-        apply_pentect_env(&mut cmd, pentect);
+        apply_pentect_env(&mut cmd, pentect, Some(launch_proof));
         apply_agent_auto_approve_env(&mut cmd);
         let actual = cmd
             .get_envs()
@@ -1503,6 +1507,12 @@ mod tests {
             .and_then(|(_, value)| value)
             .unwrap();
         assert_eq!(actual, pentect.as_os_str());
+        let launched = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_LAUNCHED_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(launched, std::ffi::OsStr::new(launch_proof));
         let auto_approve = cmd
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_AUTO_APPROVE_ENV))
