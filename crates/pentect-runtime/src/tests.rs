@@ -1,5 +1,7 @@
 use super::*;
 
+static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn session_recovery_is_process_local() {
     let root = std::env::temp_dir().join(format!(
@@ -82,15 +84,41 @@ fn exec_parse_accepts_live_and_approve_without_env_flags() {
 }
 
 #[test]
-fn child_env_overlays_do_not_add_memory_vault_credentials() {
+fn child_env_overlays_strip_memory_vault_credentials() {
     let mut cmd = Command::new("echo");
     apply_child_env_overlays(&mut cmd, &[], "demo");
     let envs: Vec<_> = cmd
         .get_envs()
-        .map(|(name, _)| name.to_string_lossy().to_string())
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().to_string(),
+                value.map(|value| value.to_string_lossy().to_string()),
+            )
+        })
         .collect();
-    assert!(!envs.iter().any(|name| name == "PENTECT_MEMORY_VAULT_ADDR"));
-    assert!(!envs.iter().any(|name| name == "PENTECT_MEMORY_VAULT_TOKEN"));
+    assert!(
+        matches!(
+            envs.iter()
+                .find(|(name, _)| name == "PENTECT_MEMORY_VAULT_ADDR"),
+            Some((_, None))
+        ),
+        "{envs:?}"
+    );
+    assert!(
+        matches!(
+            envs.iter()
+                .find(|(name, _)| name == "PENTECT_MEMORY_VAULT_TOKEN"),
+            Some((_, None))
+        ),
+        "{envs:?}"
+    );
+    assert!(
+        matches!(
+            envs.iter().find(|(name, _)| name == "PENTECT_SESSION"),
+            Some((_, Some(value))) if value == "demo"
+        ),
+        "{envs:?}"
+    );
 }
 
 #[test]
@@ -228,6 +256,7 @@ fn session_does_not_create_key_or_recovery_dir() {
 
 #[test]
 fn default_session_root_lives_under_pentect_dir() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     std::env::remove_var("PENTECT_HOME");
     let root = session_root("demo").unwrap();
     assert_eq!(root, PathBuf::from(".pentect").join("agent").join("demo"));
@@ -555,6 +584,7 @@ fn always_fingerprint_includes_capability_value_identity() {
 
 #[test]
 fn exec_inherits_parent_environment_and_masks_output() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("env-pass-through");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let store = RecoveryStore::load(&session).unwrap();
@@ -593,6 +623,7 @@ fn exec_inherits_parent_environment_and_masks_output() {
 
 #[test]
 fn exec_capability_env_overlays_parent_environment_when_referenced() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("env-overlay");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let value = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";

@@ -25,7 +25,7 @@ use masking::{
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
-use memory_vault::MemoryVaultClient;
+use memory_vault::{MemoryVaultClient, ENV_ADDR, ENV_TOKEN};
 use pentect_core::{
     infer_kind, parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile,
     RegionKind,
@@ -1169,6 +1169,8 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
 }
 
 fn apply_child_env_overlays(command: &mut Command, env: &[(String, String)], session: &str) {
+    command.env_remove(ENV_ADDR);
+    command.env_remove(ENV_TOKEN);
     apply_env_bindings(command, env);
     apply_pentect_session(command, session);
 }
