@@ -1042,6 +1042,53 @@ fn write_tool_repairs_masked_file_after_tool() {
 }
 
 #[test]
+fn write_tool_allows_and_repairs_absolute_file_path() {
+    let root = temp_root("capability-write-absolute");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-write-absolute-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    let config = std::env::current_dir()
+        .unwrap()
+        .join(&project)
+        .join("config.txt");
+
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "content": masked
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input.clone()).unwrap();
+    assert_eq!(output, json!({}));
+    assert!(!config.exists());
+
+    std::fs::write(&config, &masked).unwrap();
+    let mut post = input;
+    post.as_object_mut()
+        .unwrap()
+        .insert("hook_event_name".to_string(), json!("PostToolUse"));
+    post.as_object_mut()
+        .unwrap()
+        .insert("tool_response".to_string(), json!("Edited config.txt"));
+    let output = handle_hook(HookProvider::Claude, "t", &session, post).unwrap();
+    assert_eq!(output, json!({}));
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(written.contains(raw), "{written}");
+    assert!(!written.contains("<<"), "{written}");
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn write_tool_refuses_masked_repair_outside_current_dir() {
     let root = temp_root("capability-write-outside");
     let session = Session::open_capability_at(&root, "t").unwrap();
@@ -1104,6 +1151,178 @@ fn write_tool_repairs_camel_case_external_schema_after_tool() {
     assert!(!written.contains("<<"), "{written}");
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_tool_repairs_edit_masked_new_string_after_tool() {
+    let root = temp_root("capability-edit-repair");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-edit-repair-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    let config = std::env::current_dir()
+        .unwrap()
+        .join(&project)
+        .join("config.txt");
+    std::fs::write(&config, "token=old\n").unwrap();
+
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "old_string": "token=old\n",
+            "new_string": masked
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input.clone()).unwrap();
+    assert_eq!(output, json!({}));
+
+    std::fs::write(&config, &masked).unwrap();
+    let mut post = input;
+    post.as_object_mut()
+        .unwrap()
+        .insert("hook_event_name".to_string(), json!("PostToolUse"));
+    post.as_object_mut()
+        .unwrap()
+        .insert("tool_response".to_string(), json!("Edited config.txt"));
+    let output = handle_hook(HookProvider::Claude, "t", &session, post).unwrap();
+    assert_eq!(output, json!({}));
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(written.contains(raw), "{written}");
+    assert!(!written.contains("<<"), "{written}");
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_tool_repairs_multiedit_masked_new_string_after_tool() {
+    let root = temp_root("capability-multiedit-repair");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-multiedit-repair-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    let config = std::env::current_dir()
+        .unwrap()
+        .join(&project)
+        .join("config.txt");
+    std::fs::write(&config, "name=old\ntoken=old\n").unwrap();
+
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "MultiEdit",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "edits": [
+                {"old_string": "name=old", "new_string": "name=new"},
+                {"old_string": "token=old\n", "new_string": masked}
+            ]
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input.clone()).unwrap();
+    assert_eq!(output, json!({}));
+
+    std::fs::write(&config, format!("name=new\n{masked}")).unwrap();
+    let mut post = input;
+    post.as_object_mut()
+        .unwrap()
+        .insert("hook_event_name".to_string(), json!("PostToolUse"));
+    post.as_object_mut()
+        .unwrap()
+        .insert("tool_response".to_string(), json!("Edited config.txt"));
+    let output = handle_hook(HookProvider::Claude, "t", &session, post).unwrap();
+    assert_eq!(output, json!({}));
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(written.contains("name=new"), "{written}");
+    assert!(written.contains(raw), "{written}");
+    assert!(!written.contains("<<"), "{written}");
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_tool_blocks_edit_masked_old_string() {
+    let root = temp_root("capability-edit-old-handle");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-edit-old-handle-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    let config = std::env::current_dir()
+        .unwrap()
+        .join(&project)
+        .join("config.txt");
+    std::fs::write(&config, format!("token={raw}\n")).unwrap();
+
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "old_string": masked,
+            "new_string": "token=rotated\n"
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("Edit old text"), "{reason}");
+    assert!(!reason.contains(raw), "{reason}");
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_tool_blocks_edit_masked_old_string_on_lazy_hook_path() {
+    let project = PathBuf::from("target").join(format!(
+        "pentect-edit-old-handle-lazy-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let config = std::env::current_dir()
+        .unwrap()
+        .join(&project)
+        .join("config.txt");
+    std::fs::write(&config, "token=raw\n").unwrap();
+
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "old_string": "token=<<RUNPOD_API_KEY_0123456789abcdef>>\n",
+            "new_string": "token=rotated\n"
+        }
+    });
+    let output = handle_hook_lazy(HookProvider::Claude, "t", true, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("Edit old text"), "{reason}");
+    assert!(!reason.contains("raw"), "{reason}");
+    let _ = std::fs::remove_dir_all(project);
 }
 
 #[cfg(unix)]
