@@ -8,6 +8,7 @@
 //!   spans are always reported in raw coordinates.
 
 use crate::model::{ByteRange, Region};
+use memchr::memchr2_iter;
 use std::borrow::Cow;
 use unicode_normalization::UnicodeNormalization;
 
@@ -221,11 +222,10 @@ impl<'a> NormalizedView<'a> {
 
 fn is_identity_detection_slice(slice: &str) -> bool {
     let bytes = slice.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if !bytes[i].is_ascii() {
-            return false;
-        }
+    if !bytes.is_ascii() {
+        return false;
+    }
+    for i in memchr2_iter(b'%', b'\\', bytes) {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
             && hex_val(bytes[i + 1]).is_some()
@@ -251,7 +251,6 @@ fn is_identity_detection_slice(slice: &str) -> bool {
                 return false;
             }
         }
-        i += 1;
     }
     true
 }
