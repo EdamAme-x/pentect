@@ -1,4 +1,3 @@
-use crate::{die, infer_kind};
 use pentect_core::normalize::NormalizedView;
 use pentect_core::{
     ByteRange, Category, Context, CredSweeperNativeDetector, CredSweeperNativeFinding, Engine,
@@ -15,7 +14,42 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
-pub(crate) fn cmd_bench(args: &[String]) {
+fn main() {
+    let mut args = std::env::args().collect::<Vec<_>>();
+    args.insert(1, "bench".to_string());
+    cmd_bench(&args);
+}
+
+fn die(msg: impl std::fmt::Display) -> ! {
+    eprintln!("[pentect-bench] {msg}");
+    std::process::exit(2);
+}
+
+fn infer_kind(path: &Path) -> pentect_core::Kind {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower == ".env" || lower.starts_with(".env.")
+        })
+    {
+        return pentect_core::Kind::Env;
+    }
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("json") => pentect_core::Kind::Json,
+        Some("env") => pentect_core::Kind::Env,
+        Some("har") => pentect_core::Kind::Har,
+        _ => pentect_core::Kind::Text,
+    }
+}
+
+fn cmd_bench(args: &[String]) {
     if args.get(2).map(String::as_str) == Some("credsweeper-parity") {
         let opts = match CredSweeperParityOpts::parse(args) {
             Ok(opts) => opts,
@@ -29,7 +63,7 @@ pub(crate) fn cmd_bench(args: &[String]) {
             println!("{}", report.to_json());
         } else {
             println!(
-                "pentect bench credsweeper-parity rust={} oracle={} common={} missing={} extra={} precision={:.3} recall={:.3} f1={:.3}",
+                "pentect-bench credsweeper-parity rust={} oracle={} common={} missing={} extra={} precision={:.3} recall={:.3} f1={:.3}",
                 report.rust_count,
                 report.oracle_count,
                 report.common,
@@ -77,7 +111,7 @@ pub(crate) fn cmd_bench(args: &[String]) {
         println!("{}", report.to_json());
     } else {
         println!(
-            "pentect bench creddata rows={} files={} precision={:.3} recall={:.3} f1={:.3}",
+            "pentect-bench creddata rows={} files={} precision={:.3} recall={:.3} f1={:.3}",
             report.rows, report.files, report.precision, report.recall, report.f1
         );
         println!(
@@ -159,7 +193,7 @@ enum Dataset {
 impl BenchOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let Some(dataset) = args.get(2).map(String::as_str) else {
-            return Err("bench creddata PATH".to_string());
+            return Err("pentect-bench creddata PATH".to_string());
         };
         match dataset {
             "creddata" => Self::parse_creddata(args),
@@ -169,7 +203,7 @@ impl BenchOpts {
 
     fn parse_creddata(args: &[String]) -> Result<Self, String> {
         let Some(path) = args.get(3) else {
-            return Err("bench creddata PATH".to_string());
+            return Err("pentect-bench creddata PATH".to_string());
         };
         let mut json = false;
         let mut limit = None;
@@ -221,7 +255,7 @@ impl BenchOpts {
                     )?));
                 }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
-                value => return Err(format!("unexpected argument for bench: {value}")),
+                value => return Err(format!("unexpected argument for pentect-bench: {value}")),
             }
         }
         Ok(Self {
@@ -254,10 +288,10 @@ struct CredSweeperParityOpts {
 impl CredSweeperParityOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let Some(rust_json) = args.get(3) else {
-            return Err("bench credsweeper-parity RUST_JSON ORACLE_JSON".to_string());
+            return Err("pentect-bench credsweeper-parity RUST_JSON ORACLE_JSON".to_string());
         };
         let Some(oracle_json) = args.get(4) else {
-            return Err("bench credsweeper-parity RUST_JSON ORACLE_JSON".to_string());
+            return Err("pentect-bench credsweeper-parity RUST_JSON ORACLE_JSON".to_string());
         };
         let mut json = false;
         let mut examples = 10usize;
@@ -280,7 +314,7 @@ impl CredSweeperParityOpts {
                     min_recall = parse_f64_arg(args, &mut i, "--min-recall")?;
                 }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
-                value => return Err(format!("unexpected argument for bench: {value}")),
+                value => return Err(format!("unexpected argument for pentect-bench: {value}")),
             }
         }
         Ok(Self {

@@ -1,0 +1,13 @@
+[package]
+name = "pentect-bench"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/EdamAme-x/pentect"
+
+[dependencies]
+pentect-core = { path = "../../crates/pentect-core" }
+csv = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
