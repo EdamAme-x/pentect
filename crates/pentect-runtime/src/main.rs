@@ -2248,7 +2248,7 @@ fn materialize_masked_write_content(
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if contains_pentect_masked_handle(&resolved) {
         return Err(
-            "Pentect blocked Write because masked content needs resolve, but this session cannot resolve every handle. Re-read the source in this Pentect session, then retry."
+            "resolve needed: re-read the source in this Pentect session, then retry Write."
                 .to_string(),
         );
     }
@@ -2264,10 +2264,7 @@ fn materialize_masked_write_content(
         }
     }
     materialize_file(&path, &resolved)?;
-    Ok(Some(format!(
-        "Pentect resolved masked content and wrote '{}'. Original Write stopped to avoid writing masked handles.",
-        path.display()
-    )))
+    Ok(Some(format!("resolved write: {}", path.display())))
 }
 
 fn contains_pentect_masked_handle(text: &str) -> bool {

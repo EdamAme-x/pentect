@@ -971,7 +971,7 @@ fn write_tool_blocks_unknown_masked_handles_that_need_resolve() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("needs resolve"), "{reason}");
+    assert!(reason.contains("resolve needed"), "{reason}");
     assert!(!config.exists());
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
