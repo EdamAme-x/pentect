@@ -1672,6 +1672,8 @@ const WRITE_CONTENT_FIELDS: &[&str] = &[
     "data",
     "body",
 ];
+const EDIT_OLD_FIELDS: &[&str] = &["old_string", "oldString", "old_text", "oldText"];
+const EDIT_NEW_FIELDS: &[&str] = &["new_string", "newString", "new_text", "newText"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputFormat {
@@ -2179,7 +2181,7 @@ fn before_tool_updated_input_lazy(
     if is_read_like_tool_name(tool_name) {
         return Err(read_tool_block_reason(tool_name));
     }
-    if is_write_like_tool_name(tool_name) {
+    if is_write_or_edit_like_tool_name(tool_name) {
         let session = open_hook_session(cli, session_name)?;
         validate_masked_write_before_tool(&session, tool_name, tool_input)?;
     }
@@ -2218,17 +2220,20 @@ fn validate_masked_write_before_tool(
     tool_name: &str,
     tool_input: &Value,
 ) -> Result<(), String> {
-    if !is_write_like_tool_name(tool_name) {
+    if is_write_like_tool_name(tool_name) {
+        let Some((path, content)) = write_path_and_content(tool_input) else {
+            return Ok(());
+        };
+        if !contains_pentect_masked_handle(content) {
+            return Ok(());
+        }
+        let (path, _) = resolved_write_parts(session, path, content)?;
+        ensure_materialize_path_within_cwd(&path)?;
         return Ok(());
     }
-    let Some((path, content)) = write_path_and_content(tool_input) else {
-        return Ok(());
-    };
-    if !contains_pentect_masked_handle(content) {
-        return Ok(());
+    if is_edit_like_tool_name(tool_name) {
+        validate_masked_edit_before_tool(session, tool_input)?;
     }
-    let (path, _) = resolved_write_parts(session, path, content)?;
-    ensure_materialize_path_within_cwd(&path)?;
     Ok(())
 }
 
@@ -2237,23 +2242,26 @@ fn repair_masked_write_after_tool(
     tool_name: &str,
     tool_input: &Value,
 ) -> Result<bool, String> {
-    if !is_write_like_tool_name(tool_name) {
-        return Ok(false);
+    if is_write_like_tool_name(tool_name) {
+        let Some((path, content)) = write_path_and_content(tool_input) else {
+            return Ok(false);
+        };
+        if !contains_pentect_masked_handle(content) {
+            return Ok(false);
+        }
+        let (path, resolved) = resolved_write_parts(session, path, content)?;
+        ensure_materialize_path_within_cwd(&path)?;
+        if !path.is_file() {
+            return Ok(false);
+        }
+        std::fs::write(&path, resolved)
+            .map_err(|e| format!("could not repair '{}': {e}", path.display()))?;
+        return Ok(true);
     }
-    let Some((path, content)) = write_path_and_content(tool_input) else {
-        return Ok(false);
-    };
-    if !contains_pentect_masked_handle(content) {
-        return Ok(false);
+    if is_edit_like_tool_name(tool_name) {
+        return repair_masked_edit_after_tool(session, tool_input);
     }
-    let (path, resolved) = resolved_write_parts(session, path, content)?;
-    ensure_materialize_path_within_cwd(&path)?;
-    if !path.is_file() {
-        return Ok(false);
-    }
-    std::fs::write(&path, resolved)
-        .map_err(|e| format!("could not repair '{}': {e}", path.display()))?;
-    Ok(true)
+    Ok(false)
 }
 
 fn resolved_write_parts(
@@ -2262,6 +2270,68 @@ fn resolved_write_parts(
     content: &str,
 ) -> Result<(PathBuf, String), String> {
     let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let resolved = resolve_masked_text(&store, content)?;
+    let path = checked_materialize_path(path)?;
+    Ok((path, resolved))
+}
+
+fn validate_masked_edit_before_tool(session: &Session, tool_input: &Value) -> Result<(), String> {
+    let Some((path, edits)) = edit_path_and_texts(tool_input) else {
+        return Ok(());
+    };
+    if !edits
+        .iter()
+        .any(|(_, text)| contains_pentect_masked_handle(text))
+    {
+        return Ok(());
+    }
+    let path = checked_materialize_path(path)?;
+    ensure_materialize_path_within_cwd(&path)?;
+    if edits.iter().any(|(kind, text)| {
+        matches!(kind, EditTextKind::Old) && contains_pentect_masked_handle(text)
+    }) {
+        return Err(
+            "resolve needed: Edit old text contains a masked handle; use Write.".to_string(),
+        );
+    }
+    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    for (kind, text) in edits {
+        if matches!(kind, EditTextKind::New) && contains_pentect_masked_handle(text) {
+            let _ = resolve_masked_text(&store, text)?;
+        }
+    }
+    Ok(())
+}
+
+fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Result<bool, String> {
+    let Some((path, edits)) = edit_path_and_texts(tool_input) else {
+        return Ok(false);
+    };
+    if !edits.iter().any(|(kind, text)| {
+        matches!(kind, EditTextKind::New) && contains_pentect_masked_handle(text)
+    }) {
+        return Ok(false);
+    }
+    let path = checked_materialize_path(path)?;
+    ensure_materialize_path_within_cwd(&path)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if !contains_pentect_masked_handle(&content) {
+        return Ok(false);
+    }
+    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let resolved = resolve_masked_text(&store, &content)?;
+    if resolved != content {
+        std::fs::write(&path, resolved)
+            .map_err(|e| format!("could not repair '{}': {e}", path.display()))?;
+    }
+    Ok(true)
+}
+
+fn resolve_masked_text(store: &RecoveryStore, content: &str) -> Result<String, String> {
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if contains_pentect_masked_handle(&resolved) {
         return Err(
@@ -2272,8 +2342,7 @@ fn resolved_write_parts(
     if resolved == content {
         return Err("resolve needed: no matching handle in this Pentect session.".to_string());
     }
-    let path = checked_materialize_path(path)?;
-    Ok((path, resolved))
+    Ok(resolved)
 }
 
 fn contains_pentect_masked_handle(text: &str) -> bool {
@@ -2301,6 +2370,21 @@ fn is_write_like_tool_name(tool_name: &str) -> bool {
         || normalized.ends_with("_write_file")
 }
 
+fn is_edit_like_tool_name(tool_name: &str) -> bool {
+    let normalized = tool_name.to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "edit" | "edit_file" | "multiedit" | "multi_edit" | "multi_edit_file"
+    ) || normalized.ends_with("__edit_file")
+        || normalized.ends_with("_edit_file")
+        || normalized.ends_with("__multi_edit_file")
+        || normalized.ends_with("_multi_edit_file")
+}
+
+fn is_write_or_edit_like_tool_name(tool_name: &str) -> bool {
+    is_write_like_tool_name(tool_name) || is_edit_like_tool_name(tool_name)
+}
+
 fn write_path_and_content(value: &Value) -> Option<(&str, &str)> {
     for candidate in write_input_candidates(value) {
         if let (Some(path), Some(content)) = (
@@ -2323,26 +2407,64 @@ fn write_input_candidates(value: &Value) -> Vec<&Value> {
     out
 }
 
+#[derive(Clone, Copy)]
+enum EditTextKind {
+    Old,
+    New,
+}
+
+fn edit_path_and_texts(value: &Value) -> Option<(&str, Vec<(EditTextKind, &str)>)> {
+    for candidate in write_input_candidates(value) {
+        let Some(path) = string_field(candidate, WRITE_PATH_FIELDS) else {
+            continue;
+        };
+        let mut texts = Vec::new();
+        push_edit_texts(candidate, &mut texts);
+        if !texts.is_empty() {
+            return Some((path, texts));
+        }
+    }
+    None
+}
+
+fn push_edit_texts<'a>(value: &'a Value, out: &mut Vec<(EditTextKind, &'a str)>) {
+    for field in EDIT_OLD_FIELDS {
+        if let Some(text) = value.get(*field).and_then(Value::as_str) {
+            out.push((EditTextKind::Old, text));
+        }
+    }
+    for field in EDIT_NEW_FIELDS {
+        if let Some(text) = value.get(*field).and_then(Value::as_str) {
+            out.push((EditTextKind::New, text));
+        }
+    }
+    if let Some(edits) = value.get("edits").and_then(Value::as_array) {
+        for edit in edits {
+            push_edit_texts(edit, out);
+        }
+    }
+}
+
 fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| value.get(*name)?.as_str())
 }
 
 fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
     let path = Path::new(path);
-    if path.is_absolute() {
-        return Err(
-            "Pentect only materializes masked writes to relative paths inside the current directory"
-                .to_string(),
-        );
-    }
-    let mut clean = PathBuf::new();
+    let mut has_normal_component = false;
     for component in path.components() {
         match component {
             std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => clean.push(part),
-            std::path::Component::ParentDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => {
+            std::path::Component::Normal(_) => has_normal_component = true,
+            std::path::Component::ParentDir => {
+                return Err(
+                    "Pentect refused to materialize masked content outside the current directory"
+                        .to_string(),
+                );
+            }
+            std::path::Component::RootDir => {}
+            std::path::Component::Prefix(_) if path.is_absolute() => {}
+            std::path::Component::Prefix(_) => {
                 return Err(
                     "Pentect refused to materialize masked content outside the current directory"
                         .to_string(),
@@ -2350,10 +2472,10 @@ fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
             }
         }
     }
-    if clean.as_os_str().is_empty() {
+    if !has_normal_component {
         return Err("Pentect refused to materialize masked content to an empty path".to_string());
     }
-    Ok(clean)
+    Ok(path.to_path_buf())
 }
 
 fn ensure_materialize_path_within_cwd(path: &Path) -> Result<(), String> {
