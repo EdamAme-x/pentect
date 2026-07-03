@@ -1735,6 +1735,7 @@ fn exit_code(status: ExitStatus) -> i32 {
 enum HookProvider {
     Codex,
     Claude,
+    Generic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1743,6 +1744,74 @@ enum HookPhase {
     AfterTool,
     Other,
 }
+
+// Hook hosts disagree on casing and envelope names. Keep that compatibility at
+// the boundary; detection still walks the returned JSON structure generically.
+const HOOK_EVENT_FIELDS: &[&str] = &[
+    "hook_event_name",
+    "hookEventName",
+    "event_name",
+    "eventName",
+    "event",
+];
+const HOOK_TOOL_NAME_FIELDS: &[&str] = &["tool_name", "toolName", "name", "tool"];
+const HOOK_TOOL_INPUT_FIELDS: &[&str] = &[
+    "tool_input",
+    "toolInput",
+    "tool_arguments",
+    "toolArguments",
+    "arguments",
+    "args",
+    "input",
+];
+const HOOK_TOOL_RESULT_FIELDS: &[&str] = &[
+    "tool_response",
+    "toolResponse",
+    "tool_output",
+    "toolOutput",
+    "tool_result",
+    "toolResult",
+    "call_tool_result",
+    "callToolResult",
+    "mcp_result",
+    "mcpResult",
+    "mcp_tool_result",
+    "mcpToolResult",
+    "structured_content",
+    "structuredContent",
+    "response",
+    "result",
+    "output",
+    "payload",
+    "data",
+    "body",
+    "content",
+];
+const WRITE_INPUT_FIELDS: &[&str] = &[
+    "arguments",
+    "args",
+    "input",
+    "tool_input",
+    "toolInput",
+    "tool_arguments",
+    "toolArguments",
+];
+const WRITE_PATH_FIELDS: &[&str] = &[
+    "file_path",
+    "filePath",
+    "filepath",
+    "path",
+    "filename",
+    "fileName",
+];
+const WRITE_CONTENT_FIELDS: &[&str] = &[
+    "content",
+    "file_content",
+    "fileContent",
+    "text",
+    "data",
+    "body",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputFormat {
@@ -1889,7 +1958,9 @@ impl HookOpts {
             }
         }
         Ok(Self {
-            provider: provider.ok_or_else(|| "hook requires cli: codex or claude".to_string())?,
+            provider: provider.ok_or_else(|| {
+                "hook requires a provider after --cli: codex, claude, or generic".to_string()
+            })?,
             session,
             cli,
         })
@@ -2096,10 +2167,10 @@ fn handle_hook(
 ) -> Result<Value, String> {
     match hook_phase(provider, &input) {
         HookPhase::BeforeTool => {
-            let Some(tool_input) = hook_field(&input, &["tool_input"]) else {
+            let Some(tool_input) = hook_tool_input(&input) else {
                 return Ok(json!({}));
             };
-            let tool_name = hook_field(&input, &["tool_name"])
+            let tool_name = hook_tool_name(&input)
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let (updated, changed) = match before_tool_updated_input(
@@ -2144,10 +2215,10 @@ fn handle_hook_lazy(
 ) -> Result<Value, String> {
     match hook_phase(provider, &input) {
         HookPhase::BeforeTool => {
-            let Some(tool_input) = hook_field(&input, &["tool_input"]) else {
+            let Some(tool_input) = hook_tool_input(&input) else {
                 return Ok(json!({}));
             };
-            let tool_name = hook_field(&input, &["tool_name"])
+            let tool_name = hook_tool_name(&input)
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let (updated, changed) = match before_tool_updated_input_lazy(
@@ -2376,8 +2447,8 @@ fn is_write_like_tool_name(tool_name: &str) -> bool {
 fn write_path_and_content(value: &Value) -> Option<(&str, &str)> {
     for candidate in write_input_candidates(value) {
         if let (Some(path), Some(content)) = (
-            string_field(candidate, &["file_path", "filepath", "path", "filename"]),
-            string_field(candidate, &["content", "file_content", "text", "data"]),
+            string_field(candidate, WRITE_PATH_FIELDS),
+            string_field(candidate, WRITE_CONTENT_FIELDS),
         ) {
             return Some((path, content));
         }
@@ -2387,7 +2458,7 @@ fn write_path_and_content(value: &Value) -> Option<(&str, &str)> {
 
 fn write_input_candidates(value: &Value) -> Vec<&Value> {
     let mut out = vec![value];
-    for key in ["arguments", "input", "tool_input"] {
+    for key in WRITE_INPUT_FIELDS {
         if let Some(candidate) = value.get(key) {
             out.push(candidate);
         }
@@ -2656,7 +2727,7 @@ fn should_emit_session_arg(session_name: &str) -> bool {
 fn hook_phase(provider: HookProvider, input: &Value) -> HookPhase {
     let event = hook_event_name(input).unwrap_or_default();
     match provider {
-        HookProvider::Codex | HookProvider::Claude => match event {
+        HookProvider::Codex | HookProvider::Claude | HookProvider::Generic => match event {
             "PreToolUse" => HookPhase::BeforeTool,
             "PostToolUse" => HookPhase::AfterTool,
             _ => HookPhase::Other,
@@ -2665,35 +2736,28 @@ fn hook_phase(provider: HookProvider, input: &Value) -> HookPhase {
 }
 
 fn hook_event_name(input: &Value) -> Option<&str> {
-    hook_field(input, &["hook_event_name", "event_name", "event"]).and_then(Value::as_str)
+    hook_field(input, HOOK_EVENT_FIELDS).and_then(Value::as_str)
 }
 
 fn hook_field<'a>(input: &'a Value, names: &[&str]) -> Option<&'a Value> {
     names.iter().find_map(|name| input.get(*name))
 }
 
+fn hook_tool_name(input: &Value) -> Option<&Value> {
+    hook_field(input, HOOK_TOOL_NAME_FIELDS)
+}
+
+fn hook_tool_input(input: &Value) -> Option<&Value> {
+    hook_field(input, HOOK_TOOL_INPUT_FIELDS)
+}
+
 fn hook_tool_result(input: &Value) -> Option<&Value> {
-    hook_field(
-        input,
-        &[
-            "tool_response",
-            "tool_output",
-            "tool_result",
-            "call_tool_result",
-            "mcp_result",
-            "mcp_tool_result",
-            "response",
-            "result",
-            "output",
-            "content",
-            "structuredContent",
-        ],
-    )
+    hook_field(input, HOOK_TOOL_RESULT_FIELDS)
 }
 
 fn before_tool_output(provider: HookProvider, updated_input: Value) -> Value {
     match provider {
-        HookProvider::Codex | HookProvider::Claude => json!({
+        HookProvider::Codex | HookProvider::Claude | HookProvider::Generic => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "allow",
@@ -2705,7 +2769,7 @@ fn before_tool_output(provider: HookProvider, updated_input: Value) -> Value {
 
 fn before_tool_block_output(provider: HookProvider, reason: &str) -> Value {
     match provider {
-        HookProvider::Codex | HookProvider::Claude => json!({
+        HookProvider::Codex | HookProvider::Claude | HookProvider::Generic => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
@@ -2717,7 +2781,7 @@ fn before_tool_block_output(provider: HookProvider, reason: &str) -> Value {
 
 fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
     match provider {
-        HookProvider::Claude => json!({
+        HookProvider::Claude | HookProvider::Generic => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
                 "updatedToolOutput": updated_output
@@ -3083,6 +3147,7 @@ fn parse_hook_provider(value: &str) -> Result<HookProvider, String> {
     match value {
         "codex" => Ok(HookProvider::Codex),
         "claude" => Ok(HookProvider::Claude),
+        "generic" | "external" | "update" => Ok(HookProvider::Generic),
         other => Err(format!("unknown hook provider: {other}")),
     }
 }

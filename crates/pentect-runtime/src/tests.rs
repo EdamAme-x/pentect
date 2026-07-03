@@ -933,6 +933,41 @@ fn write_tool_refuses_masked_materialization_outside_current_dir() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn write_tool_accepts_camel_case_external_schema() {
+    let root = temp_root("capability-write-camel");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-write-camel-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+
+    let config = project.join("config.txt");
+    let input = json!({
+        "hookEventName": "PreToolUse",
+        "toolName": "external__write_file",
+        "toolInput": {
+            "filePath": config.to_string_lossy(),
+            "fileContent": masked
+        }
+    });
+    let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("approval needed"), "{reason}");
+    assert!(!reason.contains(raw), "{reason}");
+    assert!(!config.exists());
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn write_tool_refuses_masked_materialization_through_symlink_dir() {
@@ -1026,6 +1061,57 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
     );
     assert!(updated.is_object(), "{updated}");
     assert!(updated["structuredContent"]["otp"].is_string(), "{updated}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn generic_posttool_masks_external_tool_response_aliases() {
+    let (root, session) = empty_session("hook-post-generic-aliases");
+    let raw_runpod = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let raw_openai = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let input = json!({
+        "hookEventName": "PostToolUse",
+        "toolName": "connector__browser__create_api_key",
+        "toolResponse": {
+            "content": [{
+                "type": "text",
+                "text": format!("RUNPOD_API_KEY={raw_runpod}")
+            }],
+            "structured_content": {
+                "apiKey": raw_openai
+            },
+            "data": {
+                "Authorization": format!("Bearer {raw_openai}")
+            }
+        }
+    });
+    let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
+    let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
+    let rendered = serde_json::to_string(updated).unwrap();
+    assert!(rendered.contains("<<RUNPOD_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(!rendered.contains(raw_runpod), "{rendered}");
+    assert!(!rendered.contains(raw_openai), "{rendered}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn generic_posttool_masks_payload_alias() {
+    let (root, session) = empty_session("hook-post-generic-payload");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let input = json!({
+        "eventName": "PostToolUse",
+        "tool": "connector",
+        "payload": {
+            "stdout": format!("OPENAI_API_KEY={raw}\n"),
+            "ok": true
+        }
+    });
+    let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert!(rendered.contains("updatedToolOutput"), "{rendered}");
+    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(!rendered.contains(raw), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1972,7 +2058,11 @@ fn pretool_keeps_non_ascii_payloads_readable_in_visible_exec() {
 
 #[test]
 fn pretool_wraps_plain_shell_commands_for_every_provider() {
-    for provider in [HookProvider::Codex, HookProvider::Claude] {
+    for provider in [
+        HookProvider::Codex,
+        HookProvider::Claude,
+        HookProvider::Generic,
+    ] {
         let (root, session) = empty_session("hook-pre-provider");
         let input = json!({
             "hook_event_name": "PreToolUse",
@@ -1990,6 +2080,27 @@ fn pretool_wraps_plain_shell_commands_for_every_provider() {
         assert!(!command.contains("--shell-b64"), "{command}");
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn pretool_wraps_camel_case_external_tool_input() {
+    let (root, session) = empty_session("hook-pre-camel");
+    let input = json!({
+        "hookEventName": "PreToolUse",
+        "toolName": "shell",
+        "toolInput": {
+            "command": r"Get-Content .\.env"
+        }
+    });
+    let output = handle_hook(HookProvider::Generic, DEFAULT_SESSION, &session, input).unwrap();
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains("pentect"), "{command}");
+    assert!(command.contains("exec"), "{command}");
+    assert!(command.contains("Get-Content"), "{command}");
+    assert!(!command.contains("--shell-b64"), "{command}");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

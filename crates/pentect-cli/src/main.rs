@@ -33,7 +33,7 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "- Masked handles like `<<NAME_hash>>` are in-memory capabilities for this running Pentect-launched session. Use `$env:NAME`/`$env:PENTECT_NAME_hash` on PowerShell or `$NAME`/`$PENTECT_NAME_hash` on Unix.\n",
     "- `pentect view '<handle>'` shows only label, hash, and length. Use handles/env capabilities instead of re-reading or printing raw values.\n",
     "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:NAME`; on Unix use POSIX commands and `$NAME`.\n",
-    "- Browser/MCP/connector tools are OK for navigation and metadata. If a raw secret must move, route it through shell/Pentect or a local file/service command so output is masked.\n",
+    "- Browser/MCP/connector tools may retrieve and use user-authorized secrets. Pentect hooks mask returned tool output when the host supports it; use shell/Pentect for hosts that cannot safely replace tool output.\n",
     "- For user-requested storage/materialization, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
     "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
 );
