@@ -8,7 +8,7 @@ use pentect_core::{ByteRange, Category, Engine, Input, Kind, Profile, Span};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 
 const ENGINE_NAME: &str = "pentect";
 const MAX_SCAN_FILE_BYTES: u64 = 1024 * 1024;
@@ -307,7 +307,7 @@ impl CoreBackend {
         let line_index = LineIndex::new(&data);
         let result = self.engine.as_ref().unwrap().analyze_spans(Input {
             kind: kind.clone(),
-            data: data.clone(),
+            data,
         });
         let hits = result
             .spans
@@ -367,14 +367,12 @@ impl ScanBackend for CoreBackend {
             .unwrap_or(1)
             .min(8)
             .min(files.len());
-        let files = Arc::new(files.to_vec());
-        let next = Arc::new(AtomicUsize::new(0));
+        let next = AtomicUsize::new(0);
         let packs = self.packs.take().unwrap_or_default();
         let (tx, rx) = mpsc::channel();
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                let files = Arc::clone(&files);
-                let next = Arc::clone(&next);
+                let next = &next;
                 let packs = packs.clone();
                 let tx = tx.clone();
                 let binary = self.binary;
@@ -455,24 +453,37 @@ fn engine_counts(hits: &[ScanHit]) -> BTreeMap<String, usize> {
     out
 }
 
-struct LineIndex<'a> {
-    text: &'a str,
+struct LineIndex {
+    len: usize,
     starts: Vec<usize>,
+    char_starts: Vec<usize>,
+    ascii: bool,
 }
 
-impl<'a> LineIndex<'a> {
-    fn new(text: &'a str) -> Self {
+impl LineIndex {
+    fn new(text: &str) -> Self {
         let mut starts = vec![0];
         for (i, byte) in text.bytes().enumerate() {
             if byte == b'\n' {
                 starts.push(i + 1);
             }
         }
-        Self { text, starts }
+        let ascii = text.is_ascii();
+        let char_starts = if ascii {
+            Vec::new()
+        } else {
+            text.char_indices().map(|(i, _)| i).collect()
+        };
+        Self {
+            len: text.len(),
+            starts,
+            char_starts,
+            ascii,
+        }
     }
 
     fn range(&self, range: ByteRange) -> Option<SourceRange> {
-        if range.end > self.text.len() || range.start >= range.end {
+        if range.end > self.len || range.start >= range.end {
             return None;
         }
         let line_start = self.line_for_offset(range.start)?;
@@ -494,10 +505,18 @@ impl<'a> LineIndex<'a> {
 
     fn column_for_offset(&self, line: usize, offset: usize) -> Option<usize> {
         let start = *self.starts.get(line.checked_sub(1)?)?;
-        if offset < start || offset > self.text.len() {
+        if offset < start || offset > self.len {
             return None;
         }
-        Some(self.text[start..offset].chars().count())
+        if self.ascii {
+            return Some(offset - start);
+        }
+        if offset != self.len && self.char_starts.binary_search(&offset).is_err() {
+            return None;
+        }
+        let start_chars = self.char_starts.partition_point(|i| *i < start);
+        let offset_chars = self.char_starts.partition_point(|i| *i < offset);
+        Some(offset_chars - start_chars)
     }
 }
 
@@ -540,5 +559,28 @@ mod tests {
         };
         assert!(a.overlaps(b));
         assert!(!a.overlaps(c));
+    }
+
+    #[test]
+    fn line_index_counts_utf8_columns_without_borrowing_text() {
+        let index = LineIndex::new("あb\nc");
+        assert_eq!(
+            index.range(ByteRange::new(0, "あ".len())),
+            Some(SourceRange {
+                line_start: 1,
+                line_end: 1,
+                col_start: 0,
+                col_end: 1,
+            })
+        );
+        assert_eq!(
+            index.range(ByteRange::new("あ".len(), "あb".len())),
+            Some(SourceRange {
+                line_start: 1,
+                line_end: 1,
+                col_start: 1,
+                col_end: 2,
+            })
+        );
     }
 }
