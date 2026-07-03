@@ -1,12 +1,11 @@
 use crate::Result;
 use anyhow::{anyhow, bail, Context};
 use pentect_core::{Config, Recovery};
-use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 pub(crate) const ENV_ADDR: &str = "PENTECT_MEMORY_VAULT_ADDR";
 pub(crate) const ENV_TOKEN: &str = "PENTECT_MEMORY_VAULT_TOKEN";
@@ -28,7 +27,6 @@ pub(crate) struct MemoryVaultSnapshot {
 struct MemoryVaultState {
     key: [u8; 32],
     recovery: Recovery,
-    scripts: BTreeMap<String, Zeroizing<String>>,
 }
 
 impl Drop for MemoryVaultState {
@@ -82,29 +80,6 @@ impl MemoryVaultClient {
         }
     }
 
-    pub(crate) fn put_script(&self, script: &str) -> Result<String> {
-        let payload = data_encoding::BASE64.encode(script.as_bytes());
-        let line = self.request("PUT_SCRIPT", &payload)?;
-        let fields = response_fields(&line)?;
-        if fields.len() == 2 && fields[0] == "OK" && !fields[1].is_empty() {
-            Ok(fields[1].to_string())
-        } else {
-            bail!("memory vault put-script response is malformed")
-        }
-    }
-
-    pub(crate) fn take_script(&self, id: &str) -> Result<String> {
-        let line = self.request("TAKE_SCRIPT", id)?;
-        let fields = response_fields(&line)?;
-        if fields.len() != 2 || fields[0] != "OK" {
-            bail!("memory vault take-script response is malformed");
-        }
-        let bytes = data_encoding::BASE64
-            .decode(fields[1].as_bytes())
-            .context("memory vault script response is not valid base64")?;
-        String::from_utf8(bytes).context("memory vault script response is not UTF-8")
-    }
-
     fn request(&self, command: &str, payload: &str) -> Result<String> {
         let mut stream = TcpStream::connect(&self.addr)
             .with_context(|| format!("could not connect to memory vault at {}", self.addr))?;
@@ -148,7 +123,6 @@ fn serve_memory_vault_inner() -> Result<()> {
     let state = Arc::new(Mutex::new(MemoryVaultState {
         key,
         recovery: Recovery::empty_for_key(&key),
-        scripts: BTreeMap::new(),
     }));
     println!(
         "{}",
@@ -189,12 +163,6 @@ fn handle_client(
         [provided_token, "SNAPSHOT", ""] if *provided_token == token => snapshot_response(state),
         [provided_token, "ADD", payload] if *provided_token == token => {
             add_recovery_request(state, payload)
-        }
-        [provided_token, "PUT_SCRIPT", payload] if *provided_token == token => {
-            put_script_request(state, payload)
-        }
-        [provided_token, "TAKE_SCRIPT", payload] if *provided_token == token => {
-            take_script_request(state, payload)
         }
         [provided_token, ..] if *provided_token != token => Err(anyhow!("bad token")),
         _ => Err(anyhow!("malformed request")),
@@ -243,36 +211,6 @@ fn add_recovery_request(state: &Arc<Mutex<MemoryVaultState>>, payload: &str) -> 
     Ok("OK".to_string())
 }
 
-fn put_script_request(state: &Arc<Mutex<MemoryVaultState>>, payload: &str) -> Result<String> {
-    let bytes = data_encoding::BASE64
-        .decode(payload.as_bytes())
-        .context("script payload is not valid base64")?;
-    let script = String::from_utf8(bytes).context("script payload is not UTF-8")?;
-    let id = random_token_hex()?;
-    let mut guard = state
-        .lock()
-        .map_err(|_| anyhow!("memory vault lock poisoned"))?;
-    guard.scripts.insert(id.clone(), Zeroizing::new(script));
-    Ok(format!("OK\t{id}"))
-}
-
-fn take_script_request(state: &Arc<Mutex<MemoryVaultState>>, id: &str) -> Result<String> {
-    if id.is_empty() || id.chars().any(|ch| !ch.is_ascii_hexdigit()) {
-        bail!("script handle is malformed");
-    }
-    let mut guard = state
-        .lock()
-        .map_err(|_| anyhow!("memory vault lock poisoned"))?;
-    let script = guard
-        .scripts
-        .remove(id)
-        .ok_or_else(|| anyhow!("unknown script handle"))?;
-    Ok(format!(
-        "OK\t{}",
-        data_encoding::BASE64.encode(script.as_bytes())
-    ))
-}
-
 fn request_fields(line: &str) -> Vec<&str> {
     line.trim_end_matches(['\r', '\n']).split('\t').collect()
 }
@@ -319,7 +257,6 @@ mod tests {
         let state = Arc::new(Mutex::new(MemoryVaultState {
             key,
             recovery: Recovery::empty_for_key(&key),
-            scripts: BTreeMap::new(),
         }));
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -351,15 +288,6 @@ mod tests {
             snapshot.recovery.resolve(&masked),
             "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
         );
-
-        let script_id = client
-            .put_script("Get-Content -LiteralPath $env:USERPROFILE")
-            .unwrap();
-        assert_eq!(
-            client.take_script(&script_id).unwrap(),
-            "Get-Content -LiteralPath $env:USERPROFILE"
-        );
-        assert!(client.take_script(&script_id).is_err());
     }
 
     #[test]
@@ -369,7 +297,6 @@ mod tests {
         let state = Arc::new(Mutex::new(MemoryVaultState {
             key,
             recovery: Recovery::empty_for_key(&key),
-            scripts: BTreeMap::new(),
         }));
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap().to_string();

@@ -554,15 +554,10 @@ fn exec_help() {
             "pentect exec \"<command>\"\n",
             "pentect exec --stdin\n",
             "pentect exec --live \"<command>\"\n\n",
-            "Runs a command and prints normal stdout/stderr with secrets masked.\n",
-            "`--stdin` reads the shell script from stdin; hooks use it on PowerShell so quotes and pipes survive the outer shell.\n",
-            "Referenced `<<LABEL_hash>>` handles become PENTECT_LABEL_hash env vars in child commands while the same Pentect-launched agent session is running.\n",
-            "If prior output showed `KEY=<<...>>`, commands in that running session can reference KEY as an env var.\n",
-            "Set `no_approve = true` in `.pentect/config.toml` only when this project should bypass approval prompts.\n",
-            "Masked output registers in-memory capabilities; referenced local files are also scanned as hints.\n",
-            "Use normal commands and let Pentect return masked handles; do not hand-roll parsers to avoid output.\n",
-            "Use `$env:KEY` on PowerShell or `$KEY` on Unix; stdout/stderr stays masked.\n",
-            "Masked handles in command text resolve in memory before execution.\n",
+            "stdout/stderr: masked\n",
+            "handles: in memory\n",
+            "env: $env:KEY or $KEY\n",
+            "approve: .pentect/config.toml\n",
         )
     );
 }
@@ -2007,25 +2002,6 @@ impl ExecOpts {
                         mode: ExecMode::Shell(script),
                     });
                 }
-                "--script-handle" => {
-                    if stdin {
-                        return Err(
-                            "exec --stdin does not accept a script handle argument".to_string()
-                        );
-                    }
-                    let script = take_memory_script(&value(args, &mut i, "--script-handle")?)?;
-                    if i < args.len() {
-                        return Err(
-                            "exec --script-handle does not accept trailing arguments".to_string()
-                        );
-                    }
-                    return Ok(Self {
-                        session: checked_session_name(&session).map_err(|e| e.to_string())?,
-                        live,
-                        approve,
-                        mode: ExecMode::Shell(script),
-                    });
-                }
                 "--shell" => {
                     return Err(
                         "`--shell` was removed; use `pentect exec \"<command>\"`".to_string()
@@ -2084,16 +2060,6 @@ fn decode_script_base64(value: &str) -> Result<String, String> {
         .decode(value.as_bytes())
         .map_err(|_| "exec --script-b64 requires valid base64".to_string())?;
     String::from_utf8(bytes).map_err(|_| "exec --script-b64 requires UTF-8 text".to_string())
-}
-
-fn take_memory_script(id: &str) -> Result<String, String> {
-    if id.is_empty() || id.chars().any(|ch| !ch.is_ascii_hexdigit()) {
-        return Err("exec --script-handle requires a hex handle".to_string());
-    }
-    let client = MemoryVaultClient::from_env().ok_or_else(|| {
-        "exec --script-handle requires a running Pentect memory vault".to_string()
-    })?;
-    client.take_script(id).map_err(|e| e.to_string())
 }
 
 fn default_session_name() -> Result<String, String> {
@@ -2641,98 +2607,33 @@ fn wrap_shell_command(
     session_name: &str,
     masked_command: &str,
 ) -> Result<String, String> {
-    if cfg!(windows) {
-        if let Some(command) = powershell_memory_script_exec_command(session_name, masked_command)?
-        {
-            return Ok(command);
-        }
-        let mut args = agent_exec_args(session_name);
-        args.push("--stdin".to_string());
-        Ok(powershell_stdin_exec_command(&args, masked_command))
-    } else {
-        let mut args = agent_exec_args(session_name);
-        args.push(masked_command.to_string());
-        Ok(shell_agent_env_command(&args))
-    }
-}
-
-fn powershell_memory_script_exec_command(
-    session_name: &str,
-    script: &str,
-) -> Result<Option<String>, String> {
-    let Some(client) = MemoryVaultClient::from_env() else {
-        return Ok(None);
-    };
-    let handle = client.put_script(script).map_err(|e| e.to_string())?;
-    let mut args = vec!["agent".to_string(), "exec".to_string()];
+    let mut args = vec!["exec".to_string()];
     add_non_default_session(&mut args, session_name);
-    args.push("--script-handle".to_string());
-    args.push(handle);
-    Ok(Some(powershell_agent_env_command(&args)))
+    args.push(exec_shell_argument(masked_command));
+    Ok(visible_pentect_command(&args))
 }
 
-fn powershell_agent_env_command(args: &[String]) -> String {
-    let mut out = powershell_agent_env_setup();
-    out.push_str("; ");
-    out.push_str(&powershell_agent_env_invocation(args));
-    out
+fn exec_shell_argument(command: &str) -> String {
+    if command.starts_with('-') {
+        format!(" {command}")
+    } else {
+        command.to_string()
+    }
 }
 
-fn powershell_agent_env_setup() -> String {
-    String::from("$p=$env:PENTECT_BIN; if (-not $p) { $p='pentect' }")
-}
-
-fn powershell_agent_env_invocation(args: &[String]) -> String {
-    let mut out = String::from("& $p");
+fn visible_pentect_command(args: &[String]) -> String {
+    let quote = if cfg!(windows) {
+        powershell_word
+    } else {
+        shell_quote_unix
+    };
+    let mut out = String::from("pentect");
     if !args.is_empty() {
         out.push(' ');
         out.push_str(
             &args
                 .iter()
-                .map(|arg| powershell_word(arg))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    out
-}
-
-fn powershell_stdin_exec_command(args: &[String], script: &str) -> String {
-    if script.is_ascii() && !has_powershell_single_here_string_terminator(script) {
-        let setup = powershell_agent_env_setup();
-        let exec = powershell_agent_env_invocation(args);
-        return format!("{setup}\n@'\n{script}\n'@ | {exec}");
-    }
-    let encoded = data_encoding::BASE64.encode(script.as_bytes());
-    let mut args = args.to_vec();
-    if args.last().is_some_and(|word| word == "--stdin") {
-        args.pop();
-    }
-    args.push("--script-b64".to_string());
-    args.push(encoded);
-    powershell_agent_env_command(&args)
-}
-
-fn has_powershell_single_here_string_terminator(script: &str) -> bool {
-    script
-        .lines()
-        .any(|line| line.trim_end_matches('\r') == "'@")
-}
-
-fn agent_exec_args(session_name: &str) -> Vec<String> {
-    let mut words = vec!["agent".to_string(), "exec".to_string()];
-    add_non_default_session(&mut words, session_name);
-    words
-}
-
-fn shell_agent_env_command(args: &[String]) -> String {
-    let mut out = String::from("${PENTECT_BIN:-pentect}");
-    if !args.is_empty() {
-        out.push(' ');
-        out.push_str(
-            &args
-                .iter()
-                .map(|arg| shell_quote_unix(arg))
+                .map(|arg| quote(arg))
                 .collect::<Vec<_>>()
                 .join(" "),
         );
