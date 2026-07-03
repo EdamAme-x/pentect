@@ -2885,7 +2885,7 @@ fn string_media_field(key: &str, value: &Value) -> bool {
     };
     match key {
         "type" | "kind" => matches!(
-            normalized_json_value(text).as_str(),
+            normalized_json_key(text).as_str(),
             "image" | "imageurl" | "screenshot" | "qrcode" | "audio" | "video"
         ),
         "mimetype" | "mediatype" | "contenttype" => is_unsupported_media_mime(text),
@@ -2931,17 +2931,9 @@ fn string_side_effect_field(key: &str, value: &Value) -> bool {
     };
     matches!(key, "type" | "kind")
         && matches!(
-            normalized_json_value(text).as_str(),
+            normalized_json_key(text).as_str(),
             "clipboard" | "download" | "guisave" | "savedfile"
         )
-}
-
-fn normalized_json_value(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| *c != '_' && *c != '-' && !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 fn empty_json_value(value: &Value) -> bool {
