@@ -2046,9 +2046,22 @@ fn handle_hook(
     session: &Session,
     input: Value,
 ) -> Result<Value, String> {
+    handle_hook_with_launch_requirement(provider, session_name, session, input, false)
+}
+
+#[cfg(test)]
+fn handle_hook_with_launch_requirement(
+    provider: HookProvider,
+    session_name: &str,
+    session: &Session,
+    input: Value,
+    require_pentect_launch: bool,
+) -> Result<Value, String> {
     match hook_phase(provider, &input) {
         HookPhase::BeforeTool => {
-            if let Err(reason) = ensure_pentect_agent_launch(provider) {
+            if let Err(reason) =
+                ensure_pentect_agent_launch_required(provider, require_pentect_launch)
+            {
                 return Ok(before_tool_block_output(provider, &reason));
             }
             let Some(tool_input) = hook_tool_input(&input) else {
@@ -2074,7 +2087,9 @@ fn handle_hook(
             }
         }
         HookPhase::AfterTool => {
-            if let Err(reason) = ensure_pentect_agent_launch(provider) {
+            if let Err(reason) =
+                ensure_pentect_agent_launch_required(provider, require_pentect_launch)
+            {
                 return Ok(after_tool_block_output(provider, &reason));
             }
             let tool_name = hook_tool_name(&input)
