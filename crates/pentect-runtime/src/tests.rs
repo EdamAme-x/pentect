@@ -912,6 +912,23 @@ fn unresolved_masked_command_handle_is_rejected() {
 }
 
 #[test]
+fn write_tool_passes_through_regular_ui_content() {
+    let (root, session) = empty_session("write-regular-ui");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "src/App.tsx",
+            "content": "export function App() { return <main>Settings</main>; }\n"
+        }
+    });
+
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn write_tool_materialization_requires_approval_without_dashboard() {
     let root = temp_root("capability-write-generic");
     let project = PathBuf::from("target").join(format!(
