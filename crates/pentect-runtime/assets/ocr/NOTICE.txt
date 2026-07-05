@@ -1,0 +1,14 @@
+Ocrs RTen models
+
+Source: https://huggingface.co/robertknight/ocrs
+Runtime default model URLs:
+- https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.rten
+- https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten
+Repository: https://github.com/robertknight/ocrs-models
+License: CC-BY-SA-4.0
+
+Files:
+- text-detection.rten
+  SHA-256: f15cfb56bd02c4bf478a20343986504a1f01e1665c2b3a0ad66340f054b1b5ca
+- text-recognition.rten
+  SHA-256: e484866d4cce403175bd8d00b128feb08ab42e208de30e42cd9889d8f1735a6e

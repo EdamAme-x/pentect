@@ -11,6 +11,7 @@ mod approval;
 mod approve_ui;
 mod config;
 mod extension_adapter;
+mod image_ocr;
 mod masking;
 mod memory_vault;
 mod session;
@@ -123,6 +124,10 @@ pub fn status_line_text() -> String {
         Ok(Some(count)) => format!("Pentect {count}"),
         _ => "Pentect 0".to_string(),
     }
+}
+
+pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
+    image_ocr::ocr_image_bytes(bytes)
 }
 
 pub fn resolve_text_from_active_memory_vault(text: &str) -> Result<Option<String>, String> {
@@ -1788,6 +1793,7 @@ const EDIT_NEW_FIELDS: &[&str] = &["new_string", "newString", "new_text", "newTe
 enum InputFormat {
     Text,
     Pdf,
+    Image,
 }
 
 struct ReadOpts {
@@ -2194,6 +2200,9 @@ fn handle_hook_with_launch_requirement(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
+            if let Some(reason) = image_tool_result_block_reason(session, tool_response)? {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             if let Some(reason) = unsupported_tool_result_reason(tool_response) {
                 return Ok(after_tool_block_output(provider, &reason));
             }
@@ -2261,6 +2270,9 @@ fn handle_hook_lazy(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
+            if let Some(reason) = image_tool_result_block_reason(&session, tool_response)? {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             if let Some(reason) = unsupported_tool_result_reason(tool_response) {
                 return Ok(after_tool_block_output(provider, &reason));
             }
@@ -3012,12 +3024,39 @@ fn after_tool_block_output(_provider: HookProvider, reason: &str) -> Value {
     })
 }
 
+fn image_tool_result_block_reason(
+    session: &Session,
+    value: &Value,
+) -> Result<Option<String>, String> {
+    if !image_ocr::contains_image_result(value) {
+        return Ok(None);
+    }
+    if !image_ocr::image_ocr_enabled()? {
+        return Ok(Some(
+            "image output blocked: OCR is disabled by config.".to_string(),
+        ));
+    }
+    let inspection = image_ocr::inspect_tool_images_for_secrets(value, &session.key)?;
+    if inspection.uninspectable_images > 0 {
+        return Ok(Some(
+            "image output blocked: OCR can inspect inline image bytes only.".to_string(),
+        ));
+    }
+    if inspection.ocr_failures > 0 {
+        return Ok(Some("image output blocked: OCR failed.".to_string()));
+    }
+    if inspection.secret_images > 0 {
+        return Ok(Some(
+            "image output blocked: secret text detected by OCR.".to_string(),
+        ));
+    }
+    Ok(None)
+}
+
 fn unsupported_tool_result_reason(value: &Value) -> Option<String> {
-    // TODO(media-adapters): replace these fail-closed blocks with OCR/QR/media
-    // extraction once adapters can prove the returned content was inspected.
     if contains_unsupported_media_result(value) {
         return Some(
-            "Pentect blocked non-text media output because OCR/media masking is not active yet."
+            "Pentect blocked non-text media output because media masking is not active yet."
                 .to_string(),
         );
     }
@@ -3067,21 +3106,7 @@ fn normalized_json_key(key: &str) -> String {
 }
 
 fn key_marks_media_value(key: &str, value: &Value) -> bool {
-    matches!(
-        key,
-        "image"
-            | "images"
-            | "imageurl"
-            | "screenshot"
-            | "screenshots"
-            | "thumbnail"
-            | "qrcode"
-            | "audio"
-            | "video"
-            | "media"
-            | "binary"
-            | "blob"
-    ) && !empty_json_value(value)
+    matches!(key, "audio" | "video" | "media" | "binary" | "blob") && !empty_json_value(value)
 }
 
 fn string_media_field(key: &str, value: &Value) -> bool {
@@ -3089,10 +3114,7 @@ fn string_media_field(key: &str, value: &Value) -> bool {
         return false;
     };
     match key {
-        "type" | "kind" => matches!(
-            normalized_json_key(text).as_str(),
-            "image" | "imageurl" | "screenshot" | "qrcode" | "audio" | "video"
-        ),
+        "type" | "kind" => matches!(normalized_json_key(text).as_str(), "audio" | "video"),
         "mimetype" | "mediatype" | "contenttype" => is_unsupported_media_mime(text),
         "url" | "uri" | "src" | "href" | "dataurl" => looks_like_media_reference(text),
         _ => false,
@@ -3101,18 +3123,14 @@ fn string_media_field(key: &str, value: &Value) -> bool {
 
 fn looks_like_media_reference(text: &str) -> bool {
     let value = text.trim().to_ascii_lowercase();
-    value.starts_with("data:image/")
-        || value.starts_with("data:audio/")
+    value.starts_with("data:audio/")
         || value.starts_with("data:video/")
         || value.starts_with("data:application/pdf")
 }
 
 fn is_unsupported_media_mime(text: &str) -> bool {
     let value = text.trim().to_ascii_lowercase();
-    value.starts_with("image/")
-        || value.starts_with("audio/")
-        || value.starts_with("video/")
-        || value == "application/pdf"
+    value.starts_with("audio/") || value.starts_with("video/") || value == "application/pdf"
 }
 
 fn key_marks_unobserved_side_effect(key: &str, value: &Value) -> bool {
@@ -3306,6 +3324,7 @@ fn read_input(path: &Path, format: InputFormat) -> Result<String, String> {
         InputFormat::Text => String::from_utf8(bytes)
             .map_err(|_| format!("input '{}' is not UTF-8 text", path.display())),
         InputFormat::Pdf => pdf_text(&bytes),
+        InputFormat::Image => image_ocr::ocr_image_bytes(&bytes),
     }
 }
 
@@ -3433,6 +3452,7 @@ fn parse_input_format(value: &str) -> Result<InputFormat, String> {
     match value {
         "text" => Ok(InputFormat::Text),
         "pdf" => Ok(InputFormat::Pdf),
+        "image" | "ocr" => Ok(InputFormat::Image),
         other => Err(format!("unknown input format: {other}")),
     }
 }

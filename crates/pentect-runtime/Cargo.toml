@@ -12,8 +12,9 @@ name = "pentect_agent"
 path = "src/main.rs"
 
 [features]
-default = ["pdf"]
+default = ["pdf", "ocr"]
 pdf = ["dep:pdf-extract"]
+ocr = ["dep:image", "dep:ocrs", "dep:rten"]
 
 [dependencies]
 pentect-core = { path = "../pentect-core" }
@@ -21,6 +22,9 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+ocrs = { workspace = true, optional = true }
+rten = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }

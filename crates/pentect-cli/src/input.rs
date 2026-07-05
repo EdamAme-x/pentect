@@ -3,6 +3,7 @@ pub trait InputAdapter {
 }
 
 pub struct TextInput;
+pub struct ImageOcrInput;
 
 impl InputAdapter for TextInput {
     fn read(&self, bytes: Vec<u8>) -> Result<String, String> {
@@ -10,6 +11,12 @@ impl InputAdapter for TextInput {
             bytes,
             "input is not UTF-8 text (binary not supported)".to_string(),
         )
+    }
+}
+
+impl InputAdapter for ImageOcrInput {
+    fn read(&self, bytes: Vec<u8>) -> Result<String, String> {
+        pentect_agent::ocr_image_bytes(&bytes)
     }
 }
 

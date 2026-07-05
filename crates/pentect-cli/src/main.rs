@@ -9,7 +9,7 @@ mod input;
 mod scan;
 mod terminal;
 
-use input::{decode_utf8_text, InputAdapter, TextInput};
+use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
 use pentect_core::{
     infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
 };
@@ -36,6 +36,7 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "- `pentect view '<handle>'` shows only label, hash, and length. Use handles/env capabilities instead of printing raw values.\n",
     "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:NAME`; on Unix use POSIX commands and `$NAME`.\n",
     "- Browser/MCP/connector tools may retrieve and use user-authorized secrets. Pentect hooks mask returned tool output when the host supports it; use shell/Pentect for hosts that cannot safely replace tool output.\n",
+    "- Image tool output is OCR-inspected when available; unsafe or unreadable images fail closed.\n",
     "- For user-requested storage/materialization, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
     "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
 );
@@ -393,6 +394,7 @@ enum AgentTool {
 enum ReadInputFormat {
     Text,
     Pdf,
+    Image,
 }
 
 struct ReadOpts {
@@ -1261,6 +1263,7 @@ fn checked_agent_session_name(name: &str) -> Result<String, String> {
 fn input_adapter(args: &[String]) -> Result<Box<dyn InputAdapter>, String> {
     match arg_value(args, "--input").as_deref() {
         Some("pdf") => pdf_input_adapter(),
+        Some("image" | "ocr") => Ok(Box::new(ImageOcrInput)),
         Some("text") | None => Ok(Box::new(TextInput)),
         Some(other) => Err(format!("unknown --input: {other}")),
     }
@@ -1270,6 +1273,7 @@ fn parse_read_input_format(value: &str) -> Result<ReadInputFormat, String> {
     match value {
         "text" => Ok(ReadInputFormat::Text),
         "pdf" => Ok(ReadInputFormat::Pdf),
+        "image" | "ocr" => Ok(ReadInputFormat::Image),
         other => Err(format!("unknown --input: {other}")),
     }
 }
@@ -1293,6 +1297,7 @@ fn read_input(path: &Path, format: ReadInputFormat) -> Result<String, String> {
             format!("input '{}' is not UTF-8 text", path.display()),
         ),
         ReadInputFormat::Pdf => pdf_text(&bytes),
+        ReadInputFormat::Image => pentect_agent::ocr_image_bytes(&bytes),
     }
 }
 

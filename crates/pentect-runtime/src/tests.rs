@@ -1482,7 +1482,7 @@ fn generic_posttool_masks_payload_alias() {
 }
 
 #[test]
-fn posttool_blocks_image_output_until_media_adapter_exists() {
+fn posttool_blocks_uninspectable_image_output() {
     let (root, session) = empty_session("hook-post-image-block");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -1498,14 +1498,14 @@ fn posttool_blocks_image_output_until_media_adapter_exists() {
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().unwrap();
-    assert!(reason.contains("non-text media"), "{reason}");
-    assert!(reason.contains("OCR"), "{reason}");
+    assert!(reason.contains("image output blocked"), "{reason}");
+    assert!(reason.contains("inline image bytes"), "{reason}");
     assert!(output.get("hookSpecificOutput").is_none(), "{output}");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn posttool_blocks_data_uri_media_output() {
+fn posttool_blocks_broken_data_uri_image_output() {
     let (root, session) = empty_session("hook-post-media-uri-block");
     let input = json!({
         "hookEventName": "PostToolUse",
@@ -1517,7 +1517,8 @@ fn posttool_blocks_data_uri_media_output() {
     let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().unwrap();
-    assert!(reason.contains("media"), "{reason}");
+    assert!(reason.contains("image output blocked"), "{reason}");
+    assert!(reason.contains("OCR failed"), "{reason}");
     let _ = std::fs::remove_dir_all(root);
 }
 
