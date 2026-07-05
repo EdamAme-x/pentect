@@ -3,9 +3,9 @@
 //! It demonstrates the product loop:
 //! shell tool input -> force execution through `pentect exec`;
 //! command output -> mask before it returns to the AI.
-//! `read` is a one-way human preview. `exec` and hooks use process-local or
-//! parent-hosted in-memory capabilities so masked handles can be passed back
-//! into later tool-boundary commands without persisting recovery material.
+//! `read` is a one-way human preview. `exec` and hooks keep vault handles in
+//! process memory so later tool commands can reuse them without persisting raw
+//! recovery material.
 
 mod approval;
 mod approve_ui;
@@ -160,7 +160,7 @@ pub fn preflight_exec_server_process_start_from_active_memory_vault(
         approve: false,
         mode: ExecMode::Shell(exec_server_approval_command(&argv_mode, env)),
     };
-    prepare_exec_capabilities(&store, &opts)?;
+    prepare_exec_secret_inputs(&store, &opts)?;
     let approval = exec_approval(&store, &opts)?;
     let already_allowed = approval_always_granted(&opts.session, &approval)?;
     if approval.requires_approval() && !already_allowed {
@@ -251,7 +251,7 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
         format!("{}\nsession: {session}\nvault: {vault_line}", cwd.display())
     };
     let warnings = if vault.is_some() {
-        vec!["In-memory capability vault is active for this process tree.".to_string()]
+        vec!["Memory vault is active for this process tree.".to_string()]
     } else {
         Vec::new()
     };
@@ -420,7 +420,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         exec_help();
         return 0;
     }
-    let opts = match ExecOpts::parse(args).and_then(materialize_stdin_exec_opts) {
+    let opts = match ExecOpts::parse(args).and_then(prepare_stdin_exec_opts) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
@@ -432,7 +432,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    if let Err(e) = prepare_exec_capabilities(&store, &opts) {
+    if let Err(e) = prepare_exec_secret_inputs(&store, &opts) {
         return die(&e);
     }
     let approval = match exec_approval(&store, &opts) {
@@ -588,7 +588,7 @@ fn resolve_approval_ticket(paths: &[PathBuf]) -> ApprovalTicket {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let mut material = String::from("resolve-materialize-v1\0");
+    let mut material = String::from("resolve-local-write-v1\0");
     material.push_str(&command);
     material.push('\0');
     for path in paths {
@@ -610,14 +610,14 @@ fn resolve_approval_ticket(paths: &[PathBuf]) -> ApprovalTicket {
             .collect(),
         direct_handles: 0,
         destinations: Vec::new(),
-        network_like: false,
-        materialize_like: true,
+        may_send_network: false,
+        may_write_local_file: true,
     })
 }
 
 fn resolve_stdin_approval_ticket(input: &str) -> ApprovalTicket {
     let command = "pentect resolve <stdin>".to_string();
-    let mut material = String::from("resolve-stdin-materialize-v1\0");
+    let mut material = String::from("resolve-stdin-local-write-v1\0");
     material.push_str(&secret_value_hash(input));
     material.push('\0');
     let digest = Sha256::digest(material.as_bytes());
@@ -628,8 +628,8 @@ fn resolve_stdin_approval_ticket(input: &str) -> ApprovalTicket {
         secret_files: Vec::new(),
         direct_handles: masked_handles_in_text(input).len(),
         destinations: Vec::new(),
-        network_like: false,
-        materialize_like: true,
+        may_send_network: false,
+        may_write_local_file: true,
     })
 }
 
@@ -658,7 +658,7 @@ fn exec_help() {
 }
 
 fn cmd_approve(args: &[String]) -> i32 {
-    let opts = match ExecOpts::parse(args).and_then(materialize_stdin_exec_opts) {
+    let opts = match ExecOpts::parse(args).and_then(prepare_stdin_exec_opts) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
@@ -670,7 +670,7 @@ fn cmd_approve(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    if let Err(e) = prepare_exec_capabilities(&store, &opts) {
+    if let Err(e) = prepare_exec_secret_inputs(&store, &opts) {
         return die(&e);
     }
     let approval = match exec_approval(&store, &opts) {
@@ -747,11 +747,11 @@ fn approval_warnings(opts: &ExecOpts, approval: &ExecApproval) -> Vec<String> {
     if !approval.secret_files.is_empty() {
         warnings.push("this command can read local secret file content".to_string());
     }
-    if approval.network_like && approval.requires_approval() {
-        warnings.push("this command may send approved capabilities to the network".to_string());
+    if approval.may_send_network && approval.requires_approval() {
+        warnings.push("this command may send approved secrets to the network".to_string());
     }
-    if approval.materialize_like && approval.requires_approval() {
-        warnings.push("this command may write approved capabilities to local files".to_string());
+    if approval.may_write_local_file && approval.requires_approval() {
+        warnings.push("this command may write approved secrets to local files".to_string());
     }
     warnings
 }
@@ -785,10 +785,10 @@ fn approval_decision_for_ticket(
 
 fn ticket_warnings(ticket: &ApprovalTicket) -> Vec<String> {
     let mut warnings = Vec::new();
-    if ticket.network_like {
+    if ticket.may_send_network {
         warnings.push("may send secret".to_string());
     }
-    if ticket.materialize_like {
+    if ticket.may_write_local_file {
         warnings.push("may write secret".to_string());
     }
     warnings
@@ -801,8 +801,8 @@ struct ExecApproval {
     secret_files: Vec<SecretFileRef>,
     direct_handles: Vec<String>,
     destinations: Vec<String>,
-    network_like: bool,
-    materialize_like: bool,
+    may_send_network: bool,
+    may_write_local_file: bool,
 }
 
 #[derive(Debug)]
@@ -822,7 +822,7 @@ impl ExecApproval {
         !self.env_refs.is_empty()
             || !self.secret_files.is_empty()
             || !self.direct_handles.is_empty()
-            || self.network_like
+            || self.may_send_network
     }
 
     fn env_names(&self) -> Vec<String> {
@@ -855,10 +855,14 @@ impl ExecApproval {
             material.push('\0');
         }
         material.push_str("network:");
-        material.push_str(if self.network_like { "true" } else { "false" });
+        material.push_str(if self.may_send_network {
+            "true"
+        } else {
+            "false"
+        });
         material.push('\0');
-        material.push_str("materialize:");
-        material.push_str(if self.materialize_like {
+        material.push_str("local-write:");
+        material.push_str(if self.may_write_local_file {
             "true"
         } else {
             "false"
@@ -891,10 +895,10 @@ impl ExecApproval {
             }
             if !self.destinations.is_empty() {
                 lines.push(format!("send {}", self.destinations.join(", ")));
-            } else if self.network_like {
+            } else if self.may_send_network {
                 lines.push("send possible".to_string());
             }
-            if self.materialize_like {
+            if self.may_write_local_file {
                 lines.push("write local file".to_string());
             }
         } else {
@@ -916,8 +920,8 @@ impl ExecApproval {
                 .collect(),
             direct_handles: self.direct_handles.len(),
             destinations: self.destinations.clone(),
-            network_like: self.network_like,
-            materialize_like: self.materialize_like,
+            may_send_network: self.may_send_network,
+            may_write_local_file: self.may_write_local_file,
         })
     }
 }
@@ -937,16 +941,16 @@ fn exec_approval(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExecApproval,
     let secret_files = secret_file_refs_for_mode(store, &opts.mode)?;
     let direct_handles = masked_handles_in_mode(&opts.mode);
     let destinations = network_destinations(&command);
-    let network_like = !destinations.is_empty() || command_looks_network_like(&command);
-    let materialize_like = command_looks_local_materialize_like(&command);
+    let may_send_network = !destinations.is_empty() || command_may_send_network(&command);
+    let may_write_local_file = command_may_write_local_file(&command);
     Ok(ExecApproval {
         command,
         env_refs,
         secret_files,
         direct_handles,
         destinations,
-        network_like,
-        materialize_like,
+        may_send_network,
+        may_write_local_file,
     })
 }
 
@@ -957,7 +961,7 @@ fn approval_always_granted(session: &str, approval: &ExecApproval) -> Result<boo
     Ok(ApprovalQueue::open(session)?.always_granted(&approval.fingerprint()))
 }
 
-fn prepare_exec_capabilities(store: &RecoveryStore, opts: &ExecOpts) -> Result<(), String> {
+fn prepare_exec_secret_inputs(store: &RecoveryStore, opts: &ExecOpts) -> Result<(), String> {
     if let ExecMode::Shell(command) = &opts.mode {
         let command = resolve_command_text(store, command)?;
         register_local_file_inputs(store, &command)?;
@@ -1060,7 +1064,7 @@ fn network_destinations(command: &str) -> Vec<String> {
     out
 }
 
-fn command_looks_network_like(command: &str) -> bool {
+fn command_may_send_network(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     let mut cursor = 0usize;
     while let Some((word, _, next)) = next_shell_word(&lower, cursor) {
@@ -1088,7 +1092,7 @@ fn command_looks_network_like(command: &str) -> bool {
     lower.contains("://")
 }
 
-fn command_looks_local_materialize_like(command: &str) -> bool {
+fn command_may_write_local_file(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     let mut cursor = 0usize;
     while let Some((word, _, next)) = next_shell_word(&lower, cursor) {
@@ -1197,7 +1201,7 @@ fn run_resolved_command(
             let env = requested_env_bindings(store, &opts.mode)?;
             run_shell_script(&command, &env, &opts.session)
         }
-        ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
+        ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
     }
 }
 
@@ -1224,7 +1228,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             apply_child_env_overlays(&mut shell, &env, &opts.session);
             run_live_command(shell, Some(&command), store.clone())
         }
-        ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
+        ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
     }
 }
 
@@ -1252,8 +1256,8 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
     let Some(path_text) = path.to_str() else {
         return Err("resolve requires a UTF-8 relative path".to_string());
     };
-    let path = checked_materialize_path(path_text)?;
-    ensure_materialize_path_within_cwd(&path)?;
+    let path = checked_local_write_path(path_text)?;
+    ensure_local_write_path_within_cwd(&path)?;
     let input = read_input(&path, InputFormat::Text)?;
     let resolved = resolve_command_text(store, &input)?;
     if resolved != input {
@@ -2096,7 +2100,7 @@ impl ExecOpts {
     }
 }
 
-fn materialize_stdin_exec_opts(mut opts: ExecOpts) -> Result<ExecOpts, String> {
+fn prepare_stdin_exec_opts(mut opts: ExecOpts) -> Result<ExecOpts, String> {
     if matches!(opts.mode, ExecMode::Stdin) {
         opts.mode = ExecMode::Shell(read_stdin_text()?);
     }
@@ -2468,7 +2472,7 @@ fn validate_masked_write_before_tool(
             return Ok(());
         }
         let (path, _) = resolved_write_parts(session, path, content)?;
-        ensure_materialize_path_within_cwd(&path)?;
+        ensure_local_write_path_within_cwd(&path)?;
         return Ok(());
     }
     if is_edit_like_tool_name(tool_name) {
@@ -2490,7 +2494,7 @@ fn repair_masked_write_after_tool(
             return Ok(false);
         }
         let (path, resolved) = resolved_write_parts(session, path, content)?;
-        ensure_materialize_path_within_cwd(&path)?;
+        ensure_local_write_path_within_cwd(&path)?;
         if !path.is_file() {
             return Ok(false);
         }
@@ -2511,7 +2515,7 @@ fn resolved_write_parts(
 ) -> Result<(PathBuf, String), String> {
     let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     let resolved = resolve_masked_text(&store, content)?;
-    let path = checked_materialize_path(path)?;
+    let path = checked_local_write_path(path)?;
     Ok((path, resolved))
 }
 
@@ -2525,8 +2529,8 @@ fn validate_masked_edit_before_tool(session: &Session, tool_input: &Value) -> Re
     {
         return Ok(());
     }
-    let path = checked_materialize_path(path)?;
-    ensure_materialize_path_within_cwd(&path)?;
+    let path = checked_local_write_path(path)?;
+    ensure_local_write_path_within_cwd(&path)?;
     if edits.iter().any(|(kind, text)| {
         matches!(kind, EditTextKind::Old) && contains_pentect_masked_handle(text)
     }) {
@@ -2552,8 +2556,8 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
     }) {
         return Ok(false);
     }
-    let path = checked_materialize_path(path)?;
-    ensure_materialize_path_within_cwd(&path)?;
+    let path = checked_local_write_path(path)?;
+    ensure_local_write_path_within_cwd(&path)?;
     if !path.is_file() {
         return Ok(false);
     }
@@ -2704,7 +2708,7 @@ fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| value.get(*name)?.as_str())
 }
 
-fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
+fn checked_local_write_path(path: &str) -> Result<PathBuf, String> {
     let path = Path::new(path);
     let mut has_normal_component = false;
     for component in path.components() {
@@ -2713,7 +2717,7 @@ fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
             std::path::Component::Normal(_) => has_normal_component = true,
             std::path::Component::ParentDir => {
                 return Err(
-                    "Pentect refused to materialize masked content outside the current directory"
+                    "Pentect refused to write masked content outside the current directory"
                         .to_string(),
                 );
             }
@@ -2721,19 +2725,19 @@ fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
             std::path::Component::Prefix(_) if path.is_absolute() => {}
             std::path::Component::Prefix(_) => {
                 return Err(
-                    "Pentect refused to materialize masked content outside the current directory"
+                    "Pentect refused to write masked content outside the current directory"
                         .to_string(),
                 );
             }
         }
     }
     if !has_normal_component {
-        return Err("Pentect refused to materialize masked content to an empty path".to_string());
+        return Err("Pentect refused to write masked content to an empty path".to_string());
     }
     Ok(path.to_path_buf())
 }
 
-fn ensure_materialize_path_within_cwd(path: &Path) -> Result<(), String> {
+fn ensure_local_write_path_within_cwd(path: &Path) -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("could not read current directory: {e}"))?
         .canonicalize()
@@ -2759,12 +2763,11 @@ fn ensure_materialize_path_within_cwd(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("could not canonicalize '{}': {e}", parent.display()))?;
     if !parent.starts_with(&cwd) {
         return Err(
-            "Pentect refused to materialize masked content outside the current directory"
-                .to_string(),
+            "Pentect refused to write masked content outside the current directory".to_string(),
         );
     }
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err("Pentect refused to materialize masked content through a symlink".to_string());
+        return Err("Pentect refused to write masked content through a symlink".to_string());
     }
     Ok(())
 }
@@ -3034,26 +3037,24 @@ fn image_tool_result_block_reason(
     let cfg = config::image_ocr_config()?;
     if matches!(cfg.mode, config::ImageOcrMode::Off) {
         return Ok(
-            matches!(cfg.unreadable, config::ImageUnreadableAction::Block)
-                .then_some("image output blocked: OCR is disabled by config.".to_string()),
+            matches!(cfg.unreadable_images, config::UnreadableImagePolicy::Block)
+                .then_some("image blocked: OCR is off.".to_string()),
         );
     }
     let inspection = image_ocr::inspect_tool_images_for_secrets(value, &session.key)?;
     if inspection.secret_images > 0 {
-        return Ok(Some(
-            "image output blocked: secret text detected by OCR.".to_string(),
-        ));
+        return Ok(Some("image blocked: secret text detected.".to_string()));
     }
-    if matches!(cfg.unreadable, config::ImageUnreadableAction::Pass) {
+    if matches!(cfg.unreadable_images, config::UnreadableImagePolicy::Allow) {
         return Ok(None);
     }
-    if inspection.uninspectable_images > 0 {
+    if inspection.unreadable_images > 0 {
         return Ok(Some(
-            "image output blocked: OCR can inspect inline image bytes only.".to_string(),
+            "image blocked: OCR needs inline image bytes.".to_string(),
         ));
     }
     if inspection.ocr_failures > 0 {
-        return Ok(Some("image output blocked: OCR failed.".to_string()));
+        return Ok(Some("image blocked: OCR failed.".to_string()));
     }
     Ok(None)
 }
@@ -3065,7 +3066,7 @@ fn unsupported_tool_result_reason(value: &Value) -> Option<String> {
                 .to_string(),
         );
     }
-    // TODO(side-effect-audit): replace this with explicit capability tracking
+    // TODO(side-effect-audit): replace this with explicit secret side-effect tracking
     // for clipboard/download/GUI-save destinations when those surfaces exist.
     if contains_unobserved_side_effect_result(value) {
         return Some(

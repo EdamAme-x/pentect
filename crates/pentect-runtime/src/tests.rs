@@ -435,7 +435,7 @@ fn exec_approval_sees_capabilities_registered_from_referenced_files() {
     assert!(before.requires_approval(), "{before:?}");
     assert_eq!(before.secret_files.len(), 1, "{before:?}");
 
-    prepare_exec_capabilities(&store, &opts).unwrap();
+    prepare_exec_secret_inputs(&store, &opts).unwrap();
     let after = exec_approval(&store, &opts).unwrap();
 
     assert!(after.requires_approval(), "{after:?}");
@@ -444,7 +444,7 @@ fn exec_approval_sees_capabilities_registered_from_referenced_files() {
 }
 
 #[test]
-fn network_like_exec_requires_approval_without_dashboard() {
+fn may_send_network_exec_requires_approval_without_dashboard() {
     let root = temp_root("approval-network-needs-dashboard");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let store = RecoveryStore::load(&session).unwrap();
@@ -458,7 +458,7 @@ fn network_like_exec_requires_approval_without_dashboard() {
 
     let approval = exec_approval(&store, &opts).unwrap();
     assert!(approval.requires_approval(), "{approval:?}");
-    assert!(approval.network_like, "{approval:?}");
+    assert!(approval.may_send_network, "{approval:?}");
     let err = approval_decision_for_exec(&opts.session, &approval).unwrap_err();
     assert!(err.contains("approval needed"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
@@ -466,7 +466,7 @@ fn network_like_exec_requires_approval_without_dashboard() {
 }
 
 #[test]
-fn env_capability_local_write_is_reported_as_materialization() {
+fn env_capability_local_write_is_reported_as_local_write() {
     let (root, session) = empty_session("approval-local-write");
     let store = RecoveryStore::load(&session).unwrap();
     let mut masker = OutputMasker::new_shared(store.clone()).unwrap();
@@ -489,31 +489,31 @@ fn env_capability_local_write_is_reported_as_materialization() {
 
     assert!(approval.requires_approval(), "{approval:?}");
     assert_eq!(approval.env_names(), vec!["API_TOKEN".to_string()]);
-    assert!(approval.materialize_like, "{approval:?}");
+    assert!(approval.may_write_local_file, "{approval:?}");
     assert!(
         approval.body().contains("write local file"),
         "{:?}",
         approval.body()
     );
-    assert!(approval.ticket().materialize_like);
+    assert!(approval.ticket().may_write_local_file);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn local_write_detection_covers_common_powershell_write_forms() {
-    assert!(command_looks_local_materialize_like(
+    assert!(command_may_write_local_file(
         "[IO.File]::WriteAllText('credentials.local', $env:API_TOKEN)"
     ));
-    assert!(command_looks_local_materialize_like(
+    assert!(command_may_write_local_file(
         "Write-Output $env:API_TOKEN>credentials.local"
     ));
-    assert!(command_looks_local_materialize_like(
+    assert!(command_may_write_local_file(
         "Write-Output $env:API_TOKEN 2>errors.log"
     ));
 }
 
 #[test]
-fn resolve_file_materialization_requires_approval_without_dashboard() {
+fn resolve_file_local_write_requires_approval_without_dashboard() {
     let root = temp_root("approval-resolve-needs-dashboard");
     let approval_session = format!("approval_resolve_needs_dashboard_{}", unix_millis());
 
@@ -549,7 +549,7 @@ fn forged_unsigned_heartbeat_is_not_alive() {
 }
 
 #[test]
-fn resolve_stdin_materialization_requires_approval_without_dashboard() {
+fn resolve_stdin_local_write_requires_approval_without_dashboard() {
     let root = temp_root("approval-resolve-stdin-needs-dashboard");
     let approval_session = format!("approval_resolve_stdin_needs_dashboard_{}", unix_millis());
     let input = "OPENAI_API_KEY=<<OPENAI_API_KEY_abcdef0123456789>>\n";
@@ -572,8 +572,8 @@ fn always_fingerprint_includes_capability_value_identity() {
         secret_files: Vec::new(),
         direct_handles: Vec::new(),
         destinations: Vec::new(),
-        network_like: false,
-        materialize_like: false,
+        may_send_network: false,
+        may_write_local_file: false,
     };
     let b = ExecApproval {
         command,
@@ -584,8 +584,8 @@ fn always_fingerprint_includes_capability_value_identity() {
         secret_files: Vec::new(),
         direct_handles: Vec::new(),
         destinations: Vec::new(),
-        network_like: false,
-        materialize_like: false,
+        may_send_network: false,
+        may_write_local_file: false,
     };
 
     assert_ne!(a.fingerprint(), b.fingerprint());
@@ -1482,9 +1482,12 @@ fn generic_posttool_masks_payload_alias() {
 }
 
 #[test]
-fn posttool_passes_uninspectable_image_output_by_default() {
+fn posttool_allows_unreadable_image_output_by_default() {
     let (root, session) = empty_session("hook-post-image-best-effort");
-    write_project_config(&root, "[image]\nocr = \"auto\"\nunreadable = \"pass\"\n");
+    write_project_config(
+        &root,
+        "[image]\nocr = \"auto\"\nunreadable_images = \"allow\"\n",
+    );
     let input = json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "mcp__chrome__screenshot",
@@ -1507,9 +1510,12 @@ fn posttool_passes_uninspectable_image_output_by_default() {
 }
 
 #[test]
-fn posttool_blocks_uninspectable_image_output_when_unreadable_is_block() {
+fn posttool_blocks_unreadable_image_output_when_configured() {
     let (root, session) = empty_session("hook-post-image-strict");
-    write_project_config(&root, "[image]\nocr = \"auto\"\nunreadable = \"block\"\n");
+    write_project_config(
+        &root,
+        "[image]\nocr = \"auto\"\nunreadable_images = \"block\"\n",
+    );
     let input = json!({
         "hookEventName": "PostToolUse",
         "toolName": "connector__browser__capture",
@@ -1524,7 +1530,7 @@ fn posttool_blocks_uninspectable_image_output_when_unreadable_is_block() {
     };
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().unwrap();
-    assert!(reason.contains("image output blocked"), "{reason}");
+    assert!(reason.contains("image blocked"), "{reason}");
     assert!(reason.contains("OCR failed"), "{reason}");
     let _ = std::fs::remove_dir_all(root);
 }

@@ -28,8 +28,8 @@ pub(crate) enum ImageOcrMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ImageUnreadableAction {
-    Pass,
+pub(crate) enum UnreadableImagePolicy {
+    Allow,
     Block,
 }
 
@@ -37,14 +37,14 @@ pub(crate) enum ImageUnreadableAction {
 pub(crate) struct ImageOcrConfig {
     pub(crate) mode: ImageOcrMode,
     pub(crate) max_pixels: u64,
-    pub(crate) unreadable: ImageUnreadableAction,
+    pub(crate) unreadable_images: UnreadableImagePolicy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ImageOcrConfigPartial {
     mode: Option<ImageOcrMode>,
     max_pixels: Option<u64>,
-    unreadable: Option<ImageUnreadableAction>,
+    unreadable_images: Option<UnreadableImagePolicy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,10 +105,10 @@ pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
             .max_pixels
             .or(global.max_pixels)
             .unwrap_or(4_000_000),
-        unreadable: project
-            .unreadable
-            .or(global.unreadable)
-            .unwrap_or(ImageUnreadableAction::Pass),
+        unreadable_images: project
+            .unreadable_images
+            .or(global.unreadable_images)
+            .unwrap_or(UnreadableImagePolicy::Allow),
     })
 }
 
@@ -303,14 +303,8 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
     if let Some(raw) = table.get("max_pixels") {
         out.max_pixels = Some(config_u64(raw, "image.max_pixels")?);
     }
-    if table.contains_key("fail_closed") {
-        return Err(
-            "image.fail_closed was removed; use image.unreadable = \"pass\" or \"block\""
-                .to_string(),
-        );
-    }
-    if let Some(raw) = table.get("unreadable") {
-        out.unreadable = Some(image_unreadable_action(raw, "image.unreadable")?);
+    if let Some(raw) = table.get("unreadable_images") {
+        out.unreadable_images = Some(unreadable_image_policy(raw, "image.unreadable_images")?);
     }
     Ok(out)
 }
@@ -348,17 +342,17 @@ fn image_ocr_mode(value: &toml::Value, field: &str) -> Result<ImageOcrMode, Stri
     }
 }
 
-fn image_unreadable_action(
+fn unreadable_image_policy(
     value: &toml::Value,
     field: &str,
-) -> Result<ImageUnreadableAction, String> {
+) -> Result<UnreadableImagePolicy, String> {
     let Some(value) = value.as_str() else {
-        return Err(format!("{field} must be pass or block"));
+        return Err(format!("{field} must be allow or block"));
     };
     match value.trim().to_ascii_lowercase().as_str() {
-        "pass" => Ok(ImageUnreadableAction::Pass),
-        "block" => Ok(ImageUnreadableAction::Block),
-        _ => Err(format!("{field} must be pass or block")),
+        "allow" => Ok(UnreadableImagePolicy::Allow),
+        "block" => Ok(UnreadableImagePolicy::Block),
+        _ => Err(format!("{field} must be allow or block")),
     }
 }
 
@@ -514,25 +508,16 @@ mod tests {
 
     #[test]
     fn image_ocr_config_accepts_mode_and_limit() {
-        let value = "[image]\nocr = \"on\"\nmax_pixels = 1234\nunreadable = \"block\""
+        let value = "[image]\nocr = \"on\"\nmax_pixels = 1234\nunreadable_images = \"block\""
             .parse::<toml::Value>()
             .unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::On));
         assert_eq!(cfg.max_pixels, Some(1234));
-        assert_eq!(cfg.unreadable, Some(ImageUnreadableAction::Block));
+        assert_eq!(cfg.unreadable_images, Some(UnreadableImagePolicy::Block));
 
         let value = "image_ocr = false".parse::<toml::Value>().unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::Off));
-    }
-
-    #[test]
-    fn image_ocr_config_rejects_removed_fail_closed_key() {
-        let value = "[image]\nfail_closed = true"
-            .parse::<toml::Value>()
-            .unwrap();
-        let err = image_ocr_config_value(&value).unwrap_err();
-        assert!(err.contains("image.unreadable"), "{err}");
     }
 }

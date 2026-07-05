@@ -3,7 +3,7 @@ use serde_json::Value;
 
 pub(crate) struct ImageInspection {
     pub(crate) inline_images: usize,
-    pub(crate) uninspectable_images: usize,
+    pub(crate) unreadable_images: usize,
     pub(crate) ocr_failures: usize,
     pub(crate) secret_images: usize,
 }
@@ -49,7 +49,7 @@ pub(crate) fn inspect_tool_images_for_secrets(
 ) -> Result<ImageInspection, String> {
     let mut inspection = ImageInspection {
         inline_images: 0,
-        uninspectable_images: 0,
+        unreadable_images: 0,
         ocr_failures: 0,
         secret_images: 0,
     };
@@ -67,7 +67,7 @@ fn collect_image_inspection(
             if let Some(bytes) = inline_image_bytes(text)? {
                 inspect_image_bytes(&bytes, key, inspection);
             } else if looks_like_image_reference(text) {
-                inspection.uninspectable_images += 1;
+                inspection.unreadable_images += 1;
             }
         }
         Value::Number(_) | Value::Bool(_) | Value::Null => {}
@@ -81,7 +81,7 @@ fn collect_image_inspection(
                 if let Some(bytes) = inline_image_object_bytes(map)? {
                     inspect_image_bytes(&bytes, key, inspection);
                 } else if !empty_image_object(map) {
-                    inspection.uninspectable_images += 1;
+                    inspection.unreadable_images += 1;
                 }
                 return Ok(());
             }
@@ -358,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn object_image_payload_is_not_uninspectable_when_inline() {
+    fn object_image_payload_is_readable_when_inline() {
         let value = serde_json::json!({
             "type": "image",
             "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="

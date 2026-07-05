@@ -1,4 +1,4 @@
-//! Pentect CLI: local secret-capability tool boundary for AI agents.
+//! Pentect CLI: local secret masking boundary for AI agents.
 
 mod doctor;
 mod eval;
@@ -32,12 +32,12 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "- Use normal shell commands. Pentect routes stdout/stderr through its protected runner and masks tool results.\n",
     "- You may read, fetch, transform, store, sync, and use user-authorized secrets. Pentect is the safety layer; raw secret values must not reach chat.\n",
     "- Prefer one normal shell command for secret work, e.g. `cat .env`, service CLIs, or a command that reads a source and writes the exact requested destination.\n",
-    "- Masked handles like `<<NAME_hash>>` are in-memory capabilities for this running Pentect-launched session. Use `$env:NAME`/`$env:PENTECT_NAME_hash` on PowerShell or `$NAME`/`$PENTECT_NAME_hash` on Unix.\n",
-    "- `pentect view '<handle>'` shows only label, hash, and length. Use handles/env capabilities instead of printing raw values.\n",
+    "- Masked handles like `<<NAME_hash>>` work only in this running Pentect-launched session. Use `$env:NAME`/`$env:PENTECT_NAME_hash` on PowerShell or `$NAME`/`$PENTECT_NAME_hash` on Unix.\n",
+    "- `pentect view '<handle>'` shows only label, hash, and length. Use handles or generated env vars instead of printing raw values.\n",
     "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:NAME`; on Unix use POSIX commands and `$NAME`.\n",
     "- Browser/MCP/connector tools may retrieve and use user-authorized secrets. Pentect hooks mask returned tool output when the host supports it; use shell/Pentect for hosts that cannot safely replace tool output.\n",
-    "- Image tool output is OCR-inspected when available; detected secrets fail closed.\n",
-    "- For user-requested storage/materialization, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
+    "- Image tool output is OCR-inspected when available; detected secrets are blocked.\n",
+    "- For user-requested storage, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
     "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
 );
 const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
@@ -120,7 +120,7 @@ fn help_text() -> &'static str {
         "read: masked file preview\n",
         "view: handle metadata\n",
         "statusline: masked count\n",
-        "resolve: local materialize\n",
+        "resolve: write handles\n",
         "scan: CredSweeper + core; binary skip(default)|text(lossy); narrow with --exclude, --gitignore, .pentectignore\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness\n",
@@ -1610,7 +1610,6 @@ mod tests {
         assert!(help.contains("eval: precision, recall"), "{help}");
         assert!(help.contains("scan: CredSweeper + core"), "{help}");
         assert!(help.contains("statusline: masked count"), "{help}");
-        assert!(!help.contains("pentect materialize"), "{help}");
         assert!(!help.contains("pentect purge"), "{help}");
         assert!(!help.contains("authenticated browser/API/MCP"), "{help}");
     }
@@ -1753,12 +1752,11 @@ mod tests {
         assert!(!rendered.contains("pentect read"), "{rendered}");
         assert!(rendered.contains("PowerShell"), "{rendered}");
         assert!(rendered.contains("Browser/MCP/connector"), "{rendered}");
-        assert!(rendered.contains("storage/materialization"), "{rendered}");
+        assert!(rendered.contains("user-requested storage"), "{rendered}");
         assert!(rendered.contains("exact requested"), "{rendered}");
         assert!(rendered.contains("local file"), "{rendered}");
         assert!(rendered.contains("service CLIs"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
-        assert!(!rendered.contains("pentect materialize"), "{rendered}");
         assert!(
             rendered.contains("Do not disclose raw secrets"),
             "{rendered}"
@@ -1806,12 +1804,11 @@ mod tests {
         assert!(!rendered.contains("pentect read"), "{rendered}");
         assert!(rendered.contains("PowerShell"), "{rendered}");
         assert!(rendered.contains("Browser/MCP/connector"), "{rendered}");
-        assert!(rendered.contains("storage/materialization"), "{rendered}");
+        assert!(rendered.contains("user-requested storage"), "{rendered}");
         assert!(rendered.contains("exact requested"), "{rendered}");
         assert!(rendered.contains("local file"), "{rendered}");
         assert!(rendered.contains("service CLIs"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
-        assert!(!rendered.contains("pentect materialize"), "{rendered}");
         assert!(
             rendered.contains("Do not disclose raw secrets"),
             "{rendered}"

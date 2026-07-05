@@ -37,8 +37,8 @@ pub(crate) struct ApprovalTicket {
     pub(crate) secret_files: Vec<String>,
     pub(crate) direct_handles: usize,
     pub(crate) destinations: Vec<String>,
-    pub(crate) network_like: bool,
-    pub(crate) materialize_like: bool,
+    pub(crate) may_send_network: bool,
+    pub(crate) may_write_local_file: bool,
     pub(crate) path: Option<PathBuf>,
 }
 
@@ -49,8 +49,8 @@ pub(crate) struct ApprovalTicketDraft {
     pub(crate) secret_files: Vec<String>,
     pub(crate) direct_handles: usize,
     pub(crate) destinations: Vec<String>,
-    pub(crate) network_like: bool,
-    pub(crate) materialize_like: bool,
+    pub(crate) may_send_network: bool,
+    pub(crate) may_write_local_file: bool,
 }
 
 #[derive(Clone)]
@@ -865,8 +865,8 @@ impl ApprovalTicket {
             secret_files: draft.secret_files,
             direct_handles: draft.direct_handles,
             destinations: draft.destinations,
-            network_like: draft.network_like,
-            materialize_like: draft.materialize_like,
+            may_send_network: draft.may_send_network,
+            may_write_local_file: draft.may_write_local_file,
             path: None,
         };
         ticket.id = ticket_id(&ticket);
@@ -884,8 +884,8 @@ impl ApprovalTicket {
         if self.direct_handles > 0 {
             bits.push(format!("{} handle(s)", self.direct_handles));
         }
-        if self.materialize_like {
-            bits.push("materialize".to_string());
+        if self.may_write_local_file {
+            bits.push("write".to_string());
         }
         if bits.is_empty() {
             "no-secret".to_string()
@@ -920,10 +920,10 @@ pub(crate) fn ticket_summary(ticket: &ApprovalTicket) -> String {
     }
     if !ticket.destinations.is_empty() {
         lines.push(format!("send {}", ticket.destinations.join(", ")));
-    } else if ticket.network_like {
+    } else if ticket.may_send_network {
         lines.push("send possible".to_string());
     }
-    if ticket.materialize_like {
+    if ticket.may_write_local_file {
         lines.push("write local file".to_string());
     }
     lines.join("\n")
@@ -939,8 +939,8 @@ fn ticket_json(ticket: &ApprovalTicket) -> Value {
         "files": ticket.secret_files,
         "handles": ticket.direct_handles,
         "destinations": ticket.destinations,
-        "network": ticket.network_like,
-        "materialize": ticket.materialize_like,
+        "network": ticket.may_send_network,
+        "local_write": ticket.may_write_local_file,
     })
 }
 
@@ -959,12 +959,12 @@ fn ticket_from_json(text: &str) -> Result<ApprovalTicket, String> {
             .and_then(Value::as_u64)
             .unwrap_or_default() as usize,
         destinations: string_array_json(&value, "destinations")?,
-        network_like: value
+        may_send_network: value
             .get("network")
             .and_then(Value::as_bool)
             .unwrap_or_default(),
-        materialize_like: value
-            .get("materialize")
+        may_write_local_file: value
+            .get("local_write")
             .and_then(Value::as_bool)
             .unwrap_or_default(),
         path: None,
@@ -991,8 +991,12 @@ fn canonical_ticket_payload(ticket: &ApprovalTicket) -> String {
     canonical_list(&mut out, "files", &ticket.secret_files);
     canonical_field(&mut out, "handles", &ticket.direct_handles.to_string());
     canonical_list(&mut out, "destinations", &ticket.destinations);
-    canonical_field(&mut out, "network", bool_str(ticket.network_like));
-    canonical_field(&mut out, "materialize", bool_str(ticket.materialize_like));
+    canonical_field(&mut out, "network", bool_str(ticket.may_send_network));
+    canonical_field(
+        &mut out,
+        "local_write",
+        bool_str(ticket.may_write_local_file),
+    );
     out
 }
 
@@ -1312,8 +1316,8 @@ mod tests {
             secret_files: Vec::new(),
             direct_handles: 0,
             destinations: vec!["https://api.example.test".to_string()],
-            network_like: true,
-            materialize_like: false,
+            may_send_network: true,
+            may_write_local_file: false,
         })
     }
 
