@@ -36,7 +36,7 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "- `pentect view '<handle>'` shows only label, hash, and length. Use handles/env capabilities instead of printing raw values.\n",
     "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:NAME`; on Unix use POSIX commands and `$NAME`.\n",
     "- Browser/MCP/connector tools may retrieve and use user-authorized secrets. Pentect hooks mask returned tool output when the host supports it; use shell/Pentect for hosts that cannot safely replace tool output.\n",
-    "- Image tool output is OCR-inspected when available; unsafe or unreadable images fail closed.\n",
+    "- Image tool output is OCR-inspected when available; detected secrets fail closed.\n",
     "- For user-requested storage/materialization, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
     "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
 );

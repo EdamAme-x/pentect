@@ -3031,12 +3031,21 @@ fn image_tool_result_block_reason(
     if !image_ocr::contains_image_result(value) {
         return Ok(None);
     }
-    if !image_ocr::image_ocr_enabled()? {
-        return Ok(Some(
-            "image output blocked: OCR is disabled by config.".to_string(),
-        ));
+    let cfg = config::image_ocr_config()?;
+    if matches!(cfg.mode, config::ImageOcrMode::Off) {
+        return Ok(cfg
+            .fail_closed
+            .then_some("image output blocked: OCR is disabled by config.".to_string()));
     }
     let inspection = image_ocr::inspect_tool_images_for_secrets(value, &session.key)?;
+    if inspection.secret_images > 0 {
+        return Ok(Some(
+            "image output blocked: secret text detected by OCR.".to_string(),
+        ));
+    }
+    if !cfg.fail_closed {
+        return Ok(None);
+    }
     if inspection.uninspectable_images > 0 {
         return Ok(Some(
             "image output blocked: OCR can inspect inline image bytes only.".to_string(),
@@ -3044,11 +3053,6 @@ fn image_tool_result_block_reason(
     }
     if inspection.ocr_failures > 0 {
         return Ok(Some("image output blocked: OCR failed.".to_string()));
-    }
-    if inspection.secret_images > 0 {
-        return Ok(Some(
-            "image output blocked: secret text detected by OCR.".to_string(),
-        ));
     }
     Ok(None)
 }
@@ -3190,13 +3194,17 @@ fn collect_tool_json_scalars(
     out: &mut Vec<ToolScalarInput>,
 ) {
     match value {
-        Value::String(text) => out.push(ToolScalarInput {
-            text: text.clone(),
-            region_kind: RegionKind::JsonValue,
-            key: key.map(str::to_string),
-            path: path.map(str::to_string),
-            hints: hints.to_vec(),
-        }),
+        Value::String(text) => {
+            if !image_ocr::skip_text_masking_for_image_payload(text) {
+                out.push(ToolScalarInput {
+                    text: text.clone(),
+                    region_kind: RegionKind::JsonValue,
+                    key: key.map(str::to_string),
+                    path: path.map(str::to_string),
+                    hints: hints.to_vec(),
+                });
+            }
+        }
         Value::Number(_) | Value::Bool(_) => {
             out.push(ToolScalarInput {
                 text: value.to_string(),
@@ -3214,6 +3222,7 @@ fn collect_tool_json_scalars(
             }
         }
         Value::Object(map) => {
+            let image_object = image_ocr::is_image_object(value);
             for (object_key, item) in map {
                 let child_path = path_with_segment(path, object_key);
                 out.push(ToolScalarInput {
@@ -3224,13 +3233,18 @@ fn collect_tool_json_scalars(
                     hints: Vec::new(),
                 });
                 let child_hints = sibling_context_hints(map, object_key);
-                collect_tool_json_scalars(
-                    item,
-                    Some(object_key),
-                    Some(&child_path),
-                    &child_hints,
-                    out,
-                );
+                if !(image_object
+                    && item.is_string()
+                    && image_ocr::image_payload_field_key(object_key))
+                {
+                    collect_tool_json_scalars(
+                        item,
+                        Some(object_key),
+                        Some(&child_path),
+                        &child_hints,
+                        out,
+                    );
+                }
             }
         }
     }
@@ -3242,6 +3256,9 @@ fn rebuild_masked_tool_json(
     cursor: &mut usize,
 ) -> Result<Value, String> {
     match value {
+        Value::String(text) if image_ocr::skip_text_masking_for_image_payload(text) => {
+            Ok(value.clone())
+        }
         Value::String(_) => {
             let out = take_masked(masked, cursor)?;
             Ok(Value::String(out))
@@ -3264,10 +3281,18 @@ fn rebuild_masked_tool_json(
             Ok(Value::Array(out))
         }
         Value::Object(map) => {
+            let image_object = image_ocr::is_image_object(value);
             let mut out = serde_json::Map::with_capacity(map.len());
-            for (_, item) in map {
+            for (key, item) in map {
                 let masked_key = take_masked(masked, cursor)?;
-                let item = rebuild_masked_tool_json(item, masked, cursor)?;
+                let item = if image_object
+                    && item.is_string()
+                    && image_ocr::image_payload_field_key(key)
+                {
+                    item.clone()
+                } else {
+                    rebuild_masked_tool_json(item, masked, cursor)?
+                };
                 out.insert(masked_key, item);
             }
             Ok(Value::Object(out))

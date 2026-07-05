@@ -31,12 +31,14 @@ pub(crate) enum ImageOcrMode {
 pub(crate) struct ImageOcrConfig {
     pub(crate) mode: ImageOcrMode,
     pub(crate) max_pixels: u64,
+    pub(crate) fail_closed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ImageOcrConfigPartial {
     mode: Option<ImageOcrMode>,
     max_pixels: Option<u64>,
+    fail_closed: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +99,7 @@ pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
             .max_pixels
             .or(global.max_pixels)
             .unwrap_or(4_000_000),
+        fail_closed: project.fail_closed.or(global.fail_closed).unwrap_or(false),
     })
 }
 
@@ -291,6 +294,9 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
     if let Some(raw) = table.get("max_pixels") {
         out.max_pixels = Some(config_u64(raw, "image.max_pixels")?);
     }
+    if let Some(raw) = table.get("fail_closed") {
+        out.fail_closed = Some(config_bool(raw, "image.fail_closed")?);
+    }
     Ok(out)
 }
 
@@ -479,12 +485,13 @@ mod tests {
 
     #[test]
     fn image_ocr_config_accepts_mode_and_limit() {
-        let value = "[image]\nocr = \"on\"\nmax_pixels = 1234"
+        let value = "[image]\nocr = \"on\"\nmax_pixels = 1234\nfail_closed = true"
             .parse::<toml::Value>()
             .unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::On));
         assert_eq!(cfg.max_pixels, Some(1234));
+        assert_eq!(cfg.fail_closed, Some(true));
 
         let value = "image_ocr = false".parse::<toml::Value>().unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();

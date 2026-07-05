@@ -1482,8 +1482,9 @@ fn generic_posttool_masks_payload_alias() {
 }
 
 #[test]
-fn posttool_blocks_uninspectable_image_output() {
-    let (root, session) = empty_session("hook-post-image-block");
+fn posttool_passes_uninspectable_image_output_by_default() {
+    let (root, session) = empty_session("hook-post-image-best-effort");
+    write_project_config(&root, "[image]\nocr = \"auto\"\nfail_closed = false\n");
     let input = json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "mcp__chrome__screenshot",
@@ -1495,18 +1496,20 @@ fn posttool_blocks_uninspectable_image_output() {
             }]
         }
     });
-    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output["decision"], "block");
-    let reason = output["reason"].as_str().unwrap();
-    assert!(reason.contains("image output blocked"), "{reason}");
-    assert!(reason.contains("inline image bytes"), "{reason}");
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Claude, "t", &session, input).unwrap()
+    };
+    assert!(output.get("decision").is_none(), "{output}");
     assert!(output.get("hookSpecificOutput").is_none(), "{output}");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn posttool_blocks_broken_data_uri_image_output() {
-    let (root, session) = empty_session("hook-post-media-uri-block");
+fn posttool_blocks_uninspectable_image_output_when_fail_closed() {
+    let (root, session) = empty_session("hook-post-image-strict");
+    write_project_config(&root, "[image]\nocr = \"auto\"\nfail_closed = true\n");
     let input = json!({
         "hookEventName": "PostToolUse",
         "toolName": "connector__browser__capture",
@@ -1514,7 +1517,11 @@ fn posttool_blocks_broken_data_uri_image_output() {
             "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
         }
     });
-    let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Generic, "t", &session, input).unwrap()
+    };
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().unwrap();
     assert!(reason.contains("image output blocked"), "{reason}");
@@ -2838,6 +2845,29 @@ fn temp_root(name: &str) -> PathBuf {
         std::process::id(),
         unix_millis()
     ))
+}
+
+fn write_project_config(root: &Path, config: &str) {
+    let dir = root.join(".pentect");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), config).unwrap();
+}
+
+struct TestCwd {
+    previous: PathBuf,
+}
+
+impl Drop for TestCwd {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.previous);
+    }
+}
+
+fn enter_temp_cwd(root: &Path) -> TestCwd {
+    std::fs::create_dir_all(root).unwrap();
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    TestCwd { previous }
 }
 
 fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {

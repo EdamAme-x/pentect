@@ -8,10 +8,6 @@ pub(crate) struct ImageInspection {
     pub(crate) secret_images: usize,
 }
 
-pub(crate) fn image_ocr_enabled() -> Result<bool, String> {
-    Ok(!matches!(image_ocr_config()?.mode, ImageOcrMode::Off))
-}
-
 pub(crate) fn contains_image_result(value: &Value) -> bool {
     match value {
         Value::String(text) => looks_like_image_reference(text) || looks_like_base64_image(text),
@@ -19,6 +15,32 @@ pub(crate) fn contains_image_result(value: &Value) -> bool {
         Value::Array(items) => items.iter().any(contains_image_result),
         Value::Object(map) => object_marks_image(map) || map.values().any(contains_image_result),
     }
+}
+
+pub(crate) fn is_image_object(value: &Value) -> bool {
+    value.as_object().is_some_and(object_marks_image)
+}
+
+pub(crate) fn skip_text_masking_for_image_payload(text: &str) -> bool {
+    text.trim().to_ascii_lowercase().starts_with("data:image/") || looks_like_base64_image(text)
+}
+
+pub(crate) fn image_payload_field_key(key: &str) -> bool {
+    matches!(
+        normalized_json_key(key).as_str(),
+        "data"
+            | "bytes"
+            | "base64"
+            | "content"
+            | "image"
+            | "imagedata"
+            | "imageurl"
+            | "url"
+            | "uri"
+            | "src"
+            | "href"
+            | "dataurl"
+    )
 }
 
 pub(crate) fn inspect_tool_images_for_secrets(
