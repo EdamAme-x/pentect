@@ -2305,6 +2305,11 @@ fn before_tool_updated_input(
     if is_read_like_tool_name(tool_name) {
         validate_read_before_tool(session, tool_name, tool_input)?;
     }
+    if is_edit_like_tool_name(tool_name) {
+        if let Some(updated) = apply_masked_old_edit_before_tool(session, tool_input)? {
+            return Ok((updated, true));
+        }
+    }
     validate_masked_write_before_tool(session, tool_name, tool_input)?;
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
         if let Some(reason) = pentect_human_only_command_reason(command) {
@@ -2339,6 +2344,11 @@ fn before_tool_updated_input_lazy(
     }
     if is_write_or_edit_like_tool_name(tool_name) {
         let session = open_hook_session(cli, session_name)?;
+        if is_edit_like_tool_name(tool_name) {
+            if let Some(updated) = apply_masked_old_edit_before_tool(&session, tool_input)? {
+                return Ok((updated, true));
+            }
+        }
         validate_masked_write_before_tool(&session, tool_name, tool_input)?;
     }
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
@@ -2531,13 +2541,6 @@ fn validate_masked_edit_before_tool(session: &Session, tool_input: &Value) -> Re
     }
     let path = checked_local_write_path(path)?;
     ensure_local_write_path_within_cwd(&path)?;
-    if edits.iter().any(|(kind, text)| {
-        matches!(kind, EditTextKind::Old) && contains_pentect_masked_handle(text)
-    }) {
-        return Err(
-            "resolve needed: Edit old text contains a masked handle; use Write.".to_string(),
-        );
-    }
     let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     for (kind, text) in edits {
         if matches!(kind, EditTextKind::New) && contains_pentect_masked_handle(text) {
@@ -2545,6 +2548,43 @@ fn validate_masked_edit_before_tool(session: &Session, tool_input: &Value) -> Re
         }
     }
     Ok(())
+}
+
+fn apply_masked_old_edit_before_tool(
+    session: &Session,
+    tool_input: &Value,
+) -> Result<Option<Value>, String> {
+    let Some((path_text, edits)) = edit_path_and_replacements(tool_input) else {
+        return Ok(None);
+    };
+    if !edits
+        .iter()
+        .any(|edit| contains_pentect_masked_handle(edit.old))
+    {
+        return Ok(None);
+    }
+    let path = checked_local_write_path(path_text)?;
+    ensure_local_write_path_within_cwd(&path)?;
+    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let mut content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    for edit in edits {
+        let old = resolve_masked_text_if_needed(&store, edit.old)?;
+        let new = resolve_masked_text_if_needed(&store, edit.new)?;
+        if old.is_empty() {
+            return Err("masked edit needs non-empty old text.".to_string());
+        }
+        if !content.contains(&old) {
+            return Err("masked edit target was not found; re-read the file.".to_string());
+        }
+        content = content.replacen(&old, &new, 1);
+    }
+    let anchor = safe_noop_edit_anchor(&content, &session.key)
+        .ok_or_else(|| "masked edit has no safe no-op anchor; use Write.".to_string())?;
+    let updated = noop_edit_input(tool_input, &anchor)?;
+    std::fs::write(&path, content)
+        .map_err(|e| format!("could not edit '{}': {e}", path.display()))?;
+    Ok(Some(updated))
 }
 
 fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Result<bool, String> {
@@ -2573,6 +2613,14 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
             .map_err(|e| format!("could not repair '{}': {e}", path.display()))?;
     }
     Ok(true)
+}
+
+fn resolve_masked_text_if_needed(store: &RecoveryStore, content: &str) -> Result<String, String> {
+    if contains_pentect_masked_handle(content) {
+        resolve_masked_text(store, content)
+    } else {
+        Ok(content.to_string())
+    }
 }
 
 fn resolve_masked_text(store: &RecoveryStore, content: &str) -> Result<String, String> {
@@ -2672,6 +2720,11 @@ enum EditTextKind {
     New,
 }
 
+struct EditReplacement<'a> {
+    old: &'a str,
+    new: &'a str,
+}
+
 fn edit_path_and_texts(value: &Value) -> Option<(&str, Vec<(EditTextKind, &str)>)> {
     for candidate in write_input_candidates(value) {
         let Some(path) = string_field(candidate, WRITE_PATH_FIELDS) else {
@@ -2681,6 +2734,20 @@ fn edit_path_and_texts(value: &Value) -> Option<(&str, Vec<(EditTextKind, &str)>
         push_edit_texts(candidate, &mut texts);
         if !texts.is_empty() {
             return Some((path, texts));
+        }
+    }
+    None
+}
+
+fn edit_path_and_replacements(value: &Value) -> Option<(&str, Vec<EditReplacement<'_>>)> {
+    for candidate in write_input_candidates(value) {
+        let Some(path) = string_field(candidate, WRITE_PATH_FIELDS) else {
+            continue;
+        };
+        let mut edits = Vec::new();
+        push_edit_replacements(candidate, &mut edits);
+        if !edits.is_empty() {
+            return Some((path, edits));
         }
     }
     None
@@ -2702,6 +2769,86 @@ fn push_edit_texts<'a>(value: &'a Value, out: &mut Vec<(EditTextKind, &'a str)>)
             push_edit_texts(edit, out);
         }
     }
+}
+
+fn push_edit_replacements<'a>(value: &'a Value, out: &mut Vec<EditReplacement<'a>>) {
+    if let (Some(old), Some(new)) = (
+        string_field(value, EDIT_OLD_FIELDS),
+        string_field(value, EDIT_NEW_FIELDS),
+    ) {
+        out.push(EditReplacement { old, new });
+    }
+    if let Some(edits) = value.get("edits").and_then(Value::as_array) {
+        for edit in edits {
+            push_edit_replacements(edit, out);
+        }
+    }
+}
+
+fn noop_edit_input(value: &Value, anchor: &str) -> Result<Value, String> {
+    let mut updated = value.clone();
+    let Some(candidate) = edit_candidate_object_mut(&mut updated) else {
+        return Err("masked edit input was not recognized.".to_string());
+    };
+    if candidate.get("edits").is_some() {
+        candidate.insert(
+            "edits".to_string(),
+            json!([{ "old_string": anchor, "new_string": anchor }]),
+        );
+        return Ok(updated);
+    }
+    let old_field = existing_field_name(candidate, EDIT_OLD_FIELDS).unwrap_or("old_string");
+    let new_field = existing_field_name(candidate, EDIT_NEW_FIELDS).unwrap_or("new_string");
+    candidate.insert(old_field.to_string(), Value::String(anchor.to_string()));
+    candidate.insert(new_field.to_string(), Value::String(anchor.to_string()));
+    Ok(updated)
+}
+
+fn edit_candidate_object_mut(value: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    if direct_edit_candidate(value) {
+        return value.as_object_mut();
+    }
+    let field = WRITE_INPUT_FIELDS
+        .iter()
+        .copied()
+        .find(|field| value.get(*field).is_some_and(direct_edit_candidate))?;
+    value.get_mut(field)?.as_object_mut()
+}
+
+fn direct_edit_candidate(value: &Value) -> bool {
+    string_field(value, WRITE_PATH_FIELDS).is_some() && edit_path_and_replacements(value).is_some()
+}
+
+fn existing_field_name<'a>(
+    object: &serde_json::Map<String, Value>,
+    names: &'a [&'a str],
+) -> Option<&'a str> {
+    names
+        .iter()
+        .copied()
+        .find(|name| object.contains_key(*name))
+}
+
+fn safe_noop_edit_anchor(content: &str, key: &[u8; 32]) -> Option<String> {
+    content
+        .split_inclusive('\n')
+        .find(|candidate| safe_noop_edit_anchor_candidate(candidate, key))
+        .map(str::to_string)
+}
+
+fn safe_noop_edit_anchor_candidate(candidate: &str, key: &[u8; 32]) -> bool {
+    let text = candidate.trim();
+    if text.is_empty() || candidate.len() > 512 || contains_pentect_masked_handle(candidate) {
+        return false;
+    }
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Text,
+            data: candidate.to_string(),
+        },
+        &Config::new(*key),
+    );
+    result.summary.masked_count == 0
 }
 
 fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {

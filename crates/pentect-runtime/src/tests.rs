@@ -1262,7 +1262,7 @@ fn write_tool_repairs_multiedit_masked_new_string_after_tool() {
 }
 
 #[test]
-fn write_tool_blocks_edit_masked_old_string() {
+fn write_tool_applies_edit_with_masked_old_string_before_tool() {
     let root = temp_root("capability-edit-old-handle");
     let project = PathBuf::from("target").join(format!(
         "pentect-edit-old-handle-{}-{}",
@@ -1290,12 +1290,58 @@ fn write_tool_blocks_edit_masked_old_string() {
         }
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-        .as_str()
-        .unwrap();
-    assert!(reason.contains("Edit old text"), "{reason}");
-    assert!(!reason.contains(raw), "{reason}");
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    let updated = &output["hookSpecificOutput"]["updatedInput"];
+    let old_string = updated["old_string"].as_str().unwrap();
+    let new_string = updated["new_string"].as_str().unwrap();
+    assert_eq!(old_string, new_string);
+    assert!(!old_string.contains(raw), "{old_string}");
+    assert!(!old_string.contains("<<"), "{old_string}");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(written, "token=rotated\n");
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_tool_applies_multiedit_with_masked_old_string_before_tool() {
+    let root = temp_root("capability-multiedit-old-handle");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-multiedit-old-handle-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    let config = std::env::current_dir()
+        .unwrap()
+        .join(&project)
+        .join("config.txt");
+    std::fs::write(&config, format!("name=old\ntoken={raw}\n")).unwrap();
+
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "MultiEdit",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "edits": [
+                {"old_string": "name=old\n", "new_string": "name=new\n"},
+                {"old_string": masked, "new_string": "token=rotated\n"}
+            ]
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    let updated = &output["hookSpecificOutput"]["updatedInput"];
+    let rendered = serde_json::to_string(updated).unwrap();
+    assert!(!rendered.contains(raw), "{rendered}");
+    assert!(!rendered.contains("<<"), "{rendered}");
+    assert_eq!(updated["edits"].as_array().unwrap().len(), 1);
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(written, "name=new\ntoken=rotated\n");
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1329,7 +1375,7 @@ fn write_tool_blocks_edit_masked_old_string_on_lazy_hook_path() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("Edit old text"), "{reason}");
+    assert!(reason.contains("resolve needed"), "{reason}");
     assert!(!reason.contains("raw"), "{reason}");
     let _ = std::fs::remove_dir_all(project);
 }
