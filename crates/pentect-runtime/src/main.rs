@@ -3033,9 +3033,10 @@ fn image_tool_result_block_reason(
     }
     let cfg = config::image_ocr_config()?;
     if matches!(cfg.mode, config::ImageOcrMode::Off) {
-        return Ok(cfg
-            .fail_closed
-            .then_some("image output blocked: OCR is disabled by config.".to_string()));
+        return Ok(
+            matches!(cfg.unreadable, config::ImageUnreadableAction::Block)
+                .then_some("image output blocked: OCR is disabled by config.".to_string()),
+        );
     }
     let inspection = image_ocr::inspect_tool_images_for_secrets(value, &session.key)?;
     if inspection.secret_images > 0 {
@@ -3043,7 +3044,7 @@ fn image_tool_result_block_reason(
             "image output blocked: secret text detected by OCR.".to_string(),
         ));
     }
-    if !cfg.fail_closed {
+    if matches!(cfg.unreadable, config::ImageUnreadableAction::Pass) {
         return Ok(None);
     }
     if inspection.uninspectable_images > 0 {

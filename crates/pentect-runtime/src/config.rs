@@ -28,17 +28,23 @@ pub(crate) enum ImageOcrMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageUnreadableAction {
+    Pass,
+    Block,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ImageOcrConfig {
     pub(crate) mode: ImageOcrMode,
     pub(crate) max_pixels: u64,
-    pub(crate) fail_closed: bool,
+    pub(crate) unreadable: ImageUnreadableAction,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ImageOcrConfigPartial {
     mode: Option<ImageOcrMode>,
     max_pixels: Option<u64>,
-    fail_closed: Option<bool>,
+    unreadable: Option<ImageUnreadableAction>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +105,10 @@ pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
             .max_pixels
             .or(global.max_pixels)
             .unwrap_or(4_000_000),
-        fail_closed: project.fail_closed.or(global.fail_closed).unwrap_or(false),
+        unreadable: project
+            .unreadable
+            .or(global.unreadable)
+            .unwrap_or(ImageUnreadableAction::Pass),
     })
 }
 
@@ -294,8 +303,14 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
     if let Some(raw) = table.get("max_pixels") {
         out.max_pixels = Some(config_u64(raw, "image.max_pixels")?);
     }
-    if let Some(raw) = table.get("fail_closed") {
-        out.fail_closed = Some(config_bool(raw, "image.fail_closed")?);
+    if table.contains_key("fail_closed") {
+        return Err(
+            "image.fail_closed was removed; use image.unreadable = \"pass\" or \"block\""
+                .to_string(),
+        );
+    }
+    if let Some(raw) = table.get("unreadable") {
+        out.unreadable = Some(image_unreadable_action(raw, "image.unreadable")?);
     }
     Ok(out)
 }
@@ -330,6 +345,20 @@ fn image_ocr_mode(value: &toml::Value, field: &str) -> Result<ImageOcrMode, Stri
         "auto" => Ok(ImageOcrMode::Auto),
         "1" | "true" | "yes" | "on" => Ok(ImageOcrMode::On),
         _ => Err(format!("{field} must be off, auto, or on")),
+    }
+}
+
+fn image_unreadable_action(
+    value: &toml::Value,
+    field: &str,
+) -> Result<ImageUnreadableAction, String> {
+    let Some(value) = value.as_str() else {
+        return Err(format!("{field} must be pass or block"));
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pass" => Ok(ImageUnreadableAction::Pass),
+        "block" => Ok(ImageUnreadableAction::Block),
+        _ => Err(format!("{field} must be pass or block")),
     }
 }
 
@@ -485,16 +514,25 @@ mod tests {
 
     #[test]
     fn image_ocr_config_accepts_mode_and_limit() {
-        let value = "[image]\nocr = \"on\"\nmax_pixels = 1234\nfail_closed = true"
+        let value = "[image]\nocr = \"on\"\nmax_pixels = 1234\nunreadable = \"block\""
             .parse::<toml::Value>()
             .unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::On));
         assert_eq!(cfg.max_pixels, Some(1234));
-        assert_eq!(cfg.fail_closed, Some(true));
+        assert_eq!(cfg.unreadable, Some(ImageUnreadableAction::Block));
 
         let value = "image_ocr = false".parse::<toml::Value>().unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::Off));
+    }
+
+    #[test]
+    fn image_ocr_config_rejects_removed_fail_closed_key() {
+        let value = "[image]\nfail_closed = true"
+            .parse::<toml::Value>()
+            .unwrap();
+        let err = image_ocr_config_value(&value).unwrap_err();
+        assert!(err.contains("image.unreadable"), "{err}");
     }
 }

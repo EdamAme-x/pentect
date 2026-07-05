@@ -445,10 +445,10 @@ fn exec_approval_sees_capabilities_registered_from_referenced_files() {
 
 #[test]
 fn network_like_exec_requires_approval_without_dashboard() {
-    let root = temp_root("approval-network-fail-closed");
+    let root = temp_root("approval-network-needs-dashboard");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let store = RecoveryStore::load(&session).unwrap();
-    let approval_session = format!("approval_network_fail_closed_{}", unix_millis());
+    let approval_session = format!("approval_network_needs_dashboard_{}", unix_millis());
     let opts = ExecOpts {
         session: approval_session.clone(),
         live: false,
@@ -514,8 +514,8 @@ fn local_write_detection_covers_common_powershell_write_forms() {
 
 #[test]
 fn resolve_file_materialization_requires_approval_without_dashboard() {
-    let root = temp_root("approval-resolve-fail-closed");
-    let approval_session = format!("approval_resolve_fail_closed_{}", unix_millis());
+    let root = temp_root("approval-resolve-needs-dashboard");
+    let approval_session = format!("approval_resolve_needs_dashboard_{}", unix_millis());
 
     let err = approval_decision_for_resolve(&approval_session, &[PathBuf::from(".env.prod")])
         .unwrap_err();
@@ -550,8 +550,8 @@ fn forged_unsigned_heartbeat_is_not_alive() {
 
 #[test]
 fn resolve_stdin_materialization_requires_approval_without_dashboard() {
-    let root = temp_root("approval-resolve-stdin-fail-closed");
-    let approval_session = format!("approval_resolve_stdin_fail_closed_{}", unix_millis());
+    let root = temp_root("approval-resolve-stdin-needs-dashboard");
+    let approval_session = format!("approval_resolve_stdin_needs_dashboard_{}", unix_millis());
     let input = "OPENAI_API_KEY=<<OPENAI_API_KEY_abcdef0123456789>>\n";
 
     let err = approval_decision_for_resolve_stdin(&approval_session, input).unwrap_err();
@@ -1484,7 +1484,7 @@ fn generic_posttool_masks_payload_alias() {
 #[test]
 fn posttool_passes_uninspectable_image_output_by_default() {
     let (root, session) = empty_session("hook-post-image-best-effort");
-    write_project_config(&root, "[image]\nocr = \"auto\"\nfail_closed = false\n");
+    write_project_config(&root, "[image]\nocr = \"auto\"\nunreadable = \"pass\"\n");
     let input = json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "mcp__chrome__screenshot",
@@ -1507,9 +1507,9 @@ fn posttool_passes_uninspectable_image_output_by_default() {
 }
 
 #[test]
-fn posttool_blocks_uninspectable_image_output_when_fail_closed() {
+fn posttool_blocks_uninspectable_image_output_when_unreadable_is_block() {
     let (root, session) = empty_session("hook-post-image-strict");
-    write_project_config(&root, "[image]\nocr = \"auto\"\nfail_closed = true\n");
+    write_project_config(&root, "[image]\nocr = \"auto\"\nunreadable = \"block\"\n");
     let input = json!({
         "hookEventName": "PostToolUse",
         "toolName": "connector__browser__capture",
