@@ -2,6 +2,7 @@
 
 mod doctor;
 mod eval;
+mod exec_proxy;
 mod extensions;
 mod extensions_cmd;
 mod input;
@@ -13,6 +14,7 @@ use pentect_core::{
     infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
 };
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -27,11 +29,11 @@ pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
-    "- Use normal shell commands. Pentect hooks implicitly route stdout/stderr through `pentect exec \"<command>\"` and mask tool results.\n",
+    "- Use normal shell commands. Pentect routes stdout/stderr through its protected runner and masks tool results.\n",
     "- You may read, fetch, transform, store, sync, and use user-authorized secrets. Pentect is the safety layer; raw secret values must not reach chat.\n",
     "- Prefer one normal shell command for secret work, e.g. `cat .env`, service CLIs, or a command that reads a source and writes the exact requested destination.\n",
     "- Masked handles like `<<NAME_hash>>` are in-memory capabilities for this running Pentect-launched session. Use `$env:NAME`/`$env:PENTECT_NAME_hash` on PowerShell or `$NAME`/`$PENTECT_NAME_hash` on Unix.\n",
-    "- `pentect view '<handle>'` shows only label, hash, and length. Use handles/env capabilities instead of re-reading or printing raw values.\n",
+    "- `pentect view '<handle>'` shows only label, hash, and length. Use handles/env capabilities instead of printing raw values.\n",
     "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:NAME`; on Unix use POSIX commands and `$NAME`.\n",
     "- Browser/MCP/connector tools may retrieve and use user-authorized secrets. Pentect hooks mask returned tool output when the host supports it; use shell/Pentect for hosts that cannot safely replace tool output.\n",
     "- For user-requested storage/materialization, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
@@ -588,9 +590,40 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     let mut cmd = Command::new(&opts.command);
     apply_extension_env(&mut cmd, &active_extensions)?;
     let memory_vault = start_memory_vault(pentect)?;
+    let _parent_env = EnvVarGuard::set_optional([
+        (
+            PENTECT_MEMORY_VAULT_ADDR_ENV,
+            Some(OsString::from(memory_vault.addr.as_str())),
+        ),
+        (
+            PENTECT_MEMORY_VAULT_TOKEN_ENV,
+            Some(OsString::from(memory_vault.token.as_str())),
+        ),
+        (
+            extensions::PACKS_ENV,
+            active_extensions
+                .pack_env_value()
+                .map_err(|e| e.to_string())?,
+        ),
+        (
+            extensions::ADAPTERS_ENV,
+            active_extensions
+                .adapter_env_value()
+                .map_err(|e| e.to_string())?,
+        ),
+    ]);
+    let exec_proxy = if codex_unified_exec_proxy_enabled(&opts.tool_args) {
+        Some(exec_proxy::ExecProxyGuard::start(&opts.command)?)
+    } else {
+        None
+    };
     apply_pentect_env(&mut cmd, pentect, Some(memory_vault.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
     apply_memory_vault_env(&mut cmd, Some(&memory_vault));
+    if let Some(exec_proxy) = &exec_proxy {
+        cmd.env("CODEX_EXEC_SERVER_URL", exec_proxy.url());
+        cmd.env(exec_proxy::PENTECT_CODEX_EXEC_PROXY_ENV, "1");
+    }
     cmd.args(codex_args(&configs, &opts.tool_args));
     run_interactive_command(cmd, &opts.command)
 }
@@ -748,6 +781,35 @@ fn parse_memory_vault_startup(line: &str) -> Result<(String, String), String> {
     Ok((addr, token))
 }
 
+struct EnvVarGuard {
+    previous: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvVarGuard {
+    fn set_optional<const N: usize>(pairs: [(&'static str, Option<OsString>); N]) -> Self {
+        let mut previous = Vec::with_capacity(N);
+        for (name, value) in pairs {
+            previous.push((name, std::env::var_os(name)));
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.previous.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 fn apply_extension_env(
     cmd: &mut Command,
     active: &extensions::ActiveExtensions,
@@ -762,12 +824,16 @@ fn apply_extension_env(
 }
 
 fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
-    let mut args = Vec::with_capacity(configs.len() * 2 + 3 + tool_args.len());
+    let mut args = Vec::with_capacity(configs.len() * 2 + 5 + tool_args.len());
     if !tool_args
         .iter()
         .any(|arg| arg == "--dangerously-bypass-hook-trust")
     {
         args.push("--dangerously-bypass-hook-trust".to_string());
+    }
+    if !codex_args_disable_unified_exec(tool_args) && !codex_args_enable_unified_exec(tool_args) {
+        args.push("--enable".to_string());
+        args.push("unified_exec".to_string());
     }
     for config in configs {
         args.push("--config".to_string());
@@ -780,6 +846,39 @@ fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
     ));
     args.extend(tool_args.iter().cloned());
     args
+}
+
+fn codex_args_enable_unified_exec(args: &[String]) -> bool {
+    codex_args_feature_value(args, "--enable", "unified_exec")
+}
+
+fn codex_args_disable_unified_exec(args: &[String]) -> bool {
+    codex_args_feature_value(args, "--disable", "unified_exec")
+}
+
+fn codex_unified_exec_proxy_enabled(args: &[String]) -> bool {
+    !codex_args_disable_unified_exec(args)
+}
+
+fn codex_args_feature_value(args: &[String], flag: &str, feature: &str) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == flag {
+            if args.get(i + 1).is_some_and(|value| value == feature) {
+                return true;
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+            if value == feature {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn claude_args(settings: &str, tool_args: &[String]) -> Vec<String> {
@@ -1529,11 +1628,8 @@ mod tests {
         assert!(rendered.contains("developer_instructions="), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
         assert!(rendered.contains("Use normal shell commands"), "{rendered}");
-        assert!(
-            rendered.contains("implicitly route stdout/stderr"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("pentect exec"), "{rendered}");
+        assert!(rendered.contains("--enable\nunified_exec"), "{rendered}");
+        assert!(rendered.contains("protected runner"), "{rendered}");
         assert!(rendered.contains("tool results"), "{rendered}");
         assert!(rendered.contains("Masked handles"), "{rendered}");
         assert!(rendered.contains("$env:NAME"), "{rendered}");
@@ -1566,17 +1662,28 @@ mod tests {
     }
 
     #[test]
+    fn codex_args_respects_explicit_unified_exec_disable() {
+        let tool_args = vec![
+            "--disable".to_string(),
+            "unified_exec".to_string(),
+            "exec".to_string(),
+            "hello".to_string(),
+        ];
+        let args = codex_args(&[], &tool_args);
+        let rendered = args.join("\n");
+        assert!(!codex_unified_exec_proxy_enabled(&tool_args));
+        assert!(!rendered.contains("--enable\nunified_exec"), "{rendered}");
+        assert!(rendered.contains("--disable\nunified_exec"), "{rendered}");
+    }
+
+    #[test]
     fn claude_args_inject_model_visible_pentect_contract() {
         let args = claude_args("{}", &["hello".to_string()]);
         let rendered = args.join("\n");
         assert!(rendered.contains("--append-system-prompt"), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
         assert!(rendered.contains("Use normal shell commands"), "{rendered}");
-        assert!(
-            rendered.contains("implicitly route stdout/stderr"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("pentect exec"), "{rendered}");
+        assert!(rendered.contains("protected runner"), "{rendered}");
         assert!(rendered.contains("tool results"), "{rendered}");
         assert!(rendered.contains("$env:NAME"), "{rendered}");
         assert!(rendered.contains("user-authorized secrets"), "{rendered}");

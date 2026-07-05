@@ -43,6 +43,7 @@ use std::time::Duration;
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
 const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
+const PENTECT_CODEX_EXEC_PROXY_ENV: &str = "PENTECT_CODEX_EXEC_PROXY";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
@@ -105,6 +106,73 @@ fn mask_input_into_memory_vault_client(
         .add_recovery(&key, &recovery)
         .map_err(|e| e.to_string())?;
     Ok(result)
+}
+
+pub fn resolve_text_from_active_memory_vault(text: &str) -> Result<Option<String>, String> {
+    if MemoryVaultClient::from_env().is_none() {
+        return Ok(None);
+    }
+    let session = Session::open_capability("default").map_err(|e| e.to_string())?;
+    let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
+    let resolved = store.resolve_all(text).map_err(|e| e.to_string())?;
+    if contains_unresolved_masked_handle(&resolved) {
+        return Err("unknown masked handle in exec-server request".to_string());
+    }
+    Ok(Some(resolved))
+}
+
+pub fn preflight_exec_server_process_start_from_active_memory_vault(
+    argv: &[String],
+    env: &[(String, String)],
+) -> Result<Option<Vec<(String, String)>>, String> {
+    if MemoryVaultClient::from_env().is_none() {
+        return Ok(None);
+    }
+    let session_name = default_session_name()?;
+    let session = Session::open_capability(&session_name).map_err(|e| e.to_string())?;
+    let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
+    let argv_mode = ExecMode::Program(argv.to_vec());
+    let opts = ExecOpts {
+        session: session_name,
+        live: false,
+        approve: false,
+        mode: ExecMode::Shell(exec_server_approval_command(&argv_mode, env)),
+    };
+    prepare_exec_capabilities(&store, &opts)?;
+    let approval = exec_approval(&store, &opts)?;
+    let already_allowed = approval_always_granted(&opts.session, &approval)?;
+    if approval.requires_approval() && !already_allowed {
+        match approval_decision_for_exec(&opts.session, &approval)? {
+            ApprovalDecision::Once | ApprovalDecision::Always => {}
+            ApprovalDecision::Decline => return Err("command declined".to_string()),
+        }
+    }
+    requested_env_bindings(&store, &argv_mode).map(Some)
+}
+
+pub fn mask_tool_output_into_active_memory_vault(text: &str) -> Result<Option<String>, String> {
+    if MemoryVaultClient::from_env().is_none() {
+        return Ok(None);
+    }
+    let session = Session::open_capability("default").map_err(|e| e.to_string())?;
+    let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
+    let mut masker = OutputMasker::new_deferred(store)?;
+    let masked = masker.mask_tool_output(text)?;
+    masker.flush()?;
+    Ok(Some(masked))
+}
+
+fn exec_server_approval_command(mode: &ExecMode, env: &[(String, String)]) -> String {
+    let mut command = display_exec_mode(mode);
+    for (name, value) in env {
+        if contains_pentect_masked_handle(value) {
+            command.push(' ');
+            command.push_str(name);
+            command.push('=');
+            command.push_str(value);
+        }
+    }
+    command
 }
 
 fn usage() {
@@ -2205,6 +2273,9 @@ fn before_tool_updated_input(
         if let Some(reason) = pentect_human_only_command_reason(command) {
             return Err(reason);
         }
+        if provider == HookProvider::Codex && codex_exec_proxy_enabled() {
+            return Ok((tool_input.clone(), false));
+        }
         let command = canonical_hook_shell_command(command)?;
         let mut updated = tool_input.clone();
         if let Some(object) = updated.as_object_mut() {
@@ -2237,6 +2308,9 @@ fn before_tool_updated_input_lazy(
         if let Some(reason) = pentect_human_only_command_reason(command) {
             return Err(reason);
         }
+        if provider == HookProvider::Codex && codex_exec_proxy_enabled() {
+            return Ok((tool_input.clone(), false));
+        }
         let command = canonical_hook_shell_command(command)?;
         let mut updated = tool_input.clone();
         if let Some(object) = updated.as_object_mut() {
@@ -2252,6 +2326,10 @@ fn before_tool_updated_input_lazy(
 
 fn ensure_pentect_agent_launch(provider: HookProvider) -> Result<(), String> {
     ensure_pentect_agent_launch_required(provider, config::require_pentect_agent_by_config()?)
+}
+
+fn codex_exec_proxy_enabled() -> bool {
+    std::env::var(PENTECT_CODEX_EXEC_PROXY_ENV).is_ok_and(|value| value == "1")
 }
 
 fn ensure_pentect_agent_launch_required(
