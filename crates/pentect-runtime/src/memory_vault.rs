@@ -27,6 +27,7 @@ pub(crate) struct MemoryVaultSnapshot {
 struct MemoryVaultState {
     key: [u8; 32],
     recovery: Recovery,
+    masked_count: u64,
 }
 
 impl Drop for MemoryVaultState {
@@ -80,6 +81,30 @@ impl MemoryVaultClient {
         }
     }
 
+    pub(crate) fn masked_count(&self) -> Result<u64> {
+        let line = self.request("COUNT", "")?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 2 || fields[0] != "OK" {
+            bail!("memory vault count response is malformed");
+        }
+        fields[1]
+            .parse::<u64>()
+            .context("memory vault masked count is not a number")
+    }
+
+    pub(crate) fn add_masked_count(&self, count: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let line = self.request("ADD_COUNT", &count.to_string())?;
+        let fields = response_fields(&line)?;
+        if fields.as_slice() == ["OK"] {
+            Ok(())
+        } else {
+            bail!("memory vault add count response is malformed")
+        }
+    }
+
     fn request(&self, command: &str, payload: &str) -> Result<String> {
         let mut stream = TcpStream::connect(&self.addr)
             .with_context(|| format!("could not connect to memory vault at {}", self.addr))?;
@@ -123,6 +148,7 @@ fn serve_memory_vault_inner() -> Result<()> {
     let state = Arc::new(Mutex::new(MemoryVaultState {
         key,
         recovery: Recovery::empty_for_key(&key),
+        masked_count: 0,
     }));
     println!(
         "{}",
@@ -152,6 +178,7 @@ pub(crate) fn spawn_test_memory_vault(token: String) -> String {
     let state = Arc::new(Mutex::new(MemoryVaultState {
         key,
         recovery: Recovery::empty_for_key(&key),
+        masked_count: 0,
     }));
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -179,9 +206,13 @@ fn handle_client(
     let fields = request_fields(&line);
     let response = match fields.as_slice() {
         [provided_token, "KEY", ""] if *provided_token == token => key_response(state),
+        [provided_token, "COUNT", ""] if *provided_token == token => count_response(state),
         [provided_token, "SNAPSHOT", ""] if *provided_token == token => snapshot_response(state),
         [provided_token, "ADD", payload] if *provided_token == token => {
             add_recovery_request(state, payload)
+        }
+        [provided_token, "ADD_COUNT", payload] if *provided_token == token => {
+            add_masked_count_request(state, payload)
         }
         [provided_token, ..] if *provided_token != token => Err(anyhow!("bad token")),
         _ => Err(anyhow!("malformed request")),
@@ -215,6 +246,13 @@ fn snapshot_response(state: &Arc<Mutex<MemoryVaultState>>) -> Result<String> {
     ))
 }
 
+fn count_response(state: &Arc<Mutex<MemoryVaultState>>) -> Result<String> {
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory vault lock poisoned"))?;
+    Ok(format!("OK\t{}", guard.masked_count))
+}
+
 fn add_recovery_request(state: &Arc<Mutex<MemoryVaultState>>, payload: &str) -> Result<String> {
     let bytes = data_encoding::BASE64
         .decode(payload.as_bytes())
@@ -227,6 +265,17 @@ fn add_recovery_request(state: &Arc<Mutex<MemoryVaultState>>, payload: &str) -> 
     if !recovery.is_empty() {
         guard.recovery.extend_same_key(recovery);
     }
+    Ok("OK".to_string())
+}
+
+fn add_masked_count_request(state: &Arc<Mutex<MemoryVaultState>>, payload: &str) -> Result<String> {
+    let count = payload
+        .parse::<u64>()
+        .context("masked count payload is not a number")?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory vault lock poisoned"))?;
+    guard.masked_count = guard.masked_count.saturating_add(count);
     Ok("OK".to_string())
 }
 
@@ -317,6 +366,7 @@ mod tests {
         )
         .unwrap();
         assert!(result.masked.contains("OPENAI_API_KEY=<<OPENAI_API_KEY_"));
+        assert_eq!(client.masked_count().unwrap(), 1);
 
         let snapshot = client.snapshot().unwrap();
         assert_eq!(snapshot.recovery.resolve(&result.masked), raw);
@@ -335,5 +385,18 @@ mod tests {
             name == "OPENAI_API_KEY"
                 && snapshot.recovery.resolve(handle) == "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
         }));
+    }
+
+    #[test]
+    fn client_tracks_masked_count_in_memory() {
+        let token = "test-token-count".to_string();
+        let client = MemoryVaultClient {
+            addr: spawn_test_memory_vault(token.clone()),
+            token,
+        };
+        assert_eq!(client.masked_count().unwrap(), 0);
+        client.add_masked_count(2).unwrap();
+        client.add_masked_count(3).unwrap();
+        assert_eq!(client.masked_count().unwrap(), 5);
     }
 }

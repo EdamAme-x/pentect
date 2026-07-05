@@ -105,7 +105,24 @@ fn mask_input_into_memory_vault_client(
     client
         .add_recovery(&key, &recovery)
         .map_err(|e| e.to_string())?;
+    client
+        .add_masked_count(result.summary.masked_count as u64)
+        .map_err(|e| e.to_string())?;
     Ok(result)
+}
+
+pub fn active_masked_count() -> Result<Option<u64>, String> {
+    let Some(client) = MemoryVaultClient::from_env() else {
+        return Ok(None);
+    };
+    client.masked_count().map(Some).map_err(|e| e.to_string())
+}
+
+pub fn status_line_text() -> String {
+    match active_masked_count() {
+        Ok(Some(count)) => format!("Pentect {count}"),
+        _ => "Pentect 0".to_string(),
+    }
 }
 
 pub fn resolve_text_from_active_memory_vault(text: &str) -> Result<Option<String>, String> {
@@ -151,14 +168,18 @@ pub fn preflight_exec_server_process_start_from_active_memory_vault(
 }
 
 pub fn mask_tool_output_into_active_memory_vault(text: &str) -> Result<Option<String>, String> {
-    if MemoryVaultClient::from_env().is_none() {
+    let Some(client) = MemoryVaultClient::from_env() else {
         return Ok(None);
-    }
+    };
     let session = Session::open_capability("default").map_err(|e| e.to_string())?;
     let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
     let mut masker = OutputMasker::new_deferred(store)?;
     let masked = masker.mask_tool_output(text)?;
+    let masked_count = masker.masked_count();
     masker.flush()?;
+    client
+        .add_masked_count(masked_count)
+        .map_err(|e| e.to_string())?;
     Ok(Some(masked))
 }
 

@@ -474,6 +474,7 @@ fn env_capability_local_write_is_reported_as_materialization() {
         .mask_tool_output("API_TOKEN=sk-ABCDEFGHIJKLMNOPQRSTUVWX")
         .unwrap();
     assert!(masked.contains("API_TOKEN=<<"), "{masked}");
+    assert_eq!(masker.masked_count(), 1);
 
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),

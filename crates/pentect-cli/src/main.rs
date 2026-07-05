@@ -44,6 +44,9 @@ const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_AGENT_AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
 const PENTECT_MEMORY_VAULT_ADDR_ENV: &str = "PENTECT_MEMORY_VAULT_ADDR";
 const PENTECT_MEMORY_VAULT_TOKEN_ENV: &str = "PENTECT_MEMORY_VAULT_TOKEN";
+const PENTECT_STATUS_LINE_ENV: &str = "PENTECT_STATUS_LINE";
+const PENTECT_DIR: &str = ".pentect";
+const PENTECT_CONFIG_FILE: &str = "config.toml";
 const MEMORY_VAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() {
@@ -56,6 +59,7 @@ fn main() {
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
+        Some("statusline") => cmd_statusline(&args),
         Some("doctor") => doctor::cmd_doctor(&args),
         Some("extensions") => extensions_cmd::cmd_extensions(&args),
         Some("eval") => eval::cmd_eval(&args),
@@ -78,6 +82,7 @@ fn usage() {
          pentect eval [--json]\n\
          pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\
          pentect view <HANDLE>\n\
+         pentect statusline\n\
          pentect resolve [PATH...]\n\
          pentect help\n\
          \n\
@@ -86,6 +91,7 @@ fn usage() {
          eval reports local precision/recall metrics.\n\
          scan reports files that contain likely secrets.\n\
          view handle metadata.\n\
+         statusline prints mask count.\n\
          resolve rewrites files containing handles, or resolves stdin when no path is given."
     );
 }
@@ -107,10 +113,12 @@ fn help_text() -> &'static str {
         "  pentect eval [--json]\n\n",
         "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
+        "  pentect statusline\n\n",
         "dashboard: vault\n",
         "exec: masked stdout/stderr\n",
         "read: masked file preview\n",
         "view: handle metadata\n",
+        "statusline: masked count\n",
         "resolve: local materialize\n",
         "scan: CredSweeper + core; binary skip(default)|text(lossy); narrow with --exclude, --gitignore, .pentectignore\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
@@ -368,6 +376,13 @@ fn cmd_view(args: &[String]) {
     }
 }
 
+fn cmd_statusline(args: &[String]) {
+    if args.len() != 2 {
+        die("statusline");
+    }
+    println!("{}", pentect_agent::status_line_text());
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentTool {
     Codex,
@@ -574,6 +589,7 @@ impl AgentToolOpts {
 
 fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
     let configs = codex_hook_config_args(pentect, opts.session.as_deref());
+    let status_line_enabled = status_line_enabled_by_config()?;
     if opts.dry_run {
         if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
             eprintln!(
@@ -620,6 +636,7 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     apply_pentect_env(&mut cmd, pentect, Some(memory_vault.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
     apply_memory_vault_env(&mut cmd, Some(&memory_vault));
+    apply_status_line_env(&mut cmd, status_line_enabled);
     if let Some(exec_proxy) = &exec_proxy {
         cmd.env("CODEX_EXEC_SERVER_URL", exec_proxy.url());
         cmd.env(exec_proxy::PENTECT_CODEX_EXEC_PROXY_ENV, "1");
@@ -642,6 +659,7 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     apply_pentect_env(&mut cmd, pentect, Some(memory_vault.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
     apply_memory_vault_env(&mut cmd, Some(&memory_vault));
+    apply_status_line_env(&mut cmd, status_line_enabled_by_config()?);
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
 }
@@ -761,6 +779,56 @@ fn apply_memory_vault_env(cmd: &mut Command, memory_vault: Option<&MemoryVaultGu
     };
     cmd.env(PENTECT_MEMORY_VAULT_ADDR_ENV, &memory_vault.addr);
     cmd.env(PENTECT_MEMORY_VAULT_TOKEN_ENV, &memory_vault.token);
+}
+
+fn apply_status_line_env(cmd: &mut Command, enabled: bool) {
+    cmd.env(PENTECT_STATUS_LINE_ENV, if enabled { "1" } else { "0" });
+}
+
+fn status_line_enabled_by_config() -> Result<bool, String> {
+    let path = Path::new(PENTECT_DIR).join(PENTECT_CONFIG_FILE);
+    if !path.exists() {
+        return Ok(true);
+    }
+    let src = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(true);
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    Ok(status_line_config_value(&value)?.unwrap_or(true))
+}
+
+fn status_line_config_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    if let Some(raw) = value.get("status_line") {
+        return status_line_config_bool(raw, "status_line").map(Some);
+    }
+    let Some(raw) = value.get("agent") else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("agent config must be a table".to_string());
+    };
+    if let Some(raw) = table.get("status_line") {
+        return status_line_config_bool(raw, "agent.status_line").map(Some);
+    }
+    Ok(None)
+}
+
+fn status_line_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
+    if let Some(value) = value.as_bool() {
+        return Ok(value);
+    }
+    if let Some(value) = value.as_str() {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(format!("config {field} must be boolean-like")),
+        };
+    }
+    Err(format!("config {field} must be a boolean"))
 }
 
 fn parse_memory_vault_startup(line: &str) -> Result<(String, String), String> {
@@ -1536,6 +1604,7 @@ mod tests {
         assert!(help.contains("extensions: list, inspect, test"), "{help}");
         assert!(help.contains("eval: precision, recall"), "{help}");
         assert!(help.contains("scan: CredSweeper + core"), "{help}");
+        assert!(help.contains("statusline: masked count"), "{help}");
         assert!(!help.contains("pentect materialize"), "{help}");
         assert!(!help.contains("pentect purge"), "{help}");
         assert!(!help.contains("authenticated browser/API/MCP"), "{help}");
@@ -1618,6 +1687,42 @@ mod tests {
             .and_then(|(_, value)| value)
             .unwrap();
         assert_eq!(auto_approve, std::ffi::OsStr::new("1"));
+    }
+
+    #[test]
+    fn status_line_config_defaults_on_and_accepts_agent_toggle() {
+        let empty = ""
+            .parse::<toml::Value>()
+            .unwrap_or(toml::Value::Table(Default::default()));
+        assert_eq!(status_line_config_value(&empty).unwrap(), None);
+
+        let value = "[agent]\nstatus_line = false"
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(status_line_config_value(&value).unwrap(), Some(false));
+
+        let value = "status_line = \"on\"".parse::<toml::Value>().unwrap();
+        assert_eq!(status_line_config_value(&value).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn status_line_env_is_compact() {
+        let mut cmd = Command::new("codex");
+        apply_status_line_env(&mut cmd, true);
+        let enabled = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_STATUS_LINE_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(enabled, std::ffi::OsStr::new("1"));
+
+        apply_status_line_env(&mut cmd, false);
+        let disabled = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_STATUS_LINE_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(disabled, std::ffi::OsStr::new("0"));
     }
 
     #[test]
