@@ -28,6 +28,13 @@ memchr = { workspace = true }
 zerocopy = { workspace = true }
 crossterm = { workspace = true }
 toml = { workspace = true }
+fastwebsockets = { version = "0.10.0", features = ["upgrade"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { workspace = true, features = ["io-util", "process", "sync"] }
+data-encoding.workspace = true
+getrandom = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
