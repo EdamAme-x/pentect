@@ -2387,6 +2387,24 @@ fn derived_env_summary_output_does_not_leak_prefix_suffix_or_length() {
 }
 
 #[test]
+fn api_reference_text_is_not_redacted_as_env_derivatives() {
+    let (root, session) = empty_session("exec-api-reference-text");
+    let output = concat!(
+        "- Do not pass a regex as `name` to `getByRole(...)` in this environment.\n",
+        "openTabs(): Promise<Array<BrowserUserTabInfo>>; // List currently open tabs.\n",
+        "downloadMedia(options: LocatorDownloadMediaOptions): Promise<void>;\n",
+        "getAttribute(name: string): Promise<string | null>;\n",
+        "innerText(): Promise<string>;\n",
+        "isEnabled(): Promise<boolean>;\n",
+        "lastOpened?: string; // User-visible timestamp.\n",
+        "On `getByRole(..., { name })`, prefer plain strings.\n",
+    );
+    let masked = mask_tool_output(&session, output).unwrap();
+    assert_eq!(masked, output);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn encoded_env_derivatives_do_not_leak() {
     let (root, session) = empty_session("exec-encoded-env-derivatives");
     let dotenv = "RUNPOD_API_KEY=rpa_FAKEPENTECTJAILBREAK1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";

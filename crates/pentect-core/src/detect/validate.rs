@@ -7,6 +7,7 @@ use bip39::{Language, Mnemonic};
 use data_encoding::BASE64;
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 
 static BIP39_WORDSETS: LazyLock<Vec<(Language, HashSet<&'static str>)>> = LazyLock::new(|| {
@@ -900,7 +901,9 @@ pub enum Validator {
     BtcBech32,
     EthAddress,
     Bip39,
+    Ipv4NonLoopback,
     Ipv6,
+    Ipv6NonLoopback,
     FiHetu,
     ItFiscalCode,
     FrNir,
@@ -950,7 +953,9 @@ impl Validator {
             "btc_bech32" => Validator::BtcBech32,
             "eth_address" => Validator::EthAddress,
             "bip39" => Validator::Bip39,
+            "ipv4_non_loopback" => Validator::Ipv4NonLoopback,
             "ipv6" => Validator::Ipv6,
+            "ipv6_non_loopback" => Validator::Ipv6NonLoopback,
             "fi_hetu" => Validator::FiHetu,
             "it_codice_fiscale" => Validator::ItFiscalCode,
             "fr_nir" => Validator::FrNir,
@@ -998,7 +1003,9 @@ impl Validator {
             Validator::BtcBech32 => btc_bech32(s),
             Validator::EthAddress => eth_address(s),
             Validator::Bip39 => bip39_mnemonic(s),
+            Validator::Ipv4NonLoopback => ipv4_non_loopback(s),
             Validator::Ipv6 => ipv6(s),
+            Validator::Ipv6NonLoopback => ipv6_non_loopback(s),
             Validator::FiHetu => fi_hetu(s),
             Validator::ItFiscalCode => it_codice_fiscale(s),
             Validator::FrNir => fr_nir(s),
@@ -1012,6 +1019,25 @@ impl Validator {
             Validator::TwilioApiKey => twilio_api_key(s),
         }
     }
+}
+
+pub fn ipv4_non_loopback(s: &str) -> bool {
+    let host = s.split_once('/').map_or(s, |(host, _)| host);
+    host.parse::<Ipv4Addr>()
+        .is_ok_and(|addr| !addr.is_loopback())
+}
+
+pub fn ipv6_non_loopback(s: &str) -> bool {
+    if !ipv6(s) {
+        return false;
+    }
+    let without_prefix = s.split_once('/').map_or(s, |(host, _)| host);
+    let without_zone = without_prefix
+        .split_once('%')
+        .map_or(without_prefix, |(host, _)| host);
+    without_zone
+        .parse::<Ipv6Addr>()
+        .is_ok_and(|addr| !addr.is_loopback())
 }
 
 pub fn twilio_api_key(s: &str) -> bool {

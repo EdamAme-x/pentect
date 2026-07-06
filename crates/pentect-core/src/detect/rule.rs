@@ -179,12 +179,6 @@ impl RuleDetector {
                 "MAC_ADDRESS",
                 Medium,
             ),
-            (
-                r"\b(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}(?:/(?:3[0-2]|[12][0-9]|[0-9]))?\b",
-                Endpoint,
-                "IP_ADDRESS_V4",
-                High,
-            ),
             // Structural national IDs (no public checksum) — the regex encodes the
             // grammar; confidence reflects how distinctive it is. Higher false-
             // positive risk than the checksummed ones, kept lower-confidence.
@@ -391,6 +385,7 @@ impl RuleDetector {
             (r"\b[0-8][0-9]{2}[- ][0-9]{2}[- ][0-9]{4}\b", Pii, "US_SSN", Medium, V::UsSsn),
             (r"\bbc1[02-9ac-hj-np-z]{6,87}\b", Identifier, "BTC_ADDRESS_BECH32", High, V::BtcBech32),
             (r"\b0x[0-9a-fA-F]{40}\b", Identifier, "ETH_ADDRESS", High, V::EthAddress),
+            (r"\b(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}(?:/(?:3[0-2]|[12][0-9]|[0-9]))?\b", Endpoint, "IP_ADDRESS_V4", High, V::Ipv4NonLoopback),
             (r"\b[0-9]{6}[-+A-Y][0-9]{3}[0-9A-Y]\b", Identifier, "FI_HETU", High, V::FiHetu),
             (r"(?i)\b[A-Z]{6}[0-9A-Z]{2}[A-Z][0-9A-Z]{2}[A-Z][0-9A-Z]{3}[A-Z]\b", Identifier, "IT_FISCAL_CODE", High, V::ItFiscalCode),
             (r"\b[12][0-9]{4}(?:[0-9]{2}|2[AB])[0-9]{8}\b", Identifier, "FR_NIR_INSEE", High, V::FrNir),
@@ -430,7 +425,7 @@ impl RuleDetector {
             // segment that frequently leaks in stack traces and tool output.
             (r#"(?i)\bAccountKey\b[ \t]*=[ \t]*([A-Za-z0-9+/=]{40,})(?:;|$|[\s"',)])"#, Secret, "AZURE_STORAGE_ACCOUNT_KEY", High, 1, V::None),
             (r#"(?i)\bclient[-_]?key[-_]?data\b[ \t]*:[ \t]*['"]?([A-Za-z0-9+/=]{40,})['"]?(?:$|[\s"',;)])"#, Secret, "KUBE_CLIENT_KEY_DATA", High, 1, V::None),
-            (r#"(?i)(?:^|[^A-Za-z0-9_:.])((?:[0-9A-F]{0,4}:){2,}[0-9A-F]{0,4}(?:%[0-9A-Za-z]+)?(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?)(?:$|[^A-Za-z0-9_:.])"#, Endpoint, "IP_ADDRESS_V6", High, 1, V::Ipv6),
+            (r#"(?i)(?:^|[^A-Za-z0-9_:.])((?:[0-9A-F]{0,4}:){2,}[0-9A-F]{0,4}(?:%[0-9A-Za-z]+)?(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?)(?:$|[^A-Za-z0-9_:.])"#, Endpoint, "IP_ADDRESS_V6", High, 1, V::Ipv6NonLoopback),
             (r#"(?i)\b[A-Z]:[\\/]+Users[\\/]+([^\\/\s:\r\n"<>|?*]{1,64})(?:[\\/]|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])/(?:home|Users|var/home|export/home)/([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
             (r#"(?i)(?:^|[\s"'=(:])~([^/\s\r\n"']{1,64})(?:/|$|[\s"',;)])"#, Pii, "LOCAL_USERNAME", Medium, 1, V::LocalUsername),
@@ -705,6 +700,23 @@ mod tests {
                 spans.iter().map(|s| &s.label).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn loopback_ips_are_not_reported_as_endpoint_secrets() {
+        let det = RuleDetector::builtin();
+        let labels = |s: &str| {
+            let reg = region(s);
+            let v = NormalizedView::build(&reg, s);
+            det.detect(&v)
+                .into_iter()
+                .map(|sp| sp.label)
+                .collect::<Vec<_>>()
+        };
+        assert!(!labels("localhost, 127.0.0.1, or ::1").contains(&"IP_ADDRESS_V4".to_string()));
+        assert!(!labels("localhost, 127.0.0.1, or ::1").contains(&"IP_ADDRESS_V6".to_string()));
+        assert!(labels("service at 192.168.1.1").contains(&"IP_ADDRESS_V4".to_string()));
+        assert!(labels("service at fe80::1%eth0").contains(&"IP_ADDRESS_V6".to_string()));
     }
 
     // Every label must be UPPER_SNAKE so it renders into a well-formed
