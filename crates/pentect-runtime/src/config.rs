@@ -29,7 +29,7 @@ pub(crate) enum ImageOcrMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UnreadableImagePolicy {
+pub(crate) enum UnscannedImagePolicy {
     Allow,
     Block,
 }
@@ -39,7 +39,7 @@ pub(crate) struct ImageOcrConfig {
     pub(crate) mode: ImageOcrMode,
     pub(crate) max_pixels: u64,
     pub(crate) max_edge: u32,
-    pub(crate) unreadable_images: UnreadableImagePolicy,
+    pub(crate) unscanned_images: UnscannedImagePolicy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,7 +47,7 @@ struct ImageOcrConfigPartial {
     mode: Option<ImageOcrMode>,
     max_pixels: Option<u64>,
     max_edge: Option<u32>,
-    unreadable_images: Option<UnreadableImagePolicy>,
+    unscanned_images: Option<UnscannedImagePolicy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,9 +287,6 @@ fn read_image_ocr_config(path: PathBuf) -> Result<ImageOcrConfigPartial, String>
 
 fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, String> {
     let mut out = ImageOcrConfigPartial::default();
-    if let Some(raw) = value.get("image_ocr") {
-        out.mode = Some(image_ocr_mode(raw, "image_ocr")?);
-    }
     let Some(raw) = value.get("image") else {
         return Ok(out);
     };
@@ -305,8 +302,8 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
     if let Some(raw) = table.get("max_edge") {
         out.max_edge = Some(config_u32(raw, "image.max_edge")?);
     }
-    if let Some(raw) = table.get("unreadable_images") {
-        out.unreadable_images = Some(unreadable_image_policy(raw, "image.unreadable_images")?);
+    if let Some(raw) = table.get("unscanned_images") {
+        out.unscanned_images = Some(unscanned_image_policy(raw, "image.unscanned_images")?);
     }
     Ok(out)
 }
@@ -374,16 +371,16 @@ fn image_ocr_mode(value: &toml::Value, field: &str) -> Result<ImageOcrMode, Stri
     }
 }
 
-fn unreadable_image_policy(
+fn unscanned_image_policy(
     value: &toml::Value,
     field: &str,
-) -> Result<UnreadableImagePolicy, String> {
+) -> Result<UnscannedImagePolicy, String> {
     let Some(value) = value.as_str() else {
         return Err(format!("{field} must be allow or block"));
     };
     match value.trim().to_ascii_lowercase().as_str() {
-        "allow" => Ok(UnreadableImagePolicy::Allow),
-        "block" => Ok(UnreadableImagePolicy::Block),
+        "allow" => Ok(UnscannedImagePolicy::Allow),
+        "block" => Ok(UnscannedImagePolicy::Block),
         _ => Err(format!("{field} must be allow or block")),
     }
 }
@@ -422,10 +419,10 @@ fn merge_image_ocr_config(
             .max_edge
             .or(global.max_edge)
             .unwrap_or(DEFAULT_IMAGE_OCR_MAX_EDGE),
-        unreadable_images: project
-            .unreadable_images
-            .or(global.unreadable_images)
-            .unwrap_or(UnreadableImagePolicy::Allow),
+        unscanned_images: project
+            .unscanned_images
+            .or(global.unscanned_images)
+            .unwrap_or(UnscannedImagePolicy::Allow),
     }
 }
 
@@ -575,16 +572,16 @@ mod tests {
     #[test]
     fn image_ocr_config_accepts_mode_and_limit() {
         let value =
-            "[image]\nocr = \"on\"\nmax_pixels = 1234\nmax_edge = 2048\nunreadable_images = \"block\""
+            "[image]\nocr = \"on\"\nmax_pixels = 1234\nmax_edge = 2048\nunscanned_images = \"block\""
                 .parse::<toml::Value>()
             .unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::On));
         assert_eq!(cfg.max_pixels, Some(1234));
         assert_eq!(cfg.max_edge, Some(2048));
-        assert_eq!(cfg.unreadable_images, Some(UnreadableImagePolicy::Block));
+        assert_eq!(cfg.unscanned_images, Some(UnscannedImagePolicy::Block));
 
-        let value = "image_ocr = false".parse::<toml::Value>().unwrap();
+        let value = "[image]\nocr = false".parse::<toml::Value>().unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::Off));
     }

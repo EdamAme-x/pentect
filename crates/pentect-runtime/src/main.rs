@@ -3374,7 +3374,7 @@ fn image_tool_result_block_reason(
     let cfg = config::image_ocr_config()?;
     if matches!(cfg.mode, config::ImageOcrMode::Off) {
         return Ok(
-            matches!(cfg.unreadable_images, config::UnreadableImagePolicy::Block)
+            matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block)
                 .then_some("image blocked: OCR is off.".to_string()),
         );
     }
@@ -3382,16 +3382,16 @@ fn image_tool_result_block_reason(
     if inspection.secret_images > 0 {
         return Ok(Some("image blocked: secret text detected.".to_string()));
     }
-    if matches!(cfg.unreadable_images, config::UnreadableImagePolicy::Allow) {
+    if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Allow) {
         return Ok(None);
     }
-    if inspection.unreadable_images > 0 {
+    if inspection.unscanned_images > 0 {
         return Ok(Some(
-            "image blocked: OCR needs inline image bytes.".to_string(),
+            "image blocked: image bytes were not available to scan.".to_string(),
         ));
     }
     if inspection.ocr_failures > 0 {
-        return Ok(Some("image blocked: OCR failed.".to_string()));
+        return Ok(Some("image blocked: image scan failed.".to_string()));
     }
     Ok(None)
 }

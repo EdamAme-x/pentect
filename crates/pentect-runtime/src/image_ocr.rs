@@ -4,7 +4,7 @@ use serde_json::Value;
 
 pub(crate) struct ImageInspection {
     pub(crate) inline_images: usize,
-    pub(crate) unreadable_images: usize,
+    pub(crate) unscanned_images: usize,
     pub(crate) ocr_failures: usize,
     pub(crate) secret_images: usize,
 }
@@ -50,7 +50,7 @@ pub(crate) fn inspect_tool_images_for_secrets(
 ) -> Result<ImageInspection, String> {
     let mut inspection = ImageInspection {
         inline_images: 0,
-        unreadable_images: 0,
+        unscanned_images: 0,
         ocr_failures: 0,
         secret_images: 0,
     };
@@ -68,7 +68,7 @@ fn collect_image_inspection(
             if let Some(bytes) = inline_image_bytes(text)? {
                 inspect_image_bytes(&bytes, key, inspection);
             } else if looks_like_image_reference(text) {
-                inspection.unreadable_images += 1;
+                inspection.unscanned_images += 1;
             }
         }
         Value::Number(_) | Value::Bool(_) | Value::Null => {}
@@ -82,7 +82,7 @@ fn collect_image_inspection(
                 if let Some(bytes) = inline_image_object_bytes(map)? {
                     inspect_image_bytes(&bytes, key, inspection);
                 } else if !empty_image_object(map) {
-                    inspection.unreadable_images += 1;
+                    inspection.unscanned_images += 1;
                 }
                 return Ok(());
             }
@@ -391,6 +391,12 @@ mod tests {
         let inner = value["image_url"].as_object().unwrap();
         assert!(object_marks_image(inner));
         assert!(inline_image_object_bytes(inner).unwrap().is_some());
+    }
+
+    #[test]
+    fn empty_ocr_text_is_not_secret() {
+        assert!(!ocr_text_has_secret("", &[7; 32]));
+        assert!(!ocr_text_has_secret("   \n\t", &[7; 32]));
     }
 
     #[cfg(feature = "ocr")]
