@@ -3379,7 +3379,7 @@ fn image_tool_result_block_reason(
                 .then_some("image blocked: OCR is off.".to_string()),
         );
     }
-    let inspection = image_ocr::inspect_tool_images_for_secrets(value, &session.key)?;
+    let inspection = image_ocr::inspect_tool_images_for_secrets(value, &session.key, &cfg)?;
     if inspection.secret_images > 0 {
         return Ok(Some("image blocked: secret text detected.".to_string()));
     }
