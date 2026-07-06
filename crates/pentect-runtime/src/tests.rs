@@ -1559,7 +1559,7 @@ fn posttool_allows_unreadable_image_output_by_default() {
     let (root, session) = empty_session("hook-post-image-best-effort");
     write_project_config(
         &root,
-        "[image]\nocr = \"auto\"\nunreadable_images = \"allow\"\n",
+        "[image]\nocr = \"on\"\nunreadable_images = \"allow\"\n",
     );
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -1587,7 +1587,7 @@ fn posttool_blocks_unreadable_image_output_when_configured() {
     let (root, session) = empty_session("hook-post-image-strict");
     write_project_config(
         &root,
-        "[image]\nocr = \"auto\"\nunreadable_images = \"block\"\n",
+        "[image]\nocr = \"on\"\nunreadable_images = \"block\"\n",
     );
     let input = json!({
         "hookEventName": "PostToolUse",
