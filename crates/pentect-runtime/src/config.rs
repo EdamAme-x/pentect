@@ -25,7 +25,6 @@ pub(crate) struct ApprovalConfigScope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImageOcrMode {
     Off,
-    Auto,
     On,
 }
 
@@ -366,13 +365,12 @@ fn image_ocr_mode(value: &toml::Value, field: &str) -> Result<ImageOcrMode, Stri
         });
     }
     let Some(value) = value.as_str() else {
-        return Err(format!("{field} must be off, auto, or on"));
+        return Err(format!("{field} must be off or on"));
     };
     match value.trim().to_ascii_lowercase().as_str() {
         "0" | "false" | "no" | "off" => Ok(ImageOcrMode::Off),
-        "auto" => Ok(ImageOcrMode::Auto),
         "1" | "true" | "yes" | "on" => Ok(ImageOcrMode::On),
-        _ => Err(format!("{field} must be off, auto, or on")),
+        _ => Err(format!("{field} must be off or on")),
     }
 }
 
@@ -415,7 +413,7 @@ fn merge_image_ocr_config(
     global: ImageOcrConfigPartial,
 ) -> ImageOcrConfig {
     ImageOcrConfig {
-        mode: project.mode.or(global.mode).unwrap_or(ImageOcrMode::Auto),
+        mode: project.mode.or(global.mode).unwrap_or(ImageOcrMode::On),
         max_pixels: project
             .max_pixels
             .or(global.max_pixels)
@@ -578,7 +576,7 @@ mod tests {
     fn image_ocr_config_accepts_mode_and_limit() {
         let value =
             "[image]\nocr = \"on\"\nmax_pixels = 1234\nmax_edge = 2048\nunreadable_images = \"block\""
-            .parse::<toml::Value>()
+                .parse::<toml::Value>()
             .unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::On));
@@ -592,11 +590,18 @@ mod tests {
     }
 
     #[test]
+    fn image_ocr_config_rejects_auto_mode() {
+        let value = "[image]\nocr = \"auto\"".parse::<toml::Value>().unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
+    }
+
+    #[test]
     fn image_ocr_config_defaults_to_2k_ocr_edge() {
         let cfg = merge_image_ocr_config(
             ImageOcrConfigPartial::default(),
             ImageOcrConfigPartial::default(),
         );
+        assert_eq!(cfg.mode, ImageOcrMode::On);
         assert_eq!(cfg.max_edge, 2048);
         assert_eq!(cfg.max_pixels, 64_000_000);
     }
