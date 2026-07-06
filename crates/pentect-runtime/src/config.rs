@@ -391,18 +391,20 @@ fn unreadable_image_policy(
 }
 
 fn config_u64(value: &toml::Value, field: &str) -> Result<u64, String> {
-    let Some(value) = value.as_integer() else {
-        return Err(format!("{field} must be an integer"));
-    };
+    let value = config_positive_integer(value, field)?;
     u64::try_from(value).map_err(|_| format!("{field} must be positive"))
 }
 
 fn config_u32(value: &toml::Value, field: &str) -> Result<u32, String> {
+    let value = config_positive_integer(value, field)?;
+    u32::try_from(value).map_err(|_| format!("{field} must be positive"))
+}
+
+fn config_positive_integer(value: &toml::Value, field: &str) -> Result<i64, String> {
     let Some(value) = value.as_integer() else {
         return Err(format!("{field} must be an integer"));
     };
-    let value = u32::try_from(value).map_err(|_| format!("{field} must be positive"))?;
-    if value == 0 {
+    if value <= 0 {
         return Err(format!("{field} must be positive"));
     }
     Ok(value)
@@ -597,6 +599,15 @@ mod tests {
         );
         assert_eq!(cfg.max_edge, 2048);
         assert_eq!(cfg.max_pixels, 64_000_000);
+    }
+
+    #[test]
+    fn image_ocr_config_rejects_zero_limits() {
+        let value = "[image]\nmax_pixels = 0".parse::<toml::Value>().unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
+
+        let value = "[image]\nmax_edge = 0".parse::<toml::Value>().unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
     }
 
     #[test]
