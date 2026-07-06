@@ -111,7 +111,7 @@ fn exec_parse_accepts_live_and_approve_without_env_flags() {
 }
 
 #[test]
-fn child_env_overlays_strip_memory_vault_credentials() {
+fn child_env_overlays_strip_in_memory_manager_credentials() {
     let mut cmd = Command::new("echo");
     apply_child_env_overlays(&mut cmd, &[], "demo");
     let envs: Vec<_> = cmd
@@ -126,7 +126,7 @@ fn child_env_overlays_strip_memory_vault_credentials() {
     assert!(
         matches!(
             envs.iter()
-                .find(|(name, _)| name == "PENTECT_MEMORY_VAULT_ADDR"),
+                .find(|(name, _)| name == "PENTECT_IN_MEMORY_MANAGER_ADDR"),
             Some((_, None))
         ),
         "{envs:?}"
@@ -134,7 +134,7 @@ fn child_env_overlays_strip_memory_vault_credentials() {
     assert!(
         matches!(
             envs.iter()
-                .find(|(name, _)| name == "PENTECT_MEMORY_VAULT_TOKEN"),
+                .find(|(name, _)| name == "PENTECT_IN_MEMORY_MANAGER_TOKEN"),
             Some((_, None))
         ),
         "{envs:?}"
@@ -298,7 +298,7 @@ fn default_session_root_lives_under_pentect_dir() {
 }
 
 #[test]
-fn open_at_stays_in_memory_even_when_base_has_capability_vault() {
+fn open_at_stays_in_memory_even_when_base_has_capability_manager() {
     let root = temp_root("open-at-in-memory");
     let persisted = Session::open_capability_at(&root, "t").unwrap();
     let persisted_key = persisted.key;
@@ -1007,7 +1007,7 @@ fn write_tool_blocks_unknown_masked_handles_that_need_resolve() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("resolve needed"), "{reason}");
+    assert!(reason.contains("masked handle is unavailable"), "{reason}");
     assert!(!config.exists());
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
@@ -1402,7 +1402,7 @@ fn write_tool_blocks_edit_masked_old_string_on_lazy_hook_path() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("resolve needed"), "{reason}");
+    assert!(reason.contains("masked handle is unavailable"), "{reason}");
     assert!(!reason.contains("raw"), "{reason}");
     let _ = std::fs::remove_dir_all(project);
 }
@@ -2360,7 +2360,7 @@ fn require_pentect_blocks_unwrapped_agent_when_enabled() {
 }
 
 #[test]
-fn require_pentect_rejects_matching_env_without_live_vault() {
+fn require_pentect_rejects_matching_env_without_live_manager() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
@@ -2374,10 +2374,10 @@ fn require_pentect_rejects_matching_env_without_live_vault() {
 }
 
 #[test]
-fn require_pentect_allows_wrapped_agent_with_vault_proof() {
+fn require_pentect_allows_wrapped_agent_with_manager_proof() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let addr = memory_vault::spawn_test_memory_vault(token.to_string());
+    let addr = in_memory_manager::spawn_test_in_memory_manager(token.to_string());
     std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
     std::env::set_var(ENV_TOKEN, token);
     std::env::set_var(ENV_ADDR, addr);
@@ -2455,7 +2455,7 @@ fn pretool_allows_direct_read_tool_for_clean_file() {
 }
 
 #[test]
-fn pretool_blocks_direct_read_tool_when_file_needs_masking() {
+fn pretool_rewrites_direct_read_tool_to_masked_copy() {
     let (root, session) = empty_session("hook-pre-direct-read-secret");
     let project = PathBuf::from("target").join(format!(
         "pentect-read-secret-{}-{}",
@@ -2474,18 +2474,26 @@ fn pretool_blocks_direct_read_tool_when_file_needs_masking() {
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    let masked_path = output["hookSpecificOutput"]["updatedInput"]["file_path"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("pentect read"), "{reason}");
-    assert!(!reason.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{reason}");
+    assert!(masked_path.contains(".pentect"), "{masked_path}");
+    assert!(masked_path.contains("masked-read"), "{masked_path}");
+    let masked = std::fs::read_to_string(masked_path).unwrap();
+    assert!(masked.contains("<<OPENAI_API_KEY_"), "{masked}");
+    assert!(!masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{masked}");
+    assert_eq!(
+        session.resolve_all(&masked).unwrap(),
+        "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
+    );
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(".pentect/masked-read");
 }
 
 #[test]
-fn pretool_blocks_read_many_when_any_file_needs_masking() {
+fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
     let (root, session) = empty_session("hook-pre-read-many-secret");
     let project = PathBuf::from("target").join(format!(
         "pentect-read-many-secret-{}-{}",
@@ -2510,17 +2518,21 @@ fn pretool_blocks_read_many_when_any_file_needs_masking() {
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-        .as_str()
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    let paths = output["hookSpecificOutput"]["updatedInput"]["paths"]
+        .as_array()
         .unwrap();
-    assert!(reason.contains("pentect read"), "{reason}");
-    assert!(
-        !reason.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
-        "{reason}"
-    );
+    assert_eq!(paths.len(), 2);
+    assert_eq!(paths[0].as_str().unwrap(), readme.to_string_lossy());
+    let masked_path = paths[1].as_str().unwrap();
+    assert!(masked_path.contains(".pentect"), "{masked_path}");
+    assert!(masked_path.contains("masked-read"), "{masked_path}");
+    let masked = std::fs::read_to_string(masked_path).unwrap();
+    assert!(masked.contains("<<RUNPOD_API_KEY_"), "{masked}");
+    assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(".pentect/masked-read");
 }
 
 #[test]

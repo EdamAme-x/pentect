@@ -44,12 +44,13 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
 const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
 const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_AGENT_AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
-const PENTECT_MEMORY_VAULT_ADDR_ENV: &str = "PENTECT_MEMORY_VAULT_ADDR";
-const PENTECT_MEMORY_VAULT_TOKEN_ENV: &str = "PENTECT_MEMORY_VAULT_TOKEN";
+const PENTECT_IN_MEMORY_MANAGER_ADDR_ENV: &str = "PENTECT_IN_MEMORY_MANAGER_ADDR";
+const PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV: &str = "PENTECT_IN_MEMORY_MANAGER_TOKEN";
 const PENTECT_STATUS_LINE_ENV: &str = "PENTECT_STATUS_LINE";
 const PENTECT_DIR: &str = ".pentect";
 const PENTECT_CONFIG_FILE: &str = "config.toml";
-const MEMORY_VAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const IN_MEMORY_MANAGER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -66,7 +67,9 @@ fn main() {
         Some("extensions") => extensions_cmd::cmd_extensions(&args),
         Some("eval") => eval::cmd_eval(&args),
         Some("scan") => scan::cmd_scan(&args),
-        Some("exec" | "resolve" | "approve" | "hook" | "purge") => cmd_agent_from(1, &args),
+        Some("exec" | "resolve" | "approve" | "hook" | "manager" | "purge") => {
+            cmd_agent_from(1, &args)
+        }
         Some("agent") => cmd_agent_from(2, &args),
         Some("codex") => cmd_agent_tool(AgentTool::Codex, &args),
         Some("claude") => cmd_agent_tool(AgentTool::Claude, &args),
@@ -116,7 +119,7 @@ fn help_text() -> &'static str {
         "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
         "  pentect statusline\n\n",
-        "dashboard: vault\n",
+        "dashboard: memory\n",
         "exec: masked stdout/stderr\n",
         "read: masked file preview\n",
         "view: handle metadata\n",
@@ -133,6 +136,45 @@ fn help_text() -> &'static str {
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("[pentect] {msg}");
     std::process::exit(2);
+}
+
+fn die_with_issue(msg: impl std::fmt::Display) -> ! {
+    eprintln!("[pentect] {msg}");
+    eprintln!("[pentect] report: {}", issue_report_url());
+    std::process::exit(2);
+}
+
+fn issue_report_url() -> String {
+    let body = concat!(
+        "## What happened\n\n",
+        "<what did you run?>\n\n",
+        "## Error\n\n",
+        "```text\n",
+        "<paste Pentect error output here>\n",
+        "```\n\n",
+        "## Environment\n\n",
+        "- OS:\n",
+        "- Pentect version or commit:\n",
+        "- Terminal:\n\n",
+        "Do not paste raw secrets, API keys, tokens, cookies, or private files.\n",
+    );
+    format!(
+        "{ISSUE_NEW_URL}?title={}&body={}",
+        url_query_encode("Pentect error"),
+        url_query_encode(body)
+    )
+}
+
+fn url_query_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 fn cmd_agent_from(start: usize, args: &[String]) {
@@ -182,13 +224,13 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
         AgentTool::Codex => run_codex(&opts, &pentect),
         AgentTool::Claude => run_claude(&opts, &pentect),
     }
-    .unwrap_or_else(|e| die(&e));
+    .unwrap_or_else(|e| die_with_issue(&e));
     let code = status.code().unwrap_or(1);
     std::process::exit(code);
 }
 
-fn start_memory_vault(pentect: &Path) -> Result<MemoryVaultGuard, String> {
-    MemoryVaultGuard::start(pentect)
+fn start_in_memory_manager(pentect: &Path) -> Result<InMemoryManagerGuard, String> {
+    InMemoryManagerGuard::start(pentect)
 }
 
 fn agent_tool_extensions(opts: &AgentToolOpts) -> Result<extensions::ActiveExtensions, String> {
@@ -324,7 +366,7 @@ fn cmd_read(args: &[String]) {
         Err(e) => die(&e),
     };
     let input = Input { kind, data };
-    match pentect_agent::mask_input_into_active_memory_vault(
+    match pentect_agent::mask_input_into_active_in_memory_manager(
         input.clone(),
         opts.profile,
         packs.clone(),
@@ -598,15 +640,15 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     let active_extensions = agent_tool_extensions(opts)?;
     let mut cmd = Command::new(&opts.command);
     apply_extension_env(&mut cmd, &active_extensions)?;
-    let memory_vault = start_memory_vault(pentect)?;
+    let in_memory_manager = start_in_memory_manager(pentect)?;
     let _parent_env = EnvVarGuard::set_optional([
         (
-            PENTECT_MEMORY_VAULT_ADDR_ENV,
-            Some(OsString::from(memory_vault.addr.as_str())),
+            PENTECT_IN_MEMORY_MANAGER_ADDR_ENV,
+            Some(OsString::from(in_memory_manager.addr.as_str())),
         ),
         (
-            PENTECT_MEMORY_VAULT_TOKEN_ENV,
-            Some(OsString::from(memory_vault.token.as_str())),
+            PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV,
+            Some(OsString::from(in_memory_manager.token.as_str())),
         ),
         (
             extensions::PACKS_ENV,
@@ -626,9 +668,9 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     } else {
         None
     };
-    apply_pentect_env(&mut cmd, pentect, Some(memory_vault.token.as_str()));
+    apply_pentect_env(&mut cmd, pentect, Some(in_memory_manager.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
-    apply_memory_vault_env(&mut cmd, Some(&memory_vault));
+    apply_in_memory_manager_env(&mut cmd, Some(&in_memory_manager));
     apply_status_line_env(&mut cmd, status_line_enabled);
     if let Some(exec_proxy) = &exec_proxy {
         cmd.env("CODEX_EXEC_SERVER_URL", exec_proxy.url());
@@ -648,10 +690,10 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     let active_extensions = agent_tool_extensions(opts)?;
     let mut cmd = Command::new(&opts.command);
     apply_extension_env(&mut cmd, &active_extensions)?;
-    let memory_vault = start_memory_vault(pentect)?;
-    apply_pentect_env(&mut cmd, pentect, Some(memory_vault.token.as_str()));
+    let in_memory_manager = start_in_memory_manager(pentect)?;
+    apply_pentect_env(&mut cmd, pentect, Some(in_memory_manager.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
-    apply_memory_vault_env(&mut cmd, Some(&memory_vault));
+    apply_in_memory_manager_env(&mut cmd, Some(&in_memory_manager));
     apply_status_line_env(&mut cmd, status_line_enabled_by_config()?);
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
@@ -685,43 +727,43 @@ fn run_interactive_command(
     Ok(status)
 }
 
-struct MemoryVaultGuard {
+struct InMemoryManagerGuard {
     child: Child,
     addr: String,
     token: String,
 }
 
-impl MemoryVaultGuard {
+impl InMemoryManagerGuard {
     fn start(pentect: &Path) -> Result<Self, String> {
         let mut child = Command::new(pentect)
             .arg("agent")
-            .arg("vault")
+            .arg("manager")
             .arg("--serve")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("could not start Pentect memory vault: {e}"))?;
+            .map_err(|e| format!("could not start Pentect in-memory manager: {e}"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "could not capture Pentect memory vault startup".to_string())?;
+            .ok_or_else(|| "could not capture Pentect in-memory manager startup".to_string())?;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut line = String::new();
             let result = BufReader::new(stdout)
                 .read_line(&mut line)
-                .map_err(|e| format!("could not read Pentect memory vault startup: {e}"))
+                .map_err(|e| format!("could not read Pentect in-memory manager startup: {e}"))
                 .and_then(|_| {
                     if line.trim().is_empty() {
-                        Err("Pentect memory vault exited before startup".to_string())
+                        Err("Pentect in-memory manager exited before startup".to_string())
                     } else {
                         Ok(line)
                     }
                 });
             let _ = tx.send(result);
         });
-        let line = match rx.recv_timeout(MEMORY_VAULT_STARTUP_TIMEOUT) {
+        let line = match rx.recv_timeout(IN_MEMORY_MANAGER_STARTUP_TIMEOUT) {
             Ok(Ok(line)) => line,
             Ok(Err(e)) => {
                 let _ = child.kill();
@@ -731,10 +773,10 @@ impl MemoryVaultGuard {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Pentect memory vault did not start within 5 seconds".to_string());
+                return Err("Pentect in-memory manager did not start within 5 seconds".to_string());
             }
         };
-        let (addr, token) = match parse_memory_vault_startup(&line) {
+        let (addr, token) = match parse_in_memory_manager_startup(&line) {
             Ok(parsed) => parsed,
             Err(e) => {
                 let _ = child.kill();
@@ -746,7 +788,7 @@ impl MemoryVaultGuard {
     }
 }
 
-impl Drop for MemoryVaultGuard {
+impl Drop for InMemoryManagerGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -766,12 +808,18 @@ fn apply_agent_auto_approve_env(cmd: &mut Command) {
     cmd.env(PENTECT_AGENT_AUTO_APPROVE_ENV, "1");
 }
 
-fn apply_memory_vault_env(cmd: &mut Command, memory_vault: Option<&MemoryVaultGuard>) {
-    let Some(memory_vault) = memory_vault else {
+fn apply_in_memory_manager_env(
+    cmd: &mut Command,
+    in_memory_manager: Option<&InMemoryManagerGuard>,
+) {
+    let Some(in_memory_manager) = in_memory_manager else {
         return;
     };
-    cmd.env(PENTECT_MEMORY_VAULT_ADDR_ENV, &memory_vault.addr);
-    cmd.env(PENTECT_MEMORY_VAULT_TOKEN_ENV, &memory_vault.token);
+    cmd.env(PENTECT_IN_MEMORY_MANAGER_ADDR_ENV, &in_memory_manager.addr);
+    cmd.env(
+        PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV,
+        &in_memory_manager.token,
+    );
 }
 
 fn apply_status_line_env(cmd: &mut Command, enabled: bool) {
@@ -824,20 +872,20 @@ fn status_line_config_bool(value: &toml::Value, field: &str) -> Result<bool, Str
     Err(format!("config {field} must be a boolean"))
 }
 
-fn parse_memory_vault_startup(line: &str) -> Result<(String, String), String> {
+fn parse_in_memory_manager_startup(line: &str) -> Result<(String, String), String> {
     let startup: Value = serde_json::from_str(line)
-        .map_err(|e| format!("Pentect memory vault startup was not JSON: {e}"))?;
+        .map_err(|e| format!("Pentect in-memory manager startup was not JSON: {e}"))?;
     let addr = startup
         .get("addr")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Pentect memory vault startup did not include addr".to_string())?
+        .ok_or_else(|| "Pentect in-memory manager startup did not include addr".to_string())?
         .to_string();
     let token = startup
         .get("token")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Pentect memory vault startup did not include token".to_string())?
+        .ok_or_else(|| "Pentect in-memory manager startup did not include token".to_string())?
         .to_string();
     Ok((addr, token))
 }
@@ -1709,6 +1757,16 @@ mod tests {
         assert!(help.contains("statusline: masked count"), "{help}");
         assert!(!help.contains("pentect purge"), "{help}");
         assert!(!help.contains("authenticated browser/API/MCP"), "{help}");
+    }
+
+    #[test]
+    fn issue_report_url_prefills_safe_template() {
+        let url = issue_report_url();
+        assert!(url.starts_with("https://github.com/EdamAme-x/pentect/issues/new?"));
+        assert!(url.contains("title=Pentect%20error"), "{url}");
+        assert!(url.contains("body="), "{url}");
+        assert!(url.contains("Do%20not%20paste%20raw%20secrets"), "{url}");
+        assert!(!url.contains("<paste Pentect error output here>"), "{url}");
     }
 
     #[test]

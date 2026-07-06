@@ -3,7 +3,7 @@
 //! It demonstrates the product loop:
 //! shell tool input -> force execution through `pentect exec`;
 //! command output -> mask before it returns to the AI.
-//! `read` is a one-way human preview. `exec` and hooks keep vault handles in
+//! `read` is a one-way human preview. `exec` and hooks keep masked handles in
 //! process memory so later tool commands can reuse them without persisting raw
 //! recovery material.
 
@@ -12,21 +12,21 @@ mod approve_ui;
 mod config;
 mod extension_adapter;
 mod image_ocr;
+mod in_memory_manager;
 mod masking;
-mod memory_vault;
 mod session;
 mod shell;
 
 use approval::{ticket_summary, ApprovalQueue, ApprovalTicket, ApprovalTicketDraft};
 use approve_ui::{ApprovalDecision, ApprovalRequest};
 use config::{approval_bypassed_by_config, approval_config_state};
+use in_memory_manager::{InMemoryManagerClient, ENV_ADDR, ENV_TOKEN};
 use masking::{
     contains_unresolved_masked_handle, env_alias_recovery, is_ascii_word_char, is_env_name_byte,
     live_output_kind, OutputMasker, ToolScalarInput,
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
-use memory_vault::{MemoryVaultClient, ENV_ADDR, ENV_TOKEN};
 use pentect_core::{
     infer_kind, parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile,
     RegionKind,
@@ -74,7 +74,7 @@ pub fn run_from(args: Vec<String>) -> i32 {
         Some("resolve") => cmd_resolve(&args),
         Some("approve") => cmd_approve(&args),
         Some("hook") => cmd_hook(&args),
-        Some("vault") => cmd_vault(&args),
+        Some("manager") => cmd_in_memory_manager(&args),
         Some("purge") => cmd_purge(&args),
         _ => {
             usage();
@@ -83,19 +83,19 @@ pub fn run_from(args: Vec<String>) -> i32 {
     }
 }
 
-pub fn mask_input_into_active_memory_vault(
+pub fn mask_input_into_active_in_memory_manager(
     input: Input,
     profile: Profile,
     packs: Vec<Pack>,
 ) -> Result<Option<MaskResult>, String> {
-    let Some(client) = MemoryVaultClient::from_env() else {
+    let Some(client) = InMemoryManagerClient::from_env() else {
         return Ok(None);
     };
-    mask_input_into_memory_vault_client(&client, input, profile, packs).map(Some)
+    mask_input_into_in_memory_manager_client(&client, input, profile, packs).map(Some)
 }
 
-fn mask_input_into_memory_vault_client(
-    client: &MemoryVaultClient,
+fn mask_input_into_in_memory_manager_client(
+    client: &InMemoryManagerClient,
     input: Input,
     profile: Profile,
     packs: Vec<Pack>,
@@ -116,7 +116,7 @@ fn mask_input_into_memory_vault_client(
 }
 
 pub fn active_masked_count() -> Result<Option<u64>, String> {
-    let Some(client) = MemoryVaultClient::from_env() else {
+    let Some(client) = InMemoryManagerClient::from_env() else {
         return Ok(None);
     };
     client.masked_count().map(Some).map_err(|e| e.to_string())
@@ -133,8 +133,8 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
     image_ocr::ocr_image_bytes(bytes)
 }
 
-pub fn resolve_text_from_active_memory_vault(text: &str) -> Result<Option<String>, String> {
-    if MemoryVaultClient::from_env().is_none() {
+pub fn resolve_text_from_active_in_memory_manager(text: &str) -> Result<Option<String>, String> {
+    if InMemoryManagerClient::from_env().is_none() {
         return Ok(None);
     }
     let session = Session::open_capability("default").map_err(|e| e.to_string())?;
@@ -146,11 +146,11 @@ pub fn resolve_text_from_active_memory_vault(text: &str) -> Result<Option<String
     Ok(Some(resolved))
 }
 
-pub fn preflight_exec_server_process_start_from_active_memory_vault(
+pub fn preflight_exec_server_process_start_from_active_in_memory_manager(
     argv: &[String],
     env: &[(String, String)],
 ) -> Result<Option<Vec<(String, String)>>, String> {
-    if MemoryVaultClient::from_env().is_none() {
+    if InMemoryManagerClient::from_env().is_none() {
         return Ok(None);
     }
     let session_name = default_session_name()?;
@@ -175,8 +175,10 @@ pub fn preflight_exec_server_process_start_from_active_memory_vault(
     requested_env_bindings(&store, &argv_mode).map(Some)
 }
 
-pub fn mask_tool_output_into_active_memory_vault(text: &str) -> Result<Option<String>, String> {
-    let Some(client) = MemoryVaultClient::from_env() else {
+pub fn mask_tool_output_into_active_in_memory_manager(
+    text: &str,
+) -> Result<Option<String>, String> {
+    let Some(client) = InMemoryManagerClient::from_env() else {
         return Ok(None);
     };
     let session = Session::open_capability("default").map_err(|e| e.to_string())?;
@@ -242,19 +244,22 @@ fn cmd_dashboard(args: &[String]) -> i32 {
 
 fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?;
-    let vault = Session::vault_status(session).map_err(|e| e.to_string())?;
-    let vault_line = match &vault {
+    let manager = Session::in_memory_manager_status(session).map_err(|e| e.to_string())?;
+    let manager_line = match &manager {
         Some(status) => format!("active ({status})"),
         None => "not created yet".to_string(),
     };
     let implicit_session = default_session_name().is_ok_and(|default| default == session);
     let body = if implicit_session {
-        format!("{}\nvault: {vault_line}", cwd.display())
+        format!("{}\nmemory: {manager_line}", cwd.display())
     } else {
-        format!("{}\nsession: {session}\nvault: {vault_line}", cwd.display())
+        format!(
+            "{}\nsession: {session}\nmemory: {manager_line}",
+            cwd.display()
+        )
     };
-    let warnings = if vault.is_some() {
-        vec!["Memory vault is active for this process tree.".to_string()]
+    let warnings = if manager.is_some() {
+        vec!["In-memory manager is active for this process tree.".to_string()]
     } else {
         Vec::new()
     };
@@ -363,7 +368,7 @@ fn cmd_read(args: &[String]) -> i32 {
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
     let input = Input { kind, data };
-    match mask_input_into_active_memory_vault(input.clone(), Profile::Strict, Vec::new()) {
+    match mask_input_into_active_in_memory_manager(input.clone(), Profile::Strict, Vec::new()) {
         Ok(Some(result)) => {
             print_read_result(result, opts.emit_meta);
             return 0;
@@ -413,7 +418,7 @@ fn cmd_view(args: &[String]) -> i32 {
 }
 
 pub fn active_handle_length(handle: &str) -> Result<Option<usize>, String> {
-    let Some(client) = MemoryVaultClient::from_env() else {
+    let Some(client) = InMemoryManagerClient::from_env() else {
         return Ok(None);
     };
     let snapshot = client.snapshot().map_err(|e| e.to_string())?;
@@ -727,10 +732,10 @@ fn cmd_purge(args: &[String]) -> i32 {
     0
 }
 
-fn cmd_vault(args: &[String]) -> i32 {
+fn cmd_in_memory_manager(args: &[String]) -> i32 {
     match args.get(2).map(String::as_str) {
-        Some("--serve") if args.len() == 3 => memory_vault::serve_memory_vault(),
-        _ => die("vault accepts only `--serve`"),
+        Some("--serve") if args.len() == 3 => in_memory_manager::serve_in_memory_manager(),
+        _ => die("manager accepts only `--serve`"),
     }
 }
 
@@ -2320,7 +2325,9 @@ fn before_tool_updated_input(
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
     if is_read_like_tool_name(tool_name) {
-        validate_read_before_tool(session, tool_name, tool_input)?;
+        if let Some(updated) = apply_masked_read_before_tool(session, tool_input)? {
+            return Ok((updated, true));
+        }
     }
     if is_edit_like_tool_name(tool_name) {
         if let Some(updated) = apply_masked_old_edit_before_tool(session, tool_input)? {
@@ -2357,7 +2364,9 @@ fn before_tool_updated_input_lazy(
 ) -> Result<(Value, bool), String> {
     if is_read_like_tool_name(tool_name) {
         let session = open_hook_session(cli, session_name)?;
-        validate_read_before_tool(&session, tool_name, tool_input)?;
+        if let Some(updated) = apply_masked_read_before_tool(&session, tool_input)? {
+            return Ok((updated, true));
+        }
     }
     if is_write_or_edit_like_tool_name(tool_name) {
         let session = open_hook_session(cli, session_name)?;
@@ -2444,23 +2453,23 @@ fn agent_launch_proof_valid() -> bool {
         return false;
     };
     agent_launch_proof_matches(&proof, &token)
-        && memory_vault_env_addr_is_loopback()
-        && memory_vault_accepts_env_token()
+        && in_memory_manager_env_addr_is_loopback()
+        && in_memory_manager_accepts_env_token()
 }
 
 fn agent_launch_proof_matches(proof: &str, token: &str) -> bool {
     token.len() >= 32 && proof == token
 }
 
-fn memory_vault_env_addr_is_loopback() -> bool {
+fn in_memory_manager_env_addr_is_loopback() -> bool {
     std::env::var(ENV_ADDR)
         .ok()
         .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|addr| addr.ip().is_loopback())
 }
 
-fn memory_vault_accepts_env_token() -> bool {
-    MemoryVaultClient::from_env().is_some_and(|client| client.key().is_ok())
+fn in_memory_manager_accepts_env_token() -> bool {
+    InMemoryManagerClient::from_env().is_some_and(|client| client.key().is_ok())
 }
 
 fn canonical_hook_shell_command(command: &str) -> Result<String, String> {
@@ -2476,38 +2485,128 @@ fn canonical_hook_shell_command(command: &str) -> Result<String, String> {
     }
 }
 
-fn validate_read_before_tool(
+fn apply_masked_read_before_tool(
     session: &Session,
-    tool_name: &str,
     tool_input: &Value,
-) -> Result<(), String> {
-    if !is_read_like_tool_name(tool_name) {
-        return Ok(());
+) -> Result<Option<Value>, String> {
+    let mut replacements = BTreeMap::new();
+    for path in read_tool_paths(tool_input) {
+        if replacements.contains_key(path) {
+            continue;
+        }
+        let Some(masked_path) = masked_read_copy(session, path)? else {
+            continue;
+        };
+        replacements.insert(path.to_string(), masked_path.to_string_lossy().into_owned());
     }
-    if read_tool_has_detected_secret(session, tool_input)? {
-        return Err(read_tool_block_reason(tool_name));
+    if replacements.is_empty() {
+        return Ok(None);
     }
-    Ok(())
+    let mut updated = tool_input.clone();
+    if rewrite_read_paths(&mut updated, &replacements) {
+        Ok(Some(updated))
+    } else {
+        Err("Read input was not recognized.".to_string())
+    }
 }
 
-fn read_tool_has_detected_secret(session: &Session, tool_input: &Value) -> Result<bool, String> {
-    for path in read_tool_paths(tool_input) {
-        let path = Path::new(path);
-        let data = read_input(path, InputFormat::Text).map_err(|_| {
-            "read target could not be scanned; use `pentect read PATH`.".to_string()
-        })?;
-        let result = Engine::with_profile(Profile::Strict).mask(
-            Input {
-                kind: infer_kind(path),
-                data,
-            },
-            &Config::new(session.key),
-        );
-        if result.summary.masked_count > 0 {
-            return Ok(true);
+fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf>, String> {
+    let path = Path::new(path_text);
+    let data = read_input(path, InputFormat::Text)
+        .map_err(|_| "read target could not be scanned.".to_string())?;
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: infer_kind(path),
+            data,
+        },
+        &Config::new(session.key),
+    );
+    if result.summary.masked_count == 0 {
+        return Ok(None);
+    }
+    let mut recovery = result.recovery.clone();
+    recovery.extend_same_key(env_alias_recovery(&result.masked, &session.key));
+    RecoveryStore::load(session)
+        .map_err(|e| e.to_string())?
+        .add_recovery(recovery)
+        .map_err(|e| e.to_string())?;
+
+    let masked_path = masked_read_copy_path(path, &result.masked);
+    if let Some(parent) = masked_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
+    }
+    std::fs::write(&masked_path, result.masked)
+        .map_err(|e| format!("could not write '{}': {e}", masked_path.display()))?;
+    Ok(Some(masked_path))
+}
+
+fn masked_read_copy_path(original: &Path, masked: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pentect-masked-read-v1");
+    hasher.update(original.to_string_lossy().as_bytes());
+    hasher.update(masked.as_bytes());
+    let digest = hasher.finalize();
+    let hash = data_encoding::HEXLOWER.encode(&digest[..8]);
+    let name = original
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(safe_masked_read_file_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "file.txt".to_string());
+    PathBuf::from(".pentect")
+        .join("masked-read")
+        .join(format!("{hash}-{name}"))
+}
+
+fn safe_masked_read_file_name(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(96) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
         }
     }
-    Ok(false)
+    out
+}
+
+fn rewrite_read_paths(value: &mut Value, replacements: &BTreeMap<String, String>) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for field in WRITE_PATH_FIELDS {
+        if let Some(path) = object
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            if let Some(replacement) = replacements.get(&path) {
+                object.insert((*field).to_string(), Value::String(replacement.clone()));
+                changed = true;
+            }
+        }
+    }
+    for field in READ_PATH_LIST_FIELDS {
+        if let Some(paths) = object.get_mut(*field).and_then(Value::as_array_mut) {
+            for path in paths {
+                let Some(path_text) = path.as_str().map(str::to_string) else {
+                    continue;
+                };
+                if let Some(replacement) = replacements.get(&path_text) {
+                    *path = Value::String(replacement.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
+    for field in WRITE_INPUT_FIELDS {
+        if let Some(child) = object.get_mut(*field) {
+            changed |= rewrite_read_paths(child, replacements);
+        }
+    }
+    changed
 }
 
 fn validate_masked_write_before_tool(
@@ -2668,12 +2767,12 @@ fn resolve_masked_text(store: &RecoveryStore, content: &str) -> Result<String, S
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if contains_pentect_masked_handle(&resolved) {
         return Err(
-            "resolve needed: re-read the source in this Pentect session, then retry Write."
+            "masked handle is unavailable in this running Pentect session; re-read the source and retry."
                 .to_string(),
         );
     }
     if resolved == content {
-        return Err("resolve needed: no matching handle in this Pentect session.".to_string());
+        return Err("masked handle is unavailable in this running Pentect session.".to_string());
     }
     Ok(resolved)
 }
@@ -3014,10 +3113,6 @@ fn pentect_human_only_command_reason(command: &str) -> Option<String> {
     match invocation.subcommand {
         PentectSubcommand::Exec | PentectSubcommand::Read | PentectSubcommand::Resolve => None,
     }
-}
-
-fn read_tool_block_reason(tool_name: &str) -> String {
-    format!("{tool_name} found masked content; use `pentect read PATH`.")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
