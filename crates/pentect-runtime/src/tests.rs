@@ -2807,25 +2807,23 @@ fn file_pointer_manager_skips_non_text_read_inputs() {
 #[test]
 fn pretool_allows_read_many_when_all_files_are_clean() {
     let (root, session) = empty_session("hook-pre-read-many-clean");
-    let project = PathBuf::from("target").join(format!(
-        "pentect-read-many-clean-{}-{}",
-        std::process::id(),
-        unix_millis()
-    ));
-    let _ = std::fs::remove_dir_all(&project);
-    std::fs::create_dir_all(&project).unwrap();
-    let first = project.join("README.txt");
-    let second = project.join("notes.txt");
-    std::fs::write(&first, "Settings\n").unwrap();
-    std::fs::write(&second, "No credentials here.\n").unwrap();
-    let input = json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "ReadManyFiles",
-        "tool_input": {
-            "paths": [first.to_string_lossy(), second.to_string_lossy()]
-        }
-    });
-    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    let project = temp_root("pentect-read-many-clean");
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&project);
+        let first = PathBuf::from("README.txt");
+        let second = PathBuf::from("notes.txt");
+        std::fs::write(&first, "Settings\n").unwrap();
+        std::fs::write(&second, "No credentials here.\n").unwrap();
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "ReadManyFiles",
+            "tool_input": {
+                "paths": [first.to_string_lossy(), second.to_string_lossy()]
+            }
+        });
+        handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap()
+    };
     assert_eq!(output, json!({}));
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
