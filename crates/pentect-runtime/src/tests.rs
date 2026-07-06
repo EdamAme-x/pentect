@@ -1555,6 +1555,47 @@ fn generic_posttool_masks_payload_alias() {
 }
 
 #[test]
+fn tool_text_output_masks_mcp_connector_and_plugin_envelopes() {
+    let (root, session) = empty_session("hook-post-tool-text-unified");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let inputs = [
+        json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "mcp__vault__get_key",
+            "tool_response": {
+                "content": [{
+                    "type": "text",
+                    "text": format!("OPENAI_API_KEY={raw}")
+                }]
+            }
+        }),
+        json!({
+            "hookEventName": "PostToolUse",
+            "toolName": "connector__browser__text",
+            "toolResponse": {
+                "visibleText": format!("OPENAI_API_KEY={raw}")
+            }
+        }),
+        json!({
+            "eventName": "PostToolUse",
+            "tool": "plugin__browser_text",
+            "payload": {
+                "text": format!("OPENAI_API_KEY={raw}")
+            }
+        }),
+    ];
+
+    for input in inputs {
+        let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
+        let rendered = serde_json::to_string(&output).unwrap();
+        assert!(rendered.contains("updatedToolOutput"), "{rendered}");
+        assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+        assert!(!rendered.contains(raw), "{rendered}");
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn posttool_allows_unscanned_image_output_by_default() {
     let (root, session) = empty_session("hook-post-image-best-effort");
     write_project_config(

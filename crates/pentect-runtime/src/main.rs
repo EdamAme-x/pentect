@@ -1756,6 +1756,12 @@ enum HookPhase {
     Other,
 }
 
+enum ToolTextOutput {
+    Unchanged,
+    Updated(Value),
+    Block(String),
+}
+
 // Hook hosts disagree on casing and envelope names. Keep that compatibility at
 // the boundary; detection still walks the returned JSON structure generically.
 const HOOK_EVENT_FIELDS: &[&str] = &[
@@ -2238,23 +2244,13 @@ fn handle_hook_with_launch_requirement(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
-            if let Some(reason) = image_tool_result_block_reason(session, tool_response)? {
-                return Ok(after_tool_block_output(provider, &reason));
-            }
-            if let Some(reason) = unsupported_tool_result_reason(tool_response) {
-                return Ok(after_tool_block_output(provider, &reason));
-            }
             if codex_exec_proxy_owns_shell_output(provider, tool_name) {
                 return Ok(json!({}));
             }
-            let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
-            let mut masker = OutputMasker::new_deferred(store)?;
-            let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
-            masker.flush()?;
-            if changed {
-                Ok(after_tool_output(provider, updated))
-            } else {
-                Ok(json!({}))
+            match mask_tool_text_output(session, tool_response)? {
+                ToolTextOutput::Unchanged => Ok(json!({})),
+                ToolTextOutput::Updated(updated) => Ok(after_tool_output(provider, updated)),
+                ToolTextOutput::Block(reason) => Ok(after_tool_block_output(provider, &reason)),
             }
         }
         HookPhase::Other => Ok(json!({})),
@@ -2311,23 +2307,13 @@ fn handle_hook_lazy(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
-            if let Some(reason) = image_tool_result_block_reason(&session, tool_response)? {
-                return Ok(after_tool_block_output(provider, &reason));
-            }
-            if let Some(reason) = unsupported_tool_result_reason(tool_response) {
-                return Ok(after_tool_block_output(provider, &reason));
-            }
             if codex_exec_proxy_owns_shell_output(provider, tool_name) {
                 return Ok(json!({}));
             }
-            let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
-            let mut masker = OutputMasker::new_deferred(store)?;
-            let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
-            masker.flush()?;
-            if changed {
-                Ok(after_tool_output(provider, updated))
-            } else {
-                Ok(json!({}))
+            match mask_tool_text_output(&session, tool_response)? {
+                ToolTextOutput::Unchanged => Ok(json!({})),
+                ToolTextOutput::Updated(updated) => Ok(after_tool_output(provider, updated)),
+                ToolTextOutput::Block(reason) => Ok(after_tool_block_output(provider, &reason)),
             }
         }
         HookPhase::Other => Ok(json!({})),
@@ -3362,6 +3348,27 @@ fn after_tool_block_output(_provider: HookProvider, reason: &str) -> Value {
         "decision": "block",
         "reason": reason
     })
+}
+
+fn mask_tool_text_output(
+    session: &Session,
+    tool_response: &Value,
+) -> Result<ToolTextOutput, String> {
+    if let Some(reason) = image_tool_result_block_reason(session, tool_response)? {
+        return Ok(ToolTextOutput::Block(reason));
+    }
+    if let Some(reason) = unsupported_tool_result_reason(tool_response) {
+        return Ok(ToolTextOutput::Block(reason));
+    }
+    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let mut masker = OutputMasker::new_deferred(store)?;
+    let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
+    masker.flush()?;
+    if changed {
+        Ok(ToolTextOutput::Updated(updated))
+    } else {
+        Ok(ToolTextOutput::Unchanged)
+    }
 }
 
 fn image_tool_result_block_reason(
