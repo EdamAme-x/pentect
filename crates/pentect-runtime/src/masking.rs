@@ -721,15 +721,27 @@ fn is_env_summary_key_char(ch: char) -> bool {
 }
 
 fn looks_like_env_summary_key(key: &str) -> bool {
-    if key.is_empty() || key.as_bytes()[0].is_ascii_digit() {
+    if key.is_empty()
+        || key.as_bytes()[0].is_ascii_digit()
+        || !key.chars().any(|ch| ch.is_ascii_alphanumeric())
+    {
         return false;
     }
     let lower = key.to_ascii_lowercase();
     is_sensitive_env_output_name(&lower)
+        || is_derived_output_key(key)
         || key.contains('_')
         || key.contains('.')
         || key.contains('-')
-        || key.chars().any(|ch| ch.is_ascii_uppercase())
+        || is_all_caps_summary_key(key)
+}
+
+fn is_all_caps_summary_key(key: &str) -> bool {
+    key.len() >= 2
+        && key.chars().any(|ch| ch.is_ascii_uppercase())
+        && key
+            .chars()
+            .all(|ch| !ch.is_ascii_lowercase() && is_env_summary_key_char(ch))
 }
 
 fn is_sensitive_env_output_name(name: &str) -> bool {
