@@ -2531,7 +2531,7 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
         .add_recovery(recovery)
         .map_err(|e| e.to_string())?;
 
-    let masked_path = masked_read_copy_path(path, &result.masked);
+    let masked_path = masked_read_copy_path(path);
     if let Some(parent) = masked_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
@@ -2541,27 +2541,62 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
     Ok(Some(masked_path))
 }
 
-fn masked_read_copy_path(original: &Path, masked: &str) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(b"pentect-masked-read-v1");
-    hasher.update(original.to_string_lossy().as_bytes());
-    hasher.update(masked.as_bytes());
-    let digest = hasher.finalize();
-    let hash = data_encoding::HEXLOWER.encode(&digest[..8]);
-    let name = original
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(safe_masked_read_file_name)
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "file.txt".to_string());
-    PathBuf::from(".pentect")
-        .join("masked-read")
-        .join(format!("{hash}-{name}"))
+fn masked_read_copy_path(original: &Path) -> PathBuf {
+    let display_path = masked_read_display_path(original);
+    PathBuf::from(".pentect").join("read").join(display_path)
 }
 
-fn safe_masked_read_file_name(value: &str) -> String {
+fn masked_read_display_path(original: &Path) -> PathBuf {
+    if original.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(relative) = original.strip_prefix(cwd) {
+                return safe_masked_read_path(relative);
+            }
+        }
+        return PathBuf::from("_external").join(
+            original
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(safe_masked_read_component)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "file.txt".to_string()),
+        );
+    }
+    safe_masked_read_path(original)
+}
+
+fn safe_masked_read_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    let mut has_component = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                let value = safe_masked_read_component(&value.to_string_lossy());
+                if !value.is_empty() {
+                    out.push(value);
+                    has_component = true;
+                }
+            }
+            std::path::Component::ParentDir => {
+                out.push("_up");
+                has_component = true;
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                out.push("_external");
+                has_component = true;
+            }
+            std::path::Component::CurDir => {}
+        }
+    }
+    if has_component {
+        return out;
+    }
+    PathBuf::from("file.txt")
+}
+
+fn safe_masked_read_component(value: &str) -> String {
     let mut out = String::new();
-    for ch in value.chars().take(96) {
+    for ch in value.chars().take(80) {
         if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
             out.push(ch);
         } else {

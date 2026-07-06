@@ -2478,8 +2478,16 @@ fn pretool_rewrites_direct_read_tool_to_masked_copy() {
     let masked_path = output["hookSpecificOutput"]["updatedInput"]["file_path"]
         .as_str()
         .unwrap();
-    assert!(masked_path.contains(".pentect"), "{masked_path}");
-    assert!(masked_path.contains("masked-read"), "{masked_path}");
+    let masked_path_buf = PathBuf::from(masked_path);
+    assert!(
+        masked_path_buf.starts_with(Path::new(".pentect").join("read")),
+        "{masked_path}"
+    );
+    assert!(
+        masked_path_buf.ends_with(project.join(".env")),
+        "{masked_path}"
+    );
+    assert!(!masked_path.contains("masked-read"), "{masked_path}");
     let masked = std::fs::read_to_string(masked_path).unwrap();
     assert!(masked.contains("<<OPENAI_API_KEY_"), "{masked}");
     assert!(!masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{masked}");
@@ -2489,7 +2497,7 @@ fn pretool_rewrites_direct_read_tool_to_masked_copy() {
     );
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
-    let _ = std::fs::remove_dir_all(".pentect/masked-read");
+    let _ = std::fs::remove_dir_all(".pentect/read");
 }
 
 #[test]
@@ -2525,14 +2533,31 @@ fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
     assert_eq!(paths.len(), 2);
     assert_eq!(paths[0].as_str().unwrap(), readme.to_string_lossy());
     let masked_path = paths[1].as_str().unwrap();
-    assert!(masked_path.contains(".pentect"), "{masked_path}");
-    assert!(masked_path.contains("masked-read"), "{masked_path}");
+    let masked_path_buf = PathBuf::from(masked_path);
+    assert!(
+        masked_path_buf.starts_with(Path::new(".pentect").join("read")),
+        "{masked_path}"
+    );
+    assert!(masked_path_buf.ends_with(env), "{masked_path}");
+    assert!(!masked_path.contains("masked-read"), "{masked_path}");
     let masked = std::fs::read_to_string(masked_path).unwrap();
     assert!(masked.contains("<<RUNPOD_API_KEY_"), "{masked}");
     assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
-    let _ = std::fs::remove_dir_all(".pentect/masked-read");
+    let _ = std::fs::remove_dir_all(".pentect/read");
+}
+
+#[test]
+fn masked_read_copy_path_mirrors_relative_paths() {
+    let path = masked_read_copy_path(Path::new("nested/.env"));
+    assert_eq!(
+        path,
+        Path::new(".pentect")
+            .join("read")
+            .join("nested")
+            .join(".env")
+    );
 }
 
 #[test]
