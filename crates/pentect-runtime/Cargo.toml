@@ -29,6 +29,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+chacha20 = { workspace = true }
 toml = { workspace = true }
 anstream = { workspace = true }
 zeroize = { workspace = true }
