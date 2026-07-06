@@ -35,11 +35,14 @@ use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
 use sha2::{Digest, Sha256};
 use shell::{next_shell_word, powershell_word, shell_quote_unix};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
+use zeroize::Zeroize;
 
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
@@ -48,6 +51,11 @@ const PENTECT_CODEX_EXEC_PROXY_ENV: &str = "PENTECT_CODEX_EXEC_PROXY";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
+
+#[cfg(test)]
+thread_local! {
+    static CODEX_EXEC_PROXY_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -405,11 +413,34 @@ fn cmd_view(args: &[String]) -> i32 {
     };
     println!("label: {}", parts.label);
     println!("hash: {}", parts.hash);
-    match parts.length_hint {
-        Some(hint) => println!("length: {}", hint.short()),
+    match parts.length_hint.map(|hint| hint.short()).or_else(|| {
+        active_handle_length(&args[2])
+            .ok()
+            .flatten()
+            .map(|len| format!("{len} chars"))
+    }) {
+        Some(length) => println!("length: {length}"),
         None => println!("length: -"),
     }
     0
+}
+
+pub fn active_handle_length(handle: &str) -> Result<Option<usize>, String> {
+    let Some(client) = MemoryVaultClient::from_env() else {
+        return Ok(None);
+    };
+    let snapshot = client.snapshot().map_err(|e| e.to_string())?;
+    Ok(handle_length_from_recovery(&snapshot.recovery, handle))
+}
+
+fn handle_length_from_recovery(recovery: &pentect_core::Recovery, handle: &str) -> Option<usize> {
+    let mut value = recovery.resolve(handle);
+    if value == handle {
+        return None;
+    }
+    let len = value.chars().count();
+    value.zeroize();
+    Some(len)
 }
 
 fn cmd_exec(args: &[String]) -> i32 {
@@ -2210,6 +2241,9 @@ fn handle_hook_with_launch_requirement(
             if let Some(reason) = unsupported_tool_result_reason(tool_response) {
                 return Ok(after_tool_block_output(provider, &reason));
             }
+            if codex_exec_proxy_owns_shell_output(provider, tool_name) {
+                return Ok(json!({}));
+            }
             let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
             let mut masker = OutputMasker::new_deferred(store)?;
             let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
@@ -2279,6 +2313,9 @@ fn handle_hook_lazy(
             }
             if let Some(reason) = unsupported_tool_result_reason(tool_response) {
                 return Ok(after_tool_block_output(provider, &reason));
+            }
+            if codex_exec_proxy_owns_shell_output(provider, tool_name) {
+                return Ok(json!({}));
             }
             let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
             let mut masker = OutputMasker::new_deferred(store)?;
@@ -2376,7 +2413,31 @@ fn ensure_pentect_agent_launch(provider: HookProvider) -> Result<(), String> {
 }
 
 fn codex_exec_proxy_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(value) = CODEX_EXEC_PROXY_TEST_OVERRIDE.with(Cell::get) {
+        return value;
+    }
     std::env::var(PENTECT_CODEX_EXEC_PROXY_ENV).is_ok_and(|value| value == "1")
+}
+
+#[cfg(test)]
+fn set_codex_exec_proxy_test_override(value: Option<bool>) -> Option<bool> {
+    CODEX_EXEC_PROXY_TEST_OVERRIDE.with(|cell| {
+        let previous = cell.get();
+        cell.set(value);
+        previous
+    })
+}
+
+fn codex_exec_proxy_owns_shell_output(provider: HookProvider, tool_name: &str) -> bool {
+    provider == HookProvider::Codex && codex_exec_proxy_enabled() && is_shell_tool_name(tool_name)
+}
+
+fn is_shell_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "bash" | "shell" | "exec" | "run_command"
+    )
 }
 
 fn ensure_pentect_agent_launch_required(

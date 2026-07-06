@@ -96,7 +96,7 @@ impl OutputMasker {
         let remasked = self.mask_model_adapter_input(remasked, kind.clone(), None)?;
         let needs_text_pass = !matches!(kind, Kind::Text | Kind::ToolResult);
         let cfg = Config {
-            disclose_length: true,
+            disclose_length: false,
             ..Config::new(self.store.session.key)
         };
         let result = self.engine.mask(
@@ -146,7 +146,7 @@ impl OutputMasker {
         let remasked =
             self.mask_model_adapter_input(remasked, Kind::ToolResult, Some(context.clone()))?;
         let cfg = Config {
-            disclose_length: true,
+            disclose_length: false,
             ..Config::new(self.store.session.key)
         };
         let result = self.engine.mask_context(remasked, context, &cfg);
@@ -202,7 +202,7 @@ impl OutputMasker {
         }
 
         let cfg = Config {
-            disclose_length: true,
+            disclose_length: false,
             ..Config::new(self.store.session.key)
         };
         let result = self.engine.mask_regions(raw, regions, &cfg);
@@ -238,7 +238,7 @@ impl OutputMasker {
         }
         let unchanged = data.clone();
         let cfg = Config {
-            disclose_length: true,
+            disclose_length: false,
             ..Config::new(self.store.session.key)
         };
         match self.model_adapters.mask(

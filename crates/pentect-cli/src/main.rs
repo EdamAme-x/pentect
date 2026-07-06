@@ -14,6 +14,7 @@ use pentect_core::{
     infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -371,8 +372,13 @@ fn cmd_view(args: &[String]) {
     };
     println!("label: {}", parts.label);
     println!("hash: {}", parts.hash);
-    match parts.length_hint {
-        Some(hint) => println!("length: {}", hint.short()),
+    match parts.length_hint.map(|hint| hint.short()).or_else(|| {
+        pentect_agent::active_handle_length(&args[2])
+            .ok()
+            .flatten()
+            .map(|len| format!("{len} chars"))
+    }) {
+        Some(length) => println!("length: {length}"),
         None => println!("length: -"),
     }
 }
@@ -590,7 +596,7 @@ impl AgentToolOpts {
 }
 
 fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
-    let configs = codex_hook_config_args(pentect, opts.session.as_deref());
+    let configs = codex_hook_config_args(pentect, opts.session.as_deref())?;
     let status_line_enabled = status_line_enabled_by_config()?;
     if opts.dry_run {
         if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
@@ -895,12 +901,6 @@ fn apply_extension_env(
 
 fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
     let mut args = Vec::with_capacity(configs.len() * 2 + 5 + tool_args.len());
-    if !tool_args
-        .iter()
-        .any(|arg| arg == "--dangerously-bypass-hook-trust")
-    {
-        args.push("--dangerously-bypass-hook-trust".to_string());
-    }
     if !codex_args_disable_unified_exec(tool_args) && !codex_args_enable_unified_exec(tool_args) {
         args.push("--enable".to_string());
         args.push("unified_exec".to_string());
@@ -962,22 +962,143 @@ fn claude_args(settings: &str, tool_args: &[String]) -> Vec<String> {
     args
 }
 
-fn codex_hook_config_args(agent: &Path, session: Option<&str>) -> Vec<String> {
-    let unix = hook_command_unix(agent, "codex", session);
+fn codex_hook_config_args(agent: &Path, session: Option<&str>) -> Result<Vec<String>, String> {
+    let command = hook_command(agent, "codex", session);
     let windows = hook_command_windows(agent, "codex", session);
-    vec![
+    let hooks = codex_hooks_inline_table(&command, &windows)?;
+    Ok(vec![
         "features.hooks=true".to_string(),
-        format!(
-            "hooks.PreToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30,statusMessage=\"Pentect\"}}]}}]",
-            toml_string(&unix),
-            toml_string(&windows)
-        ),
-        format!(
-            "hooks.PostToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},commandWindows={},timeout=30,statusMessage=\"Pentect\"}}]}}]",
-            toml_string(&unix),
-            toml_string(&windows)
-        ),
-    ]
+        format!("hooks={hooks}"),
+    ])
+}
+
+fn codex_hooks_inline_table(command: &str, windows: &str) -> Result<String, String> {
+    const MATCHER: &str = "*";
+    const TIMEOUT: u64 = 30;
+    let pre_hash = codex_command_hook_hash("pre_tool_use", MATCHER, command, TIMEOUT)?;
+    let post_hash = codex_command_hook_hash("post_tool_use", MATCHER, command, TIMEOUT)?;
+    let pre_key = codex_session_flags_hook_key("pre_tool_use", 0, 0);
+    let post_key = codex_session_flags_hook_key("post_tool_use", 0, 0);
+    let hook = format!(
+        "{{matcher={},hooks=[{{type=\"command\",command={},commandWindows={},timeout={TIMEOUT}}}]}}",
+        toml_string(MATCHER),
+        toml_string(command),
+        toml_string(windows)
+    );
+    Ok(format!(
+        "{{PreToolUse=[{hook}],PostToolUse=[{hook}],state={{{}={{trusted_hash={}}},{}={{trusted_hash={}}}}}}}",
+        toml_string(&pre_key),
+        toml_string(&pre_hash),
+        toml_string(&post_key),
+        toml_string(&post_hash)
+    ))
+}
+
+fn codex_session_flags_hook_key(
+    event_label: &str,
+    group_index: usize,
+    handler_index: usize,
+) -> String {
+    format!(
+        "{}:{event_label}:{group_index}:{handler_index}",
+        codex_session_flags_config_path()
+    )
+}
+
+fn codex_session_flags_config_path() -> &'static str {
+    if cfg!(windows) {
+        r"C:\<session-flags>\config.toml"
+    } else {
+        "/<session-flags>/config.toml"
+    }
+}
+
+#[derive(serde::Serialize)]
+struct CodexNormalizedHookIdentity<'a> {
+    event_name: &'a str,
+    #[serde(flatten)]
+    group: CodexMatcherGroup<'a>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct CodexMatcherGroup<'a> {
+    matcher: Option<&'a str>,
+    hooks: Vec<CodexHookHandlerConfig<'a>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "type")]
+enum CodexHookHandlerConfig<'a> {
+    #[serde(rename = "command")]
+    Command {
+        command: &'a str,
+        #[serde(rename = "commandWindows", skip_serializing_if = "Option::is_none")]
+        command_windows: Option<&'a str>,
+        #[serde(rename = "timeout", skip_serializing_if = "Option::is_none")]
+        timeout_sec: Option<u64>,
+        #[serde(rename = "async")]
+        r#async: bool,
+        #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
+        status_message: Option<&'a str>,
+    },
+}
+
+fn codex_command_hook_hash(
+    event_label: &str,
+    matcher: &str,
+    command: &str,
+    timeout_sec: u64,
+) -> Result<String, String> {
+    let identity = CodexNormalizedHookIdentity {
+        event_name: event_label,
+        group: CodexMatcherGroup {
+            matcher: Some(matcher),
+            hooks: vec![CodexHookHandlerConfig::Command {
+                command,
+                command_windows: None,
+                timeout_sec: Some(timeout_sec),
+                r#async: false,
+                status_message: None,
+            }],
+        },
+    };
+    let value = toml::Value::try_from(identity)
+        .map_err(|e| format!("could not build Codex hook trust identity: {e}"))?;
+    version_for_toml_value(&value)
+}
+
+fn version_for_toml_value(value: &toml::Value) -> Result<String, String> {
+    let json = serde_json::to_value(value)
+        .map_err(|e| format!("could not serialize Codex hook trust identity: {e}"))?;
+    let canonical = canonical_json_value(&json);
+    let serialized = serde_json::to_vec(&canonical)
+        .map_err(|e| format!("could not encode Codex hook trust identity: {e}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(serialized);
+    let hash = hasher.finalize();
+    let hex = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("sha256:{hex}"))
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = map.get(key) {
+                    sorted.insert(key.clone(), canonical_json_value(value));
+                }
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        other => other.clone(),
+    }
 }
 
 fn codex_uses_unverified_headless_hook_path(tool_args: &[String]) -> bool {
@@ -1078,46 +1199,44 @@ fn claude_settings_json(agent: &Path, session: Option<&str>) -> String {
     .to_string()
 }
 
-fn hook_command_unix(_agent: &Path, provider: &str, session: Option<&str>) -> String {
-    let mut words = vec![
-        "hook".to_string(),
-        "--cli".to_string(),
-        provider.to_string(),
-    ];
-    add_explicit_session(&mut words, session);
-    let mut out = String::from("${PENTECT_BIN:-pentect}");
-    if !words.is_empty() {
-        out.push(' ');
-        out.push_str(
-            &words
-                .iter()
-                .map(|word| shell_quote_unix(word))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    out
+#[cfg(not(windows))]
+fn hook_command_unix(agent: &Path, provider: &str, session: Option<&str>) -> String {
+    hook_words(agent, provider, session)
+        .iter()
+        .map(|word| shell_quote_unix(word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-fn hook_command_windows(_agent: &Path, provider: &str, session: Option<&str>) -> String {
-    let mut words = vec![
-        "hook".to_string(),
-        "--cli".to_string(),
-        provider.to_string(),
-    ];
-    add_explicit_session(&mut words, session);
-    let mut out = String::from("$p=$env:PENTECT_BIN; if (-not $p) { $p='pentect' }; & $p");
-    if !words.is_empty() {
-        out.push(' ');
-        out.push_str(
-            &words
-                .iter()
-                .map(|word| powershell_quote(word))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
+fn hook_command_windows(agent: &Path, provider: &str, session: Option<&str>) -> String {
+    let words = hook_words(agent, provider, session);
+    let command = words
+        .iter()
+        .map(|word| cmd_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("cmd /D /S /C {command}")
+}
+
+#[cfg(windows)]
+fn hook_command(agent: &Path, provider: &str, session: Option<&str>) -> String {
+    hook_command_windows(agent, provider, session)
+}
+
+#[cfg(not(windows))]
+fn hook_command(agent: &Path, provider: &str, session: Option<&str>) -> String {
+    hook_command_unix(agent, provider, session)
+}
+
+fn cmd_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'\\' | b':')
+        })
+    {
+        return value.to_string();
     }
-    out
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn hook_words(agent: &Path, provider: &str, session: Option<&str>) -> Vec<String> {
@@ -1212,13 +1331,6 @@ fn shell_quote_unix(value: &str) -> String {
 
 fn shell_quote_windows(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
-}
-
-fn powershell_quote(value: &str) -> String {
-    if is_simple_shell_word(value) {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn is_simple_shell_word(value: &str) -> bool {
@@ -1733,7 +1845,7 @@ mod tests {
     fn codex_args_inject_model_visible_pentect_contract() {
         let args = codex_args(&["features.hooks=true".to_string()], &["hello".to_string()]);
         let rendered = args.join("\n");
-        assert!(args.contains(&"--dangerously-bypass-hook-trust".to_string()));
+        assert!(!args.contains(&"--dangerously-bypass-hook-trust".to_string()));
         assert!(rendered.contains("developer_instructions="), "{rendered}");
         assert!(rendered.contains("Pentect agent contract"), "{rendered}");
         assert!(rendered.contains("Use normal shell commands"), "{rendered}");
@@ -1765,6 +1877,27 @@ mod tests {
         assert!(rendered.contains("third-party destinations"), "{rendered}");
         assert!(
             !rendered.contains("pentect exec \\\"pentect exec"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn codex_hook_config_trusts_pentect_hooks_for_this_session() {
+        let pentect = absolute_pentect_fixture_path();
+        let configs = codex_hook_config_args(&pentect, None).unwrap();
+        let rendered = configs.join("\n");
+        assert!(rendered.contains("features.hooks=true"), "{rendered}");
+        assert!(rendered.contains("hooks={"), "{rendered}");
+        assert!(rendered.contains("PreToolUse"), "{rendered}");
+        assert!(rendered.contains("PostToolUse"), "{rendered}");
+        assert!(rendered.contains("state={"), "{rendered}");
+        assert!(rendered.contains("<session-flags>"), "{rendered}");
+        assert!(rendered.contains(":pre_tool_use:0:0"), "{rendered}");
+        assert!(rendered.contains(":post_tool_use:0:0"), "{rendered}");
+        assert!(rendered.contains("trusted_hash=\"sha256:"), "{rendered}");
+        assert!(!rendered.contains("statusMessage"), "{rendered}");
+        assert!(
+            !rendered.contains("dangerously-bypass-hook-trust"),
             "{rendered}"
         );
     }

@@ -2,6 +2,33 @@ use super::*;
 
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+struct ScopedCodexExecProxy {
+    previous: Option<bool>,
+}
+
+impl ScopedCodexExecProxy {
+    fn set(value: bool) -> Self {
+        Self {
+            previous: set_codex_exec_proxy_test_override(Some(value)),
+        }
+    }
+}
+
+impl Drop for ScopedCodexExecProxy {
+    fn drop(&mut self) {
+        set_codex_exec_proxy_test_override(self.previous.take());
+    }
+}
+
+fn first_handle_with_prefix(text: &str, prefix: &str) -> String {
+    let start = text.find(prefix).unwrap_or_else(|| panic!("{text}"));
+    let end = text[start..]
+        .find(">>")
+        .map(|offset| start + offset + 2)
+        .unwrap_or_else(|| panic!("{text}"));
+    text[start..end].to_string()
+}
+
 #[test]
 fn session_recovery_is_process_local() {
     let root = std::env::temp_dir().join(format!(
@@ -1992,6 +2019,7 @@ fn env_like_tool_output_masks_all_env_values() {
 
 #[test]
 fn codex_posttool_does_not_block_already_masked_exec_output() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-already-masked");
     let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
     let masked = mask_tool_output(&session, output).unwrap();
@@ -2010,6 +2038,7 @@ fn codex_posttool_does_not_block_already_masked_exec_output() {
 
 #[test]
 fn codex_posttool_masks_raw_output_even_if_command_claims_pentect_exec() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-fake-pentect-exec");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2032,7 +2061,47 @@ fn codex_posttool_masks_raw_output_even_if_command_claims_pentect_exec() {
 }
 
 #[test]
+fn codex_posttool_skips_shell_block_when_exec_proxy_is_active() {
+    let _proxy = ScopedCodexExecProxy::set(true);
+    let (root, session) = empty_session("hook-post-codex-proxy-shell");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "Get-Content .env"
+        },
+        "tool_response": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
+    });
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn codex_posttool_still_blocks_mcp_when_exec_proxy_is_active() {
+    let _proxy = ScopedCodexExecProxy::set(true);
+    let (root, session) = empty_session("hook-post-codex-proxy-mcp");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__demo__read",
+        "tool_input": {},
+        "tool_response": {
+            "content": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
+        }
+    });
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert_eq!(output["decision"], "block");
+    assert!(
+        !rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        "{rendered}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn codex_posttool_does_not_block_short_exec_footer() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-legacy-footer");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2049,6 +2118,7 @@ fn codex_posttool_does_not_block_short_exec_footer() {
 
 #[test]
 fn codex_posttool_masks_pentect_exec_with_trailing_shell_escape() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-exec-trailing-shell");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2071,15 +2141,37 @@ fn codex_posttool_masks_pentect_exec_with_trailing_shell_escape() {
 }
 
 #[test]
-fn exec_tool_output_discloses_readable_exact_length() {
-    let (root, session) = empty_session("exec-readable-length");
+fn exec_tool_output_uses_short_handles_without_length() {
+    let (root, session) = empty_session("exec-short-handle");
     let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
     let masked = mask_tool_output(&session, &format!("payload={blob}\n")).unwrap();
     assert!(!masked.contains(blob), "{masked}");
     assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
-    assert!(masked.contains("_length_29_chars>>"), "{masked}");
+    assert!(!masked.contains("_length_"), "{masked}");
     assert!(!masked.contains("_len24"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn view_length_comes_from_recovery_not_label() {
+    let secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let key = Config::generate().key;
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: format!("OPENAI_API_KEY={secret}\n"),
+        },
+        &Config {
+            disclose_length: false,
+            ..Config::new(key)
+        },
+    );
+    assert!(!result.masked.contains("_length_"), "{}", result.masked);
+    let handle = first_handle_with_prefix(&result.masked, "<<OPENAI_API_KEY_");
+    assert_eq!(
+        handle_length_from_recovery(&result.recovery, &handle),
+        Some(secret.chars().count())
+    );
 }
 
 #[test]
@@ -2835,6 +2927,7 @@ fn hook_text_masks_runpod_token_as_plain_text() {
 
 #[test]
 fn codex_posttool_blocks_with_masked_feedback() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2852,6 +2945,7 @@ fn codex_posttool_blocks_with_masked_feedback() {
 
 #[test]
 fn codex_mcp_posttool_blocks_with_masked_feedback() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-mcp");
     let input = json!({
         "hook_event_name": "PostToolUse",
