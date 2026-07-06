@@ -4,13 +4,13 @@ use serde_json::Value;
 #[cfg(feature = "ocr")]
 use std::net::{IpAddr, SocketAddr};
 
-const IMAGE_SCAN_MAX_IMAGES_PER_RESULT: usize = 8;
-const IMAGE_SCAN_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
-const IMAGE_SCAN_MAX_ELAPSED: std::time::Duration = std::time::Duration::from_secs(10);
+const IMAGE_SCAN_MAX_IMAGES_PER_RESULT: usize = 64;
+const IMAGE_SCAN_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const IMAGE_SCAN_MAX_ELAPSED: std::time::Duration = std::time::Duration::from_secs(25);
 #[cfg(feature = "ocr")]
-const IMAGE_URL_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const IMAGE_URL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(feature = "ocr")]
-const IMAGE_URL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const IMAGE_URL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 #[cfg(feature = "ocr")]
 const IMAGE_URL_MAX_REDIRECTS: usize = 5;
 
