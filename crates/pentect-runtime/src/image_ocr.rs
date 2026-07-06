@@ -1,16 +1,10 @@
+use crate::config::ImageOcrConfig;
 #[cfg(feature = "ocr")]
 use crate::config::{image_ocr_config, ImageOcrMode};
 use serde_json::Value;
 #[cfg(feature = "ocr")]
 use std::net::{IpAddr, SocketAddr};
 
-const IMAGE_SCAN_MAX_IMAGES_PER_RESULT: usize = 8;
-const IMAGE_SCAN_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
-const IMAGE_SCAN_MAX_ELAPSED: std::time::Duration = std::time::Duration::from_secs(10);
-#[cfg(feature = "ocr")]
-const IMAGE_URL_MAX_BYTES: u64 = 16 * 1024 * 1024;
-#[cfg(feature = "ocr")]
-const IMAGE_URL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(feature = "ocr")]
 const IMAGE_URL_MAX_REDIRECTS: usize = 5;
 
@@ -19,6 +13,7 @@ pub(crate) struct ImageInspection {
     pub(crate) unscanned_images: usize,
     pub(crate) ocr_failures: usize,
     pub(crate) secret_images: usize,
+    attempted_images: usize,
     total_image_bytes: u64,
     started_at: std::time::Instant,
 }
@@ -49,29 +44,44 @@ pub(crate) fn skip_text_masking_for_image_field(key: &str, text: &str) -> bool {
 pub(crate) fn inspect_tool_images_for_secrets(
     value: &Value,
     key: &[u8; 32],
+    cfg: &ImageOcrConfig,
 ) -> Result<ImageInspection, String> {
     let mut inspection = ImageInspection {
         scanned_images: 0,
         unscanned_images: 0,
         ocr_failures: 0,
         secret_images: 0,
+        attempted_images: 0,
         total_image_bytes: 0,
         started_at: std::time::Instant::now(),
     };
-    collect_image_inspection(value, key, &mut inspection)?;
+    collect_image_inspection(value, key, cfg, &mut inspection)?;
     Ok(inspection)
 }
 
 fn collect_image_inspection(
     value: &Value,
     key: &[u8; 32],
+    cfg: &ImageOcrConfig,
     inspection: &mut ImageInspection,
 ) -> Result<(), String> {
     match value {
         Value::String(text) => {
             if looks_like_image_reference(text) || looks_like_base64_image(text) {
-                match image_reference_bytes(text) {
-                    Ok(Some(bytes)) => inspect_image_bytes(&bytes, key, inspection),
+                if !inspection.reserve_image_slot(cfg) {
+                    inspection.unscanned_images += 1;
+                    return Ok(());
+                }
+                let Some(deadline) = inspection.deadline(cfg) else {
+                    inspection.unscanned_images += 1;
+                    return Ok(());
+                };
+                let Some(max_bytes) = inspection.remaining_image_bytes(cfg) else {
+                    inspection.unscanned_images += 1;
+                    return Ok(());
+                };
+                match image_reference_bytes(text, cfg, max_bytes, deadline) {
+                    Ok(Some(bytes)) => inspect_image_bytes(&bytes, key, cfg, inspection),
                     Ok(None) | Err(_) => inspection.unscanned_images += 1,
                 }
             }
@@ -79,20 +89,32 @@ fn collect_image_inspection(
         Value::Number(_) | Value::Bool(_) | Value::Null => {}
         Value::Array(items) => {
             for item in items {
-                collect_image_inspection(item, key, inspection)?;
+                collect_image_inspection(item, key, cfg, inspection)?;
             }
         }
         Value::Object(map) => {
             if object_marks_image(map) {
-                match image_object_bytes(map) {
+                if !inspection.reserve_image_slot(cfg) {
+                    inspection.unscanned_images += 1;
+                    return Ok(());
+                }
+                let Some(deadline) = inspection.deadline(cfg) else {
+                    inspection.unscanned_images += 1;
+                    return Ok(());
+                };
+                let Some(max_bytes) = inspection.remaining_image_bytes(cfg) else {
+                    inspection.unscanned_images += 1;
+                    return Ok(());
+                };
+                match image_object_bytes(map, cfg, max_bytes, deadline) {
                     Ok(Some(bytes)) => {
-                        inspect_image_bytes(&bytes, key, inspection);
+                        inspect_image_bytes(&bytes, key, cfg, inspection);
                         return Ok(());
                     }
                     Ok(None) | Err(_) => {
                         let before = inspection.total_observations();
                         for item in map.values() {
-                            collect_image_inspection(item, key, inspection)?;
+                            collect_image_inspection(item, key, cfg, inspection)?;
                         }
                         if !empty_image_object(map) && inspection.total_observations() == before {
                             inspection.unscanned_images += 1;
@@ -102,15 +124,20 @@ fn collect_image_inspection(
                 return Ok(());
             }
             for item in map.values() {
-                collect_image_inspection(item, key, inspection)?;
+                collect_image_inspection(item, key, cfg, inspection)?;
             }
         }
     }
     Ok(())
 }
 
-fn inspect_image_bytes(bytes: &[u8], key: &[u8; 32], inspection: &mut ImageInspection) {
-    if !inspection.reserve_scan_budget(bytes.len() as u64) {
+fn inspect_image_bytes(
+    bytes: &[u8],
+    key: &[u8; 32],
+    cfg: &ImageOcrConfig,
+    inspection: &mut ImageInspection,
+) {
+    if !inspection.reserve_scan_bytes(bytes.len() as u64, cfg) {
         inspection.unscanned_images += 1;
         return;
     }
@@ -132,21 +159,40 @@ impl ImageInspection {
         self.scanned_images + self.unscanned_images + self.ocr_failures + self.secret_images
     }
 
-    fn reserve_scan_budget(&mut self, bytes: u64) -> bool {
-        if self.scanned_images >= IMAGE_SCAN_MAX_IMAGES_PER_RESULT {
+    fn reserve_image_slot(&mut self, cfg: &ImageOcrConfig) -> bool {
+        if self.attempted_images >= cfg.max_images {
             return false;
         }
-        if self.started_at.elapsed() > IMAGE_SCAN_MAX_ELAPSED {
+        if self.started_at.elapsed() >= std::time::Duration::from_secs(cfg.max_seconds) {
+            return false;
+        }
+        self.attempted_images += 1;
+        true
+    }
+
+    fn reserve_scan_bytes(&mut self, bytes: u64, cfg: &ImageOcrConfig) -> bool {
+        if bytes > cfg.max_image_bytes {
             return false;
         }
         let Some(total) = self.total_image_bytes.checked_add(bytes) else {
             return false;
         };
-        if total > IMAGE_SCAN_MAX_TOTAL_BYTES {
+        if total > cfg.max_total_bytes {
             return false;
         }
         self.total_image_bytes = total;
         true
+    }
+
+    fn deadline(&self, cfg: &ImageOcrConfig) -> Option<std::time::Instant> {
+        self.started_at
+            .checked_add(std::time::Duration::from_secs(cfg.max_seconds))
+    }
+
+    fn remaining_image_bytes(&self, cfg: &ImageOcrConfig) -> Option<u64> {
+        let remaining_total = cfg.max_total_bytes.checked_sub(self.total_image_bytes)?;
+        let remaining = remaining_total.min(cfg.max_image_bytes);
+        (remaining > 0).then_some(remaining)
     }
 }
 
@@ -172,7 +218,12 @@ fn object_marks_image(map: &serde_json::Map<String, Value>) -> bool {
     })
 }
 
-fn image_object_bytes(map: &serde_json::Map<String, Value>) -> Result<Option<Vec<u8>>, String> {
+fn image_object_bytes(
+    map: &serde_json::Map<String, Value>,
+    cfg: &ImageOcrConfig,
+    max_bytes: u64,
+    deadline: std::time::Instant,
+) -> Result<Option<Vec<u8>>, String> {
     for key in [
         "data",
         "bytes",
@@ -193,31 +244,36 @@ fn image_object_bytes(map: &serde_json::Map<String, Value>) -> Result<Option<Vec
         let Some(text) = map.get(key).and_then(Value::as_str) else {
             continue;
         };
-        if let Some(bytes) = image_reference_bytes(text)? {
+        if let Some(bytes) = image_reference_bytes(text, cfg, max_bytes, deadline)? {
             return Ok(Some(bytes));
         }
     }
     Ok(None)
 }
 
-fn image_reference_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
-    if let Some(bytes) = inline_image_bytes(text)? {
+fn image_reference_bytes(
+    text: &str,
+    cfg: &ImageOcrConfig,
+    max_bytes: u64,
+    deadline: std::time::Instant,
+) -> Result<Option<Vec<u8>>, String> {
+    if let Some(bytes) = inline_image_bytes(text, max_bytes)? {
         return Ok(Some(bytes));
     }
-    fetch_image_url_bytes(text)
+    fetch_image_url_bytes(text, cfg, max_bytes, deadline)
 }
 
-fn inline_image_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
+fn inline_image_bytes(text: &str, max_bytes: u64) -> Result<Option<Vec<u8>>, String> {
     let text = text.trim();
     if let Some(payload) = text
         .strip_prefix("data:image/")
         .and_then(|rest| rest.split_once(','))
         .and_then(|(meta, payload)| meta.contains(";base64").then_some(payload))
     {
-        return decode_base64(payload).map(Some);
+        return decode_base64_limited(payload, max_bytes).map(Some);
     }
     if looks_like_base64_image(text) {
-        return decode_base64(text).map(Some);
+        return decode_base64_limited(text, max_bytes).map(Some);
     }
     Ok(None)
 }
@@ -233,11 +289,25 @@ fn looks_like_base64_image(text: &str) -> bool {
     decode_base64_prefix(&compact).is_some_and(|prefix| image_signature(&prefix).is_some())
 }
 
-fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
+fn decode_base64_limited(text: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
     let compact = compact_base64(text);
-    data_encoding::BASE64
+    if base64_decoded_len_upper_bound(compact.len()) > max_bytes {
+        return Err(format!("image is larger than {max_bytes} bytes"));
+    }
+    let bytes = data_encoding::BASE64
         .decode(compact.as_bytes())
-        .map_err(|e| format!("image base64 is invalid: {e}"))
+        .map_err(|e| format!("image base64 is invalid: {e}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("image is larger than {max_bytes} bytes"));
+    }
+    Ok(bytes)
+}
+
+fn base64_decoded_len_upper_bound(len: usize) -> u64 {
+    let Ok(len) = u64::try_from(len) else {
+        return u64::MAX;
+    };
+    len.div_ceil(4).saturating_mul(3)
 }
 
 fn decode_base64_prefix(text: &str) -> Option<Vec<u8>> {
@@ -348,7 +418,12 @@ fn image_signature(bytes: &[u8]) -> Option<&'static str> {
 }
 
 #[cfg(feature = "ocr")]
-fn fetch_image_url_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
+fn fetch_image_url_bytes(
+    text: &str,
+    cfg: &ImageOcrConfig,
+    max_bytes: u64,
+    deadline: std::time::Instant,
+) -> Result<Option<Vec<u8>>, String> {
     let url = text.trim();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Ok(None);
@@ -359,7 +434,7 @@ fn fetch_image_url_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
     }
 
     for _ in 0..=IMAGE_URL_MAX_REDIRECTS {
-        let response = send_image_url_request(&url)?;
+        let response = send_image_url_request(&url, cfg, deadline)?;
         if response.status().is_redirection() {
             let location = response
                 .headers()
@@ -374,7 +449,7 @@ fn fetch_image_url_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
             }
             continue;
         }
-        return read_image_url_response(response).map(Some);
+        return read_image_url_response(response, max_bytes).map(Some);
     }
     Err(format!(
         "image URL redirected more than {IMAGE_URL_MAX_REDIRECTS} times"
@@ -382,13 +457,18 @@ fn fetch_image_url_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
 }
 
 #[cfg(feature = "ocr")]
-fn send_image_url_request(url: &reqwest::Url) -> Result<reqwest::blocking::Response, String> {
+fn send_image_url_request(
+    url: &reqwest::Url,
+    cfg: &ImageOcrConfig,
+    deadline: std::time::Instant,
+) -> Result<reqwest::blocking::Response, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "image URL has no host".to_string())?;
     let addrs = resolve_remote_image_url_target(url)?;
+    let timeout = remaining_fetch_timeout(cfg, deadline)?;
     let client = reqwest::blocking::Client::builder()
-        .timeout(IMAGE_URL_TIMEOUT)
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(host, &addrs)
         .build()
@@ -400,7 +480,10 @@ fn send_image_url_request(url: &reqwest::Url) -> Result<reqwest::blocking::Respo
 }
 
 #[cfg(feature = "ocr")]
-fn read_image_url_response(response: reqwest::blocking::Response) -> Result<Vec<u8>, String> {
+fn read_image_url_response(
+    response: reqwest::blocking::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
     if !response.status().is_success() {
@@ -416,29 +499,34 @@ fn read_image_url_response(response: reqwest::blocking::Response) -> Result<Vec<
             return Err(format!("image URL content type is {content_type}"));
         }
     }
-    if response
-        .content_length()
-        .is_some_and(|len| len > IMAGE_URL_MAX_BYTES)
-    {
-        return Err(format!(
-            "image URL is larger than {IMAGE_URL_MAX_BYTES} bytes"
-        ));
+    if response.content_length().is_some_and(|len| len > max_bytes) {
+        return Err(format!("image URL is larger than {max_bytes} bytes"));
     }
 
     let mut bytes = Vec::new();
-    let mut limited = response.take(IMAGE_URL_MAX_BYTES + 1);
+    let mut limited = response.take(max_bytes + 1);
     limited
         .read_to_end(&mut bytes)
         .map_err(|e| format!("could not read image URL: {e}"))?;
-    if bytes.len() as u64 > IMAGE_URL_MAX_BYTES {
-        return Err(format!(
-            "image URL is larger than {IMAGE_URL_MAX_BYTES} bytes"
-        ));
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("image URL is larger than {max_bytes} bytes"));
     }
     if image_signature(&bytes).is_none() {
         return Err("image URL did not return a supported image".to_string());
     }
     Ok(bytes)
+}
+
+#[cfg(feature = "ocr")]
+fn remaining_fetch_timeout(
+    cfg: &ImageOcrConfig,
+    deadline: std::time::Instant,
+) -> Result<std::time::Duration, String> {
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| "image scan time limit reached".to_string())?;
+    Ok(remaining.min(std::time::Duration::from_secs(cfg.fetch_seconds)))
 }
 
 #[cfg(feature = "ocr")]
@@ -513,7 +601,12 @@ fn remote_image_ip_is_private(ip: IpAddr) -> bool {
 }
 
 #[cfg(not(feature = "ocr"))]
-fn fetch_image_url_bytes(_text: &str) -> Result<Option<Vec<u8>>, String> {
+fn fetch_image_url_bytes(
+    _text: &str,
+    _cfg: &ImageOcrConfig,
+    _max_bytes: u64,
+    _deadline: std::time::Instant,
+) -> Result<Option<Vec<u8>>, String> {
     Ok(None)
 }
 
@@ -589,11 +682,28 @@ pub fn ocr_image_bytes(_bytes: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ImageOcrMode, UnscannedImagePolicy};
+
+    fn test_config() -> ImageOcrConfig {
+        ImageOcrConfig {
+            mode: ImageOcrMode::On,
+            max_pixels: 64_000_000,
+            max_edge: 2_048,
+            max_images: 64,
+            max_total_bytes: 512 * 1024 * 1024,
+            max_seconds: 20,
+            max_image_bytes: 64 * 1024 * 1024,
+            fetch_seconds: 8,
+            unscanned_images: UnscannedImagePolicy::Allow,
+        }
+    }
 
     #[test]
     fn data_url_image_payload_is_decoded() {
         let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
-        let bytes = inline_image_bytes(png).unwrap().unwrap();
+        let bytes = inline_image_bytes(png, test_config().max_image_bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(image_signature(&bytes), Some("png"));
     }
 
@@ -605,7 +715,14 @@ mod tests {
         });
         let map = value.as_object().unwrap();
         assert!(object_marks_image(map));
-        assert!(image_object_bytes(map).unwrap().is_some());
+        assert!(image_object_bytes(
+            map,
+            &test_config(),
+            test_config().max_image_bytes,
+            std::time::Instant::now() + std::time::Duration::from_secs(20)
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
@@ -620,7 +737,14 @@ mod tests {
         assert!(!object_marks_image(outer));
         let inner = value["image_url"].as_object().unwrap();
         assert!(object_marks_image(inner));
-        assert!(image_object_bytes(inner).unwrap().is_some());
+        assert!(image_object_bytes(
+            inner,
+            &test_config(),
+            test_config().max_image_bytes,
+            std::time::Instant::now() + std::time::Duration::from_secs(20)
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
@@ -628,9 +752,55 @@ mod tests {
         let value = serde_json::json!(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
         );
-        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32]).unwrap();
+        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32], &test_config()).unwrap();
         assert_eq!(inspection.scanned_images, 1);
         assert_eq!(inspection.unscanned_images, 0);
+    }
+
+    #[test]
+    fn image_scan_budget_limits_count_and_bytes() {
+        let image =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+        let value = serde_json::json!([image, image]);
+
+        let mut cfg = test_config();
+        cfg.max_images = 1;
+        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32], &cfg).unwrap();
+        assert_eq!(inspection.scanned_images, 1);
+        assert_eq!(inspection.unscanned_images, 1);
+
+        let mut cfg = test_config();
+        cfg.max_image_bytes = 1;
+        let inspection =
+            inspect_tool_images_for_secrets(&serde_json::json!(image), &[7; 32], &cfg).unwrap();
+        assert_eq!(inspection.scanned_images, 0);
+        assert_eq!(inspection.unscanned_images, 1);
+
+        let bytes = inline_image_bytes(image, test_config().max_image_bytes)
+            .unwrap()
+            .unwrap();
+        let mut cfg = test_config();
+        cfg.max_total_bytes = bytes.len() as u64 - 1;
+        let inspection =
+            inspect_tool_images_for_secrets(&serde_json::json!(image), &[7; 32], &cfg).unwrap();
+        assert_eq!(inspection.scanned_images, 0);
+        assert_eq!(inspection.unscanned_images, 1);
+    }
+
+    #[test]
+    fn image_scan_budget_limits_elapsed_time() {
+        let mut inspection = ImageInspection {
+            scanned_images: 0,
+            unscanned_images: 0,
+            ocr_failures: 0,
+            secret_images: 0,
+            attempted_images: 0,
+            total_image_bytes: 0,
+            started_at: std::time::Instant::now() - std::time::Duration::from_secs(2),
+        };
+        let mut cfg = test_config();
+        cfg.max_seconds = 1;
+        assert!(!inspection.reserve_image_slot(&cfg));
     }
 
     #[test]
@@ -650,6 +820,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let png = inline_image_bytes(
             "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+            test_config().max_image_bytes,
         )
         .unwrap()
         .unwrap();
@@ -668,7 +839,14 @@ mod tests {
         });
 
         let url = format!("http://{addr}/scan.png?cache=1");
-        let bytes = fetch_image_url_bytes(&url).unwrap().unwrap();
+        let bytes = fetch_image_url_bytes(
+            &url,
+            &test_config(),
+            test_config().max_image_bytes,
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(image_signature(&bytes), Some("png"));
         handle.join().unwrap();
     }
@@ -683,6 +861,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let png = inline_image_bytes(
             "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+            test_config().max_image_bytes,
         )
         .unwrap()
         .unwrap();
@@ -706,7 +885,7 @@ mod tests {
                 "url": format!("http://{addr}/nested.png")
             }
         });
-        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32]).unwrap();
+        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32], &test_config()).unwrap();
         assert_eq!(inspection.scanned_images, 1);
         assert_eq!(inspection.unscanned_images, 0);
         handle.join().unwrap();
@@ -724,6 +903,7 @@ mod tests {
         let redirect_addr = redirect_listener.local_addr().unwrap();
         let png = inline_image_bytes(
             "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+            test_config().max_image_bytes,
         )
         .unwrap()
         .unwrap();
@@ -752,7 +932,14 @@ mod tests {
         });
 
         let url = format!("http://{redirect_addr}/start.png");
-        let bytes = fetch_image_url_bytes(&url).unwrap().unwrap();
+        let bytes = fetch_image_url_bytes(
+            &url,
+            &test_config(),
+            test_config().max_image_bytes,
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(image_signature(&bytes), Some("png"));
         redirect_handle.join().unwrap();
         image_handle.join().unwrap();
@@ -778,7 +965,7 @@ mod tests {
         });
 
         let value = serde_json::json!(format!("http://{addr}/missing.png"));
-        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32]).unwrap();
+        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32], &test_config()).unwrap();
         assert_eq!(inspection.unscanned_images, 1);
         assert_eq!(inspection.scanned_images, 0);
         handle.join().unwrap();

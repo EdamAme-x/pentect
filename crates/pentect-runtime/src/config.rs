@@ -5,6 +5,11 @@ const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
 const DEFAULT_IMAGE_OCR_MAX_EDGE: u32 = 2_048;
 const DEFAULT_IMAGE_OCR_MAX_PIXELS: u64 = 64_000_000;
+const DEFAULT_IMAGE_MAX_IMAGES: usize = 64;
+const DEFAULT_IMAGE_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_IMAGE_MAX_SECONDS: u64 = 20;
+const DEFAULT_IMAGE_MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_IMAGE_FETCH_SECONDS: u64 = 8;
 #[cfg(not(test))]
 const AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
 
@@ -39,6 +44,11 @@ pub(crate) struct ImageOcrConfig {
     pub(crate) mode: ImageOcrMode,
     pub(crate) max_pixels: u64,
     pub(crate) max_edge: u32,
+    pub(crate) max_images: usize,
+    pub(crate) max_total_bytes: u64,
+    pub(crate) max_seconds: u64,
+    pub(crate) max_image_bytes: u64,
+    pub(crate) fetch_seconds: u64,
     pub(crate) unscanned_images: UnscannedImagePolicy,
 }
 
@@ -47,6 +57,11 @@ struct ImageOcrConfigPartial {
     mode: Option<ImageOcrMode>,
     max_pixels: Option<u64>,
     max_edge: Option<u32>,
+    max_images: Option<usize>,
+    max_total_bytes: Option<u64>,
+    max_seconds: Option<u64>,
+    max_image_bytes: Option<u64>,
+    fetch_seconds: Option<u64>,
     unscanned_images: Option<UnscannedImagePolicy>,
 }
 
@@ -302,6 +317,21 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
     if let Some(raw) = table.get("max_edge") {
         out.max_edge = Some(config_u32(raw, "image.max_edge")?);
     }
+    if let Some(raw) = table.get("max_images") {
+        out.max_images = Some(config_usize(raw, "image.max_images")?);
+    }
+    if let Some(raw) = table.get("max_total_bytes") {
+        out.max_total_bytes = Some(config_u64(raw, "image.max_total_bytes")?);
+    }
+    if let Some(raw) = table.get("max_seconds") {
+        out.max_seconds = Some(config_u64(raw, "image.max_seconds")?);
+    }
+    if let Some(raw) = table.get("max_image_bytes") {
+        out.max_image_bytes = Some(config_u64(raw, "image.max_image_bytes")?);
+    }
+    if let Some(raw) = table.get("fetch_seconds") {
+        out.fetch_seconds = Some(config_u64(raw, "image.fetch_seconds")?);
+    }
     if let Some(raw) = table.get("unscanned_images") {
         out.unscanned_images = Some(unscanned_image_policy(raw, "image.unscanned_images")?);
     }
@@ -395,6 +425,11 @@ fn config_u32(value: &toml::Value, field: &str) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| format!("{field} must be positive"))
 }
 
+fn config_usize(value: &toml::Value, field: &str) -> Result<usize, String> {
+    let value = config_positive_integer(value, field)?;
+    usize::try_from(value).map_err(|_| format!("{field} must be positive"))
+}
+
 fn config_positive_integer(value: &toml::Value, field: &str) -> Result<i64, String> {
     let Some(value) = value.as_integer() else {
         return Err(format!("{field} must be an integer"));
@@ -419,6 +454,26 @@ fn merge_image_ocr_config(
             .max_edge
             .or(global.max_edge)
             .unwrap_or(DEFAULT_IMAGE_OCR_MAX_EDGE),
+        max_images: project
+            .max_images
+            .or(global.max_images)
+            .unwrap_or(DEFAULT_IMAGE_MAX_IMAGES),
+        max_total_bytes: project
+            .max_total_bytes
+            .or(global.max_total_bytes)
+            .unwrap_or(DEFAULT_IMAGE_MAX_TOTAL_BYTES),
+        max_seconds: project
+            .max_seconds
+            .or(global.max_seconds)
+            .unwrap_or(DEFAULT_IMAGE_MAX_SECONDS),
+        max_image_bytes: project
+            .max_image_bytes
+            .or(global.max_image_bytes)
+            .unwrap_or(DEFAULT_IMAGE_MAX_IMAGE_BYTES),
+        fetch_seconds: project
+            .fetch_seconds
+            .or(global.fetch_seconds)
+            .unwrap_or(DEFAULT_IMAGE_FETCH_SECONDS),
         unscanned_images: project
             .unscanned_images
             .or(global.unscanned_images)
@@ -571,14 +626,28 @@ mod tests {
 
     #[test]
     fn image_ocr_config_accepts_mode_and_limit() {
-        let value =
-            "[image]\nocr = \"on\"\nmax_pixels = 1234\nmax_edge = 2048\nunscanned_images = \"block\""
-                .parse::<toml::Value>()
+        let value = "\
+[image]
+ocr = \"on\"
+max_pixels = 1234
+max_edge = 2048
+max_images = 32
+max_total_bytes = 268435456
+max_seconds = 15
+max_image_bytes = 33554432
+fetch_seconds = 4
+unscanned_images = \"block\""
+            .parse::<toml::Value>()
             .unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::On));
         assert_eq!(cfg.max_pixels, Some(1234));
         assert_eq!(cfg.max_edge, Some(2048));
+        assert_eq!(cfg.max_images, Some(32));
+        assert_eq!(cfg.max_total_bytes, Some(268_435_456));
+        assert_eq!(cfg.max_seconds, Some(15));
+        assert_eq!(cfg.max_image_bytes, Some(33_554_432));
+        assert_eq!(cfg.fetch_seconds, Some(4));
         assert_eq!(cfg.unscanned_images, Some(UnscannedImagePolicy::Block));
 
         let value = "[image]\nocr = false".parse::<toml::Value>().unwrap();
@@ -601,6 +670,11 @@ mod tests {
         assert_eq!(cfg.mode, ImageOcrMode::On);
         assert_eq!(cfg.max_edge, 2048);
         assert_eq!(cfg.max_pixels, 64_000_000);
+        assert_eq!(cfg.max_images, 64);
+        assert_eq!(cfg.max_total_bytes, 512 * 1024 * 1024);
+        assert_eq!(cfg.max_seconds, 20);
+        assert_eq!(cfg.max_image_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.fetch_seconds, 8);
     }
 
     #[test]
@@ -609,6 +683,25 @@ mod tests {
         assert!(image_ocr_config_value(&value).is_err());
 
         let value = "[image]\nmax_edge = 0".parse::<toml::Value>().unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
+
+        let value = "[image]\nmax_images = 0".parse::<toml::Value>().unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
+
+        let value = "[image]\nmax_total_bytes = 0"
+            .parse::<toml::Value>()
+            .unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
+
+        let value = "[image]\nmax_seconds = 0".parse::<toml::Value>().unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
+
+        let value = "[image]\nmax_image_bytes = 0"
+            .parse::<toml::Value>()
+            .unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
+
+        let value = "[image]\nfetch_seconds = 0".parse::<toml::Value>().unwrap();
         assert!(image_ocr_config_value(&value).is_err());
     }
 
