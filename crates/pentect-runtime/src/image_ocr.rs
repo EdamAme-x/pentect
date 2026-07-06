@@ -117,10 +117,7 @@ fn ocr_text_has_secret(text: &str, key: &[u8; 32]) -> bool {
             kind: pentect_core::Kind::Text,
             data: text.to_string(),
         },
-        &pentect_core::Config {
-            disclose_length: true,
-            ..pentect_core::Config::new(*key)
-        },
+        &pentect_core::Config::new(*key),
     );
     result.summary.masked_count > 0
 }

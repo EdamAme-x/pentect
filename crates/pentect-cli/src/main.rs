@@ -234,7 +234,6 @@ fn cmd_mask(args: &[String]) {
         },
         None => Profile::Strict,
     };
-    let disclose_length = has_flag(args, "--length");
     let aggressive = has_flag(args, "--aggressive");
     let packs = match load_packs(args) {
         Ok(p) => p,
@@ -253,10 +252,7 @@ fn cmd_mask(args: &[String]) {
     // reproducible key isn't needed (resolve/restore is unavailable by design).
     let kind_label = format!("{kind:?}");
     let engine = build_engine(profile, aggressive, packs);
-    let cfg = Config {
-        disclose_length,
-        ..Config::generate()
-    };
+    let cfg = Config::generate();
     let result = engine.mask(Input { kind, data }, &cfg);
 
     print!("{}", result.masked);
@@ -299,7 +295,7 @@ fn validate_mask_args(args: &[String]) -> Result<(), String> {
                 }
                 i += 2;
             }
-            "--length" | "--aggressive" => {
+            "--aggressive" => {
                 i += 1;
             }
             flag if flag.starts_with("--") => {
@@ -332,7 +328,6 @@ fn cmd_read(args: &[String]) {
         input.clone(),
         opts.profile,
         packs.clone(),
-        opts.disclose_length,
     ) {
         Ok(Some(result)) => {
             print_read_result(result, opts.emit_meta);
@@ -342,10 +337,7 @@ fn cmd_read(args: &[String]) {
         Err(e) => die(&e),
     }
     let engine = Engine::with_profile_and_packs(opts.profile, packs, false);
-    let cfg = Config {
-        disclose_length: opts.disclose_length,
-        ..Config::generate()
-    };
+    let cfg = Config::generate();
     let result = engine.mask(input, &cfg);
     print_read_result(result, opts.emit_meta);
 }
@@ -407,7 +399,6 @@ struct ReadOpts {
     input_format: ReadInputFormat,
     kind: Option<Kind>,
     profile: Profile,
-    disclose_length: bool,
     emit_meta: bool,
     extensions: Vec<String>,
     path: PathBuf,
@@ -418,7 +409,6 @@ impl ReadOpts {
         let mut input_format = ReadInputFormat::Text;
         let mut kind = None;
         let mut profile = Profile::Strict;
-        let mut disclose_length = false;
         let mut emit_meta = false;
         let mut extensions = Vec::new();
         let mut path = None;
@@ -434,10 +424,6 @@ impl ReadOpts {
                 }
                 "--profile" => {
                     profile = required_value(args, &mut i, "--profile")?.parse()?;
-                }
-                "--length" => {
-                    disclose_length = true;
-                    i += 1;
                 }
                 "--meta" => {
                     emit_meta = true;
@@ -470,7 +456,6 @@ impl ReadOpts {
             input_format,
             kind,
             profile,
-            disclose_length,
             emit_meta,
             extensions,
             path: path.ok_or_else(|| "read requires PATH".to_string())?,

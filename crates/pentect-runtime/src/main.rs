@@ -87,12 +87,11 @@ pub fn mask_input_into_active_memory_vault(
     input: Input,
     profile: Profile,
     packs: Vec<Pack>,
-    disclose_length: bool,
 ) -> Result<Option<MaskResult>, String> {
     let Some(client) = MemoryVaultClient::from_env() else {
         return Ok(None);
     };
-    mask_input_into_memory_vault_client(&client, input, profile, packs, disclose_length).map(Some)
+    mask_input_into_memory_vault_client(&client, input, profile, packs).map(Some)
 }
 
 fn mask_input_into_memory_vault_client(
@@ -100,14 +99,10 @@ fn mask_input_into_memory_vault_client(
     input: Input,
     profile: Profile,
     packs: Vec<Pack>,
-    disclose_length: bool,
 ) -> Result<MaskResult, String> {
     let key = client.key().map_err(|e| e.to_string())?;
     let engine = Engine::with_profile_and_packs(profile, packs, false);
-    let cfg = Config {
-        disclose_length,
-        ..Config::new(key)
-    };
+    let cfg = Config::new(key);
     let result = engine.mask(input, &cfg);
     let mut recovery = result.recovery.clone();
     recovery.extend_same_key(env_alias_recovery(&result.masked, &key));
@@ -368,12 +363,7 @@ fn cmd_read(args: &[String]) -> i32 {
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
     let input = Input { kind, data };
-    match mask_input_into_active_memory_vault(
-        input.clone(),
-        Profile::Strict,
-        Vec::new(),
-        opts.disclose_length,
-    ) {
+    match mask_input_into_active_memory_vault(input.clone(), Profile::Strict, Vec::new()) {
         Ok(Some(result)) => {
             print_read_result(result, opts.emit_meta);
             return 0;
@@ -382,10 +372,7 @@ fn cmd_read(args: &[String]) -> i32 {
         Err(e) => return die(&e),
     }
     let engine = Engine::with_profile(Profile::Strict);
-    let cfg = Config {
-        disclose_length: opts.disclose_length,
-        ..Config::generate()
-    };
+    let cfg = Config::generate();
     let result = engine.mask(input, &cfg);
     print_read_result(result, opts.emit_meta);
     0
@@ -1834,7 +1821,6 @@ enum InputFormat {
 struct ReadOpts {
     input_format: InputFormat,
     kind: Option<Kind>,
-    disclose_length: bool,
     emit_meta: bool,
     path: PathBuf,
 }
@@ -1843,7 +1829,6 @@ impl ReadOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut input_format = InputFormat::Text;
         let mut kind = None;
-        let mut disclose_length = false;
         let mut emit_meta = false;
         let mut path = None;
         let mut i = 2;
@@ -1854,10 +1839,6 @@ impl ReadOpts {
                 }
                 "--kind" => {
                     kind = Some(parse_kind(&value(args, &mut i, "--kind")?)?);
-                }
-                "--length" => {
-                    disclose_length = true;
-                    i += 1;
                 }
                 "--meta" => {
                     emit_meta = true;
@@ -1876,7 +1857,6 @@ impl ReadOpts {
         Ok(Self {
             input_format,
             kind,
-            disclose_length,
             emit_meta,
             path: path.ok_or_else(|| "read requires PATH".to_string())?,
         })

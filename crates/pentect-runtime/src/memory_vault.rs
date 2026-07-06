@@ -362,10 +362,10 @@ mod tests {
             },
             Profile::Strict,
             Vec::new(),
-            true,
         )
         .unwrap();
         assert!(result.masked.contains("OPENAI_API_KEY=<<OPENAI_API_KEY_"));
+        assert!(!result.masked.contains("_length_"), "{}", result.masked);
         assert_eq!(client.masked_count().unwrap(), 1);
 
         let snapshot = client.snapshot().unwrap();
