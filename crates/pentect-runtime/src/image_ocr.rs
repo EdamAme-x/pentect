@@ -1,3 +1,4 @@
+#[cfg(feature = "ocr")]
 use crate::config::{image_ocr_config, ImageOcrMode};
 use serde_json::Value;
 
@@ -310,6 +311,7 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
         ));
     }
 
+    let img = resize_for_ocr(img, cfg.max_edge);
     let img = img.into_rgb8();
     let img_source = ImageSource::from_bytes(img.as_raw(), img.dimensions())
         .map_err(|e| format!("could not prepare image: {e}"))?;
@@ -336,6 +338,17 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
     engine
         .get_text(&input)
         .map_err(|e| format!("could not OCR image: {e}"))
+}
+
+#[cfg(feature = "ocr")]
+fn resize_for_ocr(img: image::DynamicImage, max_edge: u32) -> image::DynamicImage {
+    use image::GenericImageView;
+
+    let (width, height) = img.dimensions();
+    if width <= max_edge && height <= max_edge {
+        return img;
+    }
+    img.resize(max_edge, max_edge, image::imageops::FilterType::Triangle)
 }
 
 #[cfg(not(feature = "ocr"))]
@@ -378,5 +391,19 @@ mod tests {
         let inner = value["image_url"].as_object().unwrap();
         assert!(object_marks_image(inner));
         assert!(inline_image_object_bytes(inner).unwrap().is_some());
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn resize_for_ocr_caps_long_edge() {
+        use image::GenericImageView;
+
+        let img = image::DynamicImage::new_rgb8(4096, 1024);
+        let resized = resize_for_ocr(img, 2048);
+        assert_eq!(resized.dimensions(), (2048, 512));
+
+        let img = image::DynamicImage::new_rgb8(1024, 512);
+        let resized = resize_for_ocr(img, 2048);
+        assert_eq!(resized.dimensions(), (1024, 512));
     }
 }

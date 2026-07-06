@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
+const DEFAULT_IMAGE_OCR_MAX_EDGE: u32 = 2_048;
+const DEFAULT_IMAGE_OCR_MAX_PIXELS: u64 = 64_000_000;
 #[cfg(not(test))]
 const AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
 
@@ -37,6 +39,7 @@ pub(crate) enum UnreadableImagePolicy {
 pub(crate) struct ImageOcrConfig {
     pub(crate) mode: ImageOcrMode,
     pub(crate) max_pixels: u64,
+    pub(crate) max_edge: u32,
     pub(crate) unreadable_images: UnreadableImagePolicy,
 }
 
@@ -44,6 +47,7 @@ pub(crate) struct ImageOcrConfig {
 struct ImageOcrConfigPartial {
     mode: Option<ImageOcrMode>,
     max_pixels: Option<u64>,
+    max_edge: Option<u32>,
     unreadable_images: Option<UnreadableImagePolicy>,
 }
 
@@ -99,17 +103,7 @@ pub(crate) fn require_pentect_agent_by_config() -> Result<bool, String> {
 pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
     let project = read_image_ocr_config(project_config_path())?;
     let global = read_image_ocr_config(global_config_path()?)?;
-    Ok(ImageOcrConfig {
-        mode: project.mode.or(global.mode).unwrap_or(ImageOcrMode::Auto),
-        max_pixels: project
-            .max_pixels
-            .or(global.max_pixels)
-            .unwrap_or(4_000_000),
-        unreadable_images: project
-            .unreadable_images
-            .or(global.unreadable_images)
-            .unwrap_or(UnreadableImagePolicy::Allow),
-    })
+    Ok(merge_image_ocr_config(project, global))
 }
 
 pub(crate) fn file_pointer_manager_save_enabled() -> Result<bool, String> {
@@ -309,6 +303,9 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
     if let Some(raw) = table.get("max_pixels") {
         out.max_pixels = Some(config_u64(raw, "image.max_pixels")?);
     }
+    if let Some(raw) = table.get("max_edge") {
+        out.max_edge = Some(config_u32(raw, "image.max_edge")?);
+    }
     if let Some(raw) = table.get("unreadable_images") {
         out.unreadable_images = Some(unreadable_image_policy(raw, "image.unreadable_images")?);
     }
@@ -394,10 +391,44 @@ fn unreadable_image_policy(
 }
 
 fn config_u64(value: &toml::Value, field: &str) -> Result<u64, String> {
+    let value = config_positive_integer(value, field)?;
+    u64::try_from(value).map_err(|_| format!("{field} must be positive"))
+}
+
+fn config_u32(value: &toml::Value, field: &str) -> Result<u32, String> {
+    let value = config_positive_integer(value, field)?;
+    u32::try_from(value).map_err(|_| format!("{field} must be positive"))
+}
+
+fn config_positive_integer(value: &toml::Value, field: &str) -> Result<i64, String> {
     let Some(value) = value.as_integer() else {
         return Err(format!("{field} must be an integer"));
     };
-    u64::try_from(value).map_err(|_| format!("{field} must be positive"))
+    if value <= 0 {
+        return Err(format!("{field} must be positive"));
+    }
+    Ok(value)
+}
+
+fn merge_image_ocr_config(
+    project: ImageOcrConfigPartial,
+    global: ImageOcrConfigPartial,
+) -> ImageOcrConfig {
+    ImageOcrConfig {
+        mode: project.mode.or(global.mode).unwrap_or(ImageOcrMode::Auto),
+        max_pixels: project
+            .max_pixels
+            .or(global.max_pixels)
+            .unwrap_or(DEFAULT_IMAGE_OCR_MAX_PIXELS),
+        max_edge: project
+            .max_edge
+            .or(global.max_edge)
+            .unwrap_or(DEFAULT_IMAGE_OCR_MAX_EDGE),
+        unreadable_images: project
+            .unreadable_images
+            .or(global.unreadable_images)
+            .unwrap_or(UnreadableImagePolicy::Allow),
+    }
 }
 
 fn agent_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
@@ -545,17 +576,38 @@ mod tests {
 
     #[test]
     fn image_ocr_config_accepts_mode_and_limit() {
-        let value = "[image]\nocr = \"on\"\nmax_pixels = 1234\nunreadable_images = \"block\""
+        let value =
+            "[image]\nocr = \"on\"\nmax_pixels = 1234\nmax_edge = 2048\nunreadable_images = \"block\""
             .parse::<toml::Value>()
             .unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::On));
         assert_eq!(cfg.max_pixels, Some(1234));
+        assert_eq!(cfg.max_edge, Some(2048));
         assert_eq!(cfg.unreadable_images, Some(UnreadableImagePolicy::Block));
 
         let value = "image_ocr = false".parse::<toml::Value>().unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::Off));
+    }
+
+    #[test]
+    fn image_ocr_config_defaults_to_2k_ocr_edge() {
+        let cfg = merge_image_ocr_config(
+            ImageOcrConfigPartial::default(),
+            ImageOcrConfigPartial::default(),
+        );
+        assert_eq!(cfg.max_edge, 2048);
+        assert_eq!(cfg.max_pixels, 64_000_000);
+    }
+
+    #[test]
+    fn image_ocr_config_rejects_zero_limits() {
+        let value = "[image]\nmax_pixels = 0".parse::<toml::Value>().unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
+
+        let value = "[image]\nmax_edge = 0".parse::<toml::Value>().unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
     }
 
     #[test]
