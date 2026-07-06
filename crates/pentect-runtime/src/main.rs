@@ -24,7 +24,7 @@ use config::{approval_bypassed_by_config, approval_config_state};
 use in_memory_manager::{InMemoryManagerClient, ENV_ADDR, ENV_TOKEN};
 use masking::{
     contains_unresolved_masked_handle, env_alias_recovery, is_ascii_word_char, is_env_name_byte,
-    live_output_kind, OutputMasker, ToolScalarInput,
+    live_output_kind, mask_read_data, OutputMasker, ToolScalarInput,
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
@@ -2518,13 +2518,7 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
     let path = Path::new(path_text);
     let data = read_input(path, InputFormat::Text)
         .map_err(|_| "read target could not be scanned.".to_string())?;
-    let result = Engine::with_profile(Profile::Strict).mask(
-        Input {
-            kind: infer_kind(path),
-            data: data.clone(),
-        },
-        &Config::new(session.key),
-    );
+    let result = mask_read_data(session.key, data.clone(), infer_kind(path))?;
     if result.summary.masked_count == 0 {
         return Ok(None);
     }
@@ -3568,7 +3562,7 @@ fn collect_tool_json_scalars(
             }
         }
         Value::Object(map) => {
-            let image_object = image_ocr::is_image_object(value);
+            let image_object = image_ocr::contains_image_result(value);
             for (object_key, item) in map {
                 let child_path = path_with_segment(path, object_key);
                 out.push(ToolScalarInput {
@@ -3580,8 +3574,9 @@ fn collect_tool_json_scalars(
                 });
                 let child_hints = sibling_context_hints(map, object_key);
                 if !(image_object
-                    && item.is_string()
-                    && image_ocr::image_payload_field_key(object_key))
+                    && item.as_str().is_some_and(|text| {
+                        image_ocr::skip_text_masking_for_image_field(object_key, text)
+                    }))
                 {
                     collect_tool_json_scalars(
                         item,
@@ -3627,13 +3622,14 @@ fn rebuild_masked_tool_json(
             Ok(Value::Array(out))
         }
         Value::Object(map) => {
-            let image_object = image_ocr::is_image_object(value);
+            let image_object = image_ocr::contains_image_result(value);
             let mut out = serde_json::Map::with_capacity(map.len());
             for (key, item) in map {
                 let masked_key = take_masked(masked, cursor)?;
                 let item = if image_object
-                    && item.is_string()
-                    && image_ocr::image_payload_field_key(key)
+                    && item
+                        .as_str()
+                        .is_some_and(|text| image_ocr::skip_text_masking_for_image_field(key, text))
                 {
                     item.clone()
                 } else {

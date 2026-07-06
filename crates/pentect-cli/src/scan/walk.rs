@@ -223,7 +223,7 @@ fn filter_git_files(
     git_files: Vec<PathBuf>,
     excludes: &[String],
 ) -> Result<Vec<PathBuf>, String> {
-    if !has_pentectignore(&git_files) {
+    if !has_pentectignore(&base, &git_files) {
         let Some(overrides) = rules::build_overrides(&base, excludes)? else {
             return Ok(git_files);
         };
@@ -247,7 +247,10 @@ fn filter_git_files(
     Ok(filtered)
 }
 
-fn has_pentectignore(paths: &[PathBuf]) -> bool {
+fn has_pentectignore(base: &Path, paths: &[PathBuf]) -> bool {
+    if base.join(".pentectignore").is_file() {
+        return true;
+    }
     paths
         .iter()
         .any(|path| path.file_name().and_then(|name| name.to_str()) == Some(".pentectignore"))
@@ -369,6 +372,14 @@ mod tests {
         push_git_regular_file(&root, "tracked.txt", &mut files);
 
         assert_eq!(vec![root.join("tracked.txt")], files);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn untracked_root_pentectignore_is_detected_for_git_filtering() {
+        let root = temp_root("pentect-untracked-ignore");
+        std::fs::write(root.join(".pentectignore"), "ignored.env\n").unwrap();
+        assert!(has_pentectignore(&root, &[]));
         let _ = std::fs::remove_dir_all(root);
     }
 }

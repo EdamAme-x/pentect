@@ -1008,8 +1008,8 @@ fn codex_hook_config_args(agent: &Path, session: Option<&str>) -> Result<Vec<Str
 fn codex_hooks_inline_table(command: &str, windows: &str) -> Result<String, String> {
     const MATCHER: &str = "*";
     const TIMEOUT: u64 = 30;
-    let pre_hash = codex_command_hook_hash("pre_tool_use", MATCHER, command, TIMEOUT)?;
-    let post_hash = codex_command_hook_hash("post_tool_use", MATCHER, command, TIMEOUT)?;
+    let pre_hash = codex_command_hook_hash("pre_tool_use", MATCHER, command, windows, TIMEOUT)?;
+    let post_hash = codex_command_hook_hash("post_tool_use", MATCHER, command, windows, TIMEOUT)?;
     let pre_key = codex_session_flags_hook_key("pre_tool_use", 0, 0);
     let post_key = codex_session_flags_hook_key("post_tool_use", 0, 0);
     let hook = format!(
@@ -1080,6 +1080,7 @@ fn codex_command_hook_hash(
     event_label: &str,
     matcher: &str,
     command: &str,
+    windows: &str,
     timeout_sec: u64,
 ) -> Result<String, String> {
     let identity = CodexNormalizedHookIdentity {
@@ -1088,7 +1089,7 @@ fn codex_command_hook_hash(
             matcher: Some(matcher),
             hooks: vec![CodexHookHandlerConfig::Command {
                 command,
-                command_windows: None,
+                command_windows: Some(windows),
                 timeout_sec: Some(timeout_sec),
                 r#async: false,
                 status_message: None,
