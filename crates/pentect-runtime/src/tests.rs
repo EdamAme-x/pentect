@@ -1555,6 +1555,39 @@ fn generic_posttool_masks_payload_alias() {
 }
 
 #[test]
+fn posttool_masks_secret_query_inside_image_url() {
+    let (root, session) = empty_session("hook-post-image-url-query");
+    write_project_config(
+        &root,
+        "[image]\nocr = \"off\"\nunscanned_images = \"allow\"\n",
+    );
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__browser__screenshot",
+        "tool_response": {
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("https://cdn.example.com/screenshot.png?api_key={raw}")
+                }
+            }]
+        }
+    });
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Claude, "t", &session, input).unwrap()
+    };
+    let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
+    let rendered = serde_json::to_string(updated).unwrap();
+    assert!(rendered.contains("<<URL_CREDENTIAL_"), "{rendered}");
+    assert!(!rendered.contains(raw), "{rendered}");
+    assert!(rendered.contains("screenshot.png?api_key="), "{rendered}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn tool_text_output_masks_mcp_connector_and_plugin_envelopes() {
     let (root, session) = empty_session("hook-post-tool-text-unified");
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
@@ -2566,49 +2599,46 @@ fn pretool_rewrites_direct_read_tool_to_masked_copy() {
 #[test]
 fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
     let (root, session) = empty_session("hook-pre-read-many-secret");
-    let project = PathBuf::from("target").join(format!(
-        "pentect-read-many-secret-{}-{}",
-        std::process::id(),
-        unix_millis()
-    ));
-    let _ = std::fs::remove_dir_all(&project);
-    std::fs::create_dir_all(&project).unwrap();
-    let readme = project.join("README.txt");
-    let env = project.join(".env");
-    std::fs::write(&readme, "Settings\n").unwrap();
-    std::fs::write(
-        &env,
-        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
-    )
-    .unwrap();
-    let input = json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "ReadManyFiles",
-        "tool_input": {
-            "paths": [readme.to_string_lossy(), env.to_string_lossy()]
-        }
-    });
-    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
-    let paths = output["hookSpecificOutput"]["updatedInput"]["paths"]
-        .as_array()
+    let project = temp_root("pentect-read-many-secret");
+    let result = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&project);
+        let readme = PathBuf::from("README.txt");
+        let env = PathBuf::from(".env");
+        std::fs::write(&readme, "Settings\n").unwrap();
+        std::fs::write(
+            &env,
+            "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+        )
         .unwrap();
-    assert_eq!(paths.len(), 2);
-    assert_eq!(paths[0].as_str().unwrap(), readme.to_string_lossy());
-    let masked_path = paths[1].as_str().unwrap();
-    let masked_path_buf = PathBuf::from(masked_path);
-    assert!(
-        masked_path_buf.starts_with(Path::new(".pentect").join("read")),
-        "{masked_path}"
-    );
-    assert!(masked_path_buf.ends_with(env), "{masked_path}");
-    assert!(!masked_path.contains("masked-read"), "{masked_path}");
-    let masked = std::fs::read_to_string(masked_path).unwrap();
-    assert!(masked.contains("<<RUNPOD_API_KEY_"), "{masked}");
-    assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "ReadManyFiles",
+            "tool_input": {
+                "paths": [readme.to_string_lossy(), env.to_string_lossy()]
+            }
+        });
+        let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+        let paths = output["hookSpecificOutput"]["updatedInput"]["paths"]
+            .as_array()
+            .unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].as_str().unwrap(), readme.to_string_lossy());
+        let masked_path = paths[1].as_str().unwrap();
+        let masked_path_buf = PathBuf::from(masked_path);
+        assert!(
+            masked_path_buf.starts_with(Path::new(".pentect").join("read")),
+            "{masked_path}"
+        );
+        assert!(masked_path_buf.ends_with(&env), "{masked_path}");
+        assert!(!masked_path.contains("masked-read"), "{masked_path}");
+        std::fs::read_to_string(masked_path).unwrap()
+    };
+    assert!(result.contains("<<RUNPOD_API_KEY_"), "{result}");
+    assert!(!result.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
-    let _ = std::fs::remove_dir_all(".pentect/read");
 }
 
 #[test]

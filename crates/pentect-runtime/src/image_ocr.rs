@@ -2,18 +2,25 @@
 use crate::config::{image_ocr_config, ImageOcrMode};
 use serde_json::Value;
 #[cfg(feature = "ocr")]
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
+const IMAGE_SCAN_MAX_IMAGES_PER_RESULT: usize = 8;
+const IMAGE_SCAN_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const IMAGE_SCAN_MAX_ELAPSED: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(feature = "ocr")]
 const IMAGE_URL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(feature = "ocr")]
 const IMAGE_URL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(feature = "ocr")]
+const IMAGE_URL_MAX_REDIRECTS: usize = 5;
 
 pub(crate) struct ImageInspection {
     pub(crate) scanned_images: usize,
     pub(crate) unscanned_images: usize,
     pub(crate) ocr_failures: usize,
     pub(crate) secret_images: usize,
+    total_image_bytes: u64,
+    started_at: std::time::Instant,
 }
 
 pub(crate) fn contains_image_result(value: &Value) -> bool {
@@ -25,29 +32,17 @@ pub(crate) fn contains_image_result(value: &Value) -> bool {
     }
 }
 
-pub(crate) fn is_image_object(value: &Value) -> bool {
-    value.as_object().is_some_and(object_marks_image)
-}
-
 pub(crate) fn skip_text_masking_for_image_payload(text: &str) -> bool {
     text.trim().to_ascii_lowercase().starts_with("data:image/") || looks_like_base64_image(text)
 }
 
-pub(crate) fn image_payload_field_key(key: &str) -> bool {
+pub(crate) fn skip_text_masking_for_image_field(key: &str, text: &str) -> bool {
+    if skip_text_masking_for_image_payload(text) {
+        return true;
+    }
     matches!(
         normalized_json_key(key).as_str(),
-        "data"
-            | "bytes"
-            | "base64"
-            | "content"
-            | "image"
-            | "imagedata"
-            | "imageurl"
-            | "url"
-            | "uri"
-            | "src"
-            | "href"
-            | "dataurl"
+        "data" | "bytes" | "base64" | "content" | "imagedata" | "dataurl"
     )
 }
 
@@ -60,6 +55,8 @@ pub(crate) fn inspect_tool_images_for_secrets(
         unscanned_images: 0,
         ocr_failures: 0,
         secret_images: 0,
+        total_image_bytes: 0,
+        started_at: std::time::Instant::now(),
     };
     collect_image_inspection(value, key, &mut inspection)?;
     Ok(inspection)
@@ -72,7 +69,7 @@ fn collect_image_inspection(
 ) -> Result<(), String> {
     match value {
         Value::String(text) => {
-            if looks_like_image_reference(text) {
+            if looks_like_image_reference(text) || looks_like_base64_image(text) {
                 match image_reference_bytes(text) {
                     Ok(Some(bytes)) => inspect_image_bytes(&bytes, key, inspection),
                     Ok(None) | Err(_) => inspection.unscanned_images += 1,
@@ -88,9 +85,16 @@ fn collect_image_inspection(
         Value::Object(map) => {
             if object_marks_image(map) {
                 match image_object_bytes(map) {
-                    Ok(Some(bytes)) => inspect_image_bytes(&bytes, key, inspection),
+                    Ok(Some(bytes)) => {
+                        inspect_image_bytes(&bytes, key, inspection);
+                        return Ok(());
+                    }
                     Ok(None) | Err(_) => {
-                        if !empty_image_object(map) {
+                        let before = inspection.total_observations();
+                        for item in map.values() {
+                            collect_image_inspection(item, key, inspection)?;
+                        }
+                        if !empty_image_object(map) && inspection.total_observations() == before {
                             inspection.unscanned_images += 1;
                         }
                     }
@@ -106,6 +110,10 @@ fn collect_image_inspection(
 }
 
 fn inspect_image_bytes(bytes: &[u8], key: &[u8; 32], inspection: &mut ImageInspection) {
+    if !inspection.reserve_scan_budget(bytes.len() as u64) {
+        inspection.unscanned_images += 1;
+        return;
+    }
     inspection.scanned_images += 1;
     match ocr_image_bytes(bytes) {
         Ok(text) => {
@@ -116,6 +124,29 @@ fn inspect_image_bytes(bytes: &[u8], key: &[u8; 32], inspection: &mut ImageInspe
         Err(_) => {
             inspection.ocr_failures += 1;
         }
+    }
+}
+
+impl ImageInspection {
+    fn total_observations(&self) -> usize {
+        self.scanned_images + self.unscanned_images + self.ocr_failures + self.secret_images
+    }
+
+    fn reserve_scan_budget(&mut self, bytes: u64) -> bool {
+        if self.scanned_images >= IMAGE_SCAN_MAX_IMAGES_PER_RESULT {
+            return false;
+        }
+        if self.started_at.elapsed() > IMAGE_SCAN_MAX_ELAPSED {
+            return false;
+        }
+        let Some(total) = self.total_image_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if total > IMAGE_SCAN_MAX_TOTAL_BYTES {
+            return false;
+        }
+        self.total_image_bytes = total;
+        true
     }
 }
 
@@ -318,35 +349,60 @@ fn image_signature(bytes: &[u8]) -> Option<&'static str> {
 
 #[cfg(feature = "ocr")]
 fn fetch_image_url_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
-    use std::io::Read;
-    use std::sync::OnceLock;
-
     let url = text.trim();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Ok(None);
     }
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("image URL is invalid: {e}"))?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+    let mut url = reqwest::Url::parse(url).map_err(|e| format!("image URL is invalid: {e}"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
         return Ok(None);
     }
-    validate_remote_image_url_target(&parsed)?;
 
-    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
-    let client = CLIENT
-        .get_or_init(|| {
-            reqwest::blocking::Client::builder()
-                .timeout(IMAGE_URL_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build()
-                .map_err(|e| format!("could not initialize image fetcher: {e}"))
-        })
-        .as_ref()
-        .map_err(Clone::clone)?;
+    for _ in 0..=IMAGE_URL_MAX_REDIRECTS {
+        let response = send_image_url_request(&url)?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "image URL redirect has no location".to_string())?;
+            url = url
+                .join(location)
+                .map_err(|e| format!("image URL redirect is invalid: {e}"))?;
+            if url.scheme() != "http" && url.scheme() != "https" {
+                return Err("image URL redirected to a non-HTTP URL".to_string());
+            }
+            continue;
+        }
+        return read_image_url_response(response).map(Some);
+    }
+    Err(format!(
+        "image URL redirected more than {IMAGE_URL_MAX_REDIRECTS} times"
+    ))
+}
 
-    let response = client
-        .get(parsed)
+#[cfg(feature = "ocr")]
+fn send_image_url_request(url: &reqwest::Url) -> Result<reqwest::blocking::Response, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "image URL has no host".to_string())?;
+    let addrs = resolve_remote_image_url_target(url)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(IMAGE_URL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, &addrs)
+        .build()
+        .map_err(|e| format!("could not initialize image fetcher: {e}"))?;
+    client
+        .get(url.clone())
         .send()
-        .map_err(|e| format!("could not fetch image URL: {e}"))?;
+        .map_err(|e| format!("could not fetch image URL: {e}"))
+}
+
+#[cfg(feature = "ocr")]
+fn read_image_url_response(response: reqwest::blocking::Response) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
     if !response.status().is_success() {
         return Err(format!("image URL returned {}", response.status()));
     }
@@ -382,11 +438,11 @@ fn fetch_image_url_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
     if image_signature(&bytes).is_none() {
         return Err("image URL did not return a supported image".to_string());
     }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 #[cfg(feature = "ocr")]
-fn validate_remote_image_url_target(url: &reqwest::Url) -> Result<(), String> {
+fn resolve_remote_image_url_target(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
     use std::net::ToSocketAddrs;
 
     let host = url
@@ -394,27 +450,27 @@ fn validate_remote_image_url_target(url: &reqwest::Url) -> Result<(), String> {
         .ok_or_else(|| "image URL has no host".to_string())?;
     let host_lc = host.to_ascii_lowercase();
     if host_lc == "localhost" || host_lc.ends_with(".localhost") {
-        return local_image_url_result();
+        local_image_url_result()?;
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return validate_remote_image_ip(ip);
-    }
-
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "image URL has no port".to_string())?;
-    let mut saw_addr = false;
-    for addr in (host, port)
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        validate_remote_image_ip(ip)?;
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let addrs = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("could not resolve image URL host: {e}"))?
-    {
-        saw_addr = true;
-        validate_remote_image_ip(addr.ip())?;
-    }
-    if !saw_addr {
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
         return Err("image URL host did not resolve".to_string());
     }
-    Ok(())
+    for addr in &addrs {
+        validate_remote_image_ip(addr.ip())?;
+    }
+    Ok(addrs)
 }
 
 #[cfg(feature = "ocr")]
@@ -568,6 +624,16 @@ mod tests {
     }
 
     #[test]
+    fn bare_base64_image_is_inspected() {
+        let value = serde_json::json!(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+        );
+        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32]).unwrap();
+        assert_eq!(inspection.scanned_images, 1);
+        assert_eq!(inspection.unscanned_images, 0);
+    }
+
+    #[test]
     fn remote_image_url_with_query_is_reference() {
         assert!(looks_like_image_reference(
             "https://example.test/images/screenshot.png?token=public#main"
@@ -605,6 +671,91 @@ mod tests {
         let bytes = fetch_image_url_bytes(&url).unwrap().unwrap();
         assert_eq!(image_signature(&bytes), Some("png"));
         handle.join().unwrap();
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn nested_remote_image_url_object_is_scanned() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let png = inline_image_bytes(
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+        )
+        .unwrap()
+        .unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png.len()
+            )
+            .unwrap();
+            stream.write_all(&png).unwrap();
+        });
+
+        let value = serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("http://{addr}/nested.png")
+            }
+        });
+        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32]).unwrap();
+        assert_eq!(inspection.scanned_images, 1);
+        assert_eq!(inspection.unscanned_images, 0);
+        handle.join().unwrap();
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn remote_image_redirect_is_validated_and_followed() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let image_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let image_addr = image_listener.local_addr().unwrap();
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        let png = inline_image_bytes(
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+        )
+        .unwrap()
+        .unwrap();
+
+        let image_handle = std::thread::spawn(move || {
+            let (mut stream, _) = image_listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png.len()
+            )
+            .unwrap();
+            stream.write_all(&png).unwrap();
+        });
+        let redirect_handle = std::thread::spawn(move || {
+            let (mut stream, _) = redirect_listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://{image_addr}/final.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let url = format!("http://{redirect_addr}/start.png");
+        let bytes = fetch_image_url_bytes(&url).unwrap().unwrap();
+        assert_eq!(image_signature(&bytes), Some("png"));
+        redirect_handle.join().unwrap();
+        image_handle.join().unwrap();
     }
 
     #[cfg(feature = "ocr")]

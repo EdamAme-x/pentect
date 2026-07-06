@@ -160,6 +160,19 @@ impl OutputMasker {
         if scalars.is_empty() {
             return Ok(Vec::new());
         }
+        if !self.model_adapters.is_empty() {
+            let mut out = Vec::with_capacity(scalars.len());
+            for scalar in scalars {
+                out.push(self.mask_tool_result_scalar(
+                    &scalar.text,
+                    scalar.region_kind,
+                    scalar.key.as_deref(),
+                    scalar.path.as_deref(),
+                    &scalar.hints,
+                )?);
+            }
+            return Ok(out);
+        }
         let mut prepared = Vec::with_capacity(scalars.len());
         for scalar in scalars {
             let redacted = redact_env_derivative_lines(&scalar.text);
@@ -278,6 +291,41 @@ impl OutputMasker {
             }
         }
     }
+}
+
+pub(crate) fn mask_read_data(
+    key: [u8; 32],
+    data: String,
+    kind: Kind,
+) -> Result<MaskResult, String> {
+    let engine = tool_boundary_engine()?;
+    let adapters = ModelAdapters::from_env()?;
+    let cfg = Config {
+        disclose_length: false,
+        ..Config::new(key)
+    };
+    let mut adapter_count = 0usize;
+    let mut adapter_recovery = Recovery::empty_for_key(&key);
+    let data = match adapters.mask(
+        &engine,
+        Input {
+            kind: kind.clone(),
+            data: data.clone(),
+        },
+        None,
+        &cfg,
+    )? {
+        Some(result) => {
+            adapter_count = result.summary.masked_count;
+            adapter_recovery = result.recovery;
+            result.masked
+        }
+        None => data,
+    };
+    let mut result = engine.mask(Input { kind, data }, &cfg);
+    result.summary.masked_count = result.summary.masked_count.saturating_add(adapter_count);
+    result.recovery.extend_same_key(adapter_recovery);
+    Ok(result)
 }
 
 fn choose_batch_delimiter(values: &[String]) -> Option<&'static str> {
