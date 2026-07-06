@@ -41,6 +41,7 @@ pdf-extract = "0.10.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
 ocrs = "0.12.2"
 rten = { version = "0.24.0", default-features = false, features = ["rten_format"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 anstream = "0.6"
 crossterm = "0.28"
 ed25519-dalek = "2"

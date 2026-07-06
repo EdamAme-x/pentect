@@ -14,7 +14,7 @@ path = "src/main.rs"
 [features]
 default = ["pdf", "ocr"]
 pdf = ["dep:pdf-extract"]
-ocr = ["dep:image", "dep:ocrs", "dep:rten"]
+ocr = ["dep:image", "dep:ocrs", "dep:reqwest", "dep:rten"]
 
 [dependencies]
 pentect-core = { path = "../pentect-core" }
@@ -24,6 +24,7 @@ data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 ocrs = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 rten = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

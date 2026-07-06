@@ -1,9 +1,16 @@
 #[cfg(feature = "ocr")]
 use crate::config::{image_ocr_config, ImageOcrMode};
 use serde_json::Value;
+#[cfg(feature = "ocr")]
+use std::net::IpAddr;
+
+#[cfg(feature = "ocr")]
+const IMAGE_URL_MAX_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "ocr")]
+const IMAGE_URL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) struct ImageInspection {
-    pub(crate) inline_images: usize,
+    pub(crate) scanned_images: usize,
     pub(crate) unscanned_images: usize,
     pub(crate) ocr_failures: usize,
     pub(crate) secret_images: usize,
@@ -49,7 +56,7 @@ pub(crate) fn inspect_tool_images_for_secrets(
     key: &[u8; 32],
 ) -> Result<ImageInspection, String> {
     let mut inspection = ImageInspection {
-        inline_images: 0,
+        scanned_images: 0,
         unscanned_images: 0,
         ocr_failures: 0,
         secret_images: 0,
@@ -65,10 +72,11 @@ fn collect_image_inspection(
 ) -> Result<(), String> {
     match value {
         Value::String(text) => {
-            if let Some(bytes) = inline_image_bytes(text)? {
-                inspect_image_bytes(&bytes, key, inspection);
-            } else if looks_like_image_reference(text) {
-                inspection.unscanned_images += 1;
+            if looks_like_image_reference(text) {
+                match image_reference_bytes(text) {
+                    Ok(Some(bytes)) => inspect_image_bytes(&bytes, key, inspection),
+                    Ok(None) | Err(_) => inspection.unscanned_images += 1,
+                }
             }
         }
         Value::Number(_) | Value::Bool(_) | Value::Null => {}
@@ -79,10 +87,13 @@ fn collect_image_inspection(
         }
         Value::Object(map) => {
             if object_marks_image(map) {
-                if let Some(bytes) = inline_image_object_bytes(map)? {
-                    inspect_image_bytes(&bytes, key, inspection);
-                } else if !empty_image_object(map) {
-                    inspection.unscanned_images += 1;
+                match image_object_bytes(map) {
+                    Ok(Some(bytes)) => inspect_image_bytes(&bytes, key, inspection),
+                    Ok(None) | Err(_) => {
+                        if !empty_image_object(map) {
+                            inspection.unscanned_images += 1;
+                        }
+                    }
                 }
                 return Ok(());
             }
@@ -95,7 +106,7 @@ fn collect_image_inspection(
 }
 
 fn inspect_image_bytes(bytes: &[u8], key: &[u8; 32], inspection: &mut ImageInspection) {
-    inspection.inline_images += 1;
+    inspection.scanned_images += 1;
     match ocr_image_bytes(bytes) {
         Ok(text) => {
             if ocr_text_has_secret(&text, key) {
@@ -130,9 +141,7 @@ fn object_marks_image(map: &serde_json::Map<String, Value>) -> bool {
     })
 }
 
-fn inline_image_object_bytes(
-    map: &serde_json::Map<String, Value>,
-) -> Result<Option<Vec<u8>>, String> {
+fn image_object_bytes(map: &serde_json::Map<String, Value>) -> Result<Option<Vec<u8>>, String> {
     for key in [
         "data",
         "bytes",
@@ -153,11 +162,18 @@ fn inline_image_object_bytes(
         let Some(text) = map.get(key).and_then(Value::as_str) else {
             continue;
         };
-        if let Some(bytes) = inline_image_bytes(text)? {
+        if let Some(bytes) = image_reference_bytes(text)? {
             return Ok(Some(bytes));
         }
     }
     Ok(None)
+}
+
+fn image_reference_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
+    if let Some(bytes) = inline_image_bytes(text)? {
+        return Ok(Some(bytes));
+    }
+    fetch_image_url_bytes(text)
 }
 
 fn inline_image_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
@@ -209,12 +225,25 @@ fn compact_base64(text: &str) -> String {
 fn looks_like_image_reference(text: &str) -> bool {
     let value = text.trim().to_ascii_lowercase();
     value.starts_with("data:image/")
-        || value.ends_with(".png")
-        || value.ends_with(".jpg")
-        || value.ends_with(".jpeg")
-        || value.ends_with(".webp")
-        || value.ends_with(".gif")
-        || value.ends_with(".bmp")
+        || image_extension_path(&value)
+        || looks_like_remote_image_url(&value)
+}
+
+fn looks_like_remote_image_url(value: &str) -> bool {
+    if !(value.starts_with("http://") || value.starts_with("https://")) {
+        return false;
+    }
+    let path = value.split(['?', '#']).next().unwrap_or(value);
+    image_extension_path(path)
+}
+
+fn image_extension_path(path: &str) -> bool {
+    path.ends_with(".png")
+        || path.ends_with(".jpg")
+        || path.ends_with(".jpeg")
+        || path.ends_with(".webp")
+        || path.ends_with(".gif")
+        || path.ends_with(".bmp")
 }
 
 fn key_marks_image_value(key: &str, value: &Value) -> bool {
@@ -285,6 +314,151 @@ fn image_signature(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+#[cfg(feature = "ocr")]
+fn fetch_image_url_bytes(text: &str) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    use std::sync::OnceLock;
+
+    let url = text.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Ok(None);
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("image URL is invalid: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Ok(None);
+    }
+    validate_remote_image_url_target(&parsed)?;
+
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(IMAGE_URL_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .map_err(|e| format!("could not initialize image fetcher: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+
+    let response = client
+        .get(parsed)
+        .send()
+        .map_err(|e| format!("could not fetch image URL: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("image URL returned {}", response.status()));
+    }
+    if let Some(content_type) = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        let content_type = content_type.to_ascii_lowercase();
+        if !content_type.starts_with("image/") {
+            return Err(format!("image URL content type is {content_type}"));
+        }
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > IMAGE_URL_MAX_BYTES)
+    {
+        return Err(format!(
+            "image URL is larger than {IMAGE_URL_MAX_BYTES} bytes"
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    let mut limited = response.take(IMAGE_URL_MAX_BYTES + 1);
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("could not read image URL: {e}"))?;
+    if bytes.len() as u64 > IMAGE_URL_MAX_BYTES {
+        return Err(format!(
+            "image URL is larger than {IMAGE_URL_MAX_BYTES} bytes"
+        ));
+    }
+    if image_signature(&bytes).is_none() {
+        return Err("image URL did not return a supported image".to_string());
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(feature = "ocr")]
+fn validate_remote_image_url_target(url: &reqwest::Url) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "image URL has no host".to_string())?;
+    let host_lc = host.to_ascii_lowercase();
+    if host_lc == "localhost" || host_lc.ends_with(".localhost") {
+        return local_image_url_result();
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return validate_remote_image_ip(ip);
+    }
+
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "image URL has no port".to_string())?;
+    let mut saw_addr = false;
+    for addr in (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("could not resolve image URL host: {e}"))?
+    {
+        saw_addr = true;
+        validate_remote_image_ip(addr.ip())?;
+    }
+    if !saw_addr {
+        return Err("image URL host did not resolve".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ocr")]
+fn validate_remote_image_ip(ip: IpAddr) -> Result<(), String> {
+    if remote_image_ip_is_private(ip) {
+        return local_image_url_result();
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "ocr", test))]
+fn local_image_url_result() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(all(feature = "ocr", not(test)))]
+fn local_image_url_result() -> Result<(), String> {
+    Err("image URL points to a local or private network address".to_string())
+}
+
+#[cfg(feature = "ocr")]
+fn remote_image_ip_is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+        }
+    }
+}
+
+#[cfg(not(feature = "ocr"))]
+fn fetch_image_url_bytes(_text: &str) -> Result<Option<Vec<u8>>, String> {
+    Ok(None)
 }
 
 #[cfg(feature = "ocr")]
@@ -375,7 +549,7 @@ mod tests {
         });
         let map = value.as_object().unwrap();
         assert!(object_marks_image(map));
-        assert!(inline_image_object_bytes(map).unwrap().is_some());
+        assert!(image_object_bytes(map).unwrap().is_some());
     }
 
     #[test]
@@ -390,7 +564,84 @@ mod tests {
         assert!(!object_marks_image(outer));
         let inner = value["image_url"].as_object().unwrap();
         assert!(object_marks_image(inner));
-        assert!(inline_image_object_bytes(inner).unwrap().is_some());
+        assert!(image_object_bytes(inner).unwrap().is_some());
+    }
+
+    #[test]
+    fn remote_image_url_with_query_is_reference() {
+        assert!(looks_like_image_reference(
+            "https://example.test/images/screenshot.png?token=public#main"
+        ));
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn remote_image_url_bytes_are_downloaded() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let png = inline_image_bytes(
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+        )
+        .unwrap()
+        .unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png.len()
+            )
+            .unwrap();
+            stream.write_all(&png).unwrap();
+        });
+
+        let url = format!("http://{addr}/scan.png?cache=1");
+        let bytes = fetch_image_url_bytes(&url).unwrap().unwrap();
+        assert_eq!(image_signature(&bytes), Some("png"));
+        handle.join().unwrap();
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn failed_remote_image_url_is_unscanned() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let value = serde_json::json!(format!("http://{addr}/missing.png"));
+        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32]).unwrap();
+        assert_eq!(inspection.unscanned_images, 1);
+        assert_eq!(inspection.scanned_images, 0);
+        handle.join().unwrap();
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn private_image_url_targets_are_recognized() {
+        assert!(remote_image_ip_is_private("127.0.0.1".parse().unwrap()));
+        assert!(remote_image_ip_is_private(
+            "169.254.169.254".parse().unwrap()
+        ));
+        assert!(remote_image_ip_is_private("10.0.0.1".parse().unwrap()));
+        assert!(!remote_image_ip_is_private("8.8.8.8".parse().unwrap()));
     }
 
     #[test]
