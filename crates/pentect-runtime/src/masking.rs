@@ -4,8 +4,9 @@ use crate::session::RecoveryStore;
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
-    load_pack, ByteRange, Config, Context, Engine, Input, Kind, MaskResult, Profile, ProfilePolicy,
-    Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard, ToolResultParser,
+    load_pack, ByteRange, Category, Config, Context, Engine, Input, Kind, MaskResult, Profile,
+    ProfilePolicy, Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard,
+    ToolResultParser,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -99,6 +100,7 @@ impl OutputMasker {
             disclose_length: false,
             ..Config::new(self.store.session.key)
         };
+        let endpoint_unchanged = remasked.clone();
         let result = self.engine.mask(
             Input {
                 kind,
@@ -106,6 +108,9 @@ impl OutputMasker {
             },
             &cfg,
         );
+        if !needs_text_pass && masks_only_endpoint_metadata(&result) {
+            return Ok(endpoint_unchanged);
+        }
         self.add_masked_count(result.summary.masked_count);
         let mut masked = result.masked;
         let mut recovery = result.recovery;
@@ -113,13 +118,15 @@ impl OutputMasker {
             let text_result = self.engine.mask(
                 Input {
                     kind: Kind::Text,
-                    data: masked,
+                    data: masked.clone(),
                 },
                 &cfg,
             );
-            self.add_masked_count(text_result.summary.masked_count);
-            masked = text_result.masked;
-            recovery.extend_same_key(text_result.recovery);
+            if !masks_only_endpoint_metadata(&text_result) {
+                self.add_masked_count(text_result.summary.masked_count);
+                masked = text_result.masked;
+                recovery.extend_same_key(text_result.recovery);
+            }
         }
         recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
         self.record_recovery(recovery)?;
@@ -149,8 +156,9 @@ impl OutputMasker {
             disclose_length: false,
             ..Config::new(self.store.session.key)
         };
+        let endpoint_unchanged = remasked.clone();
         let result = self.engine.mask_context(remasked, context, &cfg);
-        self.record_mask_result(result)
+        self.record_tool_result_mask_result(result, endpoint_unchanged)
     }
 
     pub(crate) fn mask_tool_result_scalars(
@@ -219,6 +227,9 @@ impl OutputMasker {
             ..Config::new(self.store.session.key)
         };
         let result = self.engine.mask_regions(raw, regions, &cfg);
+        if masks_only_endpoint_metadata(&result) {
+            return Ok(prepared);
+        }
         let masked = self.record_mask_result(result)?;
         let parts: Vec<String> = masked.split(delimiter).map(str::to_string).collect();
         if parts.len() != scalars.len() {
@@ -234,6 +245,17 @@ impl OutputMasker {
         recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
         self.record_recovery(recovery)?;
         Ok(masked)
+    }
+
+    fn record_tool_result_mask_result(
+        &mut self,
+        result: MaskResult,
+        endpoint_unchanged: String,
+    ) -> Result<String, String> {
+        if masks_only_endpoint_metadata(&result) {
+            return Ok(endpoint_unchanged);
+        }
+        self.record_mask_result(result)
     }
 
     fn add_masked_count(&mut self, count: usize) {
@@ -291,6 +313,15 @@ impl OutputMasker {
             }
         }
     }
+}
+
+fn masks_only_endpoint_metadata(result: &MaskResult) -> bool {
+    result.summary.masked_count > 0
+        && !result.items.is_empty()
+        && result
+            .items
+            .iter()
+            .all(|item| item.category == Category::Endpoint)
 }
 
 pub(crate) fn mask_read_data(

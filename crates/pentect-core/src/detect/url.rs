@@ -445,6 +445,17 @@ fn inspect_url(view: &NormalizedView, base: usize, url: &str, out: &mut Vec<Span
         return;
     }
 
+    if endpoint_is_display_only(host, view.text(), base) {
+        if let Some(q) = query_at {
+            let query_end = fragment_at.unwrap_or(url.len());
+            inspect_query_values(view, base, url, q + 1, query_end, false, out);
+        }
+        if let Some(f) = fragment_at {
+            inspect_external_fragment_query(view, base, url, f + 1, url.len(), out);
+        }
+        return;
+    }
+
     push_span(
         view,
         out,
@@ -685,6 +696,28 @@ fn is_internal_host(host: &str) -> bool {
     ]
     .iter()
     .any(|suffix| host.ends_with(suffix))
+}
+
+fn endpoint_is_display_only(host: &str, text: &str, url_start: usize) -> bool {
+    is_loopback_or_localhost_host(host) || is_dev_server_status_url_context(text, url_start)
+}
+
+fn is_loopback_or_localhost_host(host: &str) -> bool {
+    let host = host
+        .trim()
+        .trim_end_matches('.')
+        .trim_matches(|ch| matches!(ch, '[' | ']'))
+        .to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "::1") {
+        return true;
+    }
+    parse_ipv4(&host).is_some_and(|(a, _, _, _)| a == 127)
+}
+
+fn is_dev_server_status_url_context(text: &str, url_start: usize) -> bool {
+    let line_start = text[..url_start].rfind('\n').map_or(0, |pos| pos + 1);
+    let line_prefix = text[line_start..url_start].trim();
+    line_prefix.ends_with("Local:") || line_prefix.ends_with("Network:")
 }
 
 fn parse_ipv4(host: &str) -> Option<(u8, u8, u8, u8)> {
@@ -1398,6 +1431,53 @@ mod tests {
         assert!(labels("http://jira/api/users/abc12345")
             .iter()
             .any(|(_, value)| value == "jira"));
+    }
+
+    #[test]
+    fn localhost_and_loopback_urls_are_status_not_internal_endpoints() {
+        for raw in [
+            "http://localhost:5173/",
+            "http://127.0.0.1:5173/",
+            "http://[::1]:5173/",
+        ] {
+            assert!(
+                labels(raw)
+                    .iter()
+                    .all(|(label, _)| label != "INTERNAL_ENDPOINT"),
+                "{raw}: {:?}",
+                labels(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn dev_server_status_urls_are_not_internal_endpoint_findings() {
+        let raw = concat!(
+            "  VITE v6.3.5  ready in 281 ms\n\n",
+            "  Local:   http://localhost:5173/\n",
+            "  Local:   http://127.0.0.1:5173/\n",
+            "  Local:   http://[::1]:5173/\n",
+            "  Network: http://192.168.1.42:5173/\n",
+            "  press h + enter to show help\n",
+        );
+        let got = labels(raw);
+        assert!(
+            got.iter()
+                .all(|(label, _)| label != "INTERNAL_ENDPOINT" && label != "RESOURCE_ID"),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn display_only_local_urls_still_scan_credentials() {
+        let got = labels("Local: http://alice:letmein@localhost:5173/?access_token=abc12345abcdef");
+        assert!(got
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "alice:letmein"));
+        assert!(got
+            .iter()
+            .any(|(label, value)| label == "URL_CREDENTIAL" && value == "abc12345abcdef"));
+        assert!(got.iter().all(|(label, _)| label != "INTERNAL_ENDPOINT"));
     }
 
     #[test]

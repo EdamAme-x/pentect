@@ -2405,6 +2405,27 @@ fn api_reference_text_is_not_redacted_as_env_derivatives() {
 }
 
 #[test]
+fn codex_posttool_does_not_block_vite_dev_server_banner() {
+    let _proxy = ScopedCodexExecProxy::set(false);
+    let (root, session) = empty_session("hook-post-codex-vite-banner");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_response": concat!(
+            "  VITE v6.3.5  ready in 281 ms\n\n",
+            "  Local:   http://localhost:5173/\n",
+            "  Local:   http://127.0.0.1:5173/\n",
+            "  Local:   http://[::1]:5173/\n",
+            "  Network: http://192.168.1.42:5173/\n",
+            "  press h + enter to show help\n",
+        )
+    });
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn encoded_env_derivatives_do_not_leak() {
     let (root, session) = empty_session("exec-encoded-env-derivatives");
     let dotenv = "RUNPOD_API_KEY=rpa_FAKEPENTECTJAILBREAK1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
