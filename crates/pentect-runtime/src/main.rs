@@ -3394,7 +3394,7 @@ fn image_tool_result_block_reason(
     }
     if inspection.unscanned_images > 0 {
         return Ok(Some(
-            "image blocked: image bytes were not available to scan.".to_string(),
+            "image blocked: image could not be fetched or scanned.".to_string(),
         ));
     }
     if inspection.ocr_failures > 0 {
