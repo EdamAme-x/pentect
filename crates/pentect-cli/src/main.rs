@@ -51,6 +51,7 @@ const PENTECT_DIR: &str = ".pentect";
 const PENTECT_CONFIG_FILE: &str = "config.toml";
 const IN_MEMORY_MANAGER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
+const CODEX_ENVIRONMENT_OVERLAY_MARKER: &[u8] = b"# pentect-managed-environments\n";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -676,6 +677,10 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         cmd.env("CODEX_EXEC_SERVER_URL", exec_proxy.url());
         cmd.env(exec_proxy::PENTECT_CODEX_EXEC_PROXY_ENV, "1");
     }
+    let _codex_environment_overlay = exec_proxy
+        .as_ref()
+        .map(|exec_proxy| CodexEnvironmentOverlayGuard::install(exec_proxy.url()))
+        .transpose()?;
     cmd.args(codex_args(&configs, &opts.tool_args));
     run_interactive_command(cmd, &opts.command)
 }
@@ -919,6 +924,145 @@ impl Drop for EnvVarGuard {
     }
 }
 
+struct CodexEnvironmentOverlayGuard {
+    path: PathBuf,
+    backup_path: PathBuf,
+    previous: Option<Vec<u8>>,
+}
+
+impl CodexEnvironmentOverlayGuard {
+    fn install(exec_proxy_url: &str) -> Result<Self, String> {
+        let codex_home = codex_home_dir()?;
+        std::fs::create_dir_all(&codex_home).map_err(|e| {
+            format!(
+                "could not create Codex home '{}': {e}",
+                codex_home.display()
+            )
+        })?;
+        let path = codex_home.join("environments.toml");
+        let backup_path = codex_home.join("environments.toml.pentect.bak");
+        recover_stale_codex_environment_overlay(&path, &backup_path)?;
+        let previous = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(format!(
+                    "could not read Codex environments '{}': {e}",
+                    path.display()
+                ));
+            }
+        };
+        match previous.as_ref() {
+            Some(previous) => std::fs::write(&backup_path, previous).map_err(|e| {
+                format!(
+                    "could not write Codex environments backup '{}': {e}",
+                    backup_path.display()
+                )
+            })?,
+            None => {
+                let _ = std::fs::remove_file(&backup_path);
+            }
+        }
+        std::fs::write(&path, codex_environments_toml(exec_proxy_url)).map_err(|e| {
+            format!(
+                "could not write Codex environments '{}': {e}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            path,
+            backup_path,
+            previous,
+        })
+    }
+}
+
+impl Drop for CodexEnvironmentOverlayGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(previous) => {
+                let _ = std::fs::write(&self.path, previous);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+        let _ = std::fs::remove_file(&self.backup_path);
+    }
+}
+
+fn recover_stale_codex_environment_overlay(path: &Path, backup_path: &Path) -> Result<(), String> {
+    let current = match std::fs::read(path) {
+        Ok(current) => current,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "could not inspect Codex environments '{}': {e}",
+                path.display()
+            ));
+        }
+    };
+    if !current.starts_with(CODEX_ENVIRONMENT_OVERLAY_MARKER) {
+        return Ok(());
+    }
+    match std::fs::read(backup_path) {
+        Ok(previous) => {
+            std::fs::write(path, previous).map_err(|e| {
+                format!(
+                    "could not restore Codex environments '{}': {e}",
+                    path.display()
+                )
+            })?;
+            let _ = std::fs::remove_file(backup_path);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::remove_file(path).map_err(|e| {
+                format!(
+                    "could not remove stale Codex environments '{}': {e}",
+                    path.display()
+                )
+            })?;
+        }
+        Err(e) => {
+            return Err(format!(
+                "could not read Codex environments backup '{}': {e}",
+                backup_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn codex_home_dir() -> Result<PathBuf, String> {
+    if let Some(value) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value));
+    }
+    if cfg!(windows) {
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(profile).join(".codex"));
+        }
+        if let (Some(drive), Some(path)) =
+            (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        {
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            return Ok(home.join(".codex"));
+        }
+    }
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).join(".codex"))
+        .ok_or_else(|| "could not resolve Codex home".to_string())
+}
+
+fn codex_environments_toml(exec_proxy_url: &str) -> String {
+    format!(
+        "{}default = \"pentect\"\ninclude_local = true\n\n[[environments]]\nid = \"pentect\"\nurl = {}\n",
+        String::from_utf8_lossy(CODEX_ENVIRONMENT_OVERLAY_MARKER),
+        toml_string(exec_proxy_url)
+    )
+}
+
 fn apply_extension_env(
     cmd: &mut Command,
     active: &extensions::ActiveExtensions,
@@ -1083,13 +1227,14 @@ fn codex_command_hook_hash(
     windows: &str,
     timeout_sec: u64,
 ) -> Result<String, String> {
+    let platform_command = if cfg!(windows) { windows } else { command };
     let identity = CodexNormalizedHookIdentity {
         event_name: event_label,
         group: CodexMatcherGroup {
             matcher: Some(matcher),
             hooks: vec![CodexHookHandlerConfig::Command {
-                command,
-                command_windows: Some(windows),
+                command: platform_command,
+                command_windows: None,
                 timeout_sec: Some(timeout_sec),
                 r#async: false,
                 status_message: None,
@@ -1886,6 +2031,73 @@ mod tests {
     }
 
     #[test]
+    fn codex_environments_toml_keeps_local_available() {
+        let rendered = codex_environments_toml("ws://127.0.0.1:12345/pentect");
+        assert!(rendered.contains("default = \"pentect\""), "{rendered}");
+        assert!(rendered.contains("include_local = true"), "{rendered}");
+        assert!(rendered.contains("id = \"pentect\""), "{rendered}");
+        assert!(
+            rendered.contains("url = \"ws://127.0.0.1:12345/pentect\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn codex_environment_overlay_restores_existing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-env-overlay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("environments.toml");
+        std::fs::write(&path, b"default = \"local\"\n").unwrap();
+        let _env = EnvVarGuard::set_optional([("CODEX_HOME", Some(root.clone().into_os_string()))]);
+        {
+            let _guard =
+                CodexEnvironmentOverlayGuard::install("ws://127.0.0.1:12345/pentect").unwrap();
+            let current = std::fs::read_to_string(&path).unwrap();
+            assert!(current.contains("default = \"pentect\""), "{current}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "default = \"local\"\n"
+        );
+        assert!(!root.join("environments.toml.pentect.bak").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_environment_overlay_recovers_stale_file() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-env-overlay-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("environments.toml");
+        let backup_path = root.join("environments.toml.pentect.bak");
+        std::fs::write(&path, codex_environments_toml("ws://127.0.0.1:1")).unwrap();
+        std::fs::write(&backup_path, b"default = \"local\"\n").unwrap();
+        recover_stale_codex_environment_overlay(&path, &backup_path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "default = \"local\"\n"
+        );
+        assert!(!backup_path.exists());
+        std::fs::write(&path, codex_environments_toml("ws://127.0.0.1:1")).unwrap();
+        recover_stale_codex_environment_overlay(&path, &backup_path).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn codex_args_inject_model_visible_pentect_contract() {
         let args = codex_args(&["features.hooks=true".to_string()], &["hello".to_string()]);
         let rendered = args.join("\n");
@@ -1947,6 +2159,34 @@ mod tests {
         assert!(
             !rendered.contains("dangerously-bypass-hook-trust"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn codex_hook_hash_uses_platform_command_only() {
+        let command = "pentect hook --cli codex";
+        let windows = "cmd /D /S /C pentect hook --cli codex";
+        let selected = if cfg!(windows) { windows } else { command };
+        let expected = version_for_toml_value(
+            &toml::Value::try_from(CodexNormalizedHookIdentity {
+                event_name: "pre_tool_use",
+                group: CodexMatcherGroup {
+                    matcher: Some("*"),
+                    hooks: vec![CodexHookHandlerConfig::Command {
+                        command: selected,
+                        command_windows: None,
+                        timeout_sec: Some(30),
+                        r#async: false,
+                        status_message: None,
+                    }],
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_command_hook_hash("pre_tool_use", "*", command, windows, 30).unwrap(),
+            expected
         );
     }
 
