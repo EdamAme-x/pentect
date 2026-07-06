@@ -1592,6 +1592,28 @@ fn tool_text_output_masks_mcp_connector_and_plugin_envelopes() {
         assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
         assert!(!rendered.contains(raw), "{rendered}");
     }
+
+    let unchanged = json!({
+        "eventName": "PostToolUse",
+        "tool": "plugin__browser_text",
+        "payload": {
+            "text": "visible page title only"
+        }
+    });
+    let output = handle_hook(HookProvider::Generic, "t", &session, unchanged).unwrap();
+    assert_eq!(output, json!({}));
+
+    let blocked = json!({
+        "eventName": "PostToolUse",
+        "tool": "plugin__browser_media",
+        "payload": {
+            "url": "data:video/mp4;base64,AAAA"
+        }
+    });
+    let output = handle_hook(HookProvider::Generic, "t", &session, blocked).unwrap();
+    assert_eq!(output["decision"], "block");
+    let reason = output["reason"].as_str().unwrap();
+    assert!(reason.contains("non-text media"), "{reason}");
     let _ = std::fs::remove_dir_all(root);
 }
 
