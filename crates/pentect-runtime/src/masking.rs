@@ -34,6 +34,7 @@ pub(crate) struct OutputMasker {
     model_adapters: ModelAdapters,
     mode: OutputMaskerMode,
     pending: Recovery,
+    masked_count: u64,
 }
 
 enum OutputMaskerMode {
@@ -50,6 +51,7 @@ impl OutputMasker {
             model_adapters: ModelAdapters::from_env()?,
             mode: OutputMaskerMode::Shared,
             pending: Recovery::empty_for_key(&key),
+            masked_count: 0,
         })
     }
 
@@ -62,7 +64,12 @@ impl OutputMasker {
             model_adapters: ModelAdapters::from_env()?,
             mode: OutputMaskerMode::Deferred { remask_recoveries },
             pending: Recovery::empty_for_key(&key),
+            masked_count: 0,
         })
+    }
+
+    pub(crate) fn masked_count(&self) -> u64 {
+        self.masked_count
     }
 
     pub(crate) fn flush(&mut self) -> Result<(), String> {
@@ -89,7 +96,7 @@ impl OutputMasker {
         let remasked = self.mask_model_adapter_input(remasked, kind.clone(), None)?;
         let needs_text_pass = !matches!(kind, Kind::Text | Kind::ToolResult);
         let cfg = Config {
-            disclose_length: true,
+            disclose_length: false,
             ..Config::new(self.store.session.key)
         };
         let result = self.engine.mask(
@@ -99,6 +106,7 @@ impl OutputMasker {
             },
             &cfg,
         );
+        self.add_masked_count(result.summary.masked_count);
         let mut masked = result.masked;
         let mut recovery = result.recovery;
         if needs_text_pass {
@@ -109,6 +117,7 @@ impl OutputMasker {
                 },
                 &cfg,
             );
+            self.add_masked_count(text_result.summary.masked_count);
             masked = text_result.masked;
             recovery.extend_same_key(text_result.recovery);
         }
@@ -137,7 +146,7 @@ impl OutputMasker {
         let remasked =
             self.mask_model_adapter_input(remasked, Kind::ToolResult, Some(context.clone()))?;
         let cfg = Config {
-            disclose_length: true,
+            disclose_length: false,
             ..Config::new(self.store.session.key)
         };
         let result = self.engine.mask_context(remasked, context, &cfg);
@@ -193,7 +202,7 @@ impl OutputMasker {
         }
 
         let cfg = Config {
-            disclose_length: true,
+            disclose_length: false,
             ..Config::new(self.store.session.key)
         };
         let result = self.engine.mask_regions(raw, regions, &cfg);
@@ -206,11 +215,16 @@ impl OutputMasker {
     }
 
     fn record_mask_result(&mut self, result: MaskResult) -> Result<String, String> {
+        self.add_masked_count(result.summary.masked_count);
         let masked = result.masked;
         let mut recovery = result.recovery;
         recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
         self.record_recovery(recovery)?;
         Ok(masked)
+    }
+
+    fn add_masked_count(&mut self, count: usize) {
+        self.masked_count = self.masked_count.saturating_add(count as u64);
     }
 
     fn mask_model_adapter_input(
@@ -224,7 +238,7 @@ impl OutputMasker {
         }
         let unchanged = data.clone();
         let cfg = Config {
-            disclose_length: true,
+            disclose_length: false,
             ..Config::new(self.store.session.key)
         };
         match self.model_adapters.mask(

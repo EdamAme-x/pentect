@@ -144,8 +144,8 @@ async fn handle_client(fut: upgrade::UpgradeFut, codex: PathBuf) -> Result<(), S
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .env_remove("PENTECT_MEMORY_VAULT_ADDR")
-        .env_remove("PENTECT_MEMORY_VAULT_TOKEN")
+        .env_remove("PENTECT_IN_MEMORY_MANAGER_ADDR")
+        .env_remove("PENTECT_IN_MEMORY_MANAGER_TOKEN")
         .env_remove("PENTECT_AGENT_LAUNCHED");
     let mut backend = backend
         .spawn()
@@ -252,15 +252,17 @@ fn rewrite_client_json_line(line: &str) -> Result<String, String> {
         line,
         &mut |argv, env| {
             Ok(
-                pentect_agent::preflight_exec_server_process_start_from_active_memory_vault(
+                pentect_agent::preflight_exec_server_process_start_from_active_in_memory_manager(
                     argv, env,
                 )?
                 .unwrap_or_default(),
             )
         },
         &mut |text| {
-            Ok(pentect_agent::resolve_text_from_active_memory_vault(text)?
-                .unwrap_or_else(|| text.to_string()))
+            Ok(
+                pentect_agent::resolve_text_from_active_in_memory_manager(text)?
+                    .unwrap_or_else(|| text.to_string()),
+            )
         },
     )
 }
@@ -322,8 +324,8 @@ where
 }
 
 fn strip_private_env(env: &mut serde_json::Map<String, Value>) {
-    env.remove("PENTECT_MEMORY_VAULT_ADDR");
-    env.remove("PENTECT_MEMORY_VAULT_TOKEN");
+    env.remove("PENTECT_IN_MEMORY_MANAGER_ADDR");
+    env.remove("PENTECT_IN_MEMORY_MANAGER_TOKEN");
     env.remove("PENTECT_AGENT_LAUNCHED");
 }
 
@@ -551,10 +553,10 @@ where
 }
 
 fn mask_exec_output_text(text: &str) -> Result<String, String> {
-    let masked = pentect_agent::mask_tool_output_into_active_memory_vault(text)?;
+    let masked = pentect_agent::mask_tool_output_into_active_in_memory_manager(text)?;
     if exec_proxy_debug() {
         eprintln!(
-            "[pentect] exec proxy mask vault={} changed={}",
+            "[pentect] exec proxy mask memory={} changed={}",
             masked.is_some(),
             masked.as_ref().is_some_and(|value| value != text)
         );
@@ -590,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn client_process_start_resolves_argv_and_drops_vault_env() {
+    fn client_process_start_resolves_argv_and_drops_manager_env() {
         let line = serde_json::json!({
             "id": 1,
             "method": PROCESS_START_METHOD,
@@ -599,7 +601,7 @@ mod tests {
                 "argv": ["powershell", "-Command", "echo <<SECRET_x>>"],
                 "cwd": "file:///tmp",
                 "env": {
-                    "PENTECT_MEMORY_VAULT_TOKEN": "token",
+                    "PENTECT_IN_MEMORY_MANAGER_TOKEN": "token",
                     "SAFE": "<<SECRET_x>>"
                 },
                 "tty": false,
@@ -632,7 +634,7 @@ mod tests {
         assert!(rewritten.contains("\"SAFE\":\"raw\""), "{rewritten}");
         assert!(rewritten.contains("\"RUNPOD_API_KEY\":\"runpod-raw\""));
         assert!(
-            !rewritten.contains("PENTECT_MEMORY_VAULT_TOKEN"),
+            !rewritten.contains("PENTECT_IN_MEMORY_MANAGER_TOKEN"),
             "{rewritten}"
         );
     }

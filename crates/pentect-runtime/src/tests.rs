@@ -2,6 +2,33 @@ use super::*;
 
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+struct ScopedCodexExecProxy {
+    previous: Option<bool>,
+}
+
+impl ScopedCodexExecProxy {
+    fn set(value: bool) -> Self {
+        Self {
+            previous: set_codex_exec_proxy_test_override(Some(value)),
+        }
+    }
+}
+
+impl Drop for ScopedCodexExecProxy {
+    fn drop(&mut self) {
+        set_codex_exec_proxy_test_override(self.previous.take());
+    }
+}
+
+fn first_handle_with_prefix(text: &str, prefix: &str) -> String {
+    let start = text.find(prefix).unwrap_or_else(|| panic!("{text}"));
+    let end = text[start..]
+        .find(">>")
+        .map(|offset| start + offset + 2)
+        .unwrap_or_else(|| panic!("{text}"));
+    text[start..end].to_string()
+}
+
 #[test]
 fn session_recovery_is_process_local() {
     let root = std::env::temp_dir().join(format!(
@@ -84,7 +111,7 @@ fn exec_parse_accepts_live_and_approve_without_env_flags() {
 }
 
 #[test]
-fn child_env_overlays_strip_memory_vault_credentials() {
+fn child_env_overlays_strip_in_memory_manager_credentials() {
     let mut cmd = Command::new("echo");
     apply_child_env_overlays(&mut cmd, &[], "demo");
     let envs: Vec<_> = cmd
@@ -99,7 +126,7 @@ fn child_env_overlays_strip_memory_vault_credentials() {
     assert!(
         matches!(
             envs.iter()
-                .find(|(name, _)| name == "PENTECT_MEMORY_VAULT_ADDR"),
+                .find(|(name, _)| name == "PENTECT_IN_MEMORY_MANAGER_ADDR"),
             Some((_, None))
         ),
         "{envs:?}"
@@ -107,7 +134,7 @@ fn child_env_overlays_strip_memory_vault_credentials() {
     assert!(
         matches!(
             envs.iter()
-                .find(|(name, _)| name == "PENTECT_MEMORY_VAULT_TOKEN"),
+                .find(|(name, _)| name == "PENTECT_IN_MEMORY_MANAGER_TOKEN"),
             Some((_, None))
         ),
         "{envs:?}"
@@ -271,7 +298,7 @@ fn default_session_root_lives_under_pentect_dir() {
 }
 
 #[test]
-fn open_at_stays_in_memory_even_when_base_has_capability_vault() {
+fn open_at_stays_in_memory_even_when_base_has_capability_manager() {
     let root = temp_root("open-at-in-memory");
     let persisted = Session::open_capability_at(&root, "t").unwrap();
     let persisted_key = persisted.key;
@@ -435,7 +462,7 @@ fn exec_approval_sees_capabilities_registered_from_referenced_files() {
     assert!(before.requires_approval(), "{before:?}");
     assert_eq!(before.secret_files.len(), 1, "{before:?}");
 
-    prepare_exec_capabilities(&store, &opts).unwrap();
+    prepare_exec_secret_inputs(&store, &opts).unwrap();
     let after = exec_approval(&store, &opts).unwrap();
 
     assert!(after.requires_approval(), "{after:?}");
@@ -444,11 +471,11 @@ fn exec_approval_sees_capabilities_registered_from_referenced_files() {
 }
 
 #[test]
-fn network_like_exec_requires_approval_without_dashboard() {
-    let root = temp_root("approval-network-fail-closed");
+fn may_send_network_exec_requires_approval_without_dashboard() {
+    let root = temp_root("approval-network-needs-dashboard");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let store = RecoveryStore::load(&session).unwrap();
-    let approval_session = format!("approval_network_fail_closed_{}", unix_millis());
+    let approval_session = format!("approval_network_needs_dashboard_{}", unix_millis());
     let opts = ExecOpts {
         session: approval_session.clone(),
         live: false,
@@ -458,7 +485,7 @@ fn network_like_exec_requires_approval_without_dashboard() {
 
     let approval = exec_approval(&store, &opts).unwrap();
     assert!(approval.requires_approval(), "{approval:?}");
-    assert!(approval.network_like, "{approval:?}");
+    assert!(approval.may_send_network, "{approval:?}");
     let err = approval_decision_for_exec(&opts.session, &approval).unwrap_err();
     assert!(err.contains("approval needed"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
@@ -466,7 +493,7 @@ fn network_like_exec_requires_approval_without_dashboard() {
 }
 
 #[test]
-fn env_capability_local_write_is_reported_as_materialization() {
+fn env_capability_local_write_is_reported_as_local_write() {
     let (root, session) = empty_session("approval-local-write");
     let store = RecoveryStore::load(&session).unwrap();
     let mut masker = OutputMasker::new_shared(store.clone()).unwrap();
@@ -474,6 +501,7 @@ fn env_capability_local_write_is_reported_as_materialization() {
         .mask_tool_output("API_TOKEN=sk-ABCDEFGHIJKLMNOPQRSTUVWX")
         .unwrap();
     assert!(masked.contains("API_TOKEN=<<"), "{masked}");
+    assert_eq!(masker.masked_count(), 1);
 
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
@@ -488,33 +516,33 @@ fn env_capability_local_write_is_reported_as_materialization() {
 
     assert!(approval.requires_approval(), "{approval:?}");
     assert_eq!(approval.env_names(), vec!["API_TOKEN".to_string()]);
-    assert!(approval.materialize_like, "{approval:?}");
+    assert!(approval.may_write_local_file, "{approval:?}");
     assert!(
         approval.body().contains("write local file"),
         "{:?}",
         approval.body()
     );
-    assert!(approval.ticket().materialize_like);
+    assert!(approval.ticket().may_write_local_file);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn local_write_detection_covers_common_powershell_write_forms() {
-    assert!(command_looks_local_materialize_like(
+    assert!(command_may_write_local_file(
         "[IO.File]::WriteAllText('credentials.local', $env:API_TOKEN)"
     ));
-    assert!(command_looks_local_materialize_like(
+    assert!(command_may_write_local_file(
         "Write-Output $env:API_TOKEN>credentials.local"
     ));
-    assert!(command_looks_local_materialize_like(
+    assert!(command_may_write_local_file(
         "Write-Output $env:API_TOKEN 2>errors.log"
     ));
 }
 
 #[test]
-fn resolve_file_materialization_requires_approval_without_dashboard() {
-    let root = temp_root("approval-resolve-fail-closed");
-    let approval_session = format!("approval_resolve_fail_closed_{}", unix_millis());
+fn resolve_file_local_write_requires_approval_without_dashboard() {
+    let root = temp_root("approval-resolve-needs-dashboard");
+    let approval_session = format!("approval_resolve_needs_dashboard_{}", unix_millis());
 
     let err = approval_decision_for_resolve(&approval_session, &[PathBuf::from(".env.prod")])
         .unwrap_err();
@@ -548,9 +576,9 @@ fn forged_unsigned_heartbeat_is_not_alive() {
 }
 
 #[test]
-fn resolve_stdin_materialization_requires_approval_without_dashboard() {
-    let root = temp_root("approval-resolve-stdin-fail-closed");
-    let approval_session = format!("approval_resolve_stdin_fail_closed_{}", unix_millis());
+fn resolve_stdin_local_write_requires_approval_without_dashboard() {
+    let root = temp_root("approval-resolve-stdin-needs-dashboard");
+    let approval_session = format!("approval_resolve_stdin_needs_dashboard_{}", unix_millis());
     let input = "OPENAI_API_KEY=<<OPENAI_API_KEY_abcdef0123456789>>\n";
 
     let err = approval_decision_for_resolve_stdin(&approval_session, input).unwrap_err();
@@ -571,8 +599,8 @@ fn always_fingerprint_includes_capability_value_identity() {
         secret_files: Vec::new(),
         direct_handles: Vec::new(),
         destinations: Vec::new(),
-        network_like: false,
-        materialize_like: false,
+        may_send_network: false,
+        may_write_local_file: false,
     };
     let b = ExecApproval {
         command,
@@ -583,8 +611,8 @@ fn always_fingerprint_includes_capability_value_identity() {
         secret_files: Vec::new(),
         direct_handles: Vec::new(),
         destinations: Vec::new(),
-        network_like: false,
-        materialize_like: false,
+        may_send_network: false,
+        may_write_local_file: false,
     };
 
     assert_ne!(a.fingerprint(), b.fingerprint());
@@ -979,7 +1007,7 @@ fn write_tool_blocks_unknown_masked_handles_that_need_resolve() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("resolve needed"), "{reason}");
+    assert!(reason.contains("masked handle is unavailable"), "{reason}");
     assert!(!config.exists());
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
@@ -1261,7 +1289,7 @@ fn write_tool_repairs_multiedit_masked_new_string_after_tool() {
 }
 
 #[test]
-fn write_tool_blocks_edit_masked_old_string() {
+fn write_tool_applies_edit_with_masked_old_string_before_tool() {
     let root = temp_root("capability-edit-old-handle");
     let project = PathBuf::from("target").join(format!(
         "pentect-edit-old-handle-{}-{}",
@@ -1289,12 +1317,58 @@ fn write_tool_blocks_edit_masked_old_string() {
         }
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-        .as_str()
-        .unwrap();
-    assert!(reason.contains("Edit old text"), "{reason}");
-    assert!(!reason.contains(raw), "{reason}");
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    let updated = &output["hookSpecificOutput"]["updatedInput"];
+    let old_string = updated["old_string"].as_str().unwrap();
+    let new_string = updated["new_string"].as_str().unwrap();
+    assert_eq!(old_string, new_string);
+    assert!(!old_string.contains(raw), "{old_string}");
+    assert!(!old_string.contains("<<"), "{old_string}");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(written, "token=rotated\n");
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_tool_applies_multiedit_with_masked_old_string_before_tool() {
+    let root = temp_root("capability-multiedit-old-handle");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-multiedit-old-handle-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    let config = std::env::current_dir()
+        .unwrap()
+        .join(&project)
+        .join("config.txt");
+    std::fs::write(&config, format!("name=old\ntoken={raw}\n")).unwrap();
+
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "MultiEdit",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "edits": [
+                {"old_string": "name=old\n", "new_string": "name=new\n"},
+                {"old_string": masked, "new_string": "token=rotated\n"}
+            ]
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    let updated = &output["hookSpecificOutput"]["updatedInput"];
+    let rendered = serde_json::to_string(updated).unwrap();
+    assert!(!rendered.contains(raw), "{rendered}");
+    assert!(!rendered.contains("<<"), "{rendered}");
+    assert_eq!(updated["edits"].as_array().unwrap().len(), 1);
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(written, "name=new\ntoken=rotated\n");
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1328,7 +1402,7 @@ fn write_tool_blocks_edit_masked_old_string_on_lazy_hook_path() {
     let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("Edit old text"), "{reason}");
+    assert!(reason.contains("masked handle is unavailable"), "{reason}");
     assert!(!reason.contains("raw"), "{reason}");
     let _ = std::fs::remove_dir_all(project);
 }
@@ -1481,8 +1555,12 @@ fn generic_posttool_masks_payload_alias() {
 }
 
 #[test]
-fn posttool_blocks_image_output_until_media_adapter_exists() {
-    let (root, session) = empty_session("hook-post-image-block");
+fn posttool_allows_unreadable_image_output_by_default() {
+    let (root, session) = empty_session("hook-post-image-best-effort");
+    write_project_config(
+        &root,
+        "[image]\nocr = \"auto\"\nunreadable_images = \"allow\"\n",
+    );
     let input = json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "mcp__chrome__screenshot",
@@ -1494,18 +1572,23 @@ fn posttool_blocks_image_output_until_media_adapter_exists() {
             }]
         }
     });
-    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    assert_eq!(output["decision"], "block");
-    let reason = output["reason"].as_str().unwrap();
-    assert!(reason.contains("non-text media"), "{reason}");
-    assert!(reason.contains("OCR"), "{reason}");
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Claude, "t", &session, input).unwrap()
+    };
+    assert!(output.get("decision").is_none(), "{output}");
     assert!(output.get("hookSpecificOutput").is_none(), "{output}");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn posttool_blocks_data_uri_media_output() {
-    let (root, session) = empty_session("hook-post-media-uri-block");
+fn posttool_blocks_unreadable_image_output_when_configured() {
+    let (root, session) = empty_session("hook-post-image-strict");
+    write_project_config(
+        &root,
+        "[image]\nocr = \"auto\"\nunreadable_images = \"block\"\n",
+    );
     let input = json!({
         "hookEventName": "PostToolUse",
         "toolName": "connector__browser__capture",
@@ -1513,10 +1596,15 @@ fn posttool_blocks_data_uri_media_output() {
             "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
         }
     });
-    let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Generic, "t", &session, input).unwrap()
+    };
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().unwrap();
-    assert!(reason.contains("media"), "{reason}");
+    assert!(reason.contains("image blocked"), "{reason}");
+    assert!(reason.contains("OCR failed"), "{reason}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1931,6 +2019,7 @@ fn env_like_tool_output_masks_all_env_values() {
 
 #[test]
 fn codex_posttool_does_not_block_already_masked_exec_output() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-already-masked");
     let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
     let masked = mask_tool_output(&session, output).unwrap();
@@ -1949,6 +2038,7 @@ fn codex_posttool_does_not_block_already_masked_exec_output() {
 
 #[test]
 fn codex_posttool_masks_raw_output_even_if_command_claims_pentect_exec() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-fake-pentect-exec");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -1971,7 +2061,47 @@ fn codex_posttool_masks_raw_output_even_if_command_claims_pentect_exec() {
 }
 
 #[test]
+fn codex_posttool_skips_shell_block_when_exec_proxy_is_active() {
+    let _proxy = ScopedCodexExecProxy::set(true);
+    let (root, session) = empty_session("hook-post-codex-proxy-shell");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "Get-Content .env"
+        },
+        "tool_response": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
+    });
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn codex_posttool_still_blocks_mcp_when_exec_proxy_is_active() {
+    let _proxy = ScopedCodexExecProxy::set(true);
+    let (root, session) = empty_session("hook-post-codex-proxy-mcp");
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__demo__read",
+        "tool_input": {},
+        "tool_response": {
+            "content": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
+        }
+    });
+    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    let rendered = serde_json::to_string(&output).unwrap();
+    assert_eq!(output["decision"], "block");
+    assert!(
+        !rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        "{rendered}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn codex_posttool_does_not_block_short_exec_footer() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-legacy-footer");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -1988,6 +2118,7 @@ fn codex_posttool_does_not_block_short_exec_footer() {
 
 #[test]
 fn codex_posttool_masks_pentect_exec_with_trailing_shell_escape() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-exec-trailing-shell");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2010,15 +2141,37 @@ fn codex_posttool_masks_pentect_exec_with_trailing_shell_escape() {
 }
 
 #[test]
-fn exec_tool_output_discloses_readable_exact_length() {
-    let (root, session) = empty_session("exec-readable-length");
+fn exec_tool_output_uses_short_handles_without_length() {
+    let (root, session) = empty_session("exec-short-handle");
     let blob = "Zk7Qx9Lm2Pw8Rt4Vy6Nb1Cs3Df5Gh";
     let masked = mask_tool_output(&session, &format!("payload={blob}\n")).unwrap();
     assert!(!masked.contains(blob), "{masked}");
     assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
-    assert!(masked.contains("_length_29_chars>>"), "{masked}");
+    assert!(!masked.contains("_length_"), "{masked}");
     assert!(!masked.contains("_len24"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn view_length_comes_from_recovery_not_label() {
+    let secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let key = Config::generate().key;
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: format!("OPENAI_API_KEY={secret}\n"),
+        },
+        &Config {
+            disclose_length: false,
+            ..Config::new(key)
+        },
+    );
+    assert!(!result.masked.contains("_length_"), "{}", result.masked);
+    let handle = first_handle_with_prefix(&result.masked, "<<OPENAI_API_KEY_");
+    assert_eq!(
+        handle_length_from_recovery(&result.recovery, &handle),
+        Some(secret.chars().count())
+    );
 }
 
 #[test]
@@ -2207,7 +2360,7 @@ fn require_pentect_blocks_unwrapped_agent_when_enabled() {
 }
 
 #[test]
-fn require_pentect_rejects_matching_env_without_live_vault() {
+fn require_pentect_rejects_matching_env_without_live_manager() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
@@ -2221,10 +2374,10 @@ fn require_pentect_rejects_matching_env_without_live_vault() {
 }
 
 #[test]
-fn require_pentect_allows_wrapped_agent_with_vault_proof() {
+fn require_pentect_allows_wrapped_agent_with_manager_proof() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let addr = memory_vault::spawn_test_memory_vault(token.to_string());
+    let addr = in_memory_manager::spawn_test_in_memory_manager(token.to_string());
     std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
     std::env::set_var(ENV_TOKEN, token);
     std::env::set_var(ENV_ADDR, addr);
@@ -2302,7 +2455,7 @@ fn pretool_allows_direct_read_tool_for_clean_file() {
 }
 
 #[test]
-fn pretool_blocks_direct_read_tool_when_file_needs_masking() {
+fn pretool_rewrites_direct_read_tool_to_masked_copy() {
     let (root, session) = empty_session("hook-pre-direct-read-secret");
     let project = PathBuf::from("target").join(format!(
         "pentect-read-secret-{}-{}",
@@ -2321,18 +2474,34 @@ fn pretool_blocks_direct_read_tool_when_file_needs_masking() {
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    let masked_path = output["hookSpecificOutput"]["updatedInput"]["file_path"]
         .as_str()
         .unwrap();
-    assert!(reason.contains("pentect read"), "{reason}");
-    assert!(!reason.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{reason}");
+    let masked_path_buf = PathBuf::from(masked_path);
+    assert!(
+        masked_path_buf.starts_with(Path::new(".pentect").join("read")),
+        "{masked_path}"
+    );
+    assert!(
+        masked_path_buf.ends_with(project.join(".env")),
+        "{masked_path}"
+    );
+    assert!(!masked_path.contains("masked-read"), "{masked_path}");
+    let masked = std::fs::read_to_string(masked_path).unwrap();
+    assert!(masked.contains("<<OPENAI_API_KEY_"), "{masked}");
+    assert!(!masked.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{masked}");
+    assert_eq!(
+        session.resolve_all(&masked).unwrap(),
+        "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
+    );
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(".pentect/read");
 }
 
 #[test]
-fn pretool_blocks_read_many_when_any_file_needs_masking() {
+fn pretool_rewrites_secret_read_many_paths_to_masked_copies() {
     let (root, session) = empty_session("hook-pre-read-many-secret");
     let project = PathBuf::from("target").join(format!(
         "pentect-read-many-secret-{}-{}",
@@ -2357,17 +2526,38 @@ fn pretool_blocks_read_many_when_any_file_needs_masking() {
         }
     });
     let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
-    let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-        .as_str()
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+    let paths = output["hookSpecificOutput"]["updatedInput"]["paths"]
+        .as_array()
         .unwrap();
-    assert!(reason.contains("pentect read"), "{reason}");
+    assert_eq!(paths.len(), 2);
+    assert_eq!(paths[0].as_str().unwrap(), readme.to_string_lossy());
+    let masked_path = paths[1].as_str().unwrap();
+    let masked_path_buf = PathBuf::from(masked_path);
     assert!(
-        !reason.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
-        "{reason}"
+        masked_path_buf.starts_with(Path::new(".pentect").join("read")),
+        "{masked_path}"
     );
+    assert!(masked_path_buf.ends_with(env), "{masked_path}");
+    assert!(!masked_path.contains("masked-read"), "{masked_path}");
+    let masked = std::fs::read_to_string(masked_path).unwrap();
+    assert!(masked.contains("<<RUNPOD_API_KEY_"), "{masked}");
+    assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     let _ = std::fs::remove_dir_all(project);
     let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(".pentect/read");
+}
+
+#[test]
+fn masked_read_copy_path_mirrors_relative_paths() {
+    let path = masked_read_copy_path(Path::new("nested/.env"));
+    assert_eq!(
+        path,
+        Path::new(".pentect")
+            .join("read")
+            .join("nested")
+            .join(".env")
+    );
 }
 
 #[test]
@@ -2774,6 +2964,7 @@ fn hook_text_masks_runpod_token_as_plain_text() {
 
 #[test]
 fn codex_posttool_blocks_with_masked_feedback() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2791,6 +2982,7 @@ fn codex_posttool_blocks_with_masked_feedback() {
 
 #[test]
 fn codex_mcp_posttool_blocks_with_masked_feedback() {
+    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-mcp");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2836,6 +3028,29 @@ fn temp_root(name: &str) -> PathBuf {
         std::process::id(),
         unix_millis()
     ))
+}
+
+fn write_project_config(root: &Path, config: &str) {
+    let dir = root.join(".pentect");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), config).unwrap();
+}
+
+struct TestCwd {
+    previous: PathBuf,
+}
+
+impl Drop for TestCwd {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.previous);
+    }
+}
+
+fn enter_temp_cwd(root: &Path) -> TestCwd {
+    std::fs::create_dir_all(root).unwrap();
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    TestCwd { previous }
 }
 
 fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {

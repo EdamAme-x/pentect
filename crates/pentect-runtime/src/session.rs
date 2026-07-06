@@ -1,5 +1,5 @@
+use crate::in_memory_manager::InMemoryManagerClient;
 use crate::masking::{decode_env_alias_record, is_env_alias_placeholder};
-use crate::memory_vault::MemoryVaultClient;
 use crate::Result;
 use anyhow::{anyhow, bail};
 use pentect_core::{Config, Recovery};
@@ -23,7 +23,7 @@ pub(crate) struct Session {
 #[derive(Clone)]
 enum SessionBackend {
     Local,
-    MemoryVault(MemoryVaultClient),
+    InMemoryManager(InMemoryManagerClient),
 }
 
 impl Session {
@@ -46,7 +46,7 @@ impl Session {
     }
 
     fn open_active() -> Result<Self> {
-        let Some(client) = MemoryVaultClient::from_env() else {
+        let Some(client) = InMemoryManagerClient::from_env() else {
             return Ok(Self::in_memory());
         };
         let snapshot = client.snapshot()?;
@@ -57,7 +57,7 @@ impl Session {
             } else {
                 vec![snapshot.recovery]
             })),
-            backend: SessionBackend::MemoryVault(client),
+            backend: SessionBackend::InMemoryManager(client),
         })
     }
 
@@ -114,9 +114,9 @@ impl Session {
             .clone())
     }
 
-    pub(crate) fn vault_status(name: &str) -> Result<Option<String>> {
+    pub(crate) fn in_memory_manager_status(name: &str) -> Result<Option<String>> {
         checked_session_name(name)?;
-        Ok(MemoryVaultClient::from_env()
+        Ok(InMemoryManagerClient::from_env()
             .is_some()
             .then_some("memory-only, active while parent Pentect process is running".to_string()))
     }
@@ -201,7 +201,7 @@ impl RecoveryStore {
         if recovery.is_empty() {
             return Ok(());
         }
-        if let SessionBackend::MemoryVault(client) = &self.session.backend {
+        if let SessionBackend::InMemoryManager(client) = &self.session.backend {
             client.add_recovery(&self.session.key, &recovery)?;
         }
         {

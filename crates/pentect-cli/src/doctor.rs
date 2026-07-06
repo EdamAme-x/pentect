@@ -63,7 +63,7 @@ fn parse_args(args: &[String]) -> Result<bool, String> {
 fn run_checks() -> Vec<Check> {
     vec![
         check_pentect_binary(),
-        check_memory_vault(),
+        check_in_memory_manager(),
         check_config_extensions(),
         check_command("codex"),
         check_command("claude"),
@@ -78,14 +78,14 @@ fn check_pentect_binary() -> Check {
     }
 }
 
-fn check_memory_vault() -> Check {
+fn check_in_memory_manager() -> Check {
     let exe = match std::env::current_exe() {
         Ok(path) => path,
-        Err(e) => return Check::fail("vault", e.to_string()),
+        Err(e) => return Check::fail("memory", e.to_string()),
     };
     let mut child = match Command::new(exe)
         .arg("agent")
-        .arg("vault")
+        .arg("manager")
         .arg("--serve")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -93,12 +93,12 @@ fn check_memory_vault() -> Check {
         .spawn()
     {
         Ok(child) => child,
-        Err(e) => return Check::fail("vault", e.to_string()),
+        Err(e) => return Check::fail("memory", e.to_string()),
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return Check::fail("vault", "stdout unavailable");
+        return Check::fail("memory", "stdout unavailable");
     };
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -114,14 +114,14 @@ fn check_memory_vault() -> Check {
                     if value.get("addr").and_then(|v| v.as_str()).is_some()
                         && value.get("token").and_then(|v| v.as_str()).is_some() =>
                 {
-                    Check::ok("vault", "ready")
+                    Check::ok("memory", "ready")
                 }
-                Ok(_) => Check::fail("vault", "bad startup"),
-                Err(_) => Check::fail("vault", "bad startup"),
+                Ok(_) => Check::fail("memory", "bad startup"),
+                Err(_) => Check::fail("memory", "bad startup"),
             }
         }
-        Ok(Err(e)) => Check::fail("vault", e.to_string()),
-        Err(_) => Check::fail("vault", "timeout"),
+        Ok(Err(e)) => Check::fail("memory", e.to_string()),
+        Err(_) => Check::fail("memory", "timeout"),
     };
     let _ = child.kill();
     let _ = child.wait();

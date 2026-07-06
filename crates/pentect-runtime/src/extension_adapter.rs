@@ -434,17 +434,19 @@ mod tests {
     }
 
     #[test]
-    fn adapter_env_does_not_inherit_memory_vault_credentials() {
+    fn adapter_env_does_not_inherit_in_memory_manager_credentials() {
         let mut command = Command::new("echo");
         apply_adapter_child_env(&mut command);
         let names = command
             .get_envs()
             .map(|(name, _)| name.to_string_lossy().to_string())
             .collect::<Vec<_>>();
-        assert!(!names.iter().any(|name| name == "PENTECT_MEMORY_VAULT_ADDR"));
         assert!(!names
             .iter()
-            .any(|name| name == "PENTECT_MEMORY_VAULT_TOKEN"));
+            .any(|name| name == "PENTECT_IN_MEMORY_MANAGER_ADDR"));
+        assert!(!names
+            .iter()
+            .any(|name| name == "PENTECT_IN_MEMORY_MANAGER_TOKEN"));
     }
 
     #[cfg(windows)]

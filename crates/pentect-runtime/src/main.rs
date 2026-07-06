@@ -3,29 +3,30 @@
 //! It demonstrates the product loop:
 //! shell tool input -> force execution through `pentect exec`;
 //! command output -> mask before it returns to the AI.
-//! `read` is a one-way human preview. `exec` and hooks use process-local or
-//! parent-hosted in-memory capabilities so masked handles can be passed back
-//! into later tool-boundary commands without persisting recovery material.
+//! `read` is a one-way human preview. `exec` and hooks keep masked handles in
+//! process memory so later tool commands can reuse them without persisting raw
+//! recovery material.
 
 mod approval;
 mod approve_ui;
 mod config;
 mod extension_adapter;
+mod image_ocr;
+mod in_memory_manager;
 mod masking;
-mod memory_vault;
 mod session;
 mod shell;
 
 use approval::{ticket_summary, ApprovalQueue, ApprovalTicket, ApprovalTicketDraft};
 use approve_ui::{ApprovalDecision, ApprovalRequest};
 use config::{approval_bypassed_by_config, approval_config_state};
+use in_memory_manager::{InMemoryManagerClient, ENV_ADDR, ENV_TOKEN};
 use masking::{
     contains_unresolved_masked_handle, env_alias_recovery, is_ascii_word_char, is_env_name_byte,
     live_output_kind, OutputMasker, ToolScalarInput,
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
-use memory_vault::{MemoryVaultClient, ENV_ADDR, ENV_TOKEN};
 use pentect_core::{
     infer_kind, parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile,
     RegionKind,
@@ -34,11 +35,14 @@ use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
 use sha2::{Digest, Sha256};
 use shell::{next_shell_word, powershell_word, shell_quote_unix};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
+use zeroize::Zeroize;
 
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
@@ -47,6 +51,11 @@ const PENTECT_CODEX_EXEC_PROXY_ENV: &str = "PENTECT_CODEX_EXEC_PROXY";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
+
+#[cfg(test)]
+thread_local! {
+    static CODEX_EXEC_PROXY_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -65,7 +74,7 @@ pub fn run_from(args: Vec<String>) -> i32 {
         Some("resolve") => cmd_resolve(&args),
         Some("approve") => cmd_approve(&args),
         Some("hook") => cmd_hook(&args),
-        Some("vault") => cmd_vault(&args),
+        Some("manager") => cmd_in_memory_manager(&args),
         Some("purge") => cmd_purge(&args),
         _ => {
             usage();
@@ -74,42 +83,58 @@ pub fn run_from(args: Vec<String>) -> i32 {
     }
 }
 
-pub fn mask_input_into_active_memory_vault(
+pub fn mask_input_into_active_in_memory_manager(
     input: Input,
     profile: Profile,
     packs: Vec<Pack>,
-    disclose_length: bool,
 ) -> Result<Option<MaskResult>, String> {
-    let Some(client) = MemoryVaultClient::from_env() else {
+    let Some(client) = InMemoryManagerClient::from_env() else {
         return Ok(None);
     };
-    mask_input_into_memory_vault_client(&client, input, profile, packs, disclose_length).map(Some)
+    mask_input_into_in_memory_manager_client(&client, input, profile, packs).map(Some)
 }
 
-fn mask_input_into_memory_vault_client(
-    client: &MemoryVaultClient,
+fn mask_input_into_in_memory_manager_client(
+    client: &InMemoryManagerClient,
     input: Input,
     profile: Profile,
     packs: Vec<Pack>,
-    disclose_length: bool,
 ) -> Result<MaskResult, String> {
     let key = client.key().map_err(|e| e.to_string())?;
     let engine = Engine::with_profile_and_packs(profile, packs, false);
-    let cfg = Config {
-        disclose_length,
-        ..Config::new(key)
-    };
+    let cfg = Config::new(key);
     let result = engine.mask(input, &cfg);
     let mut recovery = result.recovery.clone();
     recovery.extend_same_key(env_alias_recovery(&result.masked, &key));
     client
         .add_recovery(&key, &recovery)
         .map_err(|e| e.to_string())?;
+    client
+        .add_masked_count(result.summary.masked_count as u64)
+        .map_err(|e| e.to_string())?;
     Ok(result)
 }
 
-pub fn resolve_text_from_active_memory_vault(text: &str) -> Result<Option<String>, String> {
-    if MemoryVaultClient::from_env().is_none() {
+pub fn active_masked_count() -> Result<Option<u64>, String> {
+    let Some(client) = InMemoryManagerClient::from_env() else {
+        return Ok(None);
+    };
+    client.masked_count().map(Some).map_err(|e| e.to_string())
+}
+
+pub fn status_line_text() -> String {
+    match active_masked_count() {
+        Ok(Some(count)) => format!("Pentect {count}"),
+        _ => "Pentect 0".to_string(),
+    }
+}
+
+pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
+    image_ocr::ocr_image_bytes(bytes)
+}
+
+pub fn resolve_text_from_active_in_memory_manager(text: &str) -> Result<Option<String>, String> {
+    if InMemoryManagerClient::from_env().is_none() {
         return Ok(None);
     }
     let session = Session::open_capability("default").map_err(|e| e.to_string())?;
@@ -121,11 +146,11 @@ pub fn resolve_text_from_active_memory_vault(text: &str) -> Result<Option<String
     Ok(Some(resolved))
 }
 
-pub fn preflight_exec_server_process_start_from_active_memory_vault(
+pub fn preflight_exec_server_process_start_from_active_in_memory_manager(
     argv: &[String],
     env: &[(String, String)],
 ) -> Result<Option<Vec<(String, String)>>, String> {
-    if MemoryVaultClient::from_env().is_none() {
+    if InMemoryManagerClient::from_env().is_none() {
         return Ok(None);
     }
     let session_name = default_session_name()?;
@@ -138,7 +163,7 @@ pub fn preflight_exec_server_process_start_from_active_memory_vault(
         approve: false,
         mode: ExecMode::Shell(exec_server_approval_command(&argv_mode, env)),
     };
-    prepare_exec_capabilities(&store, &opts)?;
+    prepare_exec_secret_inputs(&store, &opts)?;
     let approval = exec_approval(&store, &opts)?;
     let already_allowed = approval_always_granted(&opts.session, &approval)?;
     if approval.requires_approval() && !already_allowed {
@@ -150,15 +175,21 @@ pub fn preflight_exec_server_process_start_from_active_memory_vault(
     requested_env_bindings(&store, &argv_mode).map(Some)
 }
 
-pub fn mask_tool_output_into_active_memory_vault(text: &str) -> Result<Option<String>, String> {
-    if MemoryVaultClient::from_env().is_none() {
+pub fn mask_tool_output_into_active_in_memory_manager(
+    text: &str,
+) -> Result<Option<String>, String> {
+    let Some(client) = InMemoryManagerClient::from_env() else {
         return Ok(None);
-    }
+    };
     let session = Session::open_capability("default").map_err(|e| e.to_string())?;
     let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
     let mut masker = OutputMasker::new_deferred(store)?;
     let masked = masker.mask_tool_output(text)?;
+    let masked_count = masker.masked_count();
     masker.flush()?;
+    client
+        .add_masked_count(masked_count)
+        .map_err(|e| e.to_string())?;
     Ok(Some(masked))
 }
 
@@ -213,19 +244,22 @@ fn cmd_dashboard(args: &[String]) -> i32 {
 
 fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?;
-    let vault = Session::vault_status(session).map_err(|e| e.to_string())?;
-    let vault_line = match &vault {
+    let manager = Session::in_memory_manager_status(session).map_err(|e| e.to_string())?;
+    let manager_line = match &manager {
         Some(status) => format!("active ({status})"),
         None => "not created yet".to_string(),
     };
     let implicit_session = default_session_name().is_ok_and(|default| default == session);
     let body = if implicit_session {
-        format!("{}\nvault: {vault_line}", cwd.display())
+        format!("{}\nmemory: {manager_line}", cwd.display())
     } else {
-        format!("{}\nsession: {session}\nvault: {vault_line}", cwd.display())
+        format!(
+            "{}\nsession: {session}\nmemory: {manager_line}",
+            cwd.display()
+        )
     };
-    let warnings = if vault.is_some() {
-        vec!["In-memory capability vault is active for this process tree.".to_string()]
+    let warnings = if manager.is_some() {
+        vec!["In-memory manager is active for this process tree.".to_string()]
     } else {
         Vec::new()
     };
@@ -334,12 +368,7 @@ fn cmd_read(args: &[String]) -> i32 {
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
     let input = Input { kind, data };
-    match mask_input_into_active_memory_vault(
-        input.clone(),
-        Profile::Strict,
-        Vec::new(),
-        opts.disclose_length,
-    ) {
+    match mask_input_into_active_in_memory_manager(input.clone(), Profile::Strict, Vec::new()) {
         Ok(Some(result)) => {
             print_read_result(result, opts.emit_meta);
             return 0;
@@ -348,10 +377,7 @@ fn cmd_read(args: &[String]) -> i32 {
         Err(e) => return die(&e),
     }
     let engine = Engine::with_profile(Profile::Strict);
-    let cfg = Config {
-        disclose_length: opts.disclose_length,
-        ..Config::generate()
-    };
+    let cfg = Config::generate();
     let result = engine.mask(input, &cfg);
     print_read_result(result, opts.emit_meta);
     0
@@ -379,11 +405,34 @@ fn cmd_view(args: &[String]) -> i32 {
     };
     println!("label: {}", parts.label);
     println!("hash: {}", parts.hash);
-    match parts.length_hint {
-        Some(hint) => println!("length: {}", hint.short()),
+    match parts.length_hint.map(|hint| hint.short()).or_else(|| {
+        active_handle_length(&args[2])
+            .ok()
+            .flatten()
+            .map(|len| format!("{len} chars"))
+    }) {
+        Some(length) => println!("length: {length}"),
         None => println!("length: -"),
     }
     0
+}
+
+pub fn active_handle_length(handle: &str) -> Result<Option<usize>, String> {
+    let Some(client) = InMemoryManagerClient::from_env() else {
+        return Ok(None);
+    };
+    let snapshot = client.snapshot().map_err(|e| e.to_string())?;
+    Ok(handle_length_from_recovery(&snapshot.recovery, handle))
+}
+
+fn handle_length_from_recovery(recovery: &pentect_core::Recovery, handle: &str) -> Option<usize> {
+    let mut value = recovery.resolve(handle);
+    if value == handle {
+        return None;
+    }
+    let len = value.chars().count();
+    value.zeroize();
+    Some(len)
 }
 
 fn cmd_exec(args: &[String]) -> i32 {
@@ -394,7 +443,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         exec_help();
         return 0;
     }
-    let opts = match ExecOpts::parse(args).and_then(materialize_stdin_exec_opts) {
+    let opts = match ExecOpts::parse(args).and_then(prepare_stdin_exec_opts) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
@@ -406,7 +455,7 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    if let Err(e) = prepare_exec_capabilities(&store, &opts) {
+    if let Err(e) = prepare_exec_secret_inputs(&store, &opts) {
         return die(&e);
     }
     let approval = match exec_approval(&store, &opts) {
@@ -562,7 +611,7 @@ fn resolve_approval_ticket(paths: &[PathBuf]) -> ApprovalTicket {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let mut material = String::from("resolve-materialize-v1\0");
+    let mut material = String::from("resolve-local-write-v1\0");
     material.push_str(&command);
     material.push('\0');
     for path in paths {
@@ -584,14 +633,14 @@ fn resolve_approval_ticket(paths: &[PathBuf]) -> ApprovalTicket {
             .collect(),
         direct_handles: 0,
         destinations: Vec::new(),
-        network_like: false,
-        materialize_like: true,
+        may_send_network: false,
+        may_write_local_file: true,
     })
 }
 
 fn resolve_stdin_approval_ticket(input: &str) -> ApprovalTicket {
     let command = "pentect resolve <stdin>".to_string();
-    let mut material = String::from("resolve-stdin-materialize-v1\0");
+    let mut material = String::from("resolve-stdin-local-write-v1\0");
     material.push_str(&secret_value_hash(input));
     material.push('\0');
     let digest = Sha256::digest(material.as_bytes());
@@ -602,8 +651,8 @@ fn resolve_stdin_approval_ticket(input: &str) -> ApprovalTicket {
         secret_files: Vec::new(),
         direct_handles: masked_handles_in_text(input).len(),
         destinations: Vec::new(),
-        network_like: false,
-        materialize_like: true,
+        may_send_network: false,
+        may_write_local_file: true,
     })
 }
 
@@ -632,7 +681,7 @@ fn exec_help() {
 }
 
 fn cmd_approve(args: &[String]) -> i32 {
-    let opts = match ExecOpts::parse(args).and_then(materialize_stdin_exec_opts) {
+    let opts = match ExecOpts::parse(args).and_then(prepare_stdin_exec_opts) {
         Ok(o) => o,
         Err(e) => return die(&e),
     };
@@ -644,7 +693,7 @@ fn cmd_approve(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    if let Err(e) = prepare_exec_capabilities(&store, &opts) {
+    if let Err(e) = prepare_exec_secret_inputs(&store, &opts) {
         return die(&e);
     }
     let approval = match exec_approval(&store, &opts) {
@@ -683,10 +732,10 @@ fn cmd_purge(args: &[String]) -> i32 {
     0
 }
 
-fn cmd_vault(args: &[String]) -> i32 {
+fn cmd_in_memory_manager(args: &[String]) -> i32 {
     match args.get(2).map(String::as_str) {
-        Some("--serve") if args.len() == 3 => memory_vault::serve_memory_vault(),
-        _ => die("vault accepts only `--serve`"),
+        Some("--serve") if args.len() == 3 => in_memory_manager::serve_in_memory_manager(),
+        _ => die("manager accepts only `--serve`"),
     }
 }
 
@@ -721,11 +770,11 @@ fn approval_warnings(opts: &ExecOpts, approval: &ExecApproval) -> Vec<String> {
     if !approval.secret_files.is_empty() {
         warnings.push("this command can read local secret file content".to_string());
     }
-    if approval.network_like && approval.requires_approval() {
-        warnings.push("this command may send approved capabilities to the network".to_string());
+    if approval.may_send_network && approval.requires_approval() {
+        warnings.push("this command may send approved secrets to the network".to_string());
     }
-    if approval.materialize_like && approval.requires_approval() {
-        warnings.push("this command may write approved capabilities to local files".to_string());
+    if approval.may_write_local_file && approval.requires_approval() {
+        warnings.push("this command may write approved secrets to local files".to_string());
     }
     warnings
 }
@@ -759,10 +808,10 @@ fn approval_decision_for_ticket(
 
 fn ticket_warnings(ticket: &ApprovalTicket) -> Vec<String> {
     let mut warnings = Vec::new();
-    if ticket.network_like {
+    if ticket.may_send_network {
         warnings.push("may send secret".to_string());
     }
-    if ticket.materialize_like {
+    if ticket.may_write_local_file {
         warnings.push("may write secret".to_string());
     }
     warnings
@@ -775,8 +824,8 @@ struct ExecApproval {
     secret_files: Vec<SecretFileRef>,
     direct_handles: Vec<String>,
     destinations: Vec<String>,
-    network_like: bool,
-    materialize_like: bool,
+    may_send_network: bool,
+    may_write_local_file: bool,
 }
 
 #[derive(Debug)]
@@ -796,7 +845,7 @@ impl ExecApproval {
         !self.env_refs.is_empty()
             || !self.secret_files.is_empty()
             || !self.direct_handles.is_empty()
-            || self.network_like
+            || self.may_send_network
     }
 
     fn env_names(&self) -> Vec<String> {
@@ -829,10 +878,14 @@ impl ExecApproval {
             material.push('\0');
         }
         material.push_str("network:");
-        material.push_str(if self.network_like { "true" } else { "false" });
+        material.push_str(if self.may_send_network {
+            "true"
+        } else {
+            "false"
+        });
         material.push('\0');
-        material.push_str("materialize:");
-        material.push_str(if self.materialize_like {
+        material.push_str("local-write:");
+        material.push_str(if self.may_write_local_file {
             "true"
         } else {
             "false"
@@ -865,10 +918,10 @@ impl ExecApproval {
             }
             if !self.destinations.is_empty() {
                 lines.push(format!("send {}", self.destinations.join(", ")));
-            } else if self.network_like {
+            } else if self.may_send_network {
                 lines.push("send possible".to_string());
             }
-            if self.materialize_like {
+            if self.may_write_local_file {
                 lines.push("write local file".to_string());
             }
         } else {
@@ -890,8 +943,8 @@ impl ExecApproval {
                 .collect(),
             direct_handles: self.direct_handles.len(),
             destinations: self.destinations.clone(),
-            network_like: self.network_like,
-            materialize_like: self.materialize_like,
+            may_send_network: self.may_send_network,
+            may_write_local_file: self.may_write_local_file,
         })
     }
 }
@@ -911,16 +964,16 @@ fn exec_approval(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExecApproval,
     let secret_files = secret_file_refs_for_mode(store, &opts.mode)?;
     let direct_handles = masked_handles_in_mode(&opts.mode);
     let destinations = network_destinations(&command);
-    let network_like = !destinations.is_empty() || command_looks_network_like(&command);
-    let materialize_like = command_looks_local_materialize_like(&command);
+    let may_send_network = !destinations.is_empty() || command_may_send_network(&command);
+    let may_write_local_file = command_may_write_local_file(&command);
     Ok(ExecApproval {
         command,
         env_refs,
         secret_files,
         direct_handles,
         destinations,
-        network_like,
-        materialize_like,
+        may_send_network,
+        may_write_local_file,
     })
 }
 
@@ -931,7 +984,7 @@ fn approval_always_granted(session: &str, approval: &ExecApproval) -> Result<boo
     Ok(ApprovalQueue::open(session)?.always_granted(&approval.fingerprint()))
 }
 
-fn prepare_exec_capabilities(store: &RecoveryStore, opts: &ExecOpts) -> Result<(), String> {
+fn prepare_exec_secret_inputs(store: &RecoveryStore, opts: &ExecOpts) -> Result<(), String> {
     if let ExecMode::Shell(command) = &opts.mode {
         let command = resolve_command_text(store, command)?;
         register_local_file_inputs(store, &command)?;
@@ -1034,7 +1087,7 @@ fn network_destinations(command: &str) -> Vec<String> {
     out
 }
 
-fn command_looks_network_like(command: &str) -> bool {
+fn command_may_send_network(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     let mut cursor = 0usize;
     while let Some((word, _, next)) = next_shell_word(&lower, cursor) {
@@ -1062,7 +1115,7 @@ fn command_looks_network_like(command: &str) -> bool {
     lower.contains("://")
 }
 
-fn command_looks_local_materialize_like(command: &str) -> bool {
+fn command_may_write_local_file(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     let mut cursor = 0usize;
     while let Some((word, _, next)) = next_shell_word(&lower, cursor) {
@@ -1171,7 +1224,7 @@ fn run_resolved_command(
             let env = requested_env_bindings(store, &opts.mode)?;
             run_shell_script(&command, &env, &opts.session)
         }
-        ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
+        ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
     }
 }
 
@@ -1198,7 +1251,7 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
             apply_child_env_overlays(&mut shell, &env, &opts.session);
             run_live_command(shell, Some(&command), store.clone())
         }
-        ExecMode::Stdin => Err("internal error: exec stdin was not materialized".to_string()),
+        ExecMode::Stdin => Err("internal error: exec stdin was not prepared".to_string()),
     }
 }
 
@@ -1226,8 +1279,8 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
     let Some(path_text) = path.to_str() else {
         return Err("resolve requires a UTF-8 relative path".to_string());
     };
-    let path = checked_materialize_path(path_text)?;
-    ensure_materialize_path_within_cwd(&path)?;
+    let path = checked_local_write_path(path_text)?;
+    ensure_local_write_path_within_cwd(&path)?;
     let input = read_input(&path, InputFormat::Text)?;
     let resolved = resolve_command_text(store, &input)?;
     if resolved != input {
@@ -1767,12 +1820,12 @@ const EDIT_NEW_FIELDS: &[&str] = &["new_string", "newString", "new_text", "newTe
 enum InputFormat {
     Text,
     Pdf,
+    Image,
 }
 
 struct ReadOpts {
     input_format: InputFormat,
     kind: Option<Kind>,
-    disclose_length: bool,
     emit_meta: bool,
     path: PathBuf,
 }
@@ -1781,7 +1834,6 @@ impl ReadOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut input_format = InputFormat::Text;
         let mut kind = None;
-        let mut disclose_length = false;
         let mut emit_meta = false;
         let mut path = None;
         let mut i = 2;
@@ -1792,10 +1844,6 @@ impl ReadOpts {
                 }
                 "--kind" => {
                     kind = Some(parse_kind(&value(args, &mut i, "--kind")?)?);
-                }
-                "--length" => {
-                    disclose_length = true;
-                    i += 1;
                 }
                 "--meta" => {
                     emit_meta = true;
@@ -1814,7 +1862,6 @@ impl ReadOpts {
         Ok(Self {
             input_format,
             kind,
-            disclose_length,
             emit_meta,
             path: path.ok_or_else(|| "read requires PATH".to_string())?,
         })
@@ -2069,7 +2116,7 @@ impl ExecOpts {
     }
 }
 
-fn materialize_stdin_exec_opts(mut opts: ExecOpts) -> Result<ExecOpts, String> {
+fn prepare_stdin_exec_opts(mut opts: ExecOpts) -> Result<ExecOpts, String> {
     if matches!(opts.mode, ExecMode::Stdin) {
         opts.mode = ExecMode::Shell(read_stdin_text()?);
     }
@@ -2173,8 +2220,14 @@ fn handle_hook_with_launch_requirement(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
+            if let Some(reason) = image_tool_result_block_reason(session, tool_response)? {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             if let Some(reason) = unsupported_tool_result_reason(tool_response) {
                 return Ok(after_tool_block_output(provider, &reason));
+            }
+            if codex_exec_proxy_owns_shell_output(provider, tool_name) {
+                return Ok(json!({}));
             }
             let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
             let mut masker = OutputMasker::new_deferred(store)?;
@@ -2240,8 +2293,14 @@ fn handle_hook_lazy(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
+            if let Some(reason) = image_tool_result_block_reason(&session, tool_response)? {
+                return Ok(after_tool_block_output(provider, &reason));
+            }
             if let Some(reason) = unsupported_tool_result_reason(tool_response) {
                 return Ok(after_tool_block_output(provider, &reason));
+            }
+            if codex_exec_proxy_owns_shell_output(provider, tool_name) {
+                return Ok(json!({}));
             }
             let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
             let mut masker = OutputMasker::new_deferred(store)?;
@@ -2266,7 +2325,14 @@ fn before_tool_updated_input(
     tool_input: &Value,
 ) -> Result<(Value, bool), String> {
     if is_read_like_tool_name(tool_name) {
-        validate_read_before_tool(session, tool_name, tool_input)?;
+        if let Some(updated) = apply_masked_read_before_tool(session, tool_input)? {
+            return Ok((updated, true));
+        }
+    }
+    if is_edit_like_tool_name(tool_name) {
+        if let Some(updated) = apply_masked_old_edit_before_tool(session, tool_input)? {
+            return Ok((updated, true));
+        }
     }
     validate_masked_write_before_tool(session, tool_name, tool_input)?;
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
@@ -2298,10 +2364,17 @@ fn before_tool_updated_input_lazy(
 ) -> Result<(Value, bool), String> {
     if is_read_like_tool_name(tool_name) {
         let session = open_hook_session(cli, session_name)?;
-        validate_read_before_tool(&session, tool_name, tool_input)?;
+        if let Some(updated) = apply_masked_read_before_tool(&session, tool_input)? {
+            return Ok((updated, true));
+        }
     }
     if is_write_or_edit_like_tool_name(tool_name) {
         let session = open_hook_session(cli, session_name)?;
+        if is_edit_like_tool_name(tool_name) {
+            if let Some(updated) = apply_masked_old_edit_before_tool(&session, tool_input)? {
+                return Ok((updated, true));
+            }
+        }
         validate_masked_write_before_tool(&session, tool_name, tool_input)?;
     }
     if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
@@ -2329,7 +2402,31 @@ fn ensure_pentect_agent_launch(provider: HookProvider) -> Result<(), String> {
 }
 
 fn codex_exec_proxy_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(value) = CODEX_EXEC_PROXY_TEST_OVERRIDE.with(Cell::get) {
+        return value;
+    }
     std::env::var(PENTECT_CODEX_EXEC_PROXY_ENV).is_ok_and(|value| value == "1")
+}
+
+#[cfg(test)]
+fn set_codex_exec_proxy_test_override(value: Option<bool>) -> Option<bool> {
+    CODEX_EXEC_PROXY_TEST_OVERRIDE.with(|cell| {
+        let previous = cell.get();
+        cell.set(value);
+        previous
+    })
+}
+
+fn codex_exec_proxy_owns_shell_output(provider: HookProvider, tool_name: &str) -> bool {
+    provider == HookProvider::Codex && codex_exec_proxy_enabled() && is_shell_tool_name(tool_name)
+}
+
+fn is_shell_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "bash" | "shell" | "exec" | "run_command"
+    )
 }
 
 fn ensure_pentect_agent_launch_required(
@@ -2356,23 +2453,23 @@ fn agent_launch_proof_valid() -> bool {
         return false;
     };
     agent_launch_proof_matches(&proof, &token)
-        && memory_vault_env_addr_is_loopback()
-        && memory_vault_accepts_env_token()
+        && in_memory_manager_env_addr_is_loopback()
+        && in_memory_manager_accepts_env_token()
 }
 
 fn agent_launch_proof_matches(proof: &str, token: &str) -> bool {
     token.len() >= 32 && proof == token
 }
 
-fn memory_vault_env_addr_is_loopback() -> bool {
+fn in_memory_manager_env_addr_is_loopback() -> bool {
     std::env::var(ENV_ADDR)
         .ok()
         .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|addr| addr.ip().is_loopback())
 }
 
-fn memory_vault_accepts_env_token() -> bool {
-    MemoryVaultClient::from_env().is_some_and(|client| client.key().is_ok())
+fn in_memory_manager_accepts_env_token() -> bool {
+    InMemoryManagerClient::from_env().is_some_and(|client| client.key().is_ok())
 }
 
 fn canonical_hook_shell_command(command: &str) -> Result<String, String> {
@@ -2388,38 +2485,163 @@ fn canonical_hook_shell_command(command: &str) -> Result<String, String> {
     }
 }
 
-fn validate_read_before_tool(
+fn apply_masked_read_before_tool(
     session: &Session,
-    tool_name: &str,
     tool_input: &Value,
-) -> Result<(), String> {
-    if !is_read_like_tool_name(tool_name) {
-        return Ok(());
+) -> Result<Option<Value>, String> {
+    let mut replacements = BTreeMap::new();
+    for path in read_tool_paths(tool_input) {
+        if replacements.contains_key(path) {
+            continue;
+        }
+        let Some(masked_path) = masked_read_copy(session, path)? else {
+            continue;
+        };
+        replacements.insert(path.to_string(), masked_path.to_string_lossy().into_owned());
     }
-    if read_tool_has_detected_secret(session, tool_input)? {
-        return Err(read_tool_block_reason(tool_name));
+    if replacements.is_empty() {
+        return Ok(None);
     }
-    Ok(())
+    let mut updated = tool_input.clone();
+    if rewrite_read_paths(&mut updated, &replacements) {
+        Ok(Some(updated))
+    } else {
+        Err("Read input was not recognized.".to_string())
+    }
 }
 
-fn read_tool_has_detected_secret(session: &Session, tool_input: &Value) -> Result<bool, String> {
-    for path in read_tool_paths(tool_input) {
-        let path = Path::new(path);
-        let data = read_input(path, InputFormat::Text).map_err(|_| {
-            "read target could not be scanned; use `pentect read PATH`.".to_string()
-        })?;
-        let result = Engine::with_profile(Profile::Strict).mask(
-            Input {
-                kind: infer_kind(path),
-                data,
-            },
-            &Config::new(session.key),
+fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf>, String> {
+    let path = Path::new(path_text);
+    let data = read_input(path, InputFormat::Text)
+        .map_err(|_| "read target could not be scanned.".to_string())?;
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: infer_kind(path),
+            data,
+        },
+        &Config::new(session.key),
+    );
+    if result.summary.masked_count == 0 {
+        return Ok(None);
+    }
+    let mut recovery = result.recovery.clone();
+    recovery.extend_same_key(env_alias_recovery(&result.masked, &session.key));
+    RecoveryStore::load(session)
+        .map_err(|e| e.to_string())?
+        .add_recovery(recovery)
+        .map_err(|e| e.to_string())?;
+
+    let masked_path = masked_read_copy_path(path);
+    if let Some(parent) = masked_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
+    }
+    std::fs::write(&masked_path, result.masked)
+        .map_err(|e| format!("could not write '{}': {e}", masked_path.display()))?;
+    Ok(Some(masked_path))
+}
+
+fn masked_read_copy_path(original: &Path) -> PathBuf {
+    let display_path = masked_read_display_path(original);
+    PathBuf::from(".pentect").join("read").join(display_path)
+}
+
+fn masked_read_display_path(original: &Path) -> PathBuf {
+    if original.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(relative) = original.strip_prefix(cwd) {
+                return safe_masked_read_path(relative);
+            }
+        }
+        return PathBuf::from("_external").join(
+            original
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(safe_masked_read_component)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "file.txt".to_string()),
         );
-        if result.summary.masked_count > 0 {
-            return Ok(true);
+    }
+    safe_masked_read_path(original)
+}
+
+fn safe_masked_read_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    let mut has_component = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                let value = safe_masked_read_component(&value.to_string_lossy());
+                if !value.is_empty() {
+                    out.push(value);
+                    has_component = true;
+                }
+            }
+            std::path::Component::ParentDir => {
+                out.push("_up");
+                has_component = true;
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                out.push("_external");
+                has_component = true;
+            }
+            std::path::Component::CurDir => {}
         }
     }
-    Ok(false)
+    if has_component {
+        return out;
+    }
+    PathBuf::from("file.txt")
+}
+
+fn safe_masked_read_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(80) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+fn rewrite_read_paths(value: &mut Value, replacements: &BTreeMap<String, String>) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for field in WRITE_PATH_FIELDS {
+        if let Some(path) = object
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            if let Some(replacement) = replacements.get(&path) {
+                object.insert((*field).to_string(), Value::String(replacement.clone()));
+                changed = true;
+            }
+        }
+    }
+    for field in READ_PATH_LIST_FIELDS {
+        if let Some(paths) = object.get_mut(*field).and_then(Value::as_array_mut) {
+            for path in paths {
+                let Some(path_text) = path.as_str().map(str::to_string) else {
+                    continue;
+                };
+                if let Some(replacement) = replacements.get(&path_text) {
+                    *path = Value::String(replacement.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
+    for field in WRITE_INPUT_FIELDS {
+        if let Some(child) = object.get_mut(*field) {
+            changed |= rewrite_read_paths(child, replacements);
+        }
+    }
+    changed
 }
 
 fn validate_masked_write_before_tool(
@@ -2435,7 +2657,7 @@ fn validate_masked_write_before_tool(
             return Ok(());
         }
         let (path, _) = resolved_write_parts(session, path, content)?;
-        ensure_materialize_path_within_cwd(&path)?;
+        ensure_local_write_path_within_cwd(&path)?;
         return Ok(());
     }
     if is_edit_like_tool_name(tool_name) {
@@ -2457,7 +2679,7 @@ fn repair_masked_write_after_tool(
             return Ok(false);
         }
         let (path, resolved) = resolved_write_parts(session, path, content)?;
-        ensure_materialize_path_within_cwd(&path)?;
+        ensure_local_write_path_within_cwd(&path)?;
         if !path.is_file() {
             return Ok(false);
         }
@@ -2478,7 +2700,7 @@ fn resolved_write_parts(
 ) -> Result<(PathBuf, String), String> {
     let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     let resolved = resolve_masked_text(&store, content)?;
-    let path = checked_materialize_path(path)?;
+    let path = checked_local_write_path(path)?;
     Ok((path, resolved))
 }
 
@@ -2492,15 +2714,8 @@ fn validate_masked_edit_before_tool(session: &Session, tool_input: &Value) -> Re
     {
         return Ok(());
     }
-    let path = checked_materialize_path(path)?;
-    ensure_materialize_path_within_cwd(&path)?;
-    if edits.iter().any(|(kind, text)| {
-        matches!(kind, EditTextKind::Old) && contains_pentect_masked_handle(text)
-    }) {
-        return Err(
-            "resolve needed: Edit old text contains a masked handle; use Write.".to_string(),
-        );
-    }
+    let path = checked_local_write_path(path)?;
+    ensure_local_write_path_within_cwd(&path)?;
     let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     for (kind, text) in edits {
         if matches!(kind, EditTextKind::New) && contains_pentect_masked_handle(text) {
@@ -2508,6 +2723,43 @@ fn validate_masked_edit_before_tool(session: &Session, tool_input: &Value) -> Re
         }
     }
     Ok(())
+}
+
+fn apply_masked_old_edit_before_tool(
+    session: &Session,
+    tool_input: &Value,
+) -> Result<Option<Value>, String> {
+    let Some((path_text, edits)) = edit_path_and_replacements(tool_input) else {
+        return Ok(None);
+    };
+    if !edits
+        .iter()
+        .any(|edit| contains_pentect_masked_handle(edit.old))
+    {
+        return Ok(None);
+    }
+    let path = checked_local_write_path(path_text)?;
+    ensure_local_write_path_within_cwd(&path)?;
+    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let mut content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    for edit in edits {
+        let old = resolve_masked_text_if_needed(&store, edit.old)?;
+        let new = resolve_masked_text_if_needed(&store, edit.new)?;
+        if old.is_empty() {
+            return Err("masked edit needs non-empty old text.".to_string());
+        }
+        if !content.contains(&old) {
+            return Err("masked edit target was not found; re-read the file.".to_string());
+        }
+        content = content.replacen(&old, &new, 1);
+    }
+    let anchor = safe_noop_edit_anchor(&content, &session.key)
+        .ok_or_else(|| "masked edit has no safe no-op anchor; use Write.".to_string())?;
+    let updated = noop_edit_input(tool_input, &anchor)?;
+    std::fs::write(&path, content)
+        .map_err(|e| format!("could not edit '{}': {e}", path.display()))?;
+    Ok(Some(updated))
 }
 
 fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Result<bool, String> {
@@ -2519,8 +2771,8 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
     }) {
         return Ok(false);
     }
-    let path = checked_materialize_path(path)?;
-    ensure_materialize_path_within_cwd(&path)?;
+    let path = checked_local_write_path(path)?;
+    ensure_local_write_path_within_cwd(&path)?;
     if !path.is_file() {
         return Ok(false);
     }
@@ -2538,16 +2790,24 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
     Ok(true)
 }
 
+fn resolve_masked_text_if_needed(store: &RecoveryStore, content: &str) -> Result<String, String> {
+    if contains_pentect_masked_handle(content) {
+        resolve_masked_text(store, content)
+    } else {
+        Ok(content.to_string())
+    }
+}
+
 fn resolve_masked_text(store: &RecoveryStore, content: &str) -> Result<String, String> {
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if contains_pentect_masked_handle(&resolved) {
         return Err(
-            "resolve needed: re-read the source in this Pentect session, then retry Write."
+            "masked handle is unavailable in this running Pentect session; re-read the source and retry."
                 .to_string(),
         );
     }
     if resolved == content {
-        return Err("resolve needed: no matching handle in this Pentect session.".to_string());
+        return Err("masked handle is unavailable in this running Pentect session.".to_string());
     }
     Ok(resolved)
 }
@@ -2635,6 +2895,11 @@ enum EditTextKind {
     New,
 }
 
+struct EditReplacement<'a> {
+    old: &'a str,
+    new: &'a str,
+}
+
 fn edit_path_and_texts(value: &Value) -> Option<(&str, Vec<(EditTextKind, &str)>)> {
     for candidate in write_input_candidates(value) {
         let Some(path) = string_field(candidate, WRITE_PATH_FIELDS) else {
@@ -2644,6 +2909,20 @@ fn edit_path_and_texts(value: &Value) -> Option<(&str, Vec<(EditTextKind, &str)>
         push_edit_texts(candidate, &mut texts);
         if !texts.is_empty() {
             return Some((path, texts));
+        }
+    }
+    None
+}
+
+fn edit_path_and_replacements(value: &Value) -> Option<(&str, Vec<EditReplacement<'_>>)> {
+    for candidate in write_input_candidates(value) {
+        let Some(path) = string_field(candidate, WRITE_PATH_FIELDS) else {
+            continue;
+        };
+        let mut edits = Vec::new();
+        push_edit_replacements(candidate, &mut edits);
+        if !edits.is_empty() {
+            return Some((path, edits));
         }
     }
     None
@@ -2667,11 +2946,91 @@ fn push_edit_texts<'a>(value: &'a Value, out: &mut Vec<(EditTextKind, &'a str)>)
     }
 }
 
+fn push_edit_replacements<'a>(value: &'a Value, out: &mut Vec<EditReplacement<'a>>) {
+    if let (Some(old), Some(new)) = (
+        string_field(value, EDIT_OLD_FIELDS),
+        string_field(value, EDIT_NEW_FIELDS),
+    ) {
+        out.push(EditReplacement { old, new });
+    }
+    if let Some(edits) = value.get("edits").and_then(Value::as_array) {
+        for edit in edits {
+            push_edit_replacements(edit, out);
+        }
+    }
+}
+
+fn noop_edit_input(value: &Value, anchor: &str) -> Result<Value, String> {
+    let mut updated = value.clone();
+    let Some(candidate) = edit_candidate_object_mut(&mut updated) else {
+        return Err("masked edit input was not recognized.".to_string());
+    };
+    if candidate.get("edits").is_some() {
+        candidate.insert(
+            "edits".to_string(),
+            json!([{ "old_string": anchor, "new_string": anchor }]),
+        );
+        return Ok(updated);
+    }
+    let old_field = existing_field_name(candidate, EDIT_OLD_FIELDS).unwrap_or("old_string");
+    let new_field = existing_field_name(candidate, EDIT_NEW_FIELDS).unwrap_or("new_string");
+    candidate.insert(old_field.to_string(), Value::String(anchor.to_string()));
+    candidate.insert(new_field.to_string(), Value::String(anchor.to_string()));
+    Ok(updated)
+}
+
+fn edit_candidate_object_mut(value: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    if direct_edit_candidate(value) {
+        return value.as_object_mut();
+    }
+    let field = WRITE_INPUT_FIELDS
+        .iter()
+        .copied()
+        .find(|field| value.get(*field).is_some_and(direct_edit_candidate))?;
+    value.get_mut(field)?.as_object_mut()
+}
+
+fn direct_edit_candidate(value: &Value) -> bool {
+    string_field(value, WRITE_PATH_FIELDS).is_some() && edit_path_and_replacements(value).is_some()
+}
+
+fn existing_field_name<'a>(
+    object: &serde_json::Map<String, Value>,
+    names: &'a [&'a str],
+) -> Option<&'a str> {
+    names
+        .iter()
+        .copied()
+        .find(|name| object.contains_key(*name))
+}
+
+fn safe_noop_edit_anchor(content: &str, key: &[u8; 32]) -> Option<String> {
+    content
+        .split_inclusive('\n')
+        .find(|candidate| safe_noop_edit_anchor_candidate(candidate, key))
+        .map(str::to_string)
+}
+
+fn safe_noop_edit_anchor_candidate(candidate: &str, key: &[u8; 32]) -> bool {
+    let text = candidate.trim();
+    if text.is_empty() || candidate.len() > 512 || contains_pentect_masked_handle(candidate) {
+        return false;
+    }
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Text,
+            data: candidate.to_string(),
+        },
+        &Config::new(*key),
+    );
+    result.summary.masked_count == 0
+}
+
 fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| value.get(*name)?.as_str())
 }
 
-fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
+fn checked_local_write_path(path: &str) -> Result<PathBuf, String> {
     let path = Path::new(path);
     let mut has_normal_component = false;
     for component in path.components() {
@@ -2680,7 +3039,7 @@ fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
             std::path::Component::Normal(_) => has_normal_component = true,
             std::path::Component::ParentDir => {
                 return Err(
-                    "Pentect refused to materialize masked content outside the current directory"
+                    "Pentect refused to write masked content outside the current directory"
                         .to_string(),
                 );
             }
@@ -2688,19 +3047,19 @@ fn checked_materialize_path(path: &str) -> Result<PathBuf, String> {
             std::path::Component::Prefix(_) if path.is_absolute() => {}
             std::path::Component::Prefix(_) => {
                 return Err(
-                    "Pentect refused to materialize masked content outside the current directory"
+                    "Pentect refused to write masked content outside the current directory"
                         .to_string(),
                 );
             }
         }
     }
     if !has_normal_component {
-        return Err("Pentect refused to materialize masked content to an empty path".to_string());
+        return Err("Pentect refused to write masked content to an empty path".to_string());
     }
     Ok(path.to_path_buf())
 }
 
-fn ensure_materialize_path_within_cwd(path: &Path) -> Result<(), String> {
+fn ensure_local_write_path_within_cwd(path: &Path) -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("could not read current directory: {e}"))?
         .canonicalize()
@@ -2726,12 +3085,11 @@ fn ensure_materialize_path_within_cwd(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("could not canonicalize '{}': {e}", parent.display()))?;
     if !parent.starts_with(&cwd) {
         return Err(
-            "Pentect refused to materialize masked content outside the current directory"
-                .to_string(),
+            "Pentect refused to write masked content outside the current directory".to_string(),
         );
     }
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err("Pentect refused to materialize masked content through a symlink".to_string());
+        return Err("Pentect refused to write masked content through a symlink".to_string());
     }
     Ok(())
 }
@@ -2790,10 +3148,6 @@ fn pentect_human_only_command_reason(command: &str) -> Option<String> {
     match invocation.subcommand {
         PentectSubcommand::Exec | PentectSubcommand::Read | PentectSubcommand::Resolve => None,
     }
-}
-
-fn read_tool_block_reason(tool_name: &str) -> String {
-    format!("{tool_name} found masked content; use `pentect read PATH`.")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2991,16 +3345,46 @@ fn after_tool_block_output(_provider: HookProvider, reason: &str) -> Value {
     })
 }
 
+fn image_tool_result_block_reason(
+    session: &Session,
+    value: &Value,
+) -> Result<Option<String>, String> {
+    if !image_ocr::contains_image_result(value) {
+        return Ok(None);
+    }
+    let cfg = config::image_ocr_config()?;
+    if matches!(cfg.mode, config::ImageOcrMode::Off) {
+        return Ok(
+            matches!(cfg.unreadable_images, config::UnreadableImagePolicy::Block)
+                .then_some("image blocked: OCR is off.".to_string()),
+        );
+    }
+    let inspection = image_ocr::inspect_tool_images_for_secrets(value, &session.key)?;
+    if inspection.secret_images > 0 {
+        return Ok(Some("image blocked: secret text detected.".to_string()));
+    }
+    if matches!(cfg.unreadable_images, config::UnreadableImagePolicy::Allow) {
+        return Ok(None);
+    }
+    if inspection.unreadable_images > 0 {
+        return Ok(Some(
+            "image blocked: OCR needs inline image bytes.".to_string(),
+        ));
+    }
+    if inspection.ocr_failures > 0 {
+        return Ok(Some("image blocked: OCR failed.".to_string()));
+    }
+    Ok(None)
+}
+
 fn unsupported_tool_result_reason(value: &Value) -> Option<String> {
-    // TODO(media-adapters): replace these fail-closed blocks with OCR/QR/media
-    // extraction once adapters can prove the returned content was inspected.
     if contains_unsupported_media_result(value) {
         return Some(
-            "Pentect blocked non-text media output because OCR/media masking is not active yet."
+            "Pentect blocked non-text media output because media masking is not active yet."
                 .to_string(),
         );
     }
-    // TODO(side-effect-audit): replace this with explicit capability tracking
+    // TODO(side-effect-audit): replace this with explicit secret side-effect tracking
     // for clipboard/download/GUI-save destinations when those surfaces exist.
     if contains_unobserved_side_effect_result(value) {
         return Some(
@@ -3046,21 +3430,7 @@ fn normalized_json_key(key: &str) -> String {
 }
 
 fn key_marks_media_value(key: &str, value: &Value) -> bool {
-    matches!(
-        key,
-        "image"
-            | "images"
-            | "imageurl"
-            | "screenshot"
-            | "screenshots"
-            | "thumbnail"
-            | "qrcode"
-            | "audio"
-            | "video"
-            | "media"
-            | "binary"
-            | "blob"
-    ) && !empty_json_value(value)
+    matches!(key, "audio" | "video" | "media" | "binary" | "blob") && !empty_json_value(value)
 }
 
 fn string_media_field(key: &str, value: &Value) -> bool {
@@ -3068,10 +3438,7 @@ fn string_media_field(key: &str, value: &Value) -> bool {
         return false;
     };
     match key {
-        "type" | "kind" => matches!(
-            normalized_json_key(text).as_str(),
-            "image" | "imageurl" | "screenshot" | "qrcode" | "audio" | "video"
-        ),
+        "type" | "kind" => matches!(normalized_json_key(text).as_str(), "audio" | "video"),
         "mimetype" | "mediatype" | "contenttype" => is_unsupported_media_mime(text),
         "url" | "uri" | "src" | "href" | "dataurl" => looks_like_media_reference(text),
         _ => false,
@@ -3080,18 +3447,14 @@ fn string_media_field(key: &str, value: &Value) -> bool {
 
 fn looks_like_media_reference(text: &str) -> bool {
     let value = text.trim().to_ascii_lowercase();
-    value.starts_with("data:image/")
-        || value.starts_with("data:audio/")
+    value.starts_with("data:audio/")
         || value.starts_with("data:video/")
         || value.starts_with("data:application/pdf")
 }
 
 fn is_unsupported_media_mime(text: &str) -> bool {
     let value = text.trim().to_ascii_lowercase();
-    value.starts_with("image/")
-        || value.starts_with("audio/")
-        || value.starts_with("video/")
-        || value == "application/pdf"
+    value.starts_with("audio/") || value.starts_with("video/") || value == "application/pdf"
 }
 
 fn key_marks_unobserved_side_effect(key: &str, value: &Value) -> bool {
@@ -3151,13 +3514,17 @@ fn collect_tool_json_scalars(
     out: &mut Vec<ToolScalarInput>,
 ) {
     match value {
-        Value::String(text) => out.push(ToolScalarInput {
-            text: text.clone(),
-            region_kind: RegionKind::JsonValue,
-            key: key.map(str::to_string),
-            path: path.map(str::to_string),
-            hints: hints.to_vec(),
-        }),
+        Value::String(text) => {
+            if !image_ocr::skip_text_masking_for_image_payload(text) {
+                out.push(ToolScalarInput {
+                    text: text.clone(),
+                    region_kind: RegionKind::JsonValue,
+                    key: key.map(str::to_string),
+                    path: path.map(str::to_string),
+                    hints: hints.to_vec(),
+                });
+            }
+        }
         Value::Number(_) | Value::Bool(_) => {
             out.push(ToolScalarInput {
                 text: value.to_string(),
@@ -3175,6 +3542,7 @@ fn collect_tool_json_scalars(
             }
         }
         Value::Object(map) => {
+            let image_object = image_ocr::is_image_object(value);
             for (object_key, item) in map {
                 let child_path = path_with_segment(path, object_key);
                 out.push(ToolScalarInput {
@@ -3185,13 +3553,18 @@ fn collect_tool_json_scalars(
                     hints: Vec::new(),
                 });
                 let child_hints = sibling_context_hints(map, object_key);
-                collect_tool_json_scalars(
-                    item,
-                    Some(object_key),
-                    Some(&child_path),
-                    &child_hints,
-                    out,
-                );
+                if !(image_object
+                    && item.is_string()
+                    && image_ocr::image_payload_field_key(object_key))
+                {
+                    collect_tool_json_scalars(
+                        item,
+                        Some(object_key),
+                        Some(&child_path),
+                        &child_hints,
+                        out,
+                    );
+                }
             }
         }
     }
@@ -3203,6 +3576,9 @@ fn rebuild_masked_tool_json(
     cursor: &mut usize,
 ) -> Result<Value, String> {
     match value {
+        Value::String(text) if image_ocr::skip_text_masking_for_image_payload(text) => {
+            Ok(value.clone())
+        }
         Value::String(_) => {
             let out = take_masked(masked, cursor)?;
             Ok(Value::String(out))
@@ -3225,10 +3601,18 @@ fn rebuild_masked_tool_json(
             Ok(Value::Array(out))
         }
         Value::Object(map) => {
+            let image_object = image_ocr::is_image_object(value);
             let mut out = serde_json::Map::with_capacity(map.len());
-            for (_, item) in map {
+            for (key, item) in map {
                 let masked_key = take_masked(masked, cursor)?;
-                let item = rebuild_masked_tool_json(item, masked, cursor)?;
+                let item = if image_object
+                    && item.is_string()
+                    && image_ocr::image_payload_field_key(key)
+                {
+                    item.clone()
+                } else {
+                    rebuild_masked_tool_json(item, masked, cursor)?
+                };
                 out.insert(masked_key, item);
             }
             Ok(Value::Object(out))
@@ -3285,6 +3669,7 @@ fn read_input(path: &Path, format: InputFormat) -> Result<String, String> {
         InputFormat::Text => String::from_utf8(bytes)
             .map_err(|_| format!("input '{}' is not UTF-8 text", path.display())),
         InputFormat::Pdf => pdf_text(&bytes),
+        InputFormat::Image => image_ocr::ocr_image_bytes(&bytes),
     }
 }
 
@@ -3412,6 +3797,7 @@ fn parse_input_format(value: &str) -> Result<InputFormat, String> {
     match value {
         "text" => Ok(InputFormat::Text),
         "pdf" => Ok(InputFormat::Pdf),
+        "image" | "ocr" => Ok(InputFormat::Image),
         other => Err(format!("unknown input format: {other}")),
     }
 }

@@ -21,6 +21,33 @@ pub(crate) struct ApprovalConfigScope {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageOcrMode {
+    Off,
+    Auto,
+    On,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnreadableImagePolicy {
+    Allow,
+    Block,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageOcrConfig {
+    pub(crate) mode: ImageOcrMode,
+    pub(crate) max_pixels: u64,
+    pub(crate) unreadable_images: UnreadableImagePolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ImageOcrConfigPartial {
+    mode: Option<ImageOcrMode>,
+    max_pixels: Option<u64>,
+    unreadable_images: Option<UnreadableImagePolicy>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApprovalConfigSource {
     Project,
     Global,
@@ -67,6 +94,22 @@ pub(crate) fn require_pentect_agent_by_config() -> Result<bool, String> {
     let project = read_agent_require_pentect(project_config_path())?;
     let global = read_agent_require_pentect(global_config_path()?)?;
     Ok(require_pentect_agent_effective(project, global))
+}
+
+pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
+    let project = read_image_ocr_config(project_config_path())?;
+    let global = read_image_ocr_config(global_config_path()?)?;
+    Ok(ImageOcrConfig {
+        mode: project.mode.or(global.mode).unwrap_or(ImageOcrMode::Auto),
+        max_pixels: project
+            .max_pixels
+            .or(global.max_pixels)
+            .unwrap_or(4_000_000),
+        unreadable_images: project
+            .unreadable_images
+            .or(global.unreadable_images)
+            .unwrap_or(UnreadableImagePolicy::Allow),
+    })
 }
 
 fn require_pentect_agent_effective(project: Option<bool>, global: Option<bool>) -> bool {
@@ -228,6 +271,44 @@ fn agent_require_pentect_value(value: &toml::Value) -> Result<Option<bool>, Stri
     Ok(None)
 }
 
+fn read_image_ocr_config(path: PathBuf) -> Result<ImageOcrConfigPartial, String> {
+    if !path.exists() {
+        return Ok(ImageOcrConfigPartial::default());
+    }
+    let src = fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(ImageOcrConfigPartial::default());
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    image_ocr_config_value(&value)
+}
+
+fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, String> {
+    let mut out = ImageOcrConfigPartial::default();
+    if let Some(raw) = value.get("image_ocr") {
+        out.mode = Some(image_ocr_mode(raw, "image_ocr")?);
+    }
+    let Some(raw) = value.get("image") else {
+        return Ok(out);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("image config must be a table".to_string());
+    };
+    if let Some(raw) = table.get("ocr") {
+        out.mode = Some(image_ocr_mode(raw, "image.ocr")?);
+    }
+    if let Some(raw) = table.get("max_pixels") {
+        out.max_pixels = Some(config_u64(raw, "image.max_pixels")?);
+    }
+    if let Some(raw) = table.get("unreadable_images") {
+        out.unreadable_images = Some(unreadable_image_policy(raw, "image.unreadable_images")?);
+    }
+    Ok(out)
+}
+
 fn config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
     if let Some(value) = value.as_bool() {
         return Ok(value);
@@ -240,6 +321,46 @@ fn config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
         };
     }
     Err(format!("approval config {field} must be a boolean"))
+}
+
+fn image_ocr_mode(value: &toml::Value, field: &str) -> Result<ImageOcrMode, String> {
+    if let Some(value) = value.as_bool() {
+        return Ok(if value {
+            ImageOcrMode::On
+        } else {
+            ImageOcrMode::Off
+        });
+    }
+    let Some(value) = value.as_str() else {
+        return Err(format!("{field} must be off, auto, or on"));
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "off" => Ok(ImageOcrMode::Off),
+        "auto" => Ok(ImageOcrMode::Auto),
+        "1" | "true" | "yes" | "on" => Ok(ImageOcrMode::On),
+        _ => Err(format!("{field} must be off, auto, or on")),
+    }
+}
+
+fn unreadable_image_policy(
+    value: &toml::Value,
+    field: &str,
+) -> Result<UnreadableImagePolicy, String> {
+    let Some(value) = value.as_str() else {
+        return Err(format!("{field} must be allow or block"));
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "allow" => Ok(UnreadableImagePolicy::Allow),
+        "block" => Ok(UnreadableImagePolicy::Block),
+        _ => Err(format!("{field} must be allow or block")),
+    }
+}
+
+fn config_u64(value: &toml::Value, field: &str) -> Result<u64, String> {
+    let Some(value) = value.as_integer() else {
+        return Err(format!("{field} must be an integer"));
+    };
+    u64::try_from(value).map_err(|_| format!("{field} must be positive"))
 }
 
 fn agent_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
@@ -383,5 +504,20 @@ mod tests {
         assert!(!require_pentect_agent_effective(Some(false), None));
         assert!(!require_pentect_agent_effective(None, Some(false)));
         assert!(!require_pentect_agent_effective(None, None));
+    }
+
+    #[test]
+    fn image_ocr_config_accepts_mode_and_limit() {
+        let value = "[image]\nocr = \"on\"\nmax_pixels = 1234\nunreadable_images = \"block\""
+            .parse::<toml::Value>()
+            .unwrap();
+        let cfg = image_ocr_config_value(&value).unwrap();
+        assert_eq!(cfg.mode, Some(ImageOcrMode::On));
+        assert_eq!(cfg.max_pixels, Some(1234));
+        assert_eq!(cfg.unreadable_images, Some(UnreadableImagePolicy::Block));
+
+        let value = "image_ocr = false".parse::<toml::Value>().unwrap();
+        let cfg = image_ocr_config_value(&value).unwrap();
+        assert_eq!(cfg.mode, Some(ImageOcrMode::Off));
     }
 }
