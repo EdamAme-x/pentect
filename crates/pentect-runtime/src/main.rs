@@ -11,6 +11,7 @@ mod approval;
 mod approve_ui;
 mod config;
 mod extension_adapter;
+mod file_pointer_manager;
 mod image_ocr;
 mod in_memory_manager;
 mod masking;
@@ -367,9 +368,11 @@ fn cmd_read(args: &[String]) -> i32 {
         Err(e) => return die(&e),
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
+    let source = data.clone();
     let input = Input { kind, data };
     match mask_input_into_active_in_memory_manager(input.clone(), Profile::Strict, Vec::new()) {
         Ok(Some(result)) => {
+            register_read_file_pointers(&opts.path, &input.data, &result, opts.input_format);
             print_read_result(result, opts.emit_meta);
             return 0;
         }
@@ -379,8 +382,22 @@ fn cmd_read(args: &[String]) -> i32 {
     let engine = Engine::with_profile(Profile::Strict);
     let cfg = Config::generate();
     let result = engine.mask(input, &cfg);
+    register_read_file_pointers(&opts.path, &source, &result, opts.input_format);
     print_read_result(result, opts.emit_meta);
     0
+}
+
+fn register_read_file_pointers(
+    path: &Path,
+    source: &str,
+    result: &MaskResult,
+    input_format: InputFormat,
+) -> bool {
+    if input_format != InputFormat::Text {
+        return false;
+    }
+    file_pointer_manager::register_file_pointers(path, source, result);
+    true
 }
 
 fn print_read_result(result: MaskResult, emit_meta: bool) {
@@ -419,10 +436,11 @@ fn cmd_view(args: &[String]) -> i32 {
 
 pub fn active_handle_length(handle: &str) -> Result<Option<usize>, String> {
     let Some(client) = InMemoryManagerClient::from_env() else {
-        return Ok(None);
+        return Ok(file_pointer_manager::handle_length(handle));
     };
     let snapshot = client.snapshot().map_err(|e| e.to_string())?;
-    Ok(handle_length_from_recovery(&snapshot.recovery, handle))
+    Ok(handle_length_from_recovery(&snapshot.recovery, handle)
+        .or_else(|| file_pointer_manager::handle_length(handle)))
 }
 
 fn handle_length_from_recovery(recovery: &pentect_core::Recovery, handle: &str) -> Option<usize> {
@@ -2517,7 +2535,7 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
     let result = Engine::with_profile(Profile::Strict).mask(
         Input {
             kind: infer_kind(path),
-            data,
+            data: data.clone(),
         },
         &Config::new(session.key),
     );
@@ -2530,6 +2548,7 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
         .map_err(|e| e.to_string())?
         .add_recovery(recovery)
         .map_err(|e| e.to_string())?;
+    file_pointer_manager::register_file_pointers(path, &data, &result);
 
     let masked_path = masked_read_copy_path(path);
     if let Some(parent) = masked_path.parent() {

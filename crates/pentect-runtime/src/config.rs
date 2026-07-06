@@ -112,6 +112,12 @@ pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
     })
 }
 
+pub(crate) fn file_pointer_manager_save_enabled() -> Result<bool, String> {
+    let project = read_file_pointer_manager_save(project_config_path())?;
+    let global = read_file_pointer_manager_save(global_config_path()?)?;
+    Ok(project.or(global).unwrap_or(true))
+}
+
 fn require_pentect_agent_effective(project: Option<bool>, global: Option<bool>) -> bool {
     project.unwrap_or(false) || global.unwrap_or(false)
 }
@@ -307,6 +313,37 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
         out.unreadable_images = Some(unreadable_image_policy(raw, "image.unreadable_images")?);
     }
     Ok(out)
+}
+
+fn read_file_pointer_manager_save(path: PathBuf) -> Result<Option<bool>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let src = fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(None);
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    file_pointer_manager_save_value(&value)
+}
+
+fn file_pointer_manager_save_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    let Some(raw) = value.get("file_pointer_manager") else {
+        return Ok(None);
+    };
+    if raw.is_bool() || raw.is_str() {
+        return config_bool(raw, "file_pointer_manager").map(Some);
+    }
+    let Some(table) = raw.as_table() else {
+        return Err("file_pointer_manager config must be a boolean or table".to_string());
+    };
+    let Some(raw) = table.get("save") else {
+        return Ok(None);
+    };
+    config_bool(raw, "file_pointer_manager.save").map(Some)
 }
 
 fn config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
@@ -519,5 +556,21 @@ mod tests {
         let value = "image_ocr = false".parse::<toml::Value>().unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::Off));
+    }
+
+    #[test]
+    fn file_pointer_manager_save_config_accepts_table_and_bool() {
+        let value = "[file_pointer_manager]\nsave = false"
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(
+            file_pointer_manager_save_value(&value).unwrap(),
+            Some(false)
+        );
+
+        let value = "file_pointer_manager = \"on\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(file_pointer_manager_save_value(&value).unwrap(), Some(true));
     }
 }

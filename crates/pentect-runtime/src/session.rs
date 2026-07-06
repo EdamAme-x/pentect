@@ -156,6 +156,11 @@ impl RecoveryStore {
         for rec in recoveries.iter() {
             out = rec.resolve(&out);
         }
+        drop(recoveries);
+        if let Some(recovery) = crate::file_pointer_manager::recover_text(&out, &self.session.key) {
+            self.add_recovery(recovery.clone())?;
+            out = recovery.resolve(&out);
+        }
         Ok(out)
     }
 

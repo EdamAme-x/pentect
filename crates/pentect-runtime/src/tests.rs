@@ -2561,6 +2561,157 @@ fn masked_read_copy_path_mirrors_relative_paths() {
 }
 
 #[test]
+fn file_pointer_manager_recovers_read_handle_after_restart() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-pointer-recover");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[file_pointer_manager]\nsave = true\n");
+    let project = PathBuf::from("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let env = project.join(".env");
+    std::fs::write(&env, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let session = Session::open_at(&root, "t").unwrap();
+    let masked_path = masked_read_copy(&session, env.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let masked = std::fs::read_to_string(masked_path).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+
+    let restarted = Session::open_at(&root.join("restart"), "t").unwrap();
+    let store = RecoveryStore::load(&restarted).unwrap();
+    assert_eq!(
+        store.resolve_all(&handle).unwrap(),
+        "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+    );
+
+    let index = std::fs::read(
+        Path::new(".pentect")
+            .join("file-pointer-manager")
+            .join("index.bin"),
+    )
+    .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&index).contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        "{}",
+        String::from_utf8_lossy(&index)
+    );
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn file_pointer_manager_refuses_changed_source_file() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-pointer-changed");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[file_pointer_manager]\nsave = true\n");
+    let project = PathBuf::from("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let env = project.join(".env");
+    std::fs::write(&env, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let session = Session::open_at(&root, "t").unwrap();
+    let masked_path = masked_read_copy(&session, env.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let masked = std::fs::read_to_string(masked_path).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+
+    std::fs::write(&env, "OPENAI_API_KEY=sk-CHANGEDABCDEFGHIJKLMNOP\n").unwrap();
+    let restarted = Session::open_at(&root.join("restart"), "t").unwrap();
+    let store = RecoveryStore::load(&restarted).unwrap();
+    assert_eq!(store.resolve_all(&handle).unwrap(), handle);
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn file_pointer_manager_refuses_grown_source_before_reading_value() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-pointer-grown");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[file_pointer_manager]\nsave = true\n");
+    let env = PathBuf::from(".env");
+    std::fs::write(&env, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let session = Session::open_at(&root, "t").unwrap();
+    let masked_path = masked_read_copy(&session, env.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let masked = std::fs::read_to_string(masked_path).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+
+    std::fs::write(&env, format!("{}\n{}", "x".repeat(128 * 1024), handle)).unwrap();
+    let restarted = Session::open_at(&root.join("restart"), "t").unwrap();
+    let store = RecoveryStore::load(&restarted).unwrap();
+    assert_eq!(store.resolve_all(&handle).unwrap(), handle);
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn file_pointer_manager_save_can_be_disabled() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-pointer-disabled");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[file_pointer_manager]\nsave = false\n");
+    let env = PathBuf::from(".env");
+    std::fs::write(&env, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let session = Session::open_at(&root, "t").unwrap();
+    let masked_path = masked_read_copy(&session, env.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let masked = std::fs::read_to_string(masked_path).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+
+    let restarted = Session::open_at(&root.join("restart"), "t").unwrap();
+    let store = RecoveryStore::load(&restarted).unwrap();
+    assert_eq!(store.resolve_all(&handle).unwrap(), handle);
+    assert!(!Path::new(".pentect")
+        .join("file-pointer-manager")
+        .join("index.bin")
+        .exists());
+    assert!(!Path::new(".pentect")
+        .join("file-pointer-manager")
+        .join("key.bin")
+        .exists());
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn file_pointer_manager_skips_non_text_read_inputs() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("file-pointer-non-text");
+    let _cwd = enter_temp_cwd(&root);
+    write_project_config(&root, "[file_pointer_manager]\nsave = true\n");
+    let path = PathBuf::from("image.txt");
+    std::fs::write(&path, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+    let result = Engine::with_profile(Profile::Strict).mask(
+        Input {
+            kind: Kind::Env,
+            data: std::fs::read_to_string(&path).unwrap(),
+        },
+        &Config::generate(),
+    );
+    assert!(result.summary.masked_count > 0);
+    assert!(!register_read_file_pointers(
+        &path,
+        &result.masked,
+        &result,
+        InputFormat::Pdf
+    ));
+    assert!(!Path::new(".pentect")
+        .join("file-pointer-manager")
+        .join("index.bin")
+        .exists());
+    drop(_cwd);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn pretool_allows_read_many_when_all_files_are_clean() {
     let (root, session) = empty_session("hook-pre-read-many-clean");
     let project = PathBuf::from("target").join(format!(
