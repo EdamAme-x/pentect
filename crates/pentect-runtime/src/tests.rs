@@ -1555,11 +1555,11 @@ fn generic_posttool_masks_payload_alias() {
 }
 
 #[test]
-fn posttool_allows_unreadable_image_output_by_default() {
+fn posttool_allows_unscanned_image_output_by_default() {
     let (root, session) = empty_session("hook-post-image-best-effort");
     write_project_config(
         &root,
-        "[image]\nocr = \"on\"\nunreadable_images = \"allow\"\n",
+        "[image]\nocr = \"on\"\nunscanned_images = \"allow\"\n",
     );
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -1583,11 +1583,11 @@ fn posttool_allows_unreadable_image_output_by_default() {
 }
 
 #[test]
-fn posttool_blocks_unreadable_image_output_when_configured() {
+fn posttool_blocks_unscanned_image_output_when_configured() {
     let (root, session) = empty_session("hook-post-image-strict");
     write_project_config(
         &root,
-        "[image]\nocr = \"on\"\nunreadable_images = \"block\"\n",
+        "[image]\nocr = \"on\"\nunscanned_images = \"block\"\n",
     );
     let input = json!({
         "hookEventName": "PostToolUse",
@@ -1604,7 +1604,7 @@ fn posttool_blocks_unreadable_image_output_when_configured() {
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().unwrap();
     assert!(reason.contains("image blocked"), "{reason}");
-    assert!(reason.contains("OCR failed"), "{reason}");
+    assert!(reason.contains("image scan failed"), "{reason}");
     let _ = std::fs::remove_dir_all(root);
 }
 
