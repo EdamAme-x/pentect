@@ -542,11 +542,13 @@ fn image_secret_findings(
             force_black: true,
         });
     }
-    if !findings.is_empty() {
-        return Ok(findings);
-    }
 
-    for region in ocr_image_regions_with_config(bytes, cfg)? {
+    let ocr_regions = match ocr_image_regions_with_config(bytes, cfg) {
+        Ok(regions) => regions,
+        Err(err) if findings.is_empty() => return Err(err),
+        Err(_) => return Ok(findings),
+    };
+    for region in &ocr_regions {
         let labels = image_text_secret_labels(&region.text, key);
         if labels.is_empty() {
             continue;
@@ -557,7 +559,35 @@ fn image_secret_findings(
             force_black: false,
         });
     }
+    let joined_labels = image_text_secret_labels(&image_regions_text(&ocr_regions), key);
+    let missing_joined_labels = joined_labels
+        .into_iter()
+        .filter(|label| {
+            !findings
+                .iter()
+                .any(|finding| finding.labels.iter().any(|seen| seen == label))
+        })
+        .collect::<Vec<_>>();
+    if !missing_joined_labels.is_empty() {
+        findings.push(ImageSecretFinding {
+            labels: missing_joined_labels,
+            rect: union_region_rects(&ocr_regions),
+            force_black: true,
+        });
+    }
     Ok(findings)
+}
+
+#[cfg(feature = "ocr")]
+fn union_region_rects(regions: &[ImageTextRegion]) -> Option<NormalizedImageRect> {
+    let mut out: Option<NormalizedImageRect> = None;
+    for rect in regions.iter().filter_map(|region| region.rect) {
+        out = Some(match out {
+            Some(existing) => existing.union(rect),
+            None => rect,
+        });
+    }
+    out
 }
 
 #[cfg(not(feature = "ocr"))]
@@ -863,6 +893,16 @@ impl NormalizedImageRect {
             width: right - left,
             height: bottom - top,
         })
+    }
+
+    #[cfg(feature = "ocr")]
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
     }
 }
 
@@ -2104,6 +2144,31 @@ mod tests {
         let outside = image.get_pixel(250, 140).0;
         assert!(inside[0] < 32 && inside[1] < 32 && inside[2] < 32);
         assert_eq!([outside[0], outside[1], outside[2]], [220, 190, 80]);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn joined_ocr_regions_detect_split_seed_phrase() {
+        let regions = vec![
+            ImageTextRegion {
+                text: "seed phrase: abandon abandon abandon abandon abandon abandon".to_string(),
+                rect: NormalizedImageRect::new(0.10, 0.20, 0.80, 0.30),
+            },
+            ImageTextRegion {
+                text: "abandon abandon abandon abandon abandon about".to_string(),
+                rect: NormalizedImageRect::new(0.10, 0.32, 0.76, 0.42),
+            },
+        ];
+        assert!(regions
+            .iter()
+            .all(|region| image_text_secret_labels(&region.text, &[7; 32]).is_empty()));
+        let labels = image_text_secret_labels(&image_regions_text(&regions), &[7; 32]);
+        assert!(labels.contains(&labels::BIP39_MNEMONIC.to_string()));
+        let rect = union_region_rects(&regions).unwrap();
+        assert_eq!(
+            rect,
+            NormalizedImageRect::new(0.10, 0.20, 0.80, 0.42).unwrap()
+        );
     }
 
     #[test]
