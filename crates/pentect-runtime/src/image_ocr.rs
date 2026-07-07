@@ -142,6 +142,13 @@ fn inspect_image_bytes(
         return;
     }
     inspection.scanned_images += 1;
+    if image_barcode_texts(bytes, cfg)
+        .iter()
+        .any(|text| ocr_text_has_secret(text, key))
+    {
+        inspection.secret_images += 1;
+        return;
+    }
     match ocr_image_bytes_with_config(bytes, cfg) {
         Ok(text) => {
             if ocr_text_has_secret(&text, key) {
@@ -209,6 +216,54 @@ fn ocr_text_has_secret(text: &str, key: &[u8; 32]) -> bool {
         &pentect_core::Config::new(*key),
     );
     result.summary.masked_count > 0
+}
+
+#[cfg(feature = "ocr")]
+fn image_barcode_texts(bytes: &[u8], cfg: &ImageOcrConfig) -> Vec<String> {
+    use image::GenericImageView;
+
+    if matches!(cfg.mode, ImageOcrMode::Off) {
+        return Vec::new();
+    }
+    let Ok(mut image) = image::load_from_memory(bytes) else {
+        return Vec::new();
+    };
+    let (width, height) = image.dimensions();
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > cfg.max_pixels {
+        return Vec::new();
+    }
+    image = resize_for_barcode(image, cfg.max_edge);
+    let luma = image.into_luma8();
+    let (width, height) = luma.dimensions();
+    let Ok(results) = rxing::helpers::detect_multiple_in_luma(luma.into_raw(), width, height)
+    else {
+        return Vec::new();
+    };
+    let mut texts = Vec::new();
+    for result in results {
+        let text = result.getText();
+        if !text.trim().is_empty() && !texts.iter().any(|seen| seen == text) {
+            texts.push(text.to_string());
+        }
+    }
+    texts
+}
+
+#[cfg(not(feature = "ocr"))]
+fn image_barcode_texts(_bytes: &[u8], _cfg: &ImageOcrConfig) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(feature = "ocr")]
+fn resize_for_barcode(img: image::DynamicImage, max_edge: u32) -> image::DynamicImage {
+    use image::GenericImageView;
+
+    let (width, height) = img.dimensions();
+    if max_edge == 0 || (width <= max_edge && height <= max_edge) {
+        return img;
+    }
+    img.resize(max_edge, max_edge, image::imageops::FilterType::Triangle)
 }
 
 fn image_ocr_secret_engine() -> &'static pentect_core::Engine {
@@ -987,6 +1042,31 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ocr")]
+    fn qr_png(payload: &str) -> Vec<u8> {
+        use image::{GrayImage, ImageFormat, Luma};
+        use rxing::{BarcodeFormat, Writer};
+        use std::io::Cursor;
+
+        let writer = rxing::qrcode::QRCodeWriter {};
+        let matrix = writer
+            .encode(payload, &BarcodeFormat::QR_CODE, 192, 192)
+            .unwrap();
+        let mut img = GrayImage::from_pixel(matrix.getWidth(), matrix.getHeight(), Luma([255]));
+        for y in 0..matrix.getHeight() {
+            for x in 0..matrix.getWidth() {
+                if matrix.get(x, y) {
+                    img.put_pixel(x, y, Luma([0]));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
     #[test]
     fn data_url_image_payload_is_decoded() {
         let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
@@ -1043,6 +1123,35 @@ mod tests {
         );
         let inspection = inspect_tool_images_for_secrets(&value, &[7; 32], &test_config()).unwrap();
         assert_eq!(inspection.scanned_images, 1);
+        assert_eq!(inspection.unscanned_images, 0);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn qr_image_secret_is_detected() {
+        let payload = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let png = qr_png(payload);
+        let value = serde_json::json!(format!(
+            "data:image/png;base64,{}",
+            data_encoding::BASE64.encode(&png)
+        ));
+        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32], &test_config()).unwrap();
+        assert_eq!(inspection.scanned_images, 1);
+        assert_eq!(inspection.secret_images, 1);
+        assert_eq!(inspection.unscanned_images, 0);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn qr_image_plain_text_is_not_secret() {
+        let png = qr_png("hello from pentect qr");
+        let value = serde_json::json!(format!(
+            "data:image/png;base64,{}",
+            data_encoding::BASE64.encode(&png)
+        ));
+        let inspection = inspect_tool_images_for_secrets(&value, &[7; 32], &test_config()).unwrap();
+        assert_eq!(inspection.scanned_images, 1);
+        assert_eq!(inspection.secret_images, 0);
         assert_eq!(inspection.unscanned_images, 0);
     }
 
