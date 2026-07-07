@@ -1,6 +1,6 @@
 use crate::config::ImageOcrConfig;
 #[cfg(feature = "ocr")]
-use crate::config::{image_ocr_config, ImageOcrMode};
+use crate::config::{image_ocr_config, ImageOcrMode, ImageRedactionStyle};
 use pentect_core::model::labels;
 use serde_json::Value;
 #[cfg(feature = "ocr")]
@@ -59,6 +59,27 @@ struct ImageRedactionState {
 struct RedactedImagePayload {
     base64: String,
     data_url: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NormalizedImageRect {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ImageTextRegion {
+    text: String,
+    rect: Option<NormalizedImageRect>,
+}
+
+#[derive(Clone, Debug)]
+struct ImageSecretFinding {
+    labels: Vec<String>,
+    rect: Option<NormalizedImageRect>,
+    force_black: bool,
 }
 
 enum ImageObjectEncoding {
@@ -227,22 +248,10 @@ fn inspect_image_bytes(
         return;
     }
     inspection.scanned_images += 1;
-    if image_barcode_texts(bytes, cfg)
-        .iter()
-        .any(|text| ocr_text_has_secret(text, key))
-    {
-        inspection.secret_images += 1;
-        return;
-    }
-    match ocr_image_bytes_with_config(bytes, cfg) {
-        Ok(text) => {
-            if ocr_text_has_secret(&text, key) {
-                inspection.secret_images += 1;
-            }
-        }
-        Err(_) => {
-            inspection.ocr_failures += 1;
-        }
+    match image_secret_findings(bytes, key, cfg) {
+        Ok(findings) if !findings.is_empty() => inspection.secret_images += 1,
+        Ok(_) => {}
+        Err(_) => inspection.ocr_failures += 1,
     }
 }
 
@@ -493,25 +502,101 @@ fn redact_image_bytes(
     }
     state.scanned_images += 1;
 
-    let mut labels = Vec::new();
-    for text in image_barcode_texts(bytes, cfg) {
-        push_secret_labels(&mut labels, &image_text_secret_labels(&text, key));
-    }
-    if labels.is_empty() {
-        match ocr_image_bytes_with_config(bytes, cfg) {
-            Ok(text) => push_secret_labels(&mut labels, &image_text_secret_labels(&text, key)),
-            Err(_) => state.ocr_failures += 1,
+    let findings = match image_secret_findings(bytes, key, cfg) {
+        Ok(findings) => findings,
+        Err(_) => {
+            state.ocr_failures += 1;
+            Vec::new()
         }
-    }
-    if labels.is_empty() {
+    };
+    if findings.is_empty() {
         return Ok(ImageRedactionDecision::Clean);
     }
 
+    let mut labels = Vec::new();
+    for finding in &findings {
+        push_secret_labels(&mut labels, &finding.labels);
+    }
     state.secret_images += 1;
     let index = state.notes.len() + 1;
     state.notes.push(format!("[{index}] {}", labels.join(", ")));
-    let payload = redacted_image_payload(bytes, index, cfg)?;
+    let payload = redacted_image_payload(bytes, index, cfg, &findings)?;
     Ok(ImageRedactionDecision::Redacted(payload))
+}
+
+#[cfg(feature = "ocr")]
+fn image_secret_findings(
+    bytes: &[u8],
+    key: &[u8; 32],
+    cfg: &ImageOcrConfig,
+) -> Result<Vec<ImageSecretFinding>, String> {
+    let mut findings = Vec::new();
+    for region in image_barcode_regions(bytes, cfg) {
+        let labels = image_text_secret_labels(&region.text, key);
+        if labels.is_empty() {
+            continue;
+        }
+        findings.push(ImageSecretFinding {
+            labels,
+            rect: region.rect,
+            force_black: true,
+        });
+    }
+
+    let ocr_regions = match ocr_image_regions_with_config(bytes, cfg) {
+        Ok(regions) => regions,
+        Err(err) if findings.is_empty() => return Err(err),
+        Err(_) => return Ok(findings),
+    };
+    for region in &ocr_regions {
+        let labels = image_text_secret_labels(&region.text, key);
+        if labels.is_empty() {
+            continue;
+        }
+        findings.push(ImageSecretFinding {
+            labels,
+            rect: region.rect,
+            force_black: false,
+        });
+    }
+    let joined_labels = image_text_secret_labels(&image_regions_text(&ocr_regions), key);
+    let missing_joined_labels = joined_labels
+        .into_iter()
+        .filter(|label| {
+            !findings
+                .iter()
+                .any(|finding| finding.labels.iter().any(|seen| seen == label))
+        })
+        .collect::<Vec<_>>();
+    if !missing_joined_labels.is_empty() {
+        findings.push(ImageSecretFinding {
+            labels: missing_joined_labels,
+            rect: union_region_rects(&ocr_regions),
+            force_black: true,
+        });
+    }
+    Ok(findings)
+}
+
+#[cfg(feature = "ocr")]
+fn union_region_rects(regions: &[ImageTextRegion]) -> Option<NormalizedImageRect> {
+    let mut out: Option<NormalizedImageRect> = None;
+    for rect in regions.iter().filter_map(|region| region.rect) {
+        out = Some(match out {
+            Some(existing) => existing.union(rect),
+            None => rect,
+        });
+    }
+    out
+}
+
+#[cfg(not(feature = "ocr"))]
+fn image_secret_findings(
+    _bytes: &[u8],
+    _key: &[u8; 32],
+    _cfg: &ImageOcrConfig,
+) -> Result<Vec<ImageSecretFinding>, String> {
+    Ok(Vec::new())
 }
 
 fn push_secret_labels(out: &mut Vec<String>, labels: &[String]) {
@@ -564,11 +649,18 @@ impl ImageRedactionState {
     }
 }
 
-fn ocr_text_has_secret(text: &str, key: &[u8; 32]) -> bool {
-    if text.trim().is_empty() {
-        return false;
+fn image_regions_text(regions: &[ImageTextRegion]) -> String {
+    let mut text = String::new();
+    for region in regions {
+        if region.text.trim().is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&region.text);
     }
-    !image_text_secret_labels(text, key).is_empty()
+    text
 }
 
 fn image_text_secret_labels(text: &str, key: &[u8; 32]) -> Vec<String> {
@@ -717,20 +809,136 @@ fn ocr_key_label(words: &[String]) -> String {
     }
 }
 
+impl NormalizedImageRect {
+    #[cfg(feature = "ocr")]
+    fn from_pixels(
+        left: f32,
+        top: f32,
+        width: f32,
+        height: f32,
+        image_width: u32,
+        image_height: u32,
+    ) -> Option<Self> {
+        if image_width == 0 || image_height == 0 || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let image_width = image_width as f32;
+        let image_height = image_height as f32;
+        Self::new(
+            left / image_width,
+            top / image_height,
+            (left + width) / image_width,
+            (top + height) / image_height,
+        )
+    }
+
+    #[cfg(feature = "ocr")]
+    fn from_points(points: &[rxing::Point], image_width: u32, image_height: u32) -> Option<Self> {
+        if points.is_empty() || image_width == 0 || image_height == 0 {
+            return None;
+        }
+        let mut left = f32::MAX;
+        let mut top = f32::MAX;
+        let mut right = f32::MIN;
+        let mut bottom = f32::MIN;
+        for point in points {
+            left = left.min(point.x);
+            top = top.min(point.y);
+            right = right.max(point.x);
+            bottom = bottom.max(point.y);
+        }
+        Self::from_pixels(
+            left,
+            top,
+            right - left,
+            bottom - top,
+            image_width,
+            image_height,
+        )
+    }
+
+    #[cfg(feature = "ocr")]
+    fn new(left: f32, top: f32, right: f32, bottom: f32) -> Option<Self> {
+        if !left.is_finite() || !top.is_finite() || !right.is_finite() || !bottom.is_finite() {
+            return None;
+        }
+        let left = left.clamp(0.0, 1.0);
+        let top = top.clamp(0.0, 1.0);
+        let right = right.clamp(0.0, 1.0);
+        let bottom = bottom.clamp(0.0, 1.0);
+        (right > left && bottom > top).then_some(Self {
+            left,
+            top,
+            right,
+            bottom,
+        })
+    }
+
+    #[cfg(feature = "ocr")]
+    fn to_pixels(self, image_width: u32, image_height: u32) -> Option<PixelRect> {
+        if image_width == 0 || image_height == 0 {
+            return None;
+        }
+        let left = (self.left * image_width as f32).floor().max(0.0) as u32;
+        let top = (self.top * image_height as f32).floor().max(0.0) as u32;
+        let right = (self.right * image_width as f32)
+            .ceil()
+            .min(image_width as f32) as u32;
+        let bottom = (self.bottom * image_height as f32)
+            .ceil()
+            .min(image_height as f32) as u32;
+        (right > left && bottom > top).then_some(PixelRect {
+            left,
+            top,
+            width: right - left,
+            height: bottom - top,
+        })
+    }
+
+    #[cfg(feature = "ocr")]
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+}
+
+#[cfg(feature = "ocr")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PixelRect {
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+}
+
 #[cfg(feature = "ocr")]
 fn redacted_image_payload(
     bytes: &[u8],
     index: usize,
     cfg: &ImageOcrConfig,
+    findings: &[ImageSecretFinding],
 ) -> Result<RedactedImagePayload, String> {
-    use image::{GenericImageView, ImageFormat, Rgba, RgbaImage};
+    use image::{GenericImageView, ImageFormat};
     use std::io::Cursor;
 
-    let image = image::load_from_memory(bytes)
-        .map_err(|e| format!("could not prepare redacted image: {e}"))?;
+    let image =
+        image::load_from_memory(bytes).map_err(|e| format!("could not decode image: {e}"))?;
     let (width, height) = redacted_image_dimensions(image.dimensions(), cfg.max_edge);
-    let mut redacted = RgbaImage::from_pixel(width, height, Rgba([18, 18, 18, 255]));
-    draw_image_mask_badge(&mut redacted, index);
+    let mut redacted = image
+        .resize_exact(width, height, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    for finding in findings {
+        let style = if finding.force_black {
+            ImageRedactionStyle::Black
+        } else {
+            cfg.redaction
+        };
+        apply_local_redaction(&mut redacted, finding.rect, style, index);
+    }
 
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(redacted)
@@ -748,8 +956,92 @@ fn redacted_image_payload(
     _bytes: &[u8],
     _index: usize,
     _cfg: &ImageOcrConfig,
+    _findings: &[ImageSecretFinding],
 ) -> Result<RedactedImagePayload, String> {
     Err("image OCR requires a build with `--features ocr`".to_string())
+}
+
+#[cfg(feature = "ocr")]
+fn apply_local_redaction(
+    image: &mut image::RgbaImage,
+    rect: Option<NormalizedImageRect>,
+    style: ImageRedactionStyle,
+    _index: usize,
+) {
+    let Some(rect) = rect
+        .or_else(|| NormalizedImageRect::new(0.0, 0.0, 1.0, 1.0))
+        .and_then(|rect| padded_pixel_rect(rect, image.width(), image.height()))
+    else {
+        return;
+    };
+    match style {
+        ImageRedactionStyle::Black => fill_rect(
+            image,
+            rect.left,
+            rect.top,
+            rect.width,
+            rect.height,
+            image::Rgba([0, 0, 0, 255]),
+        ),
+        ImageRedactionStyle::Blur => blur_rect(image, rect),
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn padded_pixel_rect(
+    rect: NormalizedImageRect,
+    image_width: u32,
+    image_height: u32,
+) -> Option<PixelRect> {
+    let rect = rect.to_pixels(image_width, image_height)?;
+    let pad_x = rect.width.saturating_div(10).clamp(16, 96);
+    let pad_y = rect.height.saturating_div(2).clamp(8, 32);
+    let left = rect.left.saturating_sub(pad_x);
+    let top = rect.top.saturating_sub(pad_y);
+    let right = rect
+        .left
+        .saturating_add(rect.width)
+        .saturating_add(pad_x)
+        .min(image_width);
+    let bottom = rect
+        .top
+        .saturating_add(rect.height)
+        .saturating_add(pad_y)
+        .min(image_height);
+    (right > left && bottom > top).then_some(PixelRect {
+        left,
+        top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+#[cfg(feature = "ocr")]
+fn blur_rect(image: &mut image::RgbaImage, rect: PixelRect) {
+    use image::imageops::FilterType;
+
+    let crop =
+        image::imageops::crop_imm(image, rect.left, rect.top, rect.width, rect.height).to_image();
+    let tiny_width = rect.width.saturating_div(24).clamp(1, 16);
+    let tiny_height = rect.height.saturating_div(24).clamp(1, 16);
+    let tiny = image::imageops::resize(&crop, tiny_width, tiny_height, FilterType::Triangle);
+    let mut redacted =
+        image::imageops::resize(&tiny, rect.width, rect.height, FilterType::Triangle);
+    for pixel in redacted.pixels_mut() {
+        let channels = pixel.0;
+        pixel.0 = [
+            dim_redaction_channel(channels[0]),
+            dim_redaction_channel(channels[1]),
+            dim_redaction_channel(channels[2]),
+            255,
+        ];
+    }
+    image::imageops::replace(image, &redacted, i64::from(rect.left), i64::from(rect.top));
+}
+
+#[cfg(feature = "ocr")]
+fn dim_redaction_channel(value: u8) -> u8 {
+    ((u16::from(value) * 65 / 100) + 16).min(255) as u8
 }
 
 #[cfg(feature = "ocr")]
@@ -772,27 +1064,6 @@ fn redacted_image_dimensions((width, height): (u32, u32), max_edge: u32) -> (u32
 }
 
 #[cfg(feature = "ocr")]
-fn draw_image_mask_badge(image: &mut image::RgbaImage, index: usize) {
-    use image::Rgba;
-
-    let label = format!("[{index}]");
-    let scale = 5u32;
-    let padding = 8u32;
-    let glyph_width = 4u32 * scale;
-    let glyph_height = 7u32 * scale;
-    let badge_width = padding
-        .saturating_mul(2)
-        .saturating_add(glyph_width.saturating_mul(label.chars().count() as u32));
-    let badge_height = padding.saturating_mul(2).saturating_add(glyph_height);
-    fill_rect(image, 8, 8, badge_width, badge_height, Rgba([0, 0, 0, 255]));
-    let mut x = 8 + padding;
-    for ch in label.chars() {
-        draw_glyph(image, x, 8 + padding, ch, scale, Rgba([255, 255, 255, 255]));
-        x = x.saturating_add(glyph_width);
-    }
-}
-
-#[cfg(feature = "ocr")]
 fn fill_rect(
     image: &mut image::RgbaImage,
     left: u32,
@@ -811,54 +1082,7 @@ fn fill_rect(
 }
 
 #[cfg(feature = "ocr")]
-fn draw_glyph(
-    image: &mut image::RgbaImage,
-    left: u32,
-    top: u32,
-    ch: char,
-    scale: u32,
-    color: image::Rgba<u8>,
-) {
-    for (row, pattern) in mask_label_glyph(ch).iter().enumerate() {
-        let row = row as u32;
-        for (col, bit) in pattern.chars().enumerate() {
-            if bit != '1' {
-                continue;
-            }
-            let col = col as u32;
-            fill_rect(
-                image,
-                left.saturating_add(col.saturating_mul(scale)),
-                top.saturating_add(row.saturating_mul(scale)),
-                scale,
-                scale,
-                color,
-            );
-        }
-    }
-}
-
-#[cfg(feature = "ocr")]
-fn mask_label_glyph(ch: char) -> &'static [&'static str] {
-    match ch {
-        '0' => &["111", "101", "101", "101", "101", "101", "111"],
-        '1' => &["010", "110", "010", "010", "010", "010", "111"],
-        '2' => &["111", "001", "001", "111", "100", "100", "111"],
-        '3' => &["111", "001", "001", "111", "001", "001", "111"],
-        '4' => &["101", "101", "101", "111", "001", "001", "001"],
-        '5' => &["111", "100", "100", "111", "001", "001", "111"],
-        '6' => &["111", "100", "100", "111", "101", "101", "111"],
-        '7' => &["111", "001", "001", "010", "010", "010", "010"],
-        '8' => &["111", "101", "101", "111", "101", "101", "111"],
-        '9' => &["111", "101", "101", "111", "001", "001", "111"],
-        '[' => &["011", "010", "010", "010", "010", "010", "011"],
-        ']' => &["110", "010", "010", "010", "010", "010", "110"],
-        _ => &["000", "000", "000", "000", "000", "000", "000"],
-    }
-}
-
-#[cfg(feature = "ocr")]
-fn image_barcode_texts(bytes: &[u8], cfg: &ImageOcrConfig) -> Vec<String> {
+fn image_barcode_regions(bytes: &[u8], cfg: &ImageOcrConfig) -> Vec<ImageTextRegion> {
     use image::GenericImageView;
 
     if matches!(cfg.mode, ImageOcrMode::Off) {
@@ -879,19 +1103,22 @@ fn image_barcode_texts(bytes: &[u8], cfg: &ImageOcrConfig) -> Vec<String> {
     else {
         return Vec::new();
     };
-    let mut texts = Vec::new();
+    let mut regions = Vec::new();
     for result in results {
         let text = result.getText();
-        if !text.trim().is_empty() && !texts.iter().any(|seen| seen == text) {
-            texts.push(text.to_string());
+        if text.trim().is_empty()
+            || regions
+                .iter()
+                .any(|seen: &ImageTextRegion| seen.text == text)
+        {
+            continue;
         }
+        regions.push(ImageTextRegion {
+            text: text.to_string(),
+            rect: NormalizedImageRect::from_points(result.getPoints(), width, height),
+        });
     }
-    texts
-}
-
-#[cfg(not(feature = "ocr"))]
-fn image_barcode_texts(_bytes: &[u8], _cfg: &ImageOcrConfig) -> Vec<String> {
-    Vec::new()
+    regions
 }
 
 #[cfg(feature = "ocr")]
@@ -1329,6 +1556,15 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
 
 #[cfg(all(feature = "ocr", target_os = "windows"))]
 fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<String, String> {
+    let regions = ocr_image_regions_with_config(bytes, cfg)?;
+    Ok(image_regions_text(&regions))
+}
+
+#[cfg(all(feature = "ocr", target_os = "windows"))]
+fn ocr_image_regions_with_config(
+    bytes: &[u8],
+    cfg: &ImageOcrConfig,
+) -> Result<Vec<ImageTextRegion>, String> {
     use windows::Graphics::Imaging::{
         BitmapAlphaMode, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat,
         BitmapTransform, ColorManagementMode, ExifOrientationMode,
@@ -1422,10 +1658,61 @@ fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<Str
         .map_err(|e| format!("could not start Windows OCR: {e}"))?
         .join()
         .map_err(|e| format!("could not OCR image: {e}"))?;
-    result
-        .Text()
-        .map(|text| text.to_string_lossy())
-        .map_err(|e| format!("could not read OCR text: {e}"))
+    let lines = result
+        .Lines()
+        .map_err(|e| format!("could not read OCR lines: {e}"))?;
+    let mut regions = Vec::new();
+    for index in 0..lines
+        .Size()
+        .map_err(|e| format!("could not count OCR lines: {e}"))?
+    {
+        let line = lines
+            .GetAt(index)
+            .map_err(|e| format!("could not read OCR line: {e}"))?;
+        let text = line
+            .Text()
+            .map(|text| text.to_string_lossy())
+            .map_err(|e| format!("could not read OCR line text: {e}"))?;
+        if text.trim().is_empty() {
+            continue;
+        }
+        let words = line
+            .Words()
+            .map_err(|e| format!("could not read OCR words: {e}"))?;
+        let mut left = f32::MAX;
+        let mut top = f32::MAX;
+        let mut right = f32::MIN;
+        let mut bottom = f32::MIN;
+        for word_index in 0..words
+            .Size()
+            .map_err(|e| format!("could not count OCR words: {e}"))?
+        {
+            let word = words
+                .GetAt(word_index)
+                .map_err(|e| format!("could not read OCR word: {e}"))?;
+            let rect = word
+                .BoundingRect()
+                .map_err(|e| format!("could not read OCR word bounds: {e}"))?;
+            left = left.min(rect.X);
+            top = top.min(rect.Y);
+            right = right.max(rect.X + rect.Width);
+            bottom = bottom.max(rect.Y + rect.Height);
+        }
+        let rect = if right > left && bottom > top {
+            NormalizedImageRect::from_pixels(
+                left,
+                top,
+                right - left,
+                bottom - top,
+                scaled_width,
+                scaled_height,
+            )
+        } else {
+            None
+        };
+        regions.push(ImageTextRegion { text, rect });
+    }
+    Ok(regions)
 }
 
 #[cfg(all(feature = "ocr", target_os = "windows"))]
@@ -1450,6 +1737,15 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
 
 #[cfg(all(feature = "ocr", target_os = "macos"))]
 fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<String, String> {
+    let regions = ocr_image_regions_with_config(bytes, cfg)?;
+    Ok(image_regions_text(&regions))
+}
+
+#[cfg(all(feature = "ocr", target_os = "macos"))]
+fn ocr_image_regions_with_config(
+    bytes: &[u8],
+    cfg: &ImageOcrConfig,
+) -> Result<Vec<ImageTextRegion>, String> {
     use objc2::{runtime::AnyObject, AnyThread};
     use objc2_foundation::{NSArray, NSData, NSDictionary};
     use objc2_vision::{
@@ -1486,9 +1782,9 @@ fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<Str
         .map_err(|e| format!("could not OCR image with macOS Vision: {e}"))?;
 
     let Some(observations) = request.results() else {
-        return Ok(String::new());
+        return Ok(Vec::new());
     };
-    let mut text = String::new();
+    let mut regions = Vec::new();
     for index in 0..observations.len() {
         let observation = observations.objectAtIndex(index);
         let candidates = observation.topCandidates(1);
@@ -1496,12 +1792,13 @@ fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<Str
             continue;
         }
         let candidate = candidates.objectAtIndex(0);
-        if !text.is_empty() {
-            text.push('\n');
+        let text = candidate.string().to_string();
+        if text.trim().is_empty() {
+            continue;
         }
-        text.push_str(&candidate.string().to_string());
+        regions.push(ImageTextRegion { text, rect: None });
     }
-    Ok(text)
+    Ok(regions)
 }
 
 #[cfg(all(feature = "ocr", target_os = "macos"))]
@@ -1559,8 +1856,17 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
 
 #[cfg(all(feature = "ocr", target_os = "linux"))]
 fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<String, String> {
+    let regions = ocr_image_regions_with_config(bytes, cfg)?;
+    Ok(image_regions_text(&regions))
+}
+
+#[cfg(all(feature = "ocr", target_os = "linux"))]
+fn ocr_image_regions_with_config(
+    bytes: &[u8],
+    cfg: &ImageOcrConfig,
+) -> Result<Vec<ImageTextRegion>, String> {
     use image::GenericImageView;
-    use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
+    use ocrs::{ImageSource, OcrEngine, OcrEngineParams, TextItem};
     use rten::Model;
     use std::sync::OnceLock;
 
@@ -1581,6 +1887,7 @@ fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<Str
     }
 
     let img = resize_for_ocr(img, cfg.max_edge);
+    let (ocr_width, ocr_height) = img.dimensions();
     let img = img.into_rgb8();
     let img_source = ImageSource::from_bytes(img.as_raw(), img.dimensions())
         .map_err(|e| format!("could not prepare image: {e}"))?;
@@ -1604,9 +1911,31 @@ fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<Str
     let input = engine
         .prepare_input(img_source)
         .map_err(|e| format!("could not preprocess image: {e}"))?;
-    engine
-        .get_text(&input)
-        .map_err(|e| format!("could not OCR image: {e}"))
+    let words = engine
+        .detect_words(&input)
+        .map_err(|e| format!("could not detect OCR words: {e}"))?;
+    let lines = engine.find_text_lines(&input, &words);
+    let recognized = engine
+        .recognize_text(&input, &lines)
+        .map_err(|e| format!("could not OCR image: {e}"))?;
+    let mut regions = Vec::new();
+    for line in recognized.into_iter().flatten() {
+        let text = line.to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let bounds = line.bounding_rect();
+        let rect = NormalizedImageRect::from_pixels(
+            bounds.left() as f32,
+            bounds.top() as f32,
+            bounds.width() as f32,
+            bounds.height() as f32,
+            ocr_width,
+            ocr_height,
+        );
+        regions.push(ImageTextRegion { text, rect });
+    }
+    Ok(regions)
 }
 
 #[cfg(all(feature = "ocr", target_os = "linux"))]
@@ -1636,6 +1965,17 @@ fn ocr_image_bytes_with_config(_bytes: &[u8], _cfg: &ImageOcrConfig) -> Result<S
     Err("image OCR is not supported on this platform".to_string())
 }
 
+#[cfg(all(
+    feature = "ocr",
+    not(any(target_os = "linux", target_os = "windows", target_os = "macos"))
+))]
+fn ocr_image_regions_with_config(
+    _bytes: &[u8],
+    _cfg: &ImageOcrConfig,
+) -> Result<Vec<ImageTextRegion>, String> {
+    Err("image OCR is not supported on this platform".to_string())
+}
+
 #[cfg(not(feature = "ocr"))]
 pub fn ocr_image_bytes(_bytes: &[u8]) -> Result<String, String> {
     Err("image OCR requires a build with `--features ocr`".to_string())
@@ -1646,14 +1986,23 @@ fn ocr_image_bytes_with_config(_bytes: &[u8], _cfg: &ImageOcrConfig) -> Result<S
     Err("image OCR requires a build with `--features ocr`".to_string())
 }
 
+#[cfg(not(feature = "ocr"))]
+fn ocr_image_regions_with_config(
+    _bytes: &[u8],
+    _cfg: &ImageOcrConfig,
+) -> Result<Vec<ImageTextRegion>, String> {
+    Err("image OCR requires a build with `--features ocr`".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ImageOcrMode, UnscannedImagePolicy};
+    use crate::config::{ImageOcrMode, ImageRedactionStyle, UnscannedImagePolicy};
 
     fn test_config() -> ImageOcrConfig {
         ImageOcrConfig {
             mode: ImageOcrMode::On,
+            redaction: ImageRedactionStyle::Black,
             max_pixels: 64_000_000,
             max_edge: 2_048,
             max_images: 64,
@@ -1662,6 +2011,47 @@ mod tests {
             max_image_bytes: 64 * 1024 * 1024,
             fetch_seconds: 8,
             unscanned_images: UnscannedImagePolicy::Allow,
+        }
+    }
+
+    #[cfg(feature = "ocr")]
+    fn color_grid_png() -> Vec<u8> {
+        use image::{ImageFormat, Rgba, RgbaImage};
+        use std::io::Cursor;
+
+        let mut img = RgbaImage::from_pixel(320, 180, Rgba([240, 240, 240, 255]));
+        for y in 0..180 {
+            for x in 0..320 {
+                let color = match (x >= 160, y >= 90) {
+                    (false, false) => Rgba([220, 80, 80, 255]),
+                    (true, false) => Rgba([80, 170, 110, 255]),
+                    (false, true) => Rgba([80, 120, 220, 255]),
+                    (true, true) => Rgba([220, 190, 80, 255]),
+                };
+                img.put_pixel(x, y, color);
+            }
+        }
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    #[cfg(feature = "ocr")]
+    fn decode_redacted_payload(payload: &RedactedImagePayload) -> image::RgbaImage {
+        let bytes = data_encoding::BASE64
+            .decode(payload.base64.as_bytes())
+            .unwrap();
+        image::load_from_memory(&bytes).unwrap().to_rgba8()
+    }
+
+    #[cfg(feature = "ocr")]
+    fn test_finding(force_black: bool) -> ImageSecretFinding {
+        ImageSecretFinding {
+            labels: vec![labels::KEYED_SECRET.to_string()],
+            rect: NormalizedImageRect::new(0.12, 0.16, 0.42, 0.46),
+            force_black,
         }
     }
 
@@ -1712,6 +2102,73 @@ mod tests {
             .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
             .unwrap();
         out
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn black_redaction_only_covers_secret_rect() {
+        let mut cfg = test_config();
+        cfg.redaction = ImageRedactionStyle::Black;
+        let payload =
+            redacted_image_payload(&color_grid_png(), 1, &cfg, &[test_finding(false)]).unwrap();
+        let image = decode_redacted_payload(&payload);
+        let inside = image.get_pixel(80, 50).0;
+        let outside = image.get_pixel(250, 140).0;
+        assert!(inside[0] < 32 && inside[1] < 32 && inside[2] < 32);
+        assert_eq!([outside[0], outside[1], outside[2]], [220, 190, 80]);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn blur_redaction_only_covers_secret_rect() {
+        let mut cfg = test_config();
+        cfg.redaction = ImageRedactionStyle::Blur;
+        let payload =
+            redacted_image_payload(&color_grid_png(), 1, &cfg, &[test_finding(false)]).unwrap();
+        let image = decode_redacted_payload(&payload);
+        let inside = image.get_pixel(80, 50).0;
+        let outside = image.get_pixel(250, 140).0;
+        assert_ne!([inside[0], inside[1], inside[2]], [220, 80, 80]);
+        assert_eq!([outside[0], outside[1], outside[2]], [220, 190, 80]);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn forced_black_redaction_overrides_blur() {
+        let mut cfg = test_config();
+        cfg.redaction = ImageRedactionStyle::Blur;
+        let payload =
+            redacted_image_payload(&color_grid_png(), 1, &cfg, &[test_finding(true)]).unwrap();
+        let image = decode_redacted_payload(&payload);
+        let inside = image.get_pixel(80, 50).0;
+        let outside = image.get_pixel(250, 140).0;
+        assert!(inside[0] < 32 && inside[1] < 32 && inside[2] < 32);
+        assert_eq!([outside[0], outside[1], outside[2]], [220, 190, 80]);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn joined_ocr_regions_detect_split_seed_phrase() {
+        let regions = vec![
+            ImageTextRegion {
+                text: "seed phrase: abandon abandon abandon abandon abandon abandon".to_string(),
+                rect: NormalizedImageRect::new(0.10, 0.20, 0.80, 0.30),
+            },
+            ImageTextRegion {
+                text: "abandon abandon abandon abandon abandon about".to_string(),
+                rect: NormalizedImageRect::new(0.10, 0.32, 0.76, 0.42),
+            },
+        ];
+        assert!(regions
+            .iter()
+            .all(|region| image_text_secret_labels(&region.text, &[7; 32]).is_empty()));
+        let labels = image_text_secret_labels(&image_regions_text(&regions), &[7; 32]);
+        assert!(labels.contains(&labels::BIP39_MNEMONIC.to_string()));
+        let rect = union_region_rects(&regions).unwrap();
+        assert_eq!(
+            rect,
+            NormalizedImageRect::new(0.10, 0.20, 0.80, 0.42).unwrap()
+        );
     }
 
     #[test]
@@ -2029,8 +2486,8 @@ mod tests {
 
     #[test]
     fn empty_ocr_text_is_not_secret() {
-        assert!(!ocr_text_has_secret("", &[7; 32]));
-        assert!(!ocr_text_has_secret("   \n\t", &[7; 32]));
+        assert!(image_text_secret_labels("", &[7; 32]).is_empty());
+        assert!(image_text_secret_labels("   \n\t", &[7; 32]).is_empty());
     }
 
     #[cfg(all(feature = "ocr", target_os = "linux"))]

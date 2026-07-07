@@ -40,8 +40,15 @@ pub(crate) enum UnscannedImagePolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageRedactionStyle {
+    Black,
+    Blur,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ImageOcrConfig {
     pub(crate) mode: ImageOcrMode,
+    pub(crate) redaction: ImageRedactionStyle,
     pub(crate) max_pixels: u64,
     pub(crate) max_edge: u32,
     pub(crate) max_images: usize,
@@ -55,6 +62,7 @@ pub(crate) struct ImageOcrConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ImageOcrConfigPartial {
     mode: Option<ImageOcrMode>,
+    redaction: Option<ImageRedactionStyle>,
     max_pixels: Option<u64>,
     max_edge: Option<u32>,
     max_images: Option<usize>,
@@ -311,6 +319,9 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
     if let Some(raw) = table.get("ocr") {
         out.mode = Some(image_ocr_mode(raw, "image.ocr")?);
     }
+    if let Some(raw) = table.get("redaction") {
+        out.redaction = Some(image_redaction_style(raw, "image.redaction")?);
+    }
     if let Some(raw) = table.get("max_pixels") {
         out.max_pixels = Some(config_u64(raw, "image.max_pixels")?);
     }
@@ -415,6 +426,17 @@ fn unscanned_image_policy(
     }
 }
 
+fn image_redaction_style(value: &toml::Value, field: &str) -> Result<ImageRedactionStyle, String> {
+    let Some(value) = value.as_str() else {
+        return Err(format!("{field} must be black or blur"));
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "black" => Ok(ImageRedactionStyle::Black),
+        "blur" => Ok(ImageRedactionStyle::Blur),
+        _ => Err(format!("{field} must be black or blur")),
+    }
+}
+
 fn config_u64(value: &toml::Value, field: &str) -> Result<u64, String> {
     let value = config_positive_integer(value, field)?;
     u64::try_from(value).map_err(|_| format!("{field} must be positive"))
@@ -446,6 +468,10 @@ fn merge_image_ocr_config(
 ) -> ImageOcrConfig {
     ImageOcrConfig {
         mode: project.mode.or(global.mode).unwrap_or(ImageOcrMode::On),
+        redaction: project
+            .redaction
+            .or(global.redaction)
+            .unwrap_or(ImageRedactionStyle::Black),
         max_pixels: project
             .max_pixels
             .or(global.max_pixels)
@@ -629,6 +655,7 @@ mod tests {
         let value = "\
 [image]
 ocr = \"on\"
+redaction = \"blur\"
 max_pixels = 1234
 max_edge = 2048
 max_images = 32
@@ -641,6 +668,7 @@ unscanned_images = \"block\""
             .unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::On));
+        assert_eq!(cfg.redaction, Some(ImageRedactionStyle::Blur));
         assert_eq!(cfg.max_pixels, Some(1234));
         assert_eq!(cfg.max_edge, Some(2048));
         assert_eq!(cfg.max_images, Some(32));
@@ -662,12 +690,21 @@ unscanned_images = \"block\""
     }
 
     #[test]
+    fn image_ocr_config_rejects_unknown_redaction() {
+        let value = "[image]\nredaction = \"pixelate\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert!(image_ocr_config_value(&value).is_err());
+    }
+
+    #[test]
     fn image_ocr_config_defaults_to_2k_ocr_edge() {
         let cfg = merge_image_ocr_config(
             ImageOcrConfigPartial::default(),
             ImageOcrConfigPartial::default(),
         );
         assert_eq!(cfg.mode, ImageOcrMode::On);
+        assert_eq!(cfg.redaction, ImageRedactionStyle::Black);
         assert_eq!(cfg.max_edge, 2048);
         assert_eq!(cfg.max_pixels, 64_000_000);
         assert_eq!(cfg.max_images, 64);
