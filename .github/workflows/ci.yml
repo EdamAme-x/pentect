@@ -9,6 +9,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  native-ocr:
+    name: Native OCR (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check native OCR build
+        run: cargo check -p pentect-cli --features ocr --locked
+
   test:
     runs-on: ubuntu-latest
     steps:

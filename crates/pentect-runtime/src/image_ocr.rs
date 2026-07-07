@@ -610,9 +610,27 @@ fn fetch_image_url_bytes(
     Ok(None)
 }
 
-#[cfg(feature = "ocr")]
+#[cfg(all(feature = "ocr", target_os = "linux"))]
 pub fn ocr_status() -> &'static str {
     "bundled"
+}
+
+#[cfg(all(feature = "ocr", target_os = "windows"))]
+pub fn ocr_status() -> &'static str {
+    "windows"
+}
+
+#[cfg(all(feature = "ocr", target_os = "macos"))]
+pub fn ocr_status() -> &'static str {
+    "macos"
+}
+
+#[cfg(all(
+    feature = "ocr",
+    not(any(target_os = "linux", target_os = "windows", target_os = "macos"))
+))]
+pub fn ocr_status() -> &'static str {
+    "unsupported"
 }
 
 #[cfg(not(feature = "ocr"))]
@@ -620,7 +638,178 @@ pub fn ocr_status() -> &'static str {
     "disabled"
 }
 
-#[cfg(feature = "ocr")]
+#[cfg(all(feature = "ocr", target_os = "windows"))]
+pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
+    use windows::Graphics::Imaging::{
+        BitmapAlphaMode, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat,
+        BitmapTransform, ColorManagementMode, ExifOrientationMode,
+    };
+    use windows::Media::Ocr::OcrEngine;
+    use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+
+    let cfg = image_ocr_config()?;
+    if matches!(cfg.mode, ImageOcrMode::Off) {
+        return Err("image OCR disabled".to_string());
+    }
+    if bytes.len() as u64 > cfg.max_image_bytes {
+        return Err(format!(
+            "image is larger than {} bytes",
+            cfg.max_image_bytes
+        ));
+    }
+
+    let stream = InMemoryRandomAccessStream::new()
+        .map_err(|e| format!("could not initialize image stream: {e}"))?;
+    let output = stream
+        .GetOutputStreamAt(0)
+        .map_err(|e| format!("could not open image stream: {e}"))?;
+    let writer = DataWriter::CreateDataWriter(&output)
+        .map_err(|e| format!("could not initialize image writer: {e}"))?;
+    writer
+        .WriteBytes(bytes)
+        .map_err(|e| format!("could not write image bytes: {e}"))?;
+    writer
+        .StoreAsync()
+        .map_err(|e| format!("could not store image bytes: {e}"))?
+        .join()
+        .map_err(|e| format!("could not store image bytes: {e}"))?;
+    writer
+        .FlushAsync()
+        .map_err(|e| format!("could not flush image bytes: {e}"))?
+        .join()
+        .map_err(|e| format!("could not flush image bytes: {e}"))?;
+    stream
+        .Seek(0)
+        .map_err(|e| format!("could not rewind image stream: {e}"))?;
+
+    let decoder = BitmapDecoder::CreateAsync(&stream)
+        .map_err(|e| format!("could not decode image: {e}"))?
+        .join()
+        .map_err(|e| format!("could not decode image: {e}"))?;
+    let width = decoder
+        .PixelWidth()
+        .map_err(|e| format!("could not read image width: {e}"))?;
+    let height = decoder
+        .PixelHeight()
+        .map_err(|e| format!("could not read image height: {e}"))?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > cfg.max_pixels {
+        return Err(format!(
+            "image has {pixels} pixels; limit is {}",
+            cfg.max_pixels
+        ));
+    }
+
+    let max_dimension = OcrEngine::MaxImageDimension()
+        .map_err(|e| format!("could not read OCR image limit: {e}"))?
+        .min(cfg.max_edge);
+    let (scaled_width, scaled_height) = scaled_dimensions(width, height, max_dimension);
+    let transform =
+        BitmapTransform::new().map_err(|e| format!("could not initialize image transform: {e}"))?;
+    transform
+        .SetScaledWidth(scaled_width)
+        .map_err(|e| format!("could not set image width: {e}"))?;
+    transform
+        .SetScaledHeight(scaled_height)
+        .map_err(|e| format!("could not set image height: {e}"))?;
+    transform
+        .SetInterpolationMode(BitmapInterpolationMode::Fant)
+        .map_err(|e| format!("could not set image interpolation: {e}"))?;
+
+    let bitmap = decoder
+        .GetSoftwareBitmapTransformedAsync(
+            BitmapPixelFormat::Bgra8,
+            BitmapAlphaMode::Premultiplied,
+            &transform,
+            ExifOrientationMode::RespectExifOrientation,
+            ColorManagementMode::ColorManageToSRgb,
+        )
+        .map_err(|e| format!("could not prepare image bitmap: {e}"))?
+        .join()
+        .map_err(|e| format!("could not prepare image bitmap: {e}"))?;
+    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
+        .map_err(|e| format!("could not initialize Windows OCR: {e}"))?;
+    let result = engine
+        .RecognizeAsync(&bitmap)
+        .map_err(|e| format!("could not start Windows OCR: {e}"))?
+        .join()
+        .map_err(|e| format!("could not OCR image: {e}"))?;
+    result
+        .Text()
+        .map(|text| text.to_string_lossy())
+        .map_err(|e| format!("could not read OCR text: {e}"))
+}
+
+#[cfg(all(feature = "ocr", target_os = "windows"))]
+fn scaled_dimensions(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
+    if max_edge == 0 || (width <= max_edge && height <= max_edge) {
+        return (width.max(1), height.max(1));
+    }
+    if width >= height {
+        let scaled_height = (u64::from(height) * u64::from(max_edge) / u64::from(width)).max(1);
+        (max_edge, scaled_height as u32)
+    } else {
+        let scaled_width = (u64::from(width) * u64::from(max_edge) / u64::from(height)).max(1);
+        (scaled_width as u32, max_edge)
+    }
+}
+
+#[cfg(all(feature = "ocr", target_os = "macos"))]
+pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
+    use objc2::AnyObject;
+    use objc2_foundation::{NSArray, NSData, NSDictionary};
+    use objc2_vision::{
+        VNImageOption, VNImageRequestHandler, VNRecognizeTextRequest, VNRequestTextRecognitionLevel,
+    };
+
+    let cfg = image_ocr_config()?;
+    if matches!(cfg.mode, ImageOcrMode::Off) {
+        return Err("image OCR disabled".to_string());
+    }
+    if bytes.len() as u64 > cfg.max_image_bytes {
+        return Err(format!(
+            "image is larger than {} bytes",
+            cfg.max_image_bytes
+        ));
+    }
+
+    let data = NSData::with_bytes(bytes);
+    let options = NSDictionary::<VNImageOption, AnyObject>::from_slices::<VNImageOption>(&[], &[]);
+    let request = VNRecognizeTextRequest::new();
+    request.setRecognitionLevel(VNRequestTextRecognitionLevel::Fast);
+    request.setAutomaticallyDetectsLanguage(true);
+    request.setUsesLanguageCorrection(false);
+
+    let request_for_handler = request.clone().into_super().into_super();
+    let requests = NSArray::from_retained_slice(&[request_for_handler]);
+    let handler = VNImageRequestHandler::initWithData_options(
+        VNImageRequestHandler::alloc(),
+        &data,
+        &options,
+    );
+    handler
+        .performRequests_error(&requests)
+        .map_err(|e| format!("could not OCR image with macOS Vision: {e}"))?;
+
+    let Some(observations) = request.results() else {
+        return Ok(String::new());
+    };
+    let mut text = String::new();
+    for observation in observations.iter() {
+        let candidates = observation.topCandidates(1);
+        let mut iter = candidates.iter();
+        let Some(candidate) = iter.next() else {
+            continue;
+        };
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&candidate.string().to_string());
+    }
+    Ok(text)
+}
+
+#[cfg(all(feature = "ocr", target_os = "linux"))]
 pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
     use image::GenericImageView;
     use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
@@ -673,7 +862,7 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
         .map_err(|e| format!("could not OCR image: {e}"))
 }
 
-#[cfg(feature = "ocr")]
+#[cfg(all(feature = "ocr", target_os = "linux"))]
 fn resize_for_ocr(img: image::DynamicImage, max_edge: u32) -> image::DynamicImage {
     use image::GenericImageView;
 
@@ -682,6 +871,14 @@ fn resize_for_ocr(img: image::DynamicImage, max_edge: u32) -> image::DynamicImag
         return img;
     }
     img.resize(max_edge, max_edge, image::imageops::FilterType::Triangle)
+}
+
+#[cfg(all(
+    feature = "ocr",
+    not(any(target_os = "linux", target_os = "windows", target_os = "macos"))
+))]
+pub fn ocr_image_bytes(_bytes: &[u8]) -> Result<String, String> {
+    Err("image OCR is not supported on this platform".to_string())
 }
 
 #[cfg(not(feature = "ocr"))]
@@ -998,7 +1195,7 @@ mod tests {
         assert!(!ocr_text_has_secret("   \n\t", &[7; 32]));
     }
 
-    #[cfg(feature = "ocr")]
+    #[cfg(all(feature = "ocr", target_os = "linux"))]
     #[test]
     fn resize_for_ocr_caps_long_edge() {
         use image::GenericImageView;
@@ -1010,5 +1207,13 @@ mod tests {
         let img = image::DynamicImage::new_rgb8(1024, 512);
         let resized = resize_for_ocr(img, 2048);
         assert_eq!(resized.dimensions(), (1024, 512));
+    }
+
+    #[cfg(all(feature = "ocr", target_os = "windows"))]
+    #[test]
+    fn windows_scaled_dimensions_cap_long_edge() {
+        assert_eq!(scaled_dimensions(4096, 1024, 2048), (2048, 512));
+        assert_eq!(scaled_dimensions(1024, 512, 2048), (1024, 512));
+        assert_eq!(scaled_dimensions(10, 100, 50), (5, 50));
     }
 }
