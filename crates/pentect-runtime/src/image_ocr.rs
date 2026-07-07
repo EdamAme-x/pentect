@@ -773,7 +773,8 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
         ));
     }
 
-    let data = NSData::with_bytes(bytes);
+    let ocr_bytes = prepare_macos_ocr_bytes(bytes, &cfg)?;
+    let data = NSData::with_bytes(ocr_bytes.as_ref());
     let options = NSDictionary::<VNImageOption, AnyObject>::from_slices::<VNImageOption>(&[], &[]);
     let request = VNRecognizeTextRequest::new();
     request.setRecognitionLevel(VNRequestTextRecognitionLevel::Fast);
@@ -808,6 +809,53 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
         text.push_str(&candidate.string().to_string());
     }
     Ok(text)
+}
+
+#[cfg(all(feature = "ocr", target_os = "macos"))]
+fn prepare_macos_ocr_bytes<'a>(
+    bytes: &'a [u8],
+    cfg: &ImageOcrConfig,
+) -> Result<std::borrow::Cow<'a, [u8]>, String> {
+    use image::{GenericImageView, ImageFormat, ImageReader};
+    use std::{borrow::Cow, io::Cursor};
+
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("could not inspect image: {e}"))?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|e| format!("could not read image dimensions: {e}"))?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > cfg.max_pixels {
+        return Err(format!(
+            "image has {pixels} pixels; limit is {}",
+            cfg.max_pixels
+        ));
+    }
+    if cfg.max_edge == 0 || (width <= cfg.max_edge && height <= cfg.max_edge) {
+        return Ok(Cow::Borrowed(bytes));
+    }
+
+    let img = image::load_from_memory(bytes).map_err(|e| format!("could not decode image: {e}"))?;
+    let resized = img.resize(
+        cfg.max_edge,
+        cfg.max_edge,
+        image::imageops::FilterType::Triangle,
+    );
+    let (resized_width, resized_height) = resized.dimensions();
+    let resized_pixels = u64::from(resized_width).saturating_mul(u64::from(resized_height));
+    if resized_pixels > cfg.max_pixels {
+        return Err(format!(
+            "image has {resized_pixels} pixels after resize; limit is {}",
+            cfg.max_pixels
+        ));
+    }
+
+    let mut out = Vec::new();
+    resized
+        .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+        .map_err(|e| format!("could not prepare image for macOS OCR: {e}"))?;
+    Ok(Cow::Owned(out))
 }
 
 #[cfg(all(feature = "ocr", target_os = "linux"))]
