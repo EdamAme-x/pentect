@@ -7,6 +7,23 @@ use std::net::{IpAddr, SocketAddr};
 
 #[cfg(feature = "ocr")]
 const IMAGE_URL_MAX_REDIRECTS: usize = 5;
+const IMAGE_OBJECT_BYTE_FIELDS: &[&str] = &[
+    "data",
+    "bytes",
+    "base64",
+    "content",
+    "image",
+    "imageUrl",
+    "image_url",
+    "imageData",
+    "image_data",
+    "url",
+    "uri",
+    "src",
+    "href",
+    "dataUrl",
+    "data_url",
+];
 
 pub(crate) struct ImageInspection {
     pub(crate) scanned_images: usize,
@@ -16,6 +33,47 @@ pub(crate) struct ImageInspection {
     attempted_images: usize,
     total_image_bytes: u64,
     started_at: std::time::Instant,
+}
+
+pub(crate) struct ImageRedaction {
+    pub(crate) updated: Value,
+    pub(crate) changed: bool,
+    pub(crate) unscanned_images: usize,
+    pub(crate) ocr_failures: usize,
+    pub(crate) secret_images: usize,
+    pub(crate) notes: Vec<String>,
+}
+
+struct ImageRedactionState {
+    scanned_images: usize,
+    unscanned_images: usize,
+    ocr_failures: usize,
+    secret_images: usize,
+    attempted_images: usize,
+    total_image_bytes: u64,
+    started_at: std::time::Instant,
+    notes: Vec<String>,
+}
+
+struct RedactedImagePayload {
+    base64: String,
+    data_url: String,
+}
+
+enum ImageObjectEncoding {
+    Base64,
+    DataUrl,
+}
+
+struct ImageObjectSource {
+    key: String,
+    bytes: Vec<u8>,
+    encoding: ImageObjectEncoding,
+}
+
+enum ImageRedactionDecision {
+    Clean,
+    Redacted(RedactedImagePayload),
 }
 
 pub(crate) fn contains_image_result(value: &Value) -> bool {
@@ -57,6 +115,32 @@ pub(crate) fn inspect_tool_images_for_secrets(
     };
     collect_image_inspection(value, key, cfg, &mut inspection)?;
     Ok(inspection)
+}
+
+pub(crate) fn redact_tool_images_for_secrets(
+    value: &Value,
+    key: &[u8; 32],
+    cfg: &ImageOcrConfig,
+) -> Result<ImageRedaction, String> {
+    let mut state = ImageRedactionState {
+        scanned_images: 0,
+        unscanned_images: 0,
+        ocr_failures: 0,
+        secret_images: 0,
+        attempted_images: 0,
+        total_image_bytes: 0,
+        started_at: std::time::Instant::now(),
+        notes: Vec::new(),
+    };
+    let updated = redact_image_value(value, key, cfg, &mut state)?;
+    Ok(ImageRedaction {
+        changed: updated != *value,
+        updated,
+        unscanned_images: state.unscanned_images,
+        ocr_failures: state.ocr_failures,
+        secret_images: state.secret_images,
+        notes: state.notes,
+    })
 }
 
 fn collect_image_inspection(
@@ -203,6 +287,282 @@ impl ImageInspection {
     }
 }
 
+fn redact_image_value(
+    value: &Value,
+    key: &[u8; 32],
+    cfg: &ImageOcrConfig,
+    state: &mut ImageRedactionState,
+) -> Result<Value, String> {
+    match value {
+        Value::String(text) => {
+            if looks_like_image_reference(text) || looks_like_base64_image(text) {
+                let Some(bytes) = reserve_and_read_image_reference(text, cfg, state)? else {
+                    return Ok(value.clone());
+                };
+                return redact_image_bytes(&bytes, key, cfg, state)
+                    .map(|decision| replace_string_image(value, decision));
+            }
+            Ok(value.clone())
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Null => Ok(value.clone()),
+        Value::Array(items) => {
+            let mut changed = false;
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let updated = redact_image_value(item, key, cfg, state)?;
+                changed |= updated != *item;
+                out.push(updated);
+            }
+            if changed {
+                Ok(Value::Array(out))
+            } else {
+                Ok(value.clone())
+            }
+        }
+        Value::Object(map) => {
+            if object_marks_image(map) {
+                let before = state.total_observations();
+                if let Some(updated) = redact_image_object_fields(value, map, key, cfg, state)? {
+                    return Ok(updated);
+                }
+                let updated = redact_object_children(map, key, cfg, state)?;
+                if !empty_image_object(map) && state.total_observations() == before {
+                    state.unscanned_images += 1;
+                }
+                return Ok(updated.unwrap_or_else(|| value.clone()));
+            }
+            Ok(redact_object_children(map, key, cfg, state)?.unwrap_or_else(|| value.clone()))
+        }
+    }
+}
+
+fn redact_object_children(
+    map: &serde_json::Map<String, Value>,
+    key: &[u8; 32],
+    cfg: &ImageOcrConfig,
+    state: &mut ImageRedactionState,
+) -> Result<Option<Value>, String> {
+    let mut changed = false;
+    let mut out = serde_json::Map::with_capacity(map.len());
+    for (object_key, item) in map {
+        let updated = redact_image_value(item, key, cfg, state)?;
+        changed |= updated != *item;
+        out.insert(object_key.clone(), updated);
+    }
+    Ok(changed.then_some(Value::Object(out)))
+}
+
+fn reserve_and_read_image_reference(
+    text: &str,
+    cfg: &ImageOcrConfig,
+    state: &mut ImageRedactionState,
+) -> Result<Option<Vec<u8>>, String> {
+    if !state.reserve_image_slot(cfg) {
+        state.unscanned_images += 1;
+        return Ok(None);
+    }
+    let Some(deadline) = state.deadline(cfg) else {
+        state.unscanned_images += 1;
+        return Ok(None);
+    };
+    let Some(max_bytes) = state.remaining_image_bytes(cfg) else {
+        state.unscanned_images += 1;
+        return Ok(None);
+    };
+    match image_reference_bytes(text, cfg, max_bytes, deadline) {
+        Ok(Some(bytes)) => Ok(Some(bytes)),
+        Ok(None) | Err(_) => {
+            state.unscanned_images += 1;
+            Ok(None)
+        }
+    }
+}
+
+fn redact_image_object_fields(
+    original: &Value,
+    map: &serde_json::Map<String, Value>,
+    key: &[u8; 32],
+    cfg: &ImageOcrConfig,
+    state: &mut ImageRedactionState,
+) -> Result<Option<Value>, String> {
+    let mut out = original
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    let mut saw_image_field = false;
+    let mut changed = false;
+    for &field in IMAGE_OBJECT_BYTE_FIELDS {
+        let Some(text) = map.get(field).and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(bytes) = reserve_and_read_image_reference(text, cfg, state)? else {
+            continue;
+        };
+        saw_image_field = true;
+        let source = ImageObjectSource {
+            key: field.to_string(),
+            bytes,
+            encoding: image_object_field_encoding(field, text),
+        };
+        let decision = redact_image_bytes(&source.bytes, key, cfg, state)?;
+        changed |= replace_object_image_field(&mut out, source, decision);
+    }
+    if !saw_image_field {
+        return Ok(None);
+    }
+    if changed {
+        Ok(Some(Value::Object(out)))
+    } else {
+        Ok(Some(original.clone()))
+    }
+}
+
+fn image_object_field_encoding(key: &str, text: &str) -> ImageObjectEncoding {
+    let normalized = normalized_json_key(key);
+    if matches!(
+        normalized.as_str(),
+        "data" | "bytes" | "base64" | "content" | "imagedata"
+    ) && !text.trim().to_ascii_lowercase().starts_with("data:image/")
+    {
+        ImageObjectEncoding::Base64
+    } else {
+        ImageObjectEncoding::DataUrl
+    }
+}
+
+fn replace_string_image(original: &Value, decision: ImageRedactionDecision) -> Value {
+    match decision {
+        ImageRedactionDecision::Clean => original.clone(),
+        ImageRedactionDecision::Redacted(payload) => Value::String(payload.data_url),
+    }
+}
+
+fn replace_object_image_field(
+    out: &mut serde_json::Map<String, Value>,
+    source: ImageObjectSource,
+    decision: ImageRedactionDecision,
+) -> bool {
+    let ImageRedactionDecision::Redacted(payload) = decision else {
+        return false;
+    };
+    let replacement = match source.encoding {
+        ImageObjectEncoding::Base64 => {
+            set_png_mime_metadata(out);
+            payload.base64
+        }
+        ImageObjectEncoding::DataUrl => payload.data_url,
+    };
+    out.insert(source.key, Value::String(replacement));
+    true
+}
+
+fn set_png_mime_metadata(out: &mut serde_json::Map<String, Value>) {
+    let mut updated_existing = false;
+    for key in [
+        "mimeType",
+        "mimetype",
+        "mime_type",
+        "mediaType",
+        "media_type",
+        "contentType",
+        "content_type",
+    ] {
+        if out.contains_key(key) {
+            out.insert(key.to_string(), Value::String("image/png".to_string()));
+            updated_existing = true;
+        }
+    }
+    if !updated_existing {
+        out.insert(
+            "mimeType".to_string(),
+            Value::String("image/png".to_string()),
+        );
+    }
+}
+
+fn redact_image_bytes(
+    bytes: &[u8],
+    key: &[u8; 32],
+    cfg: &ImageOcrConfig,
+    state: &mut ImageRedactionState,
+) -> Result<ImageRedactionDecision, String> {
+    if !state.reserve_scan_bytes(bytes.len() as u64, cfg) {
+        state.unscanned_images += 1;
+        return Ok(ImageRedactionDecision::Clean);
+    }
+    state.scanned_images += 1;
+
+    let mut labels = Vec::new();
+    for text in image_barcode_texts(bytes, cfg) {
+        push_secret_labels(&mut labels, &image_text_secret_labels(&text, key));
+    }
+    if labels.is_empty() {
+        match ocr_image_bytes_with_config(bytes, cfg) {
+            Ok(text) => push_secret_labels(&mut labels, &image_text_secret_labels(&text, key)),
+            Err(_) => state.ocr_failures += 1,
+        }
+    }
+    if labels.is_empty() {
+        return Ok(ImageRedactionDecision::Clean);
+    }
+
+    state.secret_images += 1;
+    let index = state.notes.len() + 1;
+    state.notes.push(format!("[{index}] {}", labels.join(", ")));
+    let payload = redacted_image_payload(bytes, index, cfg)?;
+    Ok(ImageRedactionDecision::Redacted(payload))
+}
+
+fn push_secret_labels(out: &mut Vec<String>, labels: &[String]) {
+    for label in labels {
+        if !out.iter().any(|seen| seen == label) {
+            out.push(label.clone());
+        }
+    }
+}
+
+impl ImageRedactionState {
+    fn total_observations(&self) -> usize {
+        self.scanned_images + self.unscanned_images + self.ocr_failures + self.secret_images
+    }
+
+    fn reserve_image_slot(&mut self, cfg: &ImageOcrConfig) -> bool {
+        if self.attempted_images >= cfg.max_images {
+            return false;
+        }
+        if self.started_at.elapsed() >= std::time::Duration::from_secs(cfg.max_seconds) {
+            return false;
+        }
+        self.attempted_images += 1;
+        true
+    }
+
+    fn reserve_scan_bytes(&mut self, bytes: u64, cfg: &ImageOcrConfig) -> bool {
+        if bytes > cfg.max_image_bytes {
+            return false;
+        }
+        let Some(total) = self.total_image_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if total > cfg.max_total_bytes {
+            return false;
+        }
+        self.total_image_bytes = total;
+        true
+    }
+
+    fn deadline(&self, cfg: &ImageOcrConfig) -> Option<std::time::Instant> {
+        self.started_at
+            .checked_add(std::time::Duration::from_secs(cfg.max_seconds))
+    }
+
+    fn remaining_image_bytes(&self, cfg: &ImageOcrConfig) -> Option<u64> {
+        let remaining_total = cfg.max_total_bytes.checked_sub(self.total_image_bytes)?;
+        let remaining = remaining_total.min(cfg.max_image_bytes);
+        (remaining > 0).then_some(remaining)
+    }
+}
+
 fn ocr_text_has_secret(text: &str, key: &[u8; 32]) -> bool {
     if text.trim().is_empty() {
         return false;
@@ -216,6 +576,167 @@ fn ocr_text_has_secret(text: &str, key: &[u8; 32]) -> bool {
         &pentect_core::Config::new(*key),
     );
     result.summary.masked_count > 0
+}
+
+fn image_text_secret_labels(text: &str, key: &[u8; 32]) -> Vec<String> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let engine = image_ocr_secret_engine();
+    let result = engine.mask(
+        pentect_core::Input {
+            kind: pentect_core::Kind::Text,
+            data: text.to_string(),
+        },
+        &pentect_core::Config::new(*key),
+    );
+    let mut labels = Vec::new();
+    for item in result.items {
+        if !labels.iter().any(|seen| seen == &item.label) {
+            labels.push(item.label);
+        }
+    }
+    labels
+}
+
+#[cfg(feature = "ocr")]
+fn redacted_image_payload(
+    bytes: &[u8],
+    index: usize,
+    cfg: &ImageOcrConfig,
+) -> Result<RedactedImagePayload, String> {
+    use image::{GenericImageView, ImageFormat, Rgba, RgbaImage};
+    use std::io::Cursor;
+
+    let image = image::load_from_memory(bytes)
+        .map_err(|e| format!("could not prepare redacted image: {e}"))?;
+    let (width, height) = redacted_image_dimensions(image.dimensions(), cfg.max_edge);
+    let mut redacted = RgbaImage::from_pixel(width, height, Rgba([18, 18, 18, 255]));
+    draw_image_mask_badge(&mut redacted, index);
+
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(redacted)
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(|e| format!("could not encode redacted image: {e}"))?;
+    let base64 = data_encoding::BASE64.encode(&png);
+    Ok(RedactedImagePayload {
+        data_url: format!("data:image/png;base64,{base64}"),
+        base64,
+    })
+}
+
+#[cfg(not(feature = "ocr"))]
+fn redacted_image_payload(
+    _bytes: &[u8],
+    _index: usize,
+    _cfg: &ImageOcrConfig,
+) -> Result<RedactedImagePayload, String> {
+    Err("image OCR requires a build with `--features ocr`".to_string())
+}
+
+#[cfg(feature = "ocr")]
+fn redacted_image_dimensions((width, height): (u32, u32), max_edge: u32) -> (u32, u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    let max_edge = max_edge.clamp(128, 2_048);
+    let (mut out_width, mut out_height) = if width <= max_edge && height <= max_edge {
+        (width, height)
+    } else if width >= height {
+        let scaled_height = (u64::from(height) * u64::from(max_edge) / u64::from(width)).max(1);
+        (max_edge, scaled_height as u32)
+    } else {
+        let scaled_width = (u64::from(width) * u64::from(max_edge) / u64::from(height)).max(1);
+        (scaled_width as u32, max_edge)
+    };
+    out_width = out_width.max(128);
+    out_height = out_height.max(128);
+    (out_width, out_height)
+}
+
+#[cfg(feature = "ocr")]
+fn draw_image_mask_badge(image: &mut image::RgbaImage, index: usize) {
+    use image::Rgba;
+
+    let label = format!("[{index}]");
+    let scale = 5u32;
+    let padding = 8u32;
+    let glyph_width = 4u32 * scale;
+    let glyph_height = 7u32 * scale;
+    let badge_width = padding
+        .saturating_mul(2)
+        .saturating_add(glyph_width.saturating_mul(label.chars().count() as u32));
+    let badge_height = padding.saturating_mul(2).saturating_add(glyph_height);
+    fill_rect(image, 8, 8, badge_width, badge_height, Rgba([0, 0, 0, 255]));
+    let mut x = 8 + padding;
+    for ch in label.chars() {
+        draw_glyph(image, x, 8 + padding, ch, scale, Rgba([255, 255, 255, 255]));
+        x = x.saturating_add(glyph_width);
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn fill_rect(
+    image: &mut image::RgbaImage,
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+    color: image::Rgba<u8>,
+) {
+    let right = left.saturating_add(width).min(image.width());
+    let bottom = top.saturating_add(height).min(image.height());
+    for y in top..bottom {
+        for x in left..right {
+            image.put_pixel(x, y, color);
+        }
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn draw_glyph(
+    image: &mut image::RgbaImage,
+    left: u32,
+    top: u32,
+    ch: char,
+    scale: u32,
+    color: image::Rgba<u8>,
+) {
+    for (row, pattern) in mask_label_glyph(ch).iter().enumerate() {
+        let row = row as u32;
+        for (col, bit) in pattern.chars().enumerate() {
+            if bit != '1' {
+                continue;
+            }
+            let col = col as u32;
+            fill_rect(
+                image,
+                left.saturating_add(col.saturating_mul(scale)),
+                top.saturating_add(row.saturating_mul(scale)),
+                scale,
+                scale,
+                color,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn mask_label_glyph(ch: char) -> &'static [&'static str] {
+    match ch {
+        '0' => &["111", "101", "101", "101", "101", "101", "111"],
+        '1' => &["010", "110", "010", "010", "010", "010", "111"],
+        '2' => &["111", "001", "001", "111", "100", "100", "111"],
+        '3' => &["111", "001", "001", "111", "001", "001", "111"],
+        '4' => &["101", "101", "101", "111", "001", "001", "001"],
+        '5' => &["111", "100", "100", "111", "001", "001", "111"],
+        '6' => &["111", "100", "100", "111", "101", "101", "111"],
+        '7' => &["111", "001", "001", "010", "010", "010", "010"],
+        '8' => &["111", "101", "101", "111", "101", "101", "111"],
+        '9' => &["111", "101", "101", "111", "001", "001", "111"],
+        '[' => &["011", "010", "010", "010", "010", "010", "011"],
+        ']' => &["110", "010", "010", "010", "010", "010", "110"],
+        _ => &["000", "000", "000", "000", "000", "000", "000"],
+    }
 }
 
 #[cfg(feature = "ocr")]
@@ -284,23 +805,7 @@ fn image_object_bytes(
     max_bytes: u64,
     deadline: std::time::Instant,
 ) -> Result<Option<Vec<u8>>, String> {
-    for key in [
-        "data",
-        "bytes",
-        "base64",
-        "content",
-        "image",
-        "imageUrl",
-        "image_url",
-        "imageData",
-        "image_data",
-        "url",
-        "uri",
-        "src",
-        "href",
-        "dataUrl",
-        "data_url",
-    ] {
+    for &key in IMAGE_OBJECT_BYTE_FIELDS {
         let Some(text) = map.get(key).and_then(Value::as_str) else {
             continue;
         };

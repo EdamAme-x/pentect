@@ -29,6 +29,31 @@ fn first_handle_with_prefix(text: &str, prefix: &str) -> String {
     text[start..end].to_string()
 }
 
+#[cfg(feature = "ocr")]
+fn qr_png(payload: &str) -> Vec<u8> {
+    use image::{GrayImage, ImageFormat, Luma};
+    use rxing::{BarcodeFormat, Writer};
+    use std::io::Cursor;
+
+    let writer = rxing::qrcode::QRCodeWriter {};
+    let matrix = writer
+        .encode(payload, &BarcodeFormat::QR_CODE, 192, 192)
+        .unwrap();
+    let mut img = GrayImage::from_pixel(matrix.getWidth(), matrix.getHeight(), Luma([255]));
+    for y in 0..matrix.getHeight() {
+        for x in 0..matrix.getWidth() {
+            if matrix.get(x, y) {
+                img.put_pixel(x, y, Luma([0]));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    image::DynamicImage::ImageLuma8(img)
+        .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+        .unwrap();
+    out
+}
+
 #[test]
 fn session_recovery_is_process_local() {
     let root = std::env::temp_dir().join(format!(
@@ -1753,6 +1778,69 @@ fn posttool_blocks_unscanned_image_output_when_configured() {
     let reason = output["reason"].as_str().unwrap();
     assert!(reason.contains("image blocked"), "{reason}");
     assert!(reason.contains("image scan failed"), "{reason}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
+    let (root, session) = empty_session("hook-post-claude-image-redact");
+    let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let original = data_encoding::BASE64.encode(&qr_png(raw));
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__chrome__screenshot",
+        "tool_response": {
+            "content": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": original
+            }]
+        }
+    });
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Claude, "t", &session, input).unwrap()
+    };
+    assert!(output.get("decision").is_none(), "{output}");
+    let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
+    let rendered = serde_json::to_string(updated).unwrap();
+    assert!(rendered.contains("Pentect image masks"), "{rendered}");
+    assert!(rendered.contains("[1] OPENAI_API_KEY"), "{rendered}");
+    assert!(
+        rendered.contains("\"mimeType\":\"image/png\""),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(&original), "{rendered}");
+    assert!(!rendered.contains(raw), "{rendered}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn codex_posttool_still_blocks_secret_qr_image() {
+    let (root, session) = empty_session("hook-post-codex-image-block");
+    let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__chrome__screenshot",
+        "tool_response": {
+            "content": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": data_encoding::BASE64.encode(&qr_png(raw))
+            }]
+        }
+    });
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Codex, "t", &session, input).unwrap()
+    };
+    assert_eq!(output["decision"], "block");
+    let reason = output["reason"].as_str().unwrap();
+    assert!(reason.contains("secret text detected"), "{reason}");
     let _ = std::fs::remove_dir_all(root);
 }
 

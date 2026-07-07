@@ -2340,7 +2340,7 @@ fn handle_hook_with_launch_requirement(
             if codex_exec_proxy_owns_shell_output(provider, tool_name) {
                 return Ok(json!({}));
             }
-            match mask_tool_text_output(session, tool_response)? {
+            match mask_tool_text_output(provider, session, tool_response)? {
                 ToolTextOutput::Unchanged => Ok(json!({})),
                 ToolTextOutput::Updated(updated) => Ok(after_tool_output(provider, updated)),
                 ToolTextOutput::Block(reason) => Ok(after_tool_block_output(provider, &reason)),
@@ -2403,7 +2403,7 @@ fn handle_hook_lazy(
             if codex_exec_proxy_owns_shell_output(provider, tool_name) {
                 return Ok(json!({}));
             }
-            match mask_tool_text_output(&session, tool_response)? {
+            match mask_tool_text_output(provider, &session, tool_response)? {
                 ToolTextOutput::Unchanged => Ok(json!({})),
                 ToolTextOutput::Updated(updated) => Ok(after_tool_output(provider, updated)),
                 ToolTextOutput::Block(reason) => Ok(after_tool_block_output(provider, &reason)),
@@ -3438,23 +3438,132 @@ fn after_tool_block_output(_provider: HookProvider, reason: &str) -> Value {
 }
 
 fn mask_tool_text_output(
+    provider: HookProvider,
     session: &Session,
     tool_response: &Value,
 ) -> Result<ToolTextOutput, String> {
-    if let Some(reason) = image_tool_result_block_reason(session, tool_response)? {
+    let mut output = tool_response.clone();
+    let mut image_changed = false;
+    if provider == HookProvider::Claude {
+        match claude_image_tool_output(session, tool_response)? {
+            Some(ToolTextOutput::Updated(updated)) => {
+                output = updated;
+                image_changed = true;
+            }
+            Some(ToolTextOutput::Block(reason)) => return Ok(ToolTextOutput::Block(reason)),
+            Some(ToolTextOutput::Unchanged) | None => {}
+        }
+    } else if let Some(reason) = image_tool_result_block_reason(session, tool_response)? {
         return Ok(ToolTextOutput::Block(reason));
     }
-    if let Some(reason) = unsupported_tool_result_reason(tool_response) {
+    if let Some(reason) = unsupported_tool_result_reason(&output) {
         return Ok(ToolTextOutput::Block(reason));
     }
     let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
     let mut masker = OutputMasker::new_deferred(store)?;
-    let (updated, changed) = mask_tool_json(tool_response, &mut masker)?;
+    let (updated, changed) = mask_tool_json(&output, &mut masker)?;
     masker.flush()?;
-    if changed {
+    if changed || image_changed {
         Ok(ToolTextOutput::Updated(updated))
     } else {
         Ok(ToolTextOutput::Unchanged)
+    }
+}
+
+fn claude_image_tool_output(
+    session: &Session,
+    value: &Value,
+) -> Result<Option<ToolTextOutput>, String> {
+    if !image_ocr::contains_image_result(value) {
+        return Ok(None);
+    }
+    let cfg = config::image_ocr_config()?;
+    if matches!(cfg.mode, config::ImageOcrMode::Off) {
+        return Ok(
+            matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block).then_some(
+                ToolTextOutput::Block("image blocked: OCR is off.".to_string()),
+            ),
+        );
+    }
+    let redaction = image_ocr::redact_tool_images_for_secrets(value, &session.key, &cfg)?;
+    if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
+        if redaction.unscanned_images > 0 {
+            return Ok(Some(ToolTextOutput::Block(
+                "image blocked: image could not be fetched or scanned.".to_string(),
+            )));
+        }
+        if redaction.ocr_failures > 0 {
+            return Ok(Some(ToolTextOutput::Block(
+                "image blocked: image scan failed.".to_string(),
+            )));
+        }
+    }
+    if redaction.secret_images > 0 {
+        if !redaction.changed {
+            return Ok(Some(ToolTextOutput::Block(
+                "image blocked: secret text detected.".to_string(),
+            )));
+        }
+        let updated = append_image_mask_notes(redaction.updated, &redaction.notes);
+        return Ok(Some(ToolTextOutput::Updated(updated)));
+    }
+    if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Allow) {
+        return Ok(None);
+    }
+    Ok(None)
+}
+
+fn append_image_mask_notes(mut value: Value, notes: &[String]) -> Value {
+    if notes.is_empty() {
+        return value;
+    }
+    let text = format!("Pentect image masks\n{}", notes.join("\n"));
+    if append_text_block_to_content(&mut value, &text) {
+        return value;
+    }
+    match value {
+        Value::Object(mut map) => {
+            map.insert("pentect_image_masks".to_string(), Value::String(text));
+            Value::Object(map)
+        }
+        other => json!({
+            "content": [
+                other,
+                {
+                    "type": "text",
+                    "text": text
+                }
+            ]
+        }),
+    }
+}
+
+fn append_text_block_to_content(value: &mut Value, text: &str) -> bool {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if append_text_block_to_content(item, text) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Object(map) => {
+            if let Some(content) = map.get_mut("content").and_then(Value::as_array_mut) {
+                content.push(json!({
+                    "type": "text",
+                    "text": text
+                }));
+                return true;
+            }
+            for item in map.values_mut() {
+                if append_text_block_to_content(item, text) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => false,
     }
 }
 
