@@ -14,7 +14,8 @@ path = "src/main.rs"
 [features]
 default = ["pdf", "ocr"]
 pdf = ["dep:pdf-extract"]
-ocr = ["dep:reqwest", "native-ocr", "bundled-ocr"]
+ocr = ["dep:reqwest", "native-ocr", "bundled-ocr", "barcode"]
+barcode = ["dep:image", "dep:rxing"]
 native-ocr = [
     "dep:windows",
     "dep:objc2",
@@ -30,6 +31,8 @@ axum = { workspace = true }
 data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+rxing = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
@@ -53,7 +56,6 @@ windows = { workspace = true, optional = true, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-image = { workspace = true, optional = true }
 objc2 = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true, default-features = false, features = [
     "std",
@@ -74,6 +76,8 @@ objc2-vision = { workspace = true, optional = true, default-features = false, fe
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-image = { workspace = true, optional = true }
 ocrs = { workspace = true, optional = true }
 rten = { workspace = true, optional = true }
+
+[dev-dependencies]
+rxing = { workspace = true, features = ["encoders"] }
