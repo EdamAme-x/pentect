@@ -174,7 +174,7 @@ async fn handle_client(fut: upgrade::UpgradeFut, codex: PathBuf) -> Result<(), S
     let mut backend_rewriter =
         BackendRewriter::new(move |text: &str| mask_exec_output_text(&mut output_masker, text));
 
-    loop {
+    'session: loop {
         tokio::select! {
             frame = ws.read_frame() => {
                 let frame = match frame {
@@ -206,12 +206,13 @@ async fn handle_client(fut: upgrade::UpgradeFut, codex: PathBuf) -> Result<(), S
                 if line.trim().is_empty() {
                     continue;
                 }
-                let line = backend_rewriter.rewrite_line(&line)?;
-                if let Err(e) = ws.write_frame(Frame::text(Payload::Owned(line.into_bytes()))).await {
-                    if is_clean_websocket_close(&e) {
-                        break;
+                for line in backend_rewriter.rewrite_line(&line)? {
+                    if let Err(e) = ws.write_frame(Frame::text(Payload::Owned(line.into_bytes()))).await {
+                        if is_clean_websocket_close(&e) {
+                            break 'session;
+                        }
+                        return Err(format!("websocket write failed: {e}"));
                     }
-                    return Err(format!("websocket write failed: {e}"));
                 }
             }
         }
@@ -223,9 +224,11 @@ async fn handle_client(fut: upgrade::UpgradeFut, codex: PathBuf) -> Result<(), S
 }
 
 fn request_has_auth<B>(req: &Request<B>, auth: &str) -> bool {
-    req.uri()
-        .query()
-        .is_some_and(|query| query.split('&').any(|part| part == format!("token={auth}")))
+    req.uri().query().is_some_and(|query| {
+        query
+            .split('&')
+            .any(|part| part.strip_prefix("token=") == Some(auth))
+    })
 }
 
 fn random_auth_token() -> Result<String, String> {
@@ -355,7 +358,14 @@ where
 
 struct BackendRewriter<F> {
     mask: F,
-    pending_output: BTreeMap<String, String>,
+    pending_output: BTreeMap<String, PendingOutput>,
+    next_output_order: u64,
+}
+
+struct PendingOutput {
+    params: Value,
+    text: String,
+    order: u64,
 }
 
 impl<F> BackendRewriter<F>
@@ -366,13 +376,14 @@ where
         Self {
             mask,
             pending_output: BTreeMap::new(),
+            next_output_order: 0,
         }
     }
 
-    fn rewrite_line(&mut self, line: &str) -> Result<String, String> {
+    fn rewrite_line(&mut self, line: &str) -> Result<Vec<String>, String> {
         let mut value: Value = match serde_json::from_str(line) {
             Ok(value) => value,
-            Err(_) => return Ok(line.to_string()),
+            Err(_) => return Ok(vec![line.to_string()]),
         };
         let method = value
             .get("method")
@@ -400,7 +411,9 @@ where
         }
         if method.as_deref() == Some(PROCESS_OUTPUT_METHOD) {
             if let Some(params) = value.get_mut("params") {
-                self.mask_process_output(params)?;
+                if !self.mask_process_output(params)? {
+                    return Ok(Vec::new());
+                }
             }
         } else if is_process_read_response(&value) {
             if let Some(chunks) = value
@@ -411,30 +424,48 @@ where
                 mask_read_chunks(chunks, &mut self.mask)?;
             }
         }
-        if matches!(method.as_deref(), Some("process/exited" | "process/closed")) {
-            clear_process_pending(&mut self.pending_output, &value);
-        }
+        let mut out = if matches!(method.as_deref(), Some("process/exited" | "process/closed")) {
+            flush_process_pending(&mut self.pending_output, &value, &mut self.mask)?
+        } else {
+            Vec::new()
+        };
         if let Some(error) = value.get_mut("error") {
             mask_json_strings(error, &mut self.mask)?;
         }
-        serde_json::to_string(&value).map_err(|e| e.to_string())
+        out.push(serde_json::to_string(&value).map_err(|e| e.to_string())?);
+        Ok(out)
     }
 
-    fn mask_process_output(&mut self, value: &mut Value) -> Result<(), String> {
+    fn mask_process_output(&mut self, value: &mut Value) -> Result<bool, String> {
         let Some(text) = decoded_chunk_text(value)? else {
-            return Ok(());
+            return Ok(true);
         };
         let key = output_buffer_key(value);
-        let pending = self.pending_output.remove(&key).unwrap_or_default();
-        let combined = format!("{pending}{text}");
+        let pending = self.pending_output.remove(&key);
+        let (mut combined, params, order) = match pending {
+            Some(pending) => (pending.text, pending.params, pending.order),
+            None => {
+                let order = self.next_output_order;
+                self.next_output_order = self.next_output_order.saturating_add(1);
+                (String::new(), value.clone(), order)
+            }
+        };
+        combined.push_str(&text);
         if should_flush_output(&combined) {
             let masked = (self.mask)(&combined)?;
             set_chunk_text(value, &masked);
+            Ok(true)
         } else {
-            self.pending_output.insert(key, combined);
-            set_chunk_text(value, "");
+            self.pending_output.insert(
+                key,
+                PendingOutput {
+                    params,
+                    text: combined,
+                    order,
+                },
+            );
+            Ok(false)
         }
-        Ok(())
     }
 }
 
@@ -516,16 +547,42 @@ fn should_flush_output(text: &str) -> bool {
     text.contains('\n') || text.len() >= OUTPUT_HOLDBACK_BYTES
 }
 
-fn clear_process_pending(pending: &mut BTreeMap<String, String>, value: &Value) {
+fn flush_process_pending<F>(
+    pending: &mut BTreeMap<String, PendingOutput>,
+    value: &Value,
+    mask: &mut F,
+) -> Result<Vec<String>, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
     let Some(process) = value
         .get("params")
         .and_then(|params| params.get("processId"))
         .and_then(Value::as_str)
     else {
-        return;
+        return Ok(Vec::new());
     };
     let prefix = format!("{process}\0");
-    pending.retain(|key, _| !key.starts_with(&prefix));
+    let mut keys = pending
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(key, item)| (item.order, key.clone()))
+        .collect::<Vec<_>>();
+    keys.sort_by_key(|(order, _)| *order);
+    let mut out = Vec::new();
+    for (_, key) in keys {
+        let Some(mut item) = pending.remove(&key) else {
+            continue;
+        };
+        let masked = mask(&item.text)?;
+        set_chunk_text(&mut item.params, &masked);
+        let notification = serde_json::json!({
+            "method": PROCESS_OUTPUT_METHOD,
+            "params": item.params,
+        });
+        out.push(serde_json::to_string(&notification).map_err(|e| e.to_string())?);
+    }
+    Ok(out)
 }
 
 fn mask_json_strings<F>(value: &mut Value, mask: &mut F) -> Result<(), String>
@@ -577,6 +634,11 @@ fn exec_proxy_debug() -> bool {
 mod tests {
     use super::*;
 
+    fn single_line(lines: Vec<String>) -> String {
+        assert_eq!(1, lines.len(), "{lines:?}");
+        lines.into_iter().next().unwrap()
+    }
+
     #[test]
     fn backend_notification_masks_output_chunk() {
         let raw = data_encoding::BASE64.encode(b"OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx\n");
@@ -588,7 +650,7 @@ mod tests {
         let mut rewriter = BackendRewriter::new(|text: &str| {
             Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
         });
-        let rewritten = rewriter.rewrite_line(&line).unwrap();
+        let rewritten = single_line(rewriter.rewrite_line(&line).unwrap());
         let value: Value = serde_json::from_str(&rewritten).unwrap();
         let text = decoded_chunk_text(value.get("params").unwrap())
             .unwrap()
@@ -665,7 +727,7 @@ mod tests {
         let mut rewriter = BackendRewriter::new(|text: &str| {
             Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
         });
-        let rewritten = rewriter.rewrite_line(&line).unwrap();
+        let rewritten = single_line(rewriter.rewrite_line(&line).unwrap());
         assert!(!rewritten.contains("sk-abcdef"), "{rewritten}");
         let value: Value = serde_json::from_str(&rewritten).unwrap();
         let chunks = value
@@ -695,19 +757,72 @@ mod tests {
             Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
         });
         let first = rewriter.rewrite_line(&first).unwrap();
-        let first_value: Value = serde_json::from_str(&first).unwrap();
-        assert_eq!(
-            decoded_chunk_text(first_value.get("params").unwrap())
-                .unwrap()
-                .unwrap(),
-            ""
-        );
-        let second = rewriter.rewrite_line(&second).unwrap();
+        assert!(first.is_empty(), "{first:?}");
+        let second = single_line(rewriter.rewrite_line(&second).unwrap());
         let second_value: Value = serde_json::from_str(&second).unwrap();
         let text = decoded_chunk_text(second_value.get("params").unwrap())
             .unwrap()
             .unwrap();
         assert!(text.contains("<<OPENAI_API_KEY_x>>"), "{text}");
+    }
+
+    #[test]
+    fn backend_output_notification_flushes_partial_on_exit() {
+        let output = serde_json::json!({
+            "method": PROCESS_OUTPUT_METHOD,
+            "params": {"processId": "proc-1", "seq": 1, "stream": "stdout", "chunk": data_encoding::BASE64.encode(b"OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx")}
+        })
+        .to_string();
+        let exited = serde_json::json!({
+            "method": "process/exited",
+            "params": {"processId": "proc-1", "exitCode": 0}
+        })
+        .to_string();
+        let mut rewriter = BackendRewriter::new(|text: &str| {
+            Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
+        });
+
+        assert!(rewriter.rewrite_line(&output).unwrap().is_empty());
+        let lines = rewriter.rewrite_line(&exited).unwrap();
+        assert_eq!(2, lines.len(), "{lines:?}");
+        let output_value: Value = serde_json::from_str(&lines[0]).unwrap();
+        let text = decoded_chunk_text(output_value.get("params").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("<<OPENAI_API_KEY_x>>"), "{text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&lines[1]).unwrap()["method"],
+            "process/exited"
+        );
+    }
+
+    #[test]
+    fn backend_output_exit_flush_preserves_pending_order() {
+        let stdout = serde_json::json!({
+            "method": PROCESS_OUTPUT_METHOD,
+            "params": {"processId": "proc-1", "seq": 1, "stream": "stdout", "chunk": data_encoding::BASE64.encode(b"out")}
+        })
+        .to_string();
+        let stderr = serde_json::json!({
+            "method": PROCESS_OUTPUT_METHOD,
+            "params": {"processId": "proc-1", "seq": 2, "stream": "stderr", "chunk": data_encoding::BASE64.encode(b"err")}
+        })
+        .to_string();
+        let exited = serde_json::json!({
+            "method": "process/exited",
+            "params": {"processId": "proc-1", "exitCode": 0}
+        })
+        .to_string();
+        let mut rewriter = BackendRewriter::new(|text: &str| Ok(text.to_string()));
+
+        assert!(rewriter.rewrite_line(&stdout).unwrap().is_empty());
+        assert!(rewriter.rewrite_line(&stderr).unwrap().is_empty());
+        let lines = rewriter.rewrite_line(&exited).unwrap();
+        assert_eq!(3, lines.len(), "{lines:?}");
+        let first: Value = serde_json::from_str(&lines[0]).unwrap();
+        let second: Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(first["params"]["stream"], "stdout");
+        assert_eq!(second["params"]["stream"], "stderr");
     }
 
     #[test]
@@ -720,7 +835,7 @@ mod tests {
         let mut rewriter = BackendRewriter::new(|text: &str| {
             Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
         });
-        let rewritten = rewriter.rewrite_line(&line).unwrap();
+        let rewritten = single_line(rewriter.rewrite_line(&line).unwrap());
         assert!(
             !rewritten.contains("sk-abcdefghijklmnopqrstuvwx"),
             "{rewritten}"

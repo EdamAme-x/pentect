@@ -142,7 +142,7 @@ fn inspect_image_bytes(
         return;
     }
     inspection.scanned_images += 1;
-    match ocr_image_bytes(bytes) {
+    match ocr_image_bytes_with_config(bytes, cfg) {
         Ok(text) => {
             if ocr_text_has_secret(&text, key) {
                 inspection.secret_images += 1;
@@ -200,7 +200,7 @@ fn ocr_text_has_secret(text: &str, key: &[u8; 32]) -> bool {
     if text.trim().is_empty() {
         return false;
     }
-    let engine = pentect_core::Engine::with_profile(pentect_core::Profile::Strict);
+    let engine = image_ocr_secret_engine();
     let result = engine.mask(
         pentect_core::Input {
             kind: pentect_core::Kind::Text,
@@ -209,6 +209,11 @@ fn ocr_text_has_secret(text: &str, key: &[u8; 32]) -> bool {
         &pentect_core::Config::new(*key),
     );
     result.summary.masked_count > 0
+}
+
+fn image_ocr_secret_engine() -> &'static pentect_core::Engine {
+    static ENGINE: std::sync::OnceLock<pentect_core::Engine> = std::sync::OnceLock::new();
+    ENGINE.get_or_init(|| pentect_core::Engine::with_profile(pentect_core::Profile::Strict))
 }
 
 fn object_marks_image(map: &serde_json::Map<String, Value>) -> bool {
@@ -640,6 +645,12 @@ pub fn ocr_status() -> &'static str {
 
 #[cfg(all(feature = "ocr", target_os = "windows"))]
 pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
+    let cfg = image_ocr_config()?;
+    ocr_image_bytes_with_config(bytes, &cfg)
+}
+
+#[cfg(all(feature = "ocr", target_os = "windows"))]
+fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<String, String> {
     use windows::Graphics::Imaging::{
         BitmapAlphaMode, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat,
         BitmapTransform, ColorManagementMode, ExifOrientationMode,
@@ -647,7 +658,6 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
     use windows::Media::Ocr::OcrEngine;
     use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 
-    let cfg = image_ocr_config()?;
     if matches!(cfg.mode, ImageOcrMode::Off) {
         return Err("image OCR disabled".to_string());
     }
@@ -756,13 +766,18 @@ fn scaled_dimensions(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
 
 #[cfg(all(feature = "ocr", target_os = "macos"))]
 pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
+    let cfg = image_ocr_config()?;
+    ocr_image_bytes_with_config(bytes, &cfg)
+}
+
+#[cfg(all(feature = "ocr", target_os = "macos"))]
+fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<String, String> {
     use objc2::{runtime::AnyObject, AnyThread};
     use objc2_foundation::{NSArray, NSData, NSDictionary};
     use objc2_vision::{
         VNImageOption, VNImageRequestHandler, VNRecognizeTextRequest, VNRequestTextRecognitionLevel,
     };
 
-    let cfg = image_ocr_config()?;
     if matches!(cfg.mode, ImageOcrMode::Off) {
         return Err("image OCR disabled".to_string());
     }
@@ -773,7 +788,7 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
         ));
     }
 
-    let ocr_bytes = prepare_macos_ocr_bytes(bytes, &cfg)?;
+    let ocr_bytes = prepare_macos_ocr_bytes(bytes, cfg)?;
     let data = NSData::with_bytes(ocr_bytes.as_ref());
     let options = NSDictionary::<VNImageOption, AnyObject>::from_slices::<VNImageOption>(&[], &[]);
     let request = VNRecognizeTextRequest::new();
@@ -860,6 +875,12 @@ fn prepare_macos_ocr_bytes<'a>(
 
 #[cfg(all(feature = "ocr", target_os = "linux"))]
 pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
+    let cfg = image_ocr_config()?;
+    ocr_image_bytes_with_config(bytes, &cfg)
+}
+
+#[cfg(all(feature = "ocr", target_os = "linux"))]
+fn ocr_image_bytes_with_config(bytes: &[u8], cfg: &ImageOcrConfig) -> Result<String, String> {
     use image::GenericImageView;
     use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
     use rten::Model;
@@ -867,7 +888,6 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
 
     static ENGINE: OnceLock<Result<OcrEngine, String>> = OnceLock::new();
 
-    let cfg = image_ocr_config()?;
     if matches!(cfg.mode, ImageOcrMode::Off) {
         return Err("image OCR disabled".to_string());
     }
@@ -930,8 +950,21 @@ pub fn ocr_image_bytes(_bytes: &[u8]) -> Result<String, String> {
     Err("image OCR is not supported on this platform".to_string())
 }
 
+#[cfg(all(
+    feature = "ocr",
+    not(any(target_os = "linux", target_os = "windows", target_os = "macos"))
+))]
+fn ocr_image_bytes_with_config(_bytes: &[u8], _cfg: &ImageOcrConfig) -> Result<String, String> {
+    Err("image OCR is not supported on this platform".to_string())
+}
+
 #[cfg(not(feature = "ocr"))]
 pub fn ocr_image_bytes(_bytes: &[u8]) -> Result<String, String> {
+    Err("image OCR requires a build with `--features ocr`".to_string())
+}
+
+#[cfg(not(feature = "ocr"))]
+fn ocr_image_bytes_with_config(_bytes: &[u8], _cfg: &ImageOcrConfig) -> Result<String, String> {
     Err("image OCR requires a build with `--features ocr`".to_string())
 }
 
