@@ -149,8 +149,15 @@ fn precheck_files(
                 skipped.push(SkippedFile::new(path, "missing"));
                 continue;
             }
-            Err(e) => return Err(format!("could not read '{}': {e}", path.display())),
+            Err(_) => {
+                skipped.push(SkippedFile::new(path, "metadata error"));
+                continue;
+            }
         };
+        if !meta.is_file() {
+            skipped.push(SkippedFile::new(path, "not a regular file"));
+            continue;
+        }
         if meta.len() > MAX_SCAN_FILE_BYTES {
             skipped.push(SkippedFile::new(path, "too large"));
             continue;
@@ -294,48 +301,6 @@ impl CoreBackend {
         }
     }
 
-    fn scan_file(&mut self, path: &Path) -> Result<ScanFile, String> {
-        let data = match read_text_file(path, self.binary)? {
-            ReadTextFile::Text(data) => data,
-            ReadTextFile::Skipped(reason) => {
-                return Ok(ScanFile::Skipped(SkippedFile::new(path, reason)));
-            }
-        };
-        let kind = infer_kind(path);
-        self.ensure_engine();
-        let line_index = LineIndex::new(&data);
-        let result = self.engine.as_ref().unwrap().analyze_spans(Input {
-            kind: kind.clone(),
-            data,
-        });
-        let hits = result
-            .spans
-            .iter()
-            .filter(|span| span.category == Category::Secret)
-            .filter_map(|span| hit_from_span(span, &line_index))
-            .collect::<Vec<_>>();
-        let warnings = result
-            .residual
-            .iter()
-            .filter(|note| note.category == Category::Secret)
-            .count();
-        if hits.is_empty() && warnings == 0 {
-            return Ok(ScanFile::Clean(path.to_path_buf()));
-        }
-        Ok(ScanFile::Finding(FileFinding {
-            path: path.to_path_buf(),
-            scope: ScanScope::classify(path),
-            kind,
-            findings: hits.len(),
-            warnings,
-            labels: label_counts(&hits),
-            categories: category_counts(&hits),
-            engines: engine_counts(&hits),
-            parser_fallback: result.parser_fallback,
-            hits,
-        }))
-    }
-
     fn ensure_engine(&mut self) {
         if self.engine.is_some() {
             return;
@@ -346,6 +311,47 @@ impl CoreBackend {
             packs,
         ));
     }
+}
+
+fn scan_file_with_engine(engine: &Engine, path: &Path, binary: BinaryMode) -> ScanFile {
+    let data = match read_text_file(path, binary) {
+        ReadTextFile::Text(data) => data,
+        ReadTextFile::Skipped(reason) => {
+            return ScanFile::Skipped(SkippedFile::new(path, reason));
+        }
+    };
+    let kind = infer_kind(path);
+    let line_index = LineIndex::new(&data);
+    let result = engine.analyze_spans(Input {
+        kind: kind.clone(),
+        data,
+    });
+    let hits = result
+        .spans
+        .iter()
+        .filter(|span| span.category == Category::Secret)
+        .filter_map(|span| hit_from_span(span, &line_index))
+        .collect::<Vec<_>>();
+    let warnings = result
+        .residual
+        .iter()
+        .filter(|note| note.category == Category::Secret)
+        .count();
+    if hits.is_empty() && warnings == 0 {
+        return ScanFile::Clean(path.to_path_buf());
+    }
+    ScanFile::Finding(FileFinding {
+        path: path.to_path_buf(),
+        scope: ScanScope::classify(path),
+        kind,
+        findings: hits.len(),
+        warnings,
+        labels: label_counts(&hits),
+        categories: category_counts(&hits),
+        engines: engine_counts(&hits),
+        parser_fallback: result.parser_fallback,
+        hits,
+    })
 }
 
 impl ScanBackend for CoreBackend {
@@ -366,31 +372,34 @@ impl ScanBackend for CoreBackend {
             .unwrap_or(1)
             .min(8)
             .min(files.len());
+        self.ensure_engine();
+        let Some(engine) = self.engine.as_ref() else {
+            return Err("engine unavailable".to_string());
+        };
         let next = AtomicUsize::new(0);
-        let packs = self.packs.take().unwrap_or_default();
         let (tx, rx) = mpsc::channel();
-        std::thread::scope(|scope| {
+        let out = std::thread::scope(|scope| {
             for _ in 0..workers {
                 let next = &next;
-                let packs = packs.clone();
                 let tx = tx.clone();
                 let binary = self.binary;
-                scope.spawn(move || {
-                    let mut worker = CoreBackend::new(packs, binary);
-                    loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(path) = files.get(index) else {
-                            break;
-                        };
-                        if tx.send(worker.scan_file(path)).is_err() {
-                            break;
-                        }
+                scope.spawn(move || loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = files.get(index) else {
+                        break;
+                    };
+                    if tx
+                        .send(scan_file_with_engine(engine, path, binary))
+                        .is_err()
+                    {
+                        break;
                     }
                 });
             }
             drop(tx);
-            rx.into_iter().collect::<Result<Vec<_>, _>>()
-        })
+            rx.into_iter().collect::<Vec<_>>()
+        });
+        Ok(out)
     }
 }
 
@@ -399,23 +408,24 @@ enum ReadTextFile {
     Skipped(&'static str),
 }
 
-fn read_text_file(path: &Path, binary: BinaryMode) -> Result<ReadTextFile, String> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+fn read_text_file(path: &Path, binary: BinaryMode) -> ReadTextFile {
+    let Ok(bytes) = std::fs::read(path) else {
+        return ReadTextFile::Skipped("read error");
+    };
     if binary == BinaryMode::Skip && should_sniff_magic(path) {
         if let FileMagic::Binary(reason) = classify(&bytes) {
-            return Ok(ReadTextFile::Skipped(reason));
+            return ReadTextFile::Skipped(reason);
         }
     }
     if binary == BinaryMode::Skip && memchr(0, &bytes).is_some() {
-        return Ok(ReadTextFile::Skipped("binary content"));
+        return ReadTextFile::Skipped("binary content");
     }
     match String::from_utf8(bytes) {
-        Ok(data) => Ok(ReadTextFile::Text(data)),
-        Err(e) if binary == BinaryMode::Text => Ok(ReadTextFile::Text(
-            String::from_utf8_lossy(e.as_bytes()).into_owned(),
-        )),
-        Err(_) => Ok(ReadTextFile::Skipped("invalid utf-8")),
+        Ok(data) => ReadTextFile::Text(data),
+        Err(e) if binary == BinaryMode::Text => {
+            ReadTextFile::Text(String::from_utf8_lossy(e.as_bytes()).into_owned())
+        }
+        Err(_) => ReadTextFile::Skipped("invalid utf-8"),
     }
 }
 

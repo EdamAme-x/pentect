@@ -330,6 +330,42 @@ mod tests {
     }
 
     #[test]
+    fn scan_skips_non_regular_paths_without_aborting() {
+        let root = temp_scan_root("pentect-scan-non-regular-skip");
+        let secret = root.join(".env");
+        std::fs::write(
+            &secret,
+            "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\n",
+        )
+        .unwrap();
+
+        let (results, _) = engine::scan_files_core_for_tests(
+            vec![root.clone(), secret.clone()],
+            Vec::new(),
+            BinaryMode::Skip,
+        )
+        .unwrap();
+        let mut saw_skipped_dir = false;
+        let mut saw_secret_finding = false;
+        for result in results {
+            match result {
+                ScanFile::Skipped(skipped) if skipped.path == root => {
+                    assert_eq!("not a regular file", skipped.reason);
+                    saw_skipped_dir = true;
+                }
+                ScanFile::Finding(file) if file.path == secret => {
+                    saw_secret_finding = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_skipped_dir);
+        assert!(saw_secret_finding);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn extensionless_text_starting_with_mz_is_scanned() {
         let root = temp_scan_root("pentect-scan-extensionless-mz");
         std::fs::write(
