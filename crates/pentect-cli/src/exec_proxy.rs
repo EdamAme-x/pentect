@@ -136,6 +136,7 @@ async fn handle_client(fut: upgrade::UpgradeFut, codex: PathBuf) -> Result<(), S
         fut.await
             .map_err(|e| format!("websocket upgrade failed: {e}"))?,
     );
+    let mut output_masker = pentect_agent::ActiveToolOutputMasker::new()?;
     let mut backend = Command::new(codex);
     backend
         .arg("exec-server")
@@ -170,7 +171,6 @@ async fn handle_client(fut: upgrade::UpgradeFut, codex: PathBuf) -> Result<(), S
         });
     }
     let mut backend_lines = BufReader::new(backend_stdout).lines();
-    let mut output_masker = pentect_agent::ActiveToolOutputMasker::new()?;
     let mut backend_rewriter =
         BackendRewriter::new(move |text: &str| mask_exec_output_text(&mut output_masker, text));
 
