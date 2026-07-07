@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 use shell::{next_shell_word, powershell_word, shell_quote_unix};
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -52,6 +52,8 @@ const PENTECT_CODEX_EXEC_PROXY_ENV: &str = "PENTECT_CODEX_EXEC_PROXY";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
+const ACTIVE_TOOL_OUTPUT_CACHE_LIMIT: usize = 128;
+const ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES: usize = 16 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -176,22 +178,109 @@ pub fn preflight_exec_server_process_start_from_active_in_memory_manager(
     requested_env_bindings(&store, &argv_mode).map(Some)
 }
 
+pub struct ActiveToolOutputMasker {
+    client: Option<InMemoryManagerClient>,
+    masker: Option<OutputMasker>,
+    reported_masked_count: u64,
+    cache: HashMap<[u8; 32], CachedToolOutput>,
+    cache_order: VecDeque<[u8; 32]>,
+}
+
+struct CachedToolOutput {
+    masked: String,
+    masked_count: u64,
+}
+
+impl ActiveToolOutputMasker {
+    pub fn new() -> Result<Self, String> {
+        let Some(client) = InMemoryManagerClient::from_env() else {
+            return Ok(Self {
+                client: None,
+                masker: None,
+                reported_masked_count: 0,
+                cache: HashMap::new(),
+                cache_order: VecDeque::new(),
+            });
+        };
+        let session = Session::open_capability("default").map_err(|e| e.to_string())?;
+        let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
+        Ok(Self {
+            client: Some(client),
+            masker: Some(OutputMasker::new_shared(store)?),
+            reported_masked_count: 0,
+            cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+        })
+    }
+
+    pub fn mask_tool_output(&mut self, text: &str) -> Result<Option<String>, String> {
+        let Some(masker) = &mut self.masker else {
+            return Ok(None);
+        };
+        let cache_key =
+            (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES).then(|| tool_output_cache_key(text));
+        if let Some(key) = cache_key {
+            if let Some(cached) = self.cache.get(&key) {
+                if cached.masked_count > 0 {
+                    if let Some(client) = &self.client {
+                        client
+                            .add_masked_count(cached.masked_count)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                return Ok(Some(cached.masked.clone()));
+            }
+        }
+        let masked = masker.mask_tool_output(text)?;
+        let total = masker.masked_count();
+        let delta = total.saturating_sub(self.reported_masked_count);
+        self.reported_masked_count = total;
+        if delta > 0 {
+            self.cache.clear();
+            self.cache_order.clear();
+            if let Some(client) = &self.client {
+                client.add_masked_count(delta).map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(key) = cache_key {
+            self.remember(key, &masked, delta);
+        }
+        Ok(Some(masked))
+    }
+
+    fn remember(&mut self, key: [u8; 32], masked: &str, masked_count: u64) {
+        if self.cache.contains_key(&key) {
+            return;
+        }
+        while self.cache.len() >= ACTIVE_TOOL_OUTPUT_CACHE_LIMIT {
+            let Some(oldest) = self.cache_order.pop_front() else {
+                self.cache.clear();
+                break;
+            };
+            self.cache.remove(&oldest);
+        }
+        self.cache.insert(
+            key,
+            CachedToolOutput {
+                masked: masked.to_string(),
+                masked_count,
+            },
+        );
+        self.cache_order.push_back(key);
+    }
+}
+
+fn tool_output_cache_key(text: &str) -> [u8; 32] {
+    let digest = Sha256::digest(text.as_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest);
+    key
+}
+
 pub fn mask_tool_output_into_active_in_memory_manager(
     text: &str,
 ) -> Result<Option<String>, String> {
-    let Some(client) = InMemoryManagerClient::from_env() else {
-        return Ok(None);
-    };
-    let session = Session::open_capability("default").map_err(|e| e.to_string())?;
-    let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
-    let mut masker = OutputMasker::new_deferred(store)?;
-    let masked = masker.mask_tool_output(text)?;
-    let masked_count = masker.masked_count();
-    masker.flush()?;
-    client
-        .add_masked_count(masked_count)
-        .map_err(|e| e.to_string())?;
-    Ok(Some(masked))
+    ActiveToolOutputMasker::new()?.mask_tool_output(text)
 }
 
 fn exec_server_approval_command(mode: &ExecMode, env: &[(String, String)]) -> String {

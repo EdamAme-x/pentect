@@ -31,7 +31,7 @@ pub(crate) struct ToolScalarInput {
 
 pub(crate) struct OutputMasker {
     store: RecoveryStore,
-    engine: Engine,
+    engine: &'static Engine,
     model_adapters: ModelAdapters,
     mode: OutputMaskerMode,
     pending: Recovery,
@@ -277,12 +277,10 @@ impl OutputMasker {
             disclose_length: false,
             ..Config::new(self.store.session.key)
         };
-        match self.model_adapters.mask(
-            &self.engine,
-            Input { kind, data },
-            context.as_ref(),
-            &cfg,
-        )? {
+        match self
+            .model_adapters
+            .mask(self.engine, Input { kind, data }, context.as_ref(), &cfg)?
+        {
             Some(result) => self.record_mask_result(result),
             None => Ok(unchanged),
         }
@@ -481,7 +479,7 @@ pub(crate) fn mask_read_data(
     let mut adapter_count = 0usize;
     let mut adapter_recovery = Recovery::empty_for_key(&key);
     let data = match adapters.mask(
-        &engine,
+        engine,
         Input {
             kind: kind.clone(),
             data: data.clone(),
@@ -509,7 +507,15 @@ fn choose_batch_delimiter(values: &[String]) -> Option<&'static str> {
         .find(|delimiter| values.iter().all(|value| !value.contains(delimiter)))
 }
 
-fn tool_boundary_engine() -> Result<Engine, String> {
+fn tool_boundary_engine() -> Result<&'static Engine, String> {
+    static CACHE: OnceLock<Result<Engine, String>> = OnceLock::new();
+    match CACHE.get_or_init(build_tool_boundary_engine) {
+        Ok(engine) => Ok(engine),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn build_tool_boundary_engine() -> Result<Engine, String> {
     let mut builder = Engine::builder()
         .standard_stack(Profile::Strict.knobs())
         .parser(Kind::ToolResult, Box::new(ToolResultParser))

@@ -658,6 +658,47 @@ fn exec_inherits_parent_environment_and_masks_output() {
 }
 
 #[test]
+fn active_tool_output_masker_reuses_in_memory_state() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let token = "active-masker-token".to_string();
+    let addr = in_memory_manager::spawn_test_in_memory_manager(token.clone());
+    struct EnvCleanup;
+    impl Drop for EnvCleanup {
+        fn drop(&mut self) {
+            std::env::remove_var(ENV_ADDR);
+            std::env::remove_var(ENV_TOKEN);
+        }
+    }
+    let _cleanup = EnvCleanup;
+    std::env::set_var(ENV_ADDR, addr);
+    std::env::set_var(ENV_TOKEN, token);
+
+    let client = InMemoryManagerClient::from_env().unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let first = masker
+        .mask_tool_output(&format!("OPENAI_API_KEY={raw}\n"))
+        .unwrap()
+        .unwrap();
+    assert!(!first.contains(raw), "{first}");
+    let handle = first.split_once('=').unwrap().1.trim().to_string();
+
+    let repeated = masker
+        .mask_tool_output(&format!("OPENAI_API_KEY={raw}\n"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated, first);
+
+    let second = masker
+        .mask_tool_output(&format!("echoed {raw}\n"))
+        .unwrap()
+        .unwrap();
+    assert!(!second.contains(raw), "{second}");
+    assert!(second.contains(&handle), "{second}");
+    assert_eq!(client.masked_count().unwrap(), 2);
+}
+
+#[test]
 fn exec_capability_env_overlays_parent_environment_when_referenced() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("env-overlay");
@@ -983,6 +1024,7 @@ fn write_tool_passes_through_non_pentect_templates() {
 
 #[test]
 fn write_tool_blocks_unknown_masked_handles_that_need_resolve() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("write-unknown-handle");
     let project = PathBuf::from("target").join(format!(
         "pentect-write-unknown-{}-{}",
@@ -1015,6 +1057,7 @@ fn write_tool_blocks_unknown_masked_handles_that_need_resolve() {
 
 #[test]
 fn write_tool_allows_resolvable_masked_content_before_tool() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-write-generic");
     let project = PathBuf::from("target").join(format!(
         "pentect-write-{}-{}",
@@ -1045,6 +1088,7 @@ fn write_tool_allows_resolvable_masked_content_before_tool() {
 
 #[test]
 fn write_tool_repairs_masked_file_after_tool() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-write-repair");
     let project = PathBuf::from("target").join(format!(
         "pentect-write-repair-{}-{}",
@@ -1079,6 +1123,7 @@ fn write_tool_repairs_masked_file_after_tool() {
 
 #[test]
 fn write_tool_allows_and_repairs_absolute_file_path() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-write-absolute");
     let project = PathBuf::from("target").join(format!(
         "pentect-write-absolute-{}-{}",
@@ -1151,6 +1196,7 @@ fn write_tool_refuses_masked_repair_outside_current_dir() {
 
 #[test]
 fn write_tool_repairs_camel_case_external_schema_after_tool() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-write-camel");
     let project = PathBuf::from("target").join(format!(
         "pentect-write-camel-{}-{}",
@@ -1191,6 +1237,7 @@ fn write_tool_repairs_camel_case_external_schema_after_tool() {
 
 #[test]
 fn write_tool_repairs_edit_masked_new_string_after_tool() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-edit-repair");
     let project = PathBuf::from("target").join(format!(
         "pentect-edit-repair-{}-{}",
@@ -1239,6 +1286,7 @@ fn write_tool_repairs_edit_masked_new_string_after_tool() {
 
 #[test]
 fn write_tool_repairs_multiedit_masked_new_string_after_tool() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-multiedit-repair");
     let project = PathBuf::from("target").join(format!(
         "pentect-multiedit-repair-{}-{}",
@@ -1290,6 +1338,7 @@ fn write_tool_repairs_multiedit_masked_new_string_after_tool() {
 
 #[test]
 fn write_tool_applies_edit_with_masked_old_string_before_tool() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-edit-old-handle");
     let project = PathBuf::from("target").join(format!(
         "pentect-edit-old-handle-{}-{}",
@@ -1332,6 +1381,7 @@ fn write_tool_applies_edit_with_masked_old_string_before_tool() {
 
 #[test]
 fn write_tool_applies_multiedit_with_masked_old_string_before_tool() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-multiedit-old-handle");
     let project = PathBuf::from("target").join(format!(
         "pentect-multiedit-old-handle-{}-{}",
@@ -1375,6 +1425,7 @@ fn write_tool_applies_multiedit_with_masked_old_string_before_tool() {
 
 #[test]
 fn write_tool_blocks_edit_masked_old_string_on_lazy_hook_path() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let project = PathBuf::from("target").join(format!(
         "pentect-edit-old-handle-lazy-{}-{}",
         std::process::id(),
@@ -1410,6 +1461,7 @@ fn write_tool_blocks_edit_masked_old_string_on_lazy_hook_path() {
 #[cfg(unix)]
 #[test]
 fn write_tool_refuses_masked_repair_through_symlink_dir() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-write-symlink");
     let outside = temp_root("capability-write-symlink-outside");
     std::fs::create_dir_all(&outside).unwrap();
@@ -2642,6 +2694,7 @@ fn pretool_wraps_pentect_resolve_for_approval() {
 
 #[test]
 fn pretool_allows_direct_read_tool_for_clean_file() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (root, session) = empty_session("hook-pre-direct-read-clean");
     let project = PathBuf::from("target").join(format!(
         "pentect-read-clean-{}-{}",
@@ -2667,6 +2720,7 @@ fn pretool_allows_direct_read_tool_for_clean_file() {
 
 #[test]
 fn pretool_rewrites_direct_read_tool_to_masked_copy() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (root, session) = empty_session("hook-pre-direct-read-secret");
     let project = PathBuf::from("target").join(format!(
         "pentect-read-secret-{}-{}",
