@@ -756,7 +756,7 @@ fn scaled_dimensions(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
 
 #[cfg(all(feature = "ocr", target_os = "macos"))]
 pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
-    use objc2::AnyObject;
+    use objc2::{runtime::AnyObject, AnyThread};
     use objc2_foundation::{NSArray, NSData, NSDictionary};
     use objc2_vision::{
         VNImageOption, VNImageRequestHandler, VNRecognizeTextRequest, VNRequestTextRecognitionLevel,
@@ -795,12 +795,13 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
         return Ok(String::new());
     };
     let mut text = String::new();
-    for observation in observations.iter() {
+    for index in 0..observations.len() {
+        let observation = observations.objectAtIndex(index);
         let candidates = observation.topCandidates(1);
-        let mut iter = candidates.iter();
-        let Some(candidate) = iter.next() else {
+        if candidates.is_empty() {
             continue;
-        };
+        }
+        let candidate = candidates.objectAtIndex(0);
         if !text.is_empty() {
             text.push('\n');
         }
