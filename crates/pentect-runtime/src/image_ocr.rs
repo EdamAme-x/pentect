@@ -322,9 +322,8 @@ fn redact_image_value(
         Value::Object(map) => {
             if object_marks_image(map) {
                 let before = state.total_observations();
-                if let Some(source) = reserve_and_read_image_object(map, cfg, state)? {
-                    let decision = redact_image_bytes(&source.bytes, key, cfg, state)?;
-                    return Ok(replace_object_image(value, source, decision));
+                if let Some(updated) = redact_image_object_fields(value, map, key, cfg, state)? {
+                    return Ok(updated);
                 }
                 let updated = redact_object_children(map, key, cfg, state)?;
                 if !empty_image_object(map) && state.total_observations() == before {
@@ -379,48 +378,43 @@ fn reserve_and_read_image_reference(
     }
 }
 
-fn reserve_and_read_image_object(
+fn redact_image_object_fields(
+    original: &Value,
     map: &serde_json::Map<String, Value>,
+    key: &[u8; 32],
     cfg: &ImageOcrConfig,
     state: &mut ImageRedactionState,
-) -> Result<Option<ImageObjectSource>, String> {
-    if !state.reserve_image_slot(cfg) {
-        state.unscanned_images += 1;
-        return Ok(None);
-    }
-    let Some(deadline) = state.deadline(cfg) else {
-        state.unscanned_images += 1;
-        return Ok(None);
-    };
-    let Some(max_bytes) = state.remaining_image_bytes(cfg) else {
-        state.unscanned_images += 1;
-        return Ok(None);
-    };
-    match image_object_source(map, cfg, max_bytes, deadline) {
-        Ok(source) => Ok(source),
-        Err(_) => Ok(None),
-    }
-}
-
-fn image_object_source(
-    map: &serde_json::Map<String, Value>,
-    cfg: &ImageOcrConfig,
-    max_bytes: u64,
-    deadline: std::time::Instant,
-) -> Result<Option<ImageObjectSource>, String> {
-    for &key in IMAGE_OBJECT_BYTE_FIELDS {
-        let Some(text) = map.get(key).and_then(Value::as_str) else {
+) -> Result<Option<Value>, String> {
+    let mut out = original
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    let mut saw_image_field = false;
+    let mut changed = false;
+    for &field in IMAGE_OBJECT_BYTE_FIELDS {
+        let Some(text) = map.get(field).and_then(Value::as_str) else {
             continue;
         };
-        if let Some(bytes) = image_reference_bytes(text, cfg, max_bytes, deadline)? {
-            return Ok(Some(ImageObjectSource {
-                key: key.to_string(),
-                bytes,
-                encoding: image_object_field_encoding(key, text),
-            }));
-        }
+        let Some(bytes) = reserve_and_read_image_reference(text, cfg, state)? else {
+            continue;
+        };
+        saw_image_field = true;
+        let source = ImageObjectSource {
+            key: field.to_string(),
+            bytes,
+            encoding: image_object_field_encoding(field, text),
+        };
+        let decision = redact_image_bytes(&source.bytes, key, cfg, state)?;
+        changed |= replace_object_image_field(&mut out, source, decision);
     }
-    Ok(None)
+    if !saw_image_field {
+        return Ok(None);
+    }
+    if changed {
+        Ok(Some(Value::Object(out)))
+    } else {
+        Ok(Some(original.clone()))
+    }
 }
 
 fn image_object_field_encoding(key: &str, text: &str) -> ImageObjectEncoding {
@@ -443,30 +437,47 @@ fn replace_string_image(original: &Value, decision: ImageRedactionDecision) -> V
     }
 }
 
-fn replace_object_image(
-    original: &Value,
+fn replace_object_image_field(
+    out: &mut serde_json::Map<String, Value>,
     source: ImageObjectSource,
     decision: ImageRedactionDecision,
-) -> Value {
+) -> bool {
     let ImageRedactionDecision::Redacted(payload) = decision else {
-        return original.clone();
+        return false;
     };
-    let mut out = original
-        .as_object()
-        .cloned()
-        .unwrap_or_else(serde_json::Map::new);
     let replacement = match source.encoding {
         ImageObjectEncoding::Base64 => {
-            out.insert(
-                "mimeType".to_string(),
-                Value::String("image/png".to_string()),
-            );
+            set_png_mime_metadata(out);
             payload.base64
         }
         ImageObjectEncoding::DataUrl => payload.data_url,
     };
     out.insert(source.key, Value::String(replacement));
-    Value::Object(out)
+    true
+}
+
+fn set_png_mime_metadata(out: &mut serde_json::Map<String, Value>) {
+    let mut updated_existing = false;
+    for key in [
+        "mimeType",
+        "mimetype",
+        "mime_type",
+        "mediaType",
+        "media_type",
+        "contentType",
+        "content_type",
+    ] {
+        if out.contains_key(key) {
+            out.insert(key.to_string(), Value::String("image/png".to_string()));
+            updated_existing = true;
+        }
+    }
+    if !updated_existing {
+        out.insert(
+            "mimeType".to_string(),
+            Value::String("image/png".to_string()),
+        );
+    }
 }
 
 fn redact_image_bytes(

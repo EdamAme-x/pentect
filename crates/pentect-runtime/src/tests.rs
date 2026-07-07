@@ -1798,7 +1798,11 @@ fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
             }]
         }
     });
-    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Claude, "t", &session, input).unwrap()
+    };
     assert!(output.get("decision").is_none(), "{output}");
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
@@ -1829,7 +1833,11 @@ fn codex_posttool_still_blocks_secret_qr_image() {
             }]
         }
     });
-    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Codex, "t", &session, input).unwrap()
+    };
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().unwrap();
     assert!(reason.contains("secret text detected"), "{reason}");

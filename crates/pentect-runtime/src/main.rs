@@ -3486,6 +3486,18 @@ fn claude_image_tool_output(
         );
     }
     let redaction = image_ocr::redact_tool_images_for_secrets(value, &session.key, &cfg)?;
+    if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
+        if redaction.unscanned_images > 0 {
+            return Ok(Some(ToolTextOutput::Block(
+                "image blocked: image could not be fetched or scanned.".to_string(),
+            )));
+        }
+        if redaction.ocr_failures > 0 {
+            return Ok(Some(ToolTextOutput::Block(
+                "image blocked: image scan failed.".to_string(),
+            )));
+        }
+    }
     if redaction.secret_images > 0 {
         if !redaction.changed {
             return Ok(Some(ToolTextOutput::Block(
@@ -3497,16 +3509,6 @@ fn claude_image_tool_output(
     }
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Allow) {
         return Ok(None);
-    }
-    if redaction.unscanned_images > 0 {
-        return Ok(Some(ToolTextOutput::Block(
-            "image blocked: image could not be fetched or scanned.".to_string(),
-        )));
-    }
-    if redaction.ocr_failures > 0 {
-        return Ok(Some(ToolTextOutput::Block(
-            "image blocked: image scan failed.".to_string(),
-        )));
     }
     Ok(None)
 }
