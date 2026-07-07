@@ -857,6 +857,19 @@ impl NormalizedImageRect {
         )
     }
 
+    #[cfg(all(feature = "ocr", target_os = "macos"))]
+    fn from_macos_vision_rect(rect: objc2_core_foundation::CGRect) -> Option<Self> {
+        let left = rect.origin.x as f32;
+        let width = rect.size.width as f32;
+        let height = rect.size.height as f32;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let bottom_from_vision = rect.origin.y as f32;
+        let top = 1.0 - bottom_from_vision - height;
+        Self::new(left, top, left + width, top + height)
+    }
+
     #[cfg(feature = "ocr")]
     fn new(left: f32, top: f32, right: f32, bottom: f32) -> Option<Self> {
         if !left.is_finite() || !top.is_finite() || !right.is_finite() || !bottom.is_finite() {
@@ -1072,11 +1085,27 @@ fn fill_rect(
     height: u32,
     color: image::Rgba<u8>,
 ) {
-    let right = left.saturating_add(width).min(image.width());
-    let bottom = top.saturating_add(height).min(image.height());
+    let image_width = image.width() as usize;
+    let image_height = image.height() as usize;
+    let left = left.min(image.width()) as usize;
+    let top = top.min(image.height()) as usize;
+    let right = left.saturating_add(width as usize).min(image_width);
+    let bottom = top.saturating_add(height as usize).min(image_height);
+    if right <= left || bottom <= top {
+        return;
+    }
+    let row_stride = image_width.saturating_mul(4);
+    let row_left = left.saturating_mul(4);
+    let row_right = right.saturating_mul(4);
+    let data = image.as_mut();
     for y in top..bottom {
-        for x in left..right {
-            image.put_pixel(x, y, color);
+        let row_start = y.saturating_mul(row_stride).saturating_add(row_left);
+        let row_end = y.saturating_mul(row_stride).saturating_add(row_right);
+        let Some(row) = data.get_mut(row_start..row_end) else {
+            continue;
+        };
+        for pixel in row.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&color.0);
         }
     }
 }
@@ -1796,7 +1825,9 @@ fn ocr_image_regions_with_config(
         if text.trim().is_empty() {
             continue;
         }
-        regions.push(ImageTextRegion { text, rect: None });
+        let rect =
+            NormalizedImageRect::from_macos_vision_rect(unsafe { observation.boundingBox() });
+        regions.push(ImageTextRegion { text, rect });
     }
     Ok(regions)
 }
