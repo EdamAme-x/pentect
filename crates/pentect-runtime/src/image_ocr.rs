@@ -1,6 +1,7 @@
 use crate::config::ImageOcrConfig;
 #[cfg(feature = "ocr")]
 use crate::config::{image_ocr_config, ImageOcrMode};
+use pentect_core::model::labels;
 use serde_json::Value;
 #[cfg(feature = "ocr")]
 use std::net::{IpAddr, SocketAddr};
@@ -567,15 +568,7 @@ fn ocr_text_has_secret(text: &str, key: &[u8; 32]) -> bool {
     if text.trim().is_empty() {
         return false;
     }
-    let engine = image_ocr_secret_engine();
-    let result = engine.mask(
-        pentect_core::Input {
-            kind: pentect_core::Kind::Text,
-            data: text.to_string(),
-        },
-        &pentect_core::Config::new(*key),
-    );
-    result.summary.masked_count > 0
+    !image_text_secret_labels(text, key).is_empty()
 }
 
 fn image_text_secret_labels(text: &str, key: &[u8; 32]) -> Vec<String> {
@@ -596,7 +589,132 @@ fn image_text_secret_labels(text: &str, key: &[u8; 32]) -> Vec<String> {
             labels.push(item.label);
         }
     }
+    push_secret_labels(&mut labels, &ocr_fragmented_secret_labels(text));
     labels
+}
+
+fn ocr_fragmented_secret_labels(text: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    for segment in text.split(['\r', '\n']) {
+        for (idx, ch) in segment.char_indices() {
+            if ch != '=' && ch != ':' {
+                continue;
+            }
+            let before = bounded_prefix(segment, idx, 96);
+            let after_start = idx + ch.len_utf8();
+            let after = bounded_suffix(&segment[after_start..], 128);
+            let Some(label) = ocr_fragmented_secret_label(before, after) else {
+                continue;
+            };
+            if !labels.iter().any(|seen| seen == &label) {
+                labels.push(label);
+            }
+        }
+    }
+    labels
+}
+
+fn ocr_fragmented_secret_label(before: &str, after: &str) -> Option<String> {
+    let key_tokens = ocr_words(before);
+    if !ocr_words_have_sensitive_key(&key_tokens) || !ocr_fragmented_value_has_secret_shape(after) {
+        return None;
+    }
+    Some(ocr_key_label(&key_tokens))
+}
+
+fn bounded_prefix(text: &str, byte_end: usize, max_chars: usize) -> &str {
+    let end = byte_end.min(text.len());
+    let mut starts = text[..end].char_indices().map(|(idx, _)| idx).rev();
+    let start = starts.nth(max_chars.saturating_sub(1)).unwrap_or(0);
+    &text[start..end]
+}
+
+fn bounded_suffix(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
+fn ocr_words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_uppercase());
+        } else if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn ocr_words_have_sensitive_key(words: &[String]) -> bool {
+    let mut has_material = false;
+    let mut has_modifier = false;
+    for word in words {
+        match word.as_str() {
+            "PASSWORD" | "PASSWD" | "PWD" | "SECRET" | "TOKEN" | "CREDENTIAL" | "CREDENTIALS" => {
+                has_material = true;
+            }
+            "KEY" => {
+                has_material = true;
+            }
+            "API" | "ACCESS" | "AUTH" | "PRIVATE" | "CLIENT" => {
+                has_modifier = true;
+            }
+            _ => {}
+        }
+    }
+    has_material
+        && (has_modifier
+            || words
+                .iter()
+                .last()
+                .is_some_and(|word| matches!(word.as_str(), "PASSWORD" | "SECRET" | "TOKEN")))
+}
+
+fn ocr_fragmented_value_has_secret_shape(text: &str) -> bool {
+    let mut ascii_alnum = 0usize;
+    let mut ascii_alpha = 0usize;
+    let mut ascii_digit = 0usize;
+    let mut longest_run = 0usize;
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            ascii_alnum += 1;
+            if ch.is_ascii_alphabetic() {
+                ascii_alpha += 1;
+            }
+            if ch.is_ascii_digit() {
+                ascii_digit += 1;
+            }
+            run += 1;
+            longest_run = longest_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    ascii_alnum >= 16 && ascii_alpha >= 4 && ascii_digit >= 4 && longest_run >= 6
+}
+
+fn ocr_key_label(words: &[String]) -> String {
+    let mut relevant = words
+        .iter()
+        .rev()
+        .filter(|word| word.len() <= 32)
+        .take(3)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    relevant.reverse();
+    if relevant.is_empty() {
+        labels::KEYED_SECRET.to_string()
+    } else {
+        relevant.join("_")
+    }
 }
 
 #[cfg(feature = "ocr")]
@@ -1544,6 +1662,30 @@ mod tests {
             max_image_bytes: 64 * 1024 * 1024,
             fetch_seconds: 8,
             unscanned_images: UnscannedImagePolicy::Allow,
+        }
+    }
+
+    #[test]
+    fn fragmented_ocr_key_value_line_is_secret() {
+        let text = concat!(
+            "Kaggle API settings API token KAGGLE API TOKEN=KGAT ab ",
+            "( def123456789 ② ab ( def123456 footer"
+        );
+        let labels = ocr_fragmented_secret_labels(text);
+        assert!(
+            labels.contains(&"KAGGLE_API_TOKEN".to_string()),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn fragmented_ocr_key_without_value_shape_is_not_secret() {
+        for text in [
+            "Kaggle API settings API token Create new token",
+            "API token = disabled",
+            "secret capability can be configured here",
+        ] {
+            assert!(ocr_fragmented_secret_labels(text).is_empty(), "{text}");
         }
     }
 
