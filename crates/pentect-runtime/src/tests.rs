@@ -2678,6 +2678,7 @@ fn pretool_wraps_pentect_resolve_for_approval() {
 
 #[test]
 fn pretool_allows_direct_read_tool_for_clean_file() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (root, session) = empty_session("hook-pre-direct-read-clean");
     let project = PathBuf::from("target").join(format!(
         "pentect-read-clean-{}-{}",
@@ -2703,6 +2704,7 @@ fn pretool_allows_direct_read_tool_for_clean_file() {
 
 #[test]
 fn pretool_rewrites_direct_read_tool_to_masked_copy() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (root, session) = empty_session("hook-pre-direct-read-secret");
     let project = PathBuf::from("target").join(format!(
         "pentect-read-secret-{}-{}",
