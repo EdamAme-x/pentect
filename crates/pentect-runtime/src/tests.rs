@@ -2405,6 +2405,82 @@ fn api_reference_text_is_not_redacted_as_env_derivatives() {
 }
 
 #[test]
+fn local_home_paths_render_as_tilde_in_tool_output() {
+    let (root, session) = empty_session("exec-local-home-paths");
+    let output = concat!(
+        r#"at C:\Users\yun40\Desktop\app\src\main.ts:12:34"#,
+        "\n",
+        r#"  File "/home/yun40/demo/app.py", line 8, in main"#,
+        "\n",
+        r#"at /mnt/c/Users/yun40/project/src/main.rs:12:34"#,
+        "\n",
+    );
+    let masked = mask_tool_output(&session, output).unwrap();
+    assert!(!masked.contains("yun40"), "{masked}");
+    assert!(!masked.contains("LOCAL_USERNAME"), "{masked}");
+    assert!(masked.contains(r#"~\Desktop\app\src\main.ts"#), "{masked}");
+    assert!(masked.contains(r#""~/demo/app.py""#), "{masked}");
+    assert!(masked.contains("~/project/src/main.rs"), "{masked}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn common_dev_tool_output_does_not_block_codex_posttool() {
+    let _proxy = ScopedCodexExecProxy::set(false);
+    let cases = [
+        (
+            "next",
+            concat!(
+                "Next.js 15.3.4\n",
+                "- Local:        http://localhost:3000\n",
+                "- Network:      http://192.168.1.42:3000\n",
+                "Ready in 1290ms\n",
+            ),
+        ),
+        (
+            "astro",
+            concat!(
+                "astro 5.9.0 ready in 358 ms\n",
+                "Local    http://localhost:4321/\n",
+                "Network  http://192.168.1.42:4321/\n",
+            ),
+        ),
+        (
+            "webpack",
+            concat!(
+                "Project is running at:\n",
+                "Loopback: http://localhost:8080/\n",
+                "On Your Network (IPv4): http://192.168.1.42:8080/\n",
+                "webpack compiled successfully\n",
+            ),
+        ),
+        (
+            "uvicorn",
+            concat!(
+                "INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)\n",
+                "INFO:     127.0.0.1:53721 - \"GET /docs HTTP/1.1\" 200 OK\n",
+            ),
+        ),
+        (
+            "playwright",
+            "Listening on ws://127.0.0.1:9222/devtools/browser/4f3a2e9e-88a0-4e99-a000-abcdef123456\n",
+        ),
+    ];
+
+    for (name, output) in cases {
+        let (root, session) = empty_session(&format!("hook-post-codex-dev-{name}"));
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_response": output,
+        });
+        let hook_output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
+        assert_eq!(hook_output, json!({}), "{name}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
 fn codex_posttool_does_not_block_vite_dev_server_banner() {
     let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-vite-banner");

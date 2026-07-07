@@ -128,6 +128,7 @@ impl OutputMasker {
                 recovery.extend_same_key(text_result.recovery);
             }
         }
+        let masked = compact_local_home_paths(&masked);
         recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
         self.record_recovery(recovery)?;
         Ok(masked)
@@ -240,7 +241,7 @@ impl OutputMasker {
 
     fn record_mask_result(&mut self, result: MaskResult) -> Result<String, String> {
         self.add_masked_count(result.summary.masked_count);
-        let masked = result.masked;
+        let masked = compact_local_home_paths(&result.masked);
         let mut recovery = result.recovery;
         recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
         self.record_recovery(recovery)?;
@@ -322,6 +323,148 @@ fn masks_only_endpoint_metadata(result: &MaskResult) -> bool {
             .items
             .iter()
             .all(|item| item.category == Category::Endpoint)
+}
+
+// Stack traces and build logs frequently expose the local account segment in a
+// home path. Keep the detector active, but render that path as the familiar
+// shell form (`~\src` / `~/src`) so tool output stays readable without showing
+// the username or a Pentect placeholder.
+fn compact_local_home_paths(masked: &str) -> String {
+    let mut out = String::with_capacity(masked.len());
+    let mut cursor = 0usize;
+    let mut search = 0usize;
+    let mut changed = false;
+    while let Some((placeholder_start, placeholder_end)) =
+        next_local_username_placeholder(masked, search)
+    {
+        search = placeholder_end;
+        if placeholder_start < cursor || !local_home_tail_ok(masked, placeholder_end) {
+            continue;
+        }
+        let Some(root_start) = local_home_root_start(masked, placeholder_start) else {
+            continue;
+        };
+        if root_start < cursor {
+            continue;
+        }
+        out.push_str(&masked[cursor..root_start]);
+        out.push('~');
+        cursor = placeholder_end;
+        changed = true;
+    }
+    if !changed {
+        return masked.to_string();
+    }
+    out.push_str(&masked[cursor..]);
+    out
+}
+
+fn next_local_username_placeholder(text: &str, start: usize) -> Option<(usize, usize)> {
+    let mut search = start.min(text.len());
+    while let Some(offset) = text.get(search..)?.find("<<LOCAL_USERNAME_") {
+        let placeholder_start = search + offset;
+        let close = find_from(text.as_bytes(), placeholder_start + 2, b">>")?;
+        let placeholder_end = close + 2;
+        let placeholder = &text[placeholder_start..placeholder_end];
+        if placeholder_label(placeholder) == Some("LOCAL_USERNAME") {
+            return Some((placeholder_start, placeholder_end));
+        }
+        search = placeholder_start.saturating_add(2);
+    }
+    None
+}
+
+fn local_home_root_start(text: &str, placeholder_start: usize) -> Option<usize> {
+    let before = text.get(..placeholder_start)?;
+    let root_start = windows_home_root_start(before)
+        .or_else(|| unix_home_root_start(before))
+        .or_else(|| tilde_home_root_start(before))?;
+    local_home_root_has_boundary(text, root_start).then_some(root_start)
+}
+
+fn windows_home_root_start(before: &str) -> Option<usize> {
+    let bytes = before.as_bytes();
+    if bytes.is_empty() || !is_path_sep(*bytes.last()?) {
+        return None;
+    }
+    let mut i = bytes.len();
+    while i > 0 && is_path_sep(bytes[i - 1]) {
+        i -= 1;
+    }
+    let users_end = i;
+    while i > 0 && !is_path_sep(bytes[i - 1]) {
+        i -= 1;
+    }
+    if !before.get(i..users_end)?.eq_ignore_ascii_case("Users") {
+        return None;
+    }
+    while i > 0 && is_path_sep(bytes[i - 1]) {
+        i -= 1;
+    }
+    if i >= 2 && bytes[i - 1] == b':' && bytes[i - 2].is_ascii_alphabetic() {
+        Some(i - 2)
+    } else {
+        None
+    }
+}
+
+fn unix_home_root_start(before: &str) -> Option<usize> {
+    [
+        "/export/home/",
+        "/var/home/",
+        "/mnt/c/Users/",
+        "/c/Users/",
+        "/Users/",
+        "/home/",
+    ]
+    .into_iter()
+    .find_map(|root| ascii_suffix_start(before, root))
+}
+
+fn tilde_home_root_start(before: &str) -> Option<usize> {
+    before.strip_suffix('~')?;
+    Some(before.len().saturating_sub(1))
+}
+
+fn ascii_suffix_start(value: &str, suffix: &str) -> Option<usize> {
+    if value.len() < suffix.len() {
+        return None;
+    }
+    let start = value.len() - suffix.len();
+    value
+        .get(start..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+        .then_some(start)
+}
+
+fn local_home_root_has_boundary(text: &str, root_start: usize) -> bool {
+    if root_start == 0 {
+        return true;
+    }
+    text.get(..root_start)
+        .and_then(|prefix| prefix.chars().next_back())
+        .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '=' | '(' | '[' | '{'))
+}
+
+fn local_home_tail_ok(text: &str, placeholder_end: usize) -> bool {
+    if placeholder_end >= text.len() {
+        return true;
+    }
+    text.get(placeholder_end..)
+        .and_then(|tail| tail.chars().next())
+        .is_some_and(|ch| {
+            is_path_sep_char(ch)
+                || ch.is_whitespace()
+                || matches!(ch, '"' | '\'' | ',' | ';' | ')' | ']')
+        })
+}
+
+fn is_path_sep(byte: u8) -> bool {
+    matches!(byte, b'/' | b'\\')
+}
+
+fn is_path_sep_char(ch: char) -> bool {
+    matches!(ch, '/' | '\\')
 }
 
 pub(crate) fn mask_read_data(
