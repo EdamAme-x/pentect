@@ -252,7 +252,10 @@ mod tests {
     fn doctor_reports_ocr_status() {
         let check = check_ocr();
         assert_eq!(check.name, "ocr");
-        assert!(matches!(check.status, Status::Ok | Status::Warn));
-        assert!(matches!(check.detail.as_str(), "bundled" | "disabled"));
+        match check.detail.as_str() {
+            "bundled" => assert_eq!(check.status, Status::Ok),
+            "disabled" => assert_eq!(check.status, Status::Warn),
+            other => panic!("unexpected ocr detail: {other}"),
+        }
     }
 }
