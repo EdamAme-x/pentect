@@ -15,7 +15,7 @@ pub enum Action {
 
 /// Decides what to do with each detected span. Injected into the engine.
 /// Per-span and order-independent: it never looks at other spans.
-pub trait Policy {
+pub trait Policy: Send + Sync {
     fn classify(&self, span: &Span) -> Action;
 }
 

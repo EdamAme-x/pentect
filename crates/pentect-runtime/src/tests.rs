@@ -658,6 +658,42 @@ fn exec_inherits_parent_environment_and_masks_output() {
 }
 
 #[test]
+fn active_tool_output_masker_reuses_in_memory_state() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let token = "active-masker-token".to_string();
+    let addr = in_memory_manager::spawn_test_in_memory_manager(token.clone());
+    std::env::set_var(ENV_ADDR, addr);
+    std::env::set_var(ENV_TOKEN, token);
+
+    let client = InMemoryManagerClient::from_env().unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let first = masker
+        .mask_tool_output(&format!("OPENAI_API_KEY={raw}\n"))
+        .unwrap()
+        .unwrap();
+    assert!(!first.contains(raw), "{first}");
+    let handle = first.split_once('=').unwrap().1.trim().to_string();
+
+    let repeated = masker
+        .mask_tool_output(&format!("OPENAI_API_KEY={raw}\n"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated, first);
+
+    let second = masker
+        .mask_tool_output(&format!("echoed {raw}\n"))
+        .unwrap()
+        .unwrap();
+    assert!(!second.contains(raw), "{second}");
+    assert!(second.contains(&handle), "{second}");
+    assert_eq!(client.masked_count().unwrap(), 2);
+
+    std::env::remove_var(ENV_ADDR);
+    std::env::remove_var(ENV_TOKEN);
+}
+
+#[test]
 fn exec_capability_env_overlays_parent_environment_when_referenced() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("env-overlay");

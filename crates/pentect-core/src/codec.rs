@@ -5,7 +5,7 @@ use data_encoding::{
 /// Decodes a contiguous encoded blob to bytes, or None if the run isn't valid in
 /// this encoding. Injected into the decode detector so new encodings are added
 /// without touching the detector.
-pub trait Codec {
+pub trait Codec: Send + Sync {
     fn decode(&self, run: &str) -> Option<Vec<u8>>;
 }
 

@@ -4,7 +4,7 @@ mod json;
 
 /// Turns raw input into value regions. Injected per `Kind`; the engine falls
 /// back to whole-input plaintext when no parser matches or one returns None.
-pub trait Parser {
+pub trait Parser: Send + Sync {
     fn parse(&self, raw: &str) -> Option<Vec<Region>>;
 }
 

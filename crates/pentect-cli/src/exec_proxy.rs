@@ -170,7 +170,9 @@ async fn handle_client(fut: upgrade::UpgradeFut, codex: PathBuf) -> Result<(), S
         });
     }
     let mut backend_lines = BufReader::new(backend_stdout).lines();
-    let mut backend_rewriter = BackendRewriter::new(|text: &str| mask_exec_output_text(text));
+    let mut output_masker = pentect_agent::ActiveToolOutputMasker::new()?;
+    let mut backend_rewriter =
+        BackendRewriter::new(move |text: &str| mask_exec_output_text(&mut output_masker, text));
 
     loop {
         tokio::select! {
@@ -552,8 +554,11 @@ where
     Ok(())
 }
 
-fn mask_exec_output_text(text: &str) -> Result<String, String> {
-    let masked = pentect_agent::mask_tool_output_into_active_in_memory_manager(text)?;
+fn mask_exec_output_text(
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    text: &str,
+) -> Result<String, String> {
+    let masked = masker.mask_tool_output(text)?;
     if exec_proxy_debug() {
         eprintln!(
             "[pentect] exec proxy mask memory={} changed={}",

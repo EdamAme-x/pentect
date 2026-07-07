@@ -2,7 +2,7 @@
 /// context-free over-masking. It only ever retracts a candidate, and the engine
 /// only applies it to context-free spans, so it can never suppress an anchored
 /// secret (a benign-shaped value under a sensitive key is still masked).
-pub trait OverMaskGuard {
+pub trait OverMaskGuard: Send + Sync {
     fn benign(&self, value: &str) -> bool;
 }
 

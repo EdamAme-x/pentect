@@ -50,6 +50,6 @@ pub(crate) use util::region;
 
 /// Side-effect-free and deterministic. Runs on a region's normalized view and
 /// returns spans in absolute raw coordinates (each tagged with its `DetectorId`).
-pub trait Detector {
+pub trait Detector: Send + Sync {
     fn detect(&self, view: &NormalizedView) -> Vec<Span>;
 }
