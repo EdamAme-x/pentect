@@ -611,6 +611,16 @@ fn fetch_image_url_bytes(
 }
 
 #[cfg(feature = "ocr")]
+pub fn ocr_status() -> &'static str {
+    "bundled"
+}
+
+#[cfg(not(feature = "ocr"))]
+pub fn ocr_status() -> &'static str {
+    "disabled"
+}
+
+#[cfg(feature = "ocr")]
 pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
     use image::GenericImageView;
     use ocrs::{ImageSource, OcrEngine, OcrEngineParams};

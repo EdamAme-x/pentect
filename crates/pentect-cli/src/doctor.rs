@@ -16,7 +16,7 @@ pub(crate) fn cmd_doctor(args: &[String]) {
         println!("{}", checks_json(&checks));
     } else {
         for check in &checks {
-            println!("{}: {}", check.name, check.status.as_str());
+            println!("{}: {} {}", check.name, check.status.as_str(), check.detail);
         }
     }
     if checks.iter().any(|check| check.status == Status::Fail) {
@@ -65,6 +65,7 @@ fn run_checks() -> Vec<Check> {
         check_pentect_binary(),
         check_in_memory_manager(),
         check_config_extensions(),
+        check_ocr(),
         check_command("codex"),
         check_command("claude"),
     ]
@@ -132,6 +133,14 @@ fn check_config_extensions() -> Check {
     match extensions::active_from_specs(Vec::new(), true) {
         Ok(_) => Check::ok("extensions", "ready"),
         Err(e) => Check::fail("extensions", e.to_string()),
+    }
+}
+
+fn check_ocr() -> Check {
+    match pentect_agent::ocr_status() {
+        "bundled" => Check::ok("ocr", "bundled"),
+        "disabled" => Check::warn("ocr", "disabled"),
+        status => Check::warn("ocr", status),
     }
 }
 
@@ -237,5 +246,13 @@ mod tests {
     fn doctor_accepts_json() {
         let args = vec!["pentect".into(), "doctor".into(), "--json".into()];
         assert!(parse_args(&args).unwrap());
+    }
+
+    #[test]
+    fn doctor_reports_ocr_status() {
+        let check = check_ocr();
+        assert_eq!(check.name, "ocr");
+        assert!(matches!(check.status, Status::Ok | Status::Warn));
+        assert!(matches!(check.detail.as_str(), "bundled" | "disabled"));
     }
 }
