@@ -858,16 +858,14 @@ impl NormalizedImageRect {
     }
 
     #[cfg(all(feature = "ocr", target_os = "macos"))]
-    fn from_macos_vision_rect(rect: objc2_core_graphics::CGRect) -> Option<Self> {
-        use objc2_core_graphics::{CGRectGetHeight, CGRectGetMinX, CGRectGetMinY, CGRectGetWidth};
-
-        let left = CGRectGetMinX(rect) as f32;
-        let width = CGRectGetWidth(rect) as f32;
-        let height = CGRectGetHeight(rect) as f32;
+    fn from_macos_vision_rect(rect: objc2_core_foundation::CGRect) -> Option<Self> {
+        let left = rect.origin.x as f32;
+        let width = rect.size.width as f32;
+        let height = rect.size.height as f32;
         if width <= 0.0 || height <= 0.0 {
             return None;
         }
-        let bottom_from_vision = CGRectGetMinY(rect) as f32;
+        let bottom_from_vision = rect.origin.y as f32;
         let top = 1.0 - bottom_from_vision - height;
         Self::new(left, top, left + width, top + height)
     }

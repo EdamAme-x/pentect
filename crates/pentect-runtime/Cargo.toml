@@ -20,7 +20,7 @@ native-ocr = [
     "dep:windows",
     "dep:objc2",
     "dep:objc2-foundation",
-    "dep:objc2-core-graphics",
+    "dep:objc2-core-foundation",
     "dep:objc2-vision",
 ]
 bundled-ocr = ["dep:image", "dep:ocrs", "dep:rten"]
@@ -67,12 +67,11 @@ objc2-foundation = { workspace = true, optional = true, default-features = false
     "NSObject",
     "NSString",
 ] }
-objc2-core-graphics = { workspace = true, optional = true, default-features = false, features = [
-    "CGGeometry",
+objc2-core-foundation = { workspace = true, optional = true, default-features = false, features = [
+    "CFCGTypes",
 ] }
 objc2-vision = { workspace = true, optional = true, default-features = false, features = [
     "objc2-core-foundation",
-    "objc2-core-graphics",
     "std",
     "VNObservation",
     "VNRecognizeTextRequest",
