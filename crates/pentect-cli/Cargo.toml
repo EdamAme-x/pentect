@@ -11,14 +11,15 @@ name = "pentect"
 path = "src/main.rs"
 
 [features]
-default = ["pdf"]
+default = ["pdf", "ocr"]
 # PDF input is an adapter concern: extract text locally, then feed the normal
 # masking kernel. Disable default features for a slimmer text-only CLI.
-pdf = ["dep:pdf-extract"]
+pdf = ["dep:pdf-extract", "pentect-runtime/pdf"]
+ocr = ["pentect-runtime/ocr"]
 
 [dependencies]
 pentect-core = { path = "../pentect-core" }
-pentect-runtime = { path = "../pentect-runtime" }
+pentect-runtime = { path = "../pentect-runtime", default-features = false }
 anyhow = { workspace = true }
 ignore = { workspace = true }
 pdf-extract = { workspace = true, optional = true }

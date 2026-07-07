@@ -136,6 +136,10 @@ pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
     image_ocr::ocr_image_bytes(bytes)
 }
 
+pub fn ocr_status() -> &'static str {
+    image_ocr::ocr_status()
+}
+
 pub fn resolve_text_from_active_in_memory_manager(text: &str) -> Result<Option<String>, String> {
     if InMemoryManagerClient::from_env().is_none() {
         return Ok(None);
