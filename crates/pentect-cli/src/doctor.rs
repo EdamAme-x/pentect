@@ -137,9 +137,11 @@ fn check_config_extensions() -> Check {
 }
 
 fn check_ocr() -> Check {
-    match pentect_agent::ocr_status() {
-        "bundled" => Check::ok("ocr", "bundled"),
+    let status = pentect_agent::ocr_status();
+    match status {
+        "bundled" | "windows" | "macos" => Check::ok("ocr", status),
         "disabled" => Check::warn("ocr", "disabled"),
+        "unsupported" => Check::warn("ocr", "unsupported"),
         status => Check::warn("ocr", status),
     }
 }
@@ -253,8 +255,8 @@ mod tests {
         let check = check_ocr();
         assert_eq!(check.name, "ocr");
         match check.detail.as_str() {
-            "bundled" => assert_eq!(check.status, Status::Ok),
-            "disabled" => assert_eq!(check.status, Status::Warn),
+            "bundled" | "windows" | "macos" => assert_eq!(check.status, Status::Ok),
+            "disabled" | "unsupported" => assert_eq!(check.status, Status::Warn),
             other => panic!("unexpected ocr detail: {other}"),
         }
     }

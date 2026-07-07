@@ -46,3 +46,7 @@ anstream = "0.6"
 crossterm = "0.28"
 ed25519-dalek = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+windows = "0.62.2"
+objc2 = { version = "0.6.3", default-features = false }
+objc2-foundation = { version = "0.3.2", default-features = false }
+objc2-vision = { version = "0.3.2", default-features = false }

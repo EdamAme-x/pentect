@@ -14,7 +14,14 @@ path = "src/main.rs"
 [features]
 default = ["pdf", "ocr"]
 pdf = ["dep:pdf-extract"]
-ocr = ["dep:image", "dep:ocrs", "dep:reqwest", "dep:rten"]
+ocr = ["dep:reqwest", "native-ocr", "bundled-ocr"]
+native-ocr = [
+    "dep:windows",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-vision",
+]
+bundled-ocr = ["dep:image", "dep:ocrs", "dep:rten"]
 
 [dependencies]
 pentect-core = { path = "../pentect-core" }
@@ -22,10 +29,7 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
-image = { workspace = true, optional = true }
-ocrs = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
-rten = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
@@ -39,3 +43,37 @@ ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, optional = true, features = [
+    "Foundation",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+image = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true, default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSError",
+    "NSObject",
+    "NSString",
+] }
+objc2-vision = { workspace = true, optional = true, default-features = false, features = [
+    "std",
+    "VNObservation",
+    "VNRecognizeTextRequest",
+    "VNRequest",
+    "VNRequestHandler",
+    "VNTypes",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+image = { workspace = true, optional = true }
+ocrs = { workspace = true, optional = true }
+rten = { workspace = true, optional = true }
