@@ -206,13 +206,17 @@ pub(crate) fn load_config_packs_from_specs(
     create_named: bool,
 ) -> Result<Vec<Pack>> {
     let active = active_from_specs(explicit_specs, create_named)?;
-    let mut packs = Vec::new();
     if !active.adapter_paths.is_empty() {
         bail!("model adapter extensions are only used by agent tool-boundary commands");
     }
-    for path in active.config_paths {
+    load_config_packs_from_active(&active)
+}
+
+pub(crate) fn load_config_packs_from_active(active: &ActiveExtensions) -> Result<Vec<Pack>> {
+    let mut packs = Vec::new();
+    for path in active.config_paths() {
         let display = path.display();
-        let src = std::fs::read_to_string(&path)
+        let src = std::fs::read_to_string(path)
             .with_context(|| format!("could not read extension config '{display}'"))?;
         let pack =
             load_pack(&src).map_err(|e| anyhow!("extension config '{display}' is invalid: {e}"))?;
@@ -832,6 +836,21 @@ mod tests {
             Err(err) => err.to_string(),
         };
         assert!(err.contains("model adapter extensions"), "{err}");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_loader_ignores_adapter_paths_for_config_packs() {
+        let root =
+            std::env::temp_dir().join(format!("pentect-active-adapter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("adapter.toml"), "").unwrap();
+
+        let active = active_from_explicit_specs(vec![root.display().to_string()], true).unwrap();
+        let packs = load_config_packs_from_active(&active).unwrap();
+        assert!(packs.is_empty());
 
         std::fs::remove_dir_all(root).unwrap();
     }

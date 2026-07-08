@@ -145,7 +145,7 @@ impl ModelAdapter {
             return Ok(Vec::new());
         }
         if let AdapterBackend::Builtin(builtin) = &self.backend {
-            return self.detect_builtin(*builtin, text);
+            return self.detect_builtin(*builtin, text, context);
         }
         let request = json!({
             "schema": "pentect.model_adapter.v1",
@@ -251,7 +251,12 @@ impl ModelAdapter {
         })
     }
 
-    fn detect_builtin(&self, builtin: BuiltinAdapter, text: &str) -> Result<Vec<Span>, String> {
+    fn detect_builtin(
+        &self,
+        builtin: BuiltinAdapter,
+        text: &str,
+        _context: Option<&Context>,
+    ) -> Result<Vec<Span>, String> {
         let spans = match builtin {
             BuiltinAdapter::PiiNer => detect_pii_ner(text)?,
         };

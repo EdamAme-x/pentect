@@ -5,15 +5,16 @@ use std::sync::{Mutex, OnceLock};
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 use tract_onnx::prelude::*;
 
-const MODEL_ONNX: &[u8] = include_bytes!("../assets/ner/bert-small-ner-pii-mobile.onnx");
+const MODEL_ONNX: &[u8] =
+    include_bytes!("../assets/ner/gravitee-bert-small-pii-detection.quant.onnx");
 const TOKENIZER_JSON: &[u8] =
-    include_bytes!("../assets/ner/bert-small-ner-pii-mobile-tokenizer.json");
-const CONFIG_JSON: &str = include_str!("../assets/ner/bert-small-ner-pii-mobile-config.json");
+    include_bytes!("../assets/ner/gravitee-bert-small-pii-detection-tokenizer.json");
+const CONFIG_JSON: &str =
+    include_str!("../assets/ner/gravitee-bert-small-pii-detection-config.json");
 
 const MAX_TOKENS: usize = 256;
 const MAX_CHUNK_BYTES: usize = 2_048;
-const MIN_CONFIDENCE: f32 = 0.70;
-const MAX_SEGMENTS: usize = 256;
+const MIN_CONFIDENCE: f32 = 0.65;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NerSpan {
@@ -43,6 +44,7 @@ static ENGINE: OnceLock<Result<Mutex<NerEngine>, String>> = OnceLock::new();
 struct NerEngine {
     tokenizer: Tokenizer,
     labels: Vec<String>,
+    input_names: Vec<String>,
     plan: Arc<TypedRunnableModel>,
 }
 
@@ -60,9 +62,19 @@ impl NerEngine {
             .map_err(|e| format!("pii-ner tokenizer truncation: {e}"))?;
         let labels = load_labels()?;
         let mut cursor = Cursor::new(MODEL_ONNX);
-        let plan = tract_onnx::onnx()
+        let model = tract_onnx::onnx()
             .model_for_read(&mut cursor)
-            .map_err(|e| format!("pii-ner onnx read: {e}"))?
+            .map_err(|e| format!("pii-ner onnx read: {e}"))?;
+        let input_names = model
+            .input_outlets()
+            .map_err(|e| format!("pii-ner onnx inputs: {e}"))?
+            .iter()
+            .map(|outlet| model.nodes[outlet.node].name.clone())
+            .collect::<Vec<_>>();
+        if input_names.is_empty() {
+            return Err("pii-ner onnx has no inputs".to_string());
+        }
+        let plan = model
             .into_optimized()
             .map_err(|e| format!("pii-ner onnx optimize: {e}"))?
             .into_runnable()
@@ -70,22 +82,20 @@ impl NerEngine {
         Ok(Self {
             tokenizer,
             labels,
+            input_names,
             plan,
         })
     }
 
     fn detect(&mut self, text: &str) -> Result<Vec<NerSpan>, String> {
         let mut spans = Vec::new();
-        for (base, chunk) in text_segments(text).take(MAX_SEGMENTS) {
+        for (base, chunk) in text_segments(text) {
             spans.extend(self.detect_chunk(base, chunk)?);
         }
         Ok(merge_adjacent_spans(spans))
     }
 
     fn detect_chunk(&mut self, base: usize, chunk: &str) -> Result<Vec<NerSpan>, String> {
-        if !has_ner_signal(chunk) {
-            return Ok(Vec::new());
-        }
         let encoding = self
             .tokenizer
             .encode(chunk, true)
@@ -110,18 +120,23 @@ impl NerEngine {
             .map(|&value| i64::from(value))
             .collect::<Vec<_>>();
 
-        let input_ids = Tensor::from_shape(&[1, seq_len], &ids)
-            .map_err(|e| format!("pii-ner input_ids: {e}"))?
-            .into_tvalue();
-        let attention_mask = Tensor::from_shape(&[1, seq_len], &attention)
-            .map_err(|e| format!("pii-ner attention_mask: {e}"))?
-            .into_tvalue();
-        let token_type_ids = Tensor::from_shape(&[1, seq_len], &token_types)
-            .map_err(|e| format!("pii-ner token_type_ids: {e}"))?
-            .into_tvalue();
+        let mut inputs = tvec!();
+        for name in &self.input_names {
+            let values = match name.as_str() {
+                "input_ids" => &ids,
+                "attention_mask" => &attention,
+                "token_type_ids" => &token_types,
+                other => return Err(format!("pii-ner unsupported onnx input: {other}")),
+            };
+            inputs.push(
+                Tensor::from_shape(&[1, seq_len], values)
+                    .map_err(|e| format!("pii-ner {name}: {e}"))?
+                    .into_tvalue(),
+            );
+        }
         let mut outputs = self
             .plan
-            .run(tvec!(input_ids, attention_mask, token_type_ids))
+            .run(inputs)
             .map_err(|e| format!("pii-ner inference: {e}"))?;
         let output = outputs
             .pop()
@@ -296,16 +311,38 @@ fn normalize_model_label(label: &str) -> &str {
 
 fn span_label(label: &str) -> &str {
     match label {
-        "GIVENNAME" | "SURNAME" => "PERSON_NAME",
-        "BUILDINGNUM" | "STREET" | "CITY" | "ZIPCODE" => "ADDRESS",
-        "DATEOFBIRTH" => "DATE_OF_BIRTH",
-        "CREDITCARDNUMBER" => "CREDIT_CARD_NUMBER",
-        "DRIVERLICENSENUM" => "DRIVER_LICENSE_NUMBER",
-        "IDCARDNUM" => "ID_CARD_NUMBER",
-        "SOCIALNUM" => "SOCIAL_NUMBER",
-        "TELEPHONENUM" => "PHONE_NUMBER",
-        "ACCOUNTNUM" => "ACCOUNT_NUMBER",
-        "TAXNUM" => "TAX_NUMBER",
+        "GIVENNAME" | "SURNAME" | "PERSON" | "first_name" | "last_name" => "PERSON_NAME",
+        "BUILDINGNUM" | "STREET" | "CITY" | "ZIPCODE" | "building_number" | "city" | "country"
+        | "county" | "postcode" | "state" | "street_address" | "LOCATION" => "ADDRESS",
+        "DATEOFBIRTH" | "date_of_birth" => "DATE_OF_BIRTH",
+        "CREDITCARDNUMBER" | "CREDIT_CARD" | "credit_debit_card" => "CREDIT_CARD_NUMBER",
+        "DRIVERLICENSENUM" | "US_DRIVER_LICENSE" | "driver_license" => "DRIVER_LICENSE_NUMBER",
+        "IDCARDNUM" | "US_ITIN" | "US_PASSPORT" | "national_id" => "ID_CARD_NUMBER",
+        "SOCIALNUM" | "US_SSN" | "ssn" => "SOCIAL_NUMBER",
+        "TELEPHONENUM" | "PHONE_NUMBER" | "phone_number" => "PHONE_NUMBER",
+        "ACCOUNTNUM" | "FINANCIAL" | "US_BANK_NUMBER" | "account_number" => "ACCOUNT_NUMBER",
+        "TAXNUM" | "tax_id" => "TAX_NUMBER",
+        "EMAIL_ADDRESS" => "EMAIL",
+        "IBAN_CODE" => "IBAN_CODE",
+        "IMEI" => "IMEI",
+        "NRP" => "NRP",
+        "ORGANIZATION" => "ORGANIZATION",
+        "TITLE" => "TITLE",
+        "URL" => "URL",
+        "US_LICENSE_PLATE" => "LICENSE_PLATE",
+        "bank_routing_number" => "BANK_ROUTING_NUMBER",
+        "company_name" => "COMPANY_NAME",
+        "customer_id" => "CUSTOMER_ID",
+        "date_time" => "DATE_TIME",
+        "device_identifier" => "DEVICE_IDENTIFIER",
+        "employee_id" => "EMPLOYEE_ID",
+        "http_cookie" => "HTTP_COOKIE",
+        "ipv4" => "IP_ADDRESS",
+        "ipv6" => "IP_ADDRESS",
+        "license_plate" => "LICENSE_PLATE",
+        "mac_address" => "MAC_ADDRESS",
+        "medical_record_number" => "MEDICAL_RECORD_NUMBER",
+        "swift_bic" => "SWIFT_BIC",
         other => other,
     }
 }
@@ -374,26 +411,33 @@ fn should_expand_label(label: &str) -> bool {
         label,
         "EMAIL"
             | "PASSWORD"
+            | "API_KEY"
+            | "HTTP_COOKIE"
+            | "IBAN_CODE"
+            | "IMEI"
             | "USERNAME"
             | "ACCOUNT_NUMBER"
+            | "BANK_ROUTING_NUMBER"
             | "CREDIT_CARD_NUMBER"
+            | "CVV"
             | "DRIVER_LICENSE_NUMBER"
             | "ID_CARD_NUMBER"
+            | "IP_ADDRESS"
+            | "MAC_ADDRESS"
+            | "MEDICAL_RECORD_NUMBER"
+            | "NRP"
             | "SOCIAL_NUMBER"
             | "TAX_NUMBER"
             | "PHONE_NUMBER"
             | "ZIPCODE"
+            | "PIN"
+            | "URL"
+            | "SWIFT_BIC"
     )
 }
 
 fn is_value_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+' | '@' | '%' | '/' | '#')
-}
-
-fn has_ner_signal(chunk: &str) -> bool {
-    chunk
-        .bytes()
-        .any(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'@' | b'.' | b'-' | b'_'))
 }
 
 fn text_segments(text: &str) -> impl Iterator<Item = (usize, &str)> {
@@ -491,5 +535,55 @@ mod tests {
             },
         );
         assert_eq!((span.start, span.end), (10, 17));
+    }
+
+    #[test]
+    fn maps_model_labels_to_pentect_labels() {
+        assert_eq!(span_label("first_name"), "PERSON_NAME");
+        assert_eq!(span_label("PERSON"), "PERSON_NAME");
+        assert_eq!(span_label("last_name"), "PERSON_NAME");
+        assert_eq!(span_label("company_name"), "COMPANY_NAME");
+        assert_eq!(span_label("ORGANIZATION"), "ORGANIZATION");
+        assert_eq!(span_label("EMAIL_ADDRESS"), "EMAIL");
+        assert_eq!(span_label("credit_debit_card"), "CREDIT_CARD_NUMBER");
+        assert_eq!(span_label("CREDIT_CARD"), "CREDIT_CARD_NUMBER");
+        assert_eq!(span_label("US_SSN"), "SOCIAL_NUMBER");
+        assert_eq!(span_label("street_address"), "ADDRESS");
+        assert_eq!(span_label("LOCATION"), "ADDRESS");
+    }
+
+    #[test]
+    fn bundled_model_detects_representative_pii() {
+        let text =
+            "full name: Alice Smith email: alice@example.com company: Contoso Ltd SSN: 123-45-6789";
+        let spans = detect_pii(text).unwrap();
+        let detected = spans
+            .iter()
+            .map(|span| (span.label.as_str(), &text[span.start..span.end]))
+            .collect::<Vec<_>>();
+        assert!(
+            detected
+                .iter()
+                .any(|(label, value)| *label == "PERSON_NAME" && *value == "Alice Smith"),
+            "{detected:?}"
+        );
+        assert!(
+            detected
+                .iter()
+                .any(|(label, value)| *label == "EMAIL" && *value == "alice@example.com"),
+            "{detected:?}"
+        );
+        assert!(
+            detected
+                .iter()
+                .any(|(label, value)| *label == "ORGANIZATION" && *value == "Contoso Ltd"),
+            "{detected:?}"
+        );
+        assert!(
+            detected
+                .iter()
+                .any(|(label, value)| *label == "SOCIAL_NUMBER" && *value == "123-45-6789"),
+            "{detected:?}"
+        );
     }
 }

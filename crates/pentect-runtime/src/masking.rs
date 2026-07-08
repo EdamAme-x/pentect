@@ -471,6 +471,24 @@ pub(crate) fn mask_read_data(
     kind: Kind,
 ) -> Result<MaskResult, String> {
     let engine = tool_boundary_engine()?;
+    mask_read_input_with_engine(key, engine, Input { kind, data })
+}
+
+pub(crate) fn mask_read_input_with_profile(
+    key: [u8; 32],
+    input: Input,
+    profile: Profile,
+    packs: Vec<pentect_core::Pack>,
+) -> Result<MaskResult, String> {
+    let engine = Engine::with_profile_and_packs(profile, packs, false);
+    mask_read_input_with_engine(key, &engine, input)
+}
+
+pub(crate) fn mask_read_input_with_engine(
+    key: [u8; 32],
+    engine: &Engine,
+    input: Input,
+) -> Result<MaskResult, String> {
     let adapters = ModelAdapters::from_env()?;
     let cfg = Config {
         disclose_length: false,
@@ -478,11 +496,12 @@ pub(crate) fn mask_read_data(
     };
     let mut adapter_count = 0usize;
     let mut adapter_recovery = Recovery::empty_for_key(&key);
+    let kind = input.kind;
     let data = match adapters.mask(
         engine,
         Input {
             kind: kind.clone(),
-            data: data.clone(),
+            data: input.data.clone(),
         },
         None,
         &cfg,
@@ -492,7 +511,7 @@ pub(crate) fn mask_read_data(
             adapter_recovery = result.recovery;
             result.masked
         }
-        None => data,
+        None => input.data,
     };
     let mut result = engine.mask(Input { kind, data }, &cfg);
     result.summary.masked_count = result.summary.masked_count.saturating_add(adapter_count);

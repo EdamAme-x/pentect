@@ -1,13 +1,16 @@
-broadfield-dev/bert-small-ner-pii-mobile
+gravitee-io/bert-small-pii-detection
 
-Source: https://huggingface.co/broadfield-dev/bert-small-ner-pii-mobile
-Base model: https://huggingface.co/broadfield-dev/bert-small-ner-pii
-Base model license: MIT
-Model card: ONNX export of broadfield-dev/bert-small-ner-pii-tuned-12261022.
+Source: https://huggingface.co/gravitee-io/bert-small-pii-detection
+Source revision: f8c27a85c51c0168f07b9dcf00265bf0a4097939
+Dataset: https://huggingface.co/datasets/gravitee-io/pii-detection-dataset
+License: Apache-2.0, as declared by the source model card.
 Task: token-classification for PII labels.
-Optimization: INT8, optimized for mobile ARM64.
+Model card: reported F1 0.8686, precision 0.8182, recall 0.9256.
 
 Bundled files:
-- bert-small-ner-pii-mobile.onnx
-- bert-small-ner-pii-mobile-tokenizer.json
-- bert-small-ner-pii-mobile-config.json
+- gravitee-bert-small-pii-detection.quant.onnx
+- gravitee-bert-small-pii-detection-tokenizer.json
+- gravitee-bert-small-pii-detection-config.json
+- LICENSE-APACHE-2.0.txt
+
+Apache License 2.0 applies to the bundled model artifacts.

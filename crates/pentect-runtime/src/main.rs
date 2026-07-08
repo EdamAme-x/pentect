@@ -99,6 +99,15 @@ pub fn mask_input_into_active_in_memory_manager(
     mask_input_into_in_memory_manager_client(&client, input, profile, packs).map(Some)
 }
 
+pub fn mask_input_for_read(
+    key: [u8; 32],
+    input: Input,
+    profile: Profile,
+    packs: Vec<Pack>,
+) -> Result<MaskResult, String> {
+    masking::mask_read_input_with_profile(key, input, profile, packs)
+}
+
 fn mask_input_into_in_memory_manager_client(
     client: &InMemoryManagerClient,
     input: Input,
@@ -106,9 +115,7 @@ fn mask_input_into_in_memory_manager_client(
     packs: Vec<Pack>,
 ) -> Result<MaskResult, String> {
     let key = client.key().map_err(|e| e.to_string())?;
-    let engine = Engine::with_profile_and_packs(profile, packs, false);
-    let cfg = Config::new(key);
-    let result = engine.mask(input, &cfg);
+    let result = masking::mask_read_input_with_profile(key, input, profile, packs)?;
     let mut recovery = result.recovery.clone();
     recovery.extend_same_key(env_alias_recovery(&result.masked, &key));
     client
