@@ -667,7 +667,10 @@ mod tests {
         })
         .unwrap();
         let payload = String::from_utf8(Vec::<u8>::from(masked.payload)).unwrap();
-        assert!(!payload.contains("sk-abcdefghijklmnopqrstuvwx"), "{payload}");
+        assert!(
+            !payload.contains("sk-abcdefghijklmnopqrstuvwx"),
+            "{payload}"
+        );
         assert!(payload.contains("<<OPENAI_API_KEY_x>>"), "{payload}");
     }
 }
