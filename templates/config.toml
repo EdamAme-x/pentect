@@ -1,6 +1,6 @@
 # Copy to .pentect/config.toml.
 
-extensions = ["company", "jp-business"]
+extensions = []
 
 [agent]
 status_line = true
@@ -24,4 +24,3 @@ fetch_seconds = 8
 
 [file_pointer_manager]
 save = true
-
