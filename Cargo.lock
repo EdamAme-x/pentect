@@ -2118,6 +2118,7 @@ dependencies = [
  "pdf-extract",
  "pentect-core",
  "pentect-runtime",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
