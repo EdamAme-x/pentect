@@ -378,18 +378,25 @@ fn maskable_app_server_text_key(key: &str) -> bool {
     matches!(
         key,
         "text"
+            | "delta"
             | "message"
             | "preview"
             | "summary"
             | "content"
+            | "contentItems"
             | "output"
             | "stdout"
             | "stderr"
+            | "stdin"
             | "command"
             | "reason"
             | "detail"
             | "details"
             | "error"
+            | "aggregatedOutput"
+            | "aggregated_output"
+            | "formattedOutput"
+            | "formatted_output"
     )
 }
 
@@ -470,6 +477,57 @@ mod tests {
         let masked = String::from_utf8(masked).unwrap();
         assert!(!masked.contains("sk-abcdefghijklmnopqrstuvwx"), "{masked}");
         assert!(masked.contains("<<OPENAI_API_KEY_x>>"), "{masked}");
+    }
+
+    #[test]
+    fn server_frame_masks_command_execution_delta() {
+        let raw = serde_json::json!({
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "delta": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"
+            }
+        })
+        .to_string();
+        let masked = rewrite_server_text_frame(&raw, &mut |text| {
+            Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
+        })
+        .unwrap();
+        assert!(!masked.contains("sk-abcdefghijklmnopqrstuvwx"), "{masked}");
+        assert!(masked.contains("<<OPENAI_API_KEY_x>>"), "{masked}");
+    }
+
+    #[test]
+    fn server_frame_masks_completed_command_outputs() {
+        let raw = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "id": "item-1",
+                    "command": "Get-Content sandbox\\tmp\\pentect-e2e.env",
+                    "aggregatedOutput": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",
+                    "formattedOutput": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"
+                }
+            }
+        })
+        .to_string();
+        let masked = rewrite_server_text_frame(&raw, &mut |text| {
+            Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
+        })
+        .unwrap();
+        assert!(!masked.contains("sk-abcdefghijklmnopqrstuvwx"), "{masked}");
+        assert_eq!(
+            masked.matches("<<OPENAI_API_KEY_x>>").count(),
+            2,
+            "{masked}"
+        );
+        assert!(
+            masked.contains("Get-Content sandbox\\\\tmp\\\\pentect-e2e.env"),
+            "{masked}"
+        );
     }
 
     #[test]
