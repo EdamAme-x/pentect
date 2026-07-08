@@ -245,6 +245,7 @@ async fn handle_client(fut: upgrade::UpgradeFut, backend_addr: SocketAddr) -> Re
                 match frame.opcode {
                     OpCode::Close => break,
                     OpCode::Text | OpCode::Binary => {
+                        let frame = rewrite_app_server_frame(frame, &mut output_masker)?;
                         backend.write_frame(frame).await
                             .map_err(|e| format!("backend websocket write failed: {e}"))?;
                     }
@@ -259,20 +260,9 @@ async fn handle_client(fut: upgrade::UpgradeFut, backend_addr: SocketAddr) -> Re
                 };
                 match frame.opcode {
                     OpCode::Close => break,
-                    OpCode::Text => {
-                        let payload = Vec::<u8>::from(frame.payload);
-                        let text = std::str::from_utf8(&payload)
-                            .map_err(|e| format!("codex app-server sent non-utf8 text frame: {e}"))?;
-                        let text = rewrite_server_text_frame(text, &mut |text| mask_output_text(&mut output_masker, text))?;
-                        client.write_frame(Frame::text(Payload::Owned(text.into_bytes()))).await
-                            .map_err(|e| format!("client websocket write failed: {e}"))?;
-                    }
-                    OpCode::Binary => {
-                        let payload = Vec::<u8>::from(frame.payload);
-                        let payload = rewrite_server_binary_payload(&payload, &mut |text| {
-                            mask_output_text(&mut output_masker, text)
-                        })?;
-                        client.write_frame(Frame::binary(Payload::Owned(payload))).await
+                    OpCode::Text | OpCode::Binary => {
+                        let frame = rewrite_app_server_frame(frame, &mut output_masker)?;
+                        client.write_frame(frame).await
                             .map_err(|e| format!("client websocket write failed: {e}"))?;
                     }
                     _ => {}
@@ -281,6 +271,37 @@ async fn handle_client(fut: upgrade::UpgradeFut, backend_addr: SocketAddr) -> Re
         }
     }
     Ok(())
+}
+
+fn rewrite_app_server_frame(
+    frame: Frame<'static>,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<Frame<'static>, String> {
+    rewrite_app_server_frame_with_mask(frame, &mut |text| mask_output_text(masker, text))
+}
+
+fn rewrite_app_server_frame_with_mask<F>(
+    frame: Frame<'static>,
+    mask: &mut F,
+) -> Result<Frame<'static>, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    match frame.opcode {
+        OpCode::Text => {
+            let payload = Vec::<u8>::from(frame.payload);
+            let text = std::str::from_utf8(&payload)
+                .map_err(|e| format!("codex app-server sent non-utf8 text frame: {e}"))?;
+            let text = rewrite_server_text_frame(text, mask)?;
+            Ok(Frame::text(Payload::Owned(text.into_bytes())))
+        }
+        OpCode::Binary => {
+            let payload = Vec::<u8>::from(frame.payload);
+            let payload = rewrite_server_binary_payload(&payload, mask)?;
+            Ok(Frame::binary(Payload::Owned(payload)))
+        }
+        _ => Ok(frame),
+    }
 }
 
 struct SpawnExecutor;
@@ -324,10 +345,23 @@ fn rewrite_server_text_frame<F>(text: &str, mask: &mut F) -> Result<String, Stri
 where
     F: FnMut(&str) -> Result<String, String>,
 {
+    rewrite_server_text_frame_with_image_redactor(text, mask, &mut redact_app_server_images)
+}
+
+fn rewrite_server_text_frame_with_image_redactor<F, G>(
+    text: &str,
+    mask: &mut F,
+    redact_images: &mut G,
+) -> Result<String, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+    G: FnMut(&mut Value) -> Result<(), String>,
+{
     let mut value: Value = match serde_json::from_str(text) {
         Ok(value) => value,
         Err(_) => return mask(text),
     };
+    redact_images(&mut value)?;
     mask_app_server_display_strings(&mut value, None, mask)?;
     serde_json::to_string(&value).map_err(|e| e.to_string())
 }
@@ -340,6 +374,13 @@ where
         return Ok(payload.to_vec());
     };
     rewrite_server_text_frame(text, mask).map(String::into_bytes)
+}
+
+fn redact_app_server_images(value: &mut Value) -> Result<(), String> {
+    if let Some(updated) = pentect_agent::redact_tool_images_into_active_in_memory_manager(value)? {
+        *value = updated;
+    }
+    Ok(())
 }
 
 fn mask_app_server_display_strings<F>(
@@ -571,5 +612,65 @@ mod tests {
         assert!(masked.contains("<<OPENAI_API_KEY_x>>"), "{masked}");
         assert!(!masked.contains("<<LOCAL_PATH_x>>"), "{masked}");
         assert!(!masked.contains("<<LOCAL_URI_x>>"), "{masked}");
+    }
+
+    #[test]
+    fn server_frame_redacts_image_payloads_before_display_masking() {
+        let raw = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "content": [{
+                        "type": "image",
+                        "mimeType": "image/png",
+                        "data": "RAW_IMAGE_BYTES"
+                    }]
+                }
+            }
+        })
+        .to_string();
+        let masked = rewrite_server_text_frame_with_image_redactor(
+            &raw,
+            &mut |text| Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>")),
+            &mut |value| {
+                value["params"]["item"]["content"][0]["data"] =
+                    Value::String("REDACTED_IMAGE_BYTES".to_string());
+                value["params"]["item"]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "type": "text",
+                        "text": "Pentect image masks\n[1] OPENAI_API_KEY"
+                    }));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!masked.contains("RAW_IMAGE_BYTES"), "{masked}");
+        assert!(masked.contains("REDACTED_IMAGE_BYTES"), "{masked}");
+        assert!(masked.contains("Pentect image masks"), "{masked}");
+        assert!(masked.contains("[1] OPENAI_API_KEY"), "{masked}");
+    }
+
+    #[test]
+    fn app_server_frame_masks_client_to_backend_payloads() {
+        let raw = serde_json::json!({
+            "method": "tool/result",
+            "params": {
+                "content": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"
+            }
+        })
+        .to_string();
+        let frame = Frame::text(Payload::Owned(raw.into_bytes()));
+        let masked = rewrite_app_server_frame_with_mask(frame, &mut |text| {
+            Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
+        })
+        .unwrap();
+        let payload = String::from_utf8(Vec::<u8>::from(masked.payload)).unwrap();
+        assert!(
+            !payload.contains("sk-abcdefghijklmnopqrstuvwx"),
+            "{payload}"
+        );
+        assert!(payload.contains("<<OPENAI_API_KEY_x>>"), "{payload}");
     }
 }

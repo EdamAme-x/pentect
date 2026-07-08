@@ -140,6 +140,38 @@ pub fn ocr_status() -> &'static str {
     image_ocr::ocr_status()
 }
 
+pub fn redact_tool_images_into_active_in_memory_manager(
+    value: &Value,
+) -> Result<Option<Value>, String> {
+    if !image_ocr::contains_image_result(value) {
+        return Ok(None);
+    }
+    let cfg = config::image_ocr_config()?;
+    if matches!(cfg.mode, config::ImageOcrMode::Off) {
+        return Ok(None);
+    }
+    let session = Session::open_capability("default").map_err(|e| e.to_string())?;
+    let redaction = image_ocr::redact_tool_images_for_secrets(value, &session.key, &cfg)?;
+    if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
+        if redaction.unscanned_images > 0 {
+            return Err("image blocked: image could not be fetched or scanned.".to_string());
+        }
+        if redaction.ocr_failures > 0 {
+            return Err("image blocked: image scan failed.".to_string());
+        }
+    }
+    if redaction.secret_images == 0 {
+        return Ok(redaction.changed.then_some(redaction.updated));
+    }
+    if !redaction.changed {
+        return Err("image blocked: secret text detected.".to_string());
+    }
+    Ok(Some(append_image_mask_notes(
+        redaction.updated,
+        &redaction.notes,
+    )))
+}
+
 pub fn resolve_text_from_active_in_memory_manager(text: &str) -> Result<Option<String>, String> {
     if InMemoryManagerClient::from_env().is_none() {
         return Ok(None);
