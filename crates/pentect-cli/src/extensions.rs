@@ -785,44 +785,16 @@ mod tests {
     }
 
     #[test]
-    fn official_runtime_free_extensions_mask_contextual_pii() {
+    fn official_openai_privacy_filter_is_model_adapter() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .unwrap();
         let opf = repo.join("extensions").join("openai-privacy-filter");
-        let packs = load_config_packs_from_specs(vec![opf.display().to_string()], true).unwrap();
-        let engine = pentect_core::Engine::with_profile_and_packs(
-            pentect_core::Profile::Strict,
-            packs,
-            false,
-        );
-        let raw = concat!(
-            "full_name: Ada Lovelace\n",
-            "company: Contoso Corporation\n",
-            "住所: 東京都千代田区丸の内1丁目\n",
-            "notes: Grace Hopper appears here without a field\n"
-        );
-        let masked = engine
-            .mask(
-                pentect_core::Input::text(raw),
-                &pentect_core::Config::insecure_testing(),
-            )
-            .masked;
-
-        assert!(masked.contains("<<PERSON_NAME_"), "{masked}");
-        assert!(masked.contains("<<ORGANIZATION_"), "{masked}");
-        assert!(masked.contains("<<JP_ADDRESS_"), "{masked}");
-        assert!(!masked.contains("full_name: Ada Lovelace"), "{masked}");
-        assert!(!masked.contains("company: Contoso Corporation"), "{masked}");
-        assert!(
-            !masked.contains("住所: 東京都千代田区丸の内1丁目"),
-            "{masked}"
-        );
-        assert!(
-            masked.contains("notes: Grace Hopper appears here without a field"),
-            "{masked}"
-        );
+        let active = active_from_explicit_specs(vec![opf.display().to_string()], true).unwrap();
+        assert!(active.config_paths().is_empty());
+        assert_eq!(active.adapter_paths().len(), 1);
+        assert!(active.adapter_paths()[0].ends_with("adapter.toml"));
     }
 
     #[test]

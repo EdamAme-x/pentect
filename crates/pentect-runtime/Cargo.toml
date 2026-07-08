@@ -12,10 +12,11 @@ name = "pentect_agent"
 path = "src/main.rs"
 
 [features]
-default = ["pdf", "ocr"]
+default = ["pdf", "ocr", "ner"]
 pdf = ["dep:pdf-extract"]
 ocr = ["dep:reqwest", "native-ocr", "bundled-ocr", "barcode"]
 barcode = ["dep:image", "dep:rxing"]
+ner = ["dep:tokenizers", "dep:tract-onnx"]
 native-ocr = [
     "dep:windows",
     "dep:objc2",
@@ -34,6 +35,8 @@ pdf-extract = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 rxing = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+tract-onnx = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }

@@ -18,6 +18,7 @@ sha2 = "0.10"
 serde_yaml = "0.9"
 fancy-regex = "0.18"
 tract-onnx = "0.23.3"
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 simd-json = "0.17"
 regex = "1"
 memchr = "2"
