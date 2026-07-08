@@ -360,8 +360,8 @@ fn extension_rows() -> Result<Vec<ExtensionRow>, String> {
         "project",
     )?);
     rows.extend(extension_rows_in(
-        Path::new("examples").join("extensions"),
-        "example",
+        Path::new("extensions").to_path_buf(),
+        "official",
     )?);
     Ok(rows)
 }

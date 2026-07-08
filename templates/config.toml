@@ -1,0 +1,27 @@
+# Copy to .pentect/config.toml.
+
+extensions = ["company", "jp-business"]
+
+[agent]
+status_line = true
+codex_app_server_proxy = true
+require_pentect = false
+
+[approval]
+mode = "none"
+
+[image]
+ocr = "on"
+redaction = "black"
+unscanned_images = "allow"
+max_edge = 2048
+max_pixels = 64000000
+max_images = 64
+max_total_bytes = 536870912
+max_seconds = 20
+max_image_bytes = 67108864
+fetch_seconds = 8
+
+[file_pointer_manager]
+save = true
+

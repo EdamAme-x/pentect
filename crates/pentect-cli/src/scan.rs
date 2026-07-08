@@ -223,6 +223,40 @@ mod tests {
     }
 
     #[test]
+    fn scan_applies_extension_packs() {
+        let root = temp_scan_root("pentect-scan-extension-pack");
+        let ext = root.join("ext");
+        std::fs::create_dir(&ext).unwrap();
+        std::fs::write(
+            ext.join("pack.toml"),
+            r#"[[detector]]
+pattern = 'ACME-[0-9]{8}'
+category = "secret"
+label = "ACME_CASE"
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("note.txt"), "ticket ACME-12345678\n").unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--extensions".into(),
+            ext.to_string_lossy().to_string(),
+            root.join("note.txt").to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
+        let rendered = report_json(&report);
+        assert_eq!(report.files_scanned, 1, "{rendered}");
+        assert_eq!(report.findings, 1, "{rendered}");
+        assert_eq!(report.files[0].labels.get("ACME_CASE"), Some(&1));
+        assert!(!rendered.contains("ACME-12345678"), "{rendered}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn scan_uses_native_credsweeper_without_python() {
         let root = temp_scan_root("pentect-scan-native-credsweeper");
         let token = format!("github_pat_{}", "A".repeat(80));

@@ -1,7 +1,8 @@
 schema = "pentect.model_adapter.v1"
 kind = "model"
-name = "ner"
+name = "ner-local"
 command = ["python", "adapter.py"]
 timeout_ms = 3000
 max_input_bytes = 262144
-max_spans = 512
+max_spans = 256
+

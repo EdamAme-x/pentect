@@ -1,15 +1,23 @@
 use crate::Result;
 use anyhow::{anyhow, bail, Context};
 use pentect_core::{load_pack, Pack};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 pub(crate) const PACKS_ENV: &str = "PENTECT_EXTENSION_PACKS";
 pub(crate) const ADAPTERS_ENV: &str = "PENTECT_EXTENSION_ADAPTERS";
 
 const PENTECT_DIR: &str = ".pentect";
 const EXTENSIONS_DIR: &str = "extensions";
+const EXTENSIONS_CACHE_DIR: &str = "extension-cache";
 const CONFIG_FILE: &str = "config.toml";
+const OFFICIAL_EXTENSIONS_DIR: &str = "extensions";
+const DEFAULT_REMOTE_EXTENSIONS_BASE: &str =
+    "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions";
+const REMOTE_EXTENSION_TIMEOUT: Duration = Duration::from_secs(8);
+const REMOTE_EXTENSION_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Default)]
 pub(crate) struct ActiveExtensions {
@@ -253,7 +261,11 @@ fn extension_paths_for_specs(
     let mut packs = Vec::new();
     let mut adapters = Vec::new();
     for spec in specs {
-        if is_path_spec(spec) {
+        if is_url_spec(spec) {
+            let found = extension_paths_for_url(spec)?;
+            packs.extend(found.pack_paths);
+            adapters.extend(found.adapter_paths);
+        } else if is_path_spec(spec) {
             let found = extension_paths_for_path(Path::new(spec))?;
             packs.extend(found.pack_paths);
             adapters.extend(found.adapter_paths);
@@ -279,22 +291,32 @@ struct ExtensionPaths {
 fn extension_paths_for_named(name: &str, _create: bool) -> Result<ExtensionPaths> {
     validate_extension_name(name)?;
     let project_dir = extensions_root().join(name);
-    let example_dir = examples_extensions_root().join(name);
+    let official_dir = official_extensions_root().join(name);
     let dir = if project_dir.exists() {
         project_dir
-    } else if example_dir.exists() {
-        example_dir.clone()
+    } else if official_dir.exists() {
+        official_dir.clone()
     } else {
-        bail!(
+        let remote_error = if remote_extensions_enabled() {
+            match remote_extension_paths_for_name(name) {
+                Ok(paths) if !paths.is_empty() => return Ok(paths),
+                Ok(_) => None,
+                Err(e) => Some(e),
+            }
+        } else {
+            None
+        };
+        let mut message = format!(
             "extension '{name}' was not found at '{}' or '{}'",
             project_dir.display(),
-            example_dir.display()
+            official_dir.display()
         );
+        if let Some(error) = remote_error {
+            message.push_str(&format!("; remote lookup failed: {error}"));
+        }
+        bail!(message);
     };
-    let mut paths = extension_paths_in_dir(&dir)?;
-    if paths.is_empty() && dir != example_dir && example_dir.exists() {
-        paths = extension_paths_in_dir(&example_dir)?;
-    }
+    let paths = extension_paths_in_dir(&dir)?;
     if paths.is_empty() {
         bail!(
             "extension '{name}' has no packs or adapters; add '{}', '{}', '{}', or '{}'",
@@ -305,6 +327,22 @@ fn extension_paths_for_named(name: &str, _create: bool) -> Result<ExtensionPaths
         );
     }
     Ok(paths)
+}
+
+fn extension_paths_for_url(url: &str) -> Result<ExtensionPaths> {
+    let normalized = normalize_github_extension_url(url)?;
+    if normalized.ends_with(".toml") {
+        let mut paths = ExtensionPaths::default();
+        let file = fetch_remote_extension_file(&normalized)?
+            .ok_or_else(|| anyhow!("remote extension file was not found: {normalized}"))?;
+        if looks_like_adapter_url(&normalized) {
+            paths.adapter_paths.push(file);
+        } else {
+            paths.pack_paths.push(file);
+        }
+        return Ok(paths);
+    }
+    remote_extension_paths_for_base_url(&normalized)
 }
 
 fn extension_paths_for_path(path: &Path) -> Result<ExtensionPaths> {
@@ -367,8 +405,8 @@ fn extensions_root() -> PathBuf {
     PathBuf::from(PENTECT_DIR).join(EXTENSIONS_DIR)
 }
 
-fn examples_extensions_root() -> PathBuf {
-    PathBuf::from("examples").join(EXTENSIONS_DIR)
+fn official_extensions_root() -> PathBuf {
+    PathBuf::from(OFFICIAL_EXTENSIONS_DIR)
 }
 
 fn looks_like_adapter_file(path: &Path) -> bool {
@@ -381,6 +419,10 @@ fn looks_like_adapter_file(path: &Path) -> bool {
 }
 
 fn validate_extension_spec(spec: &str) -> Result<()> {
+    if is_url_spec(spec) {
+        normalize_github_extension_url(spec).map(|_| ())?;
+        return Ok(());
+    }
     if is_path_spec(spec) {
         if Path::new(spec)
             .components()
@@ -416,6 +458,135 @@ fn is_path_spec(spec: &str) -> bool {
         || spec.contains('/')
         || spec.contains('\\')
         || spec.starts_with('.')
+}
+
+fn is_url_spec(spec: &str) -> bool {
+    spec.starts_with("https://github.com/")
+        || spec.starts_with("https://raw.githubusercontent.com/")
+}
+
+fn remote_extension_paths_for_name(name: &str) -> Result<ExtensionPaths> {
+    remote_extension_paths_for_base_url(&format!("{DEFAULT_REMOTE_EXTENSIONS_BASE}/{name}"))
+}
+
+fn remote_extension_paths_for_base_url(base_url: &str) -> Result<ExtensionPaths> {
+    let mut paths = ExtensionPaths::default();
+    if let Some(pack) =
+        fetch_remote_extension_file(&format!("{}/pack.toml", base_url.trim_end_matches('/')))?
+    {
+        paths.pack_paths.push(pack);
+    }
+    if let Some(adapter) =
+        fetch_remote_extension_file(&format!("{}/adapter.toml", base_url.trim_end_matches('/')))?
+    {
+        paths.adapter_paths.push(adapter);
+    }
+    if paths.is_empty() {
+        bail!("remote extension has no pack.toml or adapter.toml: {base_url}");
+    }
+    Ok(paths)
+}
+
+fn fetch_remote_extension_file(url: &str) -> Result<Option<PathBuf>> {
+    let path = remote_cache_file(url);
+    if cached_remote_extension_is_fresh(&path) {
+        return Ok(Some(path));
+    }
+    let response = reqwest::blocking::Client::builder()
+        .timeout(REMOTE_EXTENSION_TIMEOUT)
+        .build()
+        .context("could not create extension HTTP client")?
+        .get(url)
+        .send()
+        .with_context(|| format!("could not fetch extension '{url}'"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        bail!("could not fetch extension '{url}': HTTP {status}");
+    }
+    let bytes = response
+        .bytes()
+        .with_context(|| format!("could not read extension '{url}'"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create extension cache '{}'", parent.display()))?;
+    }
+    std::fs::write(&path, &bytes)
+        .with_context(|| format!("could not write extension cache '{}'", path.display()))?;
+    Ok(Some(path))
+}
+
+fn cached_remote_extension_is_fresh(path: &Path) -> bool {
+    let Ok(modified) = path.metadata().and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age < REMOTE_EXTENSION_CACHE_TTL)
+}
+
+fn remote_cache_file(url: &str) -> PathBuf {
+    let mut hash = Sha256::new();
+    hash.update(url.as_bytes());
+    let digest = hash.finalize();
+    let hex = data_encoding::HEXLOWER.encode(&digest[..16]);
+    let filename = url
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("extension.toml");
+    PathBuf::from(PENTECT_DIR)
+        .join(EXTENSIONS_CACHE_DIR)
+        .join(hex)
+        .join(filename)
+}
+
+fn normalize_github_extension_url(url: &str) -> Result<String> {
+    if let Some(rest) = url.strip_prefix("https://raw.githubusercontent.com/") {
+        if rest.split('/').count() < 4 {
+            bail!("GitHub raw extension URL is incomplete: {url}");
+        }
+        return Ok(url.trim_end_matches('/').to_string());
+    }
+    let Some(rest) = url.strip_prefix("https://github.com/") else {
+        bail!("extensions can only be fetched from GitHub HTTPS URLs");
+    };
+    let parts = rest.split('/').collect::<Vec<_>>();
+    if parts.len() < 5 {
+        bail!("GitHub extension URL must point to a blob or tree path: {url}");
+    }
+    let owner = parts[0];
+    let repo = parts[1];
+    let mode = parts[2];
+    let reference = parts[3];
+    let path = parts[4..].join("/");
+    match mode {
+        "blob" | "tree" => Ok(format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/{reference}/{}",
+            path.trim_end_matches('/')
+        )),
+        _ => bail!("GitHub extension URL must use /blob/ or /tree/: {url}"),
+    }
+}
+
+fn looks_like_adapter_url(url: &str) -> bool {
+    url.rsplit('/').next() == Some("adapter.toml")
+        || url
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .is_some_and(|(parent, _)| parent.ends_with("/adapters"))
+}
+
+#[cfg(not(test))]
+fn remote_extensions_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn remote_extensions_enabled() -> bool {
+    false
 }
 
 fn toml_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -539,6 +710,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("was not found"), "{err}");
+    }
+
+    #[test]
+    fn github_extension_urls_normalize_to_raw_urls() {
+        assert_eq!(
+            normalize_github_extension_url(
+                "https://github.com/EdamAme-x/pentect/blob/main/extensions/company/pack.toml"
+            )
+            .unwrap(),
+            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/pack.toml"
+        );
+        assert_eq!(
+            normalize_github_extension_url(
+                "https://github.com/EdamAme-x/pentect/tree/main/extensions/company"
+            )
+            .unwrap(),
+            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company"
+        );
+        assert_eq!(
+            normalize_github_extension_url(
+                "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/pack.toml"
+            )
+            .unwrap(),
+            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/pack.toml"
+        );
+        assert!(normalize_github_extension_url("https://example.com/company/pack.toml").is_err());
+        assert!(
+            normalize_github_extension_url("https://raw.githubusercontent.com/owner/repo").is_err()
+        );
     }
 
     #[test]
