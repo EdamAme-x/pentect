@@ -49,7 +49,9 @@ impl AppServerProxyGuard {
                 }
             };
             runtime.block_on(async move {
+                let ready_err_tx = ready_tx.clone();
                 if let Err(e) = run_proxy(codex, app_server_args, ready_tx, shutdown_rx).await {
+                    let _ = ready_err_tx.send(Err(e.clone()));
                     eprintln!("[pentect] app-server proxy stopped: {e}");
                 }
             });
@@ -89,21 +91,38 @@ async fn run_proxy(
     let backend_addr = reserve_loopback_addr()?;
     let backend_url = format!("ws://{backend_addr}");
     let mut backend = start_codex_app_server(&codex, &backend_url, app_server_args)?;
-    wait_for_ready(backend_addr, &mut backend).await?;
+    if let Err(e) = wait_for_ready(backend_addr, &mut backend).await {
+        stop_child(&mut backend).await;
+        return Err(e);
+    }
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|e| format!("could not bind app-server proxy: {e}"))?;
-    let proxy_addr = listener
-        .local_addr()
-        .map_err(|e| format!("could not read app-server proxy addr: {e}"))?;
+    let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            stop_child(&mut backend).await;
+            return Err(format!("could not bind app-server proxy: {e}"));
+        }
+    };
+    let proxy_addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(e) => {
+            stop_child(&mut backend).await;
+            return Err(format!("could not read app-server proxy addr: {e}"));
+        }
+    };
     let _ = ready_tx.send(Ok(format!("ws://{proxy_addr}")));
 
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => break,
             accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|e| format!("app-server proxy accept failed: {e}"))?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        stop_child(&mut backend).await;
+                        return Err(format!("app-server proxy accept failed: {e}"));
+                    }
+                };
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |req| proxy_upgrade(req, backend_addr));
@@ -116,8 +135,7 @@ async fn run_proxy(
         }
     }
 
-    let _ = backend.kill().await;
-    let _ = backend.wait().await;
+    stop_child(&mut backend).await;
     Ok(())
 }
 
@@ -155,12 +173,22 @@ async fn wait_for_ready(addr: SocketAddr, child: &mut Child) -> Result<(), Strin
         {
             return Err(format!("codex app-server exited before ready: {status}"));
         }
-        if ready_probe(addr).await.unwrap_or(false) {
+        if let Ok(Ok(true)) =
+            tokio::time::timeout(Duration::from_millis(500), ready_probe(addr)).await
+        {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err("codex app-server did not become ready within 8 seconds".to_string())
+}
+
+async fn stop_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 async fn ready_probe(addr: SocketAddr) -> Result<bool, String> {

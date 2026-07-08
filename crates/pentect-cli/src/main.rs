@@ -1293,7 +1293,7 @@ fn codex_args_remote_value(args: &[String]) -> Option<&str> {
         if let Some(value) = arg.strip_prefix("--remote=") {
             return Some(value);
         }
-        i += if codex_long_option_takes_value(arg) {
+        i += if codex_long_option_takes_value(arg) || codex_short_option_takes_value(arg) {
             2
         } else {
             1
@@ -2255,6 +2255,23 @@ mod tests {
         let prompt = args.iter().position(|arg| arg == "hello").unwrap();
         assert!(remote < prompt, "{args:?}");
         assert_eq!(args[remote + 1], "ws://127.0.0.1:12345");
+    }
+
+    #[test]
+    fn codex_remote_scan_skips_short_option_values() {
+        assert_eq!(
+            codex_args_remote_value(&["-m".to_string(), "--remote".to_string()]),
+            None
+        );
+        assert_eq!(
+            codex_args_remote_value(&[
+                "-m".to_string(),
+                "gpt-5.5".to_string(),
+                "--remote".to_string(),
+                "ws://127.0.0.1:12345".to_string()
+            ]),
+            Some("ws://127.0.0.1:12345")
+        );
     }
 
     #[test]
