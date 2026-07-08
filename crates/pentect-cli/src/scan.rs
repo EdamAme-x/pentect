@@ -223,12 +223,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_applies_extension_packs() {
+    fn scan_applies_extension_configs() {
         let root = temp_scan_root("pentect-scan-extension-pack");
         let ext = root.join("ext");
         std::fs::create_dir(&ext).unwrap();
         std::fs::write(
-            ext.join("pack.toml"),
+            ext.join("config.toml"),
             r#"[[detector]]
 pattern = 'ACME-[0-9]{8}'
 category = "secret"

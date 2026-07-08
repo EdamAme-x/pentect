@@ -188,11 +188,11 @@ fn cmd_agent_from(start: usize, args: &[String]) {
         Ok(active) => active,
         Err(e) => die(&e),
     };
-    if let Some(value) = match active_extensions.pack_env_value() {
+    if let Some(value) = match active_extensions.config_env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     } {
-        std::env::set_var(extensions::PACKS_ENV, value);
+        std::env::set_var(extensions::CONFIGS_ENV, value);
     }
     if let Some(value) = match active_extensions.adapter_env_value() {
         Ok(value) => value,
@@ -363,7 +363,7 @@ fn cmd_read(args: &[String]) {
         Err(e) => die(&e),
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
-    let packs = match extensions::load_packs_from_specs(opts.extensions.clone(), true) {
+    let packs = match extensions::load_config_packs_from_specs(opts.extensions.clone(), true) {
         Ok(packs) => packs,
         Err(e) => die(&e),
     };
@@ -650,8 +650,8 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     let mut cmd = Command::new(&opts.command);
     apply_extension_env(&mut cmd, &active_extensions)?;
     let in_memory_manager = start_in_memory_manager(pentect)?;
-    let pack_env = active_extensions
-        .pack_env_value()
+    let config_env = active_extensions
+        .config_env_value()
         .map_err(|e| e.to_string())?;
     let adapter_env = active_extensions
         .adapter_env_value()
@@ -675,7 +675,7 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
             PENTECT_STATUS_LINE_ENV,
             Some(OsString::from(if status_line_enabled { "1" } else { "0" })),
         ),
-        (extensions::PACKS_ENV, pack_env),
+        (extensions::CONFIGS_ENV, config_env),
         (extensions::ADAPTERS_ENV, adapter_env),
     ]);
     let exec_proxy = if codex_unified_exec_proxy_enabled(&opts.tool_args) {
@@ -1120,8 +1120,8 @@ fn apply_extension_env(
     cmd: &mut Command,
     active: &extensions::ActiveExtensions,
 ) -> Result<(), String> {
-    if let Some(value) = active.pack_env_value().map_err(|e| e.to_string())? {
-        cmd.env(extensions::PACKS_ENV, value);
+    if let Some(value) = active.config_env_value().map_err(|e| e.to_string())? {
+        cmd.env(extensions::CONFIGS_ENV, value);
     }
     if let Some(value) = active.adapter_env_value().map_err(|e| e.to_string())? {
         cmd.env(extensions::ADAPTERS_ENV, value);
@@ -1864,7 +1864,7 @@ fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
         let pack = load_pack(&src).map_err(|e| format!("pack '{display}' is invalid: {e}"))?;
         packs.push(pack);
     }
-    packs.extend(extensions::load_packs_from_args(args, true).map_err(|e| e.to_string())?);
+    packs.extend(extensions::load_config_packs_from_args(args, true).map_err(|e| e.to_string())?);
     Ok(packs)
 }
 

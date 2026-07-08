@@ -6,13 +6,15 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-pub(crate) const PACKS_ENV: &str = "PENTECT_EXTENSION_PACKS";
+pub(crate) const CONFIGS_ENV: &str = "PENTECT_EXTENSION_CONFIGS";
 pub(crate) const ADAPTERS_ENV: &str = "PENTECT_EXTENSION_ADAPTERS";
 
 const PENTECT_DIR: &str = ".pentect";
 const EXTENSIONS_DIR: &str = "extensions";
 const EXTENSIONS_CACHE_DIR: &str = "extension-cache";
-const CONFIG_FILE: &str = "config.toml";
+const PENTECT_CONFIG_FILE: &str = "config.toml";
+const EXTENSION_CONFIG_FILE: &str = "config.toml";
+const EXTENSION_CONFIGS_DIR: &str = "configs";
 const OFFICIAL_EXTENSIONS_DIR: &str = "extensions";
 const DEFAULT_REMOTE_EXTENSIONS_BASE: &str =
     "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions";
@@ -21,26 +23,26 @@ const REMOTE_EXTENSION_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Default)]
 pub(crate) struct ActiveExtensions {
-    pack_paths: Vec<PathBuf>,
+    config_paths: Vec<PathBuf>,
     adapter_paths: Vec<PathBuf>,
 }
 
 impl ActiveExtensions {
-    pub(crate) fn pack_paths(&self) -> &[PathBuf] {
-        &self.pack_paths
+    pub(crate) fn config_paths(&self) -> &[PathBuf] {
+        &self.config_paths
     }
 
     pub(crate) fn adapter_paths(&self) -> &[PathBuf] {
         &self.adapter_paths
     }
 
-    pub(crate) fn pack_env_value(&self) -> Result<Option<OsString>> {
-        if self.pack_paths.is_empty() {
+    pub(crate) fn config_env_value(&self) -> Result<Option<OsString>> {
+        if self.config_paths.is_empty() {
             return Ok(None);
         }
-        std::env::join_paths(&self.pack_paths)
+        std::env::join_paths(&self.config_paths)
             .map(Some)
-            .context("could not encode extension pack paths")
+            .context("could not encode extension config paths")
     }
 
     pub(crate) fn adapter_env_value(&self) -> Result<Option<OsString>> {
@@ -185,36 +187,37 @@ pub(crate) fn active_from_explicit_specs(
     specs: Vec<String>,
     create_named: bool,
 ) -> Result<ActiveExtensions> {
-    let (pack_paths, adapter_paths) = extension_paths_for_specs(&specs, create_named)?;
+    let (config_paths, adapter_paths) = extension_paths_for_specs(&specs, create_named)?;
     Ok(ActiveExtensions {
-        pack_paths,
+        config_paths,
         adapter_paths,
     })
 }
 
-pub(crate) fn load_packs_from_args(args: &[String], create_named: bool) -> Result<Vec<Pack>> {
-    load_packs_from_specs(collect_from_args(args)?, create_named)
+pub(crate) fn load_config_packs_from_args(
+    args: &[String],
+    create_named: bool,
+) -> Result<Vec<Pack>> {
+    load_config_packs_from_specs(collect_from_args(args)?, create_named)
 }
 
-pub(crate) fn load_packs_from_specs(
+pub(crate) fn load_config_packs_from_specs(
     explicit_specs: Vec<String>,
     create_named: bool,
 ) -> Result<Vec<Pack>> {
     let active = active_from_specs(explicit_specs, create_named)?;
     let mut packs = Vec::new();
     if !active.adapter_paths.is_empty() {
-        bail!(
-            "model adapter extensions are only used by agent tool-boundary commands; use a rules pack for this command"
-        );
+        bail!("model adapter extensions are only used by agent tool-boundary commands");
     }
-    for path in active.pack_paths {
+    for path in active.config_paths {
         let display = path.display();
         let src = std::fs::read_to_string(&path)
-            .with_context(|| format!("could not read extension pack '{display}'"))?;
+            .with_context(|| format!("could not read extension config '{display}'"))?;
         let pack =
-            load_pack(&src).map_err(|e| anyhow!("extension pack '{display}' is invalid: {e}"))?;
+            load_pack(&src).map_err(|e| anyhow!("extension config '{display}' is invalid: {e}"))?;
         if !pack.disable.is_empty() {
-            bail!("extension pack '{display}' may add detectors but must not disable built-ins");
+            bail!("extension config '{display}' may add detectors but must not disable built-ins");
         }
         packs.push(pack);
     }
@@ -222,7 +225,7 @@ pub(crate) fn load_packs_from_specs(
 }
 
 fn config_specs() -> Result<Vec<String>> {
-    let path = PathBuf::from(PENTECT_DIR).join(CONFIG_FILE);
+    let path = PathBuf::from(PENTECT_DIR).join(PENTECT_CONFIG_FILE);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -258,33 +261,33 @@ fn extension_paths_for_specs(
     specs: &[String],
     create_named: bool,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-    let mut packs = Vec::new();
+    let mut configs = Vec::new();
     let mut adapters = Vec::new();
     for spec in specs {
         if is_url_spec(spec) {
             let found = extension_paths_for_url(spec)?;
-            packs.extend(found.pack_paths);
+            configs.extend(found.config_paths);
             adapters.extend(found.adapter_paths);
         } else if is_path_spec(spec) {
             let found = extension_paths_for_path(Path::new(spec))?;
-            packs.extend(found.pack_paths);
+            configs.extend(found.config_paths);
             adapters.extend(found.adapter_paths);
         } else {
             let found = extension_paths_for_named(spec, create_named)?;
-            packs.extend(found.pack_paths);
+            configs.extend(found.config_paths);
             adapters.extend(found.adapter_paths);
         }
     }
-    packs.sort();
-    packs.dedup();
+    configs.sort();
+    configs.dedup();
     adapters.sort();
     adapters.dedup();
-    Ok((packs, adapters))
+    Ok((configs, adapters))
 }
 
 #[derive(Debug, Default)]
 struct ExtensionPaths {
-    pack_paths: Vec<PathBuf>,
+    config_paths: Vec<PathBuf>,
     adapter_paths: Vec<PathBuf>,
 }
 
@@ -319,9 +322,9 @@ fn extension_paths_for_named(name: &str, _create: bool) -> Result<ExtensionPaths
     let paths = extension_paths_in_dir(&dir)?;
     if paths.is_empty() {
         bail!(
-            "extension '{name}' has no packs or adapters; add '{}', '{}', '{}', or '{}'",
-            dir.join("pack.toml").display(),
-            dir.join("packs").display(),
+            "extension '{name}' has no configs or adapters; add '{}', '{}', '{}', or '{}'",
+            dir.join(EXTENSION_CONFIG_FILE).display(),
+            dir.join(EXTENSION_CONFIGS_DIR).display(),
             dir.join("adapter.toml").display(),
             dir.join("adapters").display()
         );
@@ -338,7 +341,7 @@ fn extension_paths_for_url(url: &str) -> Result<ExtensionPaths> {
         if looks_like_adapter_url(&normalized) {
             paths.adapter_paths.push(file);
         } else {
-            paths.pack_paths.push(file);
+            paths.config_paths.push(file);
         }
         return Ok(paths);
     }
@@ -348,14 +351,14 @@ fn extension_paths_for_url(url: &str) -> Result<ExtensionPaths> {
 fn extension_paths_for_path(path: &Path) -> Result<ExtensionPaths> {
     if path.is_file() {
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-            bail!("extension pack must be a .toml file: {}", path.display());
+            bail!("extension config must be a .toml file: {}", path.display());
         }
         let mut paths = ExtensionPaths::default();
         let file = canonical_file(path)?;
         if looks_like_adapter_file(path) {
             paths.adapter_paths.push(file);
         } else {
-            paths.pack_paths.push(file);
+            paths.config_paths.push(file);
         }
         return Ok(paths);
     }
@@ -367,13 +370,13 @@ fn extension_paths_for_path(path: &Path) -> Result<ExtensionPaths> {
 
 fn extension_paths_in_dir(dir: &Path) -> Result<ExtensionPaths> {
     let mut paths = ExtensionPaths::default();
-    let pack = dir.join("pack.toml");
-    if pack.exists() {
-        paths.pack_paths.push(canonical_file(&pack)?);
+    let config = dir.join(EXTENSION_CONFIG_FILE);
+    if config.exists() {
+        paths.config_paths.push(canonical_file(&config)?);
     }
-    let packs_dir = dir.join("packs");
-    if packs_dir.exists() {
-        paths.pack_paths.extend(toml_files_in_dir(&packs_dir)?);
+    let configs_dir = dir.join(EXTENSION_CONFIGS_DIR);
+    if configs_dir.exists() {
+        paths.config_paths.extend(toml_files_in_dir(&configs_dir)?);
     }
     let adapter = dir.join("adapter.toml");
     if adapter.exists() {
@@ -385,14 +388,14 @@ fn extension_paths_in_dir(dir: &Path) -> Result<ExtensionPaths> {
             .adapter_paths
             .extend(toml_files_in_dir(&adapters_dir)?);
     }
-    paths.pack_paths.sort();
+    paths.config_paths.sort();
     paths.adapter_paths.sort();
     Ok(paths)
 }
 
 impl ExtensionPaths {
     fn is_empty(&self) -> bool {
-        self.pack_paths.is_empty() && self.adapter_paths.is_empty()
+        self.config_paths.is_empty() && self.adapter_paths.is_empty()
     }
 }
 
@@ -471,10 +474,12 @@ fn remote_extension_paths_for_name(name: &str) -> Result<ExtensionPaths> {
 
 fn remote_extension_paths_for_base_url(base_url: &str) -> Result<ExtensionPaths> {
     let mut paths = ExtensionPaths::default();
-    if let Some(pack) =
-        fetch_remote_extension_file(&format!("{}/pack.toml", base_url.trim_end_matches('/')))?
-    {
-        paths.pack_paths.push(pack);
+    if let Some(config) = fetch_remote_extension_file(&format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        EXTENSION_CONFIG_FILE
+    ))? {
+        paths.config_paths.push(config);
     }
     if let Some(adapter) =
         fetch_remote_extension_file(&format!("{}/adapter.toml", base_url.trim_end_matches('/')))?
@@ -482,7 +487,7 @@ fn remote_extension_paths_for_base_url(base_url: &str) -> Result<ExtensionPaths>
         paths.adapter_paths.push(adapter);
     }
     if paths.is_empty() {
-        bail!("remote extension has no pack.toml or adapter.toml: {base_url}");
+        bail!("remote extension has no config.toml or adapter.toml: {base_url}");
     }
     Ok(paths)
 }
@@ -716,10 +721,10 @@ mod tests {
     fn github_extension_urls_normalize_to_raw_urls() {
         assert_eq!(
             normalize_github_extension_url(
-                "https://github.com/EdamAme-x/pentect/blob/main/extensions/company/pack.toml"
+                "https://github.com/EdamAme-x/pentect/blob/main/extensions/company/config.toml"
             )
             .unwrap(),
-            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/pack.toml"
+            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/config.toml"
         );
         assert_eq!(
             normalize_github_extension_url(
@@ -730,30 +735,30 @@ mod tests {
         );
         assert_eq!(
             normalize_github_extension_url(
-                "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/pack.toml"
+                "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/config.toml"
             )
             .unwrap(),
-            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/pack.toml"
+            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/config.toml"
         );
-        assert!(normalize_github_extension_url("https://example.com/company/pack.toml").is_err());
+        assert!(normalize_github_extension_url("https://example.com/company/config.toml").is_err());
         assert!(
             normalize_github_extension_url("https://raw.githubusercontent.com/owner/repo").is_err()
         );
     }
 
     #[test]
-    fn directory_extensions_can_contain_packs_and_adapters() {
+    fn directory_extensions_can_contain_configs_and_adapters() {
         let root =
             std::env::temp_dir().join(format!("pentect-extension-paths-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("pack.toml"), "").unwrap();
+        std::fs::write(root.join("config.toml"), "").unwrap();
         std::fs::write(root.join("adapter.toml"), "").unwrap();
 
         let paths = extension_paths_for_path(&root).unwrap();
         assert_eq!(
-            paths.pack_paths,
-            vec![root.join("pack.toml").canonicalize().unwrap()]
+            paths.config_paths,
+            vec![root.join("config.toml").canonicalize().unwrap()]
         );
         assert_eq!(
             paths.adapter_paths,
@@ -771,7 +776,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("adapter.toml"), "").unwrap();
 
-        let err = match load_packs_from_specs(vec![root.display().to_string()], true) {
+        let err = match load_config_packs_from_specs(vec![root.display().to_string()], true) {
             Ok(_) => panic!("expected adapter-only extension to be rejected"),
             Err(err) => err.to_string(),
         };
