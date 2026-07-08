@@ -211,7 +211,8 @@ struct AdapterToml {
     schema: Option<String>,
     kind: Option<String>,
     name: Option<String>,
-    command: Vec<String>,
+    command: Option<Vec<String>>,
+    builtin: Option<String>,
     timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
     max_spans: Option<usize>,
@@ -222,10 +223,21 @@ struct AdapterFile {
     name: String,
     id: String,
     cwd: PathBuf,
-    command: Vec<String>,
+    backend: AdapterBackend,
     timeout: Duration,
     max_input_bytes: usize,
     max_spans: usize,
+}
+
+#[derive(Debug)]
+enum AdapterBackend {
+    Command(Vec<String>),
+    Builtin(BuiltinAdapter),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BuiltinAdapter {
+    PiiNer,
 }
 
 impl AdapterFile {
@@ -240,11 +252,11 @@ impl AdapterFile {
         if manifest.kind.as_deref() != Some("model") {
             return Err("kind".to_string());
         }
-        if manifest.command.is_empty() || manifest.command.iter().any(|part| part.is_empty()) {
-            return Err("command".to_string());
-        }
-        if find_command(&manifest.command[0]).is_none() {
-            return Err("command not found".to_string());
+        let backend = adapter_backend(manifest.command, manifest.builtin.as_deref())?;
+        if let AdapterBackend::Command(command) = &backend {
+            if find_command(&command[0]).is_none() {
+                return Err("command not found".to_string());
+            }
         }
         let cwd = path
             .parent()
@@ -259,7 +271,7 @@ impl AdapterFile {
             name,
             id,
             cwd,
-            command: manifest.command,
+            backend,
             timeout: Duration::from_millis(manifest.timeout_ms.unwrap_or(3_000)),
             max_input_bytes: manifest.max_input_bytes.unwrap_or(256 * 1024),
             max_spans: manifest.max_spans.unwrap_or(512),
@@ -277,9 +289,12 @@ impl AdapterFile {
         if request.len() > self.max_input_bytes {
             return Err(format!("{}: input limit", self.name));
         }
-        let mut command = adapter_command(&self.command[0], &self.id)?;
+        let AdapterBackend::Command(adapter_command_parts) = &self.backend else {
+            return self.run_builtin_probe();
+        };
+        let mut command = adapter_command(&adapter_command_parts[0], &self.id)?;
         command
-            .args(&self.command[1..])
+            .args(&adapter_command_parts[1..])
             .current_dir(&self.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -319,6 +334,47 @@ impl AdapterFile {
         }
         Ok(count)
     }
+
+    fn run_builtin_probe(&self) -> Result<usize, String> {
+        let AdapterBackend::Builtin(builtin) = &self.backend else {
+            return Err(format!("{}: adapter backend", self.name));
+        };
+        match builtin {
+            BuiltinAdapter::PiiNer => {
+                run_pii_ner_probe().map_err(|e| format!("{}: {e}", self.name))
+            }
+        }
+    }
+}
+
+fn adapter_backend(
+    command: Option<Vec<String>>,
+    builtin: Option<&str>,
+) -> Result<AdapterBackend, String> {
+    match (command, builtin) {
+        (Some(command), None) => {
+            if command.is_empty() || command.iter().any(|part| part.is_empty()) {
+                return Err("command".to_string());
+            }
+            Ok(AdapterBackend::Command(command))
+        }
+        (None, Some("pii-ner")) => Ok(AdapterBackend::Builtin(BuiltinAdapter::PiiNer)),
+        (None, Some(other)) => Err(format!("unknown builtin adapter: {other}")),
+        (Some(_), Some(_)) => Err("command or builtin".to_string()),
+        (None, None) => Err("command or builtin".to_string()),
+    }
+}
+
+#[cfg(feature = "ner")]
+fn run_pii_ner_probe() -> Result<usize, String> {
+    pentect_agent::model_ner::detect_pii("full name: Alice Smith")
+        .map(|spans| spans.len())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "ner"))]
+fn run_pii_ner_probe() -> Result<usize, String> {
+    Err("Pentect was built without ner support".to_string())
 }
 
 fn adapter_command(name: &str, id_or_name: &str) -> Result<Command, String> {
@@ -687,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn list_extensions_includes_official_runtime_free_configs() {
+    fn list_extensions_includes_official_model_and_rule_extensions() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
@@ -700,7 +756,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         assert!(names.contains("openai-privacy-filter"), "{names:?}");
-        assert!(names.contains("ner-lite"), "{names:?}");
+        assert!(names.contains("pii-ner"), "{names:?}");
         assert!(names.contains("jp-pii"), "{names:?}");
     }
 }

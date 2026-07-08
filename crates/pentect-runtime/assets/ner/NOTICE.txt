@@ -1,0 +1,16 @@
+gravitee-io/bert-small-pii-detection
+
+Source: https://huggingface.co/gravitee-io/bert-small-pii-detection
+Source revision: f8c27a85c51c0168f07b9dcf00265bf0a4097939
+Dataset: https://huggingface.co/datasets/gravitee-io/pii-detection-dataset
+License: Apache-2.0, as declared by the source model card.
+Task: token-classification for PII labels.
+Model card: reported F1 0.8686, precision 0.8182, recall 0.9256.
+
+Bundled files:
+- gravitee-bert-small-pii-detection.quant.onnx
+- gravitee-bert-small-pii-detection-tokenizer.json
+- gravitee-bert-small-pii-detection-config.json
+- LICENSE-APACHE-2.0.txt
+
+Apache License 2.0 applies to the bundled model artifacts.

@@ -206,13 +206,17 @@ pub(crate) fn load_config_packs_from_specs(
     create_named: bool,
 ) -> Result<Vec<Pack>> {
     let active = active_from_specs(explicit_specs, create_named)?;
-    let mut packs = Vec::new();
     if !active.adapter_paths.is_empty() {
         bail!("model adapter extensions are only used by agent tool-boundary commands");
     }
-    for path in active.config_paths {
+    load_config_packs_from_active(&active)
+}
+
+pub(crate) fn load_config_packs_from_active(active: &ActiveExtensions) -> Result<Vec<Pack>> {
+    let mut packs = Vec::new();
+    for path in active.config_paths() {
         let display = path.display();
-        let src = std::fs::read_to_string(&path)
+        let src = std::fs::read_to_string(path)
             .with_context(|| format!("could not read extension config '{display}'"))?;
         let pack =
             load_pack(&src).map_err(|e| anyhow!("extension config '{display}' is invalid: {e}"))?;
@@ -785,44 +789,16 @@ mod tests {
     }
 
     #[test]
-    fn official_runtime_free_extensions_mask_contextual_pii() {
+    fn official_openai_privacy_filter_is_model_adapter() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .unwrap();
         let opf = repo.join("extensions").join("openai-privacy-filter");
-        let packs = load_config_packs_from_specs(vec![opf.display().to_string()], true).unwrap();
-        let engine = pentect_core::Engine::with_profile_and_packs(
-            pentect_core::Profile::Strict,
-            packs,
-            false,
-        );
-        let raw = concat!(
-            "full_name: Ada Lovelace\n",
-            "company: Contoso Corporation\n",
-            "住所: 東京都千代田区丸の内1丁目\n",
-            "notes: Grace Hopper appears here without a field\n"
-        );
-        let masked = engine
-            .mask(
-                pentect_core::Input::text(raw),
-                &pentect_core::Config::insecure_testing(),
-            )
-            .masked;
-
-        assert!(masked.contains("<<PERSON_NAME_"), "{masked}");
-        assert!(masked.contains("<<ORGANIZATION_"), "{masked}");
-        assert!(masked.contains("<<JP_ADDRESS_"), "{masked}");
-        assert!(!masked.contains("full_name: Ada Lovelace"), "{masked}");
-        assert!(!masked.contains("company: Contoso Corporation"), "{masked}");
-        assert!(
-            !masked.contains("住所: 東京都千代田区丸の内1丁目"),
-            "{masked}"
-        );
-        assert!(
-            masked.contains("notes: Grace Hopper appears here without a field"),
-            "{masked}"
-        );
+        let active = active_from_explicit_specs(vec![opf.display().to_string()], true).unwrap();
+        assert!(active.config_paths().is_empty());
+        assert_eq!(active.adapter_paths().len(), 1);
+        assert!(active.adapter_paths()[0].ends_with("adapter.toml"));
     }
 
     #[test]
@@ -860,6 +836,21 @@ mod tests {
             Err(err) => err.to_string(),
         };
         assert!(err.contains("model adapter extensions"), "{err}");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_loader_ignores_adapter_paths_for_config_packs() {
+        let root =
+            std::env::temp_dir().join(format!("pentect-active-adapter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("adapter.toml"), "").unwrap();
+
+        let active = active_from_explicit_specs(vec![root.display().to_string()], true).unwrap();
+        let packs = load_config_packs_from_active(&active).unwrap();
+        assert!(packs.is_empty());
 
         std::fs::remove_dir_all(root).unwrap();
     }

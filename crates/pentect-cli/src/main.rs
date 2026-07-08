@@ -363,10 +363,26 @@ fn cmd_read(args: &[String]) {
         Err(e) => die(&e),
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
-    let packs = match extensions::load_config_packs_from_specs(opts.extensions.clone(), true) {
+    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
+        Ok(active) => active,
+        Err(e) => die(&e),
+    };
+    let packs = match extensions::load_config_packs_from_active(&active_extensions) {
         Ok(packs) => packs,
         Err(e) => die(&e),
     };
+    let config_env = match active_extensions.config_env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    };
+    let adapter_env = match active_extensions.adapter_env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    };
+    let _extension_env = EnvVarGuard::set_optional([
+        (extensions::CONFIGS_ENV, config_env),
+        (extensions::ADAPTERS_ENV, adapter_env),
+    ]);
     let input = Input { kind, data };
     match pentect_agent::mask_input_into_active_in_memory_manager(
         input.clone(),
@@ -380,9 +396,11 @@ fn cmd_read(args: &[String]) {
         Ok(None) => {}
         Err(e) => die(&e),
     }
-    let engine = Engine::with_profile_and_packs(opts.profile, packs, false);
     let cfg = Config::generate();
-    let result = engine.mask(input, &cfg);
+    let result = match pentect_agent::mask_input_for_read(cfg.key, input, opts.profile, packs) {
+        Ok(result) => result,
+        Err(e) => die(&e),
+    };
     print_read_result(result, opts.emit_meta);
 }
 

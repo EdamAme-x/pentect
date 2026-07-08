@@ -85,7 +85,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         push_literal(&mut segments, &mut masked, &raw[cursor..s.range.start]);
         let val = &raw[s.range.start..s.range.end];
 
-        match split_email(val) {
+        match should_split_email(s).then(|| split_email(val)).flatten() {
             // Mask each side under the same label; the `@` stays literal so
             // restore reconstructs the address from the two mappings.
             Some((local, domain)) => {
@@ -144,6 +144,10 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
         map,
         collisions,
     }
+}
+
+fn should_split_email(span: &Span) -> bool {
+    !(span.source == DetectorId::Extension && span.label == "EMAIL")
 }
 
 fn push_literal(segments: &mut Vec<RenderSegment>, masked: &mut String, text: &str) {

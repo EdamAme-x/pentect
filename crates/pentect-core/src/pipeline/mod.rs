@@ -783,6 +783,30 @@ mod tests {
     }
 
     #[test]
+    fn external_email_span_masks_as_one_handle() {
+        let input = "email: alice@example.com";
+        let result = Engine::with_profile(Profile::Strict).mask_spans(
+            Input::text(input),
+            vec![Span {
+                range: ByteRange::new(7, input.len()),
+                category: Category::Pii,
+                label: "EMAIL".into(),
+                confidence: Confidence::High,
+                source: DetectorId::Extension,
+            }],
+            &Config::insecure_testing(),
+        );
+        assert_eq!(result.summary.masked_count, 1);
+        assert!(
+            result.masked.contains("email: <<EMAIL_"),
+            "{}",
+            result.masked
+        );
+        assert!(!result.masked.contains('@'), "{}", result.masked);
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+    }
+
+    #[test]
     fn length_disclosed_for_encoded_entropy_blob_too() {
         use data_encoding::BASE64;
         let bytes: Vec<u8> = (0u8..24)

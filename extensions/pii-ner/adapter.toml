@@ -1,0 +1,7 @@
+schema = "pentect.model_adapter.v1"
+kind = "model"
+name = "pii-ner"
+builtin = "pii-ner"
+timeout_ms = 10000
+max_input_bytes = 262144
+max_spans = 512
