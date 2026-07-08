@@ -1,6 +1,7 @@
 # Copy to .pentect/config.toml.
 
 extensions = []
+# extension data: .pentect/extensions-data/<extension-id>
 
 [agent]
 status_line = true

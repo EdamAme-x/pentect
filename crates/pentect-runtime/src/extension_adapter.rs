@@ -10,6 +10,14 @@ use std::time::{Duration, Instant};
 
 pub(crate) const ADAPTERS_ENV: &str = "PENTECT_EXTENSION_ADAPTERS";
 
+const PENTECT_DIR: &str = ".pentect";
+const EXTENSIONS_DATA_DIR: &str = "extensions-data";
+const EXTENSION_CONFIG_FILE: &str = "config.toml";
+const EXTENSION_CACHE_DIR: &str = "cache";
+const EXTENSION_NAME_ENV: &str = "PENTECT_EXTENSION_NAME";
+const EXTENSION_DATA_DIR_ENV: &str = "PENTECT_EXTENSION_DATA_DIR";
+const EXTENSION_CACHE_DIR_ENV: &str = "PENTECT_EXTENSION_CACHE_DIR";
+const EXTENSION_CONFIG_ENV: &str = "PENTECT_EXTENSION_CONFIG";
 const DEFAULT_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_MAX_INPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_SPANS: usize = 512;
@@ -63,6 +71,7 @@ impl ModelAdapters {
 #[derive(Clone, Debug)]
 struct ModelAdapter {
     name: String,
+    id: String,
     path: PathBuf,
     command: Vec<String>,
     timeout: Duration,
@@ -104,16 +113,14 @@ impl ModelAdapter {
                 path.display()
             ));
         }
+        let name = file
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| adapter_default_name(path));
+        let id = extension_id(&name);
         Ok(Self {
-            name: file
-                .name
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| {
-                    path.file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .unwrap_or("adapter")
-                        .to_string()
-                }),
+            name,
+            id,
             path: path.to_path_buf(),
             command: file.command,
             timeout: Duration::from_millis(file.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
@@ -162,7 +169,7 @@ impl ModelAdapter {
 
     fn run(&self, request: &str) -> Result<String, String> {
         let mut cmd = Command::new(&self.command[0]);
-        apply_adapter_child_env(&mut cmd);
+        apply_adapter_child_env(&mut cmd, &self.id)?;
         cmd.args(&self.command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -233,12 +240,101 @@ impl ModelAdapter {
     }
 }
 
-fn apply_adapter_child_env(command: &mut Command) {
+fn apply_adapter_child_env(command: &mut Command, id_or_name: &str) -> Result<(), String> {
     command.env_clear();
     for name in safe_adapter_env_names() {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
+    }
+    let id = extension_id(id_or_name);
+    let dirs = extension_runtime_dirs(&id)?;
+    command.env(EXTENSION_NAME_ENV, id);
+    command.env(EXTENSION_DATA_DIR_ENV, dirs.data_dir);
+    command.env(EXTENSION_CACHE_DIR_ENV, dirs.cache_dir);
+    command.env(EXTENSION_CONFIG_ENV, dirs.config_file);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ExtensionRuntimeDirs {
+    data_dir: PathBuf,
+    cache_dir: PathBuf,
+    config_file: PathBuf,
+}
+
+fn extension_runtime_dirs(id_or_name: &str) -> Result<ExtensionRuntimeDirs, String> {
+    let id = extension_id(id_or_name);
+    let data_dir = PathBuf::from(PENTECT_DIR)
+        .join(EXTENSIONS_DATA_DIR)
+        .join(&id);
+    let cache_dir = data_dir.join(EXTENSION_CACHE_DIR);
+    std::fs::create_dir_all(&cache_dir).map_err(|e| {
+        format!(
+            "could not create extension data '{}': {e}",
+            cache_dir.display()
+        )
+    })?;
+    let config_file = data_dir.join(EXTENSION_CONFIG_FILE);
+    Ok(ExtensionRuntimeDirs {
+        data_dir,
+        cache_dir,
+        config_file,
+    })
+}
+
+fn adapter_default_name(path: &Path) -> String {
+    if path.file_name().and_then(|name| name.to_str()) == Some("adapter.toml") {
+        if let Some(name) = path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+        {
+            return name.to_string();
+        }
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("extension")
+        .to_string()
+}
+
+fn extension_id(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.trim().chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if matches!(ch, '-' | '_' | '.' | ' ') {
+            Some('-')
+        } else {
+            None
+        };
+        let Some(next) = next else {
+            continue;
+        };
+        if next == '-' {
+            if out.is_empty() || last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        out.push(next);
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "extension".to_string()
+    } else {
+        out
     }
 }
 
@@ -387,6 +483,7 @@ mod tests {
     fn adapter_spans_mask_through_core_renderer() {
         let adapter = ModelAdapter {
             name: "test-ner".to_string(),
+            id: "test-ner".to_string(),
             path: std::env::current_dir().unwrap().join("adapter.toml"),
             command: echo_adapter_command(
                 r#"{"spans":[{"start":0,"end":5,"label":"person name","category":"pii","confidence":"high"}]}"#,
@@ -436,7 +533,7 @@ mod tests {
     #[test]
     fn adapter_env_does_not_inherit_in_memory_manager_credentials() {
         let mut command = Command::new("echo");
-        apply_adapter_child_env(&mut command);
+        apply_adapter_child_env(&mut command, "test-env").unwrap();
         let names = command
             .get_envs()
             .map(|(name, _)| name.to_string_lossy().to_string())
@@ -447,6 +544,42 @@ mod tests {
         assert!(!names
             .iter()
             .any(|name| name == "PENTECT_IN_MEMORY_MANAGER_TOKEN"));
+    }
+
+    #[test]
+    fn adapter_env_exposes_project_local_extension_data() {
+        let mut command = Command::new("echo");
+        apply_adapter_child_env(&mut command, "My Ext!").unwrap();
+        let envs = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().to_string(),
+                    value
+                        .map(|value| value.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            envs.get(EXTENSION_NAME_ENV).map(String::as_str),
+            Some("my-ext")
+        );
+        assert!(
+            envs.get(EXTENSION_DATA_DIR_ENV)
+                .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext")),
+            "{envs:?}"
+        );
+        assert!(
+            envs.get(EXTENSION_CACHE_DIR_ENV)
+                .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext/cache")),
+            "{envs:?}"
+        );
+        assert!(
+            envs.get(EXTENSION_CONFIG_ENV)
+                .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext/config.toml")),
+            "{envs:?}"
+        );
     }
 
     #[cfg(windows)]
