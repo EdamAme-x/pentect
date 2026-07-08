@@ -268,7 +268,11 @@ async fn handle_client(fut: upgrade::UpgradeFut, backend_addr: SocketAddr) -> Re
                             .map_err(|e| format!("client websocket write failed: {e}"))?;
                     }
                     OpCode::Binary => {
-                        client.write_frame(frame).await
+                        let payload = Vec::<u8>::from(frame.payload);
+                        let payload = rewrite_server_binary_payload(&payload, &mut |text| {
+                            mask_output_text(&mut output_masker, text)
+                        })?;
+                        client.write_frame(Frame::binary(Payload::Owned(payload))).await
                             .map_err(|e| format!("client websocket write failed: {e}"))?;
                     }
                     _ => {}
@@ -326,6 +330,16 @@ where
     };
     mask_app_server_display_strings(&mut value, None, mask)?;
     serde_json::to_string(&value).map_err(|e| e.to_string())
+}
+
+fn rewrite_server_binary_payload<F>(payload: &[u8], mask: &mut F) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return Ok(payload.to_vec());
+    };
+    rewrite_server_text_frame(text, mask).map(String::into_bytes)
 }
 
 fn mask_app_server_display_strings<F>(
@@ -434,6 +448,37 @@ mod tests {
         })
         .unwrap();
         assert_eq!(masked, "token <<OPENAI_API_KEY_x>>");
+    }
+
+    #[test]
+    fn server_binary_frame_masks_utf8_json_payload() {
+        let raw = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "content": [
+                        {"text": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"}
+                    ]
+                }
+            }
+        })
+        .to_string();
+        let masked = rewrite_server_binary_payload(raw.as_bytes(), &mut |text| {
+            Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
+        })
+        .unwrap();
+        let masked = String::from_utf8(masked).unwrap();
+        assert!(!masked.contains("sk-abcdefghijklmnopqrstuvwx"), "{masked}");
+        assert!(masked.contains("<<OPENAI_API_KEY_x>>"), "{masked}");
+    }
+
+    #[test]
+    fn server_binary_frame_leaves_non_utf8_payload() {
+        let raw = [0xff, 0x00, 0x80];
+        let masked =
+            rewrite_server_binary_payload(&raw, &mut |_| Ok("<<SHOULD_NOT_RUN>>".to_string()))
+                .unwrap();
+        assert_eq!(masked, raw);
     }
 
     #[test]
