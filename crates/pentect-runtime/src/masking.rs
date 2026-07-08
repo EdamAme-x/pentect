@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
-const EXTENSION_PACKS_ENV: &str = "PENTECT_EXTENSION_PACKS";
+const EXTENSION_CONFIGS_ENV: &str = "PENTECT_EXTENSION_CONFIGS";
 const BATCH_DELIMITERS: [&str; 4] = [
     "\u{1f}pentect-batch-0\u{1e}",
     "\u{1f}pentect-batch-1\u{1d}",
@@ -520,10 +520,10 @@ fn build_tool_boundary_engine() -> Result<Engine, String> {
         .standard_stack(Profile::Strict.knobs())
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
         .detector(Box::new(SensitiveKeyDetector));
-    for pack in extension_packs_from_env()? {
+    for config_pack in extension_configs_from_env()? {
         builder = builder
-            .detector(Box::new(pack.rules))
-            .disable_labels(pack.disable);
+            .detector(Box::new(config_pack.rules))
+            .disable_labels(config_pack.disable);
     }
     Ok(builder
         .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
@@ -531,36 +531,39 @@ fn build_tool_boundary_engine() -> Result<Engine, String> {
         .build())
 }
 
-fn extension_packs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
+fn extension_configs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
     static CACHE: OnceLock<Result<Vec<pentect_core::Pack>, String>> = OnceLock::new();
-    CACHE.get_or_init(load_extension_packs_from_env).clone()
+    CACHE.get_or_init(load_extension_configs_from_env).clone()
 }
 
-fn load_extension_packs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
-    let Some(value) = std::env::var_os(EXTENSION_PACKS_ENV) else {
+fn load_extension_configs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
+    let Some(value) = std::env::var_os(EXTENSION_CONFIGS_ENV) else {
         return Ok(Vec::new());
     };
-    let mut packs = Vec::new();
+    let mut config_packs = Vec::new();
     for path in std::env::split_paths(&value) {
         if path.as_os_str().is_empty() {
             continue;
         }
         if !path.is_file() {
-            return Err(format!("extension pack does not exist: {}", path.display()));
-        }
-        let src = std::fs::read_to_string(&path)
-            .map_err(|e| format!("could not read extension pack '{}': {e}", path.display()))?;
-        let pack = load_pack(&src)
-            .map_err(|e| format!("extension pack '{}' is invalid: {e}", path.display()))?;
-        if !pack.disable.is_empty() {
             return Err(format!(
-                "extension pack '{}' may add detectors but must not disable built-ins",
+                "extension config does not exist: {}",
                 path.display()
             ));
         }
-        packs.push(pack);
+        let src = std::fs::read_to_string(&path)
+            .map_err(|e| format!("could not read extension config '{}': {e}", path.display()))?;
+        let config_pack = load_pack(&src)
+            .map_err(|e| format!("extension config '{}' is invalid: {e}", path.display()))?;
+        if !config_pack.disable.is_empty() {
+            return Err(format!(
+                "extension config '{}' may add detectors but must not disable built-ins",
+                path.display()
+            ));
+        }
+        config_packs.push(config_pack);
     }
-    Ok(packs)
+    Ok(config_packs)
 }
 
 #[cfg(test)]

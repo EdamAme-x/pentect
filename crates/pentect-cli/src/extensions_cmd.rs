@@ -95,7 +95,7 @@ fn list_extensions(json_output: bool) -> Result<(), String> {
                     "name": row.name,
                     "source": row.source,
                     "status": row.status(),
-                    "packs": row.packs,
+                    "configs": row.configs,
                     "adapters": row.adapters,
                 })).collect::<Vec<_>>()
             })
@@ -108,11 +108,11 @@ fn list_extensions(json_output: bool) -> Result<(), String> {
     }
     for row in rows {
         println!(
-            "{}: {} {} packs={} adapters={}",
+            "{}: {} {} configs={} adapters={}",
             row.name,
             row.source,
             row.status(),
-            row.packs,
+            row.configs,
             row.adapters
         );
     }
@@ -125,9 +125,9 @@ fn inspect_extension(spec: &str, json_output: bool) -> Result<(), String> {
         println!("{}", active_json(&active));
         return Ok(());
     }
-    println!("packs: {}", active.pack_paths().len());
-    for path in active.pack_paths() {
-        println!("pack: {}", display_path(path));
+    println!("configs: {}", active.config_paths().len());
+    for path in active.config_paths() {
+        println!("config: {}", display_path(path));
     }
     println!("adapters: {}", active.adapter_paths().len());
     for path in active.adapter_paths() {
@@ -139,7 +139,7 @@ fn inspect_extension(spec: &str, json_output: bool) -> Result<(), String> {
 fn test_extension(spec: &str, json_output: bool) -> Result<(), String> {
     let active = active_for_one(spec)?;
     let mut checks = Vec::new();
-    for path in active.pack_paths() {
+    for path in active.config_paths() {
         checks.push(test_pack(path));
     }
     for path in active.adapter_paths() {
@@ -177,7 +177,7 @@ fn active_for_one(spec: &str) -> Result<extensions::ActiveExtensions, String> {
 
 fn active_json(active: &extensions::ActiveExtensions) -> String {
     json!({
-        "packs": active.pack_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
+        "configs": active.config_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
         "adapters": active.adapter_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
     })
     .to_string()
@@ -186,11 +186,11 @@ fn active_json(active: &extensions::ActiveExtensions) -> String {
 fn test_pack(path: &Path) -> Check {
     let src = match std::fs::read_to_string(path) {
         Ok(src) => src,
-        Err(e) => return Check::fail("pack", e.to_string()),
+        Err(e) => return Check::fail("config", e.to_string()),
     };
     match load_pack(&src) {
-        Ok(_) => Check::ok("pack", display_path(path)),
-        Err(e) => Check::fail("pack", e),
+        Ok(_) => Check::ok("config", display_path(path)),
+        Err(e) => Check::fail("config", e),
     }
 }
 
@@ -443,13 +443,13 @@ fn safe_adapter_env_names() -> &'static [&'static str] {
 struct ExtensionRow {
     name: String,
     source: &'static str,
-    packs: usize,
+    configs: usize,
     adapters: usize,
 }
 
 impl ExtensionRow {
     fn status(&self) -> &'static str {
-        if self.packs == 0 && self.adapters == 0 {
+        if self.configs == 0 && self.adapters == 0 {
             "empty"
         } else {
             "ok"
@@ -498,10 +498,13 @@ fn extension_rows_in(root: PathBuf, source: &'static str) -> Result<Vec<Extensio
             .unwrap_or("")
             .to_string();
         let active = active_for_one(&path.to_string_lossy())?;
+        if active.config_paths().is_empty() && active.adapter_paths().is_empty() {
+            continue;
+        }
         rows.push(ExtensionRow {
             name,
             source,
-            packs: active.pack_paths().len(),
+            configs: active.config_paths().len(),
             adapters: active.adapter_paths().len(),
         });
     }
@@ -663,5 +666,23 @@ mod tests {
                 .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext/config.toml")),
             "{envs:?}"
         );
+    }
+
+    #[test]
+    fn list_extensions_skips_empty_dirs() {
+        let root =
+            std::env::temp_dir().join(format!("pentect-extension-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(root.join("rules").join("config.toml"), "").unwrap();
+
+        let rows = extension_rows_in(root.clone(), "official").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "rules");
+        assert_eq!(rows[0].configs, 1);
+        assert_eq!(rows[0].adapters, 0);
     }
 }
