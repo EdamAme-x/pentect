@@ -295,41 +295,58 @@ fn extension_paths_for_named(name: &str, _create: bool) -> Result<ExtensionPaths
     validate_extension_name(name)?;
     let project_dir = extensions_root().join(name);
     let official_dir = official_extensions_root().join(name);
-    let dir = if project_dir.exists() {
-        project_dir
-    } else if official_dir.exists() {
-        official_dir.clone()
+
+    if project_dir.is_dir() {
+        let paths = extension_paths_in_dir(&project_dir)?;
+        if !paths.is_empty() {
+            return Ok(paths);
+        }
+    }
+
+    if official_dir.is_dir() {
+        let paths = extension_paths_in_dir(&official_dir)?;
+        if !paths.is_empty() {
+            return Ok(paths);
+        }
+    }
+
+    let remote_error = if remote_extensions_enabled() {
+        match remote_extension_paths_for_name(name) {
+            Ok(paths) if !paths.is_empty() => return Ok(paths),
+            Ok(_) => None,
+            Err(e) => Some(e),
+        }
     } else {
-        let remote_error = if remote_extensions_enabled() {
-            match remote_extension_paths_for_name(name) {
-                Ok(paths) if !paths.is_empty() => return Ok(paths),
-                Ok(_) => None,
-                Err(e) => Some(e),
-            }
+        None
+    };
+    if project_dir.is_dir() || official_dir.is_dir() {
+        let suggestion_dir = if project_dir.is_dir() {
+            &project_dir
         } else {
-            None
+            &official_dir
         };
         let mut message = format!(
-            "extension '{name}' was not found at '{}' or '{}'",
-            project_dir.display(),
-            official_dir.display()
+            "extension '{name}' has no configs or adapters; add '{}', '{}', '{}', or '{}'",
+            suggestion_dir.join(EXTENSION_CONFIG_FILE).display(),
+            suggestion_dir.join(EXTENSION_CONFIGS_DIR).display(),
+            suggestion_dir.join("adapter.toml").display(),
+            suggestion_dir.join("adapters").display()
         );
         if let Some(error) = remote_error {
             message.push_str(&format!("; remote lookup failed: {error}"));
         }
         bail!(message);
-    };
-    let paths = extension_paths_in_dir(&dir)?;
-    if paths.is_empty() {
-        bail!(
-            "extension '{name}' has no configs or adapters; add '{}', '{}', '{}', or '{}'",
-            dir.join(EXTENSION_CONFIG_FILE).display(),
-            dir.join(EXTENSION_CONFIGS_DIR).display(),
-            dir.join("adapter.toml").display(),
-            dir.join("adapters").display()
-        );
     }
-    Ok(paths)
+
+    let mut message = format!(
+        "extension '{name}' was not found at '{}' or '{}'",
+        project_dir.display(),
+        official_dir.display()
+    );
+    if let Some(error) = remote_error {
+        message.push_str(&format!("; remote lookup failed: {error}"));
+    }
+    bail!(message)
 }
 
 fn extension_paths_for_url(url: &str) -> Result<ExtensionPaths> {
@@ -743,6 +760,68 @@ mod tests {
         assert!(normalize_github_extension_url("https://example.com/company/config.toml").is_err());
         assert!(
             normalize_github_extension_url("https://raw.githubusercontent.com/owner/repo").is_err()
+        );
+    }
+
+    #[test]
+    fn empty_project_extension_does_not_shadow_official_extension() {
+        let name = format!("shadow-test-{}", std::process::id());
+        let project = PathBuf::from(".pentect").join("extensions").join(&name);
+        let official = PathBuf::from("extensions").join(&name);
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&official);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&official).unwrap();
+        std::fs::write(official.join("config.toml"), "").unwrap();
+
+        let paths = extension_paths_for_named(&name, true).unwrap();
+        let expected = official.join("config.toml").canonicalize().unwrap();
+
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&official);
+
+        assert_eq!(paths.config_paths, vec![expected]);
+        assert!(paths.adapter_paths.is_empty());
+    }
+
+    #[test]
+    fn official_runtime_free_extensions_mask_contextual_pii() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap();
+        let opf = repo.join("extensions").join("openai-privacy-filter");
+        let packs = load_config_packs_from_specs(vec![opf.display().to_string()], true).unwrap();
+        let engine = pentect_core::Engine::with_profile_and_packs(
+            pentect_core::Profile::Strict,
+            packs,
+            false,
+        );
+        let raw = concat!(
+            "full_name: Ada Lovelace\n",
+            "company: Contoso Corporation\n",
+            "住所: 東京都千代田区丸の内1丁目\n",
+            "notes: Grace Hopper appears here without a field\n"
+        );
+        let masked = engine
+            .mask(
+                pentect_core::Input::text(raw),
+                &pentect_core::Config::insecure_testing(),
+            )
+            .masked;
+
+        assert!(masked.contains("<<PERSON_NAME_"), "{masked}");
+        assert!(masked.contains("<<ORGANIZATION_"), "{masked}");
+        assert!(masked.contains("<<JP_ADDRESS_"), "{masked}");
+        assert!(!masked.contains("full_name: Ada Lovelace"), "{masked}");
+        assert!(!masked.contains("company: Contoso Corporation"), "{masked}");
+        assert!(
+            !masked.contains("住所: 東京都千代田区丸の内1丁目"),
+            "{masked}"
+        );
+        assert!(
+            masked.contains("notes: Grace Hopper appears here without a field"),
+            "{masked}"
         );
     }
 

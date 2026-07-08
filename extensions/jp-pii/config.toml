@@ -1,0 +1,34 @@
+# Runtime-free Japanese PII extension.
+# Rules are key/context-gated to avoid broad Japanese prose masking.
+
+[[detector]]
+pattern = '(?:氏名|名前|お名前|担当者|顧客名|利用者名)\s*[:：=]\s*"?([\p{Han}\p{Hiragana}\p{Katakana}ー々]{2,12}(?:[ 　][\p{Han}\p{Hiragana}\p{Katakana}ー々]{1,12})?)"?'
+prefilter = ["氏名", "名前", "お名前", "担当者", "顧客名", "利用者名"]
+category = "pii"
+label = "JP_PERSON_NAME"
+confidence = "medium"
+capture = 1
+
+[[detector]]
+pattern = '(?:会社名|法人名|組織名|勤務先)\s*[:：=]\s*"?((?:株式会社|合同会社|有限会社)[\p{Han}\p{Hiragana}\p{Katakana}A-Za-z0-9ー・ 　]{2,40}|[\p{Han}\p{Hiragana}\p{Katakana}A-Za-z0-9ー・ 　]{2,40}(?:株式会社|合同会社|有限会社))"?'
+prefilter = ["会社名", "法人名", "組織名", "勤務先", "株式会社", "合同会社", "有限会社"]
+category = "pii"
+label = "JP_ORGANIZATION"
+confidence = "medium"
+capture = 1
+
+[[detector]]
+pattern = '(?:住所|所在地|送付先|配送先)\s*[:：=]\s*"?(?:〒\s*[0-9０-９]{3}-?[0-9０-９]{4}[ 　]*)?((?:東京都|北海道|(?:京都|大阪)府|[\p{Han}]{2,3}県)[\p{Han}\p{Hiragana}\p{Katakana}0-9０-９ー丁目番地号\-－の 　]{4,80})"?'
+prefilter = ["住所", "所在地", "送付先", "配送先"]
+category = "pii"
+label = "JP_ADDRESS"
+confidence = "medium"
+capture = 1
+
+[[detector]]
+pattern = '(?:生年月日|誕生日)\s*[:：=]\s*"?([0-9０-９]{4}年[0-9０-９]{1,2}月[0-9０-９]{1,2}日|[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2})"?'
+prefilter = ["生年月日", "誕生日"]
+category = "pii"
+label = "JP_DATE_OF_BIRTH"
+confidence = "medium"
+capture = 1

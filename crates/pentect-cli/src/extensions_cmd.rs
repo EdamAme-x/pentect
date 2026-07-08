@@ -685,4 +685,22 @@ mod tests {
         assert_eq!(rows[0].configs, 1);
         assert_eq!(rows[0].adapters, 0);
     }
+
+    #[test]
+    fn list_extensions_includes_official_runtime_free_configs() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap();
+        let rows = extension_rows_in(repo.join("extensions"), "official").unwrap();
+        let names = rows
+            .iter()
+            .filter(|row| row.source == "official")
+            .map(|row| row.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(names.contains("openai-privacy-filter"), "{names:?}");
+        assert!(names.contains("ner-lite"), "{names:?}");
+        assert!(names.contains("jp-pii"), "{names:?}");
+    }
 }
