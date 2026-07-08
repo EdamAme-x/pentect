@@ -4,7 +4,7 @@ use pentect_core::{load_pack, Pack};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub(crate) const PACKS_ENV: &str = "PENTECT_EXTENSION_PACKS";
 pub(crate) const ADAPTERS_ENV: &str = "PENTECT_EXTENSION_ADAPTERS";
@@ -17,6 +17,7 @@ const OFFICIAL_EXTENSIONS_DIR: &str = "extensions";
 const DEFAULT_REMOTE_EXTENSIONS_BASE: &str =
     "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions";
 const REMOTE_EXTENSION_TIMEOUT: Duration = Duration::from_secs(8);
+const REMOTE_EXTENSION_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Default)]
 pub(crate) struct ActiveExtensions {
@@ -296,18 +297,24 @@ fn extension_paths_for_named(name: &str, _create: bool) -> Result<ExtensionPaths
     } else if official_dir.exists() {
         official_dir.clone()
     } else {
-        if remote_extensions_enabled() {
-            if let Ok(paths) = remote_extension_paths_for_name(name) {
-                if !paths.is_empty() {
-                    return Ok(paths);
-                }
+        let remote_error = if remote_extensions_enabled() {
+            match remote_extension_paths_for_name(name) {
+                Ok(paths) if !paths.is_empty() => return Ok(paths),
+                Ok(_) => None,
+                Err(e) => Some(e),
             }
-        }
-        bail!(
+        } else {
+            None
+        };
+        let mut message = format!(
             "extension '{name}' was not found at '{}' or '{}'",
             project_dir.display(),
             official_dir.display()
         );
+        if let Some(error) = remote_error {
+            message.push_str(&format!("; remote lookup failed: {error}"));
+        }
+        bail!(message);
     };
     let paths = extension_paths_in_dir(&dir)?;
     if paths.is_empty() {
@@ -326,7 +333,8 @@ fn extension_paths_for_url(url: &str) -> Result<ExtensionPaths> {
     let normalized = normalize_github_extension_url(url)?;
     if normalized.ends_with(".toml") {
         let mut paths = ExtensionPaths::default();
-        let file = fetch_remote_extension_file(&normalized)?;
+        let file = fetch_remote_extension_file(&normalized)?
+            .ok_or_else(|| anyhow!("remote extension file was not found: {normalized}"))?;
         if looks_like_adapter_url(&normalized) {
             paths.adapter_paths.push(file);
         } else {
@@ -463,13 +471,13 @@ fn remote_extension_paths_for_name(name: &str) -> Result<ExtensionPaths> {
 
 fn remote_extension_paths_for_base_url(base_url: &str) -> Result<ExtensionPaths> {
     let mut paths = ExtensionPaths::default();
-    if let Ok(pack) =
-        fetch_remote_extension_file(&format!("{}/pack.toml", base_url.trim_end_matches('/')))
+    if let Some(pack) =
+        fetch_remote_extension_file(&format!("{}/pack.toml", base_url.trim_end_matches('/')))?
     {
         paths.pack_paths.push(pack);
     }
-    if let Ok(adapter) =
-        fetch_remote_extension_file(&format!("{}/adapter.toml", base_url.trim_end_matches('/')))
+    if let Some(adapter) =
+        fetch_remote_extension_file(&format!("{}/adapter.toml", base_url.trim_end_matches('/')))?
     {
         paths.adapter_paths.push(adapter);
     }
@@ -479,20 +487,26 @@ fn remote_extension_paths_for_base_url(base_url: &str) -> Result<ExtensionPaths>
     Ok(paths)
 }
 
-fn fetch_remote_extension_file(url: &str) -> Result<PathBuf> {
+fn fetch_remote_extension_file(url: &str) -> Result<Option<PathBuf>> {
     let path = remote_cache_file(url);
-    if path.exists() {
-        return Ok(path);
+    if cached_remote_extension_is_fresh(&path) {
+        return Ok(Some(path));
     }
-    let bytes = reqwest::blocking::Client::builder()
+    let response = reqwest::blocking::Client::builder()
         .timeout(REMOTE_EXTENSION_TIMEOUT)
         .build()
         .context("could not create extension HTTP client")?
         .get(url)
         .send()
-        .with_context(|| format!("could not fetch extension '{url}'"))?
-        .error_for_status()
-        .with_context(|| format!("could not fetch extension '{url}'"))?
+        .with_context(|| format!("could not fetch extension '{url}'"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        bail!("could not fetch extension '{url}': HTTP {status}");
+    }
+    let bytes = response
         .bytes()
         .with_context(|| format!("could not read extension '{url}'"))?;
     if let Some(parent) = path.parent() {
@@ -501,7 +515,16 @@ fn fetch_remote_extension_file(url: &str) -> Result<PathBuf> {
     }
     std::fs::write(&path, &bytes)
         .with_context(|| format!("could not write extension cache '{}'", path.display()))?;
-    Ok(path)
+    Ok(Some(path))
+}
+
+fn cached_remote_extension_is_fresh(path: &Path) -> bool {
+    let Ok(modified) = path.metadata().and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age < REMOTE_EXTENSION_CACHE_TTL)
 }
 
 fn remote_cache_file(url: &str) -> PathBuf {
@@ -705,7 +728,17 @@ mod tests {
             .unwrap(),
             "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company"
         );
+        assert_eq!(
+            normalize_github_extension_url(
+                "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/pack.toml"
+            )
+            .unwrap(),
+            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/company/pack.toml"
+        );
         assert!(normalize_github_extension_url("https://example.com/company/pack.toml").is_err());
+        assert!(
+            normalize_github_extension_url("https://raw.githubusercontent.com/owner/repo").is_err()
+        );
     }
 
     #[test]
