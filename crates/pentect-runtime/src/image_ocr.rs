@@ -741,8 +741,8 @@ fn text_range_to_rect(
     if total_chars == 0 {
         return None;
     }
-    let start = char_count_to_byte(text, range.start.min(text.len()));
-    let end = char_count_to_byte(text, range.end.min(text.len())).max(start + 1);
+    let start = byte_to_char_count(text, range.start.min(text.len()));
+    let end = byte_to_char_count(text, range.end.min(text.len())).max(start + 1);
     if end <= start {
         return None;
     }
@@ -753,7 +753,7 @@ fn text_range_to_rect(
 }
 
 #[cfg(feature = "ocr")]
-fn char_count_to_byte(text: &str, byte: usize) -> usize {
+fn byte_to_char_count(text: &str, byte: usize) -> usize {
     let end = floor_char_boundary(text, byte.min(text.len()));
     text[..end].chars().count()
 }
