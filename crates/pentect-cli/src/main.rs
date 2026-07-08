@@ -1,5 +1,6 @@
 //! Pentect CLI: local secret masking boundary for AI agents.
 
+mod app_server_proxy;
 mod doctor;
 mod eval;
 mod exec_proxy;
@@ -541,6 +542,7 @@ struct AgentToolOpts {
     extensions: Vec<String>,
     dry_run: bool,
     allow_unverified_hooks: bool,
+    codex_app_server_proxy_disabled: bool,
     tool_args: Vec<String>,
 }
 
@@ -554,6 +556,7 @@ impl AgentToolOpts {
         let mut extensions = Vec::new();
         let mut dry_run = false;
         let mut allow_unverified_hooks = false;
+        let mut codex_app_server_proxy_disabled = false;
         let mut tool_args = Vec::new();
         let mut i = 2;
         while i < args.len() {
@@ -599,6 +602,10 @@ impl AgentToolOpts {
                     allow_unverified_hooks = true;
                     i += 1;
                 }
+                "--no-app-server-proxy" if tool == AgentTool::Codex => {
+                    codex_app_server_proxy_disabled = true;
+                    i += 1;
+                }
                 "--prompt-proxy" | "--no-prompt-proxy" => {
                     return Err(
                         "prompt proxy is currently disabled/TODO; Pentect now protects tool boundaries via agent hooks only"
@@ -618,6 +625,7 @@ impl AgentToolOpts {
             extensions,
             dry_run,
             allow_unverified_hooks,
+            codex_app_server_proxy_disabled,
             tool_args,
         })
     }
@@ -642,6 +650,12 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     let mut cmd = Command::new(&opts.command);
     apply_extension_env(&mut cmd, &active_extensions)?;
     let in_memory_manager = start_in_memory_manager(pentect)?;
+    let pack_env = active_extensions
+        .pack_env_value()
+        .map_err(|e| e.to_string())?;
+    let adapter_env = active_extensions
+        .adapter_env_value()
+        .map_err(|e| e.to_string())?;
     let _parent_env = EnvVarGuard::set_optional([
         (
             PENTECT_IN_MEMORY_MANAGER_ADDR_ENV,
@@ -651,24 +665,36 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
             PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV,
             Some(OsString::from(in_memory_manager.token.as_str())),
         ),
+        (PENTECT_BIN_ENV, Some(pentect.as_os_str().to_os_string())),
         (
-            extensions::PACKS_ENV,
-            active_extensions
-                .pack_env_value()
-                .map_err(|e| e.to_string())?,
+            PENTECT_AGENT_LAUNCHED_ENV,
+            Some(OsString::from(in_memory_manager.token.as_str())),
         ),
+        (PENTECT_AGENT_AUTO_APPROVE_ENV, Some(OsString::from("1"))),
         (
-            extensions::ADAPTERS_ENV,
-            active_extensions
-                .adapter_env_value()
-                .map_err(|e| e.to_string())?,
+            PENTECT_STATUS_LINE_ENV,
+            Some(OsString::from(if status_line_enabled { "1" } else { "0" })),
         ),
+        (extensions::PACKS_ENV, pack_env),
+        (extensions::ADAPTERS_ENV, adapter_env),
     ]);
     let exec_proxy = if codex_unified_exec_proxy_enabled(&opts.tool_args) {
         Some(exec_proxy::ExecProxyGuard::start(&opts.command)?)
     } else {
         None
     };
+    let _exec_proxy_env = exec_proxy.as_ref().map(|exec_proxy| {
+        EnvVarGuard::set_optional([
+            (
+                "CODEX_EXEC_SERVER_URL",
+                Some(OsString::from(exec_proxy.url())),
+            ),
+            (
+                exec_proxy::PENTECT_CODEX_EXEC_PROXY_ENV,
+                Some(OsString::from("1")),
+            ),
+        ])
+    });
     apply_pentect_env(&mut cmd, pentect, Some(in_memory_manager.token.as_str()));
     apply_agent_auto_approve_env(&mut cmd);
     apply_in_memory_manager_env(&mut cmd, Some(&in_memory_manager));
@@ -681,7 +707,19 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         .as_ref()
         .map(|exec_proxy| CodexEnvironmentOverlayGuard::install(exec_proxy.url()))
         .transpose()?;
-    cmd.args(codex_args(&configs, &opts.tool_args));
+    let codex_args =
+        if codex_app_server_proxy_enabled(&opts.tool_args, opts.codex_app_server_proxy_disabled)? {
+            let proxy = app_server_proxy::AppServerProxyGuard::start(
+                &opts.command,
+                codex_app_server_args(&configs, &opts.tool_args),
+            )?;
+            let args = codex_args_with_remote(&configs, &opts.tool_args, Some(proxy.url()));
+            cmd.args(args);
+            return run_interactive_command_with_guard(cmd, &opts.command, proxy);
+        } else {
+            codex_args(&configs, &opts.tool_args)
+        };
+    cmd.args(codex_args);
     run_interactive_command(cmd, &opts.command)
 }
 
@@ -706,6 +744,21 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
 
 fn run_interactive_command(
     mut cmd: Command,
+    display: &Path,
+) -> Result<std::process::ExitStatus, String> {
+    run_interactive_command_inner(&mut cmd, display)
+}
+
+fn run_interactive_command_with_guard<G>(
+    mut cmd: Command,
+    display: &Path,
+    _guard: G,
+) -> Result<std::process::ExitStatus, String> {
+    run_interactive_command_inner(&mut cmd, display)
+}
+
+fn run_interactive_command_inner(
+    cmd: &mut Command,
     display: &Path,
 ) -> Result<std::process::ExitStatus, String> {
     let mut terminal_guard = terminal::TuiSessionGuard::enter();
@@ -1077,6 +1130,14 @@ fn apply_extension_env(
 }
 
 fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
+    codex_args_with_remote(configs, tool_args, None)
+}
+
+fn codex_args_with_remote(
+    configs: &[String],
+    tool_args: &[String],
+    remote: Option<&str>,
+) -> Vec<String> {
     let mut args = Vec::with_capacity(configs.len() * 2 + 5 + tool_args.len());
     if !codex_args_disable_unified_exec(tool_args) && !codex_args_enable_unified_exec(tool_args) {
         args.push("--enable".to_string());
@@ -1091,8 +1152,79 @@ fn codex_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
         "developer_instructions={}",
         toml_string(PENTECT_CONTRACT_INSTRUCTIONS)
     ));
+    if let Some(remote) = remote {
+        args.push("--remote".to_string());
+        args.push(remote.to_string());
+    }
     args.extend(tool_args.iter().cloned());
     args
+}
+
+fn codex_app_server_args(configs: &[String], tool_args: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(configs.len() * 2 + 5);
+    if !codex_args_disable_unified_exec(tool_args) && !codex_args_enable_unified_exec(tool_args) {
+        args.push("--enable".to_string());
+        args.push("unified_exec".to_string());
+    }
+    for config in configs {
+        args.push("--config".to_string());
+        args.push(config.clone());
+    }
+    args.push("--config".to_string());
+    args.push(format!(
+        "developer_instructions={}",
+        toml_string(PENTECT_CONTRACT_INSTRUCTIONS)
+    ));
+    for (flag, value) in codex_root_config_args(tool_args) {
+        args.push(flag);
+        if let Some(value) = value {
+            args.push(value);
+        }
+    }
+    args
+}
+
+fn codex_root_config_args(args: &[String]) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        match arg {
+            "-c" | "--config" | "--enable" | "--disable" => {
+                if let Some(value) = args.get(i + 1) {
+                    out.push((arg.to_string(), Some(value.clone())));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--strict-config" => {
+                out.push((arg.to_string(), None));
+                i += 1;
+            }
+            _ if arg.starts_with("--config=")
+                || arg.starts_with("--enable=")
+                || arg.starts_with("--disable=") =>
+            {
+                out.push((arg.to_string(), None));
+                i += 1;
+            }
+            _ if arg.starts_with('-') => {
+                i += if codex_long_option_takes_value(arg) || codex_short_option_takes_value(arg) {
+                    2
+                } else {
+                    1
+                };
+            }
+            _ => {
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn codex_args_enable_unified_exec(args: &[String]) -> bool {
@@ -1105,6 +1237,75 @@ fn codex_args_disable_unified_exec(args: &[String]) -> bool {
 
 fn codex_unified_exec_proxy_enabled(args: &[String]) -> bool {
     !codex_args_disable_unified_exec(args)
+}
+
+fn codex_app_server_proxy_enabled(args: &[String], disabled: bool) -> Result<bool, String> {
+    if disabled {
+        return Ok(false);
+    }
+    if codex_metadata_only_args(args) {
+        return Ok(false);
+    }
+    if codex_args_remote_value(args).is_some() {
+        return Err(
+            "`pentect codex` owns Codex --remote; remove --remote or pass --no-app-server-proxy"
+                .to_string(),
+        );
+    }
+    let path = Path::new(PENTECT_DIR).join(PENTECT_CONFIG_FILE);
+    if !path.exists() {
+        return Ok(true);
+    }
+    let src = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(true);
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    Ok(codex_app_server_proxy_config_value(&value)?.unwrap_or(true))
+}
+
+fn codex_app_server_proxy_config_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    let Some(raw) = value.get("agent") else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("agent config must be a table".to_string());
+    };
+    if let Some(raw) = table.get("codex_app_server_proxy") {
+        return status_line_config_bool(raw, "agent.codex_app_server_proxy").map(Some);
+    }
+    Ok(None)
+}
+
+fn codex_args_remote_value(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            return None;
+        }
+        if arg == "--remote" {
+            return args.get(i + 1).map(String::as_str);
+        }
+        if let Some(value) = arg.strip_prefix("--remote=") {
+            return Some(value);
+        }
+        i += if codex_long_option_takes_value(arg) || codex_short_option_takes_value(arg) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+fn codex_metadata_only_args(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
+        || matches!(codex_first_positional(args), Some("help"))
 }
 
 fn codex_args_feature_value(args: &[String], flag: &str, feature: &str) -> bool {
@@ -1844,6 +2045,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_tool_parse_consumes_codex_app_server_proxy_toggle() {
+        let args = vec![
+            "pentect".to_string(),
+            "codex".to_string(),
+            "--no-app-server-proxy".to_string(),
+            "hello".to_string(),
+        ];
+        let opts = AgentToolOpts::parse(AgentTool::Codex, &args).unwrap();
+        assert!(opts.codex_app_server_proxy_disabled);
+        assert_eq!(opts.tool_args, vec!["hello"]);
+    }
+
+    #[test]
     fn agent_tool_parse_consumes_extensions_before_tool_args() {
         let args = vec![
             "pentect".to_string(),
@@ -2028,6 +2242,78 @@ mod tests {
             .and_then(|(_, value)| value)
             .unwrap();
         assert_eq!(disabled, std::ffi::OsStr::new("0"));
+    }
+
+    #[test]
+    fn codex_args_place_remote_before_prompt() {
+        let args = codex_args_with_remote(
+            &["features.hooks=true".to_string()],
+            &["hello".to_string()],
+            Some("ws://127.0.0.1:12345"),
+        );
+        let remote = args.iter().position(|arg| arg == "--remote").unwrap();
+        let prompt = args.iter().position(|arg| arg == "hello").unwrap();
+        assert!(remote < prompt, "{args:?}");
+        assert_eq!(args[remote + 1], "ws://127.0.0.1:12345");
+    }
+
+    #[test]
+    fn codex_remote_scan_skips_short_option_values() {
+        assert_eq!(
+            codex_args_remote_value(&["-m".to_string(), "--remote".to_string()]),
+            None
+        );
+        assert_eq!(
+            codex_args_remote_value(&[
+                "-m".to_string(),
+                "gpt-5.5".to_string(),
+                "--remote".to_string(),
+                "ws://127.0.0.1:12345".to_string()
+            ]),
+            Some("ws://127.0.0.1:12345")
+        );
+    }
+
+    #[test]
+    fn codex_app_server_args_keep_pentect_and_root_config_only() {
+        let args = codex_app_server_args(
+            &["features.hooks=true".to_string()],
+            &[
+                "-m".to_string(),
+                "gpt-5.3-codex".to_string(),
+                "--config".to_string(),
+                "model_reasoning_effort=\"high\"".to_string(),
+                "hello".to_string(),
+            ],
+        );
+        assert!(args.contains(&"--enable".to_string()), "{args:?}");
+        assert!(args.contains(&"unified_exec".to_string()), "{args:?}");
+        assert!(
+            args.contains(&"features.hooks=true".to_string()),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"model_reasoning_effort=\"high\"".to_string()),
+            "{args:?}"
+        );
+        assert!(!args.contains(&"-m".to_string()), "{args:?}");
+        assert!(!args.contains(&"hello".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn codex_app_server_proxy_config_defaults_and_can_disable() {
+        let empty = ""
+            .parse::<toml::Value>()
+            .unwrap_or(toml::Value::Table(Default::default()));
+        assert_eq!(codex_app_server_proxy_config_value(&empty).unwrap(), None);
+
+        let value = "[agent]\ncodex_app_server_proxy = false"
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(
+            codex_app_server_proxy_config_value(&value).unwrap(),
+            Some(false)
+        );
     }
 
     #[test]
