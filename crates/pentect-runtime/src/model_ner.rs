@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::{Mutex, OnceLock};
-use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
+use tokenizers::{Encoding, Tokenizer};
 use tract_onnx::prelude::*;
 
 const MODEL_ONNX: &[u8] =
@@ -12,7 +12,7 @@ const TOKENIZER_JSON: &[u8] =
 const CONFIG_JSON: &str =
     include_str!("../assets/ner/gravitee-bert-small-pii-detection-config.json");
 
-const MAX_TOKENS: usize = 256;
+const MAX_TOKENS: usize = 512;
 const MAX_CHUNK_BYTES: usize = 2_048;
 const MIN_CONFIDENCE: f32 = 0.65;
 
@@ -50,16 +50,8 @@ struct NerEngine {
 
 impl NerEngine {
     fn load() -> Result<Self, String> {
-        let mut tokenizer =
+        let tokenizer =
             Tokenizer::from_bytes(TOKENIZER_JSON).map_err(|e| format!("pii-ner tokenizer: {e}"))?;
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: MAX_TOKENS,
-                strategy: TruncationStrategy::LongestFirst,
-                stride: 0,
-                direction: TruncationDirection::Right,
-            }))
-            .map_err(|e| format!("pii-ner tokenizer truncation: {e}"))?;
         let labels = load_labels()?;
         let mut cursor = Cursor::new(MODEL_ONNX);
         let model = tract_onnx::onnx()
@@ -100,6 +92,35 @@ impl NerEngine {
             .tokenizer
             .encode(chunk, true)
             .map_err(|e| format!("pii-ner tokenize: {e}"))?;
+        if encoding.get_ids().len() > MAX_TOKENS {
+            let Some(split) = split_chunk_at_boundary(chunk) else {
+                return Err("pii-ner could not split overlong token window".to_string());
+            };
+            let mut spans = Vec::new();
+            let (left, right) = chunk.split_at(split);
+            spans.extend(self.detect_subchunk(base, left)?);
+            spans.extend(self.detect_subchunk(base + split, right)?);
+            return Ok(spans);
+        }
+        self.detect_encoding(base, chunk, &encoding)
+    }
+
+    fn detect_subchunk(&mut self, base: usize, chunk: &str) -> Result<Vec<NerSpan>, String> {
+        let trimmed = chunk.trim_start();
+        let leading = chunk.len() - trimmed.len();
+        let trimmed = trimmed.trim_end();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.detect_chunk(base + leading, trimmed)
+    }
+
+    fn detect_encoding(
+        &mut self,
+        base: usize,
+        chunk: &str,
+        encoding: &Encoding,
+    ) -> Result<Vec<NerSpan>, String> {
         let ids = encoding
             .get_ids()
             .iter()
@@ -440,6 +461,35 @@ fn is_value_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+' | '@' | '%' | '/' | '#')
 }
 
+fn split_chunk_at_boundary(chunk: &str) -> Option<usize> {
+    if chunk.len() < 2 {
+        return None;
+    }
+    let mid = chunk.len() / 2;
+    if let Some(split) = chunk
+        .char_indices()
+        .skip_while(|(idx, _)| *idx <= mid)
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
+        .filter(|idx| *idx > 0 && *idx < chunk.len())
+    {
+        return Some(split);
+    }
+    if let Some(split) = chunk
+        .char_indices()
+        .take_while(|(idx, _)| *idx < mid)
+        .filter_map(|(idx, ch)| ch.is_whitespace().then_some(idx + ch.len_utf8()))
+        .last()
+        .filter(|idx| *idx > 0 && *idx < chunk.len())
+    {
+        return Some(split);
+    }
+    let mut split = mid;
+    while split > 0 && !chunk.is_char_boundary(split) {
+        split -= 1;
+    }
+    (split > 0 && split < chunk.len()).then_some(split)
+}
+
 fn text_segments(text: &str) -> impl Iterator<Item = (usize, &str)> {
     SegmentIter { text, offset: 0 }
 }
@@ -522,6 +572,14 @@ mod tests {
     }
 
     #[test]
+    fn overlong_chunks_split_without_losing_offsets() {
+        let raw = "  ".to_string() + &"a ".repeat(700) + "email: alice@example.com";
+        let split = split_chunk_at_boundary(&raw).unwrap();
+        assert!(raw.is_char_boundary(split));
+        assert!(split > 0 && split < raw.len());
+    }
+
+    #[test]
     fn expands_partial_secret_like_model_span() {
         let raw = "password: hunter2";
         let span = expand_value_span(
@@ -584,6 +642,19 @@ mod tests {
                 .iter()
                 .any(|(label, value)| *label == "SOCIAL_NUMBER" && *value == "123-45-6789"),
             "{detected:?}"
+        );
+    }
+
+    #[test]
+    fn bundled_model_scans_overflow_tail() {
+        let text = format!("{} email: alice@example.com", "a ".repeat(700));
+        assert!(text.len() < MAX_CHUNK_BYTES);
+        let spans = detect_pii(&text).unwrap();
+        assert!(
+            spans.iter().any(|span| {
+                span.label == "EMAIL" && &text[span.start..span.end] == "alice@example.com"
+            }),
+            "{spans:?}"
         );
     }
 }

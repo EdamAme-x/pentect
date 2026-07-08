@@ -6,6 +6,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub(crate) const ADAPTERS_ENV: &str = "PENTECT_EXTENSION_ADAPTERS";
@@ -258,7 +260,7 @@ impl ModelAdapter {
         _context: Option<&Context>,
     ) -> Result<Vec<Span>, String> {
         let spans = match builtin {
-            BuiltinAdapter::PiiNer => detect_pii_ner(text)?,
+            BuiltinAdapter::PiiNer => detect_pii_ner_with_timeout(text, self.timeout)?,
         };
         if spans.len() > self.max_spans {
             return Err(format!(
@@ -302,9 +304,44 @@ fn detect_pii_ner(text: &str) -> Result<Vec<BuiltinNerSpan>, String> {
     })
 }
 
+#[cfg(feature = "ner")]
+fn detect_pii_ner_with_timeout(
+    text: &str,
+    timeout: Duration,
+) -> Result<Vec<BuiltinNerSpan>, String> {
+    if timeout.is_zero() {
+        return Err("builtin adapter 'pii-ner' timed out".to_string());
+    }
+    let text = text.to_string();
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("pentect-pii-ner".to_string())
+        .spawn(move || {
+            let _ = tx.send(detect_pii_ner(&text));
+        })
+        .map_err(|e| format!("could not start builtin adapter 'pii-ner': {e}"))?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("builtin adapter 'pii-ner' timed out".to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("builtin adapter 'pii-ner' stopped unexpectedly".to_string())
+        }
+    }
+}
+
 #[cfg(not(feature = "ner"))]
 fn detect_pii_ner(_text: &str) -> Result<Vec<BuiltinNerSpan>, String> {
     Err("builtin adapter 'pii-ner' requires a Pentect build with ner support".to_string())
+}
+
+#[cfg(not(feature = "ner"))]
+fn detect_pii_ner_with_timeout(
+    text: &str,
+    _timeout: Duration,
+) -> Result<Vec<BuiltinNerSpan>, String> {
+    detect_pii_ner(text)
 }
 
 struct BuiltinNerSpan {
@@ -691,6 +728,24 @@ mod tests {
                 .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext/config.toml")),
             "{envs:?}"
         );
+    }
+
+    #[cfg(feature = "ner")]
+    #[test]
+    fn builtin_adapter_honors_zero_timeout() {
+        let adapter = ModelAdapter {
+            name: "pii-ner".to_string(),
+            id: "pii-ner".to_string(),
+            path: std::env::current_dir().unwrap().join("adapter.toml"),
+            backend: AdapterBackend::Builtin(BuiltinAdapter::PiiNer),
+            timeout: Duration::ZERO,
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_spans: DEFAULT_MAX_SPANS,
+        };
+        let err = adapter
+            .detect_builtin(BuiltinAdapter::PiiNer, "Alice Smith", None)
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
     }
 
     #[cfg(windows)]
