@@ -2,6 +2,7 @@ use crate::config::ImageOcrConfig;
 #[cfg(feature = "ocr")]
 use crate::config::{image_ocr_config, ImageOcrMode, ImageRedactionStyle};
 use pentect_core::model::labels;
+use pentect_core::ByteRange;
 use serde_json::Value;
 #[cfg(feature = "ocr")]
 use std::net::{IpAddr, SocketAddr};
@@ -80,6 +81,25 @@ struct ImageSecretFinding {
     labels: Vec<String>,
     rect: Option<NormalizedImageRect>,
     force_black: bool,
+    pad_left: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ImageTextSecretHit {
+    label: String,
+    range: Option<ByteRange>,
+}
+
+#[cfg(feature = "ocr")]
+struct TextRedactionRange {
+    range: ByteRange,
+    tight_left: bool,
+}
+
+#[cfg(feature = "ocr")]
+struct TextRedactionRect {
+    rect: Option<NormalizedImageRect>,
+    pad_left: bool,
 }
 
 enum ImageObjectEncoding {
@@ -532,7 +552,7 @@ fn image_secret_findings(
 ) -> Result<Vec<ImageSecretFinding>, String> {
     let mut findings = Vec::new();
     for region in image_barcode_regions(bytes, cfg) {
-        let labels = image_text_secret_labels(&region.text, key);
+        let labels = labels_from_text_hits(&image_text_secret_hits(&region.text, key));
         if labels.is_empty() {
             continue;
         }
@@ -540,6 +560,7 @@ fn image_secret_findings(
             labels,
             rect: region.rect,
             force_black: true,
+            pad_left: true,
         });
     }
 
@@ -549,17 +570,20 @@ fn image_secret_findings(
         Err(_) => return Ok(findings),
     };
     for region in &ocr_regions {
-        let labels = image_text_secret_labels(&region.text, key);
-        if labels.is_empty() {
-            continue;
+        for hit in image_text_secret_hits(&region.text, key) {
+            let redaction = rect_for_text_secret_hit(region, &hit);
+            findings.push(ImageSecretFinding {
+                labels: vec![hit.label.clone()],
+                rect: redaction.rect,
+                force_black: false,
+                pad_left: redaction.pad_left,
+            });
         }
-        findings.push(ImageSecretFinding {
-            labels,
-            rect: region.rect,
-            force_black: false,
-        });
     }
-    let joined_labels = image_text_secret_labels(&image_regions_text(&ocr_regions), key);
+    let joined_labels = labels_from_text_hits(&image_text_secret_hits(
+        &image_regions_text(&ocr_regions),
+        key,
+    ));
     let missing_joined_labels = joined_labels
         .into_iter()
         .filter(|label| {
@@ -573,6 +597,7 @@ fn image_secret_findings(
             labels: missing_joined_labels,
             rect: union_region_rects(&ocr_regions),
             force_black: true,
+            pad_left: true,
         });
     }
     Ok(findings)
@@ -663,44 +688,239 @@ fn image_regions_text(regions: &[ImageTextRegion]) -> String {
     text
 }
 
+#[cfg(feature = "ocr")]
+fn rect_for_text_secret_hit(
+    region: &ImageTextRegion,
+    hit: &ImageTextSecretHit,
+) -> TextRedactionRect {
+    let Some(base) = region.rect else {
+        return TextRedactionRect {
+            rect: None,
+            pad_left: true,
+        };
+    };
+    let Some(redaction) = redaction_text_range(&region.text, hit.range) else {
+        return TextRedactionRect {
+            rect: region.rect,
+            pad_left: true,
+        };
+    };
+    TextRedactionRect {
+        rect: text_range_to_rect(base, &region.text, redaction.range).or(region.rect),
+        pad_left: !redaction.tight_left,
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn redaction_text_range(text: &str, range: Option<ByteRange>) -> Option<TextRedactionRange> {
+    match range {
+        Some(range) => match assignment_value_range_for_span(text, range) {
+            Some(range) => Some(TextRedactionRange {
+                range,
+                tight_left: true,
+            }),
+            None => Some(TextRedactionRange {
+                range,
+                tight_left: false,
+            }),
+        },
+        None => first_sensitive_assignment_value_range(text).map(|range| TextRedactionRange {
+            range,
+            tight_left: true,
+        }),
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn text_range_to_rect(
+    rect: NormalizedImageRect,
+    text: &str,
+    range: ByteRange,
+) -> Option<NormalizedImageRect> {
+    let total_chars = text.chars().count();
+    if total_chars == 0 {
+        return None;
+    }
+    let start = char_count_to_byte(text, range.start.min(text.len()));
+    let end = char_count_to_byte(text, range.end.min(text.len())).max(start + 1);
+    if end <= start {
+        return None;
+    }
+    let width = rect.right - rect.left;
+    let left = rect.left + width * (start as f32 / total_chars as f32);
+    let right = rect.left + width * (end as f32 / total_chars as f32);
+    NormalizedImageRect::new(left, rect.top, right, rect.bottom)
+}
+
+#[cfg(feature = "ocr")]
+fn char_count_to_byte(text: &str, byte: usize) -> usize {
+    let end = floor_char_boundary(text, byte.min(text.len()));
+    text[..end].chars().count()
+}
+
+fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
+
+fn assignment_value_range_for_span(text: &str, range: ByteRange) -> Option<ByteRange> {
+    if range.start >= text.len() || range.end <= range.start {
+        return None;
+    }
+    let (line_start, line_end) = text_line_bounds(text, range.start);
+    if range.end > line_end {
+        return None;
+    }
+    let mut out = None;
+    let search_end = range.end.min(line_end);
+    for (rel, ch) in text[line_start..search_end].char_indices() {
+        if ch != '=' && ch != ':' {
+            continue;
+        }
+        let sep = line_start + rel;
+        let Some(value) = sensitive_assignment_value_range(text, line_start, line_end, sep, None)
+        else {
+            continue;
+        };
+        out = Some(value);
+    }
+    out
+}
+
+fn first_sensitive_assignment_value_range(text: &str) -> Option<ByteRange> {
+    for (idx, ch) in text.char_indices() {
+        if ch != '=' && ch != ':' {
+            continue;
+        }
+        let (line_start, line_end) = text_line_bounds(text, idx);
+        if let Some(range) = sensitive_assignment_value_range(text, line_start, line_end, idx, None)
+        {
+            return Some(range);
+        }
+    }
+    None
+}
+
+fn sensitive_assignment_value_range(
+    text: &str,
+    line_start: usize,
+    line_end: usize,
+    sep: usize,
+    end_hint: Option<usize>,
+) -> Option<ByteRange> {
+    if !(line_start <= sep && sep < line_end) {
+        return None;
+    }
+    let key_tokens = ocr_words(&text[line_start..sep]);
+    if !ocr_words_have_sensitive_key(&key_tokens) {
+        return None;
+    }
+    let sep_ch = text[sep..].chars().next()?;
+    let value_start = trim_ascii_ws_start(text, sep + sep_ch.len_utf8(), line_end);
+    let end_limit = end_hint.unwrap_or(line_end).min(line_end).max(value_start);
+    let value_end = trim_ascii_ws_end(text, value_start, end_limit);
+    (value_end > value_start).then_some(ByteRange::new(value_start, value_end))
+}
+
+fn text_line_bounds(text: &str, byte: usize) -> (usize, usize) {
+    let byte = floor_char_boundary(text, byte.min(text.len()));
+    let start = text[..byte].rfind(['\r', '\n']).map_or(0, |idx| idx + 1);
+    let end = text[byte..]
+        .find(['\r', '\n'])
+        .map_or(text.len(), |offset| byte + offset);
+    (start, end)
+}
+
+fn trim_ascii_ws_start(text: &str, mut start: usize, end: usize) -> usize {
+    start = floor_char_boundary(text, start.min(text.len()));
+    let end = floor_char_boundary(text, end.min(text.len()));
+    while start < end && text.as_bytes()[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    start
+}
+
+fn trim_ascii_ws_end(text: &str, start: usize, mut end: usize) -> usize {
+    let start = floor_char_boundary(text, start.min(text.len()));
+    end = floor_char_boundary(text, end.min(text.len()));
+    while start < end && text.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    end
+}
+
+#[cfg(test)]
 fn image_text_secret_labels(text: &str, key: &[u8; 32]) -> Vec<String> {
+    labels_from_text_hits(&image_text_secret_hits(text, key))
+}
+
+fn image_text_secret_hits(text: &str, _key: &[u8; 32]) -> Vec<ImageTextSecretHit> {
     if text.trim().is_empty() {
         return Vec::new();
     }
     let engine = image_ocr_secret_engine();
-    let result = engine.mask(
-        pentect_core::Input {
-            kind: pentect_core::Kind::Text,
-            data: text.to_string(),
-        },
-        &pentect_core::Config::new(*key),
-    );
-    let mut labels = Vec::new();
-    for item in result.items {
-        if !labels.iter().any(|seen| seen == &item.label) {
-            labels.push(item.label);
+    let result = engine.analyze_spans(pentect_core::Input {
+        kind: pentect_core::Kind::Text,
+        data: text.to_string(),
+    });
+    let mut hits = Vec::new();
+    for span in result.spans {
+        if !hits.iter().any(|seen: &ImageTextSecretHit| {
+            seen.label == span.label && seen.range == Some(span.range)
+        }) {
+            hits.push(ImageTextSecretHit {
+                label: span.label,
+                range: Some(span.range),
+            });
         }
     }
-    push_secret_labels(&mut labels, &ocr_fragmented_secret_labels(text));
+    for hit in ocr_fragmented_secret_hits(text) {
+        if !hits
+            .iter()
+            .any(|seen| seen.label == hit.label && seen.range == hit.range)
+        {
+            hits.push(hit);
+        }
+    }
+    hits
+}
+
+fn labels_from_text_hits(hits: &[ImageTextSecretHit]) -> Vec<String> {
+    let mut labels = Vec::new();
+    for hit in hits {
+        if !labels.iter().any(|seen| seen == &hit.label) {
+            labels.push(hit.label.clone());
+        }
+    }
     labels
 }
 
+#[cfg(test)]
 fn ocr_fragmented_secret_labels(text: &str) -> Vec<String> {
+    labels_from_text_hits(&ocr_fragmented_secret_hits(text))
+}
+
+fn ocr_fragmented_secret_hits(text: &str) -> Vec<ImageTextSecretHit> {
     let mut labels = Vec::new();
-    for segment in text.split(['\r', '\n']) {
-        for (idx, ch) in segment.char_indices() {
-            if ch != '=' && ch != ':' {
-                continue;
-            }
-            let before = bounded_prefix(segment, idx, 96);
-            let after_start = idx + ch.len_utf8();
-            let after = bounded_suffix(&segment[after_start..], 128);
-            let Some(label) = ocr_fragmented_secret_label(before, after) else {
-                continue;
-            };
-            if !labels.iter().any(|seen| seen == &label) {
-                labels.push(label);
-            }
+    for (idx, ch) in text.char_indices() {
+        if ch != '=' && ch != ':' {
+            continue;
+        }
+        let (line_start, line_end) = text_line_bounds(text, idx);
+        let before = bounded_prefix(&text[line_start..idx], idx - line_start, 96);
+        let after_start = idx + ch.len_utf8();
+        let after = bounded_suffix(&text[after_start..line_end], 128);
+        let Some(label) = ocr_fragmented_secret_label(before, after) else {
+            continue;
+        };
+        let range = sensitive_assignment_value_range(text, line_start, line_end, idx, None);
+        if !labels
+            .iter()
+            .any(|seen: &ImageTextSecretHit| seen.label == label && seen.range == range)
+        {
+            labels.push(ImageTextSecretHit { label, range });
         }
     }
     labels
@@ -950,7 +1170,7 @@ fn redacted_image_payload(
         } else {
             cfg.redaction
         };
-        apply_local_redaction(&mut redacted, finding.rect, style, index);
+        apply_local_redaction(&mut redacted, finding.rect, style, finding.pad_left, index);
     }
 
     let mut png = Vec::new();
@@ -979,11 +1199,12 @@ fn apply_local_redaction(
     image: &mut image::RgbaImage,
     rect: Option<NormalizedImageRect>,
     style: ImageRedactionStyle,
+    pad_left: bool,
     _index: usize,
 ) {
     let Some(rect) = rect
         .or_else(|| NormalizedImageRect::new(0.0, 0.0, 1.0, 1.0))
-        .and_then(|rect| padded_pixel_rect(rect, image.width(), image.height()))
+        .and_then(|rect| padded_pixel_rect(rect, image.width(), image.height(), pad_left))
     else {
         return;
     };
@@ -1005,11 +1226,16 @@ fn padded_pixel_rect(
     rect: NormalizedImageRect,
     image_width: u32,
     image_height: u32,
+    pad_left: bool,
 ) -> Option<PixelRect> {
     let rect = rect.to_pixels(image_width, image_height)?;
     let pad_x = rect.width.saturating_div(10).clamp(16, 96);
     let pad_y = rect.height.saturating_div(2).clamp(8, 32);
-    let left = rect.left.saturating_sub(pad_x);
+    let left = if pad_left {
+        rect.left.saturating_sub(pad_x)
+    } else {
+        rect.left
+    };
     let top = rect.top.saturating_sub(pad_y);
     let right = rect
         .left
@@ -2083,6 +2309,7 @@ mod tests {
             labels: vec![labels::KEYED_SECRET.to_string()],
             rect: NormalizedImageRect::new(0.12, 0.16, 0.42, 0.46),
             force_black,
+            pad_left: true,
         }
     }
 
@@ -2175,6 +2402,50 @@ mod tests {
         let outside = image.get_pixel(250, 140).0;
         assert!(inside[0] < 32 && inside[1] < 32 && inside[2] < 32);
         assert_eq!([outside[0], outside[1], outside[2]], [220, 190, 80]);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn ocr_secret_rect_uses_value_span_when_available() {
+        let text = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let value_start = text.find("sk-").unwrap();
+        let hits = image_text_secret_hits(text, &[7; 32]);
+        let hit = hits
+            .iter()
+            .find(|hit| hit.range.is_some_and(|range| range.start >= value_start))
+            .unwrap_or_else(|| panic!("missing value hit in {hits:?}"));
+        let region = ImageTextRegion {
+            text: text.to_string(),
+            rect: NormalizedImageRect::new(0.0, 0.20, 1.0, 0.30),
+        };
+        let redaction = rect_for_text_secret_hit(&region, hit);
+        let rect = redaction.rect.unwrap();
+        assert!(!redaction.pad_left);
+        assert!(rect.left > 0.25, "{rect:?}");
+        assert!(rect.left < 0.50, "{rect:?}");
+        assert_eq!(rect.top, 0.20);
+        assert_eq!(rect.bottom, 0.30);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn ocr_secret_rect_uses_value_side_without_span() {
+        let text = "KAGGLE_API_TOKEN=KGAT_abcdefghijklmnopqrstuvwxyz123456";
+        let region = ImageTextRegion {
+            text: text.to_string(),
+            rect: NormalizedImageRect::new(0.0, 0.20, 1.0, 0.30),
+        };
+        let hit = ImageTextSecretHit {
+            label: "KAGGLE_API_TOKEN".to_string(),
+            range: None,
+        };
+        let redaction = rect_for_text_secret_hit(&region, &hit);
+        let rect = redaction.rect.unwrap();
+        assert!(!redaction.pad_left);
+        assert!(rect.left > 0.25, "{rect:?}");
+        assert!(rect.left < 0.50, "{rect:?}");
+        assert_eq!(rect.top, 0.20);
+        assert_eq!(rect.bottom, 0.30);
     }
 
     #[cfg(feature = "ocr")]
