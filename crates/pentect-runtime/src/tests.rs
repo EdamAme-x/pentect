@@ -136,6 +136,81 @@ fn exec_parse_accepts_live_and_approve_without_env_flags() {
 }
 
 #[test]
+fn shell_parse_accepts_default_and_program_override() {
+    let args = strings(["pentect", "shell"]);
+    let opts = ShellOpts::parse(&args).unwrap();
+    assert!(opts.program.is_none());
+
+    let args = strings(["pentect", "shell", "--", "pwsh", "-NoLogo"]);
+    let opts = ShellOpts::parse(&args).unwrap();
+    assert_eq!(
+        opts.program.unwrap(),
+        vec!["pwsh".to_string(), "-NoLogo".to_string()]
+    );
+
+    let args = strings(["pentect", "shell", "pwsh"]);
+    let err = ShellOpts::parse(&args).unwrap_err();
+    assert!(err.contains("pentect shell -- PROGRAM"), "{err}");
+}
+
+#[test]
+fn shell_shim_dir_routes_common_agents_through_pentect() {
+    let root = temp_root("shell-shim");
+    let shim = ShellShimDir::install_at(root.clone(), Path::new("pentect")).unwrap();
+    if cfg!(windows) {
+        let codex = std::fs::read_to_string(root.join("codex.cmd")).unwrap();
+        let claude = std::fs::read_to_string(root.join("claude.cmd")).unwrap();
+        assert!(codex.contains("\"%PENTECT_SHELL_BIN%\" codex"), "{codex}");
+        assert!(
+            claude.contains("\"%PENTECT_SHELL_BIN%\" claude"),
+            "{claude}"
+        );
+    } else {
+        let codex = std::fs::read_to_string(root.join("codex")).unwrap();
+        let claude = std::fs::read_to_string(root.join("claude")).unwrap();
+        assert!(codex.contains("\"$PENTECT_SHELL_BIN\" codex"), "{codex}");
+        assert!(claude.contains("\"$PENTECT_SHELL_BIN\" claude"), "{claude}");
+    }
+    drop(shim);
+    assert!(!root.exists(), "{}", root.display());
+}
+
+#[test]
+fn shell_masked_paste_preserves_original_stdin_bytes() {
+    let (root, session) = empty_session("shell-paste-clean");
+    let store = RecoveryStore::load(&session).unwrap();
+    let mut protector = ShellInputProtector::new(store).unwrap();
+    let mut forwarded = Vec::new();
+    let mut line_stars = 0usize;
+    forward_masked_text("abc\n秘密", &mut forwarded, &mut line_stars, &mut protector).unwrap();
+    assert_eq!(forwarded, "abc\n秘密".as_bytes());
+    assert_eq!(line_stars, 2);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_secret_paste_replaces_visible_value_with_env_ref() {
+    let (root, session) = empty_session("shell-paste-secret");
+    let store = RecoveryStore::load(&session).unwrap();
+    let mut protector = ShellInputProtector::new(store).unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let paste = protector
+        .prepare_paste(&format!("Authorization: Bearer {raw}"))
+        .unwrap();
+    assert!(paste.changed);
+    assert!(!paste.visible.contains(raw), "{}", paste.visible);
+    assert!(!paste.visible.contains("<<"), "{}", paste.visible);
+    if cfg!(windows) {
+        assert!(paste.visible.contains("$env:PENTECT_"), "{}", paste.visible);
+        assert!(paste.child.contains("$env:PENTECT_"), "{}", paste.child);
+    } else {
+        assert!(paste.visible.contains("${PENTECT_"), "{}", paste.visible);
+        assert!(paste.child.contains("${PENTECT_"), "{}", paste.child);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn child_env_overlays_strip_in_memory_manager_credentials() {
     let mut cmd = Command::new("echo");
     apply_child_env_overlays(&mut cmd, &[], "demo");
