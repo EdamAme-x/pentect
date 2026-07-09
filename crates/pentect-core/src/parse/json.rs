@@ -12,10 +12,26 @@ use memchr::memchr2;
 const MAX_DEPTH: usize = 128;
 
 pub fn parse_json_regions(raw: &str) -> Option<Vec<Region>> {
-    parse_json_regions_with(raw, JsonRegionMode::Json)
+    parse_json_regions_with(raw, JsonRegionMode::Json, false)
 }
 
 pub fn parse_ndjson_regions(raw: &str) -> Option<Vec<Region>> {
+    parse_ndjson_regions_with(raw, false)
+}
+
+pub(crate) fn parse_json_analysis_regions(raw: &str) -> Option<Vec<Region>> {
+    parse_json_regions_with(raw, JsonRegionMode::Json, true)
+}
+
+pub(crate) fn parse_ndjson_analysis_regions(raw: &str) -> Option<Vec<Region>> {
+    parse_ndjson_regions_with(raw, true)
+}
+
+pub(crate) fn parse_tool_result_analysis_regions(raw: &str) -> Option<Vec<Region>> {
+    parse_json_regions_with(raw, JsonRegionMode::ToolResult, true)
+}
+
+fn parse_ndjson_regions_with(raw: &str, include_primitives: bool) -> Option<Vec<Region>> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut saw_line = false;
@@ -30,7 +46,8 @@ pub fn parse_ndjson_regions(raw: &str) -> Option<Vec<Region>> {
         let line = &raw[start..end];
         if !line.trim().is_empty() {
             saw_line = true;
-            let mut regions = parse_json_regions(line)?;
+            let mut regions =
+                parse_json_regions_with(line, JsonRegionMode::Json, include_primitives)?;
             for region in &mut regions {
                 region.span.start += start;
                 region.span.end += start;
@@ -46,15 +63,20 @@ pub fn parse_ndjson_regions(raw: &str) -> Option<Vec<Region>> {
 }
 
 pub fn parse_tool_result_regions(raw: &str) -> Option<Vec<Region>> {
-    parse_json_regions_with(raw, JsonRegionMode::ToolResult)
+    parse_json_regions_with(raw, JsonRegionMode::ToolResult, false)
 }
 
-fn parse_json_regions_with(raw: &str, mode: JsonRegionMode) -> Option<Vec<Region>> {
+fn parse_json_regions_with(
+    raw: &str,
+    mode: JsonRegionMode,
+    include_primitives: bool,
+) -> Option<Vec<Region>> {
     let mut p = Parser {
         b: raw.as_bytes(),
         i: 0,
         out: Vec::new(),
         mode,
+        include_primitives,
     };
     if p.b.starts_with(&[0xef, 0xbb, 0xbf]) {
         p.i = 3;
@@ -79,6 +101,7 @@ struct Parser<'a> {
     i: usize,
     out: Vec<Region>,
     mode: JsonRegionMode,
+    include_primitives: bool,
 }
 
 impl Parser<'_> {
@@ -121,7 +144,7 @@ impl Parser<'_> {
             b't' => self.literal(b"true"),
             b'f' => self.literal(b"false"),
             b'n' => self.literal(b"null"),
-            _ => self.number(),
+            _ => self.number(key, hints),
         }
     }
 
@@ -262,7 +285,7 @@ impl Parser<'_> {
         }
     }
 
-    fn number(&mut self) -> Option<()> {
+    fn number(&mut self, key: Option<String>, hints: Vec<String>) -> Option<()> {
         let start = self.i;
         if self.b.get(self.i) == Some(&b'-') {
             self.i += 1;
@@ -277,6 +300,18 @@ impl Parser<'_> {
         if self.i == start {
             None
         } else {
+            if self.include_primitives {
+                self.out.push(Region {
+                    span: ByteRange::new(start, self.i),
+                    ctx: Context {
+                        path: None,
+                        key,
+                        hints,
+                        kind: RegionKind::JsonValue,
+                        format: self.format(),
+                    },
+                });
+            }
             Some(())
         }
     }
@@ -398,6 +433,17 @@ mod tests {
             got,
             [(Some("password"), "hunter2"), (Some("token"), "abc123")]
         );
+    }
+
+    #[test]
+    fn analysis_regions_include_numeric_values_with_key_context() {
+        let raw = r#"{"otp":100482,"name":"demo"}"#;
+        let regions = parse_json_analysis_regions(raw).unwrap();
+        let got = regions
+            .iter()
+            .map(|r| (r.ctx.key.as_deref(), &raw[r.span.start..r.span.end]))
+            .collect::<Vec<_>>();
+        assert_eq!(got, [(Some("otp"), "100482"), (Some("name"), "demo")]);
     }
 
     #[test]

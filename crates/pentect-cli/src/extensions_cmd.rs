@@ -2,9 +2,10 @@ use crate::extensions;
 use pentect_core::load_pack;
 use serde::Deserialize;
 use serde_json::json;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const PENTECT_DIR: &str = ".pentect";
@@ -15,6 +16,7 @@ const EXTENSION_NAME_ENV: &str = "PENTECT_EXTENSION_NAME";
 const EXTENSION_DATA_DIR_ENV: &str = "PENTECT_EXTENSION_DATA_DIR";
 const EXTENSION_CACHE_DIR_ENV: &str = "PENTECT_EXTENSION_CACHE_DIR";
 const EXTENSION_CONFIG_ENV: &str = "PENTECT_EXTENSION_CONFIG";
+const MAX_STDOUT_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn cmd_extensions(args: &[String]) {
     let opts = match ExtensionCmd::parse(args) {
@@ -285,30 +287,35 @@ impl AdapterFile {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = command.spawn().map_err(|e| format!("{}: {e}", self.name))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("{}: stdout", self.name))?;
+        let stdout_reader = spawn_adapter_stdout_reader(stdout);
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(request.as_bytes())
-                .map_err(|e| format!("{}: {e}", self.name))?;
-        }
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => break,
-                Ok(Some(status)) => return Err(format!("{}: {status}", self.name)),
-                Ok(None) if start.elapsed() >= self.timeout => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("{}: timeout", self.name));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                Err(e) => return Err(format!("{}: {e}", self.name)),
+            if let Err(e) = stdin.write_all(request.as_bytes()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_adapter_stdout(stdout_reader, &self.name);
+                return Err(format!("{}: {e}", self.name));
             }
         }
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("{}: {e}", self.name))?;
+        let status = match wait_for_adapter_child(&mut child, &self.name, self.timeout) {
+            Ok(status) => status,
+            Err(err) => {
+                let _ = join_adapter_stdout(stdout_reader, &self.name);
+                return Err(err);
+            }
+        };
+        let stdout = join_adapter_stdout(stdout_reader, &self.name)?;
+        if stdout.len() > MAX_STDOUT_BYTES {
+            return Err(format!("{}: output limit", self.name));
+        }
+        if !status.success() {
+            return Err(format!("{}: {status}", self.name));
+        }
         let value: serde_json::Value =
-            serde_json::from_slice(&output.stdout).map_err(|e| format!("{}: {e}", self.name))?;
+            serde_json::from_slice(&stdout).map_err(|e| format!("{}: {e}", self.name))?;
         let count = value
             .get("spans")
             .and_then(|spans| spans.as_array())
@@ -319,6 +326,51 @@ impl AdapterFile {
         }
         Ok(count)
     }
+}
+
+fn spawn_adapter_stdout_reader(stdout: ChildStdout) -> JoinHandle<Result<Vec<u8>, String>> {
+    std::thread::spawn(move || {
+        let mut stdout = stdout.take(MAX_STDOUT_BYTES as u64 + 1);
+        let mut out = Vec::new();
+        stdout
+            .read_to_end(&mut out)
+            .map_err(|e| format!("stdout: {e}"))?;
+        Ok(out)
+    })
+}
+
+fn wait_for_adapter_child(
+    child: &mut Child,
+    name: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{name}: timeout"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{name}: {e}"));
+            }
+        }
+    }
+}
+
+fn join_adapter_stdout(
+    reader: JoinHandle<Result<Vec<u8>, String>>,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    reader
+        .join()
+        .map_err(|_| format!("{name}: stdout reader panicked"))?
+        .map_err(|e| format!("{name}: {e}"))
 }
 
 fn adapter_command_from_manifest(command: Option<Vec<String>>) -> Result<Vec<String>, String> {
@@ -563,14 +615,28 @@ impl Check {
 
 fn adapter_program(program: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(program);
-    if path.is_absolute() || !looks_like_path_command(program) {
+    if path.is_absolute() {
         return path.to_path_buf();
     }
-    cwd.join(path)
+    if looks_like_path_command(program) {
+        return cwd.join(path);
+    }
+    adapter_sidecar_program(program).unwrap_or_else(|| path.to_path_buf())
 }
 
 fn looks_like_path_command(program: &str) -> bool {
     program.contains('/') || program.contains('\\')
+}
+
+fn adapter_sidecar_program(program: &str) -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    for name in command_names(program) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn find_command(path: &Path) -> Option<PathBuf> {

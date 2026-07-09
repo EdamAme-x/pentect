@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 const ENGINE_NAME: &str = "pentect";
-const MAX_SCAN_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_SCAN_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) fn scan_files(
     files: Vec<PathBuf>,
@@ -322,10 +322,13 @@ fn scan_file_with_engine(engine: &Engine, path: &Path, binary: BinaryMode) -> Sc
     };
     let kind = infer_kind(path);
     let line_index = LineIndex::new(&data);
-    let result = engine.analyze_spans(Input {
-        kind: kind.clone(),
-        data,
-    });
+    let result = engine.analyze_spans_with_path(
+        Input {
+            kind: kind.clone(),
+            data,
+        },
+        path.to_string_lossy().into_owned(),
+    );
     let hits = result
         .spans
         .iter()

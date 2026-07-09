@@ -226,12 +226,45 @@ impl Engine {
     }
 
     pub fn analyze_spans(&self, input: Input) -> SpanAnalysisResult {
-        let (ir, fell_back) = self.parse(input);
+        let kind = input.kind.clone();
+        let (mut ir, fell_back) = self.parse(input);
+        self.replace_analysis_regions(&mut ir, &kind, fell_back);
         let (spans, residual) = self.masked_spans(&ir);
         SpanAnalysisResult {
             spans,
             residual,
             parser_fallback: fell_back,
+        }
+    }
+
+    pub fn analyze_spans_with_path(
+        &self,
+        input: Input,
+        path: impl Into<String>,
+    ) -> SpanAnalysisResult {
+        let path = path.into();
+        let kind = input.kind.clone();
+        let (mut ir, fell_back) = self.parse(input);
+        self.replace_analysis_regions(&mut ir, &kind, fell_back);
+        for region in &mut ir.regions {
+            if region.ctx.path.is_none() {
+                region.ctx.path = Some(path.clone());
+            }
+        }
+        let (spans, residual) = self.masked_spans(&ir);
+        SpanAnalysisResult {
+            spans,
+            residual,
+            parser_fallback: fell_back,
+        }
+    }
+
+    fn replace_analysis_regions(&self, ir: &mut Ir, kind: &Kind, fell_back: bool) {
+        if fell_back {
+            return;
+        }
+        if let Some(regions) = crate::parse::analysis_regions_for_kind(&ir.raw, kind) {
+            ir.regions = regions;
         }
     }
 
@@ -927,6 +960,32 @@ mod tests {
         assert!(r.masked.contains("<<PASSWORD_"), "{}", r.masked);
         assert!(r.masked.contains("<<TOKEN_"), "{}", r.masked);
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn analyze_spans_checks_numeric_json_values_without_changing_mask_output() {
+        let input = r#"{"otp":100482,"ok":1}"#;
+        let engine = Engine::with_profile(Profile::Strict);
+        let result = engine.analyze_spans(Input {
+            kind: Kind::Json,
+            data: input.to_string(),
+        });
+        assert!(
+            result.spans.iter().any(|span| span.label == labels::OTP
+                && &input[span.range.start..span.range.end] == "100482"),
+            "{:?}",
+            result.spans
+        );
+
+        let masked = engine.mask(
+            Input {
+                kind: Kind::Json,
+                data: input.to_string(),
+            },
+            &Config::insecure_testing(),
+        );
+        serde_json::from_str::<serde_json::Value>(&masked.masked)
+            .expect("regular JSON masking keeps JSON valid");
     }
 
     #[test]
