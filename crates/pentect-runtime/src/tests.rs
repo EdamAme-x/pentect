@@ -853,6 +853,56 @@ fn active_tool_output_masker_reuses_in_memory_state() {
 }
 
 #[test]
+fn prompt_masked_env_is_available_to_exec_proxy_without_visible_pentect_exec() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let token = "prompt-exec-proxy-token".to_string();
+    let addr = in_memory_manager::spawn_test_in_memory_manager(token.clone());
+    struct EnvCleanup;
+    impl Drop for EnvCleanup {
+        fn drop(&mut self) {
+            std::env::remove_var(ENV_ADDR);
+            std::env::remove_var(ENV_TOKEN);
+        }
+    }
+    let _cleanup = EnvCleanup;
+    std::env::set_var(ENV_ADDR, addr);
+    std::env::set_var(ENV_TOKEN, token);
+
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let prompt = mask_prompt_text_into_active_in_memory_manager(&format!("OPENAI_API_KEY={raw}"))
+        .unwrap()
+        .unwrap();
+    assert!(!prompt.contains(raw), "{prompt}");
+    assert!(
+        prompt.contains("OPENAI_API_KEY=<<OPENAI_API_KEY_"),
+        "{prompt}"
+    );
+
+    let argv_mode = if cfg!(windows) {
+        vec![
+            "powershell".to_string(),
+            "-Command".to_string(),
+            "Write-Output $env:OPENAI_API_KEY".to_string(),
+        ]
+    } else {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf '%s' \"$OPENAI_API_KEY\"".to_string(),
+        ]
+    };
+    let session = Session::open_capability("default").unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+    let overlays = requested_env_bindings(&store, &ExecMode::Program(argv_mode)).unwrap();
+    assert!(
+        overlays
+            .iter()
+            .any(|(name, value)| name == "OPENAI_API_KEY" && value == raw),
+        "{overlays:?}"
+    );
+}
+
+#[test]
 fn exec_capability_env_overlays_parent_environment_when_referenced() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("env-overlay");
