@@ -2349,6 +2349,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pentect-pii-ner"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tract-onnx",
+]
+
+[[package]]
 name = "pentect-runtime"
 version = "0.0.1"
 dependencies = [
@@ -2376,10 +2386,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "simd-json",
- "tokenizers",
  "tokio",
  "toml",
- "tract-onnx",
  "windows",
  "zeroize",
 ]

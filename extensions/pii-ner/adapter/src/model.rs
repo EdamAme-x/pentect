@@ -6,11 +6,11 @@ use tokenizers::{Encoding, Tokenizer};
 use tract_onnx::prelude::*;
 
 const MODEL_ONNX: &[u8] =
-    include_bytes!("../assets/ner/gravitee-bert-small-pii-detection.quant.onnx");
+    include_bytes!("../../assets/gravitee-bert-small-pii-detection.quant.onnx");
 const TOKENIZER_JSON: &[u8] =
-    include_bytes!("../assets/ner/gravitee-bert-small-pii-detection-tokenizer.json");
+    include_bytes!("../../assets/gravitee-bert-small-pii-detection-tokenizer.json");
 const CONFIG_JSON: &str =
-    include_str!("../assets/ner/gravitee-bert-small-pii-detection-config.json");
+    include_str!("../../assets/gravitee-bert-small-pii-detection-config.json");
 
 const MAX_TOKENS: usize = 512;
 const MAX_CHUNK_BYTES: usize = 2_048;
