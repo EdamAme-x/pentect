@@ -6,8 +6,6 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 pub(crate) const ADAPTERS_ENV: &str = "PENTECT_EXTENSION_ADAPTERS";
@@ -75,21 +73,10 @@ struct ModelAdapter {
     name: String,
     id: String,
     path: PathBuf,
-    backend: AdapterBackend,
+    command: Vec<String>,
     timeout: Duration,
     max_input_bytes: usize,
     max_spans: usize,
-}
-
-#[derive(Clone, Debug)]
-enum AdapterBackend {
-    Command(Vec<String>),
-    Builtin(BuiltinAdapter),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BuiltinAdapter {
-    PiiNer,
 }
 
 impl ModelAdapter {
@@ -120,7 +107,7 @@ impl ModelAdapter {
                 ));
             }
         }
-        let backend = adapter_backend(path, file.command, file.builtin.as_deref())?;
+        let command = adapter_command_from_file(path, file.command)?;
         let name = file
             .name
             .filter(|name| !name.trim().is_empty())
@@ -130,7 +117,7 @@ impl ModelAdapter {
             name,
             id,
             path: path.to_path_buf(),
-            backend,
+            command,
             timeout: Duration::from_millis(file.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
             max_input_bytes: file.max_input_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES),
             max_spans: file.max_spans.unwrap_or(DEFAULT_MAX_SPANS),
@@ -145,9 +132,6 @@ impl ModelAdapter {
     ) -> Result<Vec<Span>, String> {
         if text.len() > self.max_input_bytes {
             return Ok(Vec::new());
-        }
-        if let AdapterBackend::Builtin(builtin) = &self.backend {
-            return self.detect_builtin(*builtin, text, context);
         }
         let request = json!({
             "schema": "pentect.model_adapter.v1",
@@ -179,12 +163,11 @@ impl ModelAdapter {
     }
 
     fn run(&self, request: &str) -> Result<String, String> {
-        let AdapterBackend::Command(command) = &self.backend else {
-            return Err(format!("extension adapter '{}' has no command", self.name));
-        };
-        let mut cmd = Command::new(&command[0]);
+        let cwd = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let program = adapter_program(&self.command[0], cwd);
+        let mut cmd = Command::new(program);
         apply_adapter_child_env(&mut cmd, &self.id)?;
-        cmd.args(&command[1..])
+        cmd.args(&self.command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -252,103 +235,6 @@ impl ModelAdapter {
             )
         })
     }
-
-    fn detect_builtin(
-        &self,
-        builtin: BuiltinAdapter,
-        text: &str,
-        _context: Option<&Context>,
-    ) -> Result<Vec<Span>, String> {
-        let spans = match builtin {
-            BuiltinAdapter::PiiNer => detect_pii_ner_with_timeout(text, self.timeout)?,
-        };
-        if spans.len() > self.max_spans {
-            return Err(format!(
-                "extension adapter '{}' returned too many spans: {} > {}",
-                self.name,
-                spans.len(),
-                self.max_spans
-            ));
-        }
-        spans
-            .into_iter()
-            .map(|span| {
-                adapter_span(
-                    text,
-                    AdapterSpan {
-                        start: span.start,
-                        end: span.end,
-                        label: span.label,
-                        category: Some("pii".to_string()),
-                        confidence: Some(span.confidence.to_string()),
-                    },
-                    &self.name,
-                )
-            })
-            .collect()
-    }
-}
-
-#[cfg(feature = "ner")]
-fn detect_pii_ner(text: &str) -> Result<Vec<BuiltinNerSpan>, String> {
-    crate::model_ner::detect_pii(text).map(|spans| {
-        spans
-            .into_iter()
-            .map(|span| BuiltinNerSpan {
-                start: span.start,
-                end: span.end,
-                label: span.label,
-                confidence: span.confidence,
-            })
-            .collect()
-    })
-}
-
-#[cfg(feature = "ner")]
-fn detect_pii_ner_with_timeout(
-    text: &str,
-    timeout: Duration,
-) -> Result<Vec<BuiltinNerSpan>, String> {
-    if timeout.is_zero() {
-        return Err("builtin adapter 'pii-ner' timed out".to_string());
-    }
-    let text = text.to_string();
-    let (tx, rx) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("pentect-pii-ner".to_string())
-        .spawn(move || {
-            let _ = tx.send(detect_pii_ner(&text));
-        })
-        .map_err(|e| format!("could not start builtin adapter 'pii-ner': {e}"))?;
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            Err("builtin adapter 'pii-ner' timed out".to_string())
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err("builtin adapter 'pii-ner' stopped unexpectedly".to_string())
-        }
-    }
-}
-
-#[cfg(not(feature = "ner"))]
-fn detect_pii_ner(_text: &str) -> Result<Vec<BuiltinNerSpan>, String> {
-    Err("builtin adapter 'pii-ner' requires a Pentect build with ner support".to_string())
-}
-
-#[cfg(not(feature = "ner"))]
-fn detect_pii_ner_with_timeout(
-    text: &str,
-    _timeout: Duration,
-) -> Result<Vec<BuiltinNerSpan>, String> {
-    detect_pii_ner(text)
-}
-
-struct BuiltinNerSpan {
-    start: usize,
-    end: usize,
-    label: String,
-    confidence: &'static str,
 }
 
 fn apply_adapter_child_env(command: &mut Command, id_or_name: &str) -> Result<(), String> {
@@ -410,6 +296,18 @@ fn adapter_default_name(path: &Path) -> String {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("extension")
         .to_string()
+}
+
+fn adapter_program(program: &str, cwd: &Path) -> PathBuf {
+    let path = Path::new(program);
+    if path.is_absolute() || !looks_like_path_command(program) {
+        return path.to_path_buf();
+    }
+    cwd.join(path)
+}
+
+fn looks_like_path_command(program: &str) -> bool {
+    program.contains('/') || program.contains('\\')
 }
 
 fn extension_id(value: &str) -> String {
@@ -475,46 +373,28 @@ struct AdapterFile {
     kind: Option<String>,
     name: Option<String>,
     command: Option<Vec<String>>,
-    builtin: Option<String>,
     timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
     max_spans: Option<usize>,
 }
 
-fn adapter_backend(
+fn adapter_command_from_file(
     path: &Path,
     command: Option<Vec<String>>,
-    builtin: Option<&str>,
-) -> Result<AdapterBackend, String> {
-    match (command, builtin) {
-        (Some(command), None) => {
-            if command.is_empty() || command.iter().any(|part| part.is_empty()) {
-                return Err(format!(
-                    "extension adapter '{}' requires a non-empty command array",
-                    path.display()
-                ));
-            }
-            Ok(AdapterBackend::Command(command))
-        }
-        (None, Some(name)) => parse_builtin_adapter(name)
-            .map(AdapterBackend::Builtin)
-            .map_err(|e| format!("extension adapter '{}' {e}", path.display())),
-        (Some(_), Some(_)) => Err(format!(
-            "extension adapter '{}' must set either command or builtin, not both",
+) -> Result<Vec<String>, String> {
+    let Some(command) = command else {
+        return Err(format!(
+            "extension adapter '{}' requires command",
             path.display()
-        )),
-        (None, None) => Err(format!(
-            "extension adapter '{}' requires command or builtin",
+        ));
+    };
+    if command.is_empty() || command.iter().any(|part| part.is_empty()) {
+        return Err(format!(
+            "extension adapter '{}' requires a non-empty command array",
             path.display()
-        )),
+        ));
     }
-}
-
-fn parse_builtin_adapter(name: &str) -> Result<BuiltinAdapter, String> {
-    match name {
-        "pii-ner" => Ok(BuiltinAdapter::PiiNer),
-        other => Err(format!("has unknown builtin adapter: {other}")),
-    }
+    Ok(command)
 }
 
 #[derive(Debug, Deserialize)]
@@ -633,9 +513,9 @@ mod tests {
             name: "test-ner".to_string(),
             id: "test-ner".to_string(),
             path: std::env::current_dir().unwrap().join("adapter.toml"),
-            backend: AdapterBackend::Command(echo_adapter_command(
+            command: echo_adapter_command(
                 r#"{"spans":[{"start":0,"end":5,"label":"person name","category":"pii","confidence":"high"}]}"#,
-            )),
+            ),
             timeout: Duration::from_secs(3),
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_spans: DEFAULT_MAX_SPANS,
@@ -676,6 +556,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("invalid byte span"), "{err}");
+    }
+
+    #[test]
+    fn adapter_manifest_rejects_builtin_field() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-builtin-adapter-reject-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("adapter.toml");
+        std::fs::write(
+            &path,
+            r#"
+schema = "pentect.model_adapter.v1"
+kind = "model"
+name = "bad"
+builtin = "pii-ner"
+"#,
+        )
+        .unwrap();
+        let err = ModelAdapter::load(&path).unwrap_err();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(err.contains("unknown field `builtin`"), "{err}");
+    }
+
+    #[test]
+    fn relative_adapter_program_is_resolved_from_adapter_dir() {
+        let cwd = Path::new("extensions/pii-ner");
+        assert_eq!(
+            adapter_program("./bin/pentect-pii-ner", cwd),
+            cwd.join("./bin/pentect-pii-ner")
+        );
+        assert_eq!(
+            adapter_program("pentect-pii-ner", cwd),
+            PathBuf::from("pentect-pii-ner")
+        );
     }
 
     #[test]
@@ -728,24 +645,6 @@ mod tests {
                 .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext/config.toml")),
             "{envs:?}"
         );
-    }
-
-    #[cfg(feature = "ner")]
-    #[test]
-    fn builtin_adapter_honors_zero_timeout() {
-        let adapter = ModelAdapter {
-            name: "pii-ner".to_string(),
-            id: "pii-ner".to_string(),
-            path: std::env::current_dir().unwrap().join("adapter.toml"),
-            backend: AdapterBackend::Builtin(BuiltinAdapter::PiiNer),
-            timeout: Duration::ZERO,
-            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
-            max_spans: DEFAULT_MAX_SPANS,
-        };
-        let err = adapter
-            .detect_builtin(BuiltinAdapter::PiiNer, "Alice Smith", None)
-            .unwrap_err();
-        assert!(err.contains("timed out"), "{err}");
     }
 
     #[cfg(windows)]

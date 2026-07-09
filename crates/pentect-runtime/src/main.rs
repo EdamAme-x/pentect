@@ -15,8 +15,6 @@ mod file_pointer_manager;
 mod image_ocr;
 mod in_memory_manager;
 mod masking;
-#[cfg(feature = "ner")]
-pub mod model_ner;
 mod session;
 mod shell;
 
