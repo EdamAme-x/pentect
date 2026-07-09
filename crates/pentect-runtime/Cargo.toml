@@ -14,7 +14,7 @@ path = "src/main.rs"
 [features]
 default = ["pdf", "ocr"]
 pdf = ["dep:pdf-extract"]
-ocr = ["dep:reqwest", "native-ocr", "bundled-ocr", "barcode"]
+ocr = ["dep:reqwest", "dep:flate2", "native-ocr", "bundled-ocr", "barcode"]
 barcode = ["dep:image", "dep:rxing"]
 native-ocr = [
     "dep:windows",
@@ -32,6 +32,7 @@ axum = { workspace = true }
 data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 rxing = { workspace = true, optional = true }
 serde = { workspace = true }

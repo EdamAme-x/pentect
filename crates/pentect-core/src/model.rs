@@ -40,6 +40,8 @@ pub mod labels {
     pub const URL_QUERY_VALUE: &str = "URL_QUERY_VALUE";
     /// Fragment value in an internal URL.
     pub const URL_FRAGMENT: &str = "URL_FRAGMENT";
+    /// Location metadata embedded in image EXIF GPS tags.
+    pub const IMAGE_GPS_METADATA: &str = "IMAGE_GPS_METADATA";
 }
 
 /// Half-open byte range into the raw input, aligned to UTF-8 char boundaries.

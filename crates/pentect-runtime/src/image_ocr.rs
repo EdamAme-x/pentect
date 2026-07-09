@@ -9,6 +9,8 @@ use std::net::{IpAddr, SocketAddr};
 
 #[cfg(feature = "ocr")]
 const IMAGE_URL_MAX_REDIRECTS: usize = 5;
+#[cfg(feature = "ocr")]
+const IMAGE_METADATA_MAX_INFLATED_BYTES: u64 = 1024 * 1024;
 const IMAGE_OBJECT_BYTE_FIELDS: &[&str] = &[
     "data",
     "bytes",
@@ -60,6 +62,7 @@ struct ImageRedactionState {
 struct RedactedImagePayload {
     base64: String,
     data_url: String,
+    mime_type: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -82,12 +85,26 @@ struct ImageSecretFinding {
     rect: Option<NormalizedImageRect>,
     force_black: bool,
     pad_left: bool,
+    redact_pixels: bool,
 }
 
 #[derive(Clone, Debug)]
 struct ImageTextSecretHit {
     label: String,
     range: Option<ByteRange>,
+}
+
+#[cfg(feature = "ocr")]
+struct PngChunk<'a> {
+    kind: &'a [u8],
+    data: &'a [u8],
+    range: std::ops::Range<usize>,
+}
+
+#[cfg(feature = "ocr")]
+struct JpegApp1Segment<'a> {
+    data: &'a [u8],
+    range: std::ops::Range<usize>,
 }
 
 #[cfg(feature = "ocr")]
@@ -477,7 +494,7 @@ fn replace_object_image_field(
     };
     let replacement = match source.encoding {
         ImageObjectEncoding::Base64 => {
-            set_png_mime_metadata(out);
+            set_image_mime_metadata(out, payload.mime_type);
             payload.base64
         }
         ImageObjectEncoding::DataUrl => payload.data_url,
@@ -486,7 +503,7 @@ fn replace_object_image_field(
     true
 }
 
-fn set_png_mime_metadata(out: &mut serde_json::Map<String, Value>) {
+fn set_image_mime_metadata(out: &mut serde_json::Map<String, Value>, mime_type: &'static str) {
     let mut updated_existing = false;
     for key in [
         "mimeType",
@@ -498,15 +515,12 @@ fn set_png_mime_metadata(out: &mut serde_json::Map<String, Value>) {
         "content_type",
     ] {
         if out.contains_key(key) {
-            out.insert(key.to_string(), Value::String("image/png".to_string()));
+            out.insert(key.to_string(), Value::String(mime_type.to_string()));
             updated_existing = true;
         }
     }
     if !updated_existing {
-        out.insert(
-            "mimeType".to_string(),
-            Value::String("image/png".to_string()),
-        );
+        out.insert("mimeType".to_string(), Value::String(mime_type.to_string()));
     }
 }
 
@@ -551,6 +565,27 @@ fn image_secret_findings(
     cfg: &ImageOcrConfig,
 ) -> Result<Vec<ImageSecretFinding>, String> {
     let mut findings = Vec::new();
+    for region in image_metadata_regions(bytes) {
+        for hit in image_text_secret_hits(&region.text, key) {
+            findings.push(ImageSecretFinding {
+                labels: vec![hit.label.clone()],
+                rect: None,
+                force_black: false,
+                pad_left: false,
+                redact_pixels: false,
+            });
+        }
+    }
+    if image_exif_has_gps(bytes) {
+        findings.push(ImageSecretFinding {
+            labels: vec![labels::IMAGE_GPS_METADATA.to_string()],
+            rect: None,
+            force_black: false,
+            pad_left: false,
+            redact_pixels: false,
+        });
+    }
+
     for region in image_barcode_regions(bytes, cfg) {
         let labels = labels_from_text_hits(&image_text_secret_hits(&region.text, key));
         if labels.is_empty() {
@@ -561,6 +596,7 @@ fn image_secret_findings(
             rect: region.rect,
             force_black: true,
             pad_left: true,
+            redact_pixels: true,
         });
     }
 
@@ -577,6 +613,7 @@ fn image_secret_findings(
                 rect: redaction.rect,
                 force_black: false,
                 pad_left: redaction.pad_left,
+                redact_pixels: true,
             });
         }
     }
@@ -598,6 +635,7 @@ fn image_secret_findings(
             rect: union_region_rects(&ocr_regions),
             force_black: true,
             pad_left: true,
+            redact_pixels: true,
         });
     }
     Ok(findings)
@@ -619,9 +657,13 @@ fn union_region_rects(regions: &[ImageTextRegion]) -> Option<NormalizedImageRect
 fn image_secret_findings(
     _bytes: &[u8],
     _key: &[u8; 32],
-    _cfg: &ImageOcrConfig,
+    cfg: &ImageOcrConfig,
 ) -> Result<Vec<ImageSecretFinding>, String> {
-    Ok(Vec::new())
+    if matches!(cfg.mode, crate::config::ImageOcrMode::Off) {
+        Ok(Vec::new())
+    } else {
+        Err("image OCR requires a build with `--features ocr`".to_string())
+    }
 }
 
 fn push_secret_labels(out: &mut Vec<String>, labels: &[String]) {
@@ -686,6 +728,423 @@ fn image_regions_text(regions: &[ImageTextRegion]) -> String {
         text.push_str(&region.text);
     }
     text
+}
+
+#[cfg(feature = "ocr")]
+fn image_metadata_regions(bytes: &[u8]) -> Vec<ImageTextRegion> {
+    let mut texts = Vec::new();
+    collect_jpeg_metadata_text(bytes, &mut texts);
+    collect_png_metadata_text(bytes, &mut texts);
+    texts.sort();
+    texts.dedup();
+    texts
+        .into_iter()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| ImageTextRegion { text, rect: None })
+        .collect()
+}
+
+#[cfg(feature = "ocr")]
+fn collect_jpeg_metadata_text(bytes: &[u8], out: &mut Vec<String>) {
+    for segment in jpeg_app1_segments(bytes) {
+        if let Some(tiff) = segment.strip_prefix(b"Exif\0\0") {
+            collect_printable_metadata_strings(tiff, out);
+        } else if let Some(xmp) = segment.strip_prefix(b"http://ns.adobe.com/xap/1.0/\0") {
+            if let Ok(text) = std::str::from_utf8(xmp) {
+                out.push(text.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn collect_png_metadata_text(bytes: &[u8], out: &mut Vec<String>) {
+    for chunk in png_chunks(bytes) {
+        match chunk.kind {
+            b"tEXt" => collect_png_text_chunk(chunk.data, out),
+            b"zTXt" => collect_png_ztxt_chunk(chunk.data, out),
+            b"iTXt" => collect_png_itxt_chunk(chunk.data, out),
+            b"eXIf" => collect_printable_metadata_strings(chunk.data, out),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn png_chunks(bytes: &[u8]) -> Vec<PngChunk<'_>> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if !bytes.starts_with(PNG_SIGNATURE) {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut offset = 8usize;
+    while offset.saturating_add(12) <= bytes.len() {
+        let Some(len) = read_be_u32(bytes, offset).and_then(|len| usize::try_from(len).ok()) else {
+            break;
+        };
+        let kind_start = offset + 4;
+        let data_start = kind_start + 4;
+        let Some(data_end) = data_start.checked_add(len) else {
+            break;
+        };
+        let Some(next) = data_end.checked_add(4) else {
+            break;
+        };
+        if next > bytes.len() {
+            break;
+        }
+        let kind = &bytes[kind_start..data_start];
+        if kind == b"IEND" {
+            break;
+        }
+        chunks.push(PngChunk {
+            kind,
+            data: &bytes[data_start..data_end],
+            range: offset..next,
+        });
+        offset = next;
+    }
+    chunks
+}
+
+#[cfg(feature = "ocr")]
+fn collect_png_text_chunk(data: &[u8], out: &mut Vec<String>) {
+    let Some(split) = data.iter().position(|&b| b == 0) else {
+        return;
+    };
+    let key = lossy_metadata_text(&data[..split]);
+    let value = lossy_metadata_text(&data[split + 1..]);
+    push_metadata_line(out, &key, &value);
+}
+
+#[cfg(feature = "ocr")]
+fn collect_png_ztxt_chunk(data: &[u8], out: &mut Vec<String>) {
+    let Some(key_end) = data.iter().position(|&b| b == 0) else {
+        return;
+    };
+    let method = data.get(key_end + 1).copied();
+    if method != Some(0) {
+        return;
+    }
+    let Some(compressed) = data.get(key_end + 2..) else {
+        return;
+    };
+    let Some(value_bytes) = inflate_png_metadata_text(compressed) else {
+        return;
+    };
+    let key = lossy_metadata_text(&data[..key_end]);
+    let value = lossy_metadata_text(&value_bytes);
+    push_metadata_line(out, &key, &value);
+}
+
+#[cfg(feature = "ocr")]
+fn collect_png_itxt_chunk(data: &[u8], out: &mut Vec<String>) {
+    let Some(key_end) = data.iter().position(|&b| b == 0) else {
+        return;
+    };
+    let mut cursor = key_end + 1;
+    if cursor + 2 > data.len() {
+        return;
+    }
+    let compression_flag = data[cursor];
+    let compression_method = data[cursor + 1];
+    cursor += 2;
+    let Some(lang_end) = data[cursor..].iter().position(|&b| b == 0) else {
+        return;
+    };
+    cursor += lang_end + 1;
+    let Some(translated_end) = data[cursor..].iter().position(|&b| b == 0) else {
+        return;
+    };
+    cursor += translated_end + 1;
+    let key = lossy_metadata_text(&data[..key_end]);
+    let value_bytes = match compression_flag {
+        0 => data[cursor..].to_vec(),
+        1 if compression_method == 0 => match inflate_png_metadata_text(&data[cursor..]) {
+            Some(value) => value,
+            None => return,
+        },
+        _ => return,
+    };
+    let value = lossy_metadata_text(&value_bytes);
+    push_metadata_line(out, &key, &value);
+}
+
+#[cfg(feature = "ocr")]
+fn inflate_png_metadata_text(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let decoder = flate2::read::ZlibDecoder::new(data);
+    let mut limited = decoder.take(IMAGE_METADATA_MAX_INFLATED_BYTES + 1);
+    let mut out = Vec::new();
+    limited.read_to_end(&mut out).ok()?;
+    (out.len() as u64 <= IMAGE_METADATA_MAX_INFLATED_BYTES).then_some(out)
+}
+
+#[cfg(feature = "ocr")]
+fn collect_printable_metadata_strings(bytes: &[u8], out: &mut Vec<String>) {
+    for text in printable_ascii_strings(bytes, 6) {
+        out.push(text);
+    }
+    for text in printable_utf16_strings(bytes, 6, Endian::Little) {
+        out.push(text);
+    }
+    for text in printable_utf16_strings(bytes, 6, Endian::Big) {
+        out.push(text);
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn printable_ascii_strings(bytes: &[u8], min_chars: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        if byte.is_ascii_graphic() || byte == b' ' || byte == b'\t' {
+            start.get_or_insert(idx);
+            continue;
+        }
+        if let Some(s) = take_printable_ascii(bytes, start.take(), idx, min_chars) {
+            out.push(s);
+        }
+    }
+    if let Some(s) = take_printable_ascii(bytes, start, bytes.len(), min_chars) {
+        out.push(s);
+    }
+    out
+}
+
+#[cfg(feature = "ocr")]
+fn take_printable_ascii(
+    bytes: &[u8],
+    start: Option<usize>,
+    end: usize,
+    min_chars: usize,
+) -> Option<String> {
+    let start = start?;
+    let slice = bytes.get(start..end)?;
+    let text = std::str::from_utf8(slice).ok()?.trim();
+    (text.chars().count() >= min_chars).then(|| text.to_string())
+}
+
+#[cfg(feature = "ocr")]
+fn printable_utf16_strings(bytes: &[u8], min_chars: usize, endian: Endian) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    let mut chunks = bytes.chunks_exact(2);
+    for pair in &mut chunks {
+        let unit = match endian {
+            Endian::Little => u16::from_le_bytes([pair[0], pair[1]]),
+            Endian::Big => u16::from_be_bytes([pair[0], pair[1]]),
+        };
+        let Some(ch) = char::from_u32(u32::from(unit)) else {
+            flush_utf16_string(&mut current, min_chars, &mut out);
+            continue;
+        };
+        if ch.is_ascii_graphic() || ch == ' ' || ch == '\t' {
+            current.push(ch);
+        } else {
+            flush_utf16_string(&mut current, min_chars, &mut out);
+        }
+    }
+    flush_utf16_string(&mut current, min_chars, &mut out);
+    out
+}
+
+#[cfg(feature = "ocr")]
+fn flush_utf16_string(current: &mut Vec<char>, min_chars: usize, out: &mut Vec<String>) {
+    if current.len() >= min_chars {
+        let text = current.iter().collect::<String>();
+        let text = text.trim();
+        if text.chars().count() >= min_chars {
+            out.push(text.to_string());
+        }
+    }
+    current.clear();
+}
+
+#[cfg(feature = "ocr")]
+fn lossy_metadata_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+#[cfg(feature = "ocr")]
+fn push_metadata_line(out: &mut Vec<String>, key: &str, value: &str) {
+    if key.is_empty() && value.is_empty() {
+        return;
+    }
+    if key.is_empty() {
+        out.push(value.to_string());
+    } else if value.is_empty() {
+        out.push(key.to_string());
+    } else {
+        out.push(format!("{key}: {value}"));
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn image_exif_has_gps(bytes: &[u8]) -> bool {
+    jpeg_exif_has_gps(bytes) || png_exif_has_gps(bytes)
+}
+
+#[cfg(feature = "ocr")]
+fn jpeg_exif_has_gps(bytes: &[u8]) -> bool {
+    jpeg_app1_segments(bytes)
+        .iter()
+        .filter_map(|segment| segment.strip_prefix(b"Exif\0\0"))
+        .any(tiff_has_gps_ifd)
+}
+
+#[cfg(feature = "ocr")]
+fn png_exif_has_gps(bytes: &[u8]) -> bool {
+    for chunk in png_chunks(bytes) {
+        if chunk.kind == b"eXIf" && tiff_has_gps_ifd(chunk.data) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(feature = "ocr")]
+fn jpeg_app1_segments(bytes: &[u8]) -> Vec<&[u8]> {
+    jpeg_app1_segment_items(bytes)
+        .into_iter()
+        .map(|segment| segment.data)
+        .collect()
+}
+
+#[cfg(feature = "ocr")]
+fn jpeg_app1_segment_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    jpeg_app1_segment_items(bytes)
+        .into_iter()
+        .map(|segment| segment.range)
+        .collect()
+}
+
+#[cfg(feature = "ocr")]
+fn jpeg_app1_segment_items(bytes: &[u8]) -> Vec<JpegApp1Segment<'_>> {
+    if !bytes.starts_with(b"\xff\xd8") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut offset = 2usize;
+    while offset + 4 <= bytes.len() {
+        if bytes[offset] != 0xff {
+            break;
+        }
+        let marker_start = offset;
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        if offset >= bytes.len() {
+            break;
+        }
+        let marker = bytes[offset];
+        offset += 1;
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if offset + 2 > bytes.len() {
+            break;
+        }
+        let Some(len) = read_be_u16(bytes, offset).map(usize::from) else {
+            break;
+        };
+        if len < 2 {
+            break;
+        }
+        let data_start = offset + 2;
+        let Some(data_end) = offset.checked_add(len) else {
+            break;
+        };
+        if data_end > bytes.len() {
+            break;
+        }
+        if marker == 0xe1 {
+            out.push(JpegApp1Segment {
+                data: &bytes[data_start..data_end],
+                range: marker_start..data_end,
+            });
+        }
+        offset = data_end;
+    }
+    out
+}
+
+#[cfg(feature = "ocr")]
+fn tiff_has_gps_ifd(tiff: &[u8]) -> bool {
+    if tiff.len() < 8 {
+        return false;
+    }
+    let endian = match tiff.get(0..2) {
+        Some(b"II") => Endian::Little,
+        Some(b"MM") => Endian::Big,
+        _ => return false,
+    };
+    if read_u16(tiff, 2, endian) != Some(42) {
+        return false;
+    }
+    let Some(ifd0) = read_u32(tiff, 4, endian).and_then(|v| usize::try_from(v).ok()) else {
+        return false;
+    };
+    ifd_has_tag(tiff, ifd0, endian, 0x8825)
+}
+
+#[cfg(feature = "ocr")]
+fn ifd_has_tag(tiff: &[u8], offset: usize, endian: Endian, tag: u16) -> bool {
+    let Some(count) = read_u16(tiff, offset, endian).map(usize::from) else {
+        return false;
+    };
+    let mut entry = offset.saturating_add(2);
+    for _ in 0..count {
+        if entry.saturating_add(12) > tiff.len() {
+            return false;
+        }
+        if read_u16(tiff, entry, endian) == Some(tag) {
+            return true;
+        }
+        entry += 12;
+    }
+    false
+}
+
+#[cfg(feature = "ocr")]
+#[derive(Clone, Copy)]
+enum Endian {
+    Little,
+    Big,
+}
+
+#[cfg(feature = "ocr")]
+fn read_be_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let slice = bytes.get(offset..offset + 2)?;
+    Some(u16::from_be_bytes([slice[0], slice[1]]))
+}
+
+#[cfg(feature = "ocr")]
+fn read_be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[cfg(feature = "ocr")]
+fn read_u16(bytes: &[u8], offset: usize, endian: Endian) -> Option<u16> {
+    let slice = bytes.get(offset..offset + 2)?;
+    Some(match endian {
+        Endian::Little => u16::from_le_bytes([slice[0], slice[1]]),
+        Endian::Big => u16::from_be_bytes([slice[0], slice[1]]),
+    })
+}
+
+#[cfg(feature = "ocr")]
+fn read_u32(bytes: &[u8], offset: usize, endian: Endian) -> Option<u32> {
+    let slice = bytes.get(offset..offset + 4)?;
+    Some(match endian {
+        Endian::Little => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]),
+        Endian::Big => u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]),
+    })
 }
 
 #[cfg(feature = "ocr")]
@@ -1158,13 +1617,30 @@ fn redacted_image_payload(
     use image::{GenericImageView, ImageFormat};
     use std::io::Cursor;
 
+    let metadata_only = findings.iter().all(|finding| !finding.redact_pixels);
+    if metadata_only {
+        return stripped_metadata_image_payload(bytes)
+            .ok_or_else(|| "could not strip image metadata safely".to_string());
+    }
+
     let image =
         image::load_from_memory(bytes).map_err(|e| format!("could not decode image: {e}"))?;
-    let (width, height) = redacted_image_dimensions(image.dimensions(), cfg.max_edge);
+    let source_dimensions = image.dimensions();
+    let pixels = u64::from(source_dimensions.0).saturating_mul(u64::from(source_dimensions.1));
+    if pixels > cfg.max_pixels {
+        return Err(format!(
+            "image has {pixels} pixels; limit is {}",
+            cfg.max_pixels
+        ));
+    }
+    let (width, height) = redacted_image_dimensions(source_dimensions, cfg.max_edge);
     let mut redacted = image
         .resize_exact(width, height, image::imageops::FilterType::Triangle)
         .to_rgba8();
     for finding in findings {
+        if !finding.redact_pixels {
+            continue;
+        }
         let style = if finding.force_black {
             ImageRedactionStyle::Black
         } else {
@@ -1181,7 +1657,68 @@ fn redacted_image_payload(
     Ok(RedactedImagePayload {
         data_url: format!("data:image/png;base64,{base64}"),
         base64,
+        mime_type: "image/png",
     })
+}
+
+#[cfg(feature = "ocr")]
+fn stripped_metadata_image_payload(bytes: &[u8]) -> Option<RedactedImagePayload> {
+    let (stripped, mime_type) = strip_image_metadata(bytes)?;
+    Some(redacted_payload_from_bytes(stripped, mime_type))
+}
+
+#[cfg(feature = "ocr")]
+fn redacted_payload_from_bytes(bytes: Vec<u8>, mime_type: &'static str) -> RedactedImagePayload {
+    let base64 = data_encoding::BASE64.encode(&bytes);
+    RedactedImagePayload {
+        data_url: format!("data:{mime_type};base64,{base64}"),
+        base64,
+        mime_type,
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn strip_image_metadata(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    match image_signature(bytes) {
+        Some("jpeg") => strip_jpeg_app1_segments(bytes).map(|bytes| (bytes, "image/jpeg")),
+        Some("png") => strip_png_metadata_chunks(bytes).map(|bytes| (bytes, "image/png")),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn strip_jpeg_app1_segments(bytes: &[u8]) -> Option<Vec<u8>> {
+    let ranges = jpeg_app1_segment_ranges(bytes);
+    (!ranges.is_empty()).then(|| strip_byte_ranges(bytes, &ranges))
+}
+
+#[cfg(feature = "ocr")]
+fn strip_png_metadata_chunks(bytes: &[u8]) -> Option<Vec<u8>> {
+    let ranges = png_chunks(bytes)
+        .into_iter()
+        .filter(|chunk| matches!(chunk.kind, b"tEXt" | b"iTXt" | b"zTXt" | b"eXIf"))
+        .map(|chunk| chunk.range)
+        .collect::<Vec<_>>();
+    (!ranges.is_empty()).then(|| strip_byte_ranges(bytes, &ranges))
+}
+
+#[cfg(feature = "ocr")]
+fn strip_byte_ranges(bytes: &[u8], ranges: &[std::ops::Range<usize>]) -> Vec<u8> {
+    let removed = ranges
+        .iter()
+        .map(|range| range.end.saturating_sub(range.start))
+        .sum::<usize>();
+    let mut out = Vec::with_capacity(bytes.len().saturating_sub(removed));
+    let mut cursor = 0usize;
+    for range in ranges {
+        if range.start < cursor || range.end > bytes.len() {
+            continue;
+        }
+        out.extend_from_slice(&bytes[cursor..range.start]);
+        cursor = range.end;
+    }
+    out.extend_from_slice(&bytes[cursor..]);
+    out
 }
 
 #[cfg(not(feature = "ocr"))]
@@ -2296,6 +2833,126 @@ mod tests {
     }
 
     #[cfg(feature = "ocr")]
+    fn solid_jpeg_with_app1(app1: &[u8]) -> Vec<u8> {
+        use image::{codecs::jpeg::JpegEncoder, Rgb, RgbImage};
+
+        let img = RgbImage::from_pixel(48, 32, Rgb([220, 120, 40]));
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode_image(&img)
+            .unwrap();
+        let len = app1.len() + 2;
+        assert!(len <= u16::MAX as usize);
+        let mut out = Vec::with_capacity(jpeg.len() + len + 2);
+        out.extend_from_slice(&jpeg[..2]);
+        out.extend_from_slice(&[0xff, 0xe1, (len >> 8) as u8, len as u8]);
+        out.extend_from_slice(app1);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[cfg(feature = "ocr")]
+    fn exif_text_payload(text: &str) -> Vec<u8> {
+        let mut payload = b"Exif\0\0II*\0\x08\0\0\0\0\0".to_vec();
+        payload.extend_from_slice(text.as_bytes());
+        payload
+    }
+
+    #[cfg(feature = "ocr")]
+    fn exif_gps_payload() -> Vec<u8> {
+        let mut payload = b"Exif\0\0II*\0\x08\0\0\0".to_vec();
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&0x8825u16.to_le_bytes());
+        payload.extend_from_slice(&4u16.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&26u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload
+    }
+
+    #[cfg(feature = "ocr")]
+    fn png_with_text_chunk(keyword: &str, value: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(keyword.as_bytes());
+        data.push(0);
+        data.extend_from_slice(value.as_bytes());
+        png_with_raw_chunk(*b"tEXt", &data)
+    }
+
+    #[cfg(feature = "ocr")]
+    fn png_with_ztxt_chunk(keyword: &str, value: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(keyword.as_bytes());
+        data.push(0);
+        data.push(0);
+        data.extend_from_slice(&zlib_compress(value.as_bytes()));
+        png_with_raw_chunk(*b"zTXt", &data)
+    }
+
+    #[cfg(feature = "ocr")]
+    fn png_with_compressed_itxt_chunk(keyword: &str, value: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(keyword.as_bytes());
+        data.push(0);
+        data.push(1);
+        data.push(0);
+        data.push(0);
+        data.push(0);
+        data.extend_from_slice(&zlib_compress(value.as_bytes()));
+        png_with_raw_chunk(*b"iTXt", &data)
+    }
+
+    #[cfg(feature = "ocr")]
+    fn zlib_compress(bytes: &[u8]) -> Vec<u8> {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[cfg(feature = "ocr")]
+    fn png_with_raw_chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut png = color_grid_png();
+        let iend = png
+            .windows(8)
+            .position(|window| window == b"\0\0\0\0IEND")
+            .unwrap();
+        let len = data.len() as u32;
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&len.to_be_bytes());
+        chunk.extend_from_slice(&kind);
+        chunk.extend_from_slice(data);
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(&kind);
+        crc_input.extend_from_slice(data);
+        chunk.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        png.splice(iend..iend, chunk);
+        png
+    }
+
+    #[cfg(feature = "ocr")]
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = 0u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    #[cfg(feature = "ocr")]
+    fn metadata_test_config() -> ImageOcrConfig {
+        let mut cfg = test_config();
+        cfg.max_pixels = 1;
+        cfg
+    }
+
+    #[cfg(feature = "ocr")]
     fn decode_redacted_payload(payload: &RedactedImagePayload) -> image::RgbaImage {
         let bytes = data_encoding::BASE64
             .decode(payload.base64.as_bytes())
@@ -2310,6 +2967,7 @@ mod tests {
             rect: NormalizedImageRect::new(0.12, 0.16, 0.42, 0.46),
             force_black,
             pad_left: true,
+            redact_pixels: true,
         }
     }
 
@@ -2360,6 +3018,90 @@ mod tests {
             .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
             .unwrap();
         out
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn jpeg_exif_secret_metadata_is_detected_without_pixel_redaction() {
+        let app1 = exif_text_payload("OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX");
+        let jpeg = solid_jpeg_with_app1(&app1);
+        let findings = image_secret_findings(&jpeg, &[7; 32], &metadata_test_config()).unwrap();
+        let exif_finding = findings
+            .iter()
+            .find(|finding| finding.labels.iter().any(|label| label == "OPENAI_API_KEY"))
+            .unwrap_or_else(|| panic!("missing EXIF secret finding: {findings:?}"));
+        assert!(!exif_finding.redact_pixels);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn jpeg_exif_gps_metadata_is_detected_without_pixel_redaction() {
+        let jpeg = solid_jpeg_with_app1(&exif_gps_payload());
+        let findings = image_secret_findings(&jpeg, &[7; 32], &metadata_test_config()).unwrap();
+        let gps_finding = findings
+            .iter()
+            .find(|finding| {
+                finding
+                    .labels
+                    .iter()
+                    .any(|label| label == labels::IMAGE_GPS_METADATA)
+            })
+            .unwrap_or_else(|| panic!("missing EXIF GPS finding: {findings:?}"));
+        assert!(!gps_finding.redact_pixels);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn png_text_metadata_secret_is_detected_without_pixel_redaction() {
+        let png = png_with_text_chunk("Description", "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX");
+        let findings = image_secret_findings(&png, &[7; 32], &metadata_test_config()).unwrap();
+        let text_finding = findings
+            .iter()
+            .find(|finding| finding.labels.iter().any(|label| label == "OPENAI_API_KEY"))
+            .unwrap_or_else(|| panic!("missing PNG text metadata finding: {findings:?}"));
+        assert!(!text_finding.redact_pixels);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn compressed_png_text_metadata_secret_is_detected_without_pixel_redaction() {
+        for png in [
+            png_with_ztxt_chunk("Description", "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+            png_with_compressed_itxt_chunk(
+                "Description",
+                "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+            ),
+        ] {
+            let findings = image_secret_findings(&png, &[7; 32], &metadata_test_config()).unwrap();
+            let text_finding = findings
+                .iter()
+                .find(|finding| finding.labels.iter().any(|label| label == "OPENAI_API_KEY"))
+                .unwrap_or_else(|| panic!("missing compressed PNG metadata finding: {findings:?}"));
+            assert!(!text_finding.redact_pixels);
+        }
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn metadata_only_redaction_strips_metadata_without_reencoding() {
+        let app1 = exif_text_payload("OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX");
+        let jpeg = solid_jpeg_with_app1(&app1);
+        let findings = vec![ImageSecretFinding {
+            labels: vec!["OPENAI_API_KEY".to_string()],
+            rect: None,
+            force_black: false,
+            pad_left: false,
+            redact_pixels: false,
+        }];
+        let payload = redacted_image_payload(&jpeg, 1, &metadata_test_config(), &findings).unwrap();
+        let redacted_bytes = data_encoding::BASE64
+            .decode(payload.base64.as_bytes())
+            .unwrap();
+        assert_eq!(payload.mime_type, "image/jpeg");
+        assert!(payload.data_url.starts_with("data:image/jpeg;base64,"));
+        assert_eq!(image_signature(&redacted_bytes), Some("jpeg"));
+        assert!(image_metadata_regions(&redacted_bytes).is_empty());
+        assert!(jpeg_app1_segments(&redacted_bytes).is_empty());
     }
 
     #[cfg(feature = "ocr")]

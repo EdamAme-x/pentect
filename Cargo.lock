@@ -2368,6 +2368,7 @@ dependencies = [
  "chacha20",
  "data-encoding",
  "ed25519-dalek",
+ "flate2",
  "getrandom 0.2.17",
  "hmac",
  "image",
