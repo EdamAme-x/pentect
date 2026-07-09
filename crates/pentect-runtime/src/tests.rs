@@ -566,19 +566,24 @@ fn local_write_detection_covers_common_powershell_write_forms() {
 
 #[test]
 fn resolve_file_local_write_requires_approval_without_dashboard() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("approval-resolve-needs-dashboard");
+    let _cwd = enter_temp_cwd(&root);
     let approval_session = format!("approval_resolve_needs_dashboard_{}", unix_millis());
 
     let err = approval_decision_for_resolve(&approval_session, &[PathBuf::from(".env.prod")])
         .unwrap_err();
     assert!(err.contains("approval needed"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
+    drop(_cwd);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn forged_unsigned_heartbeat_is_not_alive() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("approval-forged-heartbeat");
+    let _cwd = enter_temp_cwd(&root);
     let session_name = format!("approval_forged_heartbeat_{}", unix_millis());
     let queue = ApprovalQueue::open(&session_name).unwrap();
     let heartbeat = session_root(&session_name)
@@ -597,18 +602,22 @@ fn forged_unsigned_heartbeat_is_not_alive() {
 
     assert!(!queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE));
     let _ = std::fs::remove_dir_all(session_root(&session_name).unwrap());
+    drop(_cwd);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn resolve_stdin_local_write_requires_approval_without_dashboard() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("approval-resolve-stdin-needs-dashboard");
+    let _cwd = enter_temp_cwd(&root);
     let approval_session = format!("approval_resolve_stdin_needs_dashboard_{}", unix_millis());
     let input = "OPENAI_API_KEY=<<OPENAI_API_KEY_abcdef0123456789>>\n";
 
     let err = approval_decision_for_resolve_stdin(&approval_session, input).unwrap_err();
     assert!(err.contains("approval needed"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
+    drop(_cwd);
     let _ = std::fs::remove_dir_all(root);
 }
 

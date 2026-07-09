@@ -5,7 +5,7 @@ use pentect_core::{
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -181,29 +181,21 @@ impl ModelAdapter {
             )
         })?;
         let stdout_reader = spawn_adapter_stdout_reader(stdout);
-        {
-            let mut stdin = child.stdin.take().ok_or_else(|| {
-                format!("could not open stdin for extension adapter '{}'", self.name)
-            })?;
-            use std::io::Write as _;
-            if let Err(e) = stdin.write_all(request.as_bytes()) {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = join_adapter_stdout(stdout_reader, &self.name);
-                return Err(format!(
-                    "could not write to extension adapter '{}': {e}",
-                    self.name
-                ));
-            }
-        }
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("could not open stdin for extension adapter '{}'", self.name))?;
+        let stdin_writer = spawn_adapter_stdin_writer(stdin, request.as_bytes().to_vec());
 
         let status = match wait_for_adapter_child(&mut child, &self.name, self.timeout) {
             Ok(status) => status,
             Err(err) => {
+                let _ = join_adapter_stdin(stdin_writer, &self.name);
                 let _ = join_adapter_stdout(stdout_reader, &self.name);
                 return Err(err);
             }
         };
+        join_adapter_stdin(stdin_writer, &self.name)?;
         let stdout = join_adapter_stdout(stdout_reader, &self.name)?;
         if stdout.len() > MAX_STDOUT_BYTES {
             return Err(format!(
@@ -224,6 +216,18 @@ impl ModelAdapter {
             )
         })
     }
+}
+
+fn spawn_adapter_stdin_writer(
+    mut stdin: ChildStdin,
+    request: Vec<u8>,
+) -> JoinHandle<Result<(), String>> {
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        stdin
+            .write_all(&request)
+            .map_err(|e| format!("could not write adapter stdin: {e}"))
+    })
 }
 
 fn spawn_adapter_stdout_reader(stdout: ChildStdout) -> JoinHandle<Result<Vec<u8>, String>> {
@@ -262,6 +266,13 @@ fn wait_for_adapter_child(
             }
         }
     }
+}
+
+fn join_adapter_stdin(writer: JoinHandle<Result<(), String>>, name: &str) -> Result<(), String> {
+    writer
+        .join()
+        .map_err(|_| format!("extension adapter '{name}' stdin writer panicked"))?
+        .map_err(|e| format!("extension adapter '{name}' {e}"))
 }
 
 fn join_adapter_stdout(

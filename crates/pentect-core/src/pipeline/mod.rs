@@ -226,9 +226,7 @@ impl Engine {
     }
 
     pub fn analyze_spans(&self, input: Input) -> SpanAnalysisResult {
-        let kind = input.kind.clone();
-        let (mut ir, fell_back) = self.parse(input);
-        self.replace_analysis_regions(&mut ir, &kind, fell_back);
+        let (ir, fell_back) = self.parse_for_analysis(input);
         let (spans, residual) = self.masked_spans(&ir);
         SpanAnalysisResult {
             spans,
@@ -243,9 +241,7 @@ impl Engine {
         path: impl Into<String>,
     ) -> SpanAnalysisResult {
         let path = path.into();
-        let kind = input.kind.clone();
-        let (mut ir, fell_back) = self.parse(input);
-        self.replace_analysis_regions(&mut ir, &kind, fell_back);
+        let (mut ir, fell_back) = self.parse_for_analysis(input);
         for region in &mut ir.regions {
             if region.ctx.path.is_none() {
                 region.ctx.path = Some(path.clone());
@@ -256,15 +252,6 @@ impl Engine {
             spans,
             residual,
             parser_fallback: fell_back,
-        }
-    }
-
-    fn replace_analysis_regions(&self, ir: &mut Ir, kind: &Kind, fell_back: bool) {
-        if fell_back {
-            return;
-        }
-        if let Some(regions) = crate::parse::analysis_regions_for_kind(&ir.raw, kind) {
-            ir.regions = regions;
         }
     }
 
@@ -475,7 +462,36 @@ impl Engine {
     /// fallback.
     fn parse(&self, input: Input) -> (Ir, bool) {
         let Input { kind, data: raw } = input;
+        self.parse_raw(kind, raw)
+    }
+
+    fn parse_for_analysis(&self, input: Input) -> (Ir, bool) {
+        let Input { kind, data: raw } = input;
         let protected = scan_placeholders(&raw);
+        if let Some(regions) = crate::parse::analysis_regions_for_kind(&raw, &kind) {
+            return (
+                Ir {
+                    raw,
+                    regions,
+                    protected,
+                },
+                false,
+            );
+        }
+        self.parse_raw_with_protected(kind, raw, protected)
+    }
+
+    fn parse_raw(&self, kind: Kind, raw: String) -> (Ir, bool) {
+        let protected = scan_placeholders(&raw);
+        self.parse_raw_with_protected(kind, raw, protected)
+    }
+
+    fn parse_raw_with_protected(
+        &self,
+        kind: Kind,
+        raw: String,
+        protected: Vec<ByteRange>,
+    ) -> (Ir, bool) {
         let (regions, fell_back) = match self.parsers.iter().find(|(k, _)| *k == kind) {
             Some((_, p)) => match p.parse(&raw) {
                 Some(regions) => (regions, false),

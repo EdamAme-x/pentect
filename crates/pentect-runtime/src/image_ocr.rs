@@ -7,7 +7,7 @@ use pentect_core::model::labels;
 use pentect_core::ByteRange;
 use serde_json::Value;
 #[cfg(feature = "ocr")]
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[cfg(feature = "ocr")]
 const IMAGE_URL_MAX_REDIRECTS: usize = 5;
@@ -2334,6 +2334,9 @@ fn remote_image_ip_is_private(ip: IpAddr) -> bool {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return remote_image_ip_is_private(IpAddr::V4(mapped));
             }
+            if let Some(embedded) = ipv6_embedded_ipv4(ip) {
+                return remote_image_ip_is_private(IpAddr::V4(embedded));
+            }
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
@@ -2341,6 +2344,26 @@ fn remote_image_ip_is_private(ip: IpAddr) -> bool {
                 || ip.is_multicast()
         }
     }
+}
+
+#[cfg(feature = "ocr")]
+fn ipv6_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = ip.octets();
+    if octets[..12] == [0; 12] {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    if octets[..12]
+        == [
+            0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    None
 }
 
 #[cfg(not(feature = "ocr"))]
@@ -3559,8 +3582,17 @@ mod tests {
         assert!(remote_image_ip_is_private(
             "::ffff:10.0.0.1".parse().unwrap()
         ));
+        assert!(remote_image_ip_is_private("::127.0.0.1".parse().unwrap()));
+        assert!(remote_image_ip_is_private("::10.0.0.1".parse().unwrap()));
+        assert!(remote_image_ip_is_private(
+            "64:ff9b::a00:1".parse().unwrap()
+        ));
         assert!(!remote_image_ip_is_private(
             "::ffff:8.8.8.8".parse().unwrap()
+        ));
+        assert!(!remote_image_ip_is_private("::8.8.8.8".parse().unwrap()));
+        assert!(!remote_image_ip_is_private(
+            "64:ff9b::808:808".parse().unwrap()
         ));
         assert!(!remote_image_ip_is_private("8.8.8.8".parse().unwrap()));
     }
