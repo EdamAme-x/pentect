@@ -32,6 +32,7 @@ use pentect_core::{
     infer_kind, parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile,
     RegionKind,
 };
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, PtySize};
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, RecoveryStore, Session};
 use sha2::{Digest, Sha256};
@@ -39,9 +40,11 @@ use shell::{next_shell_word, powershell_word, shell_quote_unix};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use zeroize::Zeroize;
 
@@ -54,6 +57,9 @@ const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
 const ACTIVE_TOOL_OUTPUT_CACHE_LIMIT: usize = 128;
 const ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES: usize = 16 * 1024;
+const PTY_PARTIAL_FLUSH_TIMEOUT: Duration = Duration::from_millis(30);
+const PTY_PARTIAL_FLUSH_BYTES: usize = 4096;
+const PTY_PARTIAL_TAIL_BYTES: usize = 512;
 
 #[cfg(test)]
 thread_local! {
@@ -697,11 +703,10 @@ fn cmd_shell(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let status = match run_masked_shell(store, &opts) {
-        Ok(status) => status,
-        Err(e) => return die(&e),
-    };
-    exit_code(status)
+    match run_masked_shell(store, &opts) {
+        Ok(code) => code,
+        Err(e) => die(&e),
+    }
 }
 
 fn cmd_resolve(args: &[String]) -> i32 {
@@ -1797,15 +1802,27 @@ fn run_live_command(
     Ok(status)
 }
 
-fn run_masked_shell(store: RecoveryStore, opts: &ShellOpts) -> Result<ExitStatus, String> {
+fn run_masked_shell(store: RecoveryStore, opts: &ShellOpts) -> Result<i32, String> {
     let shim = ShellShimDir::install()?;
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        run_masked_shell_pty(store, opts, &shim)
+    } else {
+        run_masked_shell_pipe(store, opts, &shim)
+    }
+}
+
+fn run_masked_shell_pipe(
+    store: RecoveryStore,
+    opts: &ShellOpts,
+    shim: &ShellShimDir,
+) -> Result<i32, String> {
     let mut command = match &opts.program {
         Some(program) => shell_program_command(program)?,
-        None => interactive_shell_command(),
+        None => interactive_shell_pipe_command(),
     };
     apply_child_env_overlays(&mut command, &[], &opts.session);
     apply_active_in_memory_manager_env(&mut command);
-    shim.apply_to(&mut command);
+    shim.apply_to_command(&mut command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1844,7 +1861,56 @@ fn run_masked_shell(store: RecoveryStore, opts: &ShellOpts) -> Result<ExitStatus
     };
     join_stream_thread(stdout_thread)?;
     join_stream_thread(stderr_thread)?;
-    Ok(status)
+    Ok(exit_code(status))
+}
+
+fn run_masked_shell_pty(
+    store: RecoveryStore,
+    opts: &ShellOpts,
+    shim: &ShellShimDir,
+) -> Result<i32, String> {
+    let shell = match &opts.program {
+        Some(program) => shell_program_argv(program)?,
+        None => interactive_shell_pty_program(),
+    };
+    let pty_system = native_pty_system();
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("could not start pty: {e}"))?;
+    let mut command = CommandBuilder::new(&shell.command);
+    command.args(&shell.args);
+    apply_shell_env_builder(&mut command, &opts.session, shim);
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|e| format!("could not start shell: {e}"))?;
+    drop(pair.slave);
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("could not capture shell output: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("could not open shell input: {e}"))?;
+    let suppressor = PtyEchoSuppressor::default();
+    let output_store = store.clone();
+    let output_suppressor = suppressor.clone();
+    let output_thread = std::thread::spawn(move || {
+        let mut masker = OutputMasker::new_deferred(output_store)?;
+        stream_masked_pty_reader(&mut masker, reader, output_suppressor)?;
+        masker.flush()
+    });
+    let status = pump_masked_pty_terminal_stdin(child.as_mut(), writer, store, suppressor)?;
+    drop(pair.master);
+    join_stream_thread(output_thread)?;
+    Ok(pty_exit_code(status))
 }
 
 fn shell_program_command(program: &[String]) -> Result<Command, String> {
@@ -1856,9 +1922,24 @@ fn shell_program_command(program: &[String]) -> Result<Command, String> {
     Ok(cmd)
 }
 
+struct ShellProgram {
+    command: OsString,
+    args: Vec<OsString>,
+}
+
+fn shell_program_argv(program: &[String]) -> Result<ShellProgram, String> {
+    let Some((command, args)) = program.split_first() else {
+        return Err("shell requires PROGRAM after `--`".to_string());
+    };
+    Ok(ShellProgram {
+        command: OsString::from(command),
+        args: args.iter().map(OsString::from).collect(),
+    })
+}
+
 #[cfg(windows)]
-fn interactive_shell_command() -> Command {
-    let shell = std::env::var_os("SystemRoot")
+fn windows_powershell_path() -> PathBuf {
+    std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .map(|root| {
             root.join("System32")
@@ -1867,7 +1948,12 @@ fn interactive_shell_command() -> Command {
                 .join("powershell.exe")
         })
         .filter(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from("powershell"));
+        .unwrap_or_else(|| PathBuf::from("powershell"))
+}
+
+#[cfg(windows)]
+fn interactive_shell_pipe_command() -> Command {
+    let shell = windows_powershell_path();
     let mut cmd = Command::new(shell);
     cmd.arg("-NoLogo")
         .arg("-NoProfile")
@@ -1876,8 +1962,43 @@ fn interactive_shell_command() -> Command {
     cmd
 }
 
+#[cfg(windows)]
+fn interactive_shell_pty_program() -> ShellProgram {
+    ShellProgram {
+        command: windows_powershell_path().into_os_string(),
+        args: vec![
+            OsString::from("-NoLogo"),
+            OsString::from("-NoProfile"),
+            OsString::from("-NoExit"),
+            OsString::from("-Command"),
+            OsString::from("try { Set-PSReadLineOption -HistorySaveStyle SaveNothing } catch {}"),
+        ],
+    }
+}
+
 #[cfg(not(windows))]
-fn interactive_shell_command() -> Command {
+fn interactive_shell_path() -> PathBuf {
+    std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            Path::new("/bin/sh")
+                .is_file()
+                .then(|| PathBuf::from("/bin/sh"))
+        })
+        .unwrap_or_else(|| PathBuf::from("sh"))
+}
+
+#[cfg(not(windows))]
+fn interactive_shell_pipe_command() -> Command {
+    let shell = interactive_shell_path();
+    let mut cmd = Command::new(shell);
+    cmd.arg("-i");
+    cmd
+}
+
+#[cfg(not(windows))]
+fn interactive_shell_pty_program() -> ShellProgram {
     let shell = std::env::var_os("SHELL")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -1887,9 +2008,10 @@ fn interactive_shell_command() -> Command {
                 .then(|| PathBuf::from("/bin/sh"))
         })
         .unwrap_or_else(|| PathBuf::from("sh"));
-    let mut cmd = Command::new(shell);
-    cmd.arg("-i");
-    cmd
+    ShellProgram {
+        command: shell.into_os_string(),
+        args: vec![OsString::from("-i")],
+    }
 }
 
 fn pump_plain_stdin_until_exit(
@@ -1943,9 +2065,74 @@ fn pump_masked_terminal_stdin(
                 }
             }
             crossterm::event::Event::Paste(text) => {
-                forward_masked_text(&text, &mut child_stdin, &mut line_stars, &mut protector)?;
+                forward_masked_text(
+                    &text,
+                    &mut child_stdin,
+                    &mut line_stars,
+                    &mut protector,
+                    ShellInputEcho::Masked,
+                    None,
+                )?;
             }
             _ => {}
+        }
+    }
+}
+
+fn pump_masked_pty_terminal_stdin(
+    child: &mut dyn PtyChild,
+    mut child_stdin: Box<dyn Write + Send>,
+    store: RecoveryStore,
+    suppressor: PtyEchoSuppressor,
+) -> Result<portable_pty::ExitStatus, String> {
+    let _raw = RawModeGuard::enable()?;
+    let mut protector = ShellInputProtector::new(store)?;
+    let (input_tx, input_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut input = std::io::stdin().lock();
+        let mut buf = [0u8; 8192];
+        loop {
+            match input.read(&mut buf) {
+                Ok(0) => {
+                    let _ = input_tx.send(Vec::new());
+                    break;
+                }
+                Ok(n) => {
+                    if input_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = input_tx.send(Vec::new());
+                    break;
+                }
+            }
+        }
+    });
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("could not poll shell: {e}"))?
+        {
+            return Ok(status);
+        }
+        match input_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(bytes) if bytes.is_empty() => {
+                drop(child_stdin);
+                return child
+                    .wait()
+                    .map_err(|e| format!("could not wait for shell: {e}"));
+            }
+            Ok(bytes) => {
+                forward_pty_input_bytes(&bytes, child_stdin.as_mut(), &mut protector, &suppressor)?;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(child_stdin);
+                return child
+                    .wait()
+                    .map_err(|e| format!("could not wait for shell: {e}"));
+            }
         }
     }
 }
@@ -2039,21 +2226,67 @@ fn forward_masked_key(
     Ok(true)
 }
 
+fn forward_pty_input_bytes(
+    bytes: &[u8],
+    child_stdin: &mut dyn Write,
+    protector: &mut ShellInputProtector,
+    suppressor: &PtyEchoSuppressor,
+) -> Result<(), String> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if should_protect_pty_input_text(text) {
+            let mut line_stars = 0usize;
+            return forward_masked_text(
+                text,
+                child_stdin,
+                &mut line_stars,
+                protector,
+                ShellInputEcho::Native,
+                Some(suppressor),
+            );
+        }
+    }
+    child_stdin
+        .write_all(bytes)
+        .map_err(|e| format!("could not write shell stdin: {e}"))?;
+    child_stdin
+        .flush()
+        .map_err(|e| format!("could not flush shell stdin: {e}"))
+}
+
+fn should_protect_pty_input_text(text: &str) -> bool {
+    text.len() >= 16 && !text.contains('\x1b')
+}
+
+#[derive(Clone, Copy)]
+enum ShellInputEcho {
+    Masked,
+    Native,
+}
+
 fn forward_masked_text(
     text: &str,
     child_stdin: &mut dyn Write,
     line_stars: &mut usize,
     protector: &mut ShellInputProtector,
+    echo: ShellInputEcho,
+    suppressor: Option<&PtyEchoSuppressor>,
 ) -> Result<(), String> {
     let paste = protector.prepare_paste(text)?;
     child_stdin
         .write_all(paste.child.as_bytes())
         .map_err(|e| format!("could not write shell stdin: {e}"))?;
-    if paste.changed {
-        echo_visible_input(&paste.visible)?;
-        *line_stars = trailing_line_width(&paste.visible);
-    } else {
-        echo_masked_text(&paste.visible, line_stars)?;
+    if let Some(suppressor) = suppressor {
+        suppressor.push(paste.injected_prefix.clone());
+    }
+    match echo {
+        ShellInputEcho::Masked if paste.changed => {
+            echo_visible_input(&paste.visible)?;
+            *line_stars = trailing_line_width(&paste.visible);
+        }
+        ShellInputEcho::Masked => {
+            echo_masked_text(&paste.visible, line_stars)?;
+        }
+        ShellInputEcho::Native => {}
     }
     child_stdin
         .flush()
@@ -2111,10 +2344,62 @@ fn trailing_line_width(text: &str) -> usize {
         .count()
 }
 
+#[derive(Clone, Default)]
+struct PtyEchoSuppressor {
+    entries: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl PtyEchoSuppressor {
+    fn push(&self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        while entries.len() >= 32 {
+            if let Some(mut old) = entries.pop_front() {
+                old.zeroize();
+            }
+        }
+        entries.push_back(text);
+    }
+
+    fn scrub(&self, text: &mut String) {
+        if text.is_empty() {
+            return;
+        }
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let mut index = 0;
+        while index < entries.len() {
+            let found = {
+                let entry = &entries[index];
+                let mut found = false;
+                while let Some(start) = text.find(entry.as_str()) {
+                    let end = start + entry.len();
+                    text.replace_range(start..end, "");
+                    found = true;
+                }
+                found
+            };
+            if found {
+                if let Some(mut removed) = entries.remove(index) {
+                    removed.zeroize();
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
 struct ProtectedPaste {
     child: String,
     visible: String,
     changed: bool,
+    injected_prefix: String,
 }
 
 struct ShellInputProtector {
@@ -2143,12 +2428,15 @@ impl ShellInputProtector {
                 child: text.to_string(),
                 visible: text.to_string(),
                 changed: false,
+                injected_prefix: String::new(),
             });
         }
         let mut child = String::new();
+        let mut injected_prefix = String::new();
         for mut binding in bindings {
             if self.defined_env.insert(binding.name.clone()) {
                 let assignment = self.syntax.env_assignment(&binding.name, &binding.value);
+                injected_prefix.push_str(&assignment);
                 child.push_str(&assignment);
             }
             binding.value.zeroize();
@@ -2158,6 +2446,7 @@ impl ShellInputProtector {
             child,
             visible,
             changed: true,
+            injected_prefix,
         })
     }
 }
@@ -2237,6 +2526,21 @@ fn apply_active_in_memory_manager_env(command: &mut Command) {
     command.env(PENTECT_AGENT_LAUNCHED_ENV, token);
 }
 
+fn apply_shell_env_builder(command: &mut CommandBuilder, session: &str, shim: &ShellShimDir) {
+    command.env_remove(ENV_ADDR);
+    command.env_remove(ENV_TOKEN);
+    command.env_remove(PENTECT_AGENT_LAUNCHED_ENV);
+    command.env("PENTECT_SESSION", session);
+    if let (Some(addr), Some(token)) = (std::env::var_os(ENV_ADDR), std::env::var_os(ENV_TOKEN)) {
+        if !addr.is_empty() && !token.is_empty() {
+            command.env(ENV_ADDR, addr);
+            command.env(ENV_TOKEN, &token);
+            command.env(PENTECT_AGENT_LAUNCHED_ENV, token);
+        }
+    }
+    shim.apply_to_builder(command);
+}
+
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -2278,10 +2582,16 @@ impl ShellShimDir {
         Ok(shim)
     }
 
-    fn apply_to(&self, command: &mut Command) {
+    fn apply_to_command(&self, command: &mut Command) {
         command.env("PENTECT_SHELL_BIN", &self.pentect);
         command.env("PENTECT_SHELL", "1");
-        prepend_path_env(command, &self.path);
+        command.env(path_env_key(), prepended_path_value(&self.path));
+    }
+
+    fn apply_to_builder(&self, command: &mut CommandBuilder) {
+        command.env("PENTECT_SHELL_BIN", &self.pentect);
+        command.env("PENTECT_SHELL", "1");
+        command.env(path_env_key(), prepended_path_value(&self.path));
     }
 }
 
@@ -2357,13 +2667,13 @@ fn write_tool_shim(dir: &Path, tool: &str) -> Result<(), String> {
         .map_err(|e| format!("could not chmod shell shim '{}': {e}", path.display()))
 }
 
-fn prepend_path_env(command: &mut Command, path: &Path) {
+fn prepended_path_value(path: &Path) -> OsString {
     let mut value = std::ffi::OsString::from(path.as_os_str());
     if let Some(existing) = std::env::var_os("PATH") {
         value.push(if cfg!(windows) { ";" } else { ":" });
         value.push(existing);
     }
-    command.env(path_env_key(), value);
+    value
 }
 
 fn path_env_key() -> &'static str {
@@ -2410,6 +2720,130 @@ fn stream_masked_reader<R: Read>(
         flush_masked_chunk(masker, target, &mut chunk, kind)?;
     }
     Ok(())
+}
+
+enum PtyReadEvent {
+    Data(Vec<u8>),
+    Eof,
+    Error(String),
+}
+
+fn stream_masked_pty_reader(
+    masker: &mut OutputMasker,
+    mut reader: Box<dyn Read + Send>,
+    suppressor: PtyEchoSuppressor,
+) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    let _ = tx.send(PtyReadEvent::Eof);
+                    break;
+                }
+                Ok(n) => {
+                    if tx.send(PtyReadEvent::Data(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(PtyReadEvent::Error(format!(
+                        "could not read shell output: {e}"
+                    )));
+                    break;
+                }
+            }
+        }
+    });
+    let mut pending = String::new();
+    let mut read_error = None;
+    loop {
+        match rx.recv_timeout(PTY_PARTIAL_FLUSH_TIMEOUT) {
+            Ok(PtyReadEvent::Data(bytes)) => {
+                pending.push_str(&String::from_utf8_lossy(&bytes));
+                flush_pty_complete_lines(masker, &suppressor, &mut pending)?;
+                flush_pty_large_prefix(masker, &suppressor, &mut pending)?;
+            }
+            Ok(PtyReadEvent::Eof) => break,
+            Ok(PtyReadEvent::Error(e)) => {
+                read_error = Some(e);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if should_flush_pty_partial(&pending) {
+                    flush_pty_text(masker, &suppressor, &mut pending)?;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !pending.is_empty() {
+        flush_pty_text(masker, &suppressor, &mut pending)?;
+    }
+    match reader_thread.join() {
+        Ok(()) => {}
+        Err(_) => return Err("pty output reader thread panicked".to_string()),
+    }
+    if let Some(e) = read_error {
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn flush_pty_complete_lines(
+    masker: &mut OutputMasker,
+    suppressor: &PtyEchoSuppressor,
+    pending: &mut String,
+) -> Result<(), String> {
+    while let Some(index) = pending.find('\n') {
+        let mut line: String = pending.drain(..=index).collect();
+        flush_pty_text(masker, suppressor, &mut line)?;
+    }
+    Ok(())
+}
+
+fn flush_pty_large_prefix(
+    masker: &mut OutputMasker,
+    suppressor: &PtyEchoSuppressor,
+    pending: &mut String,
+) -> Result<(), String> {
+    if pending.len() <= PTY_PARTIAL_FLUSH_BYTES {
+        return Ok(());
+    }
+    let mut split = pending.len().saturating_sub(PTY_PARTIAL_TAIL_BYTES);
+    while split > 0 && !pending.is_char_boundary(split) {
+        split -= 1;
+    }
+    if split == 0 {
+        return Ok(());
+    }
+    let mut prefix: String = pending.drain(..split).collect();
+    flush_pty_text(masker, suppressor, &mut prefix)
+}
+
+fn should_flush_pty_partial(pending: &str) -> bool {
+    !pending.is_empty()
+        && (pending.contains('\x1b')
+            || pending.len() >= 256
+            || pending.ends_with("> ")
+            || pending.ends_with("$ ")
+            || pending.ends_with("# ")
+            || pending.ends_with(": ")
+            || pending.ends_with("? "))
+}
+
+fn flush_pty_text(
+    masker: &mut OutputMasker,
+    suppressor: &PtyEchoSuppressor,
+    chunk: &mut String,
+) -> Result<(), String> {
+    suppressor.scrub(chunk);
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let kind = live_output_kind(chunk);
+    flush_masked_chunk(masker, StreamTarget::Stdout, chunk, kind)
 }
 
 fn flush_masked_chunk(
@@ -2482,6 +2916,10 @@ fn shell_script_command() -> Command {
 
 fn exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
+}
+
+fn pty_exit_code(status: portable_pty::ExitStatus) -> i32 {
+    i32::try_from(status.exit_code()).unwrap_or(1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

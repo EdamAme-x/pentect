@@ -182,7 +182,15 @@ fn shell_masked_paste_preserves_original_stdin_bytes() {
     let mut protector = ShellInputProtector::new(store).unwrap();
     let mut forwarded = Vec::new();
     let mut line_stars = 0usize;
-    forward_masked_text("abc\n秘密", &mut forwarded, &mut line_stars, &mut protector).unwrap();
+    forward_masked_text(
+        "abc\n秘密",
+        &mut forwarded,
+        &mut line_stars,
+        &mut protector,
+        ShellInputEcho::Masked,
+        None,
+    )
+    .unwrap();
     assert_eq!(forwarded, "abc\n秘密".as_bytes());
     assert_eq!(line_stars, 2);
     let _ = std::fs::remove_dir_all(root);
@@ -200,6 +208,11 @@ fn shell_secret_paste_replaces_visible_value_with_env_ref() {
     assert!(paste.changed);
     assert!(!paste.visible.contains(raw), "{}", paste.visible);
     assert!(!paste.visible.contains("<<"), "{}", paste.visible);
+    assert!(
+        paste.injected_prefix.contains(raw),
+        "{}",
+        paste.injected_prefix
+    );
     if cfg!(windows) {
         assert!(paste.visible.contains("$env:PENTECT_"), "{}", paste.visible);
         assert!(paste.child.contains("$env:PENTECT_"), "{}", paste.child);
@@ -207,6 +220,38 @@ fn shell_secret_paste_replaces_visible_value_with_env_ref() {
         assert!(paste.visible.contains("${PENTECT_"), "{}", paste.visible);
         assert!(paste.child.contains("${PENTECT_"), "{}", paste.child);
     }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pty_echo_suppressor_removes_injected_env_prefix_only() {
+    let suppressor = PtyEchoSuppressor::default();
+    suppressor.push("$env:PENTECT_TOKEN='raw-secret'; ".to_string());
+    let mut text = "$env:PENTECT_TOKEN='raw-secret'; curl -H $env:PENTECT_TOKEN\r\n".to_string();
+    suppressor.scrub(&mut text);
+    assert_eq!(text, "curl -H $env:PENTECT_TOKEN\r\n");
+}
+
+#[test]
+fn pty_input_bytes_keep_escape_sequences_and_rewrite_secret_chunks() {
+    let (root, session) = empty_session("shell-pty-input");
+    let store = RecoveryStore::load(&session).unwrap();
+    let mut protector = ShellInputProtector::new(store).unwrap();
+    let suppressor = PtyEchoSuppressor::default();
+    let mut forwarded = Vec::new();
+
+    forward_pty_input_bytes(b"\x1b[A", &mut forwarded, &mut protector, &suppressor).unwrap();
+    assert_eq!(forwarded, b"\x1b[A");
+
+    let raw = b"Authorization: Bearer sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    forward_pty_input_bytes(raw, &mut forwarded, &mut protector, &suppressor).unwrap();
+    let text = String::from_utf8(forwarded).unwrap();
+    assert!(text.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{text}");
+    assert!(text.contains("PENTECT_OPENAI_API_KEY_"), "{text}");
+    let mut echoed = text.clone();
+    suppressor.scrub(&mut echoed);
+    assert!(!echoed.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{echoed}");
+    assert!(echoed.contains("PENTECT_OPENAI_API_KEY_"), "{echoed}");
     let _ = std::fs::remove_dir_all(root);
 }
 
