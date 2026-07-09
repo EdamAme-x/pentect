@@ -298,6 +298,24 @@ impl ActiveToolOutputMasker {
         Ok(Some(masked))
     }
 
+    pub fn mask_prompt_text(&mut self, text: &str) -> Result<Option<String>, String> {
+        let Some(masker) = &mut self.masker else {
+            return Ok(None);
+        };
+        let masked = masker.mask_text(text, Kind::Text)?;
+        let total = masker.masked_count();
+        let delta = total.saturating_sub(self.reported_masked_count);
+        self.reported_masked_count = total;
+        if delta > 0 {
+            self.cache.clear();
+            self.cache_order.clear();
+            if let Some(client) = &self.client {
+                client.add_masked_count(delta).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(Some(masked))
+    }
+
     fn remember(&mut self, key: [u8; 32], masked: &str, masked_count: u64) {
         if self.cache.contains_key(&key) {
             return;
@@ -339,7 +357,7 @@ pub fn mask_prompt_text_into_active_in_memory_manager(
     if text.is_empty() {
         return Ok(None);
     }
-    ActiveToolOutputMasker::new()?.mask_tool_output(text)
+    ActiveToolOutputMasker::new()?.mask_prompt_text(text)
 }
 
 fn exec_server_approval_command(mode: &ExecMode, env: &[(String, String)]) -> String {
@@ -1545,6 +1563,7 @@ fn referenced_env_names(mode: &ExecMode) -> BTreeSet<String> {
     match mode {
         ExecMode::Shell(command) => {
             collect_powershell_env_refs(command, &mut names);
+            collect_powershell_env_provider_refs(command, &mut names);
             collect_printenv_refs(command, &mut names);
             collect_percent_env_refs(command, &mut names);
             if !cfg!(windows) {
@@ -1555,6 +1574,7 @@ fn referenced_env_names(mode: &ExecMode) -> BTreeSet<String> {
         ExecMode::Program(args) => {
             let text = args.join(" ");
             collect_powershell_env_refs(&text, &mut names);
+            collect_powershell_env_provider_refs(&text, &mut names);
             collect_printenv_refs(&text, &mut names);
             collect_percent_env_refs(&text, &mut names);
             collect_bare_dollar_env_refs(&text, &mut names);
@@ -1577,6 +1597,29 @@ fn collect_powershell_env_refs(text: &str, out: &mut BTreeSet<String>) {
             out.insert(lower[name_start..name_end].to_string());
         }
         offset = name_end.max(offset + index + "$env:".len());
+    }
+}
+
+fn collect_powershell_env_provider_refs(text: &str, out: &mut BTreeSet<String>) {
+    let lower = text.to_ascii_lowercase();
+    let mut offset = 0usize;
+    while let Some(index) = lower[offset..].find("env:") {
+        let env_start = offset + index;
+        let before = lower[..env_start].chars().next_back();
+        if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            offset = env_start + "env:".len();
+            continue;
+        }
+        let name_start = env_start + "env:".len();
+        let mut name_end = name_start;
+        let bytes = lower.as_bytes();
+        while name_end < bytes.len() && is_env_name_byte(bytes[name_end]) {
+            name_end += 1;
+        }
+        if name_end > name_start {
+            out.insert(lower[name_start..name_end].to_string());
+        }
+        offset = name_end.max(env_start + "env:".len());
     }
 }
 
@@ -3581,7 +3624,7 @@ fn before_tool_updated_input(
         if let Some(reason) = pentect_human_only_command_reason(command) {
             return Err(reason);
         }
-        if provider == HookProvider::Codex && codex_exec_proxy_enabled() {
+        if codex_exec_proxy_should_own_shell_tool(provider) {
             return Ok((tool_input.clone(), false));
         }
         let command = canonical_hook_shell_command(command)?;
@@ -3623,7 +3666,7 @@ fn before_tool_updated_input_lazy(
         if let Some(reason) = pentect_human_only_command_reason(command) {
             return Err(reason);
         }
-        if provider == HookProvider::Codex && codex_exec_proxy_enabled() {
+        if codex_exec_proxy_should_own_shell_tool(provider) {
             return Ok((tool_input.clone(), false));
         }
         let command = canonical_hook_shell_command(command)?;
@@ -3651,6 +3694,16 @@ fn codex_exec_proxy_enabled() -> bool {
     std::env::var(PENTECT_CODEX_EXEC_PROXY_ENV).is_ok_and(|value| value == "1")
 }
 
+fn codex_app_server_proxy_active() -> bool {
+    std::env::var("PENTECT_CODEX_APP_SERVER_PROXY").is_ok_and(|value| value == "1")
+}
+
+fn codex_exec_proxy_should_own_shell_tool(provider: HookProvider) -> bool {
+    provider == HookProvider::Codex
+        && codex_exec_proxy_enabled()
+        && !codex_app_server_proxy_active()
+}
+
 #[cfg(test)]
 fn set_codex_exec_proxy_test_override(value: Option<bool>) -> Option<bool> {
     CODEX_EXEC_PROXY_TEST_OVERRIDE.with(|cell| {
@@ -3661,7 +3714,7 @@ fn set_codex_exec_proxy_test_override(value: Option<bool>) -> Option<bool> {
 }
 
 fn codex_exec_proxy_owns_shell_output(provider: HookProvider, tool_name: &str) -> bool {
-    provider == HookProvider::Codex && codex_exec_proxy_enabled() && is_shell_tool_name(tool_name)
+    codex_exec_proxy_should_own_shell_tool(provider) && is_shell_tool_name(tool_name)
 }
 
 fn is_shell_tool_name(tool_name: &str) -> bool {
@@ -4394,6 +4447,10 @@ fn extract_pentect_exec_shell_payload(command: &str) -> Option<String> {
     }
 }
 
+pub fn display_command_without_pentect_exec_wrapper(command: &str) -> Option<String> {
+    extract_pentect_exec_shell_payload(command)
+}
+
 fn pentect_human_only_command_reason(command: &str) -> Option<String> {
     let invocation = parse_pentect_subcommand(command)?;
     match invocation.subcommand {
@@ -4448,6 +4505,7 @@ fn parse_pentect_subcommand(command: &str) -> Option<PentectInvocation<'_>> {
 fn is_pentect_command(command: &str) -> bool {
     let normalized = command.replace('\\', "/");
     let command = normalized.trim_start_matches("./");
+    let command = command.to_ascii_lowercase();
     command == "pentect"
         || command == "pentect.exe"
         || command.ends_with("/pentect")

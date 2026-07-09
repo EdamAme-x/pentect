@@ -869,14 +869,13 @@ fn prompt_masked_env_is_available_to_exec_proxy_without_visible_pentect_exec() {
     std::env::set_var(ENV_TOKEN, token);
 
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-    let prompt = mask_prompt_text_into_active_in_memory_manager(&format!("OPENAI_API_KEY={raw}"))
-        .unwrap()
-        .unwrap();
+    let prompt = mask_prompt_text_into_active_in_memory_manager(&format!(
+        "OPENAI_API_KEY={raw} use it from $env:OPENAI_API_KEY"
+    ))
+    .unwrap()
+    .unwrap();
     assert!(!prompt.contains(raw), "{prompt}");
-    assert!(
-        prompt.contains("OPENAI_API_KEY=<<OPENAI_API_KEY_"),
-        "{prompt}"
-    );
+    assert!(prompt.contains("OPENAI_API_KEY=<<"), "{prompt}");
 
     let argv_mode = if cfg!(windows) {
         vec![
@@ -1060,6 +1059,26 @@ fn exec_only_injects_referenced_capability_env() {
     assert_eq!(one.len(), 1, "{one:?}");
     assert_eq!(one[0].0, "RUNPOD_API_KEY");
     assert_eq!(one[0].1, "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn exec_injects_powershell_env_provider_references() {
+    let root = temp_root("capability-env-provider");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let value = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let _masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={value}\n")).unwrap();
+    let store = RecoveryStore::load(&session).unwrap();
+    let env = requested_env_bindings(
+        &store,
+        &ExecMode::Shell("Test-Path Env:OPENAI_API_KEY".to_string()),
+    )
+    .unwrap();
+    assert!(
+        env.iter()
+            .any(|(name, found)| name == "OPENAI_API_KEY" && found == value),
+        "{env:?}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3623,6 +3642,66 @@ fn pretool_wraps_plain_shell_commands_for_every_provider() {
         assert!(!command.contains("--shell-b64"), "{command}");
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn codex_app_server_proxy_wraps_shell_even_when_exec_proxy_is_enabled() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    std::env::set_var("PENTECT_CODEX_APP_SERVER_PROXY", "1");
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("PENTECT_CODEX_APP_SERVER_PROXY");
+        }
+    }
+    let _cleanup = Cleanup;
+    let _exec_proxy = ScopedCodexExecProxy::set(true);
+    let (root, session) = empty_session("hook-pre-codex-app-server");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "Write-Output $env:OPENAI_API_KEY"
+        }
+    });
+    let output = handle_hook(HookProvider::Codex, DEFAULT_SESSION, &session, input).unwrap();
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.starts_with("pentect exec "), "{command}");
+    assert!(command.contains("$env:OPENAI_API_KEY"), "{command}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn codex_exec_proxy_keeps_plain_shell_unwrapped_without_app_server_proxy() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("PENTECT_CODEX_APP_SERVER_PROXY");
+    let _exec_proxy = ScopedCodexExecProxy::set(true);
+    let (root, session) = empty_session("hook-pre-codex-exec-proxy");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "echo hello"
+        }
+    });
+    let output = handle_hook(HookProvider::Codex, DEFAULT_SESSION, &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn display_command_without_pentect_exec_wrapper_returns_shell_payload() {
+    let wrapped = wrap_shell_command(HookProvider::Codex, DEFAULT_SESSION, "cat .env").unwrap();
+    assert_eq!(
+        display_command_without_pentect_exec_wrapper(&wrapped).as_deref(),
+        Some("cat .env")
+    );
+    assert_eq!(
+        display_command_without_pentect_exec_wrapper("cat .env"),
+        None
+    );
 }
 
 #[test]

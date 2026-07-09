@@ -765,6 +765,11 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         .transpose()?;
     let codex_args =
         if codex_app_server_proxy_enabled(&opts.tool_args, opts.codex_app_server_proxy_disabled)? {
+            let _app_server_proxy_env = EnvVarGuard::set_optional([(
+                app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV,
+                Some(OsString::from("1")),
+            )]);
+            cmd.env(app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV, "1");
             let proxy = app_server_proxy::AppServerProxyGuard::start(
                 &opts.command,
                 codex_app_server_args(&configs, &opts.tool_args),
