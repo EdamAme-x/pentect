@@ -49,6 +49,15 @@ impl Parser for ToolResultParser {
     }
 }
 
+pub(crate) fn analysis_regions_for_kind(raw: &str, kind: &Kind) -> Option<Vec<Region>> {
+    match kind {
+        Kind::Json | Kind::Har => json::parse_json_analysis_regions(raw),
+        Kind::Ndjson => json::parse_ndjson_analysis_regions(raw),
+        Kind::ToolResult => json::parse_tool_result_analysis_regions(raw),
+        _ => None,
+    }
+}
+
 /// Parses `.env` / KEY=VALUE lines into one region per value, tagged with its
 /// key, so key-anchored detection works on the highest-yield leak format. Keys,
 /// `=`, quotes, comments, and newlines stay outside regions and are preserved.

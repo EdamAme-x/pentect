@@ -566,19 +566,24 @@ fn local_write_detection_covers_common_powershell_write_forms() {
 
 #[test]
 fn resolve_file_local_write_requires_approval_without_dashboard() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("approval-resolve-needs-dashboard");
+    let _cwd = enter_temp_cwd(&root);
     let approval_session = format!("approval_resolve_needs_dashboard_{}", unix_millis());
 
     let err = approval_decision_for_resolve(&approval_session, &[PathBuf::from(".env.prod")])
         .unwrap_err();
     assert!(err.contains("approval needed"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
+    drop(_cwd);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn forged_unsigned_heartbeat_is_not_alive() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("approval-forged-heartbeat");
+    let _cwd = enter_temp_cwd(&root);
     let session_name = format!("approval_forged_heartbeat_{}", unix_millis());
     let queue = ApprovalQueue::open(&session_name).unwrap();
     let heartbeat = session_root(&session_name)
@@ -597,18 +602,22 @@ fn forged_unsigned_heartbeat_is_not_alive() {
 
     assert!(!queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE));
     let _ = std::fs::remove_dir_all(session_root(&session_name).unwrap());
+    drop(_cwd);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn resolve_stdin_local_write_requires_approval_without_dashboard() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("approval-resolve-stdin-needs-dashboard");
+    let _cwd = enter_temp_cwd(&root);
     let approval_session = format!("approval_resolve_stdin_needs_dashboard_{}", unix_millis());
     let input = "OPENAI_API_KEY=<<OPENAI_API_KEY_abcdef0123456789>>\n";
 
     let err = approval_decision_for_resolve_stdin(&approval_session, input).unwrap_err();
     assert!(err.contains("approval needed"), "{err}");
     let _ = std::fs::remove_dir_all(session_root(&approval_session).unwrap());
+    drop(_cwd);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1147,6 +1156,41 @@ fn write_tool_repairs_masked_file_after_tool() {
 }
 
 #[test]
+fn write_tool_does_not_repair_when_tool_left_existing_file_unchanged() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("capability-write-repair-unchanged");
+    let project = PathBuf::from("target").join(format!(
+        "pentect-write-repair-unchanged-{}-{}",
+        std::process::id(),
+        unix_millis()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("token={raw}\n")).unwrap();
+    let config = project.join("config.txt");
+    std::fs::write(&config, "token=existing\n").unwrap();
+
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": config.to_string_lossy(),
+            "content": masked
+        },
+        "tool_response": "Write failed"
+    });
+    let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(written, "token=existing\n");
+    assert!(!written.contains(raw), "{written}");
+    let _ = std::fs::remove_dir_all(project);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn write_tool_allows_and_repairs_absolute_file_path() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("capability-write-absolute");
@@ -1661,6 +1705,36 @@ fn posttool_masks_secret_query_inside_image_url() {
     assert!(rendered.contains("<<URL_CREDENTIAL_"), "{rendered}");
     assert!(!rendered.contains(raw), "{rendered}");
     assert!(rendered.contains("screenshot.png?api_key="), "{rendered}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn posttool_masks_text_in_invalid_image_shaped_object() {
+    let (root, session) = empty_session("hook-post-invalid-image-object");
+    write_project_config(
+        &root,
+        "[image]\nocr = \"off\"\nunscanned_images = \"allow\"\n",
+    );
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let input = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__browser__screenshot",
+        "tool_response": {
+            "content": [{
+                "type": "image",
+                "content": format!("OPENAI_API_KEY={raw}")
+            }]
+        }
+    });
+    let output = {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _cwd = enter_temp_cwd(&root);
+        handle_hook(HookProvider::Claude, "t", &session, input).unwrap()
+    };
+    let rendered =
+        serde_json::to_string(&output["hookSpecificOutput"]["updatedToolOutput"]).unwrap();
+    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(!rendered.contains(raw), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2908,6 +2982,49 @@ fn masked_read_copy_path_mirrors_relative_paths() {
             .join("nested")
             .join(".env")
     );
+}
+
+#[test]
+fn masked_read_copy_paths_do_not_collide_for_external_same_basename() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("masked-read-external-collision");
+    let project = root.join("project");
+    let external = root.join("external");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(external.join("one")).unwrap();
+    std::fs::create_dir_all(external.join("two")).unwrap();
+    let first = external.join("one").join(".env");
+    let second = external.join("two").join(".env");
+    std::fs::write(
+        &first,
+        "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\n",
+    )
+    .unwrap();
+    std::fs::write(&second, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
+
+    let first_masked = {
+        let _cwd = enter_temp_cwd(&project);
+        let session = Session::open_at(&project, "t").unwrap();
+        masked_read_copy(&session, first.to_str().unwrap())
+            .unwrap()
+            .unwrap()
+    };
+    let second_masked = {
+        let _cwd = enter_temp_cwd(&project);
+        let session = Session::open_at(&project, "t").unwrap();
+        masked_read_copy(&session, second.to_str().unwrap())
+            .unwrap()
+            .unwrap()
+    };
+
+    assert_ne!(first_masked, second_masked);
+    assert!(first_masked.starts_with(Path::new(".pentect").join("read").join("_external")));
+    assert!(second_masked.starts_with(Path::new(".pentect").join("read").join("_external")));
+    let first_text = std::fs::read_to_string(project.join(&first_masked)).unwrap();
+    let second_text = std::fs::read_to_string(project.join(&second_masked)).unwrap();
+    assert!(first_text.contains("<<RUNPOD_API_KEY_"), "{first_text}");
+    assert!(second_text.contains("<<OPENAI_API_KEY_"), "{second_text}");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

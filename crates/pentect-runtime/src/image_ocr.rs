@@ -1,11 +1,13 @@
 use crate::config::ImageOcrConfig;
 #[cfg(feature = "ocr")]
 use crate::config::{image_ocr_config, ImageOcrMode, ImageRedactionStyle};
+#[cfg(any(feature = "ocr", test))]
 use pentect_core::model::labels;
+#[cfg(any(feature = "ocr", test))]
 use pentect_core::ByteRange;
 use serde_json::Value;
 #[cfg(feature = "ocr")]
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[cfg(feature = "ocr")]
 const IMAGE_URL_MAX_REDIRECTS: usize = 5;
@@ -65,6 +67,7 @@ struct RedactedImagePayload {
     mime_type: &'static str,
 }
 
+#[cfg(feature = "ocr")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NormalizedImageRect {
     left: f32,
@@ -73,6 +76,7 @@ struct NormalizedImageRect {
     bottom: f32,
 }
 
+#[cfg(feature = "ocr")]
 #[derive(Clone, Debug)]
 struct ImageTextRegion {
     text: String,
@@ -82,12 +86,17 @@ struct ImageTextRegion {
 #[derive(Clone, Debug)]
 struct ImageSecretFinding {
     labels: Vec<String>,
+    #[cfg(feature = "ocr")]
     rect: Option<NormalizedImageRect>,
+    #[cfg(feature = "ocr")]
     force_black: bool,
+    #[cfg(feature = "ocr")]
     pad_left: bool,
+    #[cfg(feature = "ocr")]
     redact_pixels: bool,
 }
 
+#[cfg(any(feature = "ocr", test))]
 #[derive(Clone, Debug)]
 struct ImageTextSecretHit {
     label: String,
@@ -154,8 +163,8 @@ pub(crate) fn skip_text_masking_for_image_field(key: &str, text: &str) -> bool {
     }
     matches!(
         normalized_json_key(key).as_str(),
-        "data" | "bytes" | "base64" | "content" | "imagedata" | "dataurl"
-    )
+        "data" | "bytes" | "base64" | "imagedata" | "dataurl"
+    ) && looks_like_base64_image_field_value(text)
 }
 
 pub(crate) fn inspect_tool_images_for_secrets(
@@ -716,6 +725,7 @@ impl ImageRedactionState {
     }
 }
 
+#[cfg(feature = "ocr")]
 fn image_regions_text(regions: &[ImageTextRegion]) -> String {
     let mut text = String::new();
     for region in regions {
@@ -1217,6 +1227,7 @@ fn byte_to_char_count(text: &str, byte: usize) -> usize {
     text[..end].chars().count()
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
     while byte > 0 && !text.is_char_boundary(byte) {
         byte -= 1;
@@ -1224,6 +1235,7 @@ fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
     byte
 }
 
+#[cfg(feature = "ocr")]
 fn assignment_value_range_for_span(text: &str, range: ByteRange) -> Option<ByteRange> {
     if range.start >= text.len() || range.end <= range.start {
         return None;
@@ -1248,6 +1260,7 @@ fn assignment_value_range_for_span(text: &str, range: ByteRange) -> Option<ByteR
     out
 }
 
+#[cfg(feature = "ocr")]
 fn first_sensitive_assignment_value_range(text: &str) -> Option<ByteRange> {
     for (idx, ch) in text.char_indices() {
         if ch != '=' && ch != ':' {
@@ -1262,6 +1275,7 @@ fn first_sensitive_assignment_value_range(text: &str) -> Option<ByteRange> {
     None
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn sensitive_assignment_value_range(
     text: &str,
     line_start: usize,
@@ -1283,6 +1297,7 @@ fn sensitive_assignment_value_range(
     (value_end > value_start).then_some(ByteRange::new(value_start, value_end))
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn text_line_bounds(text: &str, byte: usize) -> (usize, usize) {
     let byte = floor_char_boundary(text, byte.min(text.len()));
     let start = text[..byte].rfind(['\r', '\n']).map_or(0, |idx| idx + 1);
@@ -1292,6 +1307,7 @@ fn text_line_bounds(text: &str, byte: usize) -> (usize, usize) {
     (start, end)
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn trim_ascii_ws_start(text: &str, mut start: usize, end: usize) -> usize {
     start = floor_char_boundary(text, start.min(text.len()));
     let end = floor_char_boundary(text, end.min(text.len()));
@@ -1301,6 +1317,7 @@ fn trim_ascii_ws_start(text: &str, mut start: usize, end: usize) -> usize {
     start
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn trim_ascii_ws_end(text: &str, start: usize, mut end: usize) -> usize {
     let start = floor_char_boundary(text, start.min(text.len()));
     end = floor_char_boundary(text, end.min(text.len()));
@@ -1315,6 +1332,7 @@ fn image_text_secret_labels(text: &str, key: &[u8; 32]) -> Vec<String> {
     labels_from_text_hits(&image_text_secret_hits(text, key))
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn image_text_secret_hits(text: &str, _key: &[u8; 32]) -> Vec<ImageTextSecretHit> {
     if text.trim().is_empty() {
         return Vec::new();
@@ -1346,6 +1364,7 @@ fn image_text_secret_hits(text: &str, _key: &[u8; 32]) -> Vec<ImageTextSecretHit
     hits
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn labels_from_text_hits(hits: &[ImageTextSecretHit]) -> Vec<String> {
     let mut labels = Vec::new();
     for hit in hits {
@@ -1361,6 +1380,7 @@ fn ocr_fragmented_secret_labels(text: &str) -> Vec<String> {
     labels_from_text_hits(&ocr_fragmented_secret_hits(text))
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn ocr_fragmented_secret_hits(text: &str) -> Vec<ImageTextSecretHit> {
     let mut labels = Vec::new();
     for (idx, ch) in text.char_indices() {
@@ -1385,6 +1405,7 @@ fn ocr_fragmented_secret_hits(text: &str) -> Vec<ImageTextSecretHit> {
     labels
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn ocr_fragmented_secret_label(before: &str, after: &str) -> Option<String> {
     let key_tokens = ocr_words(before);
     if !ocr_words_have_sensitive_key(&key_tokens) || !ocr_fragmented_value_has_secret_shape(after) {
@@ -1393,6 +1414,7 @@ fn ocr_fragmented_secret_label(before: &str, after: &str) -> Option<String> {
     Some(ocr_key_label(&key_tokens))
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn bounded_prefix(text: &str, byte_end: usize, max_chars: usize) -> &str {
     let end = byte_end.min(text.len());
     let mut starts = text[..end].char_indices().map(|(idx, _)| idx).rev();
@@ -1400,6 +1422,7 @@ fn bounded_prefix(text: &str, byte_end: usize, max_chars: usize) -> &str {
     &text[start..end]
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn bounded_suffix(text: &str, max_chars: usize) -> &str {
     match text.char_indices().nth(max_chars) {
         Some((idx, _)) => &text[..idx],
@@ -1407,6 +1430,7 @@ fn bounded_suffix(text: &str, max_chars: usize) -> &str {
     }
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn ocr_words(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -1423,6 +1447,7 @@ fn ocr_words(text: &str) -> Vec<String> {
     out
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn ocr_words_have_sensitive_key(words: &[String]) -> bool {
     let mut has_material = false;
     let mut has_modifier = false;
@@ -1448,6 +1473,7 @@ fn ocr_words_have_sensitive_key(words: &[String]) -> bool {
                 .is_some_and(|word| matches!(word.as_str(), "PASSWORD" | "SECRET" | "TOKEN")))
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn ocr_fragmented_value_has_secret_shape(text: &str) -> bool {
     let mut ascii_alnum = 0usize;
     let mut ascii_alpha = 0usize;
@@ -1472,6 +1498,7 @@ fn ocr_fragmented_value_has_secret_shape(text: &str) -> bool {
     ascii_alnum >= 16 && ascii_alpha >= 4 && ascii_digit >= 4 && longest_run >= 6
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn ocr_key_label(words: &[String]) -> String {
     let mut relevant = words
         .iter()
@@ -1488,6 +1515,7 @@ fn ocr_key_label(words: &[String]) -> String {
     }
 }
 
+#[cfg(feature = "ocr")]
 impl NormalizedImageRect {
     #[cfg(feature = "ocr")]
     fn from_pixels(
@@ -1924,6 +1952,7 @@ fn resize_for_barcode(img: image::DynamicImage, max_edge: u32) -> image::Dynamic
     img.resize(max_edge, max_edge, image::imageops::FilterType::Triangle)
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn image_ocr_secret_engine() -> &'static pentect_core::Engine {
     static ENGINE: std::sync::OnceLock<pentect_core::Engine> = std::sync::OnceLock::new();
     ENGINE.get_or_init(|| pentect_core::Engine::with_profile(pentect_core::Profile::Strict))
@@ -1989,6 +2018,15 @@ fn looks_like_base64_image(text: &str) -> bool {
         return false;
     }
     decode_base64_prefix(&compact).is_some_and(|prefix| image_signature(&prefix).is_some())
+}
+
+fn looks_like_base64_image_field_value(text: &str) -> bool {
+    let compact = compact_base64(text);
+    compact.len() >= 16
+        && compact.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
+        })
 }
 
 fn decode_base64_limited(text: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
@@ -2293,6 +2331,12 @@ fn remote_image_ip_is_private(ip: IpAddr) -> bool {
                 || ip.is_multicast()
         }
         IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return remote_image_ip_is_private(IpAddr::V4(mapped));
+            }
+            if let Some(embedded) = ipv6_embedded_ipv4(ip) {
+                return remote_image_ip_is_private(IpAddr::V4(embedded));
+            }
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
@@ -2300,6 +2344,26 @@ fn remote_image_ip_is_private(ip: IpAddr) -> bool {
                 || ip.is_multicast()
         }
     }
+}
+
+#[cfg(feature = "ocr")]
+fn ipv6_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = ip.octets();
+    if octets[..12] == [0; 12] {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    if octets[..12]
+        == [
+            0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    {
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    None
 }
 
 #[cfg(not(feature = "ocr"))]
@@ -2772,19 +2836,6 @@ fn ocr_image_regions_with_config(
 
 #[cfg(not(feature = "ocr"))]
 pub fn ocr_image_bytes(_bytes: &[u8]) -> Result<String, String> {
-    Err("image OCR requires a build with `--features ocr`".to_string())
-}
-
-#[cfg(not(feature = "ocr"))]
-fn ocr_image_bytes_with_config(_bytes: &[u8], _cfg: &ImageOcrConfig) -> Result<String, String> {
-    Err("image OCR requires a build with `--features ocr`".to_string())
-}
-
-#[cfg(not(feature = "ocr"))]
-fn ocr_image_regions_with_config(
-    _bytes: &[u8],
-    _cfg: &ImageOcrConfig,
-) -> Result<Vec<ImageTextRegion>, String> {
     Err("image OCR requires a build with `--features ocr`".to_string())
 }
 
@@ -3525,6 +3576,24 @@ mod tests {
             "169.254.169.254".parse().unwrap()
         ));
         assert!(remote_image_ip_is_private("10.0.0.1".parse().unwrap()));
+        assert!(remote_image_ip_is_private(
+            "::ffff:127.0.0.1".parse().unwrap()
+        ));
+        assert!(remote_image_ip_is_private(
+            "::ffff:10.0.0.1".parse().unwrap()
+        ));
+        assert!(remote_image_ip_is_private("::127.0.0.1".parse().unwrap()));
+        assert!(remote_image_ip_is_private("::10.0.0.1".parse().unwrap()));
+        assert!(remote_image_ip_is_private(
+            "64:ff9b::a00:1".parse().unwrap()
+        ));
+        assert!(!remote_image_ip_is_private(
+            "::ffff:8.8.8.8".parse().unwrap()
+        ));
+        assert!(!remote_image_ip_is_private("::8.8.8.8".parse().unwrap()));
+        assert!(!remote_image_ip_is_private(
+            "64:ff9b::808:808".parse().unwrap()
+        ));
         assert!(!remote_image_ip_is_private("8.8.8.8".parse().unwrap()));
     }
 

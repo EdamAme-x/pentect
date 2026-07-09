@@ -81,8 +81,21 @@ pub fn infer_kind(path: &std::path::Path) -> Kind {
         .as_deref()
     {
         Some("json") => Kind::Json,
+        Some("jsonl" | "ndjson") => Kind::Ndjson,
         Some("env") => Kind::Env,
         Some("har") => Kind::Har,
         _ => Kind::Text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn infer_kind_recognizes_json_lines_files() {
+        assert_eq!(infer_kind(Path::new("events.jsonl")), Kind::Ndjson);
+        assert_eq!(infer_kind(Path::new("events.ndjson")), Kind::Ndjson);
     }
 }

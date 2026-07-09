@@ -2684,16 +2684,25 @@ fn masked_read_display_path(original: &Path) -> PathBuf {
                 return safe_masked_read_path(relative);
             }
         }
-        return PathBuf::from("_external").join(
-            original
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(safe_masked_read_component)
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "file.txt".to_string()),
-        );
+        return PathBuf::from("_external")
+            .join(masked_read_path_hash(original))
+            .join(
+                original
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(safe_masked_read_component)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "file.txt".to_string()),
+            );
     }
     safe_masked_read_path(original)
+}
+
+fn masked_read_path_hash(path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_os_str().to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    data_encoding::HEXLOWER.encode(&digest[..6])
 }
 
 fn safe_masked_read_path(path: &Path) -> PathBuf {
@@ -2812,6 +2821,11 @@ fn repair_masked_write_after_tool(
         let (path, resolved) = resolved_write_parts(session, path, content)?;
         ensure_local_write_path_within_cwd(&path)?;
         if !path.is_file() {
+            return Ok(false);
+        }
+        let current = std::fs::read_to_string(&path)
+            .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+        if current != content {
             return Ok(false);
         }
         std::fs::write(&path, resolved)

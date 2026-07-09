@@ -226,7 +226,27 @@ impl Engine {
     }
 
     pub fn analyze_spans(&self, input: Input) -> SpanAnalysisResult {
-        let (ir, fell_back) = self.parse(input);
+        let (ir, fell_back) = self.parse_for_analysis(input);
+        let (spans, residual) = self.masked_spans(&ir);
+        SpanAnalysisResult {
+            spans,
+            residual,
+            parser_fallback: fell_back,
+        }
+    }
+
+    pub fn analyze_spans_with_path(
+        &self,
+        input: Input,
+        path: impl Into<String>,
+    ) -> SpanAnalysisResult {
+        let path = path.into();
+        let (mut ir, fell_back) = self.parse_for_analysis(input);
+        for region in &mut ir.regions {
+            if region.ctx.path.is_none() {
+                region.ctx.path = Some(path.clone());
+            }
+        }
         let (spans, residual) = self.masked_spans(&ir);
         SpanAnalysisResult {
             spans,
@@ -442,7 +462,36 @@ impl Engine {
     /// fallback.
     fn parse(&self, input: Input) -> (Ir, bool) {
         let Input { kind, data: raw } = input;
+        self.parse_raw(kind, raw)
+    }
+
+    fn parse_for_analysis(&self, input: Input) -> (Ir, bool) {
+        let Input { kind, data: raw } = input;
         let protected = scan_placeholders(&raw);
+        if let Some(regions) = crate::parse::analysis_regions_for_kind(&raw, &kind) {
+            return (
+                Ir {
+                    raw,
+                    regions,
+                    protected,
+                },
+                false,
+            );
+        }
+        self.parse_raw_with_protected(kind, raw, protected)
+    }
+
+    fn parse_raw(&self, kind: Kind, raw: String) -> (Ir, bool) {
+        let protected = scan_placeholders(&raw);
+        self.parse_raw_with_protected(kind, raw, protected)
+    }
+
+    fn parse_raw_with_protected(
+        &self,
+        kind: Kind,
+        raw: String,
+        protected: Vec<ByteRange>,
+    ) -> (Ir, bool) {
         let (regions, fell_back) = match self.parsers.iter().find(|(k, _)| *k == kind) {
             Some((_, p)) => match p.parse(&raw) {
                 Some(regions) => (regions, false),
@@ -927,6 +976,32 @@ mod tests {
         assert!(r.masked.contains("<<PASSWORD_"), "{}", r.masked);
         assert!(r.masked.contains("<<TOKEN_"), "{}", r.masked);
         assert_eq!(restore(&r.masked, &r.recovery).unwrap(), input);
+    }
+
+    #[test]
+    fn analyze_spans_checks_numeric_json_values_without_changing_mask_output() {
+        let input = r#"{"otp":100482,"ok":1}"#;
+        let engine = Engine::with_profile(Profile::Strict);
+        let result = engine.analyze_spans(Input {
+            kind: Kind::Json,
+            data: input.to_string(),
+        });
+        assert!(
+            result.spans.iter().any(|span| span.label == labels::OTP
+                && &input[span.range.start..span.range.end] == "100482"),
+            "{:?}",
+            result.spans
+        );
+
+        let masked = engine.mask(
+            Input {
+                kind: Kind::Json,
+                data: input.to_string(),
+            },
+            &Config::insecure_testing(),
+        );
+        serde_json::from_str::<serde_json::Value>(&masked.masked)
+            .expect("regular JSON masking keeps JSON valid");
     }
 
     #[test]
