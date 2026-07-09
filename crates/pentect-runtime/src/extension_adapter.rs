@@ -163,7 +163,9 @@ impl ModelAdapter {
     }
 
     fn run(&self, request: &str) -> Result<String, String> {
-        let mut cmd = Command::new(&self.command[0]);
+        let cwd = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let program = adapter_program(&self.command[0], cwd);
+        let mut cmd = Command::new(program);
         apply_adapter_child_env(&mut cmd, &self.id)?;
         cmd.args(&self.command[1..])
             .stdin(Stdio::piped())
@@ -294,6 +296,18 @@ fn adapter_default_name(path: &Path) -> String {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("extension")
         .to_string()
+}
+
+fn adapter_program(program: &str, cwd: &Path) -> PathBuf {
+    let path = Path::new(program);
+    if path.is_absolute() || !looks_like_path_command(program) {
+        return path.to_path_buf();
+    }
+    cwd.join(path)
+}
+
+fn looks_like_path_command(program: &str) -> bool {
+    program.contains('/') || program.contains('\\')
 }
 
 fn extension_id(value: &str) -> String {
@@ -566,6 +580,19 @@ builtin = "pii-ner"
         let err = ModelAdapter::load(&path).unwrap_err();
         std::fs::remove_dir_all(root).unwrap();
         assert!(err.contains("unknown field `builtin`"), "{err}");
+    }
+
+    #[test]
+    fn relative_adapter_program_is_resolved_from_adapter_dir() {
+        let cwd = Path::new("extensions/pii-ner");
+        assert_eq!(
+            adapter_program("./bin/pentect-pii-ner", cwd),
+            cwd.join("./bin/pentect-pii-ner")
+        );
+        assert_eq!(
+            adapter_program("pentect-pii-ner", cwd),
+            PathBuf::from("pentect-pii-ner")
+        );
     }
 
     #[test]

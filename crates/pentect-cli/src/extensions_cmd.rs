@@ -240,14 +240,15 @@ impl AdapterFile {
         if manifest.kind.as_deref() != Some("model") {
             return Err("kind".to_string());
         }
-        let command = adapter_command_from_manifest(manifest.command)?;
-        if find_command(&command[0]).is_none() {
-            return Err("command not found".to_string());
-        }
         let cwd = path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        let command = adapter_command_from_manifest(manifest.command)?;
+        let program = adapter_program(&command[0], &cwd);
+        if find_command(&program).is_none() {
+            return Err("command not found".to_string());
+        }
         let name = manifest
             .name
             .filter(|name| !name.trim().is_empty())
@@ -275,7 +276,8 @@ impl AdapterFile {
         if request.len() > self.max_input_bytes {
             return Err(format!("{}: input limit", self.name));
         }
-        let mut command = adapter_command(&self.command[0], &self.id)?;
+        let program = adapter_program(&self.command[0], &self.cwd);
+        let mut command = adapter_command(&program, &self.id)?;
         command
             .args(&self.command[1..])
             .current_dir(&self.cwd)
@@ -329,8 +331,8 @@ fn adapter_command_from_manifest(command: Option<Vec<String>>) -> Result<Vec<Str
     Ok(command)
 }
 
-fn adapter_command(name: &str, id_or_name: &str) -> Result<Command, String> {
-    let mut command = Command::new(name);
+fn adapter_command(program: &Path, id_or_name: &str) -> Result<Command, String> {
+    let mut command = Command::new(program);
     command.env_clear();
     for env_name in safe_adapter_env_names() {
         if let Some(value) = std::env::var_os(env_name) {
@@ -559,11 +561,30 @@ impl Check {
     }
 }
 
-fn find_command(name: &str) -> Option<PathBuf> {
-    let path = Path::new(name);
+fn adapter_program(program: &str, cwd: &Path) -> PathBuf {
+    let path = Path::new(program);
+    if path.is_absolute() || !looks_like_path_command(program) {
+        return path.to_path_buf();
+    }
+    cwd.join(path)
+}
+
+fn looks_like_path_command(program: &str) -> bool {
+    program.contains('/') || program.contains('\\')
+}
+
+fn find_command(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
     }
+    if path.is_absolute()
+        || path
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        return None;
+    }
+    let name = path.to_str()?;
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
         for candidate in command_names(name) {
@@ -627,7 +648,7 @@ mod tests {
 
     #[test]
     fn adapter_probe_env_does_not_inherit_in_memory_manager_credentials() {
-        let command = adapter_command("echo", "test-env").unwrap();
+        let command = adapter_command(Path::new("echo"), "test-env").unwrap();
         let names = command
             .get_envs()
             .map(|(name, _)| name.to_string_lossy().to_string())
@@ -643,7 +664,7 @@ mod tests {
 
     #[test]
     fn adapter_probe_env_exposes_project_local_extension_data() {
-        let command = adapter_command("echo", "My Ext!").unwrap();
+        let command = adapter_command(Path::new("echo"), "My Ext!").unwrap();
         let envs = command
             .get_envs()
             .map(|(name, value)| {
@@ -710,5 +731,30 @@ mod tests {
         assert!(names.contains("openai-privacy-filter"), "{names:?}");
         assert!(names.contains("pii-ner"), "{names:?}");
         assert!(names.contains("jp-pii"), "{names:?}");
+    }
+
+    #[test]
+    fn adapter_command_path_is_checked_from_adapter_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-cli-adapter-relative-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("tool"), "").unwrap();
+        std::fs::write(
+            root.join("adapter.toml"),
+            r#"
+schema = "pentect.model_adapter.v1"
+kind = "model"
+name = "relative"
+command = ["./tool"]
+"#,
+        )
+        .unwrap();
+
+        let loaded = AdapterFile::load(&root.join("adapter.toml"));
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(loaded.is_ok(), "{loaded:?}");
     }
 }

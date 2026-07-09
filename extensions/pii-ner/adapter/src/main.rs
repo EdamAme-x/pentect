@@ -8,9 +8,11 @@ use std::io::{self, Read};
 #[serde(deny_unknown_fields)]
 struct AdapterRequest {
     schema: String,
-    kind: String,
+    #[serde(rename = "kind")]
+    _kind: String,
     text: String,
-    context: Option<serde_json::Value>,
+    #[serde(rename = "context")]
+    _context: Option<serde_json::Value>,
 }
 
 fn main() {
@@ -30,7 +32,6 @@ fn run() -> Result<(), String> {
     if request.schema != "pentect.model_adapter.v1" {
         return Err("unsupported schema".to_string());
     }
-    let _ = (&request.kind, &request.context);
     let spans = model::detect_pii(&request.text)?;
     let response = json!({
         "spans": spans.into_iter().map(|span| json!({
