@@ -39,7 +39,7 @@ use shell::{next_shell_word, powershell_word, shell_quote_unix};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
@@ -74,6 +74,7 @@ pub fn run_from(args: Vec<String>) -> i32 {
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
         Some("exec") => cmd_exec(&args),
+        Some("shell") => cmd_shell(&args),
         Some("resolve") => cmd_resolve(&args),
         Some("approve") => cmd_approve(&args),
         Some("hook") => cmd_hook(&args),
@@ -343,10 +344,12 @@ fn usage() {
     eprintln!(
         "pentect\n\
          pentect exec \"<command>\"\n\
+         pentect shell\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          \n\
          exec runs commands with masked output.\n\
+         shell opens a masked shell.\n\
          view handle metadata.\n\
          resolve rewrites files containing handles, or resolves stdin when no path is given."
     );
@@ -674,6 +677,33 @@ fn cmd_exec(args: &[String]) -> i32 {
     exit_code(output.status)
 }
 
+fn cmd_shell(args: &[String]) -> i32 {
+    if matches!(
+        args.get(2).map(String::as_str),
+        Some("--help" | "-h" | "help")
+    ) {
+        shell_help();
+        return 0;
+    }
+    let opts = match ShellOpts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return die(&e),
+    };
+    let session = match Session::open_capability(&opts.session) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
+    let store = match RecoveryStore::load(&session) {
+        Ok(s) => s,
+        Err(e) => return die(&e),
+    };
+    let status = match run_masked_shell(store, &opts) {
+        Ok(status) => status,
+        Err(e) => return die(&e),
+    };
+    exit_code(status)
+}
+
 fn cmd_resolve(args: &[String]) -> i32 {
     let opts = match ResolveOpts::parse(args) {
         Ok(o) => o,
@@ -826,6 +856,19 @@ fn exec_help() {
             "handles: in memory\n",
             "env: $env:KEY or $KEY\n",
             "approve: .pentect/config.toml\n",
+        )
+    );
+}
+
+fn shell_help() {
+    print!(
+        "{}",
+        concat!(
+            "pentect shell\n",
+            "pentect shell -- PROGRAM [ARG...]\n\n",
+            "stdout/stderr: masked\n",
+            "stdin: hidden\n",
+            "codex/claude: pentect wrapped\n",
         )
     );
 }
@@ -1735,7 +1778,7 @@ fn run_live_command(
         .take()
         .ok_or_else(|| "could not capture command stderr".to_string())?;
     let stdout_store = store.clone();
-    let stderr_store = store;
+    let stderr_store = store.clone();
     let stdout_thread = std::thread::spawn(move || {
         let mut masker = OutputMasker::new_deferred(stdout_store)?;
         stream_masked_reader(&mut masker, stdout, StreamTarget::Stdout)?;
@@ -1752,6 +1795,583 @@ fn run_live_command(
     join_stream_thread(stdout_thread)?;
     join_stream_thread(stderr_thread)?;
     Ok(status)
+}
+
+fn run_masked_shell(store: RecoveryStore, opts: &ShellOpts) -> Result<ExitStatus, String> {
+    let shim = ShellShimDir::install()?;
+    let mut command = match &opts.program {
+        Some(program) => shell_program_command(program)?,
+        None => interactive_shell_command(),
+    };
+    apply_child_env_overlays(&mut command, &[], &opts.session);
+    apply_active_in_memory_manager_env(&mut command);
+    shim.apply_to(&mut command);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("could not start shell: {e}"))?;
+    let child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "could not open shell stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "could not capture shell stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "could not capture shell stderr".to_string())?;
+    let stdout_store = store.clone();
+    let stderr_store = store.clone();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut masker = OutputMasker::new_deferred(stdout_store)?;
+        stream_masked_reader(&mut masker, stdout, StreamTarget::Stdout)?;
+        masker.flush()
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut masker = OutputMasker::new_deferred(stderr_store)?;
+        stream_masked_reader(&mut masker, stderr, StreamTarget::Stderr)?;
+        masker.flush()
+    });
+    let status = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        pump_masked_terminal_stdin(&mut child, child_stdin, store.clone())?
+    } else {
+        pump_plain_stdin_until_exit(&mut child, child_stdin)?
+    };
+    join_stream_thread(stdout_thread)?;
+    join_stream_thread(stderr_thread)?;
+    Ok(status)
+}
+
+fn shell_program_command(program: &[String]) -> Result<Command, String> {
+    let Some((command, args)) = program.split_first() else {
+        return Err("shell requires PROGRAM after `--`".to_string());
+    };
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+    Ok(cmd)
+}
+
+#[cfg(windows)]
+fn interactive_shell_command() -> Command {
+    let shell = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("powershell"));
+    let mut cmd = Command::new(shell);
+    cmd.arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg("-");
+    cmd
+}
+
+#[cfg(not(windows))]
+fn interactive_shell_command() -> Command {
+    let shell = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            Path::new("/bin/sh")
+                .is_file()
+                .then(|| PathBuf::from("/bin/sh"))
+        })
+        .unwrap_or_else(|| PathBuf::from("sh"));
+    let mut cmd = Command::new(shell);
+    cmd.arg("-i");
+    cmd
+}
+
+fn pump_plain_stdin_until_exit(
+    child: &mut std::process::Child,
+    mut child_stdin: std::process::ChildStdin,
+) -> Result<ExitStatus, String> {
+    let stdin_thread = std::thread::spawn(move || -> Result<(), String> {
+        let mut input = std::io::stdin().lock();
+        std::io::copy(&mut input, &mut child_stdin)
+            .map(|_| ())
+            .map_err(|e| format!("could not write shell stdin: {e}"))
+    });
+    let status = child
+        .wait()
+        .map_err(|e| format!("could not wait for shell: {e}"))?;
+    match stdin_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("shell stdin thread panicked".to_string()),
+    }
+    Ok(status)
+}
+
+fn pump_masked_terminal_stdin(
+    child: &mut std::process::Child,
+    mut child_stdin: std::process::ChildStdin,
+    store: RecoveryStore,
+) -> Result<ExitStatus, String> {
+    let _raw = RawModeGuard::enable()?;
+    let mut line_stars = 0usize;
+    let mut protector = ShellInputProtector::new(store)?;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("could not poll shell: {e}"))?
+        {
+            return Ok(status);
+        }
+        if !crossterm::event::poll(Duration::from_millis(50))
+            .map_err(|e| format!("could not read terminal input: {e}"))?
+        {
+            continue;
+        }
+        match crossterm::event::read().map_err(|e| format!("could not read terminal input: {e}"))? {
+            crossterm::event::Event::Key(event) => {
+                if !forward_masked_key(event, &mut child_stdin, &mut line_stars)? {
+                    drop(child_stdin);
+                    return child
+                        .wait()
+                        .map_err(|e| format!("could not wait for shell: {e}"));
+                }
+            }
+            crossterm::event::Event::Paste(text) => {
+                forward_masked_text(&text, &mut child_stdin, &mut line_stars, &mut protector)?;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn forward_masked_key(
+    event: crossterm::event::KeyEvent,
+    child_stdin: &mut dyn Write,
+    line_stars: &mut usize,
+) -> Result<bool, String> {
+    if !matches!(
+        event.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    ) {
+        return Ok(true);
+    }
+    match event.code {
+        crossterm::event::KeyCode::Char('c')
+            if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            child_stdin
+                .write_all(&[0x03])
+                .map_err(|e| format!("could not write shell stdin: {e}"))?;
+            print!("\r\n");
+            *line_stars = 0;
+        }
+        crossterm::event::KeyCode::Char('d')
+            if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            return Ok(false);
+        }
+        crossterm::event::KeyCode::Char(ch) => {
+            let mut buf = [0u8; 4];
+            let text = ch.encode_utf8(&mut buf);
+            child_stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("could not write shell stdin: {e}"))?;
+            echo_masked_input(1)?;
+            *line_stars += 1;
+        }
+        crossterm::event::KeyCode::Enter => {
+            if cfg!(windows) {
+                child_stdin
+                    .write_all(b"\r\n")
+                    .map_err(|e| format!("could not write shell stdin: {e}"))?;
+            } else {
+                child_stdin
+                    .write_all(b"\n")
+                    .map_err(|e| format!("could not write shell stdin: {e}"))?;
+            }
+            print!("\r\n");
+            std::io::stdout()
+                .flush()
+                .map_err(|e| format!("could not flush terminal input: {e}"))?;
+            *line_stars = 0;
+        }
+        crossterm::event::KeyCode::Backspace => {
+            child_stdin
+                .write_all(&[0x08])
+                .map_err(|e| format!("could not write shell stdin: {e}"))?;
+            if *line_stars > 0 {
+                print!("\x08 \x08");
+                std::io::stdout()
+                    .flush()
+                    .map_err(|e| format!("could not flush terminal input: {e}"))?;
+                *line_stars -= 1;
+            }
+        }
+        crossterm::event::KeyCode::Tab => {
+            child_stdin
+                .write_all(b"\t")
+                .map_err(|e| format!("could not write shell stdin: {e}"))?;
+            echo_masked_input(1)?;
+            *line_stars += 1;
+        }
+        crossterm::event::KeyCode::Esc => {
+            child_stdin
+                .write_all(&[0x1b])
+                .map_err(|e| format!("could not write shell stdin: {e}"))?;
+            echo_masked_input(1)?;
+            *line_stars += 1;
+        }
+        _ => {}
+    }
+    child_stdin
+        .flush()
+        .map_err(|e| format!("could not flush shell stdin: {e}"))?;
+    Ok(true)
+}
+
+fn forward_masked_text(
+    text: &str,
+    child_stdin: &mut dyn Write,
+    line_stars: &mut usize,
+    protector: &mut ShellInputProtector,
+) -> Result<(), String> {
+    let paste = protector.prepare_paste(text)?;
+    child_stdin
+        .write_all(paste.child.as_bytes())
+        .map_err(|e| format!("could not write shell stdin: {e}"))?;
+    if paste.changed {
+        echo_visible_input(&paste.visible)?;
+        *line_stars = trailing_line_width(&paste.visible);
+    } else {
+        echo_masked_text(&paste.visible, line_stars)?;
+    }
+    child_stdin
+        .flush()
+        .map_err(|e| format!("could not flush shell stdin: {e}"))
+}
+
+fn echo_masked_text(text: &str, line_stars: &mut usize) -> Result<(), String> {
+    let mut stars = 0usize;
+    for ch in text.chars() {
+        if matches!(ch, '\r' | '\n') {
+            if stars > 0 {
+                echo_masked_input(stars)?;
+                stars = 0;
+            }
+            eprint!("\r\n");
+            *line_stars = 0;
+        } else {
+            stars += 1;
+            *line_stars += 1;
+        }
+    }
+    if stars > 0 {
+        echo_masked_input(stars)?;
+    }
+    Ok(())
+}
+
+fn echo_visible_input(text: &str) -> Result<(), String> {
+    for ch in text.chars() {
+        if matches!(ch, '\r' | '\n') {
+            eprint!("\r\n");
+        } else {
+            eprint!("{ch}");
+        }
+    }
+    std::io::stderr()
+        .flush()
+        .map_err(|e| format!("could not flush terminal input: {e}"))
+}
+
+fn echo_masked_input(count: usize) -> Result<(), String> {
+    for _ in 0..count {
+        eprint!("*");
+    }
+    std::io::stderr()
+        .flush()
+        .map_err(|e| format!("could not flush terminal input: {e}"))
+}
+
+fn trailing_line_width(text: &str) -> usize {
+    text.rsplit(['\r', '\n'])
+        .next()
+        .unwrap_or("")
+        .chars()
+        .count()
+}
+
+struct ProtectedPaste {
+    child: String,
+    visible: String,
+    changed: bool,
+}
+
+struct ShellInputProtector {
+    masker: OutputMasker,
+    store: RecoveryStore,
+    syntax: ShellSyntax,
+    defined_env: BTreeSet<String>,
+}
+
+impl ShellInputProtector {
+    fn new(store: RecoveryStore) -> Result<Self, String> {
+        Ok(Self {
+            masker: OutputMasker::new_shared(store.clone())?,
+            store,
+            syntax: ShellSyntax::current(),
+            defined_env: BTreeSet::new(),
+        })
+    }
+
+    fn prepare_paste(&mut self, text: &str) -> Result<ProtectedPaste, String> {
+        let masked = self.masker.mask_text(text, live_output_kind(text))?;
+        let (visible, bindings) =
+            replace_masked_handles_with_env_refs(&masked, &self.store, self.syntax)?;
+        if bindings.is_empty() {
+            return Ok(ProtectedPaste {
+                child: text.to_string(),
+                visible: text.to_string(),
+                changed: false,
+            });
+        }
+        let mut child = String::new();
+        for mut binding in bindings {
+            if self.defined_env.insert(binding.name.clone()) {
+                let assignment = self.syntax.env_assignment(&binding.name, &binding.value);
+                child.push_str(&assignment);
+            }
+            binding.value.zeroize();
+        }
+        child.push_str(&visible);
+        Ok(ProtectedPaste {
+            child,
+            visible,
+            changed: true,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ShellSyntax {
+    PowerShell,
+    Posix,
+}
+
+impl ShellSyntax {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::PowerShell
+        } else {
+            Self::Posix
+        }
+    }
+
+    fn env_ref(self, name: &str) -> String {
+        match self {
+            Self::PowerShell => format!("$env:{name}"),
+            Self::Posix => format!("${{{name}}}"),
+        }
+    }
+
+    fn env_assignment(self, name: &str, value: &str) -> String {
+        match self {
+            Self::PowerShell => format!("$env:{name}={}; ", powershell_word(value)),
+            Self::Posix => format!("export {name}={}; ", shell_quote_unix(value)),
+        }
+    }
+}
+
+struct ShellEnvBinding {
+    name: String,
+    value: String,
+}
+
+fn replace_masked_handles_with_env_refs(
+    masked: &str,
+    store: &RecoveryStore,
+    syntax: ShellSyntax,
+) -> Result<(String, Vec<ShellEnvBinding>), String> {
+    let handles = masked_handles_in_text(masked);
+    if handles.is_empty() {
+        return Ok((masked.to_string(), Vec::new()));
+    }
+    let mut out = masked.to_string();
+    let mut bindings = Vec::new();
+    for handle in handles {
+        let Ok(parts) = parse_placeholder(&handle) else {
+            continue;
+        };
+        let name = format!("PENTECT_{}_{}", parts.label, parts.hash);
+        let mut value = store.resolve_all(&handle).map_err(|e| e.to_string())?;
+        if value == handle {
+            value.zeroize();
+            continue;
+        }
+        out = out.replace(&handle, &syntax.env_ref(&name));
+        bindings.push(ShellEnvBinding { name, value });
+    }
+    Ok((out, bindings))
+}
+
+fn apply_active_in_memory_manager_env(command: &mut Command) {
+    let (Some(addr), Some(token)) = (std::env::var_os(ENV_ADDR), std::env::var_os(ENV_TOKEN))
+    else {
+        return;
+    };
+    if addr.is_empty() || token.is_empty() {
+        return;
+    }
+    command.env(ENV_ADDR, addr);
+    command.env(ENV_TOKEN, &token);
+    command.env(PENTECT_AGENT_LAUNCHED_ENV, token);
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> Result<Self, String> {
+        crossterm::terminal::enable_raw_mode()
+            .map_err(|e| format!("could not enter raw terminal mode: {e}"))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+struct ShellShimDir {
+    path: PathBuf,
+    pentect: PathBuf,
+}
+
+impl ShellShimDir {
+    fn install() -> Result<Self, String> {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("could not locate pentect executable: {e}"))?;
+        let path = create_shell_shim_dir()?;
+        Self::install_at(path, &exe)
+    }
+
+    fn install_at(path: PathBuf, pentect: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("could not create shell shim dir '{}': {e}", path.display()))?;
+        write_tool_shim(&path, "codex")?;
+        write_tool_shim(&path, "claude")?;
+        let shim = Self {
+            path,
+            pentect: pentect.to_path_buf(),
+        };
+        Ok(shim)
+    }
+
+    fn apply_to(&self, command: &mut Command) {
+        command.env("PENTECT_SHELL_BIN", &self.pentect);
+        command.env("PENTECT_SHELL", "1");
+        prepend_path_env(command, &self.path);
+    }
+}
+
+impl Drop for ShellShimDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn create_shell_shim_dir() -> Result<PathBuf, String> {
+    let base = std::env::temp_dir();
+    for _ in 0..16 {
+        let mut bytes = [0u8; 8];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|e| format!("could not generate shell shim name: {e}"))?;
+        let name = format!("pentect-shell-{}", data_encoding::HEXLOWER.encode(&bytes));
+        let path = base.join(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                secure_shell_shim_dir_permissions(&path)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "could not create shell shim dir '{}': {e}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err("could not allocate shell shim dir".to_string())
+}
+
+#[cfg(unix)]
+fn secure_shell_shim_dir_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|e| format!("could not stat shell shim dir '{}': {e}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|e| format!("could not chmod shell shim dir '{}': {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn secure_shell_shim_dir_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_tool_shim(dir: &Path, tool: &str) -> Result<(), String> {
+    let path = dir.join(format!("{tool}.cmd"));
+    let content = format!("@echo off\r\n\"%PENTECT_SHELL_BIN%\" {tool} %*\r\n");
+    std::fs::write(&path, content)
+        .map_err(|e| format!("could not write shell shim '{}': {e}", path.display()))
+}
+
+#[cfg(not(windows))]
+fn write_tool_shim(dir: &Path, tool: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(tool);
+    let content = format!("#!/bin/sh\nexec \"$PENTECT_SHELL_BIN\" {tool} \"$@\"\n");
+    std::fs::write(&path, content)
+        .map_err(|e| format!("could not write shell shim '{}': {e}", path.display()))?;
+    let mut permissions = std::fs::metadata(&path)
+        .map_err(|e| format!("could not stat shell shim '{}': {e}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&path, permissions)
+        .map_err(|e| format!("could not chmod shell shim '{}': {e}", path.display()))
+}
+
+fn prepend_path_env(command: &mut Command, path: &Path) {
+    let mut value = std::ffi::OsString::from(path.as_os_str());
+    if let Some(existing) = std::env::var_os("PATH") {
+        value.push(if cfg!(windows) { ";" } else { ":" });
+        value.push(existing);
+    }
+    command.env(path_env_key(), value);
+}
+
+fn path_env_key() -> &'static str {
+    if cfg!(windows) {
+        "Path"
+    } else {
+        "PATH"
+    }
 }
 
 fn stream_masked_reader<R: Read>(
@@ -2138,6 +2758,12 @@ struct ExecOpts {
     mode: ExecMode,
 }
 
+#[derive(Debug)]
+struct ShellOpts {
+    session: String,
+    program: Option<Vec<String>>,
+}
+
 enum ExecMode {
     Program(Vec<String>),
     Shell(String),
@@ -2180,6 +2806,37 @@ impl ResolveOpts {
                 ResolveMode::Files(paths)
             },
         })
+    }
+}
+
+impl ShellOpts {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut session = default_session_name()?;
+        let mut program = None;
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--session" => {
+                    session = checked_session_name(&value(args, &mut i, "--session")?)
+                        .map_err(|e| e.to_string())?;
+                }
+                "--" => {
+                    let command = args[i + 1..].to_vec();
+                    if command.is_empty() {
+                        return Err("shell requires PROGRAM after `--`".to_string());
+                    }
+                    program = Some(command);
+                    break;
+                }
+                flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
+                value => {
+                    return Err(format!(
+                        "unknown argument: {value}; use `pentect shell -- PROGRAM [ARG...]`"
+                    ));
+                }
+            }
+        }
+        Ok(Self { session, program })
     }
 }
 

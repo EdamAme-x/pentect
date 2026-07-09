@@ -69,7 +69,7 @@ fn main() {
         Some("extensions") => extensions_cmd::cmd_extensions(&args),
         Some("eval") => eval::cmd_eval(&args),
         Some("scan") => scan::cmd_scan(&args),
-        Some("exec" | "resolve" | "approve" | "hook" | "manager" | "purge") => {
+        Some("exec" | "shell" | "resolve" | "approve" | "hook" | "manager" | "purge") => {
             cmd_agent_from(1, &args)
         }
         Some("agent") => cmd_agent_from(2, &args),
@@ -84,6 +84,7 @@ fn usage() {
         "pentect\n\
          pentect codex|claude\n\
          pentect exec \"<command>\"\n\
+         pentect shell\n\
          pentect doctor\n\
          pentect extensions list|inspect|test [NAME]\n\
          pentect eval [--json]\n\
@@ -94,6 +95,7 @@ fn usage() {
          pentect help\n\
          \n\
          exec runs commands with masked output.\n\
+         shell opens a masked shell.\n\
          doctor checks local readiness.\n\
          eval reports local precision/recall metrics.\n\
          scan reports files that contain likely secrets.\n\
@@ -115,6 +117,7 @@ fn help_text() -> &'static str {
         "  pentect --port 7331\n",
         "  pentect codex|claude [--extensions NAME|PATH.toml]\n",
         "  pentect exec \"<command>\"\n\n",
+        "  pentect shell\n\n",
         "  pentect doctor [--json]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
         "  pentect eval [--json]\n\n",
@@ -123,6 +126,7 @@ fn help_text() -> &'static str {
         "  pentect statusline\n\n",
         "dashboard: memory\n",
         "exec: masked stdout/stderr\n",
+        "shell: masked shell\n",
         "read: masked file preview\n",
         "view: handle metadata\n",
         "statusline: masked count\n",
@@ -207,7 +211,35 @@ fn cmd_agent_from(start: usize, args: &[String]) {
             .unwrap_or_else(|| "pentect".to_string()),
     );
     agent_args.extend(forward_args);
-    std::process::exit(pentect_agent::run_from(agent_args));
+    let shell_manager = if agent_args.get(1).is_some_and(|arg| arg == "shell") {
+        let pentect = std::env::var_os(PENTECT_BIN_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(default_pentect_path);
+        Some(start_in_memory_manager(&pentect).unwrap_or_else(|e| die_with_issue(e)))
+    } else {
+        None
+    };
+    let _shell_manager_env = shell_manager.as_ref().map(|manager| {
+        EnvVarGuard::set_optional([
+            (
+                PENTECT_IN_MEMORY_MANAGER_ADDR_ENV,
+                Some(OsString::from(manager.addr.as_str())),
+            ),
+            (
+                PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV,
+                Some(OsString::from(manager.token.as_str())),
+            ),
+            (
+                PENTECT_AGENT_LAUNCHED_ENV,
+                Some(OsString::from(manager.token.as_str())),
+            ),
+            (PENTECT_AGENT_AUTO_APPROVE_ENV, Some(OsString::from("1"))),
+        ])
+    });
+    let code = pentect_agent::run_from(agent_args);
+    drop(_shell_manager_env);
+    drop(shell_manager);
+    std::process::exit(code);
 }
 
 fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
@@ -804,13 +836,27 @@ fn run_interactive_command_inner(
 }
 
 struct InMemoryManagerGuard {
-    child: Child,
+    child: Option<Child>,
     addr: String,
     token: String,
 }
 
 impl InMemoryManagerGuard {
     fn start(pentect: &Path) -> Result<Self, String> {
+        if let (Some(addr), Some(token)) = (
+            std::env::var_os(PENTECT_IN_MEMORY_MANAGER_ADDR_ENV),
+            std::env::var_os(PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV),
+        ) {
+            let addr = addr.to_string_lossy().to_string();
+            let token = token.to_string_lossy().to_string();
+            if !addr.is_empty() && !token.is_empty() {
+                return Ok(Self {
+                    child: None,
+                    addr,
+                    token,
+                });
+            }
+        }
         let mut child = Command::new(pentect)
             .arg("agent")
             .arg("manager")
@@ -860,14 +906,20 @@ impl InMemoryManagerGuard {
                 return Err(e);
             }
         };
-        Ok(Self { child, addr, token })
+        Ok(Self {
+            child: Some(child),
+            addr,
+            token,
+        })
     }
 }
 
 impl Drop for InMemoryManagerGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -2126,6 +2178,7 @@ mod tests {
     fn help_text_is_compact() {
         let help = help_text();
         assert!(help.contains("pentect exec"), "{help}");
+        assert!(help.contains("pentect shell"), "{help}");
         assert!(!help.contains("agent exec"), "{help}");
         assert!(!help.contains("bench"), "{help}");
         assert!(help.contains("doctor: readiness"), "{help}");
