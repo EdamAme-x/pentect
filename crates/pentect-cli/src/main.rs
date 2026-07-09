@@ -14,15 +14,17 @@ use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
 use pentect_core::{
     infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
 };
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, PtySize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use zeroize::Zeroize;
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -53,6 +55,10 @@ const PENTECT_CONFIG_FILE: &str = "config.toml";
 const IN_MEMORY_MANAGER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
 const CODEX_ENVIRONMENT_OVERLAY_MARKER: &[u8] = b"# pentect-managed-environments\n";
+const PROMPT_PASTE_START: &[u8] = b"\x1b[200~";
+const PROMPT_PASTE_END: &[u8] = b"\x1b[201~";
+const PROMPT_INPUT_POLL: Duration = Duration::from_millis(50);
+const PROMPT_INPUT_MAX_PENDING_BYTES: usize = 1024 * 1024;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -812,6 +818,10 @@ fn run_interactive_command_inner(
     display: &Path,
 ) -> Result<std::process::ExitStatus, String> {
     let mut terminal_guard = terminal::TuiSessionGuard::enter();
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let status = run_interactive_command_pty(cmd, display, &mut terminal_guard);
+        return status;
+    }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -833,6 +843,324 @@ fn run_interactive_command_inner(
     drop(ctrl_c_guard);
     terminal_guard.restore_after_tui();
     Ok(status)
+}
+
+fn run_interactive_command_pty(
+    cmd: &Command,
+    display: &Path,
+    terminal_guard: &mut terminal::TuiSessionGuard,
+) -> Result<std::process::ExitStatus, String> {
+    let pty_system = native_pty_system();
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("could not start pty for '{}': {e}", display.display()))?;
+    let command = command_builder_from_process_command(cmd)?;
+    let mut child = match pair.slave.spawn_command(command) {
+        Ok(child) => child,
+        Err(e) => {
+            terminal_guard.restore_without_prompt();
+            return Err(format!("could not start '{}': {e}", display.display()));
+        }
+    };
+    drop(pair.slave);
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("could not capture '{}': {e}", display.display()))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("could not open '{}': {e}", display.display()))?;
+    let output_thread = thread::spawn(move || proxy_pty_output(reader));
+    let ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
+    let status = pump_prompt_guarded_pty_input(child.as_mut(), writer);
+    drop(ctrl_c_guard);
+    drop(pair.master);
+    match output_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            terminal_guard.restore_after_tui();
+            return Err(e);
+        }
+        Err(_) => {
+            terminal_guard.restore_after_tui();
+            return Err("pty output thread panicked".to_string());
+        }
+    }
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => {
+            terminal_guard.restore_after_tui();
+            return Err(e);
+        }
+    };
+    terminal_guard.restore_after_tui();
+    Ok(exit_status_from_code(status.exit_code()))
+}
+
+fn command_builder_from_process_command(cmd: &Command) -> Result<CommandBuilder, String> {
+    let mut command = CommandBuilder::new(cmd.get_program());
+    command.args(cmd.get_args());
+    let cwd = match cmd.get_current_dir() {
+        Some(cwd) => cwd.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?,
+    };
+    command.cwd(cwd.as_os_str());
+    for (name, value) in cmd.get_envs() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        }
+    }
+    Ok(command)
+}
+
+fn proxy_pty_output(mut reader: Box<dyn Read + Send>) -> Result<(), String> {
+    let mut out = std::io::stdout().lock();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("could not read pty output: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])
+            .map_err(|e| format!("could not write pty output: {e}"))?;
+        out.flush()
+            .map_err(|e| format!("could not flush pty output: {e}"))?;
+    }
+    Ok(())
+}
+
+fn pump_prompt_guarded_pty_input(
+    child: &mut dyn PtyChild,
+    mut child_stdin: Box<dyn Write + Send>,
+) -> Result<portable_pty::ExitStatus, String> {
+    let _raw = RawModeGuard::enable()?;
+    let mut protector = PromptInputProtector::default();
+    let (input_tx, input_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut input = std::io::stdin().lock();
+        let mut buf = [0u8; 8192];
+        loop {
+            match input.read(&mut buf) {
+                Ok(0) => {
+                    let _ = input_tx.send(Vec::new());
+                    break;
+                }
+                Ok(n) => {
+                    if input_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = input_tx.send(Vec::new());
+                    break;
+                }
+            }
+        }
+    });
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("could not poll agent: {e}"))?
+        {
+            return Ok(status);
+        }
+        match input_rx.recv_timeout(PROMPT_INPUT_POLL) {
+            Ok(bytes) if bytes.is_empty() => {
+                let tail = protector.flush()?;
+                if !tail.is_empty() {
+                    child_stdin
+                        .write_all(&tail)
+                        .map_err(|e| format!("could not write agent input: {e}"))?;
+                }
+                drop(child_stdin);
+                return child
+                    .wait()
+                    .map_err(|e| format!("could not wait for agent: {e}"));
+            }
+            Ok(bytes) => {
+                let rewritten = protector.rewrite_bytes(&bytes)?;
+                if !rewritten.is_empty() {
+                    child_stdin
+                        .write_all(&rewritten)
+                        .map_err(|e| format!("could not write agent input: {e}"))?;
+                    child_stdin
+                        .flush()
+                        .map_err(|e| format!("could not flush agent input: {e}"))?;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let tail = protector.flush()?;
+                if !tail.is_empty() {
+                    child_stdin
+                        .write_all(&tail)
+                        .map_err(|e| format!("could not write agent input: {e}"))?;
+                }
+                drop(child_stdin);
+                return child
+                    .wait()
+                    .map_err(|e| format!("could not wait for agent: {e}"));
+            }
+        }
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> Result<Self, String> {
+        crossterm::terminal::enable_raw_mode()
+            .map_err(|e| format!("could not enter raw terminal mode: {e}"))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+#[derive(Default)]
+struct PromptInputProtector {
+    state: PromptInputState,
+}
+
+impl PromptInputProtector {
+    fn rewrite_bytes(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        rewrite_prompt_input_bytes_with(&mut self.state, bytes, &mut |text| {
+            pentect_agent::mask_prompt_text_into_active_in_memory_manager(text)
+        })
+    }
+
+    fn flush(&mut self) -> Result<Vec<u8>, String> {
+        flush_prompt_input_with(&mut self.state, &mut |text| {
+            pentect_agent::mask_prompt_text_into_active_in_memory_manager(text)
+        })
+    }
+}
+
+#[derive(Default)]
+struct PromptInputState {
+    pending: Vec<u8>,
+    in_bracketed_paste: bool,
+}
+
+fn rewrite_prompt_input_bytes_with<F>(
+    state: &mut PromptInputState,
+    bytes: &[u8],
+    mask: &mut F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    state.pending.extend_from_slice(bytes);
+    let mut out = Vec::with_capacity(bytes.len());
+    loop {
+        if state.in_bracketed_paste {
+            if let Some(end) = find_bytes(&state.pending, PROMPT_PASTE_END) {
+                let mut content: Vec<u8> = state.pending.drain(..end).collect();
+                out.extend(rewrite_prompt_plain_bytes_with(&content, true, mask)?);
+                content.zeroize();
+                state.pending.drain(..PROMPT_PASTE_END.len());
+                out.extend_from_slice(PROMPT_PASTE_END);
+                state.in_bracketed_paste = false;
+                continue;
+            }
+            if state.pending.len() > PROMPT_INPUT_MAX_PENDING_BYTES {
+                let mut content = std::mem::take(&mut state.pending);
+                out.extend(rewrite_prompt_plain_bytes_with(&content, true, mask)?);
+                content.zeroize();
+                state.in_bracketed_paste = false;
+            }
+            break;
+        }
+
+        if let Some(start) = find_bytes(&state.pending, PROMPT_PASTE_START) {
+            let mut before: Vec<u8> = state.pending.drain(..start).collect();
+            out.extend(rewrite_prompt_plain_bytes_with(&before, false, mask)?);
+            before.zeroize();
+            state.pending.drain(..PROMPT_PASTE_START.len());
+            out.extend_from_slice(PROMPT_PASTE_START);
+            state.in_bracketed_paste = true;
+            continue;
+        }
+
+        let keep = partial_suffix_prefix_len(&state.pending, PROMPT_PASTE_START);
+        let emit_len = state.pending.len().saturating_sub(keep);
+        if emit_len > 0 {
+            let mut plain: Vec<u8> = state.pending.drain(..emit_len).collect();
+            out.extend(rewrite_prompt_plain_bytes_with(&plain, false, mask)?);
+            plain.zeroize();
+        }
+        break;
+    }
+    Ok(out)
+}
+
+fn flush_prompt_input_with<F>(state: &mut PromptInputState, mask: &mut F) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    if state.pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pending = std::mem::take(&mut state.pending);
+    let out = rewrite_prompt_plain_bytes_with(&pending, state.in_bracketed_paste, mask)?;
+    pending.zeroize();
+    state.in_bracketed_paste = false;
+    Ok(out)
+}
+
+fn rewrite_prompt_plain_bytes_with<F>(
+    bytes: &[u8],
+    force_scan: bool,
+    mask: &mut F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(bytes.to_vec());
+    };
+    if !force_scan && !should_scan_prompt_input_text(text) {
+        return Ok(bytes.to_vec());
+    }
+    match mask(text)? {
+        Some(masked) if masked != text => Ok(masked.into_bytes()),
+        _ => Ok(bytes.to_vec()),
+    }
+}
+
+fn should_scan_prompt_input_text(text: &str) -> bool {
+    text.len() >= 32 && !text.contains('\x1b')
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn partial_suffix_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
+    let max = bytes.len().min(prefix.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|len| bytes[bytes.len() - len..] == prefix[..*len])
+        .unwrap_or(0)
 }
 
 struct InMemoryManagerGuard {
@@ -1749,15 +2077,19 @@ fn print_dry_run(command: &Path, args: &[String]) {
 }
 
 fn success_status() -> std::process::ExitStatus {
+    exit_status_from_code(0)
+}
+
+fn exit_status_from_code(code: u32) -> std::process::ExitStatus {
     #[cfg(windows)]
     {
         use std::os::windows::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(0)
+        std::process::ExitStatus::from_raw(code)
     }
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(0)
+        std::process::ExitStatus::from_raw((code as i32) << 8)
     }
 }
 
@@ -2639,5 +2971,57 @@ mod tests {
             "foo".to_string(),
             "exec".to_string()
         ]));
+    }
+
+    #[test]
+    fn prompt_input_rewrites_bracketed_paste_payload() {
+        let mut state = PromptInputState::default();
+        let mut mask = |text: &str| {
+            Ok(Some(text.replace(
+                "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+                "<<OPENAI_API_KEY_demo>>",
+            )))
+        };
+        let out = rewrite_prompt_input_bytes_with(
+            &mut state,
+            b"\x1b[200~OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\x1b[201~",
+            &mut mask,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("\x1b[200~"), "{text:?}");
+        assert!(text.ends_with("\x1b[201~"), "{text:?}");
+        assert!(!text.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{text}");
+        assert!(text.contains("<<OPENAI_API_KEY_demo>>"), "{text}");
+    }
+
+    #[test]
+    fn prompt_input_rewrites_split_bracketed_paste() {
+        let mut state = PromptInputState::default();
+        let mut mask = |text: &str| Ok(Some(text.replace("secret-value", "<<TOKEN_demo>>")));
+        let first = rewrite_prompt_input_bytes_with(&mut state, b"\x1b[20", &mut mask).unwrap();
+        assert!(first.is_empty(), "{first:?}");
+        let second =
+            rewrite_prompt_input_bytes_with(&mut state, b"0~token=secret-", &mut mask).unwrap();
+        assert_eq!(second, b"\x1b[200~");
+        let third =
+            rewrite_prompt_input_bytes_with(&mut state, b"value\x1b[201~", &mut mask).unwrap();
+        assert_eq!(
+            String::from_utf8(third).unwrap(),
+            "token=<<TOKEN_demo>>\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn prompt_input_keeps_escape_sequences_raw() {
+        let mut state = PromptInputState::default();
+        let mut called = false;
+        let mut mask = |_: &str| {
+            called = true;
+            Ok(Some("masked".to_string()))
+        };
+        let out = rewrite_prompt_input_bytes_with(&mut state, b"\x1b[A", &mut mask).unwrap();
+        assert_eq!(out, b"\x1b[A");
+        assert!(!called);
     }
 }

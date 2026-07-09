@@ -2345,6 +2345,7 @@ dependencies = [
  "pdf-extract",
  "pentect-core",
  "pentect-runtime",
+ "portable-pty",
  "reqwest",
  "serde",
  "serde_json",
@@ -2353,6 +2354,7 @@ dependencies = [
  "toml",
  "windows-sys 0.61.2",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]

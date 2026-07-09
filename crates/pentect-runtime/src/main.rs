@@ -333,6 +333,15 @@ pub fn mask_tool_output_into_active_in_memory_manager(
     ActiveToolOutputMasker::new()?.mask_tool_output(text)
 }
 
+pub fn mask_prompt_text_into_active_in_memory_manager(
+    text: &str,
+) -> Result<Option<String>, String> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    ActiveToolOutputMasker::new()?.mask_tool_output(text)
+}
+
 fn exec_server_approval_command(mode: &ExecMode, env: &[(String, String)]) -> String {
     let mut command = display_exec_mode(mode);
     for (name, value) in env {
