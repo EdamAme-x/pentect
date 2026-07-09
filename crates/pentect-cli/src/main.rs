@@ -94,14 +94,14 @@ fn usage() {
          pentect resolve [PATH...]\n\
          pentect help\n\
          \n\
-         exec runs commands with masked output.\n\
-         shell opens a masked shell.\n\
-         doctor checks local readiness.\n\
-         eval reports local precision/recall metrics.\n\
-         scan reports files that contain likely secrets.\n\
-         view handle metadata.\n\
-         statusline prints mask count.\n\
-         resolve rewrites files containing handles, or resolves stdin when no path is given."
+         exec: masked output\n\
+         shell: masked shell\n\
+         doctor: readiness\n\
+         eval: metrics\n\
+         scan: secrets\n\
+         view: handle\n\
+         statusline: count\n\
+         resolve: write handles"
     );
 }
 
@@ -128,7 +128,7 @@ fn help_text() -> &'static str {
         "exec: masked stdout/stderr\n",
         "shell: masked shell\n",
         "read: masked file preview\n",
-        "view: handle metadata\n",
+        "view: handle\n",
         "statusline: masked count\n",
         "resolve: write handles\n",
         "scan: CredSweeper + core; binary skip(default)|text(lossy); narrow with --exclude, --gitignore, .pentectignore\n",

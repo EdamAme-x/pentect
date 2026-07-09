@@ -354,10 +354,10 @@ fn usage() {
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          \n\
-         exec runs commands with masked output.\n\
-         shell opens a masked shell.\n\
-         view handle metadata.\n\
-         resolve rewrites files containing handles, or resolves stdin when no path is given."
+         exec: masked output\n\
+         shell: masked shell\n\
+         view: handle\n\
+         resolve: write handles"
     );
 }
 
@@ -1885,6 +1885,8 @@ fn run_masked_shell_pty(
         .map_err(|e| format!("could not start pty: {e}"))?;
     let mut command = CommandBuilder::new(&shell.command);
     command.args(&shell.args);
+    let cwd = std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?;
+    command.cwd(cwd.as_os_str());
     apply_shell_env_builder(&mut command, &opts.session, shim);
     let mut child = pair
         .slave
