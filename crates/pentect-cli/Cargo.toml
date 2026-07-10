@@ -36,7 +36,7 @@ fastwebsockets = { version = "0.10.0", features = ["upgrade"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-tokio = { workspace = true, features = ["io-util", "process", "sync"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "sync"] }
 data-encoding.workspace = true
 getrandom = { workspace = true }
 reqwest = { workspace = true }

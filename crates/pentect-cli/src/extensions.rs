@@ -96,8 +96,8 @@ pub(crate) fn collect_from_args(args: &[String]) -> Result<Vec<String>> {
 pub(crate) fn strip_from_args(args: &[String]) -> Result<(Vec<String>, Vec<String>)> {
     match args.first().map(String::as_str) {
         Some("exec" | "approve") => strip_exec_like_args(args),
-        Some("dashboard") | Some("--dir" | "--session" | "--port") | None => {
-            strip_option_args(args, &["--dir", "--session", "--port"])
+        Some("dashboard") | Some("--dir" | "--session") | None => {
+            strip_option_args(args, &["--dir", "--session"])
         }
         Some("hook") => strip_option_args(args, &["--session"]),
         _ => Ok((args.to_vec(), Vec::new())),
@@ -707,20 +707,10 @@ mod tests {
             "work".to_string(),
             "--extensions".to_string(),
             "rules".to_string(),
-            "--port".to_string(),
-            "7331".to_string(),
         ];
         let (stripped, specs) = strip_from_args(&args).unwrap();
         assert_eq!(specs, ["rules"]);
-        assert_eq!(
-            stripped,
-            vec![
-                "--dir".to_string(),
-                "work".to_string(),
-                "--port".to_string(),
-                "7331".to_string()
-            ]
-        );
+        assert_eq!(stripped, vec!["--dir".to_string(), "work".to_string()]);
     }
 
     #[test]

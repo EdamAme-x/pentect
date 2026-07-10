@@ -379,10 +379,13 @@ fn resolve_parse_defaults_to_stdin_without_paths() {
 }
 
 #[test]
-fn dashboard_parse_accepts_top_level_port() {
+fn dashboard_rejects_removed_web_port_option() {
     let args = strings(["pentect", "--port", "7319"]);
-    let opts = DashboardOpts::parse(&args).unwrap();
-    assert_eq!(opts.port, Some(7319));
+    let err = match DashboardOpts::parse(&args) {
+        Ok(_) => panic!("expected --port to be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("unknown option: --port"), "{err}");
 }
 
 #[test]

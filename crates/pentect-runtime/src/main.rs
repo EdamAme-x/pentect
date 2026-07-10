@@ -76,7 +76,7 @@ pub fn run_from(args: Vec<String>) -> i32 {
     match args.get(1).map(String::as_str) {
         None => cmd_dashboard(&args),
         Some("dashboard") => cmd_dashboard(&args),
-        Some("--dir" | "--session" | "--port") => cmd_dashboard(&args),
+        Some("--dir" | "--session") => cmd_dashboard(&args),
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
         Some("exec") => cmd_exec(&args),
@@ -405,7 +405,7 @@ fn cmd_dashboard(args: &[String]) -> i32 {
             Err(e) => return die(&e),
         },
     };
-    match run_dashboard(&session, opts.port) {
+    match run_dashboard(&session) {
         Ok(()) => 0,
         Err(e) => die(&e),
     }
@@ -442,24 +442,18 @@ fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
     })
 }
 
-fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
+fn run_dashboard(session: &str) -> Result<(), String> {
     let queue = ApprovalQueue::open_dashboard(session)?;
-    if let Some(port) = port {
-        return queue
-            .serve_web(session, port, DASHBOARD_HEARTBEAT_MAX_AGE)
-            .map_err(|e| e.to_string());
-    }
-
     let heartbeat_queue = queue.clone();
     let _heartbeat_thread = std::thread::spawn(move || loop {
-        let _ = heartbeat_queue.heartbeat(None);
+        let _ = heartbeat_queue.heartbeat();
         std::thread::sleep(Duration::from_millis(500));
     });
 
-    print_dashboard_status(session, &queue, None)?;
+    print_dashboard_status(session, &queue)?;
     loop {
         if approval_bypassed_by_config()? {
-            print_dashboard_status(session, &queue, None)?;
+            print_dashboard_status(session, &queue)?;
             std::thread::sleep(Duration::from_millis(500));
             continue;
         }
@@ -474,26 +468,19 @@ fn run_dashboard(session: &str, port: Option<u16>) -> Result<(), String> {
             };
             let decision = approve_ui::run(&request).map_err(|e| e.to_string())?;
             queue.decide(&ticket, decision, "ui")?;
-            print_dashboard_status(session, &queue, None)?;
+            print_dashboard_status(session, &queue)?;
         } else {
             std::thread::sleep(Duration::from_millis(250));
         }
     }
 }
 
-fn print_dashboard_status(
-    session: &str,
-    queue: &ApprovalQueue,
-    port: Option<u16>,
-) -> Result<(), String> {
+fn print_dashboard_status(session: &str, queue: &ApprovalQueue) -> Result<(), String> {
     let request = dashboard_request(session)?;
     let config = approval_config_state()?;
     print!("\x1b[2J\x1b[H");
     println!("pentect");
     println!("{}", request.body);
-    if let Some(port) = port {
-        println!("port: {port}");
-    }
     println!();
     if config.effective_no_approve {
         println!(
@@ -3153,14 +3140,12 @@ impl PurgeOpts {
 struct DashboardOpts {
     session: Option<String>,
     dir: Option<PathBuf>,
-    port: Option<u16>,
 }
 
 impl DashboardOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut session = None;
         let mut dir = None;
-        let mut port = None;
         let mut i = if matches!(args.get(1).map(String::as_str), Some("dashboard")) {
             2
         } else {
@@ -3175,18 +3160,11 @@ impl DashboardOpts {
                     )
                 }
                 "--dir" => dir = Some(PathBuf::from(value(args, &mut i, "--dir")?)),
-                "--port" => {
-                    let raw = value(args, &mut i, "--port")?;
-                    port = Some(
-                        raw.parse::<u16>()
-                            .map_err(|_| format!("invalid port: {raw}"))?,
-                    );
-                }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
                 arg => return Err(format!("unexpected dashboard argument: {arg}")),
             }
         }
-        Ok(Self { session, dir, port })
+        Ok(Self { session, dir })
     }
 }
 

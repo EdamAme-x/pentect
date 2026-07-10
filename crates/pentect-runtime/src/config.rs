@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
@@ -148,19 +148,6 @@ fn approval_bypassed_with_state(state: &ApprovalConfigState, agent_auto_approve:
     agent_auto_approve
 }
 
-pub(crate) fn set_approval_config(
-    scope: &str,
-    no_approve: Option<bool>,
-) -> Result<PathBuf, String> {
-    let path = match scope {
-        "project" => project_config_path(),
-        "global" => global_config_path()?,
-        _ => return Err("unknown approval config scope".to_string()),
-    };
-    write_approval_config_value(&path, no_approve)?;
-    Ok(path)
-}
-
 #[cfg(test)]
 pub(crate) fn approval_bypassed_by_config_value(value: &toml::Value) -> Result<bool, String> {
     Ok(approval_config_override_value(value)?.unwrap_or(false))
@@ -184,51 +171,6 @@ fn read_approval_config_scope(
         display_path,
         no_approve,
     })
-}
-
-fn write_approval_config_value(path: &Path, no_approve: Option<bool>) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
-    }
-    let mut value = if path.exists() {
-        let src = fs::read_to_string(path)
-            .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-        if src.trim().is_empty() {
-            toml::Value::Table(toml::map::Map::new())
-        } else {
-            src.parse::<toml::Value>()
-                .map_err(|e| format!("could not parse '{}': {e}", path.display()))?
-        }
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    let Some(table) = value.as_table_mut() else {
-        return Err(format!("'{}' must be a TOML table", path.display()));
-    };
-    match no_approve {
-        Some(value) => {
-            table.insert("no_approve".to_string(), toml::Value::Boolean(value));
-        }
-        None => {
-            table.remove("no_approve");
-            if let Some(approval) = table.get_mut("approval") {
-                if let Some(approval_table) = approval.as_table_mut() {
-                    approval_table.remove("no_approve");
-                    approval_table.remove("required");
-                    approval_table.remove("mode");
-                    if approval_table.is_empty() {
-                        table.remove("approval");
-                    }
-                } else {
-                    table.remove("approval");
-                }
-            }
-        }
-    }
-    let src = toml::to_string_pretty(&value)
-        .map_err(|e| format!("could not serialize '{}': {e}", path.display()))?;
-    fs::write(path, src).map_err(|e| format!("could not write '{}': {e}", path.display()))
 }
 
 fn approval_config_override_value(value: &toml::Value) -> Result<Option<bool>, String> {

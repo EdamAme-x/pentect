@@ -28,7 +28,6 @@ bundled-ocr = ["dep:image", "dep:ocrs", "dep:rten"]
 [dependencies]
 pentect-core = { path = "../pentect-core" }
 anyhow = { workspace = true }
-axum = { workspace = true }
 data-encoding = { workspace = true }
 pdf-extract = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
@@ -49,7 +48,6 @@ zeroize = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 jiff = { workspace = true }
-tokio = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, optional = true, features = [
