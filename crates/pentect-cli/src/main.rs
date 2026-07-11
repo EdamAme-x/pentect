@@ -1,5 +1,6 @@
 //! Pentect CLI: local secret masking boundary for AI agents.
 
+mod agent_integrations;
 mod app_server_proxy;
 mod doctor;
 mod eval;
@@ -75,12 +76,14 @@ fn main() {
         Some("extensions") => extensions_cmd::cmd_extensions(&args),
         Some("eval") => eval::cmd_eval(&args),
         Some("scan") => scan::cmd_scan(&args),
-        Some("exec" | "shell" | "resolve" | "approve" | "hook" | "manager" | "purge") => {
-            cmd_agent_from(1, &args)
-        }
+        Some(
+            "exec" | "shell" | "resolve" | "approve" | "hook" | "bridge" | "manager" | "purge",
+        ) => cmd_agent_from(1, &args),
         Some("agent") => cmd_agent_from(2, &args),
         Some("codex") => cmd_agent_tool(AgentTool::Codex, &args),
         Some("claude") => cmd_agent_tool(AgentTool::Claude, &args),
+        Some("opencode") => cmd_agent_tool(AgentTool::OpenCode, &args),
+        Some("pi") => cmd_agent_tool(AgentTool::Pi, &args),
         _ => usage(),
     }
 }
@@ -88,7 +91,7 @@ fn main() {
 fn usage() {
     eprintln!(
         "pentect\n\
-         pentect codex|claude\n\
+         pentect codex|claude|opencode|pi\n\
          pentect exec \"<command>\"\n\
          pentect shell\n\
          pentect doctor\n\
@@ -120,7 +123,7 @@ fn help_text() -> &'static str {
         "pentect protects AI tool boundaries.\n\n",
         "Use:\n",
         "  pentect\n",
-        "  pentect codex|claude [--extensions NAME|PATH.toml]\n",
+        "  pentect codex|claude|opencode|pi [--extensions NAME|PATH.toml]\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect shell\n\n",
         "  pentect doctor [--json]\n",
@@ -262,6 +265,8 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
     let status = match tool {
         AgentTool::Codex => run_codex(&opts, &pentect),
         AgentTool::Claude => run_claude(&opts, &pentect),
+        AgentTool::OpenCode => run_bridge_agent(&opts, &pentect, tool),
+        AgentTool::Pi => run_bridge_agent(&opts, &pentect, tool),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     let code = status.code().unwrap_or(1);
@@ -485,6 +490,8 @@ fn cmd_statusline(args: &[String]) {
 enum AgentTool {
     Codex,
     Claude,
+    OpenCode,
+    Pi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -567,6 +574,8 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "codex",
             AgentTool::Claude => "claude",
+            AgentTool::OpenCode => "opencode",
+            AgentTool::Pi => "pi",
         }
     }
 
@@ -574,6 +583,8 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "PENTECT_CODEX",
             AgentTool::Claude => "PENTECT_CLAUDE",
+            AgentTool::OpenCode => "PENTECT_OPENCODE",
+            AgentTool::Pi => "PENTECT_PI",
         }
     }
 
@@ -585,6 +596,8 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "--codex",
             AgentTool::Claude => "--claude",
+            AgentTool::OpenCode => "--opencode",
+            AgentTool::Pi => "--pi",
         }
     }
 }
@@ -800,6 +813,53 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     apply_status_line_env(&mut cmd, status_line_enabled_by_config()?);
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
+}
+
+fn run_bridge_agent(
+    opts: &AgentToolOpts,
+    pentect: &Path,
+    tool: AgentTool,
+) -> Result<std::process::ExitStatus, String> {
+    use agent_integrations::{IntegrationKind, TempAgentIntegration};
+
+    let kind = match tool {
+        AgentTool::OpenCode => IntegrationKind::OpenCode,
+        AgentTool::Pi => IntegrationKind::Pi,
+        AgentTool::Codex | AgentTool::Claude => {
+            return Err("unsupported bridge agent".to_string());
+        }
+    };
+    let integration = TempAgentIntegration::create(kind)?;
+    let mut args = Vec::new();
+    if tool == AgentTool::Pi {
+        args.push("--extension".to_string());
+        args.push(integration.path().to_string_lossy().into_owned());
+    }
+    args.extend(opts.tool_args.iter().cloned());
+    if opts.dry_run {
+        print_dry_run(&opts.command, &args);
+        return Ok(success_status());
+    }
+
+    let active_extensions = agent_tool_extensions(opts)?;
+    let in_memory_manager = start_in_memory_manager(pentect)?;
+    let mut cmd = Command::new(&opts.command);
+    apply_extension_env(&mut cmd, &active_extensions)?;
+    apply_pentect_env(&mut cmd, pentect, Some(in_memory_manager.token.as_str()));
+    apply_agent_auto_approve_env(&mut cmd);
+    apply_in_memory_manager_env(&mut cmd, Some(&in_memory_manager));
+    apply_status_line_env(&mut cmd, status_line_enabled_by_config()?);
+    cmd.env("PENTECT_AGENT_CONTRACT", PENTECT_CONTRACT_INSTRUCTIONS);
+    if tool == AgentTool::OpenCode {
+        let existing = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+        let config = agent_integrations::opencode_config_with_plugin(
+            existing.as_deref(),
+            integration.path(),
+        )?;
+        cmd.env("OPENCODE_CONFIG_CONTENT", config);
+    }
+    cmd.args(args);
+    run_interactive_command_with_guard(cmd, &opts.command, (integration, in_memory_manager))
 }
 
 fn run_interactive_command(
@@ -2486,7 +2546,12 @@ mod tests {
 
     #[test]
     fn agent_tool_parse_rejects_prompt_proxy_for_all_agents() {
-        for tool in [AgentTool::Codex, AgentTool::Claude] {
+        for tool in [
+            AgentTool::Codex,
+            AgentTool::Claude,
+            AgentTool::OpenCode,
+            AgentTool::Pi,
+        ] {
             let args = vec![
                 "pentect".to_string(),
                 tool.name().to_string(),
@@ -2495,6 +2560,14 @@ mod tests {
             let err = AgentToolOpts::parse(tool, &args).unwrap_err();
             assert!(err.contains("disabled/TODO"), "{tool:?}: {err}");
         }
+    }
+
+    #[test]
+    fn bridge_agents_have_distinct_commands_and_path_flags() {
+        assert_eq!(AgentTool::OpenCode.env_var(), "PENTECT_OPENCODE");
+        assert_eq!(AgentTool::OpenCode.path_flag(), "--opencode");
+        assert_eq!(AgentTool::Pi.env_var(), "PENTECT_PI");
+        assert_eq!(AgentTool::Pi.path_flag(), "--pi");
     }
 
     #[test]

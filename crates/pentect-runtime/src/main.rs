@@ -84,6 +84,7 @@ pub fn run_from(args: Vec<String>) -> i32 {
         Some("resolve") => cmd_resolve(&args),
         Some("approve") => cmd_approve(&args),
         Some("hook") => cmd_hook(&args),
+        Some("bridge") => cmd_bridge(&args),
         Some("manager") => cmd_in_memory_manager(&args),
         Some("purge") => cmd_purge(&args),
         _ => {
@@ -1398,6 +1399,176 @@ fn cmd_hook(args: &[String]) -> i32 {
             0
         }
         Err(e) => die(format!("could not serialize hook output: {e}")),
+    }
+}
+
+fn cmd_bridge(args: &[String]) -> i32 {
+    if args.len() != 2 {
+        return die("bridge");
+    }
+    if !agent_launch_proof_valid() {
+        return die("Pentect unavailable.");
+    }
+    let session = match Session::open_capability(DEFAULT_SESSION) {
+        Ok(session) => session,
+        Err(_) => return die("Pentect unavailable."),
+    };
+    let mut prompt_masker = match ActiveToolOutputMasker::new() {
+        Ok(masker) => masker,
+        Err(_) => return die("Pentect unavailable."),
+    };
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match read_bridge_line(&mut reader, &mut line) {
+            Ok(BridgeLine::Eof) => return 0,
+            Ok(BridgeLine::Ready) => {}
+            Ok(BridgeLine::Oversized) => return 2,
+            Err(_) => return 2,
+        }
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        let request = match serde_json::from_slice::<Value>(&line) {
+            Ok(request) => request,
+            Err(_) => return 2,
+        };
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let result = handle_bridge_request(&session, &mut prompt_masker, &request).ok();
+        if write_bridge_response(&mut writer, id, result).is_err() {
+            return 2;
+        }
+    }
+}
+
+enum BridgeLine {
+    Eof,
+    Ready,
+    Oversized,
+}
+
+fn read_bridge_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<BridgeLine> {
+    read_bridge_line_with_limit(reader, line, MAX_INPUT_BYTES)
+}
+
+fn read_bridge_line_with_limit(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<BridgeLine> {
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() && !oversized {
+                BridgeLine::Eof
+            } else if oversized {
+                BridgeLine::Oversized
+            } else {
+                BridgeLine::Ready
+            });
+        }
+        let end = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if !oversized {
+            if line.len().saturating_add(end) <= max_bytes {
+                line.extend_from_slice(&available[..end]);
+            } else {
+                oversized = true;
+                line.clear();
+            }
+        }
+        let complete = available.get(end.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(end);
+        if complete {
+            return Ok(if oversized {
+                BridgeLine::Oversized
+            } else {
+                BridgeLine::Ready
+            });
+        }
+    }
+}
+
+fn write_bridge_response(
+    writer: &mut impl Write,
+    id: Value,
+    value: Option<Value>,
+) -> Result<(), String> {
+    let response = match value {
+        Some(value) => json!({ "id": id, "ok": true, "value": value }),
+        None => json!({ "id": id, "ok": false }),
+    };
+    serde_json::to_writer(&mut *writer, &response).map_err(|_| "bridge unavailable".to_string())?;
+    writer
+        .write_all(b"\n")
+        .and_then(|_| writer.flush())
+        .map_err(|_| "bridge unavailable".to_string())
+}
+
+fn handle_bridge_request(
+    session: &Session,
+    prompt_masker: &mut ActiveToolOutputMasker,
+    request: &Value,
+) -> Result<Value, String> {
+    let op = request
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "invalid bridge request".to_string())?;
+    let value = request
+        .get("value")
+        .ok_or_else(|| "invalid bridge request".to_string())?;
+    match op {
+        "prompt" => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| "invalid bridge request".to_string())?;
+            Ok(Value::String(
+                prompt_masker
+                    .mask_prompt_text(text)?
+                    .unwrap_or_else(|| text.to_string()),
+            ))
+        }
+        "media" => match claude_image_tool_output(session, value)? {
+            Some(ToolTextOutput::Updated(updated)) => Ok(updated),
+            Some(ToolTextOutput::Block(_)) => Err("media unavailable".to_string()),
+            Some(ToolTextOutput::Unchanged) | None => Ok(value.clone()),
+        },
+        "before" => {
+            let tool_name = request
+                .get("tool")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "invalid bridge request".to_string())?;
+            before_tool_updated_input(
+                HookProvider::Generic,
+                DEFAULT_SESSION,
+                session,
+                tool_name,
+                value,
+            )
+            .map(|(updated, _)| updated)
+        }
+        "after" => {
+            let tool_name = request
+                .get("tool")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "invalid bridge request".to_string())?;
+            if let Some(tool_input) = request.get("input") {
+                repair_masked_write_after_tool(session, tool_name, tool_input)?;
+            }
+            match mask_tool_text_output(HookProvider::Claude, session, value)? {
+                ToolTextOutput::Unchanged => Ok(value.clone()),
+                ToolTextOutput::Updated(updated) => Ok(updated),
+                ToolTextOutput::Block(_) => Err("output unavailable".to_string()),
+            }
+        }
+        _ => Err("invalid bridge request".to_string()),
     }
 }
 
@@ -2975,7 +3146,7 @@ impl HookProvider {
         match self {
             HookProvider::Codex => "pentect codex",
             HookProvider::Claude => "pentect claude",
-            HookProvider::Generic => "pentect codex|claude",
+            HookProvider::Generic => "pentect codex|claude|opencode|pi",
         }
     }
 }
@@ -3579,7 +3750,6 @@ fn handle_hook_lazy(
     }
 }
 
-#[cfg(test)]
 fn before_tool_updated_input(
     provider: HookProvider,
     session_name: &str,

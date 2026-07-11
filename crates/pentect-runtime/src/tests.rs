@@ -856,6 +856,83 @@ fn active_tool_output_masker_reuses_in_memory_state() {
 }
 
 #[test]
+fn bridge_masks_prompt_wraps_shell_and_masks_result() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let token = "bridge-mask-token".to_string();
+    let addr = in_memory_manager::spawn_test_in_memory_manager(token.clone());
+    struct EnvCleanup;
+    impl Drop for EnvCleanup {
+        fn drop(&mut self) {
+            std::env::remove_var(ENV_ADDR);
+            std::env::remove_var(ENV_TOKEN);
+        }
+    }
+    let _cleanup = EnvCleanup;
+    std::env::set_var(ENV_ADDR, addr);
+    std::env::set_var(ENV_TOKEN, token);
+
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let session = Session::open_capability(DEFAULT_SESSION).unwrap();
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+    let prompt = handle_bridge_request(
+        &session,
+        &mut masker,
+        &json!({ "op": "prompt", "value": format!("OPENAI_API_KEY={raw}") }),
+    )
+    .unwrap();
+    let prompt = prompt.as_str().unwrap();
+    assert!(!prompt.contains(raw), "{prompt}");
+    assert!(prompt.contains("<<OPENAI_API_KEY_"), "{prompt}");
+
+    let before = handle_bridge_request(
+        &session,
+        &mut masker,
+        &json!({
+            "op": "before",
+            "tool": "bash",
+            "value": { "command": "Get-Content .env" }
+        }),
+    )
+    .unwrap();
+    let command = before["command"].as_str().unwrap();
+    assert!(command.contains("pentect"), "{command}");
+    assert!(command.contains("exec"), "{command}");
+
+    let after = handle_bridge_request(
+        &session,
+        &mut masker,
+        &json!({
+            "op": "after",
+            "tool": "connector",
+            "input": {},
+            "value": { "content": format!("OPENAI_API_KEY={raw}") }
+        }),
+    )
+    .unwrap();
+    let rendered = serde_json::to_string(&after).unwrap();
+    assert!(!rendered.contains(raw), "{rendered}");
+    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+}
+
+#[test]
+fn bridge_line_reader_discards_oversized_request() {
+    let mut input = vec![b'x'; 9];
+    input.extend_from_slice(b"\n{}\n");
+    let mut reader = std::io::Cursor::new(input);
+    let mut line = Vec::new();
+    assert!(matches!(
+        read_bridge_line_with_limit(&mut reader, &mut line, 8).unwrap(),
+        BridgeLine::Oversized
+    ));
+    assert!(line.is_empty());
+    assert!(matches!(
+        read_bridge_line(&mut reader, &mut line).unwrap(),
+        BridgeLine::Ready
+    ));
+    assert_eq!(line, b"{}\n");
+}
+
+#[test]
 fn prompt_masked_env_is_available_to_exec_proxy_without_visible_pentect_exec() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let token = "prompt-exec-proxy-token".to_string();
