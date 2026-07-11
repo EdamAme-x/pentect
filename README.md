@@ -10,12 +10,10 @@ Extensions:
 - Model adapters for local NER/classifier spans: `examples/extensions/ner/adapter.toml`
 
 TODO
-- codex issue
+- codex issue (plugin, mcp, tool output)
 - host prompt secret (patch...?)
-- pdf as exts, image as exts, etc...
-- dirty log
-- staring
+- starter
 - docs site
 - easy install
-
 - opencode, antigravity cli, pico, https://github.com/usestrix/strix
+- codex app, claude app, and more, chatgpt web and more and general..
