@@ -137,6 +137,45 @@ const SAFE_RESULT = {
   isError: true,
 };
 
+function pentectBashOperations() {
+  return {
+    exec(command, cwd, { onData, signal, timeout, env }) {
+      return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new Error("aborted"));
+          return;
+        }
+        const child = spawn(process.env.PENTECT_BIN || "pentect", ["exec", command], {
+          cwd,
+          env: { ...process.env, ...env },
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        });
+        let settled = false;
+        const finish = (callback) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          callback();
+        };
+        const abort = () => {
+          child.kill();
+          finish(() => resolve({ exitCode: null }));
+        };
+        const timer = timeout
+          ? setTimeout(abort, Math.min(timeout * 1000, 2_147_483_647))
+          : undefined;
+        signal?.addEventListener("abort", abort, { once: true });
+        child.stdout.on("data", onData);
+        child.stderr.on("data", onData);
+        child.on("error", () => finish(() => reject(new Error("Pentect unavailable"))));
+        child.on("close", (code) => finish(() => resolve({ exitCode: code })));
+      });
+    },
+  };
+}
+
 export default function pentectExtension(pi) {
   const bridge = createPentectBridge();
 
@@ -183,6 +222,8 @@ export default function pentectExtension(pi) {
       return SAFE_RESULT;
     }
   });
+
+  pi.on("user_bash", async () => ({ operations: pentectBashOperations() }));
 
   pi.on("session_shutdown", async () => bridge.close());
 }
@@ -277,6 +318,7 @@ mod tests {
         assert!(pi.contains("pi.on(\"before_agent_start\""));
         assert!(pi.contains("pi.on(\"tool_call\""));
         assert!(pi.contains("pi.on(\"tool_result\""));
+        assert!(pi.contains("pi.on(\"user_bash\""));
     }
 
     #[test]
