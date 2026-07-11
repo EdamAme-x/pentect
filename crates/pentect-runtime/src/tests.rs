@@ -256,6 +256,44 @@ fn pty_input_bytes_keep_escape_sequences_and_rewrite_secret_chunks() {
 }
 
 #[test]
+fn pty_bracketed_paste_is_masked_before_reaching_the_child() {
+    let (root, session) = empty_session("shell-pty-bracketed-paste");
+    let store = RecoveryStore::load(&session).unwrap();
+    let mut protector = ShellInputProtector::new(store).unwrap();
+    let suppressor = PtyEchoSuppressor::default();
+    let mut forwarded = Vec::new();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+
+    forward_pty_input_bytes(b"\x1b[20", &mut forwarded, &mut protector, &suppressor).unwrap();
+    assert!(forwarded.is_empty());
+
+    forward_pty_input_bytes(
+        format!("0~Authorization: Bearer {raw}").as_bytes(),
+        &mut forwarded,
+        &mut protector,
+        &suppressor,
+    )
+    .unwrap();
+    assert_eq!(forwarded, BRACKETED_PASTE_START);
+    assert!(!String::from_utf8_lossy(&forwarded).contains(raw));
+
+    forward_pty_input_bytes(
+        BRACKETED_PASTE_END,
+        &mut forwarded,
+        &mut protector,
+        &suppressor,
+    )
+    .unwrap();
+    let child = String::from_utf8(forwarded).unwrap();
+    assert!(child.contains("PENTECT_OPENAI_API_KEY_"), "{child}");
+    let mut visible = child;
+    suppressor.scrub(&mut visible);
+    assert!(!visible.contains(raw), "{visible}");
+    assert!(visible.contains("PENTECT_OPENAI_API_KEY_"), "{visible}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn child_env_overlays_strip_in_memory_manager_credentials() {
     let mut cmd = Command::new("echo");
     apply_child_env_overlays(&mut cmd, &[], "demo");

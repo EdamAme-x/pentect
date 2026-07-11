@@ -60,6 +60,9 @@ const ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES: usize = 16 * 1024;
 const PTY_PARTIAL_FLUSH_TIMEOUT: Duration = Duration::from_millis(30);
 const PTY_PARTIAL_FLUSH_BYTES: usize = 4096;
 const PTY_PARTIAL_TAIL_BYTES: usize = 512;
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+const PTY_PASTE_MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -2330,6 +2333,7 @@ fn pump_masked_pty_terminal_stdin(
         }
         match input_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(bytes) if bytes.is_empty() => {
+                flush_pty_input(child_stdin.as_mut(), &mut protector, &suppressor)?;
                 drop(child_stdin);
                 return child
                     .wait()
@@ -2340,6 +2344,7 @@ fn pump_masked_pty_terminal_stdin(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                flush_pty_input(child_stdin.as_mut(), &mut protector, &suppressor)?;
                 drop(child_stdin);
                 return child
                     .wait()
@@ -2444,6 +2449,73 @@ fn forward_pty_input_bytes(
     protector: &mut ShellInputProtector,
     suppressor: &PtyEchoSuppressor,
 ) -> Result<(), String> {
+    protector.pty_pending.extend_from_slice(bytes);
+    if protector.pty_pending.len() > PTY_PASTE_MAX_PENDING_BYTES {
+        return Err("pasted input is too large".to_string());
+    }
+    loop {
+        if protector.in_bracketed_paste {
+            let Some(end) = find_input_bytes(&protector.pty_pending, BRACKETED_PASTE_END) else {
+                return Ok(());
+            };
+            let mut content: Vec<u8> = protector.pty_pending.drain(..end).collect();
+            let text = match std::str::from_utf8(&content) {
+                Ok(text) => text,
+                Err(_) => {
+                    content.zeroize();
+                    return Err("pasted input must be UTF-8 text".to_string());
+                }
+            };
+            let mut line_stars = 0usize;
+            forward_masked_text(
+                text,
+                child_stdin,
+                &mut line_stars,
+                protector,
+                ShellInputEcho::Native,
+                Some(suppressor),
+            )?;
+            content.zeroize();
+            protector.pty_pending.drain(..BRACKETED_PASTE_END.len());
+            child_stdin
+                .write_all(BRACKETED_PASTE_END)
+                .map_err(|e| format!("could not write shell stdin: {e}"))?;
+            protector.in_bracketed_paste = false;
+            continue;
+        }
+
+        if let Some(start) = find_input_bytes(&protector.pty_pending, BRACKETED_PASTE_START) {
+            let mut before: Vec<u8> = protector.pty_pending.drain(..start).collect();
+            forward_pty_plain_bytes(&before, child_stdin, protector, suppressor)?;
+            before.zeroize();
+            protector.pty_pending.drain(..BRACKETED_PASTE_START.len());
+            child_stdin
+                .write_all(BRACKETED_PASTE_START)
+                .map_err(|e| format!("could not write shell stdin: {e}"))?;
+            protector.in_bracketed_paste = true;
+            continue;
+        }
+
+        let keep = partial_input_prefix_len(&protector.pty_pending, BRACKETED_PASTE_START);
+        let emit_len = protector.pty_pending.len().saturating_sub(keep);
+        if emit_len > 0 {
+            let mut plain: Vec<u8> = protector.pty_pending.drain(..emit_len).collect();
+            forward_pty_plain_bytes(&plain, child_stdin, protector, suppressor)?;
+            plain.zeroize();
+        }
+        child_stdin
+            .flush()
+            .map_err(|e| format!("could not flush shell stdin: {e}"))?;
+        return Ok(());
+    }
+}
+
+fn forward_pty_plain_bytes(
+    bytes: &[u8],
+    child_stdin: &mut dyn Write,
+    protector: &mut ShellInputProtector,
+    suppressor: &PtyEchoSuppressor,
+) -> Result<(), String> {
     if let Ok(text) = std::str::from_utf8(bytes) {
         if should_protect_pty_input_text(text) {
             let mut line_stars = 0usize;
@@ -2459,10 +2531,57 @@ fn forward_pty_input_bytes(
     }
     child_stdin
         .write_all(bytes)
-        .map_err(|e| format!("could not write shell stdin: {e}"))?;
+        .map_err(|e| format!("could not write shell stdin: {e}"))
+}
+
+fn flush_pty_input(
+    child_stdin: &mut dyn Write,
+    protector: &mut ShellInputProtector,
+    suppressor: &PtyEchoSuppressor,
+) -> Result<(), String> {
+    if protector.pty_pending.is_empty() {
+        return Ok(());
+    }
+    let mut pending = std::mem::take(&mut protector.pty_pending);
+    if protector.in_bracketed_paste {
+        let text = match std::str::from_utf8(&pending) {
+            Ok(text) => text,
+            Err(_) => {
+                pending.zeroize();
+                return Err("pasted input must be UTF-8 text".to_string());
+            }
+        };
+        let mut line_stars = 0usize;
+        forward_masked_text(
+            text,
+            child_stdin,
+            &mut line_stars,
+            protector,
+            ShellInputEcho::Native,
+            Some(suppressor),
+        )?;
+    } else {
+        forward_pty_plain_bytes(&pending, child_stdin, protector, suppressor)?;
+    }
+    pending.zeroize();
+    protector.in_bracketed_paste = false;
     child_stdin
         .flush()
         .map_err(|e| format!("could not flush shell stdin: {e}"))
+}
+
+fn find_input_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn partial_input_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
+    let max = bytes.len().min(prefix.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|len| bytes[bytes.len() - len..] == prefix[..*len])
+        .unwrap_or(0)
 }
 
 fn should_protect_pty_input_text(text: &str) -> bool {
@@ -2484,12 +2603,12 @@ fn forward_masked_text(
     suppressor: Option<&PtyEchoSuppressor>,
 ) -> Result<(), String> {
     let paste = protector.prepare_paste(text)?;
+    if let Some(suppressor) = suppressor {
+        suppressor.push(paste.injected_prefix);
+    }
     child_stdin
         .write_all(paste.child.as_bytes())
         .map_err(|e| format!("could not write shell stdin: {e}"))?;
-    if let Some(suppressor) = suppressor {
-        suppressor.push(paste.injected_prefix.clone());
-    }
     match echo {
         ShellInputEcho::Masked if paste.changed => {
             echo_visible_input(&paste.visible)?;
@@ -2619,6 +2738,8 @@ struct ShellInputProtector {
     store: RecoveryStore,
     syntax: ShellSyntax,
     defined_env: BTreeSet<String>,
+    pty_pending: Vec<u8>,
+    in_bracketed_paste: bool,
 }
 
 impl ShellInputProtector {
@@ -2628,6 +2749,8 @@ impl ShellInputProtector {
             store,
             syntax: ShellSyntax::current(),
             defined_env: BTreeSet::new(),
+            pty_pending: Vec::new(),
+            in_bracketed_paste: false,
         })
     }
 
