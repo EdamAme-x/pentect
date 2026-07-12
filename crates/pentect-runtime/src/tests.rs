@@ -294,6 +294,37 @@ fn pty_bracketed_paste_is_masked_before_reaching_the_child() {
 }
 
 #[test]
+fn pty_terminal_queries_are_answered_without_reaching_output() {
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("lock"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let response = Arc::new(Mutex::new(Vec::new()));
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(Box::new(SharedWriter(response.clone()))));
+    let mut pending = "before\x1b[6nafter\x1b[5n".to_string();
+    respond_to_terminal_queries(&mut pending, &writer).unwrap();
+    assert_eq!(pending, "beforeafter");
+    assert_eq!(*response.lock().unwrap(), b"\x1b[1;1R\x1b[0n");
+    assert!(is_terminal_query_prefix(b"\x1b"));
+    assert!(is_terminal_query_prefix(b"\x1b[6"));
+    assert!(!is_terminal_query_prefix(b"\x1b[A"));
+}
+
+#[test]
 fn child_env_overlays_strip_in_memory_manager_credentials() {
     let mut cmd = Command::new("echo");
     apply_child_env_overlays(&mut cmd, &[], "demo");

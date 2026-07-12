@@ -915,7 +915,7 @@ fn run_interactive_command_pty(
     terminal_guard: &mut terminal::TuiSessionGuard,
 ) -> Result<std::process::ExitStatus, String> {
     let pty_system = native_pty_system();
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = pty_size_without_terminal_query();
     let pair = pty_system
         .openpty(PtySize {
             rows,
@@ -966,6 +966,20 @@ fn run_interactive_command_pty(
     };
     terminal_guard.restore_after_tui();
     Ok(exit_status_from_code(status.exit_code()))
+}
+
+fn pty_size_without_terminal_query() -> (u16, u16) {
+    let cols = pty_dimension_from_env("COLUMNS").unwrap_or(120);
+    let rows = pty_dimension_from_env("LINES").unwrap_or(30);
+    (cols, rows)
+}
+
+fn pty_dimension_from_env(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value >= 2)
 }
 
 fn command_builder_from_process_command(cmd: &Command) -> Result<CommandBuilder, String> {
@@ -1079,18 +1093,53 @@ fn pump_prompt_guarded_pty_input(
     }
 }
 
-struct RawModeGuard;
+struct RawModeGuard {
+    #[cfg(windows)]
+    previous: Option<(*mut std::ffi::c_void, u32)>,
+}
 
 impl RawModeGuard {
     fn enable() -> Result<Self, String> {
-        crossterm::terminal::enable_raw_mode()
-            .map_err(|e| format!("could not enter raw terminal mode: {e}"))?;
-        Ok(Self)
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{
+                GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+                ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, STD_INPUT_HANDLE,
+            };
+
+            let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let mut previous = 0;
+            if unsafe { GetConsoleMode(handle, &mut previous) } == 0 {
+                return Ok(Self { previous: None });
+            }
+            let mode = (previous
+                & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            if unsafe { SetConsoleMode(handle, mode) } == 0 {
+                return Err("could not enter raw terminal mode".to_string());
+            }
+            Ok(Self {
+                previous: Some((handle, previous)),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            crossterm::terminal::enable_raw_mode()
+                .map_err(|e| format!("could not enter raw terminal mode: {e}"))?;
+            Ok(Self {})
+        }
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some((handle, mode)) = self.previous {
+            unsafe {
+                let _ = windows_sys::Win32::System::Console::SetConsoleMode(handle, mode);
+            }
+        }
+        #[cfg(not(windows))]
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }

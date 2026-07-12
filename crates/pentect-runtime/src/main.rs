@@ -2087,7 +2087,7 @@ fn run_masked_shell_pty(
         None => interactive_shell_pty_program(),
     };
     let pty_system = native_pty_system();
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = pty_size_without_terminal_query();
     let pair = pty_system
         .openpty(PtySize {
             rows,
@@ -2114,18 +2114,34 @@ fn run_masked_shell_pty(
         .master
         .take_writer()
         .map_err(|e| format!("could not open shell input: {e}"))?;
+    let writer = Arc::new(Mutex::new(writer));
     let suppressor = PtyEchoSuppressor::default();
     let output_store = store.clone();
     let output_suppressor = suppressor.clone();
+    let terminal_responder = writer.clone();
     let output_thread = std::thread::spawn(move || {
         let mut masker = OutputMasker::new_deferred(output_store)?;
-        stream_masked_pty_reader(&mut masker, reader, output_suppressor)?;
+        stream_masked_pty_reader(&mut masker, reader, output_suppressor, terminal_responder)?;
         masker.flush()
     });
     let status = pump_masked_pty_terminal_stdin(child.as_mut(), writer, store, suppressor)?;
     drop(pair.master);
     join_stream_thread(output_thread)?;
     Ok(pty_exit_code(status))
+}
+
+fn pty_size_without_terminal_query() -> (u16, u16) {
+    let cols = pty_dimension_from_env("COLUMNS").unwrap_or(120);
+    let rows = pty_dimension_from_env("LINES").unwrap_or(30);
+    (cols, rows)
+}
+
+fn pty_dimension_from_env(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value >= 2)
 }
 
 fn shell_program_command(program: &[String]) -> Result<Command, String> {
@@ -2296,7 +2312,7 @@ fn pump_masked_terminal_stdin(
 
 fn pump_masked_pty_terminal_stdin(
     child: &mut dyn PtyChild,
-    mut child_stdin: Box<dyn Write + Send>,
+    child_stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     store: RecoveryStore,
     suppressor: PtyEchoSuppressor,
 ) -> Result<portable_pty::ExitStatus, String> {
@@ -2333,18 +2349,24 @@ fn pump_masked_pty_terminal_stdin(
         }
         match input_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(bytes) if bytes.is_empty() => {
-                flush_pty_input(child_stdin.as_mut(), &mut protector, &suppressor)?;
+                with_pty_writer(&child_stdin, |writer| {
+                    flush_pty_input(writer, &mut protector, &suppressor)
+                })?;
                 drop(child_stdin);
                 return child
                     .wait()
                     .map_err(|e| format!("could not wait for shell: {e}"));
             }
             Ok(bytes) => {
-                forward_pty_input_bytes(&bytes, child_stdin.as_mut(), &mut protector, &suppressor)?;
+                with_pty_writer(&child_stdin, |writer| {
+                    forward_pty_input_bytes(&bytes, writer, &mut protector, &suppressor)
+                })?;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                flush_pty_input(child_stdin.as_mut(), &mut protector, &suppressor)?;
+                with_pty_writer(&child_stdin, |writer| {
+                    flush_pty_input(writer, &mut protector, &suppressor)
+                })?;
                 drop(child_stdin);
                 return child
                     .wait()
@@ -2352,6 +2374,16 @@ fn pump_masked_pty_terminal_stdin(
             }
         }
     }
+}
+
+fn with_pty_writer<T>(
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    action: impl FnOnce(&mut dyn Write) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| "shell input lock failed".to_string())?;
+    action(writer.as_mut())
 }
 
 fn forward_masked_key(
@@ -2876,18 +2908,53 @@ fn apply_shell_env_builder(command: &mut CommandBuilder, session: &str, shim: &S
     shim.apply_to_builder(command);
 }
 
-struct RawModeGuard;
+struct RawModeGuard {
+    #[cfg(windows)]
+    previous: Option<(*mut std::ffi::c_void, u32)>,
+}
 
 impl RawModeGuard {
     fn enable() -> Result<Self, String> {
-        crossterm::terminal::enable_raw_mode()
-            .map_err(|e| format!("could not enter raw terminal mode: {e}"))?;
-        Ok(Self)
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{
+                GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+                ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, STD_INPUT_HANDLE,
+            };
+
+            let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let mut previous = 0;
+            if unsafe { GetConsoleMode(handle, &mut previous) } == 0 {
+                return Ok(Self { previous: None });
+            }
+            let mode = (previous
+                & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            if unsafe { SetConsoleMode(handle, mode) } == 0 {
+                return Err("could not enter raw terminal mode".to_string());
+            }
+            Ok(Self {
+                previous: Some((handle, previous)),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            crossterm::terminal::enable_raw_mode()
+                .map_err(|e| format!("could not enter raw terminal mode: {e}"))?;
+            Ok(Self {})
+        }
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some((handle, mode)) = self.previous {
+            unsafe {
+                let _ = windows_sys::Win32::System::Console::SetConsoleMode(handle, mode);
+            }
+        }
+        #[cfg(not(windows))]
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
@@ -3067,6 +3134,7 @@ fn stream_masked_pty_reader(
     masker: &mut OutputMasker,
     mut reader: Box<dyn Read + Send>,
     suppressor: PtyEchoSuppressor,
+    terminal_responder: Arc<Mutex<Box<dyn Write + Send>>>,
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
@@ -3097,6 +3165,7 @@ fn stream_masked_pty_reader(
         match rx.recv_timeout(PTY_PARTIAL_FLUSH_TIMEOUT) {
             Ok(PtyReadEvent::Data(bytes)) => {
                 pending.push_str(&String::from_utf8_lossy(&bytes));
+                respond_to_terminal_queries(&mut pending, &terminal_responder)?;
                 flush_pty_complete_lines(masker, &suppressor, &mut pending)?;
                 flush_pty_large_prefix(masker, &suppressor, &mut pending)?;
             }
@@ -3122,6 +3191,31 @@ fn stream_masked_pty_reader(
     }
     if let Some(e) = read_error {
         return Err(e);
+    }
+    Ok(())
+}
+
+fn respond_to_terminal_queries(
+    pending: &mut String,
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+) -> Result<(), String> {
+    while let Some(start) = pending.find("\x1b[6n") {
+        pending.replace_range(start..start + 4, "");
+        with_pty_writer(writer, |writer| {
+            writer
+                .write_all(b"\x1b[1;1R")
+                .and_then(|_| writer.flush())
+                .map_err(|e| format!("could not answer shell terminal query: {e}"))
+        })?;
+    }
+    while let Some(start) = pending.find("\x1b[5n") {
+        pending.replace_range(start..start + 4, "");
+        with_pty_writer(writer, |writer| {
+            writer
+                .write_all(b"\x1b[0n")
+                .and_then(|_| writer.flush())
+                .map_err(|e| format!("could not answer shell terminal query: {e}"))
+        })?;
     }
     Ok(())
 }
@@ -3159,6 +3253,7 @@ fn flush_pty_large_prefix(
 
 fn should_flush_pty_partial(pending: &str) -> bool {
     !pending.is_empty()
+        && !is_terminal_query_prefix(pending.as_bytes())
         && (pending.contains('\x1b')
             || pending.len() >= 256
             || pending.ends_with("> ")
@@ -3166,6 +3261,12 @@ fn should_flush_pty_partial(pending: &str) -> bool {
             || pending.ends_with("# ")
             || pending.ends_with(": ")
             || pending.ends_with("? "))
+}
+
+fn is_terminal_query_prefix(pending: &[u8]) -> bool {
+    [b"\x1b[5n".as_slice(), b"\x1b[6n".as_slice()]
+        .iter()
+        .any(|query| pending.len() < query.len() && query.starts_with(pending))
 }
 
 fn flush_pty_text(

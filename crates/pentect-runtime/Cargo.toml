@@ -50,6 +50,7 @@ getrandom = { workspace = true }
 jiff = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
 windows = { workspace = true, optional = true, features = [
     "Foundation",
     "Graphics_Imaging",
