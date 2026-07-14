@@ -12,6 +12,7 @@ jobs:
   native-ocr:
     name: Native OCR (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -24,9 +25,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check native OCR build
         run: cargo check -p pentect-cli --features ocr --locked
+      - name: Test Windows ConPTY
+        if: runner.os == 'Windows'
+        run: cargo test -p pentect-cli --no-default-features --test pty_dimensions --locked
+      - name: Test macOS PTY
+        if: runner.os == 'macOS'
+        run: cargo test -p pentect-cli --no-default-features --test pty_unix --locked
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:

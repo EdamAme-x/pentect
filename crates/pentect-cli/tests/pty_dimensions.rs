@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INITIAL_SIZE: (u16, u16) = (177, 43);
 const RESIZED_SIZE: (u16, u16) = (101, 31);
+static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn shell_pty_inherits_and_tracks_parent_dimensions() {
@@ -39,6 +40,9 @@ fn agent_pty_inherits_and_tracks_parent_dimensions() {
 
 #[test]
 fn agent_pty_preserves_backspace_as_one_key_event() {
+    let _serial = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = test_root();
     std::fs::create_dir_all(&root).unwrap();
 
@@ -95,14 +99,136 @@ fn agent_pty_preserves_backspace_as_one_key_event() {
     }
     wait_for_text(&rx, &mut output, "KEY:Backspace:8");
 
-    let status = child.wait().unwrap();
+    let status = wait_for_child(child.as_mut());
     assert_eq!(status.exit_code(), 0, "{output:?}");
     drop(pair.master);
-    reader_thread.join().unwrap();
+    join_reader(reader_thread);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_pty_does_not_forward_nested_win32_input_mode() {
+    let _serial = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+
+    let pty = native_pty_system();
+    let pair = pty.openpty(pty_size(INITIAL_SIZE)).unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_pentect"));
+    command.args([
+        "opencode",
+        "--tool",
+        "powershell.exe",
+        "--",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$esc=[char]27;Write-Output 'BEFORE';[Console]::Out.Write($esc+'[?9001h');Write-Output 'READY';[Console]::Out.Write($esc+'[?9001l');Write-Output 'AFTER'",
+    ]);
+    command.cwd(&root);
+    command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    for name in [
+        "PENTECT_MEMORY_STORE_ADDR",
+        "PENTECT_MEMORY_STORE_TOKEN",
+        "PENTECT_PROCESS_HOST_READ_TOKEN",
+        "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+        "PENTECT_AGENT_LAUNCHED",
+    ] {
+        command.env_remove(name);
+    }
+
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().unwrap();
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+    let terminal_size = Arc::new(AtomicU32::new(pack_size(INITIAL_SIZE)));
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = {
+        let writer = writer.clone();
+        std::thread::spawn(move || forward_output(reader, writer, terminal_size, tx))
+    };
+
+    let status = wait_for_child(child.as_mut());
+    assert_eq!(status.exit_code(), 0);
+    drop(pair.master);
+    join_reader(reader_thread);
+    let output = rx.try_iter().collect::<String>().into_bytes();
+    let start = find_bytes(&output, b"BEFORE").expect("child output was not forwarded");
+    let end = find_bytes(&output[start..], b"AFTER")
+        .map(|offset| start + offset + b"AFTER".len())
+        .expect("child output was truncated");
+    assert!(!output[start..end]
+        .windows(b"\x1b[?9001h".len())
+        .any(|window| window == b"\x1b[?9001h"));
+    assert!(!output[start..end]
+        .windows(b"\x1b[?9001l".len())
+        .any(|window| window == b"\x1b[?9001l"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_pty_stops_background_processes_on_exit() {
+    let _serial = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+
+    let pty = native_pty_system();
+    let pair = pty.openpty(pty_size(INITIAL_SIZE)).unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_pentect"));
+    command.args([
+        "opencode",
+        "--tool",
+        "powershell.exe",
+        "--",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Process ping.exe -ArgumentList '-t','127.0.0.1' -NoNewWindow | Out-Null; Write-Output 'READY'",
+    ]);
+    command.cwd(&root);
+    command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    for name in [
+        "PENTECT_MEMORY_STORE_ADDR",
+        "PENTECT_MEMORY_STORE_TOKEN",
+        "PENTECT_PROCESS_HOST_READ_TOKEN",
+        "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+        "PENTECT_AGENT_LAUNCHED",
+    ] {
+        command.env_remove(name);
+    }
+
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().unwrap();
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+    let terminal_size = Arc::new(AtomicU32::new(pack_size(INITIAL_SIZE)));
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = {
+        let writer = writer.clone();
+        std::thread::spawn(move || forward_output(reader, writer, terminal_size, tx))
+    };
+
+    let mut output = String::new();
+    wait_for_text(&rx, &mut output, "READY");
+    let status = wait_for_child(child.as_mut());
+    assert_eq!(status.exit_code(), 0, "{output:?}");
+    drop(pair.master);
+    join_reader(reader_thread);
     let _ = std::fs::remove_dir_all(root);
 }
 
 fn assert_pty_dimensions(command_prefix: &[&str]) {
+    let _serial = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = test_root();
     std::fs::create_dir_all(&root).unwrap();
 
@@ -142,10 +268,10 @@ fn assert_pty_dimensions(command_prefix: &[&str]) {
     pair.master.resize(pty_size(RESIZED_SIZE)).unwrap();
     wait_for_text(&rx, &mut output, "SIZE:101x31");
 
-    let status = child.wait().unwrap();
+    let status = wait_for_child(child.as_mut());
     assert_eq!(status.exit_code(), 0, "{output:?}");
     drop(pair.master);
-    reader_thread.join().unwrap();
+    join_reader(reader_thread);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -179,11 +305,15 @@ fn forward_output(
     tx: mpsc::Sender<String>,
 ) {
     let mut buf = [0u8; 4096];
+    let mut dsr_state = 0usize;
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if buf[..n].windows(4).any(|bytes| bytes == b"\x1b[6n") {
+                if buf[..n]
+                    .iter()
+                    .any(|byte| observe_dsr(&mut dsr_state, *byte))
+                {
                     let (cols, rows) = unpack_size(terminal_size.load(Ordering::Relaxed));
                     let response = format!("\x1b[{rows};{cols}R");
                     if let Ok(mut writer) = writer.lock() {
@@ -202,12 +332,71 @@ fn forward_output(
     }
 }
 
+fn observe_dsr(state: &mut usize, byte: u8) -> bool {
+    const DSR: &[u8] = b"\x1b[6n";
+    if byte == DSR[*state] {
+        *state += 1;
+        if *state == DSR.len() {
+            *state = 0;
+            return true;
+        }
+    } else {
+        *state = usize::from(byte == DSR[0]);
+    }
+    false
+}
+
+fn wait_for_child(child: &mut dyn portable_pty::Child) -> portable_pty::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let stop_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < stop_deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("PTY child did not exit within 15 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn join_reader(thread: std::thread::JoinHandle<()>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(thread.is_finished(), "PTY reader did not reach EOF");
+    thread.join().unwrap();
+}
+
+#[test]
+fn dsr_detection_survives_read_boundaries() {
+    let mut state = 0usize;
+    assert!(!b"prefix\x1b["
+        .iter()
+        .any(|byte| observe_dsr(&mut state, *byte)));
+    assert!(b"6n".iter().any(|byte| observe_dsr(&mut state, *byte)));
+}
+
 fn pack_size((cols, rows): (u16, u16)) -> u32 {
     u32::from(cols) << 16 | u32::from(rows)
 }
 
 fn unpack_size(size: u32) -> (u16, u16) {
     ((size >> 16) as u16, size as u16)
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn wait_for_text(rx: &mpsc::Receiver<String>, output: &mut String, expected: &str) {

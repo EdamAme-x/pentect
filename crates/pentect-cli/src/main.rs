@@ -22,7 +22,10 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
 use zeroize::Zeroize;
@@ -961,17 +964,14 @@ fn run_interactive_command_inner(
     cmd: &mut Command,
     display: &Path,
 ) -> Result<std::process::ExitStatus, String> {
-    let mut terminal_guard = terminal::TuiSessionGuard::enter();
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let mut terminal_guard = terminal::TuiSessionGuard::enter();
         let status = run_interactive_command_pty(cmd, display, &mut terminal_guard);
         return status;
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(e) => {
-            terminal_guard.restore_without_prompt();
-            return Err(format!("could not start '{}': {e}", display.display()));
-        }
+        Err(e) => return Err(format!("could not start '{}': {e}", display.display())),
     };
     // Set this after spawn so child TUIs still receive Ctrl+C; the parent
     // stays alive long enough to restore terminal state after the child exits.
@@ -980,12 +980,10 @@ fn run_interactive_command_inner(
         Ok(status) => status,
         Err(e) => {
             drop(ctrl_c_guard);
-            terminal_guard.restore_after_tui();
             return Err(format!("could not wait for '{}': {e}", display.display()));
         }
     };
     drop(ctrl_c_guard);
-    terminal_guard.restore_after_tui();
     Ok(status)
 }
 
@@ -1012,6 +1010,7 @@ fn run_interactive_command_pty(
             return Err(format!("could not start '{}': {e}", display.display()));
         }
     };
+    let mut process_supervisor = PtyProcessSupervisor::new(child.as_ref());
     drop(pair.slave);
     let reader = pair
         .master
@@ -1021,21 +1020,31 @@ fn run_interactive_command_pty(
         .master
         .take_writer()
         .map_err(|e| format!("could not open '{}': {e}", display.display()))?;
-    let output_thread = thread::spawn(move || proxy_pty_output(reader));
+    let mode_tracker = terminal_guard.mode_tracker();
+    let output_error = Arc::new(Mutex::new(None));
+    let output_error_writer = output_error.clone();
+    let output_thread =
+        thread::spawn(move || proxy_pty_output(reader, mode_tracker, output_error_writer));
     let ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
-    let status =
-        pump_prompt_guarded_pty_input(child.as_mut(), writer, pair.master.as_ref(), (cols, rows));
+    let status = pump_prompt_guarded_pty_input(
+        child.as_mut(),
+        writer,
+        pair.master.as_ref(),
+        (cols, rows),
+        &output_error,
+    );
+    if status.is_err() {
+        let _ = child.kill();
+    }
+    process_supervisor.terminate();
+    finish_pty_child(child.as_mut());
     drop(ctrl_c_guard);
     drop(pair.master);
-    match output_thread.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
+    match join_pty_output(output_thread) {
+        Ok(()) => {}
+        Err(e) => {
             terminal_guard.restore_after_tui();
             return Err(e);
-        }
-        Err(_) => {
-            terminal_guard.restore_after_tui();
-            return Err("pty output thread panicked".to_string());
         }
     }
     let status = match status {
@@ -1099,63 +1108,361 @@ fn command_builder_from_process_command(cmd: &Command) -> Result<CommandBuilder,
     Ok(command)
 }
 
-fn proxy_pty_output(mut reader: Box<dyn Read + Send>) -> Result<(), String> {
-    let mut out = std::io::stdout().lock();
+fn proxy_pty_output(
+    mut reader: Box<dyn Read + Send>,
+    mode_tracker: terminal::TerminalModeTracker,
+    output_error: Arc<Mutex<Option<String>>>,
+) -> Result<(), String> {
     let mut buf = [0u8; 8192];
-    let mut remasker = pentect_agent::ActiveTerminalOutputRemasker::new()?;
+    let mut remasker = match pentect_agent::ActiveTerminalOutputRemasker::new() {
+        Ok(remasker) => remasker,
+        Err(error) => {
+            record_output_error(&output_error, &error);
+            drain_pty_reader(&mut reader, &mut buf);
+            return Err(error);
+        }
+    };
+    let mut first_error = None;
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("could not read pty output: {e}"))?;
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(error) => {
+                let error = format!("could not read pty output: {error}");
+                record_output_error(&output_error, &error);
+                return Err(error);
+            }
+        };
         if n == 0 {
             break;
         }
-        let remasked = remasker.push(&buf[..n])?;
+        if first_error.is_some() {
+            buf[..n].zeroize();
+            continue;
+        }
+        let remasked = match remasker.push(&buf[..n]) {
+            Ok(remasked) => remasked,
+            Err(error) => {
+                buf[..n].zeroize();
+                record_output_error(&output_error, &error);
+                first_error = Some(error);
+                continue;
+            }
+        };
         buf[..n].zeroize();
-        out.write_all(&remasked)
-            .map_err(|e| format!("could not write pty output: {e}"))?;
-        out.flush()
-            .map_err(|e| format!("could not flush pty output: {e}"))?;
+        mode_tracker.observe(&remasked);
+        if let Err(error) = write_pty_output(&remasked) {
+            record_output_error(&output_error, &error);
+            first_error = Some(error);
+        }
     }
-    let tail = remasker.finish()?;
-    out.write_all(&tail)
-        .map_err(|e| format!("could not write pty output tail: {e}"))?;
-    out.flush()
-        .map_err(|e| format!("could not flush pty output tail: {e}"))?;
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    let tail = match remasker.finish() {
+        Ok(tail) => tail,
+        Err(error) => {
+            record_output_error(&output_error, &error);
+            return Err(error);
+        }
+    };
+    mode_tracker.observe(&tail);
+    if let Err(error) = write_pty_output(&tail) {
+        record_output_error(&output_error, &error);
+        return Err(error);
+    }
     Ok(())
+}
+
+fn drain_pty_reader(reader: &mut dyn Read, buf: &mut [u8]) {
+    loop {
+        match reader.read(buf) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => buf[..read].zeroize(),
+        }
+    }
+    buf.zeroize();
+}
+
+fn record_output_error(output_error: &Arc<Mutex<Option<String>>>, error: &str) {
+    let mut pending = match output_error.lock() {
+        Ok(pending) => pending,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if pending.is_none() {
+        *pending = Some(error.to_string());
+    }
+}
+
+fn write_pty_output(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut out = std::io::stdout().lock();
+    out.write_all(bytes)
+        .map_err(|e| format!("could not write pty output: {e}"))?;
+    out.flush()
+        .map_err(|e| format!("could not flush pty output: {e}"))?;
+    Ok(())
+}
+
+fn join_pty_output(output_thread: thread::JoinHandle<Result<(), String>>) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !output_thread.is_finished() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !output_thread.is_finished() {
+        return Err("pty output did not close".to_string());
+    }
+    match output_thread.join() {
+        Ok(result) => result,
+        Err(_) => Err("pty output thread panicked".to_string()),
+    }
+}
+
+fn finish_pty_child(child: &mut dyn PtyChild) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct PtyProcessSupervisor {
+    root: Option<SupervisedRoot>,
+}
+
+#[cfg(unix)]
+impl PtyProcessSupervisor {
+    fn new(child: &dyn PtyChild) -> Self {
+        Self {
+            root: capture_supervised_root(child),
+        }
+    }
+
+    fn terminate(&mut self) {
+        let Some(root) = self.root.take() else {
+            return;
+        };
+        terminate_supervised_processes(root);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtyProcessSupervisor {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(windows)]
+fn process_descends_from(
+    mut pid: sysinfo::Pid,
+    root: sysinfo::Pid,
+    processes: &std::collections::HashMap<sysinfo::Pid, sysinfo::Process>,
+) -> bool {
+    for _ in 0..64 {
+        let Some(parent) = processes.get(&pid).and_then(sysinfo::Process::parent) else {
+            return false;
+        };
+        if parent == root {
+            return true;
+        }
+        if parent == pid {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+struct SupervisedRoot {
+    pid: sysinfo::Pid,
+    start_time: Option<u64>,
+}
+
+fn capture_supervised_root(child: &dyn PtyChild) -> Option<SupervisedRoot> {
+    let pid = child.process_id().map(sysinfo::Pid::from_u32)?;
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    Some(SupervisedRoot {
+        pid,
+        start_time: system.process(pid).map(sysinfo::Process::start_time),
+    })
+}
+
+fn terminate_supervised_processes(root: SupervisedRoot) {
+    for _ in 0..4 {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        let root_matches = system
+            .process(root.pid)
+            .is_some_and(|process| root.start_time == Some(process.start_time()));
+        let root_reused = system.process(root.pid).is_some() && !root_matches;
+        let mut targets = system
+            .processes()
+            .iter()
+            .filter_map(|(pid, process)| {
+                is_supervised_process(
+                    *pid,
+                    process,
+                    root,
+                    root_matches,
+                    root_reused,
+                    system.processes(),
+                )
+                .then_some(*pid)
+            })
+            .filter(|pid| pid.as_u32() > 1 && pid.as_u32() != std::process::id())
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            break;
+        }
+        targets.sort_unstable_by_key(|pid| std::cmp::Reverse(pid.as_u32()));
+        for pid in targets {
+            if let Some(process) = system.process(pid) {
+                let _ = process.kill();
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn is_supervised_process(
+    pid: sysinfo::Pid,
+    _process: &sysinfo::Process,
+    root: SupervisedRoot,
+    _root_matches: bool,
+    _root_reused: bool,
+    _processes: &std::collections::HashMap<sysinfo::Pid, sysinfo::Process>,
+) -> bool {
+    if pid == root.pid {
+        return false;
+    }
+    #[cfg(windows)]
+    if !_root_reused && process_descends_from(pid, root.pid, _processes) {
+        return true;
+    }
+    #[cfg(unix)]
+    if _process.session_id() == Some(root.pid) {
+        return true;
+    }
+    false
+}
+
+#[cfg(windows)]
+struct PtyProcessSupervisor {
+    job: windows_sys::Win32::Foundation::HANDLE,
+    root: Option<SupervisedRoot>,
+}
+
+#[cfg(windows)]
+impl PtyProcessSupervisor {
+    fn new(child: &dyn PtyChild) -> Self {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+        };
+
+        let root = capture_supervised_root(child);
+        let Some(process) = child.as_raw_handle() else {
+            return Self {
+                job: std::ptr::null_mut(),
+                root,
+            };
+        };
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Self { job, root };
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        let assigned = configured && unsafe { AssignProcessToJobObject(job, process.cast()) } != 0;
+        if !assigned {
+            unsafe {
+                let _ = CloseHandle(job);
+            }
+            return Self {
+                job: std::ptr::null_mut(),
+                root,
+            };
+        }
+        Self { job, root }
+    }
+
+    fn terminate(&mut self) {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::JobObjects::TerminateJobObject};
+        let mut job_terminated = false;
+        if !self.job.is_null() {
+            unsafe {
+                job_terminated = TerminateJobObject(self.job, 1) != 0;
+                let _ = CloseHandle(self.job);
+            }
+            self.job = std::ptr::null_mut();
+        }
+        if let (false, Some(root)) = (job_terminated, self.root.take()) {
+            terminate_supervised_processes(root);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PtyProcessSupervisor {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct PtyProcessSupervisor;
+
+#[cfg(not(any(unix, windows)))]
+impl PtyProcessSupervisor {
+    fn new(_child: &dyn PtyChild) -> Self {
+        Self
+    }
+
+    fn terminate(&mut self) {}
 }
 
 fn pump_prompt_guarded_pty_input(
     child: &mut dyn PtyChild,
-    mut child_stdin: Box<dyn Write + Send>,
+    child_stdin: Box<dyn Write + Send>,
     master: &dyn MasterPty,
     mut pty_size: (u16, u16),
+    output_error: &Arc<Mutex<Option<String>>>,
 ) -> Result<portable_pty::ExitStatus, String> {
     let _raw = RawModeGuard::enable()?;
     let mut protector = PromptInputProtector::default();
-    let (input_tx, input_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut input = std::io::stdin().lock();
-        let mut buf = [0u8; 8192];
-        loop {
-            match input.read(&mut buf) {
-                Ok(0) => {
-                    let _ = input_tx.send(Vec::new());
-                    break;
-                }
-                Ok(n) => {
-                    if input_tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    let _ = input_tx.send(Vec::new());
-                    break;
-                }
-            }
-        }
-    });
+    let mut child_stdin = Some(child_stdin);
+    let input = PtyInputReader::start();
     loop {
+        if let Some(error) = current_output_error(output_error) {
+            return Err(error);
+        }
         sync_pty_size(master, &mut pty_size);
         if let Some(status) = child
             .try_wait()
@@ -1163,44 +1470,198 @@ fn pump_prompt_guarded_pty_input(
         {
             return Ok(status);
         }
-        match input_rx.recv_timeout(PROMPT_INPUT_POLL) {
-            Ok(bytes) if bytes.is_empty() => {
+        if child_stdin.is_none() {
+            thread::sleep(PROMPT_INPUT_POLL);
+            continue;
+        }
+        match input.receiver.recv_timeout(PROMPT_INPUT_POLL) {
+            Ok(PtyInputEvent::Eof) => {
                 let tail = protector.flush()?;
-                if !tail.is_empty() {
-                    child_stdin
-                        .write_all(&tail)
-                        .map_err(|e| format!("could not write agent input: {e}"))?;
+                if let Some(writer) = child_stdin.as_mut() {
+                    if !tail.is_empty() {
+                        writer
+                            .write_all(&tail)
+                            .map_err(|e| format!("could not write agent input: {e}"))?;
+                    }
                 }
-                drop(child_stdin);
-                return child
-                    .wait()
-                    .map_err(|e| format!("could not wait for agent: {e}"));
+                child_stdin.take();
             }
-            Ok(bytes) => {
+            Ok(PtyInputEvent::Data(bytes)) => {
                 let rewritten = protector.rewrite_bytes(&bytes)?;
-                if !rewritten.is_empty() {
-                    child_stdin
-                        .write_all(&rewritten)
-                        .map_err(|e| format!("could not write agent input: {e}"))?;
-                    child_stdin
-                        .flush()
-                        .map_err(|e| format!("could not flush agent input: {e}"))?;
+                if let Some(writer) = child_stdin.as_mut() {
+                    if !rewritten.is_empty() {
+                        writer
+                            .write_all(&rewritten)
+                            .map_err(|e| format!("could not write agent input: {e}"))?;
+                        writer
+                            .flush()
+                            .map_err(|e| format!("could not flush agent input: {e}"))?;
+                    }
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(PtyInputEvent::Error(error)) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let idle = protector.flush_idle()?;
+                if let Some(writer) = child_stdin.as_mut() {
+                    if !idle.is_empty() {
+                        writer
+                            .write_all(&idle)
+                            .map_err(|e| format!("could not write agent input: {e}"))?;
+                        writer
+                            .flush()
+                            .map_err(|e| format!("could not flush agent input: {e}"))?;
+                    }
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let tail = protector.flush()?;
-                if !tail.is_empty() {
-                    child_stdin
-                        .write_all(&tail)
-                        .map_err(|e| format!("could not write agent input: {e}"))?;
+                if let Some(writer) = child_stdin.as_mut() {
+                    if !tail.is_empty() {
+                        writer
+                            .write_all(&tail)
+                            .map_err(|e| format!("could not write agent input: {e}"))?;
+                    }
                 }
-                drop(child_stdin);
-                return child
-                    .wait()
-                    .map_err(|e| format!("could not wait for agent: {e}"));
+                child_stdin.take();
             }
         }
+    }
+}
+
+enum PtyInputEvent {
+    Data(Vec<u8>),
+    Eof,
+    Error(String),
+}
+
+struct PtyInputReader {
+    receiver: mpsc::Receiver<PtyInputEvent>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PtyInputReader {
+    fn start() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            let mut input = std::io::stdin().lock();
+            let mut buf = [0u8; 8192];
+            while !worker_stop.load(Ordering::Acquire) {
+                match wait_for_stdin_ready(PROMPT_INPUT_POLL) {
+                    Ok(false) => continue,
+                    Err(error) => {
+                        let _ = sender.send(PtyInputEvent::Error(error));
+                        break;
+                    }
+                    Ok(true) => {}
+                }
+                match input.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = sender.send(PtyInputEvent::Eof);
+                        break;
+                    }
+                    Ok(n) => {
+                        if sender.send(PtyInputEvent::Data(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        let _ = sender.send(PtyInputEvent::Error(format!(
+                            "could not read terminal input: {error}"
+                        )));
+                        break;
+                    }
+                }
+            }
+            buf.zeroize();
+        });
+        Self {
+            receiver,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for PtyInputReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            unsafe {
+                let _ = windows_sys::Win32::System::IO::CancelSynchronousIo(
+                    thread.as_raw_handle().cast(),
+                );
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_stdin_ready(timeout: Duration) -> Result<bool, String> {
+    let mut descriptor = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let result = unsafe { libc::poll(std::ptr::from_mut(&mut descriptor), 1, timeout_ms) };
+    if result > 0 {
+        return Ok(true);
+    }
+    if result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+        return Ok(false);
+    }
+    Err(format!(
+        "could not poll terminal input: {}",
+        std::io::Error::last_os_error()
+    ))
+}
+
+#[cfg(windows)]
+fn wait_for_stdin_ready(timeout: Duration) -> Result<bool, String> {
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{
+            Console::GetStdHandle, Console::STD_INPUT_HANDLE, Threading::WaitForSingleObject,
+        },
+    };
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+    match unsafe { WaitForSingleObject(handle, timeout_ms) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(format!(
+            "could not poll terminal input: {}",
+            std::io::Error::last_os_error()
+        )),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn wait_for_stdin_ready(timeout: Duration) -> Result<bool, String> {
+    thread::sleep(timeout);
+    Ok(true)
+}
+
+fn current_output_error(error: &Arc<Mutex<Option<String>>>) -> Option<String> {
+    match error.lock() {
+        Ok(error) => error.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
     }
 }
 
@@ -1310,6 +1771,13 @@ impl PromptInputProtector {
         {
             flush_prompt_input_with(&mut self.state, &mut mask)
         }
+    }
+
+    fn flush_idle(&mut self) -> Result<Vec<u8>, String> {
+        if self.state.in_bracketed_paste {
+            return Ok(Vec::new());
+        }
+        self.flush()
     }
 }
 
@@ -3866,6 +4334,13 @@ mod tests {
         let out = rewrite_prompt_input_bytes_with(&mut state, b"\x1b[A", &mut mask).unwrap();
         assert_eq!(out, b"\x1b[A");
         assert!(!called);
+    }
+
+    #[test]
+    fn prompt_input_releases_a_standalone_escape_after_idle_timeout() {
+        let mut protector = PromptInputProtector::default();
+        assert!(protector.rewrite_bytes(b"\x1b").unwrap().is_empty());
+        assert_eq!(protector.flush_idle().unwrap(), b"\x1b");
     }
 
     #[test]

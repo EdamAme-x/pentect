@@ -279,6 +279,12 @@ impl RecoveryStreamRemasker {
         self.drain_ready(false)
     }
 
+    pub fn push_boundary_control(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = self.drain_ready(true);
+        out.extend_from_slice(bytes);
+        out
+    }
+
     pub fn finish(&mut self) -> Vec<u8> {
         self.drain_ready(true)
     }
