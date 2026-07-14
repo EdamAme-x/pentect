@@ -1,5 +1,6 @@
+use crate::config;
 use crate::extension_adapter::ModelAdapters;
-use crate::session::RecoveryStore;
+use crate::memory_store::MemoryStore;
 #[cfg(test)]
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
@@ -8,7 +9,7 @@ use pentect_core::{
     ProfilePolicy, Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard,
     ToolResultParser,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
@@ -30,12 +31,19 @@ pub(crate) struct ToolScalarInput {
 }
 
 pub(crate) struct OutputMasker {
-    store: RecoveryStore,
+    store: MemoryStore,
     engine: &'static Engine,
     model_adapters: ModelAdapters,
     mode: OutputMaskerMode,
     pending: Recovery,
     masked_count: u64,
+    activity: BTreeMap<&'static str, ActivitySummary>,
+}
+
+#[derive(Default)]
+struct ActivitySummary {
+    count: u64,
+    labels: BTreeMap<String, u64>,
 }
 
 enum OutputMaskerMode {
@@ -44,7 +52,7 @@ enum OutputMaskerMode {
 }
 
 impl OutputMasker {
-    pub(crate) fn new_shared(store: RecoveryStore) -> Result<Self, String> {
+    pub(crate) fn new_shared(store: MemoryStore) -> Result<Self, String> {
         let key = store.session.key;
         Ok(Self {
             store,
@@ -53,10 +61,11 @@ impl OutputMasker {
             mode: OutputMaskerMode::Shared,
             pending: Recovery::empty_for_key(&key),
             masked_count: 0,
+            activity: BTreeMap::new(),
         })
     }
 
-    pub(crate) fn new_deferred(store: RecoveryStore) -> Result<Self, String> {
+    pub(crate) fn new_deferred(store: MemoryStore) -> Result<Self, String> {
         let key = store.session.key;
         let remask_recoveries = store.snapshot().map_err(|e| e.to_string())?;
         Ok(Self {
@@ -66,6 +75,7 @@ impl OutputMasker {
             mode: OutputMaskerMode::Deferred { remask_recoveries },
             pending: Recovery::empty_for_key(&key),
             masked_count: 0,
+            activity: BTreeMap::new(),
         })
     }
 
@@ -74,12 +84,15 @@ impl OutputMasker {
     }
 
     pub(crate) fn flush(&mut self) -> Result<(), String> {
-        if self.pending.is_empty() {
-            return Ok(());
+        if !self.pending.is_empty() {
+            let next = Recovery::empty_for_key(&self.store.session.key);
+            let pending = std::mem::replace(&mut self.pending, next);
+            self.store
+                .add_recovery(pending)
+                .map_err(|e| e.to_string())?;
         }
-        let next = Recovery::empty_for_key(&self.store.session.key);
-        let pending = std::mem::replace(&mut self.pending, next);
-        self.store.add_recovery(pending).map_err(|e| e.to_string())
+        self.flush_activity();
+        Ok(())
     }
 
     pub(crate) fn mask_tool_output(&mut self, text: &str) -> Result<String, String> {
@@ -89,6 +102,26 @@ impl OutputMasker {
             Kind::Text
         };
         self.mask_text(text, kind)
+    }
+
+    pub(crate) fn mask_prompt_text(&mut self, text: &str) -> Result<String, String> {
+        let remasked = self.remask_all(text)?;
+        let result = mask_read_input_with_profile(
+            self.store.session.key,
+            Input {
+                kind: Kind::Text,
+                data: remasked,
+            },
+            Profile::Strict,
+            Vec::new(),
+        )?;
+        self.track_mask_result("prompt", &result);
+        self.add_masked_count(result.summary.masked_count);
+        let masked = compact_local_home_paths(&result.masked);
+        let mut recovery = result.recovery;
+        recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
+        self.record_recovery(recovery)?;
+        Ok(masked)
     }
 
     pub(crate) fn mask_text(&mut self, text: &str, kind: Kind) -> Result<String, String> {
@@ -111,6 +144,7 @@ impl OutputMasker {
         if !needs_text_pass && masks_only_endpoint_metadata(&result) {
             return Ok(endpoint_unchanged);
         }
+        self.track_mask_result("output", &result);
         self.add_masked_count(result.summary.masked_count);
         let mut masked = result.masked;
         let mut recovery = result.recovery;
@@ -123,6 +157,7 @@ impl OutputMasker {
                 &cfg,
             );
             if !masks_only_endpoint_metadata(&text_result) {
+                self.track_mask_result("output", &text_result);
                 self.add_masked_count(text_result.summary.masked_count);
                 masked = text_result.masked;
                 recovery.extend_same_key(text_result.recovery);
@@ -240,6 +275,7 @@ impl OutputMasker {
     }
 
     fn record_mask_result(&mut self, result: MaskResult) -> Result<String, String> {
+        self.track_mask_result("tool", &result);
         self.add_masked_count(result.summary.masked_count);
         let masked = compact_local_home_paths(&result.masked);
         let mut recovery = result.recovery;
@@ -261,6 +297,32 @@ impl OutputMasker {
 
     fn add_masked_count(&mut self, count: usize) {
         self.masked_count = self.masked_count.saturating_add(count as u64);
+    }
+
+    fn track_mask_result(&mut self, surface: &'static str, result: &MaskResult) {
+        if result.summary.masked_count == 0 {
+            return;
+        }
+        let summary = self.activity.entry(surface).or_default();
+        summary.count = summary
+            .count
+            .saturating_add(result.summary.masked_count as u64);
+        for item in &result.items {
+            let count = summary.labels.entry(item.label.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn flush_activity(&mut self) {
+        for (surface, summary) in std::mem::take(&mut self.activity) {
+            crate::activity_log::record_summary(
+                "mask",
+                surface,
+                summary.count,
+                summary.labels,
+                None,
+            );
+        }
     }
 
     fn mask_model_adapter_input(
@@ -311,6 +373,12 @@ impl OutputMasker {
                 Ok(out)
             }
         }
+    }
+}
+
+impl Drop for OutputMasker {
+    fn drop(&mut self) {
+        self.flush_activity();
     }
 }
 
@@ -480,7 +548,8 @@ pub(crate) fn mask_read_input_with_profile(
     profile: Profile,
     packs: Vec<pentect_core::Pack>,
 ) -> Result<MaskResult, String> {
-    let engine = Engine::with_profile_and_packs(profile, packs, false);
+    let decode = config::decode_config(profile)?;
+    let engine = Engine::with_profile_and_packs_and_decode_config(profile, packs, false, decode);
     mask_read_input_with_engine(key, &engine, input)
 }
 
@@ -535,8 +604,9 @@ fn tool_boundary_engine() -> Result<&'static Engine, String> {
 }
 
 fn build_tool_boundary_engine() -> Result<Engine, String> {
+    let decode = config::decode_config(Profile::Strict)?;
     let mut builder = Engine::builder()
-        .standard_stack(Profile::Strict.knobs())
+        .standard_stack_with_decode(Profile::Strict.knobs(), decode)
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
         .detector(Box::new(SensitiveKeyDetector));
     for config_pack in extension_configs_from_env()? {
@@ -587,13 +657,13 @@ fn load_extension_configs_from_env() -> Result<Vec<pentect_core::Pack>, String> 
 
 #[cfg(test)]
 pub(crate) fn mask_tool_output(session: &Session, text: &str) -> Result<String, String> {
-    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let store = MemoryStore::for_session(session);
     OutputMasker::new_shared(store)?.mask_tool_output(text)
 }
 
 #[cfg(test)]
 pub(crate) fn mask_live_output(session: &Session, text: &str) -> Result<String, String> {
-    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let store = MemoryStore::for_session(session);
     OutputMasker::new_shared(store)?.mask_text(text, live_output_kind(text))
 }
 
@@ -668,6 +738,7 @@ pub(crate) fn env_alias_recovery(masked: &str, key: &[u8; 32]) -> Recovery {
 
 fn reusable_env_aliases(text: &str) -> Vec<(String, String)> {
     let mut out = reusable_assignment_env_aliases(text);
+    out.extend(reusable_inline_assignment_env_aliases(text));
     out.extend(reusable_handle_env_aliases(text));
     out
 }
@@ -698,6 +769,44 @@ fn reusable_assignment_env_aliases(text: &str) -> Vec<(String, String)> {
     out
 }
 
+fn reusable_inline_assignment_env_aliases(text: &str) -> Vec<(String, String)> {
+    reusable_placeholders_with_spans(text)
+        .into_iter()
+        .filter_map(|(handle, start, end)| {
+            let key = inline_assignment_key_before_handle(text, start)?;
+            inline_assignment_handle_boundary_ok(text, end).then_some((key, handle))
+        })
+        .collect()
+}
+
+fn inline_assignment_key_before_handle(text: &str, handle_start: usize) -> Option<String> {
+    let before = text.get(..handle_start)?;
+    let line_start = before
+        .rfind(['\r', '\n'])
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let line_before = before.get(line_start..)?.trim_end();
+    let assignment_left = line_before.strip_suffix('=')?.trim_end();
+    let key_end = assignment_left.len();
+    let key_start = assignment_left
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !is_env_name_char(*ch))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let key = assignment_left.get(key_start..key_end)?;
+    is_env_name(key).then(|| key.to_string())
+}
+
+fn inline_assignment_handle_boundary_ok(text: &str, handle_end: usize) -> bool {
+    let Some(rest) = text.get(handle_end..) else {
+        return true;
+    };
+    rest.chars()
+        .next()
+        .is_none_or(|ch| !is_env_name_char(ch) && ch != '<')
+}
+
 fn reusable_handle_env_aliases(text: &str) -> Vec<(String, String)> {
     reusable_placeholders(text)
         .into_iter()
@@ -720,6 +829,27 @@ fn reusable_placeholders(text: &str) -> Vec<String> {
                     out.push(handle.to_string());
                 }
                 i = close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn reusable_placeholders_with_spans(text: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'<' {
+            if let Some(close) = find_from(bytes, i + 2, b">>") {
+                let end = close + 2;
+                let handle = &text[i..end];
+                if is_reusable_placeholder(handle) {
+                    out.push((handle.to_string(), i, end));
+                }
+                i = end;
                 continue;
             }
         }
@@ -844,6 +974,10 @@ fn placeholder_label(value: &str) -> Option<&str> {
 
 fn is_env_name(name: &str) -> bool {
     !name.is_empty() && !name.as_bytes()[0].is_ascii_digit() && name.bytes().all(is_env_name_byte)
+}
+
+fn is_env_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn redact_env_derivative_lines(text: &str) -> String {

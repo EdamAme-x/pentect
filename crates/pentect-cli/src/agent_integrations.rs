@@ -1,0 +1,369 @@
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+const BRIDGE_CLIENT_JS: &str = r#"
+import { spawn } from "node:child_process";
+
+function replaceObject(target, source) {
+  for (const key of Object.keys(target)) delete target[key];
+  Object.assign(target, source);
+}
+
+function replaceArray(target, source) {
+  target.splice(0, target.length, ...source);
+}
+
+function createPentectBridge() {
+  const child = spawn(process.env.PENTECT_BIN || "pentect", ["bridge"], {
+    stdio: ["pipe", "pipe", "ignore"],
+    windowsHide: true,
+  });
+  let nextId = 1;
+  let pending = new Map();
+  let buffered = "";
+  let closed = false;
+
+  const fail = () => {
+    if (closed) return;
+    closed = true;
+    for (const { reject } of pending.values()) reject(new Error("Pentect unavailable"));
+    pending.clear();
+  };
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    buffered += chunk;
+    for (;;) {
+      const end = buffered.indexOf("\n");
+      if (end < 0) break;
+      const line = buffered.slice(0, end);
+      buffered = buffered.slice(end + 1);
+      let response;
+      try {
+        response = JSON.parse(line);
+      } catch {
+        fail();
+        return;
+      }
+      const waiter = pending.get(response.id);
+      if (!waiter) continue;
+      pending.delete(response.id);
+      if (response.ok) waiter.resolve(response.value);
+      else waiter.reject(new Error("Pentect rejected the operation"));
+    }
+  });
+  child.on("error", fail);
+  child.on("exit", fail);
+
+  return {
+    request(op, fields = {}) {
+      if (closed) return Promise.reject(new Error("Pentect unavailable"));
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        child.stdin.write(`${JSON.stringify({ id, op, ...fields })}\n`, (error) => {
+          if (!error) return;
+          pending.delete(id);
+          reject(new Error("Pentect unavailable"));
+        });
+      });
+    },
+    close() {
+      closed = true;
+      child.kill();
+      pending.clear();
+    },
+  };
+}
+"#;
+
+const OPENCODE_PLUGIN_BODY: &str = r#"
+const SAFE_TEXT = "[Pentect: content unavailable]";
+
+export const PentectPlugin = async () => {
+  const bridge = createPentectBridge();
+  return {
+    "experimental.chat.system.transform": async (_input, output) => {
+      const contract = process.env.PENTECT_AGENT_CONTRACT;
+      if (contract && !output.system.includes(contract)) output.system.push(contract);
+    },
+    "chat.message": async (_input, output) => {
+      const original = structuredClone(output.parts);
+      replaceArray(output.parts, [{ type: "text", text: SAFE_TEXT }]);
+      try {
+        const withSafeImages = await bridge.request("media", { value: original });
+        for (const part of withSafeImages) {
+          if (part && part.type === "text" && typeof part.text === "string") {
+            part.text = await bridge.request("prompt", { value: part.text });
+          }
+        }
+        replaceArray(output.parts, withSafeImages);
+      } catch {
+        throw new Error("Pentect could not protect this message");
+      }
+    },
+    "tool.execute.before": async (input, output) => {
+      try {
+        const next = await bridge.request("before", { tool: input.tool, value: output.args });
+        replaceObject(output.args, next);
+      } catch {
+        throw new Error("Pentect could not protect this tool call");
+      }
+    },
+    "tool.execute.after": async (input, output) => {
+      const original = structuredClone(output);
+      replaceObject(output, { title: "Pentect", output: SAFE_TEXT, metadata: {} });
+      try {
+        const next = await bridge.request("after", {
+          tool: input.tool,
+          input: input.args,
+          value: original,
+        });
+        replaceObject(output, next);
+      } catch {
+        // Keep the safe replacement already installed above.
+      }
+    },
+    dispose: async () => bridge.close(),
+  };
+};
+"#;
+
+const PI_EXTENSION_BODY: &str = r#"
+const SAFE_TEXT = "[Pentect: content unavailable]";
+const SAFE_RESULT = {
+  content: [{ type: "text", text: SAFE_TEXT }],
+  details: undefined,
+  isError: true,
+};
+
+function pentectBashOperations() {
+  return {
+    exec(command, cwd, { onData, signal, timeout, env }) {
+      return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new Error("aborted"));
+          return;
+        }
+        const child = spawn(process.env.PENTECT_BIN || "pentect", ["exec", command], {
+          cwd,
+          env: { ...process.env, ...env },
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        });
+        let settled = false;
+        const finish = (callback) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          callback();
+        };
+        const abort = () => {
+          child.kill();
+          finish(() => resolve({ exitCode: null }));
+        };
+        const timer = timeout
+          ? setTimeout(abort, Math.min(timeout * 1000, 2_147_483_647))
+          : undefined;
+        signal?.addEventListener("abort", abort, { once: true });
+        child.stdout.on("data", onData);
+        child.stderr.on("data", onData);
+        child.on("error", () => finish(() => reject(new Error("Pentect unavailable"))));
+        child.on("close", (code) => finish(() => resolve({ exitCode: code })));
+      });
+    },
+  };
+}
+
+export default function pentectExtension(pi) {
+  const bridge = createPentectBridge();
+
+  pi.on("before_agent_start", async (event) => {
+    const contract = process.env.PENTECT_AGENT_CONTRACT;
+    if (!contract || event.systemPrompt.includes(contract)) return {};
+    return { systemPrompt: `${event.systemPrompt}\n\n${contract}` };
+  });
+
+  pi.on("input", async (event) => {
+    try {
+      const text = await bridge.request("prompt", { value: event.text });
+      const images = event.images
+        ? await bridge.request("media", { value: event.images })
+        : event.images;
+      return { action: "transform", text, images };
+    } catch {
+      return { action: "handled" };
+    }
+  });
+
+  pi.on("tool_call", async (event) => {
+    try {
+      const next = await bridge.request("before", { tool: event.toolName, value: event.input });
+      replaceObject(event.input, next);
+      return {};
+    } catch {
+      return { block: true, reason: "Pentect could not protect this tool call" };
+    }
+  });
+
+  pi.on("tool_result", async (event) => {
+    try {
+      return await bridge.request("after", {
+        tool: event.toolName,
+        input: event.input,
+        value: {
+          content: event.content,
+          details: event.details,
+          isError: event.isError,
+        },
+      });
+    } catch {
+      return SAFE_RESULT;
+    }
+  });
+
+  pi.on("user_bash", async () => ({ operations: pentectBashOperations() }));
+
+  pi.on("session_shutdown", async () => bridge.close());
+}
+"#;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntegrationKind {
+    OpenCode,
+    Pi,
+}
+
+pub(crate) struct TempAgentIntegration {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl TempAgentIntegration {
+    pub(crate) fn create(kind: IntegrationKind) -> Result<Self, String> {
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|_| "could not create agent integration".to_string())?;
+        let root = std::env::temp_dir().join(format!(
+            "pentect-agent-{}-{}",
+            std::process::id(),
+            data_encoding::HEXLOWER.encode(&nonce)
+        ));
+        std::fs::create_dir(&root).map_err(|_| "could not create agent integration".to_string())?;
+        let file_name = match kind {
+            IntegrationKind::OpenCode => "opencode.mjs",
+            IntegrationKind::Pi => "pi.mjs",
+        };
+        let path = root.join(file_name);
+        let body = match kind {
+            IntegrationKind::OpenCode => format!("{BRIDGE_CLIENT_JS}\n{OPENCODE_PLUGIN_BODY}"),
+            IntegrationKind::Pi => format!("{BRIDGE_CLIENT_JS}\n{PI_EXTENSION_BODY}"),
+        };
+        if std::fs::write(&path, body).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err("could not create agent integration".to_string());
+        }
+        Ok(Self { root, path })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempAgentIntegration {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+pub(crate) fn opencode_config_with_plugin(
+    existing: Option<&str>,
+    plugin_path: &Path,
+) -> Result<String, String> {
+    let mut config = match existing.filter(|value| !value.trim().is_empty()) {
+        Some(value) => serde_json::from_str::<Value>(value)
+            .map_err(|_| "OPENCODE_CONFIG_CONTENT must be valid JSON".to_string())?,
+        None => Value::Object(Default::default()),
+    };
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| "OPENCODE_CONFIG_CONTENT must be a JSON object".to_string())?;
+    let plugins = object
+        .entry("plugin")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| "OPENCODE_CONFIG_CONTENT.plugin must be an array".to_string())?;
+    let path = plugin_path.to_string_lossy().into_owned();
+    if !plugins.iter().any(|value| value.as_str() == Some(&path)) {
+        plugins.push(Value::String(path));
+    }
+    serde_json::to_string(&config).map_err(|_| "could not create OpenCode config".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scripts_cover_prompt_tool_and_result_boundaries() {
+        let opencode = format!("{BRIDGE_CLIENT_JS}{OPENCODE_PLUGIN_BODY}");
+        assert!(opencode.contains("chat.message"));
+        assert!(opencode.contains("tool.execute.before"));
+        assert!(opencode.contains("tool.execute.after"));
+
+        let pi = format!("{BRIDGE_CLIENT_JS}{PI_EXTENSION_BODY}");
+        assert!(pi.contains("pi.on(\"input\""));
+        assert!(pi.contains("pi.on(\"before_agent_start\""));
+        assert!(pi.contains("pi.on(\"tool_call\""));
+        assert!(pi.contains("pi.on(\"tool_result\""));
+        assert!(pi.contains("pi.on(\"user_bash\""));
+    }
+
+    #[test]
+    fn opencode_config_preserves_existing_values() {
+        let path = Path::new("C:/tmp/pentect-opencode.mjs");
+        let rendered =
+            opencode_config_with_plugin(Some(r#"{"model":"example","plugin":["existing"]}"#), path)
+                .unwrap();
+        let value: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["model"], "example");
+        assert_eq!(value["plugin"][0], "existing");
+        assert!(value["plugin"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn temporary_integration_is_removed_on_drop() {
+        let path = {
+            let integration = TempAgentIntegration::create(IntegrationKind::Pi).unwrap();
+            assert!(integration.path().is_file());
+            integration.path().to_path_buf()
+        };
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn generated_integrations_are_valid_javascript_when_node_is_available() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        for kind in [IntegrationKind::OpenCode, IntegrationKind::Pi] {
+            let integration = TempAgentIntegration::create(kind).unwrap();
+            let output = std::process::Command::new("node")
+                .arg("--check")
+                .arg(integration.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}

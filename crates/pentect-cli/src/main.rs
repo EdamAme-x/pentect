@@ -1,5 +1,6 @@
 //! Pentect CLI: local secret masking boundary for AI agents.
 
+mod agent_integrations;
 mod app_server_proxy;
 mod doctor;
 mod eval;
@@ -14,15 +15,20 @@ use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
 use pentect_core::{
     infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
 };
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
+use zeroize::Zeroize;
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -44,47 +50,100 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
 );
 const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
 const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
-const PENTECT_AGENT_AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
-const PENTECT_IN_MEMORY_MANAGER_ADDR_ENV: &str = "PENTECT_IN_MEMORY_MANAGER_ADDR";
-const PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV: &str = "PENTECT_IN_MEMORY_MANAGER_TOKEN";
+const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
+const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
+const PENTECT_PROCESS_HOST_ROOT_ENV: &str = "PENTECT_PROCESS_HOST_ROOT";
+const PENTECT_PROCESS_HOST_READ_TOKEN_ENV: &str = "PENTECT_PROCESS_HOST_READ_TOKEN";
+const PENTECT_PROCESS_HOST_WRITE_TOKEN_ENV: &str = "PENTECT_PROCESS_HOST_WRITE_TOKEN";
 const PENTECT_STATUS_LINE_ENV: &str = "PENTECT_STATUS_LINE";
 const PENTECT_DIR: &str = ".pentect";
 const PENTECT_CONFIG_FILE: &str = "config.toml";
-const IN_MEMORY_MANAGER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
 const CODEX_ENVIRONMENT_OVERLAY_MARKER: &[u8] = b"# pentect-managed-environments\n";
+const PROMPT_PASTE_START: &[u8] = b"\x1b[200~";
+const PROMPT_PASTE_END: &[u8] = b"\x1b[201~";
+const PROMPT_INPUT_POLL: Duration = Duration::from_millis(50);
+const PROMPT_INPUT_MAX_PENDING_BYTES: usize = 1024 * 1024;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if is_memory_store_server(&args) || !supports_process_host(&args) {
+        dispatch(args);
+        return;
+    }
+    let pentect = std::env::var_os(PENTECT_BIN_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(default_pentect_path);
+    let process_host_root = process_host_root().unwrap_or_else(|error| die_with_issue(error));
+    let _process_host_root_env = EnvVarGuard::set_optional([(
+        PENTECT_PROCESS_HOST_ROOT_ENV,
+        Some(process_host_root.clone().into_os_string()),
+    )]);
+    let process_host = MemoryStoreGuard::start(&pentect, false)
+        .unwrap_or_else(|error| die_with_issue(error))
+        .unwrap_or_else(|| die_with_issue("could not start process host candidate"));
+    let _process_host_env = memory_store_parent_env_guard(&pentect, &process_host);
+    dispatch(args);
+}
+
+fn dispatch(args: Vec<String>) {
     match args.get(1).map(String::as_str) {
-        None => cmd_agent_from(1, &args),
+        None => usage(),
         Some("help" | "--help" | "-h") => cmd_help(),
-        Some("dashboard") => cmd_agent_from(1, &args),
-        Some("--dir" | "--session" | "--port") => cmd_agent_from(1, &args),
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
         Some("statusline") => cmd_statusline(&args),
+        Some("up") => cmd_up(&args),
         Some("doctor") => doctor::cmd_doctor(&args),
         Some("extensions") => extensions_cmd::cmd_extensions(&args),
         Some("eval") => eval::cmd_eval(&args),
         Some("scan") => scan::cmd_scan(&args),
-        Some("exec" | "shell" | "resolve" | "approve" | "hook" | "manager" | "purge") => {
-            cmd_agent_from(1, &args)
-        }
+        Some(
+            "exec" | "shell" | "resolve" | "log" | "hook" | "bridge" | "memory-store" | "purge",
+        ) => cmd_agent_from(1, &args),
         Some("agent") => cmd_agent_from(2, &args),
         Some("codex") => cmd_agent_tool(AgentTool::Codex, &args),
         Some("claude") => cmd_agent_tool(AgentTool::Claude, &args),
+        Some("opencode") => cmd_agent_tool(AgentTool::OpenCode, &args),
+        Some("pi") => cmd_agent_tool(AgentTool::Pi, &args),
         _ => usage(),
     }
+}
+
+fn is_memory_store_server(args: &[String]) -> bool {
+    matches!(
+        (
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str)
+        ),
+        (Some("memory-store"), _) | (Some("agent"), Some("memory-store"))
+    )
+}
+
+/// A process-host candidate needs enough lifetime to serve other processes.
+/// One-shot inspection commands would only add startup cost and disappear
+/// before a useful handoff can occur.
+fn supports_process_host(args: &[String]) -> bool {
+    matches!(
+        (
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        (Some("codex" | "claude" | "opencode" | "pi"), _)
+            | (Some("exec" | "shell" | "log" | "bridge"), _)
+            | (Some("agent"), Some("exec" | "shell" | "log" | "bridge"))
+    )
 }
 
 fn usage() {
     eprintln!(
         "pentect\n\
-         pentect codex|claude\n\
+         pentect codex|claude|opencode|pi\n\
          pentect exec \"<command>\"\n\
          pentect shell\n\
+         pentect up\n\
          pentect doctor\n\
          pentect extensions list|inspect|test [NAME]\n\
          pentect eval [--json]\n\
@@ -92,16 +151,19 @@ fn usage() {
          pentect view <HANDLE>\n\
          pentect statusline\n\
          pentect resolve [PATH...]\n\
+         pentect log [--json]\n\
          pentect help\n\
          \n\
-         exec runs commands with masked output.\n\
-         shell opens a masked shell.\n\
-         doctor checks local readiness.\n\
-         eval reports local precision/recall metrics.\n\
-         scan reports files that contain likely secrets.\n\
-         view handle metadata.\n\
-         statusline prints mask count.\n\
-         resolve rewrites files containing handles, or resolves stdin when no path is given."
+         exec: masked output\n\
+         shell: masked shell\n\
+         up: process host\n\
+         doctor: readiness\n\
+         eval: metrics\n\
+         scan: secrets\n\
+         view: handle\n\
+         statusline: count\n\
+         resolve: write handles\n\
+         log: live events"
     );
 }
 
@@ -114,22 +176,24 @@ fn help_text() -> &'static str {
         "pentect protects AI tool boundaries.\n\n",
         "Use:\n",
         "  pentect\n",
-        "  pentect --port 7331\n",
-        "  pentect codex|claude [--extensions NAME|PATH.toml]\n",
+        "  pentect codex|claude|opencode|pi [--extensions NAME|PATH.toml]\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect shell\n\n",
+        "  pentect up\n\n",
         "  pentect doctor [--json]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
         "  pentect eval [--json]\n\n",
         "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
         "  pentect statusline\n\n",
-        "dashboard: memory\n",
+        "  pentect log [--json]\n\n",
         "exec: masked stdout/stderr\n",
         "shell: masked shell\n",
+        "up: process host\n",
         "read: masked file preview\n",
-        "view: handle metadata\n",
+        "view: handle\n",
         "statusline: masked count\n",
+        "log: live events\n",
         "resolve: write handles\n",
         "scan: CredSweeper + core; binary skip(default)|text(lossy); narrow with --exclude, --gitignore, .pentectignore\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
@@ -211,34 +275,48 @@ fn cmd_agent_from(start: usize, args: &[String]) {
             .unwrap_or_else(|| "pentect".to_string()),
     );
     agent_args.extend(forward_args);
-    let shell_manager = if agent_args.get(1).is_some_and(|arg| arg == "shell") {
+    let shell_store = if agent_args
+        .get(1)
+        .is_some_and(|arg| matches!(arg.as_str(), "shell" | "log"))
+    {
         let pentect = std::env::var_os(PENTECT_BIN_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(default_pentect_path);
-        Some(start_in_memory_manager(&pentect).unwrap_or_else(|e| die_with_issue(e)))
+        Some(start_memory_store(&pentect).unwrap_or_else(|e| die_with_issue(e)))
     } else {
         None
     };
-    let _shell_manager_env = shell_manager.as_ref().map(|manager| {
+    let _shell_store_env = shell_store.as_ref().map(|store| {
         EnvVarGuard::set_optional([
             (
-                PENTECT_IN_MEMORY_MANAGER_ADDR_ENV,
-                Some(OsString::from(manager.addr.as_str())),
+                PENTECT_MEMORY_STORE_ADDR_ENV,
+                Some(OsString::from(store.addr.as_str())),
             ),
             (
-                PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV,
-                Some(OsString::from(manager.token.as_str())),
+                PENTECT_MEMORY_STORE_TOKEN_ENV,
+                Some(OsString::from(store.token.as_str())),
+            ),
+            (
+                PENTECT_PROCESS_HOST_READ_TOKEN_ENV,
+                Some(OsString::from(store.process_host_read_token.as_str())),
+            ),
+            (
+                PENTECT_PROCESS_HOST_WRITE_TOKEN_ENV,
+                Some(OsString::from(store.process_host_write_token.as_str())),
+            ),
+            (
+                PENTECT_PROCESS_HOST_ROOT_ENV,
+                Some(store.process_host_root.clone().into_os_string()),
             ),
             (
                 PENTECT_AGENT_LAUNCHED_ENV,
-                Some(OsString::from(manager.token.as_str())),
+                Some(OsString::from(store.token.as_str())),
             ),
-            (PENTECT_AGENT_AUTO_APPROVE_ENV, Some(OsString::from("1"))),
         ])
     });
     let code = pentect_agent::run_from(agent_args);
-    drop(_shell_manager_env);
-    drop(shell_manager);
+    drop(_shell_store_env);
+    drop(shell_store);
     std::process::exit(code);
 }
 
@@ -257,14 +335,35 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
     let status = match tool {
         AgentTool::Codex => run_codex(&opts, &pentect),
         AgentTool::Claude => run_claude(&opts, &pentect),
+        AgentTool::OpenCode => run_bridge_agent(&opts, &pentect, tool),
+        AgentTool::Pi => run_bridge_agent(&opts, &pentect, tool),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     let code = status.code().unwrap_or(1);
     std::process::exit(code);
 }
 
-fn start_in_memory_manager(pentect: &Path) -> Result<InMemoryManagerGuard, String> {
-    InMemoryManagerGuard::start(pentect)
+fn start_memory_store(pentect: &Path) -> Result<MemoryStoreGuard, String> {
+    MemoryStoreGuard::start(pentect, false)?
+        .ok_or_else(|| "could not start Pentect memory store".to_string())
+}
+
+fn cmd_up(args: &[String]) {
+    if args.len() != 2 {
+        die("up");
+    }
+    let root = process_host_root().unwrap_or_else(|error| die_with_issue(error));
+    if pentect_agent::persistent_process_host_running(&root) {
+        return;
+    }
+    let pentect = std::env::var_os(PENTECT_BIN_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(default_pentect_path);
+    if let Some(host) =
+        MemoryStoreGuard::start(&pentect, true).unwrap_or_else(|error| die_with_issue(error))
+    {
+        host.detach();
+    }
 }
 
 fn agent_tool_extensions(opts: &AgentToolOpts) -> Result<extensions::ActiveExtensions, String> {
@@ -327,7 +426,10 @@ fn cmd_mask(args: &[String]) {
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (resolve/restore is unavailable by design).
     let kind_label = format!("{kind:?}");
-    let engine = build_engine(profile, aggressive, packs);
+    let engine = match build_engine(profile, aggressive, packs) {
+        Ok(engine) => engine,
+        Err(error) => die(error),
+    };
     let cfg = Config::generate();
     let result = engine.mask(Input { kind, data }, &cfg);
 
@@ -416,12 +518,13 @@ fn cmd_read(args: &[String]) {
         (extensions::ADAPTERS_ENV, adapter_env),
     ]);
     let input = Input { kind, data };
-    match pentect_agent::mask_input_into_active_in_memory_manager(
+    match pentect_agent::mask_input_into_active_memory_store(
         input.clone(),
         opts.profile,
         packs.clone(),
     ) {
         Ok(Some(result)) => {
+            pentect_agent::record_read_activity(&result, &opts.path);
             print_read_result(result, opts.emit_meta);
             return;
         }
@@ -433,6 +536,7 @@ fn cmd_read(args: &[String]) {
         Ok(result) => result,
         Err(e) => die(&e),
     };
+    pentect_agent::record_read_activity(&result, &opts.path);
     print_read_result(result, opts.emit_meta);
 }
 
@@ -480,6 +584,8 @@ fn cmd_statusline(args: &[String]) {
 enum AgentTool {
     Codex,
     Claude,
+    OpenCode,
+    Pi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -562,6 +668,8 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "codex",
             AgentTool::Claude => "claude",
+            AgentTool::OpenCode => "opencode",
+            AgentTool::Pi => "pi",
         }
     }
 
@@ -569,6 +677,8 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "PENTECT_CODEX",
             AgentTool::Claude => "PENTECT_CLAUDE",
+            AgentTool::OpenCode => "PENTECT_OPENCODE",
+            AgentTool::Pi => "PENTECT_PI",
         }
     }
 
@@ -580,6 +690,8 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "--codex",
             AgentTool::Claude => "--claude",
+            AgentTool::OpenCode => "--opencode",
+            AgentTool::Pi => "--pi",
         }
     }
 }
@@ -699,35 +811,13 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     let active_extensions = agent_tool_extensions(opts)?;
     let mut cmd = Command::new(&opts.command);
     apply_extension_env(&mut cmd, &active_extensions)?;
-    let in_memory_manager = start_in_memory_manager(pentect)?;
-    let config_env = active_extensions
-        .config_env_value()
-        .map_err(|e| e.to_string())?;
-    let adapter_env = active_extensions
-        .adapter_env_value()
-        .map_err(|e| e.to_string())?;
-    let _parent_env = EnvVarGuard::set_optional([
-        (
-            PENTECT_IN_MEMORY_MANAGER_ADDR_ENV,
-            Some(OsString::from(in_memory_manager.addr.as_str())),
-        ),
-        (
-            PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV,
-            Some(OsString::from(in_memory_manager.token.as_str())),
-        ),
-        (PENTECT_BIN_ENV, Some(pentect.as_os_str().to_os_string())),
-        (
-            PENTECT_AGENT_LAUNCHED_ENV,
-            Some(OsString::from(in_memory_manager.token.as_str())),
-        ),
-        (PENTECT_AGENT_AUTO_APPROVE_ENV, Some(OsString::from("1"))),
-        (
-            PENTECT_STATUS_LINE_ENV,
-            Some(OsString::from(if status_line_enabled { "1" } else { "0" })),
-        ),
-        (extensions::CONFIGS_ENV, config_env),
-        (extensions::ADAPTERS_ENV, adapter_env),
-    ]);
+    let memory_store = start_memory_store(pentect)?;
+    let _parent_env = agent_parent_env_guard(
+        pentect,
+        &memory_store,
+        status_line_enabled,
+        &active_extensions,
+    )?;
     let exec_proxy = if codex_unified_exec_proxy_enabled(&opts.tool_args) {
         Some(exec_proxy::ExecProxyGuard::start(&opts.command)?)
     } else {
@@ -745,9 +835,8 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
             ),
         ])
     });
-    apply_pentect_env(&mut cmd, pentect, Some(in_memory_manager.token.as_str()));
-    apply_agent_auto_approve_env(&mut cmd);
-    apply_in_memory_manager_env(&mut cmd, Some(&in_memory_manager));
+    apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()));
+    apply_memory_store_env(&mut cmd, Some(&memory_store));
     apply_status_line_env(&mut cmd, status_line_enabled);
     if let Some(exec_proxy) = &exec_proxy {
         cmd.env("CODEX_EXEC_SERVER_URL", exec_proxy.url());
@@ -759,6 +848,11 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         .transpose()?;
     let codex_args =
         if codex_app_server_proxy_enabled(&opts.tool_args, opts.codex_app_server_proxy_disabled)? {
+            let _app_server_proxy_env = EnvVarGuard::set_optional([(
+                app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV,
+                Some(OsString::from("1")),
+            )]);
+            cmd.env(app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV, "1");
             let proxy = app_server_proxy::AppServerProxyGuard::start(
                 &opts.command,
                 codex_app_server_args(&configs, &opts.tool_args),
@@ -783,13 +877,72 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     let active_extensions = agent_tool_extensions(opts)?;
     let mut cmd = Command::new(&opts.command);
     apply_extension_env(&mut cmd, &active_extensions)?;
-    let in_memory_manager = start_in_memory_manager(pentect)?;
-    apply_pentect_env(&mut cmd, pentect, Some(in_memory_manager.token.as_str()));
-    apply_agent_auto_approve_env(&mut cmd);
-    apply_in_memory_manager_env(&mut cmd, Some(&in_memory_manager));
-    apply_status_line_env(&mut cmd, status_line_enabled_by_config()?);
+    let memory_store = start_memory_store(pentect)?;
+    let status_line_enabled = status_line_enabled_by_config()?;
+    let _parent_env = agent_parent_env_guard(
+        pentect,
+        &memory_store,
+        status_line_enabled,
+        &active_extensions,
+    )?;
+    apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()));
+    apply_memory_store_env(&mut cmd, Some(&memory_store));
+    apply_status_line_env(&mut cmd, status_line_enabled);
     cmd.args(&args);
     run_interactive_command(cmd, &opts.command)
+}
+
+fn run_bridge_agent(
+    opts: &AgentToolOpts,
+    pentect: &Path,
+    tool: AgentTool,
+) -> Result<std::process::ExitStatus, String> {
+    use agent_integrations::{IntegrationKind, TempAgentIntegration};
+
+    let kind = match tool {
+        AgentTool::OpenCode => IntegrationKind::OpenCode,
+        AgentTool::Pi => IntegrationKind::Pi,
+        AgentTool::Codex | AgentTool::Claude => {
+            return Err("unsupported bridge agent".to_string());
+        }
+    };
+    let integration = TempAgentIntegration::create(kind)?;
+    let mut args = Vec::new();
+    if tool == AgentTool::Pi {
+        args.push("--extension".to_string());
+        args.push(integration.path().to_string_lossy().into_owned());
+    }
+    args.extend(opts.tool_args.iter().cloned());
+    if opts.dry_run {
+        print_dry_run(&opts.command, &args);
+        return Ok(success_status());
+    }
+
+    let active_extensions = agent_tool_extensions(opts)?;
+    let memory_store = start_memory_store(pentect)?;
+    let status_line_enabled = status_line_enabled_by_config()?;
+    let _parent_env = agent_parent_env_guard(
+        pentect,
+        &memory_store,
+        status_line_enabled,
+        &active_extensions,
+    )?;
+    let mut cmd = Command::new(&opts.command);
+    apply_extension_env(&mut cmd, &active_extensions)?;
+    apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()));
+    apply_memory_store_env(&mut cmd, Some(&memory_store));
+    apply_status_line_env(&mut cmd, status_line_enabled);
+    cmd.env("PENTECT_AGENT_CONTRACT", PENTECT_CONTRACT_INSTRUCTIONS);
+    if tool == AgentTool::OpenCode {
+        let existing = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+        let config = agent_integrations::opencode_config_with_plugin(
+            existing.as_deref(),
+            integration.path(),
+        )?;
+        cmd.env("OPENCODE_CONFIG_CONTENT", config);
+    }
+    cmd.args(args);
+    run_interactive_command_with_guard(cmd, &opts.command, (integration, memory_store))
 }
 
 fn run_interactive_command(
@@ -811,13 +964,14 @@ fn run_interactive_command_inner(
     cmd: &mut Command,
     display: &Path,
 ) -> Result<std::process::ExitStatus, String> {
-    let mut terminal_guard = terminal::TuiSessionGuard::enter();
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let mut terminal_guard = terminal::TuiSessionGuard::enter();
+        let status = run_interactive_command_pty(cmd, display, &mut terminal_guard);
+        return status;
+    }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(e) => {
-            terminal_guard.restore_without_prompt();
-            return Err(format!("could not start '{}': {e}", display.display()));
-        }
+        Err(e) => return Err(format!("could not start '{}': {e}", display.display())),
     };
     // Set this after spawn so child TUIs still receive Ctrl+C; the parent
     // stays alive long enough to restore terminal state after the child exits.
@@ -826,66 +980,1200 @@ fn run_interactive_command_inner(
         Ok(status) => status,
         Err(e) => {
             drop(ctrl_c_guard);
-            terminal_guard.restore_after_tui();
             return Err(format!("could not wait for '{}': {e}", display.display()));
         }
     };
     drop(ctrl_c_guard);
-    terminal_guard.restore_after_tui();
     Ok(status)
 }
 
-struct InMemoryManagerGuard {
-    child: Option<Child>,
-    addr: String,
-    token: String,
+fn run_interactive_command_pty(
+    cmd: &Command,
+    display: &Path,
+    terminal_guard: &mut terminal::TuiSessionGuard,
+) -> Result<std::process::ExitStatus, String> {
+    let pty_system = native_pty_system();
+    let (cols, rows) = current_pty_size();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("could not start pty for '{}': {e}", display.display()))?;
+    let command = command_builder_from_process_command(cmd)?;
+    let mut child = match pair.slave.spawn_command(command) {
+        Ok(child) => child,
+        Err(e) => {
+            terminal_guard.restore_without_prompt();
+            return Err(format!("could not start '{}': {e}", display.display()));
+        }
+    };
+    let mut process_supervisor = PtyProcessSupervisor::new(child.as_ref());
+    drop(pair.slave);
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("could not capture '{}': {e}", display.display()))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("could not open '{}': {e}", display.display()))?;
+    let mode_tracker = terminal_guard.mode_tracker();
+    let output_error = Arc::new(Mutex::new(None));
+    let output_error_writer = output_error.clone();
+    let output_thread =
+        thread::spawn(move || proxy_pty_output(reader, mode_tracker, output_error_writer));
+    let ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
+    let status = pump_prompt_guarded_pty_input(
+        child.as_mut(),
+        writer,
+        pair.master.as_ref(),
+        (cols, rows),
+        &output_error,
+    );
+    if status.is_err() {
+        let _ = child.kill();
+    }
+    process_supervisor.terminate();
+    finish_pty_child(child.as_mut());
+    drop(ctrl_c_guard);
+    drop(pair.master);
+    match join_pty_output(output_thread) {
+        Ok(()) => {}
+        Err(e) => {
+            terminal_guard.restore_after_tui();
+            return Err(e);
+        }
+    }
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => {
+            terminal_guard.restore_after_tui();
+            return Err(e);
+        }
+    };
+    terminal_guard.restore_after_tui();
+    Ok(exit_status_from_code(status.exit_code()))
 }
 
-impl InMemoryManagerGuard {
-    fn start(pentect: &Path) -> Result<Self, String> {
-        if let (Some(addr), Some(token)) = (
-            std::env::var_os(PENTECT_IN_MEMORY_MANAGER_ADDR_ENV),
-            std::env::var_os(PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV),
-        ) {
-            let addr = addr.to_string_lossy().to_string();
-            let token = token.to_string_lossy().to_string();
-            if !addr.is_empty() && !token.is_empty() {
-                return Ok(Self {
-                    child: None,
-                    addr,
-                    token,
-                });
+fn current_pty_size() -> (u16, u16) {
+    select_pty_size(
+        observed_terminal_size(),
+        pty_dimension_from_env("COLUMNS"),
+        pty_dimension_from_env("LINES"),
+    )
+}
+
+fn observed_terminal_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size()
+        .ok()
+        .filter(|(cols, rows)| *cols >= 2 && *rows >= 2)
+}
+
+fn select_pty_size(
+    terminal: Option<(u16, u16)>,
+    env_cols: Option<u16>,
+    env_rows: Option<u16>,
+) -> (u16, u16) {
+    let terminal = terminal.filter(|(cols, rows)| *cols >= 2 && *rows >= 2);
+    let cols = terminal.map(|size| size.0).or(env_cols).unwrap_or(120);
+    let rows = terminal.map(|size| size.1).or(env_rows).unwrap_or(30);
+    (cols, rows)
+}
+
+fn pty_dimension_from_env(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value >= 2)
+}
+
+fn command_builder_from_process_command(cmd: &Command) -> Result<CommandBuilder, String> {
+    let mut command = CommandBuilder::new(cmd.get_program());
+    command.args(cmd.get_args());
+    let cwd = match cmd.get_current_dir() {
+        Some(cwd) => cwd.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?,
+    };
+    command.cwd(cwd.as_os_str());
+    for (name, value) in cmd.get_envs() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        }
+    }
+    Ok(command)
+}
+
+fn proxy_pty_output(
+    mut reader: Box<dyn Read + Send>,
+    mode_tracker: terminal::TerminalModeTracker,
+    output_error: Arc<Mutex<Option<String>>>,
+) -> Result<(), String> {
+    let mut buf = [0u8; 8192];
+    let mut remasker = match pentect_agent::ActiveTerminalOutputRemasker::new() {
+        Ok(remasker) => remasker,
+        Err(error) => {
+            record_output_error(&output_error, &error);
+            drain_pty_reader(&mut reader, &mut buf);
+            return Err(error);
+        }
+    };
+    let mut first_error = None;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(error) => {
+                let error = format!("could not read pty output: {error}");
+                record_output_error(&output_error, &error);
+                return Err(error);
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if first_error.is_some() {
+            buf[..n].zeroize();
+            continue;
+        }
+        let remasked = match remasker.push(&buf[..n]) {
+            Ok(remasked) => remasked,
+            Err(error) => {
+                buf[..n].zeroize();
+                record_output_error(&output_error, &error);
+                first_error = Some(error);
+                continue;
+            }
+        };
+        buf[..n].zeroize();
+        mode_tracker.observe(&remasked);
+        if let Err(error) = write_pty_output(&remasked) {
+            record_output_error(&output_error, &error);
+            first_error = Some(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    let tail = match remasker.finish() {
+        Ok(tail) => tail,
+        Err(error) => {
+            record_output_error(&output_error, &error);
+            return Err(error);
+        }
+    };
+    mode_tracker.observe(&tail);
+    if let Err(error) = write_pty_output(&tail) {
+        record_output_error(&output_error, &error);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn drain_pty_reader(reader: &mut dyn Read, buf: &mut [u8]) {
+    loop {
+        match reader.read(buf) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => buf[..read].zeroize(),
+        }
+    }
+    buf.zeroize();
+}
+
+fn record_output_error(output_error: &Arc<Mutex<Option<String>>>, error: &str) {
+    let mut pending = match output_error.lock() {
+        Ok(pending) => pending,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if pending.is_none() {
+        *pending = Some(error.to_string());
+    }
+}
+
+fn write_pty_output(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut out = std::io::stdout().lock();
+    out.write_all(bytes)
+        .map_err(|e| format!("could not write pty output: {e}"))?;
+    out.flush()
+        .map_err(|e| format!("could not flush pty output: {e}"))?;
+    Ok(())
+}
+
+fn join_pty_output(output_thread: thread::JoinHandle<Result<(), String>>) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !output_thread.is_finished() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !output_thread.is_finished() {
+        return Err("pty output did not close".to_string());
+    }
+    match output_thread.join() {
+        Ok(result) => result,
+        Err(_) => Err("pty output thread panicked".to_string()),
+    }
+}
+
+fn finish_pty_child(child: &mut dyn PtyChild) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct PtyProcessSupervisor {
+    root: Option<SupervisedRoot>,
+}
+
+#[cfg(unix)]
+impl PtyProcessSupervisor {
+    fn new(child: &dyn PtyChild) -> Self {
+        Self {
+            root: capture_supervised_root(child),
+        }
+    }
+
+    fn terminate(&mut self) {
+        let Some(root) = self.root.take() else {
+            return;
+        };
+        terminate_supervised_processes(root);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtyProcessSupervisor {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(windows)]
+fn process_descends_from(
+    mut pid: sysinfo::Pid,
+    root: sysinfo::Pid,
+    processes: &std::collections::HashMap<sysinfo::Pid, sysinfo::Process>,
+) -> bool {
+    for _ in 0..64 {
+        let Some(parent) = processes.get(&pid).and_then(sysinfo::Process::parent) else {
+            return false;
+        };
+        if parent == root {
+            return true;
+        }
+        if parent == pid {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+struct SupervisedRoot {
+    pid: sysinfo::Pid,
+    start_time: Option<u64>,
+}
+
+fn capture_supervised_root(child: &dyn PtyChild) -> Option<SupervisedRoot> {
+    let pid = child.process_id().map(sysinfo::Pid::from_u32)?;
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    Some(SupervisedRoot {
+        pid,
+        start_time: system.process(pid).map(sysinfo::Process::start_time),
+    })
+}
+
+fn terminate_supervised_processes(root: SupervisedRoot) {
+    for _ in 0..4 {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        let root_matches = system
+            .process(root.pid)
+            .is_some_and(|process| root.start_time == Some(process.start_time()));
+        let root_reused = system.process(root.pid).is_some() && !root_matches;
+        let mut targets = system
+            .processes()
+            .iter()
+            .filter_map(|(pid, process)| {
+                is_supervised_process(
+                    *pid,
+                    process,
+                    root,
+                    root_matches,
+                    root_reused,
+                    system.processes(),
+                )
+                .then_some(*pid)
+            })
+            .filter(|pid| pid.as_u32() > 1 && pid.as_u32() != std::process::id())
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            break;
+        }
+        targets.sort_unstable_by_key(|pid| std::cmp::Reverse(pid.as_u32()));
+        for pid in targets {
+            if let Some(process) = system.process(pid) {
+                let _ = process.kill();
             }
         }
-        let mut child = Command::new(pentect)
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn is_supervised_process(
+    pid: sysinfo::Pid,
+    _process: &sysinfo::Process,
+    root: SupervisedRoot,
+    _root_matches: bool,
+    _root_reused: bool,
+    _processes: &std::collections::HashMap<sysinfo::Pid, sysinfo::Process>,
+) -> bool {
+    if pid == root.pid {
+        return false;
+    }
+    #[cfg(windows)]
+    if !_root_reused && process_descends_from(pid, root.pid, _processes) {
+        return true;
+    }
+    #[cfg(unix)]
+    if _process.session_id() == Some(root.pid) {
+        return true;
+    }
+    false
+}
+
+#[cfg(windows)]
+struct PtyProcessSupervisor {
+    job: windows_sys::Win32::Foundation::HANDLE,
+    root: Option<SupervisedRoot>,
+}
+
+#[cfg(windows)]
+impl PtyProcessSupervisor {
+    fn new(child: &dyn PtyChild) -> Self {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+        };
+
+        let root = capture_supervised_root(child);
+        let Some(process) = child.as_raw_handle() else {
+            return Self {
+                job: std::ptr::null_mut(),
+                root,
+            };
+        };
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Self { job, root };
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        let assigned = configured && unsafe { AssignProcessToJobObject(job, process.cast()) } != 0;
+        if !assigned {
+            unsafe {
+                let _ = CloseHandle(job);
+            }
+            return Self {
+                job: std::ptr::null_mut(),
+                root,
+            };
+        }
+        Self { job, root }
+    }
+
+    fn terminate(&mut self) {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::JobObjects::TerminateJobObject};
+        let mut job_terminated = false;
+        if !self.job.is_null() {
+            unsafe {
+                job_terminated = TerminateJobObject(self.job, 1) != 0;
+                let _ = CloseHandle(self.job);
+            }
+            self.job = std::ptr::null_mut();
+        }
+        if let (false, Some(root)) = (job_terminated, self.root.take()) {
+            terminate_supervised_processes(root);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PtyProcessSupervisor {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct PtyProcessSupervisor;
+
+#[cfg(not(any(unix, windows)))]
+impl PtyProcessSupervisor {
+    fn new(_child: &dyn PtyChild) -> Self {
+        Self
+    }
+
+    fn terminate(&mut self) {}
+}
+
+fn pump_prompt_guarded_pty_input(
+    child: &mut dyn PtyChild,
+    child_stdin: Box<dyn Write + Send>,
+    master: &dyn MasterPty,
+    mut pty_size: (u16, u16),
+    output_error: &Arc<Mutex<Option<String>>>,
+) -> Result<portable_pty::ExitStatus, String> {
+    let _raw = RawModeGuard::enable()?;
+    let mut protector = PromptInputProtector::default();
+    let mut child_stdin = Some(child_stdin);
+    let input = PtyInputReader::start();
+    loop {
+        if let Some(error) = current_output_error(output_error) {
+            return Err(error);
+        }
+        sync_pty_size(master, &mut pty_size);
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("could not poll agent: {e}"))?
+        {
+            return Ok(status);
+        }
+        if child_stdin.is_none() {
+            thread::sleep(PROMPT_INPUT_POLL);
+            continue;
+        }
+        match input.receiver.recv_timeout(PROMPT_INPUT_POLL) {
+            Ok(PtyInputEvent::Eof) => {
+                let tail = protector.flush()?;
+                if let Some(writer) = child_stdin.as_mut() {
+                    if !tail.is_empty() {
+                        writer
+                            .write_all(&tail)
+                            .map_err(|e| format!("could not write agent input: {e}"))?;
+                    }
+                }
+                child_stdin.take();
+            }
+            Ok(PtyInputEvent::Data(bytes)) => {
+                let rewritten = protector.rewrite_bytes(&bytes)?;
+                if let Some(writer) = child_stdin.as_mut() {
+                    if !rewritten.is_empty() {
+                        writer
+                            .write_all(&rewritten)
+                            .map_err(|e| format!("could not write agent input: {e}"))?;
+                        writer
+                            .flush()
+                            .map_err(|e| format!("could not flush agent input: {e}"))?;
+                    }
+                }
+            }
+            Ok(PtyInputEvent::Error(error)) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let idle = protector.flush_idle()?;
+                if let Some(writer) = child_stdin.as_mut() {
+                    if !idle.is_empty() {
+                        writer
+                            .write_all(&idle)
+                            .map_err(|e| format!("could not write agent input: {e}"))?;
+                        writer
+                            .flush()
+                            .map_err(|e| format!("could not flush agent input: {e}"))?;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let tail = protector.flush()?;
+                if let Some(writer) = child_stdin.as_mut() {
+                    if !tail.is_empty() {
+                        writer
+                            .write_all(&tail)
+                            .map_err(|e| format!("could not write agent input: {e}"))?;
+                    }
+                }
+                child_stdin.take();
+            }
+        }
+    }
+}
+
+enum PtyInputEvent {
+    Data(Vec<u8>),
+    Eof,
+    Error(String),
+}
+
+struct PtyInputReader {
+    receiver: mpsc::Receiver<PtyInputEvent>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PtyInputReader {
+    fn start() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            let mut input = std::io::stdin().lock();
+            let mut buf = [0u8; 8192];
+            while !worker_stop.load(Ordering::Acquire) {
+                match wait_for_stdin_ready(PROMPT_INPUT_POLL) {
+                    Ok(false) => continue,
+                    Err(error) => {
+                        let _ = sender.send(PtyInputEvent::Error(error));
+                        break;
+                    }
+                    Ok(true) => {}
+                }
+                match input.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = sender.send(PtyInputEvent::Eof);
+                        break;
+                    }
+                    Ok(n) => {
+                        if sender.send(PtyInputEvent::Data(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        let _ = sender.send(PtyInputEvent::Error(format!(
+                            "could not read terminal input: {error}"
+                        )));
+                        break;
+                    }
+                }
+            }
+            buf.zeroize();
+        });
+        Self {
+            receiver,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for PtyInputReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            unsafe {
+                let _ = windows_sys::Win32::System::IO::CancelSynchronousIo(
+                    thread.as_raw_handle().cast(),
+                );
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_stdin_ready(timeout: Duration) -> Result<bool, String> {
+    let mut descriptor = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let result = unsafe { libc::poll(std::ptr::from_mut(&mut descriptor), 1, timeout_ms) };
+    if result > 0 {
+        return Ok(true);
+    }
+    if result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+        return Ok(false);
+    }
+    Err(format!(
+        "could not poll terminal input: {}",
+        std::io::Error::last_os_error()
+    ))
+}
+
+#[cfg(windows)]
+fn wait_for_stdin_ready(timeout: Duration) -> Result<bool, String> {
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{
+            Console::GetStdHandle, Console::STD_INPUT_HANDLE, Threading::WaitForSingleObject,
+        },
+    };
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+    match unsafe { WaitForSingleObject(handle, timeout_ms) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(format!(
+            "could not poll terminal input: {}",
+            std::io::Error::last_os_error()
+        )),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn wait_for_stdin_ready(timeout: Duration) -> Result<bool, String> {
+    thread::sleep(timeout);
+    Ok(true)
+}
+
+fn current_output_error(error: &Arc<Mutex<Option<String>>>) -> Option<String> {
+    match error.lock() {
+        Ok(error) => error.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+fn sync_pty_size(master: &dyn MasterPty, current: &mut (u16, u16)) {
+    let Some(next) = observed_terminal_size() else {
+        return;
+    };
+    if next == *current {
+        return;
+    }
+    if master
+        .resize(PtySize {
+            rows: next.1,
+            cols: next.0,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_ok()
+    {
+        *current = next;
+    }
+}
+
+struct RawModeGuard {
+    #[cfg(windows)]
+    previous: Option<(*mut std::ffi::c_void, u32)>,
+}
+
+impl RawModeGuard {
+    fn enable() -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{
+                GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+                ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, STD_INPUT_HANDLE,
+            };
+
+            let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let mut previous = 0;
+            if unsafe { GetConsoleMode(handle, &mut previous) } == 0 {
+                return Ok(Self { previous: None });
+            }
+            let mode = (previous
+                & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            if unsafe { SetConsoleMode(handle, mode) } == 0 {
+                return Err("could not enter raw terminal mode".to_string());
+            }
+            Ok(Self {
+                previous: Some((handle, previous)),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            crossterm::terminal::enable_raw_mode()
+                .map_err(|e| format!("could not enter raw terminal mode: {e}"))?;
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some((handle, mode)) = self.previous {
+            unsafe {
+                let _ = windows_sys::Win32::System::Console::SetConsoleMode(handle, mode);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+#[derive(Default)]
+struct PromptInputProtector {
+    state: PromptInputState,
+    #[cfg(windows)]
+    win32: Win32PromptInputState,
+}
+
+impl PromptInputProtector {
+    fn rewrite_bytes(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        let mut mask = |text: &str| pentect_agent::mask_prompt_text_into_active_memory_store(text);
+        #[cfg(windows)]
+        {
+            rewrite_win32_prompt_input_bytes_with(
+                &mut self.state,
+                &mut self.win32,
+                bytes,
+                &mut mask,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            rewrite_prompt_input_bytes_with(&mut self.state, bytes, &mut mask)
+        }
+    }
+
+    fn flush(&mut self) -> Result<Vec<u8>, String> {
+        let mut mask = |text: &str| pentect_agent::mask_prompt_text_into_active_memory_store(text);
+        #[cfg(windows)]
+        {
+            flush_win32_prompt_input_with(&mut self.state, &mut self.win32, &mut mask)
+        }
+        #[cfg(not(windows))]
+        {
+            flush_prompt_input_with(&mut self.state, &mut mask)
+        }
+    }
+
+    fn flush_idle(&mut self) -> Result<Vec<u8>, String> {
+        if self.state.in_bracketed_paste {
+            return Ok(Vec::new());
+        }
+        self.flush()
+    }
+}
+
+#[derive(Default)]
+struct PromptInputState {
+    pending: Vec<u8>,
+    in_bracketed_paste: bool,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct Win32PromptInputState {
+    decode_pending: Vec<u8>,
+    paste_prefix_raw: Vec<u8>,
+    paste_prefix_text: Vec<u8>,
+    drop_next_key_up: bool,
+}
+
+#[cfg(windows)]
+enum Win32InputRecord {
+    Text { units: Vec<u16>, virtual_key: u32 },
+    KeyUp,
+    NonText,
+}
+
+#[cfg(windows)]
+fn rewrite_win32_prompt_input_bytes_with<F>(
+    normal: &mut PromptInputState,
+    state: &mut Win32PromptInputState,
+    bytes: &[u8],
+    mask: &mut F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    state.decode_pending.extend_from_slice(bytes);
+    let mut out = Vec::with_capacity(bytes.len());
+    loop {
+        let Some(start) = find_bytes(&state.decode_pending, b"\x1b[") else {
+            let keep = partial_suffix_prefix_len(&state.decode_pending, b"\x1b[");
+            let emit_len = state.decode_pending.len().saturating_sub(keep);
+            if emit_len > 0 {
+                let mut raw: Vec<u8> = state.decode_pending.drain(..emit_len).collect();
+                out.extend(rewrite_prompt_input_bytes_with(normal, &raw, mask)?);
+                raw.zeroize();
+            }
+            break;
+        };
+        if start > 0 {
+            let mut raw: Vec<u8> = state.decode_pending.drain(..start).collect();
+            out.extend(rewrite_prompt_input_bytes_with(normal, &raw, mask)?);
+            raw.zeroize();
+            continue;
+        }
+        let Some(final_offset) = state
+            .decode_pending
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find_map(|(index, byte)| (b'@'..=b'~').contains(byte).then_some(index))
+        else {
+            break;
+        };
+        let mut sequence: Vec<u8> = state.decode_pending.drain(..=final_offset).collect();
+        match parse_win32_input_record(&sequence) {
+            Some(Win32InputRecord::Text { units, virtual_key }) => match String::from_utf16(&units)
+            {
+                Ok(mut text) => {
+                    if normal.in_bracketed_paste {
+                        let was_paste = normal.in_bracketed_paste;
+                        out.extend(rewrite_prompt_input_bytes_with(
+                            normal,
+                            text.as_bytes(),
+                            mask,
+                        )?);
+                        state.drop_next_key_up = was_paste && !normal.in_bracketed_paste;
+                    } else if !state.paste_prefix_raw.is_empty()
+                        || (matches!(virtual_key, 0 | 231)
+                            && text.as_bytes().first() == PROMPT_PASTE_START.first())
+                    {
+                        state.paste_prefix_raw.extend_from_slice(&sequence);
+                        state.paste_prefix_text.extend_from_slice(text.as_bytes());
+                        if !PROMPT_PASTE_START.starts_with(&state.paste_prefix_text) {
+                            flush_win32_paste_prefix(state, &mut out);
+                        } else if state.paste_prefix_text == PROMPT_PASTE_START {
+                            out.extend(rewrite_prompt_input_bytes_with(
+                                normal,
+                                PROMPT_PASTE_START,
+                                mask,
+                            )?);
+                            state.paste_prefix_raw.zeroize();
+                            state.paste_prefix_raw.clear();
+                            state.paste_prefix_text.zeroize();
+                            state.paste_prefix_text.clear();
+                        }
+                    } else {
+                        out.extend_from_slice(&sequence);
+                    }
+                    text.zeroize();
+                }
+                Err(_) => {
+                    flush_win32_paste_prefix(state, &mut out);
+                    out.extend_from_slice(&sequence);
+                }
+            },
+            Some(Win32InputRecord::KeyUp) => {
+                if state.drop_next_key_up {
+                    state.drop_next_key_up = false;
+                } else if normal.in_bracketed_paste {
+                    // Pasted text is rewritten as one safe payload, so its original
+                    // key-up records must not reach the nested terminal.
+                } else if !state.paste_prefix_raw.is_empty() {
+                    state.paste_prefix_raw.extend_from_slice(&sequence);
+                } else {
+                    out.extend_from_slice(&sequence);
+                }
+            }
+            Some(Win32InputRecord::NonText) => {
+                flush_win32_paste_prefix(state, &mut out);
+                out.extend_from_slice(&sequence);
+            }
+            None => {
+                flush_win32_paste_prefix(state, &mut out);
+                out.extend(rewrite_prompt_input_bytes_with(normal, &sequence, mask)?);
+            }
+        }
+        sequence.zeroize();
+    }
+    if state.decode_pending.len() > PROMPT_INPUT_MAX_PENDING_BYTES {
+        state.decode_pending.zeroize();
+        state.decode_pending.clear();
+        return Err("terminal input sequence exceeds 1 MiB".to_string());
+    }
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn flush_win32_paste_prefix(state: &mut Win32PromptInputState, out: &mut Vec<u8>) {
+    out.append(&mut state.paste_prefix_raw);
+    state.paste_prefix_text.zeroize();
+    state.paste_prefix_text.clear();
+}
+
+#[cfg(windows)]
+fn parse_win32_input_record(sequence: &[u8]) -> Option<Win32InputRecord> {
+    let body = sequence.strip_prefix(b"\x1b[")?.strip_suffix(b"_")?;
+    let text = std::str::from_utf8(body).ok()?;
+    let fields = text
+        .split(';')
+        .map(|field| field.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if fields.len() != 6 {
+        return None;
+    }
+    let virtual_key = *fields.first()?;
+    let unicode = u16::try_from(*fields.get(2)?).ok()?;
+    let key_down = *fields.get(3)?;
+    let repeat = usize::try_from(*fields.get(5)?).ok()?;
+    if repeat > 1024 {
+        return None;
+    }
+    if key_down == 0 {
+        return Some(Win32InputRecord::KeyUp);
+    }
+    if unicode == 0 {
+        return Some(Win32InputRecord::NonText);
+    }
+    Some(Win32InputRecord::Text {
+        units: vec![unicode; repeat.max(1)],
+        virtual_key,
+    })
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+fn encode_win32_unicode_input(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len().saturating_mul(40));
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(format!("\x1b[0;0;{unit};1;0;1_").as_bytes());
+        out.extend_from_slice(format!("\x1b[0;0;{unit};0;0;1_").as_bytes());
+    }
+    out
+}
+
+#[cfg(windows)]
+fn flush_win32_prompt_input_with<F>(
+    normal: &mut PromptInputState,
+    state: &mut Win32PromptInputState,
+    mask: &mut F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    let mut out = Vec::new();
+    flush_win32_paste_prefix(state, &mut out);
+    if !state.decode_pending.is_empty() {
+        let mut raw = std::mem::take(&mut state.decode_pending);
+        out.extend(rewrite_prompt_input_bytes_with(normal, &raw, mask)?);
+        raw.zeroize();
+    }
+    out.extend(flush_prompt_input_with(normal, mask)?);
+    Ok(out)
+}
+
+fn rewrite_prompt_input_bytes_with<F>(
+    state: &mut PromptInputState,
+    bytes: &[u8],
+    mask: &mut F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    state.pending.extend_from_slice(bytes);
+    let mut out = Vec::with_capacity(bytes.len());
+    loop {
+        if state.in_bracketed_paste {
+            if let Some(end) = find_bytes(&state.pending, PROMPT_PASTE_END) {
+                let mut content: Vec<u8> = state.pending.drain(..end).collect();
+                out.extend(rewrite_prompt_plain_bytes_with(&content, true, mask)?);
+                content.zeroize();
+                state.pending.drain(..PROMPT_PASTE_END.len());
+                out.extend_from_slice(PROMPT_PASTE_END);
+                state.in_bracketed_paste = false;
+                continue;
+            }
+            if state.pending.len() > PROMPT_INPUT_MAX_PENDING_BYTES {
+                let mut content = std::mem::take(&mut state.pending);
+                out.extend(rewrite_prompt_plain_bytes_with(&content, true, mask)?);
+                content.zeroize();
+                state.in_bracketed_paste = false;
+            }
+            break;
+        }
+
+        if let Some(start) = find_bytes(&state.pending, PROMPT_PASTE_START) {
+            let mut before: Vec<u8> = state.pending.drain(..start).collect();
+            out.extend(rewrite_prompt_plain_bytes_with(&before, false, mask)?);
+            before.zeroize();
+            state.pending.drain(..PROMPT_PASTE_START.len());
+            out.extend_from_slice(PROMPT_PASTE_START);
+            state.in_bracketed_paste = true;
+            continue;
+        }
+
+        let keep = partial_suffix_prefix_len(&state.pending, PROMPT_PASTE_START);
+        let emit_len = state.pending.len().saturating_sub(keep);
+        if emit_len > 0 {
+            let mut plain: Vec<u8> = state.pending.drain(..emit_len).collect();
+            out.extend(rewrite_prompt_plain_bytes_with(&plain, false, mask)?);
+            plain.zeroize();
+        }
+        break;
+    }
+    Ok(out)
+}
+
+fn flush_prompt_input_with<F>(state: &mut PromptInputState, mask: &mut F) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    if state.pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pending = std::mem::take(&mut state.pending);
+    let out = rewrite_prompt_plain_bytes_with(&pending, state.in_bracketed_paste, mask)?;
+    pending.zeroize();
+    state.in_bracketed_paste = false;
+    Ok(out)
+}
+
+fn rewrite_prompt_plain_bytes_with<F>(
+    bytes: &[u8],
+    force_scan: bool,
+    mask: &mut F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(bytes.to_vec());
+    };
+    if !force_scan && !should_scan_prompt_input_text(text) {
+        return Ok(bytes.to_vec());
+    }
+    match mask(text)? {
+        Some(masked) if masked != text => Ok(masked.into_bytes()),
+        _ => Ok(bytes.to_vec()),
+    }
+}
+
+fn should_scan_prompt_input_text(text: &str) -> bool {
+    text.len() >= 32 && !text.contains('\x1b')
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn partial_suffix_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
+    let max = bytes.len().min(prefix.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|len| bytes[bytes.len() - len..] == prefix[..*len])
+        .unwrap_or(0)
+}
+
+struct MemoryStoreGuard {
+    child: Option<Child>,
+    lease: Option<pentect_agent::MemoryStoreLease>,
+    addr: String,
+    token: String,
+    process_host_read_token: String,
+    process_host_write_token: String,
+    process_host_root: PathBuf,
+    process_host_candidate: Option<PathBuf>,
+}
+
+impl MemoryStoreGuard {
+    fn start(pentect: &Path, persistent: bool) -> Result<Option<Self>, String> {
+        if !persistent {
+            if let (
+                Some(addr),
+                Some(token),
+                Some(process_host_read_token),
+                Some(process_host_write_token),
+                Some(process_host_root),
+            ) = (
+                std::env::var_os(PENTECT_MEMORY_STORE_ADDR_ENV),
+                std::env::var_os(PENTECT_MEMORY_STORE_TOKEN_ENV),
+                std::env::var_os(PENTECT_PROCESS_HOST_READ_TOKEN_ENV),
+                std::env::var_os(PENTECT_PROCESS_HOST_WRITE_TOKEN_ENV),
+                std::env::var_os(PENTECT_PROCESS_HOST_ROOT_ENV),
+            ) {
+                let addr = addr.to_string_lossy().to_string();
+                let token = token.to_string_lossy().to_string();
+                let process_host_read_token = process_host_read_token.to_string_lossy().to_string();
+                let process_host_write_token =
+                    process_host_write_token.to_string_lossy().to_string();
+                if !addr.is_empty()
+                    && !token.is_empty()
+                    && !process_host_read_token.is_empty()
+                    && !process_host_write_token.is_empty()
+                    && !process_host_root.is_empty()
+                {
+                    return Ok(Some(Self {
+                        child: None,
+                        lease: None,
+                        addr,
+                        token,
+                        process_host_read_token,
+                        process_host_write_token,
+                        process_host_root: PathBuf::from(process_host_root),
+                        process_host_candidate: None,
+                    }));
+                }
+            }
+        }
+        let mut command = Command::new(pentect);
+        command
             .arg("agent")
-            .arg("manager")
+            .arg("memory-store")
             .arg("--serve")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        if persistent {
+            configure_persistent_child(&mut command);
+        }
+        let mut child = command
             .spawn()
-            .map_err(|e| format!("could not start Pentect in-memory manager: {e}"))?;
+            .map_err(|e| format!("could not start Pentect memory store: {e}"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "could not capture Pentect in-memory manager startup".to_string())?;
+            .ok_or_else(|| "could not capture Pentect memory store startup".to_string())?;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut line = String::new();
             let result = BufReader::new(stdout)
                 .read_line(&mut line)
-                .map_err(|e| format!("could not read Pentect in-memory manager startup: {e}"))
+                .map_err(|e| format!("could not read Pentect memory store startup: {e}"))
                 .and_then(|_| {
                     if line.trim().is_empty() {
-                        Err("Pentect in-memory manager exited before startup".to_string())
+                        Err("Pentect memory store exited before startup".to_string())
                     } else {
                         Ok(line)
                     }
                 });
             let _ = tx.send(result);
         });
-        let line = match rx.recv_timeout(IN_MEMORY_MANAGER_STARTUP_TIMEOUT) {
+        let line = match rx.recv_timeout(MEMORY_STORE_STARTUP_TIMEOUT) {
             Ok(Ok(line)) => line,
             Ok(Err(e)) => {
                 let _ = child.kill();
@@ -895,32 +2183,138 @@ impl InMemoryManagerGuard {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Pentect in-memory manager did not start within 5 seconds".to_string());
+                return Err("Pentect memory store did not start within 5 seconds".to_string());
             }
         };
-        let (addr, token) = match parse_in_memory_manager_startup(&line) {
-            Ok(parsed) => parsed,
+        let (addr, token, process_host_read_token, process_host_write_token) =
+            match parse_memory_store_startup(&line) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
+                }
+            };
+        let lease = if persistent {
+            None
+        } else {
+            match pentect_agent::open_memory_store_lease(&addr, &token) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.to_string());
+                }
+            }
+        };
+        let process_host_root = process_host_root()?;
+        let process_host_candidate = match pentect_agent::register_process_host_candidate(
+            &process_host_root,
+            &addr,
+            &process_host_read_token,
+            &process_host_write_token,
+            child.id(),
+            persistent,
+        ) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(e);
             }
         };
-        Ok(Self {
+        Ok(Some(Self {
             child: Some(child),
+            lease,
             addr,
             token,
-        })
+            process_host_read_token,
+            process_host_write_token,
+            process_host_root,
+            process_host_candidate: Some(process_host_candidate),
+        }))
+    }
+
+    fn detach(mut self) {
+        self.lease.take();
+        self.child.take();
+        self.process_host_candidate.take();
     }
 }
 
-impl Drop for InMemoryManagerGuard {
+impl Drop for MemoryStoreGuard {
     fn drop(&mut self) {
+        if let Some(path) = self.process_host_candidate.take() {
+            pentect_agent::unregister_process_host_candidate(&path);
+        }
         if let Some(child) = &mut self.child {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.token.zeroize();
+        self.process_host_read_token.zeroize();
+        self.process_host_write_token.zeroize();
     }
+}
+
+#[cfg(windows)]
+fn configure_persistent_child(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+fn process_host_root() -> Result<PathBuf, String> {
+    if let Some(root) = std::env::var_os(PENTECT_PROCESS_HOST_ROOT_ENV).filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(root));
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .or_else(|| {
+                std::env::var_os("USERPROFILE").map(|home| {
+                    PathBuf::from(home)
+                        .join("AppData")
+                        .join("Local")
+                        .into_os_string()
+                })
+            })
+            .map(PathBuf::from)
+            .map(|root| root.join("pentect"))
+            .ok_or_else(|| "could not locate local application data".to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Caches").join("pentect"))
+            .ok_or_else(|| "could not locate the user cache directory".to_string())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(root).join("pentect"));
+        }
+        if let Some(root) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(root).join("pentect"));
+        }
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".cache").join("pentect"))
+            .ok_or_else(|| "could not locate the user cache directory".to_string())
+    }
+}
+
+#[cfg(unix)]
+fn configure_persistent_child(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
 }
 
 fn apply_pentect_env(cmd: &mut Command, pentect: &Path, launch_proof: Option<&str>) {
@@ -932,26 +2326,113 @@ fn apply_pentect_env(cmd: &mut Command, pentect: &Path, launch_proof: Option<&st
     }
 }
 
-fn apply_agent_auto_approve_env(cmd: &mut Command) {
-    cmd.env(PENTECT_AGENT_AUTO_APPROVE_ENV, "1");
-}
-
-fn apply_in_memory_manager_env(
-    cmd: &mut Command,
-    in_memory_manager: Option<&InMemoryManagerGuard>,
-) {
-    let Some(in_memory_manager) = in_memory_manager else {
+fn apply_memory_store_env(cmd: &mut Command, memory_store: Option<&MemoryStoreGuard>) {
+    let Some(memory_store) = memory_store else {
         return;
     };
-    cmd.env(PENTECT_IN_MEMORY_MANAGER_ADDR_ENV, &in_memory_manager.addr);
+    cmd.env(PENTECT_MEMORY_STORE_ADDR_ENV, &memory_store.addr);
+    cmd.env(PENTECT_MEMORY_STORE_TOKEN_ENV, &memory_store.token);
     cmd.env(
-        PENTECT_IN_MEMORY_MANAGER_TOKEN_ENV,
-        &in_memory_manager.token,
+        PENTECT_PROCESS_HOST_READ_TOKEN_ENV,
+        &memory_store.process_host_read_token,
+    );
+    cmd.env(
+        PENTECT_PROCESS_HOST_WRITE_TOKEN_ENV,
+        &memory_store.process_host_write_token,
+    );
+    cmd.env(
+        PENTECT_PROCESS_HOST_ROOT_ENV,
+        &memory_store.process_host_root,
     );
 }
 
 fn apply_status_line_env(cmd: &mut Command, enabled: bool) {
     cmd.env(PENTECT_STATUS_LINE_ENV, if enabled { "1" } else { "0" });
+}
+
+fn memory_store_parent_env_guard(pentect: &Path, memory_store: &MemoryStoreGuard) -> EnvVarGuard {
+    EnvVarGuard::set_optional([
+        (
+            PENTECT_MEMORY_STORE_ADDR_ENV,
+            Some(OsString::from(memory_store.addr.as_str())),
+        ),
+        (
+            PENTECT_MEMORY_STORE_TOKEN_ENV,
+            Some(OsString::from(memory_store.token.as_str())),
+        ),
+        (
+            PENTECT_PROCESS_HOST_READ_TOKEN_ENV,
+            Some(OsString::from(
+                memory_store.process_host_read_token.as_str(),
+            )),
+        ),
+        (
+            PENTECT_PROCESS_HOST_WRITE_TOKEN_ENV,
+            Some(OsString::from(
+                memory_store.process_host_write_token.as_str(),
+            )),
+        ),
+        (
+            PENTECT_PROCESS_HOST_ROOT_ENV,
+            Some(memory_store.process_host_root.clone().into_os_string()),
+        ),
+        (PENTECT_BIN_ENV, Some(pentect.as_os_str().to_os_string())),
+        (
+            PENTECT_AGENT_LAUNCHED_ENV,
+            Some(OsString::from(memory_store.token.as_str())),
+        ),
+    ])
+}
+
+fn agent_parent_env_guard(
+    pentect: &Path,
+    memory_store: &MemoryStoreGuard,
+    status_line_enabled: bool,
+    active_extensions: &extensions::ActiveExtensions,
+) -> Result<EnvVarGuard, String> {
+    let config_env = active_extensions
+        .config_env_value()
+        .map_err(|e| e.to_string())?;
+    let adapter_env = active_extensions
+        .adapter_env_value()
+        .map_err(|e| e.to_string())?;
+    Ok(EnvVarGuard::set_optional([
+        (
+            PENTECT_MEMORY_STORE_ADDR_ENV,
+            Some(OsString::from(memory_store.addr.as_str())),
+        ),
+        (
+            PENTECT_MEMORY_STORE_TOKEN_ENV,
+            Some(OsString::from(memory_store.token.as_str())),
+        ),
+        (
+            PENTECT_PROCESS_HOST_READ_TOKEN_ENV,
+            Some(OsString::from(
+                memory_store.process_host_read_token.as_str(),
+            )),
+        ),
+        (
+            PENTECT_PROCESS_HOST_WRITE_TOKEN_ENV,
+            Some(OsString::from(
+                memory_store.process_host_write_token.as_str(),
+            )),
+        ),
+        (
+            PENTECT_PROCESS_HOST_ROOT_ENV,
+            Some(memory_store.process_host_root.clone().into_os_string()),
+        ),
+        (PENTECT_BIN_ENV, Some(pentect.as_os_str().to_os_string())),
+        (
+            PENTECT_AGENT_LAUNCHED_ENV,
+            Some(OsString::from(memory_store.token.as_str())),
+        ),
+        (
+            PENTECT_STATUS_LINE_ENV,
+            Some(OsString::from(if status_line_enabled { "1" } else { "0" })),
+        ),
+        (extensions::CONFIGS_ENV, config_env),
+        (extensions::ADAPTERS_ENV, adapter_env),
+    ]))
 }
 
 fn status_line_enabled_by_config() -> Result<bool, String> {
@@ -1000,22 +2481,43 @@ fn status_line_config_bool(value: &toml::Value, field: &str) -> Result<bool, Str
     Err(format!("config {field} must be a boolean"))
 }
 
-fn parse_in_memory_manager_startup(line: &str) -> Result<(String, String), String> {
+fn parse_memory_store_startup(line: &str) -> Result<(String, String, String, String), String> {
     let startup: Value = serde_json::from_str(line)
-        .map_err(|e| format!("Pentect in-memory manager startup was not JSON: {e}"))?;
+        .map_err(|e| format!("Pentect memory store startup was not JSON: {e}"))?;
     let addr = startup
         .get("addr")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Pentect in-memory manager startup did not include addr".to_string())?
+        .ok_or_else(|| "Pentect memory store startup did not include addr".to_string())?
         .to_string();
     let token = startup
         .get("token")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Pentect in-memory manager startup did not include token".to_string())?
+        .ok_or_else(|| "Pentect memory store startup did not include token".to_string())?
         .to_string();
-    Ok((addr, token))
+    let process_host_read_token = startup
+        .get("process_host_read_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "Pentect memory store startup did not include process_host_read_token".to_string()
+        })?
+        .to_string();
+    let process_host_write_token = startup
+        .get("process_host_write_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "Pentect memory store startup did not include process_host_write_token".to_string()
+        })?
+        .to_string();
+    Ok((
+        addr,
+        token,
+        process_host_read_token,
+        process_host_write_token,
+    ))
 }
 
 struct EnvVarGuard {
@@ -1749,15 +3251,19 @@ fn print_dry_run(command: &Path, args: &[String]) {
 }
 
 fn success_status() -> std::process::ExitStatus {
+    exit_status_from_code(0)
+}
+
+fn exit_status_from_code(code: u32) -> std::process::ExitStatus {
     #[cfg(windows)]
     {
         use std::os::windows::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(0)
+        std::process::ExitStatus::from_raw(code)
     }
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(0)
+        std::process::ExitStatus::from_raw((code as i32) << 8)
     }
 }
 
@@ -1915,11 +3421,14 @@ fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
 /// masked. Output is then mostly unusable for reasoning, but still reversible.
-fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Engine {
+fn build_engine(profile: Profile, aggressive: bool, packs: Vec<Pack>) -> Result<Engine, String> {
     if aggressive {
         eprintln!("[pentect] WARNING: --aggressive disables benign-shape guards; output likely unusable for reasoning.");
     }
-    Engine::with_profile_and_packs(profile, packs, aggressive)
+    let decode = pentect_agent::load_decode_config(profile)?;
+    Ok(Engine::with_profile_and_packs_and_decode_config(
+        profile, packs, aggressive, decode,
+    ))
 }
 
 /// Load each `--pack FILE` as a TOML rule pack. Reading a config file is input,
@@ -1996,6 +3505,16 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_size_tracks_the_real_terminal_before_fallbacks() {
+        assert_eq!(
+            select_pty_size(Some((180, 52)), Some(100), Some(24)),
+            (180, 52)
+        );
+        assert_eq!(select_pty_size(None, Some(100), Some(24)), (100, 24));
+        assert_eq!(select_pty_size(Some((0, 0)), None, None), (120, 30));
+    }
 
     #[test]
     fn read_parse_infers_dotenv_and_defaults_to_strict() {
@@ -2150,7 +3669,12 @@ mod tests {
 
     #[test]
     fn agent_tool_parse_rejects_prompt_proxy_for_all_agents() {
-        for tool in [AgentTool::Codex, AgentTool::Claude] {
+        for tool in [
+            AgentTool::Codex,
+            AgentTool::Claude,
+            AgentTool::OpenCode,
+            AgentTool::Pi,
+        ] {
             let args = vec![
                 "pentect".to_string(),
                 tool.name().to_string(),
@@ -2159,6 +3683,14 @@ mod tests {
             let err = AgentToolOpts::parse(tool, &args).unwrap_err();
             assert!(err.contains("disabled/TODO"), "{tool:?}: {err}");
         }
+    }
+
+    #[test]
+    fn bridge_agents_have_distinct_commands_and_path_flags() {
+        assert_eq!(AgentTool::OpenCode.env_var(), "PENTECT_OPENCODE");
+        assert_eq!(AgentTool::OpenCode.path_flag(), "--opencode");
+        assert_eq!(AgentTool::Pi.env_var(), "PENTECT_PI");
+        assert_eq!(AgentTool::Pi.path_flag(), "--pi");
     }
 
     #[test]
@@ -2258,7 +3790,6 @@ mod tests {
         let launch_proof = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let mut cmd = Command::new("codex");
         apply_pentect_env(&mut cmd, pentect, Some(launch_proof));
-        apply_agent_auto_approve_env(&mut cmd);
         let actual = cmd
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_BIN_ENV))
@@ -2271,12 +3802,6 @@ mod tests {
             .and_then(|(_, value)| value)
             .unwrap();
         assert_eq!(launched, std::ffi::OsStr::new(launch_proof));
-        let auto_approve = cmd
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_AUTO_APPROVE_ENV))
-            .and_then(|(_, value)| value)
-            .unwrap();
-        assert_eq!(auto_approve, std::ffi::OsStr::new("1"));
     }
 
     #[test]
@@ -2293,6 +3818,26 @@ mod tests {
 
         let value = "status_line = \"on\"".parse::<toml::Value>().unwrap();
         assert_eq!(status_line_config_value(&value).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn memory_store_startup_requires_process_host_tokens() {
+        let parsed = parse_memory_store_startup(
+            r#"{"addr":"127.0.0.1:1234","token":"memory","process_host_read_token":"read","process_host_write_token":"write"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            (
+                "127.0.0.1:1234".to_string(),
+                "memory".to_string(),
+                "read".to_string(),
+                "write".to_string(),
+            )
+        );
+        assert!(
+            parse_memory_store_startup(r#"{"addr":"127.0.0.1:1234","token":"write"}"#).is_err()
+        );
     }
 
     #[test]
@@ -2638,6 +4183,198 @@ mod tests {
             "--enable".to_string(),
             "foo".to_string(),
             "exec".to_string()
+        ]));
+    }
+
+    #[test]
+    fn prompt_input_rewrites_bracketed_paste_payload() {
+        let mut state = PromptInputState::default();
+        let mut mask = |text: &str| {
+            Ok(Some(text.replace(
+                "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+                "<<OPENAI_API_KEY_demo>>",
+            )))
+        };
+        let out = rewrite_prompt_input_bytes_with(
+            &mut state,
+            b"\x1b[200~OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\x1b[201~",
+            &mut mask,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("\x1b[200~"), "{text:?}");
+        assert!(text.ends_with("\x1b[201~"), "{text:?}");
+        assert!(!text.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{text}");
+        assert!(text.contains("<<OPENAI_API_KEY_demo>>"), "{text}");
+    }
+
+    #[test]
+    fn prompt_input_rewrites_split_bracketed_paste() {
+        let mut state = PromptInputState::default();
+        let mut mask = |text: &str| Ok(Some(text.replace("secret-value", "<<TOKEN_demo>>")));
+        let first = rewrite_prompt_input_bytes_with(&mut state, b"\x1b[20", &mut mask).unwrap();
+        assert!(first.is_empty(), "{first:?}");
+        let second =
+            rewrite_prompt_input_bytes_with(&mut state, b"0~token=secret-", &mut mask).unwrap();
+        assert_eq!(second, b"\x1b[200~");
+        let third =
+            rewrite_prompt_input_bytes_with(&mut state, b"value\x1b[201~", &mut mask).unwrap();
+        assert_eq!(
+            String::from_utf8(third).unwrap(),
+            "token=<<TOKEN_demo>>\x1b[201~"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prompt_input_rewrites_win32_encoded_bracketed_paste() {
+        let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let mut encoded = encode_win32_unicode_input("\x1b[200~");
+        encoded.extend(encode_win32_unicode_input(raw));
+        encoded.extend(encode_win32_unicode_input("\x1b[201~"));
+        let split = encoded.len() / 2;
+        let mut normal = PromptInputState::default();
+        let mut win32 = Win32PromptInputState::default();
+        let mut mask = |text: &str| {
+            Ok(Some(text.replace(
+                "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+                "<<OPENAI_API_KEY_demo>>",
+            )))
+        };
+        let mut out = rewrite_win32_prompt_input_bytes_with(
+            &mut normal,
+            &mut win32,
+            &encoded[..split],
+            &mut mask,
+        )
+        .unwrap();
+        out.extend(
+            rewrite_win32_prompt_input_bytes_with(
+                &mut normal,
+                &mut win32,
+                &encoded[split..],
+                &mut mask,
+            )
+            .unwrap(),
+        );
+        let decoded = String::from_utf8_lossy(&out);
+        assert!(
+            !decoded.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+            "{decoded}"
+        );
+        assert!(decoded.contains("<<OPENAI_API_KEY_demo>>"), "{decoded}");
+        assert!(decoded.starts_with("\x1b[200~"), "{decoded:?}");
+        assert!(decoded.contains("\x1b[201~"), "{decoded:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prompt_input_preserves_non_win32_terminal_responses() {
+        let mut normal = PromptInputState::default();
+        let mut win32 = Win32PromptInputState::default();
+        let mut mask = |_: &str| Ok(Some("masked".to_string()));
+        let out =
+            rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, b"\x1b[2;1R", &mut mask)
+                .unwrap();
+        assert_eq!(out, b"\x1b[2;1R");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prompt_input_preserves_win32_key_records_outside_paste() {
+        let encoded = encode_win32_unicode_input("tools\r");
+        let mut normal = PromptInputState::default();
+        let mut win32 = Win32PromptInputState::default();
+        let mut mask = |_: &str| Ok(None);
+        let out =
+            rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, &encoded, &mut mask)
+                .unwrap();
+        assert_eq!(out, encoded);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prompt_input_preserves_one_backspace_as_one_win32_key_press() {
+        let encoded = b"\x1b[8;14;8;1;0;1_\x1b[8;14;8;0;0;1_";
+        let mut normal = PromptInputState::default();
+        let mut win32 = Win32PromptInputState::default();
+        let mut mask = |_: &str| Ok(None);
+        let out =
+            rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, encoded, &mut mask)
+                .unwrap();
+        assert_eq!(out, encoded);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prompt_input_preserves_escape_and_navigation_without_waiting_for_paste() {
+        for encoded in [
+            b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_".as_slice(),
+            b"\x1b[37;75;0;1;256;1_\x1b[37;75;0;0;256;1_".as_slice(),
+            b"\x1b[46;83;0;1;256;1_\x1b[46;83;0;0;256;1_".as_slice(),
+        ] {
+            let mut normal = PromptInputState::default();
+            let mut win32 = Win32PromptInputState::default();
+            let mut mask = |_: &str| Ok(None);
+            let out =
+                rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, encoded, &mut mask)
+                    .unwrap();
+            assert_eq!(out, encoded);
+        }
+    }
+
+    #[test]
+    fn prompt_input_keeps_escape_sequences_raw() {
+        let mut state = PromptInputState::default();
+        let mut called = false;
+        let mut mask = |_: &str| {
+            called = true;
+            Ok(Some("masked".to_string()))
+        };
+        let out = rewrite_prompt_input_bytes_with(&mut state, b"\x1b[A", &mut mask).unwrap();
+        assert_eq!(out, b"\x1b[A");
+        assert!(!called);
+    }
+
+    #[test]
+    fn prompt_input_releases_a_standalone_escape_after_idle_timeout() {
+        let mut protector = PromptInputProtector::default();
+        assert!(protector.rewrite_bytes(b"\x1b").unwrap().is_empty());
+        assert_eq!(protector.flush_idle().unwrap(), b"\x1b");
+    }
+
+    #[test]
+    fn only_session_commands_support_process_host_handoff() {
+        for command in [
+            "exec", "shell", "log", "bridge", "codex", "claude", "opencode", "pi",
+        ] {
+            let args = vec!["pentect".to_string(), command.to_string()];
+            assert!(supports_process_host(&args), "{command}");
+        }
+        for command in [
+            "help",
+            "read",
+            "view",
+            "statusline",
+            "doctor",
+            "extensions",
+            "eval",
+            "scan",
+            "resolve",
+            "up",
+        ] {
+            let args = vec!["pentect".to_string(), command.to_string()];
+            assert!(!supports_process_host(&args), "{command}");
+        }
+        assert!(supports_process_host(&[
+            "pentect".to_string(),
+            "agent".to_string(),
+            "shell".to_string(),
+        ]));
+        assert!(!supports_process_host(&[
+            "pentect".to_string(),
+            "agent".to_string(),
+            "hook".to_string(),
         ]));
     }
 }

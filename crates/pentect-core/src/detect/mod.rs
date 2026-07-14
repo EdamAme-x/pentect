@@ -31,7 +31,10 @@ pub use credsweeper::{
     CredSweeperNativeDetector, CredSweeperNativeFinding, CredSweeperNativeRelatedFinding,
     CredSweeperNativeStats,
 };
-pub use decode::{DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MIN_OPAQUE_RUN};
+pub use decode::{
+    DecodeConfig, DecodeDetector, DEFAULT_DECODE_DEPTH, DEFAULT_MAX_DECODE_BYTES,
+    DEFAULT_MAX_INFLATE_BYTES, DEFAULT_MIN_DECODE_BYTES, DEFAULT_MIN_OPAQUE_RUN,
+};
 pub use entropy::{EntropyDetector, DEFAULT_ENTROPY_MIN_LEN, DEFAULT_ENTROPY_THRESHOLD};
 pub use key_value::KeyValueDetector;
 pub use pattern::{PatternMatchDetector, PatternSpec};

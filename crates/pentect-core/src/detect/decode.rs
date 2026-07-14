@@ -1,27 +1,73 @@
 use super::util::token_runs;
 use super::{AuthCodeDetector, Bip39Detector, Detector, RuleDetector};
-use crate::codec::{Base32Codec, Base58Codec, Base64Codec, Codec, HexCodec};
+use crate::codec::{
+    is_rfc1924_base85_byte, is_z85_byte, Ascii85Codec, Base32Codec, Base32HexCodec, Base58Codec,
+    Base64Codec, Base85Codec, BinaryCodec, Codec, HexCodec, OctalCodec, Z85Codec,
+};
 use crate::model::*;
 use crate::normalize::NormalizedView;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use std::io::Read;
 
-/// Shortest run worth attempting to decode (below this it's rarely an encoded
-/// secret and the codec false-positive rate climbs).
-const MIN_DECODE_RUN: usize = 16;
-const MAX_DECODE_RUN: usize = 256 * 1024;
-/// Default nesting limit for decode/decompress recursion (e.g. base64(gzip(..))).
-/// Deep enough for real multi-wrap payloads, bounded so crafted nesting can't fan
-/// out unboundedly.
-pub const DEFAULT_DECODE_DEPTH: u8 = 3;
+pub const DEFAULT_MIN_DECODE_BYTES: usize = 16;
+pub const DEFAULT_MAX_DECODE_BYTES: usize = 256 * 1024;
+pub const DEFAULT_DECODE_DEPTH: usize = 3;
 /// Default minimum run length for the opaque-blob ("looks encrypted") path; kept
 /// above MIN_DECODE_RUN so short decodable strings don't get masked as ciphertext.
 pub const DEFAULT_MIN_OPAQUE_RUN: usize = 24;
-/// Cap on decompression output so a zip bomb can't exhaust memory; we only need
-/// enough to detect a secret, not the full payload.
-const MAX_INFLATE: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_INFLATE_BYTES: u64 = 8 * 1024 * 1024;
 /// Fraction of C0 control bytes above which decoded text is treated as binary.
 const BINARY_NONPRINT_RATIO: f64 = 0.3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeConfig {
+    pub enabled: bool,
+    /// `None` means unlimited. A numeric value counts codec and decompression
+    /// transforms exactly, so `Some(3)` permits three transforms.
+    pub max_depth: Option<usize>,
+    pub min_bytes: usize,
+    /// `None` means unlimited.
+    pub max_bytes: Option<usize>,
+    /// `None` means unlimited.
+    pub max_inflate_bytes: Option<u64>,
+    pub mask_unknown: bool,
+    pub unknown_min_bytes: usize,
+}
+
+impl Default for DecodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_depth: Some(DEFAULT_DECODE_DEPTH),
+            min_bytes: DEFAULT_MIN_DECODE_BYTES,
+            max_bytes: Some(DEFAULT_MAX_DECODE_BYTES),
+            max_inflate_bytes: Some(DEFAULT_MAX_INFLATE_BYTES),
+            mask_unknown: false,
+            unknown_min_bytes: DEFAULT_MIN_OPAQUE_RUN,
+        }
+    }
+}
+
+impl DecodeConfig {
+    pub fn validate(self) -> Result<Self, String> {
+        if self.enabled && self.max_depth == Some(0) {
+            return Err("decode.max_depth must be positive or unlimited".to_string());
+        }
+        if self.min_bytes == 0 {
+            return Err("decode.min_bytes must be positive".to_string());
+        }
+        if self.max_bytes.is_some_and(|max| max < self.min_bytes) {
+            return Err("decode.max_bytes must be at least decode.min_bytes".to_string());
+        }
+        if self.max_inflate_bytes == Some(0) {
+            return Err("decode.max_inflate_bytes must be positive or unlimited".to_string());
+        }
+        if self.mask_unknown && self.unknown_min_bytes < self.min_bytes {
+            return Err("decode.unknown_min_bytes must be at least decode.min_bytes".to_string());
+        }
+        Ok(self)
+    }
+}
 
 /// Tries injected codecs on each encoded-looking run; if the decoded content
 /// (possibly nested) is identified by an injected detector, masks the whole
@@ -30,48 +76,52 @@ const BINARY_NONPRINT_RATIO: f64 = 0.3;
 pub struct DecodeDetector {
     codecs: Vec<Box<dyn Codec>>,
     identify: Vec<Box<dyn Detector>>,
-    max_depth: u8,
-    /// When set, a run that decodes to binary-looking bytes but yields no inner
-    /// secret is still masked as an opaque blob ("looks encrypted").
-    mask_unknown: bool,
-    min_unknown_run: usize,
+    config: DecodeConfig,
 }
 
 impl DecodeDetector {
     pub fn new(
         codecs: Vec<Box<dyn Codec>>,
         identify: Vec<Box<dyn Detector>>,
-        max_depth: u8,
+        config: DecodeConfig,
     ) -> Self {
         Self {
             codecs,
             identify,
-            max_depth,
-            mask_unknown: false,
-            min_unknown_run: MIN_DECODE_RUN,
+            config,
         }
     }
 
     pub fn builtin() -> Self {
+        Self::builtin_with_config(DecodeConfig::default())
+    }
+
+    pub fn builtin_with_config(config: DecodeConfig) -> Self {
         Self::new(
             vec![
+                Box::new(BinaryCodec),
+                Box::new(OctalCodec),
                 Box::new(HexCodec),
                 Box::new(Base32Codec),
+                Box::new(Base32HexCodec),
                 Box::new(Base64Codec),
                 Box::new(Base58Codec),
+                Box::new(Ascii85Codec),
+                Box::new(Base85Codec),
+                Box::new(Z85Codec),
             ],
             vec![
                 Box::new(RuleDetector::builtin()),
                 Box::new(AuthCodeDetector),
                 Box::new(Bip39Detector),
             ],
-            DEFAULT_DECODE_DEPTH,
+            config,
         )
     }
 
     pub fn with_opaque(mut self, mask_unknown: bool, min_run: usize) -> Self {
-        self.mask_unknown = mask_unknown;
-        self.min_unknown_run = min_run.max(MIN_DECODE_RUN);
+        self.config.mask_unknown = mask_unknown;
+        self.config.unknown_min_bytes = min_run.max(self.config.min_bytes);
         self
     }
 
@@ -83,10 +133,15 @@ impl DecodeDetector {
             .any(|c| c.decode(run).is_some_and(|b| looks_binary(&b)))
     }
 
-    fn probe(&self, run: &str, depth: u8) -> Option<(Category, String, Confidence)> {
+    fn probe(
+        &self,
+        run: &str,
+        remaining_depth: Option<usize>,
+    ) -> Option<(Category, String, Confidence)> {
+        let after_decode = consume_depth(remaining_depth)?;
         for codec in &self.codecs {
             if let Some(bytes) = codec.decode(run) {
-                if let Some(hit) = self.scan_bytes(&bytes, depth) {
+                if let Some(hit) = self.scan_bytes(&bytes, after_decode) {
                     return Some(hit);
                 }
             }
@@ -94,16 +149,36 @@ impl DecodeDetector {
         None
     }
 
-    fn scan_bytes(&self, bytes: &[u8], depth: u8) -> Option<(Category, String, Confidence)> {
+    fn scan_bytes(
+        &self,
+        bytes: &[u8],
+        remaining_depth: Option<usize>,
+    ) -> Option<(Category, String, Confidence)> {
         match std::str::from_utf8(bytes) {
             Ok(text) => {
                 if let Some(hit) = self.identify(text) {
                     return Some(hit);
                 }
-                if depth > 0 {
+                if remaining_depth != Some(0) {
                     for (a, b) in token_runs(text) {
-                        if b - a >= MIN_DECODE_RUN {
-                            if let Some(hit) = self.probe(&text[a..b], depth - 1) {
+                        if self.accepts_run(b - a) {
+                            if let Some(hit) = self.probe(&text[a..b], remaining_depth) {
+                                return Some(hit);
+                            }
+                        }
+                    }
+                    for (a, b) in encoded85_runs(text, self.config.min_bytes) {
+                        if self.accepts_run(b - a) {
+                            if let Some(hit) =
+                                self.probe_assignment_aware(&text[a..b], remaining_depth)
+                            {
+                                return Some(hit.0);
+                            }
+                        }
+                    }
+                    for (a, b) in wrapped_base64_runs(text, self.config.min_bytes) {
+                        if self.accepts_run(b - a) {
+                            if let Some(hit) = self.probe(&text[a..b], remaining_depth) {
                                 return Some(hit);
                             }
                         }
@@ -111,9 +186,10 @@ impl DecodeDetector {
                 }
             }
             // Binary bytes might be compressed (e.g. SAML's base64(deflate(..))).
-            Err(_) if depth > 0 => {
-                if let Some(inflated) = decompress(bytes) {
-                    return self.scan_bytes(&inflated, depth - 1);
+            Err(_) if remaining_depth != Some(0) => {
+                let after_decompress = consume_depth(remaining_depth)?;
+                if let Some(inflated) = decompress(bytes, self.config.max_inflate_bytes) {
+                    return self.scan_bytes(&inflated, after_decompress);
                 }
             }
             Err(_) => {}
@@ -149,6 +225,34 @@ impl DecodeDetector {
             }
         }
         best.map(|s| (s.category, s.label, s.confidence))
+    }
+
+    fn probe_assignment_aware(
+        &self,
+        run: &str,
+        remaining_depth: Option<usize>,
+    ) -> Option<((Category, String, Confidence), usize)> {
+        if let Some(hit) = self.probe(run, remaining_depth) {
+            return Some((hit, 0));
+        }
+        let (prefix, value) = run.split_once('=')?;
+        if prefix.is_empty() || !self.accepts_run(value.len()) {
+            return None;
+        }
+        self.probe(value, remaining_depth)
+            .map(|hit| (hit, prefix.len() + 1))
+    }
+
+    fn accepts_run(&self, len: usize) -> bool {
+        len >= self.config.min_bytes && self.config.max_bytes.is_none_or(|max| len <= max)
+    }
+}
+
+fn consume_depth(remaining: Option<usize>) -> Option<Option<usize>> {
+    match remaining {
+        None => Some(None),
+        Some(0) => None,
+        Some(value) => Some(Some(value - 1)),
     }
 }
 
@@ -190,20 +294,22 @@ fn looks_like_env_secret_text(text: &str) -> bool {
 
 impl Detector for DecodeDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
+        if !self.config.enabled {
+            return Vec::new();
+        }
         let s = view.text();
         let mut out = Vec::new();
         for (start, end) in token_runs(s) {
-            if end - start < MIN_DECODE_RUN {
-                continue;
-            }
-            if end - start > MAX_DECODE_RUN {
+            if !self.accepts_run(end - start) {
                 continue;
             }
             let run = &s[start..end];
             let mut pushed = false;
-            if let Some((cat, label, conf)) = self.probe(run, self.max_depth) {
+            if let Some(((cat, label, conf), relative_start)) =
+                self.probe_assignment_aware(run, self.config.max_depth)
+            {
                 out.push(Span {
-                    range: view.to_raw(ByteRange::new(start, end)),
+                    range: view.to_raw(ByteRange::new(start + relative_start, end)),
                     category: cat,
                     label,
                     confidence: conf,
@@ -211,27 +317,9 @@ impl Detector for DecodeDetector {
                 });
                 pushed = true;
             }
-            if !pushed {
-                if let Some(eq) = run.find('=') {
-                    let value_start = eq + 1;
-                    let value = &run[value_start..];
-                    if value.len() >= MIN_DECODE_RUN {
-                        if let Some((cat, label, conf)) = self.probe(value, self.max_depth) {
-                            out.push(Span {
-                                range: view.to_raw(ByteRange::new(start + value_start, end)),
-                                category: cat,
-                                label,
-                                confidence: conf,
-                                source: DetectorId::Decode,
-                            });
-                            pushed = true;
-                        }
-                    }
-                }
-            }
             if !pushed
-                && self.mask_unknown
-                && end - start >= self.min_unknown_run
+                && self.config.mask_unknown
+                && end - start >= self.config.unknown_min_bytes
                 && self.decodes_to_binary(run)
             {
                 out.push(Span {
@@ -243,7 +331,184 @@ impl Detector for DecodeDetector {
                 });
             }
         }
+        for (start, end) in encoded85_runs(s, self.config.min_bytes) {
+            if !self.accepts_run(end - start) {
+                continue;
+            }
+            if let Some(((category, label, confidence), relative_start)) =
+                self.probe_assignment_aware(&s[start..end], self.config.max_depth)
+            {
+                out.push(Span {
+                    range: view.to_raw(ByteRange::new(start + relative_start, end)),
+                    category,
+                    label,
+                    confidence,
+                    source: DetectorId::Decode,
+                });
+            }
+        }
+        for (start, end) in wrapped_base64_runs(s, self.config.min_bytes) {
+            if !self.accepts_run(end - start) {
+                continue;
+            }
+            if let Some((category, label, confidence)) =
+                self.probe(&s[start..end], self.config.max_depth)
+            {
+                out.push(Span {
+                    range: view.to_raw(ByteRange::new(start, end)),
+                    category,
+                    label,
+                    confidence,
+                    source: DetectorId::Decode,
+                });
+            }
+        }
         out
+    }
+}
+
+fn encoded85_runs(text: &str, min_bytes: usize) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut framed = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(open) = text[cursor..].find("<~").map(|index| cursor + index) {
+        let body = open + 2;
+        let Some(close) = text[body..].find("~>").map(|index| body + index + 2) else {
+            break;
+        };
+        if close - open >= min_bytes {
+            framed.push((open, close));
+        }
+        cursor = close;
+    }
+
+    let mut runs = framed.clone();
+    collect_quoted_base85_runs(bytes, min_bytes, &framed, &mut runs);
+    collect_base85_runs(
+        bytes,
+        min_bytes,
+        |byte| (b'!'..=b'u').contains(&byte),
+        &framed,
+        &mut runs,
+    );
+    collect_base85_runs(bytes, min_bytes, is_rfc1924_base85_byte, &framed, &mut runs);
+    collect_base85_runs(bytes, min_bytes, is_z85_byte, &framed, &mut runs);
+    runs.sort_unstable();
+    runs.dedup();
+    runs
+}
+
+fn collect_quoted_base85_runs(
+    bytes: &[u8],
+    min_bytes: usize,
+    framed: &[(usize, usize)],
+    runs: &mut Vec<(usize, usize)>,
+) {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !matches!(bytes[i], b'\'' | b'"') {
+            i += 1;
+            continue;
+        }
+        let quote = bytes[i];
+        let start = i + 1;
+        i = start;
+        while i < bytes.len() && bytes[i] != quote {
+            if bytes[i] == b'\\' {
+                i = (i + 2).min(bytes.len());
+            } else {
+                i += 1;
+            }
+        }
+        let end = i;
+        if end - start >= min_bytes
+            && looks_like_base85_run(&bytes[start..end])
+            && !framed
+                .iter()
+                .any(|&(frame_start, frame_end)| start >= frame_start && end <= frame_end)
+        {
+            runs.push((start, end));
+        }
+        i = (i + 1).min(bytes.len());
+    }
+}
+
+fn looks_like_base85_run(bytes: &[u8]) -> bool {
+    let punctuation = bytes
+        .iter()
+        .filter(|byte| !byte.is_ascii_alphanumeric())
+        .count();
+    punctuation >= 2
+        && (bytes
+            .iter()
+            .copied()
+            .all(|byte| (b'!'..=b'u').contains(&byte))
+            || bytes.iter().copied().all(is_rfc1924_base85_byte)
+            || bytes.iter().copied().all(is_z85_byte))
+}
+
+fn wrapped_base64_runs(text: &str, min_bytes: usize) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut block_start = None;
+    let mut block_end = 0usize;
+    let mut lines = 0usize;
+    let mut offset = 0usize;
+
+    for line in text.split_inclusive('\n') {
+        let content = line.trim();
+        let leading = line.len() - line.trim_start().len();
+        let is_base64_line = content.len() >= min_bytes
+            && content.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'=')
+            });
+        if is_base64_line {
+            block_start.get_or_insert(offset + leading);
+            block_end = offset + leading + content.len();
+            lines += 1;
+        } else {
+            if let Some(start) = block_start.take() {
+                if lines >= 2 {
+                    runs.push((start, block_end));
+                }
+            }
+            lines = 0;
+        }
+        offset += line.len();
+    }
+    if let Some(start) = block_start {
+        if lines >= 2 {
+            runs.push((start, block_end));
+        }
+    }
+    runs
+}
+
+fn collect_base85_runs(
+    bytes: &[u8],
+    min_bytes: usize,
+    accepts: fn(u8) -> bool,
+    framed: &[(usize, usize)],
+    runs: &mut Vec<(usize, usize)>,
+) {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && !accepts(bytes[i]) {
+            i += 1;
+        }
+        let start = i;
+        let mut punctuation = 0usize;
+        while i < bytes.len() && accepts(bytes[i]) {
+            punctuation += usize::from(!bytes[i].is_ascii_alphanumeric());
+            i += 1;
+        }
+        if i - start >= min_bytes
+            && punctuation >= 2
+            && !framed
+                .iter()
+                .any(|&(frame_start, frame_end)| start >= frame_start && i <= frame_end)
+        {
+            runs.push((start, i));
+        }
     }
 }
 
@@ -264,19 +529,17 @@ fn looks_binary(bytes: &[u8]) -> bool {
     nonprint as f64 > bytes.len() as f64 * BINARY_NONPRINT_RATIO
 }
 
-/// Try gzip, zlib, then raw deflate. Output is capped to bound decompression
-/// bombs; we only need enough to detect a secret, not the full payload.
-fn decompress(data: &[u8]) -> Option<Vec<u8>> {
+fn decompress(data: &[u8], max_bytes: Option<u64>) -> Option<Vec<u8>> {
     if data.starts_with(&[0x1f, 0x8b]) {
-        return inflate(GzDecoder::new(data));
+        return inflate(GzDecoder::new(data), max_bytes);
     }
     if looks_like_zlib(data) {
-        return inflate(ZlibDecoder::new(data));
+        return inflate(ZlibDecoder::new(data), max_bytes);
     }
     // Raw DEFLATE has no reliable magic bytes. Trying it on every random decoded
     // hash is expensive, so only keep it as a fallback for payload-sized blobs.
     if data.len() >= 32 {
-        return inflate(DeflateDecoder::new(data));
+        return inflate(DeflateDecoder::new(data), max_bytes);
     }
     None
 }
@@ -290,9 +553,12 @@ fn looks_like_zlib(data: &[u8]) -> bool {
     cmf & 0x0f == 8 && (cmf >> 4) <= 7 && u16::from_be_bytes([cmf, flg]).is_multiple_of(31)
 }
 
-fn inflate<R: Read>(reader: R) -> Option<Vec<u8>> {
+fn inflate<R: Read>(mut reader: R, max_bytes: Option<u64>) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    reader.take(MAX_INFLATE).read_to_end(&mut out).ok()?;
+    match max_bytes {
+        Some(max_bytes) => reader.take(max_bytes).read_to_end(&mut out).ok()?,
+        None => reader.read_to_end(&mut out).ok()?,
+    };
     (!out.is_empty()).then_some(out)
 }
 
@@ -357,5 +623,60 @@ mod tests {
                 .any(|span| span.label == labels::BIP39_MNEMONIC),
             "{spans:?}"
         );
+    }
+
+    fn nested_base64(value: &str, layers: usize) -> String {
+        (0..layers).fold(value.to_string(), |value, _| {
+            data_encoding::BASE64.encode(value.as_bytes())
+        })
+    }
+
+    fn detects_with_config(value: &str, config: DecodeConfig) -> bool {
+        let reg = region(value);
+        !DecodeDetector::builtin_with_config(config)
+            .detect(&NormalizedView::build(&reg, value))
+            .is_empty()
+    }
+
+    #[test]
+    fn configured_depth_counts_transforms_exactly() {
+        let config = DecodeConfig {
+            max_depth: Some(3),
+            ..DecodeConfig::default()
+        };
+        assert!(detects_with_config(
+            &nested_base64("AKIAIOSFODNN7EXAMPLE", 3),
+            config
+        ));
+        assert!(!detects_with_config(
+            &nested_base64("AKIAIOSFODNN7EXAMPLE", 4),
+            config
+        ));
+    }
+
+    #[test]
+    fn unlimited_depth_and_size_are_not_silently_capped() {
+        let config = DecodeConfig {
+            max_depth: None,
+            max_bytes: None,
+            max_inflate_bytes: None,
+            ..DecodeConfig::default()
+        };
+        assert!(detects_with_config(
+            &nested_base64("AKIAIOSFODNN7EXAMPLE", 12),
+            config
+        ));
+    }
+
+    #[test]
+    fn decode_can_be_disabled_explicitly() {
+        let config = DecodeConfig {
+            enabled: false,
+            ..DecodeConfig::default()
+        };
+        assert!(!detects_with_config(
+            &nested_base64("AKIAIOSFODNN7EXAMPLE", 1),
+            config
+        ));
     }
 }

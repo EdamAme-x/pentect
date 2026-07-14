@@ -3,9 +3,10 @@ use crossterm::{
     event::{DisableBracketedPaste, DisableMouseCapture},
     execute,
     style::ResetColor,
-    terminal::{EnableLineWrap, LeaveAlternateScreen},
+    terminal::EnableLineWrap,
 };
 use std::io::{IsTerminal, Write};
+use std::sync::{Arc, Mutex};
 
 pub(crate) struct IgnoreCtrlCGuard {
     active: bool,
@@ -13,6 +14,7 @@ pub(crate) struct IgnoreCtrlCGuard {
 
 pub(crate) struct TuiSessionGuard {
     state: PlatformConsoleState,
+    keyboard_modes: TerminalModeTracker,
     restored: bool,
 }
 
@@ -20,10 +22,17 @@ impl TuiSessionGuard {
     pub(crate) fn enter() -> Self {
         let state = capture_platform_console_state();
         sanitize_platform_console_mode();
+        let keyboard_modes = TerminalModeTracker::default();
+        begin_main_keyboard_isolation(&keyboard_modes);
         Self {
             state,
+            keyboard_modes,
             restored: false,
         }
+    }
+
+    pub(crate) fn mode_tracker(&self) -> TerminalModeTracker {
+        self.keyboard_modes.clone()
     }
 
     pub(crate) fn restore_after_tui(&mut self) {
@@ -39,7 +48,8 @@ impl TuiSessionGuard {
             return;
         }
         sanitize_platform_console_mode();
-        restore_ansi_state(reset_line);
+        let keyboard_restore = self.keyboard_modes.take_restore();
+        restore_ansi_state(reset_line, &keyboard_restore);
         restore_platform_console_state(&self.state);
         self.restored = true;
     }
@@ -77,7 +87,6 @@ const ANSI_TUI_RESET: &str = concat!(
     "\x1b[?5l",    // disable reverse video
     "\x1b[?6l",    // disable origin mode
     "\x1b[?9l",    // disable xterm mouse reporting
-    "\x1b[?47l",   // leave legacy alternate screen
     "\x1b[?69l",   // disable left/right margin mode
     "\x1b[?1000l", // disable X10 mouse
     "\x1b[?1001l", // disable highlight mouse
@@ -92,13 +101,306 @@ const ANSI_TUI_RESET: &str = concat!(
     "\x1b[?2005l", // disable bracketed paste quote mode
     "\x1b[?2006l", // disable bracketed paste literal newline mode
     "\x1b[?2026l", // disable synchronized output
-    "\x1b[?1048l", // restore cursor from older alt-screen flows
-    "\x1b[?1047l", // leave older alternate screen
-    "\x1b[?1049l", // leave alternate screen
     "\x1b[r",      // reset top/bottom scroll margins
 );
 
 const ANSI_FRESH_PROMPT_LINE: &str = "\r\x1b[2K\r\n";
+
+#[derive(Clone, Default)]
+pub(crate) struct TerminalModeTracker {
+    state: Arc<Mutex<TerminalModeState>>,
+}
+
+#[derive(Default)]
+struct TerminalModeState {
+    parser: CsiParser,
+    screen: TerminalScreen,
+    alternate_kind: Option<AlternateScreen>,
+    main: KeyboardModeState,
+    alternate: KeyboardModeState,
+}
+
+#[derive(Default)]
+struct CsiParser {
+    escape: bool,
+    body: Option<Vec<u8>>,
+    string: Option<StringControl>,
+    string_escape: bool,
+    string_utf8_remaining: u8,
+    utf8_remaining: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringControl {
+    Osc,
+    Other,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum TerminalScreen {
+    #[default]
+    Main,
+    Alternate(AlternateScreen),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlternateScreen {
+    Legacy,
+    Extended,
+    SavedCursor,
+}
+
+#[derive(Default)]
+struct KeyboardModeState {
+    stack_depth: usize,
+}
+
+#[derive(Default)]
+struct KeyboardModeRestore {
+    before_screen_leave: Vec<u8>,
+    after_screen_leave: Vec<u8>,
+    leave_alternate_screen: Option<AlternateScreen>,
+}
+
+impl TerminalModeTracker {
+    pub(crate) fn observe(&self, bytes: &[u8]) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for byte in bytes {
+            state.observe(*byte);
+        }
+    }
+
+    fn take_restore(&self) -> KeyboardModeRestore {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.take_restore()
+    }
+
+    fn register_main_isolation(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.main.stack_depth = state.main.stack_depth.saturating_add(1);
+    }
+}
+
+fn begin_main_keyboard_isolation(tracker: &TerminalModeTracker) {
+    let mut out = std::io::stdout();
+    if !out.is_terminal() {
+        return;
+    }
+    enable_ansi_for_reset();
+    if out.write_all(b"\x1b[>0u").and_then(|_| out.flush()).is_ok() {
+        tracker.register_main_isolation();
+    }
+}
+
+impl TerminalModeState {
+    fn observe(&mut self, byte: u8) {
+        if let Some(kind) = self.parser.string {
+            if self.parser.string_utf8_remaining > 0 {
+                if (0x80..=0xbf).contains(&byte) {
+                    self.parser.string_utf8_remaining -= 1;
+                    return;
+                }
+                self.parser.string_utf8_remaining = 0;
+            }
+            if let Some(remaining) = utf8_continuation_count(byte) {
+                self.parser.string_utf8_remaining = remaining;
+                return;
+            }
+            if byte == 0x9c || (kind == StringControl::Osc && byte == 0x07) {
+                self.parser.string = None;
+                self.parser.string_escape = false;
+                self.parser.string_utf8_remaining = 0;
+            } else if self.parser.string_escape {
+                if byte == b'\\' {
+                    self.parser.string = None;
+                    self.parser.string_escape = false;
+                } else {
+                    self.parser.string_escape = byte == 0x1b;
+                }
+            } else if byte == 0x1b {
+                self.parser.string_escape = true;
+            }
+            return;
+        }
+        if let Some(mut body) = self.parser.body.take() {
+            if (b'@'..=b'~').contains(&byte) {
+                self.apply_csi(&body, byte);
+            } else if (0x20..=0x3f).contains(&byte) && body.len() < 64 {
+                body.push(byte);
+                self.parser.body = Some(body);
+            } else {
+                self.parser.escape = byte == 0x1b;
+            }
+            return;
+        }
+        if self.parser.escape {
+            self.parser.escape = false;
+            match byte {
+                b'[' => self.parser.body = Some(Vec::new()),
+                b']' => self.parser.string = Some(StringControl::Osc),
+                b'P' | b'X' | b'^' | b'_' => self.parser.string = Some(StringControl::Other),
+                0x1b => self.parser.escape = true,
+                _ => {}
+            }
+            return;
+        }
+        if self.parser.utf8_remaining > 0 {
+            if (0x80..=0xbf).contains(&byte) {
+                self.parser.utf8_remaining -= 1;
+                return;
+            }
+            self.parser.utf8_remaining = 0;
+        }
+        if let Some(remaining) = utf8_continuation_count(byte) {
+            self.parser.utf8_remaining = remaining;
+            return;
+        }
+        match byte {
+            0x1b => self.parser.escape = true,
+            0x90 | 0x98 | 0x9e | 0x9f => self.parser.string = Some(StringControl::Other),
+            0x9b => self.parser.body = Some(Vec::new()),
+            0x9d => self.parser.string = Some(StringControl::Osc),
+            _ => {}
+        }
+    }
+
+    fn apply_csi(&mut self, body: &[u8], final_byte: u8) {
+        if matches!(final_byte, b'h' | b'l') {
+            self.update_screen(body, final_byte == b'h');
+            return;
+        }
+        if final_byte != b'u' {
+            return;
+        }
+        let Some(prefix) = body.first().copied() else {
+            return;
+        };
+        match prefix {
+            b'>' => {
+                let mode = self.current_mode_mut();
+                mode.stack_depth = mode.stack_depth.saturating_add(1);
+            }
+            b'<' => {
+                let count = parse_decimal(&body[1..]).unwrap_or(1).max(1);
+                let mode = self.current_mode_mut();
+                mode.stack_depth = mode.stack_depth.saturating_sub(count);
+            }
+            _ => {}
+        }
+    }
+
+    fn update_screen(&mut self, body: &[u8], enabled: bool) {
+        let Some(parameters) = body.strip_prefix(b"?") else {
+            return;
+        };
+        let kind = parameters
+            .split(|byte| *byte == b';')
+            .filter_map(alternate_screen_kind)
+            .next_back();
+        let Some(kind) = kind else { return };
+        self.alternate_kind = Some(kind);
+        self.screen = if enabled {
+            TerminalScreen::Alternate(kind)
+        } else {
+            TerminalScreen::Main
+        };
+    }
+
+    fn current_mode_mut(&mut self) -> &mut KeyboardModeState {
+        match self.screen {
+            TerminalScreen::Main => &mut self.main,
+            TerminalScreen::Alternate(_) => &mut self.alternate,
+        }
+    }
+
+    fn take_restore(&mut self) -> KeyboardModeRestore {
+        let mut restore = KeyboardModeRestore::default();
+        match self.screen {
+            TerminalScreen::Main => {
+                restore.before_screen_leave = take_keyboard_restore(&mut self.main);
+                let alternate = take_keyboard_restore(&mut self.alternate);
+                if !alternate.is_empty() {
+                    let kind = self.alternate_kind.unwrap_or(AlternateScreen::SavedCursor);
+                    restore
+                        .before_screen_leave
+                        .extend_from_slice(alternate_screen_control(kind, true));
+                    restore.before_screen_leave.extend(alternate);
+                    restore
+                        .before_screen_leave
+                        .extend_from_slice(alternate_screen_control(kind, false));
+                }
+            }
+            TerminalScreen::Alternate(kind) => {
+                restore.before_screen_leave = take_keyboard_restore(&mut self.alternate);
+                restore.after_screen_leave = take_keyboard_restore(&mut self.main);
+                restore.leave_alternate_screen = Some(kind);
+            }
+        }
+        restore
+    }
+}
+
+fn utf8_continuation_count(byte: u8) -> Option<u8> {
+    match byte {
+        0xc2..=0xdf => Some(1),
+        0xe0..=0xef => Some(2),
+        0xf0..=0xf4 => Some(3),
+        _ => None,
+    }
+}
+
+fn alternate_screen_kind(parameter: &[u8]) -> Option<AlternateScreen> {
+    match parameter {
+        b"47" => Some(AlternateScreen::Legacy),
+        b"1047" => Some(AlternateScreen::Extended),
+        b"1049" => Some(AlternateScreen::SavedCursor),
+        _ => None,
+    }
+}
+
+fn alternate_screen_control(kind: AlternateScreen, enabled: bool) -> &'static [u8] {
+    match (kind, enabled) {
+        (AlternateScreen::Legacy, true) => b"\x1b[?47h",
+        (AlternateScreen::Legacy, false) => b"\x1b[?47l",
+        (AlternateScreen::Extended, true) => b"\x1b[?1047h",
+        (AlternateScreen::Extended, false) => b"\x1b[?1047l",
+        (AlternateScreen::SavedCursor, true) => b"\x1b[?1049h",
+        (AlternateScreen::SavedCursor, false) => b"\x1b[?1049l",
+    }
+}
+
+fn parse_decimal(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
+    }
+    bytes.iter().try_fold(0usize, |value, byte| {
+        byte.is_ascii_digit().then(|| {
+            value
+                .saturating_mul(10)
+                .saturating_add(usize::from(byte - b'0'))
+        })
+    })
+}
+
+fn take_keyboard_restore(mode: &mut KeyboardModeState) -> Vec<u8> {
+    let mut restore = Vec::new();
+    if mode.stack_depth == 1 {
+        restore.extend_from_slice(b"\x1b[<u");
+    } else if mode.stack_depth > 1 {
+        restore.extend_from_slice(format!("\x1b[<{}u", mode.stack_depth).as_bytes());
+    }
+    *mode = KeyboardModeState::default();
+    restore
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResetLine {
@@ -106,21 +408,25 @@ enum ResetLine {
     FreshPrompt,
 }
 
-fn restore_ansi_state(reset_line: ResetLine) {
+fn restore_ansi_state(reset_line: ResetLine, keyboard_restore: &KeyboardModeRestore) {
     let mut out = std::io::stdout();
     if !out.is_terminal() {
         return;
     }
     enable_ansi_for_reset();
+    let _ = out.write_all(&keyboard_restore.before_screen_leave);
+    if let Some(kind) = keyboard_restore.leave_alternate_screen {
+        let _ = out.write_all(alternate_screen_control(kind, false));
+    }
     let _ = execute!(
         out,
-        LeaveAlternateScreen,
         DisableMouseCapture,
         DisableBracketedPaste,
         EnableLineWrap,
         Show,
         ResetColor
     );
+    let _ = out.write_all(&keyboard_restore.after_screen_leave);
     let _ = out.write_all(ANSI_TUI_RESET.as_bytes());
     if reset_line == ResetLine::FreshPrompt {
         let _ = out.write_all(ANSI_FRESH_PROMPT_LINE.as_bytes());
@@ -373,11 +679,7 @@ mod tests {
             "\x1b[?9l",
             "\x1b[?5l",
             "\x1b[?6l",
-            "\x1b[?47l",
             "\x1b[?69l",
-            "\x1b[?1047l",
-            "\x1b[?1048l",
-            "\x1b[?1049l",
             "\x1b[r",
             "\x1b>",
         ] {
@@ -386,7 +688,105 @@ mod tests {
     }
 
     #[test]
+    fn ansi_tui_reset_does_not_leave_an_unowned_alternate_screen() {
+        for mode in ["\x1b[?47l", "\x1b[?1047l", "\x1b[?1048l", "\x1b[?1049l"] {
+            assert!(!ANSI_TUI_RESET.contains(mode), "{mode:?}");
+        }
+    }
+
+    #[test]
     fn after_tui_reset_moves_prompt_to_fresh_line() {
         assert_eq!(ANSI_FRESH_PROMPT_LINE, "\r\x1b[2K\r\n");
+    }
+
+    #[test]
+    fn keyboard_mode_tracker_restores_each_screen_in_order() {
+        let tracker = TerminalModeTracker::default();
+        tracker.observe(b"\x1b[>1u\x1b[?1049h\x1b[>3");
+        tracker.observe(b"u\x1b[>7u");
+
+        let restore = tracker.take_restore();
+        assert_eq!(restore.before_screen_leave, b"\x1b[<2u");
+        assert_eq!(restore.after_screen_leave, b"\x1b[<u");
+        assert_eq!(
+            restore.leave_alternate_screen,
+            Some(AlternateScreen::SavedCursor)
+        );
+    }
+
+    #[test]
+    fn keyboard_mode_tracker_ignores_balanced_push_and_pop() {
+        let tracker = TerminalModeTracker::default();
+        tracker.observe(b"\x1b[>1u\x1b[<u");
+
+        let restore = tracker.take_restore();
+        assert!(restore.before_screen_leave.is_empty());
+        assert!(restore.after_screen_leave.is_empty());
+        assert!(restore.leave_alternate_screen.is_none());
+    }
+
+    #[test]
+    fn keyboard_mode_tracker_restores_direct_changes_through_owned_frame() {
+        let tracker = TerminalModeTracker::default();
+        tracker.register_main_isolation();
+        tracker.observe(b"\x9b=15;1u");
+
+        let restore = tracker.take_restore();
+        assert_eq!(restore.before_screen_leave, b"\x1b[<u");
+        assert!(restore.leave_alternate_screen.is_none());
+    }
+
+    #[test]
+    fn keyboard_mode_tracker_cleans_inactive_alternate_screen() {
+        let tracker = TerminalModeTracker::default();
+        tracker.observe(b"\x1b[?1049h\x1b[>1u\x1b[?1049l");
+
+        let restore = tracker.take_restore();
+        assert_eq!(
+            restore.before_screen_leave,
+            b"\x1b[?1049h\x1b[<u\x1b[?1049l"
+        );
+        assert!(restore.after_screen_leave.is_empty());
+        assert!(restore.leave_alternate_screen.is_none());
+    }
+
+    #[test]
+    fn keyboard_mode_tracker_ignores_controls_inside_terminal_strings() {
+        let tracker = TerminalModeTracker::default();
+        tracker.register_main_isolation();
+        tracker.observe("\u{1b}]0;title Ü\u{1b}[>7u\u{7}".as_bytes());
+        tracker.observe("\u{1b}Ppayload Ü\u{1b}[>3u\u{1b}\\".as_bytes());
+
+        let restore = tracker.take_restore();
+        assert_eq!(restore.before_screen_leave, b"\x1b[<u");
+    }
+
+    #[test]
+    fn keyboard_mode_tracker_does_not_parse_utf8_continuations_as_c1() {
+        let tracker = TerminalModeTracker::default();
+        tracker.register_main_isolation();
+        let text = "日本語の漛端末";
+        assert!(text.as_bytes().contains(&0x9b));
+        tracker.observe(text.as_bytes());
+
+        let restore = tracker.take_restore();
+        assert_eq!(restore.before_screen_leave, b"\x1b[<u");
+        assert!(restore.after_screen_leave.is_empty());
+        assert!(restore.leave_alternate_screen.is_none());
+    }
+
+    #[test]
+    fn keyboard_mode_tracker_restores_the_matching_alternate_screen_kind() {
+        for (enter, kind) in [
+            (b"\x1b[?47h".as_slice(), AlternateScreen::Legacy),
+            (b"\x1b[?1047h".as_slice(), AlternateScreen::Extended),
+            (b"\x1b[?1049h".as_slice(), AlternateScreen::SavedCursor),
+        ] {
+            let tracker = TerminalModeTracker::default();
+            tracker.observe(enter);
+            let restore = tracker.take_restore();
+            assert_eq!(restore.leave_alternate_screen, Some(kind));
+            assert_eq!(alternate_screen_control(kind, false).last(), Some(&b'l'));
+        }
     }
 }

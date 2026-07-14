@@ -726,19 +726,23 @@ mod tests {
     }
 
     #[test]
-    fn adapter_probe_env_does_not_inherit_in_memory_manager_credentials() {
+    fn adapter_probe_env_does_not_inherit_memory_store_credentials() {
         let command = adapter_command(Path::new("echo"), "test-env").unwrap();
         let names = command
             .get_envs()
             .map(|(name, _)| name.to_string_lossy().to_string())
             .collect::<Vec<_>>();
 
+        assert!(!names.iter().any(|name| name == "PENTECT_MEMORY_STORE_ADDR"));
         assert!(!names
             .iter()
-            .any(|name| name == "PENTECT_IN_MEMORY_MANAGER_ADDR"));
+            .any(|name| name == "PENTECT_MEMORY_STORE_TOKEN"));
         assert!(!names
             .iter()
-            .any(|name| name == "PENTECT_IN_MEMORY_MANAGER_TOKEN"));
+            .any(|name| name == "PENTECT_PROCESS_HOST_READ_TOKEN"));
+        assert!(!names
+            .iter()
+            .any(|name| name == "PENTECT_PROCESS_HOST_WRITE_TOKEN"));
     }
 
     #[test]

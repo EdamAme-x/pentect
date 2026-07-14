@@ -63,7 +63,7 @@ fn parse_args(args: &[String]) -> Result<bool, String> {
 fn run_checks() -> Vec<Check> {
     vec![
         check_pentect_binary(),
-        check_in_memory_manager(),
+        check_memory_store(),
         check_config_extensions(),
         check_ocr(),
         check_command("codex"),
@@ -79,14 +79,14 @@ fn check_pentect_binary() -> Check {
     }
 }
 
-fn check_in_memory_manager() -> Check {
+fn check_memory_store() -> Check {
     let exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(e) => return Check::fail("memory", e.to_string()),
     };
     let mut child = match Command::new(exe)
         .arg("agent")
-        .arg("manager")
+        .arg("memory-store")
         .arg("--serve")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -1,5 +1,6 @@
+use pentect_core::{DecodeConfig, Profile};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
@@ -10,23 +11,6 @@ const DEFAULT_IMAGE_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_IMAGE_MAX_SECONDS: u64 = 20;
 const DEFAULT_IMAGE_MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_IMAGE_FETCH_SECONDS: u64 = 8;
-#[cfg(not(test))]
-const AUTO_APPROVE_ENV: &str = "PENTECT_AGENT_AUTO_APPROVE";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ApprovalConfigState {
-    pub(crate) project: ApprovalConfigScope,
-    pub(crate) global: ApprovalConfigScope,
-    pub(crate) effective_no_approve: bool,
-    pub(crate) effective_source: ApprovalConfigSource,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ApprovalConfigScope {
-    pub(crate) display_path: String,
-    pub(crate) no_approve: Option<bool>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImageOcrMode {
     Off,
@@ -73,47 +57,15 @@ struct ImageOcrConfigPartial {
     unscanned_images: Option<UnscannedImagePolicy>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ApprovalConfigSource {
-    Project,
-    Global,
-    Default,
-}
-
-pub(crate) fn approval_config_state() -> Result<ApprovalConfigState, String> {
-    let project_path = project_config_path();
-    let global_path = global_config_path()?;
-    let project = read_approval_config_scope(project_path, project_config_display_path());
-    let global = read_approval_config_scope(global_path, global_config_display_path());
-    let project = project?;
-    let global = global?;
-    let (effective_no_approve, effective_source) = if let Some(value) = project.no_approve {
-        (value, ApprovalConfigSource::Project)
-    } else if let Some(value) = global.no_approve {
-        (value, ApprovalConfigSource::Global)
-    } else {
-        (false, ApprovalConfigSource::Default)
-    };
-    Ok(ApprovalConfigState {
-        project,
-        global,
-        effective_no_approve,
-        effective_source,
-    })
-}
-
-#[cfg(not(test))]
-pub(crate) fn approval_bypassed_by_config() -> Result<bool, String> {
-    let state = approval_config_state()?;
-    Ok(approval_bypassed_with_state(
-        &state,
-        env_bool(AUTO_APPROVE_ENV),
-    ))
-}
-
-#[cfg(test)]
-pub(crate) fn approval_bypassed_by_config() -> Result<bool, String> {
-    Ok(false)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DecodeConfigPartial {
+    enabled: Option<bool>,
+    max_depth: Option<Option<usize>>,
+    min_bytes: Option<usize>,
+    max_bytes: Option<Option<usize>>,
+    max_inflate_bytes: Option<Option<u64>>,
+    mask_unknown: Option<bool>,
+    unknown_min_bytes: Option<usize>,
 }
 
 pub(crate) fn require_pentect_agent_by_config() -> Result<bool, String> {
@@ -128,135 +80,37 @@ pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
     Ok(merge_image_ocr_config(project, global))
 }
 
+#[cfg(not(test))]
+pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
+    let project = read_decode_config(project_config_path())?;
+    let global = read_decode_config(global_config_path()?)?;
+    merge_decode_config(profile, project, global).validate()
+}
+
+#[cfg(test)]
+pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
+    merge_decode_config(
+        profile,
+        DecodeConfigPartial::default(),
+        DecodeConfigPartial::default(),
+    )
+    .validate()
+}
+
 pub(crate) fn file_pointer_manager_save_enabled() -> Result<bool, String> {
     let project = read_file_pointer_manager_save(project_config_path())?;
     let global = read_file_pointer_manager_save(global_config_path()?)?;
     Ok(project.or(global).unwrap_or(true))
 }
 
+pub(crate) fn log_share_enabled() -> Result<bool, String> {
+    let project = read_log_share(project_config_path())?;
+    let global = read_log_share(global_config_path()?)?;
+    Ok(project.or(global).unwrap_or(true))
+}
+
 fn require_pentect_agent_effective(project: Option<bool>, global: Option<bool>) -> bool {
     project.unwrap_or(false) || global.unwrap_or(false)
-}
-
-fn approval_bypassed_with_state(state: &ApprovalConfigState, agent_auto_approve: bool) -> bool {
-    if state.effective_no_approve {
-        return true;
-    }
-    if state.effective_source != ApprovalConfigSource::Default {
-        return false;
-    }
-    agent_auto_approve
-}
-
-pub(crate) fn set_approval_config(
-    scope: &str,
-    no_approve: Option<bool>,
-) -> Result<PathBuf, String> {
-    let path = match scope {
-        "project" => project_config_path(),
-        "global" => global_config_path()?,
-        _ => return Err("unknown approval config scope".to_string()),
-    };
-    write_approval_config_value(&path, no_approve)?;
-    Ok(path)
-}
-
-#[cfg(test)]
-pub(crate) fn approval_bypassed_by_config_value(value: &toml::Value) -> Result<bool, String> {
-    Ok(approval_config_override_value(value)?.unwrap_or(false))
-}
-
-fn read_approval_config_scope(
-    path: PathBuf,
-    display_path: String,
-) -> Result<ApprovalConfigScope, String> {
-    let no_approve = if path.exists() {
-        let src = fs::read_to_string(&path)
-            .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-        let value = src
-            .parse::<toml::Value>()
-            .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-        approval_config_override_value(&value)?
-    } else {
-        None
-    };
-    Ok(ApprovalConfigScope {
-        display_path,
-        no_approve,
-    })
-}
-
-fn write_approval_config_value(path: &Path, no_approve: Option<bool>) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
-    }
-    let mut value = if path.exists() {
-        let src = fs::read_to_string(path)
-            .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-        if src.trim().is_empty() {
-            toml::Value::Table(toml::map::Map::new())
-        } else {
-            src.parse::<toml::Value>()
-                .map_err(|e| format!("could not parse '{}': {e}", path.display()))?
-        }
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    let Some(table) = value.as_table_mut() else {
-        return Err(format!("'{}' must be a TOML table", path.display()));
-    };
-    match no_approve {
-        Some(value) => {
-            table.insert("no_approve".to_string(), toml::Value::Boolean(value));
-        }
-        None => {
-            table.remove("no_approve");
-            if let Some(approval) = table.get_mut("approval") {
-                if let Some(approval_table) = approval.as_table_mut() {
-                    approval_table.remove("no_approve");
-                    approval_table.remove("required");
-                    approval_table.remove("mode");
-                    if approval_table.is_empty() {
-                        table.remove("approval");
-                    }
-                } else {
-                    table.remove("approval");
-                }
-            }
-        }
-    }
-    let src = toml::to_string_pretty(&value)
-        .map_err(|e| format!("could not serialize '{}': {e}", path.display()))?;
-    fs::write(path, src).map_err(|e| format!("could not write '{}': {e}", path.display()))
-}
-
-fn approval_config_override_value(value: &toml::Value) -> Result<Option<bool>, String> {
-    if let Some(raw) = value.get("no_approve") {
-        return config_bool(raw, "no_approve").map(Some);
-    }
-    let Some(raw) = value.get("approval") else {
-        return Ok(None);
-    };
-    if let Some(mode) = raw.as_str() {
-        return Ok(Some(approval_mode_bypasses(mode)));
-    }
-    let Some(table) = raw.as_table() else {
-        return Err("approval config approval must be a string or table".to_string());
-    };
-    if let Some(raw) = table.get("no_approve") {
-        return config_bool(raw, "approval.no_approve").map(Some);
-    }
-    if let Some(raw) = table.get("required") {
-        return config_bool(raw, "approval.required").map(|value| Some(!value));
-    }
-    if let Some(raw) = table.get("mode") {
-        let Some(mode) = raw.as_str() else {
-            return Err("approval config approval.mode must be a string".to_string());
-        };
-        return Ok(Some(approval_mode_bypasses(mode)));
-    }
-    Ok(None)
 }
 
 fn read_agent_require_pentect(path: PathBuf) -> Result<Option<bool>, String> {
@@ -349,6 +203,53 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
     Ok(out)
 }
 
+fn read_decode_config(path: PathBuf) -> Result<DecodeConfigPartial, String> {
+    if !path.exists() {
+        return Ok(DecodeConfigPartial::default());
+    }
+    let src = fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(DecodeConfigPartial::default());
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    decode_config_value(&value)
+}
+
+fn decode_config_value(value: &toml::Value) -> Result<DecodeConfigPartial, String> {
+    let mut out = DecodeConfigPartial::default();
+    let Some(raw) = value.get("decode") else {
+        return Ok(out);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("decode config must be a table".to_string());
+    };
+    if let Some(raw) = table.get("enabled") {
+        out.enabled = Some(config_bool(raw, "decode.enabled")?);
+    }
+    if let Some(raw) = table.get("max_depth") {
+        out.max_depth = Some(config_optional_usize(raw, "decode.max_depth")?);
+    }
+    if let Some(raw) = table.get("min_bytes") {
+        out.min_bytes = Some(config_usize(raw, "decode.min_bytes")?);
+    }
+    if let Some(raw) = table.get("max_bytes") {
+        out.max_bytes = Some(config_optional_usize(raw, "decode.max_bytes")?);
+    }
+    if let Some(raw) = table.get("max_inflate_bytes") {
+        out.max_inflate_bytes = Some(config_optional_u64(raw, "decode.max_inflate_bytes")?);
+    }
+    if let Some(raw) = table.get("mask_unknown") {
+        out.mask_unknown = Some(config_bool(raw, "decode.mask_unknown")?);
+    }
+    if let Some(raw) = table.get("unknown_min_bytes") {
+        out.unknown_min_bytes = Some(config_usize(raw, "decode.unknown_min_bytes")?);
+    }
+    Ok(out)
+}
+
 fn read_file_pointer_manager_save(path: PathBuf) -> Result<Option<bool>, String> {
     if !path.exists() {
         return Ok(None);
@@ -380,6 +281,34 @@ fn file_pointer_manager_save_value(value: &toml::Value) -> Result<Option<bool>, 
     config_bool(raw, "file_pointer_manager.save").map(Some)
 }
 
+fn read_log_share(path: PathBuf) -> Result<Option<bool>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let src = fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(None);
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    log_share_value(&value)
+}
+
+fn log_share_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    let Some(raw) = value.get("log") else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("log config must be a table".to_string());
+    };
+    let Some(raw) = table.get("share") else {
+        return Ok(None);
+    };
+    config_bool(raw, "log.share").map(Some)
+}
+
 fn config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
     if let Some(value) = value.as_bool() {
         return Ok(value);
@@ -388,10 +317,10 @@ fn config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
         return match value.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Ok(true),
             "0" | "false" | "no" | "off" => Ok(false),
-            _ => Err(format!("approval config {field} must be boolean-like")),
+            _ => Err(format!("{field} must be boolean-like")),
         };
     }
-    Err(format!("approval config {field} must be a boolean"))
+    Err(format!("{field} must be a boolean"))
 }
 
 fn image_ocr_mode(value: &toml::Value, field: &str) -> Result<ImageOcrMode, String> {
@@ -452,6 +381,26 @@ fn config_usize(value: &toml::Value, field: &str) -> Result<usize, String> {
     usize::try_from(value).map_err(|_| format!("{field} must be positive"))
 }
 
+fn config_optional_usize(value: &toml::Value, field: &str) -> Result<Option<usize>, String> {
+    if value
+        .as_str()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("unlimited"))
+    {
+        return Ok(None);
+    }
+    config_usize(value, field).map(Some)
+}
+
+fn config_optional_u64(value: &toml::Value, field: &str) -> Result<Option<u64>, String> {
+    if value
+        .as_str()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("unlimited"))
+    {
+        return Ok(None);
+    }
+    config_u64(value, field).map(Some)
+}
+
 fn config_positive_integer(value: &toml::Value, field: &str) -> Result<i64, String> {
     let Some(value) = value.as_integer() else {
         return Err(format!("{field} must be an integer"));
@@ -507,6 +456,52 @@ fn merge_image_ocr_config(
     }
 }
 
+fn merge_decode_config(
+    profile: Profile,
+    project: DecodeConfigPartial,
+    global: DecodeConfigPartial,
+) -> DecodeConfig {
+    let knobs = profile.knobs();
+    let defaults = DecodeConfig {
+        mask_unknown: knobs.mask_unknown_codec,
+        unknown_min_bytes: knobs.min_opaque_run,
+        ..DecodeConfig::default()
+    };
+    let min_bytes = project
+        .min_bytes
+        .or(global.min_bytes)
+        .unwrap_or(defaults.min_bytes);
+    let mask_unknown = project
+        .mask_unknown
+        .or(global.mask_unknown)
+        .unwrap_or(defaults.mask_unknown);
+    let unknown_min_bytes = project
+        .unknown_min_bytes
+        .or(global.unknown_min_bytes)
+        .unwrap_or_else(|| defaults.unknown_min_bytes.max(min_bytes));
+    DecodeConfig {
+        enabled: project
+            .enabled
+            .or(global.enabled)
+            .unwrap_or(defaults.enabled),
+        max_depth: project
+            .max_depth
+            .or(global.max_depth)
+            .unwrap_or(defaults.max_depth),
+        min_bytes,
+        max_bytes: project
+            .max_bytes
+            .or(global.max_bytes)
+            .unwrap_or(defaults.max_bytes),
+        max_inflate_bytes: project
+            .max_inflate_bytes
+            .or(global.max_inflate_bytes)
+            .unwrap_or(defaults.max_inflate_bytes),
+        mask_unknown,
+        unknown_min_bytes,
+    }
+}
+
 fn agent_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
     if let Some(value) = value.as_bool() {
         return Ok(value);
@@ -521,43 +516,14 @@ fn agent_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
     Err(format!("agent config {field} must be a boolean"))
 }
 
-fn approval_mode_bypasses(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "none" | "off" | "bypass" | "no_approve" | "no-approve"
-    )
-}
-
-#[cfg(not(test))]
-fn env_bool(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on" | "no_approve" | "no-approve"
-        )
-    })
-}
-
 fn project_config_path() -> PathBuf {
     PathBuf::from(PENTECT_DIR).join(CONFIG_FILE)
-}
-
-fn project_config_display_path() -> String {
-    format!("{PENTECT_DIR}\\{CONFIG_FILE}")
 }
 
 fn global_config_path() -> Result<PathBuf, String> {
     home_dir()
         .map(|home| home.join(PENTECT_DIR).join(CONFIG_FILE))
         .ok_or_else(|| "could not find a home directory for global Pentect config".to_string())
-}
-
-fn global_config_display_path() -> String {
-    if cfg!(windows) {
-        format!("%USERPROFILE%\\{PENTECT_DIR}\\{CONFIG_FILE}")
-    } else {
-        format!("$HOME/{PENTECT_DIR}/{CONFIG_FILE}")
-    }
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -569,62 +535,6 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn approval_config_accepts_no_approve_forms() {
-        let value = "no_approve = true".parse::<toml::Value>().unwrap();
-        assert!(approval_bypassed_by_config_value(&value).unwrap());
-
-        let value = "approval = \"none\"".parse::<toml::Value>().unwrap();
-        assert!(approval_bypassed_by_config_value(&value).unwrap());
-
-        let value = "[approval]\nrequired = false"
-            .parse::<toml::Value>()
-            .unwrap();
-        assert!(approval_bypassed_by_config_value(&value).unwrap());
-
-        let value = "[approval]\nmode = \"required\""
-            .parse::<toml::Value>()
-            .unwrap();
-        assert!(!approval_bypassed_by_config_value(&value).unwrap());
-    }
-
-    #[test]
-    fn approval_config_detects_explicit_required() {
-        let value = "no_approve = false".parse::<toml::Value>().unwrap();
-        assert_eq!(approval_config_override_value(&value).unwrap(), Some(false));
-    }
-
-    #[test]
-    fn agent_auto_approve_respects_explicit_required_config() {
-        let explicit_required = ApprovalConfigState {
-            project: ApprovalConfigScope {
-                display_path: ".pentect/config.toml".to_string(),
-                no_approve: Some(false),
-            },
-            global: ApprovalConfigScope {
-                display_path: "$HOME/.pentect/config.toml".to_string(),
-                no_approve: None,
-            },
-            effective_no_approve: false,
-            effective_source: ApprovalConfigSource::Project,
-        };
-        assert!(!approval_bypassed_with_state(&explicit_required, true));
-
-        let default_required = ApprovalConfigState {
-            project: ApprovalConfigScope {
-                display_path: ".pentect/config.toml".to_string(),
-                no_approve: None,
-            },
-            global: ApprovalConfigScope {
-                display_path: "$HOME/.pentect/config.toml".to_string(),
-                no_approve: None,
-            },
-            effective_no_approve: false,
-            effective_source: ApprovalConfigSource::Default,
-        };
-        assert!(approval_bypassed_with_state(&default_required, true));
-    }
 
     #[test]
     fn agent_require_pentect_accepts_top_level_and_table_forms() {
@@ -681,6 +591,87 @@ unscanned_images = \"block\""
         let value = "[image]\nocr = false".parse::<toml::Value>().unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
         assert_eq!(cfg.mode, Some(ImageOcrMode::Off));
+    }
+
+    #[test]
+    fn decode_config_accepts_numeric_and_unlimited_limits() {
+        let value = r#"
+[decode]
+enabled = true
+max_depth = "unlimited"
+min_bytes = 8
+max_bytes = 1048576
+max_inflate_bytes = "unlimited"
+mask_unknown = true
+unknown_min_bytes = 32
+"#
+        .parse::<toml::Value>()
+        .unwrap();
+        let partial = decode_config_value(&value).unwrap();
+        assert_eq!(partial.enabled, Some(true));
+        assert_eq!(partial.max_depth, Some(None));
+        assert_eq!(partial.min_bytes, Some(8));
+        assert_eq!(partial.max_bytes, Some(Some(1_048_576)));
+        assert_eq!(partial.max_inflate_bytes, Some(None));
+        assert_eq!(partial.mask_unknown, Some(true));
+        assert_eq!(partial.unknown_min_bytes, Some(32));
+    }
+
+    #[test]
+    fn decode_config_reads_config_file() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-decode-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        std::fs::write(
+            &path,
+            "[decode]\nmax_depth = \"unlimited\"\nmax_bytes = 999999\n",
+        )
+        .unwrap();
+        let config = read_decode_config(path).unwrap();
+        assert_eq!(config.max_depth, Some(None));
+        assert_eq!(config.max_bytes, Some(Some(999_999)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_decode_config_overrides_global_including_unlimited() {
+        let project = DecodeConfigPartial {
+            max_depth: Some(None),
+            max_bytes: Some(Some(2_000_000)),
+            ..DecodeConfigPartial::default()
+        };
+        let global = DecodeConfigPartial {
+            max_depth: Some(Some(9)),
+            min_bytes: Some(24),
+            max_bytes: Some(None),
+            ..DecodeConfigPartial::default()
+        };
+        let merged = merge_decode_config(Profile::Strict, project, global);
+        assert_eq!(merged.max_depth, None);
+        assert_eq!(merged.min_bytes, 24);
+        assert_eq!(merged.max_bytes, Some(2_000_000));
+    }
+
+    #[test]
+    fn decode_config_rejects_invalid_limits_without_capping_valid_values() {
+        let zero = "[decode]\nmax_depth = 0".parse::<toml::Value>().unwrap();
+        assert!(decode_config_value(&zero).is_err());
+
+        let project = DecodeConfigPartial {
+            max_depth: Some(Some(100_000)),
+            ..DecodeConfigPartial::default()
+        };
+        let merged = merge_decode_config(Profile::Strict, project, DecodeConfigPartial::default())
+            .validate()
+            .unwrap();
+        assert_eq!(merged.max_depth, Some(100_000));
     }
 
     #[test]
@@ -756,5 +747,17 @@ unscanned_images = \"block\""
             .parse::<toml::Value>()
             .unwrap();
         assert_eq!(file_pointer_manager_save_value(&value).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn log_share_config_is_explicit_and_defaults_elsewhere() {
+        let value = "[log]\nshare = false".parse::<toml::Value>().unwrap();
+        assert_eq!(log_share_value(&value).unwrap(), Some(false));
+
+        let value = "[log]\nshare = \"on\"".parse::<toml::Value>().unwrap();
+        assert_eq!(log_share_value(&value).unwrap(), Some(true));
+
+        let value = "log = true".parse::<toml::Value>().unwrap();
+        assert!(log_share_value(&value).is_err());
     }
 }

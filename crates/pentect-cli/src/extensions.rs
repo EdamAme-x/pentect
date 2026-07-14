@@ -95,10 +95,7 @@ pub(crate) fn collect_from_args(args: &[String]) -> Result<Vec<String>> {
 
 pub(crate) fn strip_from_args(args: &[String]) -> Result<(Vec<String>, Vec<String>)> {
     match args.first().map(String::as_str) {
-        Some("exec" | "approve") => strip_exec_like_args(args),
-        Some("dashboard") | Some("--dir" | "--session" | "--port") | None => {
-            strip_option_args(args, &["--dir", "--session", "--port"])
-        }
+        Some("exec") => strip_exec_like_args(args),
         Some("hook") => strip_option_args(args, &["--session"]),
         _ => Ok((args.to_vec(), Vec::new())),
     }
@@ -129,7 +126,7 @@ fn strip_exec_like_args(args: &[String]) -> Result<(Vec<String>, Vec<String>)> {
             };
             stripped.push(value.clone());
             i += 2;
-        } else if matches!(args[i].as_str(), "--live" | "--approve") || i == 0 {
+        } else if args[i] == "--live" || i == 0 {
             stripped.push(args[i].clone());
             i += 1;
         } else {
@@ -696,29 +693,6 @@ mod tests {
                 "exec".to_string(),
                 "--live".to_string(),
                 "Write-Output ok".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn strip_extensions_from_dashboard_options_after_values() {
-        let args = vec![
-            "--dir".to_string(),
-            "work".to_string(),
-            "--extensions".to_string(),
-            "rules".to_string(),
-            "--port".to_string(),
-            "7331".to_string(),
-        ];
-        let (stripped, specs) = strip_from_args(&args).unwrap();
-        assert_eq!(specs, ["rules"]);
-        assert_eq!(
-            stripped,
-            vec![
-                "--dir".to_string(),
-                "work".to_string(),
-                "--port".to_string(),
-                "7331".to_string()
             ]
         );
     }

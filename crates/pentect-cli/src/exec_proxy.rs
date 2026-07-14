@@ -145,8 +145,11 @@ async fn handle_client(fut: upgrade::UpgradeFut, codex: PathBuf) -> Result<(), S
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .env_remove("PENTECT_IN_MEMORY_MANAGER_ADDR")
-        .env_remove("PENTECT_IN_MEMORY_MANAGER_TOKEN")
+        .env_remove("PENTECT_MEMORY_STORE_ADDR")
+        .env_remove("PENTECT_MEMORY_STORE_TOKEN")
+        .env_remove("PENTECT_PROCESS_HOST_READ_TOKEN")
+        .env_remove("PENTECT_PROCESS_HOST_WRITE_TOKEN")
+        .env_remove("PENTECT_PROCESS_HOST_ROOT")
         .env_remove("PENTECT_AGENT_LAUNCHED");
     let mut backend = backend
         .spawn()
@@ -257,17 +260,15 @@ fn rewrite_client_json_line(line: &str) -> Result<String, String> {
         line,
         &mut |argv, env| {
             Ok(
-                pentect_agent::preflight_exec_server_process_start_from_active_in_memory_manager(
+                pentect_agent::preflight_exec_server_process_start_from_active_memory_store(
                     argv, env,
                 )?
                 .unwrap_or_default(),
             )
         },
         &mut |text| {
-            Ok(
-                pentect_agent::resolve_text_from_active_in_memory_manager(text)?
-                    .unwrap_or_else(|| text.to_string()),
-            )
+            Ok(pentect_agent::resolve_text_from_active_memory_store(text)?
+                .unwrap_or_else(|| text.to_string()))
         },
     )
 }
@@ -329,8 +330,11 @@ where
 }
 
 fn strip_private_env(env: &mut serde_json::Map<String, Value>) {
-    env.remove("PENTECT_IN_MEMORY_MANAGER_ADDR");
-    env.remove("PENTECT_IN_MEMORY_MANAGER_TOKEN");
+    env.remove("PENTECT_MEMORY_STORE_ADDR");
+    env.remove("PENTECT_MEMORY_STORE_TOKEN");
+    env.remove("PENTECT_PROCESS_HOST_READ_TOKEN");
+    env.remove("PENTECT_PROCESS_HOST_WRITE_TOKEN");
+    env.remove("PENTECT_PROCESS_HOST_ROOT");
     env.remove("PENTECT_AGENT_LAUNCHED");
 }
 
@@ -659,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn client_process_start_resolves_argv_and_drops_manager_env() {
+    fn client_process_start_resolves_argv_and_drops_memory_store_env() {
         let line = serde_json::json!({
             "id": 1,
             "method": PROCESS_START_METHOD,
@@ -668,7 +672,9 @@ mod tests {
                 "argv": ["powershell", "-Command", "echo <<SECRET_x>>"],
                 "cwd": "file:///tmp",
                 "env": {
-                    "PENTECT_IN_MEMORY_MANAGER_TOKEN": "token",
+                    "PENTECT_MEMORY_STORE_TOKEN": "token",
+                    "PENTECT_PROCESS_HOST_READ_TOKEN": "read-token",
+                    "PENTECT_PROCESS_HOST_WRITE_TOKEN": "write-token",
                     "SAFE": "<<SECRET_x>>"
                 },
                 "tty": false,
@@ -701,7 +707,15 @@ mod tests {
         assert!(rewritten.contains("\"SAFE\":\"raw\""), "{rewritten}");
         assert!(rewritten.contains("\"RUNPOD_API_KEY\":\"runpod-raw\""));
         assert!(
-            !rewritten.contains("PENTECT_IN_MEMORY_MANAGER_TOKEN"),
+            !rewritten.contains("PENTECT_MEMORY_STORE_TOKEN"),
+            "{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("PENTECT_PROCESS_HOST_READ_TOKEN"),
+            "{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("PENTECT_PROCESS_HOST_WRITE_TOKEN"),
             "{rewritten}"
         );
     }

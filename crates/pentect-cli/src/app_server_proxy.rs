@@ -23,6 +23,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const PENTECT_CODEX_APP_SERVER_PROXY_ENV: &str = "PENTECT_CODEX_APP_SERVER_PROXY";
 
 pub(crate) struct AppServerProxyGuard {
     url: String,
@@ -245,7 +246,8 @@ async fn handle_client(fut: upgrade::UpgradeFut, backend_addr: SocketAddr) -> Re
                 match frame.opcode {
                     OpCode::Close => break,
                     OpCode::Text | OpCode::Binary => {
-                        let frame = rewrite_app_server_frame(frame, &mut output_masker)?;
+                        debug_app_server_frame("client", &frame);
+                        let frame = rewrite_app_server_frame(frame, false, &mut output_masker)?;
                         backend.write_frame(frame).await
                             .map_err(|e| format!("backend websocket write failed: {e}"))?;
                     }
@@ -261,7 +263,8 @@ async fn handle_client(fut: upgrade::UpgradeFut, backend_addr: SocketAddr) -> Re
                 match frame.opcode {
                     OpCode::Close => break,
                     OpCode::Text | OpCode::Binary => {
-                        let frame = rewrite_app_server_frame(frame, &mut output_masker)?;
+                        debug_app_server_frame("backend", &frame);
+                        let frame = rewrite_app_server_frame(frame, true, &mut output_masker)?;
                         client.write_frame(frame).await
                             .map_err(|e| format!("client websocket write failed: {e}"))?;
                     }
@@ -273,15 +276,108 @@ async fn handle_client(fut: upgrade::UpgradeFut, backend_addr: SocketAddr) -> Re
     Ok(())
 }
 
+fn debug_app_server_frame(direction: &str, frame: &Frame<'_>) {
+    if !app_server_debug() {
+        return;
+    }
+    let payload: &[u8] = frame.payload.as_ref();
+    let mut line = format!(
+        "direction={direction} opcode={:?} bytes={}",
+        frame.opcode,
+        payload.len()
+    );
+    if let Ok(text) = std::str::from_utf8(payload) {
+        match serde_json::from_str::<Value>(text) {
+            Ok(value) => {
+                let mut parts = Vec::new();
+                debug_value_shape(&value, "$", 0, &mut parts);
+                if !parts.is_empty() {
+                    line.push(' ');
+                    line.push_str(&parts.join(" "));
+                }
+            }
+            Err(_) => {
+                line.push_str(" text=plain");
+            }
+        }
+    } else {
+        line.push_str(" text=non-utf8");
+    }
+    let _ = append_app_server_debug_line(&line);
+}
+
+fn app_server_debug() -> bool {
+    std::env::var("PENTECT_APP_PROXY_DEBUG").is_ok_and(|value| value == "1")
+}
+
+fn append_app_server_debug_line(line: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let path = Path::new("log").join("app-proxy-debug.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
+fn debug_value_shape(value: &Value, path: &str, depth: usize, out: &mut Vec<String>) {
+    if depth > 5 || out.len() >= 80 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            let keys = object.keys().cloned().collect::<Vec<_>>().join(",");
+            out.push(format!("{path}=object[{keys}]"));
+            for (key, value) in object {
+                let child = format!("{path}.{key}");
+                if debug_key_interesting(key) || matches!(value, Value::Object(_) | Value::Array(_))
+                {
+                    debug_value_shape(value, &child, depth + 1, out);
+                }
+            }
+        }
+        Value::Array(values) => {
+            out.push(format!("{path}=array[{}]", values.len()));
+            for (index, value) in values.iter().take(4).enumerate() {
+                debug_value_shape(value, &format!("{path}[{index}]"), depth + 1, out);
+            }
+        }
+        Value::String(text) => {
+            out.push(format!("{path}=string[{}]", text.len()));
+        }
+        Value::Bool(_) => out.push(format!("{path}=bool")),
+        Value::Number(_) => out.push(format!("{path}=number")),
+        Value::Null => out.push(format!("{path}=null")),
+    }
+}
+
+fn debug_key_interesting(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    [
+        "type", "method", "tool", "toolname", "name", "command", "cmd", "argv", "args", "env",
+        "input", "output", "stdout", "stderr", "params", "request", "response", "process",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn rewrite_app_server_frame(
     frame: Frame<'static>,
+    clean_command_display: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
 ) -> Result<Frame<'static>, String> {
-    rewrite_app_server_frame_with_mask(frame, &mut |text| mask_output_text(masker, text))
+    rewrite_app_server_frame_with_mask(frame, clean_command_display, &mut |text| {
+        mask_output_text(masker, text)
+    })
 }
 
 fn rewrite_app_server_frame_with_mask<F>(
     frame: Frame<'static>,
+    clean_command_display: bool,
     mask: &mut F,
 ) -> Result<Frame<'static>, String>
 where
@@ -292,12 +388,12 @@ where
             let payload = Vec::<u8>::from(frame.payload);
             let text = std::str::from_utf8(&payload)
                 .map_err(|e| format!("codex app-server sent non-utf8 text frame: {e}"))?;
-            let text = rewrite_server_text_frame(text, mask)?;
+            let text = rewrite_server_text_frame_for_display(text, clean_command_display, mask)?;
             Ok(Frame::text(Payload::Owned(text.into_bytes())))
         }
         OpCode::Binary => {
             let payload = Vec::<u8>::from(frame.payload);
-            let payload = rewrite_server_binary_payload(&payload, mask)?;
+            let payload = rewrite_server_binary_payload(&payload, clean_command_display, mask)?;
             Ok(Frame::binary(Payload::Owned(payload)))
         }
         _ => Ok(frame),
@@ -341,15 +437,33 @@ async fn connect_backend(
     Ok(fastwebsockets::FragmentCollector::new(ws))
 }
 
+#[cfg(test)]
 fn rewrite_server_text_frame<F>(text: &str, mask: &mut F) -> Result<String, String>
 where
     F: FnMut(&str) -> Result<String, String>,
 {
-    rewrite_server_text_frame_with_image_redactor(text, mask, &mut redact_app_server_images)
+    rewrite_server_text_frame_for_display(text, true, mask)
+}
+
+fn rewrite_server_text_frame_for_display<F>(
+    text: &str,
+    clean_command_display: bool,
+    mask: &mut F,
+) -> Result<String, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    rewrite_server_text_frame_with_image_redactor(
+        text,
+        clean_command_display,
+        mask,
+        &mut redact_app_server_images,
+    )
 }
 
 fn rewrite_server_text_frame_with_image_redactor<F, G>(
     text: &str,
+    clean_command_display: bool,
     mask: &mut F,
     redact_images: &mut G,
 ) -> Result<String, String>
@@ -362,22 +476,29 @@ where
         Err(_) => return mask(text),
     };
     redact_images(&mut value)?;
-    mask_app_server_display_strings(&mut value, None, mask)?;
+    mask_app_server_display_strings(&mut value, None, clean_command_display, mask)?;
+    if clean_command_display {
+        prefer_command_action_display(&mut value);
+    }
     serde_json::to_string(&value).map_err(|e| e.to_string())
 }
 
-fn rewrite_server_binary_payload<F>(payload: &[u8], mask: &mut F) -> Result<Vec<u8>, String>
+fn rewrite_server_binary_payload<F>(
+    payload: &[u8],
+    clean_command_display: bool,
+    mask: &mut F,
+) -> Result<Vec<u8>, String>
 where
     F: FnMut(&str) -> Result<String, String>,
 {
     let Ok(text) = std::str::from_utf8(payload) else {
         return Ok(payload.to_vec());
     };
-    rewrite_server_text_frame(text, mask).map(String::into_bytes)
+    rewrite_server_text_frame_for_display(text, clean_command_display, mask).map(String::into_bytes)
 }
 
 fn redact_app_server_images(value: &mut Value) -> Result<(), String> {
-    if let Some(updated) = pentect_agent::redact_tool_images_into_active_in_memory_manager(value)? {
+    if let Some(updated) = pentect_agent::redact_tool_images_into_active_memory_store(value)? {
         *value = updated;
     }
     Ok(())
@@ -386,6 +507,7 @@ fn redact_app_server_images(value: &mut Value) -> Result<(), String> {
 fn mask_app_server_display_strings<F>(
     value: &mut Value,
     key: Option<&str>,
+    clean_command_display: bool,
     mask: &mut F,
 ) -> Result<(), String>
 where
@@ -393,6 +515,15 @@ where
 {
     match value {
         Value::String(text) => {
+            if clean_command_display && key.is_some_and(maskable_app_server_text_key) {
+                let before_len = text.len();
+                if let Some(clean) = clean_pentect_exec_display_text(text) {
+                    *text = clean;
+                    debug_app_server_display_clean(key, before_len, text.len(), true);
+                } else if text.to_ascii_lowercase().contains("pentect exec") {
+                    debug_app_server_display_clean(key, before_len, before_len, false);
+                }
+            }
             if key.is_some_and(maskable_app_server_text_key) {
                 let masked = mask(text)?;
                 if masked != *text {
@@ -402,17 +533,177 @@ where
         }
         Value::Array(values) => {
             for value in values {
-                mask_app_server_display_strings(value, key, mask)?;
+                mask_app_server_display_strings(value, key, clean_command_display, mask)?;
             }
         }
         Value::Object(object) => {
             for (key, value) in object {
-                mask_app_server_display_strings(value, Some(key), mask)?;
+                mask_app_server_display_strings(value, Some(key), clean_command_display, mask)?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn prefer_command_action_display(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                prefer_command_action_display(value);
+            }
+        }
+        Value::Object(object) => {
+            let action_command = object
+                .get("commandActions")
+                .and_then(Value::as_array)
+                .and_then(|actions| actions.first())
+                .and_then(|action| action.get("command"))
+                .and_then(Value::as_str)
+                .filter(|command| !command.trim().is_empty())
+                .map(|command| normalize_pentect_display_payload(command.to_string()));
+            if let Some(action_command) = action_command {
+                if object.get("command").and_then(Value::as_str).is_some() {
+                    object.insert("command".to_string(), Value::String(action_command));
+                }
+            }
+            for value in object.values_mut() {
+                prefer_command_action_display(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn debug_app_server_display_clean(
+    key: Option<&str>,
+    before_len: usize,
+    after_len: usize,
+    cleaned: bool,
+) {
+    if !app_server_debug() {
+        return;
+    }
+    let key = key.unwrap_or("<none>");
+    let _ = append_app_server_debug_line(&format!(
+        "display-clean key={key} before_len={before_len} after_len={after_len} cleaned={cleaned}"
+    ));
+}
+
+fn clean_pentect_exec_display_text(text: &str) -> Option<String> {
+    if let Some(clean) = pentect_agent::display_command_without_pentect_exec_wrapper(text) {
+        return Some(normalize_pentect_display_payload(clean));
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(relative) = lower[search_from..].find("pentect") {
+        let start = search_from + relative;
+        let before = &text[..start];
+        let Some(clean) =
+            pentect_agent::display_command_without_pentect_exec_wrapper(&text[start..])
+        else {
+            search_from = start + "pentect".len();
+            continue;
+        };
+        if display_prefix_keeps_before_pentect(before) {
+            return Some(format!(
+                "{before}{}",
+                normalize_pentect_display_payload(clean)
+            ));
+        }
+        if let Some(prefix) = display_prefix_replaces_path_before_pentect(before) {
+            return Some(format!(
+                "{prefix}{}",
+                normalize_pentect_display_payload(clean)
+            ));
+        }
+        if display_prefix_drops_before_pentect(before) {
+            return Some(normalize_pentect_display_payload(clean));
+        }
+        return Some(normalize_pentect_display_payload(clean));
+    }
+    None
+}
+
+fn normalize_pentect_display_payload(command: String) -> String {
+    if quoted_word_count(&command) < 3 {
+        return command;
+    }
+    dequote_display_words(&command).unwrap_or(command)
+}
+
+fn quoted_word_count(text: &str) -> usize {
+    let mut count = 0usize;
+    let mut at_word_start = true;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            at_word_start = true;
+            continue;
+        }
+        if at_word_start && matches!(ch, '\'' | '"') {
+            count += 1;
+        }
+        at_word_start = false;
+    }
+    count
+}
+
+fn dequote_display_words(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    let mut at_word_start = true;
+    while let Some((_, ch)) = chars.next() {
+        if at_word_start && matches!(ch, '\'' | '"') {
+            let quote = ch;
+            let mut closed = false;
+            while let Some((_, inner)) = chars.next() {
+                if inner == quote {
+                    if quote == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                        out.push('\'');
+                        let _ = chars.next();
+                        continue;
+                    }
+                    closed = true;
+                    break;
+                }
+                out.push(inner);
+            }
+            if !closed {
+                return None;
+            }
+            at_word_start = false;
+            continue;
+        }
+        out.push(ch);
+        at_word_start = ch.is_whitespace();
+    }
+    Some(out)
+}
+
+fn display_prefix_keeps_before_pentect(before: &str) -> bool {
+    let before = before.trim_end();
+    before.is_empty() || before.ends_with("Ran")
+}
+
+fn display_prefix_replaces_path_before_pentect(before: &str) -> Option<String> {
+    let trimmed_len = before.trim_end().len();
+    let trimmed = before.get(..trimmed_len)?;
+    let lower = trimmed.to_ascii_lowercase();
+    let ran_pos = lower.rfind("ran ")?;
+    if !trimmed[..ran_pos].trim().is_empty() {
+        return None;
+    }
+    Some(format!("{}Ran ", &trimmed[..ran_pos]))
+}
+
+fn display_prefix_drops_before_pentect(before: &str) -> bool {
+    let before = before.trim_end().to_ascii_lowercase();
+    before == "cmd /d /s /c"
+        || before.ends_with(" cmd /d /s /c")
+        || before == "powershell -command"
+        || before.ends_with(" powershell -command")
+        || before == "pwsh -command"
+        || before.ends_with(" pwsh -command")
 }
 
 fn maskable_app_server_text_key(key: &str) -> bool {
@@ -511,7 +802,7 @@ mod tests {
             }
         })
         .to_string();
-        let masked = rewrite_server_binary_payload(raw.as_bytes(), &mut |text| {
+        let masked = rewrite_server_binary_payload(raw.as_bytes(), true, &mut |text| {
             Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
         })
         .unwrap();
@@ -572,11 +863,125 @@ mod tests {
     }
 
     #[test]
+    fn server_frame_hides_pentect_exec_wrapper_in_command_display() {
+        let raw = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "id": "item-1",
+                    "command": "pentect exec 'Get-Content .env'",
+                    "aggregatedOutput": "done"
+                }
+            }
+        })
+        .to_string();
+        let rewritten = rewrite_server_text_frame(&raw, &mut |text| Ok(text.to_string())).unwrap();
+        assert!(!rewritten.contains("pentect exec"), "{rewritten}");
+        assert!(rewritten.contains("Get-Content .env"), "{rewritten}");
+    }
+
+    #[test]
+    fn server_frame_prefers_clean_command_action_display() {
+        let raw = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "id": "item-1",
+                    "command": "internal setup; pentect exec 'Get-Content .env'",
+                    "commandActions": [{
+                        "type": "copy",
+                        "command": "pentect exec 'Get-Content .env'"
+                    }]
+                }
+            }
+        })
+        .to_string();
+        let rewritten = rewrite_server_text_frame(&raw, &mut |text| Ok(text.to_string())).unwrap();
+        let value: Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(
+            value["params"]["item"]["command"].as_str(),
+            Some("Get-Content .env")
+        );
+        assert!(!rewritten.contains("pentect exec"), "{rewritten}");
+    }
+
+    #[test]
+    fn display_text_hides_ran_pentect_exec_wrapper() {
+        let text = "Ran pentect exec '$has = if ($true) { ''HAS_ENV=YES'' }'";
+        let cleaned = clean_pentect_exec_display_text(text).unwrap();
+        assert!(!cleaned.contains("pentect exec"), "{cleaned}");
+        assert!(cleaned.contains("Ran $has = if"), "{cleaned}");
+        assert!(cleaned.contains("'HAS_ENV=YES'"), "{cleaned}");
+    }
+
+    #[test]
+    fn display_text_hides_real_powershell_pentect_exec_wrapper() {
+        let text = concat!(
+            "Ran pentect exec '$out = if ($env:OPENAI_API_KEY) { ''HAS_ENV=YES'' } else ",
+            "{ ''HAS_ENV=NO_ENV'' }; New-Item -ItemType Directory -Path ''log'' -Force | ",
+            "Out-Null; Set-Content -Path ''log\\prompt-appserver-final.txt'' -Value $out'"
+        );
+        let cleaned = clean_pentect_exec_display_text(text).unwrap();
+        assert!(!cleaned.contains("pentect exec"), "{cleaned}");
+        assert!(cleaned.contains("Ran $out = if"), "{cleaned}");
+        assert!(cleaned.contains("$env:OPENAI_API_KEY"), "{cleaned}");
+    }
+
+    #[test]
+    fn display_text_hides_shell_prefixed_pentect_exec_wrapper() {
+        let text = "cmd /D /S /C pentect exec 'Get-Content .env'";
+        let cleaned = clean_pentect_exec_display_text(text).unwrap();
+        assert_eq!(cleaned, "Get-Content .env");
+    }
+
+    #[test]
+    fn display_text_drops_unknown_prefix_before_pentect_exec_wrapper() {
+        let text = "internal setup; pentect exec 'Get-Content .env'";
+        let cleaned = clean_pentect_exec_display_text(text).unwrap();
+        assert_eq!(cleaned, "Get-Content .env");
+    }
+
+    #[test]
+    fn display_text_dequotes_shell_word_list_payload() {
+        let text = "'$target' '=' \"log\\\\out.txt;\" '$dir' '=' Split-Path '$target'";
+        let cleaned = normalize_pentect_display_payload(text.to_string());
+        assert!(!cleaned.contains("'$target'"), "{cleaned}");
+        assert!(cleaned.contains("$target ="), "{cleaned}");
+        assert!(cleaned.contains("$dir = Split-Path $target"), "{cleaned}");
+    }
+
+    #[test]
+    fn display_text_dequotes_real_codex_word_list_payload() {
+        let text = "'$value' '=' '$env:OPENAI_API_KEY;' '$status' '=' if '([string]::IsNullOrWhiteSpace($value))' '{' 'HAS_ENV=NO_ENV' '}' else '{' 'HAS_ENV=YES' '};' New-Item -ItemType Directory -Path log -Force '|' 'Out-Null;' Set-Content -Path log\\out.txt -Value '$status'";
+        let cleaned = normalize_pentect_display_payload(text.to_string());
+        assert!(!cleaned.contains("'$value'"), "{cleaned}");
+        assert!(
+            cleaned.contains("$value = $env:OPENAI_API_KEY;"),
+            "{cleaned}"
+        );
+        assert!(cleaned.contains("| Out-Null;"), "{cleaned}");
+    }
+
+    #[test]
+    fn display_text_hides_uppercase_pentect_exe_wrapper() {
+        let text = "Ran C:\\Tools\\PENTECT.EXE exec 'Get-Content .env'";
+        let cleaned = clean_pentect_exec_display_text(text).unwrap();
+        assert!(!cleaned.contains("PENTECT.EXE"), "{cleaned}");
+        assert!(cleaned.contains("Ran Get-Content .env"), "{cleaned}");
+    }
+
+    #[test]
     fn server_binary_frame_leaves_non_utf8_payload() {
         let raw = [0xff, 0x00, 0x80];
         let masked =
-            rewrite_server_binary_payload(&raw, &mut |_| Ok("<<SHOULD_NOT_RUN>>".to_string()))
-                .unwrap();
+            rewrite_server_binary_payload(
+                &raw,
+                true,
+                &mut |_| Ok("<<SHOULD_NOT_RUN>>".to_string()),
+            )
+            .unwrap();
         assert_eq!(masked, raw);
     }
 
@@ -631,6 +1036,7 @@ mod tests {
         .to_string();
         let masked = rewrite_server_text_frame_with_image_redactor(
             &raw,
+            true,
             &mut |text| Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>")),
             &mut |value| {
                 value["params"]["item"]["content"][0]["data"] =
@@ -662,7 +1068,7 @@ mod tests {
         })
         .to_string();
         let frame = Frame::text(Payload::Owned(raw.into_bytes()));
-        let masked = rewrite_app_server_frame_with_mask(frame, &mut |text| {
+        let masked = rewrite_app_server_frame_with_mask(frame, false, &mut |text| {
             Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
         })
         .unwrap();
@@ -672,5 +1078,23 @@ mod tests {
             "{payload}"
         );
         assert!(payload.contains("<<OPENAI_API_KEY_x>>"), "{payload}");
+    }
+
+    #[test]
+    fn app_server_client_frame_keeps_pentect_exec_command_for_execution() {
+        let raw = serde_json::json!({
+            "method": "tool/request",
+            "params": {
+                "command": "pentect exec 'Get-Content .env'"
+            }
+        })
+        .to_string();
+        let frame = Frame::text(Payload::Owned(raw.into_bytes()));
+        let rewritten =
+            rewrite_app_server_frame_with_mask(frame, false, &mut |text| Ok(text.to_string()))
+                .unwrap();
+        let payload = String::from_utf8(Vec::<u8>::from(rewritten.payload)).unwrap();
+        assert!(payload.contains("pentect exec"), "{payload}");
+        assert!(payload.contains("Get-Content .env"), "{payload}");
     }
 }

@@ -21,6 +21,13 @@ pub(crate) fn cmd_scan(args: &[String]) {
         Ok(report) => report,
         Err(e) => die(e),
     };
+    let mut labels = std::collections::BTreeMap::new();
+    for file in &report.files {
+        for (label, count) in &file.labels {
+            *labels.entry(label.clone()).or_insert(0) += count;
+        }
+    }
+    pentect_agent::record_scan_activity(report.files_scanned, report.findings, labels);
     if opts.json {
         println!("{}", report_json(&report));
     } else {

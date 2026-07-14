@@ -1,3 +1,5 @@
+#[cfg(any(feature = "ocr", test))]
+use crate::config;
 use crate::config::ImageOcrConfig;
 #[cfg(feature = "ocr")]
 use crate::config::{image_ocr_config, ImageOcrMode, ImageRedactionStyle};
@@ -575,7 +577,7 @@ fn image_secret_findings(
 ) -> Result<Vec<ImageSecretFinding>, String> {
     let mut findings = Vec::new();
     for region in image_metadata_regions(bytes) {
-        for hit in image_text_secret_hits(&region.text, key) {
+        for hit in image_text_secret_hits(&region.text, key)? {
             findings.push(ImageSecretFinding {
                 labels: vec![hit.label.clone()],
                 rect: None,
@@ -596,7 +598,7 @@ fn image_secret_findings(
     }
 
     for region in image_barcode_regions(bytes, cfg) {
-        let labels = labels_from_text_hits(&image_text_secret_hits(&region.text, key));
+        let labels = labels_from_text_hits(&image_text_secret_hits(&region.text, key)?);
         if labels.is_empty() {
             continue;
         }
@@ -615,7 +617,7 @@ fn image_secret_findings(
         Err(_) => return Ok(findings),
     };
     for region in &ocr_regions {
-        for hit in image_text_secret_hits(&region.text, key) {
+        for hit in image_text_secret_hits(&region.text, key)? {
             let redaction = rect_for_text_secret_hit(region, &hit);
             findings.push(ImageSecretFinding {
                 labels: vec![hit.label.clone()],
@@ -629,7 +631,7 @@ fn image_secret_findings(
     let joined_labels = labels_from_text_hits(&image_text_secret_hits(
         &image_regions_text(&ocr_regions),
         key,
-    ));
+    )?);
     let missing_joined_labels = joined_labels
         .into_iter()
         .filter(|label| {
@@ -1329,15 +1331,15 @@ fn trim_ascii_ws_end(text: &str, start: usize, mut end: usize) -> usize {
 
 #[cfg(test)]
 fn image_text_secret_labels(text: &str, key: &[u8; 32]) -> Vec<String> {
-    labels_from_text_hits(&image_text_secret_hits(text, key))
+    labels_from_text_hits(&image_text_secret_hits(text, key).unwrap_or_default())
 }
 
 #[cfg(any(feature = "ocr", test))]
-fn image_text_secret_hits(text: &str, _key: &[u8; 32]) -> Vec<ImageTextSecretHit> {
+fn image_text_secret_hits(text: &str, _key: &[u8; 32]) -> Result<Vec<ImageTextSecretHit>, String> {
     if text.trim().is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let engine = image_ocr_secret_engine();
+    let engine = image_ocr_secret_engine()?;
     let result = engine.analyze_spans(pentect_core::Input {
         kind: pentect_core::Kind::Text,
         data: text.to_string(),
@@ -1361,7 +1363,7 @@ fn image_text_secret_hits(text: &str, _key: &[u8; 32]) -> Vec<ImageTextSecretHit
             hits.push(hit);
         }
     }
-    hits
+    Ok(hits)
 }
 
 #[cfg(any(feature = "ocr", test))]
@@ -1953,9 +1955,19 @@ fn resize_for_barcode(img: image::DynamicImage, max_edge: u32) -> image::Dynamic
 }
 
 #[cfg(any(feature = "ocr", test))]
-fn image_ocr_secret_engine() -> &'static pentect_core::Engine {
-    static ENGINE: std::sync::OnceLock<pentect_core::Engine> = std::sync::OnceLock::new();
-    ENGINE.get_or_init(|| pentect_core::Engine::with_profile(pentect_core::Profile::Strict))
+fn image_ocr_secret_engine() -> Result<&'static pentect_core::Engine, String> {
+    static ENGINE: std::sync::OnceLock<Result<pentect_core::Engine, String>> =
+        std::sync::OnceLock::new();
+    match ENGINE.get_or_init(|| {
+        let profile = pentect_core::Profile::Strict;
+        let decode = config::decode_config(profile)?;
+        Ok(pentect_core::Engine::with_profile_and_decode_config(
+            profile, decode,
+        ))
+    }) {
+        Ok(engine) => Ok(engine),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 fn object_marks_image(map: &serde_json::Map<String, Value>) -> bool {
@@ -3202,7 +3214,7 @@ mod tests {
     fn ocr_secret_rect_uses_value_span_when_available() {
         let text = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
         let value_start = text.find("sk-").unwrap();
-        let hits = image_text_secret_hits(text, &[7; 32]);
+        let hits = image_text_secret_hits(text, &[7; 32]).unwrap();
         let hit = hits
             .iter()
             .find(|hit| hit.range.is_some_and(|range| range.start >= value_start))
