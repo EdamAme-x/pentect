@@ -37,6 +37,71 @@ fn agent_pty_inherits_and_tracks_parent_dimensions() {
     ]);
 }
 
+#[test]
+fn agent_pty_preserves_backspace_as_one_key_event() {
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+
+    let pty = native_pty_system();
+    let pair = pty.openpty(pty_size(INITIAL_SIZE)).unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_pentect"));
+    command.args([
+        "opencode",
+        "--tool",
+        "powershell.exe",
+        "--",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+    ]);
+    command.arg(concat!(
+        "Write-Output 'READY';",
+        "$key=[Console]::ReadKey($true);",
+        "Write-Output ('KEY:{0}:{1}' -f $key.Key,[int]$key.KeyChar)"
+    ));
+    command.cwd(&root);
+    command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    for name in [
+        "PENTECT_MEMORY_STORE_ADDR",
+        "PENTECT_MEMORY_STORE_TOKEN",
+        "PENTECT_PROCESS_HOST_READ_TOKEN",
+        "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+        "PENTECT_AGENT_LAUNCHED",
+    ] {
+        command.env_remove(name);
+    }
+
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().unwrap();
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+    let terminal_size = Arc::new(AtomicU32::new(pack_size(INITIAL_SIZE)));
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = {
+        let writer = writer.clone();
+        std::thread::spawn(move || forward_output(reader, writer, terminal_size, tx))
+    };
+
+    let mut output = String::new();
+    wait_for_text(&rx, &mut output, "READY");
+    {
+        let mut input = writer.lock().unwrap();
+        input
+            .write_all(b"\x1b[8;14;8;1;0;1_\x1b[8;14;8;0;0;1_")
+            .unwrap();
+        input.flush().unwrap();
+    }
+    wait_for_text(&rx, &mut output, "KEY:Backspace:8");
+
+    let status = child.wait().unwrap();
+    assert_eq!(status.exit_code(), 0, "{output:?}");
+    drop(pair.master);
+    reader_thread.join().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn assert_pty_dimensions(command_prefix: &[&str]) {
     let root = test_root();
     std::fs::create_dir_all(&root).unwrap();

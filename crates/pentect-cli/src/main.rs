@@ -1323,11 +1323,14 @@ struct PromptInputState {
 #[derive(Default)]
 struct Win32PromptInputState {
     decode_pending: Vec<u8>,
+    paste_prefix_raw: Vec<u8>,
+    paste_prefix_text: Vec<u8>,
+    drop_next_key_up: bool,
 }
 
 #[cfg(windows)]
 enum Win32InputRecord {
-    Text(Vec<u16>),
+    Text { units: Vec<u16>, virtual_key: u32 },
     KeyUp,
     NonText,
 }
@@ -1372,20 +1375,66 @@ where
         };
         let mut sequence: Vec<u8> = state.decode_pending.drain(..=final_offset).collect();
         match parse_win32_input_record(&sequence) {
-            Some(Win32InputRecord::Text(units)) => match String::from_utf16(&units) {
+            Some(Win32InputRecord::Text { units, virtual_key }) => match String::from_utf16(&units)
+            {
                 Ok(mut text) => {
-                    out.extend(rewrite_prompt_input_bytes_with(
-                        normal,
-                        text.as_bytes(),
-                        mask,
-                    )?);
+                    if normal.in_bracketed_paste {
+                        let was_paste = normal.in_bracketed_paste;
+                        out.extend(rewrite_prompt_input_bytes_with(
+                            normal,
+                            text.as_bytes(),
+                            mask,
+                        )?);
+                        state.drop_next_key_up = was_paste && !normal.in_bracketed_paste;
+                    } else if !state.paste_prefix_raw.is_empty()
+                        || (matches!(virtual_key, 0 | 231)
+                            && text.as_bytes().first() == PROMPT_PASTE_START.first())
+                    {
+                        state.paste_prefix_raw.extend_from_slice(&sequence);
+                        state.paste_prefix_text.extend_from_slice(text.as_bytes());
+                        if !PROMPT_PASTE_START.starts_with(&state.paste_prefix_text) {
+                            flush_win32_paste_prefix(state, &mut out);
+                        } else if state.paste_prefix_text == PROMPT_PASTE_START {
+                            out.extend(rewrite_prompt_input_bytes_with(
+                                normal,
+                                PROMPT_PASTE_START,
+                                mask,
+                            )?);
+                            state.paste_prefix_raw.zeroize();
+                            state.paste_prefix_raw.clear();
+                            state.paste_prefix_text.zeroize();
+                            state.paste_prefix_text.clear();
+                        }
+                    } else {
+                        out.extend_from_slice(&sequence);
+                    }
                     text.zeroize();
                 }
-                Err(_) => out.extend_from_slice(&sequence),
+                Err(_) => {
+                    flush_win32_paste_prefix(state, &mut out);
+                    out.extend_from_slice(&sequence);
+                }
             },
-            Some(Win32InputRecord::KeyUp) => {}
-            Some(Win32InputRecord::NonText) => out.extend_from_slice(&sequence),
-            None => out.extend(rewrite_prompt_input_bytes_with(normal, &sequence, mask)?),
+            Some(Win32InputRecord::KeyUp) => {
+                if state.drop_next_key_up {
+                    state.drop_next_key_up = false;
+                } else if normal.in_bracketed_paste {
+                    // Pasted text is rewritten as one safe payload, so its original
+                    // key-up records must not reach the nested terminal.
+                } else if !state.paste_prefix_raw.is_empty() {
+                    state.paste_prefix_raw.extend_from_slice(&sequence);
+                } else {
+                    out.extend_from_slice(&sequence);
+                }
+            }
+            Some(Win32InputRecord::NonText) => {
+                flush_win32_paste_prefix(state, &mut out);
+                out.extend_from_slice(&sequence);
+            }
+            None => {
+                flush_win32_paste_prefix(state, &mut out);
+                out.extend(rewrite_prompt_input_bytes_with(normal, &sequence, mask)?);
+            }
         }
         sequence.zeroize();
     }
@@ -1395,6 +1444,13 @@ where
         return Err("terminal input sequence exceeds 1 MiB".to_string());
     }
     Ok(out)
+}
+
+#[cfg(windows)]
+fn flush_win32_paste_prefix(state: &mut Win32PromptInputState, out: &mut Vec<u8>) {
+    out.append(&mut state.paste_prefix_raw);
+    state.paste_prefix_text.zeroize();
+    state.paste_prefix_text.clear();
 }
 
 #[cfg(windows)]
@@ -1408,6 +1464,7 @@ fn parse_win32_input_record(sequence: &[u8]) -> Option<Win32InputRecord> {
     if fields.len() != 6 {
         return None;
     }
+    let virtual_key = *fields.first()?;
     let unicode = u16::try_from(*fields.get(2)?).ok()?;
     let key_down = *fields.get(3)?;
     let repeat = usize::try_from(*fields.get(5)?).ok()?;
@@ -1420,7 +1477,10 @@ fn parse_win32_input_record(sequence: &[u8]) -> Option<Win32InputRecord> {
     if unicode == 0 {
         return Some(Win32InputRecord::NonText);
     }
-    Some(Win32InputRecord::Text(vec![unicode; repeat.max(1)]))
+    Some(Win32InputRecord::Text {
+        units: vec![unicode; repeat.max(1)],
+        virtual_key,
+    })
 }
 
 #[cfg(windows)]
@@ -1444,6 +1504,7 @@ where
     F: FnMut(&str) -> Result<Option<String>, String>,
 {
     let mut out = Vec::new();
+    flush_win32_paste_prefix(state, &mut out);
     if !state.decode_pending.is_empty() {
         let mut raw = std::mem::take(&mut state.decode_pending);
         out.extend(rewrite_prompt_input_bytes_with(normal, &raw, mask)?);
@@ -3752,7 +3813,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn prompt_input_decodes_win32_text_and_enter_without_dropping_repeats() {
+    fn prompt_input_preserves_win32_key_records_outside_paste() {
         let encoded = encode_win32_unicode_input("tools\r");
         let mut normal = PromptInputState::default();
         let mut win32 = Win32PromptInputState::default();
@@ -3760,7 +3821,38 @@ mod tests {
         let out =
             rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, &encoded, &mut mask)
                 .unwrap();
-        assert_eq!(out, b"tools\r");
+        assert_eq!(out, encoded);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prompt_input_preserves_one_backspace_as_one_win32_key_press() {
+        let encoded = b"\x1b[8;14;8;1;0;1_\x1b[8;14;8;0;0;1_";
+        let mut normal = PromptInputState::default();
+        let mut win32 = Win32PromptInputState::default();
+        let mut mask = |_: &str| Ok(None);
+        let out =
+            rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, encoded, &mut mask)
+                .unwrap();
+        assert_eq!(out, encoded);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prompt_input_preserves_escape_and_navigation_without_waiting_for_paste() {
+        for encoded in [
+            b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_".as_slice(),
+            b"\x1b[37;75;0;1;256;1_\x1b[37;75;0;0;256;1_".as_slice(),
+            b"\x1b[46;83;0;1;256;1_\x1b[46;83;0;0;256;1_".as_slice(),
+        ] {
+            let mut normal = PromptInputState::default();
+            let mut win32 = Win32PromptInputState::default();
+            let mut mask = |_: &str| Ok(None);
+            let out =
+                rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, encoded, &mut mask)
+                    .unwrap();
+            assert_eq!(out, encoded);
+        }
     }
 
     #[test]
