@@ -39,7 +39,8 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
     "- Use normal shell commands. Pentect routes stdout/stderr through its protected runner and masks tool results.\n",
     "- You may read, fetch, transform, store, sync, and use user-authorized secrets. Pentect is the safety layer; raw secret values must not reach chat.\n",
-    "- Prefer one normal shell command for secret work, e.g. `cat .env`, service CLIs, or a command that reads a source and writes the exact requested destination.\n",
+    "- Prefer generated environment variables for secret values already seen through Pentect. Do not make helper scripts reopen a secret source when an equivalent environment binding is available.\n",
+    "- When a source has not been seen yet, read it once with a normal protected command. Then use its assignment name or generated `PENTECT_...` environment variable in later commands.\n",
     "- Masked handles like `<<NAME_hash>>` work only in this running Pentect-launched session. Use `$env:NAME`/`$env:PENTECT_NAME_hash` on PowerShell or `$NAME`/`$PENTECT_NAME_hash` on Unix.\n",
     "- `pentect view '<handle>'` shows only label, hash, and length. Use handles or generated env vars instead of printing raw values.\n",
     "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:NAME`; on Unix use POSIX commands and `$NAME`.\n",
@@ -4010,6 +4011,13 @@ mod tests {
         assert!(rendered.contains("--enable\nunified_exec"), "{rendered}");
         assert!(rendered.contains("protected runner"), "{rendered}");
         assert!(rendered.contains("tool results"), "{rendered}");
+        assert!(
+            rendered.contains("generated environment variables"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("read it once"), "{rendered}");
+        assert!(rendered.contains("helper scripts"), "{rendered}");
+        assert!(!rendered.contains("cat .env"), "{rendered}");
         assert!(rendered.contains("Masked handles"), "{rendered}");
         assert!(rendered.contains("$env:NAME"), "{rendered}");
         assert!(rendered.contains("user-authorized secrets"), "{rendered}");
@@ -4029,7 +4037,6 @@ mod tests {
         assert!(rendered.contains("user-requested storage"), "{rendered}");
         assert!(rendered.contains("exact requested"), "{rendered}");
         assert!(rendered.contains("local file"), "{rendered}");
-        assert!(rendered.contains("service CLIs"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(
             rendered.contains("Do not disclose raw secrets"),
@@ -4116,6 +4123,13 @@ mod tests {
         assert!(rendered.contains("Use normal shell commands"), "{rendered}");
         assert!(rendered.contains("protected runner"), "{rendered}");
         assert!(rendered.contains("tool results"), "{rendered}");
+        assert!(
+            rendered.contains("generated environment variables"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("read it once"), "{rendered}");
+        assert!(rendered.contains("helper scripts"), "{rendered}");
+        assert!(!rendered.contains("cat .env"), "{rendered}");
         assert!(rendered.contains("$env:NAME"), "{rendered}");
         assert!(rendered.contains("user-authorized secrets"), "{rendered}");
         assert!(
@@ -4134,7 +4148,6 @@ mod tests {
         assert!(rendered.contains("user-requested storage"), "{rendered}");
         assert!(rendered.contains("exact requested"), "{rendered}");
         assert!(rendered.contains("local file"), "{rendered}");
-        assert!(rendered.contains("service CLIs"), "{rendered}");
         assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(
             rendered.contains("Do not disclose raw secrets"),
