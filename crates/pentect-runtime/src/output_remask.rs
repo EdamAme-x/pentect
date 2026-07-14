@@ -120,14 +120,24 @@ impl TerminalOutputRemasker {
                         cursor = sequence_end;
                     }
                     b'P' | b'X' | b'^' | b'_' => {
-                        let Some(end) = string_control_end(&self.pending, cursor + 2) else {
+                        let Some((payload_end, sequence_end)) =
+                            string_control_end(&self.pending, cursor + 2)
+                        else {
                             break;
                         };
                         out.extend(
                             self.matcher
-                                .push_boundary_control(&self.pending[cursor..end]),
+                                .push_boundary_control(&self.pending[cursor..cursor + 2]),
                         );
-                        cursor = end;
+                        out.extend(
+                            self.matcher
+                                .push_text(&self.pending[cursor + 2..payload_end]),
+                        );
+                        out.extend(
+                            self.matcher
+                                .push_boundary_control(&self.pending[payload_end..sequence_end]),
+                        );
+                        cursor = sequence_end;
                     }
                     _ => {
                         out.extend(
@@ -174,14 +184,24 @@ impl TerminalOutputRemasker {
                 continue;
             }
             if matches!(byte, 0x90 | 0x98 | 0x9e | 0x9f) {
-                let Some(end) = string_control_end(&self.pending, cursor + 1) else {
+                let Some((payload_end, sequence_end)) =
+                    string_control_end(&self.pending, cursor + 1)
+                else {
                     break;
                 };
                 out.extend(
                     self.matcher
-                        .push_boundary_control(&self.pending[cursor..end]),
+                        .push_boundary_control(&self.pending[cursor..cursor + 1]),
                 );
-                cursor = end;
+                out.extend(
+                    self.matcher
+                        .push_text(&self.pending[cursor + 1..payload_end]),
+                );
+                out.extend(
+                    self.matcher
+                        .push_boundary_control(&self.pending[payload_end..sequence_end]),
+                );
+                cursor = sequence_end;
                 continue;
             }
             if is_terminal_control(byte) {
@@ -200,8 +220,10 @@ impl TerminalOutputRemasker {
             cursor = end;
         }
         if cursor > 0 {
-            let mut consumed = self.pending.drain(..cursor).collect::<Vec<_>>();
-            consumed.zeroize();
+            let remaining = self.pending.len() - cursor;
+            self.pending.copy_within(cursor.., 0);
+            self.pending[remaining..].zeroize();
+            self.pending.truncate(remaining);
         }
         if self.pending.len() > MAX_PENDING_CONTROL_BYTES {
             self.pending.zeroize();
@@ -374,7 +396,7 @@ fn osc_end(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
     None
 }
 
-fn string_control_end(bytes: &[u8], start: usize) -> Option<usize> {
+fn string_control_end(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
     let mut index = start;
     while index < bytes.len() {
         if let Some(width) = utf8_sequence_width(bytes[index]) {
@@ -391,10 +413,10 @@ fn string_control_end(bytes: &[u8], start: usize) -> Option<usize> {
             }
         }
         if bytes[index] == 0x9c {
-            return Some(index + 1);
+            return Some((index, index + 1));
         }
         if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
-            return Some(index + 2);
+            return Some((index, index + 2));
         }
         index += 1;
     }
@@ -492,6 +514,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_output_remasks_secrets_inside_7_bit_control_strings() {
+        for introducer in [b"\x1bP", b"\x1bX", b"\x1b^", b"\x1b_"] {
+            assert_control_string_remasked(introducer, b"\x1b\\");
+        }
+    }
+
+    #[test]
+    fn terminal_output_remasks_secrets_inside_c1_control_strings() {
+        for introducer in [b"\x90".as_slice(), b"\x98", b"\x9e", b"\x9f"] {
+            assert_control_string_remasked(introducer, b"\x9c");
+        }
+    }
+
+    #[test]
     fn utf8_inside_terminal_strings_is_not_a_c1_terminator() {
         let mut remasker = TerminalOutputRemasker::new(&recovery());
         let mut input = b"\x9d0;title ".to_vec();
@@ -580,5 +616,34 @@ mod tests {
         let mut out = remasker.push(b"\x1b[?1049h\x1b[=15;1u\x1b[?1049l").unwrap();
         out.extend(remasker.finish());
         assert_eq!(out, b"\x1b[?1049h\x1b[>0u\x1b[=15;1u\x1b[<u\x1b[?1049l");
+    }
+
+    fn assert_control_string_remasked(introducer: &[u8], terminator: &[u8]) {
+        let secret = b"sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let mut input = Vec::new();
+        input.extend_from_slice(introducer);
+        input.extend_from_slice(b"key=");
+        input.extend_from_slice(secret);
+        input.extend_from_slice(terminator);
+        input.extend_from_slice(b"after");
+
+        let secret_split = introducer.len() + b"key=sk-ABC".len();
+        let terminator_split = introducer.len() + b"key=".len() + secret.len() + 1;
+        let mut remasker = TerminalOutputRemasker::new(&recovery());
+        let mut out = remasker.push(&input[..secret_split]).unwrap();
+        out.extend(
+            remasker
+                .push(&input[secret_split..terminator_split])
+                .unwrap(),
+        );
+        out.extend(remasker.push(&input[terminator_split..]).unwrap());
+        out.extend(remasker.finish());
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(introducer);
+        expected.extend_from_slice(b"key=<<OPENAI_API_KEY_0011223344556677>>");
+        expected.extend_from_slice(terminator);
+        expected.extend_from_slice(b"after");
+        assert_eq!(out, expected);
     }
 }

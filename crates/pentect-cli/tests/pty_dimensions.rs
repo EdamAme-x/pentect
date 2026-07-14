@@ -310,14 +310,17 @@ fn forward_output(
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if buf[..n]
+                let query_count = buf[..n]
                     .iter()
-                    .any(|byte| observe_dsr(&mut dsr_state, *byte))
-                {
+                    .filter(|byte| observe_dsr(&mut dsr_state, **byte))
+                    .count();
+                if query_count > 0 {
                     let (cols, rows) = unpack_size(terminal_size.load(Ordering::Relaxed));
                     let response = format!("\x1b[{rows};{cols}R");
                     if let Ok(mut writer) = writer.lock() {
-                        let _ = writer.write_all(response.as_bytes());
+                        for _ in 0..query_count {
+                            let _ = writer.write_all(response.as_bytes());
+                        }
                         let _ = writer.flush();
                     }
                 }
@@ -379,10 +382,20 @@ fn join_reader(thread: std::thread::JoinHandle<()>) {
 #[test]
 fn dsr_detection_survives_read_boundaries() {
     let mut state = 0usize;
-    assert!(!b"prefix\x1b["
-        .iter()
-        .any(|byte| observe_dsr(&mut state, *byte)));
-    assert!(b"6n".iter().any(|byte| observe_dsr(&mut state, *byte)));
+    assert_eq!(
+        b"prefix\x1b["
+            .iter()
+            .filter(|byte| observe_dsr(&mut state, **byte))
+            .count(),
+        0
+    );
+    assert_eq!(
+        b"6n\x1b[6n\x1b[6n"
+            .iter()
+            .filter(|byte| observe_dsr(&mut state, **byte))
+            .count(),
+        3
+    );
 }
 
 fn pack_size((cols, rows): (u16, u16)) -> u32 {
