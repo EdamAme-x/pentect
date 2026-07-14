@@ -15,7 +15,7 @@ use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
 use pentect_core::{
     infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
 };
-use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -995,7 +995,7 @@ fn run_interactive_command_pty(
     terminal_guard: &mut terminal::TuiSessionGuard,
 ) -> Result<std::process::ExitStatus, String> {
     let pty_system = native_pty_system();
-    let (cols, rows) = pty_size_without_terminal_query();
+    let (cols, rows) = current_pty_size();
     let pair = pty_system
         .openpty(PtySize {
             rows,
@@ -1023,7 +1023,8 @@ fn run_interactive_command_pty(
         .map_err(|e| format!("could not open '{}': {e}", display.display()))?;
     let output_thread = thread::spawn(move || proxy_pty_output(reader));
     let ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
-    let status = pump_prompt_guarded_pty_input(child.as_mut(), writer);
+    let status =
+        pump_prompt_guarded_pty_input(child.as_mut(), writer, pair.master.as_ref(), (cols, rows));
     drop(ctrl_c_guard);
     drop(pair.master);
     match output_thread.join() {
@@ -1048,9 +1049,28 @@ fn run_interactive_command_pty(
     Ok(exit_status_from_code(status.exit_code()))
 }
 
-fn pty_size_without_terminal_query() -> (u16, u16) {
-    let cols = pty_dimension_from_env("COLUMNS").unwrap_or(120);
-    let rows = pty_dimension_from_env("LINES").unwrap_or(30);
+fn current_pty_size() -> (u16, u16) {
+    select_pty_size(
+        observed_terminal_size(),
+        pty_dimension_from_env("COLUMNS"),
+        pty_dimension_from_env("LINES"),
+    )
+}
+
+fn observed_terminal_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size()
+        .ok()
+        .filter(|(cols, rows)| *cols >= 2 && *rows >= 2)
+}
+
+fn select_pty_size(
+    terminal: Option<(u16, u16)>,
+    env_cols: Option<u16>,
+    env_rows: Option<u16>,
+) -> (u16, u16) {
+    let terminal = terminal.filter(|(cols, rows)| *cols >= 2 && *rows >= 2);
+    let cols = terminal.map(|size| size.0).or(env_cols).unwrap_or(120);
+    let rows = terminal.map(|size| size.1).or(env_rows).unwrap_or(30);
     (cols, rows)
 }
 
@@ -1108,6 +1128,8 @@ fn proxy_pty_output(mut reader: Box<dyn Read + Send>) -> Result<(), String> {
 fn pump_prompt_guarded_pty_input(
     child: &mut dyn PtyChild,
     mut child_stdin: Box<dyn Write + Send>,
+    master: &dyn MasterPty,
+    mut pty_size: (u16, u16),
 ) -> Result<portable_pty::ExitStatus, String> {
     let _raw = RawModeGuard::enable()?;
     let mut protector = PromptInputProtector::default();
@@ -1134,6 +1156,7 @@ fn pump_prompt_guarded_pty_input(
         }
     });
     loop {
+        sync_pty_size(master, &mut pty_size);
         if let Some(status) = child
             .try_wait()
             .map_err(|e| format!("could not poll agent: {e}"))?
@@ -1178,6 +1201,26 @@ fn pump_prompt_guarded_pty_input(
                     .map_err(|e| format!("could not wait for agent: {e}"));
             }
         }
+    }
+}
+
+fn sync_pty_size(master: &dyn MasterPty, current: &mut (u16, u16)) {
+    let Some(next) = observed_terminal_size() else {
+        return;
+    };
+    if next == *current {
+        return;
+    }
+    if master
+        .resize(PtySize {
+            rows: next.1,
+            cols: next.0,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_ok()
+    {
+        *current = next;
     }
 }
 
@@ -2933,6 +2976,16 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_size_tracks_the_real_terminal_before_fallbacks() {
+        assert_eq!(
+            select_pty_size(Some((180, 52)), Some(100), Some(24)),
+            (180, 52)
+        );
+        assert_eq!(select_pty_size(None, Some(100), Some(24)), (100, 24));
+        assert_eq!(select_pty_size(Some((0, 0)), None, None), (120, 30));
+    }
 
     #[test]
     fn read_parse_infers_dotenv_and_defaults_to_strict() {

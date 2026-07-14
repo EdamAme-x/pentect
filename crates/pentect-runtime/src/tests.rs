@@ -2,6 +2,16 @@ use super::*;
 
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn shell_pty_size_tracks_the_real_terminal_before_fallbacks() {
+    assert_eq!(
+        select_pty_size(Some((180, 52)), Some(100), Some(24)),
+        (180, 52)
+    );
+    assert_eq!(select_pty_size(None, Some(100), Some(24)), (100, 24));
+    assert_eq!(select_pty_size(Some((0, 0)), None, None), (120, 30));
+}
+
 struct ScopedCodexExecProxy {
     previous: Option<bool>,
 }

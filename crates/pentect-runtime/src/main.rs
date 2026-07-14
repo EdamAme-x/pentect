@@ -43,7 +43,7 @@ use pentect_core::{
     infer_kind, parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile,
     RegionKind,
 };
-use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, Session};
 use sha2::{Digest, Sha256};
@@ -1403,7 +1403,7 @@ fn run_masked_shell_pty(
         None => interactive_shell_pty_program(),
     };
     let pty_system = native_pty_system();
-    let (cols, rows) = pty_size_without_terminal_query();
+    let (cols, rows) = current_pty_size();
     let pair = pty_system
         .openpty(PtySize {
             rows,
@@ -1440,15 +1440,41 @@ fn run_masked_shell_pty(
         stream_masked_pty_reader(&mut masker, reader, output_suppressor, terminal_responder)?;
         masker.flush()
     });
-    let status = pump_masked_pty_terminal_stdin(child.as_mut(), writer, store, suppressor)?;
+    let status = pump_masked_pty_terminal_stdin(
+        child.as_mut(),
+        writer,
+        store,
+        suppressor,
+        pair.master.as_ref(),
+        (cols, rows),
+    )?;
     drop(pair.master);
     join_stream_thread(output_thread)?;
     Ok(pty_exit_code(status))
 }
 
-fn pty_size_without_terminal_query() -> (u16, u16) {
-    let cols = pty_dimension_from_env("COLUMNS").unwrap_or(120);
-    let rows = pty_dimension_from_env("LINES").unwrap_or(30);
+fn current_pty_size() -> (u16, u16) {
+    select_pty_size(
+        observed_terminal_size(),
+        pty_dimension_from_env("COLUMNS"),
+        pty_dimension_from_env("LINES"),
+    )
+}
+
+fn observed_terminal_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size()
+        .ok()
+        .filter(|(cols, rows)| *cols >= 2 && *rows >= 2)
+}
+
+fn select_pty_size(
+    terminal: Option<(u16, u16)>,
+    env_cols: Option<u16>,
+    env_rows: Option<u16>,
+) -> (u16, u16) {
+    let terminal = terminal.filter(|(cols, rows)| *cols >= 2 && *rows >= 2);
+    let cols = terminal.map(|size| size.0).or(env_cols).unwrap_or(120);
+    let rows = terminal.map(|size| size.1).or(env_rows).unwrap_or(30);
     (cols, rows)
 }
 
@@ -1631,6 +1657,8 @@ fn pump_masked_pty_terminal_stdin(
     child_stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     store: MemoryStore,
     suppressor: PtyEchoSuppressor,
+    master: &dyn MasterPty,
+    mut pty_size: (u16, u16),
 ) -> Result<portable_pty::ExitStatus, String> {
     let _raw = RawModeGuard::enable()?;
     let mut protector = ShellInputProtector::new(store)?;
@@ -1657,6 +1685,7 @@ fn pump_masked_pty_terminal_stdin(
         }
     });
     loop {
+        sync_pty_size(master, &mut pty_size);
         if let Some(status) = child
             .try_wait()
             .map_err(|e| format!("could not poll shell: {e}"))?
@@ -1689,6 +1718,26 @@ fn pump_masked_pty_terminal_stdin(
                     .map_err(|e| format!("could not wait for shell: {e}"));
             }
         }
+    }
+}
+
+fn sync_pty_size(master: &dyn MasterPty, current: &mut (u16, u16)) {
+    let Some(next) = observed_terminal_size() else {
+        return;
+    };
+    if next == *current {
+        return;
+    }
+    if master
+        .resize(PtySize {
+            rows: next.1,
+            cols: next.0,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_ok()
+    {
+        *current = next;
     }
 }
 
