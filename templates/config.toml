@@ -3,13 +3,13 @@
 extensions = []
 # extension data: .pentect/extensions-data/<extension-id>
 
+[log]
+share = true
+
 [agent]
 status_line = true
 codex_app_server_proxy = true
 require_pentect = false
-
-[approval]
-mode = "none"
 
 [image]
 ocr = "on"

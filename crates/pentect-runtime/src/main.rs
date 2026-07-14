@@ -7,34 +7,45 @@
 //! process memory so later tool commands can reuse them without persisting raw
 //! recovery material.
 
-mod approval;
-mod approve_ui;
+mod activity_log;
 mod config;
+mod delegated_process_host;
 mod extension_adapter;
 mod file_pointer_manager;
 mod image_ocr;
-mod in_memory_manager;
 mod masking;
+mod memory_store;
+mod output_remask;
 mod session;
 mod shell;
 
-use approval::{ticket_summary, ApprovalQueue, ApprovalTicket, ApprovalTicketDraft};
-use approve_ui::{ApprovalDecision, ApprovalRequest};
-use config::{approval_bypassed_by_config, approval_config_state};
-use in_memory_manager::{InMemoryManagerClient, ENV_ADDR, ENV_TOKEN};
+pub use activity_log::record_scan as record_scan_activity;
+pub use delegated_process_host::{
+    is_host as delegated_process_host_owned_by, is_running as delegated_process_host_running,
+    persistent_candidate_is_running as persistent_process_host_running,
+    register_candidate as register_process_host_candidate,
+    unregister_candidate as unregister_process_host_candidate,
+};
+use delegated_process_host::{
+    ENV_READ_TOKEN as PROCESS_HOST_READ_TOKEN_ENV, ENV_ROOT as PROCESS_HOST_ROOT_ENV,
+    ENV_WRITE_TOKEN as PROCESS_HOST_WRITE_TOKEN_ENV,
+};
 use masking::{
     contains_unresolved_masked_handle, env_alias_recovery, is_ascii_word_char, is_env_name_byte,
     live_output_kind, mask_read_data, OutputMasker, ToolScalarInput,
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
+pub use memory_store::{open_memory_store_lease, MemoryStoreLease};
+use memory_store::{MemoryStore, MemoryStoreClient, ENV_ADDR, ENV_TOKEN};
+pub use output_remask::ActiveTerminalOutputRemasker;
 use pentect_core::{
     infer_kind, parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile,
     RegionKind,
 };
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, PtySize};
 use serde_json::{json, Value};
-use session::{checked_session_name, session_root, RecoveryStore, Session};
+use session::{checked_session_name, session_root, Session};
 use sha2::{Digest, Sha256};
 use shell::{next_shell_word, powershell_word, shell_quote_unix};
 #[cfg(test)]
@@ -54,7 +65,6 @@ const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_CODEX_EXEC_PROXY_ENV: &str = "PENTECT_CODEX_EXEC_PROXY";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
-const DASHBOARD_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
 const ACTIVE_TOOL_OUTPUT_CACHE_LIMIT: usize = 128;
 const ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES: usize = 16 * 1024;
 const PTY_PARTIAL_FLUSH_TIMEOUT: Duration = Duration::from_millis(30);
@@ -77,18 +87,19 @@ pub fn run() -> i32 {
 
 pub fn run_from(args: Vec<String>) -> i32 {
     match args.get(1).map(String::as_str) {
-        None => cmd_dashboard(&args),
-        Some("dashboard") => cmd_dashboard(&args),
-        Some("--dir" | "--session") => cmd_dashboard(&args),
+        None => {
+            usage();
+            0
+        }
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
         Some("exec") => cmd_exec(&args),
         Some("shell") => cmd_shell(&args),
         Some("resolve") => cmd_resolve(&args),
-        Some("approve") => cmd_approve(&args),
+        Some("log") => cmd_log(&args),
         Some("hook") => cmd_hook(&args),
         Some("bridge") => cmd_bridge(&args),
-        Some("manager") => cmd_in_memory_manager(&args),
+        Some("memory-store") => cmd_memory_store(&args),
         Some("purge") => cmd_purge(&args),
         _ => {
             usage();
@@ -97,15 +108,19 @@ pub fn run_from(args: Vec<String>) -> i32 {
     }
 }
 
-pub fn mask_input_into_active_in_memory_manager(
+pub fn load_decode_config(profile: Profile) -> Result<pentect_core::DecodeConfig, String> {
+    config::decode_config(profile)
+}
+
+pub fn mask_input_into_active_memory_store(
     input: Input,
     profile: Profile,
     packs: Vec<Pack>,
 ) -> Result<Option<MaskResult>, String> {
-    let Some(client) = InMemoryManagerClient::from_env() else {
+    let Some(client) = MemoryStoreClient::from_env() else {
         return Ok(None);
     };
-    mask_input_into_in_memory_manager_client(&client, input, profile, packs).map(Some)
+    mask_input_into_memory_store_client(&client, input, profile, packs).map(Some)
 }
 
 pub fn mask_input_for_read(
@@ -117,8 +132,12 @@ pub fn mask_input_for_read(
     masking::mask_read_input_with_profile(key, input, profile, packs)
 }
 
-fn mask_input_into_in_memory_manager_client(
-    client: &InMemoryManagerClient,
+pub fn record_read_activity(result: &MaskResult, path: &Path) {
+    activity_log::record_mask_result("read", result, Some(path));
+}
+
+fn mask_input_into_memory_store_client(
+    client: &MemoryStoreClient,
     input: Input,
     profile: Profile,
     packs: Vec<Pack>,
@@ -137,7 +156,7 @@ fn mask_input_into_in_memory_manager_client(
 }
 
 pub fn active_masked_count() -> Result<Option<u64>, String> {
-    let Some(client) = InMemoryManagerClient::from_env() else {
+    let Some(client) = MemoryStoreClient::from_env() else {
         return Ok(None);
     };
     client.masked_count().map(Some).map_err(|e| e.to_string())
@@ -158,9 +177,7 @@ pub fn ocr_status() -> &'static str {
     image_ocr::ocr_status()
 }
 
-pub fn redact_tool_images_into_active_in_memory_manager(
-    value: &Value,
-) -> Result<Option<Value>, String> {
+pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Option<Value>, String> {
     if !image_ocr::contains_image_result(value) {
         return Ok(None);
     }
@@ -170,6 +187,7 @@ pub fn redact_tool_images_into_active_in_memory_manager(
     }
     let session = Session::open_capability("default").map_err(|e| e.to_string())?;
     let redaction = image_ocr::redact_tool_images_for_secrets(value, &session.key, &cfg)?;
+    activity_log::record_image(redaction.secret_images, &redaction.notes);
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
         if redaction.unscanned_images > 0 {
             return Err("image blocked: image could not be fetched or scanned.".to_string());
@@ -190,12 +208,12 @@ pub fn redact_tool_images_into_active_in_memory_manager(
     )))
 }
 
-pub fn resolve_text_from_active_in_memory_manager(text: &str) -> Result<Option<String>, String> {
-    if InMemoryManagerClient::from_env().is_none() {
+pub fn resolve_text_from_active_memory_store(text: &str) -> Result<Option<String>, String> {
+    if MemoryStoreClient::from_env().is_none() {
         return Ok(None);
     }
     let session = Session::open_capability("default").map_err(|e| e.to_string())?;
-    let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
+    let store = MemoryStore::for_session(&session);
     let resolved = store.resolve_all(text).map_err(|e| e.to_string())?;
     if contains_unresolved_masked_handle(&resolved) {
         return Err("unknown masked handle in exec-server request".to_string());
@@ -203,37 +221,39 @@ pub fn resolve_text_from_active_in_memory_manager(text: &str) -> Result<Option<S
     Ok(Some(resolved))
 }
 
-pub fn preflight_exec_server_process_start_from_active_in_memory_manager(
+pub fn preflight_exec_server_process_start_from_active_memory_store(
     argv: &[String],
     env: &[(String, String)],
 ) -> Result<Option<Vec<(String, String)>>, String> {
-    if InMemoryManagerClient::from_env().is_none() {
+    if MemoryStoreClient::from_env().is_none() {
         return Ok(None);
     }
     let session_name = default_session_name()?;
     let session = Session::open_capability(&session_name).map_err(|e| e.to_string())?;
-    let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
+    let store = MemoryStore::for_session(&session);
     let argv_mode = ExecMode::Program(argv.to_vec());
     let opts = ExecOpts {
         session: session_name,
         live: false,
-        approve: false,
-        mode: ExecMode::Shell(exec_server_approval_command(&argv_mode, env)),
+        mode: argv_mode,
     };
     prepare_exec_secret_inputs(&store, &opts)?;
-    let approval = exec_approval(&store, &opts)?;
-    let already_allowed = approval_always_granted(&opts.session, &approval)?;
-    if approval.requires_approval() && !already_allowed {
-        match approval_decision_for_exec(&opts.session, &approval)? {
-            ApprovalDecision::Once | ApprovalDecision::Always => {}
-            ApprovalDecision::Decline => return Err("command declined".to_string()),
+    let mut bindings: BTreeMap<String, (String, String)> =
+        requested_env_bindings(&store, &opts.mode)?
+            .into_iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), (name, value)))
+            .collect();
+    for (name, value) in env {
+        let resolved = store.resolve_all(value).map_err(|e| e.to_string())?;
+        if resolved != *value {
+            bindings.insert(name.to_ascii_lowercase(), (name.clone(), resolved));
         }
     }
-    requested_env_bindings(&store, &argv_mode).map(Some)
+    Ok(Some(bindings.into_values().collect()))
 }
 
 pub struct ActiveToolOutputMasker {
-    client: Option<InMemoryManagerClient>,
+    client: Option<MemoryStoreClient>,
     masker: Option<OutputMasker>,
     reported_masked_count: u64,
     cache: HashMap<[u8; 32], CachedToolOutput>,
@@ -247,7 +267,7 @@ struct CachedToolOutput {
 
 impl ActiveToolOutputMasker {
     pub fn new() -> Result<Self, String> {
-        let Some(client) = InMemoryManagerClient::from_env() else {
+        let Some(client) = MemoryStoreClient::from_env() else {
             return Ok(Self {
                 client: None,
                 masker: None,
@@ -257,7 +277,7 @@ impl ActiveToolOutputMasker {
             });
         };
         let session = Session::open_capability("default").map_err(|e| e.to_string())?;
-        let store = RecoveryStore::load(&session).map_err(|e| e.to_string())?;
+        let store = MemoryStore::for_session(&session);
         Ok(Self {
             client: Some(client),
             masker: Some(OutputMasker::new_shared(store)?),
@@ -286,6 +306,7 @@ impl ActiveToolOutputMasker {
             }
         }
         let masked = masker.mask_tool_output(text)?;
+        masker.flush_activity();
         let total = masker.masked_count();
         let delta = total.saturating_sub(self.reported_masked_count);
         self.reported_masked_count = total;
@@ -306,7 +327,8 @@ impl ActiveToolOutputMasker {
         let Some(masker) = &mut self.masker else {
             return Ok(None);
         };
-        let masked = masker.mask_text(text, Kind::Text)?;
+        let masked = masker.mask_prompt_text(text)?;
+        masker.flush_activity();
         let total = masker.masked_count();
         let delta = total.saturating_sub(self.reported_masked_count);
         self.reported_masked_count = total;
@@ -349,32 +371,15 @@ fn tool_output_cache_key(text: &str) -> [u8; 32] {
     key
 }
 
-pub fn mask_tool_output_into_active_in_memory_manager(
-    text: &str,
-) -> Result<Option<String>, String> {
+pub fn mask_tool_output_into_active_memory_store(text: &str) -> Result<Option<String>, String> {
     ActiveToolOutputMasker::new()?.mask_tool_output(text)
 }
 
-pub fn mask_prompt_text_into_active_in_memory_manager(
-    text: &str,
-) -> Result<Option<String>, String> {
+pub fn mask_prompt_text_into_active_memory_store(text: &str) -> Result<Option<String>, String> {
     if text.is_empty() {
         return Ok(None);
     }
     ActiveToolOutputMasker::new()?.mask_prompt_text(text)
-}
-
-fn exec_server_approval_command(mode: &ExecMode, env: &[(String, String)]) -> String {
-    let mut command = display_exec_mode(mode);
-    for (name, value) in env {
-        if contains_pentect_masked_handle(value) {
-            command.push(' ');
-            command.push_str(name);
-            command.push('=');
-            command.push_str(value);
-        }
-    }
-    command
 }
 
 fn usage() {
@@ -384,136 +389,25 @@ fn usage() {
          pentect shell\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
+         pentect log [--json]\n\
          \n\
          exec: masked output\n\
          shell: masked shell\n\
          view: handle\n\
-         resolve: write handles"
+         resolve: write handles\n\
+         log: live events"
     );
 }
 
-fn cmd_dashboard(args: &[String]) -> i32 {
-    let opts = match DashboardOpts::parse(args) {
-        Ok(o) => o,
-        Err(e) => return die(&e),
+fn cmd_log(args: &[String]) -> i32 {
+    let json = match args.get(2).map(String::as_str) {
+        None => false,
+        Some("--json") if args.len() == 3 => true,
+        _ => return die("log [--json]"),
     };
-    if let Some(dir) = &opts.dir {
-        if let Err(e) = std::env::set_current_dir(dir) {
-            return die(format!("could not open directory '{}': {e}", dir.display()));
-        }
-    }
-    let session = match opts.session {
-        Some(session) => session,
-        None => match default_session_name() {
-            Ok(session) => session,
-            Err(e) => return die(&e),
-        },
-    };
-    match run_dashboard(&session) {
+    match activity_log::follow(json) {
         Ok(()) => 0,
-        Err(e) => die(&e),
-    }
-}
-
-fn dashboard_request(session: &str) -> Result<ApprovalRequest, String> {
-    let cwd = std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?;
-    let manager = Session::in_memory_manager_status(session).map_err(|e| e.to_string())?;
-    let manager_line = match &manager {
-        Some(status) => format!("active ({status})"),
-        None => "not created yet".to_string(),
-    };
-    let implicit_session = default_session_name().is_ok_and(|default| default == session);
-    let body = if implicit_session {
-        format!("{}\nmemory: {manager_line}", cwd.display())
-    } else {
-        format!(
-            "{}\nsession: {session}\nmemory: {manager_line}",
-            cwd.display()
-        )
-    };
-    let warnings = if manager.is_some() {
-        vec!["In-memory manager is active for this process tree.".to_string()]
-    } else {
-        Vec::new()
-    };
-    Ok(ApprovalRequest {
-        prompt: "status".to_string(),
-        body,
-        approve_label: "close".to_string(),
-        deny_label: "close".to_string(),
-        allow_always: false,
-        warnings,
-    })
-}
-
-fn run_dashboard(session: &str) -> Result<(), String> {
-    let queue = ApprovalQueue::open_dashboard(session)?;
-    let heartbeat_queue = queue.clone();
-    let _heartbeat_thread = std::thread::spawn(move || loop {
-        let _ = heartbeat_queue.heartbeat();
-        std::thread::sleep(Duration::from_millis(500));
-    });
-
-    print_dashboard_status(session, &queue)?;
-    loop {
-        if approval_bypassed_by_config()? {
-            print_dashboard_status(session, &queue)?;
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
-        }
-        if let Some(ticket) = queue.next_pending()? {
-            let request = ApprovalRequest {
-                prompt: "secret".to_string(),
-                body: ticket_summary(&ticket),
-                approve_label: "once".to_string(),
-                deny_label: "decline".to_string(),
-                allow_always: true,
-                warnings: ticket_warnings(&ticket),
-            };
-            let decision = approve_ui::run(&request).map_err(|e| e.to_string())?;
-            queue.decide(&ticket, decision, "ui")?;
-            print_dashboard_status(session, &queue)?;
-        } else {
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    }
-}
-
-fn print_dashboard_status(session: &str, queue: &ApprovalQueue) -> Result<(), String> {
-    let request = dashboard_request(session)?;
-    let config = approval_config_state()?;
-    print!("\x1b[2J\x1b[H");
-    println!("pentect");
-    println!("{}", request.body);
-    println!();
-    if config.effective_no_approve {
-        println!(
-            "approval: no-approve ({})",
-            approval_source_label(config.effective_source)
-        );
-    } else {
-        println!(
-            "approval: required ({})",
-            approval_source_label(config.effective_source)
-        );
-    }
-    let history = queue.recent_history(5)?;
-    if !history.is_empty() {
-        println!();
-        println!("history");
-        for line in history {
-            println!("{line}");
-        }
-    }
-    let _ = std::io::stdout().flush();
-    Ok(())
-}
-
-fn approval_source_label(source: config::ApprovalConfigSource) -> &'static str {
-    match source {
-        config::ApprovalConfigSource::Project => "project config",
-        config::ApprovalConfigSource::Global => "global config",
-        config::ApprovalConfigSource::Default => "default",
+        Err(error) => die(&error),
     }
 }
 
@@ -529,19 +423,25 @@ fn cmd_read(args: &[String]) -> i32 {
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
     let source = data.clone();
     let input = Input { kind, data };
-    match mask_input_into_active_in_memory_manager(input.clone(), Profile::Strict, Vec::new()) {
+    match mask_input_into_active_memory_store(input.clone(), Profile::Strict, Vec::new()) {
         Ok(Some(result)) => {
             register_read_file_pointers(&opts.path, &input.data, &result, opts.input_format);
+            activity_log::record_mask_result("read", &result, Some(&opts.path));
             print_read_result(result, opts.emit_meta);
             return 0;
         }
         Ok(None) => {}
         Err(e) => return die(&e),
     }
-    let engine = Engine::with_profile(Profile::Strict);
+    let decode = match config::decode_config(Profile::Strict) {
+        Ok(config) => config,
+        Err(error) => return die(&error),
+    };
+    let engine = Engine::with_profile_and_decode_config(Profile::Strict, decode);
     let cfg = Config::generate();
     let result = engine.mask(input, &cfg);
     register_read_file_pointers(&opts.path, &source, &result, opts.input_format);
+    activity_log::record_mask_result("read", &result, Some(&opts.path));
     print_read_result(result, opts.emit_meta);
     0
 }
@@ -594,7 +494,7 @@ fn cmd_view(args: &[String]) -> i32 {
 }
 
 pub fn active_handle_length(handle: &str) -> Result<Option<usize>, String> {
-    let Some(client) = InMemoryManagerClient::from_env() else {
+    let Some(client) = MemoryStoreClient::from_env() else {
         return Ok(file_pointer_manager::handle_length(handle));
     };
     let snapshot = client.snapshot().map_err(|e| e.to_string())?;
@@ -628,46 +528,9 @@ fn cmd_exec(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let store = match RecoveryStore::load(&session) {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
+    let store = MemoryStore::for_session(&session);
     if let Err(e) = prepare_exec_secret_inputs(&store, &opts) {
         return die(&e);
-    }
-    let approval = match exec_approval(&store, &opts) {
-        Ok(approval) => approval,
-        Err(e) => return die(&e),
-    };
-    let already_allowed = match approval_always_granted(&opts.session, &approval) {
-        Ok(allowed) => allowed,
-        Err(e) => return die(&e),
-    };
-    if opts.approve {
-        match request_approval(&opts, &approval, false) {
-            Ok(ApprovalDecision::Once) => {}
-            Ok(ApprovalDecision::Always) => {
-                if let Err(e) = ApprovalQueue::open(&opts.session).and_then(|queue| {
-                    queue.record(&approval.ticket(), ApprovalDecision::Always, "local")
-                }) {
-                    return die(&e);
-                }
-            }
-            Ok(ApprovalDecision::Decline) => {
-                eprintln!("[pentect] command declined");
-                return 1;
-            }
-            Err(e) => return die(&e),
-        }
-    } else if approval.requires_approval() && !already_allowed {
-        match approval_decision_for_exec(&opts.session, &approval) {
-            Ok(ApprovalDecision::Once | ApprovalDecision::Always) => {}
-            Ok(ApprovalDecision::Decline) => {
-                eprintln!("[pentect] command declined");
-                return 1;
-            }
-            Err(e) => return die(&e),
-        }
     }
     if opts.live {
         let status = match run_resolved_command_live(&store, &opts) {
@@ -717,10 +580,7 @@ fn cmd_shell(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let store = match RecoveryStore::load(&session) {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
+    let store = MemoryStore::for_session(&session);
     match run_masked_shell(store, &opts) {
         Ok(code) => code,
         Err(e) => die(&e),
@@ -736,20 +596,9 @@ fn cmd_resolve(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let store = match RecoveryStore::load(&session) {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
+    let store = MemoryStore::for_session(&session);
     match opts.mode {
         ResolveMode::Files(paths) => {
-            match approval_decision_for_resolve(&opts.session, &paths) {
-                Ok(ApprovalDecision::Once | ApprovalDecision::Always) => {}
-                Ok(ApprovalDecision::Decline) => {
-                    eprintln!("[pentect] resolve declined");
-                    return 1;
-                }
-                Err(e) => return die(&e),
-            }
             for path in &paths {
                 if let Err(e) = resolve_path_in_place(&store, path) {
                     return die(&e);
@@ -767,105 +616,13 @@ fn cmd_resolve(args: &[String]) -> i32 {
                 Err(e) => return die(&e),
             };
             if resolved != input {
-                match approval_decision_for_resolve_stdin(&opts.session, &input) {
-                    Ok(ApprovalDecision::Once | ApprovalDecision::Always) => {}
-                    Ok(ApprovalDecision::Decline) => {
-                        eprintln!("[pentect] resolve declined");
-                        return 1;
-                    }
-                    Err(e) => return die(&e),
-                }
+                activity_log::record_resolve("stdin", None);
             }
             print!("{resolved}");
             let _ = std::io::stdout().flush();
         }
     }
     0
-}
-
-fn approval_decision_for_resolve(
-    session: &str,
-    paths: &[PathBuf],
-) -> Result<ApprovalDecision, String> {
-    let ticket = resolve_approval_ticket(paths);
-    if ApprovalQueue::open(session)?.always_granted(&ticket.fingerprint) {
-        return Ok(ApprovalDecision::Always);
-    }
-    approval_decision_for_ticket(session, &ticket)
-}
-
-fn approval_decision_for_resolve_stdin(
-    session: &str,
-    input: &str,
-) -> Result<ApprovalDecision, String> {
-    let ticket = resolve_stdin_approval_ticket(input);
-    if ApprovalQueue::open(session)?.always_granted(&ticket.fingerprint) {
-        return Ok(ApprovalDecision::Always);
-    }
-    approval_decision_for_ticket(session, &ticket)
-}
-
-fn resolve_approval_ticket(paths: &[PathBuf]) -> ApprovalTicket {
-    let command = format!(
-        "pentect resolve {}",
-        paths
-            .iter()
-            .map(|path| shell_quote_path(path))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let mut material = String::from("resolve-local-write-v1\0");
-    material.push_str(&command);
-    material.push('\0');
-    for path in paths {
-        material.push_str(&path.to_string_lossy());
-        material.push('\0');
-        if let Ok(input) = read_input(path, InputFormat::Text) {
-            material.push_str(&secret_value_hash(&input));
-        }
-        material.push('\0');
-    }
-    let digest = Sha256::digest(material.as_bytes());
-    ApprovalTicket::new(ApprovalTicketDraft {
-        fingerprint: data_encoding::HEXLOWER.encode(&digest[..16]),
-        command,
-        env_names: Vec::new(),
-        secret_files: paths
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect(),
-        direct_handles: 0,
-        destinations: Vec::new(),
-        may_send_network: false,
-        may_write_local_file: true,
-    })
-}
-
-fn resolve_stdin_approval_ticket(input: &str) -> ApprovalTicket {
-    let command = "pentect resolve <stdin>".to_string();
-    let mut material = String::from("resolve-stdin-local-write-v1\0");
-    material.push_str(&secret_value_hash(input));
-    material.push('\0');
-    let digest = Sha256::digest(material.as_bytes());
-    ApprovalTicket::new(ApprovalTicketDraft {
-        fingerprint: data_encoding::HEXLOWER.encode(&digest[..16]),
-        command,
-        env_names: Vec::new(),
-        secret_files: Vec::new(),
-        direct_handles: masked_handles_in_text(input).len(),
-        destinations: Vec::new(),
-        may_send_network: false,
-        may_write_local_file: true,
-    })
-}
-
-fn shell_quote_path(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    if cfg!(windows) {
-        powershell_word(&value)
-    } else {
-        shell_quote_unix(&value)
-    }
 }
 
 fn exec_help() {
@@ -878,7 +635,6 @@ fn exec_help() {
             "stdout/stderr: masked\n",
             "handles: in memory\n",
             "env: $env:KEY or $KEY\n",
-            "approve: .pentect/config.toml\n",
         )
     );
 }
@@ -894,39 +650,6 @@ fn shell_help() {
             "codex/claude: pentect wrapped\n",
         )
     );
-}
-
-fn cmd_approve(args: &[String]) -> i32 {
-    let opts = match ExecOpts::parse(args).and_then(prepare_stdin_exec_opts) {
-        Ok(o) => o,
-        Err(e) => return die(&e),
-    };
-    let session = match Session::open_capability(&opts.session) {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
-    let store = match RecoveryStore::load(&session) {
-        Ok(s) => s,
-        Err(e) => return die(&e),
-    };
-    if let Err(e) = prepare_exec_secret_inputs(&store, &opts) {
-        return die(&e);
-    }
-    let approval = match exec_approval(&store, &opts) {
-        Ok(approval) => approval,
-        Err(e) => return die(&e),
-    };
-    match request_approval(&opts, &approval, true) {
-        Ok(ApprovalDecision::Once) => 0,
-        Ok(ApprovalDecision::Always) => match ApprovalQueue::open(&opts.session)
-            .and_then(|queue| queue.record(&approval.ticket(), ApprovalDecision::Always, "local"))
-        {
-            Ok(()) => 0,
-            Err(e) => die(&e),
-        },
-        Ok(ApprovalDecision::Decline) => 1,
-        Err(e) => die(&e),
-    }
 }
 
 fn cmd_purge(args: &[String]) -> i32 {
@@ -948,430 +671,19 @@ fn cmd_purge(args: &[String]) -> i32 {
     0
 }
 
-fn cmd_in_memory_manager(args: &[String]) -> i32 {
+fn cmd_memory_store(args: &[String]) -> i32 {
     match args.get(2).map(String::as_str) {
-        Some("--serve") if args.len() == 3 => in_memory_manager::serve_in_memory_manager(),
-        _ => die("manager accepts only `--serve`"),
+        Some("--serve") if args.len() == 3 => memory_store::serve_memory_store(),
+        _ => die("memory-store accepts only `--serve`"),
     }
 }
 
-fn request_approval(
-    opts: &ExecOpts,
-    approval: &ExecApproval,
-    preview: bool,
-) -> Result<ApprovalDecision, String> {
-    if approval_bypassed_by_config()? {
-        return Ok(ApprovalDecision::Once);
-    }
-    let request = ApprovalRequest {
-        prompt: if preview {
-            "preview".to_string()
-        } else {
-            "run".to_string()
-        },
-        body: approval.body(),
-        approve_label: "once".to_string(),
-        deny_label: "decline".to_string(),
-        allow_always: true,
-        warnings: approval_warnings(opts, approval),
-    };
-    approve_ui::run(&request).map_err(|e| e.to_string())
-}
-
-fn approval_warnings(opts: &ExecOpts, approval: &ExecApproval) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if opts.live {
-        warnings.push("live output is masked in chunks".to_string());
-    }
-    if !approval.secret_files.is_empty() {
-        warnings.push("this command can read local secret file content".to_string());
-    }
-    if approval.may_send_network && approval.requires_approval() {
-        warnings.push("this command may send approved secrets to the network".to_string());
-    }
-    if approval.may_write_local_file && approval.requires_approval() {
-        warnings.push("this command may write approved secrets to local files".to_string());
-    }
-    warnings
-}
-
-fn approval_decision_for_exec(
-    session: &str,
-    approval: &ExecApproval,
-) -> Result<ApprovalDecision, String> {
-    let ticket = approval.ticket();
-    approval_decision_for_ticket(session, &ticket)
-}
-
-fn approval_decision_for_ticket(
-    session: &str,
-    ticket: &ApprovalTicket,
-) -> Result<ApprovalDecision, String> {
-    if approval_bypassed_by_config()? {
-        return Ok(ApprovalDecision::Once);
-    }
-    let queue = ApprovalQueue::open(session)?;
-    if !queue.dashboard_alive(DASHBOARD_HEARTBEAT_MAX_AGE) {
-        queue.record(ticket, ApprovalDecision::Decline, "auto")?;
-        return Err(
-            "approval needed; run `pentect` or set `.pentect/config.toml` no_approve = true."
-                .to_string(),
-        );
-    }
-    queue.submit(ticket)?;
-    queue.wait_for_decision(ticket, DASHBOARD_HEARTBEAT_MAX_AGE)
-}
-
-fn ticket_warnings(ticket: &ApprovalTicket) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if ticket.may_send_network {
-        warnings.push("may send secret".to_string());
-    }
-    if ticket.may_write_local_file {
-        warnings.push("may write secret".to_string());
-    }
-    warnings
-}
-
-#[derive(Debug)]
-struct ExecApproval {
-    command: String,
-    env_refs: Vec<EnvApprovalRef>,
-    secret_files: Vec<SecretFileRef>,
-    direct_handles: Vec<String>,
-    destinations: Vec<String>,
-    may_send_network: bool,
-    may_write_local_file: bool,
-}
-
-#[derive(Debug)]
-struct EnvApprovalRef {
-    name: String,
-    value_hash: String,
-}
-
-#[derive(Debug)]
-struct SecretFileRef {
-    path: String,
-    value_hashes: Vec<String>,
-}
-
-impl ExecApproval {
-    fn requires_approval(&self) -> bool {
-        !self.env_refs.is_empty()
-            || !self.secret_files.is_empty()
-            || !self.direct_handles.is_empty()
-            || self.may_send_network
-    }
-
-    fn env_names(&self) -> Vec<String> {
-        self.env_refs.iter().map(|env| env.name.clone()).collect()
-    }
-
-    fn fingerprint(&self) -> String {
-        let mut material = String::new();
-        material.push_str("approval-v1\0");
-        material.push_str(&self.command);
-        material.push('\0');
-        for env in &self.env_refs {
-            material.push_str(&env.name);
-            material.push('\0');
-            material.push_str(&env.value_hash);
-            material.push('\0');
-        }
-        material.push_str("files:");
-        for file in &self.secret_files {
-            material.push_str(&file.path);
-            material.push('\0');
-            for hash in &file.value_hashes {
-                material.push_str(hash);
-                material.push('\0');
-            }
-        }
-        material.push_str("handles:");
-        for handle in &self.direct_handles {
-            material.push_str(handle);
-            material.push('\0');
-        }
-        material.push_str("network:");
-        material.push_str(if self.may_send_network {
-            "true"
-        } else {
-            "false"
-        });
-        material.push('\0');
-        material.push_str("local-write:");
-        material.push_str(if self.may_write_local_file {
-            "true"
-        } else {
-            "false"
-        });
-        material.push('\0');
-        let digest = Sha256::digest(material.as_bytes());
-        data_encoding::HEXLOWER.encode(&digest[..16])
-    }
-
-    fn body(&self) -> String {
-        let mut lines = vec!["command".to_string(), self.command.clone()];
-        if self.requires_approval() {
-            lines.push(String::new());
-            let env_names = self.env_names();
-            if !env_names.is_empty() {
-                lines.push(format!("secret {}", env_names.join(", ")));
-            }
-            if !self.secret_files.is_empty() {
-                lines.push(format!(
-                    "file {}",
-                    self.secret_files
-                        .iter()
-                        .map(|file| file.path.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if !self.direct_handles.is_empty() {
-                lines.push(format!("handles {}", self.direct_handles.len()));
-            }
-            if !self.destinations.is_empty() {
-                lines.push(format!("send {}", self.destinations.join(", ")));
-            } else if self.may_send_network {
-                lines.push("send possible".to_string());
-            }
-            if self.may_write_local_file {
-                lines.push("write local file".to_string());
-            }
-        } else {
-            lines.push(String::new());
-            lines.push("no secret".to_string());
-        }
-        lines.join("\n")
-    }
-
-    fn ticket(&self) -> ApprovalTicket {
-        ApprovalTicket::new(ApprovalTicketDraft {
-            fingerprint: self.fingerprint(),
-            command: self.command.clone(),
-            env_names: self.env_names(),
-            secret_files: self
-                .secret_files
-                .iter()
-                .map(|file| file.path.clone())
-                .collect(),
-            direct_handles: self.direct_handles.len(),
-            destinations: self.destinations.clone(),
-            may_send_network: self.may_send_network,
-            may_write_local_file: self.may_write_local_file,
-        })
-    }
-}
-
-fn exec_approval(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExecApproval, String> {
-    let command = display_exec_mode(&opts.mode);
-    let env = requested_env_bindings(store, &opts.mode)?;
-    let mut env_refs = env
-        .into_iter()
-        .map(|(name, value)| EnvApprovalRef {
-            name,
-            value_hash: secret_value_hash(&value),
-        })
-        .collect::<Vec<_>>();
-    env_refs.sort_by_key(|env| env.name.to_ascii_lowercase());
-    env_refs.dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name));
-    let secret_files = secret_file_refs_for_mode(store, &opts.mode)?;
-    let direct_handles = masked_handles_in_mode(&opts.mode);
-    let destinations = network_destinations(&command);
-    let may_send_network = !destinations.is_empty() || command_may_send_network(&command);
-    let may_write_local_file = command_may_write_local_file(&command);
-    Ok(ExecApproval {
-        command,
-        env_refs,
-        secret_files,
-        direct_handles,
-        destinations,
-        may_send_network,
-        may_write_local_file,
-    })
-}
-
-fn approval_always_granted(session: &str, approval: &ExecApproval) -> Result<bool, String> {
-    if !approval.requires_approval() {
-        return Ok(false);
-    }
-    Ok(ApprovalQueue::open(session)?.always_granted(&approval.fingerprint()))
-}
-
-fn prepare_exec_secret_inputs(store: &RecoveryStore, opts: &ExecOpts) -> Result<(), String> {
+fn prepare_exec_secret_inputs(store: &MemoryStore, opts: &ExecOpts) -> Result<(), String> {
     if let ExecMode::Shell(command) = &opts.mode {
         let command = resolve_command_text(store, command)?;
         register_local_file_inputs(store, &command)?;
     }
     Ok(())
-}
-
-fn secret_file_refs_for_mode(
-    store: &RecoveryStore,
-    mode: &ExecMode,
-) -> Result<Vec<SecretFileRef>, String> {
-    let ExecMode::Shell(command) = mode else {
-        return Ok(Vec::new());
-    };
-    let command = resolve_command_text(store, command)?;
-    secret_file_refs_for_script(&command)
-}
-
-fn secret_file_refs_for_script(script: &str) -> Result<Vec<SecretFileRef>, String> {
-    let mut refs = Vec::new();
-    let mut seen = BTreeSet::new();
-    let engine = Engine::with_profile(Profile::Strict);
-    let cfg = Config::generate();
-    for path in local_file_input_paths(script) {
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(input) = read_input(&path, InputFormat::Text) else {
-            continue;
-        };
-        let value_hash = secret_value_hash(&input);
-        let result = engine.mask(
-            Input {
-                kind: infer_kind(&path),
-                data: input,
-            },
-            &cfg,
-        );
-        if result.recovery.is_empty() {
-            continue;
-        }
-        let display = path.to_string_lossy().to_string();
-        if !seen.insert(display.clone()) {
-            continue;
-        }
-        refs.push(SecretFileRef {
-            path: display,
-            value_hashes: vec![value_hash],
-        });
-    }
-    Ok(refs)
-}
-
-fn secret_value_hash(value: &str) -> String {
-    let digest = Sha256::digest(value.as_bytes());
-    data_encoding::HEXLOWER.encode(&digest[..16])
-}
-
-fn masked_handles_in_mode(mode: &ExecMode) -> Vec<String> {
-    let text = match mode {
-        ExecMode::Shell(command) => command.clone(),
-        ExecMode::Program(args) => args.join(" "),
-        ExecMode::Stdin => String::new(),
-    };
-    masked_handles_in_text(&text)
-}
-
-fn masked_handles_in_text(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut offset = 0usize;
-    while let Some(start) = text[offset..].find("<<") {
-        let start = offset + start;
-        let Some(end_rel) = text[start + 2..].find(">>") else {
-            break;
-        };
-        let end = start + 2 + end_rel + 2;
-        let handle = &text[start..end];
-        if !handle.starts_with("<<PENTECT_APPROVAL_")
-            && !out.iter().any(|existing| existing == handle)
-        {
-            out.push(handle.to_string());
-        }
-        offset = end;
-    }
-    out
-}
-
-fn network_destinations(command: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cursor = 0usize;
-    while let Some((word, _, next)) = next_shell_word(command, cursor) {
-        let cleaned = word.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ')' | ']'));
-        if (cleaned.starts_with("https://") || cleaned.starts_with("http://"))
-            && !out.iter().any(|existing| existing == cleaned)
-        {
-            out.push(cleaned.to_string());
-        }
-        cursor = next;
-    }
-    out
-}
-
-fn command_may_send_network(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    let mut cursor = 0usize;
-    while let Some((word, _, next)) = next_shell_word(&lower, cursor) {
-        let word = word.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | '(' | ')'));
-        if matches!(
-            word,
-            "curl"
-                | "curl.exe"
-                | "wget"
-                | "wget.exe"
-                | "ssh"
-                | "scp"
-                | "gh"
-                | "http"
-                | "httpie"
-                | "invoke-restmethod"
-                | "invoke-webrequest"
-                | "irm"
-                | "iwr"
-        ) {
-            return true;
-        }
-        cursor = next;
-    }
-    lower.contains("://")
-}
-
-fn command_may_write_local_file(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    let mut cursor = 0usize;
-    while let Some((word, _, next)) = next_shell_word(&lower, cursor) {
-        let word = word.trim_matches(|ch: char| matches!(ch, '\'' | '"' | ',' | ';' | '(' | ')'));
-        if matches!(
-            word,
-            "set-content" | "add-content" | "out-file" | "tee-object" | "sc" | "ac"
-        ) || word.contains("::writealltext")
-            || looks_like_shell_redirection(word)
-        {
-            return true;
-        }
-        cursor = next;
-    }
-    false
-}
-
-fn looks_like_shell_redirection(word: &str) -> bool {
-    if !word.contains('>') {
-        return false;
-    }
-    !word.contains("=>")
-}
-
-fn display_exec_mode(mode: &ExecMode) -> String {
-    match mode {
-        ExecMode::Shell(command) => command.clone(),
-        ExecMode::Program(args) => args
-            .iter()
-            .map(|arg| {
-                if cfg!(windows) {
-                    powershell_word(arg)
-                } else {
-                    shell_quote_unix(arg)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-        ExecMode::Stdin => "<stdin>".to_string(),
-    }
 }
 
 fn cmd_hook(args: &[String]) -> i32 {
@@ -1585,7 +897,7 @@ fn open_hook_session(cli: bool, session_name: &str) -> Result<Session, String> {
 }
 
 fn run_resolved_command(
-    store: &RecoveryStore,
+    store: &MemoryStore,
     opts: &ExecOpts,
 ) -> Result<std::process::Output, String> {
     match &opts.mode {
@@ -1614,7 +926,7 @@ fn run_resolved_command(
     }
 }
 
-fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<ExitStatus, String> {
+fn run_resolved_command_live(store: &MemoryStore, opts: &ExecOpts) -> Result<ExitStatus, String> {
     match &opts.mode {
         ExecMode::Program(args) => {
             if args.is_empty() {
@@ -1641,13 +953,13 @@ fn run_resolved_command_live(store: &RecoveryStore, opts: &ExecOpts) -> Result<E
     }
 }
 
-fn resolve_command_args(store: &RecoveryStore, args: &[String]) -> Result<Vec<String>, String> {
+fn resolve_command_args(store: &MemoryStore, args: &[String]) -> Result<Vec<String>, String> {
     args.iter()
         .map(|arg| resolve_command_text(store, arg))
         .collect()
 }
 
-fn resolve_command_text(store: &RecoveryStore, text: &str) -> Result<String, String> {
+fn resolve_command_text(store: &MemoryStore, text: &str) -> Result<String, String> {
     let resolved = store.resolve_all(text).map_err(|e| e.to_string())?;
     if contains_unresolved_masked_handle(&resolved) {
         return Err(
@@ -1658,7 +970,7 @@ fn resolve_command_text(store: &RecoveryStore, text: &str) -> Result<String, Str
     Ok(resolved)
 }
 
-fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), String> {
+fn resolve_path_in_place(store: &MemoryStore, path: &Path) -> Result<(), String> {
     if path == Path::new("-") {
         return Err("resolve requires a real file path".to_string());
     }
@@ -1672,6 +984,7 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
     if resolved != input {
         std::fs::write(&path, resolved)
             .map_err(|e| format!("could not write '{}': {e}", path.display()))?;
+        activity_log::record_resolve("file", Some(&path));
     }
     Ok(())
 }
@@ -1679,6 +992,9 @@ fn resolve_path_in_place(store: &RecoveryStore, path: &Path) -> Result<(), Strin
 fn apply_child_env_overlays(command: &mut Command, env: &[(String, String)], session: &str) {
     command.env_remove(ENV_ADDR);
     command.env_remove(ENV_TOKEN);
+    command.env_remove(PROCESS_HOST_READ_TOKEN_ENV);
+    command.env_remove(PROCESS_HOST_WRITE_TOKEN_ENV);
+    command.env_remove(PROCESS_HOST_ROOT_ENV);
     command.env_remove(PENTECT_AGENT_LAUNCHED_ENV);
     apply_env_bindings(command, env);
     apply_pentect_session(command, session);
@@ -1695,7 +1011,7 @@ fn apply_pentect_session(command: &mut Command, session: &str) {
 }
 
 fn requested_env_bindings(
-    store: &RecoveryStore,
+    store: &MemoryStore,
     mode: &ExecMode,
 ) -> Result<Vec<(String, String)>, String> {
     let available = store.auto_env_bindings().map_err(|e| e.to_string())?;
@@ -1846,7 +1162,7 @@ fn collect_printenv_refs(text: &str, out: &mut BTreeSet<String>) {
     }
 }
 
-fn register_local_file_inputs(store: &RecoveryStore, script: &str) -> Result<(), String> {
+fn register_local_file_inputs(store: &MemoryStore, script: &str) -> Result<(), String> {
     let paths = local_file_input_paths(script);
     if paths.is_empty() {
         return Ok(());
@@ -1966,7 +1282,7 @@ enum StreamTarget {
 fn run_live_command(
     mut command: Command,
     stdin_script: Option<&str>,
-    store: RecoveryStore,
+    store: MemoryStore,
 ) -> Result<ExitStatus, String> {
     live_status("streaming masked command output");
     if stdin_script.is_some() {
@@ -2015,7 +1331,7 @@ fn run_live_command(
     Ok(status)
 }
 
-fn run_masked_shell(store: RecoveryStore, opts: &ShellOpts) -> Result<i32, String> {
+fn run_masked_shell(store: MemoryStore, opts: &ShellOpts) -> Result<i32, String> {
     let shim = ShellShimDir::install()?;
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         run_masked_shell_pty(store, opts, &shim)
@@ -2025,7 +1341,7 @@ fn run_masked_shell(store: RecoveryStore, opts: &ShellOpts) -> Result<i32, Strin
 }
 
 fn run_masked_shell_pipe(
-    store: RecoveryStore,
+    store: MemoryStore,
     opts: &ShellOpts,
     shim: &ShellShimDir,
 ) -> Result<i32, String> {
@@ -2034,7 +1350,7 @@ fn run_masked_shell_pipe(
         None => interactive_shell_pipe_command(),
     };
     apply_child_env_overlays(&mut command, &[], &opts.session);
-    apply_active_in_memory_manager_env(&mut command);
+    apply_active_memory_store_env(&mut command);
     shim.apply_to_command(&mut command);
     command
         .stdin(Stdio::piped())
@@ -2078,7 +1394,7 @@ fn run_masked_shell_pipe(
 }
 
 fn run_masked_shell_pty(
-    store: RecoveryStore,
+    store: MemoryStore,
     opts: &ShellOpts,
     shim: &ShellShimDir,
 ) -> Result<i32, String> {
@@ -2269,7 +1585,7 @@ fn pump_plain_stdin_until_exit(
 fn pump_masked_terminal_stdin(
     child: &mut std::process::Child,
     mut child_stdin: std::process::ChildStdin,
-    store: RecoveryStore,
+    store: MemoryStore,
 ) -> Result<ExitStatus, String> {
     let _raw = RawModeGuard::enable()?;
     let mut line_stars = 0usize;
@@ -2313,7 +1629,7 @@ fn pump_masked_terminal_stdin(
 fn pump_masked_pty_terminal_stdin(
     child: &mut dyn PtyChild,
     child_stdin: Arc<Mutex<Box<dyn Write + Send>>>,
-    store: RecoveryStore,
+    store: MemoryStore,
     suppressor: PtyEchoSuppressor,
 ) -> Result<portable_pty::ExitStatus, String> {
     let _raw = RawModeGuard::enable()?;
@@ -2767,7 +2083,7 @@ struct ProtectedPaste {
 
 struct ShellInputProtector {
     masker: OutputMasker,
-    store: RecoveryStore,
+    store: MemoryStore,
     syntax: ShellSyntax,
     defined_env: BTreeSet<String>,
     pty_pending: Vec<u8>,
@@ -2775,7 +2091,7 @@ struct ShellInputProtector {
 }
 
 impl ShellInputProtector {
-    fn new(store: RecoveryStore) -> Result<Self, String> {
+    fn new(store: MemoryStore) -> Result<Self, String> {
         Ok(Self {
             masker: OutputMasker::new_shared(store.clone())?,
             store,
@@ -2853,9 +2169,27 @@ struct ShellEnvBinding {
     value: String,
 }
 
+fn masked_handles_in_text(text: &str) -> Vec<String> {
+    let mut handles = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = text[cursor..].find("<<") {
+        let start = cursor + relative_start;
+        let Some(relative_end) = text[start + 2..].find(">>") else {
+            break;
+        };
+        let end = start + 2 + relative_end + 2;
+        let candidate = &text[start..end];
+        if parse_placeholder(candidate).is_ok() && !handles.iter().any(|item| item == candidate) {
+            handles.push(candidate.to_string());
+        }
+        cursor = end;
+    }
+    handles
+}
+
 fn replace_masked_handles_with_env_refs(
     masked: &str,
-    store: &RecoveryStore,
+    store: &MemoryStore,
     syntax: ShellSyntax,
 ) -> Result<(String, Vec<ShellEnvBinding>), String> {
     let handles = masked_handles_in_text(masked);
@@ -2880,7 +2214,7 @@ fn replace_masked_handles_with_env_refs(
     Ok((out, bindings))
 }
 
-fn apply_active_in_memory_manager_env(command: &mut Command) {
+fn apply_active_memory_store_env(command: &mut Command) {
     let (Some(addr), Some(token)) = (std::env::var_os(ENV_ADDR), std::env::var_os(ENV_TOKEN))
     else {
         return;
@@ -2890,18 +2224,47 @@ fn apply_active_in_memory_manager_env(command: &mut Command) {
     }
     command.env(ENV_ADDR, addr);
     command.env(ENV_TOKEN, &token);
+    apply_process_host_env(command);
     command.env(PENTECT_AGENT_LAUNCHED_ENV, token);
+}
+
+fn apply_process_host_env(command: &mut Command) {
+    for name in [
+        PROCESS_HOST_READ_TOKEN_ENV,
+        PROCESS_HOST_WRITE_TOKEN_ENV,
+        PROCESS_HOST_ROOT_ENV,
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            if !value.is_empty() {
+                command.env(name, value);
+            }
+        }
+    }
 }
 
 fn apply_shell_env_builder(command: &mut CommandBuilder, session: &str, shim: &ShellShimDir) {
     command.env_remove(ENV_ADDR);
     command.env_remove(ENV_TOKEN);
+    command.env_remove(PROCESS_HOST_READ_TOKEN_ENV);
+    command.env_remove(PROCESS_HOST_WRITE_TOKEN_ENV);
+    command.env_remove(PROCESS_HOST_ROOT_ENV);
     command.env_remove(PENTECT_AGENT_LAUNCHED_ENV);
     command.env("PENTECT_SESSION", session);
     if let (Some(addr), Some(token)) = (std::env::var_os(ENV_ADDR), std::env::var_os(ENV_TOKEN)) {
         if !addr.is_empty() && !token.is_empty() {
             command.env(ENV_ADDR, addr);
             command.env(ENV_TOKEN, &token);
+            for name in [
+                PROCESS_HOST_READ_TOKEN_ENV,
+                PROCESS_HOST_WRITE_TOKEN_ENV,
+                PROCESS_HOST_ROOT_ENV,
+            ] {
+                if let Some(value) = std::env::var_os(name) {
+                    if !value.is_empty() {
+                        command.env(name, value);
+                    }
+                }
+            }
             command.env(PENTECT_AGENT_LAUNCHED_ENV, token);
         }
     }
@@ -3532,37 +2895,6 @@ impl PurgeOpts {
     }
 }
 
-struct DashboardOpts {
-    session: Option<String>,
-    dir: Option<PathBuf>,
-}
-
-impl DashboardOpts {
-    fn parse(args: &[String]) -> Result<Self, String> {
-        let mut session = None;
-        let mut dir = None;
-        let mut i = if matches!(args.get(1).map(String::as_str), Some("dashboard")) {
-            2
-        } else {
-            1
-        };
-        while i < args.len() {
-            match args[i].as_str() {
-                "--session" => {
-                    session = Some(
-                        checked_session_name(&value(args, &mut i, "--session")?)
-                            .map_err(|e| e.to_string())?,
-                    )
-                }
-                "--dir" => dir = Some(PathBuf::from(value(args, &mut i, "--dir")?)),
-                flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
-                arg => return Err(format!("unexpected dashboard argument: {arg}")),
-            }
-        }
-        Ok(Self { session, dir })
-    }
-}
-
 struct HookOpts {
     provider: HookProvider,
     session: Option<String>,
@@ -3619,7 +2951,6 @@ impl HookOpts {
 struct ExecOpts {
     session: String,
     live: bool,
-    approve: bool,
     mode: ExecMode,
 }
 
@@ -3709,7 +3040,6 @@ impl ExecOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut session = default_session_name()?;
         let mut live = false;
-        let mut approve = false;
         let mut stdin = false;
         let mut i = 2;
         while i < args.len() {
@@ -3719,10 +3049,6 @@ impl ExecOpts {
                 }
                 "--live" => {
                     live = true;
-                    i += 1;
-                }
-                "--approve" => {
-                    approve = true;
                     i += 1;
                 }
                 "--stdin" => {
@@ -3744,7 +3070,6 @@ impl ExecOpts {
                     return Ok(Self {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
-                        approve,
                         mode: ExecMode::Shell(script),
                     });
                 }
@@ -3764,7 +3089,6 @@ impl ExecOpts {
                     return Ok(Self {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
-                        approve,
                         mode: ExecMode::Program(command),
                     });
                 }
@@ -3776,7 +3100,6 @@ impl ExecOpts {
                     return Ok(Self {
                         session: checked_session_name(&session).map_err(|e| e.to_string())?,
                         live,
-                        approve,
                         mode: ExecMode::Shell(args[i..].join(" ")),
                     });
                 }
@@ -3786,7 +3109,6 @@ impl ExecOpts {
             return Ok(Self {
                 session: checked_session_name(&session).map_err(|e| e.to_string())?,
                 live,
-                approve,
                 mode: ExecMode::Stdin,
             });
         }
@@ -4120,23 +3442,23 @@ fn agent_launch_proof_valid() -> bool {
         return false;
     };
     agent_launch_proof_matches(&proof, &token)
-        && in_memory_manager_env_addr_is_loopback()
-        && in_memory_manager_accepts_env_token()
+        && memory_store_env_addr_is_loopback()
+        && memory_store_accepts_env_token()
 }
 
 fn agent_launch_proof_matches(proof: &str, token: &str) -> bool {
     token.len() >= 32 && proof == token
 }
 
-fn in_memory_manager_env_addr_is_loopback() -> bool {
+fn memory_store_env_addr_is_loopback() -> bool {
     std::env::var(ENV_ADDR)
         .ok()
         .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|addr| addr.ip().is_loopback())
 }
 
-fn in_memory_manager_accepts_env_token() -> bool {
-    InMemoryManagerClient::from_env().is_some_and(|client| client.key().is_ok())
+fn memory_store_accepts_env_token() -> bool {
+    MemoryStoreClient::from_env().is_some_and(|client| client.key().is_ok())
 }
 
 fn canonical_hook_shell_command(command: &str) -> Result<String, String> {
@@ -4185,10 +3507,10 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
     if result.summary.masked_count == 0 {
         return Ok(None);
     }
+    activity_log::record_mask_result("read", &result, Some(path));
     let mut recovery = result.recovery.clone();
     recovery.extend_same_key(env_alias_recovery(&result.masked, &session.key));
-    RecoveryStore::load(session)
-        .map_err(|e| e.to_string())?
+    MemoryStore::for_session(session)
         .add_recovery(recovery)
         .map_err(|e| e.to_string())?;
     file_pointer_manager::register_file_pointers(path, &data, &result);
@@ -4374,7 +3696,7 @@ fn resolved_write_parts(
     path: &str,
     content: &str,
 ) -> Result<(PathBuf, String), String> {
-    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let store = MemoryStore::for_session(session);
     let resolved = resolve_masked_text(&store, content)?;
     let path = checked_local_write_path(path)?;
     Ok((path, resolved))
@@ -4392,7 +3714,7 @@ fn validate_masked_edit_before_tool(session: &Session, tool_input: &Value) -> Re
     }
     let path = checked_local_write_path(path)?;
     ensure_local_write_path_within_cwd(&path)?;
-    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let store = MemoryStore::for_session(session);
     for (kind, text) in edits {
         if matches!(kind, EditTextKind::New) && contains_pentect_masked_handle(text) {
             let _ = resolve_masked_text(&store, text)?;
@@ -4416,7 +3738,7 @@ fn apply_masked_old_edit_before_tool(
     }
     let path = checked_local_write_path(path_text)?;
     ensure_local_write_path_within_cwd(&path)?;
-    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let store = MemoryStore::for_session(session);
     let mut content = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
     for edit in edits {
@@ -4457,7 +3779,7 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
     if !contains_pentect_masked_handle(&content) {
         return Ok(false);
     }
-    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let store = MemoryStore::for_session(session);
     let resolved = resolve_masked_text(&store, &content)?;
     if resolved != content {
         std::fs::write(&path, resolved)
@@ -4466,7 +3788,7 @@ fn repair_masked_edit_after_tool(session: &Session, tool_input: &Value) -> Resul
     Ok(true)
 }
 
-fn resolve_masked_text_if_needed(store: &RecoveryStore, content: &str) -> Result<String, String> {
+fn resolve_masked_text_if_needed(store: &MemoryStore, content: &str) -> Result<String, String> {
     if contains_pentect_masked_handle(content) {
         resolve_masked_text(store, content)
     } else {
@@ -4474,7 +3796,7 @@ fn resolve_masked_text_if_needed(store: &RecoveryStore, content: &str) -> Result
     }
 }
 
-fn resolve_masked_text(store: &RecoveryStore, content: &str) -> Result<String, String> {
+fn resolve_masked_text(store: &MemoryStore, content: &str) -> Result<String, String> {
     let resolved = store.resolve_all(content).map_err(|e| e.to_string())?;
     if contains_pentect_masked_handle(&resolved) {
         return Err(
@@ -4692,7 +4014,10 @@ fn safe_noop_edit_anchor_candidate(candidate: &str, key: &[u8; 32]) -> bool {
     if text.is_empty() || candidate.len() > 512 || contains_pentect_masked_handle(candidate) {
         return false;
     }
-    let result = Engine::with_profile(Profile::Strict).mask(
+    let Ok(decode) = config::decode_config(Profile::Strict) else {
+        return false;
+    };
+    let result = Engine::with_profile_and_decode_config(Profile::Strict, decode).mask(
         Input {
             kind: Kind::Text,
             data: candidate.to_string(),
@@ -4800,7 +4125,7 @@ fn extract_pentect_exec_shell_payload(command: &str) -> Option<String> {
                 let (_, _, value_end) = next_shell_word(rest, word_end)?;
                 rest = rest[value_end..].trim_start();
             }
-            "--live" | "--approve" => {
+            "--live" => {
                 rest = rest[word_end..].trim_start();
             }
             "--stdin" => return None,
@@ -5048,7 +4373,7 @@ fn mask_tool_text_output(
     if let Some(reason) = unsupported_tool_result_reason(&output) {
         return Ok(ToolTextOutput::Block(reason));
     }
-    let store = RecoveryStore::load(session).map_err(|e| e.to_string())?;
+    let store = MemoryStore::for_session(session);
     let mut masker = OutputMasker::new_deferred(store)?;
     let (updated, changed) = mask_tool_json(&output, &mut masker)?;
     masker.flush()?;
@@ -5075,6 +4400,7 @@ fn claude_image_tool_output(
         );
     }
     let redaction = image_ocr::redact_tool_images_for_secrets(value, &session.key, &cfg)?;
+    activity_log::record_image(redaction.secret_images, &redaction.notes);
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
         if redaction.unscanned_images > 0 {
             return Ok(Some(ToolTextOutput::Block(
@@ -5172,6 +4498,13 @@ fn image_tool_result_block_reason(
     }
     let inspection = image_ocr::inspect_tool_images_for_secrets(value, &session.key, &cfg)?;
     if inspection.secret_images > 0 {
+        activity_log::record_summary(
+            "detect",
+            "image",
+            inspection.secret_images as u64,
+            BTreeMap::new(),
+            None,
+        );
         return Ok(Some("image blocked: secret text detected.".to_string()));
     }
     if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Allow) {

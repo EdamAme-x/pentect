@@ -1,0 +1,789 @@
+use crate::masking::{decode_env_alias_record, is_env_alias_placeholder};
+use crate::session::Session;
+use crate::Result;
+use anyhow::{anyhow, bail, Context};
+use pentect_core::{Config, Recovery};
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
+
+pub(crate) const ENV_ADDR: &str = "PENTECT_MEMORY_STORE_ADDR";
+pub(crate) const ENV_TOKEN: &str = "PENTECT_MEMORY_STORE_TOKEN";
+
+const TOKEN_BYTES: usize = 32;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ACTIVITY_EVENTS: usize = 4_096;
+const MAX_ACTIVITY_EVENT_BYTES: usize = 16 * 1024;
+const MAX_ACTIVITY_POLL_EVENTS: usize = 256;
+
+#[derive(Clone)]
+pub(crate) struct MemoryStore {
+    pub(crate) session: Session,
+}
+
+impl MemoryStore {
+    pub(crate) fn for_session(session: &Session) -> Self {
+        Self {
+            session: session.clone(),
+        }
+    }
+
+    pub(crate) fn resolve_all(&self, text: &str) -> Result<String> {
+        let recoveries = self.lock()?;
+        let mut out = text.to_string();
+        for recovery in recoveries.iter() {
+            out = recovery.resolve(&out);
+        }
+        drop(recoveries);
+        if let Some(recovery) = crate::file_pointer_manager::recover_text(&out, &self.session.key) {
+            self.add_recovery(recovery.clone())?;
+            out = recovery.resolve(&out);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn remask_all(&self, text: &str) -> Result<String> {
+        let recoveries = self.lock()?;
+        let mut out = text.to_string();
+        for recovery in recoveries.iter() {
+            out = recovery.remask(&out);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<Vec<Recovery>> {
+        Ok(self.lock()?.clone())
+    }
+
+    pub(crate) fn auto_env_bindings(&self) -> Result<Vec<(String, String)>> {
+        let recoveries = self.snapshot()?;
+        let mut bindings: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for recovery in &recoveries {
+            for placeholder in recovery.placeholders() {
+                if !is_env_alias_placeholder(&placeholder) {
+                    continue;
+                }
+                let record = recovery.resolve(&placeholder);
+                let Some((name, handle)) = decode_env_alias_record(&record) else {
+                    continue;
+                };
+                if is_reserved_child_env_name(name) {
+                    continue;
+                }
+                let value = resolve_with_recoveries(&recoveries, handle);
+                if value == handle {
+                    continue;
+                }
+                bindings.insert(name.to_ascii_lowercase(), (name.to_string(), value));
+            }
+        }
+        Ok(bindings.into_values().collect())
+    }
+
+    pub(crate) fn add_recovery(&self, recovery: Recovery) -> Result<()> {
+        if recovery.is_empty() {
+            return Ok(());
+        }
+        self.session.sync_recovery(&recovery)?;
+        self.lock()?.push(recovery);
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Vec<Recovery>>> {
+        self.session
+            .recoveries
+            .lock()
+            .map_err(|_| anyhow!("recovery cache lock poisoned"))
+    }
+}
+
+fn resolve_with_recoveries(recoveries: &[Recovery], text: &str) -> String {
+    let mut out = text.to_string();
+    for recovery in recoveries {
+        out = recovery.resolve(&out);
+    }
+    out
+}
+
+fn is_reserved_child_env_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "path"
+            | "pathext"
+            | "systemroot"
+            | "windir"
+            | "comspec"
+            | "temp"
+            | "tmp"
+            | "userprofile"
+            | "home"
+            | "shell"
+            | "term"
+            | "lang"
+            | "lc_all"
+            | "tmpdir"
+            | "pentect_bin"
+            | "pentect_home"
+            | "pentect_session"
+    )
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryStoreClient {
+    addr: String,
+    token: String,
+    connection: Arc<Mutex<Option<BufReader<TcpStream>>>>,
+}
+
+pub(crate) struct MemoryStoreSnapshot {
+    pub(crate) key: [u8; 32],
+    pub(crate) recovery: Recovery,
+}
+
+pub struct MemoryStoreLease {
+    _stream: TcpStream,
+}
+
+struct MemoryStoreState {
+    key: [u8; 32],
+    recovery: Recovery,
+    masked_count: u64,
+    activity: VecDeque<(u64, String)>,
+    next_activity_id: u64,
+}
+
+impl Drop for MemoryStoreState {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl MemoryStoreClient {
+    pub(crate) fn from_env() -> Option<Self> {
+        let addr = std::env::var(ENV_ADDR).ok()?;
+        let token = std::env::var(ENV_TOKEN).ok()?;
+        if addr.is_empty() || token.is_empty() {
+            return None;
+        }
+        Some(Self::new(addr, token))
+    }
+
+    pub(crate) fn new(addr: String, token: String) -> Self {
+        Self {
+            addr,
+            token,
+            connection: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn for_activity(addr: String, token: String) -> Self {
+        Self::new(addr, token)
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<MemoryStoreSnapshot> {
+        let line = self.request("SNAPSHOT", "")?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 3 || fields[0] != "OK" {
+            bail!("memory store snapshot response is malformed");
+        }
+        let key = decode_key_hex(fields[1])?;
+        let recovery_blob = data_encoding::BASE64
+            .decode(fields[2].as_bytes())
+            .context("memory store snapshot is not valid base64")?;
+        let recovery = Recovery::load(&recovery_blob, &key)
+            .map_err(|e| anyhow!("memory store snapshot is invalid: {e}"))?;
+        Ok(MemoryStoreSnapshot { key, recovery })
+    }
+
+    pub(crate) fn key(&self) -> Result<[u8; 32]> {
+        let line = self.request("KEY", "")?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 2 || fields[0] != "OK" {
+            bail!("memory store key response is malformed");
+        }
+        decode_key_hex(fields[1])
+    }
+
+    pub(crate) fn add_recovery(&self, key: &[u8; 32], recovery: &Recovery) -> Result<()> {
+        let payload = data_encoding::BASE64.encode(&recovery.serialize(key));
+        let line = self.request("ADD", &payload)?;
+        let fields = response_fields(&line)?;
+        if fields.as_slice() == ["OK"] {
+            Ok(())
+        } else {
+            bail!("memory store add response is malformed")
+        }
+    }
+
+    pub(crate) fn masked_count(&self) -> Result<u64> {
+        let line = self.request("COUNT", "")?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 2 || fields[0] != "OK" {
+            bail!("memory store count response is malformed");
+        }
+        fields[1]
+            .parse::<u64>()
+            .context("memory store masked count is not a number")
+    }
+
+    pub(crate) fn add_masked_count(&self, count: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let line = self.request("ADD_COUNT", &count.to_string())?;
+        let fields = response_fields(&line)?;
+        if fields.as_slice() == ["OK"] {
+            Ok(())
+        } else {
+            bail!("memory store add count response is malformed")
+        }
+    }
+
+    pub(crate) fn add_activity(&self, event_json: &str) -> Result<()> {
+        if event_json.len() > MAX_ACTIVITY_EVENT_BYTES {
+            bail!("activity event is too large");
+        }
+        let payload = data_encoding::BASE64.encode(event_json.as_bytes());
+        let line = self.request("LOG_ADD", &payload)?;
+        let fields = response_fields(&line)?;
+        if fields.as_slice() == ["OK"] {
+            Ok(())
+        } else {
+            bail!("memory store activity response is malformed")
+        }
+    }
+
+    pub(crate) fn poll_activity(&self, after: u64) -> Result<Vec<(u64, String)>> {
+        let line = self.request("LOGS", &after.to_string())?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 2 || fields[0] != "OK" {
+            bail!("memory store activity response is malformed");
+        }
+        let payload = data_encoding::BASE64
+            .decode(fields[1].as_bytes())
+            .context("memory store activity response is not valid base64")?;
+        serde_json::from_slice(&payload).context("memory store activity response is not valid JSON")
+    }
+
+    fn request(&self, command: &str, payload: &str) -> Result<String> {
+        let mut first_error = None;
+        for _ in 0..2 {
+            match self.request_once(command, payload) {
+                Ok(line) => return Ok(line),
+                Err(error) => {
+                    if let Ok(mut connection) = self.connection.lock() {
+                        *connection = None;
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        Err(first_error.unwrap_or_else(|| anyhow!("memory store request failed")))
+    }
+
+    fn request_once(&self, command: &str, payload: &str) -> Result<String> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow!("memory store connection lock poisoned"))?;
+        if connection.is_none() {
+            let stream = TcpStream::connect(&self.addr)
+                .with_context(|| format!("could not connect to memory store at {}", self.addr))?;
+            let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
+            *connection = Some(BufReader::new(stream));
+        }
+        let reader = connection
+            .as_mut()
+            .ok_or_else(|| anyhow!("memory store connection unavailable"))?;
+        writeln!(reader.get_mut(), "{}\t{}\t{}", self.token, command, payload)
+            .and_then(|_| reader.get_mut().flush())
+            .context("could not send memory store request")?;
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .context("could not read memory store response")?;
+        if line.is_empty() {
+            bail!("memory store closed the connection");
+        }
+        if let Some(reason) = line.strip_prefix("ERR\t") {
+            bail!("memory store rejected request: {}", reason.trim());
+        }
+        Ok(line)
+    }
+}
+
+impl Drop for MemoryStoreClient {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
+}
+
+pub fn open_memory_store_lease(addr: &str, token: &str) -> Result<MemoryStoreLease> {
+    let mut stream = TcpStream::connect(addr)
+        .with_context(|| format!("could not connect to memory store at {addr}"))?;
+    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
+    writeln!(stream, "{token}\tLEASE\t")
+        .and_then(|_| stream.flush())
+        .context("could not open memory store lease")?;
+    let reader_stream = stream
+        .try_clone()
+        .context("could not clone memory store lease")?;
+    let mut reader = BufReader::new(reader_stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .context("could not read memory store lease response")?;
+    if response_fields(&line)?.as_slice() != ["OK"] {
+        bail!("memory store lease response is malformed");
+    }
+    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_write_timeout(None);
+    Ok(MemoryStoreLease { _stream: stream })
+}
+
+pub(crate) fn serve_memory_store() -> i32 {
+    match serve_memory_store_inner() {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[pentect] {e}");
+            2
+        }
+    }
+}
+
+fn serve_memory_store_inner() -> Result<()> {
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).context("could not bind memory store listener")?;
+    let addr = listener
+        .local_addr()
+        .context("could not read memory store address")?;
+    let token = Arc::new(Zeroizing::new(random_token_hex()?));
+    let process_host_read_token = Arc::new(Zeroizing::new(random_token_hex()?));
+    let process_host_write_token = Arc::new(Zeroizing::new(random_token_hex()?));
+    let key = Config::generate().key;
+    let state = Arc::new(Mutex::new(MemoryStoreState {
+        key,
+        recovery: Recovery::empty_for_key(&key),
+        masked_count: 0,
+        activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
+        next_activity_id: 1,
+    }));
+    println!(
+        "{}",
+        serde_json::json!({
+            "addr": addr.to_string(),
+            "token": token.as_str(),
+            "process_host_read_token": process_host_read_token.as_str(),
+            "process_host_write_token": process_host_write_token.as_str(),
+        })
+    );
+    let _ = std::io::stdout().flush();
+
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            continue;
+        };
+        let state = state.clone();
+        let token = Arc::clone(&token);
+        let process_host_read_token = Arc::clone(&process_host_read_token);
+        let process_host_write_token = Arc::clone(&process_host_write_token);
+        std::thread::spawn(move || {
+            let _ = handle_client(
+                stream,
+                token.as_str(),
+                process_host_read_token.as_str(),
+                process_host_write_token.as_str(),
+                &state,
+            );
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_test_memory_store(token: String) -> String {
+    let read_token = format!("{token}-activity-read");
+    let write_token = format!("{token}-activity-write");
+    spawn_test_memory_store_with_activity(token, read_token, write_token)
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_test_memory_store_with_activity(
+    token: String,
+    read_token: String,
+    write_token: String,
+) -> String {
+    let token = Arc::new(Zeroizing::new(token));
+    let read_token = Arc::new(Zeroizing::new(read_token));
+    let write_token = Arc::new(Zeroizing::new(write_token));
+    let key = Config::generate().key;
+    let state = Arc::new(Mutex::new(MemoryStoreState {
+        key,
+        recovery: Recovery::empty_for_key(&key),
+        masked_count: 0,
+        activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
+        next_activity_id: 1,
+    }));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let token = Arc::clone(&token);
+            let read_token = Arc::clone(&read_token);
+            let write_token = Arc::clone(&write_token);
+            let state = state.clone();
+            std::thread::spawn(move || {
+                handle_client(
+                    stream,
+                    token.as_str(),
+                    read_token.as_str(),
+                    write_token.as_str(),
+                    &state,
+                )
+                .unwrap();
+            });
+        }
+    });
+    addr
+}
+
+fn handle_client(
+    stream: TcpStream,
+    token: &str,
+    process_host_read_token: &str,
+    process_host_write_token: &str,
+    state: &Arc<Mutex<MemoryStoreState>>,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let mut exit_on_disconnect = false;
+    loop {
+        line.clear();
+        let read = match reader.read_line(&mut line) {
+            Ok(read) => read,
+            Err(_) if exit_on_disconnect => std::process::exit(0),
+            Err(error) => return Err(error).context("could not read memory store request"),
+        };
+        if read == 0 {
+            if exit_on_disconnect {
+                std::process::exit(0);
+            }
+            return Ok(());
+        }
+        let fields = request_fields(&line);
+        let response = match fields.as_slice() {
+            [provided_token, "KEY", ""] if *provided_token == token => key_response(state),
+            [provided_token, "COUNT", ""] if *provided_token == token => count_response(state),
+            [provided_token, "SNAPSHOT", ""] if *provided_token == token => {
+                snapshot_response(state)
+            }
+            [provided_token, "ADD", payload] if *provided_token == token => {
+                add_recovery_request(state, payload)
+            }
+            [provided_token, "ADD_COUNT", payload] if *provided_token == token => {
+                add_masked_count_request(state, payload)
+            }
+            [provided_token, "LEASE", ""] if *provided_token == token => {
+                exit_on_disconnect = true;
+                Ok("OK".to_string())
+            }
+            [provided_token, "LOG_ADD", payload] if *provided_token == process_host_write_token => {
+                add_activity_request(state, payload)
+            }
+            [provided_token, "LOGS", payload] if *provided_token == process_host_read_token => {
+                activity_response(state, payload)
+            }
+            [provided_token, ..]
+                if *provided_token != token
+                    && *provided_token != process_host_read_token
+                    && *provided_token != process_host_write_token =>
+            {
+                Err(anyhow!("bad token"))
+            }
+            _ => Err(anyhow!("malformed request")),
+        };
+        let stream = reader.get_mut();
+        match response {
+            Ok(line) => writeln!(stream, "{line}")
+                .and_then(|_| stream.flush())
+                .context("could not write memory store response")?,
+            Err(error) => writeln!(stream, "ERR\t{}", sanitize_field(&error.to_string()))
+                .and_then(|_| stream.flush())
+                .context("could not write memory store error")?,
+        }
+    }
+}
+
+fn key_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    Ok(format!(
+        "OK\t{}",
+        data_encoding::HEXLOWER.encode(&guard.key)
+    ))
+}
+
+fn snapshot_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    Ok(format!(
+        "OK\t{}\t{}",
+        data_encoding::HEXLOWER.encode(&guard.key),
+        data_encoding::BASE64.encode(&guard.recovery.serialize(&guard.key))
+    ))
+}
+
+fn count_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    Ok(format!("OK\t{}", guard.masked_count))
+}
+
+fn add_recovery_request(state: &Arc<Mutex<MemoryStoreState>>, payload: &str) -> Result<String> {
+    let bytes = data_encoding::BASE64
+        .decode(payload.as_bytes())
+        .context("recovery payload is not valid base64")?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    let recovery = Recovery::load(&bytes, &guard.key)
+        .map_err(|e| anyhow!("recovery payload is invalid: {e}"))?;
+    if !recovery.is_empty() {
+        guard.recovery.extend_same_key(recovery);
+    }
+    Ok("OK".to_string())
+}
+
+fn add_masked_count_request(state: &Arc<Mutex<MemoryStoreState>>, payload: &str) -> Result<String> {
+    let count = payload
+        .parse::<u64>()
+        .context("masked count payload is not a number")?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    guard.masked_count = guard.masked_count.saturating_add(count);
+    Ok("OK".to_string())
+}
+
+fn add_activity_request(state: &Arc<Mutex<MemoryStoreState>>, payload: &str) -> Result<String> {
+    let bytes = data_encoding::BASE64
+        .decode(payload.as_bytes())
+        .context("activity payload is not valid base64")?;
+    if bytes.len() > MAX_ACTIVITY_EVENT_BYTES {
+        bail!("activity payload is too large");
+    }
+    let event = String::from_utf8(bytes).context("activity payload is not UTF-8")?;
+    serde_json::from_str::<serde_json::Value>(&event)
+        .context("activity payload is not valid JSON")?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    let id = guard.next_activity_id;
+    guard.next_activity_id = guard.next_activity_id.saturating_add(1);
+    guard.activity.push_back((id, event));
+    while guard.activity.len() > MAX_ACTIVITY_EVENTS {
+        guard.activity.pop_front();
+    }
+    Ok("OK".to_string())
+}
+
+fn activity_response(state: &Arc<Mutex<MemoryStoreState>>, payload: &str) -> Result<String> {
+    let after = payload
+        .parse::<u64>()
+        .context("activity cursor is not a number")?;
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    let events = guard
+        .activity
+        .iter()
+        .filter(|(id, _)| *id > after)
+        .take(MAX_ACTIVITY_POLL_EVENTS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let json = serde_json::to_vec(&events).context("could not serialize activity events")?;
+    Ok(format!("OK\t{}", data_encoding::BASE64.encode(&json)))
+}
+
+fn request_fields(line: &str) -> Vec<&str> {
+    line.trim_end_matches(['\r', '\n']).split('\t').collect()
+}
+
+fn response_fields(line: &str) -> Result<Vec<&str>> {
+    let fields = request_fields(line);
+    if fields.first() == Some(&"ERR") {
+        let reason = fields.get(1).copied().unwrap_or("unknown error");
+        bail!("{reason}");
+    }
+    Ok(fields)
+}
+
+fn random_token_hex() -> Result<String> {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| anyhow!("could not generate memory store token: {e}"))?;
+    Ok(data_encoding::HEXLOWER.encode(&bytes))
+}
+
+fn decode_key_hex(value: &str) -> Result<[u8; 32]> {
+    let bytes = data_encoding::HEXLOWER
+        .decode(value.as_bytes())
+        .context("memory store key is not valid hex")?;
+    let key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("memory store key has wrong length"))?;
+    Ok(key)
+}
+
+fn sanitize_field(value: &str) -> String {
+    value.replace(['\r', '\n', '\t'], " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pentect_core::{Engine, Input, Kind, Profile};
+
+    #[test]
+    fn client_round_trips_recovery_through_memory_store_state() {
+        let token = "test-token".to_string();
+        let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
+        assert_eq!(client.key().unwrap(), client.snapshot().unwrap().key);
+        let snapshot = client.snapshot().unwrap();
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Env,
+                data: "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n".to_string(),
+            },
+            &Config::new(snapshot.key),
+        );
+        let masked = result.masked.clone();
+        client
+            .add_recovery(&snapshot.key, &result.recovery)
+            .unwrap();
+
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(
+            snapshot.recovery.resolve(&masked),
+            "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
+        );
+    }
+
+    #[test]
+    fn read_style_masking_registers_recovery_and_env_aliases_in_memory_store() {
+        let token = "test-token-read".to_string();
+        let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
+        let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n";
+        let result = crate::mask_input_into_memory_store_client(
+            &client,
+            Input {
+                kind: Kind::Env,
+                data: raw.to_string(),
+            },
+            Profile::Strict,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(result.masked.contains("OPENAI_API_KEY=<<OPENAI_API_KEY_"));
+        assert!(!result.masked.contains("_length_"), "{}", result.masked);
+        assert_eq!(client.masked_count().unwrap(), 1);
+
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.recovery.resolve(&result.masked), raw);
+        let alias_records: Vec<_> = snapshot
+            .recovery
+            .placeholders()
+            .into_iter()
+            .filter(|placeholder| crate::masking::is_env_alias_placeholder(placeholder))
+            .filter_map(|placeholder| {
+                let record = snapshot.recovery.resolve(&placeholder);
+                crate::masking::decode_env_alias_record(&record)
+                    .map(|(name, handle)| (name.to_string(), handle.to_string()))
+            })
+            .collect();
+        assert!(alias_records.iter().any(|(name, handle)| {
+            name == "OPENAI_API_KEY"
+                && snapshot.recovery.resolve(handle) == "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
+        }));
+    }
+
+    #[test]
+    fn client_tracks_masked_count_in_memory() {
+        let token = "test-token-count".to_string();
+        let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
+        assert_eq!(client.masked_count().unwrap(), 0);
+        client.add_masked_count(2).unwrap();
+        client.add_masked_count(3).unwrap();
+        assert_eq!(client.masked_count().unwrap(), 5);
+    }
+
+    #[test]
+    fn client_reuses_one_connection_for_repeated_output_checks() {
+        let token = "test-token-persistent".to_string();
+        let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
+        for _ in 0..1_000 {
+            assert_eq!(client.masked_count().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn activity_stream_uses_read_only_token_and_cursor() {
+        let token = "test-token-activity".to_string();
+        let read_token = "test-token-activity-read".to_string();
+        let write_token = "test-token-activity-write".to_string();
+        let addr =
+            spawn_test_memory_store_with_activity(token, read_token.clone(), write_token.clone());
+        let writer = MemoryStoreClient::for_activity(addr.clone(), write_token);
+        let reader = MemoryStoreClient::for_activity(addr, read_token);
+
+        writer
+            .add_activity(r#"{"action":"mask","count":1}"#)
+            .unwrap();
+        let first = reader.poll_activity(0).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, 1);
+        assert!(first[0].1.contains("\"action\":\"mask\""));
+        assert!(
+            reader.key().is_err(),
+            "activity token exposed the store key"
+        );
+
+        writer
+            .add_activity(r#"{"action":"resolve","count":1}"#)
+            .unwrap();
+        let second = reader.poll_activity(first[0].0).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0, 2);
+        assert!(second[0].1.contains("\"action\":\"resolve\""));
+    }
+
+    #[test]
+    fn activity_ring_discards_oldest_events() {
+        let key = Config::generate().key;
+        let state = Arc::new(Mutex::new(MemoryStoreState {
+            key,
+            recovery: Recovery::empty_for_key(&key),
+            masked_count: 0,
+            activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
+            next_activity_id: 1,
+        }));
+        let payload = data_encoding::BASE64.encode(br#"{"action":"mask"}"#);
+        for _ in 0..=MAX_ACTIVITY_EVENTS {
+            add_activity_request(&state, &payload).unwrap();
+        }
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.activity.len(), MAX_ACTIVITY_EVENTS);
+        assert_eq!(guard.activity.front().map(|(id, _)| *id), Some(2));
+    }
+}

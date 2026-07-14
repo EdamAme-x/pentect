@@ -8,7 +8,7 @@
 //!   spans are always reported in raw coordinates.
 
 use crate::model::{ByteRange, Region};
-use memchr::memchr2_iter;
+use memchr::{memchr2_iter, memchr_iter};
 use std::borrow::Cow;
 use unicode_normalization::UnicodeNormalization;
 
@@ -45,9 +45,65 @@ fn push_ascii_escape(norm: &mut String, segs: &mut Vec<Seg>, byte: u8, raw: Byte
     });
 }
 
+fn html_numeric_escape(bytes: &[u8], start: usize) -> Option<(u8, usize)> {
+    if bytes.get(start..start + 2)? != b"&#" {
+        return None;
+    }
+    let mut i = start + 2;
+    let radix = if matches!(bytes.get(i), Some(b'x' | b'X')) {
+        i += 1;
+        16u32
+    } else {
+        10u32
+    };
+    let digits_start = i;
+    let mut value = 0u32;
+    while let Some(&byte) = bytes.get(i) {
+        let digit = match (radix, byte) {
+            (16, b'0'..=b'9') => u32::from(byte - b'0'),
+            (16, b'a'..=b'f') => u32::from(byte - b'a' + 10),
+            (16, b'A'..=b'F') => u32::from(byte - b'A' + 10),
+            (10, b'0'..=b'9') => u32::from(byte - b'0'),
+            _ => break,
+        };
+        value = value.checked_mul(radix)?.checked_add(digit)?;
+        i += 1;
+    }
+    if i == digits_start || bytes.get(i) != Some(&b';') || value > 0x7f {
+        return None;
+    }
+    Some((value as u8, i + 1))
+}
+
+fn quoted_printable_runs(bytes: &[u8]) -> Vec<ByteRange> {
+    let mut runs = Vec::new();
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] != b'=' || hex_val(bytes[i + 1]).is_none() || hex_val(bytes[i + 2]).is_none() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut escapes = 0usize;
+        while i + 2 < bytes.len()
+            && bytes[i] == b'='
+            && hex_val(bytes[i + 1]).is_some()
+            && hex_val(bytes[i + 2]).is_some()
+        {
+            escapes += 1;
+            i += 3;
+        }
+        if escapes >= 4 {
+            runs.push(ByteRange::new(start, i));
+        }
+    }
+    runs
+}
+
 /// A region's text after aggressive normalization for detection (NFKC, zero-width
-/// /bidi stripping, percent-decoding of `%XX` ASCII, and source-literal decoding
-/// of ASCII `\u00XX` / `\xXX` escapes), with a map back to raw byte ranges.
+/// /bidi stripping, percent/HTML/quoted-printable decoding, and source-literal
+/// decoding of ASCII `\u00XX` / `\xXX` / octal escapes), with a map back to raw
+/// byte ranges.
 /// Detectors run on the normalized text so these tricks can't break a match; the
 /// resulting spans are always reported in raw coordinates.
 pub struct NormalizedView<'a> {
@@ -79,12 +135,50 @@ impl<'a> NormalizedView<'a> {
             };
         }
         let bytes = slice.as_bytes();
+        // Adjacent escapes distinguish encoded data from independent assignments
+        // such as `a=41 b=42`. Canonical QP leaves ordinary secret characters
+        // unchanged for normal detectors, so only dense escaped runs need this.
+        let quoted_printable = quoted_printable_runs(bytes);
+        let mut quoted_printable_index = 0usize;
         let mut norm = String::with_capacity(slice.len());
         let mut segs = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
             // Percent-encoded ASCII byte (%XX) -> one normalized char.
             if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    let byte = (hi << 4) | lo;
+                    if byte.is_ascii() {
+                        let raw = ByteRange::new(base + i, base + i + 3);
+                        push_ascii_escape(&mut norm, &mut segs, byte, raw);
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+            // HTML numeric character references are self-delimiting and do not
+            // need a heuristic. Named entities are intentionally excluded: they
+            // are aliases rather than a general byte encoding.
+            if bytes[i] == b'&' {
+                if let Some((byte, end)) = html_numeric_escape(bytes, i) {
+                    let raw = ByteRange::new(base + i, base + end);
+                    push_ascii_escape(&mut norm, &mut segs, byte, raw);
+                    i = end;
+                    continue;
+                }
+            }
+            // RFC 2045 quoted-printable. Decode only clearly encoded slices so
+            // source assignments such as `code=41` retain their structure.
+            while quoted_printable
+                .get(quoted_printable_index)
+                .is_some_and(|range| range.end <= i)
+            {
+                quoted_printable_index += 1;
+            }
+            let in_quoted_printable = quoted_printable
+                .get(quoted_printable_index)
+                .is_some_and(|range| range.start <= i && i < range.end);
+            if in_quoted_printable && bytes[i] == b'=' && i + 2 < bytes.len() {
                 if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
                     let byte = (hi << 4) | lo;
                     if byte.is_ascii() {
@@ -122,6 +216,24 @@ impl<'a> NormalizedView<'a> {
                             i += 4;
                             continue;
                         }
+                    }
+                }
+                // C-family octal escapes consume at most three octal digits.
+                // Restrict to exactly three here to avoid treating ordinary
+                // backslash-number paths as encoded text.
+                if i + 3 < bytes.len()
+                    && bytes[i + 1..i + 4]
+                        .iter()
+                        .all(|byte| matches!(byte, b'0'..=b'7'))
+                {
+                    let value = u16::from(bytes[i + 1] - b'0') * 64
+                        + u16::from(bytes[i + 2] - b'0') * 8
+                        + u16::from(bytes[i + 3] - b'0');
+                    if value <= 0x7f {
+                        let raw = ByteRange::new(base + i, base + i + 4);
+                        push_ascii_escape(&mut norm, &mut segs, value as u8, raw);
+                        i += 4;
+                        continue;
                     }
                 }
             }
@@ -225,6 +337,12 @@ fn is_identity_detection_slice(slice: &str) -> bool {
     if !bytes.is_ascii() {
         return false;
     }
+    if !quoted_printable_runs(bytes).is_empty() {
+        return false;
+    }
+    if memchr_iter(b'&', bytes).any(|i| html_numeric_escape(bytes, i).is_some()) {
+        return false;
+    }
     for i in memchr2_iter(b'%', b'\\', bytes) {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
@@ -247,6 +365,13 @@ fn is_identity_detection_slice(slice: &str) -> bool {
                 && matches!(bytes[i + 1], b'x' | b'X')
                 && hex_val(bytes[i + 2]).is_some()
                 && hex_val(bytes[i + 3]).is_some()
+            {
+                return false;
+            }
+            if i + 3 < bytes.len()
+                && bytes[i + 1..i + 4]
+                    .iter()
+                    .all(|byte| matches!(byte, b'0'..=b'7'))
             {
                 return false;
             }
@@ -309,6 +434,31 @@ mod tests {
         assert_eq!(v.text(), "a-b.c");
         assert_eq!(v.to_raw(ByteRange::new(1, 2)), ByteRange::new(1, 7));
         assert_eq!(v.to_raw(ByteRange::new(3, 4)), ByteRange::new(8, 12));
+    }
+
+    #[test]
+    fn decodes_html_numeric_and_octal_escapes() {
+        let raw = r"a&#45;b\056c";
+        let r = region(raw);
+        let v = NormalizedView::build(&r, raw);
+        assert_eq!(v.text(), "a-b.c");
+        assert_eq!(v.to_raw(ByteRange::new(1, 2)), ByteRange::new(1, 6));
+        assert_eq!(v.to_raw(ByteRange::new(3, 4)), ByteRange::new(7, 11));
+    }
+
+    #[test]
+    fn decodes_quoted_printable_only_when_the_slice_is_clearly_encoded() {
+        let raw = "=41=4b=49=41";
+        let r = region(raw);
+        assert_eq!(NormalizedView::build(&r, raw).text(), "AKIA");
+
+        let assignment = "code=41";
+        let r = region(assignment);
+        assert_eq!(NormalizedView::build(&r, assignment).text(), assignment);
+
+        let assignments = "a=41 b=42 c=43 d=44";
+        let r = region(assignments);
+        assert_eq!(NormalizedView::build(&r, assignments).text(), assignments);
     }
 
     #[test]

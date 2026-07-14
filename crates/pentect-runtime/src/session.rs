@@ -1,9 +1,9 @@
-use crate::in_memory_manager::InMemoryManagerClient;
-use crate::masking::{decode_env_alias_record, is_env_alias_placeholder};
+use crate::memory_store::MemoryStoreClient;
 use crate::Result;
-use anyhow::{anyhow, bail};
+#[cfg(test)]
+use anyhow::anyhow;
+use anyhow::bail;
 use pentect_core::{Config, Recovery};
-use std::collections::BTreeMap;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ pub(crate) struct Session {
 #[derive(Clone)]
 enum SessionBackend {
     Local,
-    InMemoryManager(InMemoryManagerClient),
+    MemoryStore(MemoryStoreClient),
 }
 
 impl Session {
@@ -46,7 +46,7 @@ impl Session {
     }
 
     fn open_active() -> Result<Self> {
-        let Some(client) = InMemoryManagerClient::from_env() else {
+        let Some(client) = MemoryStoreClient::from_env() else {
             return Ok(Self::in_memory());
         };
         let snapshot = client.snapshot()?;
@@ -57,8 +57,15 @@ impl Session {
             } else {
                 vec![snapshot.recovery]
             })),
-            backend: SessionBackend::InMemoryManager(client),
+            backend: SessionBackend::MemoryStore(client),
         })
+    }
+
+    pub(crate) fn sync_recovery(&self, recovery: &Recovery) -> Result<()> {
+        if let SessionBackend::MemoryStore(client) = &self.backend {
+            client.add_recovery(&self.key, recovery)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -113,137 +120,12 @@ impl Session {
             .map_err(|_| anyhow!("recovery cache lock poisoned"))?
             .clone())
     }
-
-    pub(crate) fn in_memory_manager_status(name: &str) -> Result<Option<String>> {
-        checked_session_name(name)?;
-        Ok(InMemoryManagerClient::from_env()
-            .is_some()
-            .then_some("memory-only, active while parent Pentect process is running".to_string()))
-    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         self.key.zeroize();
     }
-}
-
-fn resolve_with_recoveries(recoveries: &[Recovery], text: &str) -> String {
-    let mut out = text.to_string();
-    for rec in recoveries {
-        out = rec.resolve(&out);
-    }
-    out
-}
-
-#[derive(Clone)]
-pub(crate) struct RecoveryStore {
-    pub(crate) session: Session,
-    recoveries: Arc<Mutex<Vec<Recovery>>>,
-}
-
-impl RecoveryStore {
-    pub(crate) fn load(session: &Session) -> Result<Self> {
-        Ok(Self {
-            session: session.clone(),
-            recoveries: session.recoveries.clone(),
-        })
-    }
-
-    pub(crate) fn resolve_all(&self, text: &str) -> Result<String> {
-        let recoveries = self.lock()?;
-        let mut out = text.to_string();
-        for rec in recoveries.iter() {
-            out = rec.resolve(&out);
-        }
-        drop(recoveries);
-        if let Some(recovery) = crate::file_pointer_manager::recover_text(&out, &self.session.key) {
-            self.add_recovery(recovery.clone())?;
-            out = recovery.resolve(&out);
-        }
-        Ok(out)
-    }
-
-    pub(crate) fn remask_all(&self, text: &str) -> Result<String> {
-        let recoveries = self.lock()?;
-        let mut out = text.to_string();
-        for rec in recoveries.iter() {
-            out = rec.remask(&out);
-        }
-        Ok(out)
-    }
-
-    pub(crate) fn snapshot(&self) -> Result<Vec<Recovery>> {
-        Ok(self.lock()?.clone())
-    }
-
-    pub(crate) fn auto_env_bindings(&self) -> Result<Vec<(String, String)>> {
-        let recoveries = self.snapshot()?;
-        let mut bindings: BTreeMap<String, (String, String)> = BTreeMap::new();
-        for recovery in &recoveries {
-            for placeholder in recovery.placeholders() {
-                if !is_env_alias_placeholder(&placeholder) {
-                    continue;
-                }
-                let record = recovery.resolve(&placeholder);
-                let Some((name, handle)) = decode_env_alias_record(&record) else {
-                    continue;
-                };
-                if is_reserved_child_env_name(name) {
-                    continue;
-                }
-                let value = resolve_with_recoveries(&recoveries, handle);
-                if value == handle {
-                    continue;
-                }
-                bindings.insert(name.to_ascii_lowercase(), (name.to_string(), value));
-            }
-        }
-        Ok(bindings.into_values().collect())
-    }
-
-    pub(crate) fn add_recovery(&self, recovery: Recovery) -> Result<()> {
-        if recovery.is_empty() {
-            return Ok(());
-        }
-        if let SessionBackend::InMemoryManager(client) = &self.session.backend {
-            client.add_recovery(&self.session.key, &recovery)?;
-        }
-        {
-            self.lock()?.push(recovery);
-        }
-        Ok(())
-    }
-
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Vec<Recovery>>> {
-        self.recoveries
-            .lock()
-            .map_err(|_| anyhow!("recovery cache lock poisoned"))
-    }
-}
-
-fn is_reserved_child_env_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "path"
-            | "pathext"
-            | "systemroot"
-            | "windir"
-            | "comspec"
-            | "temp"
-            | "tmp"
-            | "userprofile"
-            | "home"
-            | "shell"
-            | "term"
-            | "lang"
-            | "lc_all"
-            | "tmpdir"
-            | "pentect_bin"
-            | "pentect_home"
-            | "pentect_session"
-    )
 }
 
 pub(crate) fn session_root(name: &str) -> Result<PathBuf> {

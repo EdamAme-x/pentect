@@ -5,9 +5,9 @@ mod sweep;
 
 use crate::detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector,
-    CredSweeperNativeDetector, DecodeDetector, Detector, EntropyDetector, EnvValueDetector,
-    KeyValueDetector, PemDetector, PhoneDetector, RuleDetector, SensitiveKeyDetector,
-    StructuralDetector, UrlDetector, UuidDetector,
+    CredSweeperNativeDetector, DecodeConfig, DecodeDetector, Detector, EntropyDetector,
+    EnvValueDetector, KeyValueDetector, PemDetector, PhoneDetector, RuleDetector,
+    SensitiveKeyDetector, StructuralDetector, UrlDetector, UuidDetector,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -148,8 +148,12 @@ impl Engine {
     /// Standard stack tuned for the built-in strict profile. Power users can still build a fully
     /// custom Engine via `builder()`.
     pub fn with_profile(profile: Profile) -> Self {
+        Self::with_profile_and_decode_config(profile, profile_decode_config(profile.knobs()))
+    }
+
+    pub fn with_profile_and_decode_config(profile: Profile, decode: DecodeConfig) -> Self {
         Engine::builder()
-            .standard_stack(profile.knobs())
+            .standard_stack_with_decode(profile.knobs(), decode)
             .policy(Box::new(ProfilePolicy::new(profile)))
             .guard(Box::new(ShapeGuard::builtin()))
             .build()
@@ -172,7 +176,21 @@ impl Engine {
         packs: Vec<crate::pack::Pack>,
         aggressive: bool,
     ) -> Self {
-        let mut builder = Engine::builder().standard_stack(profile.knobs());
+        Self::with_profile_and_packs_and_decode_config(
+            profile,
+            packs,
+            aggressive,
+            profile_decode_config(profile.knobs()),
+        )
+    }
+
+    pub fn with_profile_and_packs_and_decode_config(
+        profile: Profile,
+        packs: Vec<crate::pack::Pack>,
+        aggressive: bool,
+        decode: DecodeConfig,
+    ) -> Self {
+        let mut builder = Engine::builder().standard_stack_with_decode(profile.knobs(), decode);
         for pack in packs {
             builder = builder
                 .detector(Box::new(pack.rules))
@@ -196,7 +214,19 @@ impl Engine {
         profile: Profile,
         packs: Vec<crate::pack::Pack>,
     ) -> Self {
-        let mut builder = Engine::builder().secret_scan_stack(profile.knobs());
+        Self::secret_scan_with_profile_packs_and_decode_config(
+            profile,
+            packs,
+            profile_decode_config(profile.knobs()),
+        )
+    }
+
+    pub fn secret_scan_with_profile_packs_and_decode_config(
+        profile: Profile,
+        packs: Vec<crate::pack::Pack>,
+        decode: DecodeConfig,
+    ) -> Self {
+        let mut builder = Engine::builder().secret_scan_stack_with_decode(profile.knobs(), decode);
         for pack in packs {
             builder = builder
                 .detector(Box::new(pack.rules))
@@ -553,6 +583,10 @@ impl EngineBuilder {
     /// It stays broad because masking local tool output has a different risk
     /// profile than repository secret scanning.
     pub fn standard_stack(self, knobs: ProfileKnobs) -> Self {
+        self.standard_stack_with_decode(knobs, profile_decode_config(knobs))
+    }
+
+    pub fn standard_stack_with_decode(self, knobs: ProfileKnobs, decode: DecodeConfig) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
@@ -570,10 +604,7 @@ impl EngineBuilder {
                 knobs.entropy_min_len,
                 knobs.entropy_threshold,
             )))
-            .detector(Box::new(
-                DecodeDetector::builtin()
-                    .with_opaque(knobs.mask_unknown_codec, knobs.min_opaque_run),
-            ))
+            .detector(Box::new(DecodeDetector::builtin_with_config(decode)))
             .detector(Box::new(SensitiveKeyDetector))
             .detector(Box::new(EnvValueDetector))
             .detector(Box::new(StructuralDetector))
@@ -581,6 +612,10 @@ impl EngineBuilder {
     }
 
     pub fn secret_scan_stack(self, knobs: ProfileKnobs) -> Self {
+        self.secret_scan_stack_with_decode(knobs, profile_decode_config(knobs))
+    }
+
+    pub fn secret_scan_stack_with_decode(self, knobs: ProfileKnobs, decode: DecodeConfig) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
@@ -594,6 +629,7 @@ impl EngineBuilder {
                 knobs.entropy_min_len,
                 knobs.entropy_threshold,
             )))
+            .detector(Box::new(DecodeDetector::builtin_with_config(decode)))
             .detector(Box::new(EnvValueDetector))
             .detector(Box::new(SensitiveKeyDetector))
     }
@@ -627,6 +663,14 @@ impl EngineBuilder {
             guard: self.guard,
             disabled: self.disabled,
         }
+    }
+}
+
+fn profile_decode_config(knobs: ProfileKnobs) -> DecodeConfig {
+    DecodeConfig {
+        mask_unknown: knobs.mask_unknown_codec,
+        unknown_min_bytes: knobs.min_opaque_run,
+        ..DecodeConfig::default()
     }
 }
 
@@ -720,6 +764,21 @@ mod tests {
         bs58::encode(data)
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
+    }
+
+    fn encode_radix85(value: &[u8], alphabet: &[u8; 85]) -> String {
+        assert!(value.len().is_multiple_of(4));
+        let mut encoded = String::new();
+        for chunk in value.chunks_exact(4) {
+            let mut number = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let mut digits = [0usize; 5];
+            for digit in digits.iter_mut().rev() {
+                *digit = (number % 85) as usize;
+                number /= 85;
+            }
+            encoded.extend(digits.into_iter().map(|digit| alphabet[digit] as char));
+        }
+        encoded
     }
 
     #[test]
@@ -897,15 +956,135 @@ mod tests {
 
     #[test]
     fn decode_unwrap_handles_multiple_codecs() {
-        use data_encoding::{BASE32, HEXLOWER};
+        use data_encoding::{BASE32, BASE32HEX_NOPAD, HEXLOWER};
         let secret = b"AKIAIOSFODNN7EXAMPLE";
-        for enc in [HEXLOWER.encode(secret), BASE32.encode(secret)] {
+        for enc in [
+            secret
+                .iter()
+                .map(|byte| format!("{byte:08b}"))
+                .collect::<String>(),
+            secret
+                .iter()
+                .map(|byte| format!("{byte:03o}"))
+                .collect::<String>(),
+            HEXLOWER.encode(secret),
+            HEXLOWER.encode(secret).to_ascii_uppercase(),
+            format!("0x{}", HEXLOWER.encode(secret)),
+            BASE32.encode(secret),
+            BASE32.encode(secret).to_ascii_lowercase(),
+            BASE32HEX_NOPAD.encode(secret),
+            bs58::encode(secret).into_string(),
+        ] {
             let r = m(&format!("blob {enc} end"));
             assert!(
                 r.masked.contains("<<AWS_AKID_"),
                 "codec failed for {enc}: {}",
                 r.masked
             );
+        }
+    }
+
+    #[test]
+    fn decode_unwrap_handles_ascii85_base85_and_z85() {
+        use crate::codec::{RFC1924_BASE85_ALPHABET, Z85_ALPHABET};
+        let secret = b"AKIAIOSFODNN7EXAMPLE";
+        let cases = [
+            "<~5tad88P`8S:IIrQ2aph79i+MP~>".to_string(),
+            "5tad88P`8S:IIrQ2aph79i+MP".to_string(),
+            "\"5tad88P`8S:IIrQ2aph79i+MP\"".to_string(),
+            encode_radix85(secret, RFC1924_BASE85_ALPHABET),
+            encode_radix85(secret, Z85_ALPHABET),
+        ];
+        for encoded in cases {
+            let result = m(&format!("blob={encoded} end"));
+            assert!(
+                result.masked.contains("<<AWS_AKID_"),
+                "base85 failed for {encoded}: {}",
+                result.masked
+            );
+            assert!(!result.masked.contains(&encoded), "{}", result.masked);
+        }
+    }
+
+    #[test]
+    fn decode_unwrap_handles_mime_wrapped_base64() {
+        use data_encoding::BASE64;
+        let mut decoded = "prefix AKIAIOSFODNN7EXAMPLE suffix ".to_string();
+        while !BASE64.encode(decoded.as_bytes()).len().is_multiple_of(32) {
+            decoded.push('x');
+        }
+        let encoded = BASE64.encode(decoded.as_bytes());
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(32)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = m(&format!("begin\n{wrapped}\nend"));
+        assert!(result.masked.contains("<<AWS_AKID_"), "{}", result.masked);
+        assert!(!result.masked.contains(&wrapped), "{}", result.masked);
+    }
+
+    #[test]
+    fn repository_secret_scan_uses_decode_detector() {
+        use data_encoding::BASE64;
+        let encoded = BASE64.encode(b"AKIAIOSFODNN7EXAMPLE");
+        let engine = Engine::secret_scan_with_profile_and_packs(Profile::Strict, Vec::new());
+        let result = engine.mask(
+            Input::text(format!("credential={encoded}")),
+            &Config::insecure_testing(),
+        );
+        assert!(result.masked.contains("<<AWS_AKID_"), "{}", result.masked);
+        assert!(!result.masked.contains(&encoded), "{}", result.masked);
+    }
+
+    #[test]
+    fn detects_secret_through_text_escape_encodings() {
+        let secret = b"AKIAIOSFODNN7EXAMPLE";
+        let quoted_printable = secret
+            .iter()
+            .map(|byte| format!("={byte:02X}"))
+            .collect::<String>();
+        let html_numeric = secret
+            .iter()
+            .map(|byte| format!("&#{byte};"))
+            .collect::<String>();
+        let html_hex = secret
+            .iter()
+            .map(|byte| format!("&#x{byte:02X};"))
+            .collect::<String>();
+        let percent = secret
+            .iter()
+            .map(|byte| format!("%{byte:02X}"))
+            .collect::<String>();
+        let hex_escape = secret
+            .iter()
+            .map(|byte| format!(r"\x{byte:02X}"))
+            .collect::<String>();
+        let unicode_escape = secret
+            .iter()
+            .map(|byte| format!(r"\u00{byte:02X}"))
+            .collect::<String>();
+        let octal = secret
+            .iter()
+            .map(|byte| format!(r"\{byte:03o}"))
+            .collect::<String>();
+        for encoded in [
+            quoted_printable,
+            html_numeric,
+            html_hex,
+            percent,
+            hex_escape,
+            unicode_escape,
+            octal,
+        ] {
+            let result = m(&format!("blob={encoded} end"));
+            assert!(
+                result.masked.contains("<<AWS_AKID_"),
+                "escape decoding failed for {encoded}: {}",
+                result.masked
+            );
+            assert!(!result.masked.contains(&encoded), "{}", result.masked);
         }
     }
 

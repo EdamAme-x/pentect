@@ -292,7 +292,7 @@ fn debug_app_server_frame(direction: &str, frame: &Frame<'_>) {
                 let mut parts = Vec::new();
                 debug_value_shape(&value, "$", 0, &mut parts);
                 if !parts.is_empty() {
-                    line.push_str(" ");
+                    line.push(' ');
                     line.push_str(&parts.join(" "));
                 }
             }
@@ -334,9 +334,8 @@ fn debug_value_shape(value: &Value, path: &str, depth: usize, out: &mut Vec<Stri
             out.push(format!("{path}=object[{keys}]"));
             for (key, value) in object {
                 let child = format!("{path}.{key}");
-                if debug_key_interesting(key) {
-                    debug_value_shape(value, &child, depth + 1, out);
-                } else if matches!(value, Value::Object(_) | Value::Array(_)) {
+                if debug_key_interesting(key) || matches!(value, Value::Object(_) | Value::Array(_))
+                {
                     debug_value_shape(value, &child, depth + 1, out);
                 }
             }
@@ -499,7 +498,7 @@ where
 }
 
 fn redact_app_server_images(value: &mut Value) -> Result<(), String> {
-    if let Some(updated) = pentect_agent::redact_tool_images_into_active_in_memory_manager(value)? {
+    if let Some(updated) = pentect_agent::redact_tool_images_into_active_memory_store(value)? {
         *value = updated;
     }
     Ok(())

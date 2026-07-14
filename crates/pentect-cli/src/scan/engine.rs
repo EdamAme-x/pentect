@@ -3,7 +3,9 @@ use super::options::BinaryMode;
 use super::report::{FileFinding, ScanScope, SkippedFile};
 use super::walk::ignored_file_reason;
 use memchr::memchr;
-use pentect_core::{infer_kind, ByteRange, Category, Engine, Input, Kind, Profile, Span};
+use pentect_core::{
+    infer_kind, ByteRange, Category, DecodeConfig, Engine, Input, Kind, Profile, Span,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,7 +19,11 @@ pub(super) fn scan_files(
     packs: Vec<pentect_core::Pack>,
     binary: BinaryMode,
 ) -> Result<(Vec<ScanFile>, String), String> {
-    ScanPipeline::pentect(packs, binary)?.scan(files)
+    #[cfg(not(test))]
+    let decode = pentect_agent::load_decode_config(Profile::Strict)?;
+    #[cfg(test)]
+    let decode = DecodeConfig::default();
+    ScanPipeline::pentect(packs, binary, decode)?.scan(files)
 }
 
 #[cfg(test)]
@@ -55,10 +61,14 @@ struct ScanPipeline {
 }
 
 impl ScanPipeline {
-    fn pentect(packs: Vec<pentect_core::Pack>, binary: BinaryMode) -> Result<Self, String> {
+    fn pentect(
+        packs: Vec<pentect_core::Pack>,
+        binary: BinaryMode,
+        decode: DecodeConfig,
+    ) -> Result<Self, String> {
         Ok(Self {
             name: ENGINE_NAME,
-            backends: vec![Box::new(CoreBackend::new(packs, binary))],
+            backends: vec![Box::new(CoreBackend::new(packs, binary, decode))],
         })
     }
 
@@ -66,7 +76,11 @@ impl ScanPipeline {
     fn core_for_tests(packs: Vec<pentect_core::Pack>, binary: BinaryMode) -> Self {
         Self {
             name: "core",
-            backends: vec![Box::new(CoreBackend::new(packs, binary))],
+            backends: vec![Box::new(CoreBackend::new(
+                packs,
+                binary,
+                DecodeConfig::default(),
+            ))],
         }
     }
 
@@ -290,14 +304,16 @@ struct CoreBackend {
     packs: Option<Vec<pentect_core::Pack>>,
     engine: Option<Engine>,
     binary: BinaryMode,
+    decode: DecodeConfig,
 }
 
 impl CoreBackend {
-    fn new(packs: Vec<pentect_core::Pack>, binary: BinaryMode) -> Self {
+    fn new(packs: Vec<pentect_core::Pack>, binary: BinaryMode, decode: DecodeConfig) -> Self {
         Self {
             packs: Some(packs),
             engine: None,
             binary,
+            decode,
         }
     }
 
@@ -306,9 +322,10 @@ impl CoreBackend {
             return;
         }
         let packs = self.packs.take().unwrap_or_default();
-        self.engine = Some(Engine::secret_scan_with_profile_and_packs(
+        self.engine = Some(Engine::secret_scan_with_profile_packs_and_decode_config(
             Profile::Strict,
             packs,
+            self.decode,
         ));
     }
 }

@@ -2300,6 +2300,7 @@ dependencies = [
  "aho-corasick",
  "bip39",
  "bs58",
+ "chacha20",
  "data-encoding",
  "fancy-regex 0.18.0",
  "flate2",

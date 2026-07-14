@@ -1,54 +1,56 @@
 use aho_corasick::{AhoCorasickBuilder, MatchKind};
+use chacha20::cipher::StreamCipher;
+use chacha20::{ChaCha20, Key, KeyIvInit, Nonce};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use zeroize::Zeroize;
 
-const PAD_DOMAIN: &[u8] = b"pentect-recovery-pad-v1";
+const MEMORY_KEY_DOMAIN: &[u8] = b"pentect-recovery-memory-key-v1";
+const MEMORY_NONCE_DOMAIN: &[u8] = b"pentect-recovery-memory-nonce-v1";
 const MAC_DOMAIN: &[u8] = b"pentect-recovery-mac-v1";
 const MAX_PLACEHOLDER_BYTES: usize = 512;
 /// Serialized recovery blob: `MAGIC | VERSION | HMAC(32) | body`. The body is
-/// the already-obfuscated map (no plaintext), the HMAC is keyed by a
+/// the already-encrypted map (no plaintext), the HMAC is keyed by a
 /// key-derived MAC key over `MAGIC | VERSION | body`, so a wrong key, a version
 /// bump, or any tampering fails closed on load.
 const MAGIC: &[u8; 4] = b"PNR1";
 const FORMAT_VERSION: u8 = 1;
 
-/// Local-only placeholder -> original mapping. Values are stored XOR-obfuscated,
-/// not as cleartext: this is lightweight in-memory obfuscation, NOT encryption.
-/// The pad is derived from the masking key and lives in the same process, so an
-/// attacker with memory access still recovers the values; the point is only that
-/// secrets don't sit as plaintext in a memory dump or trip a naive secret-scan.
+/// Local-only placeholder -> original mapping. Values are encrypted with a
+/// process-local ChaCha20 key so secrets do not remain as plaintext between
+/// operations. This does not protect against an attacker that can read the key
+/// and ciphertext from the same live process.
 /// Deliberately not serializable — persisting it to disk is a separate, gated
 /// decision (a versioned, integrity-checked header), not a casual derive.
 #[derive(Clone, Debug, Default)]
 pub struct Recovery {
-    pad: [u8; 32],
+    memory_key: [u8; 32],
     map: HashMap<String, Vec<u8>>,
 }
 
 impl Recovery {
-    /// Create an empty recovery map using the same in-memory obfuscation pad as
+    /// Create an empty recovery map using the same in-memory encryption key as
     /// maps sealed with `key`. This is useful for adapters that batch multiple
     /// mask results into one persisted recovery file.
     pub fn empty_for_key(key: &[u8; 32]) -> Self {
         Self {
-            pad: derive_pad(key),
+            memory_key: derive_memory_key(key),
             map: HashMap::new(),
         }
     }
 
-    /// Obfuscate a plaintext placeholder->value map for in-memory storage.
+    /// Encrypt a plaintext placeholder->value map for in-memory storage.
     pub fn seal(plaintext: HashMap<String, String>, key: &[u8; 32]) -> Self {
-        let pad = derive_pad(key);
+        let memory_key = derive_memory_key(key);
         let map = plaintext
             .into_iter()
             .map(|(ph, val)| {
-                let obf = xor_keystream(&pad, ph.as_bytes(), val.as_bytes());
-                (ph, obf)
+                let ciphertext = crypt_memory_value(&memory_key, ph.as_bytes(), val.as_bytes());
+                (ph, ciphertext)
             })
             .collect();
-        Self { pad, map }
+        Self { memory_key, map }
     }
 
     pub fn len(&self) -> usize {
@@ -75,11 +77,11 @@ impl Recovery {
         self.map.extend(std::mem::take(&mut other.map));
     }
 
-    /// Deobfuscate the original value for `placeholder`, if present.
+    /// Decrypt the original value for `placeholder`, if present.
     fn reveal(&self, placeholder: &str) -> Option<String> {
-        let obf = self.map.get(placeholder)?;
-        let bytes = xor_keystream(&self.pad, placeholder.as_bytes(), obf);
-        // Always valid UTF-8: we only ever sealed &str bytes and XOR is exact.
+        let ciphertext = self.map.get(placeholder)?;
+        let bytes = crypt_memory_value(&self.memory_key, placeholder.as_bytes(), ciphertext);
+        // Always valid UTF-8: we only ever sealed &str bytes and encryption is exact.
         String::from_utf8(bytes).ok()
     }
 
@@ -135,10 +137,9 @@ impl Recovery {
     }
 
     /// Serialize for persistence: `MAGIC | VERSION | HMAC | body`. The body is
-    /// the obfuscated map (no plaintext); the HMAC binds it to `key`. This is a
+    /// the encrypted map (no plaintext); the HMAC binds it to `key`. This is a
     /// FORMAT, not storage — an adapter writes the bytes to disk, and should
-    /// wrap them in an AEAD at rest. The pad is not stored (re-derived from the
-    /// key on `load`).
+    /// wrap them in an AEAD at rest. The memory key is re-derived from `key`.
     pub fn serialize(&self, key: &[u8; 32]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&(self.map.len() as u32).to_le_bytes());
@@ -194,9 +195,218 @@ impl Recovery {
             return Err(RecoveryError::Malformed); // trailing garbage
         }
         Ok(Self {
-            pad: derive_pad(key),
+            memory_key: derive_memory_key(key),
             map,
         })
+    }
+}
+
+#[derive(Default)]
+pub struct RecoveryStreamRemasker {
+    patterns: Vec<StreamPattern>,
+    pending_raw: Vec<u8>,
+    pending_visible: Vec<u8>,
+    visible_raw_starts: Vec<usize>,
+    visible_raw_ends: Vec<usize>,
+}
+
+struct StreamPattern {
+    value: Vec<u8>,
+    placeholder: Vec<u8>,
+}
+
+impl Recovery {
+    pub fn stream_remasker(&self) -> RecoveryStreamRemasker {
+        let mut remasker = RecoveryStreamRemasker::default();
+        remasker.merge_recovery(self);
+        remasker
+    }
+}
+
+impl RecoveryStreamRemasker {
+    pub fn merge_recovery(&mut self, recovery: &Recovery) {
+        let mut incoming = recovery
+            .map
+            .keys()
+            .filter_map(|placeholder| {
+                recovery
+                    .reveal(placeholder)
+                    .filter(|value| is_remaskable_echo(value))
+                    .map(|value| StreamPattern {
+                        value: value.into_bytes(),
+                        placeholder: placeholder.as_bytes().to_vec(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.patterns.append(&mut incoming);
+        self.patterns.sort_by(|left, right| {
+            left.value
+                .cmp(&right.value)
+                .then_with(|| left.placeholder.cmp(&right.placeholder))
+        });
+        let mut deduplicated = Vec::with_capacity(self.patterns.len());
+        for mut pattern in self.patterns.drain(..) {
+            if deduplicated
+                .last()
+                .is_some_and(|previous: &StreamPattern| previous.value == pattern.value)
+            {
+                pattern.value.zeroize();
+                pattern.placeholder.zeroize();
+            } else {
+                deduplicated.push(pattern);
+            }
+        }
+        self.patterns = deduplicated;
+    }
+
+    pub fn push_text(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending_raw.reserve(bytes.len());
+        self.pending_visible.reserve(bytes.len());
+        self.visible_raw_starts.reserve(bytes.len());
+        self.visible_raw_ends.reserve(bytes.len());
+        for byte in bytes {
+            let start = self.pending_raw.len();
+            self.pending_raw.push(*byte);
+            self.pending_visible.push(*byte);
+            self.visible_raw_starts.push(start);
+            self.visible_raw_ends.push(start + 1);
+        }
+        self.drain_ready(false)
+    }
+
+    pub fn push_control(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending_raw.extend_from_slice(bytes);
+        self.drain_ready(false)
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        self.drain_ready(true)
+    }
+
+    fn drain_ready(&mut self, force: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.patterns.is_empty() {
+            out.extend(std::mem::take(&mut self.pending_raw));
+            self.clear_visible();
+            return out;
+        }
+        loop {
+            let candidate = self.first_candidate(force);
+            match candidate {
+                Some(StreamCandidate::Partial { start }) => {
+                    if start > 0 {
+                        self.emit_visible_prefix(start, &mut out);
+                    }
+                    break;
+                }
+                Some(StreamCandidate::Full {
+                    start,
+                    end,
+                    pattern,
+                }) => {
+                    if start > 0 {
+                        self.emit_visible_prefix(start, &mut out);
+                        continue;
+                    }
+                    let raw_end = self.visible_raw_ends[end - 1];
+                    out.extend_from_slice(&self.patterns[pattern].placeholder);
+                    self.discard_prefix(end, raw_end);
+                }
+                None => {
+                    out.extend(std::mem::take(&mut self.pending_raw));
+                    self.clear_visible();
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn first_candidate(&self, force: bool) -> Option<StreamCandidate> {
+        for start in 0..self.pending_visible.len() {
+            let remaining = &self.pending_visible[start..];
+            let mut longest_full = None;
+            let mut has_partial = false;
+            for (index, pattern) in self.patterns.iter().enumerate() {
+                if remaining.len() >= pattern.value.len() && remaining.starts_with(&pattern.value) {
+                    if longest_full.is_none_or(|(_, len)| pattern.value.len() > len) {
+                        longest_full = Some((index, pattern.value.len()));
+                    }
+                } else if !force
+                    && remaining.len() < pattern.value.len()
+                    && pattern.value.starts_with(remaining)
+                {
+                    has_partial = true;
+                }
+            }
+            if has_partial {
+                return Some(StreamCandidate::Partial { start });
+            }
+            if let Some((pattern, len)) = longest_full {
+                return Some(StreamCandidate::Full {
+                    start,
+                    end: start + len,
+                    pattern,
+                });
+            }
+        }
+        None
+    }
+
+    fn emit_visible_prefix(&mut self, visible: usize, out: &mut Vec<u8>) {
+        let raw = self.visible_raw_starts[visible];
+        out.extend(self.pending_raw.drain(..raw));
+        self.remove_visible_prefix(visible, raw);
+    }
+
+    fn discard_prefix(&mut self, visible: usize, raw: usize) {
+        let mut discarded = self.pending_raw.drain(..raw).collect::<Vec<_>>();
+        discarded.zeroize();
+        self.remove_visible_prefix(visible, raw);
+    }
+
+    fn remove_visible_prefix(&mut self, visible: usize, raw: usize) {
+        let mut discarded = self.pending_visible.drain(..visible).collect::<Vec<_>>();
+        discarded.zeroize();
+        self.visible_raw_starts.drain(..visible);
+        self.visible_raw_ends.drain(..visible);
+        for offset in &mut self.visible_raw_starts {
+            *offset -= raw;
+        }
+        for offset in &mut self.visible_raw_ends {
+            *offset -= raw;
+        }
+    }
+
+    fn clear_visible(&mut self) {
+        self.pending_visible.zeroize();
+        self.pending_visible.clear();
+        self.visible_raw_starts.zeroize();
+        self.visible_raw_starts.clear();
+        self.visible_raw_ends.zeroize();
+        self.visible_raw_ends.clear();
+    }
+}
+
+enum StreamCandidate {
+    Partial {
+        start: usize,
+    },
+    Full {
+        start: usize,
+        end: usize,
+        pattern: usize,
+    },
+}
+
+impl Drop for RecoveryStreamRemasker {
+    fn drop(&mut self) {
+        for pattern in &mut self.patterns {
+            pattern.value.zeroize();
+            pattern.placeholder.zeroize();
+        }
+        self.pending_raw.zeroize();
+        self.clear_visible();
     }
 }
 
@@ -207,9 +417,9 @@ fn is_remaskable_echo(value: &str) -> bool {
 
 impl Drop for Recovery {
     fn drop(&mut self) {
-        // Wipe the deobfuscation pad and the (obfuscated) values so a dropped map
+        // Wipe the memory key and ciphertext so a dropped map
         // leaves no recovery material in freed memory. Placeholders are public.
-        self.pad.zeroize();
+        self.memory_key.zeroize();
         for v in self.map.values_mut() {
             v.zeroize();
         }
@@ -320,36 +530,28 @@ fn resolve_text(text: &str, rec: &Recovery) -> String {
     out
 }
 
-/// Domain-separated pad derived from the masking key (so it isn't reused verbatim
-/// for placeholder hashing).
-fn derive_pad(key: &[u8; 32]) -> [u8; 32] {
+/// Domain-separated encryption key derived from the masking key.
+fn derive_memory_key(key: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(PAD_DOMAIN);
+    h.update(MEMORY_KEY_DOMAIN);
     h.update(key);
     h.finalize().into()
 }
 
-/// XOR `data` with a per-entry keystream: block i is SHA256(pad || nonce || i).
-/// `nonce` is the placeholder, unique per entry, so values never share a stream.
-/// Reversible — calling it again on the output restores the input.
-fn xor_keystream(pad: &[u8; 32], nonce: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut block = [0u8; 32];
-    let mut bi = block.len();
-    let mut counter: u64 = 0;
-    for &b in data {
-        if bi == block.len() {
-            let mut h = Sha256::new();
-            h.update(pad);
-            h.update(nonce);
-            h.update(counter.to_le_bytes());
-            block = h.finalize().into();
-            counter += 1;
-            bi = 0;
-        }
-        out.push(b ^ block[bi]);
-        bi += 1;
-    }
+/// Encrypt or decrypt one value. A placeholder identifies one immutable value,
+/// so its domain-separated hash is a stable nonce for that entry.
+fn crypt_memory_value(key: &[u8; 32], placeholder: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut nonce_hash = Sha256::new();
+    nonce_hash.update(MEMORY_NONCE_DOMAIN);
+    nonce_hash.update(placeholder);
+    let nonce_hash = nonce_hash.finalize();
+    let key = Key::from(*key);
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&nonce_hash[..12]);
+    let nonce = Nonce::from(nonce_bytes);
+    let mut cipher = ChaCha20::new(&key, &nonce);
+    let mut out = data.to_vec();
+    cipher.apply_keystream(&mut out);
     out
 }
 
@@ -403,7 +605,7 @@ mod tests {
             )]),
             &[7u8; 32],
         );
-        // restore deobfuscates exactly,
+        // restore decrypts exactly,
         assert_eq!(
             restore("use <<AWS_AKID_0011223344556677>>", &rec).unwrap(),
             format!("use {secret}")
@@ -464,6 +666,64 @@ mod tests {
             rec.remask("AKIA3EXAMPLE has a digit"),
             "AKIA3EXAMPLE has a digit"
         );
+    }
+
+    #[test]
+    fn stream_remasker_masks_values_split_across_chunks_and_controls() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let placeholder = "<<AWS_AKID_0011223344556677>>";
+        let recovery = Recovery::seal(
+            HashMap::from([(placeholder.to_string(), secret.to_string())]),
+            &[5u8; 32],
+        );
+        let mut remasker = recovery.stream_remasker();
+        let mut out = remasker.push_text(b"answer AKIAIOS");
+        out.extend(remasker.push_control(b"\x1b[31m"));
+        out.extend(remasker.push_text(b"FODNN7EXAMPLE done"));
+        out.extend(remasker.finish());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("answer {placeholder} done")
+        );
+    }
+
+    #[test]
+    fn stream_remasker_keeps_existing_placeholders_byte_identical() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let placeholder = "<<AWS_AKID_0011223344556677>>";
+        let recovery = Recovery::seal(
+            HashMap::from([(placeholder.to_string(), secret.to_string())]),
+            &[5u8; 32],
+        );
+        let mut remasker = recovery.stream_remasker();
+        let mut out = remasker.push_text(format!("answer {placeholder}").as_bytes());
+        out.extend(remasker.finish());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("answer {placeholder}")
+        );
+    }
+
+    #[test]
+    fn stream_remasker_waits_for_the_longest_known_value() {
+        let recovery = Recovery::seal(
+            HashMap::from([
+                (
+                    "<<SHORT_0011223344556677>>".to_string(),
+                    "secret".to_string(),
+                ),
+                (
+                    "<<LONG_0011223344556677>>".to_string(),
+                    "secret-value".to_string(),
+                ),
+            ]),
+            &[5u8; 32],
+        );
+        let mut remasker = recovery.stream_remasker();
+        assert!(remasker.push_text(b"secret").is_empty());
+        let mut out = remasker.push_text(b"-value");
+        out.extend(remasker.finish());
+        assert_eq!(out, b"<<LONG_0011223344556677>>");
     }
 
     #[test]
