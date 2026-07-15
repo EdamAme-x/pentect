@@ -112,6 +112,10 @@ pub fn load_decode_config(profile: Profile) -> Result<pentect_core::DecodeConfig
     config::decode_config(profile)
 }
 
+pub fn load_environment_variable_prefix() -> Result<String, String> {
+    config::environment_variable_prefix()
+}
+
 pub fn mask_input_into_active_memory_store(
     input: Input,
     profile: Profile,
@@ -145,7 +149,8 @@ fn mask_input_into_memory_store_client(
     let key = client.key().map_err(|e| e.to_string())?;
     let result = masking::mask_read_input_with_profile(key, input, profile, packs)?;
     let mut recovery = result.recovery.clone();
-    recovery.extend_same_key(env_alias_recovery(&result.masked, &key));
+    let prefix = config::environment_variable_prefix()?;
+    recovery.extend_same_key(env_alias_recovery(&result.masked, &key, &prefix));
     client
         .add_recovery(&key, &recovery)
         .map_err(|e| e.to_string())?;
@@ -2153,8 +2158,12 @@ impl ShellInputProtector {
 
     fn prepare_paste(&mut self, text: &str) -> Result<ProtectedPaste, String> {
         let masked = self.masker.mask_text(text, live_output_kind(text))?;
-        let (visible, bindings) =
-            replace_masked_handles_with_env_refs(&masked, &self.store, self.syntax)?;
+        let (visible, bindings) = replace_masked_handles_with_env_refs(
+            &masked,
+            &self.store,
+            self.syntax,
+            self.masker.environment_prefix(),
+        )?;
         if bindings.is_empty() {
             return Ok(ProtectedPaste {
                 child: text.to_string(),
@@ -2240,6 +2249,7 @@ fn replace_masked_handles_with_env_refs(
     masked: &str,
     store: &MemoryStore,
     syntax: ShellSyntax,
+    environment_prefix: &str,
 ) -> Result<(String, Vec<ShellEnvBinding>), String> {
     let handles = masked_handles_in_text(masked);
     if handles.is_empty() {
@@ -2251,7 +2261,7 @@ fn replace_masked_handles_with_env_refs(
         let Ok(parts) = parse_placeholder(&handle) else {
             continue;
         };
-        let name = format!("PENTECT_{}_{}", parts.label, parts.hash);
+        let name = format!("{environment_prefix}{}_{}", parts.label, parts.hash);
         let mut value = store.resolve_all(&handle).map_err(|e| e.to_string())?;
         if value == handle {
             value.zeroize();
@@ -3558,7 +3568,8 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
     }
     activity_log::record_mask_result("read", &result, Some(path));
     let mut recovery = result.recovery.clone();
-    recovery.extend_same_key(env_alias_recovery(&result.masked, &session.key));
+    let prefix = config::environment_variable_prefix()?;
+    recovery.extend_same_key(env_alias_recovery(&result.masked, &session.key, &prefix));
     MemoryStore::for_session(session)
         .add_recovery(recovery)
         .map_err(|e| e.to_string())?;

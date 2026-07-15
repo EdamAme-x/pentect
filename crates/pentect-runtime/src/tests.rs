@@ -233,6 +233,30 @@ fn shell_secret_paste_replaces_visible_value_with_env_ref() {
 }
 
 #[test]
+fn shell_secret_paste_uses_explicit_environment_prefix() {
+    let (root, session) = empty_session("shell-paste-custom-prefix");
+    let store = MemoryStore::for_session(&session);
+    let mut masker = OutputMasker::new_shared(store.clone()).unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = masker
+        .mask_text(&format!("Authorization: Bearer {raw}"), Kind::Text)
+        .unwrap();
+    let (visible, mut bindings) =
+        replace_masked_handles_with_env_refs(&masked, &store, ShellSyntax::current(), "SAFE_")
+            .unwrap();
+    assert!(!visible.contains(raw), "{visible}");
+    assert!(visible.contains("SAFE_OPENAI_API_KEY_"), "{visible}");
+    assert!(!visible.contains("PENTECT_OPENAI_API_KEY_"), "{visible}");
+    assert!(bindings
+        .iter()
+        .any(|binding| binding.name.starts_with("SAFE_OPENAI_API_KEY_") && binding.value == raw));
+    for binding in &mut bindings {
+        binding.value.zeroize();
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn pty_echo_suppressor_removes_injected_env_prefix_only() {
     let suppressor = PtyEchoSuppressor::default();
     suppressor.push("$env:PENTECT_TOKEN='raw-secret'; ".to_string());
@@ -1006,6 +1030,30 @@ fn exec_auto_binds_masked_env_output_in_running_session() {
     assert!(!safe.contains("114514810"), "{safe}");
     assert!(!safe.contains("hello world"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn env_alias_recovery_uses_explicit_prefix() {
+    let key = [7u8; 32];
+    let masked = "OPENAI_API_KEY=<<OPENAI_API_KEY_0123456789abcdef>>\n";
+    let recovery = env_alias_recovery(masked, &key, "SAFE_");
+    let aliases: Vec<_> = recovery
+        .placeholders()
+        .into_iter()
+        .filter(|placeholder| masking::is_env_alias_placeholder(placeholder))
+        .filter_map(|placeholder| {
+            let record = recovery.resolve(&placeholder);
+            masking::decode_env_alias_record(&record)
+                .map(|(name, handle)| (name.to_string(), handle.to_string()))
+        })
+        .collect();
+    assert_eq!(
+        aliases,
+        vec![(
+            "SAFE_OPENAI_API_KEY_0123456789abcdef".to_string(),
+            "<<OPENAI_API_KEY_0123456789abcdef>>".to_string()
+        )]
+    );
 }
 
 #[test]
@@ -2657,7 +2705,10 @@ fn derived_redactions_do_not_claim_to_be_reusable_handles() {
     let (root, session) = empty_session("exec-derived-no-hint");
     let masked = mask_tool_output(&session, "PREFIX_32=rpa_FAKE\n").unwrap();
     assert_eq!(masked, "PREFIX_32=<<REDACTED_DERIVED>>\n");
-    assert!(first_reusable_env_name(&masked).is_none(), "{masked}");
+    assert!(
+        first_reusable_env_name(&masked, "PENTECT_").is_none(),
+        "{masked}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

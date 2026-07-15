@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
+const DEFAULT_ENVIRONMENT_PREFIX: &str = "PENTECT_";
+const MAX_ENVIRONMENT_PREFIX_BYTES: usize = 64;
 const DEFAULT_IMAGE_OCR_MAX_EDGE: u32 = 2_048;
 const DEFAULT_IMAGE_OCR_MAX_PIXELS: u64 = 64_000_000;
 const DEFAULT_IMAGE_MAX_IMAGES: usize = 64;
@@ -78,6 +80,18 @@ pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
     let project = read_image_ocr_config(project_config_path())?;
     let global = read_image_ocr_config(global_config_path()?)?;
     Ok(merge_image_ocr_config(project, global))
+}
+
+#[cfg(not(test))]
+pub(crate) fn environment_variable_prefix() -> Result<String, String> {
+    let project = read_environment_variable_prefix(project_config_path())?;
+    let global = read_environment_variable_prefix(global_config_path()?)?;
+    Ok(effective_environment_variable_prefix(project, global))
+}
+
+#[cfg(test)]
+pub(crate) fn environment_variable_prefix() -> Result<String, String> {
+    Ok(DEFAULT_ENVIRONMENT_PREFIX.to_string())
 }
 
 #[cfg(not(test))]
@@ -263,6 +277,69 @@ fn read_file_pointer_manager_save(path: PathBuf) -> Result<Option<bool>, String>
         .parse::<toml::Value>()
         .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
     file_pointer_manager_save_value(&value)
+}
+
+fn read_environment_variable_prefix(path: PathBuf) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let src = fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(None);
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    environment_variable_prefix_value(&value)
+}
+
+fn environment_variable_prefix_value(value: &toml::Value) -> Result<Option<String>, String> {
+    let Some(raw) = value.get("environment") else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("environment config must be a table".to_string());
+    };
+    let Some(raw) = table.get("prefix") else {
+        return Ok(None);
+    };
+    let Some(prefix) = raw.as_str() else {
+        return Err("environment.prefix must be a string".to_string());
+    };
+    validate_environment_variable_prefix(prefix)?;
+    Ok(Some(prefix.to_string()))
+}
+
+fn validate_environment_variable_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.len() > MAX_ENVIRONMENT_PREFIX_BYTES {
+        return Err(format!(
+            "environment.prefix must be at most {MAX_ENVIRONMENT_PREFIX_BYTES} ASCII bytes"
+        ));
+    }
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    let bytes = prefix.as_bytes();
+    if bytes[0].is_ascii_digit()
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return Err(
+            "environment.prefix must be empty or an ASCII environment-name prefix".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn effective_environment_variable_prefix(
+    project: Option<String>,
+    global: Option<String>,
+) -> String {
+    project
+        .or(global)
+        .unwrap_or_else(|| DEFAULT_ENVIRONMENT_PREFIX.to_string())
 }
 
 fn file_pointer_manager_save_value(value: &toml::Value) -> Result<Option<bool>, String> {
@@ -615,6 +692,79 @@ unknown_min_bytes = 32
         assert_eq!(partial.max_inflate_bytes, Some(None));
         assert_eq!(partial.mask_unknown, Some(true));
         assert_eq!(partial.unknown_min_bytes, Some(32));
+    }
+
+    #[test]
+    fn environment_prefix_accepts_namespaced_and_empty_values() {
+        let value = "[environment]\nprefix = \"SAFE_\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(
+            environment_variable_prefix_value(&value).unwrap(),
+            Some("SAFE_".to_string())
+        );
+
+        let value = "[environment]\nprefix = \"\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(
+            environment_variable_prefix_value(&value).unwrap(),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn environment_prefix_rejects_invalid_environment_names() {
+        let too_long = "A".repeat(MAX_ENVIRONMENT_PREFIX_BYTES + 1);
+        for prefix in ["9SAFE_", "SAFE-", "秘密_", &too_long] {
+            let value = format!("[environment]\nprefix = {prefix:?}")
+                .parse::<toml::Value>()
+                .unwrap();
+            assert!(environment_variable_prefix_value(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn environment_prefix_prefers_project_then_global_then_default() {
+        assert_eq!(
+            effective_environment_variable_prefix(
+                Some("PROJECT_".to_string()),
+                Some("GLOBAL_".to_string())
+            ),
+            "PROJECT_"
+        );
+        assert_eq!(
+            effective_environment_variable_prefix(None, Some("GLOBAL_".to_string())),
+            "GLOBAL_"
+        );
+        assert_eq!(
+            effective_environment_variable_prefix(None, None),
+            "PENTECT_"
+        );
+        assert_eq!(
+            effective_environment_variable_prefix(Some(String::new()), Some("GLOBAL_".to_string())),
+            ""
+        );
+    }
+
+    #[test]
+    fn environment_prefix_reads_config_file() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-environment-prefix-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        std::fs::write(&path, "[environment]\nprefix = \"SAFE_\"\n").unwrap();
+        assert_eq!(
+            read_environment_variable_prefix(path).unwrap(),
+            Some("SAFE_".to_string())
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
