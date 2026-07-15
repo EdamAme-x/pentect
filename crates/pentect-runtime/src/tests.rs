@@ -814,25 +814,25 @@ fn prompt_masked_env_is_available_to_exec_proxy_without_visible_pentect_exec() {
     std::env::set_var(ENV_TOKEN, token);
 
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-    let prompt = mask_prompt_text_into_active_memory_store(&format!(
-        "OPENAI_API_KEY={raw} use it from $env:OPENAI_API_KEY"
-    ))
-    .unwrap()
-    .unwrap();
+    let prompt = mask_prompt_text_into_active_memory_store(&format!("OPENAI_API_KEY={raw}"))
+        .unwrap()
+        .unwrap();
     assert!(!prompt.contains(raw), "{prompt}");
     assert!(prompt.contains("OPENAI_API_KEY=<<"), "{prompt}");
+    let env_name =
+        pentect_env_name_for_handle(&masked_handle_from_assignment(&prompt, "OPENAI_API_KEY"));
 
     let argv_mode = if cfg!(windows) {
         vec![
             "powershell".to_string(),
             "-Command".to_string(),
-            "Write-Output $env:OPENAI_API_KEY".to_string(),
+            format!("Write-Output $env:{env_name}"),
         ]
     } else {
         vec![
             "sh".to_string(),
             "-c".to_string(),
-            "printf '%s' \"$OPENAI_API_KEY\"".to_string(),
+            format!("printf '%s' \"${env_name}\""),
         ]
     };
     let session = Session::open_capability("default").unwrap();
@@ -841,7 +841,7 @@ fn prompt_masked_env_is_available_to_exec_proxy_without_visible_pentect_exec() {
     assert!(
         overlays
             .iter()
-            .any(|(name, value)| name == "OPENAI_API_KEY" && value == raw),
+            .any(|(name, value)| name == &env_name && value == raw),
         "{overlays:?}"
     );
 }
@@ -874,18 +874,24 @@ fn prompt_masking_uses_strict_input_detection_for_env_lines_in_prose() {
 }
 
 #[test]
-fn exec_capability_env_overlays_parent_environment_when_referenced() {
+fn exec_capability_env_does_not_shadow_parent_environment() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("env-overlay");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let value = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
-    let _masked = mask_tool_output(&session, &format!("RUNPOD_API_KEY={value}\n")).unwrap();
+    let masked = mask_tool_output(&session, &format!("RUNPOD_API_KEY={value}\n")).unwrap();
     let store = MemoryStore::for_session(&session);
+    let env_name =
+        pentect_env_name_for_handle(&masked_handle_from_assignment(&masked, "RUNPOD_API_KEY"));
     std::env::set_var("RUNPOD_API_KEY", "parent-value");
     let mode = if cfg!(windows) {
-        ExecMode::Shell("Write-Output $env:RUNPOD_API_KEY".to_string())
+        ExecMode::Shell(format!(
+            "Write-Output $env:RUNPOD_API_KEY; Write-Output $env:{env_name}"
+        ))
     } else {
-        ExecMode::Shell("printf '%s' \"$RUNPOD_API_KEY\"".to_string())
+        ExecMode::Shell(format!(
+            "printf '%s\\n%s' \"$RUNPOD_API_KEY\" \"${env_name}\""
+        ))
     };
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
@@ -897,7 +903,7 @@ fn exec_capability_env_overlays_parent_environment_when_referenced() {
     let output = output.unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(value), "{stdout}");
-    assert!(!stdout.contains("parent-value"), "{stdout}");
+    assert!(stdout.contains("parent-value"), "{stdout}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -945,35 +951,41 @@ fn exec_auto_binds_masked_env_output_in_running_session() {
     assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
     let runpod_handle = masked_handle_from_assignment(&masked, "RUNPOD_API_KEY");
     let runpod_pentect_env = pentect_env_name_for_handle(&runpod_handle);
+    let test_secret_env =
+        pentect_env_name_for_handle(&masked_handle_from_assignment(&masked, "TEST_SECRET"));
+    let note_env = pentect_env_name_for_handle(&masked_handle_from_assignment(&masked, "NOTE"));
 
     let store = MemoryStore::for_session(&session);
     let env = store.auto_env_bindings().unwrap();
-    assert!(
-        env.iter().any(|(name, value)| name == "RUNPOD_API_KEY"
-            && value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
-        "{env:?}"
-    );
-    assert!(
-        env.iter()
-            .any(|(name, value)| name == "TEST_SECRET" && value == "114514810"),
-        "{env:?}"
-    );
-    assert!(
-        env.iter()
-            .any(|(name, value)| name == "NOTE" && value == "hello world"),
-        "{env:?}"
-    );
     assert!(
         env.iter().any(|(name, value)| name == &runpod_pentect_env
             && value == "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
         "{env:?}"
     );
+    assert!(
+        env.iter()
+            .any(|(name, value)| name == &test_secret_env && value == "114514810"),
+        "{env:?}"
+    );
+    assert!(
+        env.iter()
+            .any(|(name, value)| name == &note_env && value == "hello world"),
+        "{env:?}"
+    );
+    assert!(
+        !env.iter()
+            .any(|(name, _)| matches!(name.as_str(), "RUNPOD_API_KEY" | "TEST_SECRET" | "NOTE")),
+        "{env:?}"
+    );
 
     let command = if cfg!(windows) {
-        "Write-Output $env:RUNPOD_API_KEY; Write-Output $env:TEST_SECRET; Write-Output $env:NOTE"
-            .to_string()
+        format!(
+            "Write-Output $env:{runpod_pentect_env}; Write-Output $env:{test_secret_env}; Write-Output $env:{note_env}"
+        )
     } else {
-        "printf '%s\n%s\n%s\n' \"$RUNPOD_API_KEY\" \"$TEST_SECRET\" \"$NOTE\"".to_string()
+        format!(
+            "printf '%s\\n%s\\n%s\\n' \"${runpod_pentect_env}\" \"${test_secret_env}\" \"${note_env}\""
+        )
     };
     let opts = ExecOpts {
         session: DEFAULT_SESSION.to_string(),
@@ -1002,8 +1014,10 @@ fn exec_only_injects_referenced_capability_env() {
     let session = Session::open_capability_at(&root, "t").unwrap();
     let output =
         "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\n";
-    let _masked = mask_tool_output(&session, output).unwrap();
+    let masked = mask_tool_output(&session, output).unwrap();
     let store = MemoryStore::for_session(&session);
+    let env_name =
+        pentect_env_name_for_handle(&masked_handle_from_assignment(&masked, "RUNPOD_API_KEY"));
 
     let none = requested_env_bindings(
         &store,
@@ -1019,14 +1033,14 @@ fn exec_only_injects_referenced_capability_env() {
     let one = requested_env_bindings(
         &store,
         &ExecMode::Shell(if cfg!(windows) {
-            "Write-Output $env:RUNPOD_API_KEY".to_string()
+            format!("Write-Output $env:{env_name}")
         } else {
-            "printf '%s' \"$RUNPOD_API_KEY\"".to_string()
+            format!("printf '%s' \"${env_name}\"")
         }),
     )
     .unwrap();
     assert_eq!(one.len(), 1, "{one:?}");
-    assert_eq!(one[0].0, "RUNPOD_API_KEY");
+    assert_eq!(one[0].0, env_name);
     assert_eq!(one[0].1, "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1036,16 +1050,18 @@ fn exec_injects_powershell_env_provider_references() {
     let root = temp_root("capability-env-provider");
     let session = Session::open_capability_at(&root, "t").unwrap();
     let value = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-    let _masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={value}\n")).unwrap();
+    let masked = mask_tool_output(&session, &format!("OPENAI_API_KEY={value}\n")).unwrap();
     let store = MemoryStore::for_session(&session);
+    let env_name =
+        pentect_env_name_for_handle(&masked_handle_from_assignment(&masked, "OPENAI_API_KEY"));
     let env = requested_env_bindings(
         &store,
-        &ExecMode::Shell("Test-Path Env:OPENAI_API_KEY".to_string()),
+        &ExecMode::Shell(format!("Test-Path Env:{env_name}")),
     )
     .unwrap();
     assert!(
         env.iter()
-            .any(|(name, found)| name == "OPENAI_API_KEY" && found == value),
+            .any(|(name, found)| name == &env_name && found == value),
         "{env:?}"
     );
     let _ = std::fs::remove_dir_all(root);
@@ -1067,12 +1083,13 @@ fn auto_env_bindings_do_not_override_baseline_environment() {
     let env = store.auto_env_bindings().unwrap();
     assert!(
         !env.iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("PATH")),
+            .any(|(name, _)| matches!(name.as_str(), "PATH" | "DUMMY_SECRET")),
         "{env:?}"
     );
     assert!(
         env.iter()
-            .any(|(name, value)| name == "DUMMY_SECRET" && value == "sk-YYYYYYYYYYYYYYYYYYYY"),
+            .any(|(name, value)| name.starts_with("PENTECT_OPENAI_API_KEY_")
+                && value == "sk-YYYYYYYYYYYYYYYYYYYY"),
         "{env:?}"
     );
     let _ = std::fs::remove_dir_all(root);

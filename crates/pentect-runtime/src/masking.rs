@@ -737,74 +737,8 @@ pub(crate) fn env_alias_recovery(masked: &str, key: &[u8; 32]) -> Recovery {
 }
 
 fn reusable_env_aliases(text: &str) -> Vec<(String, String)> {
-    let mut out = reusable_assignment_env_aliases(text);
-    out.extend(reusable_inline_assignment_env_aliases(text));
-    out.extend(reusable_handle_env_aliases(text));
-    out
-}
-
-fn reusable_assignment_env_aliases(text: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let Some((key, value)) = trimmed
-            .strip_prefix("export ")
-            .unwrap_or(trimmed)
-            .split_once('=')
-        else {
-            continue;
-        };
-        if !is_env_name(key) {
-            continue;
-        }
-        let handle = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .trim_end_matches(';');
-        if is_reusable_placeholder(handle) {
-            out.push((key.to_string(), handle.to_string()));
-        }
-    }
-    out
-}
-
-fn reusable_inline_assignment_env_aliases(text: &str) -> Vec<(String, String)> {
-    reusable_placeholders_with_spans(text)
-        .into_iter()
-        .filter_map(|(handle, start, end)| {
-            let key = inline_assignment_key_before_handle(text, start)?;
-            inline_assignment_handle_boundary_ok(text, end).then_some((key, handle))
-        })
-        .collect()
-}
-
-fn inline_assignment_key_before_handle(text: &str, handle_start: usize) -> Option<String> {
-    let before = text.get(..handle_start)?;
-    let line_start = before
-        .rfind(['\r', '\n'])
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let line_before = before.get(line_start..)?.trim_end();
-    let assignment_left = line_before.strip_suffix('=')?.trim_end();
-    let key_end = assignment_left.len();
-    let key_start = assignment_left
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| !is_env_name_char(*ch))
-        .map(|(index, ch)| index + ch.len_utf8())
-        .unwrap_or(0);
-    let key = assignment_left.get(key_start..key_end)?;
-    is_env_name(key).then(|| key.to_string())
-}
-
-fn inline_assignment_handle_boundary_ok(text: &str, handle_end: usize) -> bool {
-    let Some(rest) = text.get(handle_end..) else {
-        return true;
-    };
-    rest.chars()
-        .next()
-        .is_none_or(|ch| !is_env_name_char(ch) && ch != '<')
+    // Generated names must not shadow source or parent environment variables.
+    reusable_handle_env_aliases(text)
 }
 
 fn reusable_handle_env_aliases(text: &str) -> Vec<(String, String)> {
@@ -829,27 +763,6 @@ fn reusable_placeholders(text: &str) -> Vec<String> {
                     out.push(handle.to_string());
                 }
                 i = close + 2;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
-fn reusable_placeholders_with_spans(text: &str) -> Vec<(String, usize, usize)> {
-    let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'<' && bytes[i + 1] == b'<' {
-            if let Some(close) = find_from(bytes, i + 2, b">>") {
-                let end = close + 2;
-                let handle = &text[i..end];
-                if is_reusable_placeholder(handle) {
-                    out.push((handle.to_string(), i, end));
-                }
-                i = end;
                 continue;
             }
         }
@@ -974,10 +887,6 @@ fn placeholder_label(value: &str) -> Option<&str> {
 
 fn is_env_name(name: &str) -> bool {
     !name.is_empty() && !name.as_bytes()[0].is_ascii_digit() && name.bytes().all(is_env_name_byte)
-}
-
-fn is_env_name_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn redact_env_derivative_lines(text: &str) -> String {
