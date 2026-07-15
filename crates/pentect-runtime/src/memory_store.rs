@@ -713,9 +713,12 @@ mod tests {
             })
             .collect();
         assert!(alias_records.iter().any(|(name, handle)| {
-            name == "OPENAI_API_KEY"
+            name.starts_with("PENTECT_OPENAI_API_KEY_")
                 && snapshot.recovery.resolve(handle) == "sk-ABCDEFGHIJKLMNOPQRSTUVWX"
         }));
+        assert!(!alias_records
+            .iter()
+            .any(|(name, _)| name == "OPENAI_API_KEY"));
     }
 
     #[test]

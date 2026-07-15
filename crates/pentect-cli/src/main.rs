@@ -39,11 +39,11 @@ const PENTECT_CONTRACT_INSTRUCTIONS: &str = concat!(
     "Pentect agent contract:\n",
     "- Use normal shell commands. Pentect routes stdout/stderr through its protected runner and masks tool results.\n",
     "- You may read, fetch, transform, store, sync, and use user-authorized secrets. Pentect is the safety layer; raw secret values must not reach chat.\n",
-    "- Prefer generated environment variables for secret values already seen through Pentect. Do not make helper scripts reopen a secret source when an equivalent environment binding is available.\n",
-    "- When a source has not been seen yet, read it once with a normal protected command. Then use its assignment name or generated `PENTECT_...` environment variable in later commands.\n",
-    "- Masked handles like `<<NAME_hash>>` work only in this running Pentect-launched session. Use `$env:NAME`/`$env:PENTECT_NAME_hash` on PowerShell or `$NAME`/`$PENTECT_NAME_hash` on Unix.\n",
+    "- Prefer Pentect-generated `PENTECT_<LABEL>_<HASH>` environment variables for secret values already seen through Pentect. Do not make helper scripts reopen a secret source when an equivalent environment binding is available.\n",
+    "- When a source has not been seen yet, read it once with a normal protected command. Then use the generated `PENTECT_...` environment variable in later commands.\n",
+    "- Masked handles like `<<NAME_hash>>` work only in this running Pentect-launched session. Use `$env:PENTECT_NAME_hash` on PowerShell or `$PENTECT_NAME_hash` on Unix.\n",
     "- `pentect view '<handle>'` shows only label, hash, and length. Use handles or generated env vars instead of printing raw values.\n",
-    "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:NAME`; on Unix use POSIX commands and `$NAME`.\n",
+    "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:PENTECT_...`; on Unix use POSIX commands and `$PENTECT_...`.\n",
     "- MCP, browser, plugin, and connector tools may retrieve and use user-authorized secrets. Pentect masks tool text output when the host supports replacement; otherwise it stops unsafe output.\n",
     "- Default builds check image output with OS OCR on Windows/macOS and bundled OCR on Linux.\n",
     "- For user-requested storage, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
@@ -4011,15 +4011,13 @@ mod tests {
         assert!(rendered.contains("--enable\nunified_exec"), "{rendered}");
         assert!(rendered.contains("protected runner"), "{rendered}");
         assert!(rendered.contains("tool results"), "{rendered}");
-        assert!(
-            rendered.contains("generated environment variables"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("PENTECT_<LABEL>_<HASH>"), "{rendered}");
         assert!(rendered.contains("read it once"), "{rendered}");
         assert!(rendered.contains("helper scripts"), "{rendered}");
         assert!(!rendered.contains("cat .env"), "{rendered}");
         assert!(rendered.contains("Masked handles"), "{rendered}");
-        assert!(rendered.contains("$env:NAME"), "{rendered}");
+        assert!(rendered.contains("$env:PENTECT_NAME_hash"), "{rendered}");
+        assert!(!rendered.contains("$env:NAME"), "{rendered}");
         assert!(rendered.contains("user-authorized secrets"), "{rendered}");
         assert!(
             rendered.contains("Pentect is the safety layer"),
@@ -4123,14 +4121,12 @@ mod tests {
         assert!(rendered.contains("Use normal shell commands"), "{rendered}");
         assert!(rendered.contains("protected runner"), "{rendered}");
         assert!(rendered.contains("tool results"), "{rendered}");
-        assert!(
-            rendered.contains("generated environment variables"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("PENTECT_<LABEL>_<HASH>"), "{rendered}");
         assert!(rendered.contains("read it once"), "{rendered}");
         assert!(rendered.contains("helper scripts"), "{rendered}");
         assert!(!rendered.contains("cat .env"), "{rendered}");
-        assert!(rendered.contains("$env:NAME"), "{rendered}");
+        assert!(rendered.contains("$env:PENTECT_NAME_hash"), "{rendered}");
+        assert!(!rendered.contains("$env:NAME"), "{rendered}");
         assert!(rendered.contains("user-authorized secrets"), "{rendered}");
         assert!(
             rendered.contains("Pentect is the safety layer"),
