@@ -1009,6 +1009,30 @@ fn exec_auto_binds_masked_env_output_in_running_session() {
 }
 
 #[test]
+fn env_alias_recovery_uses_explicit_prefix() {
+    let key = [7u8; 32];
+    let masked = "OPENAI_API_KEY=<<OPENAI_API_KEY_0123456789abcdef>>\n";
+    let recovery = env_alias_recovery(masked, &key, "SAFE_");
+    let aliases: Vec<_> = recovery
+        .placeholders()
+        .into_iter()
+        .filter(|placeholder| masking::is_env_alias_placeholder(placeholder))
+        .filter_map(|placeholder| {
+            let record = recovery.resolve(&placeholder);
+            masking::decode_env_alias_record(&record)
+                .map(|(name, handle)| (name.to_string(), handle.to_string()))
+        })
+        .collect();
+    assert_eq!(
+        aliases,
+        vec![(
+            "SAFE_OPENAI_API_KEY_0123456789abcdef".to_string(),
+            "<<OPENAI_API_KEY_0123456789abcdef>>".to_string()
+        )]
+    );
+}
+
+#[test]
 fn exec_only_injects_referenced_capability_env() {
     let root = temp_root("capability-env-least");
     let session = Session::open_capability_at(&root, "t").unwrap();
@@ -2657,7 +2681,10 @@ fn derived_redactions_do_not_claim_to_be_reusable_handles() {
     let (root, session) = empty_session("exec-derived-no-hint");
     let masked = mask_tool_output(&session, "PREFIX_32=rpa_FAKE\n").unwrap();
     assert_eq!(masked, "PREFIX_32=<<REDACTED_DERIVED>>\n");
-    assert!(first_reusable_env_name(&masked).is_none(), "{masked}");
+    assert!(
+        first_reusable_env_name(&masked, "PENTECT_").is_none(),
+        "{masked}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

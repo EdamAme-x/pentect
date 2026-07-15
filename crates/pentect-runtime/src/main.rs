@@ -112,6 +112,10 @@ pub fn load_decode_config(profile: Profile) -> Result<pentect_core::DecodeConfig
     config::decode_config(profile)
 }
 
+pub fn load_environment_variable_prefix() -> Result<String, String> {
+    config::environment_variable_prefix()
+}
+
 pub fn mask_input_into_active_memory_store(
     input: Input,
     profile: Profile,
@@ -145,7 +149,8 @@ fn mask_input_into_memory_store_client(
     let key = client.key().map_err(|e| e.to_string())?;
     let result = masking::mask_read_input_with_profile(key, input, profile, packs)?;
     let mut recovery = result.recovery.clone();
-    recovery.extend_same_key(env_alias_recovery(&result.masked, &key));
+    let prefix = config::environment_variable_prefix()?;
+    recovery.extend_same_key(env_alias_recovery(&result.masked, &key, &prefix));
     client
         .add_recovery(&key, &recovery)
         .map_err(|e| e.to_string())?;
@@ -3558,7 +3563,8 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
     }
     activity_log::record_mask_result("read", &result, Some(path));
     let mut recovery = result.recovery.clone();
-    recovery.extend_same_key(env_alias_recovery(&result.masked, &session.key));
+    let prefix = config::environment_variable_prefix()?;
+    recovery.extend_same_key(env_alias_recovery(&result.masked, &session.key, &prefix));
     MemoryStore::for_session(session)
         .add_recovery(recovery)
         .map_err(|e| e.to_string())?;

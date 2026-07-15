@@ -34,6 +34,7 @@ pub(crate) struct OutputMasker {
     store: MemoryStore,
     engine: &'static Engine,
     model_adapters: ModelAdapters,
+    environment_prefix: String,
     mode: OutputMaskerMode,
     pending: Recovery,
     masked_count: u64,
@@ -58,6 +59,7 @@ impl OutputMasker {
             store,
             engine: tool_boundary_engine()?,
             model_adapters: ModelAdapters::from_env()?,
+            environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Shared,
             pending: Recovery::empty_for_key(&key),
             masked_count: 0,
@@ -72,6 +74,7 @@ impl OutputMasker {
             store,
             engine: tool_boundary_engine()?,
             model_adapters: ModelAdapters::from_env()?,
+            environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Deferred { remask_recoveries },
             pending: Recovery::empty_for_key(&key),
             masked_count: 0,
@@ -119,7 +122,11 @@ impl OutputMasker {
         self.add_masked_count(result.summary.masked_count);
         let masked = compact_local_home_paths(&result.masked);
         let mut recovery = result.recovery;
-        recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
+        recovery.extend_same_key(env_alias_recovery(
+            &masked,
+            &self.store.session.key,
+            &self.environment_prefix,
+        ));
         self.record_recovery(recovery)?;
         Ok(masked)
     }
@@ -164,7 +171,11 @@ impl OutputMasker {
             }
         }
         let masked = compact_local_home_paths(&masked);
-        recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
+        recovery.extend_same_key(env_alias_recovery(
+            &masked,
+            &self.store.session.key,
+            &self.environment_prefix,
+        ));
         self.record_recovery(recovery)?;
         Ok(masked)
     }
@@ -279,7 +290,11 @@ impl OutputMasker {
         self.add_masked_count(result.summary.masked_count);
         let masked = compact_local_home_paths(&result.masked);
         let mut recovery = result.recovery;
-        recovery.extend_same_key(env_alias_recovery(&masked, &self.store.session.key));
+        recovery.extend_same_key(env_alias_recovery(
+            &masked,
+            &self.store.session.key,
+            &self.environment_prefix,
+        ));
         self.record_recovery(recovery)?;
         Ok(masked)
     }
@@ -712,15 +727,15 @@ fn looks_like_sensitive_env_output(text: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn first_reusable_env_name(masked: &str) -> Option<String> {
-    reusable_env_aliases(masked)
+pub(crate) fn first_reusable_env_name(masked: &str, prefix: &str) -> Option<String> {
+    reusable_env_aliases(masked, prefix)
         .into_iter()
         .next()
         .map(|(name, _)| name)
 }
 
-pub(crate) fn env_alias_recovery(masked: &str, key: &[u8; 32]) -> Recovery {
-    let aliases = reusable_env_aliases(masked);
+pub(crate) fn env_alias_recovery(masked: &str, key: &[u8; 32], prefix: &str) -> Recovery {
+    let aliases = reusable_env_aliases(masked, prefix);
     if aliases.is_empty() {
         return Recovery::empty_for_key(key);
     }
@@ -736,16 +751,16 @@ pub(crate) fn env_alias_recovery(masked: &str, key: &[u8; 32]) -> Recovery {
     Recovery::seal(map, key)
 }
 
-fn reusable_env_aliases(text: &str) -> Vec<(String, String)> {
+fn reusable_env_aliases(text: &str, prefix: &str) -> Vec<(String, String)> {
     // Generated names must not shadow source or parent environment variables.
-    reusable_handle_env_aliases(text)
+    reusable_handle_env_aliases(text, prefix)
 }
 
-fn reusable_handle_env_aliases(text: &str) -> Vec<(String, String)> {
+fn reusable_handle_env_aliases(text: &str, prefix: &str) -> Vec<(String, String)> {
     reusable_placeholders(text)
         .into_iter()
         .filter_map(|handle| {
-            let name = env_name_for_handle(&handle)?;
+            let name = env_name_for_handle(&handle, prefix)?;
             Some((name, handle))
         })
         .collect()
@@ -771,9 +786,9 @@ fn reusable_placeholders(text: &str) -> Vec<String> {
     out
 }
 
-fn env_name_for_handle(handle: &str) -> Option<String> {
+fn env_name_for_handle(handle: &str, prefix: &str) -> Option<String> {
     let core = placeholder_core(handle)?;
-    Some(format!("PENTECT_{core}"))
+    Some(format!("{prefix}{core}"))
 }
 
 fn env_alias_placeholder(key: &[u8; 32], name: &str, handle: &str) -> String {
