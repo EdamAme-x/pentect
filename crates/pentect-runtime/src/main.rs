@@ -2158,8 +2158,12 @@ impl ShellInputProtector {
 
     fn prepare_paste(&mut self, text: &str) -> Result<ProtectedPaste, String> {
         let masked = self.masker.mask_text(text, live_output_kind(text))?;
-        let (visible, bindings) =
-            replace_masked_handles_with_env_refs(&masked, &self.store, self.syntax)?;
+        let (visible, bindings) = replace_masked_handles_with_env_refs(
+            &masked,
+            &self.store,
+            self.syntax,
+            self.masker.environment_prefix(),
+        )?;
         if bindings.is_empty() {
             return Ok(ProtectedPaste {
                 child: text.to_string(),
@@ -2245,6 +2249,7 @@ fn replace_masked_handles_with_env_refs(
     masked: &str,
     store: &MemoryStore,
     syntax: ShellSyntax,
+    environment_prefix: &str,
 ) -> Result<(String, Vec<ShellEnvBinding>), String> {
     let handles = masked_handles_in_text(masked);
     if handles.is_empty() {
@@ -2256,7 +2261,7 @@ fn replace_masked_handles_with_env_refs(
         let Ok(parts) = parse_placeholder(&handle) else {
             continue;
         };
-        let name = format!("PENTECT_{}_{}", parts.label, parts.hash);
+        let name = format!("{environment_prefix}{}_{}", parts.label, parts.hash);
         let mut value = store.resolve_all(&handle).map_err(|e| e.to_string())?;
         if value == handle {
             value.zeroize();

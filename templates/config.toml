@@ -3,6 +3,9 @@
 extensions = []
 # extension data: .pentect/extensions-data/<extension-id>
 
+[environment]
+prefix = "PENTECT_"
+
 [log]
 share = true
 

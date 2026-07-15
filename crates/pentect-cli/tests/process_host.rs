@@ -70,6 +70,44 @@ fn concurrent_up_keeps_one_persistent_host() {
 }
 
 #[test]
+fn codex_dry_run_uses_project_environment_prefix() {
+    let root = test_root();
+    let config_dir = root.join(".pentect");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[environment]\nprefix = \"SAFE_\"\n",
+    )
+    .unwrap();
+    let _cleanup = Cleanup {
+        root: root.clone(),
+        host_pid: None,
+        command_pids: Vec::new(),
+    };
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pentect"));
+    command
+        .args(["codex", "--dry-run"])
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in PRIVATE_ENV {
+        command.env_remove(name);
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(rendered.contains("SAFE_<LABEL>_<HASH>"), "{rendered}");
+    assert!(rendered.contains("$env:SAFE_NAME_hash"), "{rendered}");
+    assert!(!rendered.contains("PENTECT_NAME_hash"), "{rendered}");
+}
+
+#[test]
 fn log_hosts_while_running_but_help_does_not() {
     let root = test_root();
     std::fs::create_dir_all(&root).unwrap();

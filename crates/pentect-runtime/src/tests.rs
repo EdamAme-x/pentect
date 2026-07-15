@@ -233,6 +233,30 @@ fn shell_secret_paste_replaces_visible_value_with_env_ref() {
 }
 
 #[test]
+fn shell_secret_paste_uses_explicit_environment_prefix() {
+    let (root, session) = empty_session("shell-paste-custom-prefix");
+    let store = MemoryStore::for_session(&session);
+    let mut masker = OutputMasker::new_shared(store.clone()).unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = masker
+        .mask_text(&format!("Authorization: Bearer {raw}"), Kind::Text)
+        .unwrap();
+    let (visible, mut bindings) =
+        replace_masked_handles_with_env_refs(&masked, &store, ShellSyntax::current(), "SAFE_")
+            .unwrap();
+    assert!(!visible.contains(raw), "{visible}");
+    assert!(visible.contains("SAFE_OPENAI_API_KEY_"), "{visible}");
+    assert!(!visible.contains("PENTECT_OPENAI_API_KEY_"), "{visible}");
+    assert!(bindings
+        .iter()
+        .any(|binding| binding.name.starts_with("SAFE_OPENAI_API_KEY_") && binding.value == raw));
+    for binding in &mut bindings {
+        binding.value.zeroize();
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn pty_echo_suppressor_removes_injected_env_prefix_only() {
     let suppressor = PtyEchoSuppressor::default();
     suppressor.push("$env:PENTECT_TOKEN='raw-secret'; ".to_string());

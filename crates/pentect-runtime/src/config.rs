@@ -5,6 +5,7 @@ use std::path::PathBuf;
 const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
 const DEFAULT_ENVIRONMENT_PREFIX: &str = "PENTECT_";
+const MAX_ENVIRONMENT_PREFIX_BYTES: usize = 64;
 const DEFAULT_IMAGE_OCR_MAX_EDGE: u32 = 2_048;
 const DEFAULT_IMAGE_OCR_MAX_PIXELS: u64 = 64_000_000;
 const DEFAULT_IMAGE_MAX_IMAGES: usize = 64;
@@ -85,9 +86,7 @@ pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
 pub(crate) fn environment_variable_prefix() -> Result<String, String> {
     let project = read_environment_variable_prefix(project_config_path())?;
     let global = read_environment_variable_prefix(global_config_path()?)?;
-    Ok(project
-        .or(global)
-        .unwrap_or_else(|| DEFAULT_ENVIRONMENT_PREFIX.to_string()))
+    Ok(effective_environment_variable_prefix(project, global))
 }
 
 #[cfg(test)]
@@ -313,6 +312,11 @@ fn environment_variable_prefix_value(value: &toml::Value) -> Result<Option<Strin
 }
 
 fn validate_environment_variable_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.len() > MAX_ENVIRONMENT_PREFIX_BYTES {
+        return Err(format!(
+            "environment.prefix must be at most {MAX_ENVIRONMENT_PREFIX_BYTES} ASCII bytes"
+        ));
+    }
     if prefix.is_empty() {
         return Ok(());
     }
@@ -327,6 +331,15 @@ fn validate_environment_variable_prefix(prefix: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn effective_environment_variable_prefix(
+    project: Option<String>,
+    global: Option<String>,
+) -> String {
+    project
+        .or(global)
+        .unwrap_or_else(|| DEFAULT_ENVIRONMENT_PREFIX.to_string())
 }
 
 fn file_pointer_manager_save_value(value: &toml::Value) -> Result<Option<bool>, String> {
@@ -702,12 +715,36 @@ unknown_min_bytes = 32
 
     #[test]
     fn environment_prefix_rejects_invalid_environment_names() {
-        for prefix in ["9SAFE_", "SAFE-", "秘密_"] {
+        let too_long = "A".repeat(MAX_ENVIRONMENT_PREFIX_BYTES + 1);
+        for prefix in ["9SAFE_", "SAFE-", "秘密_", &too_long] {
             let value = format!("[environment]\nprefix = {prefix:?}")
                 .parse::<toml::Value>()
                 .unwrap();
             assert!(environment_variable_prefix_value(&value).is_err());
         }
+    }
+
+    #[test]
+    fn environment_prefix_prefers_project_then_global_then_default() {
+        assert_eq!(
+            effective_environment_variable_prefix(
+                Some("PROJECT_".to_string()),
+                Some("GLOBAL_".to_string())
+            ),
+            "PROJECT_"
+        );
+        assert_eq!(
+            effective_environment_variable_prefix(None, Some("GLOBAL_".to_string())),
+            "GLOBAL_"
+        );
+        assert_eq!(
+            effective_environment_variable_prefix(None, None),
+            "PENTECT_"
+        );
+        assert_eq!(
+            effective_environment_variable_prefix(Some(String::new()), Some("GLOBAL_".to_string())),
+            ""
+        );
     }
 
     #[test]

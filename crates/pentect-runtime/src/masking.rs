@@ -86,6 +86,10 @@ impl OutputMasker {
         self.masked_count
     }
 
+    pub(crate) fn environment_prefix(&self) -> &str {
+        &self.environment_prefix
+    }
+
     pub(crate) fn flush(&mut self) -> Result<(), String> {
         if !self.pending.is_empty() {
             let next = Recovery::empty_for_key(&self.store.session.key);
