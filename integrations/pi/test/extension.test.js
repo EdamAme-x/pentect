@@ -118,7 +118,10 @@ test(
           isError: false,
         })
       )[0];
-      assert.doesNotMatch(JSON.stringify(connector), new RegExp(raw));
+      const renderedConnector = JSON.stringify(connector);
+      assert.doesNotMatch(renderedConnector, new RegExp(raw));
+      assert.match(renderedConnector, /<<OPENAI_API_KEY_[a-f0-9]+>>/);
+      assert.equal(connector.isError, false);
     } finally {
       await pi.emit("session_shutdown", { reason: "quit" });
       if (originalBin === undefined) delete process.env.PENTECT_BIN;

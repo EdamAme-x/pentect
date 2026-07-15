@@ -10,6 +10,7 @@ const SAFE_RESULT = {
   details: undefined,
   isError: true,
 };
+const BRIDGE_REQUEST_TIMEOUT_MS = 10_000;
 const SESSION_ENVIRONMENT = new Set([
   "PENTECT_BIN",
   "PENTECT_MEMORY_STORE_ADDR",
@@ -38,7 +39,8 @@ function createPentectBridge() {
   const fail = () => {
     if (closed) return;
     closed = true;
-    for (const { reject } of pending.values()) {
+    for (const { reject, timer } of pending.values()) {
+      clearTimeout(timer);
       reject(new Error("Pentect unavailable"));
     }
     pending.clear();
@@ -63,6 +65,7 @@ function createPentectBridge() {
       const waiter = pending.get(response.id);
       if (!waiter) continue;
       pending.delete(response.id);
+      clearTimeout(waiter.timer);
       if (response.ok) waiter.resolve(response.value);
       else waiter.reject(new Error("Pentect rejected the operation"));
     }
@@ -75,20 +78,40 @@ function createPentectBridge() {
       if (closed) return Promise.reject(new Error("Pentect unavailable"));
       const id = nextId++;
       return new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject });
-        child.stdin.write(
-          `${JSON.stringify({ id, op, ...fields })}\n`,
-          (error) => {
-            if (!error) return;
-            pending.delete(id);
-            reject(new Error("Pentect unavailable"));
-          },
-        );
+        const timer = setTimeout(() => {
+          if (!pending.delete(id)) return;
+          reject(new Error("Pentect unavailable"));
+          child.kill();
+          fail();
+        }, BRIDGE_REQUEST_TIMEOUT_MS);
+        pending.set(id, { resolve, reject, timer });
+        try {
+          child.stdin.write(
+            `${JSON.stringify({ id, op, ...fields })}\n`,
+            (error) => {
+              if (!error) return;
+              const waiter = pending.get(id);
+              if (!waiter) return;
+              pending.delete(id);
+              clearTimeout(waiter.timer);
+              reject(new Error("Pentect unavailable"));
+              child.kill();
+              fail();
+            },
+          );
+        } catch {
+          pending.delete(id);
+          clearTimeout(timer);
+          reject(new Error("Pentect unavailable"));
+          child.kill();
+          fail();
+        }
       });
     },
     close() {
       if (closed) return;
-      for (const { reject } of pending.values()) {
+      for (const { reject, timer } of pending.values()) {
+        clearTimeout(timer);
         reject(new Error("Pentect unavailable"));
       }
       pending.clear();
