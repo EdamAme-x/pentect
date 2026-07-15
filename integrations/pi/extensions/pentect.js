@@ -1,0 +1,229 @@
+import { spawn } from "node:child_process";
+import {
+  createBashTool,
+  createLocalBashOperations,
+} from "@earendil-works/pi-coding-agent";
+
+const SAFE_TEXT = "[Pentect: content unavailable]";
+const SAFE_RESULT = {
+  content: [{ type: "text", text: SAFE_TEXT }],
+  details: undefined,
+  isError: true,
+};
+const SESSION_ENVIRONMENT = new Set([
+  "PENTECT_BIN",
+  "PENTECT_MEMORY_STORE_ADDR",
+  "PENTECT_MEMORY_STORE_TOKEN",
+  "PENTECT_PROCESS_HOST_READ_TOKEN",
+  "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+  "PENTECT_PROCESS_HOST_ROOT",
+  "PENTECT_AGENT_LAUNCHED",
+]);
+
+function replaceObject(target, source) {
+  for (const key of Object.keys(target)) delete target[key];
+  Object.assign(target, source);
+}
+
+function createPentectBridge() {
+  const child = spawn(process.env.PENTECT_BIN || "pentect", ["bridge"], {
+    stdio: ["pipe", "pipe", "ignore"],
+    windowsHide: true,
+  });
+  let nextId = 1;
+  const pending = new Map();
+  let buffered = "";
+  let closed = false;
+
+  const fail = () => {
+    if (closed) return;
+    closed = true;
+    for (const { reject } of pending.values()) {
+      reject(new Error("Pentect unavailable"));
+    }
+    pending.clear();
+  };
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    buffered += chunk;
+    for (;;) {
+      const end = buffered.indexOf("\n");
+      if (end < 0) break;
+      const line = buffered.slice(0, end);
+      buffered = buffered.slice(end + 1);
+      let response;
+      try {
+        response = JSON.parse(line);
+      } catch {
+        child.kill();
+        fail();
+        return;
+      }
+      const waiter = pending.get(response.id);
+      if (!waiter) continue;
+      pending.delete(response.id);
+      if (response.ok) waiter.resolve(response.value);
+      else waiter.reject(new Error("Pentect rejected the operation"));
+    }
+  });
+  child.on("error", fail);
+  child.on("exit", fail);
+
+  return {
+    request(op, fields = {}) {
+      if (closed) return Promise.reject(new Error("Pentect unavailable"));
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        child.stdin.write(
+          `${JSON.stringify({ id, op, ...fields })}\n`,
+          (error) => {
+            if (!error) return;
+            pending.delete(id);
+            reject(new Error("Pentect unavailable"));
+          },
+        );
+      });
+    },
+    close() {
+      if (closed) return;
+      for (const { reject } of pending.values()) {
+        reject(new Error("Pentect unavailable"));
+      }
+      pending.clear();
+      closed = true;
+      child.kill();
+    },
+  };
+}
+
+function readSessionEnvironment(values) {
+  if (!values || typeof values !== "object" || Array.isArray(values)) {
+    throw new Error("Pentect returned an invalid session");
+  }
+  for (const [name, value] of Object.entries(values)) {
+    if (!SESSION_ENVIRONMENT.has(name) || typeof value !== "string" || !value) {
+      throw new Error("Pentect returned an invalid session");
+    }
+  }
+  for (const required of SESSION_ENVIRONMENT) {
+    if (required === "PENTECT_BIN") continue;
+    if (typeof values[required] !== "string" || !values[required]) {
+      throw new Error("Pentect returned an incomplete session");
+    }
+  }
+  return Object.freeze({ ...values });
+}
+
+export default function pentectExtension(pi) {
+  const localBash = createLocalBashOperations();
+  let bridge;
+  let contract = "";
+  let sessionEnvironment;
+
+  const activeBridge = () => {
+    if (!bridge) throw new Error("Pentect unavailable");
+    return bridge;
+  };
+
+  const protectedBash = {
+    async exec(command, cwd, options) {
+      const next = await activeBridge().request("before", {
+        tool: "bash",
+        value: { command },
+      });
+      if (!next || typeof next.command !== "string") {
+        throw new Error("Pentect rejected the command");
+      }
+      if (!sessionEnvironment) throw new Error("Pentect unavailable");
+      // The bridge wraps the command with `pentect exec`, which masks each
+      // streamed chunk before Pi's onData callback receives it.
+      return localBash.exec(next.command, cwd, {
+        ...options,
+        env: { ...options.env, ...sessionEnvironment },
+      });
+    },
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    bridge?.close();
+    sessionEnvironment = undefined;
+    contract = "";
+    bridge = createPentectBridge();
+    try {
+      const session = await bridge.request("session");
+      if (!session || typeof session.contract !== "string") {
+        throw new Error("Pentect returned an invalid session");
+      }
+      sessionEnvironment = readSessionEnvironment(session.environment);
+      contract = session.contract;
+      pi.registerTool(
+        createBashTool(ctx.cwd, {
+          operations: protectedBash,
+        }),
+      );
+    } catch {
+      bridge.close();
+      bridge = undefined;
+      throw new Error("Pentect unavailable");
+    }
+  });
+
+  pi.on("before_agent_start", async (event) => {
+    if (!contract || event.systemPrompt.includes(contract)) return {};
+    return { systemPrompt: `${event.systemPrompt}\n\n${contract}` };
+  });
+
+  pi.on("input", async (event, ctx) => {
+    try {
+      const text = await activeBridge().request("prompt", { value: event.text });
+      const images = event.images
+        ? await activeBridge().request("media", { value: event.images })
+        : event.images;
+      return { action: "transform", text, images };
+    } catch {
+      if (ctx.hasUI) ctx.ui.notify("Pentect unavailable", "error");
+      return { action: "handled" };
+    }
+  });
+
+  pi.on("tool_call", async (event) => {
+    if (event.toolName === "bash") return {};
+    try {
+      const next = await activeBridge().request("before", {
+        tool: event.toolName,
+        value: event.input,
+      });
+      replaceObject(event.input, next);
+      return {};
+    } catch {
+      return { block: true, reason: "Pentect unavailable" };
+    }
+  });
+
+  pi.on("tool_result", async (event) => {
+    try {
+      return await activeBridge().request("after", {
+        tool: event.toolName,
+        input: event.input,
+        value: {
+          content: event.content,
+          details: event.details,
+          isError: event.isError,
+        },
+      });
+    } catch {
+      return SAFE_RESULT;
+    }
+  });
+
+  pi.on("user_bash", async () => ({ operations: protectedBash }));
+
+  pi.on("session_shutdown", async () => {
+    bridge?.close();
+    bridge = undefined;
+    contract = "";
+    sessionEnvironment = undefined;
+  });
+}

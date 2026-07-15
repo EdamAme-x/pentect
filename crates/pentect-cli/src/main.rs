@@ -35,25 +35,6 @@ pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 /// Refuse oversized input rather than emit partially-masked output (a masked
 /// head plus a raw tail would leak the tail).
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
-fn pentect_contract_instructions(environment_prefix: &str) -> String {
-    format!(
-        concat!(
-            "Pentect agent contract:\n",
-            "- Use normal shell commands. Pentect routes stdout/stderr through its protected runner and masks tool results.\n",
-            "- You may read, fetch, transform, store, sync, and use user-authorized secrets. Pentect is the safety layer; raw secret values must not reach chat.\n",
-            "- Prefer Pentect-generated `{environment_prefix}<LABEL>_<HASH>` environment variables for secret values already seen through Pentect. Do not make helper scripts reopen a secret source when an equivalent environment binding is available.\n",
-            "- When a source has not been seen yet, read it once with a normal protected command. Then use the generated `{environment_prefix}...` environment variable in later commands.\n",
-            "- Masked handles like `<<NAME_hash>>` work only in this running Pentect-launched session. Use `$env:{environment_prefix}NAME_hash` on PowerShell or `${environment_prefix}NAME_hash` on Unix.\n",
-            "- `pentect view '<handle>'` shows only label, hash, and length. Use handles or generated env vars instead of printing raw values.\n",
-            "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:{environment_prefix}...`; on Unix use POSIX commands and `${environment_prefix}...`.\n",
-            "- MCP, browser, plugin, and connector tools may retrieve and use user-authorized secrets. Pentect masks tool text output when the host supports replacement; otherwise it stops unsafe output.\n",
-            "- Default builds check image output with OS OCR on Windows/macOS and bundled OCR on Linux.\n",
-            "- For user-requested storage, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
-            "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
-        ),
-        environment_prefix = environment_prefix
-    )
-}
 const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
 const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
@@ -113,7 +94,6 @@ fn dispatch(args: Vec<String>) {
         Some("codex") => cmd_agent_tool(AgentTool::Codex, &args),
         Some("claude") => cmd_agent_tool(AgentTool::Claude, &args),
         Some("opencode") => cmd_agent_tool(AgentTool::OpenCode, &args),
-        Some("pi") => cmd_agent_tool(AgentTool::Pi, &args),
         _ => usage(),
     }
 }
@@ -137,7 +117,7 @@ fn supports_process_host(args: &[String]) -> bool {
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
         ),
-        (Some("codex" | "claude" | "opencode" | "pi"), _)
+        (Some("codex" | "claude" | "opencode"), _)
             | (Some("exec" | "shell" | "log" | "bridge"), _)
             | (Some("agent"), Some("exec" | "shell" | "log" | "bridge"))
     )
@@ -146,7 +126,7 @@ fn supports_process_host(args: &[String]) -> bool {
 fn usage() {
     eprintln!(
         "pentect\n\
-         pentect codex|claude|opencode|pi\n\
+         pentect codex|claude|opencode\n\
          pentect exec \"<command>\"\n\
          pentect shell\n\
          pentect up\n\
@@ -182,7 +162,7 @@ fn help_text() -> &'static str {
         "pentect protects AI tool boundaries.\n\n",
         "Use:\n",
         "  pentect\n",
-        "  pentect codex|claude|opencode|pi [--extensions NAME|PATH.toml]\n",
+        "  pentect codex|claude|opencode [--extensions NAME|PATH.toml]\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect shell\n\n",
         "  pentect up\n\n",
@@ -341,8 +321,7 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) {
     let status = match tool {
         AgentTool::Codex => run_codex(&opts, &pentect),
         AgentTool::Claude => run_claude(&opts, &pentect),
-        AgentTool::OpenCode => run_bridge_agent(&opts, &pentect, tool),
-        AgentTool::Pi => run_bridge_agent(&opts, &pentect, tool),
+        AgentTool::OpenCode => run_bridge_agent(&opts, &pentect),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     let code = status.code().unwrap_or(1);
@@ -591,7 +570,6 @@ enum AgentTool {
     Codex,
     Claude,
     OpenCode,
-    Pi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -675,7 +653,6 @@ impl AgentTool {
             AgentTool::Codex => "codex",
             AgentTool::Claude => "claude",
             AgentTool::OpenCode => "opencode",
-            AgentTool::Pi => "pi",
         }
     }
 
@@ -684,7 +661,6 @@ impl AgentTool {
             AgentTool::Codex => "PENTECT_CODEX",
             AgentTool::Claude => "PENTECT_CLAUDE",
             AgentTool::OpenCode => "PENTECT_OPENCODE",
-            AgentTool::Pi => "PENTECT_PI",
         }
     }
 
@@ -697,7 +673,6 @@ impl AgentTool {
             AgentTool::Codex => "--codex",
             AgentTool::Claude => "--claude",
             AgentTool::OpenCode => "--opencode",
-            AgentTool::Pi => "--pi",
         }
     }
 }
@@ -801,8 +776,9 @@ impl AgentToolOpts {
 
 fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
     let configs = codex_hook_config_args(pentect, opts.session.as_deref())?;
-    let contract =
-        pentect_contract_instructions(&pentect_agent::load_environment_variable_prefix()?);
+    let contract = pentect_agent::agent_contract_instructions(
+        &pentect_agent::load_environment_variable_prefix()?,
+    );
     let status_line_enabled = status_line_enabled_by_config()?;
     if opts.dry_run {
         if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
@@ -881,8 +857,9 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
 
 fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
     let settings = claude_settings_json(pentect, opts.session.as_deref());
-    let contract =
-        pentect_contract_instructions(&pentect_agent::load_environment_variable_prefix()?);
+    let contract = pentect_agent::agent_contract_instructions(
+        &pentect_agent::load_environment_variable_prefix()?,
+    );
     let args = claude_args(&settings, &opts.tool_args, &contract);
     if opts.dry_run {
         print_dry_run(&opts.command, &args);
@@ -909,25 +886,14 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
 fn run_bridge_agent(
     opts: &AgentToolOpts,
     pentect: &Path,
-    tool: AgentTool,
 ) -> Result<std::process::ExitStatus, String> {
     use agent_integrations::{IntegrationKind, TempAgentIntegration};
 
-    let kind = match tool {
-        AgentTool::OpenCode => IntegrationKind::OpenCode,
-        AgentTool::Pi => IntegrationKind::Pi,
-        AgentTool::Codex | AgentTool::Claude => {
-            return Err("unsupported bridge agent".to_string());
-        }
-    };
-    let integration = TempAgentIntegration::create(kind)?;
-    let contract =
-        pentect_contract_instructions(&pentect_agent::load_environment_variable_prefix()?);
+    let integration = TempAgentIntegration::create(IntegrationKind::OpenCode)?;
+    let contract = pentect_agent::agent_contract_instructions(
+        &pentect_agent::load_environment_variable_prefix()?,
+    );
     let mut args = Vec::new();
-    if tool == AgentTool::Pi {
-        args.push("--extension".to_string());
-        args.push(integration.path().to_string_lossy().into_owned());
-    }
     args.extend(opts.tool_args.iter().cloned());
     if opts.dry_run {
         print_dry_run(&opts.command, &args);
@@ -949,14 +915,10 @@ fn run_bridge_agent(
     apply_memory_store_env(&mut cmd, Some(&memory_store));
     apply_status_line_env(&mut cmd, status_line_enabled);
     cmd.env("PENTECT_AGENT_CONTRACT", contract);
-    if tool == AgentTool::OpenCode {
-        let existing = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
-        let config = agent_integrations::opencode_config_with_plugin(
-            existing.as_deref(),
-            integration.path(),
-        )?;
-        cmd.env("OPENCODE_CONFIG_CONTENT", config);
-    }
+    let existing = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+    let config =
+        agent_integrations::opencode_config_with_plugin(existing.as_deref(), integration.path())?;
+    cmd.env("OPENCODE_CONFIG_CONTENT", config);
     cmd.args(args);
     run_interactive_command_with_guard(cmd, &opts.command, (integration, memory_store))
 }
@@ -3680,12 +3642,7 @@ mod tests {
 
     #[test]
     fn agent_tool_parse_rejects_prompt_proxy_for_all_agents() {
-        for tool in [
-            AgentTool::Codex,
-            AgentTool::Claude,
-            AgentTool::OpenCode,
-            AgentTool::Pi,
-        ] {
+        for tool in [AgentTool::Codex, AgentTool::Claude, AgentTool::OpenCode] {
             let args = vec![
                 "pentect".to_string(),
                 tool.name().to_string(),
@@ -3697,11 +3654,9 @@ mod tests {
     }
 
     #[test]
-    fn bridge_agents_have_distinct_commands_and_path_flags() {
+    fn opencode_has_distinct_command_and_path_flag() {
         assert_eq!(AgentTool::OpenCode.env_var(), "PENTECT_OPENCODE");
         assert_eq!(AgentTool::OpenCode.path_flag(), "--opencode");
-        assert_eq!(AgentTool::Pi.env_var(), "PENTECT_PI");
-        assert_eq!(AgentTool::Pi.path_flag(), "--pi");
     }
 
     #[test]
@@ -3873,7 +3828,7 @@ mod tests {
 
     #[test]
     fn codex_args_place_remote_before_prompt() {
-        let contract = pentect_contract_instructions("PENTECT_");
+        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
         let args = codex_args_with_remote(
             &["features.hooks=true".to_string()],
             &["hello".to_string()],
@@ -3905,7 +3860,7 @@ mod tests {
 
     #[test]
     fn codex_app_server_args_keep_pentect_and_root_config_only() {
-        let contract = pentect_contract_instructions("PENTECT_");
+        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
         let args = codex_app_server_args(
             &["features.hooks=true".to_string()],
             &[
@@ -4016,7 +3971,7 @@ mod tests {
 
     #[test]
     fn codex_args_inject_model_visible_pentect_contract() {
-        let contract = pentect_contract_instructions("PENTECT_");
+        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
         let args = codex_args(
             &["features.hooks=true".to_string()],
             &["hello".to_string()],
@@ -4124,7 +4079,7 @@ mod tests {
             "exec".to_string(),
             "hello".to_string(),
         ];
-        let contract = pentect_contract_instructions("PENTECT_");
+        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
         let args = codex_args(&[], &tool_args, &contract);
         let rendered = args.join("\n");
         assert!(!codex_unified_exec_proxy_enabled(&tool_args));
@@ -4134,7 +4089,7 @@ mod tests {
 
     #[test]
     fn claude_args_inject_model_visible_pentect_contract() {
-        let contract = pentect_contract_instructions("PENTECT_");
+        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
         let args = claude_args("{}", &["hello".to_string()], &contract);
         let rendered = args.join("\n");
         assert!(rendered.contains("--append-system-prompt"), "{rendered}");
@@ -4180,7 +4135,7 @@ mod tests {
 
     #[test]
     fn agent_contract_uses_configured_environment_prefix() {
-        let rendered = pentect_contract_instructions("SAFE_");
+        let rendered = pentect_agent::agent_contract_instructions("SAFE_");
         assert!(rendered.contains("SAFE_<LABEL>_<HASH>"), "{rendered}");
         assert!(rendered.contains("$env:SAFE_NAME_hash"), "{rendered}");
         assert!(rendered.contains("$SAFE_NAME_hash"), "{rendered}");
@@ -4385,7 +4340,7 @@ mod tests {
     #[test]
     fn only_session_commands_support_process_host_handoff() {
         for command in [
-            "exec", "shell", "log", "bridge", "codex", "claude", "opencode", "pi",
+            "exec", "shell", "log", "bridge", "codex", "claude", "opencode",
         ] {
             let args = vec!["pentect".to_string(), command.to_string()];
             assert!(supports_process_host(&args), "{command}");

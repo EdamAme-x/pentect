@@ -74,6 +74,26 @@ const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const PTY_PASTE_MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
 
+pub fn agent_contract_instructions(environment_prefix: &str) -> String {
+    format!(
+        concat!(
+            "Pentect agent contract:\n",
+            "- Use normal shell commands. Pentect routes stdout/stderr through its protected runner and masks tool results.\n",
+            "- You may read, fetch, transform, store, sync, and use user-authorized secrets. Pentect is the safety layer; raw secret values must not reach chat.\n",
+            "- Prefer Pentect-generated `{environment_prefix}<LABEL>_<HASH>` environment variables for secret values already seen through Pentect. Do not make helper scripts reopen a secret source when an equivalent environment binding is available.\n",
+            "- When a source has not been seen yet, read it once with a normal protected command. Then use the generated `{environment_prefix}...` environment variable in later commands.\n",
+            "- Masked handles like `<<NAME_hash>>` work only in this running Pentect-launched session. Use `$env:{environment_prefix}NAME_hash` on PowerShell or `${environment_prefix}NAME_hash` on Unix.\n",
+            "- `pentect view '<handle>'` shows only label, hash, and length. Use handles or generated env vars instead of printing raw values.\n",
+            "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:{environment_prefix}...`; on Unix use POSIX commands and `${environment_prefix}...`.\n",
+            "- MCP, browser, plugin, and connector tools may retrieve and use user-authorized secrets. Pentect masks tool text output when the host supports replacement; otherwise it stops unsafe output.\n",
+            "- Default builds check image output with OS OCR on Windows/macOS and bundled OCR on Linux.\n",
+            "- For user-requested storage, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
+            "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
+        ),
+        environment_prefix = environment_prefix
+    )
+}
+
 #[cfg(test)]
 thread_local! {
     static CODEX_EXEC_PROXY_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
@@ -841,11 +861,12 @@ fn handle_bridge_request(
         .get("op")
         .and_then(Value::as_str)
         .ok_or_else(|| "invalid bridge request".to_string())?;
-    let value = request
-        .get("value")
-        .ok_or_else(|| "invalid bridge request".to_string())?;
     match op {
+        "session" => bridge_session_value(),
         "prompt" => {
+            let value = request
+                .get("value")
+                .ok_or_else(|| "invalid bridge request".to_string())?;
             let text = value
                 .as_str()
                 .ok_or_else(|| "invalid bridge request".to_string())?;
@@ -855,12 +876,20 @@ fn handle_bridge_request(
                     .unwrap_or_else(|| text.to_string()),
             ))
         }
-        "media" => match claude_image_tool_output(session, value)? {
-            Some(ToolTextOutput::Updated(updated)) => Ok(updated),
-            Some(ToolTextOutput::Block(_)) => Err("media unavailable".to_string()),
-            Some(ToolTextOutput::Unchanged) | None => Ok(value.clone()),
-        },
+        "media" => {
+            let value = request
+                .get("value")
+                .ok_or_else(|| "invalid bridge request".to_string())?;
+            match claude_image_tool_output(session, value)? {
+                Some(ToolTextOutput::Updated(updated)) => Ok(updated),
+                Some(ToolTextOutput::Block(_)) => Err("media unavailable".to_string()),
+                Some(ToolTextOutput::Unchanged) | None => Ok(value.clone()),
+            }
+        }
         "before" => {
+            let value = request
+                .get("value")
+                .ok_or_else(|| "invalid bridge request".to_string())?;
             let tool_name = request
                 .get("tool")
                 .and_then(Value::as_str)
@@ -875,6 +904,9 @@ fn handle_bridge_request(
             .map(|(updated, _)| updated)
         }
         "after" => {
+            let value = request
+                .get("value")
+                .ok_or_else(|| "invalid bridge request".to_string())?;
             let tool_name = request
                 .get("tool")
                 .and_then(Value::as_str)
@@ -890,6 +922,41 @@ fn handle_bridge_request(
         }
         _ => Err("invalid bridge request".to_string()),
     }
+}
+
+fn bridge_session_value() -> Result<Value, String> {
+    let required = [
+        ("PENTECT_MEMORY_STORE_ADDR", ENV_ADDR),
+        ("PENTECT_MEMORY_STORE_TOKEN", ENV_TOKEN),
+        (
+            "PENTECT_PROCESS_HOST_READ_TOKEN",
+            PROCESS_HOST_READ_TOKEN_ENV,
+        ),
+        (
+            "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+            PROCESS_HOST_WRITE_TOKEN_ENV,
+        ),
+        ("PENTECT_PROCESS_HOST_ROOT", PROCESS_HOST_ROOT_ENV),
+        ("PENTECT_AGENT_LAUNCHED", PENTECT_AGENT_LAUNCHED_ENV),
+    ];
+    let mut environment = serde_json::Map::new();
+    for (output_name, env_name) in required {
+        let value = std::env::var(env_name).map_err(|_| "bridge unavailable".to_string())?;
+        if value.is_empty() {
+            return Err("bridge unavailable".to_string());
+        }
+        environment.insert(output_name.to_string(), Value::String(value));
+    }
+    if let Ok(value) = std::env::var("PENTECT_BIN") {
+        if !value.is_empty() {
+            environment.insert("PENTECT_BIN".to_string(), Value::String(value));
+        }
+    }
+    let prefix = config::environment_variable_prefix()?;
+    Ok(json!({
+        "contract": agent_contract_instructions(&prefix),
+        "environment": environment,
+    }))
 }
 
 fn open_hook_session(cli: bool, session_name: &str) -> Result<Session, String> {
@@ -2788,11 +2855,11 @@ enum HookProvider {
 }
 
 impl HookProvider {
-    fn pentect_launch_command(self) -> &'static str {
+    fn launch_error(self) -> &'static str {
         match self {
-            HookProvider::Codex => "pentect codex",
-            HookProvider::Claude => "pentect claude",
-            HookProvider::Generic => "pentect codex|claude|opencode|pi",
+            HookProvider::Codex => "Pentect required; start with `pentect codex`.",
+            HookProvider::Claude => "Pentect required; start with `pentect claude`.",
+            HookProvider::Generic => "Pentect required; enable the installed integration.",
         }
     }
 }
@@ -3487,10 +3554,7 @@ fn ensure_pentect_agent_launch_required(
     if agent_launch_proof_valid() {
         return Ok(());
     }
-    Err(format!(
-        "Pentect required; start with `{}`.",
-        provider.pentect_launch_command()
-    ))
+    Err(provider.launch_error().to_string())
 }
 
 fn agent_launch_proof_valid() -> bool {

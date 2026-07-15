@@ -129,110 +129,9 @@ export const PentectPlugin = async () => {
 };
 "#;
 
-const PI_EXTENSION_BODY: &str = r#"
-const SAFE_TEXT = "[Pentect: content unavailable]";
-const SAFE_RESULT = {
-  content: [{ type: "text", text: SAFE_TEXT }],
-  details: undefined,
-  isError: true,
-};
-
-function pentectBashOperations() {
-  return {
-    exec(command, cwd, { onData, signal, timeout, env }) {
-      return new Promise((resolve, reject) => {
-        if (signal?.aborted) {
-          reject(new Error("aborted"));
-          return;
-        }
-        const child = spawn(process.env.PENTECT_BIN || "pentect", ["exec", command], {
-          cwd,
-          env: { ...process.env, ...env },
-          stdio: ["ignore", "pipe", "pipe"],
-          windowsHide: true,
-        });
-        let settled = false;
-        const finish = (callback) => {
-          if (settled) return;
-          settled = true;
-          if (timer) clearTimeout(timer);
-          signal?.removeEventListener("abort", abort);
-          callback();
-        };
-        const abort = () => {
-          child.kill();
-          finish(() => resolve({ exitCode: null }));
-        };
-        const timer = timeout
-          ? setTimeout(abort, Math.min(timeout * 1000, 2_147_483_647))
-          : undefined;
-        signal?.addEventListener("abort", abort, { once: true });
-        child.stdout.on("data", onData);
-        child.stderr.on("data", onData);
-        child.on("error", () => finish(() => reject(new Error("Pentect unavailable"))));
-        child.on("close", (code) => finish(() => resolve({ exitCode: code })));
-      });
-    },
-  };
-}
-
-export default function pentectExtension(pi) {
-  const bridge = createPentectBridge();
-
-  pi.on("before_agent_start", async (event) => {
-    const contract = process.env.PENTECT_AGENT_CONTRACT;
-    if (!contract || event.systemPrompt.includes(contract)) return {};
-    return { systemPrompt: `${event.systemPrompt}\n\n${contract}` };
-  });
-
-  pi.on("input", async (event) => {
-    try {
-      const text = await bridge.request("prompt", { value: event.text });
-      const images = event.images
-        ? await bridge.request("media", { value: event.images })
-        : event.images;
-      return { action: "transform", text, images };
-    } catch {
-      return { action: "handled" };
-    }
-  });
-
-  pi.on("tool_call", async (event) => {
-    try {
-      const next = await bridge.request("before", { tool: event.toolName, value: event.input });
-      replaceObject(event.input, next);
-      return {};
-    } catch {
-      return { block: true, reason: "Pentect could not protect this tool call" };
-    }
-  });
-
-  pi.on("tool_result", async (event) => {
-    try {
-      return await bridge.request("after", {
-        tool: event.toolName,
-        input: event.input,
-        value: {
-          content: event.content,
-          details: event.details,
-          isError: event.isError,
-        },
-      });
-    } catch {
-      return SAFE_RESULT;
-    }
-  });
-
-  pi.on("user_bash", async () => ({ operations: pentectBashOperations() }));
-
-  pi.on("session_shutdown", async () => bridge.close());
-}
-"#;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IntegrationKind {
     OpenCode,
-    Pi,
 }
 
 pub(crate) struct TempAgentIntegration {
@@ -253,12 +152,10 @@ impl TempAgentIntegration {
         std::fs::create_dir(&root).map_err(|_| "could not create agent integration".to_string())?;
         let file_name = match kind {
             IntegrationKind::OpenCode => "opencode.mjs",
-            IntegrationKind::Pi => "pi.mjs",
         };
         let path = root.join(file_name);
         let body = match kind {
             IntegrationKind::OpenCode => format!("{BRIDGE_CLIENT_JS}\n{OPENCODE_PLUGIN_BODY}"),
-            IntegrationKind::Pi => format!("{BRIDGE_CLIENT_JS}\n{PI_EXTENSION_BODY}"),
         };
         if std::fs::write(&path, body).is_err() {
             let _ = std::fs::remove_dir_all(&root);
@@ -312,13 +209,6 @@ mod tests {
         assert!(opencode.contains("chat.message"));
         assert!(opencode.contains("tool.execute.before"));
         assert!(opencode.contains("tool.execute.after"));
-
-        let pi = format!("{BRIDGE_CLIENT_JS}{PI_EXTENSION_BODY}");
-        assert!(pi.contains("pi.on(\"input\""));
-        assert!(pi.contains("pi.on(\"before_agent_start\""));
-        assert!(pi.contains("pi.on(\"tool_call\""));
-        assert!(pi.contains("pi.on(\"tool_result\""));
-        assert!(pi.contains("pi.on(\"user_bash\""));
     }
 
     #[test]
@@ -336,7 +226,7 @@ mod tests {
     #[test]
     fn temporary_integration_is_removed_on_drop() {
         let path = {
-            let integration = TempAgentIntegration::create(IntegrationKind::Pi).unwrap();
+            let integration = TempAgentIntegration::create(IntegrationKind::OpenCode).unwrap();
             assert!(integration.path().is_file());
             integration.path().to_path_buf()
         };
@@ -352,18 +242,16 @@ mod tests {
         {
             return;
         }
-        for kind in [IntegrationKind::OpenCode, IntegrationKind::Pi] {
-            let integration = TempAgentIntegration::create(kind).unwrap();
-            let output = std::process::Command::new("node")
-                .arg("--check")
-                .arg(integration.path())
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        let integration = TempAgentIntegration::create(IntegrationKind::OpenCode).unwrap();
+        let output = std::process::Command::new("node")
+            .arg("--check")
+            .arg(integration.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
