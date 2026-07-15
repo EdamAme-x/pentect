@@ -804,6 +804,51 @@ fn bridge_masks_prompt_wraps_shell_and_masks_result() {
 }
 
 #[test]
+fn bridge_session_exports_only_the_owned_runtime_session() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    struct EnvCleanup;
+    impl Drop for EnvCleanup {
+        fn drop(&mut self) {
+            for name in [
+                ENV_ADDR,
+                ENV_TOKEN,
+                PROCESS_HOST_READ_TOKEN_ENV,
+                PROCESS_HOST_WRITE_TOKEN_ENV,
+                PROCESS_HOST_ROOT_ENV,
+                PENTECT_AGENT_LAUNCHED_ENV,
+                "PENTECT_BIN",
+            ] {
+                std::env::remove_var(name);
+            }
+        }
+    }
+    let _cleanup = EnvCleanup;
+    let values = [
+        (ENV_ADDR, "127.0.0.1:12345"),
+        (ENV_TOKEN, "session-token"),
+        (PROCESS_HOST_READ_TOKEN_ENV, "read-token"),
+        (PROCESS_HOST_WRITE_TOKEN_ENV, "write-token"),
+        (PROCESS_HOST_ROOT_ENV, "/tmp/pentect"),
+        (PENTECT_AGENT_LAUNCHED_ENV, "session-token"),
+        ("PENTECT_BIN", "/tmp/pentect-bin"),
+    ];
+    for (name, value) in values {
+        std::env::set_var(name, value);
+    }
+
+    let session = bridge_session_value().unwrap();
+    assert!(session["contract"]
+        .as_str()
+        .unwrap()
+        .contains("Pentect agent contract"));
+    let environment = session["environment"].as_object().unwrap();
+    assert_eq!(environment.len(), values.len());
+    for (name, value) in values {
+        assert_eq!(environment[name], value);
+    }
+}
+
+#[test]
 fn bridge_line_reader_discards_oversized_request() {
     let mut input = vec![b'x'; 9];
     input.extend_from_slice(b"\n{}\n");

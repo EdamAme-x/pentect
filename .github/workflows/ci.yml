@@ -23,8 +23,21 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check native OCR build
-        run: cargo check -p pentect-cli --features ocr --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: integrations/pi/package-lock.json
+      - name: Build native OCR
+        run: cargo build -p pentect-cli --features ocr --locked
+      - name: Test Pi extension
+        working-directory: integrations/pi
+        env:
+          PENTECT_E2E_BIN: ${{ github.workspace }}/target/debug/pentect
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check
+          npm test
       - name: Test Windows ConPTY
         if: runner.os == 'Windows'
         run: cargo test -p pentect-cli --no-default-features --test pty_dimensions --locked
@@ -52,6 +65,21 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-features
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: integrations/pi/package-lock.json
+      - name: Test Pi extension
+        working-directory: integrations/pi
+        env:
+          PENTECT_E2E_BIN: ${{ github.workspace }}/target/debug/pentect
+        run: |
+          cargo build -p pentect-cli --all-features --locked --manifest-path ../../Cargo.toml
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check
+          npm test
+          npm pack --dry-run
       - name: Test (rules-only, no default features)
         run: cargo test -p pentect-core --no-default-features
       - name: Install CredSweeper oracle dependencies

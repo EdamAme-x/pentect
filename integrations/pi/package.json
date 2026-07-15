@@ -1,0 +1,41 @@
+{
+  "name": "@edamame-x/pentect-pi",
+  "version": "0.0.1",
+  "description": "Pentect protection for Pi",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EdamAme-x/pentect.git",
+    "directory": "integrations/pi"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pentect"
+  ],
+  "files": [
+    "extensions"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/pentect.js"
+    ]
+  },
+  "scripts": {
+    "check": "node --check extensions/pentect.js",
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.7 <0.81.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.7"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
