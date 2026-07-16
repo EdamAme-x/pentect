@@ -1,5 +1,5 @@
 {
-  "name": "@edamame-x/pentect-pi",
+  "name": "@pentect/pi",
   "version": "0.0.1",
   "description": "Pentect protection for Pi",
   "type": "module",
@@ -9,6 +9,8 @@
     "url": "git+https://github.com/EdamAme-x/pentect.git",
     "directory": "integrations/pi"
   },
+  "homepage": "https://github.com/EdamAme-x/pentect/tree/main/integrations/pi",
+  "bugs": "https://github.com/EdamAme-x/pentect/issues",
   "publishConfig": {
     "access": "public"
   },

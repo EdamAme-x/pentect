@@ -1,0 +1,69 @@
+name: Publish Pi
+
+on:
+  push:
+    tags:
+      - "pi-v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-pi
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'EdamAme-x/pentect'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: integrations/pi
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Verify tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node --print "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "pi-v$version"
+          test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
+          published="$(npm view @pentect/pi version 2>/dev/null || true)"
+          node - "$published" "$version" <<'NODE'
+          const [published, next] = process.argv.slice(2);
+          const parse = (value) => {
+            if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value)) {
+              throw new Error(`invalid release version: ${value}`);
+            }
+            return value.split(".").map(Number);
+          };
+          if (published) {
+            const previous = parse(published);
+            const candidate = parse(next);
+            const order = candidate.findIndex((part, index) => part !== previous[index]);
+            if (order < 0 || candidate[order] < previous[order]) {
+              throw new Error(`${next} must be newer than ${published}`);
+            }
+          } else {
+            parse(next);
+          }
+          NODE
+      - name: Install
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check
+        run: |
+          npm run check
+          npm test
+          npm pack --dry-run
+      - name: Publish
+        run: npm publish --provenance --access public
