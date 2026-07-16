@@ -1,0 +1,50 @@
+name: Publish Pi
+
+on:
+  push:
+    tags:
+      - "pi-v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-pi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'EdamAme-x/pentect'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: integrations/pi
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Verify tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node --print "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "pi-v$version"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Install
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check
+        run: |
+          npm run check
+          npm test
+          npm pack --dry-run
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
