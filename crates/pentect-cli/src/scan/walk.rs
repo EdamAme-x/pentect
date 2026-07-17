@@ -260,9 +260,11 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
-            extensions
-                .iter()
-                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+            extensions.binary_search(&ext).is_ok()
+                || (ext.bytes().any(|byte| byte.is_ascii_uppercase())
+                    && extensions
+                        .iter()
+                        .any(|candidate| ext.eq_ignore_ascii_case(candidate)))
         })
 }
 
@@ -381,5 +383,22 @@ mod tests {
         std::fs::write(root.join(".pentectignore"), "ignored.env\n").unwrap();
         assert!(has_pentectignore(&root, &[]));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ignored_extensions_are_sorted_and_case_insensitive() {
+        assert!(IGNORED_FILE_EXTENSIONS.is_sorted());
+        assert!(has_extension(
+            Path::new("artifact.exe"),
+            IGNORED_FILE_EXTENSIONS
+        ));
+        assert!(has_extension(
+            Path::new("artifact.EXE"),
+            IGNORED_FILE_EXTENSIONS
+        ));
+        assert!(!has_extension(
+            Path::new("source.rs"),
+            IGNORED_FILE_EXTENSIONS
+        ));
     }
 }
