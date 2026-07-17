@@ -134,7 +134,7 @@ fn usage() {
          pentect doctor\n\
          pentect extensions list|inspect|test [NAME]\n\
          pentect eval [--json]\n\
-         pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\
+         pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\
          pentect view <HANDLE>\n\
          pentect statusline\n\
          pentect resolve [PATH...]\n\
@@ -170,7 +170,7 @@ fn help_text() -> &'static str {
         "  pentect doctor [--json]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
         "  pentect eval [--json]\n\n",
-        "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--gitignore] [PATH...]\n\n",
+        "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
         "  pentect statusline\n\n",
         "  pentect log [--json]\n\n",
@@ -182,7 +182,7 @@ fn help_text() -> &'static str {
         "statusline: masked count\n",
         "log: live events\n",
         "resolve: write handles\n",
-        "scan: CredSweeper + core; binary skip(default)|text(lossy); narrow with --exclude, --gitignore, .pentectignore\n",
+        "scan: secrets; gitignore on; --no-gitignore broadens\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness\n",
         "extensions: list, inspect, test\n",
@@ -3691,7 +3691,10 @@ mod tests {
         assert!(help.contains("doctor: readiness"), "{help}");
         assert!(help.contains("extensions: list, inspect, test"), "{help}");
         assert!(help.contains("eval: precision, recall"), "{help}");
-        assert!(help.contains("scan: CredSweeper + core"), "{help}");
+        assert!(
+            help.contains("scan: secrets; gitignore on; --no-gitignore broadens"),
+            "{help}"
+        );
         assert!(help.contains("statusline: masked count"), "{help}");
         assert!(!help.contains("pentect purge"), "{help}");
         assert!(!help.contains("authenticated browser/API/MCP"), "{help}");

@@ -5,7 +5,7 @@ pub(super) struct ScanOpts {
     pub(super) paths: Vec<PathBuf>,
     pub(super) json: bool,
     pub(super) no_fail: bool,
-    pub(super) gitignore: bool,
+    pub(super) use_gitignore: bool,
     pub(super) binary: BinaryMode,
     pub(super) excludes: Vec<String>,
 }
@@ -31,7 +31,7 @@ impl ScanOpts {
         let mut paths = Vec::new();
         let mut json = false;
         let mut no_fail = false;
-        let mut gitignore = false;
+        let mut use_gitignore = true;
         let mut binary = BinaryMode::Skip;
         let mut excludes = Vec::new();
         let mut i = 2usize;
@@ -45,8 +45,8 @@ impl ScanOpts {
                     no_fail = true;
                     i += 1;
                 }
-                "--gitignore" => {
-                    gitignore = true;
+                "--no-gitignore" => {
+                    use_gitignore = false;
                     i += 1;
                 }
                 "--binary" => {
@@ -79,7 +79,7 @@ impl ScanOpts {
             paths,
             json,
             no_fail,
-            gitignore,
+            use_gitignore,
             binary,
             excludes,
         })
