@@ -74,7 +74,7 @@ fn run_scan_with_engine(
     let files = match collect_scan_roots(
         &opts.paths,
         &opts.excludes,
-        opts.gitignore,
+        opts.use_gitignore,
         &mut report.skipped,
         &mut report.skipped_count,
         retain_skipped,
@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(opts.paths, vec![PathBuf::from(".")]);
         assert!(!opts.json);
         assert!(!opts.no_fail);
-        assert!(!opts.gitignore);
+        assert!(opts.use_gitignore);
         assert_eq!(opts.binary, BinaryMode::Skip);
     }
 
@@ -143,7 +143,7 @@ mod tests {
             "scan".into(),
             "--json".into(),
             "--no-fail".into(),
-            "--gitignore".into(),
+            "--no-gitignore".into(),
             "--binary".into(),
             "text".into(),
             "app.env".into(),
@@ -152,7 +152,7 @@ mod tests {
         assert_eq!(opts.paths, vec![PathBuf::from("app.env")]);
         assert!(opts.json);
         assert!(opts.no_fail);
-        assert!(opts.gitignore);
+        assert!(!opts.use_gitignore);
         assert_eq!(opts.binary, BinaryMode::Text);
         assert!(opts.excludes.is_empty());
     }
@@ -167,6 +167,13 @@ mod tests {
         ];
         let err = ScanOpts::parse(&args).unwrap_err();
         assert!(err.contains("binary must be skip or text"), "{err}");
+    }
+
+    #[test]
+    fn scan_parse_rejects_removed_gitignore_flag() {
+        let args = vec!["pentect".into(), "scan".into(), "--gitignore".into()];
+        let err = ScanOpts::parse(&args).unwrap_err();
+        assert!(err.contains("unknown option"), "{err}");
     }
 
     #[test]
@@ -572,7 +579,7 @@ label = "ACME_CASE"
     }
 
     #[test]
-    fn scan_ignores_gitignore_by_default() {
+    fn scan_honors_gitignore_by_default() {
         let root = temp_scan_root("pentect-scan-gitignore");
         std::fs::write(root.join(".gitignore"), "ignored.env\n").unwrap();
         std::fs::write(
@@ -597,13 +604,13 @@ label = "ACME_CASE"
         assert!(report
             .files
             .iter()
-            .any(|file| file.path.file_name().unwrap() == "ignored.env"));
+            .all(|file| file.path.file_name().unwrap() != "ignored.env"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn scan_gitignore_flag_removes_files_from_walk() {
+    fn scan_no_gitignore_includes_ignored_files() {
         let root = temp_scan_root("pentect-scan-gitignore-flag");
         std::fs::write(root.join(".gitignore"), "ignored.env\n").unwrap();
         std::fs::write(
@@ -620,7 +627,7 @@ label = "ACME_CASE"
         let args = vec![
             "pentect".into(),
             "scan".into(),
-            "--gitignore".into(),
+            "--no-gitignore".into(),
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
@@ -629,13 +636,58 @@ label = "ACME_CASE"
         assert!(report
             .files
             .iter()
-            .all(|file| file.path.file_name().unwrap() != "ignored.env"));
+            .any(|file| file.path.file_name().unwrap() == "ignored.env"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn scan_includes_vcs_dirs_by_default() {
+    fn scan_explicit_file_bypasses_ignore_files() {
+        let root = temp_scan_root("pentect-scan-explicit-ignored-file");
+        std::fs::write(root.join(".gitignore"), "ignored.env\n").unwrap();
+        std::fs::write(root.join(".pentectignore"), "ignored.env\n").unwrap();
+        let ignored = root.join("ignored.env");
+        std::fs::write(
+            &ignored,
+            "RUNPOD_API_KEY=rpa_FAKEPENTECTSCAN1234567890abcdef\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "pentect".into(),
+            "scan".into(),
+            ignored.to_string_lossy().to_string(),
+        ];
+        let opts = ScanOpts::parse(&args).unwrap();
+        let report = run_scan_core_for_tests(&args, &opts).unwrap();
+
+        assert_eq!(1, report.files_scanned, "{}", report_json(&report));
+        assert!(report
+            .files
+            .iter()
+            .any(|file| file.path.file_name() == ignored.file_name()));
+
+        let excluded_args = vec![
+            "pentect".into(),
+            "scan".into(),
+            "--exclude".into(),
+            "ignored.env".into(),
+            ignored.to_string_lossy().to_string(),
+        ];
+        let excluded_opts = ScanOpts::parse(&excluded_args).unwrap();
+        let excluded_report = run_scan_core_for_tests(&excluded_args, &excluded_opts).unwrap();
+        assert_eq!(
+            0,
+            excluded_report.files_scanned,
+            "{}",
+            report_json(&excluded_report)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_no_gitignore_includes_vcs_dirs() {
         let root = temp_scan_root("pentect-scan-vcs-default");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(
@@ -647,6 +699,7 @@ label = "ACME_CASE"
         let args = vec![
             "pentect".into(),
             "scan".into(),
+            "--no-gitignore".into(),
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();
@@ -732,7 +785,6 @@ label = "ACME_CASE"
         let args = vec![
             "pentect".into(),
             "scan".into(),
-            "--gitignore".into(),
             root.to_string_lossy().to_string(),
         ];
         let opts = ScanOpts::parse(&args).unwrap();

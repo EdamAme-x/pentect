@@ -22,6 +22,13 @@ pub(super) fn collect_scan_roots(
     let _heartbeat = WalkHeartbeat::start(progress);
     let mut files = Vec::new();
     for root in minimal_scan_roots(roots) {
+        if root.is_file() {
+            if !explicit_file_is_excluded(&root, excludes)? {
+                files.push(root);
+                progress.advance_by(1);
+            }
+            continue;
+        }
         if use_gitignore {
             if let Some((base, walk_root, git_files)) = git_files_for_root(&root) {
                 let filtered = filter_git_files(base, walk_root, git_files, excludes, progress)?;
@@ -43,6 +50,13 @@ pub(super) fn collect_scan_roots(
     files.sort_unstable();
     files.dedup();
     Ok(files)
+}
+
+fn explicit_file_is_excluded(path: &Path, excludes: &[String]) -> Result<bool, String> {
+    let Some(overrides) = rules::build_overrides(&scan_base(path), excludes)? else {
+        return Ok(false);
+    };
+    Ok(overrides.matched(path, false).is_ignore())
 }
 
 pub(super) fn ignored_file_reason(path: &Path) -> Option<&'static str> {
