@@ -1,9 +1,8 @@
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const DRAW_EVERY: usize = 256;
 const DRAW_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
@@ -14,13 +13,14 @@ pub(super) struct ScanProgress {
 struct ProgressInner {
     completed: AtomicUsize,
     total: AtomicUsize,
+    started_at: Instant,
+    last_draw_ms: AtomicU64,
     state: Mutex<ProgressState>,
 }
 
 struct ProgressState {
     phase: &'static str,
     width: usize,
-    last_draw: Instant,
     active: bool,
 }
 
@@ -33,10 +33,11 @@ impl ScanProgress {
             inner: Some(Arc::new(ProgressInner {
                 completed: AtomicUsize::new(0),
                 total: AtomicUsize::new(0),
+                started_at: Instant::now(),
+                last_draw_ms: AtomicU64::new(0),
                 state: Mutex::new(ProgressState {
                     phase: "walk",
                     width: 0,
-                    last_draw: Instant::now(),
                     active: false,
                 }),
             })),
@@ -53,11 +54,13 @@ impl ScanProgress {
         };
         inner.completed.store(0, Ordering::Relaxed);
         inner.total.store(total.unwrap_or(0), Ordering::Relaxed);
+        inner
+            .last_draw_ms
+            .store(elapsed_ms(inner), Ordering::Relaxed);
         let Ok(mut state) = inner.state.lock() else {
             return;
         };
         state.phase = phase;
-        state.last_draw = Instant::now();
         state.active = true;
         draw(inner, &mut state);
     }
@@ -68,16 +71,21 @@ impl ScanProgress {
         };
         let completed = inner.completed.fetch_add(1, Ordering::Relaxed) + 1;
         let total = inner.total.load(Ordering::Relaxed);
-        if completed != total && !completed.is_multiple_of(DRAW_EVERY) {
-            return;
+        if completed != total {
+            let now = elapsed_ms(inner);
+            let previous = inner.last_draw_ms.load(Ordering::Relaxed);
+            if now.saturating_sub(previous) < DRAW_INTERVAL.as_millis() as u64
+                || inner
+                    .last_draw_ms
+                    .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+            {
+                return;
+            }
         }
         let Ok(mut state) = inner.state.try_lock() else {
             return;
         };
-        if completed != total && state.last_draw.elapsed() < DRAW_INTERVAL {
-            return;
-        }
-        state.last_draw = Instant::now();
         draw(inner, &mut state);
     }
 
@@ -89,11 +97,20 @@ impl ScanProgress {
             return;
         };
         if state.active {
+            draw(inner, &mut state);
             eprintln!();
             state.active = false;
             state.width = 0;
         }
     }
+}
+
+fn elapsed_ms(inner: &ProgressInner) -> u64 {
+    inner
+        .started_at
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn draw(inner: &ProgressInner, state: &mut ProgressState) {

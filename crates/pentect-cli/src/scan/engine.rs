@@ -10,10 +10,13 @@ use pentect_core::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Condvar, Mutex};
 
 const ENGINE_NAME: &str = "pentect";
 const MAX_SCAN_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const RESULT_BATCH_SIZE: usize = 256;
+const LARGE_FILE_BYTES: usize = 1024 * 1024;
+const LARGE_FILE_CONCURRENCY: usize = 2;
 
 pub(super) fn scan_files(
     files: Vec<PathBuf>,
@@ -55,8 +58,12 @@ trait ScanBackend {
     fn binary_mode(&self) -> Option<BinaryMode> {
         None
     }
-    fn scan(&mut self, files: &[PathBuf], progress: &ScanProgress)
-        -> Result<Vec<ScanFile>, String>;
+    fn scan(
+        &mut self,
+        files: &[PathBuf],
+        progress: &ScanProgress,
+        retain_hits: bool,
+    ) -> Result<Vec<ScanFile>, String>;
 }
 
 struct ScanPipeline {
@@ -105,7 +112,7 @@ impl ScanPipeline {
             progress.start("scan", Some(eligible.len()));
             out.extend(
                 backend
-                    .scan(&eligible, progress)
+                    .scan(&eligible, progress, false)
                     .map_err(|e| format!("{}: {e}", backend.name()))?,
             );
             return Ok((out, self.name.to_string()));
@@ -119,7 +126,7 @@ impl ScanPipeline {
             let backend_name = backend.name();
             progress.start("scan", Some(eligible.len()));
             for result in backend
-                .scan(&eligible, progress)
+                .scan(&eligible, progress, true)
                 .map_err(|e| format!("{backend_name}: {e}"))?
             {
                 match result {
@@ -177,7 +184,7 @@ fn precheck_files(
     let workers = worker_count(files.len());
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel();
-    let batches = std::thread::scope(|scope| {
+    let (eligible, skipped) = std::thread::scope(|scope| {
         for _ in 0..workers {
             let next = &next;
             let tx = tx.clone();
@@ -194,19 +201,28 @@ fn precheck_files(
                         Err(file) => skipped.push(file),
                     }
                     progress.advance();
+                    if eligible.len() + skipped.len() >= RESULT_BATCH_SIZE
+                        && tx
+                            .send((std::mem::take(&mut eligible), std::mem::take(&mut skipped)))
+                            .is_err()
+                    {
+                        return;
+                    }
                 }
-                let _ = tx.send((eligible, skipped));
+                if !eligible.is_empty() || !skipped.is_empty() {
+                    let _ = tx.send((eligible, skipped));
+                }
             });
         }
         drop(tx);
-        rx.into_iter().collect::<Vec<_>>()
+        let mut eligible = Vec::new();
+        let mut skipped = Vec::new();
+        for (mut batch_eligible, mut batch_skipped) in rx {
+            eligible.append(&mut batch_eligible);
+            skipped.append(&mut batch_skipped);
+        }
+        (eligible, skipped)
     });
-    let mut eligible = Vec::new();
-    let mut skipped = Vec::new();
-    for (mut batch_eligible, mut batch_skipped) in batches {
-        eligible.append(&mut batch_eligible);
-        skipped.append(&mut batch_skipped);
-    }
     Ok((eligible, skipped))
 }
 
@@ -389,13 +405,22 @@ impl CoreBackend {
     }
 }
 
-fn scan_file_with_engine(engine: &Engine, path: &Path, binary: BinaryMode) -> ScanFile {
+fn scan_file_with_limits(
+    engine: &Engine,
+    path: &Path,
+    binary: BinaryMode,
+    large_files: &LargeFileLimiter,
+    retain_hits: bool,
+) -> ScanFile {
     let data = match read_text_file(path, binary) {
         ReadTextFile::Text(data) => data,
         ReadTextFile::Skipped(reason) => {
             return ScanFile::Skipped(SkippedFile::new(path, reason));
         }
     };
+    // Detectors can temporarily expand text several times. Keep small files
+    // fully parallel while bounding the peak created by large inputs.
+    let _large_file_permit = large_files.acquire(data.len());
     let kind = infer_kind(path);
     let line_index = LineIndex::new(&data);
     let result = engine.analyze_spans_with_path(
@@ -419,15 +444,20 @@ fn scan_file_with_engine(engine: &Engine, path: &Path, binary: BinaryMode) -> Sc
     if hits.is_empty() && warnings == 0 {
         return ScanFile::Clean(path.to_path_buf());
     }
+    let findings = hits.len();
+    let labels = label_counts(&hits);
+    let categories = category_counts(&hits);
+    let engines = engine_counts(&hits);
+    let hits = if retain_hits { hits } else { Vec::new() };
     ScanFile::Finding(FileFinding {
         path: path.to_path_buf(),
         scope: ScanScope::classify(path),
         kind,
-        findings: hits.len(),
+        findings,
         warnings,
-        labels: label_counts(&hits),
-        categories: category_counts(&hits),
-        engines: engine_counts(&hits),
+        labels,
+        categories,
+        engines,
         parser_fallback: result.parser_fallback,
         hits,
     })
@@ -446,6 +476,7 @@ impl ScanBackend for CoreBackend {
         &mut self,
         files: &[PathBuf],
         progress: &ScanProgress,
+        retain_hits: bool,
     ) -> Result<Vec<ScanFile>, String> {
         if files.is_empty() {
             return Ok(Vec::new());
@@ -456,12 +487,14 @@ impl ScanBackend for CoreBackend {
             return Err("engine unavailable".to_string());
         };
         let next = AtomicUsize::new(0);
+        let large_files = LargeFileLimiter::new(LARGE_FILE_CONCURRENCY);
         let (tx, rx) = mpsc::channel();
         let out = std::thread::scope(|scope| {
             for _ in 0..workers {
                 let next = &next;
                 let tx = tx.clone();
                 let binary = self.binary;
+                let large_files = &large_files;
                 scope.spawn(move || {
                     let mut batch = Vec::new();
                     loop {
@@ -469,16 +502,77 @@ impl ScanBackend for CoreBackend {
                         let Some(path) = files.get(index) else {
                             break;
                         };
-                        batch.push(scan_file_with_engine(engine, path, binary));
+                        batch.push(scan_file_with_limits(
+                            engine,
+                            path,
+                            binary,
+                            large_files,
+                            retain_hits,
+                        ));
                         progress.advance();
+                        if batch.len() >= RESULT_BATCH_SIZE
+                            && tx.send(std::mem::take(&mut batch)).is_err()
+                        {
+                            return;
+                        }
                     }
-                    let _ = tx.send(batch);
+                    if !batch.is_empty() {
+                        let _ = tx.send(batch);
+                    }
                 });
             }
             drop(tx);
             rx.into_iter().flatten().collect::<Vec<_>>()
         });
         Ok(out)
+    }
+}
+
+struct LargeFileLimiter {
+    available: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl LargeFileLimiter {
+    fn new(permits: usize) -> Self {
+        Self {
+            available: Mutex::new(permits.max(1)),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, bytes: usize) -> Option<LargeFilePermit<'_>> {
+        if bytes < LARGE_FILE_BYTES {
+            return None;
+        }
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *available == 0 {
+            available = self
+                .ready
+                .wait(available)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *available -= 1;
+        Some(LargeFilePermit { limiter: self })
+    }
+}
+
+struct LargeFilePermit<'a> {
+    limiter: &'a LargeFileLimiter,
+}
+
+impl Drop for LargeFilePermit<'_> {
+    fn drop(&mut self) {
+        let mut available = self
+            .limiter
+            .available
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *available += 1;
+        self.limiter.ready.notify_one();
     }
 }
 
