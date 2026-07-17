@@ -2,6 +2,7 @@ use super::progress::ScanProgress;
 use super::report::SkippedFile;
 use super::rules;
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -53,7 +54,13 @@ pub(super) fn collect_scan_roots(
 }
 
 fn explicit_file_is_excluded(path: &Path, excludes: &[String]) -> Result<bool, String> {
-    let Some(overrides) = rules::build_overrides(&scan_base(path), excludes)? else {
+    if excludes.is_empty() {
+        return Ok(false);
+    }
+    let base = git_context(path)
+        .map(|context| context.top)
+        .unwrap_or_else(|| scan_base(path));
+    let Some(overrides) = rules::build_overrides(&base, excludes)? else {
         return Ok(false);
     };
     Ok(overrides.matched(path, false).is_ignore())
@@ -318,7 +325,7 @@ fn filter_git_files(
     excludes: &[String],
     progress: &ScanProgress,
 ) -> Result<Vec<PathBuf>, String> {
-    if !has_pentectignore(&base, &git_files) {
+    if !has_pentectignore(&base, &walk_root, &git_files) {
         let Some(overrides) = rules::build_overrides(&base, excludes)? else {
             progress.advance_by(git_files.len());
             return Ok(git_files);
@@ -332,6 +339,7 @@ fn filter_git_files(
     }
     let mut builder = WalkBuilder::new(&walk_root);
     configure_walker(&mut builder, &base, excludes, true)?;
+    add_ancestor_pentectignores(&mut builder, &base, &walk_root)?;
     let mut allowed = Vec::new();
     let mut skipped = Vec::new();
     let mut skipped_count = 0;
@@ -354,13 +362,45 @@ fn filter_git_files(
     Ok(filtered)
 }
 
-fn has_pentectignore(base: &Path, paths: &[PathBuf]) -> bool {
-    if base.join(".pentectignore").is_file() {
-        return true;
+fn has_pentectignore(base: &Path, walk_root: &Path, paths: &[PathBuf]) -> bool {
+    !ancestor_pentectignores(base, walk_root).is_empty()
+        || walk_root.join(".pentectignore").is_file()
+        || paths
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some(".pentectignore"))
+}
+
+fn add_ancestor_pentectignores(
+    builder: &mut WalkBuilder,
+    base: &Path,
+    walk_root: &Path,
+) -> Result<(), String> {
+    for path in ancestor_pentectignores(base, walk_root) {
+        if let Some(error) = builder.add_ignore(path) {
+            return Err(format!("could not load ancestor .pentectignore: {error}"));
+        }
     }
+    Ok(())
+}
+
+fn ancestor_pentectignores(base: &Path, walk_root: &Path) -> Vec<PathBuf> {
+    if !walk_root.starts_with(base) {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let mut current = walk_root.parent();
+    while let Some(dir) = current.filter(|dir| dir.starts_with(base)) {
+        let path = dir.join(".pentectignore");
+        if path.is_file() {
+            paths.push(path);
+        }
+        if dir == base {
+            break;
+        }
+        current = dir.parent();
+    }
+    paths.reverse();
     paths
-        .iter()
-        .any(|path| path.file_name().and_then(|name| name.to_str()) == Some(".pentectignore"))
 }
 
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
@@ -376,34 +416,21 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
 }
 
 fn git_files_for_root(root: &Path) -> Option<(PathBuf, PathBuf, Vec<PathBuf>)> {
-    let root_abs = root.canonicalize().ok()?;
-    let git_cwd = if root_abs.is_file() {
-        root_abs.parent()?
-    } else {
-        root_abs.as_path()
-    };
-    let top = Command::new("git")
-        .arg("-C")
-        .arg(git_cwd)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim())
-        .canonicalize()
-        .ok()?;
-    let rel = root_abs.strip_prefix(&top).ok()?;
+    let context = git_context(root)?;
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(&top).args([
-        "ls-files",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        "--",
-    ]);
-    if !rel.as_os_str().is_empty() {
-        cmd.arg(git_pathspec(rel));
+    cmd.arg("-C")
+        .arg(&context.top)
+        .arg("--literal-pathspecs")
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ]);
+    if !context.relative.as_os_str().is_empty() {
+        cmd.arg(git_pathspec(&context.relative));
     }
     let output = cmd.output().ok()?;
     if !output.status.success() {
@@ -414,10 +441,64 @@ fn git_files_for_root(root: &Path) -> Option<(PathBuf, PathBuf, Vec<PathBuf>)> {
         if raw.is_empty() {
             continue;
         }
-        let rel = String::from_utf8_lossy(raw);
-        push_git_regular_file(&top, rel.as_ref(), &mut files);
+        let rel = git_path_from_bytes(raw)?;
+        push_git_regular_file(&context.top, &rel, &mut files);
     }
-    Some((top, root_abs, files))
+    Some((context.top, context.root, files))
+}
+
+struct GitContext {
+    top: PathBuf,
+    root: PathBuf,
+    relative: PathBuf,
+}
+
+fn git_context(root: &Path) -> Option<GitContext> {
+    let root = root.canonicalize().ok()?;
+    let git_cwd = if root.is_file() {
+        root.parent()?
+    } else {
+        root.as_path()
+    };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(git_cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let top = git_path_from_bytes(trim_line_end(&output.stdout))?
+        .canonicalize()
+        .ok()?;
+    let relative = root.strip_prefix(&top).ok()?.to_path_buf();
+    Some(GitContext {
+        top,
+        root,
+        relative,
+    })
+}
+
+fn trim_line_end(mut bytes: &[u8]) -> &[u8] {
+    while bytes
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+    {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+#[cfg(unix)]
+fn git_path_from_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    Some(PathBuf::from(OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(unix))]
+fn git_path_from_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
 }
 
 struct WalkHeartbeat {
@@ -454,15 +535,21 @@ impl Drop for WalkHeartbeat {
     }
 }
 
-fn push_git_regular_file(top: &Path, rel: &str, files: &mut Vec<PathBuf>) {
+fn push_git_regular_file(top: &Path, rel: &Path, files: &mut Vec<PathBuf>) {
     let path = top.join(rel);
     if path.is_file() {
         files.push(path);
     }
 }
 
-fn git_pathspec(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+#[cfg(windows)]
+fn git_pathspec(path: &Path) -> OsString {
+    OsString::from(path.to_string_lossy().replace('\\', "/"))
+}
+
+#[cfg(not(windows))]
+fn git_pathspec(path: &Path) -> OsString {
+    path.as_os_str().to_os_string()
 }
 
 fn scan_base(root: &Path) -> PathBuf {
@@ -492,9 +579,11 @@ fn minimal_scan_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     });
     let mut minimal = Vec::<PathBuf>::new();
     for root in roots {
-        if minimal
-            .iter()
-            .any(|parent| parent.is_dir() && root.starts_with(parent))
+        if minimal.contains(&root)
+            || (root.is_dir()
+                && minimal
+                    .iter()
+                    .any(|parent| parent.is_dir() && root.starts_with(parent)))
         {
             continue;
         }
@@ -528,6 +617,31 @@ mod tests {
         root
     }
 
+    fn init_git(root: &Path) {
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn collect_test_roots(roots: &[PathBuf], excludes: &[String]) -> Vec<PathBuf> {
+        let mut skipped = Vec::new();
+        let mut skipped_count = 0;
+        collect_scan_roots(
+            roots,
+            excludes,
+            true,
+            &mut skipped,
+            &mut skipped_count,
+            false,
+            &ScanProgress::disabled(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn git_listed_directories_are_not_scanned_as_files() {
         let root = temp_root("pentect-git-listed-dir");
@@ -535,8 +649,8 @@ mod tests {
         std::fs::write(root.join("tracked.txt"), "ok").unwrap();
 
         let mut files = Vec::new();
-        push_git_regular_file(&root, "vendor-submodule", &mut files);
-        push_git_regular_file(&root, "tracked.txt", &mut files);
+        push_git_regular_file(&root, Path::new("vendor-submodule"), &mut files);
+        push_git_regular_file(&root, Path::new("tracked.txt"), &mut files);
 
         assert_eq!(vec![root.join("tracked.txt")], files);
         let _ = std::fs::remove_dir_all(root);
@@ -546,7 +660,68 @@ mod tests {
     fn untracked_root_pentectignore_is_detected_for_git_filtering() {
         let root = temp_root("pentect-untracked-ignore");
         std::fs::write(root.join(".pentectignore"), "ignored.env\n").unwrap();
-        assert!(has_pentectignore(&root, &[]));
+        assert!(has_pentectignore(&root, &root, &[]));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_file_is_kept_beside_parent_root() {
+        let root = temp_root("pentect-explicit-file-root");
+        init_git(&root);
+        let ignored = root.join("ignored.env");
+        std::fs::write(root.join(".gitignore"), "ignored.env\n").unwrap();
+        std::fs::write(&ignored, "secret\n").unwrap();
+
+        let files = collect_test_roots(&[root.clone(), ignored.clone()], &[]);
+        assert!(files.contains(&ignored.canonicalize().unwrap()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_file_exclude_is_relative_to_git_root() {
+        let root = temp_root("pentect-explicit-file-exclude");
+        init_git(&root);
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let ignored = sub.join("ignored.env");
+        std::fs::write(&ignored, "secret\n").unwrap();
+
+        let files = collect_test_roots(&[ignored], &["sub/ignored.env".to_string()]);
+        assert!(files.is_empty(), "{files:?}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_subtree_honors_ancestor_pentectignore() {
+        let root = temp_root("pentect-git-subtree-ignore");
+        init_git(&root);
+        let subtree = root.join("sub").join("child");
+        std::fs::create_dir_all(&subtree).unwrap();
+        std::fs::write(root.join("sub").join(".pentectignore"), "ignored.env\n").unwrap();
+        let ignored = subtree.join("ignored.env");
+        std::fs::write(&ignored, "secret\n").unwrap();
+
+        let files = collect_test_roots(&[subtree], &[]);
+        assert!(!files.contains(&ignored), "{files:?}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_listing_preserves_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_root("pentect-git-non-utf8");
+        init_git(&root);
+        let path = root.join(OsString::from_vec(b"secret-\xff.env".to_vec()));
+        std::fs::write(&path, "secret\n").unwrap();
+
+        let (_, _, files) = git_files_for_root(&root).unwrap();
+        assert!(files.contains(&path), "{files:?}");
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -576,7 +751,7 @@ mod tests {
         std::fs::write(&file, "fn main() {}\n").unwrap();
 
         assert_eq!(
-            vec![normalize_root(&root)],
+            vec![normalize_root(&root), normalize_root(&file)],
             minimal_scan_roots(&[nested, file, root.clone(), root.clone()])
         );
 

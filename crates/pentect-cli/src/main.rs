@@ -3691,7 +3691,10 @@ mod tests {
         assert!(help.contains("doctor: readiness"), "{help}");
         assert!(help.contains("extensions: list, inspect, test"), "{help}");
         assert!(help.contains("eval: precision, recall"), "{help}");
-        assert!(help.contains("scan: CredSweeper + core"), "{help}");
+        assert!(
+            help.contains("scan: secrets; gitignore on; --no-gitignore broadens"),
+            "{help}"
+        );
         assert!(help.contains("statusline: masked count"), "{help}");
         assert!(!help.contains("pentect purge"), "{help}");
         assert!(!help.contains("authenticated browser/API/MCP"), "{help}");
