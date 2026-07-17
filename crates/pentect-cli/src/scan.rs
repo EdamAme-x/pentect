@@ -1,6 +1,7 @@
 mod engine;
 mod file_magic;
 mod options;
+mod progress;
 mod report;
 mod rules;
 mod walk;
@@ -8,6 +9,7 @@ mod walk;
 use crate::{die, load_packs};
 use engine::{scan_files, ScanFile};
 use options::{BinaryMode, ScanOpts};
+use progress::ScanProgress;
 use report::{print_report, report_json, ScanReport};
 use std::io::Write;
 use walk::collect_scan_roots;
@@ -57,6 +59,7 @@ fn run_scan_with_engine(
         Vec<std::path::PathBuf>,
         Vec<pentect_core::Pack>,
         BinaryMode,
+        ScanProgress,
     ) -> Result<(Vec<ScanFile>, String), String>,
 ) -> Result<ScanReport, String> {
     let mut report = ScanReport {
@@ -64,13 +67,23 @@ fn run_scan_with_engine(
         engine: "pentect".to_string(),
         ..ScanReport::default()
     };
-    let files = collect_scan_roots(
+    let progress = ScanProgress::for_stderr();
+    progress.start("walk", None);
+    let files = match collect_scan_roots(
         &opts.paths,
         &opts.excludes,
         opts.gitignore,
         &mut report.skipped,
-    )?;
-    let (results, engine) = scanner(files, packs, opts.binary)?;
+    ) {
+        Ok(files) => files,
+        Err(error) => {
+            progress.finish();
+            return Err(error);
+        }
+    };
+    let scanned = scanner(files, packs, opts.binary, progress.clone());
+    progress.finish();
+    let (results, engine) = scanned?;
     report.engine = engine;
     for result in results {
         match result {
@@ -384,6 +397,7 @@ label = "ACME_CASE"
             vec![root.clone(), secret.clone()],
             Vec::new(),
             BinaryMode::Skip,
+            ScanProgress::disabled(),
         )
         .unwrap();
         let mut saw_skipped_dir = false;

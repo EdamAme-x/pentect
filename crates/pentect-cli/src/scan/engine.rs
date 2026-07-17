@@ -1,5 +1,6 @@
 use super::file_magic::{classify, FileMagic};
 use super::options::BinaryMode;
+use super::progress::ScanProgress;
 use super::report::{FileFinding, ScanScope, SkippedFile};
 use super::walk::ignored_file_reason;
 use memchr::memchr;
@@ -18,12 +19,13 @@ pub(super) fn scan_files(
     files: Vec<PathBuf>,
     packs: Vec<pentect_core::Pack>,
     binary: BinaryMode,
+    progress: ScanProgress,
 ) -> Result<(Vec<ScanFile>, String), String> {
     #[cfg(not(test))]
     let decode = pentect_agent::load_decode_config(Profile::Strict)?;
     #[cfg(test)]
     let decode = DecodeConfig::default();
-    ScanPipeline::pentect(packs, binary, decode)?.scan(files)
+    ScanPipeline::pentect(packs, binary, decode)?.scan(files, &progress)
 }
 
 #[cfg(test)]
@@ -31,8 +33,9 @@ pub(super) fn scan_files_core_for_tests(
     files: Vec<PathBuf>,
     packs: Vec<pentect_core::Pack>,
     binary: BinaryMode,
+    progress: ScanProgress,
 ) -> Result<(Vec<ScanFile>, String), String> {
-    ScanPipeline::core_for_tests(packs, binary).scan(files)
+    ScanPipeline::core_for_tests(packs, binary).scan(files, &progress)
 }
 
 #[derive(Clone, Debug)]
@@ -52,7 +55,8 @@ trait ScanBackend {
     fn binary_mode(&self) -> Option<BinaryMode> {
         None
     }
-    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<ScanFile>, String>;
+    fn scan(&mut self, files: &[PathBuf], progress: &ScanProgress)
+        -> Result<Vec<ScanFile>, String>;
 }
 
 struct ScanPipeline {
@@ -84,20 +88,38 @@ impl ScanPipeline {
         }
     }
 
-    fn scan(&mut self, files: Vec<PathBuf>) -> Result<(Vec<ScanFile>, String), String> {
-        let (eligible, skipped) = precheck_files(&files, self.binary_mode())?;
+    fn scan(
+        &mut self,
+        files: Vec<PathBuf>,
+        progress: &ScanProgress,
+    ) -> Result<(Vec<ScanFile>, String), String> {
+        progress.start("check", Some(files.len()));
+        let (eligible, skipped) = precheck_files(&files, self.binary_mode(), progress)?;
         let mut out = skipped
             .into_iter()
             .map(ScanFile::Skipped)
             .collect::<Vec<_>>();
+
+        if self.backends.len() == 1 {
+            let backend = &mut self.backends[0];
+            progress.start("scan", Some(eligible.len()));
+            out.extend(
+                backend
+                    .scan(&eligible, progress)
+                    .map_err(|e| format!("{}: {e}", backend.name()))?,
+            );
+            return Ok((out, self.name.to_string()));
+        }
+
         let mut scanned_paths = BTreeSet::new();
         let mut skipped_paths = BTreeMap::new();
         let mut findings = FindingSet::default();
 
         for backend in &mut self.backends {
             let backend_name = backend.name();
+            progress.start("scan", Some(eligible.len()));
             for result in backend
-                .scan(&eligible)
+                .scan(&eligible, progress)
                 .map_err(|e| format!("{backend_name}: {e}"))?
             {
                 match result {
@@ -147,38 +169,75 @@ impl ScanPipeline {
 fn precheck_files(
     files: &[PathBuf],
     binary: BinaryMode,
+    progress: &ScanProgress,
 ) -> Result<(Vec<PathBuf>, Vec<SkippedFile>), String> {
+    if files.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let workers = worker_count(files.len());
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    let batches = std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next;
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let mut eligible = Vec::new();
+                let mut skipped = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = files.get(index) else {
+                        break;
+                    };
+                    match precheck_file(path, binary) {
+                        Ok(path) => eligible.push(path),
+                        Err(file) => skipped.push(file),
+                    }
+                    progress.advance();
+                }
+                let _ = tx.send((eligible, skipped));
+            });
+        }
+        drop(tx);
+        rx.into_iter().collect::<Vec<_>>()
+    });
     let mut eligible = Vec::new();
     let mut skipped = Vec::new();
-    for path in files {
-        if binary == BinaryMode::Skip {
-            if let Some(reason) = ignored_file_reason(path) {
-                skipped.push(SkippedFile::new(path, reason));
-                continue;
-            }
-        }
-        let meta = match std::fs::metadata(path) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                skipped.push(SkippedFile::new(path, "missing"));
-                continue;
-            }
-            Err(_) => {
-                skipped.push(SkippedFile::new(path, "metadata error"));
-                continue;
-            }
-        };
-        if !meta.is_file() {
-            skipped.push(SkippedFile::new(path, "not a regular file"));
-            continue;
-        }
-        if meta.len() > MAX_SCAN_FILE_BYTES {
-            skipped.push(SkippedFile::new(path, "too large"));
-            continue;
-        }
-        eligible.push(path.clone());
+    for (mut batch_eligible, mut batch_skipped) in batches {
+        eligible.append(&mut batch_eligible);
+        skipped.append(&mut batch_skipped);
     }
     Ok((eligible, skipped))
+}
+
+fn precheck_file(path: &Path, binary: BinaryMode) -> Result<PathBuf, SkippedFile> {
+    if binary == BinaryMode::Skip {
+        if let Some(reason) = ignored_file_reason(path) {
+            return Err(SkippedFile::new(path, reason));
+        }
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SkippedFile::new(path, "missing"));
+        }
+        Err(_) => return Err(SkippedFile::new(path, "metadata error")),
+    };
+    if !meta.is_file() {
+        return Err(SkippedFile::new(path, "not a regular file"));
+    }
+    if meta.len() > MAX_SCAN_FILE_BYTES {
+        return Err(SkippedFile::new(path, "too large"));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn worker_count(file_count: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(file_count)
 }
 
 fn should_sniff_magic(path: &Path) -> bool {
@@ -383,15 +442,15 @@ impl ScanBackend for CoreBackend {
         Some(self.binary)
     }
 
-    fn scan(&mut self, files: &[PathBuf]) -> Result<Vec<ScanFile>, String> {
+    fn scan(
+        &mut self,
+        files: &[PathBuf],
+        progress: &ScanProgress,
+    ) -> Result<Vec<ScanFile>, String> {
         if files.is_empty() {
             return Ok(Vec::new());
         }
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8)
-            .min(files.len());
+        let workers = worker_count(files.len());
         self.ensure_engine();
         let Some(engine) = self.engine.as_ref() else {
             return Err("engine unavailable".to_string());
@@ -403,21 +462,21 @@ impl ScanBackend for CoreBackend {
                 let next = &next;
                 let tx = tx.clone();
                 let binary = self.binary;
-                scope.spawn(move || loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(path) = files.get(index) else {
-                        break;
-                    };
-                    if tx
-                        .send(scan_file_with_engine(engine, path, binary))
-                        .is_err()
-                    {
-                        break;
+                scope.spawn(move || {
+                    let mut batch = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(path) = files.get(index) else {
+                            break;
+                        };
+                        batch.push(scan_file_with_engine(engine, path, binary));
+                        progress.advance();
                     }
+                    let _ = tx.send(batch);
                 });
             }
             drop(tx);
-            rx.into_iter().collect::<Vec<_>>()
+            rx.into_iter().flatten().collect::<Vec<_>>()
         });
         Ok(out)
     }
