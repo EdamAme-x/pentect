@@ -5,6 +5,8 @@ use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, Wal
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 const WALK_PROGRESS_BATCH: usize = 256;
 
@@ -13,13 +15,16 @@ pub(super) fn collect_scan_roots(
     excludes: &[String],
     use_gitignore: bool,
     skipped: &mut Vec<SkippedFile>,
+    skipped_count: &mut usize,
+    retain_skipped: bool,
     progress: &ScanProgress,
 ) -> Result<Vec<PathBuf>, String> {
+    let _heartbeat = WalkHeartbeat::start(progress);
     let mut files = Vec::new();
     for root in roots {
         if use_gitignore {
-            if let Some((base, git_files)) = git_files_for_root(root) {
-                let filtered = filter_git_files(base, git_files, excludes, progress)?;
+            if let Some((base, walk_root, git_files)) = git_files_for_root(root) {
+                let filtered = filter_git_files(base, walk_root, git_files, excludes, progress)?;
                 files.extend(filtered);
                 continue;
             }
@@ -27,7 +32,14 @@ pub(super) fn collect_scan_roots(
         let root = normalize_root(root);
         let mut builder = WalkBuilder::new(&root);
         configure_walker(&mut builder, &scan_base(&root), excludes, use_gitignore)?;
-        collect_with_walker(builder, &mut files, skipped, progress)?;
+        collect_with_walker(
+            builder,
+            &mut files,
+            skipped,
+            skipped_count,
+            retain_skipped,
+            progress,
+        )?;
     }
     files.sort_unstable();
     files.dedup();
@@ -131,12 +143,15 @@ fn collect_with_walker(
     builder: WalkBuilder,
     files: &mut Vec<PathBuf>,
     skipped: &mut Vec<SkippedFile>,
+    skipped_count: &mut usize,
+    retain_skipped: bool,
     progress: &ScanProgress,
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let mut visitor = WalkCollectorBuilder {
         tx,
         progress: progress.clone(),
+        retain_skipped,
     };
     builder.build_parallel().visit(&mut visitor);
     drop(visitor);
@@ -146,6 +161,7 @@ fn collect_with_walker(
         }
         files.extend(batch.files);
         skipped.extend(batch.skipped);
+        *skipped_count += batch.skipped_count;
     }
     Ok(())
 }
@@ -153,6 +169,7 @@ fn collect_with_walker(
 struct WalkCollectorBuilder {
     tx: mpsc::Sender<WalkBatch>,
     progress: ScanProgress,
+    retain_skipped: bool,
 }
 
 impl<'s> ParallelVisitorBuilder<'s> for WalkCollectorBuilder {
@@ -164,6 +181,8 @@ impl<'s> ParallelVisitorBuilder<'s> for WalkCollectorBuilder {
             error: None,
             progress: self.progress.clone(),
             pending_progress: 0,
+            skipped_count: 0,
+            retain_skipped: self.retain_skipped,
         })
     }
 }
@@ -175,11 +194,19 @@ struct WalkCollector {
     error: Option<String>,
     progress: ScanProgress,
     pending_progress: usize,
+    skipped_count: usize,
+    retain_skipped: bool,
 }
 
 impl ParallelVisitor for WalkCollector {
     fn visit(&mut self, entry: Result<DirEntry, ignore::Error>) -> WalkState {
-        match collect_entry(entry, &mut self.files, &mut self.skipped) {
+        match collect_entry(
+            entry,
+            &mut self.files,
+            &mut self.skipped,
+            &mut self.skipped_count,
+            self.retain_skipped,
+        ) {
             Ok(is_file) => {
                 if is_file {
                     self.pending_progress += 1;
@@ -204,6 +231,7 @@ impl Drop for WalkCollector {
         let _ = self.tx.send(WalkBatch {
             files: std::mem::take(&mut self.files),
             skipped: std::mem::take(&mut self.skipped),
+            skipped_count: self.skipped_count,
             error: self.error.take(),
         });
     }
@@ -212,6 +240,7 @@ impl Drop for WalkCollector {
 struct WalkBatch {
     files: Vec<PathBuf>,
     skipped: Vec<SkippedFile>,
+    skipped_count: usize,
     error: Option<String>,
 }
 
@@ -219,6 +248,8 @@ fn collect_entry(
     entry: Result<DirEntry, ignore::Error>,
     files: &mut Vec<PathBuf>,
     skipped: &mut Vec<SkippedFile>,
+    skipped_count: &mut usize,
+    retain_skipped: bool,
 ) -> Result<bool, String> {
     let entry = entry.map_err(|e| e.to_string())?;
     let path = entry.path().to_path_buf();
@@ -226,24 +257,50 @@ fn collect_entry(
         return Err(format!("could not walk '{}': {err}", path.display()));
     }
     if entry.path_is_symlink() {
-        skipped.push(SkippedFile::new(&path, "symlink"));
+        record_skipped(path, "symlink", skipped, skipped_count, retain_skipped);
         return Ok(false);
     }
     let Some(file_type) = entry.file_type() else {
-        skipped.push(SkippedFile::new(&path, "not a regular file"));
+        record_skipped(
+            path,
+            "not a regular file",
+            skipped,
+            skipped_count,
+            retain_skipped,
+        );
         return Ok(false);
     };
     if file_type.is_file() {
         files.push(path);
         return Ok(true);
     } else if !file_type.is_dir() {
-        skipped.push(SkippedFile::new(&path, "not a regular file"));
+        record_skipped(
+            path,
+            "not a regular file",
+            skipped,
+            skipped_count,
+            retain_skipped,
+        );
     }
     Ok(false)
 }
 
+fn record_skipped(
+    path: PathBuf,
+    reason: &str,
+    skipped: &mut Vec<SkippedFile>,
+    skipped_count: &mut usize,
+    retain_skipped: bool,
+) {
+    *skipped_count += 1;
+    if retain_skipped {
+        skipped.push(SkippedFile::from_path_buf(path, reason));
+    }
+}
+
 fn filter_git_files(
     base: PathBuf,
+    walk_root: PathBuf,
     git_files: Vec<PathBuf>,
     excludes: &[String],
     progress: &ScanProgress,
@@ -260,11 +317,19 @@ fn filter_git_files(
         progress.advance_by(filtered.len());
         return Ok(filtered);
     }
-    let mut builder = WalkBuilder::new(&base);
+    let mut builder = WalkBuilder::new(&walk_root);
     configure_walker(&mut builder, &base, excludes, true)?;
     let mut allowed = Vec::new();
     let mut skipped = Vec::new();
-    collect_with_walker(builder, &mut allowed, &mut skipped, progress)?;
+    let mut skipped_count = 0;
+    collect_with_walker(
+        builder,
+        &mut allowed,
+        &mut skipped,
+        &mut skipped_count,
+        false,
+        &ScanProgress::disabled(),
+    )?;
     allowed.sort_unstable();
     let mut filtered = Vec::with_capacity(git_files.len());
     for path in git_files {
@@ -272,6 +337,7 @@ fn filter_git_files(
             filtered.push(path);
         }
     }
+    progress.advance_by(filtered.len());
     Ok(filtered)
 }
 
@@ -296,7 +362,7 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
         })
 }
 
-fn git_files_for_root(root: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+fn git_files_for_root(root: &Path) -> Option<(PathBuf, PathBuf, Vec<PathBuf>)> {
     let root_abs = root.canonicalize().ok()?;
     let git_cwd = if root_abs.is_file() {
         root_abs.parent()?
@@ -338,7 +404,41 @@ fn git_files_for_root(root: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
         let rel = String::from_utf8_lossy(raw);
         push_git_regular_file(&top, rel.as_ref(), &mut files);
     }
-    Some((top, files))
+    Some((top, root_abs, files))
+}
+
+struct WalkHeartbeat {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl WalkHeartbeat {
+    fn start(progress: &ScanProgress) -> Option<Self> {
+        if !progress.is_enabled() {
+            return None;
+        }
+        let progress = progress.clone();
+        let (stop, stopped) = mpsc::channel();
+        let thread = std::thread::spawn(move || loop {
+            match stopped.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => progress.pulse(),
+            }
+        });
+        Some(Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for WalkHeartbeat {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 fn push_git_regular_file(top: &Path, rel: &str, files: &mut Vec<PathBuf>) {

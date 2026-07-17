@@ -76,6 +76,8 @@ fn run_scan_with_engine(
         &opts.excludes,
         opts.gitignore,
         &mut report.skipped,
+        &mut report.skipped_count,
+        retain_skipped,
         &progress,
     ) {
         Ok(files) => files,
@@ -84,7 +86,6 @@ fn run_scan_with_engine(
             return Err(error);
         }
     };
-    report.skipped_count = report.skipped.len();
     let scanned = scanner(files, packs, opts.binary, progress.clone(), retain_skipped);
     progress.finish();
     let (results, engine) = scanned?;
