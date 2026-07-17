@@ -529,7 +529,7 @@ fn merge_image_ocr_config(
         unscanned_images: project
             .unscanned_images
             .or(global.unscanned_images)
-            .unwrap_or(UnscannedImagePolicy::Allow),
+            .unwrap_or(UnscannedImagePolicy::Block),
     }
 }
 
@@ -853,6 +853,7 @@ unknown_min_bytes = 32
         assert_eq!(cfg.max_seconds, 20);
         assert_eq!(cfg.max_image_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.fetch_seconds, 8);
+        assert_eq!(cfg.unscanned_images, UnscannedImagePolicy::Block);
     }
 
     #[test]

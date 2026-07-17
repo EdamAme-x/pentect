@@ -21,6 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
+use zeroize::Zeroize;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const PENTECT_CODEX_APP_SERVER_PROXY_ENV: &str = "PENTECT_CODEX_APP_SERVER_PROXY";
@@ -92,6 +93,7 @@ async fn run_proxy(
     let backend_addr = reserve_loopback_addr()?;
     let backend_url = format!("ws://{backend_addr}");
     let mut backend = start_codex_app_server(&codex, &backend_url, app_server_args)?;
+    let _backend_supervisor = AppServerProcessSupervisor::new(&backend);
     if let Err(e) = wait_for_ready(backend_addr, &mut backend).await {
         stop_child(&mut backend).await;
         return Err(e);
@@ -116,6 +118,12 @@ async fn run_proxy(
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => break,
+            status = backend.wait() => {
+                return Err(match status {
+                    Ok(status) => format!("codex app-server exited: {status}"),
+                    Err(error) => format!("could not wait for codex app-server: {error}"),
+                });
+            }
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(accepted) => accepted,
@@ -161,8 +169,194 @@ fn start_codex_app_server(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
     cmd.spawn()
         .map_err(|e| format!("could not start codex app-server: {e}"))
+}
+
+#[cfg(windows)]
+struct AppServerProcessSupervisor {
+    job: windows_sys::Win32::Foundation::HANDLE,
+    root: Option<SupervisedProcess>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct SupervisedProcess {
+    pid: sysinfo::Pid,
+    start_time: Option<u64>,
+}
+
+#[cfg(windows)]
+impl AppServerProcessSupervisor {
+    fn new(child: &Child) -> Self {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let root = child.id().map(|pid| {
+            let pid = sysinfo::Pid::from_u32(pid);
+            let mut system = sysinfo::System::new();
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            SupervisedProcess {
+                pid,
+                start_time: system.process(pid).map(sysinfo::Process::start_time),
+            }
+        });
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Self { job, root };
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        let assigned = configured
+            && child.raw_handle().is_some_and(|process| unsafe {
+                AssignProcessToJobObject(job, process.cast()) != 0
+            });
+        if assigned {
+            Self { job, root }
+        } else {
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::CloseHandle(job);
+            }
+            Self {
+                job: std::ptr::null_mut(),
+                root,
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AppServerProcessSupervisor {
+    fn drop(&mut self) {
+        if !self.job.is_null() {
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::CloseHandle(self.job);
+            }
+            self.job = std::ptr::null_mut();
+        }
+        let Some(root) = self.root.take() else {
+            return;
+        };
+        terminate_windows_process_tree(root);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_windows_process_tree(root: SupervisedProcess) {
+    use std::thread;
+
+    for _ in 0..4 {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        let root_process = system.process(root.pid);
+        let root_matches = root
+            .start_time
+            .zip(root_process)
+            .is_some_and(|(start_time, process)| start_time == process.start_time());
+        let root_reused = root.start_time.is_none() || (root_process.is_some() && !root_matches);
+        let mut targets = system
+            .processes()
+            .iter()
+            .filter_map(|(pid, _)| {
+                ((root_matches && *pid == root.pid)
+                    || (!root_reused
+                        && windows_process_descends_from(*pid, root.pid, system.processes())))
+                .then_some(*pid)
+            })
+            .filter(|pid| pid.as_u32() > 1 && pid.as_u32() != std::process::id())
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            break;
+        }
+        targets.sort_unstable_by_key(|pid| std::cmp::Reverse(pid.as_u32()));
+        for pid in targets {
+            if let Some(process) = system.process(pid) {
+                let _ = process.kill();
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_descends_from(
+    mut pid: sysinfo::Pid,
+    root: sysinfo::Pid,
+    processes: &std::collections::HashMap<sysinfo::Pid, sysinfo::Process>,
+) -> bool {
+    if pid == root {
+        return false;
+    }
+    for _ in 0..64 {
+        let Some(parent) = processes.get(&pid).and_then(sysinfo::Process::parent) else {
+            return false;
+        };
+        if parent == root {
+            return true;
+        }
+        if parent == pid {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
+#[cfg(unix)]
+struct AppServerProcessSupervisor {
+    process_group: Option<i32>,
+}
+
+#[cfg(unix)]
+impl AppServerProcessSupervisor {
+    fn new(child: &Child) -> Self {
+        Self {
+            process_group: child.id().and_then(|pid| i32::try_from(pid).ok()),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AppServerProcessSupervisor {
+    fn drop(&mut self) {
+        if let Some(process_group) = self.process_group.take() {
+            unsafe {
+                let _ = libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct AppServerProcessSupervisor;
+
+#[cfg(not(any(unix, windows)))]
+impl AppServerProcessSupervisor {
+    fn new(_child: &Child) -> Self {
+        Self
+    }
 }
 
 async fn wait_for_ready(addr: SocketAddr, child: &mut Child) -> Result<(), String> {
@@ -476,6 +670,9 @@ where
         Err(_) => return mask(text),
     };
     redact_images(&mut value)?;
+    if clean_command_display {
+        suppress_partial_json_deltas(&mut value);
+    }
     mask_app_server_display_strings(&mut value, None, clean_command_display, mask)?;
     if clean_command_display {
         prefer_command_action_display(&mut value);
@@ -491,10 +688,24 @@ fn rewrite_server_binary_payload<F>(
 where
     F: FnMut(&str) -> Result<String, String>,
 {
-    let Ok(text) = std::str::from_utf8(payload) else {
-        return Ok(payload.to_vec());
-    };
-    rewrite_server_text_frame_for_display(text, clean_command_display, mask).map(String::into_bytes)
+    if image_payload(payload) {
+        return pentect_agent::redact_image_bytes_into_active_memory_store(payload)
+            .map(|redacted| redacted.unwrap_or_else(|| payload.to_vec()));
+    }
+    if let Ok(text) = std::str::from_utf8(payload) {
+        return rewrite_server_text_frame_for_display(text, clean_command_display, mask)
+            .map(String::into_bytes);
+    }
+    Err("app-server binary output cannot be protected".to_string())
+}
+
+fn image_payload(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || bytes.starts_with(b"BM")
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
 }
 
 fn redact_app_server_images(value: &mut Value) -> Result<(), String> {
@@ -524,7 +735,9 @@ where
                     debug_app_server_display_clean(key, before_len, before_len, false);
                 }
             }
-            if key.is_some_and(maskable_app_server_text_key) {
+            if !looks_like_image_payload_string(text)
+                && !key.is_some_and(|key| safe_protocol_path(key, text))
+            {
                 let masked = mask(text)?;
                 if masked != *text {
                     *text = masked;
@@ -732,6 +945,117 @@ fn maskable_app_server_text_key(key: &str) -> bool {
     )
 }
 
+fn safe_protocol_path(key: &str, text: &str) -> bool {
+    use pentect_core::OverMaskGuard;
+
+    if !matches!(key, "path" | "cwd") {
+        return false;
+    }
+    let candidate = text
+        .strip_prefix("file:///")
+        .or_else(|| text.strip_prefix("file://"))
+        .unwrap_or(text);
+    !text.contains(['?', '#', '\r', '\n']) && pentect_core::ShapeGuard::builtin().benign(candidate)
+}
+
+fn looks_like_image_payload_string(text: &str) -> bool {
+    text.trim_start()
+        .get(..11)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/"))
+}
+
+fn suppress_partial_json_deltas(value: &mut Value) -> bool {
+    if !json_has_partial_event_marker(value) {
+        return false;
+    }
+    clear_partial_json_payload(value, None)
+}
+
+fn json_has_partial_event_marker(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.iter().any(|(key, value)| {
+                matches!(key.as_str(), "type" | "event" | "method")
+                    && value.as_str().is_some_and(|text| {
+                        let lower = text.to_ascii_lowercase();
+                        lower == "stream_event"
+                            || lower
+                                .rsplit(['/', '_'])
+                                .next()
+                                .is_some_and(|part| part.ends_with("delta"))
+                    })
+            }) || object.values().any(json_has_partial_event_marker)
+        }
+        Value::Array(values) => values.iter().any(json_has_partial_event_marker),
+        _ => false,
+    }
+}
+
+fn clear_partial_json_payload(value: &mut Value, key: Option<&str>) -> bool {
+    match value {
+        Value::Object(object) => {
+            let mut changed = false;
+            for (key, value) in object {
+                changed |= clear_partial_json_payload(value, Some(key));
+            }
+            changed
+        }
+        Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= clear_partial_json_payload(value, key);
+            }
+            changed
+        }
+        Value::String(text) if !key.is_some_and(partial_json_metadata_key) => {
+            text.zeroize();
+            text.clear();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn partial_json_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "type"
+            | "event"
+            | "method"
+            | "jsonrpc"
+            | "id"
+            | "requestId"
+            | "request_id"
+            | "responseId"
+            | "response_id"
+            | "sessionId"
+            | "session_id"
+            | "threadId"
+            | "thread_id"
+            | "turnId"
+            | "turn_id"
+            | "itemId"
+            | "item_id"
+            | "messageId"
+            | "message_id"
+            | "toolUseId"
+            | "tool_use_id"
+            | "callId"
+            | "call_id"
+            | "parentId"
+            | "parent_id"
+            | "uuid"
+            | "status"
+            | "phase"
+            | "timestamp"
+            | "createdAt"
+            | "created_at"
+            | "updatedAt"
+            | "updated_at"
+            | "version"
+    )
+}
+
 fn mask_output_text(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     text: &str,
@@ -763,11 +1087,13 @@ mod tests {
     fn server_frame_masks_nested_strings() {
         let raw = serde_json::json!({
             "method": "item/completed",
+            "session_id": "sk-abcdefghijklmnopqrstuvwx",
             "params": {
                 "item": {
                     "content": [
                         {"text": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"}
-                    ]
+                    ],
+                    "output": {"value": "sk-abcdefghijklmnopqrstuvwx"}
                 }
             }
         })
@@ -776,8 +1102,17 @@ mod tests {
             Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
         })
         .unwrap();
-        assert!(!masked.contains("sk-abcdefghijklmnopqrstuvwx"), "{masked}");
         assert!(masked.contains("<<OPENAI_API_KEY_x>>"), "{masked}");
+        let value: Value = serde_json::from_str(&masked).unwrap();
+        assert_eq!(value["session_id"], "<<OPENAI_API_KEY_x>>");
+        assert_eq!(
+            value["params"]["item"]["content"][0]["text"],
+            "OPENAI_API_KEY=<<OPENAI_API_KEY_x>>"
+        );
+        assert_eq!(
+            value["params"]["item"]["output"]["value"],
+            "<<OPENAI_API_KEY_x>>"
+        );
     }
 
     #[test]
@@ -812,14 +1147,17 @@ mod tests {
     }
 
     #[test]
-    fn server_frame_masks_command_execution_delta() {
+    fn server_frame_suppresses_partial_command_output() {
         let raw = serde_json::json!({
             "method": "item/commandExecution/outputDelta",
             "params": {
                 "threadId": "thread-1",
                 "turnId": "turn-1",
                 "itemId": "item-1",
-                "delta": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"
+                "delta": {
+                    "type": "text_delta",
+                    "text": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"
+                }
             }
         })
         .to_string();
@@ -828,7 +1166,9 @@ mod tests {
         })
         .unwrap();
         assert!(!masked.contains("sk-abcdefghijklmnopqrstuvwx"), "{masked}");
-        assert!(masked.contains("<<OPENAI_API_KEY_x>>"), "{masked}");
+        let value: Value = serde_json::from_str(&masked).unwrap();
+        assert_eq!(value["params"]["delta"]["type"], "text_delta");
+        assert_eq!(value["params"]["delta"]["text"], "");
     }
 
     #[test]
@@ -973,16 +1313,16 @@ mod tests {
     }
 
     #[test]
-    fn server_binary_frame_leaves_non_utf8_payload() {
+    fn server_binary_frame_rejects_unknown_non_utf8_payload() {
         let raw = [0xff, 0x00, 0x80];
-        let masked =
+        let error =
             rewrite_server_binary_payload(
                 &raw,
                 true,
                 &mut |_| Ok("<<SHOULD_NOT_RUN>>".to_string()),
             )
-            .unwrap();
-        assert_eq!(masked, raw);
+            .unwrap_err();
+        assert_eq!(error, "app-server binary output cannot be protected");
     }
 
     #[test]
@@ -1017,6 +1357,21 @@ mod tests {
         assert!(masked.contains("<<OPENAI_API_KEY_x>>"), "{masked}");
         assert!(!masked.contains("<<LOCAL_PATH_x>>"), "{masked}");
         assert!(!masked.contains("<<LOCAL_URI_x>>"), "{masked}");
+    }
+
+    #[test]
+    fn server_frame_scans_metadata_keys_that_do_not_contain_real_paths() {
+        let raw = serde_json::json!({
+            "id": "sk-abcdefghijklmnopqrstuvwx",
+            "path": "Authorization: Bearer sk-abcdefghijklmnopqrstuvwx"
+        })
+        .to_string();
+        let masked = rewrite_server_text_frame(&raw, &mut |text| {
+            Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
+        })
+        .unwrap();
+        assert!(!masked.contains("sk-abcdefghijklmnopqrstuvwx"), "{masked}");
+        assert_eq!(masked.matches("<<OPENAI_API_KEY_x>>").count(), 2);
     }
 
     #[test]

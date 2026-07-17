@@ -41,6 +41,7 @@ data-encoding.workspace = true
 getrandom = { workspace = true }
 reqwest = { workspace = true }
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
+ctrlc = "3.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
