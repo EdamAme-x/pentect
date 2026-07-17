@@ -1,3 +1,4 @@
+use super::progress::ScanProgress;
 use super::report::SkippedFile;
 use super::rules;
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
@@ -10,12 +11,13 @@ pub(super) fn collect_scan_roots(
     excludes: &[String],
     use_gitignore: bool,
     skipped: &mut Vec<SkippedFile>,
+    progress: &ScanProgress,
 ) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     for root in roots {
         if use_gitignore {
             if let Some((base, git_files)) = git_files_for_root(root) {
-                let filtered = filter_git_files(base, git_files, excludes)?;
+                let filtered = filter_git_files(base, git_files, excludes, progress)?;
                 files.extend(filtered);
                 continue;
             }
@@ -23,7 +25,7 @@ pub(super) fn collect_scan_roots(
         let root = normalize_root(root);
         let mut builder = WalkBuilder::new(&root);
         configure_walker(&mut builder, &scan_base(&root), excludes, use_gitignore)?;
-        collect_with_walker(builder, &mut files, skipped)?;
+        collect_with_walker(builder, &mut files, skipped, progress)?;
     }
     files.sort_unstable();
     files.dedup();
@@ -127,9 +129,13 @@ fn collect_with_walker(
     builder: WalkBuilder,
     files: &mut Vec<PathBuf>,
     skipped: &mut Vec<SkippedFile>,
+    progress: &ScanProgress,
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
-    let mut visitor = WalkCollectorBuilder { tx };
+    let mut visitor = WalkCollectorBuilder {
+        tx,
+        progress: progress.clone(),
+    };
     builder.build_parallel().visit(&mut visitor);
     drop(visitor);
     for batch in rx {
@@ -144,6 +150,7 @@ fn collect_with_walker(
 
 struct WalkCollectorBuilder {
     tx: mpsc::Sender<WalkBatch>,
+    progress: ScanProgress,
 }
 
 impl<'s> ParallelVisitorBuilder<'s> for WalkCollectorBuilder {
@@ -153,6 +160,7 @@ impl<'s> ParallelVisitorBuilder<'s> for WalkCollectorBuilder {
             files: Vec::new(),
             skipped: Vec::new(),
             error: None,
+            progress: self.progress.clone(),
         })
     }
 }
@@ -162,12 +170,18 @@ struct WalkCollector {
     files: Vec<PathBuf>,
     skipped: Vec<SkippedFile>,
     error: Option<String>,
+    progress: ScanProgress,
 }
 
 impl ParallelVisitor for WalkCollector {
     fn visit(&mut self, entry: Result<DirEntry, ignore::Error>) -> WalkState {
         match collect_entry(entry, &mut self.files, &mut self.skipped) {
-            Ok(()) => WalkState::Continue,
+            Ok(is_file) => {
+                if is_file {
+                    self.progress.advance();
+                }
+                WalkState::Continue
+            }
             Err(e) => {
                 self.error = Some(e);
                 WalkState::Quit
@@ -196,7 +210,7 @@ fn collect_entry(
     entry: Result<DirEntry, ignore::Error>,
     files: &mut Vec<PathBuf>,
     skipped: &mut Vec<SkippedFile>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let entry = entry.map_err(|e| e.to_string())?;
     let path = entry.path().to_path_buf();
     if let Some(err) = entry.error() {
@@ -204,39 +218,48 @@ fn collect_entry(
     }
     if entry.path_is_symlink() {
         skipped.push(SkippedFile::new(&path, "symlink"));
-        return Ok(());
+        return Ok(false);
     }
     let Some(file_type) = entry.file_type() else {
         skipped.push(SkippedFile::new(&path, "not a regular file"));
-        return Ok(());
+        return Ok(false);
     };
     if file_type.is_file() {
         files.push(path);
+        return Ok(true);
     } else if !file_type.is_dir() {
         skipped.push(SkippedFile::new(&path, "not a regular file"));
     }
-    Ok(())
+    Ok(false)
 }
 
 fn filter_git_files(
     base: PathBuf,
     git_files: Vec<PathBuf>,
     excludes: &[String],
+    progress: &ScanProgress,
 ) -> Result<Vec<PathBuf>, String> {
     if !has_pentectignore(&base, &git_files) {
         let Some(overrides) = rules::build_overrides(&base, excludes)? else {
+            for _ in &git_files {
+                progress.advance();
+            }
             return Ok(git_files);
         };
-        return Ok(git_files
+        let filtered = git_files
             .into_iter()
             .filter(|path| !overrides.matched(path, false).is_ignore())
-            .collect());
+            .collect::<Vec<_>>();
+        for _ in &filtered {
+            progress.advance();
+        }
+        return Ok(filtered);
     }
     let mut builder = WalkBuilder::new(&base);
     configure_walker(&mut builder, &base, excludes, true)?;
     let mut allowed = Vec::new();
     let mut skipped = Vec::new();
-    collect_with_walker(builder, &mut allowed, &mut skipped)?;
+    collect_with_walker(builder, &mut allowed, &mut skipped, progress)?;
     allowed.sort_unstable();
     let mut filtered = Vec::with_capacity(git_files.len());
     for path in git_files {

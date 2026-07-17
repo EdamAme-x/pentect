@@ -11,6 +11,7 @@ pub(super) struct ScanReport {
     pub(super) files_scanned: usize,
     pub(super) findings: usize,
     pub(super) warnings: usize,
+    pub(super) skipped_count: usize,
     pub(super) skipped: Vec<SkippedFile>,
     pub(super) files: Vec<FileFinding>,
 }
@@ -270,15 +271,19 @@ impl SkippedFile {
             reason: reason.to_string(),
         }
     }
+
+    pub(super) fn from_path_buf(path: PathBuf, reason: &str) -> Self {
+        Self {
+            path,
+            reason: reason.to_string(),
+        }
+    }
 }
 
 pub(super) fn print_report(report: &ScanReport) {
     println!(
         "pentect scan engine={} findings={} files={} skipped={}",
-        report.engine,
-        report.findings,
-        report.files_scanned,
-        report.skipped.len()
+        report.engine, report.findings, report.files_scanned, report.skipped_count
     );
     if report.files.is_empty() {
         println!("no findings");
@@ -310,7 +315,7 @@ pub(super) fn report_json(report: &ScanReport) -> String {
             "files_scanned": report.files_scanned,
             "files_with_findings": report.files.len(),
             "warnings": report.warnings,
-            "skipped": report.skipped.len(),
+            "skipped": report.skipped_count,
             "scopes": scope_counts(report),
             "labels_by_scope": labels_by_scope(report),
         },
