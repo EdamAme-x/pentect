@@ -44,17 +44,26 @@ pub(crate) struct ProtectedImageFiles {
 impl ProtectedImageFiles {
     fn protect_path(&mut self, value: &str) -> Result<String, String> {
         let path = Path::new(value);
-        let size = std::fs::metadata(path)
-            .map_err(|error| format!("could not inspect image '{}': {error}", path.display()))?
-            .len();
-        if size > MAX_HEADLESS_IMAGE_BYTES {
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("could not read image '{}': {error}", path.display()))?;
+        let mut bytes = Vec::new();
+        if let Err(error) = file
+            .take(MAX_HEADLESS_IMAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+        {
+            bytes.zeroize();
+            return Err(format!(
+                "could not read image '{}': {error}",
+                path.display()
+            ));
+        }
+        if bytes.len() as u64 > MAX_HEADLESS_IMAGE_BYTES {
+            bytes.zeroize();
             return Err(format!(
                 "image '{}' exceeds {MAX_HEADLESS_IMAGE_BYTES} bytes",
                 path.display()
             ));
         }
-        let mut bytes = std::fs::read(path)
-            .map_err(|error| format!("could not read image '{}': {error}", path.display()))?;
         let redaction = pentect_agent::redact_image_bytes_into_active_memory_store(&bytes);
         bytes.zeroize();
         let Some(mut redacted) = redaction? else {
@@ -606,8 +615,8 @@ fn proxy_output(
     let mut masker = match HeadlessOutputMasker::new(detect_new_secrets, output_mode, framing) {
         Ok(masker) => masker,
         Err(error) => {
-            drain_sensitive(&mut reader);
             cancelled.store(true, Ordering::Release);
+            drain_sensitive(&mut reader);
             return Err(error);
         }
     };
@@ -840,12 +849,19 @@ fn mask_json_record(
     }
     let mut value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| format!("agent JSON output is invalid: {error}"))?;
+    let images_changed = match redact_json_images(&mut value) {
+        Ok(changed) => changed,
+        Err(error) => {
+            zeroize_json_strings(&mut value);
+            return Err(error);
+        }
+    };
     let suppressed = suppress_partial_json_deltas(&mut value);
     let changed = mask_json_value(&mut value, true, &mut |text| {
         detector.mask_tool_output(text)
     });
     let changed = match changed {
-        Ok(changed) => suppressed || changed,
+        Ok(changed) => images_changed || suppressed || changed,
         Err(error) => {
             zeroize_json_strings(&mut value);
             return Err(error);
@@ -863,6 +879,15 @@ fn mask_json_record(
     let result = remasker.push(&masked);
     masked.zeroize();
     result
+}
+
+fn redact_json_images(value: &mut serde_json::Value) -> Result<bool, String> {
+    let Some(updated) = pentect_agent::redact_tool_images_into_active_memory_store(value)? else {
+        return Ok(false);
+    };
+    zeroize_json_strings(value);
+    *value = updated;
+    Ok(true)
 }
 
 fn mask_json_value<F>(
@@ -1148,9 +1173,17 @@ fn mask_and_write_json_prompt(
             return Err(format!("agent JSON input is invalid: {error}"));
         }
     };
+    let images_changed = match redact_json_images(&mut value) {
+        Ok(changed) => changed,
+        Err(error) => {
+            zeroize_json_strings(&mut value);
+            decoded.zeroize();
+            return Err(error);
+        }
+    };
     let changed = mask_json_value(&mut value, true, &mut |text| masker.mask_prompt_text(text));
     let changed = match changed {
-        Ok(changed) => changed,
+        Ok(changed) => images_changed || changed,
         Err(error) => {
             zeroize_json_strings(&mut value);
             decoded.zeroize();

@@ -271,11 +271,11 @@ fn terminate_windows_process_tree(root: SupervisedProcess) {
             sysinfo::ProcessRefreshKind::nothing(),
         );
         let root_process = system.process(root.pid);
-        let root_matches = root_process.is_some_and(|process| {
-            root.start_time
-                .is_none_or(|start_time| start_time == process.start_time())
-        });
-        let root_reused = root.start_time.is_some() && root_process.is_some() && !root_matches;
+        let root_matches = root
+            .start_time
+            .zip(root_process)
+            .is_some_and(|(start_time, process)| start_time == process.start_time());
+        let root_reused = root.start_time.is_none() || (root_process.is_some() && !root_matches);
         let mut targets = system
             .processes()
             .iter()
@@ -688,13 +688,13 @@ fn rewrite_server_binary_payload<F>(
 where
     F: FnMut(&str) -> Result<String, String>,
 {
-    if let Ok(text) = std::str::from_utf8(payload) {
-        return rewrite_server_text_frame_for_display(text, clean_command_display, mask)
-            .map(String::into_bytes);
-    }
     if image_payload(payload) {
         return pentect_agent::redact_image_bytes_into_active_memory_store(payload)
             .map(|redacted| redacted.unwrap_or_else(|| payload.to_vec()));
+    }
+    if let Ok(text) = std::str::from_utf8(payload) {
+        return rewrite_server_text_frame_for_display(text, clean_command_display, mask)
+            .map(String::into_bytes);
     }
     Err("app-server binary output cannot be protected".to_string())
 }

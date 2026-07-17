@@ -261,8 +261,8 @@ fn first_image_data_url(value: &Value) -> Option<&str> {
         Value::String(text)
             if text
                 .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("data:image/") =>
+                .get(.."data:image/".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/")) =>
         {
             Some(text)
         }

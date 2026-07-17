@@ -1303,11 +1303,11 @@ pub(crate) fn terminate_supervised_processes(root: SupervisedRoot) {
             sysinfo::ProcessRefreshKind::nothing(),
         );
         let root_process = system.process(root.pid);
-        let root_matches = root_process.is_some_and(|process| {
-            root.start_time
-                .is_none_or(|start_time| start_time == process.start_time())
-        });
-        let root_reused = root.start_time.is_some() && root_process.is_some() && !root_matches;
+        let root_matches = root
+            .start_time
+            .zip(root_process)
+            .is_some_and(|(start_time, process)| start_time == process.start_time());
+        let root_reused = root.start_time.is_none() || (root_process.is_some() && !root_matches);
         let mut targets = system
             .processes()
             .iter()
@@ -3048,6 +3048,7 @@ fn canonical_json_value(value: &Value) -> Value {
 fn codex_headless_agent_command(tool_args: &[String]) -> bool {
     if tool_args
         .iter()
+        .take_while(|arg| arg.as_str() != "--")
         .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
     {
         return false;
@@ -4184,6 +4185,11 @@ mod tests {
             "-a".to_string(),
             "never".to_string(),
             "exec".to_string()
+        ]));
+        assert!(codex_headless_agent_command(&[
+            "exec".to_string(),
+            "--".to_string(),
+            "--help".to_string()
         ]));
     }
 
