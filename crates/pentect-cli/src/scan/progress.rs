@@ -71,10 +71,17 @@ impl ScanProgress {
     }
 
     pub(super) fn advance(&self) {
+        self.advance_by(1);
+    }
+
+    pub(super) fn advance_by(&self, amount: usize) {
         let Some(inner) = &self.inner else {
             return;
         };
-        let completed = inner.completed.fetch_add(1, Ordering::Relaxed) + 1;
+        if amount == 0 {
+            return;
+        }
+        let completed = inner.completed.fetch_add(amount, Ordering::Relaxed) + amount;
         let total = inner.total.load(Ordering::Relaxed);
         if completed != total {
             let now = elapsed_ms(inner);

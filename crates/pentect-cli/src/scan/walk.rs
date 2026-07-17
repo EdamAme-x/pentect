@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 
+const WALK_PROGRESS_BATCH: usize = 256;
+
 pub(super) fn collect_scan_roots(
     roots: &[PathBuf],
     excludes: &[String],
@@ -161,6 +163,7 @@ impl<'s> ParallelVisitorBuilder<'s> for WalkCollectorBuilder {
             skipped: Vec::new(),
             error: None,
             progress: self.progress.clone(),
+            pending_progress: 0,
         })
     }
 }
@@ -171,6 +174,7 @@ struct WalkCollector {
     skipped: Vec<SkippedFile>,
     error: Option<String>,
     progress: ScanProgress,
+    pending_progress: usize,
 }
 
 impl ParallelVisitor for WalkCollector {
@@ -178,7 +182,11 @@ impl ParallelVisitor for WalkCollector {
         match collect_entry(entry, &mut self.files, &mut self.skipped) {
             Ok(is_file) => {
                 if is_file {
-                    self.progress.advance();
+                    self.pending_progress += 1;
+                    if self.pending_progress >= WALK_PROGRESS_BATCH {
+                        self.progress.advance_by(self.pending_progress);
+                        self.pending_progress = 0;
+                    }
                 }
                 WalkState::Continue
             }
@@ -192,6 +200,7 @@ impl ParallelVisitor for WalkCollector {
 
 impl Drop for WalkCollector {
     fn drop(&mut self) {
+        self.progress.advance_by(self.pending_progress);
         let _ = self.tx.send(WalkBatch {
             files: std::mem::take(&mut self.files),
             skipped: std::mem::take(&mut self.skipped),
@@ -241,18 +250,14 @@ fn filter_git_files(
 ) -> Result<Vec<PathBuf>, String> {
     if !has_pentectignore(&base, &git_files) {
         let Some(overrides) = rules::build_overrides(&base, excludes)? else {
-            for _ in &git_files {
-                progress.advance();
-            }
+            progress.advance_by(git_files.len());
             return Ok(git_files);
         };
         let filtered = git_files
             .into_iter()
             .filter(|path| !overrides.matched(path, false).is_ignore())
             .collect::<Vec<_>>();
-        for _ in &filtered {
-            progress.advance();
-        }
+        progress.advance_by(filtered.len());
         return Ok(filtered);
     }
     let mut builder = WalkBuilder::new(&base);
