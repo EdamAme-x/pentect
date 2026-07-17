@@ -21,15 +21,14 @@ pub(super) fn collect_scan_roots(
 ) -> Result<Vec<PathBuf>, String> {
     let _heartbeat = WalkHeartbeat::start(progress);
     let mut files = Vec::new();
-    for root in roots {
+    for root in minimal_scan_roots(roots) {
         if use_gitignore {
-            if let Some((base, walk_root, git_files)) = git_files_for_root(root) {
+            if let Some((base, walk_root, git_files)) = git_files_for_root(&root) {
                 let filtered = filter_git_files(base, walk_root, git_files, excludes, progress)?;
                 files.extend(filtered);
                 continue;
             }
         }
-        let root = normalize_root(root);
         let mut builder = WalkBuilder::new(&root);
         configure_walker(&mut builder, &scan_base(&root), excludes, use_gitignore)?;
         collect_with_walker(
@@ -466,6 +465,30 @@ fn normalize_root(root: &Path) -> PathBuf {
     root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
+fn minimal_scan_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = roots
+        .iter()
+        .map(|root| normalize_root(root))
+        .collect::<Vec<_>>();
+    roots.sort_unstable_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut minimal = Vec::<PathBuf>::new();
+    for root in roots {
+        if minimal
+            .iter()
+            .any(|parent| parent.is_dir() && root.starts_with(parent))
+        {
+            continue;
+        }
+        minimal.push(root);
+    }
+    minimal
+}
+
 fn walk_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -528,5 +551,21 @@ mod tests {
             Path::new("source.rs"),
             IGNORED_FILE_EXTENSIONS
         ));
+    }
+
+    #[test]
+    fn nested_scan_roots_are_walked_once() {
+        let root = temp_root("pentect-minimal-scan-roots");
+        let nested = root.join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let file = nested.join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        assert_eq!(
+            vec![normalize_root(&root)],
+            minimal_scan_roots(&[nested, file, root.clone(), root.clone()])
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
