@@ -5,12 +5,102 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      detector: ${{ steps.filter.outputs.detector }}
+      ocr: ${{ steps.filter.outputs.ocr }}
+      pi: ${{ steps.filter.outputs.pi }}
+      pty: ${{ steps.filter.outputs.pty }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            detector:
+              - '.github/workflows/ci.yml'
+              - '.gitmodules'
+              - '.cargo/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/*/Cargo.toml'
+              - 'rust-toolchain*'
+              - 'crates/pentect-core/**'
+              - 'benchmarks/CredData'
+              - 'benchmarks/CredData/meta/**'
+              - 'benchmarks/CredData/snapshot.json'
+              - 'tools/credsweeper-sidecar/**'
+              - 'tools/pentect-bench/**'
+            ocr:
+              - '.github/workflows/ci.yml'
+              - '.cargo/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/*/Cargo.toml'
+              - 'rust-toolchain*'
+              - 'crates/pentect-runtime/assets/ocr/**'
+              - 'crates/pentect-runtime/src/image_ocr.rs'
+            pi:
+              - '.github/workflows/ci.yml'
+              - '.cargo/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/*/Cargo.toml'
+              - 'rust-toolchain*'
+              - 'crates/pentect-cli/src/app_server_proxy.rs'
+              - 'crates/pentect-cli/src/exec_proxy.rs'
+              - 'crates/pentect-cli/src/headless.rs'
+              - 'crates/pentect-cli/src/main.rs'
+              - 'crates/pentect-runtime/**'
+              - 'integrations/pi/**'
+            pty:
+              - '.github/workflows/ci.yml'
+              - '.cargo/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/*/Cargo.toml'
+              - 'rust-toolchain*'
+              - 'crates/pentect-cli/src/agent_integrations.rs'
+              - 'crates/pentect-cli/src/app_server_proxy.rs'
+              - 'crates/pentect-cli/src/doctor.rs'
+              - 'crates/pentect-cli/src/eval.rs'
+              - 'crates/pentect-cli/src/exec_proxy.rs'
+              - 'crates/pentect-cli/src/extensions.rs'
+              - 'crates/pentect-cli/src/extensions_cmd.rs'
+              - 'crates/pentect-cli/src/headless.rs'
+              - 'crates/pentect-cli/src/input.rs'
+              - 'crates/pentect-cli/src/main.rs'
+              - 'crates/pentect-cli/src/terminal.rs'
+              - 'crates/pentect-cli/tests/process_host.rs'
+              - 'crates/pentect-cli/tests/pty_dimensions.rs'
+              - 'crates/pentect-cli/tests/pty_unix.rs'
+              - 'crates/pentect-runtime/src/activity_log.rs'
+              - 'crates/pentect-runtime/src/config.rs'
+              - 'crates/pentect-runtime/src/delegated_process_host.rs'
+              - 'crates/pentect-runtime/src/extension_adapter.rs'
+              - 'crates/pentect-runtime/src/file_pointer_manager.rs'
+              - 'crates/pentect-runtime/src/main.rs'
+              - 'crates/pentect-runtime/src/masking.rs'
+              - 'crates/pentect-runtime/src/memory_store.rs'
+              - 'crates/pentect-runtime/src/output_remask.rs'
+              - 'crates/pentect-runtime/src/session.rs'
+              - 'crates/pentect-runtime/src/shell.rs'
+              - 'crates/pentect-runtime/src/tests.rs'
+
   native-ocr:
     name: Native OCR (${{ matrix.os }})
+    needs: changes
+    if: always()
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -18,19 +108,31 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     steps:
+      - name: Require change detection
+        if: needs.changes.result != 'success'
+        run: exit 1
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.ocr == 'true' || needs.changes.outputs.pi == 'true' || needs.changes.outputs.pty == 'true'
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.ocr == 'true' || needs.changes.outputs.pi == 'true' || needs.changes.outputs.pty == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.ocr == 'true' || needs.changes.outputs.pi == 'true' || needs.changes.outputs.pty == 'true'
       - uses: actions/setup-node@v4
+        if: needs.changes.outputs.pi == 'true'
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: integrations/pi/package-lock.json
       - name: Build native OCR
+        if: needs.changes.outputs.ocr == 'true'
         run: cargo build -p pentect-cli --features ocr --locked
+      - name: Build Pi host
+        if: needs.changes.outputs.pi == 'true' && needs.changes.outputs.ocr != 'true'
+        run: cargo build -p pentect-cli --locked
       - name: Test Pi extension
+        if: needs.changes.outputs.pi == 'true'
         working-directory: integrations/pi
         env:
           PENTECT_E2E_BIN: ${{ github.workspace }}/target/debug/pentect
@@ -39,16 +141,24 @@ jobs:
           npm run check
           npm test
       - name: Test Windows ConPTY
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.changes.outputs.pty == 'true'
         run: cargo test -p pentect-cli --no-default-features --test pty_dimensions --locked
       - name: Test macOS PTY
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && needs.changes.outputs.pty == 'true'
         run: cargo test -p pentect-cli --no-default-features --test pty_unix --locked
+      - name: No native changes
+        if: needs.changes.outputs.ocr != 'true' && needs.changes.outputs.pi != 'true' && needs.changes.outputs.pty != 'true'
+        run: echo "No native changes"
 
   test:
+    needs: changes
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Require change detection
+        if: needs.changes.result != 'success'
+        run: exit 1
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -57,6 +167,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
+        if: needs.changes.outputs.detector == 'true'
         with:
           python-version: "3.12"
       - name: Format
@@ -66,11 +177,13 @@ jobs:
       - name: Test
         run: cargo test --all-features
       - uses: actions/setup-node@v4
+        if: needs.changes.outputs.pi == 'true'
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: integrations/pi/package-lock.json
       - name: Test Pi extension
+        if: needs.changes.outputs.pi == 'true'
         working-directory: integrations/pi
         env:
           PENTECT_E2E_BIN: ${{ github.workspace }}/target/debug/pentect
@@ -81,12 +194,15 @@ jobs:
           npm test
           npm pack --dry-run
       - name: Test (rules-only, no default features)
+        if: needs.changes.outputs.detector == 'true'
         run: cargo test -p pentect-core --no-default-features
       - name: Install CredSweeper oracle dependencies
+        if: needs.changes.outputs.detector == 'true'
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r tools/credsweeper-sidecar/runtime-requirements.txt
       - name: Prepare CredData shard
+        if: needs.changes.outputs.detector == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -112,6 +228,7 @@ jobs:
           PY
           (cd benchmarks/CredData && python download_data.py --clean_data --jobs 1)
       - name: CredSweeper parity shard
+        if: needs.changes.outputs.detector == 'true'
         shell: bash
         run: |
           set -euo pipefail
