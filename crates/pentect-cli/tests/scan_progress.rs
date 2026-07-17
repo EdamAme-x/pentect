@@ -79,6 +79,8 @@ fn scan_shows_progress_in_a_terminal() {
 
     assert_eq!(status.exit_code(), 0, "{output:?}");
     assert!(output.contains("[pentect] walk"), "{output:?}");
+    assert!(output.contains("[pentect] walk 1"), "{output:?}");
+    assert!(output.contains("[pentect] check 1/1"), "{output:?}");
     assert!(output.contains("[pentect] scan 0/1"), "{output:?}");
     assert!(output.contains("[pentect] scan 1/1"), "{output:?}");
     assert!(output.contains("pentect scan engine=pentect"), "{output:?}");

@@ -43,23 +43,25 @@ pub(crate) fn cmd_scan(args: &[String]) {
 
 fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
     let packs = load_packs(args)?;
-    run_scan_with_engine(opts, packs, scan_files)
+    run_scan_with_engine(opts, packs, opts.json, scan_files)
 }
 
 #[cfg(test)]
 fn run_scan_core_for_tests(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {
     let packs = load_packs(args)?;
-    run_scan_with_engine(opts, packs, engine::scan_files_core_for_tests)
+    run_scan_with_engine(opts, packs, true, engine::scan_files_core_for_tests)
 }
 
 fn run_scan_with_engine(
     opts: &ScanOpts,
     packs: Vec<pentect_core::Pack>,
+    retain_skipped: bool,
     scanner: impl FnOnce(
         Vec<std::path::PathBuf>,
         Vec<pentect_core::Pack>,
         BinaryMode,
         ScanProgress,
+        bool,
     ) -> Result<(Vec<ScanFile>, String), String>,
 ) -> Result<ScanReport, String> {
     let mut report = ScanReport {
@@ -74,6 +76,9 @@ fn run_scan_with_engine(
         &opts.excludes,
         opts.gitignore,
         &mut report.skipped,
+        &mut report.skipped_count,
+        retain_skipped,
+        &progress,
     ) {
         Ok(files) => files,
         Err(error) => {
@@ -81,14 +86,20 @@ fn run_scan_with_engine(
             return Err(error);
         }
     };
-    let scanned = scanner(files, packs, opts.binary, progress.clone());
+    let scanned = scanner(files, packs, opts.binary, progress.clone(), retain_skipped);
     progress.finish();
     let (results, engine) = scanned?;
     report.engine = engine;
     for result in results {
         match result {
-            ScanFile::Clean(path) => {
-                let _ = path.as_os_str();
+            ScanFile::Count {
+                files_scanned,
+                skipped,
+            } => {
+                report.files_scanned += files_scanned;
+                report.skipped_count += skipped;
+            }
+            ScanFile::CleanPath(_) => {
                 report.files_scanned += 1;
             }
             ScanFile::Finding(file) => {
@@ -97,7 +108,10 @@ fn run_scan_with_engine(
                 report.warnings += file.warnings;
                 report.files.push(file);
             }
-            ScanFile::Skipped(skipped) => report.skipped.push(skipped),
+            ScanFile::Skipped(skipped) => {
+                report.skipped_count += 1;
+                report.skipped.push(skipped);
+            }
         }
     }
     report.files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -398,6 +412,7 @@ label = "ACME_CASE"
             Vec::new(),
             BinaryMode::Skip,
             ScanProgress::disabled(),
+            true,
         )
         .unwrap();
         let mut saw_skipped_dir = false;
@@ -416,6 +431,50 @@ label = "ACME_CASE"
         }
         assert!(saw_skipped_dir);
         assert!(saw_secret_finding);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_coalesces_clean_and_skipped_paths_when_details_are_not_requested() {
+        let root = temp_scan_root("pentect-scan-coalesced-results");
+        let mut paths = Vec::new();
+        for index in 0..64 {
+            let path = root.join(format!("clean-{index}.txt"));
+            std::fs::write(&path, "ordinary text\n").unwrap();
+            paths.push(path);
+        }
+        let binary = root.join("image.png");
+        std::fs::write(&binary, b"\x89PNG\r\n\x1a\n").unwrap();
+        paths.push(binary);
+
+        let (results, _) = engine::scan_files_core_for_tests(
+            paths,
+            Vec::new(),
+            BinaryMode::Skip,
+            ScanProgress::disabled(),
+            false,
+        )
+        .unwrap();
+        let (mut scanned, mut skipped) = (0, 0);
+        for result in results {
+            match result {
+                ScanFile::Count {
+                    files_scanned,
+                    skipped: skipped_count,
+                } => {
+                    scanned += files_scanned;
+                    skipped += skipped_count;
+                }
+                ScanFile::CleanPath(path) => panic!("retained clean path: {}", path.display()),
+                ScanFile::Skipped(file) => {
+                    panic!("retained skipped path: {}", file.path.display())
+                }
+                ScanFile::Finding(file) => panic!("unexpected finding: {}", file.path.display()),
+            }
+        }
+        assert_eq!(64, scanned);
+        assert_eq!(1, skipped);
 
         let _ = std::fs::remove_dir_all(&root);
     }

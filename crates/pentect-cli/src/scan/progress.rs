@@ -48,28 +48,44 @@ impl ScanProgress {
         Self { inner: None }
     }
 
+    pub(super) fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
     pub(super) fn start(&self, phase: &'static str, total: Option<usize>) {
         let Some(inner) = &self.inner else {
             return;
         };
+        let Ok(mut state) = inner.state.lock() else {
+            return;
+        };
+        if state.active {
+            draw(inner, &mut state);
+            eprintln!();
+            state.width = 0;
+        }
         inner.completed.store(0, Ordering::Relaxed);
         inner.total.store(total.unwrap_or(0), Ordering::Relaxed);
         inner
             .last_draw_ms
             .store(elapsed_ms(inner), Ordering::Relaxed);
-        let Ok(mut state) = inner.state.lock() else {
-            return;
-        };
         state.phase = phase;
         state.active = true;
         draw(inner, &mut state);
     }
 
     pub(super) fn advance(&self) {
+        self.advance_by(1);
+    }
+
+    pub(super) fn advance_by(&self, amount: usize) {
         let Some(inner) = &self.inner else {
             return;
         };
-        let completed = inner.completed.fetch_add(1, Ordering::Relaxed) + 1;
+        if amount == 0 {
+            return;
+        }
+        let completed = inner.completed.fetch_add(amount, Ordering::Relaxed) + amount;
         let total = inner.total.load(Ordering::Relaxed);
         if completed != total {
             let now = elapsed_ms(inner);
@@ -82,6 +98,26 @@ impl ScanProgress {
             {
                 return;
             }
+        }
+        let Ok(mut state) = inner.state.try_lock() else {
+            return;
+        };
+        draw(inner, &mut state);
+    }
+
+    pub(super) fn pulse(&self) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let now = elapsed_ms(inner);
+        let previous = inner.last_draw_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(previous) < DRAW_INTERVAL.as_millis() as u64
+            || inner
+                .last_draw_ms
+                .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
         }
         let Ok(mut state) = inner.state.try_lock() else {
             return;
@@ -116,16 +152,21 @@ fn elapsed_ms(inner: &ProgressInner) -> u64 {
 fn draw(inner: &ProgressInner, state: &mut ProgressState) {
     let completed = inner.completed.load(Ordering::Relaxed);
     let total = inner.total.load(Ordering::Relaxed);
-    let line = render_line(state.phase, completed, total);
+    let line = render_line(state.phase, completed, total, elapsed_ms(inner) / 1_000);
     let padding = " ".repeat(state.width.saturating_sub(line.len()));
     eprint!("\r{line}{padding}");
     let _ = std::io::stderr().flush();
     state.width = line.len();
 }
 
-fn render_line(phase: &str, completed: usize, total: usize) -> String {
+fn render_line(phase: &str, completed: usize, total: usize, elapsed_secs: u64) -> String {
     if total == 0 {
-        format!("[pentect] {phase}")
+        match (completed, elapsed_secs) {
+            (0, 0) => format!("[pentect] {phase}"),
+            (0, seconds) => format!("[pentect] {phase} {seconds}s"),
+            (count, 0) => format!("[pentect] {phase} {count}"),
+            (count, seconds) => format!("[pentect] {phase} {count} {seconds}s"),
+        }
     } else {
         format!("[pentect] {phase} {completed}/{total}")
     }
@@ -137,7 +178,9 @@ mod tests {
 
     #[test]
     fn progress_line_is_compact() {
-        assert_eq!(render_line("walk", 0, 0), "[pentect] walk");
-        assert_eq!(render_line("scan", 42, 100), "[pentect] scan 42/100");
+        assert_eq!(render_line("walk", 0, 0, 0), "[pentect] walk");
+        assert_eq!(render_line("walk", 0, 0, 3), "[pentect] walk 3s");
+        assert_eq!(render_line("walk", 42, 0, 3), "[pentect] walk 42 3s");
+        assert_eq!(render_line("scan", 42, 100, 3), "[pentect] scan 42/100");
     }
 }
