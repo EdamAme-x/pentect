@@ -233,6 +233,54 @@ pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Opti
     )))
 }
 
+pub fn redact_image_bytes_into_active_memory_store(
+    bytes: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    let mut encoded = data_encoding::BASE64.encode(bytes);
+    let mut value = Value::String(format!("data:image/png;base64,{encoded}"));
+    encoded.zeroize();
+    let redaction = redact_tool_images_into_active_memory_store(&value);
+    zeroize_value_strings(&mut value);
+    let Some(mut updated) = redaction? else {
+        return Ok(None);
+    };
+    let data_url = first_image_data_url(&updated)
+        .ok_or_else(|| "protected image payload is missing".to_string())?;
+    let (_, payload) = data_url
+        .split_once(',')
+        .ok_or_else(|| "protected image payload is invalid".to_string())?;
+    let decoded = data_encoding::BASE64
+        .decode(payload.as_bytes())
+        .map_err(|_| "protected image payload is invalid".to_string());
+    zeroize_value_strings(&mut updated);
+    decoded.map(Some)
+}
+
+fn first_image_data_url(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(text)
+            if text
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("data:image/") =>
+        {
+            Some(text)
+        }
+        Value::Array(values) => values.iter().find_map(first_image_data_url),
+        Value::Object(object) => object.values().find_map(first_image_data_url),
+        _ => None,
+    }
+}
+
+fn zeroize_value_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(values) => values.iter_mut().for_each(zeroize_value_strings),
+        Value::Object(object) => object.values_mut().for_each(zeroize_value_strings),
+        _ => {}
+    }
+}
+
 pub fn resolve_text_from_active_memory_store(text: &str) -> Result<Option<String>, String> {
     if MemoryStoreClient::from_env().is_none() {
         return Ok(None);

@@ -7,6 +7,7 @@ mod eval;
 mod exec_proxy;
 mod extensions;
 mod extensions_cmd;
+mod headless;
 mod input;
 mod scan;
 mod terminal;
@@ -355,11 +356,6 @@ fn agent_tool_extensions(opts: &AgentToolOpts) -> Result<extensions::ActiveExten
     extensions::active_from_specs(opts.extensions.clone(), true).map_err(|e| e.to_string())
 }
 
-fn blocked_headless_codex_error() -> String {
-    "headless Codex may skip hooks. Use interactive `pentect codex` for protected tool use."
-        .to_string()
-}
-
 /// Read stdin as bytes (no panic on binary), cap the size, then delegate
 /// interpretation to the injected input adapter.
 fn read_stdin_capped(reader: &dyn InputAdapter) -> Result<String, String> {
@@ -684,7 +680,6 @@ struct AgentToolOpts {
     command: PathBuf,
     extensions: Vec<String>,
     dry_run: bool,
-    allow_unverified_hooks: bool,
     codex_app_server_proxy_disabled: bool,
     tool_args: Vec<String>,
 }
@@ -698,7 +693,6 @@ impl AgentToolOpts {
             .unwrap_or_else(|| PathBuf::from(tool.default_command()));
         let mut extensions = Vec::new();
         let mut dry_run = false;
-        let mut allow_unverified_hooks = false;
         let mut codex_app_server_proxy_disabled = false;
         let mut tool_args = Vec::new();
         let mut i = 2;
@@ -741,19 +735,12 @@ impl AgentToolOpts {
                     dry_run = true;
                     i += 1;
                 }
-                "--allow-unverified-hooks" => {
-                    allow_unverified_hooks = true;
-                    i += 1;
-                }
                 "--no-app-server-proxy" if tool == AgentTool::Codex => {
                     codex_app_server_proxy_disabled = true;
                     i += 1;
                 }
                 "--prompt-proxy" | "--no-prompt-proxy" => {
-                    return Err(
-                        "prompt proxy is currently disabled/TODO; Pentect now protects tool boundaries via agent hooks only"
-                            .to_string(),
-                    );
+                    return Err("prompt protection is automatic".to_string());
                 }
                 _ => {
                     tool_args.extend(args[i..].iter().cloned());
@@ -767,7 +754,6 @@ impl AgentToolOpts {
             command,
             extensions,
             dry_run,
-            allow_unverified_hooks,
             codex_app_server_proxy_disabled,
             tool_args,
         })
@@ -780,24 +766,7 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         &pentect_agent::load_environment_variable_prefix()?,
     );
     let status_line_enabled = status_line_enabled_by_config()?;
-    if opts.dry_run {
-        if codex_uses_unverified_headless_hook_path(&opts.tool_args) {
-            eprintln!(
-                "[pentect] note: headless Codex may skip hooks; use interactive `pentect codex` for protected tool use."
-            );
-        }
-        print_dry_run(
-            &opts.command,
-            &codex_args(&configs, &opts.tool_args, &contract),
-        );
-        return Ok(success_status());
-    }
-    if codex_uses_unverified_headless_hook_path(&opts.tool_args) && !opts.allow_unverified_hooks {
-        return Err(blocked_headless_codex_error());
-    }
     let active_extensions = agent_tool_extensions(opts)?;
-    let mut cmd = Command::new(&opts.command);
-    apply_extension_env(&mut cmd, &active_extensions)?;
     let memory_store = start_memory_store(pentect)?;
     let _parent_env = agent_parent_env_guard(
         pentect,
@@ -805,7 +774,29 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         status_line_enabled,
         &active_extensions,
     )?;
-    let exec_proxy = if codex_unified_exec_proxy_enabled(&opts.tool_args) {
+    let tool_args = headless::protect_prompt_args(headless::AgentKind::Codex, &opts.tool_args)?;
+    let headless_command = codex_headless_agent_command(&tool_args);
+    let (tool_args, _protected_images) = if headless_command && !opts.dry_run {
+        headless::protect_codex_image_args(&tool_args)?
+    } else {
+        (tool_args, headless::ProtectedImageFiles::default())
+    };
+    let app_server_enabled = !headless_command
+        && codex_app_server_proxy_enabled(&tool_args, opts.codex_app_server_proxy_disabled)?;
+    let protect_stdin = headless::protect_stdin(
+        headless::AgentKind::Codex,
+        &tool_args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    );
+    let output_mode = headless::codex_output_mode(&tool_args);
+    if opts.dry_run {
+        print_dry_run(&opts.command, &codex_args(&configs, &tool_args, &contract));
+        return Ok(success_status());
+    }
+    let mut cmd = Command::new(&opts.command);
+    apply_extension_env(&mut cmd, &active_extensions)?;
+    let exec_proxy = if codex_unified_exec_proxy_enabled(&tool_args) {
         Some(exec_proxy::ExecProxyGuard::start(&opts.command)?)
     } else {
         None
@@ -833,41 +824,48 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         .as_ref()
         .map(|exec_proxy| CodexEnvironmentOverlayGuard::install(exec_proxy.url()))
         .transpose()?;
-    let codex_args =
-        if codex_app_server_proxy_enabled(&opts.tool_args, opts.codex_app_server_proxy_disabled)? {
-            let _app_server_proxy_env = EnvVarGuard::set_optional([(
-                app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV,
-                Some(OsString::from("1")),
-            )]);
-            cmd.env(app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV, "1");
-            let proxy = app_server_proxy::AppServerProxyGuard::start(
-                &opts.command,
-                codex_app_server_args(&configs, &opts.tool_args, &contract),
-            )?;
-            let args =
-                codex_args_with_remote(&configs, &opts.tool_args, Some(proxy.url()), &contract);
-            cmd.args(args);
-            return run_interactive_command_with_guard(cmd, &opts.command, proxy);
-        } else {
-            codex_args(&configs, &opts.tool_args, &contract)
-        };
+    let codex_args = if app_server_enabled {
+        let _app_server_proxy_env = EnvVarGuard::set_optional([(
+            app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV,
+            Some(OsString::from("1")),
+        )]);
+        cmd.env(app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV, "1");
+        let proxy = app_server_proxy::AppServerProxyGuard::start(
+            &opts.command,
+            codex_app_server_args(&configs, &tool_args, &contract),
+        )?;
+        let args = codex_args_with_remote(&configs, &tool_args, Some(proxy.url()), &contract);
+        cmd.args(args);
+        return run_interactive_command_with_guard(
+            cmd,
+            &opts.command,
+            headless::InputMode::Buffered,
+            output_mode,
+            protect_stdin,
+            proxy,
+        );
+    } else {
+        codex_args(&configs, &tool_args, &contract)
+    };
     cmd.args(codex_args);
-    run_interactive_command(cmd, &opts.command)
+    run_interactive_command(
+        cmd,
+        &opts.command,
+        headless::InputMode::Buffered,
+        output_mode,
+        protect_stdin,
+    )
 }
 
 fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
+    if headless::claude_uses_partial_output(&opts.tool_args) {
+        return Err("Claude partial output cannot be protected".to_string());
+    }
     let settings = claude_settings_json(pentect, opts.session.as_deref());
     let contract = pentect_agent::agent_contract_instructions(
         &pentect_agent::load_environment_variable_prefix()?,
     );
-    let args = claude_args(&settings, &opts.tool_args, &contract);
-    if opts.dry_run {
-        print_dry_run(&opts.command, &args);
-        return Ok(success_status());
-    }
     let active_extensions = agent_tool_extensions(opts)?;
-    let mut cmd = Command::new(&opts.command);
-    apply_extension_env(&mut cmd, &active_extensions)?;
     let memory_store = start_memory_store(pentect)?;
     let status_line_enabled = status_line_enabled_by_config()?;
     let _parent_env = agent_parent_env_guard(
@@ -876,11 +874,27 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
         status_line_enabled,
         &active_extensions,
     )?;
+    let tool_args = headless::protect_prompt_args(headless::AgentKind::Claude, &opts.tool_args)?;
+    let input_mode = headless::claude_input_mode(&tool_args);
+    let output_mode = headless::claude_output_mode(&tool_args);
+    let protect_stdin = headless::protect_stdin(
+        headless::AgentKind::Claude,
+        &tool_args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    );
+    let args = claude_args(&settings, &tool_args, &contract);
+    if opts.dry_run {
+        print_dry_run(&opts.command, &args);
+        return Ok(success_status());
+    }
+    let mut cmd = Command::new(&opts.command);
+    apply_extension_env(&mut cmd, &active_extensions)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()));
     apply_memory_store_env(&mut cmd, Some(&memory_store));
     apply_status_line_env(&mut cmd, status_line_enabled);
     cmd.args(&args);
-    run_interactive_command(cmd, &opts.command)
+    run_interactive_command(cmd, &opts.command, input_mode, output_mode, protect_stdin)
 }
 
 fn run_bridge_agent(
@@ -920,49 +934,50 @@ fn run_bridge_agent(
         agent_integrations::opencode_config_with_plugin(existing.as_deref(), integration.path())?;
     cmd.env("OPENCODE_CONFIG_CONTENT", config);
     cmd.args(args);
-    run_interactive_command_with_guard(cmd, &opts.command, (integration, memory_store))
+    run_interactive_command_with_guard(
+        cmd,
+        &opts.command,
+        headless::InputMode::Buffered,
+        headless::OutputMode::Text,
+        !std::io::stdin().is_terminal(),
+        (integration, memory_store),
+    )
 }
 
 fn run_interactive_command(
     mut cmd: Command,
     display: &Path,
+    input_mode: headless::InputMode,
+    output_mode: headless::OutputMode,
+    protect_stdin: bool,
 ) -> Result<std::process::ExitStatus, String> {
-    run_interactive_command_inner(&mut cmd, display)
+    run_interactive_command_inner(&mut cmd, display, input_mode, output_mode, protect_stdin)
 }
 
 fn run_interactive_command_with_guard<G>(
     mut cmd: Command,
     display: &Path,
+    input_mode: headless::InputMode,
+    output_mode: headless::OutputMode,
+    protect_stdin: bool,
     _guard: G,
 ) -> Result<std::process::ExitStatus, String> {
-    run_interactive_command_inner(&mut cmd, display)
+    run_interactive_command_inner(&mut cmd, display, input_mode, output_mode, protect_stdin)
 }
 
 fn run_interactive_command_inner(
     cmd: &mut Command,
     display: &Path,
+    input_mode: headless::InputMode,
+    output_mode: headless::OutputMode,
+    protect_stdin: bool,
 ) -> Result<std::process::ExitStatus, String> {
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         let mut terminal_guard = terminal::TuiSessionGuard::enter();
         let status = run_interactive_command_pty(cmd, display, &mut terminal_guard);
         return status;
     }
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => return Err(format!("could not start '{}': {e}", display.display())),
-    };
-    // Set this after spawn so child TUIs still receive Ctrl+C; the parent
-    // stays alive long enough to restore terminal state after the child exits.
-    let ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
-    let status = match child.wait() {
-        Ok(status) => status,
-        Err(e) => {
-            drop(ctrl_c_guard);
-            return Err(format!("could not wait for '{}': {e}", display.display()));
-        }
-    };
-    drop(ctrl_c_guard);
-    Ok(status)
+    headless::run_noninteractive_command(cmd, display, input_mode, output_mode, protect_stdin)
 }
 
 fn run_interactive_command_pty(
@@ -1235,7 +1250,6 @@ impl Drop for PtyProcessSupervisor {
     }
 }
 
-#[cfg(windows)]
 fn process_descends_from(
     mut pid: sysinfo::Pid,
     root: sysinfo::Pid,
@@ -1257,13 +1271,17 @@ fn process_descends_from(
 }
 
 #[derive(Clone, Copy)]
-struct SupervisedRoot {
-    pid: sysinfo::Pid,
+pub(crate) struct SupervisedRoot {
+    pub(crate) pid: sysinfo::Pid,
     start_time: Option<u64>,
 }
 
 fn capture_supervised_root(child: &dyn PtyChild) -> Option<SupervisedRoot> {
-    let pid = child.process_id().map(sysinfo::Pid::from_u32)?;
+    capture_supervised_root_pid(child.process_id())
+}
+
+pub(crate) fn capture_supervised_root_pid(pid: Option<u32>) -> Option<SupervisedRoot> {
+    let pid = pid.map(sysinfo::Pid::from_u32)?;
     let mut system = sysinfo::System::new();
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[pid]),
@@ -1276,7 +1294,7 @@ fn capture_supervised_root(child: &dyn PtyChild) -> Option<SupervisedRoot> {
     })
 }
 
-fn terminate_supervised_processes(root: SupervisedRoot) {
+pub(crate) fn terminate_supervised_processes(root: SupervisedRoot) {
     for _ in 0..4 {
         let mut system = sysinfo::System::new();
         system.refresh_processes_specifics(
@@ -1284,10 +1302,12 @@ fn terminate_supervised_processes(root: SupervisedRoot) {
             true,
             sysinfo::ProcessRefreshKind::nothing(),
         );
-        let root_matches = system
-            .process(root.pid)
-            .is_some_and(|process| root.start_time == Some(process.start_time()));
-        let root_reused = system.process(root.pid).is_some() && !root_matches;
+        let root_process = system.process(root.pid);
+        let root_matches = root_process.is_some_and(|process| {
+            root.start_time
+                .is_none_or(|start_time| start_time == process.start_time())
+        });
+        let root_reused = root.start_time.is_some() && root_process.is_some() && !root_matches;
         let mut targets = system
             .processes()
             .iter()
@@ -1328,7 +1348,6 @@ fn is_supervised_process(
     if pid == root.pid {
         return false;
     }
-    #[cfg(windows)]
     if !_root_reused && process_descends_from(pid, root.pid, _processes) {
         return true;
     }
@@ -3026,7 +3045,7 @@ fn canonical_json_value(value: &Value) -> Value {
     }
 }
 
-fn codex_uses_unverified_headless_hook_path(tool_args: &[String]) -> bool {
+fn codex_headless_agent_command(tool_args: &[String]) -> bool {
     if tool_args
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
@@ -3045,6 +3064,16 @@ fn codex_first_positional(args: &[String]) -> Option<&str> {
         let arg = args[i].as_str();
         if arg == "--" {
             return args.get(i + 1).map(String::as_str);
+        }
+        if matches!(arg, "-i" | "--image") {
+            i += 1;
+            while i < args.len() && !args[i].starts_with('-') {
+                if headless::is_codex_command(&args[i]) {
+                    return Some(args[i].as_str());
+                }
+                i += 1;
+            }
+            continue;
         }
         if arg.starts_with("--") {
             i += if codex_long_option_takes_value(arg) {
@@ -3092,7 +3121,7 @@ fn codex_long_option_takes_value(arg: &str) -> bool {
 }
 
 fn codex_short_option_takes_value(arg: &str) -> bool {
-    matches!(arg, "-m" | "-c" | "-p" | "-s" | "-C" | "-o")
+    matches!(arg, "-m" | "-c" | "-p" | "-s" | "-a" | "-C" | "-o")
 }
 
 fn claude_settings_json(agent: &Path, session: Option<&str>) -> String {
@@ -3592,21 +3621,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_parse_accepts_unverified_hook_escape_hatch() {
-        let args = vec![
-            "pentect".to_string(),
-            "codex".to_string(),
-            "--allow-unverified-hooks".to_string(),
-            "--".to_string(),
-            "exec".to_string(),
-            "do something".to_string(),
-        ];
-        let opts = AgentToolOpts::parse(AgentTool::Codex, &args).unwrap();
-        assert!(opts.allow_unverified_hooks);
-        assert_eq!(opts.tool_args, vec!["exec", "do something"]);
-    }
-
-    #[test]
     fn agent_tool_parse_consumes_codex_app_server_proxy_toggle() {
         let args = vec![
             "pentect".to_string(),
@@ -3641,7 +3655,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_parse_rejects_prompt_proxy_for_all_agents() {
+    fn agent_tool_parse_reports_automatic_prompt_protection() {
         for tool in [AgentTool::Codex, AgentTool::Claude, AgentTool::OpenCode] {
             let args = vec![
                 "pentect".to_string(),
@@ -3649,7 +3663,7 @@ mod tests {
                 "--prompt-proxy".to_string(),
             ];
             let err = AgentToolOpts::parse(tool, &args).unwrap_err();
-            assert!(err.contains("disabled/TODO"), "{tool:?}: {err}");
+            assert!(err.contains("protection is automatic"), "{tool:?}: {err}");
         }
     }
 
@@ -3661,15 +3675,9 @@ mod tests {
 
     #[test]
     fn codex_metadata_commands_do_not_need_verified_hooks() {
-        assert!(!codex_uses_unverified_headless_hook_path(&[
-            "--version".to_string()
-        ]));
-        assert!(!codex_uses_unverified_headless_hook_path(&[
-            "--help".to_string()
-        ]));
-        assert!(!codex_uses_unverified_headless_hook_path(&[
-            "help".to_string()
-        ]));
+        assert!(!codex_headless_agent_command(&["--version".to_string()]));
+        assert!(!codex_headless_agent_command(&["--help".to_string()]));
+        assert!(!codex_headless_agent_command(&["help".to_string()]));
     }
 
     #[test]
@@ -4144,11 +4152,9 @@ mod tests {
 
     #[test]
     fn codex_interactive_invocations_do_not_need_headless_hook_guard() {
-        assert!(!codex_uses_unverified_headless_hook_path(&Vec::new()));
-        assert!(!codex_uses_unverified_headless_hook_path(&[
-            "review this".to_string()
-        ]));
-        assert!(!codex_uses_unverified_headless_hook_path(&[
+        assert!(!codex_headless_agent_command(&Vec::new()));
+        assert!(!codex_headless_agent_command(&["review this".to_string()]));
+        assert!(!codex_headless_agent_command(&[
             "--model".to_string(),
             "gpt-5.5".to_string(),
             "Run a command".to_string()
@@ -4157,25 +4163,26 @@ mod tests {
 
     #[test]
     fn codex_headless_commands_need_verified_hooks() {
-        assert!(codex_uses_unverified_headless_hook_path(&[
-            "exec".to_string()
-        ]));
-        assert!(codex_uses_unverified_headless_hook_path(&["e".to_string()]));
-        assert!(codex_uses_unverified_headless_hook_path(&[
-            "review".to_string()
-        ]));
-        assert!(codex_uses_unverified_headless_hook_path(&[
+        assert!(codex_headless_agent_command(&["exec".to_string()]));
+        assert!(codex_headless_agent_command(&["e".to_string()]));
+        assert!(codex_headless_agent_command(&["review".to_string()]));
+        assert!(codex_headless_agent_command(&[
             "--model".to_string(),
             "gpt-5.5".to_string(),
             "exec".to_string()
         ]));
-        assert!(codex_uses_unverified_headless_hook_path(&[
+        assert!(codex_headless_agent_command(&[
             "--".to_string(),
             "exec".to_string()
         ]));
-        assert!(codex_uses_unverified_headless_hook_path(&[
+        assert!(codex_headless_agent_command(&[
             "--enable".to_string(),
             "foo".to_string(),
+            "exec".to_string()
+        ]));
+        assert!(codex_headless_agent_command(&[
+            "-a".to_string(),
+            "never".to_string(),
             "exec".to_string()
         ]));
     }
