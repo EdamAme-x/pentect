@@ -1007,8 +1007,10 @@ fn bridge_masks_prompt_wraps_shell_and_masks_result() {
     )
     .unwrap();
     let command = before["command"].as_str().unwrap();
-    assert!(command.contains("pentect"), "{command}");
-    assert!(command.contains("exec"), "{command}");
+    assert!(command.contains("PENTECT_BIN"), "{command}");
+    assert!(command.contains("__agent-script"), "{command}");
+    assert!(command.contains("__agent-stream"), "{command}");
+    assert!(!command.contains("pentect exec"), "{command}");
 
     let after = handle_bridge_request(
         &session,
@@ -4158,6 +4160,7 @@ fn hook_bash_transport_keeps_shell_syntax_and_environment_aliases() {
         wrap_shell_command(HookProvider::Claude, DEFAULT_SESSION, "Bash", &script).unwrap();
     assert!(command.contains("eval"), "{command}");
     assert!(!command.contains("exec {"), "{command}");
+    assert!(!command.contains("> >("), "{command}");
     assert!(command.contains("__agent-script"), "{command}");
     assert!(command.contains("__agent-stream"), "{command}");
     assert!(!command.contains("--script-shell"), "{command}");
@@ -4333,20 +4336,20 @@ fn bash_same_shell_wrapper_preserves_script_fetch_failure() {
 }
 
 #[test]
-fn bash_same_shell_wrapper_ignores_unwaitable_process_substitution_status() {
+fn bash_same_shell_wrapper_waits_for_stream_and_preserves_its_failure() {
     let Some(bash) = bash_for_wrapper_test() else {
         return;
     };
-    let marker = "__PENTECT_STREAM_END_unwaitable_test__";
+    let marker = "__PENTECT_STREAM_END_failure_test__";
     let source = "printf 'same-shell\\n'";
     let script_command = format!("printf %s {}", shell_quote_unix(source));
     let stream = format!(
-        "sed -n {}; exit 127",
+        "sed -n {}; sleep 0.1; exit 23",
         shell_quote_unix(&format!("/{marker}/q;p"))
     );
     let wrapper = bash_same_shell_wrapper("0123456789ab", marker, &script_command, &stream);
     let output = Command::new(bash).arg("-c").arg(&wrapper).output().unwrap();
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "same-shell",
