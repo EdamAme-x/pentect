@@ -4332,6 +4332,28 @@ fn bash_same_shell_wrapper_preserves_script_fetch_failure() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
 }
 
+#[test]
+fn bash_same_shell_wrapper_ignores_unwaitable_process_substitution_status() {
+    let Some(bash) = bash_for_wrapper_test() else {
+        return;
+    };
+    let marker = "__PENTECT_STREAM_END_unwaitable_test__";
+    let source = "printf 'same-shell\\n'";
+    let script_command = format!("printf %s {}", shell_quote_unix(source));
+    let stream = format!(
+        "sed -n {}; exit 127",
+        shell_quote_unix(&format!("/{marker}/q;p"))
+    );
+    let wrapper = bash_same_shell_wrapper("0123456789ab", marker, &script_command, &stream);
+    let output = Command::new(bash).arg("-c").arg(&wrapper).output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "same-shell",
+        "{output:?}"
+    );
+}
+
 #[cfg(windows)]
 fn bash_for_wrapper_test() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH")
