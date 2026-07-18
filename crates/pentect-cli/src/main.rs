@@ -1026,6 +1026,7 @@ fn run_interactive_command_pty(
         (cols, rows),
         &output_error,
     );
+    terminal_guard.quiesce_input_reporting();
     if status.is_err() {
         let _ = child.kill();
     }

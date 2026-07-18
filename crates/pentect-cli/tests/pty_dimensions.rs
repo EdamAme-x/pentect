@@ -171,6 +171,122 @@ fn agent_pty_does_not_forward_nested_win32_input_mode() {
 }
 
 #[test]
+fn agent_pty_does_not_leak_mouse_reports_to_parent_shell() {
+    let _serial = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let parent_script = root.join("parent.ps1");
+    let release_file = root.join("release-child");
+    std::fs::write(
+        &parent_script,
+        concat!(
+            "$child = '$esc=[char]27;[Console]::Out.Write($esc+''[?1003h''+$esc+''[?1006h''+$esc+''[?1016h'');",
+            "Write-Output ''READY'';while(-not (Test-Path -LiteralPath $env:PENTECT_TEST_RELEASE)){Start-Sleep -Milliseconds 5}'\n",
+            "& $env:PENTECT_BIN opencode --tool powershell.exe -- -NoLogo -NoProfile -NonInteractive -Command $child\n",
+            "Write-Output 'PARENT_READY'\n",
+            "$line = [Console]::ReadLine()\n",
+            "Write-Output ('PARENT_INPUT:' + $line + ':END')\n",
+        ),
+    )
+    .unwrap();
+
+    let pty = native_pty_system();
+    let pair = pty.openpty(pty_size(INITIAL_SIZE)).unwrap();
+    let mut command = CommandBuilder::new("powershell.exe");
+    command.args(["-NoLogo", "-NoProfile", "-File"]);
+    command.arg(&parent_script);
+    command.cwd(&root);
+    command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_TEST_RELEASE", &release_file);
+    for name in [
+        "PENTECT_MEMORY_STORE_ADDR",
+        "PENTECT_MEMORY_STORE_TOKEN",
+        "PENTECT_PROCESS_HOST_READ_TOKEN",
+        "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+        "PENTECT_AGENT_LAUNCHED",
+    ] {
+        command.env_remove(name);
+    }
+
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().unwrap();
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+    let terminal_size = Arc::new(AtomicU32::new(pack_size(INITIAL_SIZE)));
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = {
+        let writer = writer.clone();
+        std::thread::spawn(move || forward_output(reader, writer, terminal_size, tx))
+    };
+
+    let mut output = String::new();
+    wait_for_text(&rx, &mut output, "READY");
+    let enabled = output
+        .find("\x1b[?1016h")
+        .expect("pixel mouse mode was not enabled");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let injected = Arc::new(AtomicU32::new(0));
+    let input_thread = {
+        let writer = writer.clone();
+        let stop = stop.clone();
+        let injected = injected.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if let Ok(mut input) = writer.lock() {
+                    if input
+                        .write_all(b"\x1b[<35;48;15M")
+                        .and_then(|_| input.flush())
+                        .is_ok()
+                    {
+                        injected.fetch_add(1, Ordering::Release);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let injection_deadline = Instant::now() + Duration::from_secs(2);
+    while injected.load(Ordering::Acquire) < 10 && Instant::now() < injection_deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(injected.load(Ordering::Acquire) >= 10);
+    std::fs::write(&release_file, b"ready").unwrap();
+    wait_for_text(&rx, &mut output, "\x1b[?1016l");
+    let disabled = output[enabled + "\x1b[?1016h".len()..]
+        .find("\x1b[?1016l")
+        .map(|offset| enabled + "\x1b[?1016h".len() + offset)
+        .expect("pixel mouse mode was not disabled");
+    assert!(disabled > enabled);
+    stop.store(true, Ordering::Release);
+    input_thread.join().unwrap();
+    wait_for_text(&rx, &mut output, "PARENT_READY");
+    {
+        let mut input = writer.lock().unwrap();
+        input.write_all(b"SAFE\r").unwrap();
+        input.flush().unwrap();
+    }
+    wait_for_text(&rx, &mut output, ":END");
+
+    let status = wait_for_child(child.as_mut());
+    assert_eq!(status.exit_code(), 0, "{output:?}");
+    let start = output
+        .rfind("PARENT_INPUT:")
+        .map(|offset| offset + "PARENT_INPUT:".len())
+        .expect("parent input marker was not written");
+    let end = output[start..]
+        .find(":END")
+        .map(|offset| start + offset)
+        .expect("parent input marker was incomplete");
+    assert_eq!(&output[start..end], "SAFE", "{output:?}");
+    drop(pair.master);
+    join_reader(reader_thread);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn agent_pty_stops_background_processes_on_exit() {
     let _serial = PTY_TEST_LOCK
         .lock()

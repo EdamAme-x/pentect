@@ -43,6 +43,11 @@ impl TuiSessionGuard {
         self.restore(ResetLine::Keep);
     }
 
+    pub(crate) fn quiesce_input_reporting(&self) {
+        sanitize_platform_console_mode();
+        reset_ansi_input_reporting();
+    }
+
     fn restore(&mut self, reset_line: ResetLine) {
         if self.restored {
             return;
@@ -76,6 +81,23 @@ impl Drop for IgnoreCtrlCGuard {
     }
 }
 
+const ANSI_INPUT_REPORTING_RESET: &str = concat!(
+    "\x1b[?9l",    // disable xterm mouse reporting
+    "\x1b[?1000l", // disable X10 mouse
+    "\x1b[?1001l", // disable highlight mouse
+    "\x1b[?1002l", // disable button-event mouse
+    "\x1b[?1003l", // disable any-event mouse
+    "\x1b[?1004l", // disable focus events
+    "\x1b[?1005l", // disable UTF-8 mouse mode
+    "\x1b[?1006l", // disable SGR mouse mode
+    "\x1b[?1007l", // disable alternate scroll mode
+    "\x1b[?1015l", // disable urxvt mouse mode
+    "\x1b[?1016l", // disable SGR pixel mouse mode
+    "\x1b[?2004l", // disable bracketed paste
+    "\x1b[?2005l", // disable bracketed paste quote mode
+    "\x1b[?2006l", // disable bracketed paste literal newline mode
+);
+
 const ANSI_TUI_RESET: &str = concat!(
     "\x1b[0m",     // reset SGR attributes
     "\x1b(B",      // restore ASCII character set
@@ -86,20 +108,7 @@ const ANSI_TUI_RESET: &str = concat!(
     "\x1b[?1l",    // leave application cursor-key mode
     "\x1b[?5l",    // disable reverse video
     "\x1b[?6l",    // disable origin mode
-    "\x1b[?9l",    // disable xterm mouse reporting
     "\x1b[?69l",   // disable left/right margin mode
-    "\x1b[?1000l", // disable X10 mouse
-    "\x1b[?1001l", // disable highlight mouse
-    "\x1b[?1002l", // disable button-event mouse
-    "\x1b[?1003l", // disable any-event mouse
-    "\x1b[?1004l", // disable focus events
-    "\x1b[?1005l", // disable UTF-8 mouse mode
-    "\x1b[?1006l", // disable SGR mouse mode
-    "\x1b[?1007l", // disable alternate scroll mode
-    "\x1b[?1015l", // disable urxvt mouse mode
-    "\x1b[?2004l", // disable bracketed paste
-    "\x1b[?2005l", // disable bracketed paste quote mode
-    "\x1b[?2006l", // disable bracketed paste literal newline mode
     "\x1b[?2026l", // disable synchronized output
     "\x1b[r",      // reset top/bottom scroll margins
 );
@@ -427,10 +436,21 @@ fn restore_ansi_state(reset_line: ResetLine, keyboard_restore: &KeyboardModeRest
         ResetColor
     );
     let _ = out.write_all(&keyboard_restore.after_screen_leave);
+    let _ = out.write_all(ANSI_INPUT_REPORTING_RESET.as_bytes());
     let _ = out.write_all(ANSI_TUI_RESET.as_bytes());
     if reset_line == ResetLine::FreshPrompt {
         let _ = out.write_all(ANSI_FRESH_PROMPT_LINE.as_bytes());
     }
+    let _ = out.flush();
+}
+
+fn reset_ansi_input_reporting() {
+    let mut out = std::io::stdout();
+    if !out.is_terminal() {
+        return;
+    }
+    enable_ansi_for_reset();
+    let _ = out.write_all(ANSI_INPUT_REPORTING_RESET.as_bytes());
     let _ = out.flush();
 }
 
@@ -662,7 +682,6 @@ mod tests {
     #[test]
     fn ansi_tui_reset_covers_common_leftover_private_modes() {
         for mode in [
-            "\x1b[?25h",
             "\x1b[?1000l",
             "\x1b[?1001l",
             "\x1b[?1002l",
@@ -672,11 +691,17 @@ mod tests {
             "\x1b[?1006l",
             "\x1b[?1007l",
             "\x1b[?1015l",
+            "\x1b[?1016l",
             "\x1b[?2004l",
             "\x1b[?2005l",
             "\x1b[?2006l",
-            "\x1b[?2026l",
             "\x1b[?9l",
+        ] {
+            assert!(ANSI_INPUT_REPORTING_RESET.contains(mode), "{mode:?}");
+        }
+        for mode in [
+            "\x1b[?25h",
+            "\x1b[?2026l",
             "\x1b[?5l",
             "\x1b[?6l",
             "\x1b[?69l",
