@@ -3,7 +3,7 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -227,9 +227,9 @@ fn agent_pty_does_not_leak_mouse_reports_to_parent_shell() {
     let enabled = output
         .find("\x1b[?1016h")
         .expect("pixel mouse mode was not enabled");
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     let injected = Arc::new(AtomicU32::new(0));
-    let input_thread = {
+    let mut input_thread = InputThreadGuard::new(stop.clone(), {
         let writer = writer.clone();
         let stop = stop.clone();
         let injected = injected.clone();
@@ -247,7 +247,7 @@ fn agent_pty_does_not_leak_mouse_reports_to_parent_shell() {
                 std::thread::sleep(Duration::from_millis(1));
             }
         })
-    };
+    });
     let injection_deadline = Instant::now() + Duration::from_secs(2);
     while injected.load(Ordering::Acquire) < 10 && Instant::now() < injection_deadline {
         std::thread::sleep(Duration::from_millis(1));
@@ -260,8 +260,7 @@ fn agent_pty_does_not_leak_mouse_reports_to_parent_shell() {
         .map(|offset| enabled + "\x1b[?1016h".len() + offset)
         .expect("pixel mouse mode was not disabled");
     assert!(disabled > enabled);
-    stop.store(true, Ordering::Release);
-    input_thread.join().unwrap();
+    input_thread.stop_and_join().unwrap();
     wait_for_text(&rx, &mut output, "PARENT_READY");
     {
         let mut input = writer.lock().unwrap();
@@ -493,6 +492,34 @@ fn join_reader(thread: std::thread::JoinHandle<()>) {
     }
     assert!(thread.is_finished(), "PTY reader did not reach EOF");
     thread.join().unwrap();
+}
+
+struct InputThreadGuard {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl InputThreadGuard {
+    fn new(stop: Arc<AtomicBool>, thread: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop_and_join(&mut self) -> std::thread::Result<()> {
+        self.stop.store(true, Ordering::Release);
+        match self.thread.take() {
+            Some(thread) => thread.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for InputThreadGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
 }
 
 #[test]
