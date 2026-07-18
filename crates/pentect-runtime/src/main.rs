@@ -5569,13 +5569,12 @@ fn bash_same_shell_wrapper(
     script_command: &str,
     stream_command: &str,
 ) -> String {
-    let stream_fd = format!("_pentect_stream_fd_{suffix}");
     let stream_pid = format!("_pentect_stream_pid_{suffix}");
     let status = format!("_pentect_status_{suffix}");
     let stream_status = format!("_pentect_stream_status_{suffix}");
     let script = format!("_pentect_script_{suffix}");
     format!(
-        "(exec {{{stream_fd}}}> >({stream_command}); {stream_pid}=$!; exec 1>/dev/null 2>/dev/null; {script}=\"$({script_command} 2>&${stream_fd})\"; {status}=$?; if [ \"${status}\" -eq 0 ]; then eval \"${script}\" 1>&${stream_fd} 2>&${stream_fd}; {status}=$?; fi; unset {script}; printf '%s\\n' {marker} >&${stream_fd}; exec {{{stream_fd}}}>&-; wait \"${stream_pid}\"; {stream_status}=$?; if [ \"${status}\" -eq 0 ] && [ \"${stream_status}\" -ne 0 ]; then {status}=${stream_status}; fi; exit \"${status}\")",
+        "(exec 9> >({stream_command}); {stream_pid}=$!; exec 1>/dev/null 2>/dev/null; {script}=\"$({script_command} 2>&9)\"; {status}=$?; if [ \"${status}\" -eq 0 ]; then eval \"${script}\" 1>&9 2>&9; {status}=$?; fi; unset {script}; printf '%s\\n' {marker} >&9; exec 9>&-; wait \"${stream_pid}\"; {stream_status}=$?; if [ \"${status}\" -eq 0 ] && [ \"${stream_status}\" -ne 0 ]; then {status}=${stream_status}; fi; exit \"${status}\")",
         marker = shell_quote_unix(end_marker),
     )
 }

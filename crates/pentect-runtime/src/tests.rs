@@ -4157,6 +4157,7 @@ fn hook_bash_transport_keeps_shell_syntax_and_environment_aliases() {
     let command =
         wrap_shell_command(HookProvider::Claude, DEFAULT_SESSION, "Bash", &script).unwrap();
     assert!(command.contains("eval"), "{command}");
+    assert!(!command.contains("exec {"), "{command}");
     assert!(command.contains("__agent-script"), "{command}");
     assert!(command.contains("__agent-stream"), "{command}");
     assert!(!command.contains("--script-shell"), "{command}");
