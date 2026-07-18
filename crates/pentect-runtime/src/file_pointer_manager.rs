@@ -28,7 +28,6 @@ const TAG_BYTES: usize = 32;
 const INDEX_VERSION: u32 = 1;
 const MAX_RECORDS: usize = 4096;
 const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024;
-const ENV_MANAGER_DIR: &str = "PENTECT_FILE_POINTER_MANAGER_DIR";
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -363,9 +362,7 @@ fn replace_file(tmp: &Path, path: &Path) -> Result<(), String> {
 }
 
 fn manager_dir() -> PathBuf {
-    std::env::var_os(ENV_MANAGER_DIR)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".pentect").join(MANAGER_DIR))
+    PathBuf::from(".pentect").join(MANAGER_DIR)
 }
 
 fn empty_index() -> FilePointerIndex {

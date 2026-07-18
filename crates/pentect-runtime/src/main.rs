@@ -21,14 +21,11 @@ mod shell;
 
 pub use activity_log::record_scan as record_scan_activity;
 pub use delegated_process_host::{
-    is_host as delegated_process_host_owned_by, is_running as delegated_process_host_running,
-    persistent_candidate_is_running as persistent_process_host_running,
+    contains_host as delegated_process_host_contains, is_host as delegated_process_host_owned_by,
+    is_running as delegated_process_host_running, matches_host as delegated_process_host_matches,
+    persistent_candidate_is_running as persistent_process_host_running, process_host_root,
     register_candidate as register_process_host_candidate,
     unregister_candidate as unregister_process_host_candidate,
-};
-use delegated_process_host::{
-    ENV_READ_TOKEN as PROCESS_HOST_READ_TOKEN_ENV, ENV_ROOT as PROCESS_HOST_ROOT_ENV,
-    ENV_WRITE_TOKEN as PROCESS_HOST_WRITE_TOKEN_ENV,
 };
 use masking::{
     contains_unresolved_masked_handle, env_alias_recovery, is_ascii_word_char, is_env_name_byte,
@@ -36,7 +33,10 @@ use masking::{
 };
 #[cfg(test)]
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
-pub use memory_store::{open_memory_store_lease, MemoryStoreLease};
+pub use memory_store::{
+    active_memory_store_ready, is_pentect_control_env_name, memory_store_ready,
+    open_memory_store_lease, pentect_control_env_names, MemoryStoreLease,
+};
 use memory_store::{MemoryStore, MemoryStoreClient, ENV_ADDR, ENV_TOKEN};
 pub use output_remask::ActiveTerminalOutputRemasker;
 use pentect_core::{
@@ -973,18 +973,12 @@ fn handle_bridge_request(
 }
 
 fn bridge_session_value() -> Result<Value, String> {
+    if !agent_launch_proof_valid() {
+        return Err("bridge unavailable".to_string());
+    }
     let required = [
         ("PENTECT_MEMORY_STORE_ADDR", ENV_ADDR),
         ("PENTECT_MEMORY_STORE_TOKEN", ENV_TOKEN),
-        (
-            "PENTECT_PROCESS_HOST_READ_TOKEN",
-            PROCESS_HOST_READ_TOKEN_ENV,
-        ),
-        (
-            "PENTECT_PROCESS_HOST_WRITE_TOKEN",
-            PROCESS_HOST_WRITE_TOKEN_ENV,
-        ),
-        ("PENTECT_PROCESS_HOST_ROOT", PROCESS_HOST_ROOT_ENV),
         ("PENTECT_AGENT_LAUNCHED", PENTECT_AGENT_LAUNCHED_ENV),
     ];
     let mut environment = serde_json::Map::new();
@@ -1109,25 +1103,34 @@ fn resolve_path_in_place(store: &MemoryStore, path: &Path) -> Result<(), String>
     Ok(())
 }
 
-fn apply_child_env_overlays(command: &mut Command, env: &[(String, String)], session: &str) {
+fn apply_child_env_overlays(command: &mut Command, env: &[(String, String)], _session: &str) {
+    remove_pentect_control_env(command);
     command.env_remove(ENV_ADDR);
     command.env_remove(ENV_TOKEN);
-    command.env_remove(PROCESS_HOST_READ_TOKEN_ENV);
-    command.env_remove(PROCESS_HOST_WRITE_TOKEN_ENV);
-    command.env_remove(PROCESS_HOST_ROOT_ENV);
+    command.env_remove("PENTECT_PROCESS_HOST_READ_TOKEN");
+    command.env_remove("PENTECT_PROCESS_HOST_WRITE_TOKEN");
+    command.env_remove("PENTECT_PROCESS_HOST_ROOT");
     command.env_remove(PENTECT_AGENT_LAUNCHED_ENV);
     apply_env_bindings(command, env);
-    apply_pentect_session(command, session);
+}
+
+fn remove_pentect_control_env(command: &mut Command) {
+    for name in pentect_control_env_names() {
+        command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_pentect_control_env_name) {
+            command.env_remove(name);
+        }
+    }
 }
 
 fn apply_env_bindings(command: &mut Command, env: &[(String, String)]) {
     for (name, value) in env {
-        command.env(name, value);
+        if !is_pentect_control_env_name(name) {
+            command.env(name, value);
+        }
     }
-}
-
-fn apply_pentect_session(command: &mut Command, session: &str) {
-    command.env("PENTECT_SESSION", session);
 }
 
 fn requested_env_bindings(
@@ -2389,6 +2392,9 @@ fn replace_masked_handles_with_env_refs(
 }
 
 fn apply_active_memory_store_env(command: &mut Command) {
+    if !active_memory_store_ready() {
+        return;
+    }
     let (Some(addr), Some(token)) = (std::env::var_os(ENV_ADDR), std::env::var_os(ENV_TOKEN))
     else {
         return;
@@ -2398,47 +2404,31 @@ fn apply_active_memory_store_env(command: &mut Command) {
     }
     command.env(ENV_ADDR, addr);
     command.env(ENV_TOKEN, &token);
-    apply_process_host_env(command);
     command.env(PENTECT_AGENT_LAUNCHED_ENV, token);
 }
 
-fn apply_process_host_env(command: &mut Command) {
-    for name in [
-        PROCESS_HOST_READ_TOKEN_ENV,
-        PROCESS_HOST_WRITE_TOKEN_ENV,
-        PROCESS_HOST_ROOT_ENV,
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            if !value.is_empty() {
-                command.env(name, value);
-            }
+fn apply_shell_env_builder(command: &mut CommandBuilder, _session: &str, shim: &ShellShimDir) {
+    for name in pentect_control_env_names() {
+        command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_pentect_control_env_name) {
+            command.env_remove(name);
         }
     }
-}
-
-fn apply_shell_env_builder(command: &mut CommandBuilder, session: &str, shim: &ShellShimDir) {
     command.env_remove(ENV_ADDR);
     command.env_remove(ENV_TOKEN);
-    command.env_remove(PROCESS_HOST_READ_TOKEN_ENV);
-    command.env_remove(PROCESS_HOST_WRITE_TOKEN_ENV);
-    command.env_remove(PROCESS_HOST_ROOT_ENV);
+    command.env_remove("PENTECT_PROCESS_HOST_ROOT");
     command.env_remove(PENTECT_AGENT_LAUNCHED_ENV);
-    command.env("PENTECT_SESSION", session);
-    if let (Some(addr), Some(token)) = (std::env::var_os(ENV_ADDR), std::env::var_os(ENV_TOKEN)) {
+    if active_memory_store_ready() {
+        let (Some(addr), Some(token)) = (std::env::var_os(ENV_ADDR), std::env::var_os(ENV_TOKEN))
+        else {
+            shim.apply_to_builder(command);
+            return;
+        };
         if !addr.is_empty() && !token.is_empty() {
             command.env(ENV_ADDR, addr);
             command.env(ENV_TOKEN, &token);
-            for name in [
-                PROCESS_HOST_READ_TOKEN_ENV,
-                PROCESS_HOST_WRITE_TOKEN_ENV,
-                PROCESS_HOST_ROOT_ENV,
-            ] {
-                if let Some(value) = std::env::var_os(name) {
-                    if !value.is_empty() {
-                        command.env(name, value);
-                    }
-                }
-            }
             command.env(PENTECT_AGENT_LAUNCHED_ENV, token);
         }
     }
@@ -3114,9 +3104,6 @@ impl HookOpts {
         if let Some(session) = &self.session {
             return Ok(session.clone());
         }
-        if let Ok(session) = std::env::var("PENTECT_SESSION") {
-            return checked_session_name(&session).map_err(|e| e.to_string());
-        }
         let _ = input;
         default_session_name()
     }
@@ -3305,10 +3292,7 @@ fn decode_script_base64(value: &str) -> Result<String, String> {
 }
 
 fn default_session_name() -> Result<String, String> {
-    match std::env::var("PENTECT_SESSION") {
-        Ok(value) => checked_session_name(&value).map_err(|e| e.to_string()),
-        Err(_) => default_directory_session_name(),
-    }
+    default_directory_session_name()
 }
 
 fn default_directory_session_name() -> Result<String, String> {

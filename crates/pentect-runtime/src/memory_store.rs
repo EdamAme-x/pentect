@@ -110,26 +110,67 @@ fn resolve_with_recoveries(recoveries: &[Recovery], text: &str) -> String {
 
 fn is_reserved_child_env_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "path"
-            | "pathext"
-            | "systemroot"
-            | "windir"
-            | "comspec"
-            | "temp"
-            | "tmp"
-            | "userprofile"
-            | "home"
-            | "shell"
-            | "term"
-            | "lang"
-            | "lc_all"
-            | "tmpdir"
-            | "pentect_bin"
-            | "pentect_home"
-            | "pentect_session"
-    )
+    is_pentect_control_env_name(&lower)
+        || matches!(
+            lower.as_str(),
+            "path"
+                | "pathext"
+                | "systemroot"
+                | "windir"
+                | "comspec"
+                | "temp"
+                | "tmp"
+                | "userprofile"
+                | "home"
+                | "shell"
+                | "term"
+                | "lang"
+                | "lc_all"
+                | "tmpdir"
+        )
+}
+
+/// These names control Pentect itself. Secret aliases may use the `PENTECT_`
+/// prefix, so the boundary is an explicit case-insensitive list rather than a
+/// blanket prefix ban.
+const PENTECT_CONTROL_ENV_NAMES: &[&str] = &[
+    "PENTECT_BIN",
+    "PENTECT_AGENT_LAUNCHED",
+    "PENTECT_MEMORY_STORE_ADDR",
+    "PENTECT_MEMORY_STORE_TOKEN",
+    "PENTECT_PROCESS_HOST_ROOT",
+    "PENTECT_PROCESS_HOST_READ_TOKEN",
+    "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+    "PENTECT_EXTENSION_CONFIGS",
+    "PENTECT_EXTENSION_ADAPTERS",
+    "PENTECT_EXTENSION_NAME",
+    "PENTECT_EXTENSION_DATA_DIR",
+    "PENTECT_EXTENSION_CACHE_DIR",
+    "PENTECT_EXTENSION_CONFIG",
+    "PENTECT_CODEX_EXEC_PROXY",
+    "PENTECT_CODEX_APP_SERVER_PROXY",
+    "PENTECT_EXEC_PROXY_DEBUG",
+    "PENTECT_APP_PROXY_DEBUG",
+    "PENTECT_AGENT_CONTRACT",
+    "PENTECT_STATUS_LINE",
+    "PENTECT_HOME",
+    "PENTECT_SESSION",
+    "PENTECT_SHELL",
+    "PENTECT_SHELL_BIN",
+    "PENTECT_FILE_POINTER_MANAGER_DIR",
+    "PENTECT_CODEX",
+    "PENTECT_CLAUDE",
+    "PENTECT_OPENCODE",
+];
+
+pub fn pentect_control_env_names() -> &'static [&'static str] {
+    PENTECT_CONTROL_ENV_NAMES
+}
+
+pub fn is_pentect_control_env_name(name: &str) -> bool {
+    PENTECT_CONTROL_ENV_NAMES
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 #[derive(Clone, Debug)]
@@ -166,7 +207,15 @@ impl MemoryStoreClient {
     pub(crate) fn from_env() -> Option<Self> {
         let addr = std::env::var(ENV_ADDR).ok()?;
         let token = std::env::var(ENV_TOKEN).ok()?;
-        if addr.is_empty() || token.is_empty() {
+        let launch_proof = std::env::var("PENTECT_AGENT_LAUNCHED").ok()?;
+        let root = crate::delegated_process_host::process_host_root().ok()?;
+        if !valid_runtime_token(&token)
+            || launch_proof != token
+            || !addr
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|addr| addr.ip().is_loopback())
+            || !crate::delegated_process_host::contains_host(&root, &addr, &token)
+        {
             return None;
         }
         Some(Self::new(addr, token))
@@ -186,17 +235,17 @@ impl MemoryStoreClient {
 
     pub(crate) fn snapshot(&self) -> Result<MemoryStoreSnapshot> {
         let line = self.request("SNAPSHOT", "")?;
-        let fields = response_fields(&line)?;
-        if fields.len() != 3 || fields[0] != "OK" {
-            bail!("memory store snapshot response is malformed");
-        }
-        let key = decode_key_hex(fields[1])?;
-        let recovery_blob = data_encoding::BASE64
-            .decode(fields[2].as_bytes())
-            .context("memory store snapshot is not valid base64")?;
-        let recovery = Recovery::load(&recovery_blob, &key)
-            .map_err(|e| anyhow!("memory store snapshot is invalid: {e}"))?;
-        Ok(MemoryStoreSnapshot { key, recovery })
+        decode_snapshot_response(&line)
+    }
+
+    pub(crate) fn snapshot_once(&self, timeout: Duration) -> Result<MemoryStoreSnapshot> {
+        let line = self.request_once_with_timeout("SNAPSHOT", "", timeout)?;
+        decode_snapshot_response(&line)
+    }
+
+    pub(crate) fn masked_count_once(&self, timeout: Duration) -> Result<u64> {
+        let line = self.request_once_with_timeout("COUNT", "", timeout)?;
+        decode_masked_count_response(&line)
     }
 
     pub(crate) fn key(&self) -> Result<[u8; 32]> {
@@ -221,13 +270,7 @@ impl MemoryStoreClient {
 
     pub(crate) fn masked_count(&self) -> Result<u64> {
         let line = self.request("COUNT", "")?;
-        let fields = response_fields(&line)?;
-        if fields.len() != 2 || fields[0] != "OK" {
-            bail!("memory store count response is malformed");
-        }
-        fields[1]
-            .parse::<u64>()
-            .context("memory store masked count is not a number")
+        decode_masked_count_response(&line)
     }
 
     pub(crate) fn add_masked_count(&self, count: u64) -> Result<()> {
@@ -288,20 +331,33 @@ impl MemoryStoreClient {
     }
 
     fn request_once(&self, command: &str, payload: &str) -> Result<String> {
+        self.request_once_with_timeout(command, payload, REQUEST_TIMEOUT)
+    }
+
+    fn request_once_with_timeout(
+        &self,
+        command: &str,
+        payload: &str,
+        timeout: Duration,
+    ) -> Result<String> {
         let mut connection = self
             .connection
             .lock()
             .map_err(|_| anyhow!("memory store connection lock poisoned"))?;
         if connection.is_none() {
-            let stream = TcpStream::connect(&self.addr)
+            let addr = self
+                .addr
+                .parse::<std::net::SocketAddr>()
+                .with_context(|| format!("invalid memory store address: {}", self.addr))?;
+            let stream = TcpStream::connect_timeout(&addr, timeout)
                 .with_context(|| format!("could not connect to memory store at {}", self.addr))?;
-            let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
-            let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
             *connection = Some(BufReader::new(stream));
         }
         let reader = connection
             .as_mut()
             .ok_or_else(|| anyhow!("memory store connection unavailable"))?;
+        let _ = reader.get_mut().set_read_timeout(Some(timeout));
+        let _ = reader.get_mut().set_write_timeout(Some(timeout));
         writeln!(reader.get_mut(), "{}\t{}\t{}", self.token, command, payload)
             .and_then(|_| reader.get_mut().flush())
             .context("could not send memory store request")?;
@@ -317,6 +373,34 @@ impl MemoryStoreClient {
         }
         Ok(line)
     }
+}
+
+fn decode_snapshot_response(line: &str) -> Result<MemoryStoreSnapshot> {
+    let fields = response_fields(line)?;
+    if fields.len() != 3 || fields[0] != "OK" {
+        bail!("memory store snapshot response is malformed");
+    }
+    let key = decode_key_hex(fields[1])?;
+    let recovery_blob = data_encoding::BASE64
+        .decode(fields[2].as_bytes())
+        .context("memory store snapshot is not valid base64")?;
+    let recovery = Recovery::load(&recovery_blob, &key)
+        .map_err(|e| anyhow!("memory store snapshot is invalid: {e}"))?;
+    Ok(MemoryStoreSnapshot { key, recovery })
+}
+
+fn decode_masked_count_response(line: &str) -> Result<u64> {
+    let fields = response_fields(line)?;
+    if fields.len() != 2 || fields[0] != "OK" {
+        bail!("memory store count response is malformed");
+    }
+    fields[1]
+        .parse::<u64>()
+        .context("memory store masked count is not a number")
+}
+
+fn valid_runtime_token(token: &str) -> bool {
+    token.len() == TOKEN_BYTES * 2 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl Drop for MemoryStoreClient {
@@ -347,6 +431,15 @@ pub fn open_memory_store_lease(addr: &str, token: &str) -> Result<MemoryStoreLea
     let _ = stream.set_read_timeout(None);
     let _ = stream.set_write_timeout(None);
     Ok(MemoryStoreLease { _stream: stream })
+}
+
+pub fn memory_store_ready(addr: &str, token: &str) -> bool {
+    let client = MemoryStoreClient::new(addr.to_string(), token.to_string());
+    client.masked_count().is_ok()
+}
+
+pub fn active_memory_store_ready() -> bool {
+    MemoryStoreClient::from_env().is_some_and(|client| client.masked_count().is_ok())
 }
 
 pub(crate) fn serve_memory_store() -> i32 {
@@ -738,6 +831,15 @@ mod tests {
         for _ in 0..1_000 {
             assert_eq!(client.masked_count().unwrap(), 0);
         }
+    }
+
+    #[test]
+    fn readiness_rejects_stale_or_incorrect_store_details() {
+        let token = "test-token-ready".to_string();
+        let addr = spawn_test_memory_store(token.clone());
+        assert!(memory_store_ready(&addr, &token));
+        assert!(!memory_store_ready(&addr, "wrong-token"));
+        assert!(!memory_store_ready("127.0.0.1:9", &token));
     }
 
     #[test]

@@ -31,7 +31,8 @@ fn agent_pty_inherits_and_tracks_parent_dimensions() {
     ]);
     command.cwd(&root);
     command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
-    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("XDG_RUNTIME_DIR", root.join("runtime-base"));
     for name in [
         "PENTECT_MEMORY_STORE_ADDR",
         "PENTECT_MEMORY_STORE_TOKEN",
@@ -96,7 +97,8 @@ fn agent_pty_releases_a_standalone_escape_key() {
     ]);
     command.cwd(&root);
     command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
-    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("XDG_RUNTIME_DIR", root.join("runtime-base"));
     for name in [
         "PENTECT_MEMORY_STORE_ADDR",
         "PENTECT_MEMORY_STORE_TOKEN",
@@ -164,7 +166,8 @@ fn agent_pty_stops_background_process_groups_on_exit() {
     ]);
     command.cwd(&root);
     command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
-    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("XDG_RUNTIME_DIR", root.join("runtime-base"));
     for name in [
         "PENTECT_MEMORY_STORE_ADDR",
         "PENTECT_MEMORY_STORE_TOKEN",

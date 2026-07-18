@@ -144,13 +144,8 @@ async fn handle_client(fut: upgrade::UpgradeFut, codex: PathBuf) -> Result<(), S
         .arg("stdio")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env_remove("PENTECT_MEMORY_STORE_ADDR")
-        .env_remove("PENTECT_MEMORY_STORE_TOKEN")
-        .env_remove("PENTECT_PROCESS_HOST_READ_TOKEN")
-        .env_remove("PENTECT_PROCESS_HOST_WRITE_TOKEN")
-        .env_remove("PENTECT_PROCESS_HOST_ROOT")
-        .env_remove("PENTECT_AGENT_LAUNCHED");
+        .stderr(std::process::Stdio::piped());
+    remove_pentect_control_env(&mut backend);
     let mut backend = backend
         .spawn()
         .map_err(|e| format!("could not start codex exec-server stdio: {e}"))?;
@@ -330,12 +325,21 @@ where
 }
 
 fn strip_private_env(env: &mut serde_json::Map<String, Value>) {
-    env.remove("PENTECT_MEMORY_STORE_ADDR");
-    env.remove("PENTECT_MEMORY_STORE_TOKEN");
-    env.remove("PENTECT_PROCESS_HOST_READ_TOKEN");
-    env.remove("PENTECT_PROCESS_HOST_WRITE_TOKEN");
-    env.remove("PENTECT_PROCESS_HOST_ROOT");
-    env.remove("PENTECT_AGENT_LAUNCHED");
+    env.retain(|name, _| !pentect_agent::is_pentect_control_env_name(name));
+}
+
+fn remove_pentect_control_env(command: &mut Command) {
+    for name in pentect_agent::pentect_control_env_names() {
+        command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(pentect_agent::is_pentect_control_env_name)
+        {
+            command.env_remove(name);
+        }
+    }
 }
 
 fn json_array_strings(values: &[Value]) -> Vec<String> {
@@ -672,9 +676,10 @@ mod tests {
                 "argv": ["powershell", "-Command", "echo <<SECRET_x>>"],
                 "cwd": "file:///tmp",
                 "env": {
-                    "PENTECT_MEMORY_STORE_TOKEN": "token",
+                    "pentect_memory_store_token": "token",
                     "PENTECT_PROCESS_HOST_READ_TOKEN": "read-token",
                     "PENTECT_PROCESS_HOST_WRITE_TOKEN": "write-token",
+                    "Pentect_CodeX_App_Server_Proxy": "1",
                     "SAFE": "<<SECRET_x>>"
                 },
                 "tty": false,
@@ -707,7 +712,9 @@ mod tests {
         assert!(rewritten.contains("\"SAFE\":\"raw\""), "{rewritten}");
         assert!(rewritten.contains("\"RUNPOD_API_KEY\":\"runpod-raw\""));
         assert!(
-            !rewritten.contains("PENTECT_MEMORY_STORE_TOKEN"),
+            !rewritten
+                .to_ascii_lowercase()
+                .contains("pentect_memory_store_token"),
             "{rewritten}"
         );
         assert!(
@@ -716,6 +723,12 @@ mod tests {
         );
         assert!(
             !rewritten.contains("PENTECT_PROCESS_HOST_WRITE_TOKEN"),
+            "{rewritten}"
+        );
+        assert!(
+            !rewritten
+                .to_ascii_lowercase()
+                .contains("pentect_codex_app_server_proxy"),
             "{rewritten}"
         );
     }

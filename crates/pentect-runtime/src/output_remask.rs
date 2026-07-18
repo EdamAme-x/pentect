@@ -1,8 +1,10 @@
 use crate::memory_store::MemoryStoreClient;
 use pentect_core::{recovery::RecoveryStreamRemasker, Recovery};
+use std::time::Duration;
 use zeroize::Zeroize;
 
 const MAX_PENDING_CONTROL_BYTES: usize = 1024 * 1024;
+const TERMINAL_MEMORY_STORE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct ActiveTerminalOutputRemasker {
     client: Option<MemoryStoreClient>,
@@ -19,8 +21,12 @@ impl ActiveTerminalOutputRemasker {
                 terminal: TerminalOutputRemasker::default(),
             });
         };
-        let observed_masked_count = client.masked_count().map_err(|error| error.to_string())?;
-        let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+        let observed_masked_count = client
+            .masked_count_once(TERMINAL_MEMORY_STORE_TIMEOUT)
+            .map_err(|error| error.to_string())?;
+        let snapshot = client
+            .snapshot_once(TERMINAL_MEMORY_STORE_TIMEOUT)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             client: Some(client),
             observed_masked_count,
@@ -38,15 +44,23 @@ impl ActiveTerminalOutputRemasker {
         Ok(self.terminal.finish())
     }
 
+    pub fn finish_after_error(&mut self) -> Vec<u8> {
+        self.terminal.finish()
+    }
+
     fn refresh(&mut self) -> Result<(), String> {
         let Some(client) = &self.client else {
             return Ok(());
         };
-        let count = client.masked_count().map_err(|error| error.to_string())?;
+        let count = client
+            .masked_count_once(TERMINAL_MEMORY_STORE_TIMEOUT)
+            .map_err(|error| error.to_string())?;
         if count == self.observed_masked_count {
             return Ok(());
         }
-        let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+        let snapshot = client
+            .snapshot_once(TERMINAL_MEMORY_STORE_TIMEOUT)
+            .map_err(|error| error.to_string())?;
         self.terminal.merge_recovery(&snapshot.recovery);
         self.observed_masked_count = count;
         Ok(())
@@ -57,8 +71,15 @@ impl ActiveTerminalOutputRemasker {
 struct TerminalOutputRemasker {
     matcher: RecoveryStreamRemasker,
     pending: Vec<u8>,
+    string_control: Option<StringControl>,
     alternate_screen: bool,
     alternate_keyboard_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+enum StringControl {
+    Osc,
+    Other,
 }
 
 impl TerminalOutputRemasker {
@@ -66,6 +87,7 @@ impl TerminalOutputRemasker {
         Self {
             matcher: recovery.stream_remasker(),
             pending: Vec::new(),
+            string_control: None,
             alternate_screen: false,
             alternate_keyboard_depth: 0,
         }
@@ -80,6 +102,29 @@ impl TerminalOutputRemasker {
         let mut out = Vec::with_capacity(bytes.len());
         let mut cursor = 0usize;
         while cursor < self.pending.len() {
+            if let Some(kind) = self.string_control {
+                let end = match kind {
+                    StringControl::Osc => osc_end(&self.pending, cursor),
+                    StringControl::Other => string_control_end(&self.pending, cursor),
+                };
+                if let Some((payload_end, sequence_end)) = end {
+                    out.extend(self.matcher.push_text(&self.pending[cursor..payload_end]));
+                    out.extend(
+                        self.matcher
+                            .push_boundary_control(&self.pending[payload_end..sequence_end]),
+                    );
+                    self.string_control = None;
+                    cursor = sequence_end;
+                    continue;
+                }
+                let safe_end = cursor + streamable_control_payload_len(&self.pending[cursor..]);
+                if safe_end == cursor {
+                    break;
+                }
+                out.extend(self.matcher.push_text(&self.pending[cursor..safe_end]));
+                cursor = safe_end;
+                continue;
+            }
             let byte = self.pending[cursor];
             if byte == 0x1b {
                 let Some(next) = self.pending.get(cursor + 1).copied() else {
@@ -101,43 +146,20 @@ impl TerminalOutputRemasker {
                         cursor = end + 1;
                     }
                     b']' => {
-                        let Some((payload_end, sequence_end)) = osc_end(&self.pending, cursor + 2)
-                        else {
-                            break;
-                        };
                         out.extend(
                             self.matcher
                                 .push_boundary_control(&self.pending[cursor..cursor + 2]),
                         );
-                        out.extend(
-                            self.matcher
-                                .push_text(&self.pending[cursor + 2..payload_end]),
-                        );
-                        out.extend(
-                            self.matcher
-                                .push_boundary_control(&self.pending[payload_end..sequence_end]),
-                        );
-                        cursor = sequence_end;
+                        self.string_control = Some(StringControl::Osc);
+                        cursor += 2;
                     }
                     b'P' | b'X' | b'^' | b'_' => {
-                        let Some((payload_end, sequence_end)) =
-                            string_control_end(&self.pending, cursor + 2)
-                        else {
-                            break;
-                        };
                         out.extend(
                             self.matcher
                                 .push_boundary_control(&self.pending[cursor..cursor + 2]),
                         );
-                        out.extend(
-                            self.matcher
-                                .push_text(&self.pending[cursor + 2..payload_end]),
-                        );
-                        out.extend(
-                            self.matcher
-                                .push_boundary_control(&self.pending[payload_end..sequence_end]),
-                        );
-                        cursor = sequence_end;
+                        self.string_control = Some(StringControl::Other);
+                        cursor += 2;
                     }
                     _ => {
                         out.extend(
@@ -165,43 +187,21 @@ impl TerminalOutputRemasker {
                 continue;
             }
             if byte == 0x9d {
-                let Some((payload_end, sequence_end)) = osc_end(&self.pending, cursor + 1) else {
-                    break;
-                };
                 out.extend(
                     self.matcher
                         .push_boundary_control(&self.pending[cursor..cursor + 1]),
                 );
-                out.extend(
-                    self.matcher
-                        .push_text(&self.pending[cursor + 1..payload_end]),
-                );
-                out.extend(
-                    self.matcher
-                        .push_boundary_control(&self.pending[payload_end..sequence_end]),
-                );
-                cursor = sequence_end;
+                self.string_control = Some(StringControl::Osc);
+                cursor += 1;
                 continue;
             }
             if matches!(byte, 0x90 | 0x98 | 0x9e | 0x9f) {
-                let Some((payload_end, sequence_end)) =
-                    string_control_end(&self.pending, cursor + 1)
-                else {
-                    break;
-                };
                 out.extend(
                     self.matcher
                         .push_boundary_control(&self.pending[cursor..cursor + 1]),
                 );
-                out.extend(
-                    self.matcher
-                        .push_text(&self.pending[cursor + 1..payload_end]),
-                );
-                out.extend(
-                    self.matcher
-                        .push_boundary_control(&self.pending[payload_end..sequence_end]),
-                );
-                cursor = sequence_end;
+                self.string_control = Some(StringControl::Other);
+                cursor += 1;
                 continue;
             }
             if is_terminal_control(byte) {
@@ -225,7 +225,7 @@ impl TerminalOutputRemasker {
             self.pending[remaining..].zeroize();
             self.pending.truncate(remaining);
         }
-        if self.pending.len() > MAX_PENDING_CONTROL_BYTES {
+        if self.string_control.is_none() && self.pending.len() > MAX_PENDING_CONTROL_BYTES {
             self.pending.zeroize();
             self.pending.clear();
             return Err("terminal output control sequence exceeds 1 MiB".to_string());
@@ -279,10 +279,17 @@ impl TerminalOutputRemasker {
 
     fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
-        if !self.pending.is_empty() {
+        if self.string_control.is_some() && !self.pending.is_empty() {
             out.extend(self.matcher.push_text(&self.pending));
+        }
+        if !self.pending.is_empty() {
             self.pending.zeroize();
             self.pending.clear();
+        }
+        if self.string_control.take().is_some() {
+            // A child can exit mid-OSC/DCS. Closing it here keeps the parent's
+            // terminal restore sequence from becoming control-string payload.
+            out.extend(self.matcher.push_boundary_control(b"\x1b\\"));
         }
         out.extend(self.matcher.finish());
         out
@@ -423,6 +430,30 @@ fn string_control_end(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
     None
 }
 
+fn streamable_control_payload_len(bytes: &[u8]) -> usize {
+    let utf8_suffix = incomplete_utf8_suffix_len(bytes);
+    let escape_suffix = usize::from(bytes.last() == Some(&0x1b));
+    bytes.len().saturating_sub(utf8_suffix.max(escape_suffix))
+}
+
+fn incomplete_utf8_suffix_len(bytes: &[u8]) -> usize {
+    let start = bytes.len().saturating_sub(3);
+    for index in (start..bytes.len()).rev() {
+        let Some(width) = utf8_sequence_width(bytes[index]) else {
+            continue;
+        };
+        let available = bytes.len() - index;
+        if available < width
+            && bytes[index + 1..]
+                .iter()
+                .all(|byte| (0x80..=0xbf).contains(byte))
+        {
+            return available;
+        }
+    }
+    0
+}
+
 fn is_terminal_control(byte: u8) -> bool {
     (byte < 0x20 && !matches!(byte, b'\r' | b'\n' | b'\t'))
         || byte == 0x7f
@@ -506,11 +537,53 @@ mod tests {
     fn c1_string_terminators_do_not_hold_following_output() {
         let mut remasker = TerminalOutputRemasker::new(&recovery());
         let mut out = remasker.push(b"\x9d0;title").unwrap();
-        assert!(out.is_empty());
         out.extend(remasker.push(b"\x9cafter\x90payload").unwrap());
         out.extend(remasker.push(b"\x9cmore").unwrap());
         out.extend(remasker.finish());
         assert_eq!(out, b"\x9d0;title\x9cafter\x90payload\x9cmore");
+    }
+
+    #[test]
+    fn large_control_strings_are_streamed_without_ending_the_session() {
+        let secret = b"sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+        let mut input = b"\x1b]1337;File=".to_vec();
+        input.extend(std::iter::repeat_n(b'a', MAX_PENDING_CONTROL_BYTES * 2));
+        input.extend_from_slice(secret);
+        input.extend_from_slice(b"\x1b\\after");
+
+        let mut remasker = TerminalOutputRemasker::new(&recovery());
+        let mut out = Vec::new();
+        for chunk in input.chunks(8192) {
+            out.extend(remasker.push(chunk).unwrap());
+        }
+        out.extend(remasker.finish());
+
+        assert!(!out.windows(secret.len()).any(|window| window == secret));
+        assert!(out
+            .windows(b"<<OPENAI_API_KEY_0011223344556677>>".len())
+            .any(|window| { window == b"<<OPENAI_API_KEY_0011223344556677>>" }));
+        assert!(out.ends_with(b"\x1b\\after"));
+    }
+
+    #[test]
+    fn unfinished_control_strings_are_closed_before_parent_output() {
+        for introducer in [b"\x1b]".as_slice(), b"\x1bP", b"\x9d", b"\x90"] {
+            let mut remasker = TerminalOutputRemasker::new(&recovery());
+            let mut out = remasker.push(introducer).unwrap();
+            out.extend(remasker.push(b"partial title").unwrap());
+            out.extend(remasker.finish());
+            assert!(out.ends_with(b"\x1b\\"), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn unfinished_non_string_controls_are_not_forwarded() {
+        for sequence in [b"\x1b".as_slice(), b"\x1b[?1049", b"\x9b31"] {
+            let mut remasker = TerminalOutputRemasker::new(&recovery());
+            let mut out = remasker.push(sequence).unwrap();
+            out.extend(remasker.finish());
+            assert!(out.is_empty(), "{out:?}");
+        }
     }
 
     #[test]

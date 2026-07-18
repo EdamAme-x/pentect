@@ -130,9 +130,7 @@ impl Drop for Session {
 
 pub(crate) fn session_root(name: &str) -> Result<PathBuf> {
     let name = checked_session_name(name)?;
-    let base = std::env::var_os("PENTECT_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(PENTECT_DIR).join(AGENT_DIR));
+    let base = PathBuf::from(PENTECT_DIR).join(AGENT_DIR);
     Ok(base.join(name))
 }
 

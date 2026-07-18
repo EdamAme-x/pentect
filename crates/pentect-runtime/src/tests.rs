@@ -2,6 +2,87 @@ use super::*;
 
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+struct ActiveMemoryStoreEnv {
+    candidate: std::path::PathBuf,
+    base: std::path::PathBuf,
+    runtime_env_name: &'static str,
+    previous_runtime_env: Option<std::ffi::OsString>,
+}
+
+impl ActiveMemoryStoreEnv {
+    fn start(name: &str) -> (Self, String, String) {
+        let token = data_encoding::HEXLOWER.encode(&Config::generate().key);
+        let read_token = data_encoding::HEXLOWER.encode(&Config::generate().key);
+        let write_token = data_encoding::HEXLOWER.encode(&Config::generate().key);
+        let addr = memory_store::spawn_test_memory_store_with_activity(
+            token.clone(),
+            read_token.clone(),
+            write_token.clone(),
+        );
+        let base = temp_root(name);
+        let (runtime_env_name, root) = test_process_host_root(&base);
+        let previous_runtime_env = std::env::var_os(runtime_env_name);
+        std::env::set_var(runtime_env_name, &base);
+        let candidate = register_process_host_candidate(
+            &root,
+            &addr,
+            &token,
+            &read_token,
+            &write_token,
+            std::process::id(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        for (env_name, value) in [
+            (ENV_ADDR, addr.as_str()),
+            (ENV_TOKEN, token.as_str()),
+            (PENTECT_AGENT_LAUNCHED_ENV, token.as_str()),
+        ] {
+            std::env::set_var(env_name, value);
+        }
+        (
+            Self {
+                candidate,
+                base,
+                runtime_env_name,
+                previous_runtime_env,
+            },
+            addr,
+            token,
+        )
+    }
+}
+
+impl Drop for ActiveMemoryStoreEnv {
+    fn drop(&mut self) {
+        for name in [ENV_ADDR, ENV_TOKEN, PENTECT_AGENT_LAUNCHED_ENV] {
+            std::env::remove_var(name);
+        }
+        unregister_process_host_candidate(&self.candidate);
+        match self.previous_runtime_env.take() {
+            Some(value) => std::env::set_var(self.runtime_env_name, value),
+            None => std::env::remove_var(self.runtime_env_name),
+        }
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+#[cfg(windows)]
+fn test_process_host_root(base: &std::path::Path) -> (&'static str, std::path::PathBuf) {
+    ("LOCALAPPDATA", base.join("pentect"))
+}
+
+#[cfg(target_os = "macos")]
+fn test_process_host_root(base: &std::path::Path) -> (&'static str, std::path::PathBuf) {
+    ("HOME", base.join("Library").join("Caches").join("pentect"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn test_process_host_root(base: &std::path::Path) -> (&'static str, std::path::PathBuf) {
+    ("XDG_RUNTIME_DIR", base.join("pentect"))
+}
+
 #[test]
 fn shell_pty_size_tracks_the_real_terminal_before_fallbacks() {
     assert_eq!(
@@ -360,6 +441,9 @@ fn pty_terminal_queries_are_answered_without_reaching_output() {
 #[test]
 fn child_env_overlays_strip_memory_store_credentials() {
     let mut cmd = Command::new("echo");
+    for name in pentect_control_env_names() {
+        cmd.env(name, "attacker-selected-value");
+    }
     apply_child_env_overlays(&mut cmd, &[], "demo");
     let envs: Vec<_> = cmd
         .get_envs()
@@ -370,37 +454,15 @@ fn child_env_overlays_strip_memory_store_credentials() {
             )
         })
         .collect();
-    assert!(
-        matches!(
-            envs.iter()
-                .find(|(name, _)| name == "PENTECT_MEMORY_STORE_ADDR"),
-            Some((_, None))
-        ),
-        "{envs:?}"
-    );
-    assert!(
-        matches!(
-            envs.iter()
-                .find(|(name, _)| name == "PENTECT_MEMORY_STORE_TOKEN"),
-            Some((_, None))
-        ),
-        "{envs:?}"
-    );
-    assert!(
-        matches!(
-            envs.iter()
-                .find(|(name, _)| name == "PENTECT_AGENT_LAUNCHED"),
-            Some((_, None))
-        ),
-        "{envs:?}"
-    );
-    assert!(
-        matches!(
-            envs.iter().find(|(name, _)| name == "PENTECT_SESSION"),
-            Some((_, Some(value))) if value == "demo"
-        ),
-        "{envs:?}"
-    );
+    for reserved in pentect_control_env_names() {
+        assert!(
+            matches!(
+                envs.iter().find(|(name, _)| name == reserved),
+                Some((_, None))
+            ),
+            "{reserved}: {envs:?}"
+        );
+    }
 }
 
 #[test]
@@ -532,8 +594,9 @@ fn session_does_not_create_key_or_recovery_dir() {
 #[test]
 fn default_session_root_lives_under_pentect_dir() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    std::env::remove_var("PENTECT_HOME");
+    std::env::set_var("PENTECT_HOME", "attacker-selected-directory");
     let root = session_root("demo").unwrap();
+    std::env::remove_var("PENTECT_HOME");
     assert_eq!(root, PathBuf::from(".pentect").join("agent").join("demo"));
 }
 
@@ -706,18 +769,7 @@ fn exec_inherits_parent_environment_and_masks_output() {
 #[test]
 fn active_tool_output_masker_reuses_in_memory_state() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    let token = "active-masker-token".to_string();
-    let addr = memory_store::spawn_test_memory_store(token.clone());
-    struct EnvCleanup;
-    impl Drop for EnvCleanup {
-        fn drop(&mut self) {
-            std::env::remove_var(ENV_ADDR);
-            std::env::remove_var(ENV_TOKEN);
-        }
-    }
-    let _cleanup = EnvCleanup;
-    std::env::set_var(ENV_ADDR, addr);
-    std::env::set_var(ENV_TOKEN, token);
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("active-masker");
 
     let client = MemoryStoreClient::from_env().unwrap();
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
@@ -747,18 +799,7 @@ fn active_tool_output_masker_reuses_in_memory_state() {
 #[test]
 fn bridge_masks_prompt_wraps_shell_and_masks_result() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    let token = "bridge-mask-token".to_string();
-    let addr = memory_store::spawn_test_memory_store(token.clone());
-    struct EnvCleanup;
-    impl Drop for EnvCleanup {
-        fn drop(&mut self) {
-            std::env::remove_var(ENV_ADDR);
-            std::env::remove_var(ENV_TOKEN);
-        }
-    }
-    let _cleanup = EnvCleanup;
-    std::env::set_var(ENV_ADDR, addr);
-    std::env::set_var(ENV_TOKEN, token);
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("bridge-mask");
 
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
     let session = Session::open_capability(DEFAULT_SESSION).unwrap();
@@ -806,35 +847,8 @@ fn bridge_masks_prompt_wraps_shell_and_masks_result() {
 #[test]
 fn bridge_session_exports_only_the_owned_runtime_session() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    struct EnvCleanup;
-    impl Drop for EnvCleanup {
-        fn drop(&mut self) {
-            for name in [
-                ENV_ADDR,
-                ENV_TOKEN,
-                PROCESS_HOST_READ_TOKEN_ENV,
-                PROCESS_HOST_WRITE_TOKEN_ENV,
-                PROCESS_HOST_ROOT_ENV,
-                PENTECT_AGENT_LAUNCHED_ENV,
-                "PENTECT_BIN",
-            ] {
-                std::env::remove_var(name);
-            }
-        }
-    }
-    let _cleanup = EnvCleanup;
-    let values = [
-        (ENV_ADDR, "127.0.0.1:12345"),
-        (ENV_TOKEN, "session-token"),
-        (PROCESS_HOST_READ_TOKEN_ENV, "read-token"),
-        (PROCESS_HOST_WRITE_TOKEN_ENV, "write-token"),
-        (PROCESS_HOST_ROOT_ENV, "/tmp/pentect"),
-        (PENTECT_AGENT_LAUNCHED_ENV, "session-token"),
-        ("PENTECT_BIN", "/tmp/pentect-bin"),
-    ];
-    for (name, value) in values {
-        std::env::set_var(name, value);
-    }
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("bridge-session");
+    std::env::set_var("PENTECT_BIN", "/tmp/pentect-bin");
 
     let session = bridge_session_value().unwrap();
     assert!(session["contract"]
@@ -842,10 +856,14 @@ fn bridge_session_exports_only_the_owned_runtime_session() {
         .unwrap()
         .contains("Pentect agent contract"));
     let environment = session["environment"].as_object().unwrap();
-    assert_eq!(environment.len(), values.len());
-    for (name, value) in values {
-        assert_eq!(environment[name], value);
+    assert_eq!(environment.len(), 4);
+    for name in [ENV_ADDR, ENV_TOKEN, PENTECT_AGENT_LAUNCHED_ENV] {
+        assert_eq!(environment[name], std::env::var(name).unwrap());
     }
+    assert!(!environment.contains_key("PENTECT_PROCESS_HOST_READ_TOKEN"));
+    assert!(!environment.contains_key("PENTECT_PROCESS_HOST_WRITE_TOKEN"));
+    assert_eq!(environment["PENTECT_BIN"], "/tmp/pentect-bin");
+    std::env::remove_var("PENTECT_BIN");
 }
 
 #[test]
@@ -869,18 +887,7 @@ fn bridge_line_reader_discards_oversized_request() {
 #[test]
 fn prompt_masked_env_is_available_to_exec_proxy_without_visible_pentect_exec() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    let token = "prompt-exec-proxy-token".to_string();
-    let addr = memory_store::spawn_test_memory_store(token.clone());
-    struct EnvCleanup;
-    impl Drop for EnvCleanup {
-        fn drop(&mut self) {
-            std::env::remove_var(ENV_ADDR);
-            std::env::remove_var(ENV_TOKEN);
-        }
-    }
-    let _cleanup = EnvCleanup;
-    std::env::set_var(ENV_ADDR, addr);
-    std::env::set_var(ENV_TOKEN, token);
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-exec-proxy");
 
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
     let prompt = mask_prompt_text_into_active_memory_store(&format!("OPENAI_API_KEY={raw}"))
@@ -918,18 +925,7 @@ fn prompt_masked_env_is_available_to_exec_proxy_without_visible_pentect_exec() {
 #[test]
 fn prompt_masking_uses_strict_input_detection_for_env_lines_in_prose() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    let token = "prompt-strict-token".to_string();
-    let addr = memory_store::spawn_test_memory_store(token.clone());
-    struct EnvCleanup;
-    impl Drop for EnvCleanup {
-        fn drop(&mut self) {
-            std::env::remove_var(ENV_ADDR);
-            std::env::remove_var(ENV_TOKEN);
-        }
-    }
-    let _cleanup = EnvCleanup;
-    std::env::set_var(ENV_ADDR, addr);
-    std::env::set_var(ENV_TOKEN, token);
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-strict");
 
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
     let prompt = format!(
@@ -1164,7 +1160,7 @@ fn exec_injects_powershell_env_provider_references() {
 fn auto_env_bindings_do_not_override_baseline_environment() {
     let root = temp_root("capability-reserved-env-binding");
     let session = Session::open_capability_at(&root, "t").unwrap();
-    let output = "PATH=sk-ABCDEFGHIJKLMNOPQRSTUVWX\nDUMMY_SECRET=sk-YYYYYYYYYYYYYYYYYYYY\n";
+    let output = "PATH=sk-ABCDEFGHIJKLMNOPQRSTUVWX\nPENTECT_MEMORY_STORE_TOKEN=sk-ZZZZZZZZZZZZZZZZZZZZ\nDUMMY_SECRET=sk-YYYYYYYYYYYYYYYYYYYY\n";
     let masked = mask_tool_output(&session, output).unwrap();
     assert!(masked.contains("PATH=<<OPENAI_API_KEY_"), "{masked}");
     assert!(
@@ -1175,8 +1171,10 @@ fn auto_env_bindings_do_not_override_baseline_environment() {
     let store = MemoryStore::for_session(&session);
     let env = store.auto_env_bindings().unwrap();
     assert!(
-        !env.iter()
-            .any(|(name, _)| matches!(name.as_str(), "PATH" | "DUMMY_SECRET")),
+        !env.iter().any(|(name, _)| matches!(
+            name.as_str(),
+            "PATH" | "PENTECT_MEMORY_STORE_TOKEN" | "DUMMY_SECRET"
+        )),
         "{env:?}"
     );
     assert!(
@@ -1267,13 +1265,13 @@ fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
 }
 
 #[test]
-fn child_commands_receive_pentect_session_name() {
-    let mut command = Command::new("dummy");
-    apply_pentect_session(&mut command, "child-session");
-    assert!(command.get_envs().any(|(name, value)| {
-        name == "PENTECT_SESSION"
-            && value.is_some_and(|value| value.to_string_lossy() == "child-session")
-    }));
+fn session_environment_name_is_reserved_for_internal_use() {
+    assert!(is_pentect_control_env_name("PENTECT_SESSION"));
+    assert!(is_pentect_control_env_name("pentect_session"));
+    let mut names = pentect_control_env_names().to_vec();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), pentect_control_env_names().len());
 }
 
 #[test]
@@ -3063,17 +3061,61 @@ fn require_pentect_rejects_matching_env_without_live_memory_store() {
 }
 
 #[test]
+fn reserved_control_environment_cannot_redirect_an_active_store() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("control-env-redirect");
+    assert!(active_memory_store_ready());
+
+    std::env::set_var(
+        "PENTECT_PROCESS_HOST_ROOT",
+        temp_root("attacker-selected-root"),
+    );
+    std::env::set_var("PENTECT_PROCESS_HOST_READ_TOKEN", "attacker-selected-token");
+    std::env::set_var(
+        "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+        "attacker-selected-token",
+    );
+
+    assert!(active_memory_store_ready());
+    assert!(MemoryStoreClient::from_env().is_some());
+    let environment = bridge_session_value().unwrap()["environment"]
+        .as_object()
+        .unwrap()
+        .clone();
+    assert!(!environment.contains_key("PENTECT_PROCESS_HOST_ROOT"));
+    assert!(!environment.contains_key("PENTECT_PROCESS_HOST_READ_TOKEN"));
+    assert!(!environment.contains_key("PENTECT_PROCESS_HOST_WRITE_TOKEN"));
+
+    std::env::remove_var("PENTECT_PROCESS_HOST_ROOT");
+    std::env::remove_var("PENTECT_PROCESS_HOST_READ_TOKEN");
+    std::env::remove_var("PENTECT_PROCESS_HOST_WRITE_TOKEN");
+}
+
+#[test]
+fn replaced_runtime_credentials_cannot_impersonate_the_active_store() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, addr, token) = ActiveMemoryStoreEnv::start("credential-redirect");
+    assert!(active_memory_store_ready());
+
+    let replacement = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    std::env::set_var(ENV_TOKEN, replacement);
+    std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, replacement);
+    assert!(MemoryStoreClient::from_env().is_none());
+
+    std::env::set_var(ENV_TOKEN, &token);
+    std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, &token);
+    std::env::set_var(ENV_ADDR, "127.0.0.1:9");
+    assert!(MemoryStoreClient::from_env().is_none());
+
+    std::env::set_var(ENV_ADDR, addr);
+    assert!(MemoryStoreClient::from_env().is_some());
+}
+
+#[test]
 fn require_pentect_allows_wrapped_agent_with_memory_store_proof() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let addr = memory_store::spawn_test_memory_store(token.to_string());
-    std::env::set_var(PENTECT_AGENT_LAUNCHED_ENV, token);
-    std::env::set_var(ENV_TOKEN, token);
-    std::env::set_var(ENV_ADDR, addr);
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("launch-proof");
     ensure_pentect_agent_launch_required(HookProvider::Claude, true).unwrap();
-    std::env::remove_var(PENTECT_AGENT_LAUNCHED_ENV);
-    std::env::remove_var(ENV_TOKEN);
-    std::env::remove_var(ENV_ADDR);
 }
 
 #[test]
