@@ -833,9 +833,16 @@ fn cmd_agent_stream(args: &[String]) -> i32 {
         Ok(masker) => masker,
         Err(error) => return die(&error),
     };
-    if let Err(error) = stream_masked_reader(&mut masker, std::io::stdin(), opts.target)
-        .and_then(|_| masker.flush())
-    {
+    let stream_result = match opts.end_marker.as_deref() {
+        Some(marker) => stream_masked_reader_until_marker(
+            &mut masker,
+            std::io::stdin(),
+            opts.target,
+            marker.as_bytes(),
+        ),
+        None => stream_masked_reader(&mut masker, std::io::stdin(), opts.target),
+    };
+    if let Err(error) = stream_result.and_then(|_| masker.flush()) {
         return die(&error);
     }
     0
@@ -1610,6 +1617,7 @@ fn run_masked_shell(store: MemoryStore, opts: &ShellOpts) -> Result<i32, String>
 #[cfg(windows)]
 const WINDOWS_SHELL_HOST_SCRIPT: &str = concat!(
     "$marker=$env:PENTECT_SHELL_COMMAND_MARKER;",
+    "$drain=$env:PENTECT_SHELL_DRAIN_MARKER;",
     "while (($line=[Console]::In.ReadLine()) -ne $null) {",
     "try {",
     "$text=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line));",
@@ -1617,6 +1625,8 @@ const WINDOWS_SHELL_HOST_SCRIPT: &str = concat!(
     "} catch {",
     "$message=$_ | Out-String;[Console]::Out.WriteLine($message)",
     "};",
+    "[Console]::Out.WriteLine($marker+'DRAIN');[Console]::Out.Flush();",
+    "while (($pending=[Console]::In.ReadLine()) -ne $null -and $pending -ne $drain) {}",
     "$cwd=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-Location).Path));",
     "[Console]::Out.WriteLine($marker+$cwd);[Console]::Out.Flush()",
     "}"
@@ -1629,6 +1639,7 @@ fn run_masked_windows_powershell(
     shim: &ShellShimDir,
 ) -> Result<i32, String> {
     let marker = windows_shell_marker()?;
+    let drain_marker = windows_shell_marker()?;
     let mut command = Command::new(windows_powershell_path());
     command
         .arg("-NoLogo")
@@ -1639,6 +1650,7 @@ fn run_masked_windows_powershell(
     apply_child_env_overlays(&mut command, &[], &opts.session);
     apply_active_memory_store_env(&mut command);
     command.env("PENTECT_SHELL_COMMAND_MARKER", &marker);
+    command.env("PENTECT_SHELL_DRAIN_MARKER", &drain_marker);
     shim.apply_to_command(&mut command);
     command
         .stdin(Stdio::piped())
@@ -1671,7 +1683,13 @@ fn run_masked_windows_powershell(
         stream_masked_reader(&mut masker, stderr, StreamTarget::Stderr)?;
         masker.flush()
     });
-    let status = pump_windows_shell_input(&mut child, &mut child_stdin, store, &completion_rx)?;
+    let status = pump_windows_shell_input(
+        &mut child,
+        &mut child_stdin,
+        store,
+        &completion_rx,
+        &drain_marker,
+    )?;
     drop(child_stdin);
     join_stream_thread(stdout_thread)?;
     join_stream_thread(stderr_thread)?;
@@ -1694,7 +1712,7 @@ fn stream_windows_shell_stdout(
     store: MemoryStore,
     stdout: std::process::ChildStdout,
     marker: &str,
-    completion_tx: mpsc::Sender<String>,
+    completion_tx: mpsc::Sender<WindowsShellCompletion>,
 ) -> Result<(), String> {
     let mut reader = BufReader::new(stdout);
     let mut masker = OutputMasker::new_deferred(store)?;
@@ -1719,12 +1737,24 @@ fn stream_windows_shell_stdout(
                 )?;
             }
             let encoded = line[start + marker.len()..].trim_end_matches(['\r', '\n']);
+            if encoded == "DRAIN" {
+                if completion_tx
+                    .send(WindowsShellCompletion::DrainInput)
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
             let cwd = data_encoding::BASE64
                 .decode(encoded.as_bytes())
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
                 .ok_or_else(|| "PowerShell returned an invalid working directory".to_string())?;
-            if completion_tx.send(cwd).is_err() {
+            if completion_tx
+                .send(WindowsShellCompletion::Complete(cwd))
+                .is_err()
+            {
                 break;
             }
             continue;
@@ -1733,6 +1763,12 @@ fn stream_windows_shell_stdout(
         flush_masked_chunk(&mut masker, StreamTarget::Stdout, &mut line, kind)?;
     }
     masker.flush()
+}
+
+#[cfg(windows)]
+enum WindowsShellCompletion {
+    DrainInput,
+    Complete(String),
 }
 
 #[cfg(windows)]
@@ -1929,7 +1965,8 @@ fn pump_windows_shell_input(
     child: &mut std::process::Child,
     child_stdin: &mut std::process::ChildStdin,
     store: MemoryStore,
-    completion_rx: &mpsc::Receiver<String>,
+    completion_rx: &mpsc::Receiver<WindowsShellCompletion>,
+    drain_marker: &str,
 ) -> Result<ExitStatus, String> {
     let _raw = RawModeGuard::enable()?;
     let _paste = BracketedPasteGuard::enable()?;
@@ -2012,8 +2049,12 @@ fn pump_windows_shell_input(
                         child_command.zeroize();
                         paste.child.zeroize();
                         paste.injected_prefix.zeroize();
-                        match wait_for_windows_shell_completion(child, child_stdin, completion_rx)?
-                        {
+                        match wait_for_windows_shell_completion(
+                            child,
+                            child_stdin,
+                            completion_rx,
+                            drain_marker,
+                        )? {
                             Some(next_cwd) => {
                                 cwd.zeroize();
                                 cwd = next_cwd;
@@ -2106,11 +2147,22 @@ fn pump_windows_shell_input(
 fn wait_for_windows_shell_completion(
     child: &mut std::process::Child,
     child_stdin: &mut std::process::ChildStdin,
-    completion_rx: &mpsc::Receiver<String>,
+    completion_rx: &mpsc::Receiver<WindowsShellCompletion>,
+    drain_marker: &str,
 ) -> Result<Option<String>, String> {
+    let mut input = WindowsRunningInput::default();
     loop {
         match completion_rx.try_recv() {
-            Ok(cwd) => return Ok(Some(cwd)),
+            Ok(WindowsShellCompletion::DrainInput) => {
+                input.clear();
+                child_stdin
+                    .write_all(b"\r\n")
+                    .and_then(|_| child_stdin.write_all(drain_marker.as_bytes()))
+                    .and_then(|_| child_stdin.write_all(b"\r\n"))
+                    .and_then(|_| child_stdin.flush())
+                    .map_err(|e| format!("could not drain PowerShell input: {e}"))?;
+            }
+            Ok(WindowsShellCompletion::Complete(cwd)) => return Ok(Some(cwd)),
             Err(mpsc::TryRecvError::Empty) => {
                 if child
                     .try_wait()
@@ -2127,8 +2179,47 @@ fn wait_for_windows_shell_completion(
         {
             let event = crossterm::event::read()
                 .map_err(|e| format!("could not read terminal input: {e}"))?;
-            forward_windows_running_input(event, child_stdin)?;
+            forward_windows_running_input(event, child_stdin, &mut input)?;
         }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct WindowsRunningInput {
+    pending: String,
+}
+
+#[cfg(windows)]
+impl WindowsRunningInput {
+    fn clear(&mut self) {
+        self.pending.zeroize();
+        self.pending.clear();
+    }
+
+    fn submit(&mut self, child_stdin: &mut dyn Write) -> Result<(), String> {
+        child_stdin
+            .write_all(self.pending.as_bytes())
+            .and_then(|_| child_stdin.write_all(b"\r\n"))
+            .and_then(|_| child_stdin.flush())
+            .map_err(|e| format!("could not write PowerShell input: {e}"))?;
+        self.clear();
+        Ok(())
+    }
+
+    fn paste(&mut self, text: &str, child_stdin: &mut dyn Write) -> Result<(), String> {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if matches!(ch, '\r' | '\n') {
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                self.submit(child_stdin)?;
+            } else {
+                self.pending.push(ch);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2136,62 +2227,39 @@ fn wait_for_windows_shell_completion(
 fn forward_windows_running_input(
     event: crossterm::event::Event,
     child_stdin: &mut dyn Write,
+    input: &mut WindowsRunningInput,
 ) -> Result<(), String> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-    let bytes = match event {
-        Event::Paste(text) => text.into_bytes(),
+    match event {
+        Event::Paste(text) => input.paste(&text, child_stdin),
         Event::Key(event) if matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             match event.code {
-                KeyCode::Char(ch) if event.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let lower = ch.to_ascii_lowercase();
-                    if lower.is_ascii_alphabetic()
-                        || matches!(lower, '@' | '[' | '\\' | ']' | '^' | '_')
-                    {
-                        vec![(lower.to_ascii_uppercase() as u8) & 0x1f]
-                    } else {
-                        Vec::new()
-                    }
+                KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.clear();
+                    child_stdin
+                        .write_all(&[0x03])
+                        .and_then(|_| child_stdin.flush())
+                        .map_err(|e| format!("could not write PowerShell input: {e}"))
                 }
                 KeyCode::Char(ch) => {
-                    let mut encoded = [0u8; 4];
-                    let text = ch.encode_utf8(&mut encoded);
-                    if event.modifiers.contains(KeyModifiers::ALT) {
-                        let mut bytes = Vec::with_capacity(text.len() + 1);
-                        bytes.push(0x1b);
-                        bytes.extend_from_slice(text.as_bytes());
-                        bytes
-                    } else {
-                        text.as_bytes().to_vec()
-                    }
+                    input.pending.push(ch);
+                    Ok(())
                 }
-                KeyCode::Enter => b"\r\n".to_vec(),
-                KeyCode::Backspace => vec![0x08],
-                KeyCode::Tab => vec![0x09],
-                KeyCode::BackTab => b"\x1b[Z".to_vec(),
-                KeyCode::Esc => vec![0x1b],
-                KeyCode::Left => b"\x1b[D".to_vec(),
-                KeyCode::Right => b"\x1b[C".to_vec(),
-                KeyCode::Up => b"\x1b[A".to_vec(),
-                KeyCode::Down => b"\x1b[B".to_vec(),
-                KeyCode::Home => b"\x1b[H".to_vec(),
-                KeyCode::End => b"\x1b[F".to_vec(),
-                KeyCode::Delete => b"\x1b[3~".to_vec(),
-                KeyCode::Insert => b"\x1b[2~".to_vec(),
-                KeyCode::PageUp => b"\x1b[5~".to_vec(),
-                KeyCode::PageDown => b"\x1b[6~".to_vec(),
-                _ => Vec::new(),
+                KeyCode::Enter => input.submit(child_stdin),
+                KeyCode::Backspace => {
+                    input.pending.pop();
+                    Ok(())
+                }
+                KeyCode::Tab => {
+                    input.pending.push('\t');
+                    Ok(())
+                }
+                _ => Ok(()),
             }
         }
-        _ => Vec::new(),
-    };
-    if bytes.is_empty() {
-        return Ok(());
+        _ => Ok(()),
     }
-    child_stdin
-        .write_all(&bytes)
-        .and_then(|_| child_stdin.flush())
-        .map_err(|e| format!("could not write PowerShell input: {e}"))
 }
 
 #[cfg(windows)]
@@ -3472,7 +3540,27 @@ fn stream_masked_reader<R: Read>(
     reader: R,
     target: StreamTarget,
 ) -> Result<(), String> {
-    let mut reader = BufReader::new(reader);
+    stream_masked_bufread(masker, BufReader::new(reader), target, None)
+}
+
+fn stream_masked_reader_until_marker<R: Read>(
+    masker: &mut OutputMasker,
+    reader: R,
+    target: StreamTarget,
+    end_marker: &[u8],
+) -> Result<(), String> {
+    if end_marker.is_empty() {
+        return Err("agent stream end marker is invalid".to_string());
+    }
+    stream_masked_bufread(masker, BufReader::new(reader), target, Some(end_marker))
+}
+
+fn stream_masked_bufread<R: BufRead>(
+    masker: &mut OutputMasker,
+    mut reader: R,
+    target: StreamTarget,
+    end_marker: Option<&[u8]>,
+) -> Result<(), String> {
     let mut buf = Vec::new();
     let mut chunk = String::new();
     let mut chunk_kind: Option<Kind> = None;
@@ -3485,7 +3573,15 @@ fn stream_masked_reader<R: Read>(
         if n == 0 {
             break;
         }
-        let text = String::from_utf8_lossy(&buf);
+        let marker_position = end_marker.and_then(|marker| {
+            buf.windows(marker.len())
+                .position(|window| window == marker)
+        });
+        let visible = marker_position.map_or(buf.as_slice(), |position| &buf[..position]);
+        let text = String::from_utf8_lossy(visible);
+        if text.is_empty() && marker_position.is_some() {
+            break;
+        }
         let line_kind = live_output_kind(&text);
         if !chunk.is_empty() && chunk_kind.as_ref() != Some(&line_kind) {
             flush_masked_chunk(masker, target, &mut chunk, chunk_kind.take().unwrap())?;
@@ -3497,6 +3593,9 @@ fn stream_masked_reader<R: Read>(
         if chunk.len() >= LIVE_MASK_CHUNK_BYTES || chunk_lines >= LIVE_MASK_CHUNK_LINES {
             flush_masked_chunk(masker, target, &mut chunk, chunk_kind.take().unwrap())?;
             chunk_lines = 0;
+        }
+        if marker_position.is_some() {
+            break;
         }
     }
     if let Some(kind) = chunk_kind {
@@ -4043,6 +4142,7 @@ struct AgentScriptOpts {
 struct AgentStreamOpts {
     session: String,
     target: StreamTarget,
+    end_marker: Option<String>,
 }
 
 enum ResolveMode {
@@ -4080,6 +4180,7 @@ impl AgentStreamOpts {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut session = default_session_name()?;
         let mut target = StreamTarget::Stdout;
+        let mut end_marker = None;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
@@ -4091,10 +4192,26 @@ impl AgentStreamOpts {
                     target = StreamTarget::Stderr;
                     i += 1;
                 }
+                "--end-marker" => {
+                    let marker = value(args, &mut i, "--end-marker")?;
+                    if marker.len() < 32
+                        || marker.len() > 128
+                        || !marker
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                    {
+                        return Err("agent stream end marker is invalid".to_string());
+                    }
+                    end_marker = Some(marker);
+                }
                 flag => return Err(format!("unknown option: {flag}")),
             }
         }
-        Ok(Self { session, target })
+        Ok(Self {
+            session,
+            target,
+            end_marker,
+        })
     }
 }
 
@@ -5406,22 +5523,20 @@ fn same_shell_agent_wrapper(
         .filter(|value| value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .ok_or_else(|| "agent script id is invalid".to_string())?;
     let mut script_args = vec!["__agent-script".to_string(), id.to_string()];
-    let mut stream_args = vec!["__agent-stream".to_string()];
+    let end_marker = format!("__PENTECT_STREAM_END_{id}__");
+    let mut stream_args = vec![
+        "__agent-stream".to_string(),
+        "--end-marker".to_string(),
+        end_marker.clone(),
+    ];
     add_non_default_session(&mut script_args, session_name);
     add_non_default_session(&mut stream_args, session_name);
     match shell {
         ScriptShell::Bash => Ok(bash_same_shell_wrapper(
             suffix,
+            &end_marker,
             &target_shell_pentect_command(shell, &script_args),
             &target_shell_pentect_command(shell, &stream_args),
-            &target_shell_pentect_command(
-                shell,
-                &stream_args
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once("--stderr".to_string()))
-                    .collect::<Vec<_>>(),
-            ),
         )),
         ScriptShell::PowerShell => Ok(powershell_same_shell_wrapper(
             suffix,
@@ -5437,7 +5552,10 @@ fn target_shell_pentect_command(shell: ScriptShell, args: &[String]) -> String {
         ScriptShell::Bash => shell_quote_unix,
         ScriptShell::PowerShell | ScriptShell::Native => powershell_word,
     };
-    let mut command = String::from("pentect");
+    let mut command = match shell {
+        ScriptShell::Bash => String::from("\"${PENTECT_BIN}\""),
+        ScriptShell::PowerShell | ScriptShell::Native => String::from("& $env:PENTECT_BIN"),
+    };
     for arg in args {
         command.push(' ');
         command.push_str(&quote(arg));
@@ -5447,19 +5565,18 @@ fn target_shell_pentect_command(shell: ScriptShell, args: &[String]) -> String {
 
 fn bash_same_shell_wrapper(
     suffix: &str,
+    end_marker: &str,
     script_command: &str,
-    stdout_command: &str,
-    stderr_command: &str,
+    stream_command: &str,
 ) -> String {
-    let out_fd = format!("_pentect_out_fd_{suffix}");
-    let err_fd = format!("_pentect_err_fd_{suffix}");
-    let out_pid = format!("_pentect_out_pid_{suffix}");
-    let err_pid = format!("_pentect_err_pid_{suffix}");
+    let stream_fd = format!("_pentect_stream_fd_{suffix}");
+    let stream_pid = format!("_pentect_stream_pid_{suffix}");
     let status = format!("_pentect_status_{suffix}");
-    let out_status = format!("_pentect_out_status_{suffix}");
-    let err_status = format!("_pentect_err_status_{suffix}");
+    let stream_status = format!("_pentect_stream_status_{suffix}");
+    let script = format!("_pentect_script_{suffix}");
     format!(
-        "exec {{{out_fd}}}> >({stdout_command}); {out_pid}=$!; exec {{{err_fd}}}> >({stderr_command}); {err_pid}=$!; (eval \"$({script_command})\") 1>&${out_fd} 2>&${err_fd}; {status}=$?; exec {{{out_fd}}}>&-; exec {{{err_fd}}}>&-; wait \"${out_pid}\"; {out_status}=$?; wait \"${err_pid}\"; {err_status}=$?; if [ \"${status}\" -eq 0 ] && [ \"${out_status}\" -ne 0 ]; then {status}=${out_status}; fi; if [ \"${status}\" -eq 0 ] && [ \"${err_status}\" -ne 0 ]; then {status}=${err_status}; fi; (exit \"${status}\")"
+        "(exec {{{stream_fd}}}> >({stream_command}); {stream_pid}=$!; exec 1>/dev/null 2>/dev/null; {script}=\"$({script_command} 2>&${stream_fd})\"; {status}=$?; if [ \"${status}\" -eq 0 ]; then eval \"${script}\" 1>&${stream_fd} 2>&${stream_fd}; {status}=$?; fi; unset {script}; printf '%s\\n' {marker} >&${stream_fd}; exec {{{stream_fd}}}>&-; wait \"${stream_pid}\"; {stream_status}=$?; if [ \"${status}\" -eq 0 ] && [ \"${stream_status}\" -ne 0 ]; then {status}=${stream_status}; fi; exit \"${status}\")",
+        marker = shell_quote_unix(end_marker),
     )
 }
 

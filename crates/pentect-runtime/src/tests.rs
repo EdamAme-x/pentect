@@ -100,6 +100,7 @@ fn windows_shell_host_preserves_state_without_terminal_control_sequences() {
     use std::process::Stdio;
 
     let marker = windows_shell_marker().unwrap();
+    let drain_marker = windows_shell_marker().unwrap();
     let mut child = Command::new(windows_powershell_path())
         .arg("-NoLogo")
         .arg("-NoProfile")
@@ -107,6 +108,7 @@ fn windows_shell_host_preserves_state_without_terminal_control_sequences() {
         .arg("-Command")
         .arg(WINDOWS_SHELL_HOST_SCRIPT)
         .env("PENTECT_SHELL_COMMAND_MARKER", &marker)
+        .env("PENTECT_SHELL_DRAIN_MARKER", &drain_marker)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -115,28 +117,36 @@ fn windows_shell_host_preserves_state_without_terminal_control_sequences() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    for command in [
+    let mut output = String::new();
+    for (index, command) in [
         "$global:PentectShellState=41",
         "Write-Output ($global:PentectShellState + 1)",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         writeln!(
             stdin,
             "{}",
             data_encoding::BASE64.encode(command.as_bytes())
         )
         .unwrap();
+        if index == 0 {
+            writeln!(stdin, "stale interactive input").unwrap();
+        }
         stdin.flush().unwrap();
-    }
-
-    let mut output = String::new();
-    let mut completions = 0;
-    while completions < 2 {
-        let mut line = String::new();
-        assert_ne!(stdout.read_line(&mut line).unwrap(), 0);
-        if line.contains(&marker) {
-            completions += 1;
-        } else {
-            output.push_str(&line);
+        loop {
+            let mut line = String::new();
+            assert_ne!(stdout.read_line(&mut line).unwrap(), 0);
+            if line.contains(&format!("{marker}DRAIN")) {
+                writeln!(stdin).unwrap();
+                writeln!(stdin, "{drain_marker}").unwrap();
+                stdin.flush().unwrap();
+            } else if line.contains(&marker) {
+                break;
+            } else {
+                output.push_str(&line);
+            }
         }
     }
 
@@ -4233,15 +4243,36 @@ fn running_windows_shell_forwards_interactive_input() {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     let mut output = Vec::new();
-    forward_windows_running_input(Event::Paste("secret text".to_string()), &mut output).unwrap();
+    let mut input = WindowsRunningInput::default();
+    forward_windows_running_input(
+        Event::Paste("secret texx".to_string()),
+        &mut output,
+        &mut input,
+    )
+    .unwrap();
+    forward_windows_running_input(
+        Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        &mut output,
+        &mut input,
+    )
+    .unwrap();
+    forward_windows_running_input(
+        Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        &mut output,
+        &mut input,
+    )
+    .unwrap();
+    forward_windows_running_input(Event::Paste("xt".to_string()), &mut output, &mut input).unwrap();
     forward_windows_running_input(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         &mut output,
+        &mut input,
     )
     .unwrap();
     forward_windows_running_input(
         Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
         &mut output,
+        &mut input,
     )
     .unwrap();
     assert_eq!(output, b"secret text\r\n\x03");
@@ -4252,9 +4283,11 @@ fn bash_same_shell_wrapper_preserves_output_and_exit_code() {
     let Some(bash) = bash_for_wrapper_test() else {
         return;
     };
+    let marker = "__PENTECT_STREAM_END_test__";
     let source = "printf '%s\\n' same-shell; exit 7";
     let script_command = format!("printf %s {}", shell_quote_unix(source));
-    let wrapper = bash_same_shell_wrapper("0123456789ab", &script_command, "cat", "cat >&2");
+    let stream = format!("sed -n {}", shell_quote_unix(&format!("/{marker}/q;p")));
+    let wrapper = bash_same_shell_wrapper("0123456789ab", marker, &script_command, &stream);
     let output = Command::new(bash).arg("-c").arg(&wrapper).output().unwrap();
     assert_eq!(output.status.code(), Some(7), "{output:?}");
     assert_eq!(
@@ -4262,6 +4295,40 @@ fn bash_same_shell_wrapper_preserves_output_and_exit_code() {
         "same-shell",
         "{output:?}"
     );
+}
+
+#[test]
+#[cfg(not(windows))]
+fn bash_same_shell_wrapper_does_not_wait_for_background_output_holders() {
+    let Some(bash) = bash_for_wrapper_test() else {
+        return;
+    };
+    let marker = "__PENTECT_STREAM_END_background_test__";
+    let source = "printf 'foreground\\n'; (sleep 5; printf 'background\\n') &";
+    let script_command = format!("printf %s {}", shell_quote_unix(source));
+    let stream = format!("sed -n {}", shell_quote_unix(&format!("/{marker}/q;p")));
+    let wrapper = bash_same_shell_wrapper("0123456789ab", marker, &script_command, &stream);
+    let started = std::time::Instant::now();
+    let output = Command::new(bash).arg("-c").arg(&wrapper).output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(started.elapsed() < Duration::from_secs(2), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "foreground",
+        "{output:?}"
+    );
+}
+
+#[test]
+fn bash_same_shell_wrapper_preserves_script_fetch_failure() {
+    let Some(bash) = bash_for_wrapper_test() else {
+        return;
+    };
+    let marker = "__PENTECT_STREAM_END_fetch_failure__";
+    let stream = format!("sed -n {}", shell_quote_unix(&format!("/{marker}/q;p")));
+    let wrapper = bash_same_shell_wrapper("0123456789ab", marker, "false", &stream);
+    let output = Command::new(bash).arg("-c").arg(&wrapper).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
 }
 
 #[cfg(windows)]

@@ -137,11 +137,55 @@ fn is_masked_environment_reference(text: &str, start: usize, end: usize, value: 
     }
     let before = &text[..start];
     let after = &text[end..];
-    before.ends_with('$')
-        || (before.ends_with("${") && after.starts_with('}'))
-        || ascii_ends_with_ignore_case(before, "$env:")
-        || (ascii_ends_with_ignore_case(before, "${env:") && after.starts_with('}'))
-        || (before.ends_with('%') && after.starts_with('%'))
+    if inside_single_quoted_shell_text(before) {
+        return false;
+    }
+    dollar_suffix_is_active(before, "$")
+        || (dollar_suffix_is_active(before, "${") && after.starts_with('}'))
+        || dollar_suffix_is_active_ignore_case(before, "$env:")
+        || (dollar_suffix_is_active_ignore_case(before, "${env:") && after.starts_with('}'))
+}
+
+fn dollar_suffix_is_active(value: &str, suffix: &str) -> bool {
+    value
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| trailing_backslash_count(prefix).is_multiple_of(2))
+}
+
+fn dollar_suffix_is_active_ignore_case(value: &str, suffix: &str) -> bool {
+    value
+        .get(value.len().saturating_sub(suffix.len())..)
+        .filter(|tail| tail.eq_ignore_ascii_case(suffix))
+        .and_then(|_| value.get(..value.len().saturating_sub(suffix.len())))
+        .is_some_and(|prefix| trailing_backslash_count(prefix).is_multiple_of(2))
+}
+
+fn trailing_backslash_count(value: &str) -> usize {
+    value
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+}
+
+fn inside_single_quoted_shell_text(value: &str) -> bool {
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !single {
+            escaped = true;
+        } else if ch == '\'' && !double {
+            single = !single;
+        } else if ch == '"' && !single {
+            double = !double;
+        }
+    }
+    single
 }
 
 fn has_masked_reference_shape(value: &str) -> bool {
@@ -160,12 +204,6 @@ fn has_masked_reference_shape(value: &str) -> bool {
         return false;
     }
     crate::placeholder::parse_placeholder(&format!("{label}_{hash}")).is_ok()
-}
-
-fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
-    value
-        .get(value.len().saturating_sub(suffix.len())..)
-        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
 struct Assignment {
@@ -1316,11 +1354,26 @@ mod tests {
             "${safe_RUNPOD_API_KEY_80fba8fb9b3928a8}",
             "$env:mySafeRUNPOD_API_KEY_80fba8fb9b3928a8",
             "${env:RUNPOD_API_KEY_80fba8fb9b3928a8}",
-            "%RUNPOD_API_KEY_80fba8fb9b3928a8%",
         ] {
             let reg = region(raw);
             let view = NormalizedView::build(&reg, raw);
             assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn non_expanding_environment_like_text_remains_an_entropy_candidate() {
+        for raw in [
+            "'$PENTECT_RUNPOD_API_KEY_80fba8fb9b3928a8'",
+            r"\$PENTECT_RUNPOD_API_KEY_80fba8fb9b3928a8",
+            "%RUNPOD_API_KEY_80fba8fb9b3928a8%",
+        ] {
+            let reg = region(raw);
+            let view = NormalizedView::build(&reg, raw);
+            assert!(
+                !EntropyDetector::default().detect(&view).is_empty(),
+                "{raw}"
+            );
         }
     }
 
