@@ -109,6 +109,7 @@ impl EntropyDetector {
             || is_encoded_public_metadata_value(run)
             || is_crypto_test_vector_identifier_value(run)
             || is_synthetic_hex_test_vector_value(run)
+            || is_masked_environment_reference(text, start, end, run)
             || is_api_route_fragment(run)
             || is_release_artifact_identifier(run)
             || is_jwk_public_parameter_context(text, start, &view.region.ctx)
@@ -125,6 +126,46 @@ impl EntropyDetector {
             source: DetectorId::Entropy,
         });
     }
+}
+
+fn is_masked_environment_reference(text: &str, start: usize, end: usize, value: &str) -> bool {
+    // A handle-shaped suffix alone is not enough: real secrets can have that
+    // shape. Exclude it only when shell syntax proves the token is an
+    // environment-variable reference. This also supports configured prefixes.
+    if !has_masked_reference_shape(value) {
+        return false;
+    }
+    let before = &text[..start];
+    let after = &text[end..];
+    before.ends_with('$')
+        || (before.ends_with("${") && after.starts_with('}'))
+        || ascii_ends_with_ignore_case(before, "$env:")
+        || (ascii_ends_with_ignore_case(before, "${env:") && after.starts_with('}'))
+        || (before.ends_with('%') && after.starts_with('%'))
+}
+
+fn has_masked_reference_shape(value: &str) -> bool {
+    let Some((head, hash)) = value.rsplit_once('_') else {
+        return false;
+    };
+    if !head.contains('_') {
+        return false;
+    }
+    let label_start = head
+        .char_indices()
+        .rfind(|(_, ch)| ch.is_ascii_lowercase())
+        .map_or(0, |(index, ch)| index + ch.len_utf8());
+    let label = head[label_start..].trim_start_matches('_');
+    if label.is_empty() {
+        return false;
+    }
+    crate::placeholder::parse_placeholder(&format!("{label}_{hash}")).is_ok()
+}
+
+fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
+    value
+        .get(value.len().saturating_sub(suffix.len())..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
 struct Assignment {
@@ -1266,6 +1307,45 @@ mod tests {
             let v = NormalizedView::build(&reg, raw);
             assert!(EntropyDetector::default().detect(&v).is_empty(), "{raw}");
         }
+    }
+
+    #[test]
+    fn masked_environment_references_are_not_entropy_candidates() {
+        for raw in [
+            "$PENTECT_RUNPOD_API_KEY_80fba8fb9b3928a8",
+            "${safe_RUNPOD_API_KEY_80fba8fb9b3928a8}",
+            "$env:mySafeRUNPOD_API_KEY_80fba8fb9b3928a8",
+            "${env:RUNPOD_API_KEY_80fba8fb9b3928a8}",
+            "%RUNPOD_API_KEY_80fba8fb9b3928a8%",
+        ] {
+            let reg = region(raw);
+            let view = NormalizedView::build(&reg, raw);
+            assert!(EntropyDetector::default().detect(&view).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn handle_shaped_secret_names_remain_entropy_candidates() {
+        let raw = "ACME_SECRET_TOKEN_0123456789abcdef";
+        assert!(
+            entropy_candidate(raw, raw, 0, raw.len()),
+            "handle-shaped secret was rejected before entropy scoring"
+        );
+        assert!(
+            !is_masked_environment_reference(raw, 0, raw.len(), raw),
+            "a bare value must not be treated as an environment reference"
+        );
+        assert!(!is_encoded_public_metadata_value(raw));
+        assert!(!is_crypto_test_vector_identifier_value(raw));
+        assert!(!is_synthetic_hex_test_vector_value(raw));
+        assert!(!is_api_route_fragment(raw));
+        assert!(!is_release_artifact_identifier(raw));
+        let reg = region(raw);
+        let view = NormalizedView::build(&reg, raw);
+        assert!(
+            !EntropyDetector::default().detect(&view).is_empty(),
+            "{raw}"
+        );
     }
 
     #[test]

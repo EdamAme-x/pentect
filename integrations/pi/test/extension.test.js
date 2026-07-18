@@ -54,7 +54,7 @@ test(
   async () => {
     const originalBin = process.env.PENTECT_BIN;
     const originalPath = process.env.PATH;
-    process.env.PENTECT_BIN = e2eBin;
+    process.env.PENTECT_BIN = join(tmpdir(), "untrusted-pentect-bin");
     process.env.PATH = `${dirname(e2eBin)}${delimiter}${originalPath || ""}`;
     const pi = new TestPi();
     pentectExtension(pi);
@@ -91,10 +91,7 @@ test(
 
       const handle = input.text.split("=")[1];
       const alias = `PENTECT_${handle.slice(2, -2)}`;
-      const command =
-        process.platform === "win32"
-          ? `Write-Output $env:${alias}`
-          : `printf '%s\\n' "$${alias}"`;
+      const command = `printf '%s\\n' "$${alias}"`;
       const updates = [];
       const toolInput = { command };
       const result = await pi.tools.get("bash").execute(
@@ -155,7 +152,7 @@ test(
             env: {
               ...process.env,
               PATH: `${dirname(e2eBin)}${delimiter}${process.env.PATH || ""}`,
-              PENTECT_BIN: e2eBin,
+              PENTECT_BIN: join(agentDir, "untrusted-pentect-bin"),
               PI_CODING_AGENT_DIR: agentDir,
             },
             stdio: ["pipe", "pipe", "pipe"],

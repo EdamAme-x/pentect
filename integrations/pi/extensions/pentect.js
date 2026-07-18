@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { delimiter, dirname } from "node:path";
 import {
   createBashTool,
   createLocalBashOperations,
@@ -11,14 +12,16 @@ const SAFE_RESULT = {
   isError: true,
 };
 const BRIDGE_REQUEST_TIMEOUT_MS = 10_000;
-const SESSION_ENVIRONMENT = new Set([
+const REQUIRED_SESSION_ENVIRONMENT = [
   "PENTECT_BIN",
   "PENTECT_MEMORY_STORE_ADDR",
   "PENTECT_MEMORY_STORE_TOKEN",
-  "PENTECT_PROCESS_HOST_READ_TOKEN",
-  "PENTECT_PROCESS_HOST_WRITE_TOKEN",
-  "PENTECT_PROCESS_HOST_ROOT",
   "PENTECT_AGENT_LAUNCHED",
+];
+const SESSION_ENVIRONMENT = new Set([
+  ...REQUIRED_SESSION_ENVIRONMENT,
+  "PENTECT_EXTENSION_CONFIGS",
+  "PENTECT_EXTENSION_ADAPTERS",
 ]);
 
 function replaceObject(target, source) {
@@ -27,7 +30,7 @@ function replaceObject(target, source) {
 }
 
 function createPentectBridge() {
-  const child = spawn(process.env.PENTECT_BIN || "pentect", ["bridge"], {
+  const child = spawn("pentect", ["bridge"], {
     stdio: ["pipe", "pipe", "ignore"],
     windowsHide: true,
   });
@@ -121,6 +124,20 @@ function createPentectBridge() {
   };
 }
 
+function protectedChildEnvironment(optionsEnvironment, sessionEnvironment) {
+  const environment = { ...process.env, ...optionsEnvironment };
+  for (const name of Object.keys(environment)) {
+    if (name.toUpperCase().startsWith("PENTECT_")) delete environment[name];
+  }
+  Object.assign(environment, sessionEnvironment);
+  const pathName =
+    Object.keys(environment).find((name) => name.toUpperCase() === "PATH") ||
+    "PATH";
+  const currentPath = environment[pathName] || "";
+  environment[pathName] = `${dirname(sessionEnvironment.PENTECT_BIN)}${delimiter}${currentPath}`;
+  return environment;
+}
+
 function readSessionEnvironment(values) {
   if (!values || typeof values !== "object" || Array.isArray(values)) {
     throw new Error("Pentect returned an invalid session");
@@ -130,8 +147,7 @@ function readSessionEnvironment(values) {
       throw new Error("Pentect returned an invalid session");
     }
   }
-  for (const required of SESSION_ENVIRONMENT) {
-    if (required === "PENTECT_BIN") continue;
+  for (const required of REQUIRED_SESSION_ENVIRONMENT) {
     if (typeof values[required] !== "string" || !values[required]) {
       throw new Error("Pentect returned an incomplete session");
     }
@@ -160,11 +176,11 @@ export default function pentectExtension(pi) {
         throw new Error("Pentect rejected the command");
       }
       if (!sessionEnvironment) throw new Error("Pentect unavailable");
-      // The bridge wraps the command with `pentect exec`, which masks each
-      // streamed chunk before Pi's onData callback receives it.
+      // The bridge keeps execution in Pi's Bash and masks each streamed chunk
+      // before Pi's onData callback receives it.
       return localBash.exec(next.command, cwd, {
         ...options,
-        env: { ...options.env, ...sessionEnvironment },
+        env: protectedChildEnvironment(options.env, sessionEnvironment),
       });
     },
   };

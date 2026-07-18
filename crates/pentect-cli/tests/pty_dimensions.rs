@@ -25,6 +25,86 @@ fn shell_pty_inherits_and_tracks_parent_dimensions() {
 }
 
 #[test]
+fn default_shell_keeps_split_input_aligned_and_does_not_enable_nested_terminal_modes() {
+    let _serial = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+
+    let pty = native_pty_system();
+    let pair = pty.openpty(pty_size(INITIAL_SIZE)).unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_pentect"));
+    command.arg("shell");
+    command.cwd(&root);
+    command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("LOCALAPPDATA", root.join("runtime-base"));
+    for name in [
+        "PENTECT_MEMORY_STORE_ADDR",
+        "PENTECT_MEMORY_STORE_TOKEN",
+        "PENTECT_PROCESS_HOST_READ_TOKEN",
+        "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+        "PENTECT_AGENT_LAUNCHED",
+    ] {
+        command.env_remove(name);
+    }
+
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().unwrap();
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+    let terminal_size = Arc::new(AtomicU32::new(pack_size(INITIAL_SIZE)));
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = {
+        let writer = writer.clone();
+        std::thread::spawn(move || forward_output(reader, writer, terminal_size, tx))
+    };
+
+    let mut output = String::new();
+    wait_for_text(&rx, &mut output, "protected PowerShell");
+    wait_for_text(&rx, &mut output, "PS ");
+    {
+        let mut input = writer.lock().unwrap();
+        input.write_all(b"ca").unwrap();
+        input.flush().unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(75));
+    {
+        let mut input = writer.lock().unwrap();
+        input.write_all(b"t .env").unwrap();
+        input.flush().unwrap();
+    }
+    wait_for_text(&rx, &mut output, "cat .env");
+    child.kill().unwrap();
+    let _ = wait_for_child(child.as_mut());
+    drop(pair.master);
+    join_reader(reader_thread);
+    output.extend(rx.try_iter());
+    assert!(output.contains("cat .env"), "{output:?}");
+    let shell_output = output
+        .find("PS ")
+        .map(|start| &output[start..])
+        .unwrap_or(&output);
+    for forbidden in [
+        "\x1b[?9001h",
+        "\x1b[?1000h",
+        "\x1b[?1002h",
+        "\x1b[?1003h",
+        "\x1b[?1006h",
+        "\x1b[?1015h",
+        "\x1b[?1016h",
+        "\x1b[?1049h",
+    ] {
+        assert!(
+            !shell_output.contains(forbidden),
+            "{forbidden:?} in {shell_output:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn agent_pty_inherits_and_tracks_parent_dimensions() {
     assert_pty_dimensions(&[
         "opencode",
@@ -505,7 +585,7 @@ fn assert_pty_dimensions(command_prefix: &[&str]) {
     pair.master.resize(pty_size(RESIZED_SIZE)).unwrap();
     wait_for_text(&rx, &mut output, "SIZE:101x31");
 
-    let status = wait_for_child(child.as_mut());
+    let status = wait_for_child_with_output(child.as_mut(), &rx, &mut output);
     assert_eq!(status.exit_code(), 0, "{output:?}");
     drop(pair.master);
     join_reader(reader_thread);
@@ -614,6 +694,25 @@ fn join_reader(thread: std::thread::JoinHandle<()>) {
     }
     assert!(thread.is_finished(), "PTY reader did not reach EOF");
     thread.join().unwrap();
+}
+
+fn wait_for_child_with_output(
+    child: &mut dyn portable_pty::Child,
+    rx: &mpsc::Receiver<String>,
+    output: &mut String,
+) -> portable_pty::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        output.extend(rx.try_iter());
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("PTY child did not exit within 15 seconds: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct InputThreadGuard {
