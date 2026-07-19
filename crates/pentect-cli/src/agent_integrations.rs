@@ -127,10 +127,8 @@ export const PentectPlugin = async () => {
           value: original,
         });
         replaceObject(output, next);
-      } catch (error) {
-        if (error?.executed) {
-          output.output = "Tool completed, but its output was unavailable. Check side effects before retrying.";
-        }
+      } catch {
+        output.output = "Tool completed, but its output was unavailable. Check side effects before retrying.";
       }
     },
     dispose: async () => bridge.close(),
@@ -218,6 +216,10 @@ mod tests {
         assert!(opencode.contains("chat.message"));
         assert!(opencode.contains("tool.execute.before"));
         assert!(opencode.contains("tool.execute.after"));
+        assert!(opencode.contains(
+            "Tool completed, but its output was unavailable. Check side effects before retrying."
+        ));
+        assert!(!OPENCODE_PLUGIN_BODY.contains("error?.executed"));
     }
 
     #[test]
