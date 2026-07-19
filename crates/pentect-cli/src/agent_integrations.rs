@@ -48,8 +48,15 @@ function createPentectBridge() {
       const waiter = pending.get(response.id);
       if (!waiter) continue;
       pending.delete(response.id);
-      if (response.ok) waiter.resolve(response.value);
-      else waiter.reject(new Error("Pentect rejected the operation"));
+      if (response.ok) {
+        waiter.resolve(response.value);
+      } else {
+        const error = new Error(response.error?.message || "Operation unavailable");
+        error.code = response.error?.code;
+        error.phase = response.error?.phase;
+        error.executed = response.error?.executed === true;
+        waiter.reject(error);
+      }
     }
   });
   child.on("error", fail);
@@ -78,7 +85,7 @@ function createPentectBridge() {
 "#;
 
 const OPENCODE_PLUGIN_BODY: &str = r#"
-const SAFE_TEXT = "[Pentect: content unavailable]";
+const SAFE_TEXT = "[Content unavailable]";
 
 export const PentectPlugin = async () => {
   const bridge = createPentectBridge();
@@ -99,7 +106,7 @@ export const PentectPlugin = async () => {
         }
         replaceArray(output.parts, withSafeImages);
       } catch {
-        throw new Error("Pentect could not protect this message");
+        throw new Error("Message unavailable");
       }
     },
     "tool.execute.before": async (input, output) => {
@@ -107,12 +114,12 @@ export const PentectPlugin = async () => {
         const next = await bridge.request("before", { tool: input.tool, value: output.args });
         replaceObject(output.args, next);
       } catch {
-        throw new Error("Pentect could not protect this tool call");
+        throw new Error("Tool unavailable");
       }
     },
     "tool.execute.after": async (input, output) => {
       const original = structuredClone(output);
-      replaceObject(output, { title: "Pentect", output: SAFE_TEXT, metadata: {} });
+      replaceObject(output, { title: original.title || "Tool", output: SAFE_TEXT, metadata: {} });
       try {
         const next = await bridge.request("after", {
           tool: input.tool,
@@ -120,8 +127,10 @@ export const PentectPlugin = async () => {
           value: original,
         });
         replaceObject(output, next);
-      } catch {
-        // Keep the safe replacement already installed above.
+      } catch (error) {
+        if (error?.executed) {
+          output.output = "Tool completed, but its output was unavailable. Check side effects before retrying.";
+        }
       }
     },
     dispose: async () => bridge.close(),

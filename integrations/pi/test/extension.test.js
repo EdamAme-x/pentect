@@ -72,7 +72,7 @@ test(
       const contract = (
         await pi.emit("before_agent_start", { systemPrompt: "Pi" })
       )[0].systemPrompt;
-      assert.match(contract, /Pentect agent contract/);
+      assert.match(contract, /Session rules/);
 
       const raw = ["sk-", "ABCDEFGHIJKLMNOPQRSTUVWX"].join("");
       const input = (
@@ -119,6 +119,32 @@ test(
       assert.doesNotMatch(renderedConnector, new RegExp(raw));
       assert.match(renderedConnector, /<<OPENAI_API_KEY_[a-f0-9]+>>/);
       assert.equal(connector.isError, false);
+
+      const remoteInput = { command: "remote-operation", argument: "value" };
+      const remoteBefore = (
+        await pi.emit("tool_call", {
+          toolName: "mcp__service__invoke",
+          input: remoteInput,
+        })
+      )[0];
+      assert.deepEqual(remoteBefore, {});
+      assert.deepEqual(remoteInput, {
+        command: "remote-operation",
+        argument: "value",
+      });
+
+      const unavailable = (
+        await pi.emit("tool_result", {
+          toolName: "connector",
+          input: {},
+          content: [{ type: "audio", data: "opaque" }],
+          details: { requestId: "done" },
+          isError: false,
+        })
+      )[0];
+      assert.equal(unavailable.isError, false);
+      assert.deepEqual(unavailable.details, { requestId: "done" });
+      assert.match(unavailable.content[0].text, /Tool completed/);
     } finally {
       await pi.emit("session_shutdown", { reason: "quit" });
       if (originalBin === undefined) delete process.env.PENTECT_BIN;

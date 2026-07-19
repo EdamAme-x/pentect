@@ -21,50 +21,8 @@ fn windows_shell_line_keeps_raw_and_visible_paste_separate() {
     assert!(line
         .take_injected_prefixes()
         .starts_with("$env:PENTECT_RUNPOD_API_KEY_deadbeef="));
-    assert!(line.backspace());
+    assert!(line.backspace().is_some());
     assert_eq!(line.raw(), "echo ");
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_shell_line_edits_at_the_cursor() {
-    let mut line = WindowsShellLine::default();
-    for ch in ["a", "b", "c"] {
-        line.push_typed(ch);
-    }
-    assert!(line.move_left());
-    assert!(line.move_left());
-    line.push_typed("X");
-    assert_eq!(line.raw(), "aXbc");
-    assert_eq!(line.visible_before_cursor(), "aX");
-    assert!(line.delete());
-    assert_eq!(line.raw(), "aXc");
-    assert!(line.backspace());
-    assert_eq!(line.raw(), "ac");
-    assert!(line.move_home());
-    assert!(line.delete());
-    assert_eq!(line.raw(), "c");
-    assert!(line.move_end());
-    line.push_typed("!");
-    assert_eq!(line.raw(), "c!");
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_shell_history_restores_drafts_and_skips_sensitive_commands() {
-    let mut history = WindowsShellHistory::default();
-    history.record("Get-Location", false);
-    history.record("Get-ChildItem", false);
-    history.record("Write-Output secret", true);
-
-    assert_eq!(history.previous("draft"), Some("Get-ChildItem".to_string()));
-    assert_eq!(
-        history.previous("ignored"),
-        Some("Get-Location".to_string())
-    );
-    assert_eq!(history.next(), Some("Get-ChildItem".to_string()));
-    assert_eq!(history.next(), Some("draft".to_string()));
-    assert_eq!(history.entries.len(), 2);
 }
 
 #[cfg(windows)]
@@ -1038,7 +996,7 @@ fn bridge_session_exports_only_the_owned_runtime_session() {
     assert!(session["contract"]
         .as_str()
         .unwrap()
-        .contains("Pentect agent contract"));
+        .contains("Session rules"));
     let environment = session["environment"].as_object().unwrap();
     assert_eq!(environment.len(), 4);
     for name in [ENV_ADDR, ENV_TOKEN, PENTECT_AGENT_LAUNCHED_ENV] {
@@ -1086,6 +1044,24 @@ fn bridge_line_reader_discards_oversized_request() {
         BridgeLine::Ready
     ));
     assert_eq!(line, b"{}\n");
+}
+
+#[test]
+fn bridge_error_preserves_phase_and_execution_state() {
+    let mut output = Vec::new();
+    write_bridge_response(
+        &mut output,
+        json!(7),
+        "after",
+        Err("Media output unavailable.".to_string()),
+    )
+    .unwrap();
+    let response: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "output_unavailable");
+    assert_eq!(response["error"]["phase"], "after");
+    assert_eq!(response["error"]["executed"], true);
+    assert_eq!(response["error"]["message"], "Media output unavailable.");
 }
 
 #[test]
@@ -2283,7 +2259,8 @@ fn tool_text_output_masks_mcp_connector_and_plugin_envelopes() {
     let output = handle_hook(HookProvider::Generic, "t", &session, blocked).unwrap();
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().unwrap();
-    assert!(reason.contains("non-text media"), "{reason}");
+    assert!(reason.starts_with("Tool completed"), "{reason}");
+    assert!(reason.contains("Media output unavailable"), "{reason}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2366,7 +2343,7 @@ fn claude_posttool_redacts_secret_qr_image_instead_of_blocking() {
     assert!(output.get("decision").is_none(), "{output}");
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("Pentect image masks"), "{rendered}");
+    assert!(rendered.contains("Masked regions"), "{rendered}");
     assert!(rendered.contains("[1] OPENAI_API_KEY"), "{rendered}");
     assert!(
         rendered.contains("\"mimeType\":\"image/png\""),
@@ -2405,10 +2382,11 @@ fn codex_posttool_still_blocks_secret_qr_image() {
 }
 
 #[test]
-fn posttool_blocks_clipboard_and_download_side_effect_outputs() {
-    let (root, session) = empty_session("hook-post-side-effect-block");
+fn posttool_masks_clipboard_text_without_misreporting_completed_side_effects() {
+    let (root, session) = empty_session("hook-post-side-effect-mask");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
     for response in [
-        json!({"clipboardText": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX"}),
+        json!({"clipboardText": format!("OPENAI_API_KEY={raw}")}),
         json!({"downloadPath": "C:\\Users\\demo\\Downloads\\secret.txt"}),
     ] {
         let input = json!({
@@ -2417,9 +2395,11 @@ fn posttool_blocks_clipboard_and_download_side_effect_outputs() {
             "tool_response": response
         });
         let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-        assert_eq!(output["decision"], "block", "{output}");
-        let reason = output["reason"].as_str().unwrap();
-        assert!(reason.contains("clipboard/download"), "{reason}");
+        assert!(output.get("decision").is_none(), "{output}");
+        assert!(
+            !serde_json::to_string(&output).unwrap().contains(raw),
+            "{output}"
+        );
     }
     let _ = std::fs::remove_dir_all(root);
 }
@@ -3985,6 +3965,139 @@ fn pretool_wraps_plain_shell_commands_for_every_provider() {
 }
 
 #[test]
+fn claude_pretool_wraps_powershell_and_injects_prompt_binding() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("hook-pre-powershell-binding");
+    let producer = Session::open_capability(DEFAULT_SESSION).unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_prompt_text_into_active_memory_store(&format!("OPENAI_API_KEY={raw}"))
+        .unwrap()
+        .unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let env_name = pentect_env_name_for_handle(&handle);
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "PowerShell",
+        "tool_input": {
+            "command": format!("Write-Output $env:{env_name}")
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &producer, input).unwrap();
+    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains("Invoke-Expression"), "{command}");
+    let id = powershell_agent_script_id_from_wrapper(command);
+    let client = MemoryStoreClient::from_env().unwrap();
+    let (shell, rendered) = client.take_rendered_agent_script(&id).unwrap();
+    assert_eq!(shell, "powershell");
+    assert!(
+        rendered.contains(&format!("$env:{env_name} = ")),
+        "{rendered:?}"
+    );
+    assert!(
+        rendered.contains(&format!("$env:{env_name} = '{raw}'")),
+        "{rendered:?}"
+    );
+    assert!(rendered.contains(raw), "{rendered:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn claude_powershell_wrapper_preserves_command_output() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("hook-powershell-output");
+    let session = Session::open_capability(DEFAULT_SESSION).unwrap();
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_prompt_text_into_active_memory_store(&format!("OPENAI_API_KEY={raw}"))
+        .unwrap()
+        .unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let env_name = pentect_env_name_for_handle(&handle);
+    let input = || {
+        json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "PowerShell",
+            "tool_input": {
+                "command": format!(
+                    "Write-Output 'BEFORE'; Write-Output \"OPENAI_API_KEY=$env:{env_name}\"; Write-Output 'AFTER'"
+                )
+            }
+        })
+    };
+    let fetch = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input()).unwrap();
+    let fetch_command = fetch["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    let fetch_id = powershell_agent_script_id_from_wrapper(fetch_command);
+    let fetch_output = Command::new(windows_powershell_path())
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(format!(
+            "& {}",
+            powershell_agent_script_fetch("0123456789ab", &fetch_id)
+        ))
+        .output()
+        .unwrap();
+    assert!(fetch_output.status.success(), "{fetch_output:?}");
+    let fetched = String::from_utf8_lossy(&fetch_output.stdout);
+    assert!(fetched.contains("BEFORE"), "{fetch_output:?}");
+    assert!(fetched.contains(raw), "{fetch_output:?}");
+    assert!(fetched.contains("AFTER"), "{fetch_output:?}");
+
+    let before = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input()).unwrap();
+    let command = before["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    let output = Command::new(windows_powershell_path())
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(command)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("BEFORE"), "{output:?}");
+    assert!(stdout.contains(raw), "{output:?}");
+    assert!(stdout.contains("AFTER"), "{output:?}");
+
+    let after = handle_hook(
+        HookProvider::Claude,
+        DEFAULT_SESSION,
+        &session,
+        json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "PowerShell",
+            "tool_response": { "stdout": stdout.as_ref(), "stderr": "" }
+        }),
+    )
+    .unwrap();
+    let protected = after["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+        .as_str()
+        .unwrap();
+    assert!(protected.contains("BEFORE"), "{protected}");
+    assert!(!protected.contains(raw), "{protected}");
+    assert!(protected.contains("<<OPENAI_API_KEY_"), "{protected}");
+    assert!(protected.contains("AFTER"), "{protected}");
+}
+
+#[test]
+fn pretool_does_not_treat_mcp_command_fields_as_shell_commands() {
+    let (root, session) = empty_session("hook-pre-mcp-command-field");
+    let input = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "mcp__service__invoke",
+        "tool_input": {
+            "command": "remote-operation",
+            "argument": "value"
+        }
+    });
+    let output = handle_hook(HookProvider::Claude, DEFAULT_SESSION, &session, input).unwrap();
+    assert_eq!(output, json!({}));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn codex_app_server_proxy_wraps_shell_even_when_exec_proxy_is_enabled() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     std::env::set_var("PENTECT_CODEX_APP_SERVER_PROXY", "1");
@@ -4197,10 +4310,11 @@ fn claude_powershell_uses_current_shell_without_child_shell_discovery() {
     )
     .unwrap();
     assert!(command.contains("Invoke-Expression"), "{command}");
-    assert!(command.contains("__agent-script"), "{command}");
-    assert!(command.contains("__agent-stream"), "{command}");
+    assert!(command.contains("SCRIPT_RENDER"), "{command}");
+    assert!(!command.contains("__agent-stream"), "{command}");
     assert!(!command.contains("powershell.exe"), "{command}");
     assert!(!command.contains("--script-shell"), "{command}");
+    assert!(!command.contains("& &"), "{command}");
 }
 
 #[test]
@@ -4226,7 +4340,6 @@ fn powershell_same_shell_wrapper_preserves_native_exit_code() {
     let wrapper = powershell_same_shell_wrapper(
         "0123456789ab",
         "cmd /D /S /C 'echo Write-Output same-shell; cmd /D /S /C exit 7'",
-        "cmd /D /S /C more",
     );
     let output = Command::new(windows_powershell_path())
         .arg("-NoProfile")
@@ -4237,6 +4350,29 @@ fn powershell_same_shell_wrapper_preserves_native_exit_code() {
     assert_eq!(output.status.code(), Some(7), "{output:?}");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("same-shell"),
+        "{output:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_same_shell_wrapper_preserves_script_fetch_failure() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("hook-powershell-fetch-failure");
+    let id = "0".repeat(64);
+    let wrapper = powershell_same_shell_wrapper(
+        "0123456789ab",
+        &powershell_agent_script_fetch("0123456789ab", &id),
+    );
+    let output = Command::new(windows_powershell_path())
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(&wrapper)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("script unavailable"),
         "{output:?}"
     );
 }
@@ -4445,6 +4581,10 @@ fn codex_posttool_blocks_with_masked_feedback() {
     let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
     assert_eq!(output["decision"], "block");
     let reason = output["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("Tool completed. Protected output:"),
+        "{reason}"
+    );
     assert!(reason.contains("<<OPENAI_API_KEY_"), "{reason}");
     assert!(!reason.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{reason}");
     assert!(output.get("hookSpecificOutput").is_none(), "{output}");
@@ -4543,6 +4683,18 @@ fn agent_script_id_from_wrapper(command: &str) -> String {
         .filter(|id| id.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .map(str::to_string)
         .unwrap_or_else(|| panic!("missing agent script id in {command}"))
+}
+
+fn powershell_agent_script_id_from_wrapper(command: &str) -> String {
+    let marker = "SCRIPT_RENDER`t";
+    let tail = command
+        .split_once(marker)
+        .map(|(_, tail)| tail)
+        .unwrap_or_else(|| panic!("missing memory script fetch in {command}"));
+    tail.get(..64)
+        .filter(|id| id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("invalid agent script id in {command}"))
 }
 
 fn masked_handle_from_assignment(masked: &str, key: &str) -> String {

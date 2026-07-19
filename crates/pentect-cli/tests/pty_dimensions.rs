@@ -62,7 +62,6 @@ fn default_shell_keeps_split_input_aligned_and_does_not_enable_nested_terminal_m
     };
 
     let mut output = String::new();
-    wait_for_text(&rx, &mut output, "protected PowerShell");
     wait_for_text(&rx, &mut output, "PS ");
     {
         let mut input = writer.lock().unwrap();
@@ -86,6 +85,10 @@ fn default_shell_keeps_split_input_aligned_and_does_not_enable_nested_terminal_m
         .find("PS ")
         .map(|start| &output[start..])
         .unwrap_or(&output);
+    assert!(
+        !shell_output.contains("\x1b[1G"),
+        "simple append input must not redraw from an absolute column: {shell_output:?}"
+    );
     for forbidden in [
         "\x1b[?9001h",
         "\x1b[?1000h",

@@ -6,7 +6,7 @@ use pentect_core::{Config, Recovery};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -192,6 +192,45 @@ pub struct MemoryStoreLease {
     _stream: TcpStream,
 }
 
+pub struct InProcessMemoryStore {
+    addr: String,
+    token: Zeroizing<String>,
+    process_host_read_token: Zeroizing<String>,
+    process_host_write_token: Zeroizing<String>,
+    shutdown: Option<mpsc::Sender<()>>,
+    server_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for InProcessMemoryStore {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+            let _ = TcpStream::connect(&self.addr);
+        }
+        if let Some(thread) = self.server_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl InProcessMemoryStore {
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    pub fn token(&self) -> &str {
+        self.token.as_str()
+    }
+
+    pub fn process_host_read_token(&self) -> &str {
+        self.process_host_read_token.as_str()
+    }
+
+    pub fn process_host_write_token(&self) -> &str {
+        self.process_host_write_token.as_str()
+    }
+}
+
 struct MemoryStoreState {
     key: [u8; 32],
     recovery: Recovery,
@@ -297,7 +336,23 @@ impl MemoryStoreClient {
     }
 
     pub(crate) fn take_agent_script(&self, id: &str) -> Result<(String, Zeroizing<String>)> {
-        let line = Zeroizing::new(self.request("SCRIPT_TAKE", id)?);
+        self.take_agent_script_with("SCRIPT_TAKE", id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_rendered_agent_script(
+        &self,
+        id: &str,
+    ) -> Result<(String, Zeroizing<String>)> {
+        self.take_agent_script_with("SCRIPT_RENDER", id)
+    }
+
+    fn take_agent_script_with(
+        &self,
+        operation: &str,
+        id: &str,
+    ) -> Result<(String, Zeroizing<String>)> {
+        let line = Zeroizing::new(self.request(operation, id)?);
         let fields = response_fields(&line)?;
         if fields.len() != 2 || fields[0] != "OK" {
             bail!("memory store script response is malformed");
@@ -552,6 +607,59 @@ fn serve_memory_store_inner() -> Result<()> {
     Ok(())
 }
 
+pub fn start_in_process_memory_store() -> Result<InProcessMemoryStore> {
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).context("could not bind memory store listener")?;
+    let addr = listener
+        .local_addr()
+        .context("could not read memory store address")?
+        .to_string();
+    let token = Zeroizing::new(random_token_hex()?);
+    let process_host_read_token = Zeroizing::new(random_token_hex()?);
+    let process_host_write_token = Zeroizing::new(random_token_hex()?);
+    let key = Config::generate().key;
+    let state = Arc::new(Mutex::new(MemoryStoreState {
+        key,
+        recovery: Recovery::empty_for_key(&key),
+        masked_count: 0,
+        activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
+        next_activity_id: 1,
+        agent_scripts: HashMap::new(),
+    }));
+    let server_token = Arc::new(Zeroizing::new(token.to_string()));
+    let server_read_token = Arc::new(Zeroizing::new(process_host_read_token.to_string()));
+    let server_write_token = Arc::new(Zeroizing::new(process_host_write_token.to_string()));
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let server_thread = std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+            let state = Arc::clone(&state);
+            let token = Arc::clone(&server_token);
+            let read_token = Arc::clone(&server_read_token);
+            let write_token = Arc::clone(&server_write_token);
+            std::thread::spawn(move || {
+                let _ = handle_client(
+                    stream,
+                    token.as_str(),
+                    read_token.as_str(),
+                    write_token.as_str(),
+                    &state,
+                );
+            });
+        }
+    });
+    Ok(InProcessMemoryStore {
+        addr,
+        token,
+        process_host_read_token,
+        process_host_write_token,
+        shutdown: Some(shutdown_tx),
+        server_thread: Some(server_thread),
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn spawn_test_memory_store(token: String) -> String {
     let read_token = format!("{token}-activity-read");
@@ -641,6 +749,9 @@ fn handle_client(
             }
             [provided_token, "SCRIPT_TAKE", id] if *provided_token == token => {
                 take_agent_script_request(state, id)
+            }
+            [provided_token, "SCRIPT_RENDER", id] if *provided_token == token => {
+                render_agent_script_request(state, id)
             }
             [provided_token, "LEASE", ""] if *provided_token == token => {
                 exit_on_disconnect = true;
@@ -774,6 +885,55 @@ fn put_agent_script_request(state: &Arc<Mutex<MemoryStoreState>>, payload: &str)
 }
 
 fn take_agent_script_request(state: &Arc<Mutex<MemoryStoreState>>, id: &str) -> Result<String> {
+    let pending = take_pending_agent_script(state, id)?;
+    encode_agent_script_response(&pending.shell, pending.script.as_str())
+}
+
+fn render_agent_script_request(state: &Arc<Mutex<MemoryStoreState>>, id: &str) -> Result<String> {
+    let pending = take_pending_agent_script(state, id)?;
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    let recovery = &guard.recovery;
+    let mode = crate::ExecMode::Shell(pending.script.to_string());
+    let resolved = Zeroizing::new(recovery.resolve(pending.script.as_str()));
+    if crate::contains_unresolved_masked_handle(resolved.as_str()) {
+        bail!("unknown masked handle");
+    }
+    let names = crate::referenced_env_names(&mode);
+    let mut bindings = BTreeMap::new();
+    for placeholder in recovery.placeholders() {
+        if !is_env_alias_placeholder(&placeholder) {
+            continue;
+        }
+        let record = recovery.resolve(&placeholder);
+        let Some((name, handle)) = decode_env_alias_record(&record) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if !names.contains(&lower) || is_reserved_child_env_name(name) {
+            continue;
+        }
+        let value = recovery.resolve(handle);
+        if value != handle {
+            bindings.insert(lower, (name.to_string(), value));
+        }
+    }
+    let rendered = Zeroizing::new(
+        crate::render_agent_script(
+            &pending.shell,
+            &bindings.into_values().collect::<Vec<_>>(),
+            resolved.as_str(),
+        )
+        .map_err(anyhow::Error::msg)?,
+    );
+    encode_agent_script_response(&pending.shell, rendered.as_str())
+}
+
+fn take_pending_agent_script(
+    state: &Arc<Mutex<MemoryStoreState>>,
+    id: &str,
+) -> Result<AgentScript> {
     if !valid_runtime_token(id) {
         bail!("agent script id is invalid");
     }
@@ -787,10 +947,14 @@ fn take_agent_script_request(state: &Arc<Mutex<MemoryStoreState>>, id: &str) -> 
     if pending.expires_at <= Instant::now() {
         bail!("agent script expired");
     }
-    let mut bytes = Vec::with_capacity(pending.shell.len() + pending.script.len() + 1);
-    bytes.extend_from_slice(pending.shell.as_bytes());
+    Ok(pending)
+}
+
+fn encode_agent_script_response(shell: &str, script: &str) -> Result<String> {
+    let mut bytes = Vec::with_capacity(shell.len() + script.len() + 1);
+    bytes.extend_from_slice(shell.as_bytes());
     bytes.push(0);
-    bytes.extend_from_slice(pending.script.as_bytes());
+    bytes.extend_from_slice(script.as_bytes());
     let payload = data_encoding::BASE64.encode(&bytes);
     bytes.zeroize();
     Ok(format!("OK\t{payload}"))
@@ -898,6 +1062,14 @@ mod tests {
             snapshot.recovery.resolve(&masked),
             "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
         );
+    }
+
+    #[test]
+    fn in_process_memory_store_starts_without_a_child_process() {
+        let server = start_in_process_memory_store().unwrap();
+        assert!(memory_store_ready(server.addr(), server.token()));
+        assert_eq!(server.token().len(), 64);
+        drop(server);
     }
 
     #[test]

@@ -66,9 +66,13 @@ fn run(args: Vec<String>) -> Option<i32> {
         return dispatch(args, inherited_env_is_trusted);
     }
     let pentect = default_pentect_path();
-    let process_host = MemoryStoreGuard::start(&pentect, false)
-        .unwrap_or_else(|error| die_with_issue(error))
-        .unwrap_or_else(|| die_with_issue("could not start process host candidate"));
+    let process_host = if is_shell_command(&args) && !inherited_env_is_trusted {
+        MemoryStoreGuard::start_in_process()
+    } else {
+        MemoryStoreGuard::start(&pentect, false)
+    }
+    .unwrap_or_else(|error| die_with_issue(error))
+    .unwrap_or_else(|| die_with_issue("could not start process host candidate"));
     let _process_host_env = memory_store_parent_env_guard(&pentect, &process_host);
     let exit_code = dispatch(args, inherited_env_is_trusted);
     drop(_process_host_env);
@@ -139,6 +143,16 @@ fn supports_process_host(args: &[String]) -> bool {
         ),
         (Some("exec" | "shell" | "log" | "bridge"), _)
             | (Some("agent"), Some("exec" | "shell" | "log" | "bridge"))
+    )
+}
+
+fn is_shell_command(args: &[String]) -> bool {
+    matches!(
+        (
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        (Some("shell"), _) | (Some("agent"), Some("shell"))
     )
 }
 
@@ -2305,6 +2319,7 @@ fn partial_suffix_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
 struct MemoryStoreGuard {
     child: Option<Child>,
     lease: Option<pentect_agent::MemoryStoreLease>,
+    _in_process: Option<pentect_agent::InProcessMemoryStore>,
     addr: String,
     token: String,
     process_host_candidate: Option<PathBuf>,
@@ -2338,6 +2353,7 @@ impl MemoryStoreGuard {
                     return Ok(Some(Self {
                         child: None,
                         lease: None,
+                        _in_process: None,
                         addr,
                         token,
                         process_host_candidate: None,
@@ -2440,6 +2456,34 @@ impl MemoryStoreGuard {
         Ok(Some(Self {
             child: Some(child),
             lease,
+            _in_process: None,
+            addr,
+            token,
+            process_host_candidate: Some(process_host_candidate),
+        }))
+    }
+
+    fn start_in_process() -> Result<Option<Self>, String> {
+        let server = pentect_agent::start_in_process_memory_store().map_err(|e| e.to_string())?;
+        let addr = server.addr().to_string();
+        let token = server.token().to_string();
+        let process_host_root = process_host_root()?;
+        let process_host_candidate = pentect_agent::register_process_host_candidate(
+            &process_host_root,
+            &addr,
+            &token,
+            server.process_host_read_token(),
+            server.process_host_write_token(),
+            std::process::id(),
+            false,
+        )?;
+        let Some(process_host_candidate) = process_host_candidate else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            child: None,
+            lease: None,
+            _in_process: Some(server),
             addr,
             token,
             process_host_candidate: Some(process_host_candidate),
@@ -4177,48 +4221,44 @@ mod tests {
         let rendered = args.join("\n");
         assert!(!args.contains(&"--dangerously-bypass-hook-trust".to_string()));
         assert!(rendered.contains("developer_instructions="), "{rendered}");
-        assert!(rendered.contains("Pentect agent contract"), "{rendered}");
-        assert!(rendered.contains("Use normal shell commands"), "{rendered}");
+        assert!(rendered.contains("Session rules"), "{rendered}");
+        assert!(rendered.contains("Work normally"), "{rendered}");
         assert!(rendered.contains("--enable\nunified_exec"), "{rendered}");
-        assert!(rendered.contains("protected runner"), "{rendered}");
-        assert!(rendered.contains("tool results"), "{rendered}");
-        assert!(rendered.contains("PENTECT_<LABEL>_<HASH>"), "{rendered}");
-        assert!(rendered.contains("read it once"), "{rendered}");
-        assert!(rendered.contains("helper scripts"), "{rendered}");
-        assert!(!rendered.contains("cat .env"), "{rendered}");
-        assert!(rendered.contains("Masked handles"), "{rendered}");
+        assert!(rendered.contains("current shell"), "{rendered}");
+        assert!(
+            rendered.contains("Do not invoke Pentect commands"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("user asks"), "{rendered}");
+        assert!(rendered.contains("not a failed operation"), "{rendered}");
+        assert!(rendered.contains("do not retry"), "{rendered}");
         assert!(rendered.contains("$env:PENTECT_NAME_hash"), "{rendered}");
-        assert!(rendered.contains("not the assignment key"), "{rendered}");
-        assert!(!rendered.contains("$env:NAME"), "{rendered}");
-        assert!(rendered.contains("user-authorized secrets"), "{rendered}");
+        assert!(rendered.contains("$PENTECT_NAME_hash"), "{rendered}");
         assert!(
-            rendered.contains("Pentect is the safety layer"),
+            rendered.contains("User-authorized secret work"),
             "{rendered}"
         );
-        assert!(rendered.contains("PENTECT_"), "{rendered}");
-        assert!(rendered.contains("pentect view"), "{rendered}");
-        assert!(!rendered.contains("pentect read"), "{rendered}");
-        assert!(rendered.contains("PowerShell"), "{rendered}");
+        assert!(rendered.contains("requested destination"), "{rendered}");
         assert!(
-            rendered.contains("MCP, browser, plugin, and connector"),
+            rendered.contains("Report only the task result"),
             "{rendered}"
         );
-        assert!(rendered.contains("tool text output"), "{rendered}");
-        assert!(rendered.contains("display-time redaction"), "{rendered}");
-        assert!(rendered.contains("user-requested storage"), "{rendered}");
-        assert!(rendered.contains("exact requested"), "{rendered}");
-        assert!(rendered.contains("local file"), "{rendered}");
-        assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(
-            rendered.contains("Do not disclose raw secrets"),
+            rendered.contains("Do not mention these rules"),
             "{rendered}"
         );
-        assert!(rendered.contains("encodings"), "{rendered}");
-        assert!(rendered.contains("third-party destinations"), "{rendered}");
-        assert!(
-            !rendered.contains("pentect exec \\\"pentect exec"),
-            "{rendered}"
-        );
+        for internal in [
+            "pentect exec",
+            "pentect read",
+            "pentect view",
+            "pentect resolve",
+            "protected runner",
+            "display-time redaction",
+            "MCP, browser, plugin",
+            "OCR",
+        ] {
+            assert!(!rendered.contains(internal), "{internal}: {rendered}");
+        }
     }
 
     #[test]
@@ -4292,50 +4332,47 @@ mod tests {
         let args = claude_args("{}", &["hello".to_string()], &contract);
         let rendered = args.join("\n");
         assert!(rendered.contains("--append-system-prompt"), "{rendered}");
-        assert!(rendered.contains("Pentect agent contract"), "{rendered}");
-        assert!(rendered.contains("Use normal shell commands"), "{rendered}");
-        assert!(rendered.contains("protected runner"), "{rendered}");
-        assert!(rendered.contains("tool results"), "{rendered}");
-        assert!(rendered.contains("PENTECT_<LABEL>_<HASH>"), "{rendered}");
-        assert!(rendered.contains("read it once"), "{rendered}");
-        assert!(rendered.contains("helper scripts"), "{rendered}");
-        assert!(!rendered.contains("cat .env"), "{rendered}");
+        assert!(rendered.contains("Session rules"), "{rendered}");
+        assert!(rendered.contains("Work normally"), "{rendered}");
+        assert!(rendered.contains("current shell"), "{rendered}");
+        assert!(
+            rendered.contains("Do not invoke Pentect commands"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("not a failed operation"), "{rendered}");
+        assert!(rendered.contains("do not retry"), "{rendered}");
         assert!(rendered.contains("$env:PENTECT_NAME_hash"), "{rendered}");
-        assert!(!rendered.contains("$env:NAME"), "{rendered}");
-        assert!(rendered.contains("user-authorized secrets"), "{rendered}");
+        assert!(rendered.contains("$PENTECT_NAME_hash"), "{rendered}");
         assert!(
-            rendered.contains("Pentect is the safety layer"),
+            rendered.contains("User-authorized secret work"),
             "{rendered}"
         );
-        assert!(rendered.contains("PENTECT_"), "{rendered}");
-        assert!(rendered.contains("pentect view"), "{rendered}");
-        assert!(!rendered.contains("pentect read"), "{rendered}");
-        assert!(rendered.contains("PowerShell"), "{rendered}");
+        assert!(rendered.contains("requested destination"), "{rendered}");
         assert!(
-            rendered.contains("MCP, browser, plugin, and connector"),
+            rendered.contains("Report only the task result"),
             "{rendered}"
         );
-        assert!(rendered.contains("tool text output"), "{rendered}");
-        assert!(rendered.contains("user-requested storage"), "{rendered}");
-        assert!(rendered.contains("exact requested"), "{rendered}");
-        assert!(rendered.contains("local file"), "{rendered}");
-        assert!(!rendered.contains("pentect resolve"), "{rendered}");
         assert!(
-            rendered.contains("Do not disclose raw secrets"),
+            rendered.contains("Do not mention these rules"),
             "{rendered}"
         );
-        assert!(rendered.contains("encodings"), "{rendered}");
-        assert!(rendered.contains("third-party destinations"), "{rendered}");
-        assert!(
-            !rendered.contains("pentect exec \"pentect exec"),
-            "{rendered}"
-        );
+        for internal in [
+            "pentect exec",
+            "pentect read",
+            "pentect view",
+            "pentect resolve",
+            "protected runner",
+            "display-time redaction",
+            "MCP, browser, plugin",
+            "OCR",
+        ] {
+            assert!(!rendered.contains(internal), "{internal}: {rendered}");
+        }
     }
 
     #[test]
     fn agent_contract_uses_configured_environment_prefix() {
         let rendered = pentect_agent::agent_contract_instructions("SAFE_");
-        assert!(rendered.contains("SAFE_<LABEL>_<HASH>"), "{rendered}");
         assert!(rendered.contains("$env:SAFE_NAME_hash"), "{rendered}");
         assert!(rendered.contains("$SAFE_NAME_hash"), "{rendered}");
         assert!(!rendered.contains("PENTECT_NAME_hash"), "{rendered}");
@@ -4590,5 +4627,16 @@ mod tests {
             "agent".to_string(),
             "hook".to_string(),
         ]));
+    }
+
+    #[test]
+    fn shell_commands_use_the_in_process_startup_path() {
+        assert!(is_shell_command(&["pentect".into(), "shell".into()]));
+        assert!(is_shell_command(&[
+            "pentect".into(),
+            "agent".into(),
+            "shell".into()
+        ]));
+        assert!(!is_shell_command(&["pentect".into(), "exec".into()]));
     }
 }

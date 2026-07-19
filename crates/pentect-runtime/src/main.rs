@@ -35,7 +35,8 @@ use masking::{
 use masking::{first_reusable_env_name, mask_live_output, mask_tool_output};
 pub use memory_store::{
     active_memory_store_ready, is_pentect_control_env_name, memory_store_ready,
-    open_memory_store_lease, pentect_control_env_names, MemoryStoreLease,
+    open_memory_store_lease, pentect_control_env_names, start_in_process_memory_store,
+    InProcessMemoryStore, MemoryStoreLease,
 };
 use memory_store::{MemoryStore, MemoryStoreClient, ENV_ADDR, ENV_TOKEN};
 pub use output_remask::ActiveTerminalOutputRemasker;
@@ -47,7 +48,7 @@ use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterP
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, Session};
 use sha2::{Digest, Sha256};
-use shell::{next_shell_word, powershell_word, shell_quote_unix};
+use shell::{next_shell_word, powershell_string_literal, powershell_word, shell_quote_unix};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -79,19 +80,12 @@ const PTY_PASTE_MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
 pub fn agent_contract_instructions(environment_prefix: &str) -> String {
     format!(
         concat!(
-            "Pentect agent contract:\n",
-            "- Use normal shell commands. Pentect routes stdout/stderr through its protected runner and masks tool results.\n",
-            "- You may read, fetch, transform, store, sync, and use user-authorized secrets. Pentect is the safety layer; raw secret values must not reach chat.\n",
-            "- Prefer Pentect-generated `{environment_prefix}<LABEL>_<HASH>` environment variables for secret values already seen through Pentect. Do not make helper scripts reopen a secret source when an equivalent environment binding is available.\n",
-            "- When a source has not been seen yet, read it once with a normal protected command. Then use the generated `{environment_prefix}...` environment variable in later commands.\n",
-            "- Masked handles like `<<NAME_hash>>` work only in this running Pentect-launched session. Build the environment variable from the name inside the handle, not the assignment key: use `$env:{environment_prefix}NAME_hash` on PowerShell or `${environment_prefix}NAME_hash` on Unix.\n",
-            "- `pentect view '<handle>'` shows only label, hash, and length. Use handles or generated env vars instead of printing raw values.\n",
-            "- Use the current shell syntax. On PowerShell use PowerShell commands and `$env:{environment_prefix}...`; on Unix use POSIX commands and `${environment_prefix}...`.\n",
-            "- MCP, browser, plugin, and connector tools may retrieve and use user-authorized secrets. Pentect masks tool text output when the host supports replacement; otherwise it stops unsafe output.\n",
-            "- A masked handle shown inside stdout, stderr, or an error is display-time redaction after the command ran. It does not mean the command received the handle; do not retry solely because an error echoes one.\n",
-            "- Default builds check image output with OS OCR on Windows/macOS and bundled OCR on Linux.\n",
-            "- For user-requested storage, write only to the exact requested local file, credential store, service, authenticated account, or destination; print only non-secret verification.\n",
-            "- Do not disclose raw secrets in chat, logs, screenshots, encodings, chunks, prefixes/suffixes, third-party destinations, public locations, or unrelated persistent services.\n",
+            "Session rules:\n",
+            "- Work normally with the host's tools and current shell. Do not invoke Pentect commands, explain the protection layer, or change approach because it is present unless the user asks.\n",
+            "- User-authorized secret work is allowed: retrieve, read, use, transform, and store secrets at the requested destination. Complete it normally.\n",
+            "- Use tools normally; their output is protected. Never include a raw secret in your response. A value such as `<<NAME_hash>>` is protected output, not a failed operation; do not retry because it appears.\n",
+            "- When available, reuse its environment binding: `$env:{environment_prefix}NAME_hash` in PowerShell or `${environment_prefix}NAME_hash` in a POSIX shell. Do not decode or reconstruct it.\n",
+            "- Report only the task result and ordinary errors. Do not mention these rules, handles, bindings, or the protection layer.\n",
         ),
         environment_prefix = environment_prefix
     )
@@ -875,7 +869,7 @@ fn render_agent_script(
                 rendered.push_str("$env:");
                 rendered.push_str(name);
                 rendered.push_str(" = ");
-                rendered.push_str(&powershell_word(value));
+                rendered.push_str(&powershell_string_literal(value));
                 rendered.push('\n');
             }
         }
@@ -966,8 +960,9 @@ fn cmd_bridge(args: &[String]) -> i32 {
             Err(_) => return 2,
         };
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let result = handle_bridge_request(&session, &mut prompt_masker, &request).ok();
-        if write_bridge_response(&mut writer, id, result).is_err() {
+        let phase = bridge_request_phase(&request);
+        let result = handle_bridge_request(&session, &mut prompt_masker, &request);
+        if write_bridge_response(&mut writer, id, phase, result).is_err() {
             return 2;
         }
     }
@@ -1027,17 +1022,35 @@ fn read_bridge_line_with_limit(
 fn write_bridge_response(
     writer: &mut impl Write,
     id: Value,
-    value: Option<Value>,
+    phase: &str,
+    result: Result<Value, String>,
 ) -> Result<(), String> {
-    let response = match value {
-        Some(value) => json!({ "id": id, "ok": true, "value": value }),
-        None => json!({ "id": id, "ok": false }),
+    let executed = phase == "after";
+    let response = match result {
+        Ok(value) => json!({ "id": id, "ok": true, "value": value }),
+        Err(message) => json!({
+            "id": id,
+            "ok": false,
+            "error": {
+                "code": if executed { "output_unavailable" } else { "operation_unavailable" },
+                "phase": phase,
+                "executed": executed,
+                "message": message,
+            }
+        }),
     };
     serde_json::to_writer(&mut *writer, &response).map_err(|_| "bridge unavailable".to_string())?;
     writer
         .write_all(b"\n")
         .and_then(|_| writer.flush())
         .map_err(|_| "bridge unavailable".to_string())
+}
+
+fn bridge_request_phase(request: &Value) -> &str {
+    match request.get("op").and_then(Value::as_str) {
+        Some(phase @ ("session" | "prompt" | "media" | "before" | "after")) => phase,
+        _ => "request",
+    }
 }
 
 fn handle_bridge_request(
@@ -1070,7 +1083,7 @@ fn handle_bridge_request(
                 .ok_or_else(|| "invalid bridge request".to_string())?;
             match claude_image_tool_output(session, value)? {
                 Some(ToolTextOutput::Updated(updated)) => Ok(updated),
-                Some(ToolTextOutput::Block(_)) => Err("media unavailable".to_string()),
+                Some(ToolTextOutput::Block(reason)) => Err(reason),
                 Some(ToolTextOutput::Unchanged) | None => Ok(value.clone()),
             }
         }
@@ -1105,7 +1118,7 @@ fn handle_bridge_request(
             match mask_tool_text_output(HookProvider::Claude, session, value)? {
                 ToolTextOutput::Unchanged => Ok(value.clone()),
                 ToolTextOutput::Updated(updated) => Ok(updated),
-                ToolTextOutput::Block(_) => Err("output unavailable".to_string()),
+                ToolTextOutput::Block(reason) => Err(reason),
             }
         }
         _ => Err("invalid bridge request".to_string()),
@@ -1775,23 +1788,17 @@ enum WindowsShellCompletion {
 #[derive(Default)]
 struct WindowsShellLine {
     units: Vec<(String, String, String)>,
-    cursor: usize,
 }
 
 #[cfg(windows)]
 impl WindowsShellLine {
     fn push_typed(&mut self, text: &str) {
-        self.units.insert(
-            self.cursor,
-            (text.to_string(), text.to_string(), String::new()),
-        );
-        self.cursor += 1;
+        self.units
+            .push((text.to_string(), text.to_string(), String::new()));
     }
 
     fn push_paste(&mut self, raw: String, visible: String, injected_prefix: String) {
-        self.units
-            .insert(self.cursor, (raw, visible, injected_prefix));
-        self.cursor += 1;
+        self.units.push((raw, visible, injected_prefix));
     }
 
     fn raw(&self) -> String {
@@ -1805,57 +1812,6 @@ impl WindowsShellLine {
             .collect()
     }
 
-    fn visible_before_cursor(&self) -> String {
-        self.units[..self.cursor]
-            .iter()
-            .map(|(_, visible, _)| visible.as_str())
-            .collect()
-    }
-
-    fn contains_protected_paste(&self) -> bool {
-        self.units.iter().any(|(_, _, prefix)| !prefix.is_empty())
-    }
-
-    fn replace_with_raw(&mut self, raw: &str) {
-        self.clear();
-        for ch in raw.chars() {
-            let mut encoded = [0u8; 4];
-            self.push_typed(ch.encode_utf8(&mut encoded));
-        }
-    }
-
-    fn move_left(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-        self.cursor -= 1;
-        true
-    }
-
-    fn move_right(&mut self) -> bool {
-        if self.cursor >= self.units.len() {
-            return false;
-        }
-        self.cursor += 1;
-        true
-    }
-
-    fn move_home(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-        self.cursor = 0;
-        true
-    }
-
-    fn move_end(&mut self) -> bool {
-        if self.cursor == self.units.len() {
-            return false;
-        }
-        self.cursor = self.units.len();
-        true
-    }
-
     fn take_injected_prefixes(&mut self) -> String {
         let mut out = String::new();
         for (_, _, prefix) in &mut self.units {
@@ -1865,27 +1821,13 @@ impl WindowsShellLine {
         out
     }
 
-    fn backspace(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-        self.cursor -= 1;
-        let (mut raw, mut visible, mut prefix) = self.units.remove(self.cursor);
+    fn backspace(&mut self) -> Option<usize> {
+        let (mut raw, mut visible, mut prefix) = self.units.pop()?;
+        let width = visible.chars().count();
         raw.zeroize();
         visible.zeroize();
         prefix.zeroize();
-        true
-    }
-
-    fn delete(&mut self) -> bool {
-        if self.cursor >= self.units.len() {
-            return false;
-        }
-        let (mut raw, mut visible, mut prefix) = self.units.remove(self.cursor);
-        raw.zeroize();
-        visible.zeroize();
-        prefix.zeroize();
-        true
+        Some(width)
     }
 
     fn clear(&mut self) {
@@ -1895,68 +1837,6 @@ impl WindowsShellLine {
             prefix.zeroize();
         }
         self.units.clear();
-        self.cursor = 0;
-    }
-}
-
-#[cfg(windows)]
-#[derive(Default)]
-struct WindowsShellHistory {
-    entries: Vec<Zeroizing<String>>,
-    index: Option<usize>,
-    draft: Zeroizing<String>,
-}
-
-#[cfg(windows)]
-impl WindowsShellHistory {
-    fn record(&mut self, command: &str, sensitive: bool) {
-        self.index = None;
-        self.draft.zeroize();
-        if sensitive || command.trim().is_empty() || command.contains(['\r', '\n']) {
-            return;
-        }
-        if self
-            .entries
-            .last()
-            .is_some_and(|entry| entry.as_str() == command)
-        {
-            return;
-        }
-        self.entries.push(Zeroizing::new(command.to_string()));
-        if self.entries.len() > 100 {
-            self.entries.remove(0);
-        }
-    }
-
-    fn previous(&mut self, current: &str) -> Option<String> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        let next = match self.index {
-            Some(index) => index.saturating_sub(1),
-            None => {
-                self.draft.zeroize();
-                self.draft.push_str(current);
-                self.entries.len() - 1
-            }
-        };
-        self.index = Some(next);
-        Some(self.entries[next].to_string())
-    }
-
-    fn next(&mut self) -> Option<String> {
-        let index = self.index?;
-        if index + 1 < self.entries.len() {
-            self.index = Some(index + 1);
-            return Some(self.entries[index + 1].to_string());
-        }
-        self.index = None;
-        Some(self.draft.to_string())
-    }
-
-    fn edited(&mut self) {
-        self.index = None;
-        self.draft.zeroize();
     }
 }
 
@@ -1976,8 +1856,6 @@ fn pump_windows_shell_input(
         .to_string_lossy()
         .into_owned();
     let mut line = WindowsShellLine::default();
-    let mut history = WindowsShellHistory::default();
-    print_windows_shell_welcome()?;
     print_windows_shell_prompt(&cwd)?;
     loop {
         if let Some(status) = child
@@ -2003,7 +1881,6 @@ fn pump_windows_shell_input(
                 match event.code {
                     KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         line.clear();
-                        history.edited();
                         print!("^C\r\n");
                         print_windows_shell_prompt(&cwd)?;
                     }
@@ -2014,7 +1891,11 @@ fn pump_windows_shell_input(
                             crossterm::cursor::MoveTo(0, 0)
                         )
                         .map_err(|e| format!("could not clear shell display: {e}"))?;
-                        redraw_windows_shell_line(&cwd, &line)?;
+                        print_windows_shell_prompt(&cwd)?;
+                        print!("{}", line.visible());
+                        std::io::stdout()
+                            .flush()
+                            .map_err(|e| format!("could not render shell input: {e}"))?;
                     }
                     KeyCode::Char('d')
                         if event.modifiers.contains(KeyModifiers::CONTROL)
@@ -2034,7 +1915,6 @@ fn pump_windows_shell_input(
                             .flush()
                             .map_err(|e| format!("could not render shell input: {e}"))?;
                         let mut paste = protector.prepare_paste(&raw)?;
-                        history.record(&raw, paste.changed);
                         raw.zeroize();
                         let mut child_command = line.take_injected_prefixes();
                         child_command.push_str(&paste.child);
@@ -2071,58 +1951,19 @@ fn pump_windows_shell_input(
                         let mut encoded = [0u8; 4];
                         let text = ch.encode_utf8(&mut encoded);
                         line.push_typed(text);
-                        history.edited();
-                        redraw_windows_shell_line(&cwd, &line)?;
+                        print!("{text}");
+                        std::io::stdout()
+                            .flush()
+                            .map_err(|e| format!("could not render shell input: {e}"))?;
                     }
                     KeyCode::Backspace => {
-                        if line.backspace() {
-                            history.edited();
-                            redraw_windows_shell_line(&cwd, &line)?;
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if line.delete() {
-                            history.edited();
-                            redraw_windows_shell_line(&cwd, &line)?;
-                        }
-                    }
-                    KeyCode::Left => {
-                        if line.move_left() {
-                            redraw_windows_shell_line(&cwd, &line)?;
-                        }
-                    }
-                    KeyCode::Right => {
-                        if line.move_right() {
-                            redraw_windows_shell_line(&cwd, &line)?;
-                        }
-                    }
-                    KeyCode::Home => {
-                        if line.move_home() {
-                            redraw_windows_shell_line(&cwd, &line)?;
-                        }
-                    }
-                    KeyCode::End => {
-                        if line.move_end() {
-                            redraw_windows_shell_line(&cwd, &line)?;
-                        }
-                    }
-                    KeyCode::Up => {
-                        if !line.contains_protected_paste() {
-                            let mut current = line.raw();
-                            let previous = history.previous(&current);
-                            current.zeroize();
-                            if let Some(mut command) = previous {
-                                line.replace_with_raw(&command);
-                                command.zeroize();
-                                redraw_windows_shell_line(&cwd, &line)?;
+                        if let Some(width) = line.backspace() {
+                            for _ in 0..width {
+                                print!("\x08 \x08");
                             }
-                        }
-                    }
-                    KeyCode::Down => {
-                        if let Some(mut command) = history.next() {
-                            line.replace_with_raw(&command);
-                            command.zeroize();
-                            redraw_windows_shell_line(&cwd, &line)?;
+                            std::io::stdout()
+                                .flush()
+                                .map_err(|e| format!("could not render shell input: {e}"))?;
                         }
                     }
                     _ => {}
@@ -2130,13 +1971,16 @@ fn pump_windows_shell_input(
             }
             crossterm::event::Event::Paste(mut text) => {
                 let paste = protector.prepare_paste(&text)?;
+                let visible = single_line_shell_display(&paste.visible);
                 line.push_paste(
                     std::mem::take(&mut text),
-                    single_line_shell_display(&paste.visible),
+                    visible.clone(),
                     paste.injected_prefix,
                 );
-                history.edited();
-                redraw_windows_shell_line(&cwd, &line)?;
+                print!("{visible}");
+                std::io::stdout()
+                    .flush()
+                    .map_err(|e| format!("could not render pasted input: {e}"))?;
             }
             _ => {}
         }
@@ -2265,46 +2109,10 @@ fn forward_windows_running_input(
 #[cfg(windows)]
 fn print_windows_shell_prompt(cwd: &str) -> Result<(), String> {
     let display = compact_windows_shell_cwd(cwd);
-    use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
-    crossterm::queue!(
-        std::io::stdout(),
-        Print("PS "),
-        SetForegroundColor(Color::Cyan),
-        Print(&display),
-        ResetColor,
-        Print(" "),
-        SetForegroundColor(Color::Green),
-        SetAttribute(Attribute::Bold),
-        Print("›"),
-        SetAttribute(Attribute::Reset),
-        ResetColor,
-        Print(" ")
-    )
-    .map_err(|e| format!("could not render shell prompt: {e}"))?;
+    print!("PS {display}> ");
     std::io::stdout()
         .flush()
         .map_err(|e| format!("could not render shell prompt: {e}"))
-}
-
-#[cfg(windows)]
-fn print_windows_shell_welcome() -> Result<(), String> {
-    use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
-    crossterm::queue!(
-        std::io::stdout(),
-        SetForegroundColor(Color::Cyan),
-        SetAttribute(Attribute::Bold),
-        Print("pentect shell"),
-        SetAttribute(Attribute::Reset),
-        ResetColor,
-        Print("  ·  protected PowerShell\r\n"),
-        SetForegroundColor(Color::DarkGrey),
-        Print("↑↓ history  ←→ edit  Ctrl+C clear  Ctrl+D exit\r\n"),
-        ResetColor
-    )
-    .map_err(|e| format!("could not render shell welcome: {e}"))?;
-    std::io::stdout()
-        .flush()
-        .map_err(|e| format!("could not render shell welcome: {e}"))
 }
 
 #[cfg(windows)]
@@ -2327,38 +2135,6 @@ fn compact_windows_shell_cwd_with_home(cwd: &str, home: &str) -> String {
         })
         .map(|tail| format!("~{tail}"))
         .unwrap_or_else(|| cwd.to_string())
-}
-
-#[cfg(windows)]
-fn redraw_windows_shell_line(cwd: &str, line: &WindowsShellLine) -> Result<(), String> {
-    use crossterm::cursor::MoveToColumn;
-    use crossterm::style::Print;
-    use crossterm::terminal::{Clear, ClearType};
-
-    crossterm::queue!(
-        std::io::stdout(),
-        MoveToColumn(0),
-        Clear(ClearType::CurrentLine)
-    )
-    .map_err(|e| format!("could not redraw shell input: {e}"))?;
-    print_windows_shell_prompt(cwd)?;
-    crossterm::queue!(std::io::stdout(), Print(line.visible()))
-        .map_err(|e| format!("could not redraw shell input: {e}"))?;
-    let prompt_width = windows_shell_prompt_width(cwd);
-    let input_width = line.visible_before_cursor().chars().count();
-    let column = prompt_width
-        .saturating_add(input_width)
-        .min(u16::MAX as usize) as u16;
-    crossterm::queue!(std::io::stdout(), MoveToColumn(column))
-        .map_err(|e| format!("could not position shell cursor: {e}"))?;
-    std::io::stdout()
-        .flush()
-        .map_err(|e| format!("could not redraw shell input: {e}"))
-}
-
-#[cfg(windows)]
-fn windows_shell_prompt_width(cwd: &str) -> usize {
-    6 + compact_windows_shell_cwd(cwd).chars().count()
 }
 
 #[cfg(windows)]
@@ -4558,26 +4334,28 @@ fn before_tool_updated_input(
         }
     }
     validate_masked_write_before_tool(session, tool_name, tool_input)?;
-    if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
-        if let Some(reason) = pentect_human_only_command_reason(command) {
-            return Err(reason);
-        }
-        if codex_exec_proxy_should_own_shell_tool(provider) {
-            return Ok((tool_input.clone(), false));
-        }
-        let command = canonical_hook_shell_command(command)?;
-        let mut updated = tool_input.clone();
-        if let Some(object) = updated.as_object_mut() {
-            object.insert(
-                "command".to_string(),
-                Value::String(wrap_shell_command(
-                    provider,
-                    session_name,
-                    tool_name,
-                    &command,
-                )?),
-            );
-            return Ok((updated, true));
+    if is_shell_tool_name(tool_name) {
+        if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
+            if let Some(reason) = pentect_human_only_command_reason(command) {
+                return Err(reason);
+            }
+            if codex_exec_proxy_should_own_shell_tool(provider) {
+                return Ok((tool_input.clone(), false));
+            }
+            let command = canonical_hook_shell_command(command)?;
+            let mut updated = tool_input.clone();
+            if let Some(object) = updated.as_object_mut() {
+                object.insert(
+                    "command".to_string(),
+                    Value::String(wrap_shell_command(
+                        provider,
+                        session_name,
+                        tool_name,
+                        &command,
+                    )?),
+                );
+                return Ok((updated, true));
+            }
         }
     }
     Ok((tool_input.clone(), false))
@@ -4605,26 +4383,28 @@ fn before_tool_updated_input_lazy(
         }
         validate_masked_write_before_tool(&session, tool_name, tool_input)?;
     }
-    if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
-        if let Some(reason) = pentect_human_only_command_reason(command) {
-            return Err(reason);
-        }
-        if codex_exec_proxy_should_own_shell_tool(provider) {
-            return Ok((tool_input.clone(), false));
-        }
-        let command = canonical_hook_shell_command(command)?;
-        let mut updated = tool_input.clone();
-        if let Some(object) = updated.as_object_mut() {
-            object.insert(
-                "command".to_string(),
-                Value::String(wrap_shell_command(
-                    provider,
-                    session_name,
-                    tool_name,
-                    &command,
-                )?),
-            );
-            return Ok((updated, true));
+    if is_shell_tool_name(tool_name) {
+        if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
+            if let Some(reason) = pentect_human_only_command_reason(command) {
+                return Err(reason);
+            }
+            if codex_exec_proxy_should_own_shell_tool(provider) {
+                return Ok((tool_input.clone(), false));
+            }
+            let command = canonical_hook_shell_command(command)?;
+            let mut updated = tool_input.clone();
+            if let Some(object) = updated.as_object_mut() {
+                object.insert(
+                    "command".to_string(),
+                    Value::String(wrap_shell_command(
+                        provider,
+                        session_name,
+                        tool_name,
+                        &command,
+                    )?),
+                );
+                return Ok((updated, true));
+            }
         }
     }
     Ok((tool_input.clone(), false))
@@ -4668,7 +4448,7 @@ fn codex_exec_proxy_owns_shell_output(provider: HookProvider, tool_name: &str) -
 fn is_shell_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name.to_ascii_lowercase().as_str(),
-        "bash" | "shell" | "exec" | "run_command"
+        "bash" | "powershell" | "powershell_command" | "shell" | "exec" | "run_command"
     )
 }
 
@@ -5540,8 +5320,7 @@ fn same_shell_agent_wrapper(
         )),
         ScriptShell::PowerShell => Ok(powershell_same_shell_wrapper(
             suffix,
-            &target_shell_pentect_command(shell, &script_args),
-            &target_shell_pentect_command(shell, &stream_args),
+            &powershell_agent_script_fetch(suffix, id),
         )),
         ScriptShell::Native => Err("same-shell wrapper requires a known shell".to_string()),
     }
@@ -5554,7 +5333,7 @@ fn target_shell_pentect_command(shell: ScriptShell, args: &[String]) -> String {
     };
     let mut command = match shell {
         ScriptShell::Bash => String::from("\"${PENTECT_BIN}\""),
-        ScriptShell::PowerShell | ScriptShell::Native => String::from("& $env:PENTECT_BIN"),
+        ScriptShell::PowerShell | ScriptShell::Native => String::from("$env:PENTECT_BIN"),
     };
     for arg in args {
         command.push(' ');
@@ -5579,17 +5358,28 @@ fn bash_same_shell_wrapper(
     )
 }
 
-fn powershell_same_shell_wrapper(
-    suffix: &str,
-    script_command: &str,
-    stream_command: &str,
-) -> String {
+fn powershell_same_shell_wrapper(suffix: &str, script_command: &str) -> String {
     let script = format!("__pentect_script_{suffix}");
     let status = format!("__pentect_status_{suffix}");
-    let final_status = format!("__pentect_final_status_{suffix}");
-    let stream_status = format!("__pentect_stream_status_{suffix}");
+    let success = format!("__pentect_success_{suffix}");
+    let native_status = format!("__pentect_native_status_{suffix}");
     format!(
-        "${script} = (& {script_command} | Out-String); if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; $global:{status} = 0; ${script} += \"`n`$global:{status} = if (`$?) {{ 0 }} elseif (`$LASTEXITCODE -is [int] -and `$LASTEXITCODE -ne 0) {{ `$LASTEXITCODE }} else {{ 1 }}\"; & {{ try {{ Invoke-Expression ${script} }} catch {{ Write-Error -ErrorRecord $_; $global:{status} = 1 }} }} 2>&1 | Out-String -Stream | & {stream_command}; ${stream_status} = $LASTEXITCODE; ${script} = $null; if ($global:{status} -eq 0 -and ${stream_status} -ne 0) {{ $global:{status} = ${stream_status} }}; ${final_status} = $global:{status}; Remove-Variable {status} -Scope Global -ErrorAction SilentlyContinue; exit ${final_status}"
+        "${script} = (& {script_command} | Out-String); ${status} = 0; try {{ $global:LASTEXITCODE = 0; Invoke-Expression ${script}; ${success} = $?; ${native_status} = $LASTEXITCODE; if (${native_status} -is [int] -and ${native_status} -ne 0) {{ ${status} = ${native_status} }} elseif (-not ${success}) {{ ${status} = 1 }} }} catch {{ Write-Error -ErrorRecord $_; ${status} = 1 }}; ${script} = $null; if (${status} -ne 0) {{ exit ${status} }}"
+    )
+}
+
+fn powershell_agent_script_fetch(suffix: &str, id: &str) -> String {
+    format!(
+        "{{ ${client} = [System.Net.Sockets.TcpClient]::new(); ${reader} = $null; ${writer} = $null; try {{ ${address} = $env:PENTECT_MEMORY_STORE_ADDR -split ':', 2; if (${address}.Count -ne 2) {{ throw 'session unavailable' }}; ${client}.Connect(${address}[0], [int]${address}[1]); ${stream} = ${client}.GetStream(); ${writer} = [System.IO.StreamWriter]::new(${stream}, [System.Text.UTF8Encoding]::new($false), 1024, $true); ${reader} = [System.IO.StreamReader]::new(${stream}, [System.Text.Encoding]::UTF8, $false, 1024, $true); ${writer}.NewLine = \"`n\"; ${writer}.WriteLine(\"$env:PENTECT_MEMORY_STORE_TOKEN`tSCRIPT_RENDER`t{id}\"); ${writer}.Flush(); ${response} = ${reader}.ReadLine(); ${fields} = ${response} -split \"`t\", 2; if (${fields}.Count -ne 2 -or ${fields}[0] -ne 'OK') {{ throw 'script unavailable' }}; ${decoded} = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(${fields}[1])); ${separator} = ${decoded}.IndexOf([char]0); if (${separator} -lt 0) {{ throw 'script unavailable' }}; ${decoded}.Substring(${separator} + 1) }} finally {{ if (${reader}) {{ ${reader}.Dispose() }}; if (${writer}) {{ ${writer}.Dispose() }}; ${client}.Dispose(); ${response} = $null; ${fields} = $null; ${decoded} = $null }} }}",
+        client = format!("__pentect_client_{suffix}"),
+        reader = format!("__pentect_reader_{suffix}"),
+        writer = format!("__pentect_writer_{suffix}"),
+        address = format!("__pentect_address_{suffix}"),
+        stream = format!("__pentect_network_{suffix}"),
+        response = format!("__pentect_response_{suffix}"),
+        fields = format!("__pentect_fields_{suffix}"),
+        decoded = format!("__pentect_decoded_{suffix}"),
+        separator = format!("__pentect_separator_{suffix}"),
     )
 }
 
@@ -5698,7 +5488,10 @@ fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
         }),
         HookProvider::Codex => json!({
             "decision": "block",
-            "reason": stringify_tool_output(&updated_output)
+            "reason": format!(
+                "Tool completed. Protected output:\n{}",
+                stringify_tool_output(&updated_output)
+            )
         }),
     }
 }
@@ -5706,7 +5499,9 @@ fn after_tool_output(provider: HookProvider, updated_output: Value) -> Value {
 fn after_tool_block_output(_provider: HookProvider, reason: &str) -> Value {
     json!({
         "decision": "block",
-        "reason": reason
+        "reason": format!(
+            "Tool completed, but its output was unavailable. Check side effects before retrying.\n{reason}"
+        )
     })
 }
 
@@ -5791,7 +5586,7 @@ fn append_image_mask_notes(mut value: Value, notes: &[String]) -> Value {
     if notes.is_empty() {
         return value;
     }
-    let text = format!("Pentect image masks\n{}", notes.join("\n"));
+    let text = format!("Masked regions\n{}", notes.join("\n"));
     if append_text_block_to_content(&mut value, &text) {
         return value;
     }
@@ -5882,18 +5677,7 @@ fn image_tool_result_block_reason(
 
 fn unsupported_tool_result_reason(value: &Value) -> Option<String> {
     if contains_unsupported_media_result(value) {
-        return Some(
-            "Pentect blocked non-text media output because media masking is not active yet."
-                .to_string(),
-        );
-    }
-    // TODO(side-effect-audit): replace this with explicit secret side-effect tracking
-    // for clipboard/download/GUI-save destinations when those surfaces exist.
-    if contains_unobserved_side_effect_result(value) {
-        return Some(
-            "Pentect blocked clipboard/download output because that side effect bypasses the hook boundary."
-                .to_string(),
-        );
+        return Some("Media output unavailable because it could not be inspected.".to_string());
     }
     None
 }
@@ -5908,19 +5692,6 @@ fn contains_unsupported_media_result(value: &Value) -> bool {
             key_marks_media_value(&key, item)
                 || string_media_field(&key, item)
                 || contains_unsupported_media_result(item)
-        }),
-    }
-}
-
-fn contains_unobserved_side_effect_result(value: &Value) -> bool {
-    match value {
-        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => false,
-        Value::Array(items) => items.iter().any(contains_unobserved_side_effect_result),
-        Value::Object(map) => map.iter().any(|(key, item)| {
-            let key = normalized_json_key(key);
-            key_marks_unobserved_side_effect(&key, item)
-                || string_side_effect_field(&key, item)
-                || contains_unobserved_side_effect_result(item)
         }),
     }
 }
@@ -5958,32 +5729,6 @@ fn looks_like_media_reference(text: &str) -> bool {
 fn is_unsupported_media_mime(text: &str) -> bool {
     let value = text.trim().to_ascii_lowercase();
     value.starts_with("audio/") || value.starts_with("video/") || value == "application/pdf"
-}
-
-fn key_marks_unobserved_side_effect(key: &str, value: &Value) -> bool {
-    matches!(
-        key,
-        "clipboard"
-            | "clipboardtext"
-            | "clipboardcontent"
-            | "download"
-            | "downloadpath"
-            | "downloadurl"
-            | "downloadedfile"
-            | "savedfile"
-            | "savedpath"
-    ) && !empty_json_value(value)
-}
-
-fn string_side_effect_field(key: &str, value: &Value) -> bool {
-    let Some(text) = value.as_str() else {
-        return false;
-    };
-    matches!(key, "type" | "kind")
-        && matches!(
-            normalized_json_key(text).as_str(),
-            "clipboard" | "download" | "guisave" | "savedfile"
-        )
 }
 
 fn empty_json_value(value: &Value) -> bool {
