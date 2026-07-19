@@ -257,11 +257,11 @@ impl TerminalOutputRemasker {
                 *alternate_screen = false;
                 *alternate_keyboard_depth = 0;
             }
-        } else if is_win32_input_mode(sequence) {
-            out.extend(matcher.push_boundary_control(&[]));
         } else if is_sgr(sequence) {
             out.extend(matcher.push_control(sequence));
         } else {
+            // Nested ConPTY handshakes such as ?9001 must reach the parent
+            // terminal so both PTYs use the same keyboard encoding.
             out.extend(matcher.push_boundary_control(sequence));
         }
         if *alternate_screen {
@@ -310,10 +310,6 @@ fn is_sgr(sequence: &[u8]) -> bool {
     };
     body.iter()
         .all(|byte| byte.is_ascii_digit() || matches!(byte, b';' | b':'))
-}
-
-fn is_win32_input_mode(sequence: &[u8]) -> bool {
-    csi_body(sequence).is_some_and(|body| matches!(body, b"?9001h" | b"?9001l"))
 }
 
 fn alternate_screen_change(sequence: &[u8]) -> Option<bool> {
@@ -674,13 +670,13 @@ mod tests {
     }
 
     #[test]
-    fn nested_win32_input_mode_does_not_escape_the_proxy() {
+    fn nested_win32_input_mode_reaches_the_parent_terminal() {
         let mut remasker = TerminalOutputRemasker::new(&recovery());
         let mut out = remasker
             .push(b"before\x1b[?9001hready\x1b[?9001lafter")
             .unwrap();
         out.extend(remasker.finish());
-        assert_eq!(out, b"beforereadyafter");
+        assert_eq!(out, b"before\x1b[?9001hready\x1b[?9001lafter");
     }
 
     #[test]

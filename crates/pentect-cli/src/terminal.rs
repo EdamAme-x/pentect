@@ -96,6 +96,7 @@ const ANSI_INPUT_REPORTING_RESET: &str = concat!(
     "\x1b[?2004l", // disable bracketed paste
     "\x1b[?2005l", // disable bracketed paste quote mode
     "\x1b[?2006l", // disable bracketed paste literal newline mode
+    "\x1b[?9001l", // disable Windows Terminal Win32 input mode
 );
 
 const ANSI_TUI_RESET: &str = concat!(
@@ -695,6 +696,7 @@ mod tests {
             "\x1b[?2004l",
             "\x1b[?2005l",
             "\x1b[?2006l",
+            "\x1b[?9001l",
             "\x1b[?9l",
         ] {
             assert!(ANSI_INPUT_REPORTING_RESET.contains(mode), "{mode:?}");

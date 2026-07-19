@@ -188,7 +188,7 @@ fn agent_pty_preserves_backspace_as_one_key_event() {
 }
 
 #[test]
-fn agent_pty_does_not_forward_nested_win32_input_mode() {
+fn parent_conpty_consumes_forwarded_nested_win32_input_mode() {
     let _serial = PTY_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -243,6 +243,9 @@ fn agent_pty_does_not_forward_nested_win32_input_mode() {
     let end = find_bytes(&output[start..], b"AFTER")
         .map(|offset| start + offset + b"AFTER".len())
         .expect("child output was truncated");
+    // The runtime unit test verifies that Pentect forwards these controls.
+    // The parent ConPTY consumes them to select its input encoding, so they
+    // must not appear as printable output at this outer boundary.
     assert!(!output[start..end]
         .windows(b"\x1b[?9001h".len())
         .any(|window| window == b"\x1b[?9001h"));

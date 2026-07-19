@@ -50,6 +50,8 @@ const PROMPT_PASTE_START: &[u8] = b"\x1b[200~";
 const PROMPT_PASTE_END: &[u8] = b"\x1b[201~";
 const PROMPT_INPUT_POLL: Duration = Duration::from_millis(50);
 const PROMPT_INPUT_MAX_PENDING_BYTES: usize = 1024 * 1024;
+#[cfg(windows)]
+const WIN32_BACKSPACE_INPUT: &[u8] = b"\x1b[8;14;8;1;0;1_\x1b[8;14;8;0;0;1_";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1995,14 +1997,14 @@ where
             let emit_len = state.decode_pending.len().saturating_sub(keep);
             if emit_len > 0 {
                 let mut raw: Vec<u8> = state.decode_pending.drain(..emit_len).collect();
-                out.extend(rewrite_prompt_input_bytes_with(normal, &raw, mask)?);
+                out.extend(rewrite_windows_vt_input_bytes_with(normal, &raw, mask)?);
                 raw.zeroize();
             }
             break;
         };
         if start > 0 {
             let mut raw: Vec<u8> = state.decode_pending.drain(..start).collect();
-            out.extend(rewrite_prompt_input_bytes_with(normal, &raw, mask)?);
+            out.extend(rewrite_windows_vt_input_bytes_with(normal, &raw, mask)?);
             raw.zeroize();
             continue;
         }
@@ -2089,6 +2091,43 @@ where
 }
 
 #[cfg(windows)]
+fn rewrite_windows_vt_input_bytes_with<F>(
+    normal: &mut PromptInputState,
+    bytes: &[u8],
+    mask: &mut F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    if normal.in_bracketed_paste {
+        return rewrite_prompt_input_bytes_with(normal, bytes, mask);
+    }
+
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if !matches!(byte, 0x08 | 0x7f) {
+            continue;
+        }
+        out.extend(rewrite_prompt_input_bytes_with(
+            normal,
+            &bytes[start..index],
+            mask,
+        )?);
+        // Terminals without ?9001 support use BS/DEL. Normalize both to the
+        // Win32 key record required by the nested Windows ConPTY.
+        out.extend_from_slice(WIN32_BACKSPACE_INPUT);
+        start = index + 1;
+    }
+    out.extend(rewrite_prompt_input_bytes_with(
+        normal,
+        &bytes[start..],
+        mask,
+    )?);
+    Ok(out)
+}
+
+#[cfg(windows)]
 fn flush_win32_paste_prefix(state: &mut Win32PromptInputState, out: &mut Vec<u8>) {
     out.append(&mut state.paste_prefix_raw);
     state.paste_prefix_text.zeroize();
@@ -2149,7 +2188,7 @@ where
     flush_win32_paste_prefix(state, &mut out);
     if !state.decode_pending.is_empty() {
         let mut raw = std::mem::take(&mut state.decode_pending);
-        out.extend(rewrite_prompt_input_bytes_with(normal, &raw, mask)?);
+        out.extend(rewrite_windows_vt_input_bytes_with(normal, &raw, mask)?);
         raw.zeroize();
     }
     out.extend(flush_prompt_input_with(normal, mask)?);
@@ -4461,6 +4500,22 @@ mod tests {
             rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, encoded, &mut mask)
                 .unwrap();
         assert_eq!(out, encoded);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prompt_input_normalizes_vt_backspace_for_nested_conpty() {
+        for encoded in [b"abc\x08".as_slice(), b"abc\x7f".as_slice()] {
+            let mut normal = PromptInputState::default();
+            let mut win32 = Win32PromptInputState::default();
+            let mut mask = |_: &str| Ok(None);
+            let out =
+                rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, encoded, &mut mask)
+                    .unwrap();
+            let mut expected = b"abc".to_vec();
+            expected.extend_from_slice(WIN32_BACKSPACE_INPUT);
+            assert_eq!(out, expected);
+        }
     }
 
     #[cfg(windows)]
