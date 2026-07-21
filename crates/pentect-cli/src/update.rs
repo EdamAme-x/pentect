@@ -2,6 +2,7 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
