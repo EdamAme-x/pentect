@@ -912,7 +912,7 @@ mod tests {
                 category: Category::Pii,
                 label: "PERSON_NAME".into(),
                 confidence: Confidence::High,
-                source: DetectorId::Extension,
+                source: DetectorId::Plugin,
             }],
             &Config::insecure_testing(),
         );
@@ -936,7 +936,7 @@ mod tests {
                 category: Category::Pii,
                 label: "EMAIL".into(),
                 confidence: Confidence::High,
-                source: DetectorId::Extension,
+                source: DetectorId::Plugin,
             }],
             &Config::insecure_testing(),
         );
@@ -1369,7 +1369,7 @@ mod tests {
 
     // Categorized recall corpus. CORE_FLOOR = what the deterministic core must
     // catch by value/structure (hard-asserted, so recall can't silently
-    // regress). EXTENSION_GAP = categories that need a non-core detector
+    // regress). PLUGIN_GAP = categories that need a non-core detector
     // (names, addresses, weak/keyed values, multilingual, locale IDs);
     // recorded, not asserted — that is the honest boundary, not a core failure.
     // Secret-shaped samples are split with concat! so no contiguous secret
@@ -1452,7 +1452,7 @@ mod tests {
         ("27AAPFU0939F1ZV", "in_gstin"),
         ("ACN 004085616", "au_acn"),
     ];
-    const EXTENSION_GAP: &[(&str, &str)] = &[
+    const PLUGIN_GAP: &[(&str, &str)] = &[
         ("John Smith", "person_name"),
         ("山田太郎", "person_name_ja"),
         (
@@ -1470,15 +1470,15 @@ mod tests {
                 "core recall floor regressed on {label}: {sample:?}"
             );
         }
-        // Sanity: the corpus exercises the floor and the known extension gap.
-        assert!(CORE_FLOOR.len() + CHECKSUM_FLOOR.len() >= 30 && EXTENSION_GAP.len() >= 4);
-        let gap_hit: Vec<&str> = EXTENSION_GAP
+        // Sanity: the corpus exercises the floor and the known plugin gap.
+        assert!(CORE_FLOOR.len() + CHECKSUM_FLOOR.len() >= 30 && PLUGIN_GAP.len() >= 4);
+        let gap_hit: Vec<&str> = PLUGIN_GAP
             .iter()
             .filter(|(s, _)| !m(s).items.is_empty())
             .map(|(_, l)| *l)
             .collect();
         eprintln!(
-            "recall corpus: floor {}/{} caught; extension_gap incidentally caught: {gap_hit:?}",
+            "recall corpus: floor {}/{} caught; plugin_gap incidentally caught: {gap_hit:?}",
             CORE_FLOOR.len() + CHECKSUM_FLOOR.len(),
             CORE_FLOOR.len() + CHECKSUM_FLOOR.len()
         );
@@ -1696,7 +1696,7 @@ mod tests {
     // measured against the default strict profile. Each sample lists the
     // values that must be masked and the benign values that must be preserved;
     // the corpus is the skeleton that real TAB / SecretBench data plugs into.
-    // Person/location names are extension/model-scope and excluded here.
+    // Person/location names are plugin/model-scope and excluded here.
     type Labeled = (
         &'static str,
         &'static [&'static str],
@@ -1811,22 +1811,22 @@ mod tests {
     // The two standing goals: surpass Presidio and surpass Azure. We measure it
     // entity-by-entity. Each entry is classified:
     //   Core    — deterministic (pattern/checksum); core MUST catch it (asserted).
-    //   Extension — language/locale-heavy entities (person, location, org,
+    //   Plugin — language/locale-heavy entities (person, location, org,
     //               nationality, address, age, person-type): no closed pattern,
-    //               so these belong behind the extension boundary. Recorded,
+    //               so these belong behind the plugin boundary. Recorded,
     //               not asserted.
     //   Todo    — deterministic but not implemented yet; the remaining gap to
     //             close for full deterministic parity. Recorded, not asserted.
     // "Surpassed" on the deterministic axis = every Core caught AND we add
     // entities neither vendor has (see EXCLUSIVE). Todo = the deterministic
-    // distance to zero-gap; Extension = entities outside deterministic core.
+    // distance to zero-gap; Plugin = entities outside deterministic core.
     #[derive(PartialEq, Clone, Copy)]
     enum Cov {
         Core,
-        Extension,
+        Plugin,
         Todo,
     }
-    use Cov::{Core, Extension, Todo};
+    use Cov::{Core, Plugin, Todo};
 
     // Microsoft Presidio predefined recognizers (entity, sample, classification).
     const PRESIDIO: &[(&str, &str, Cov)] = &[
@@ -1872,10 +1872,10 @@ mod tests {
         ("IN_VEHICLE_REGISTRATION", "vehicle KA01AB1234", Core),
         ("SG_UEN", "uen 53312345A", Core),
         ("DATE_TIME", "January 5, 1990", Todo),
-        ("PERSON", "John Smith", Extension),
-        ("LOCATION", "Mountain View", Extension),
-        ("NRP", "British", Extension),
-        ("ORGANIZATION", "Acme Corporation", Extension),
+        ("PERSON", "John Smith", Plugin),
+        ("LOCATION", "Mountain View", Plugin),
+        ("NRP", "British", Plugin),
+        ("ORGANIZATION", "Acme Corporation", Plugin),
     ];
 
     // Azure AI Language PII entity categories (representative; ~200 total, the
@@ -1919,15 +1919,15 @@ mod tests {
         ("URL", "https://example.com/x", Core),
         ("FrenchINSEE", "180047509112541", Core),
         ("DateTime", "2025-06-11", Todo),
-        ("Age", "35 years old", Extension),
+        ("Age", "35 years old", Plugin),
         (
             "Address",
             "1600 Amphitheatre Parkway, Mountain View CA",
-            Extension,
+            Plugin,
         ),
-        ("Person", "John Smith", Extension),
-        ("PersonType", "doctor", Extension),
-        ("Organization", "Microsoft", Extension),
+        ("Person", "John Smith", Plugin),
+        ("PersonType", "doctor", Plugin),
+        ("Organization", "Microsoft", Plugin),
     ];
 
     // Deterministic entities Pentect catches that NEITHER Presidio nor Azure has
@@ -1950,7 +1950,7 @@ mod tests {
             let caught = |s: &str| !m(s).items.is_empty();
             let core: Vec<_> = table.iter().filter(|(_, _, c)| *c == Core).collect();
             let todo: Vec<_> = table.iter().filter(|(_, _, c)| *c == Todo).collect();
-            let extension: Vec<_> = table.iter().filter(|(_, _, c)| *c == Extension).collect();
+            let plugin: Vec<_> = table.iter().filter(|(_, _, c)| *c == Plugin).collect();
 
             // The goal, asserted: every deterministic entity is caught.
             let core_missed: Vec<&str> = core
@@ -1965,10 +1965,10 @@ mod tests {
 
             let det_total = core.len() + todo.len();
             eprintln!(
-                "vs {name}: deterministic {}/{} covered; extension gap {}; remaining deterministic gap: {:?}",
+                "vs {name}: deterministic {}/{} covered; plugin gap {}; remaining deterministic gap: {:?}",
                 core.len(),
                 det_total,
-                extension.len(),
+                plugin.len(),
                 todo.iter().map(|(e, _, _)| *e).collect::<Vec<_>>(),
             );
         }

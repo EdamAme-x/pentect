@@ -58,6 +58,41 @@ pub fn load_pack(toml_src: &str) -> Result<Pack, String> {
     })
 }
 
+/// Parse only inline detector entries from a `plugin.toml` manifest.
+///
+/// Plugin metadata, setup commands, and release artifacts are deliberately not
+/// part of the rule-pack schema. Keeping only `detector` also means an inline
+/// regex plugin cannot disable Pentect's built-in detectors.
+pub fn load_plugin_pack(toml_src: &str) -> Result<Pack, String> {
+    let manifest: toml::Value = toml::from_str(toml_src).map_err(|e| e.to_string())?;
+    if manifest.get("schema").and_then(toml::Value::as_str) != Some("pentect.plugin.v1") {
+        return Err("plugin.toml requires schema = \"pentect.plugin.v1\"".to_string());
+    }
+    let detectors = manifest
+        .get("detector")
+        .cloned()
+        .ok_or_else(|| "plugin manifest has no [[detector]] entries".to_string())?;
+    let Some(entries) = detectors.as_array() else {
+        return Err("plugin manifest detector must be an array of tables".to_string());
+    };
+    if entries.is_empty() {
+        return Err("plugin manifest has no [[detector]] entries".to_string());
+    }
+    if entries.iter().any(|entry| {
+        entry
+            .as_table()
+            .and_then(|table| table.get("pattern"))
+            .and_then(toml::Value::as_str)
+            .is_none_or(str::is_empty)
+    }) {
+        return Err("plugin.toml inline detectors require a non-empty regex pattern".to_string());
+    }
+    let mut pack = toml::map::Map::new();
+    pack.insert("detector".to_string(), detectors);
+    let source = toml::to_string(&toml::Value::Table(pack)).map_err(|e| e.to_string())?;
+    load_pack(&source)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackFile {
@@ -143,6 +178,44 @@ fn parse_confidence(s: &str) -> Result<Confidence, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_manifest_loads_inline_detectors_only() {
+        let pack = load_plugin_pack(
+            r#"
+schema = "pentect.plugin.v1"
+name = "inline"
+
+[[postscript]]
+command = ["ignored"]
+
+[[detector]]
+pattern = "secret-[0-9]+"
+label = "INLINE_SECRET"
+"#,
+        )
+        .unwrap();
+        assert!(pack.disable.is_empty());
+    }
+
+    #[test]
+    fn plugin_manifest_requires_schema_and_regex_patterns() {
+        assert!(load_plugin_pack(
+            r#"
+[[detector]]
+pattern = "secret"
+"#
+        )
+        .is_err());
+        assert!(load_plugin_pack(
+            r#"
+schema = "pentect.plugin.v1"
+[[detector]]
+keywords = ["secret"]
+"#
+        )
+        .is_err());
+    }
     use crate::detect::{region, Detector};
     use crate::model::*;
     use crate::normalize::NormalizedView;

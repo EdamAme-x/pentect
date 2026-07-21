@@ -59,7 +59,7 @@ impl ScanOpts {
                     let value = required_value(args, &mut i, &flag)?;
                     excludes.push(value);
                 }
-                "--pack" | "--pack-dir" | "--extensions" => {
+                "--pack" | "--pack-dir" | "--plugins" => {
                     let flag = args[i].clone();
                     let _ = required_value(args, &mut i, &flag)?;
                 }

@@ -9,16 +9,16 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-pub(crate) const ADAPTERS_ENV: &str = "PENTECT_EXTENSION_ADAPTERS";
+pub(crate) const ADAPTERS_ENV: &str = "PENTECT_PLUGIN_ADAPTERS";
 
 const PENTECT_DIR: &str = ".pentect";
-const EXTENSIONS_DATA_DIR: &str = "extensions-data";
-const EXTENSION_CONFIG_FILE: &str = "config.toml";
-const EXTENSION_CACHE_DIR: &str = "cache";
-const EXTENSION_NAME_ENV: &str = "PENTECT_EXTENSION_NAME";
-const EXTENSION_DATA_DIR_ENV: &str = "PENTECT_EXTENSION_DATA_DIR";
-const EXTENSION_CACHE_DIR_ENV: &str = "PENTECT_EXTENSION_CACHE_DIR";
-const EXTENSION_CONFIG_ENV: &str = "PENTECT_EXTENSION_CONFIG";
+const PLUGINS_DATA_DIR: &str = "plugins-data";
+const PLUGIN_CONFIG_FILE: &str = "config.toml";
+const PLUGIN_CACHE_DIR: &str = "cache";
+const PLUGIN_NAME_ENV: &str = "PENTECT_PLUGIN_NAME";
+const PLUGIN_DATA_DIR_ENV: &str = "PENTECT_PLUGIN_DATA_DIR";
+const PLUGIN_CACHE_DIR_ENV: &str = "PENTECT_PLUGIN_CACHE_DIR";
+const PLUGIN_CONFIG_ENV: &str = "PENTECT_PLUGIN_CONFIG";
 const DEFAULT_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_MAX_INPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_SPANS: usize = 512;
@@ -83,24 +83,21 @@ struct ModelAdapter {
 impl ModelAdapter {
     fn load(path: &Path) -> Result<Self, String> {
         if !path.is_file() {
-            return Err(format!(
-                "extension adapter does not exist: {}",
-                path.display()
-            ));
+            return Err(format!("plugin adapter does not exist: {}", path.display()));
         }
         let src = std::fs::read_to_string(path)
-            .map_err(|e| format!("could not read extension adapter '{}': {e}", path.display()))?;
+            .map_err(|e| format!("could not read plugin adapter '{}': {e}", path.display()))?;
         let file: AdapterFile = toml::from_str(&src)
-            .map_err(|e| format!("extension adapter '{}' is invalid: {e}", path.display()))?;
+            .map_err(|e| format!("plugin adapter '{}' is invalid: {e}", path.display()))?;
         if file.schema.as_deref() != Some("pentect.model_adapter.v1") {
             return Err(format!(
-                "extension adapter '{}' requires schema = \"pentect.model_adapter.v1\"",
+                "plugin adapter '{}' requires schema = \"pentect.model_adapter.v1\"",
                 path.display()
             ));
         }
         if file.kind.as_deref() != Some("model") {
             return Err(format!(
-                "extension adapter '{}' requires kind = \"model\"",
+                "plugin adapter '{}' requires kind = \"model\"",
                 path.display()
             ));
         }
@@ -109,7 +106,7 @@ impl ModelAdapter {
             .name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| adapter_default_name(path));
-        let id = extension_id(&name);
+        let id = plugin_id(&name);
         Ok(Self {
             name,
             id,
@@ -138,15 +135,11 @@ impl ModelAdapter {
         })
         .to_string();
         let response = self.run(&request)?;
-        let parsed: AdapterResponse = serde_json::from_str(&response).map_err(|e| {
-            format!(
-                "extension adapter '{}' returned invalid JSON: {e}",
-                self.name
-            )
-        })?;
+        let parsed: AdapterResponse = serde_json::from_str(&response)
+            .map_err(|e| format!("plugin adapter '{}' returned invalid JSON: {e}", self.name))?;
         if parsed.spans.len() > self.max_spans {
             return Err(format!(
-                "extension adapter '{}' returned too many spans: {} > {}",
+                "plugin adapter '{}' returned too many spans: {} > {}",
                 self.name,
                 parsed.spans.len(),
                 self.max_spans
@@ -173,18 +166,16 @@ impl ModelAdapter {
         }
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("could not start extension adapter '{}': {e}", self.name))?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            format!(
-                "could not open stdout for extension adapter '{}'",
-                self.name
-            )
-        })?;
+            .map_err(|e| format!("could not start plugin adapter '{}': {e}", self.name))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("could not open stdout for plugin adapter '{}'", self.name))?;
         let stdout_reader = spawn_adapter_stdout_reader(stdout);
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| format!("could not open stdin for extension adapter '{}'", self.name))?;
+            .ok_or_else(|| format!("could not open stdin for plugin adapter '{}'", self.name))?;
         let stdin_writer = spawn_adapter_stdin_writer(stdin, request.as_bytes().to_vec());
 
         let status = match wait_for_adapter_child(&mut child, &self.name, self.timeout) {
@@ -199,19 +190,19 @@ impl ModelAdapter {
         let stdout = join_adapter_stdout(stdout_reader, &self.name)?;
         if stdout.len() > MAX_STDOUT_BYTES {
             return Err(format!(
-                "extension adapter '{}' returned too much output",
+                "plugin adapter '{}' returned too much output",
                 self.name
             ));
         }
         if !status.success() {
             return Err(format!(
-                "extension adapter '{}' exited with status {status}",
+                "plugin adapter '{}' exited with status {status}",
                 self.name
             ));
         }
         String::from_utf8(stdout).map_err(|e| {
             format!(
-                "extension adapter '{}' returned non-UTF-8 output: {e}",
+                "plugin adapter '{}' returned non-UTF-8 output: {e}",
                 self.name
             )
         })
@@ -254,15 +245,13 @@ fn wait_for_adapter_child(
             Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("extension adapter '{name}' timed out"));
+                return Err(format!("plugin adapter '{name}' timed out"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "could not wait for extension adapter '{name}': {e}"
-                ));
+                return Err(format!("could not wait for plugin adapter '{name}': {e}"));
             }
         }
     }
@@ -271,8 +260,8 @@ fn wait_for_adapter_child(
 fn join_adapter_stdin(writer: JoinHandle<Result<(), String>>, name: &str) -> Result<(), String> {
     writer
         .join()
-        .map_err(|_| format!("extension adapter '{name}' stdin writer panicked"))?
-        .map_err(|e| format!("extension adapter '{name}' {e}"))
+        .map_err(|_| format!("plugin adapter '{name}' stdin writer panicked"))?
+        .map_err(|e| format!("plugin adapter '{name}' {e}"))
 }
 
 fn join_adapter_stdout(
@@ -281,8 +270,8 @@ fn join_adapter_stdout(
 ) -> Result<Vec<u8>, String> {
     reader
         .join()
-        .map_err(|_| format!("extension adapter '{name}' stdout reader panicked"))?
-        .map_err(|e| format!("extension adapter '{name}' {e}"))
+        .map_err(|_| format!("plugin adapter '{name}' stdout reader panicked"))?
+        .map_err(|e| format!("plugin adapter '{name}' {e}"))
 }
 
 fn apply_adapter_child_env(command: &mut Command, id_or_name: &str) -> Result<(), String> {
@@ -292,36 +281,34 @@ fn apply_adapter_child_env(command: &mut Command, id_or_name: &str) -> Result<()
             command.env(name, value);
         }
     }
-    let id = extension_id(id_or_name);
-    let dirs = extension_runtime_dirs(&id)?;
-    command.env(EXTENSION_NAME_ENV, id);
-    command.env(EXTENSION_DATA_DIR_ENV, dirs.data_dir);
-    command.env(EXTENSION_CACHE_DIR_ENV, dirs.cache_dir);
-    command.env(EXTENSION_CONFIG_ENV, dirs.config_file);
+    let id = plugin_id(id_or_name);
+    let dirs = plugin_runtime_dirs(&id)?;
+    command.env(PLUGIN_NAME_ENV, id);
+    command.env(PLUGIN_DATA_DIR_ENV, dirs.data_dir);
+    command.env(PLUGIN_CACHE_DIR_ENV, dirs.cache_dir);
+    command.env(PLUGIN_CONFIG_ENV, dirs.config_file);
     Ok(())
 }
 
 #[derive(Debug)]
-struct ExtensionRuntimeDirs {
+struct PluginRuntimeDirs {
     data_dir: PathBuf,
     cache_dir: PathBuf,
     config_file: PathBuf,
 }
 
-fn extension_runtime_dirs(id_or_name: &str) -> Result<ExtensionRuntimeDirs, String> {
-    let id = extension_id(id_or_name);
-    let data_dir = PathBuf::from(PENTECT_DIR)
-        .join(EXTENSIONS_DATA_DIR)
-        .join(&id);
-    let cache_dir = data_dir.join(EXTENSION_CACHE_DIR);
+fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
+    let id = plugin_id(id_or_name);
+    let data_dir = PathBuf::from(PENTECT_DIR).join(PLUGINS_DATA_DIR).join(&id);
+    let cache_dir = data_dir.join(PLUGIN_CACHE_DIR);
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
         format!(
-            "could not create extension data '{}': {e}",
+            "could not create plugin data '{}': {e}",
             cache_dir.display()
         )
     })?;
-    let config_file = data_dir.join(EXTENSION_CONFIG_FILE);
-    Ok(ExtensionRuntimeDirs {
+    let config_file = data_dir.join(PLUGIN_CONFIG_FILE);
+    Ok(PluginRuntimeDirs {
         data_dir,
         cache_dir,
         config_file,
@@ -342,7 +329,7 @@ fn adapter_default_name(path: &Path) -> String {
     path.file_stem()
         .and_then(|stem| stem.to_str())
         .filter(|name| !name.trim().is_empty())
-        .unwrap_or("extension")
+        .unwrap_or("plugin")
         .to_string()
 }
 
@@ -354,15 +341,15 @@ fn adapter_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
     if looks_like_path_command(program) {
         return cwd.join(path);
     }
-    installed_extension_program(program, id)
+    installed_plugin_program(program, id)
         .or_else(|| adapter_sidecar_program(program))
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-fn installed_extension_program(program: &str, id: &str) -> Option<PathBuf> {
+fn installed_plugin_program(program: &str, id: &str) -> Option<PathBuf> {
     let bin = PathBuf::from(PENTECT_DIR)
-        .join(EXTENSIONS_DATA_DIR)
-        .join(extension_id(id))
+        .join(PLUGINS_DATA_DIR)
+        .join(plugin_id(id))
         .join("bin");
     for name in command_names(program) {
         let candidate = bin.join(name);
@@ -406,7 +393,7 @@ fn command_names(name: &str) -> Vec<String> {
     vec![name.to_string()]
 }
 
-fn extension_id(value: &str) -> String {
+fn plugin_id(value: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
     for ch in value.trim().chars() {
@@ -437,7 +424,7 @@ fn extension_id(value: &str) -> String {
         out.pop();
     }
     if out.is_empty() {
-        "extension".to_string()
+        "plugin".to_string()
     } else {
         out
     }
@@ -480,13 +467,13 @@ fn adapter_command_from_file(
 ) -> Result<Vec<String>, String> {
     let Some(command) = command else {
         return Err(format!(
-            "extension adapter '{}' requires command",
+            "plugin adapter '{}' requires command",
             path.display()
         ));
     };
     if command.is_empty() || command.iter().any(|part| part.is_empty()) {
         return Err(format!(
-            "extension adapter '{}' requires a non-empty command array",
+            "plugin adapter '{}' requires a non-empty command array",
             path.display()
         ));
     }
@@ -517,7 +504,7 @@ fn adapter_span(raw: &str, span: AdapterSpan, adapter: &str) -> Result<Span, Str
         || !raw.is_char_boundary(span.end)
     {
         return Err(format!(
-            "extension adapter '{adapter}' returned an invalid byte span {}..{}",
+            "plugin adapter '{adapter}' returned an invalid byte span {}..{}",
             span.start, span.end
         ));
     }
@@ -526,7 +513,7 @@ fn adapter_span(raw: &str, span: AdapterSpan, adapter: &str) -> Result<Span, Str
         category: parse_category(span.category.as_deref().unwrap_or("pii"), adapter)?,
         label: normalize_label(&span.label),
         confidence: parse_confidence(span.confidence.as_deref().unwrap_or("medium"), adapter)?,
-        source: DetectorId::Extension,
+        source: DetectorId::Plugin,
     })
 }
 
@@ -556,7 +543,7 @@ fn normalize_label(value: &str) -> String {
     }
     match out.chars().next() {
         Some(ch) if ch.is_ascii_alphabetic() => out,
-        _ => "EXTENSION_VALUE".to_string(),
+        _ => "PLUGIN_VALUE".to_string(),
     }
 }
 
@@ -568,7 +555,7 @@ fn parse_category(value: &str, adapter: &str) -> Result<Category, String> {
         "pii" => Ok(Category::Pii),
         "other" => Ok(Category::Other),
         other => Err(format!(
-            "extension adapter '{adapter}' returned unknown category: {other}"
+            "plugin adapter '{adapter}' returned unknown category: {other}"
         )),
     }
 }
@@ -579,7 +566,7 @@ fn parse_confidence(value: &str, adapter: &str) -> Result<Confidence, String> {
         "medium" => Ok(Confidence::Medium),
         "low" => Ok(Confidence::Low),
         other => Err(format!(
-            "extension adapter '{adapter}' returned unknown confidence: {other}"
+            "plugin adapter '{adapter}' returned unknown confidence: {other}"
         )),
     }
 }
@@ -705,7 +692,7 @@ command = ["pentect-pii-ner"]
 
     #[test]
     fn relative_adapter_program_is_resolved_from_adapter_dir() {
-        let cwd = Path::new("extensions/pii-ner");
+        let cwd = Path::new("plugins/pii-ner");
         assert_eq!(
             adapter_program("./bin/pentect-pii-ner", cwd, "pii-ner"),
             cwd.join("./bin/pentect-pii-ner")
@@ -737,7 +724,7 @@ command = ["pentect-pii-ner"]
     }
 
     #[test]
-    fn adapter_env_exposes_project_local_extension_data() {
+    fn adapter_env_exposes_project_local_plugin_data() {
         let mut command = Command::new("echo");
         apply_adapter_child_env(&mut command, "My Ext!").unwrap();
         let envs = command
@@ -752,22 +739,22 @@ command = ["pentect-pii-ner"]
             })
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(
-            envs.get(EXTENSION_NAME_ENV).map(String::as_str),
+            envs.get(PLUGIN_NAME_ENV).map(String::as_str),
             Some("my-ext")
         );
         assert!(
-            envs.get(EXTENSION_DATA_DIR_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext")),
+            envs.get(PLUGIN_DATA_DIR_ENV)
+                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext")),
             "{envs:?}"
         );
         assert!(
-            envs.get(EXTENSION_CACHE_DIR_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext/cache")),
+            envs.get(PLUGIN_CACHE_DIR_ENV)
+                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext/cache")),
             "{envs:?}"
         );
         assert!(
-            envs.get(EXTENSION_CONFIG_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext/config.toml")),
+            envs.get(PLUGIN_CONFIG_ENV)
+                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext/config.toml")),
             "{envs:?}"
         );
     }

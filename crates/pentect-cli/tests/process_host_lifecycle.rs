@@ -19,7 +19,7 @@ fn agent_replaces_stale_inherited_memory_store() {
 
 #[test]
 fn process_host_is_removed_after_argument_error() {
-    run_and_assert_clean(vec!["exec", "--extensions"], "argument-error", false);
+    run_and_assert_clean(vec!["exec", "--plugins"], "argument-error", false);
 }
 
 #[cfg(windows)]
@@ -49,10 +49,7 @@ fn run_and_assert_clean(args: Vec<&'static str>, suffix: &str, stale_store: bool
     command.args(args);
     command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
     command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
-    command.env(
-        "PENTECT_EXTENSION_CONFIGS",
-        root.join("untrusted-extension.toml"),
-    );
+    command.env("PENTECT_PLUGIN_CONFIGS", root.join("untrusted-plugin.toml"));
     let process_host_root = configure_runtime_root(&mut command, &root);
     if stale_store {
         command.env("PENTECT_MEMORY_STORE_ADDR", "127.0.0.1:9");

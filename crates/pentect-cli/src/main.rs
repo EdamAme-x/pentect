@@ -5,10 +5,10 @@ mod app_server_proxy;
 mod doctor;
 mod eval;
 mod exec_proxy;
-mod extensions;
-mod extensions_cmd;
 mod headless;
 mod input;
+mod plugins;
+mod plugins_cmd;
 mod scan;
 mod terminal;
 mod uninstall;
@@ -112,7 +112,7 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("statusline") => cmd_statusline(&args),
         Some("up") => cmd_up(&args),
         Some("doctor") => doctor::cmd_doctor(&args),
-        Some("extensions") => extensions_cmd::cmd_extensions(&args),
+        Some("plugins") => plugins_cmd::cmd_plugins(&args),
         Some("eval") => eval::cmd_eval(&args),
         Some("scan") => scan::cmd_scan(&args),
         Some(
@@ -172,7 +172,7 @@ fn usage() {
          pentect doctor\n\
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
-         pentect extensions list|inspect|test|config|setup|update [NAME]\n\
+         pentect plugins list|inspect|test|config|setup|update [NAME]\n\
          pentect eval [--json]\n\
          pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\
          pentect view <HANDLE>\n\
@@ -203,17 +203,17 @@ fn help_text() -> &'static str {
         "pentect protects AI tool boundaries.\n\n",
         "Use:\n",
         "  pentect\n",
-        "  pentect codex|claude|opencode [--extensions NAME|PATH.toml]\n",
+        "  pentect codex|claude|opencode [--plugins NAME|PATH.toml]\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect shell\n\n",
         "  pentect up\n\n",
         "  pentect doctor [--json]\n",
         "  pentect update [VERSION] [--check | --force]\n",
         "  pentect uninstall\n",
-        "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
-        "  pentect extensions config NAME|PATH [KEY=VALUE | --unset KEY]\n",
-        "  pentect extensions setup NAME|PATH [--yes]\n",
-        "  pentect extensions update NAME|PATH\n",
+        "  pentect plugins list|inspect|test [NAME|PATH] [--json]\n",
+        "  pentect plugins config NAME|PATH [KEY=VALUE | --unset KEY]\n",
+        "  pentect plugins setup NAME|PATH [--yes]\n",
+        "  pentect plugins update NAME|PATH\n",
         "  pentect eval [--json]\n\n",
         "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
@@ -232,7 +232,7 @@ fn help_text() -> &'static str {
         "doctor: readiness\n",
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
-        "extensions: list, inspect, test, config, setup, update\n",
+        "plugins: list, inspect, test, config, setup, update\n",
         "eval: precision, recall\n",
     )
 }
@@ -277,35 +277,35 @@ fn url_query_encode(value: &str) -> String {
 }
 
 fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool) -> i32 {
-    let (forward_args, explicit_extensions) = match extensions::strip_from_args(&args[start..]) {
+    let (forward_args, explicit_plugins) = match plugins::strip_from_args(&args[start..]) {
         Ok(parsed) => parsed,
         Err(e) => die(&e),
     };
-    let active_extensions = match extensions::active_from_specs(explicit_extensions, true) {
+    let active_plugins = match plugins::active_from_specs(explicit_plugins, true) {
         Ok(active) => active,
         Err(e) => die(&e),
     };
-    let config_env = match active_extensions.config_env_value() {
+    let config_env = match active_plugins.config_env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     }
     .or_else(|| {
         inherited_env_is_trusted
-            .then(|| std::env::var_os(extensions::CONFIGS_ENV))
+            .then(|| std::env::var_os(plugins::CONFIGS_ENV))
             .flatten()
     });
-    let adapter_env = match active_extensions.adapter_env_value() {
+    let adapter_env = match active_plugins.adapter_env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     }
     .or_else(|| {
         inherited_env_is_trusted
-            .then(|| std::env::var_os(extensions::ADAPTERS_ENV))
+            .then(|| std::env::var_os(plugins::ADAPTERS_ENV))
             .flatten()
     });
-    let extension_env = EnvVarGuard::set_optional([
-        (extensions::CONFIGS_ENV, config_env),
-        (extensions::ADAPTERS_ENV, adapter_env),
+    let plugin_env = EnvVarGuard::set_optional([
+        (plugins::CONFIGS_ENV, config_env),
+        (plugins::ADAPTERS_ENV, adapter_env),
     ]);
     let mut agent_args = Vec::with_capacity(forward_args.len() + 1);
     agent_args.push(
@@ -342,7 +342,7 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
     let code = pentect_agent::run_from(agent_args);
     drop(_shell_store_env);
     drop(shell_store);
-    drop(extension_env);
+    drop(plugin_env);
     code
 }
 
@@ -388,8 +388,8 @@ fn cmd_up(args: &[String]) {
     }
 }
 
-fn agent_tool_extensions(opts: &AgentToolOpts) -> Result<extensions::ActiveExtensions, String> {
-    extensions::active_from_specs(opts.extensions.clone(), true).map_err(|e| e.to_string())
+fn agent_tool_plugins(opts: &AgentToolOpts) -> Result<plugins::ActivePlugins, String> {
+    plugins::active_from_specs(opts.plugins.clone(), true).map_err(|e| e.to_string())
 }
 
 /// Read stdin as bytes (no panic on binary), cap the size, then delegate
@@ -472,7 +472,7 @@ fn validate_mask_args(args: &[String]) -> Result<(), String> {
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--kind" | "--profile" | "--input" | "--pack" | "--pack-dir" | "--extensions" => {
+            "--kind" | "--profile" | "--input" | "--pack" | "--pack-dir" | "--plugins" => {
                 let Some(value) = args.get(i + 1) else {
                     return Err(format!("{} requires a value", args[i]));
                 };
@@ -485,8 +485,8 @@ fn validate_mask_args(args: &[String]) -> Result<(), String> {
                 if args[i] == "--profile" {
                     value.parse::<Profile>()?;
                 }
-                if args[i] == "--extensions" {
-                    extensions::parse_extension_value(value).map_err(|e| e.to_string())?;
+                if args[i] == "--plugins" {
+                    plugins::parse_plugin_value(value).map_err(|e| e.to_string())?;
                 }
                 i += 2;
             }
@@ -514,25 +514,25 @@ fn cmd_read(args: &[String]) {
         Err(e) => die(&e),
     };
     let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
-    let active_extensions = match extensions::active_from_specs(opts.extensions.clone(), true) {
+    let active_plugins = match plugins::active_from_specs(opts.plugins.clone(), true) {
         Ok(active) => active,
         Err(e) => die(&e),
     };
-    let packs = match extensions::load_config_packs_from_active(&active_extensions) {
+    let packs = match plugins::load_config_packs_from_active(&active_plugins) {
         Ok(packs) => packs,
         Err(e) => die(&e),
     };
-    let config_env = match active_extensions.config_env_value() {
+    let config_env = match active_plugins.config_env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     };
-    let adapter_env = match active_extensions.adapter_env_value() {
+    let adapter_env = match active_plugins.adapter_env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     };
-    let _extension_env = EnvVarGuard::set_optional([
-        (extensions::CONFIGS_ENV, config_env),
-        (extensions::ADAPTERS_ENV, adapter_env),
+    let _plugin_env = EnvVarGuard::set_optional([
+        (plugins::CONFIGS_ENV, config_env),
+        (plugins::ADAPTERS_ENV, adapter_env),
     ]);
     let input = Input { kind, data };
     match pentect_agent::mask_input_into_active_memory_store(
@@ -616,7 +616,7 @@ struct ReadOpts {
     kind: Option<Kind>,
     profile: Profile,
     emit_meta: bool,
-    extensions: Vec<String>,
+    plugins: Vec<String>,
     path: PathBuf,
 }
 
@@ -626,7 +626,7 @@ impl ReadOpts {
         let mut kind = None;
         let mut profile = Profile::Strict;
         let mut emit_meta = false;
-        let mut extensions = Vec::new();
+        let mut plugins = Vec::new();
         let mut path = None;
         let mut i = 2;
         while i < args.len() {
@@ -645,16 +645,13 @@ impl ReadOpts {
                     emit_meta = true;
                     i += 1;
                 }
-                "--extensions" => {
-                    for spec in extensions::parse_extension_value(&required_value(
-                        args,
-                        &mut i,
-                        "--extensions",
-                    )?)
-                    .map_err(|e| e.to_string())?
+                "--plugins" => {
+                    for spec in
+                        plugins::parse_plugin_value(&required_value(args, &mut i, "--plugins")?)
+                            .map_err(|e| e.to_string())?
                     {
-                        if !extensions.iter().any(|existing| existing == &spec) {
-                            extensions.push(spec);
+                        if !plugins.iter().any(|existing| existing == &spec) {
+                            plugins.push(spec);
                         }
                     }
                 }
@@ -673,7 +670,7 @@ impl ReadOpts {
             kind,
             profile,
             emit_meta,
-            extensions,
+            plugins,
             path: path.ok_or_else(|| "read requires PATH".to_string())?,
         })
     }
@@ -706,7 +703,7 @@ struct AgentToolOpts {
     session: Option<String>,
     pentect: Option<PathBuf>,
     command: PathBuf,
-    extensions: Vec<String>,
+    plugins: Vec<String>,
     dry_run: bool,
     codex_app_server_proxy_disabled: bool,
     tool_args: Vec<String>,
@@ -717,7 +714,7 @@ impl AgentToolOpts {
         let mut session = None;
         let mut pentect = None;
         let mut command = PathBuf::from(tool.default_command());
-        let mut extensions = Vec::new();
+        let mut plugins = Vec::new();
         let mut dry_run = false;
         let mut codex_app_server_proxy_disabled = false;
         let mut tool_args = Vec::new();
@@ -744,16 +741,13 @@ impl AgentToolOpts {
                 flag if flag == tool.path_flag() => {
                     command = PathBuf::from(required_value(args, &mut i, flag)?);
                 }
-                "--extensions" => {
-                    for name in extensions::parse_extension_value(&required_value(
-                        args,
-                        &mut i,
-                        "--extensions",
-                    )?)
-                    .map_err(|e| e.to_string())?
+                "--plugins" => {
+                    for name in
+                        plugins::parse_plugin_value(&required_value(args, &mut i, "--plugins")?)
+                            .map_err(|e| e.to_string())?
                     {
-                        if !extensions.iter().any(|existing| existing == &name) {
-                            extensions.push(name);
+                        if !plugins.iter().any(|existing| existing == &name) {
+                            plugins.push(name);
                         }
                     }
                 }
@@ -778,7 +772,7 @@ impl AgentToolOpts {
             session,
             pentect,
             command,
-            extensions,
+            plugins,
             dry_run,
             codex_app_server_proxy_disabled,
             tool_args,
@@ -792,14 +786,10 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         &pentect_agent::load_environment_variable_prefix()?,
     );
     let status_line_enabled = status_line_enabled_by_config()?;
-    let active_extensions = agent_tool_extensions(opts)?;
+    let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
-    let _parent_env = agent_parent_env_guard(
-        pentect,
-        &memory_store,
-        status_line_enabled,
-        &active_extensions,
-    )?;
+    let _parent_env =
+        agent_parent_env_guard(pentect, &memory_store, status_line_enabled, &active_plugins)?;
     let tool_args = headless::protect_prompt_args(headless::AgentKind::Codex, &opts.tool_args)?;
     let headless_command = codex_headless_agent_command(&tool_args);
     let (tool_args, _protected_images) = if headless_command && !opts.dry_run {
@@ -822,7 +812,7 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     }
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
-    apply_extension_env(&mut cmd, &active_extensions)?;
+    apply_plugin_env(&mut cmd, &active_plugins)?;
     let exec_proxy = if codex_unified_exec_proxy_enabled(&tool_args) {
         Some(exec_proxy::ExecProxyGuard::start(&opts.command)?)
     } else {
@@ -892,15 +882,11 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     let contract = pentect_agent::agent_contract_instructions(
         &pentect_agent::load_environment_variable_prefix()?,
     );
-    let active_extensions = agent_tool_extensions(opts)?;
+    let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
     let status_line_enabled = status_line_enabled_by_config()?;
-    let _parent_env = agent_parent_env_guard(
-        pentect,
-        &memory_store,
-        status_line_enabled,
-        &active_extensions,
-    )?;
+    let _parent_env =
+        agent_parent_env_guard(pentect, &memory_store, status_line_enabled, &active_plugins)?;
     let tool_args = headless::protect_prompt_args(headless::AgentKind::Claude, &opts.tool_args)?;
     let input_mode = headless::claude_input_mode(&tool_args);
     let output_mode = headless::claude_output_mode(&tool_args);
@@ -917,7 +903,7 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     }
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
-    apply_extension_env(&mut cmd, &active_extensions)?;
+    apply_plugin_env(&mut cmd, &active_plugins)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
     apply_status_line_env(&mut cmd, status_line_enabled);
@@ -942,18 +928,14 @@ fn run_bridge_agent(
         return Ok(success_status());
     }
 
-    let active_extensions = agent_tool_extensions(opts)?;
+    let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
     let status_line_enabled = status_line_enabled_by_config()?;
-    let _parent_env = agent_parent_env_guard(
-        pentect,
-        &memory_store,
-        status_line_enabled,
-        &active_extensions,
-    )?;
+    let _parent_env =
+        agent_parent_env_guard(pentect, &memory_store, status_line_enabled, &active_plugins)?;
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
-    apply_extension_env(&mut cmd, &active_extensions)?;
+    apply_plugin_env(&mut cmd, &active_plugins)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
     apply_status_line_env(&mut cmd, status_line_enabled);
@@ -2626,12 +2608,12 @@ fn agent_parent_env_guard(
     pentect: &Path,
     memory_store: &MemoryStoreGuard,
     status_line_enabled: bool,
-    active_extensions: &extensions::ActiveExtensions,
+    active_plugins: &plugins::ActivePlugins,
 ) -> Result<EnvVarGuard, String> {
-    let config_env = active_extensions
+    let config_env = active_plugins
         .config_env_value()
         .map_err(|e| e.to_string())?;
-    let adapter_env = active_extensions
+    let adapter_env = active_plugins
         .adapter_env_value()
         .map_err(|e| e.to_string())?;
     Ok(EnvVarGuard::set_optional([
@@ -2652,8 +2634,8 @@ fn agent_parent_env_guard(
             PENTECT_STATUS_LINE_ENV,
             Some(OsString::from(if status_line_enabled { "1" } else { "0" })),
         ),
-        (extensions::CONFIGS_ENV, config_env),
-        (extensions::ADAPTERS_ENV, adapter_env),
+        (plugins::CONFIGS_ENV, config_env),
+        (plugins::ADAPTERS_ENV, adapter_env),
     ]))
 }
 
@@ -2910,15 +2892,12 @@ fn codex_environments_toml(exec_proxy_url: &str) -> String {
     )
 }
 
-fn apply_extension_env(
-    cmd: &mut Command,
-    active: &extensions::ActiveExtensions,
-) -> Result<(), String> {
+fn apply_plugin_env(cmd: &mut Command, active: &plugins::ActivePlugins) -> Result<(), String> {
     if let Some(value) = active.config_env_value().map_err(|e| e.to_string())? {
-        cmd.env(extensions::CONFIGS_ENV, value);
+        cmd.env(plugins::CONFIGS_ENV, value);
     }
     if let Some(value) = active.adapter_env_value().map_err(|e| e.to_string())? {
-        cmd.env(extensions::ADAPTERS_ENV, value);
+        cmd.env(plugins::ADAPTERS_ENV, value);
     }
     Ok(())
 }
@@ -3671,7 +3650,7 @@ fn load_packs(args: &[String]) -> Result<Vec<Pack>, String> {
         let pack = load_pack(&src).map_err(|e| format!("pack '{display}' is invalid: {e}"))?;
         packs.push(pack);
     }
-    packs.extend(extensions::load_config_packs_from_args(args, true).map_err(|e| e.to_string())?);
+    packs.extend(plugins::load_config_packs_from_args(args, true).map_err(|e| e.to_string())?);
     Ok(packs)
 }
 
@@ -3810,11 +3789,11 @@ mod tests {
     }
 
     #[test]
-    fn mask_accepts_extension_names() {
+    fn mask_accepts_plugin_names() {
         let args = vec![
             "pentect".into(),
             "mask".into(),
-            "--extensions".into(),
+            "--plugins".into(),
             "openai-privacy-filter,local.rules".into(),
         ];
         assert!(validate_mask_args(&args).is_ok());
@@ -3860,18 +3839,18 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_parse_consumes_extensions_before_tool_args() {
+    fn agent_tool_parse_consumes_plugins_before_tool_args() {
         let args = vec![
             "pentect".to_string(),
             "codex".to_string(),
-            "--extensions".to_string(),
+            "--plugins".to_string(),
             "openai-privacy-filter,local.rules".to_string(),
             "--".to_string(),
             "hello".to_string(),
         ];
         let opts = AgentToolOpts::parse(AgentTool::Codex, &args).unwrap();
         assert_eq!(
-            opts.extensions,
+            opts.plugins,
             vec![
                 "openai-privacy-filter".to_string(),
                 "local.rules".to_string()
@@ -3925,7 +3904,7 @@ mod tests {
         assert!(!help.contains("agent exec"), "{help}");
         assert!(!help.contains("bench"), "{help}");
         assert!(help.contains("doctor: readiness"), "{help}");
-        assert!(help.contains("extensions: list, inspect, test"), "{help}");
+        assert!(help.contains("plugins: list, inspect, test"), "{help}");
         assert!(help.contains("eval: precision, recall"), "{help}");
         assert!(
             help.contains("scan: secrets; gitignore on; --no-gitignore broadens"),
@@ -4636,7 +4615,7 @@ mod tests {
             "view",
             "statusline",
             "doctor",
-            "extensions",
+            "plugins",
             "eval",
             "scan",
             "resolve",

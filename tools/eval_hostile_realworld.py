@@ -12,7 +12,7 @@ No-cheat rule for using this corpus:
 - Do not hard-code generated values, names, addresses, counts, or case IDs.
 - Only add detectors that generalize to a documented syntax, protocol, or
   defensible context pattern.
-- Language-heavy PII should be handled behind the extension/model boundary, not by
+- Language-heavy PII should be handled behind the plugin/model boundary, not by
   copying names from this file into core regexes.
 """
 
@@ -109,7 +109,7 @@ def build_cases(scale: int) -> list[Case]:
         cases.extend(ops_log_cases(round_no))
         cases.extend(encoded_and_fragmented_cases(round_no))
         cases.extend(low_entropy_keyed_cases(round_no))
-        cases.extend(extension_pii_cases(round_no))
+        cases.extend(plugin_pii_cases(round_no))
         cases.extend(benign_near_miss_cases(round_no))
     return cases
 
@@ -288,7 +288,7 @@ def low_entropy_keyed_cases(round_no: int) -> list[Case]:
     return cases
 
 
-def extension_pii_cases(round_no: int) -> list[Case]:
+def plugin_pii_cases(round_no: int) -> list[Case]:
     cases: list[Case] = []
     names = [
         "Alice Tanaka",
@@ -335,15 +335,15 @@ def extension_pii_cases(round_no: int) -> list[Case]:
         )
         cases.append(
             Case(
-                f"extension_pii_{n}",
+                f"plugin_pii_{n}",
                 text,
                 (
-                    target(name, "extension_pii", "person name"),
-                    target(org, "extension_pii", "organization"),
-                    target(street, "extension_pii", "street address"),
+                    target(name, "plugin_pii", "person name"),
+                    target(org, "plugin_pii", "organization"),
+                    target(street, "plugin_pii", "street address"),
                     target(patient_id, "case_identifier", "patient/customer case id"),
-                    target(japanese_name, "extension_pii", "Japanese person name"),
-                    target(japanese_addr, "extension_pii", "Japanese address"),
+                    target(japanese_name, "plugin_pii", "Japanese person name"),
+                    target(japanese_addr, "plugin_pii", "Japanese address"),
                 ),
                 (
                     "sprint=42",

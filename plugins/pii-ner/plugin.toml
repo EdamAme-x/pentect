@@ -1,4 +1,4 @@
-schema = "pentect.extension.v1"
+schema = "pentect.plugin.v1"
 name = "pii-ner"
 description = "Local ONNX PII named-entity recognition adapter."
 

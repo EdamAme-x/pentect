@@ -1,5 +1,4 @@
-use crate::{extensions, update};
-use pentect_core::load_pack;
+use crate::{plugins, update};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -10,27 +9,27 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const PENTECT_DIR: &str = ".pentect";
-const EXTENSIONS_DATA_DIR: &str = "extensions-data";
-const EXTENSION_CONFIG_FILE: &str = "config.toml";
-const EXTENSION_CACHE_DIR: &str = "cache";
-const EXTENSION_NAME_ENV: &str = "PENTECT_EXTENSION_NAME";
-const EXTENSION_DATA_DIR_ENV: &str = "PENTECT_EXTENSION_DATA_DIR";
-const EXTENSION_CACHE_DIR_ENV: &str = "PENTECT_EXTENSION_CACHE_DIR";
-const EXTENSION_CONFIG_ENV: &str = "PENTECT_EXTENSION_CONFIG";
+const PLUGINS_DATA_DIR: &str = "plugins-data";
+const PLUGIN_CONFIG_FILE: &str = "config.toml";
+const PLUGIN_CACHE_DIR: &str = "cache";
+const PLUGIN_NAME_ENV: &str = "PENTECT_PLUGIN_NAME";
+const PLUGIN_DATA_DIR_ENV: &str = "PENTECT_PLUGIN_DATA_DIR";
+const PLUGIN_CACHE_DIR_ENV: &str = "PENTECT_PLUGIN_CACHE_DIR";
+const PLUGIN_CONFIG_ENV: &str = "PENTECT_PLUGIN_CONFIG";
 const MAX_STDOUT_BYTES: usize = 1024 * 1024;
 
-pub(crate) fn cmd_extensions(args: &[String]) {
-    let opts = match ExtensionCmd::parse(args) {
+pub(crate) fn cmd_plugins(args: &[String]) {
+    let opts = match PluginCmd::parse(args) {
         Ok(opts) => opts,
         Err(e) => crate::die(e),
     };
     let result = match opts.action {
-        Action::List => list_extensions(opts.json),
-        Action::Inspect { spec } => inspect_extension(&spec, opts.json),
-        Action::Test { spec } => test_extension(&spec, opts.json),
-        Action::Config { spec, change } => config_extension(&spec, change, opts.json),
-        Action::Setup { spec, approved } => setup_extension(&spec, approved, opts.json),
-        Action::Update { spec } => update_extension(&spec, opts.json),
+        Action::List => list_plugins(opts.json),
+        Action::Inspect { spec } => inspect_plugin(&spec, opts.json),
+        Action::Test { spec } => test_plugin(&spec, opts.json),
+        Action::Config { spec, change } => config_plugin(&spec, change, opts.json),
+        Action::Setup { spec, approved } => setup_plugin(&spec, approved, opts.json),
+        Action::Update { spec } => update_plugin(&spec, opts.json),
     };
     if let Err(e) = result {
         crate::die(e);
@@ -38,7 +37,7 @@ pub(crate) fn cmd_extensions(args: &[String]) {
 }
 
 #[derive(Debug)]
-struct ExtensionCmd {
+struct PluginCmd {
     action: Action,
     json: bool,
 }
@@ -60,10 +59,10 @@ enum ConfigChange {
     Unset(String),
 }
 
-impl ExtensionCmd {
+impl PluginCmd {
     fn parse(args: &[String]) -> Result<Self, String> {
         let Some(action) = args.get(2).map(String::as_str) else {
-            return Err("extensions list|inspect|test|config|setup|update".to_string());
+            return Err("plugins list|inspect|test|config|setup|update".to_string());
         };
         let mut json = false;
         let mut approved = false;
@@ -90,58 +89,56 @@ impl ExtensionCmd {
             "list" => {
                 reject_action_flags(approved, unset.as_deref())?;
                 if !values.is_empty() {
-                    return Err("extensions list".to_string());
+                    return Err("plugins list".to_string());
                 }
                 Action::List
             }
             "inspect" => {
                 reject_action_flags(approved, unset.as_deref())?;
                 Action::Inspect {
-                    spec: one_value("extensions inspect", values)?,
+                    spec: one_value("plugins inspect", values)?,
                 }
             }
             "test" => {
                 reject_action_flags(approved, unset.as_deref())?;
                 Action::Test {
-                    spec: one_value("extensions test", values)?,
+                    spec: one_value("plugins test", values)?,
                 }
             }
             "config" => {
                 if approved {
-                    return Err("--yes is only valid for extensions setup".to_string());
+                    return Err("--yes is only valid for plugins setup".to_string());
                 }
                 let spec = values
                     .first()
                     .cloned()
-                    .ok_or_else(|| "extensions config NAME|PATH [KEY=VALUE]".to_string())?;
+                    .ok_or_else(|| "plugins config NAME|PATH [KEY=VALUE]".to_string())?;
                 let change = match (values.get(1), values.get(2), unset) {
                     (None, None, None) => ConfigChange::Show,
                     (Some(value), None, None) => ConfigChange::Set(value.clone()),
                     (None, None, Some(key)) => ConfigChange::Unset(key),
                     _ => {
-                        return Err(
-                            "extensions config NAME|PATH [KEY=VALUE | --unset KEY]".to_string()
-                        )
+                        return Err("plugins config NAME|PATH [KEY=VALUE | --unset KEY]".to_string())
                     }
                 };
                 Action::Config { spec, change }
             }
             "setup" => {
                 if unset.is_some() {
-                    return Err("--unset is only valid for extensions config".to_string());
+                    return Err("--unset is only valid for plugins config".to_string());
                 }
                 Action::Setup {
-                    spec: one_value("extensions setup", values)?,
+                    spec: one_value("plugins setup", values)?,
                     approved,
                 }
             }
             "update" => {
                 reject_action_flags(approved, unset.as_deref())?;
                 Action::Update {
-                    spec: one_value("extensions update", values)?,
+                    spec: one_value("plugins update", values)?,
                 }
             }
-            other => return Err(format!("unknown extensions command: {other}")),
+            other => return Err(format!("unknown plugins command: {other}")),
         };
         Ok(Self { action, json })
     }
@@ -149,10 +146,10 @@ impl ExtensionCmd {
 
 fn reject_action_flags(approved: bool, unset: Option<&str>) -> Result<(), String> {
     if approved {
-        return Err("--yes is only valid for extensions setup".to_string());
+        return Err("--yes is only valid for plugins setup".to_string());
     }
     if unset.is_some() {
-        return Err("--unset is only valid for extensions config".to_string());
+        return Err("--unset is only valid for plugins config".to_string());
     }
     Ok(())
 }
@@ -164,14 +161,14 @@ fn one_value(command: &str, values: Vec<String>) -> Result<String, String> {
     }
 }
 
-fn list_extensions(json_output: bool) -> Result<(), String> {
-    let mut rows = extension_rows()?;
+fn list_plugins(json_output: bool) -> Result<(), String> {
+    let mut rows = plugin_rows()?;
     rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.source.cmp(b.source)));
     if json_output {
         println!(
             "{}",
             json!({
-                "extensions": rows.iter().map(|row| json!({
+                "plugins": rows.iter().map(|row| json!({
                     "name": row.name,
                     "source": row.source,
                     "status": row.status(),
@@ -199,15 +196,15 @@ fn list_extensions(json_output: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn inspect_extension(spec: &str, json_output: bool) -> Result<(), String> {
+fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let active = active_for_one(spec)?;
-    let source = extensions::extension_source(spec).map_err(|e| e.to_string())?;
-    let manifest = load_extension_manifest(&source)?;
+    let source = plugins::plugin_source(spec).map_err(|e| e.to_string())?;
+    let manifest = load_plugin_manifest(&source)?;
     if json_output {
         println!(
             "{}",
             json!({
-                "name": extension_name(&source, manifest.as_ref()),
+                "name": plugin_name(&source, manifest.as_ref()),
                 "description": manifest.as_ref().and_then(|manifest| manifest.description.as_deref()),
                 "manifest": source.manifest_path.as_deref().map(display_path),
                 "configs": active.config_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
@@ -218,7 +215,7 @@ fn inspect_extension(spec: &str, json_output: bool) -> Result<(), String> {
         );
         return Ok(());
     }
-    println!("name: {}", extension_name(&source, manifest.as_ref()));
+    println!("name: {}", plugin_name(&source, manifest.as_ref()));
     if let Some(description) = manifest
         .as_ref()
         .and_then(|manifest| manifest.description.as_deref())
@@ -253,7 +250,7 @@ fn inspect_extension(spec: &str, json_output: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn test_extension(spec: &str, json_output: bool) -> Result<(), String> {
+fn test_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let active = active_for_one(spec)?;
     let mut checks = Vec::new();
     for path in active.config_paths() {
@@ -263,7 +260,7 @@ fn test_extension(spec: &str, json_output: bool) -> Result<(), String> {
         checks.push(test_adapter(path));
     }
     if checks.is_empty() {
-        checks.push(Check::fail("extension", "empty"));
+        checks.push(Check::fail("plugin", "empty"));
     }
     if json_output {
         println!(
@@ -282,13 +279,13 @@ fn test_extension(spec: &str, json_output: bool) -> Result<(), String> {
         }
     }
     if checks.iter().any(|check| check.status == Status::Fail) {
-        return Err("extension test failed".to_string());
+        return Err("plugin test failed".to_string());
     }
     Ok(())
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct ExtensionManifest {
+struct PluginManifest {
     schema: Option<String>,
     name: Option<String>,
     description: Option<String>,
@@ -317,27 +314,21 @@ struct Postscript {
     timeout_ms: Option<u64>,
 }
 
-fn load_extension_manifest(
-    source: &extensions::ExtensionSource,
-) -> Result<Option<ExtensionManifest>, String> {
+fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginManifest>, String> {
     let Some(path) = &source.manifest_path else {
         return Ok(None);
     };
     let src = std::fs::read_to_string(path).map_err(|e| {
         format!(
-            "could not read extension manifest '{}': {e}",
+            "could not read plugin manifest '{}': {e}",
             display_path(path)
         )
     })?;
-    let manifest: ExtensionManifest = toml::from_str(&src)
-        .map_err(|e| format!("invalid extension manifest '{}': {e}", display_path(path)))?;
-    if manifest
-        .schema
-        .as_deref()
-        .is_some_and(|schema| schema != "pentect.extension.v1")
-    {
+    let manifest: PluginManifest = toml::from_str(&src)
+        .map_err(|e| format!("invalid plugin manifest '{}': {e}", display_path(path)))?;
+    if manifest.schema.as_deref() != Some("pentect.plugin.v1") {
         return Err(format!(
-            "unsupported extension schema in '{}': {}",
+            "plugin manifest '{}' requires schema = \"pentect.plugin.v1\"; found '{}'",
             display_path(path),
             manifest.schema.as_deref().unwrap_or_default()
         ));
@@ -345,10 +336,7 @@ fn load_extension_manifest(
     Ok(Some(manifest))
 }
 
-fn extension_name(
-    source: &extensions::ExtensionSource,
-    manifest: Option<&ExtensionManifest>,
-) -> String {
+fn plugin_name(source: &plugins::PluginSource, manifest: Option<&PluginManifest>) -> String {
     manifest
         .and_then(|manifest| manifest.name.as_deref())
         .filter(|name| !name.trim().is_empty())
@@ -356,13 +344,13 @@ fn extension_name(
         .to_string()
 }
 
-fn config_extension(spec: &str, change: ConfigChange, json_output: bool) -> Result<(), String> {
-    let source = extensions::extension_source(spec).map_err(|e| e.to_string())?;
-    let manifest = load_extension_manifest(&source)?;
-    let name = extension_name(&source, manifest.as_ref());
-    let dirs = extension_runtime_dirs(&extension_id(&name))?;
+fn config_plugin(spec: &str, change: ConfigChange, json_output: bool) -> Result<(), String> {
+    let source = plugins::plugin_source(spec).map_err(|e| e.to_string())?;
+    let manifest = load_plugin_manifest(&source)?;
+    let name = plugin_name(&source, manifest.as_ref());
+    let dirs = plugin_runtime_dirs(&plugin_id(&name))?;
     let path = dirs.config_file;
-    let mut table = read_extension_config(&path)?;
+    let mut table = read_plugin_config(&path)?;
     let action = match change {
         ConfigChange::Show => "show",
         ConfigChange::Set(assignment) => {
@@ -375,14 +363,14 @@ fn config_extension(spec: &str, change: ConfigChange, json_output: bool) -> Resu
             }
             let update = parse_config_assignment(key, raw_value.trim())?;
             merge_toml_tables(&mut table, update);
-            write_extension_config(&path, &table)?;
+            write_plugin_config(&path, &table)?;
             "set"
         }
         ConfigChange::Unset(key) => {
             if !remove_toml_key(&mut table, &key)? {
                 return Err(format!("config key was not set: {key}"));
             }
-            write_extension_config(&path, &table)?;
+            write_plugin_config(&path, &table)?;
             "unset"
         }
     };
@@ -411,18 +399,13 @@ fn config_extension(spec: &str, change: ConfigChange, json_output: bool) -> Resu
     Ok(())
 }
 
-fn read_extension_config(path: &Path) -> Result<toml::Table, String> {
+fn read_plugin_config(path: &Path) -> Result<toml::Table, String> {
     if !path.exists() {
         return Ok(toml::Table::new());
     }
-    let src = std::fs::read_to_string(path).map_err(|e| {
-        format!(
-            "could not read extension config '{}': {e}",
-            display_path(path)
-        )
-    })?;
-    toml::from_str(&src)
-        .map_err(|e| format!("invalid extension config '{}': {e}", display_path(path)))
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read plugin config '{}': {e}", display_path(path)))?;
+    toml::from_str(&src).map_err(|e| format!("invalid plugin config '{}': {e}", display_path(path)))
 }
 
 fn parse_config_assignment(key: &str, value: &str) -> Result<toml::Table, String> {
@@ -484,20 +467,20 @@ fn remove_toml_key_parts(table: &mut toml::Table, parts: &[&str]) -> Result<bool
     Ok(removed)
 }
 
-fn write_extension_config(path: &Path, table: &toml::Table) -> Result<(), String> {
+fn write_plugin_config(path: &Path, table: &toml::Table) -> Result<(), String> {
     let parent = path
         .parent()
-        .ok_or_else(|| "invalid extension config path".to_string())?;
+        .ok_or_else(|| "invalid plugin config path".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| {
         format!(
-            "could not create extension config dir '{}': {e}",
+            "could not create plugin config dir '{}': {e}",
             display_path(parent)
         )
     })?;
     let src = toml::to_string_pretty(table).map_err(|e| format!("could not encode config: {e}"))?;
     std::fs::write(path, src).map_err(|e| {
         format!(
-            "could not write extension config '{}': {e}",
+            "could not write plugin config '{}': {e}",
             display_path(path)
         )
     })
@@ -524,14 +507,14 @@ fn toml_leaf_keys(table: &toml::Table) -> Vec<String> {
     keys
 }
 
-fn setup_extension(spec: &str, approved: bool, json_output: bool) -> Result<(), String> {
+fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), String> {
     if json_output {
-        return Err("extensions setup does not support --json".to_string());
+        return Err("plugins setup does not support --json".to_string());
     }
-    let source = extensions::extension_source(spec).map_err(|e| e.to_string())?;
-    let manifest = load_extension_manifest(&source)?
-        .ok_or_else(|| format!("extension '{}' has no extension.toml", source.name))?;
-    let name = extension_name(&source, Some(&manifest));
+    let source = plugins::plugin_source(spec).map_err(|e| e.to_string())?;
+    let manifest = load_plugin_manifest(&source)?
+        .ok_or_else(|| format!("plugin '{}' has no plugin.toml", source.name))?;
+    let name = plugin_name(&source, Some(&manifest));
     let steps = manifest
         .postscript
         .iter()
@@ -541,7 +524,7 @@ fn setup_extension(spec: &str, approved: bool, json_output: bool) -> Result<(), 
         println!("setup: nothing to do for {}", current_platform());
         return Ok(());
     }
-    println!("extension: {name}");
+    println!("plugin: {name}");
     if let Some(description) = manifest.description.as_deref() {
         println!("description: {description}");
     }
@@ -551,7 +534,7 @@ fn setup_extension(spec: &str, approved: bool, json_output: bool) -> Result<(), 
             .manifest_path
             .as_deref()
             .map(display_path)
-            .unwrap_or_else(|| "extension.toml".to_string())
+            .unwrap_or_else(|| "plugin.toml".to_string())
     );
     for artifact in &manifest.artifact {
         let asset = artifact_asset(artifact)?;
@@ -574,7 +557,7 @@ fn setup_extension(spec: &str, approved: bool, json_output: bool) -> Result<(), 
         println!("  permissions: {}", step.permissions.join(", "));
     }
     if !approved && !confirm_setup()? {
-        return Err("extension setup was not approved".to_string());
+        return Err("plugin setup was not approved".to_string());
     }
     for artifact in &manifest.artifact {
         install_release_artifact(&name, artifact)?;
@@ -586,14 +569,14 @@ fn setup_extension(spec: &str, approved: bool, json_output: bool) -> Result<(), 
     Ok(())
 }
 
-fn update_extension(spec: &str, json_output: bool) -> Result<(), String> {
+fn update_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     if json_output {
-        return Err("extensions update does not support --json".to_string());
+        return Err("plugins update does not support --json".to_string());
     }
-    let source = extensions::extension_source(spec).map_err(|e| e.to_string())?;
-    let manifest = load_extension_manifest(&source)?
-        .ok_or_else(|| format!("extension '{}' has no extension.toml", source.name))?;
-    let name = extension_name(&source, Some(&manifest));
+    let source = plugins::plugin_source(spec).map_err(|e| e.to_string())?;
+    let manifest = load_plugin_manifest(&source)?
+        .ok_or_else(|| format!("plugin '{}' has no plugin.toml", source.name))?;
+    let name = plugin_name(&source, Some(&manifest));
     if manifest.artifact.is_empty() {
         println!("update: no release artifacts for {name}");
         return Ok(());
@@ -612,7 +595,7 @@ fn artifact_platform_key() -> Result<String, String> {
         ("macos", "x86_64") => Ok("macos-x86_64".to_string()),
         ("macos", "aarch64") => Ok("macos-aarch64".to_string()),
         (os, arch) => Err(format!(
-            "extension artifacts are not published for {os}/{arch}"
+            "plugin artifacts are not published for {os}/{arch}"
         )),
     }
 }
@@ -625,7 +608,7 @@ fn artifact_asset(artifact: &ReleaseArtifact) -> Result<&str, String> {
         .map(String::as_str)
         .ok_or_else(|| {
             format!(
-                "extension artifact '{}' has no asset for {platform}",
+                "plugin artifact '{}' has no asset for {platform}",
                 artifact.name
             )
         })
@@ -645,14 +628,14 @@ fn artifact_destination(name: &str, artifact: &ReleaseArtifact) -> Result<PathBu
         })
     {
         return Err(format!(
-            "extension artifact '{}' has unsafe destination: {raw}",
+            "plugin artifact '{}' has unsafe destination: {raw}",
             artifact.name
         ));
     }
     if cfg!(windows) && relative.extension().is_none() {
         relative.set_extension("exe");
     }
-    let dirs = extension_runtime_dirs(&extension_id(name))?;
+    let dirs = plugin_runtime_dirs(&plugin_id(name))?;
     Ok(dirs.data_dir.join(relative))
 }
 
@@ -669,10 +652,10 @@ fn install_release_artifact(name: &str, artifact: &ReleaseArtifact) -> Result<()
     }
     let parent = destination
         .parent()
-        .ok_or_else(|| "extension artifact destination has no parent".to_string())?;
+        .ok_or_else(|| "plugin artifact destination has no parent".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| {
         format!(
-            "could not create extension artifact directory '{}': {e}",
+            "could not create plugin artifact directory '{}': {e}",
             parent.display()
         )
     })?;
@@ -686,11 +669,11 @@ fn install_release_artifact(name: &str, artifact: &ReleaseArtifact) -> Result<()
         std::process::id()
     ));
     std::fs::write(&staged, &download.bytes)
-        .map_err(|e| format!("could not stage extension artifact: {e}"))?;
+        .map_err(|e| format!("could not stage plugin artifact: {e}"))?;
     mark_artifact_executable(&staged)?;
     if sha256_path(&staged)? != download.sha256 {
         let _ = std::fs::remove_file(&staged);
-        return Err("staged extension artifact checksum mismatch".to_string());
+        return Err("staged plugin artifact checksum mismatch".to_string());
     }
     replace_artifact(&staged, &destination)?;
     println!("artifact {}: installed {}", artifact.name, download.version);
@@ -699,19 +682,15 @@ fn install_release_artifact(name: &str, artifact: &ReleaseArtifact) -> Result<()
 
 fn sha256_path(path: &Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).map_err(|e| {
-        format!(
-            "could not verify extension artifact '{}': {e}",
-            path.display()
-        )
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("could not verify plugin artifact '{}': {e}", path.display()))?;
     Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)))
 }
 
 fn replace_artifact(staged: &Path, destination: &Path) -> Result<(), String> {
     if !destination.exists() {
         return std::fs::rename(staged, destination)
-            .map_err(|e| format!("could not install extension artifact: {e}"));
+            .map_err(|e| format!("could not install plugin artifact: {e}"));
     }
     let backup = destination.with_extension(format!(
         "{}previous",
@@ -723,17 +702,17 @@ fn replace_artifact(staged: &Path, destination: &Path) -> Result<(), String> {
     ));
     if backup.exists() {
         std::fs::remove_file(&backup)
-            .map_err(|e| format!("could not remove old extension artifact backup: {e}"))?;
+            .map_err(|e| format!("could not remove old plugin artifact backup: {e}"))?;
     }
     std::fs::rename(destination, &backup).map_err(|e| {
         format!(
-            "could not replace running extension artifact '{}': {e}",
+            "could not replace running plugin artifact '{}': {e}",
             destination.display()
         )
     })?;
     if let Err(error) = std::fs::rename(staged, destination) {
         let _ = std::fs::rename(&backup, destination);
-        return Err(format!("could not install extension artifact: {error}"));
+        return Err(format!("could not install plugin artifact: {error}"));
     }
     Ok(())
 }
@@ -742,7 +721,7 @@ fn replace_artifact(staged: &Path, destination: &Path) -> Result<(), String> {
 fn mark_artifact_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("could not mark extension artifact executable: {e}"))
+        .map_err(|e| format!("could not mark plugin artifact executable: {e}"))
 }
 
 #[cfg(windows)]
@@ -786,9 +765,9 @@ fn validate_postscript(step: &Postscript) -> Result<(), String> {
 
 fn confirm_setup() -> Result<bool, String> {
     if !std::io::stdin().is_terminal() {
-        return Err("extension setup requires interactive approval or --yes".to_string());
+        return Err("plugin setup requires interactive approval or --yes".to_string());
     }
-    eprint!("Apply this extension setup? [y/N] ");
+    eprint!("Apply this plugin setup? [y/N] ");
     std::io::stderr().flush().map_err(|e| e.to_string())?;
     let mut answer = String::new();
     std::io::stdin()
@@ -818,11 +797,11 @@ fn display_command(command: &[String]) -> String {
 }
 
 fn run_postscript(name: &str, cwd: &Path, step: &Postscript) -> Result<(), String> {
-    let program = adapter_program(&step.command[0], cwd, &extension_id(name));
+    let program = adapter_program(&step.command[0], cwd, &plugin_id(name));
     if find_command(&program).is_none() {
         return Err(format!("postscript command not found: {}", step.command[0]));
     }
-    let mut command = adapter_command(&program, &extension_id(name))?;
+    let mut command = adapter_command(&program, &plugin_id(name))?;
     command
         .args(&step.command[1..])
         .current_dir(cwd)
@@ -843,9 +822,9 @@ fn run_postscript(name: &str, cwd: &Path, step: &Postscript) -> Result<(), Strin
     Ok(())
 }
 
-fn active_for_one(spec: &str) -> Result<extensions::ActiveExtensions, String> {
-    let specs = extensions::parse_extension_value(spec).map_err(|e| e.to_string())?;
-    extensions::active_from_explicit_specs(specs, true).map_err(|e| e.to_string())
+fn active_for_one(spec: &str) -> Result<plugins::ActivePlugins, String> {
+    let specs = plugins::parse_plugin_value(spec).map_err(|e| e.to_string())?;
+    plugins::active_from_explicit_specs(specs, true).map_err(|e| e.to_string())
 }
 
 fn test_pack(path: &Path) -> Check {
@@ -853,7 +832,7 @@ fn test_pack(path: &Path) -> Check {
         Ok(src) => src,
         Err(e) => return Check::fail("config", e.to_string()),
     };
-    match load_pack(&src) {
+    match plugins::load_plugin_config(path, &src) {
         Ok(_) => Check::ok("config", display_path(path)),
         Err(e) => Check::fail("config", e),
     }
@@ -914,10 +893,10 @@ impl AdapterFile {
             .name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| adapter_default_name(path));
-        let id = extension_id(&name);
+        let id = plugin_id(&name);
         let program = adapter_program(&command[0], &cwd, &id);
         if find_command(&program).is_none() {
-            return Err("command not found; run `pentect extensions setup`".to_string());
+            return Err("command not found; run `pentect plugins setup`".to_string());
         }
         Ok(Self {
             name,
@@ -1067,36 +1046,34 @@ fn adapter_command(program: &Path, id_or_name: &str) -> Result<Command, String> 
             command.env(env_name, value);
         }
     }
-    let id = extension_id(id_or_name);
-    let dirs = extension_runtime_dirs(&id)?;
-    command.env(EXTENSION_NAME_ENV, id);
-    command.env(EXTENSION_DATA_DIR_ENV, dirs.data_dir);
-    command.env(EXTENSION_CACHE_DIR_ENV, dirs.cache_dir);
-    command.env(EXTENSION_CONFIG_ENV, dirs.config_file);
+    let id = plugin_id(id_or_name);
+    let dirs = plugin_runtime_dirs(&id)?;
+    command.env(PLUGIN_NAME_ENV, id);
+    command.env(PLUGIN_DATA_DIR_ENV, dirs.data_dir);
+    command.env(PLUGIN_CACHE_DIR_ENV, dirs.cache_dir);
+    command.env(PLUGIN_CONFIG_ENV, dirs.config_file);
     Ok(command)
 }
 
 #[derive(Debug)]
-struct ExtensionRuntimeDirs {
+struct PluginRuntimeDirs {
     data_dir: PathBuf,
     cache_dir: PathBuf,
     config_file: PathBuf,
 }
 
-fn extension_runtime_dirs(id_or_name: &str) -> Result<ExtensionRuntimeDirs, String> {
-    let id = extension_id(id_or_name);
-    let data_dir = PathBuf::from(PENTECT_DIR)
-        .join(EXTENSIONS_DATA_DIR)
-        .join(&id);
-    let cache_dir = data_dir.join(EXTENSION_CACHE_DIR);
+fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
+    let id = plugin_id(id_or_name);
+    let data_dir = PathBuf::from(PENTECT_DIR).join(PLUGINS_DATA_DIR).join(&id);
+    let cache_dir = data_dir.join(PLUGIN_CACHE_DIR);
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
         format!(
-            "could not create extension data '{}': {e}",
+            "could not create plugin data '{}': {e}",
             cache_dir.display()
         )
     })?;
-    let config_file = data_dir.join(EXTENSION_CONFIG_FILE);
-    Ok(ExtensionRuntimeDirs {
+    let config_file = data_dir.join(PLUGIN_CONFIG_FILE);
+    Ok(PluginRuntimeDirs {
         data_dir,
         cache_dir,
         config_file,
@@ -1117,11 +1094,11 @@ fn adapter_default_name(path: &Path) -> String {
     path.file_stem()
         .and_then(|stem| stem.to_str())
         .filter(|name| !name.trim().is_empty())
-        .unwrap_or("extension")
+        .unwrap_or("plugin")
         .to_string()
 }
 
-fn extension_id(value: &str) -> String {
+fn plugin_id(value: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
     for ch in value.trim().chars() {
@@ -1152,7 +1129,7 @@ fn extension_id(value: &str) -> String {
         out.pop();
     }
     if out.is_empty() {
-        "extension".to_string()
+        "plugin".to_string()
     } else {
         out
     }
@@ -1178,14 +1155,14 @@ fn safe_adapter_env_names() -> &'static [&'static str] {
 }
 
 #[derive(Debug)]
-struct ExtensionRow {
+struct PluginRow {
     name: String,
     source: &'static str,
     configs: usize,
     adapters: usize,
 }
 
-impl ExtensionRow {
+impl PluginRow {
     fn status(&self) -> &'static str {
         if self.configs == 0 && self.adapters == 0 {
             "empty"
@@ -1195,37 +1172,29 @@ impl ExtensionRow {
     }
 }
 
-fn extension_rows() -> Result<Vec<ExtensionRow>, String> {
+fn plugin_rows() -> Result<Vec<PluginRow>, String> {
     let mut rows = Vec::new();
-    rows.extend(extension_rows_in(
-        Path::new(".pentect").join("extensions"),
+    rows.extend(plugin_rows_in(
+        Path::new(".pentect").join("plugins"),
         "project",
     )?);
-    rows.extend(extension_rows_in(
-        Path::new("extensions").to_path_buf(),
+    rows.extend(plugin_rows_in(
+        Path::new("plugins").to_path_buf(),
         "official",
     )?);
     Ok(rows)
 }
 
-fn extension_rows_in(root: PathBuf, source: &'static str) -> Result<Vec<ExtensionRow>, String> {
+fn plugin_rows_in(root: PathBuf, source: &'static str) -> Result<Vec<PluginRow>, String> {
     if !root.is_dir() {
         return Ok(Vec::new());
     }
     let mut rows = Vec::new();
-    for entry in std::fs::read_dir(&root).map_err(|e| {
-        format!(
-            "could not read extension dir '{}': {e}",
-            display_path(&root)
-        )
-    })? {
+    for entry in std::fs::read_dir(&root)
+        .map_err(|e| format!("could not read plugin dir '{}': {e}", display_path(&root)))?
+    {
         let path = entry
-            .map_err(|e| {
-                format!(
-                    "could not read extension dir '{}': {e}",
-                    display_path(&root)
-                )
-            })?
+            .map_err(|e| format!("could not read plugin dir '{}': {e}", display_path(&root)))?
             .path();
         if !path.is_dir() {
             continue;
@@ -1239,7 +1208,7 @@ fn extension_rows_in(root: PathBuf, source: &'static str) -> Result<Vec<Extensio
         if active.config_paths().is_empty() && active.adapter_paths().is_empty() {
             continue;
         }
-        rows.push(ExtensionRow {
+        rows.push(PluginRow {
             name,
             source,
             configs: active.config_paths().len(),
@@ -1297,15 +1266,15 @@ fn adapter_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
     if looks_like_path_command(program) {
         return cwd.join(path);
     }
-    installed_extension_program(program, id)
+    installed_plugin_program(program, id)
         .or_else(|| adapter_sidecar_program(program))
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-fn installed_extension_program(program: &str, id: &str) -> Option<PathBuf> {
+fn installed_plugin_program(program: &str, id: &str) -> Option<PathBuf> {
     let bin = PathBuf::from(PENTECT_DIR)
-        .join(EXTENSIONS_DATA_DIR)
-        .join(extension_id(id))
+        .join(PLUGINS_DATA_DIR)
+        .join(plugin_id(id))
         .join("bin");
     for name in command_names(program) {
         let candidate = bin.join(name);
@@ -1391,30 +1360,30 @@ mod tests {
 
     #[test]
     fn parses_list() {
-        let args = vec!["pentect".into(), "extensions".into(), "list".into()];
+        let args = vec!["pentect".into(), "plugins".into(), "list".into()];
         assert!(matches!(
-            ExtensionCmd::parse(&args).unwrap().action,
+            PluginCmd::parse(&args).unwrap().action,
             Action::List
         ));
     }
 
     #[test]
     fn inspect_requires_one_spec() {
-        let args = vec!["pentect".into(), "extensions".into(), "inspect".into()];
-        assert!(ExtensionCmd::parse(&args).is_err());
+        let args = vec!["pentect".into(), "plugins".into(), "inspect".into()];
+        assert!(PluginCmd::parse(&args).is_err());
     }
 
     #[test]
     fn parses_config_and_approved_setup() {
         let args = vec![
             "pentect".into(),
-            "extensions".into(),
+            "plugins".into(),
             "config".into(),
             "pii-ner".into(),
             "model.threshold=0.8".into(),
         ];
         assert!(matches!(
-            ExtensionCmd::parse(&args).unwrap().action,
+            PluginCmd::parse(&args).unwrap().action,
             Action::Config {
                 change: ConfigChange::Set(_),
                 ..
@@ -1423,24 +1392,24 @@ mod tests {
 
         let args = vec![
             "pentect".into(),
-            "extensions".into(),
+            "plugins".into(),
             "setup".into(),
             "pii-ner".into(),
             "--yes".into(),
         ];
         assert!(matches!(
-            ExtensionCmd::parse(&args).unwrap().action,
+            PluginCmd::parse(&args).unwrap().action,
             Action::Setup { approved: true, .. }
         ));
 
         let args = vec![
             "pentect".into(),
-            "extensions".into(),
+            "plugins".into(),
             "update".into(),
             "pii-ner".into(),
         ];
         assert!(matches!(
-            ExtensionCmd::parse(&args).unwrap().action,
+            PluginCmd::parse(&args).unwrap().action,
             Action::Update { .. }
         ));
     }
@@ -1487,7 +1456,7 @@ mod tests {
     #[test]
     fn postscript_does_not_run_before_approval() {
         let root =
-            std::env::temp_dir().join(format!("pentect-extension-approval-{}", std::process::id()));
+            std::env::temp_dir().join(format!("pentect-plugin-approval-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let marker = root.join("approved.txt");
@@ -1496,10 +1465,10 @@ mod tests {
         #[cfg(not(windows))]
         let command = r#"["sh", "-c", "printf approved > approved.txt"]"#;
         std::fs::write(
-            root.join("extension.toml"),
+            root.join("plugin.toml"),
             format!(
                 r#"
-schema = "pentect.extension.v1"
+schema = "pentect.plugin.v1"
 name = "approval-test"
 
 [[postscript]]
@@ -1511,9 +1480,9 @@ permissions = ["filesystem", "process"]
         .unwrap();
 
         let spec = root.to_string_lossy();
-        assert!(setup_extension(&spec, false, false).is_err());
+        assert!(setup_plugin(&spec, false, false).is_err());
         assert!(!marker.exists());
-        setup_extension(&spec, true, false).unwrap();
+        setup_plugin(&spec, true, false).unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "approved");
 
         std::fs::remove_dir_all(root).unwrap();
@@ -1555,7 +1524,7 @@ permissions = ["filesystem", "process"]
     }
 
     #[test]
-    fn adapter_probe_env_exposes_project_local_extension_data() {
+    fn adapter_probe_env_exposes_project_local_plugin_data() {
         let command = adapter_command(Path::new("echo"), "My Ext!").unwrap();
         let envs = command
             .get_envs()
@@ -1569,36 +1538,35 @@ permissions = ["filesystem", "process"]
             })
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(
-            envs.get(EXTENSION_NAME_ENV).map(String::as_str),
+            envs.get(PLUGIN_NAME_ENV).map(String::as_str),
             Some("my-ext")
         );
         assert!(
-            envs.get(EXTENSION_DATA_DIR_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext")),
+            envs.get(PLUGIN_DATA_DIR_ENV)
+                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext")),
             "{envs:?}"
         );
         assert!(
-            envs.get(EXTENSION_CACHE_DIR_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext/cache")),
+            envs.get(PLUGIN_CACHE_DIR_ENV)
+                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext/cache")),
             "{envs:?}"
         );
         assert!(
-            envs.get(EXTENSION_CONFIG_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/extensions-data/my-ext/config.toml")),
+            envs.get(PLUGIN_CONFIG_ENV)
+                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext/config.toml")),
             "{envs:?}"
         );
     }
 
     #[test]
-    fn list_extensions_skips_empty_dirs() {
-        let root =
-            std::env::temp_dir().join(format!("pentect-extension-list-{}", std::process::id()));
+    fn list_plugins_skips_empty_dirs() {
+        let root = std::env::temp_dir().join(format!("pentect-plugin-list-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("empty")).unwrap();
         std::fs::create_dir_all(root.join("rules")).unwrap();
         std::fs::write(root.join("rules").join("config.toml"), "").unwrap();
 
-        let rows = extension_rows_in(root.clone(), "official").unwrap();
+        let rows = plugin_rows_in(root.clone(), "official").unwrap();
         let _ = std::fs::remove_dir_all(&root);
 
         assert_eq!(rows.len(), 1);
@@ -1608,12 +1576,12 @@ permissions = ["filesystem", "process"]
     }
 
     #[test]
-    fn list_extensions_includes_official_model_and_rule_extensions() {
+    fn list_plugins_includes_official_model_and_rule_plugins() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .unwrap();
-        let rows = extension_rows_in(repo.join("extensions"), "official").unwrap();
+        let rows = plugin_rows_in(repo.join("plugins"), "official").unwrap();
         let names = rows
             .iter()
             .filter(|row| row.source == "official")
@@ -1622,7 +1590,6 @@ permissions = ["filesystem", "process"]
 
         assert!(names.contains("openai-privacy-filter"), "{names:?}");
         assert!(names.contains("pii-ner"), "{names:?}");
-        assert!(names.contains("jp-pii"), "{names:?}");
     }
 
     #[test]
