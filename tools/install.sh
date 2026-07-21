@@ -2,7 +2,33 @@
 set -eu
 
 repository="EdamAme-x/pentect"
-base_url="https://github.com/$repository/releases/latest/download"
+bundled_version=""
+version=${PENTECT_VERSION:-$bundled_version}
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version)
+      [ "$#" -ge 2 ] || { echo "pentect: --version requires a value" >&2; exit 1; }
+      version=$2
+      shift 2
+      ;;
+    *)
+      echo "pentect: unknown installer option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+if [ -n "$version" ]; then
+  version=${version#v}
+  if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+    echo "pentect: invalid version: $version" >&2
+    exit 1
+  fi
+  release_tag="v$version"
+  base_url="https://github.com/$repository/releases/download/$release_tag"
+else
+  release_tag="latest"
+  base_url="https://github.com/$repository/releases/latest/download"
+fi
 
 os=$(uname -s)
 arch=$(uname -m)
@@ -24,9 +50,11 @@ esac
 
 install_dir=${PENTECT_INSTALL_DIR:-"$HOME/.local/bin"}
 destination="$install_dir/pentect"
+marker="$install_dir/.pentect-managed-install.json"
 
 if [ "${PENTECT_INSTALL_DRY_RUN:-0}" = "1" ]; then
   printf 'asset=%s\ninstall=%s\n' "$asset" "$destination"
+  printf 'version=%s\n' "$release_tag"
   exit 0
 fi
 
@@ -78,6 +106,7 @@ staged="$install_dir/.pentect.install.$$"
 cp "$temp_dir/$asset" "$staged"
 chmod 0755 "$staged"
 mv -f "$staged" "$destination"
+printf '%s\n' '{"version":1,"path_added":false}' > "$marker"
 
 echo "pentect: installed $destination"
 case ":${PATH:-}:" in

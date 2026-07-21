@@ -11,6 +11,7 @@ mod headless;
 mod input;
 mod scan;
 mod terminal;
+mod uninstall;
 mod update;
 
 use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
@@ -103,6 +104,7 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("help" | "--help" | "-h") => cmd_help(),
         Some("version" | "--version" | "-V") => update::cmd_version(),
         Some("update") => update::cmd_update(&args),
+        Some("uninstall") => uninstall::cmd_uninstall(&args),
         Some("__apply-update") => return Some(update::cmd_apply_update(&args)),
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
@@ -168,7 +170,8 @@ fn usage() {
          pentect shell\n\
          pentect up\n\
          pentect doctor\n\
-         pentect update [--check]\n\
+         pentect update [VERSION] [--check]\n\
+         pentect uninstall\n\
          pentect extensions list|inspect|test|config|setup|update [NAME]\n\
          pentect eval [--json]\n\
          pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\
@@ -205,7 +208,8 @@ fn help_text() -> &'static str {
         "  pentect shell\n\n",
         "  pentect up\n\n",
         "  pentect doctor [--json]\n",
-        "  pentect update [--check | --force]\n",
+        "  pentect update [VERSION] [--check | --force]\n",
+        "  pentect uninstall\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
         "  pentect extensions config NAME|PATH [KEY=VALUE | --unset KEY]\n",
         "  pentect extensions setup NAME|PATH [--yes]\n",
@@ -227,6 +231,7 @@ fn help_text() -> &'static str {
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness\n",
         "update: verified GitHub Release binary\n",
+        "uninstall: remove the binary; keep project data\n",
         "extensions: list, inspect, test, config, setup, update\n",
         "eval: precision, recall\n",
     )

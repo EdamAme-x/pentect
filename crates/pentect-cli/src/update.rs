@@ -37,6 +37,7 @@ struct ReleaseAsset {
 struct UpdateOptions {
     check: bool,
     force: bool,
+    target: Option<Version>,
 }
 
 pub(crate) fn cmd_version() {
@@ -60,7 +61,16 @@ fn parse_update_options(args: &[String]) -> Result<UpdateOptions, String> {
             "--check" => options.check = true,
             "--force" => options.force = true,
             flag if flag.starts_with('-') => return Err(format!("unknown update option: {flag}")),
-            value => return Err(format!("unexpected update argument: {value}")),
+            value => {
+                if options.target.is_some() {
+                    return Err("update accepts at most one version".to_string());
+                }
+                let value = value.strip_prefix('v').unwrap_or(value);
+                options.target = Some(
+                    Version::parse(value)
+                        .map_err(|error| format!("invalid update version '{value}': {error}"))?,
+                );
+            }
         }
     }
     if options.check && options.force {
@@ -75,15 +85,35 @@ fn update(options: UpdateOptions) -> Result<(), String> {
         .user_agent(USER_AGENT)
         .build()
         .map_err(|e| format!("could not create update client: {e}"))?;
-    let release: Release = get_response(&client, RELEASE_API, MAX_CHECKSUM_BYTES * 16)?;
+    let release_api = options.target.as_ref().map_or_else(
+        || RELEASE_API.to_string(),
+        |version| {
+            format!("https://api.github.com/repos/EdamAme-x/pentect/releases/tags/v{version}")
+        },
+    );
+    let release: Release = get_response(&client, &release_api, MAX_CHECKSUM_BYTES * 16)?;
     if release.draft || release.prerelease {
         return Err("latest GitHub release is not a stable release".to_string());
     }
     let latest = release_version(&release.tag_name)?;
+    if options
+        .target
+        .as_ref()
+        .is_some_and(|target| target != &latest)
+    {
+        return Err(format!(
+            "requested version does not match release tag {}",
+            release.tag_name
+        ));
+    }
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|e| format!("invalid installed version: {e}"))?;
-    if !options.force && latest <= current {
+    if !options.force && latest == current {
         println!("up to date: {current}");
+        return Ok(());
+    }
+    if options.target.is_none() && !options.force && latest < current {
+        println!("installed version {current} is newer than latest release {latest}");
         return Ok(());
     }
     println!("update available: {current} -> {latest}");
@@ -450,6 +480,11 @@ mod tests {
     fn parses_update_flags() {
         let args = vec!["pentect".into(), "update".into(), "--check".into()];
         assert!(parse_update_options(&args).unwrap().check);
+        let args = vec!["pentect".into(), "update".into(), "v1.2.3".into()];
+        assert_eq!(
+            parse_update_options(&args).unwrap().target,
+            Some(Version::new(1, 2, 3))
+        );
         let args = vec![
             "pentect".into(),
             "update".into(),

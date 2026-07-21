@@ -2358,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "pentect-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "pentect-pii-ner"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
