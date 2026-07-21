@@ -13,7 +13,7 @@ FINDINGS (echr_test.json, 127 docs):
     fits a masking engine, but its CONTENT does not fit a secrets/technical-
     text tool. Pentect is not a court-document anonymizer.
   - DIRECT identifiers (mostly PERSON names + codes): 0% — these belong behind
-    an extension/model boundary, not in deterministic core.
+    a plugin/model boundary, not in deterministic core.
 Takeaway: evaluate Pentect on secrets-in-technical-text (SecretBench — gated
 behind GCP BigQuery; ai4privacy structured PII; or the in-repo research-metric
 corpus), not prose anonymization. Run:  python tools/eval_tab.py [BIN] [DATA] [flags...]

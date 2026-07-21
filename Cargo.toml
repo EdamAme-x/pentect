@@ -4,7 +4,7 @@ members = [
     "crates/pentect-core",
     "crates/pentect-cli",
     "crates/pentect-runtime",
-    "extensions/pii-ner/adapter",
+    "plugins/pii-ner/adapter",
 ]
 exclude = ["tools/pentect-bench"]
 

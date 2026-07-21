@@ -147,7 +147,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
 }
 
 fn should_split_email(span: &Span) -> bool {
-    !(span.source == DetectorId::Extension && span.label == "EMAIL")
+    !(span.source == DetectorId::Plugin && span.label == "EMAIL")
 }
 
 fn push_literal(segments: &mut Vec<RenderSegment>, masked: &mut String, text: &str) {

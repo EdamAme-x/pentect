@@ -264,8 +264,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_applies_extension_configs() {
-        let root = temp_scan_root("pentect-scan-extension-pack");
+    fn scan_applies_plugin_configs() {
+        let root = temp_scan_root("pentect-scan-plugin-pack");
         let ext = root.join("ext");
         std::fs::create_dir(&ext).unwrap();
         std::fs::write(
@@ -282,7 +282,7 @@ label = "ACME_CASE"
         let args = vec![
             "pentect".into(),
             "scan".into(),
-            "--extensions".into(),
+            "--plugins".into(),
             ext.to_string_lossy().to_string(),
             root.join("note.txt").to_string_lossy().to_string(),
         ];

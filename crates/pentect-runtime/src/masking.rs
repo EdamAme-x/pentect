@@ -1,6 +1,6 @@
 use crate::config;
-use crate::extension_adapter::ModelAdapters;
 use crate::memory_store::MemoryStore;
+use crate::plugin_adapter::ModelAdapters;
 #[cfg(test)]
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
-const EXTENSION_CONFIGS_ENV: &str = "PENTECT_EXTENSION_CONFIGS";
+const PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
 const BATCH_DELIMITERS: [&str; 4] = [
     "\u{1f}pentect-batch-0\u{1e}",
     "\u{1f}pentect-batch-1\u{1d}",
@@ -628,7 +628,7 @@ fn build_tool_boundary_engine() -> Result<Engine, String> {
         .standard_stack_with_decode(Profile::Strict.knobs(), decode)
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
         .detector(Box::new(SensitiveKeyDetector));
-    for config_pack in extension_configs_from_env()? {
+    for config_pack in plugin_configs_from_env()? {
         builder = builder
             .detector(Box::new(config_pack.rules))
             .disable_labels(config_pack.disable);
@@ -639,13 +639,13 @@ fn build_tool_boundary_engine() -> Result<Engine, String> {
         .build())
 }
 
-fn extension_configs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
+fn plugin_configs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
     static CACHE: OnceLock<Result<Vec<pentect_core::Pack>, String>> = OnceLock::new();
-    CACHE.get_or_init(load_extension_configs_from_env).clone()
+    CACHE.get_or_init(load_plugin_configs_from_env).clone()
 }
 
-fn load_extension_configs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
-    let Some(value) = std::env::var_os(EXTENSION_CONFIGS_ENV) else {
+fn load_plugin_configs_from_env() -> Result<Vec<pentect_core::Pack>, String> {
+    let Some(value) = std::env::var_os(PLUGIN_CONFIGS_ENV) else {
         return Ok(Vec::new());
     };
     let mut config_packs = Vec::new();
@@ -654,18 +654,20 @@ fn load_extension_configs_from_env() -> Result<Vec<pentect_core::Pack>, String> 
             continue;
         }
         if !path.is_file() {
-            return Err(format!(
-                "extension config does not exist: {}",
-                path.display()
-            ));
+            return Err(format!("plugin config does not exist: {}", path.display()));
         }
         let src = std::fs::read_to_string(&path)
-            .map_err(|e| format!("could not read extension config '{}': {e}", path.display()))?;
-        let config_pack = load_pack(&src)
-            .map_err(|e| format!("extension config '{}' is invalid: {e}", path.display()))?;
+            .map_err(|e| format!("could not read plugin config '{}': {e}", path.display()))?;
+        let config_pack = if path.file_name().and_then(|name| name.to_str()) == Some("plugin.toml")
+        {
+            pentect_core::load_plugin_pack(&src)
+        } else {
+            load_pack(&src)
+        }
+        .map_err(|e| format!("plugin config '{}' is invalid: {e}", path.display()))?;
         if !config_pack.disable.is_empty() {
             return Err(format!(
-                "extension config '{}' may add detectors but must not disable built-ins",
+                "plugin config '{}' may add detectors but must not disable built-ins",
                 path.display()
             ));
         }

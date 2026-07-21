@@ -24,7 +24,7 @@ fn uninstall(args: &[String]) -> Result<(), String> {
     {
         spawn_windows_uninstall_helper(&executable, &marker)?;
         println!("pentect: uninstall scheduled");
-        println!("pentect: project configuration and extension data were kept");
+        println!("pentect: project configuration and plugin data were kept");
     }
     #[cfg(not(windows))]
     {
@@ -34,7 +34,7 @@ fn uninstall(args: &[String]) -> Result<(), String> {
         let _ = std::fs::remove_file(&marker);
         remove_empty_install_dir(install_dir);
         println!("pentect: uninstalled {}", executable.display());
-        println!("pentect: project configuration and extension data were kept");
+        println!("pentect: project configuration and plugin data were kept");
     }
     Ok(())
 }

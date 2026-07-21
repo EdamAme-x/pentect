@@ -38,9 +38,9 @@ Set `PENTECT_INSTALL_DIR` to override the default destination. The installers
 download the matching latest-release binary and its `.sha256` file before
 installing anything.
 
-Release-backed extension binaries are installed or refreshed with:
+Release-backed plugin binaries are installed or refreshed with:
 
 ```text
-pentect extensions setup pii-ner
-pentect extensions update pii-ner
+pentect plugins setup pii-ner
+pentect plugins update pii-ner
 ```

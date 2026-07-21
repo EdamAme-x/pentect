@@ -74,7 +74,7 @@ CORE_STRUCTURED_LABELS = {
     "VAT_NUMBER",
 }
 
-EXTENSION_NEEDED_LABELS = {
+PLUGIN_NEEDED_LABELS = {
     "ADDRESS",
     "AGE",
     "BUILDINGNUM",
@@ -173,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--preset",
         default="all",
-        choices=["all", "core-structured", "extension-needed"],
+        choices=["all", "core-structured", "plugin-needed"],
         help="label filter preset",
     )
     p.add_argument("--include-label", action="append", default=[], help="label to include")
@@ -355,8 +355,8 @@ def include_annotation(args: argparse.Namespace, ann: Annotation) -> bool:
         return ann.label in include
     if args.preset == "core-structured":
         return ann.label in CORE_STRUCTURED_LABELS
-    if args.preset == "extension-needed":
-        return ann.label in EXTENSION_NEEDED_LABELS
+    if args.preset == "plugin-needed":
+        return ann.label in PLUGIN_NEEDED_LABELS
     return True
 
 

@@ -1,4 +1,4 @@
-use crate::extensions;
+use crate::plugins;
 use serde_json::json;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -64,7 +64,7 @@ fn run_checks() -> Vec<Check> {
     vec![
         check_pentect_binary(),
         check_memory_store(),
-        check_config_extensions(),
+        check_config_plugins(),
         check_ocr(),
         check_command("codex"),
         check_command("claude"),
@@ -129,10 +129,10 @@ fn check_memory_store() -> Check {
     status
 }
 
-fn check_config_extensions() -> Check {
-    match extensions::active_from_specs(Vec::new(), true) {
-        Ok(_) => Check::ok("extensions", "ready"),
-        Err(e) => Check::fail("extensions", e.to_string()),
+fn check_config_plugins() -> Check {
+    match plugins::active_from_specs(Vec::new(), true) {
+        Ok(_) => Check::ok("plugins", "ready"),
+        Err(e) => Check::fail("plugins", e.to_string()),
     }
 }
 
