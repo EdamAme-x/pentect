@@ -68,13 +68,20 @@ cleanup() {
 }
 trap cleanup 0 HUP INT TERM
 
-curl -fL --proto '=https' --tlsv1.2 \
+printf 'Pentect installer\n'
+printf '  Platform : %s/%s\n' "$os" "$arch"
+printf '  Version  : %s\n' "$release_tag"
+printf '  Install  : %s\n\n' "$destination"
+
+printf '[1/4] Downloading %s...\n' "$release_tag"
+curl -fsSL --proto '=https' --tlsv1.2 \
   "$base_url/$asset" \
   -o "$temp_dir/$asset"
-curl -fL --proto '=https' --tlsv1.2 \
+curl -fsSL --proto '=https' --tlsv1.2 \
   "$base_url/$asset.sha256" \
   -o "$temp_dir/$asset.sha256"
 
+printf '[2/4] Verifying SHA-256...\n'
 expected=$(awk 'NR == 1 { print tolower($1) }' "$temp_dir/$asset.sha256")
 case "$expected" in
   *[!0-9a-f]*|'')
@@ -100,6 +107,7 @@ if [ "$actual" != "$expected" ]; then
   exit 1
 fi
 
+printf '[3/4] Installing binary...\n'
 mkdir -p "$install_dir"
 staged="$install_dir/.pentect.install.$$"
 cp "$temp_dir/$asset" "$staged"
@@ -107,8 +115,10 @@ chmod 0755 "$staged"
 mv -f "$staged" "$destination"
 printf '%s\n' '{"version":1,"path_added":false}' > "$marker"
 
-echo "pentect: installed $destination"
 case ":${PATH:-}:" in
-  *":$install_dir:"*) ;;
-  *) echo "pentect: add $install_dir to PATH" ;;
+  *":$install_dir:"*) path_status="already on PATH" ;;
+  *) path_status="add $install_dir to PATH" ;;
 esac
+printf '[4/4] PATH: %s\n\n' "$path_status"
+printf 'Installed Pentect %s\n' "$release_tag"
+printf 'Next: pentect doctor\n'
