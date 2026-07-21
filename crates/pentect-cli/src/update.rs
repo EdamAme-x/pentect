@@ -209,7 +209,7 @@ pub(crate) fn download_latest_release_asset(
     })
 }
 
-fn validate_repository(repository: &str) -> Result<(), String> {
+pub(crate) fn validate_repository(repository: &str) -> Result<(), String> {
     let parts = repository.split('/').collect::<Vec<_>>();
     if parts.len() != 2
         || parts.iter().any(|part| {

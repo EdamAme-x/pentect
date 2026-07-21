@@ -1,5 +1,5 @@
 use crate::{plugins, update};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 const PENTECT_DIR: &str = ".pentect";
 const PLUGINS_DATA_DIR: &str = "plugins-data";
 const PLUGIN_CONFIG_FILE: &str = "config.toml";
+const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
 const PLUGIN_CACHE_DIR: &str = "cache";
 const PLUGIN_NAME_ENV: &str = "PENTECT_PLUGIN_NAME";
 const PLUGIN_DATA_DIR_ENV: &str = "PENTECT_PLUGIN_DATA_DIR";
@@ -173,7 +174,7 @@ fn list_plugins(json_output: bool) -> Result<(), String> {
                     "source": row.source,
                     "status": row.status(),
                     "configs": row.configs,
-                    "adapters": row.adapters,
+                    "binary": row.binary,
                 })).collect::<Vec<_>>()
             })
         );
@@ -185,12 +186,12 @@ fn list_plugins(json_output: bool) -> Result<(), String> {
     }
     for row in rows {
         println!(
-            "{}: {} {} configs={} adapters={}",
+            "{}: {} {} configs={} binary={}",
             row.name,
             row.source,
             row.status(),
             row.configs,
-            row.adapters
+            if row.binary { "yes" } else { "no" }
         );
     }
     Ok(())
@@ -200,6 +201,17 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let active = active_for_one(spec)?;
     let source = plugins::plugin_source(spec).map_err(|e| e.to_string())?;
     let manifest = load_plugin_manifest(&source)?;
+    let platform = binary_platform();
+    let binary = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.binary.as_deref());
+    let repository = manifest.as_ref().and_then(|manifest| {
+        manifest
+            .repository
+            .as_deref()
+            .or(source.repository.as_deref())
+    });
+    let asset = binary.map(|binary| binary_asset(binary, &manifest.as_ref().unwrap().assets));
     if json_output {
         println!(
             "{}",
@@ -208,9 +220,11 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
                 "description": manifest.as_ref().and_then(|manifest| manifest.description.as_deref()),
                 "manifest": source.manifest_path.as_deref().map(display_path),
                 "configs": active.config_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
-                "adapters": active.adapter_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
+                "platform": platform,
+                "binary": binary,
+                "repository": repository,
+                "asset": asset,
                 "postscripts": manifest.as_ref().map(|manifest| manifest.postscript.len()).unwrap_or(0),
-                "artifacts": manifest.as_ref().map(|manifest| manifest.artifact.len()).unwrap_or(0),
             })
         );
         return Ok(());
@@ -229,22 +243,21 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     for path in active.config_paths() {
         println!("config: {}", display_path(path));
     }
-    println!("adapters: {}", active.adapter_paths().len());
-    for path in active.adapter_paths() {
-        println!("adapter: {}", display_path(path));
+    if let Some(binary) = binary {
+        println!("platform: {platform}");
+        println!("binary: {binary}");
+        if let Some(repository) = repository {
+            println!("repository: {repository}");
+        }
+        if let Some(asset) = asset {
+            println!("asset: {asset}");
+        }
     }
     println!(
         "postscripts: {}",
         manifest
             .as_ref()
             .map(|manifest| manifest.postscript.len())
-            .unwrap_or(0)
-    );
-    println!(
-        "artifacts: {}",
-        manifest
-            .as_ref()
-            .map(|manifest| manifest.artifact.len())
             .unwrap_or(0)
     );
     Ok(())
@@ -256,8 +269,8 @@ fn test_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     for path in active.config_paths() {
         checks.push(test_pack(path));
     }
-    for path in active.adapter_paths() {
-        checks.push(test_adapter(path));
+    for path in active.binary_paths() {
+        checks.push(test_binary(path));
     }
     if checks.is_empty() {
         checks.push(Check::fail("plugin", "empty"));
@@ -291,16 +304,20 @@ struct PluginManifest {
     description: Option<String>,
     #[serde(default)]
     postscript: Vec<Postscript>,
+    binary: Option<String>,
+    repository: Option<String>,
     #[serde(default)]
-    artifact: Vec<ReleaseArtifact>,
+    assets: BTreeMap<String, String>,
+    execution: Option<ExecutionConfig>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ReleaseArtifact {
-    name: String,
-    repository: String,
-    destination: Option<String>,
-    assets: BTreeMap<String, String>,
+#[derive(Debug, Default, Deserialize)]
+struct ExecutionConfig {
+    #[serde(default)]
+    args: Vec<String>,
+    timeout_ms: Option<u64>,
+    max_input_bytes: Option<usize>,
+    max_spans: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,6 +349,21 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
             display_path(path),
             manifest.schema.as_deref().unwrap_or_default()
         ));
+    }
+    if let Some(binary) = manifest.binary.as_deref() {
+        let name = manifest
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&source.name);
+        validate_binary_name(binary, name)?;
+        if let Some(repository) = manifest
+            .repository
+            .as_deref()
+            .or(source.repository.as_deref())
+        {
+            update::validate_repository(repository)?;
+        }
     }
     Ok(Some(manifest))
 }
@@ -520,7 +552,7 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
         .iter()
         .filter(|step| postscript_matches_platform(step))
         .collect::<Vec<_>>();
-    if steps.is_empty() && manifest.artifact.is_empty() {
+    if steps.is_empty() && manifest.binary.is_none() {
         println!("setup: nothing to do for {}", current_platform());
         return Ok(());
     }
@@ -536,14 +568,15 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
             .map(display_path)
             .unwrap_or_else(|| "plugin.toml".to_string())
     );
-    for artifact in &manifest.artifact {
-        let asset = artifact_asset(artifact)?;
-        println!("artifact: {}", artifact.name);
-        println!("  release: github:{}", artifact.repository);
+    if let Some(binary) = manifest.binary.as_deref() {
+        let repository = binary_repository(&source, &manifest)?;
+        let asset = binary_asset(binary, &manifest.assets);
+        println!("binary: {binary}");
+        println!("  release: github:{repository}");
         println!("  asset: {asset}");
         println!(
             "  destination: {}",
-            artifact_destination(&name, artifact)?.display()
+            binary_destination(&name, binary)?.display()
         );
     }
     for (index, step) in steps.iter().enumerate() {
@@ -559,8 +592,9 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
     if !approved && !confirm_setup()? {
         return Err("plugin setup was not approved".to_string());
     }
-    for artifact in &manifest.artifact {
-        install_release_artifact(&name, artifact)?;
+    if let Some(binary) = manifest.binary.as_deref() {
+        let repository = binary_repository(&source, &manifest)?;
+        install_release_binary(&name, &repository, binary, &manifest.assets)?;
     }
     for step in steps {
         run_postscript(&name, &source.root, step)?;
@@ -577,85 +611,94 @@ fn update_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let manifest = load_plugin_manifest(&source)?
         .ok_or_else(|| format!("plugin '{}' has no plugin.toml", source.name))?;
     let name = plugin_name(&source, Some(&manifest));
-    if manifest.artifact.is_empty() {
-        println!("update: no release artifacts for {name}");
+    let Some(binary) = manifest.binary.as_deref() else {
+        println!("update: no release binary for {name}");
         return Ok(());
-    }
-    for artifact in &manifest.artifact {
-        install_release_artifact(&name, artifact)?;
-    }
+    };
+    let repository = binary_repository(&source, &manifest)?;
+    install_release_binary(&name, &repository, binary, &manifest.assets)?;
     println!("update: complete");
     Ok(())
 }
 
-fn artifact_platform_key() -> Result<String, String> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Ok("windows-x86_64".to_string()),
-        ("linux", "x86_64") => Ok("linux-x86_64".to_string()),
-        ("macos", "x86_64") => Ok("macos-x86_64".to_string()),
-        ("macos", "aarch64") => Ok("macos-aarch64".to_string()),
-        (os, arch) => Err(format!(
-            "plugin artifacts are not published for {os}/{arch}"
-        )),
-    }
+fn binary_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-fn artifact_asset(artifact: &ReleaseArtifact) -> Result<&str, String> {
-    let platform = artifact_platform_key()?;
-    artifact
-        .assets
-        .get(&platform)
-        .map(String::as_str)
+fn binary_repository(
+    source: &plugins::PluginSource,
+    manifest: &PluginManifest,
+) -> Result<String, String> {
+    let repository = manifest
+        .repository
+        .as_deref()
+        .or(source.repository.as_deref())
         .ok_or_else(|| {
-            format!(
-                "plugin artifact '{}' has no asset for {platform}",
-                artifact.name
-            )
-        })
+            "local binary plugins require repository = \"OWNER/REPO\" in plugin.toml".to_string()
+        })?;
+    update::validate_repository(repository)?;
+    Ok(repository.to_string())
 }
 
-fn artifact_destination(name: &str, artifact: &ReleaseArtifact) -> Result<PathBuf, String> {
-    let default = format!("bin/{}", artifact.name);
-    let raw = artifact.destination.as_deref().unwrap_or(&default);
-    let mut relative = PathBuf::from(raw);
-    if relative.as_os_str().is_empty()
-        || relative.is_absolute()
-        || relative.components().any(|component| {
-            !matches!(
-                component,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        })
+fn validate_binary_name(binary: &str, plugin: &str) -> Result<(), String> {
+    if binary.is_empty()
+        || binary.len() > 128
+        || binary.contains('/')
+        || binary.contains('\\')
+        || !binary
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
-        return Err(format!(
-            "plugin artifact '{}' has unsafe destination: {raw}",
-            artifact.name
-        ));
+        return Err(format!("plugin '{plugin}' has an invalid binary name"));
     }
-    if cfg!(windows) && relative.extension().is_none() {
-        relative.set_extension("exe");
-    }
-    let dirs = plugin_runtime_dirs(&plugin_id(name))?;
-    Ok(dirs.data_dir.join(relative))
+    Ok(())
 }
 
-fn install_release_artifact(name: &str, artifact: &ReleaseArtifact) -> Result<(), String> {
-    let asset = artifact_asset(artifact)?;
-    let destination = artifact_destination(name, artifact)?;
-    let download = update::download_latest_release_asset(&artifact.repository, asset)?;
+fn binary_asset(binary: &str, overrides: &BTreeMap<String, String>) -> String {
+    let platform = binary_platform();
+    overrides.get(&platform).cloned().unwrap_or_else(|| {
+        let suffix = if platform.starts_with("windows-") && !binary.ends_with(".exe") {
+            ".exe"
+        } else {
+            ""
+        };
+        format!("{binary}-{platform}{suffix}")
+    })
+}
+
+fn binary_destination(name: &str, binary: &str) -> Result<PathBuf, String> {
+    validate_binary_name(binary, name)?;
+    let filename = if cfg!(windows) && !binary.to_ascii_lowercase().ends_with(".exe") {
+        format!("{binary}.exe")
+    } else {
+        binary.to_string()
+    };
+    let dirs = plugin_runtime_dirs(&plugin_id(name))?;
+    Ok(dirs.data_dir.join("bin").join(filename))
+}
+
+fn install_release_binary(
+    name: &str,
+    repository: &str,
+    binary: &str,
+    overrides: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let platform = binary_platform();
+    let asset = binary_asset(binary, overrides);
+    let destination = binary_destination(name, binary)?;
+    let download = update::download_latest_release_asset(repository, &asset)
+        .map_err(|error| map_binary_download_error(name, &platform, &asset, error))?;
     if destination.is_file() && sha256_path(&destination)? == download.sha256 {
-        println!(
-            "artifact {}: up to date ({})",
-            artifact.name, download.version
-        );
+        write_binary_lock(name, repository, &asset, &download)?;
+        println!("binary {binary}: up to date ({})", download.version);
         return Ok(());
     }
     let parent = destination
         .parent()
-        .ok_or_else(|| "plugin artifact destination has no parent".to_string())?;
+        .ok_or_else(|| "plugin binary destination has no parent".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| {
         format!(
-            "could not create plugin artifact directory '{}': {e}",
+            "could not create plugin binary directory '{}': {e}",
             parent.display()
         )
     })?;
@@ -669,28 +712,66 @@ fn install_release_artifact(name: &str, artifact: &ReleaseArtifact) -> Result<()
         std::process::id()
     ));
     std::fs::write(&staged, &download.bytes)
-        .map_err(|e| format!("could not stage plugin artifact: {e}"))?;
-    mark_artifact_executable(&staged)?;
+        .map_err(|e| format!("could not stage plugin binary: {e}"))?;
+    mark_binary_executable(&staged)?;
     if sha256_path(&staged)? != download.sha256 {
         let _ = std::fs::remove_file(&staged);
-        return Err("staged plugin artifact checksum mismatch".to_string());
+        return Err("staged plugin binary checksum mismatch".to_string());
     }
-    replace_artifact(&staged, &destination)?;
-    println!("artifact {}: installed {}", artifact.name, download.version);
+    replace_binary(&staged, &destination)?;
+    write_binary_lock(name, repository, &asset, &download)?;
+    println!("binary {binary}: installed {}", download.version);
     Ok(())
+}
+
+fn map_binary_download_error(name: &str, platform: &str, asset: &str, error: String) -> String {
+    if error.contains(&format!("missing asset '{asset}'")) {
+        format!("plugin '{name}' is unsupported on {platform}")
+    } else {
+        error
+    }
+}
+
+#[derive(Serialize)]
+struct BinaryLock<'a> {
+    schema: &'static str,
+    repository: &'a str,
+    version: String,
+    asset: &'a str,
+    sha256: &'a str,
+}
+
+fn write_binary_lock(
+    name: &str,
+    repository: &str,
+    asset: &str,
+    download: &update::DownloadedReleaseAsset,
+) -> Result<(), String> {
+    let dirs = plugin_runtime_dirs(&plugin_id(name))?;
+    let lock = BinaryLock {
+        schema: "pentect.plugin-lock.v1",
+        repository,
+        version: download.version.to_string(),
+        asset,
+        sha256: &download.sha256,
+    };
+    let source =
+        toml::to_string(&lock).map_err(|e| format!("could not encode binary lock: {e}"))?;
+    std::fs::write(dirs.data_dir.join(PLUGIN_BINARY_LOCK_FILE), source)
+        .map_err(|e| format!("could not write plugin binary lock: {e}"))
 }
 
 fn sha256_path(path: &Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(path)
-        .map_err(|e| format!("could not verify plugin artifact '{}': {e}", path.display()))?;
+        .map_err(|e| format!("could not verify plugin binary '{}': {e}", path.display()))?;
     Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)))
 }
 
-fn replace_artifact(staged: &Path, destination: &Path) -> Result<(), String> {
+fn replace_binary(staged: &Path, destination: &Path) -> Result<(), String> {
     if !destination.exists() {
         return std::fs::rename(staged, destination)
-            .map_err(|e| format!("could not install plugin artifact: {e}"));
+            .map_err(|e| format!("could not install plugin binary: {e}"));
     }
     let backup = destination.with_extension(format!(
         "{}previous",
@@ -702,30 +783,30 @@ fn replace_artifact(staged: &Path, destination: &Path) -> Result<(), String> {
     ));
     if backup.exists() {
         std::fs::remove_file(&backup)
-            .map_err(|e| format!("could not remove old plugin artifact backup: {e}"))?;
+            .map_err(|e| format!("could not remove old plugin binary backup: {e}"))?;
     }
     std::fs::rename(destination, &backup).map_err(|e| {
         format!(
-            "could not replace running plugin artifact '{}': {e}",
+            "could not replace running plugin binary '{}': {e}",
             destination.display()
         )
     })?;
     if let Err(error) = std::fs::rename(staged, destination) {
         let _ = std::fs::rename(&backup, destination);
-        return Err(format!("could not install plugin artifact: {error}"));
+        return Err(format!("could not install plugin binary: {error}"));
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn mark_artifact_executable(path: &Path) -> Result<(), String> {
+fn mark_binary_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("could not mark plugin artifact executable: {e}"))
+        .map_err(|e| format!("could not mark plugin binary executable: {e}"))
 }
 
 #[cfg(windows)]
-fn mark_artifact_executable(_path: &Path) -> Result<(), String> {
+fn mark_binary_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -838,31 +919,19 @@ fn test_pack(path: &Path) -> Check {
     }
 }
 
-fn test_adapter(path: &Path) -> Check {
-    let adapter = match AdapterFile::load(path) {
-        Ok(adapter) => adapter,
-        Err(e) => return Check::fail("adapter", e),
+fn test_binary(path: &Path) -> Check {
+    let binary = match BinaryFile::load(path) {
+        Ok(binary) => binary,
+        Err(e) => return Check::fail("binary", e),
     };
-    match adapter.run_probe() {
-        Ok(count) => Check::ok("adapter", format!("spans={count}")),
-        Err(e) => Check::fail("adapter", e),
+    match binary.run_probe() {
+        Ok(count) => Check::ok("binary", format!("spans={count}")),
+        Err(e) => Check::fail("binary", e),
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AdapterToml {
-    schema: Option<String>,
-    kind: Option<String>,
-    name: Option<String>,
-    command: Option<Vec<String>>,
-    timeout_ms: Option<u64>,
-    max_input_bytes: Option<usize>,
-    max_spans: Option<usize>,
-}
-
 #[derive(Debug)]
-struct AdapterFile {
+struct BinaryFile {
     name: String,
     id: String,
     cwd: PathBuf,
@@ -872,40 +941,45 @@ struct AdapterFile {
     max_spans: usize,
 }
 
-impl AdapterFile {
+impl BinaryFile {
     fn load(path: &Path) -> Result<Self, String> {
-        let src = std::fs::read_to_string(path)
-            .map_err(|e| format!("could not read adapter '{}': {e}", display_path(path)))?;
-        let manifest: AdapterToml = toml::from_str(&src)
-            .map_err(|e| format!("invalid adapter '{}': {e}", display_path(path)))?;
-        if manifest.schema.as_deref() != Some("pentect.model_adapter.v1") {
+        let src = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "could not read plugin manifest '{}': {e}",
+                display_path(path)
+            )
+        })?;
+        let manifest: PluginManifest = toml::from_str(&src)
+            .map_err(|e| format!("invalid plugin manifest '{}': {e}", display_path(path)))?;
+        if manifest.schema.as_deref() != Some("pentect.plugin.v1") {
             return Err("schema".to_string());
         }
-        if manifest.kind.as_deref() != Some("model") {
-            return Err("kind".to_string());
-        }
-        let cwd = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let command = adapter_command_from_manifest(manifest.command)?;
         let name = manifest
             .name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| adapter_default_name(path));
         let id = plugin_id(&name);
-        let program = adapter_program(&command[0], &cwd, &id);
+        let binary = manifest
+            .binary
+            .filter(|binary| !binary.trim().is_empty())
+            .ok_or_else(|| format!("plugin '{name}' requires binary"))?;
+        let execution = manifest.execution.unwrap_or_default();
+        let dirs = plugin_runtime_dirs(&id)?;
+        let program = binary_destination(&name, &binary)?;
+        let mut command = Vec::with_capacity(execution.args.len() + 1);
+        command.push(program.to_string_lossy().into_owned());
+        command.extend(execution.args);
         if find_command(&program).is_none() {
-            return Err("command not found; run `pentect plugins setup`".to_string());
+            return Err("binary not installed; run `pentect plugins setup`".to_string());
         }
         Ok(Self {
             name,
             id,
-            cwd,
+            cwd: dirs.data_dir,
             command,
-            timeout: Duration::from_millis(manifest.timeout_ms.unwrap_or(3_000)),
-            max_input_bytes: manifest.max_input_bytes.unwrap_or(256 * 1024),
-            max_spans: manifest.max_spans.unwrap_or(512),
+            timeout: Duration::from_millis(execution.timeout_ms.unwrap_or(10_000)),
+            max_input_bytes: execution.max_input_bytes.unwrap_or(256 * 1024),
+            max_spans: execution.max_spans.unwrap_or(512),
         })
     }
 
@@ -1028,16 +1102,6 @@ fn join_adapter_stdout(
         .map_err(|e| format!("{name}: {e}"))
 }
 
-fn adapter_command_from_manifest(command: Option<Vec<String>>) -> Result<Vec<String>, String> {
-    let Some(command) = command else {
-        return Err("command".to_string());
-    };
-    if command.is_empty() || command.iter().any(|part| part.is_empty()) {
-        return Err("command".to_string());
-    }
-    Ok(command)
-}
-
 fn adapter_command(program: &Path, id_or_name: &str) -> Result<Command, String> {
     let mut command = Command::new(program);
     command.env_clear();
@@ -1081,7 +1145,7 @@ fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
 }
 
 fn adapter_default_name(path: &Path) -> String {
-    if path.file_name().and_then(|name| name.to_str()) == Some("adapter.toml") {
+    if path.file_name().and_then(|name| name.to_str()) == Some("plugin.toml") {
         if let Some(name) = path
             .parent()
             .and_then(|parent| parent.file_name())
@@ -1159,12 +1223,12 @@ struct PluginRow {
     name: String,
     source: &'static str,
     configs: usize,
-    adapters: usize,
+    binary: bool,
 }
 
 impl PluginRow {
     fn status(&self) -> &'static str {
-        if self.configs == 0 && self.adapters == 0 {
+        if self.configs == 0 && !self.binary {
             "empty"
         } else {
             "ok"
@@ -1205,14 +1269,14 @@ fn plugin_rows_in(root: PathBuf, source: &'static str) -> Result<Vec<PluginRow>,
             .unwrap_or("")
             .to_string();
         let active = active_for_one(&path.to_string_lossy())?;
-        if active.config_paths().is_empty() && active.adapter_paths().is_empty() {
+        if active.config_paths().is_empty() && active.binary_paths().is_empty() {
             continue;
         }
         rows.push(PluginRow {
             name,
             source,
             configs: active.config_paths().len(),
-            adapters: active.adapter_paths().len(),
+            binary: !active.binary_paths().is_empty(),
         });
     }
     Ok(rows)
@@ -1489,18 +1553,51 @@ permissions = ["filesystem", "process"]
     }
 
     #[test]
-    fn release_artifacts_select_platform_and_reject_unsafe_destinations() {
-        let platform = artifact_platform_key().unwrap();
-        let mut assets = BTreeMap::new();
-        assets.insert(platform, "helper.bin".to_string());
-        let artifact = ReleaseArtifact {
-            name: "helper".to_string(),
-            repository: "owner/repo".to_string(),
-            destination: Some("../outside".to_string()),
-            assets,
+    fn release_binary_uses_convention_and_optional_override() {
+        let platform = binary_platform();
+        let expected = if cfg!(windows) {
+            format!("helper-{platform}.exe")
+        } else {
+            format!("helper-{platform}")
         };
-        assert_eq!(artifact_asset(&artifact).unwrap(), "helper.bin");
-        assert!(artifact_destination("test", &artifact).is_err());
+        assert_eq!(binary_asset("helper", &BTreeMap::new()), expected);
+        let overrides = BTreeMap::from([(platform, "custom.bin".to_string())]);
+        assert_eq!(binary_asset("helper", &overrides), "custom.bin");
+        assert!(binary_destination("test", "../outside").is_err());
+    }
+
+    #[test]
+    fn missing_platform_binary_is_reported_as_unsupported() {
+        let error = map_binary_download_error(
+            "pii-ner",
+            "linux-riscv64",
+            "pentect-pii-ner-linux-riscv64",
+            "release is missing asset 'pentect-pii-ner-linux-riscv64'".to_string(),
+        );
+        assert_eq!(error, "plugin 'pii-ner' is unsupported on linux-riscv64");
+
+        let checksum_error = "release is missing checksum asset".to_string();
+        assert_eq!(
+            map_binary_download_error("pii-ner", "linux-x86_64", "binary", checksum_error.clone()),
+            checksum_error
+        );
+    }
+
+    #[test]
+    fn binary_lock_records_the_resolved_release() {
+        let lock = BinaryLock {
+            schema: "pentect.plugin-lock.v1",
+            repository: "owner/repo",
+            version: "v1.2.3".to_string(),
+            asset: "helper-linux-x86_64",
+            sha256: "0123456789abcdef",
+        };
+        let encoded = toml::to_string(&lock).unwrap();
+        let decoded: toml::Value = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded["repository"].as_str(), Some("owner/repo"));
+        assert_eq!(decoded["version"].as_str(), Some("v1.2.3"));
+        assert_eq!(decoded["asset"].as_str(), Some("helper-linux-x86_64"));
+        assert_eq!(decoded["sha256"].as_str(), Some("0123456789abcdef"));
     }
 
     #[test]
@@ -1572,7 +1669,7 @@ permissions = ["filesystem", "process"]
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "rules");
         assert_eq!(rows[0].configs, 1);
-        assert_eq!(rows[0].adapters, 0);
+        assert!(!rows[0].binary);
     }
 
     #[test]
@@ -1593,27 +1690,27 @@ permissions = ["filesystem", "process"]
     }
 
     #[test]
-    fn adapter_command_path_is_checked_from_adapter_dir() {
-        let root = std::env::temp_dir().join(format!(
-            "pentect-cli-adapter-relative-{}",
-            std::process::id()
-        ));
+    fn local_binary_requires_repository() {
+        let root =
+            std::env::temp_dir().join(format!("pentect-local-binary-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("tool"), "").unwrap();
         std::fs::write(
-            root.join("adapter.toml"),
-            r#"
-schema = "pentect.model_adapter.v1"
-kind = "model"
-name = "relative"
-command = ["./tool"]
-"#,
+            root.join(plugins::PLUGIN_MANIFEST_FILE),
+            "schema = \"pentect.plugin.v1\"\nname = \"local\"\nbinary = \"tool\"\n",
         )
         .unwrap();
 
-        let loaded = AdapterFile::load(&root.join("adapter.toml"));
+        let source = plugins::PluginSource {
+            name: "local".to_string(),
+            root: root.clone(),
+            manifest_path: Some(root.join(plugins::PLUGIN_MANIFEST_FILE)),
+            repository: None,
+        };
+        let manifest = load_plugin_manifest(&source).unwrap().unwrap();
+        let err = binary_repository(&source, &manifest).unwrap_err();
+        assert!(err.contains("require repository"), "{err}");
+
         std::fs::remove_dir_all(root).unwrap();
-        assert!(loaded.is_ok(), "{loaded:?}");
     }
 }

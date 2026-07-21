@@ -1,14 +1,4 @@
 schema = "pentect.plugin.v1"
 name = "pii-ner"
-description = "Local ONNX PII named-entity recognition adapter."
-
-[[artifact]]
-name = "pentect-pii-ner"
-repository = "EdamAme-x/pentect"
-destination = "bin/pentect-pii-ner"
-
-[artifact.assets]
-windows-x86_64 = "pentect-pii-ner-windows-x86_64.exe"
-linux-x86_64 = "pentect-pii-ner-linux-x86_64"
-macos-x86_64 = "pentect-pii-ner-macos-x86_64"
-macos-aarch64 = "pentect-pii-ner-macos-aarch64"
+description = "Local ONNX PII named-entity recognition."
+binary = "pentect-pii-ner"

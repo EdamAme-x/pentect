@@ -1083,7 +1083,7 @@ fn bridge_owned_environment_preserves_only_verified_plugin_state() {
         (PENTECT_AGENT_LAUNCHED_ENV, "launch-proof"),
         ("PENTECT_BIN", "pentect-bin"),
         (PENTECT_PLUGIN_CONFIGS_ENV, "configs"),
-        (PENTECT_PLUGIN_ADAPTERS_ENV, "adapters"),
+        (PENTECT_PLUGIN_BINARIES_ENV, "binaries"),
         ("PENTECT_PROCESS_HOST_ROOT", "untrusted"),
     ]);
     let environment =
@@ -1091,7 +1091,7 @@ fn bridge_owned_environment_preserves_only_verified_plugin_state() {
             .unwrap();
     assert_eq!(environment.len(), 6);
     assert_eq!(environment[PENTECT_PLUGIN_CONFIGS_ENV], "configs");
-    assert_eq!(environment[PENTECT_PLUGIN_ADAPTERS_ENV], "adapters");
+    assert_eq!(environment[PENTECT_PLUGIN_BINARIES_ENV], "binaries");
     assert!(!environment.contains_key("PENTECT_PROCESS_HOST_ROOT"));
 }
 

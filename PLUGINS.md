@@ -45,28 +45,39 @@ confidence = "high"
 Inline manifest rules may only add detectors. They cannot disable Pentect's
 built-in detectors.
 
+Executable plugins only declare their binary name:
+
+```toml
+binary = "example-helper"
+```
+
+Pentect infers the GitHub repository from a `github:@OWNER/REPO/PATH` source and
+looks for `{binary}-{os}-{arch}` in its latest stable Release, adding `.exe` on
+Windows. For example, Linux x86-64 resolves to
+`example-helper-linux-x86_64`. Local manifests can declare
+`repository = "OWNER/REPO"` because they have no remote source to infer.
+
+Non-standard Release asset names can be overridden without listing every
+platform:
+
+```toml
+[assets]
+windows-x86_64 = "example-helper-win64.exe"
+```
+
+A missing asset is reported as unsupported. Pentect verifies the sibling
+`.sha256`, then installs the executable at the deterministic
+`.pentect/plugins-data/<plugin>/bin/<binary>` path and records its repository,
+version, asset, and digest in `binary.lock`. Optional process limits and
+arguments can be placed under `[execution]`, but the defaults require no extra
+configuration.
+
 Postscripts never run while loading a plugin. They only run through
 `pentect plugins setup NAME`. Pentect prints every command and its declared
 permissions first, then requires an interactive `y`/`yes` confirmation. CI can
 provide the same explicit approval with `--yes`. The process receives only a
 small allowlist of operating-system environment variables plus its isolated
 Pentect plugin paths; credentials from the parent process are not inherited.
-
-Release-hosted helper binaries use a declarative artifact entry instead of a
-postscript:
-
-```toml
-[[artifact]]
-name = "example-helper"
-repository = "owner/repository"
-destination = "bin/example-helper"
-
-[artifact.assets]
-windows-x86_64 = "example-helper-windows-x86_64.exe"
-linux-x86_64 = "example-helper-linux-x86_64"
-macos-x86_64 = "example-helper-macos-x86_64"
-macos-aarch64 = "example-helper-macos-aarch64"
-```
 
 `pentect plugins setup NAME` installs the platform asset from the latest
 stable GitHub Release after verifying its sibling `.sha256` asset.
@@ -75,7 +86,8 @@ binary only when its hash changed.
 
 ## Configuration
 
-Adapters receive the path to their config file in `PENTECT_PLUGIN_CONFIG`.
+Executable plugins receive the path to their config file in
+`PENTECT_PLUGIN_CONFIG`.
 Arbitrary TOML values can be managed without printing their values:
 
 ```text
