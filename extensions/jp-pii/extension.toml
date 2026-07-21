@@ -1,3 +1,0 @@
-schema = "pentect.extension.v1"
-name = "jp-pii"
-description = "Context-aware Japanese PII rules."
