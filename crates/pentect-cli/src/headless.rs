@@ -974,59 +974,39 @@ fn safe_agent_protocol_metadata(
     text: &str,
 ) -> bool {
     match scope {
-        JsonProtocolScope::Root => {
-            matches!(
-                key,
-                "uuid"
-                    | "session_id"
-                    | "sessionId"
-                    | "request_id"
-                    | "requestId"
-                    | "response_id"
-                    | "responseId"
-                    | "parent_tool_use_id"
-                    | "parentToolUseId"
-                    | "hook_id"
-                    | "hookId"
-                    | "prompt_id"
-                    | "promptId"
-                    | "parent_uuid"
-                    | "parentUuid"
-                    | "leaf_uuid"
-                    | "leafUuid"
-            ) && known_agent_protocol_id(text)
-        }
-        JsonProtocolScope::Message => {
-            key == "id" && text.starts_with("msg_") && protocol_tail(text)
-        }
+        JsonProtocolScope::Root => match key {
+            "uuid" | "session_id" | "sessionId" | "hook_id" | "hookId" | "prompt_id"
+            | "promptId" | "parent_uuid" | "parentUuid" | "leaf_uuid" | "leafUuid" => {
+                uuid_shape(text)
+            }
+            "request_id" | "requestId" => protocol_id(text, "req_"),
+            "response_id" | "responseId" => protocol_id(text, "resp_"),
+            "parent_tool_use_id" | "parentToolUseId" => protocol_id(text, "toolu_"),
+            _ => false,
+        },
+        JsonProtocolScope::Message => key == "id" && protocol_id(text, "msg_"),
         JsonProtocolScope::MessageContent => {
-            (key == "id" && text.starts_with("toolu_") && protocol_tail(text))
-                || (matches!(key, "tool_use_id" | "toolUseId")
-                    && text.starts_with("toolu_")
-                    && protocol_tail(text))
-                || (key == "signature" && object_type == Some("thinking"))
+            (key == "id" && protocol_id(text, "toolu_"))
+                || (matches!(key, "tool_use_id" | "toolUseId") && protocol_id(text, "toolu_"))
+                || (key == "signature"
+                    && object_type == Some("thinking")
+                    && thinking_signature(text))
         }
         JsonProtocolScope::Other => false,
     }
 }
 
-fn known_agent_protocol_id(text: &str) -> bool {
-    uuid_shape(text)
-        || [
-            "req_", "resp_", "msg_", "toolu_", "call_", "item_", "thread_", "turn_",
-        ]
-        .iter()
-        .any(|prefix| text.starts_with(prefix) && protocol_tail(text))
-}
-
-fn protocol_tail(text: &str) -> bool {
-    let Some((_, tail)) = text.split_once('_') else {
+fn protocol_id(text: &str, prefix: &str) -> bool {
+    let Some(tail) = text.strip_prefix(prefix) else {
         return false;
     };
-    tail.len() >= 8
-        && tail
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    (20..=64).contains(&tail.len()) && tail.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn thinking_signature(text: &str) -> bool {
+    (64..=16 * 1024).contains(&text.len())
+        && text.len().is_multiple_of(4)
+        && data_encoding::BASE64.decode(text.as_bytes()).is_ok()
 }
 
 fn uuid_shape(text: &str) -> bool {
@@ -2083,6 +2063,31 @@ mod tests {
             value["message"]["content"][1]["input"]["signature"],
             "SCANNED"
         );
+        zeroize_json_strings(&mut value);
+    }
+
+    #[test]
+    fn structured_output_scans_malformed_protocol_metadata() {
+        let mut value = serde_json::json!({
+            "type": "assistant",
+            "uuid": "secret-value",
+            "request_id": "req_secret_value_with_underscores",
+            "message": {
+                "id": "msg_too-short",
+                "content": [
+                    {"type": "thinking", "signature": "secret-value"},
+                    {"type": "tool_use", "id": "toolu_secret_value_with_underscores"}
+                ]
+            }
+        });
+        let changed =
+            mask_json_value(&mut value, true, &mut |_| Ok(Some("SCANNED".to_string()))).unwrap();
+        assert!(changed);
+        assert_eq!(value["uuid"], "SCANNED");
+        assert_eq!(value["request_id"], "SCANNED");
+        assert_eq!(value["message"]["id"], "SCANNED");
+        assert_eq!(value["message"]["content"][0]["signature"], "SCANNED");
+        assert_eq!(value["message"]["content"][1]["id"], "SCANNED");
         zeroize_json_strings(&mut value);
     }
 

@@ -182,7 +182,7 @@ export default function pentectExtension(pi) {
       // before Pi's onData callback receives it.
       return localBash.exec(next.command, cwd, {
         ...options,
-        env: protectedChildEnvironment(options.env, sessionEnvironment),
+        env: protectedChildEnvironment(options?.env, sessionEnvironment),
       });
     },
   };

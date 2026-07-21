@@ -157,7 +157,10 @@ fn dollar_suffix_is_active_ignore_case(value: &str, suffix: &str) -> bool {
         .get(value.len().saturating_sub(suffix.len())..)
         .filter(|tail| tail.eq_ignore_ascii_case(suffix))
         .and_then(|_| value.get(..value.len().saturating_sub(suffix.len())))
-        .is_some_and(|prefix| trailing_backslash_count(prefix).is_multiple_of(2))
+        .is_some_and(|prefix| {
+            trailing_backslash_count(prefix).is_multiple_of(2)
+                && trailing_backtick_count(prefix).is_multiple_of(2)
+        })
 }
 
 fn trailing_backslash_count(value: &str) -> usize {
@@ -166,6 +169,10 @@ fn trailing_backslash_count(value: &str) -> usize {
         .rev()
         .take_while(|byte| *byte == b'\\')
         .count()
+}
+
+fn trailing_backtick_count(value: &str) -> usize {
+    value.bytes().rev().take_while(|byte| *byte == b'`').count()
 }
 
 fn inside_single_quoted_shell_text(value: &str) -> bool {
@@ -1372,6 +1379,18 @@ mod tests {
             let view = NormalizedView::build(&reg, raw);
             assert!(
                 !EntropyDetector::default().detect(&view).is_empty(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_backtick_escaped_environment_references_are_not_suppressed() {
+        let value = "PENTECT_RUNPOD_API_KEY_80fba8fb9b3928a8";
+        for raw in [format!("`$env:{value}"), format!("`${{env:{value}}}")] {
+            let start = raw.find(value).unwrap();
+            assert!(
+                !is_masked_environment_reference(&raw, start, start + value.len(), value),
                 "{raw}"
             );
         }

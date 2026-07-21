@@ -327,7 +327,9 @@ impl MemoryStoreClient {
         bytes.extend_from_slice(script.as_bytes());
         let payload = data_encoding::BASE64.encode(&bytes);
         bytes.zeroize();
-        let line = self.request("SCRIPT_PUT", &payload)?;
+        // Script IDs are single-use capabilities. Retrying a put after the
+        // server committed it can create an unreachable duplicate.
+        let line = self.request_once("SCRIPT_PUT", &payload)?;
         let fields = response_fields(&line)?;
         if fields.len() != 2 || fields[0] != "OK" || !valid_runtime_token(fields[1]) {
             bail!("memory store script response is malformed");
@@ -336,7 +338,7 @@ impl MemoryStoreClient {
     }
 
     pub(crate) fn take_agent_script(&self, id: &str) -> Result<(String, Zeroizing<String>)> {
-        self.take_agent_script_with("SCRIPT_TAKE", id)
+        self.take_agent_script_with("SCRIPT_TAKE", id, false)
     }
 
     #[cfg(test)]
@@ -344,15 +346,22 @@ impl MemoryStoreClient {
         &self,
         id: &str,
     ) -> Result<(String, Zeroizing<String>)> {
-        self.take_agent_script_with("SCRIPT_RENDER", id)
+        self.take_agent_script_with("SCRIPT_RENDER", id, true)
     }
 
     fn take_agent_script_with(
         &self,
         operation: &str,
         id: &str,
+        retry: bool,
     ) -> Result<(String, Zeroizing<String>)> {
-        let line = Zeroizing::new(self.request(operation, id)?);
+        // Taking consumes the capability, while test-only rendering is an
+        // idempotent read and may safely use the generic reconnect path.
+        let line = Zeroizing::new(if retry {
+            self.request(operation, id)?
+        } else {
+            self.request_once(operation, id)?
+        });
         let fields = response_fields(&line)?;
         if fields.len() != 2 || fields[0] != "OK" {
             bail!("memory store script response is malformed");
