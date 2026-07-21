@@ -4,8 +4,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repository = 'EdamAme-x/pentect'
-$bundledVersion = ''
-$requestedVersion = if ($Version) { $Version } elseif ($bundledVersion) { $bundledVersion } else { $null }
+$requestedVersion = $Version
 if ($requestedVersion) {
     $requestedVersion = $requestedVersion.TrimStart('v')
     if ($requestedVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {

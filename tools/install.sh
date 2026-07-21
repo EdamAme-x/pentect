@@ -2,8 +2,7 @@
 set -eu
 
 repository="EdamAme-x/pentect"
-bundled_version=""
-version=${PENTECT_VERSION:-$bundled_version}
+version=${PENTECT_VERSION:-}
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --version)

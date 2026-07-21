@@ -125,38 +125,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Generate version-pinned installers
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - "$GITHUB_REF_NAME" <<'PY'
-          from pathlib import Path
-          import sys
-
-          tag = sys.argv[1]
-          powershell = Path("tools/install.ps1").read_text(encoding="utf-8")
-          powershell = powershell.replace(
-              "$bundledVersion = ''",
-              f"$bundledVersion = '{tag}'",
-              1,
-          )
-          shell = Path("tools/install.sh").read_text(encoding="utf-8")
-          shell = shell.replace(
-              'bundled_version=""',
-              f'bundled_version="{tag}"',
-              1,
-          )
-          Path("dist/install.ps1").write_text(powershell, encoding="utf-8")
-          Path("dist/install.sh").write_text(shell, encoding="utf-8")
-          PY
-          chmod 0755 dist/install.sh
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

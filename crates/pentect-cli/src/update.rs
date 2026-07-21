@@ -33,7 +33,7 @@ struct ReleaseAsset {
     size: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct UpdateOptions {
     check: bool,
     force: bool,
