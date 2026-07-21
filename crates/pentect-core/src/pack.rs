@@ -83,7 +83,7 @@ pub fn load_plugin_pack(toml_src: &str) -> Result<Pack, String> {
             .as_table()
             .and_then(|table| table.get("pattern"))
             .and_then(toml::Value::as_str)
-            .map_or(true, str::is_empty)
+            .is_none_or(str::is_empty)
     }) {
         return Err("plugin.toml inline detectors require a non-empty regex pattern".to_string());
     }
