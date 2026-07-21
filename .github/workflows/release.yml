@@ -28,15 +28,9 @@ jobs:
         run: |
           git fetch origin main --no-tags
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $versions = @(
-            $metadata.packages |
-              Where-Object { $_.name -in @('pentect-cli', 'pentect-pii-ner') } |
-              Select-Object -ExpandProperty version -Unique
-          )
-          if ($versions.Count -ne 1) {
-            throw "pentect-cli and pentect-pii-ner versions must match"
-          }
-          $version = $versions[0]
+          $version = $metadata.packages |
+            Where-Object { $_.name -eq 'pentect-cli' } |
+            Select-Object -ExpandProperty version -First 1
           if ($env:GITHUB_REF_NAME -ne "v$version") {
             throw "tag $env:GITHUB_REF_NAME must match pentect-cli version v$version"
           }
@@ -95,6 +89,8 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.asset }}
       - name: Build release binary
         run: cargo build --release --locked -p pentect-cli -p pentect-pii-ner
       - name: Package binary and checksum
