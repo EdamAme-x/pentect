@@ -76,7 +76,6 @@ impl Detector for EnvValueDetector {
         if region.span.is_empty()
             || region.ctx.format != Kind::Env
             || is_rendered_placeholder(view.text())
-            || is_documentation_placeholder(view.text())
         {
             return vec![];
         }
@@ -1145,8 +1144,8 @@ mod tests {
         ));
         assert_eq!(sensitive_key_fires(Some("cookie-signature"), "1.2.2"), None);
         assert_eq!(sensitive_key_fires(Some("pbkdf2-password"), "^1.0.0"), None);
-        assert!(!env_fires(Some("HIPCHAT_API_KEY"), "your_hipchat_api_key"));
-        assert!(!env_fires(Some("GRAPHITE_USER"), "username"));
-        assert!(!env_fires(Some("LOG_FILE"), "/dev/null"));
+        assert!(env_fires(Some("HIPCHAT_API_KEY"), "your_hipchat_api_key"));
+        assert!(env_fires(Some("GRAPHITE_USER"), "username"));
+        assert!(env_fires(Some("LOG_FILE"), "/dev/null"));
     }
 }

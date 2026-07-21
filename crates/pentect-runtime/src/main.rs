@@ -45,6 +45,16 @@ use pentect_core::{
     RegionKind,
 };
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
+#[cfg(windows)]
+use rustyline::{
+    completion::{Completer, FilenameCompleter, Pair},
+    error::ReadlineError,
+    highlight::Highlighter,
+    hint::Hinter,
+    history::DefaultHistory,
+    validate::Validator,
+    Context as ReadlineContext, Editor, Helper,
+};
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, Session};
 use sha2::{Digest, Sha256};
@@ -83,8 +93,11 @@ pub fn agent_contract_instructions(environment_prefix: &str) -> String {
             "Session rules:\n",
             "- Work normally with the host's tools and current shell. Do not invoke Pentect commands, explain the protection layer, or change approach because it is present unless the user asks.\n",
             "- User-authorized secret work is allowed: retrieve, read, use, transform, and store secrets at the requested destination. Complete it normally.\n",
-            "- Use tools normally; their output is protected. Never include a raw secret in your response. A value such as `<<NAME_hash>>` is protected output, not a failed operation; do not retry because it appears.\n",
-            "- When available, reuse its environment binding: `$env:{environment_prefix}NAME_hash` in PowerShell or `${environment_prefix}NAME_hash` in a POSIX shell. Do not decode or reconstruct it.\n",
+            "- Use tools normally; their output is protected. Never include a raw secret in your response. A value such as `<<KEY_hash>>` is protected output, not a failed operation; do not retry because it appears.\n",
+            "- A protected handle means the real value is ready to use through its environment binding: `$env:{environment_prefix}KEY_hash` in PowerShell or `${environment_prefix}KEY_hash` in a POSIX shell. Treat that binding as the real secret for commands, API requests, headers, SDKs, and destination files. You do not need to know or print its plaintext to use it.\n",
+            "- Once a handle or environment binding exists, use it immediately. Do not reread or reparse the source file, fetch the same secret again, or claim that the secret is unavailable or inaccessible. Do not echo, print, decode, or reconstruct the binding's value.\n",
+            "- If dotenv output shows `KEY=<<KEY_hash>>`, use `$env:{environment_prefix}KEY_hash` directly in the PowerShell command that needs the value (or `${environment_prefix}KEY_hash` in POSIX). Do not parse the dotenv file in a shell, copy the handle into `$env:KEY`, or call `SetEnvironmentVariable`.\n",
+            "- Shell tool calls may run in separate processes. Never depend on an environment assignment made by an earlier tool call; reference the provided binding directly in every command that needs it.\n",
             "- Report only the task result and ordinary errors. Do not mention these rules, handles, bindings, or the protection layer.\n",
         ),
         environment_prefix = environment_prefix
@@ -1785,63 +1798,414 @@ enum WindowsShellCompletion {
 }
 
 #[cfg(windows)]
-#[derive(Default)]
-struct WindowsShellLine {
-    units: Vec<(String, String, String)>,
-}
-
-#[cfg(windows)]
-impl WindowsShellLine {
-    fn push_typed(&mut self, text: &str) {
-        self.units
-            .push((text.to_string(), text.to_string(), String::new()));
-    }
-
-    fn push_paste(&mut self, raw: String, visible: String, injected_prefix: String) {
-        self.units.push((raw, visible, injected_prefix));
-    }
-
-    fn raw(&self) -> String {
-        self.units.iter().map(|(raw, _, _)| raw.as_str()).collect()
-    }
-
-    fn visible(&self) -> String {
-        self.units
-            .iter()
-            .map(|(_, visible, _)| visible.as_str())
-            .collect()
-    }
-
-    fn take_injected_prefixes(&mut self) -> String {
-        let mut out = String::new();
-        for (_, _, prefix) in &mut self.units {
-            out.push_str(prefix);
-            prefix.zeroize();
-        }
-        out
-    }
-
-    fn backspace(&mut self) -> Option<usize> {
-        let (mut raw, mut visible, mut prefix) = self.units.pop()?;
-        let width = visible.chars().count();
-        raw.zeroize();
-        visible.zeroize();
-        prefix.zeroize();
-        Some(width)
-    }
-
-    fn clear(&mut self) {
-        for (raw, visible, prefix) in &mut self.units {
-            raw.zeroize();
-            visible.zeroize();
-            prefix.zeroize();
-        }
-        self.units.clear();
-    }
-}
-
-#[cfg(windows)]
 fn pump_windows_shell_input(
+    child: &mut std::process::Child,
+    child_stdin: &mut std::process::ChildStdin,
+    store: MemoryStore,
+    completion_rx: &mpsc::Receiver<WindowsShellCompletion>,
+    drain_marker: &str,
+) -> Result<ExitStatus, String> {
+    normalize_windows_shell_console_input_mode()?;
+    let display = WindowsShellDisplay::new(store.clone())?;
+    let mut editor = Editor::<WindowsShellDisplay, DefaultHistory>::new()
+        .map_err(|e| format!("could not initialize shell input: {e}"))?;
+    editor.set_helper(Some(display));
+    let history_path = windows_shell_history_path()?;
+    if let Some(parent) = history_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create shell history directory: {e}"))?;
+    }
+    load_windows_powershell_history(&mut editor);
+    if history_path.exists() {
+        let _ = editor.load_history(&history_path);
+    }
+    let mut protector = ShellInputProtector::new(store)?;
+    let mut cwd = std::env::current_dir()
+        .map_err(|e| format!("could not read current directory: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("could not poll PowerShell: {e}"))?
+        {
+            return Ok(status);
+        }
+        let prompt = format!("PS {}> ", compact_windows_shell_cwd(&cwd));
+        let mut raw = match editor.readline(&prompt) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => {
+                child
+                    .kill()
+                    .map_err(|e| format!("could not stop PowerShell: {e}"))?;
+                return child
+                    .wait()
+                    .map_err(|e| format!("could not wait for PowerShell: {e}"));
+            }
+            Err(e) => return Err(format!("could not read shell input: {e}")),
+        };
+        if let Some(agent_args) = windows_shell_interactive_agent_args(&raw) {
+            let mut history_probe = protector.prepare_paste(&raw)?;
+            if windows_shell_history_is_safe(&raw, history_probe.changed) {
+                remember_windows_shell_history(&mut editor, &history_path, &raw);
+            }
+            history_probe.child.zeroize();
+            history_probe.injected_prefix.zeroize();
+            let result = run_windows_shell_interactive_agent(&agent_args, &cwd);
+            raw.zeroize();
+            result?;
+            continue;
+        }
+        let mut protected = protector.prepare_paste(&raw)?;
+        if windows_shell_history_is_safe(&raw, protected.changed) {
+            remember_windows_shell_history(&mut editor, &history_path, &raw);
+        }
+        raw.zeroize();
+        let mut encoded = data_encoding::BASE64.encode(protected.child.as_bytes());
+        child_stdin
+            .write_all(encoded.as_bytes())
+            .and_then(|_| child_stdin.write_all(b"\n"))
+            .and_then(|_| child_stdin.flush())
+            .map_err(|e| format!("could not write PowerShell input: {e}"))?;
+        encoded.zeroize();
+        protected.child.zeroize();
+        protected.injected_prefix.zeroize();
+        match wait_for_windows_shell_completion_without_terminal_input(
+            child,
+            child_stdin,
+            completion_rx,
+            drain_marker,
+        )? {
+            Some(next_cwd) => {
+                cwd.zeroize();
+                cwd = next_cwd;
+            }
+            None => {
+                return child
+                    .wait()
+                    .map_err(|e| format!("could not wait for PowerShell: {e}"));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_shell_history_path() -> Result<PathBuf, String> {
+    Ok(process_host_root()?.join("shell-history.txt"))
+}
+
+#[cfg(windows)]
+fn windows_powershell_history_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|root| {
+        PathBuf::from(root)
+            .join("Microsoft")
+            .join("Windows")
+            .join("PowerShell")
+            .join("PSReadLine")
+            .join("ConsoleHost_history.txt")
+    })
+}
+
+#[cfg(windows)]
+fn load_windows_powershell_history(editor: &mut Editor<WindowsShellDisplay, DefaultHistory>) {
+    const IMPORT_LIMIT: usize = 100;
+    let Some(path) = windows_powershell_history_path() else {
+        return;
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut recent = contents
+        .lines()
+        .rev()
+        .take(IMPORT_LIMIT)
+        .collect::<Vec<_>>();
+    recent.reverse();
+    for command in recent {
+        if windows_shell_history_is_safe(command, false) {
+            let _ = editor.add_history_entry(command);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn remember_windows_shell_history(
+    editor: &mut Editor<WindowsShellDisplay, DefaultHistory>,
+    path: &Path,
+    command: &str,
+) {
+    if command.trim().is_empty() {
+        return;
+    }
+    if editor.add_history_entry(command).is_ok() {
+        let _ = editor.save_history(path);
+    }
+}
+
+#[cfg(windows)]
+fn windows_shell_history_is_safe(command: &str, protected: bool) -> bool {
+    !protected
+        && likely_shell_secret_range(command).is_none()
+        && !contains_unresolved_masked_handle(command)
+        && !command.to_ascii_lowercase().contains("pentect_")
+}
+
+#[cfg(all(windows, test))]
+fn is_windows_shell_interactive_agent_command(command: &str) -> bool {
+    windows_shell_interactive_agent_args(command).is_some()
+}
+
+#[cfg(windows)]
+fn windows_shell_interactive_agent_args(command: &str) -> Option<Vec<String>> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() || trimmed.contains([';', '|', '&', '\r', '\n']) {
+        return None;
+    }
+    let (program, _, mut cursor) = next_shell_word(trimmed, 0)?;
+    if !matches!(
+        program.to_ascii_lowercase().as_str(),
+        "codex" | "claude" | "opencode"
+    ) {
+        return None;
+    }
+    let mut args = vec![program.to_ascii_lowercase()];
+    while let Some((arg, _, next)) = next_shell_word(trimmed, cursor) {
+        args.push(arg);
+        cursor = next;
+    }
+    Some(args)
+}
+
+#[cfg(windows)]
+fn run_windows_shell_interactive_agent(args: &[String], cwd: &str) -> Result<(), String> {
+    let executable =
+        std::env::current_exe().map_err(|e| format!("could not locate pentect executable: {e}"))?;
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
+        .status()
+        .map_err(|e| format!("could not start interactive agent: {e}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsShellDisplay {
+    protector: Mutex<ShellInputProtector>,
+    completer: FilenameCompleter,
+}
+
+#[cfg(windows)]
+impl WindowsShellDisplay {
+    fn new(store: MemoryStore) -> Result<Self, String> {
+        Ok(Self {
+            protector: Mutex::new(ShellInputProtector::new(store)?),
+            completer: FilenameCompleter::new(),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Completer for WindowsShellDisplay {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &ReadlineContext<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        self.completer.complete(line, pos, ctx)
+    }
+}
+
+#[cfg(windows)]
+impl Hinter for WindowsShellDisplay {
+    type Hint = String;
+}
+
+#[cfg(windows)]
+impl Validator for WindowsShellDisplay {}
+
+#[cfg(windows)]
+impl Helper for WindowsShellDisplay {}
+
+#[cfg(windows)]
+impl Highlighter for WindowsShellDisplay {
+    fn highlight<'line>(&self, line: &'line str, _pos: usize) -> std::borrow::Cow<'line, str> {
+        let Ok(mut protector) = self.protector.lock() else {
+            return provisional_shell_secret_display(line)
+                .map(std::borrow::Cow::Owned)
+                .unwrap_or(std::borrow::Cow::Borrowed(line));
+        };
+        let Ok(mut protected) = protector.prepare_paste(line) else {
+            return provisional_shell_secret_display(line)
+                .map(std::borrow::Cow::Owned)
+                .unwrap_or(std::borrow::Cow::Borrowed(line));
+        };
+        if !protected.changed {
+            return provisional_shell_secret_display(line)
+                .map(std::borrow::Cow::Owned)
+                .unwrap_or(std::borrow::Cow::Borrowed(line));
+        }
+        let visible = canonical_shell_secret_display(line, &protected.visible)
+            .unwrap_or_else(|| protected.visible.clone());
+        let display = shell_display_with_same_width(line, &visible);
+        protected.child.zeroize();
+        protected.injected_prefix.zeroize();
+        std::borrow::Cow::Owned(display)
+    }
+
+    fn highlight_char(
+        &self,
+        _line: &str,
+        _pos: usize,
+        _kind: rustyline::highlight::CmdKind,
+    ) -> bool {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn canonical_shell_secret_display(raw: &str, protected: &str) -> Option<String> {
+    let (start, end) = likely_shell_secret_range(raw)?;
+    let env_start = protected.find("$env:PENTECT_")?;
+    let env_end = protected[env_start..]
+        .bytes()
+        .position(|byte| !is_env_name_byte(byte) && byte != b'$' && byte != b':')
+        .map(|offset| env_start + offset)
+        .unwrap_or(protected.len());
+    let mut display = String::new();
+    display.push_str(&raw[..start]);
+    display.push_str(&protected[env_start..env_end]);
+    display.push_str(&raw[end..]);
+    Some(display)
+}
+
+#[cfg(windows)]
+fn provisional_shell_secret_display(raw: &str) -> Option<String> {
+    let (start, end) = likely_shell_secret_range(raw)?;
+    let mut display = raw.to_string();
+    display.replace_range(start..end, &"•".repeat(raw[start..end].chars().count()));
+    Some(display)
+}
+
+fn likely_shell_secret_range(text: &str) -> Option<(usize, usize)> {
+    const PREFIXES: &[&str] = &[
+        "rpa_",
+        "KGAT_",
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "AKIA",
+    ];
+    let start = PREFIXES
+        .iter()
+        .filter_map(|prefix| text.find(prefix))
+        .min()?;
+    let mut end = start;
+    for (offset, ch) in text[start..].char_indices() {
+        if offset > 0
+            && (ch.is_whitespace() || matches!(ch, '\'' | '"' | ';' | '|' | ')' | ']' | '}'))
+        {
+            break;
+        }
+        end = start + offset + ch.len_utf8();
+    }
+    Some((start, end))
+}
+
+#[cfg(windows)]
+fn shell_display_with_same_width(raw: &str, protected: &str) -> String {
+    let raw_chars = raw.chars().count();
+    let protected_chars = protected.chars().count();
+    if protected_chars <= raw_chars {
+        let mut display = protected.to_string();
+        display.extend(std::iter::repeat_n(' ', raw_chars - protected_chars));
+        return display;
+    }
+    if raw_chars == 0 {
+        return String::new();
+    }
+    let mut display = protected
+        .chars()
+        .take(raw_chars.saturating_sub(1))
+        .collect::<String>();
+    display.push('…');
+    display
+}
+
+#[cfg(windows)]
+fn normalize_windows_shell_console_input_mode() -> Result<(), String> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE,
+    };
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut current = 0;
+    if unsafe { GetConsoleMode(handle, &mut current) } == 0 {
+        return Ok(());
+    }
+    let sane = windows_shell_sane_input_mode(current);
+    if sane != current && unsafe { SetConsoleMode(handle, sane) } == 0 {
+        return Err("could not restore the Windows console input mode".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_shell_sane_input_mode(current: u32) -> u32 {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
+        ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+    };
+
+    (current & !(ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT))
+        | ENABLE_PROCESSED_INPUT
+        | ENABLE_LINE_INPUT
+        | ENABLE_ECHO_INPUT
+        | ENABLE_EXTENDED_FLAGS
+}
+
+#[cfg(windows)]
+fn wait_for_windows_shell_completion_without_terminal_input(
+    child: &mut std::process::Child,
+    child_stdin: &mut std::process::ChildStdin,
+    completion_rx: &mpsc::Receiver<WindowsShellCompletion>,
+    drain_marker: &str,
+) -> Result<Option<String>, String> {
+    loop {
+        match completion_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(WindowsShellCompletion::DrainInput) => {
+                child_stdin
+                    .write_all(drain_marker.as_bytes())
+                    .and_then(|_| child_stdin.write_all(b"\r\n"))
+                    .and_then(|_| child_stdin.flush())
+                    .map_err(|e| format!("could not drain PowerShell input: {e}"))?;
+            }
+            Ok(WindowsShellCompletion::Complete(cwd)) => return Ok(Some(cwd)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if child
+                    .try_wait()
+                    .map_err(|e| format!("could not poll PowerShell: {e}"))?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
+#[cfg(any())]
+fn pump_windows_shell_input_legacy(
     child: &mut std::process::Child,
     child_stdin: &mut std::process::ChildStdin,
     store: MemoryStore,
@@ -1987,8 +2351,8 @@ fn pump_windows_shell_input(
     }
 }
 
-#[cfg(windows)]
-fn wait_for_windows_shell_completion(
+#[cfg(any())]
+fn wait_for_windows_shell_completion_legacy(
     child: &mut std::process::Child,
     child_stdin: &mut std::process::ChildStdin,
     completion_rx: &mpsc::Receiver<WindowsShellCompletion>,
@@ -2028,13 +2392,13 @@ fn wait_for_windows_shell_completion(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any())]
 #[derive(Default)]
 struct WindowsRunningInput {
     pending: String,
 }
 
-#[cfg(windows)]
+#[cfg(any())]
 impl WindowsRunningInput {
     fn clear(&mut self) {
         self.pending.zeroize();
@@ -2067,7 +2431,7 @@ impl WindowsRunningInput {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any())]
 fn forward_windows_running_input(
     event: crossterm::event::Event,
     child_stdin: &mut dyn Write,
@@ -2106,7 +2470,7 @@ fn forward_windows_running_input(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any())]
 fn print_windows_shell_prompt(cwd: &str) -> Result<(), String> {
     let display = compact_windows_shell_cwd(cwd);
     print!("PS {display}> ");
@@ -2137,15 +2501,15 @@ fn compact_windows_shell_cwd_with_home(cwd: &str, home: &str) -> String {
         .unwrap_or_else(|| cwd.to_string())
 }
 
-#[cfg(windows)]
+#[cfg(any())]
 fn single_line_shell_display(text: &str) -> String {
     text.replace("\r\n", " ↵ ").replace(['\r', '\n'], " ↵ ")
 }
 
-#[cfg(windows)]
+#[cfg(any())]
 struct BracketedPasteGuard;
 
-#[cfg(windows)]
+#[cfg(any())]
 impl BracketedPasteGuard {
     fn enable() -> Result<Self, String> {
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)
@@ -2154,7 +2518,7 @@ impl BracketedPasteGuard {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any())]
 impl Drop for BracketedPasteGuard {
     fn drop(&mut self) {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
@@ -2974,20 +3338,25 @@ impl ShellInputProtector {
 
     fn prepare_paste(&mut self, text: &str) -> Result<ProtectedPaste, String> {
         let masked = self.masker.mask_text(text, live_output_kind(text))?;
-        let (visible, bindings) = replace_masked_handles_with_env_refs(
+        let (mut visible, mut bindings) = replace_masked_handles_with_env_refs(
             &masked,
             &self.store,
             self.syntax,
             self.masker.environment_prefix(),
         )?;
-        if bindings.is_empty() {
-            return Ok(ProtectedPaste {
-                child: text.to_string(),
-                visible: text.to_string(),
-                changed: false,
-                injected_prefix: String::new(),
-            });
+        if bindings.len() == 1 {
+            if let Some((start, end)) = likely_shell_secret_range(text) {
+                bindings[0].value.zeroize();
+                bindings[0].value.push_str(&text[start..end]);
+                let env_ref = self.syntax.env_ref(&bindings[0].name);
+                visible.clear();
+                visible.push_str(&text[..start]);
+                visible.push_str(&env_ref);
+                visible.push_str(&text[end..]);
+            }
         }
+        let replaced_secret = !bindings.is_empty();
+        let command_text = if replaced_secret { &visible } else { text };
         let mut child = String::new();
         let mut injected_prefix = String::new();
         for mut binding in bindings {
@@ -2998,14 +3367,37 @@ impl ShellInputProtector {
             }
             binding.value.zeroize();
         }
-        child.push_str(&visible);
+        let referenced = referenced_env_names_in_text(command_text);
+        if !referenced.is_empty() {
+            for (name, mut value) in self.store.auto_env_bindings().map_err(|e| e.to_string())? {
+                if referenced.contains(&name.to_ascii_lowercase())
+                    && self.defined_env.insert(name.clone())
+                {
+                    let assignment = self.syntax.env_assignment(&name, &value);
+                    injected_prefix.push_str(&assignment);
+                    child.push_str(&assignment);
+                }
+                value.zeroize();
+            }
+        }
+        child.push_str(command_text);
         Ok(ProtectedPaste {
             child,
-            visible,
-            changed: true,
+            visible: command_text.to_string(),
+            changed: replaced_secret || !injected_prefix.is_empty(),
             injected_prefix,
         })
     }
+}
+
+fn referenced_env_names_in_text(text: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_powershell_env_refs(text, &mut names);
+    collect_powershell_env_provider_refs(text, &mut names);
+    collect_printenv_refs(text, &mut names);
+    collect_percent_env_refs(text, &mut names);
+    collect_bare_dollar_env_refs(text, &mut names);
+    names
 }
 
 #[derive(Clone, Copy)]
@@ -3032,7 +3424,9 @@ impl ShellSyntax {
 
     fn env_assignment(self, name: &str, value: &str) -> String {
         match self {
-            Self::PowerShell => format!("$env:{name}={}; ", powershell_word(value)),
+            Self::PowerShell => {
+                format!("$env:{name}={}; ", powershell_string_literal(value))
+            }
             Self::Posix => format!("export {name}={}; ", shell_quote_unix(value)),
         }
     }

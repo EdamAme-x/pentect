@@ -43,6 +43,7 @@ chacha20 = { workspace = true }
 toml = { workspace = true }
 anstream = { workspace = true }
 crossterm = { workspace = true }
+rustyline = { workspace = true }
 portable-pty = { workspace = true }
 zeroize = { workspace = true }
 ed25519-dalek = { workspace = true }

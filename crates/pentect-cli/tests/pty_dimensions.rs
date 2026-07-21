@@ -25,7 +25,7 @@ fn shell_pty_inherits_and_tracks_parent_dimensions() {
 }
 
 #[test]
-fn default_shell_keeps_split_input_aligned_and_does_not_enable_nested_terminal_modes() {
+fn default_shell_accepts_backspace_enter_and_masks_command_output() {
     let _serial = PTY_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -63,47 +63,31 @@ fn default_shell_keeps_split_input_aligned_and_does_not_enable_nested_terminal_m
 
     let mut output = String::new();
     wait_for_text(&rx, &mut output, "PS ");
+    let raw_secret = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
     {
         let mut input = writer.lock().unwrap();
-        input.write_all(b"ca").unwrap();
+        input.write_all(b"Write-Outpuz").unwrap();
+        input
+            .write_all(b"\x1b[8;14;8;1;0;1_\x1b[8;14;8;0;0;1_")
+            .unwrap();
+        input.write_all(b"t ").unwrap();
+        input.write_all(raw_secret.as_bytes()).unwrap();
+        input.write_all(b"\r").unwrap();
         input.flush().unwrap();
     }
-    std::thread::sleep(Duration::from_millis(75));
-    {
-        let mut input = writer.lock().unwrap();
-        input.write_all(b"t .env").unwrap();
-        input.flush().unwrap();
-    }
-    wait_for_text(&rx, &mut output, "cat .env");
+    wait_for_text(&rx, &mut output, "<<SECRET_");
     child.kill().unwrap();
     let _ = wait_for_child(child.as_mut());
     drop(pair.master);
     join_reader(reader_thread);
     output.extend(rx.try_iter());
-    assert!(output.contains("cat .env"), "{output:?}");
-    let shell_output = output
-        .find("PS ")
-        .map(|start| &output[start..])
-        .unwrap_or(&output);
+    assert!(output.contains("<<SECRET_"), "{output:?}");
+    assert!(!output.contains(raw_secret), "{output:?}");
+    assert!(!output.contains("rpa_"), "{output:?}");
     assert!(
-        !shell_output.contains("\x1b[1G"),
-        "simple append input must not redraw from an absolute column: {shell_output:?}"
+        !output.contains("[555;"),
+        "mouse input leaked into the shell: {output:?}"
     );
-    for forbidden in [
-        "\x1b[?9001h",
-        "\x1b[?1000h",
-        "\x1b[?1002h",
-        "\x1b[?1003h",
-        "\x1b[?1006h",
-        "\x1b[?1015h",
-        "\x1b[?1016h",
-        "\x1b[?1049h",
-    ] {
-        assert!(
-            !shell_output.contains(forbidden),
-            "{forbidden:?} in {shell_output:?}"
-        );
-    }
     let _ = std::fs::remove_dir_all(root);
 }
 

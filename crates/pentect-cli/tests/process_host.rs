@@ -100,9 +100,9 @@ fn codex_dry_run_uses_project_environment_prefix() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(rendered.contains("$env:SAFE_NAME_hash"), "{rendered}");
-    assert!(rendered.contains("$SAFE_NAME_hash"), "{rendered}");
-    assert!(!rendered.contains("PENTECT_NAME_hash"), "{rendered}");
+    assert!(rendered.contains("$env:SAFE_KEY_hash"), "{rendered}");
+    assert!(rendered.contains("$SAFE_KEY_hash"), "{rendered}");
+    assert!(!rendered.contains("PENTECT_KEY_hash"), "{rendered}");
 }
 
 #[test]

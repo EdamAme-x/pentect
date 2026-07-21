@@ -4,38 +4,6 @@ static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(windows)]
 #[test]
-fn windows_shell_line_keeps_raw_and_visible_paste_separate() {
-    let mut line = WindowsShellLine::default();
-    line.push_typed("echo ");
-    line.push_paste(
-        "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef".to_string(),
-        "$env:PENTECT_RUNPOD_API_KEY_deadbeef".to_string(),
-        "$env:PENTECT_RUNPOD_API_KEY_deadbeef='secret'; ".to_string(),
-    );
-
-    assert_eq!(
-        line.raw(),
-        "echo rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"
-    );
-    assert_eq!(line.visible(), "echo $env:PENTECT_RUNPOD_API_KEY_deadbeef");
-    assert!(line
-        .take_injected_prefixes()
-        .starts_with("$env:PENTECT_RUNPOD_API_KEY_deadbeef="));
-    assert!(line.backspace().is_some());
-    assert_eq!(line.raw(), "echo ");
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_shell_paste_display_keeps_the_prompt_on_one_line() {
-    assert_eq!(
-        single_line_shell_display("Write-Output one\r\nWrite-Output two\n"),
-        "Write-Output one ↵ Write-Output two ↵ "
-    );
-}
-
-#[cfg(windows)]
-#[test]
 fn windows_shell_prompt_compacts_only_home_and_its_descendants() {
     assert_eq!(
         compact_windows_shell_cwd_with_home(r"C:\Users\yun40\Desktop\pentect", r"C:\Users\yun40"),
@@ -49,6 +17,111 @@ fn windows_shell_prompt_compacts_only_home_and_its_descendants() {
         compact_windows_shell_cwd_with_home(r"C:\Users\yun400\work", r"C:\Users\yun40"),
         r"C:\Users\yun400\work"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_shell_repairs_stale_virtual_terminal_input_mode() {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
+        ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+    };
+
+    let repaired =
+        windows_shell_sane_input_mode(ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT);
+    assert_eq!(repaired & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+    assert_eq!(repaired & ENABLE_MOUSE_INPUT, 0);
+    for required in [
+        ENABLE_PROCESSED_INPUT,
+        ENABLE_LINE_INPUT,
+        ENABLE_ECHO_INPUT,
+        ENABLE_EXTENDED_FLAGS,
+    ] {
+        assert_ne!(repaired & required, 0);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_shell_routes_interactive_agents_outside_the_protocol_pipe() {
+    assert!(is_windows_shell_interactive_agent_command("codex"));
+    assert!(is_windows_shell_interactive_agent_command(
+        "claude --resume"
+    ));
+    assert!(is_windows_shell_interactive_agent_command("opencode"));
+    assert_eq!(
+        windows_shell_interactive_agent_args("claude --resume").unwrap(),
+        ["claude", "--resume"]
+    );
+    assert!(!is_windows_shell_interactive_agent_command("codex; whoami"));
+    assert!(!is_windows_shell_interactive_agent_command(
+        "Write-Output codex"
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_shell_history_excludes_protected_commands() {
+    assert!(windows_shell_history_is_safe("git status", false));
+    assert!(!windows_shell_history_is_safe(
+        "Write-Output rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef",
+        true
+    ));
+    assert!(!windows_shell_history_is_safe(
+        "$env:PENTECT_SECRET_deadbeef",
+        false
+    ));
+    assert!(!windows_shell_history_is_safe(
+        "Write-Output <<SECRET_deadbeef>>",
+        false
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_shell_display_never_renders_the_pasted_secret() {
+    let (root, session) = empty_session("windows-shell-safe-display");
+    let store = MemoryStore::for_session(&session);
+    let display = WindowsShellDisplay::new(store).unwrap();
+    let raw = "Write-Output rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let rendered = Highlighter::highlight(&display, raw, raw.len()).into_owned();
+
+    assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
+    assert!(rendered.contains("$env:PENTECT_"), "{rendered}");
+    assert_eq!(rendered.chars().count(), raw.chars().count());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_shell_env_reference_injects_its_recovered_value() {
+    let (root, session) = empty_session("windows-shell-env-injection");
+    let store = MemoryStore::for_session(&session);
+    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let mut preview = ShellInputProtector::new(store.clone()).unwrap();
+    let displayed = preview.prepare_paste(raw).unwrap();
+    assert!(displayed.visible.starts_with("$env:PENTECT_SECRET_"));
+
+    let mut executor = ShellInputProtector::new(store).unwrap();
+    let mut submitted = executor.prepare_paste(&displayed.visible).unwrap();
+    assert!(submitted.child.contains(raw), "{}", submitted.child);
+    assert!(
+        submitted.child.ends_with(&displayed.visible),
+        "{}",
+        submitted.child
+    );
+    let output = Command::new(windows_powershell_path())
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(&submitted.child)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), raw);
+    submitted.child.zeroize();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(windows)]
@@ -432,21 +505,19 @@ fn windows_shell_keeps_previewed_secret_assignment_until_submit() {
     let store = MemoryStore::for_session(&session);
     let mut protector = ShellInputProtector::new(store).unwrap();
     let raw = "Write-Output sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-    let preview = protector.prepare_paste(raw).unwrap();
-    let mut line = WindowsShellLine::default();
-    line.push_paste(raw.to_string(), preview.visible, preview.injected_prefix);
-
-    let submitted = protector.prepare_paste(&line.raw()).unwrap();
-    assert!(submitted.injected_prefix.is_empty());
-    let mut child_command = line.take_injected_prefixes();
-    child_command.push_str(&submitted.child);
+    let mut submitted = protector.prepare_paste(raw).unwrap();
     assert!(
-        child_command.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
-        "{child_command}"
+        submitted.child.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+        "{}",
+        submitted.child
     );
-    assert!(child_command.contains("$env:PENTECT_"), "{child_command}");
-    assert!(!line.visible().contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
-    child_command.zeroize();
+    assert!(
+        submitted.child.contains("$env:PENTECT_"),
+        "{}",
+        submitted.child
+    );
+    assert!(!submitted.visible.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+    submitted.child.zeroize();
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -780,15 +851,11 @@ fn read_dotenv_masks_all_values() {
     assert!(!result.masked.contains("114514810"), "{}", result.masked);
     assert!(!result.masked.contains("hello world"), "{}", result.masked);
     assert!(
-        result.masked.contains("TEST_SECRET=<<SECRET_"),
+        result.masked.contains("TEST_SECRET=<<TEST_SECRET_"),
         "{}",
         result.masked
     );
-    assert!(
-        result.masked.contains("NOTE=<<SECRET_"),
-        "{}",
-        result.masked
-    );
+    assert!(result.masked.contains("NOTE=<<NOTE_"), "{}", result.masked);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1194,8 +1261,8 @@ fn exec_auto_binds_masked_env_output_in_running_session() {
         masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
         "{masked}"
     );
-    assert!(masked.contains("TEST_SECRET=<<SECRET_"), "{masked}");
-    assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
+    assert!(masked.contains("TEST_SECRET=<<TEST_SECRET_"), "{masked}");
+    assert!(masked.contains("NOTE=<<NOTE_"), "{masked}");
     let runpod_handle = masked_handle_from_assignment(&masked, "RUNPOD_API_KEY");
     let runpod_pentect_env = pentect_env_name_for_handle(&runpod_handle);
     let test_secret_env =
@@ -1358,11 +1425,8 @@ fn auto_env_bindings_do_not_override_baseline_environment() {
     let session = Session::open_capability_at(&root, "t").unwrap();
     let output = "PATH=sk-ABCDEFGHIJKLMNOPQRSTUVWX\nPENTECT_MEMORY_STORE_TOKEN=sk-ZZZZZZZZZZZZZZZZZZZZ\nDUMMY_SECRET=sk-YYYYYYYYYYYYYYYYYYYY\n";
     let masked = mask_tool_output(&session, output).unwrap();
-    assert!(masked.contains("PATH=<<OPENAI_API_KEY_"), "{masked}");
-    assert!(
-        masked.contains("DUMMY_SECRET=<<OPENAI_API_KEY_"),
-        "{masked}"
-    );
+    assert!(masked.contains("PATH=<<PATH_"), "{masked}");
+    assert!(masked.contains("DUMMY_SECRET=<<DUMMY_SECRET_"), "{masked}");
 
     let store = MemoryStore::for_session(&session);
     let env = store.auto_env_bindings().unwrap();
@@ -1375,7 +1439,7 @@ fn auto_env_bindings_do_not_override_baseline_environment() {
     );
     assert!(
         env.iter()
-            .any(|(name, value)| name.starts_with("PENTECT_OPENAI_API_KEY_")
+            .any(|(name, value)| name.starts_with("PENTECT_DUMMY_SECRET_")
                 && value == "sk-YYYYYYYYYYYYYYYYYYYY"),
         "{env:?}"
     );
@@ -2050,7 +2114,7 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("<<RUNPOD_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<SECRET_"), "{rendered}");
     assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
     assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     assert!(!rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
@@ -2110,7 +2174,7 @@ fn generic_posttool_masks_external_tool_response_aliases() {
     let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("<<RUNPOD_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<SECRET_"), "{rendered}");
     assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
     assert!(!rendered.contains(raw_runpod), "{rendered}");
     assert!(!rendered.contains(raw_openai), "{rendered}");
@@ -2526,10 +2590,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
     assert!(!rendered.contains(raw), "{rendered}");
-    assert!(
-        rendered.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("RUNPOD_API_KEY=<<SECRET_"), "{rendered}");
     assert!(rendered.contains("Create API key"), "{rendered}");
     assert!(
         rendered.contains("Use this key to call the health endpoint."),
@@ -2541,7 +2602,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     let env_name = env
         .iter()
         .find_map(|(name, value)| {
-            (name.starts_with("PENTECT_RUNPOD_API_KEY_") && value == raw).then(|| name.clone())
+            (name.starts_with("PENTECT_SECRET_") && value == raw).then(|| name.clone())
         })
         .unwrap_or_else(|| panic!("missing RUNPOD capability in {env:?}"));
     let command = if cfg!(windows) {
@@ -2560,7 +2621,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     assert!(stdout.contains(raw), "{stdout}");
     let safe = mask_tool_output(&session, &stdout).unwrap();
     assert!(!safe.contains(raw), "{safe}");
-    assert!(safe.contains("<<RUNPOD_API_KEY_"), "{safe}");
+    assert!(safe.contains("<<SECRET_"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2784,8 +2845,8 @@ fn env_like_tool_output_masks_all_env_values() {
     assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     assert!(!masked.contains("114514810"), "{masked}");
     assert!(!masked.contains("hello world"), "{masked}");
-    assert!(masked.contains("TEST_SECRET=<<SECRET_"), "{masked}");
-    assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
+    assert!(masked.contains("TEST_SECRET=<<TEST_SECRET_"), "{masked}");
+    assert!(masked.contains("NOTE=<<NOTE_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2981,8 +3042,8 @@ fn metadata_assignment_output_does_not_pollute_recovery() {
         masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
         "{masked}"
     );
-    assert!(masked.contains("TEST_SECRET=<<SECRET_"), "{masked}");
-    assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
+    assert!(masked.contains("TEST_SECRET=<<TEST_SECRET_"), "{masked}");
+    assert!(masked.contains("NOTE=<<NOTE_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2991,7 +3052,7 @@ fn live_single_assignment_output_masks_value() {
     let (root, session) = empty_session("exec-live-single-assignment");
     let masked = mask_live_output(&session, "NOTE=hello world\n").unwrap();
     assert!(!masked.contains("hello world"), "{masked}");
-    assert!(masked.contains("NOTE=<<SECRET_"), "{masked}");
+    assert!(masked.contains("NOTE=<<NOTE_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -4377,47 +4438,6 @@ fn powershell_same_shell_wrapper_preserves_script_fetch_failure() {
     );
 }
 
-#[cfg(windows)]
-#[test]
-fn running_windows_shell_forwards_interactive_input() {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-
-    let mut output = Vec::new();
-    let mut input = WindowsRunningInput::default();
-    forward_windows_running_input(
-        Event::Paste("secret texx".to_string()),
-        &mut output,
-        &mut input,
-    )
-    .unwrap();
-    forward_windows_running_input(
-        Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
-        &mut output,
-        &mut input,
-    )
-    .unwrap();
-    forward_windows_running_input(
-        Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
-        &mut output,
-        &mut input,
-    )
-    .unwrap();
-    forward_windows_running_input(Event::Paste("xt".to_string()), &mut output, &mut input).unwrap();
-    forward_windows_running_input(
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        &mut output,
-        &mut input,
-    )
-    .unwrap();
-    forward_windows_running_input(
-        Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-        &mut output,
-        &mut input,
-    )
-    .unwrap();
-    assert_eq!(output, b"secret text\r\n\x03");
-}
-
 #[test]
 fn bash_same_shell_wrapper_preserves_output_and_exit_code() {
     let Some(bash) = bash_for_wrapper_test() else {
@@ -4565,7 +4585,7 @@ fn hook_text_masks_runpod_token_as_plain_text() {
     let raw = concat!("RUNPOD=", "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
     let masked = mask_tool_output(&session, raw).unwrap();
     assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
-    assert!(masked.contains("<<RUNPOD_API_KEY_"), "{masked}");
+    assert!(masked.contains("<<SECRET_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 

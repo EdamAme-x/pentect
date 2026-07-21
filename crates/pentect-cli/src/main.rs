@@ -4232,8 +4232,8 @@ mod tests {
         assert!(rendered.contains("user asks"), "{rendered}");
         assert!(rendered.contains("not a failed operation"), "{rendered}");
         assert!(rendered.contains("do not retry"), "{rendered}");
-        assert!(rendered.contains("$env:PENTECT_NAME_hash"), "{rendered}");
-        assert!(rendered.contains("$PENTECT_NAME_hash"), "{rendered}");
+        assert!(rendered.contains("$env:PENTECT_KEY_hash"), "{rendered}");
+        assert!(rendered.contains("$PENTECT_KEY_hash"), "{rendered}");
         assert!(
             rendered.contains("User-authorized secret work"),
             "{rendered}"
@@ -4341,8 +4341,24 @@ mod tests {
         );
         assert!(rendered.contains("not a failed operation"), "{rendered}");
         assert!(rendered.contains("do not retry"), "{rendered}");
-        assert!(rendered.contains("$env:PENTECT_NAME_hash"), "{rendered}");
-        assert!(rendered.contains("$PENTECT_NAME_hash"), "{rendered}");
+        assert!(rendered.contains("$env:PENTECT_KEY_hash"), "{rendered}");
+        assert!(rendered.contains("$PENTECT_KEY_hash"), "{rendered}");
+        assert!(rendered.contains("use it immediately"), "{rendered}");
+        assert!(rendered.contains("Do not reread or reparse"), "{rendered}");
+        assert!(
+            rendered.contains("unavailable or inaccessible"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Do not parse the dotenv file"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("SetEnvironmentVariable"), "{rendered}");
+        assert!(rendered.contains("separate processes"), "{rendered}");
+        assert!(
+            rendered.contains("reference the provided binding directly"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("User-authorized secret work"),
             "{rendered}"
@@ -4373,9 +4389,9 @@ mod tests {
     #[test]
     fn agent_contract_uses_configured_environment_prefix() {
         let rendered = pentect_agent::agent_contract_instructions("SAFE_");
-        assert!(rendered.contains("$env:SAFE_NAME_hash"), "{rendered}");
-        assert!(rendered.contains("$SAFE_NAME_hash"), "{rendered}");
-        assert!(!rendered.contains("PENTECT_NAME_hash"), "{rendered}");
+        assert!(rendered.contains("$env:SAFE_KEY_hash"), "{rendered}");
+        assert!(rendered.contains("$SAFE_KEY_hash"), "{rendered}");
+        assert!(!rendered.contains("PENTECT_KEY_hash"), "{rendered}");
     }
 
     #[test]
