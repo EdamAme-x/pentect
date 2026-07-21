@@ -1,8 +1,21 @@
+param([string]$Version = $env:PENTECT_VERSION)
+
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repository = 'EdamAme-x/pentect'
-$baseUrl = "https://github.com/$repository/releases/latest/download"
+$requestedVersion = $Version
+if ($requestedVersion) {
+    $requestedVersion = $requestedVersion.TrimStart('v')
+    if ($requestedVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+        throw "pentect: invalid version: $requestedVersion"
+    }
+    $releaseTag = "v$requestedVersion"
+    $baseUrl = "https://github.com/$repository/releases/download/$releaseTag"
+} else {
+    $releaseTag = 'latest'
+    $baseUrl = "https://github.com/$repository/releases/latest/download"
+}
 $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 if ($architecture -ne 'X64') {
     throw "pentect: unsupported Windows architecture: $architecture"
@@ -15,9 +28,11 @@ $installDir = if ($env:PENTECT_INSTALL_DIR) {
     Join-Path $env:LOCALAPPDATA 'Pentect\bin'
 }
 $destination = Join-Path $installDir 'pentect.exe'
+$marker = Join-Path $installDir '.pentect-managed-install.json'
 
 if ($env:PENTECT_INSTALL_DRY_RUN -eq '1') {
     Write-Output "asset=$asset"
+    Write-Output "version=$releaseTag"
     Write-Output "install=$destination"
     return
 }
@@ -48,15 +63,23 @@ try {
     }
     Move-Item -LiteralPath $staged -Destination $destination -Force
 
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $pathParts = @($userPath -split ';' | Where-Object { $_ })
-    if (-not ($pathParts | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
-        $nextPath = (@($pathParts) + $installDir) -join ';'
-        [Environment]::SetEnvironmentVariable('Path', $nextPath, 'User')
+    $pathAdded = $false
+    if (Test-Path -LiteralPath $marker) {
+        try { $pathAdded = [bool]((Get-Content -Raw -LiteralPath $marker | ConvertFrom-Json).path_added) } catch {}
     }
-    if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
-        $env:Path = "$installDir;$env:Path"
+    if ($env:PENTECT_INSTALL_SKIP_PATH -ne '1') {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $pathParts = @($userPath -split ';' | Where-Object { $_ })
+        if (-not ($pathParts | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
+            $nextPath = (@($pathParts) + $installDir) -join ';'
+            [Environment]::SetEnvironmentVariable('Path', $nextPath, 'User')
+            $pathAdded = $true
+        }
+        if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
+            $env:Path = "$installDir;$env:Path"
+        }
     }
+    @{ version = 1; path_added = $pathAdded } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 -LiteralPath $marker
     Write-Output "pentect: installed $destination"
 } finally {
     if (Test-Path -LiteralPath $tempDir) {
