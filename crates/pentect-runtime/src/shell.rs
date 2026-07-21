@@ -49,11 +49,11 @@ pub(crate) fn powershell_word(value: &str) -> String {
     if is_simple_shell_word(value) {
         value.to_string()
     } else {
-        powershell_quote(value)
+        powershell_string_literal(value)
     }
 }
 
-fn powershell_quote(value: &str) -> String {
+pub(crate) fn powershell_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 

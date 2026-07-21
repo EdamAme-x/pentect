@@ -65,7 +65,7 @@ impl RuleDetector {
                 "OPENAI_API_KEY",
                 High,
             ),
-            (r"rpa_[A-Za-z0-9]{24,}", Secret, "RUNPOD_API_KEY", High),
+            (r"rpa_[A-Za-z0-9]{24,}", Secret, "SECRET", High),
             (r"hf_[A-Za-z0-9]{30,}", Secret, "HUGGINGFACE_TOKEN", High),
             (r"xox[baprs]-[A-Za-z0-9-]{10,}", Secret, "SLACK_TOKEN", High),
             (
@@ -492,7 +492,7 @@ fn builtin_prefilter(label: &str, pattern: &str) -> Vec<String> {
         "ANTHROPIC_API_KEY" => &["sk-ant-"],
         "OPENAI_API_KEY" if pattern.contains(r"[ \t]+") => &["sk ", "sk\t"],
         "OPENAI_API_KEY" => &["sk-"],
-        "RUNPOD_API_KEY" => &["rpa_"],
+        "SECRET" if pattern.starts_with("rpa_") => &["rpa_"],
         "HUGGINGFACE_TOKEN" => &["hf_"],
         "SLACK_TOKEN" => &["xox"],
         "SLACK_WEBHOOK" => &["hooks.slack.com/services/"],
@@ -596,7 +596,7 @@ mod tests {
             ),
             (
                 concat!("rpa", "_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"),
-                "RUNPOD_API_KEY",
+                "SECRET",
             ),
             (
                 concat!("sk-ant-api03-", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn"),

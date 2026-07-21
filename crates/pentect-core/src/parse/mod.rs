@@ -98,26 +98,33 @@ fn parse_env_line(raw: &str, start: usize, end: usize) -> Option<(String, ByteRa
     };
     let after_bom = &line[bom..];
     let lead = after_bom.len() - after_bom.trim_start().len();
-    let body = &after_bom[lead..];
+    let mut body_off = bom + lead;
+    let mut body = &line[body_off..];
     if body.is_empty() || body.starts_with('#') {
         return None;
     }
-    // Optional `export ` prefix.
-    let body_off = bom
-        + lead
-        + body
-            .strip_prefix("export ")
-            .map_or(0, |rest| body.len() - rest.len());
-    let after_export = &line[body_off..];
 
-    let eq = after_export.find('=')?;
-    let key = after_export[..eq].trim();
+    // Tolerate common dotenv/shell spellings without making arbitrary prose an
+    // assignment: `export KEY=...`, `set KEY=...`, and `$env:KEY=...`.
+    if let Some(rest) =
+        strip_env_command_prefix(body, "export").or_else(|| strip_env_command_prefix(body, "set"))
+    {
+        body_off += body.len() - rest.len();
+        body = rest;
+    }
+    if let Some(rest) = body.strip_prefix("$env:") {
+        body_off += body.len() - rest.len();
+        body = rest;
+    }
+
+    let (separator, separator_len) = env_separator(body)?;
+    let key = body[..separator].trim();
     if key.is_empty() || !key.chars().all(is_key_char) {
         return None;
     }
 
-    // Value starts after '=' and any spaces/tabs.
-    let val_rel = body_off + eq + 1;
+    // Value starts after the separator and any spaces/tabs.
+    let val_rel = body_off + separator + separator_len;
     let val_part = &line[val_rel..];
     let skip = val_part.len() - val_part.trim_start_matches([' ', '\t']).len();
     let vstart = val_rel + skip;
@@ -134,7 +141,10 @@ fn parse_env_line(raw: &str, start: usize, end: usize) -> Option<(String, ByteRa
             let close = after.find('\'').map_or(after.len(), |i| i);
             (vstart + 1, vstart + 1 + close)
         }
-        _ => (vstart, vstart + value.trim_end().len()),
+        _ => {
+            let comment = inline_env_comment_start(value).unwrap_or(value.len());
+            (vstart, vstart + value[..comment].trim_end().len())
+        }
     };
     if inner_end <= inner_start {
         return None;
@@ -143,6 +153,40 @@ fn parse_env_line(raw: &str, start: usize, end: usize) -> Option<(String, ByteRa
         key.to_string(),
         ByteRange::new(start + inner_start, start + inner_end),
     ))
+}
+
+fn strip_env_command_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = value.strip_prefix(prefix)?;
+    let trimmed = rest.trim_start_matches([' ', '\t']);
+    (trimmed.len() < rest.len()).then_some(trimmed)
+}
+
+fn env_separator(value: &str) -> Option<(usize, usize)> {
+    if let Some(eq) = value.find('=') {
+        return Some((eq, 1));
+    }
+    value.char_indices().find_map(|(index, ch)| {
+        if ch != ':' {
+            return None;
+        }
+        value[index + ch.len_utf8()..]
+            .chars()
+            .next()
+            .is_some_and(|next| next == ' ' || next == '\t')
+            .then_some((index, ch.len_utf8()))
+    })
+}
+
+fn inline_env_comment_start(value: &str) -> Option<usize> {
+    value.char_indices().find_map(|(index, ch)| {
+        (ch == '#'
+            && (index == 0
+                || value[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)))
+        .then_some(index)
+    })
 }
 
 fn is_key_char(c: char) -> bool {
@@ -197,6 +241,25 @@ mod tests {
         let r = EnvParser.parse(raw).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(&raw[r[0].span.start..r[0].span.end], "abc"); // no quotes
+    }
+
+    #[test]
+    fn tolerates_spacing_prefixes_inline_comments_and_colons() {
+        let raw = concat!(
+            "  export\tAPI_KEY = abc=def # keep this comment\r\n",
+            "set LOWER.name='quoted # value' # trailing\n",
+            "$env:PS_TOKEN = xyz#part\n",
+            "ODD_KEY: colon value # trailing\n",
+        );
+        assert_eq!(
+            parsed(raw),
+            [
+                (Some("API_KEY".into()), "abc=def".into()),
+                (Some("LOWER.name".into()), "quoted # value".into()),
+                (Some("PS_TOKEN".into()), "xyz#part".into()),
+                (Some("ODD_KEY".into()), "colon value".into()),
+            ]
+        );
     }
 
     #[test]

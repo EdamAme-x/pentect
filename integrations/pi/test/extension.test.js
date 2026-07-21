@@ -54,7 +54,7 @@ test(
   async () => {
     const originalBin = process.env.PENTECT_BIN;
     const originalPath = process.env.PATH;
-    process.env.PENTECT_BIN = e2eBin;
+    process.env.PENTECT_BIN = join(tmpdir(), "untrusted-pentect-bin");
     process.env.PATH = `${dirname(e2eBin)}${delimiter}${originalPath || ""}`;
     const pi = new TestPi();
     pentectExtension(pi);
@@ -72,7 +72,7 @@ test(
       const contract = (
         await pi.emit("before_agent_start", { systemPrompt: "Pi" })
       )[0].systemPrompt;
-      assert.match(contract, /Pentect agent contract/);
+      assert.match(contract, /Session rules/);
 
       const raw = ["sk-", "ABCDEFGHIJKLMNOPQRSTUVWX"].join("");
       const input = (
@@ -91,10 +91,7 @@ test(
 
       const handle = input.text.split("=")[1];
       const alias = `PENTECT_${handle.slice(2, -2)}`;
-      const command =
-        process.platform === "win32"
-          ? `Write-Output $env:${alias}`
-          : `printf '%s\\n' "$${alias}"`;
+      const command = `printf '%s\\n' "$${alias}"`;
       const updates = [];
       const toolInput = { command };
       const result = await pi.tools.get("bash").execute(
@@ -122,6 +119,32 @@ test(
       assert.doesNotMatch(renderedConnector, new RegExp(raw));
       assert.match(renderedConnector, /<<OPENAI_API_KEY_[a-f0-9]+>>/);
       assert.equal(connector.isError, false);
+
+      const remoteInput = { command: "remote-operation", argument: "value" };
+      const remoteBefore = (
+        await pi.emit("tool_call", {
+          toolName: "mcp__service__invoke",
+          input: remoteInput,
+        })
+      )[0];
+      assert.deepEqual(remoteBefore, {});
+      assert.deepEqual(remoteInput, {
+        command: "remote-operation",
+        argument: "value",
+      });
+
+      const unavailable = (
+        await pi.emit("tool_result", {
+          toolName: "connector",
+          input: {},
+          content: [{ type: "audio", data: "opaque" }],
+          details: { requestId: "done" },
+          isError: false,
+        })
+      )[0];
+      assert.equal(unavailable.isError, false);
+      assert.deepEqual(unavailable.details, { requestId: "done" });
+      assert.match(unavailable.content[0].text, /Tool completed/);
     } finally {
       await pi.emit("session_shutdown", { reason: "quit" });
       if (originalBin === undefined) delete process.env.PENTECT_BIN;
@@ -155,7 +178,7 @@ test(
             env: {
               ...process.env,
               PATH: `${dirname(e2eBin)}${delimiter}${process.env.PATH || ""}`,
-              PENTECT_BIN: e2eBin,
+              PENTECT_BIN: join(agentDir, "untrusted-pentect-bin"),
               PI_CODING_AGENT_DIR: agentDir,
             },
             stdio: ["pipe", "pipe", "pipe"],

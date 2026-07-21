@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'EdamAme-x/pentect'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify tag, version, and commit
+        shell: pwsh
+        run: |
+          git fetch origin main --no-tags
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $versions = @(
+            $metadata.packages |
+              Where-Object { $_.name -in @('pentect-cli', 'pentect-pii-ner') } |
+              Select-Object -ExpandProperty version -Unique
+          )
+          if ($versions.Count -ne 1) {
+            throw "pentect-cli and pentect-pii-ner versions must match"
+          }
+          $version = $versions[0]
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "tag $env:GITHUB_REF_NAME must match pentect-cli version v$version"
+          }
+          $main = git rev-parse origin/main
+          if ($env:GITHUB_SHA -ne $main) {
+            throw "release tag must point at origin/main ($main)"
+          }
+      - name: Validate POSIX installer
+        run: sh -n tools/install.sh
+      - name: Validate PowerShell installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'tools/install.ps1'),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -ne 0) {
+            throw ($errors | Out-String)
+          }
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: pentect-windows-x86_64.exe
+            binary: target/release/pentect.exe
+            helper_asset: pentect-pii-ner-windows-x86_64.exe
+            helper_binary: target/release/pentect-pii-ner.exe
+          - os: ubuntu-latest
+            asset: pentect-linux-x86_64
+            binary: target/release/pentect
+            helper_asset: pentect-pii-ner-linux-x86_64
+            helper_binary: target/release/pentect-pii-ner
+          - os: macos-15-intel
+            asset: pentect-macos-x86_64
+            binary: target/release/pentect
+            helper_asset: pentect-pii-ner-macos-x86_64
+            helper_binary: target/release/pentect-pii-ner
+          - os: macos-15
+            asset: pentect-macos-aarch64
+            binary: target/release/pentect
+            helper_asset: pentect-pii-ner-macos-aarch64
+            helper_binary: target/release/pentect-pii-ner
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked -p pentect-cli -p pentect-pii-ner
+      - name: Package binary and checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $asset = '${{ matrix.asset }}'
+          $destination = Join-Path dist $asset
+          Copy-Item '${{ matrix.binary }}' $destination
+          $hash = (Get-FileHash -Algorithm SHA256 $destination).Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content -NoNewline -Encoding utf8 "$destination.sha256"
+          $helperAsset = '${{ matrix.helper_asset }}'
+          $helperDestination = Join-Path dist $helperAsset
+          Copy-Item '${{ matrix.helper_binary }}' $helperDestination
+          $helperHash = (Get-FileHash -Algorithm SHA256 $helperDestination).Hash.ToLowerInvariant()
+          "$helperHash  $helperAsset" | Set-Content -NoNewline -Encoding utf8 "$helperDestination.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "Pentect $GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY"
+          fi

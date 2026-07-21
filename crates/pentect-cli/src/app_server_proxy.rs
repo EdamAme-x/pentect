@@ -673,7 +673,7 @@ where
     if clean_command_display {
         suppress_partial_json_deltas(&mut value);
     }
-    mask_app_server_display_strings(&mut value, None, clean_command_display, mask)?;
+    mask_app_server_display_strings(&mut value, None, false, clean_command_display, mask)?;
     if clean_command_display {
         prefer_command_action_display(&mut value);
     }
@@ -718,6 +718,7 @@ fn redact_app_server_images(value: &mut Value) -> Result<(), String> {
 fn mask_app_server_display_strings<F>(
     value: &mut Value,
     key: Option<&str>,
+    inside_payload: bool,
     clean_command_display: bool,
     mask: &mut F,
 ) -> Result<(), String>
@@ -736,7 +737,10 @@ where
                 }
             }
             if !looks_like_image_payload_string(text)
-                && !key.is_some_and(|key| safe_protocol_path(key, text))
+                && !key.is_some_and(|key| {
+                    (!inside_payload && app_server_protocol_metadata_key(key))
+                        || safe_protocol_path(key, text)
+                })
             {
                 let masked = mask(text)?;
                 if masked != *text {
@@ -746,17 +750,47 @@ where
         }
         Value::Array(values) => {
             for value in values {
-                mask_app_server_display_strings(value, key, clean_command_display, mask)?;
+                mask_app_server_display_strings(
+                    value,
+                    key,
+                    inside_payload,
+                    clean_command_display,
+                    mask,
+                )?;
             }
         }
         Value::Object(object) => {
             for (key, value) in object {
-                mask_app_server_display_strings(value, Some(key), clean_command_display, mask)?;
+                mask_app_server_display_strings(
+                    value,
+                    Some(key),
+                    inside_payload || app_server_payload_key(key),
+                    clean_command_display,
+                    mask,
+                )?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn app_server_payload_key(key: &str) -> bool {
+    matches!(
+        key,
+        "content"
+            | "data"
+            | "details"
+            | "input"
+            | "output"
+            | "result"
+            | "structuredContent"
+            | "structured_content"
+            | "toolInput"
+            | "toolOutput"
+            | "tool_input"
+            | "tool_output"
+    )
 }
 
 fn prefer_command_action_display(value: &mut Value) {
@@ -1007,7 +1041,7 @@ fn clear_partial_json_payload(value: &mut Value, key: Option<&str>) -> bool {
             }
             changed
         }
-        Value::String(text) if !key.is_some_and(partial_json_metadata_key) => {
+        Value::String(text) if !key.is_some_and(app_server_protocol_metadata_key) => {
             text.zeroize();
             text.clear();
             true
@@ -1016,7 +1050,7 @@ fn clear_partial_json_payload(value: &mut Value, key: Option<&str>) -> bool {
     }
 }
 
-fn partial_json_metadata_key(key: &str) -> bool {
+fn app_server_protocol_metadata_key(key: &str) -> bool {
     matches!(
         key,
         "type"
@@ -1084,14 +1118,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_frame_masks_nested_strings() {
+    fn server_frame_masks_content_without_changing_protocol_ids() {
         let raw = serde_json::json!({
             "method": "item/completed",
             "session_id": "sk-abcdefghijklmnopqrstuvwx",
+            "threadId": "sk-zyxwvutsrqponmlkjihgfedc",
             "params": {
                 "item": {
                     "content": [
-                        {"text": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"}
+                        {
+                            "text": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",
+                            "structuredContent": {
+                                "id": "sk-abcdefghijklmnopqrstuvwx"
+                            }
+                        }
                     ],
                     "output": {"value": "sk-abcdefghijklmnopqrstuvwx"}
                 }
@@ -1104,10 +1144,15 @@ mod tests {
         .unwrap();
         assert!(masked.contains("<<OPENAI_API_KEY_x>>"), "{masked}");
         let value: Value = serde_json::from_str(&masked).unwrap();
-        assert_eq!(value["session_id"], "<<OPENAI_API_KEY_x>>");
+        assert_eq!(value["session_id"], "sk-abcdefghijklmnopqrstuvwx");
+        assert_eq!(value["threadId"], "sk-zyxwvutsrqponmlkjihgfedc");
         assert_eq!(
             value["params"]["item"]["content"][0]["text"],
             "OPENAI_API_KEY=<<OPENAI_API_KEY_x>>"
+        );
+        assert_eq!(
+            value["params"]["item"]["content"][0]["structuredContent"]["id"],
+            "<<OPENAI_API_KEY_x>>"
         );
         assert_eq!(
             value["params"]["item"]["output"]["value"],
@@ -1360,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn server_frame_scans_metadata_keys_that_do_not_contain_real_paths() {
+    fn server_frame_preserves_protocol_ids_but_scans_non_path_payloads() {
         let raw = serde_json::json!({
             "id": "sk-abcdefghijklmnopqrstuvwx",
             "path": "Authorization: Bearer sk-abcdefghijklmnopqrstuvwx"
@@ -1370,8 +1415,9 @@ mod tests {
             Ok(text.replace("sk-abcdefghijklmnopqrstuvwx", "<<OPENAI_API_KEY_x>>"))
         })
         .unwrap();
-        assert!(!masked.contains("sk-abcdefghijklmnopqrstuvwx"), "{masked}");
-        assert_eq!(masked.matches("<<OPENAI_API_KEY_x>>").count(), 2);
+        let value: Value = serde_json::from_str(&masked).unwrap();
+        assert_eq!(value["id"], "sk-abcdefghijklmnopqrstuvwx");
+        assert_eq!(value["path"], "Authorization: Bearer <<OPENAI_API_KEY_x>>");
     }
 
     #[test]

@@ -446,7 +446,8 @@ impl Engine {
         }
 
         let merged = merge(to_mask, &ir.protected);
-        let swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
+        let mut swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
+        relabel_env_spans(&mut swept, &ir.regions);
         (swept, residual)
     }
 
@@ -483,7 +484,8 @@ impl Engine {
         }
 
         let merged = merge(to_mask, &ir.protected);
-        let swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
+        let mut swept = identity_sweep(&ir.raw, merged, &ir.protected, &ir.regions);
+        relabel_env_spans(&mut swept, &ir.regions);
         (swept, residual)
     }
 
@@ -538,6 +540,40 @@ impl Engine {
             fell_back,
         )
     }
+}
+
+fn relabel_env_spans(spans: &mut [Span], regions: &[Region]) {
+    for span in spans {
+        let Some(key) = regions.iter().find_map(|region| {
+            (region.ctx.format == Kind::Env && region.span.contains(&span.range))
+                .then_some(region.ctx.key.as_deref())
+                .flatten()
+        }) else {
+            continue;
+        };
+        span.label = env_placeholder_label(key);
+    }
+}
+
+fn env_placeholder_label(key: &str) -> String {
+    let mut label = key
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if !label
+        .bytes()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        label.insert_str(0, "ENV_");
+    }
+    label
 }
 
 fn masked_items(spans: Vec<Span>) -> Vec<MaskedItem> {
@@ -2317,8 +2353,44 @@ mod tests {
         );
         assert!(!r.masked.contains("114514810"), "{}", r.masked);
         assert!(!r.masked.contains("false"), "{}", r.masked);
-        assert!(r.masked.contains("TEST_SECRET=<<SECRET_"), "{}", r.masked);
-        assert!(r.masked.contains("FEATURE_FLAG=<<SECRET_"), "{}", r.masked);
+        assert!(
+            r.masked.contains("TEST_SECRET=<<TEST_SECRET_"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            r.masked.contains("FEATURE_FLAG=<<FEATURE_FLAG_"),
+            "{}",
+            r.masked
+        );
+    }
+
+    #[test]
+    fn env_placeholders_use_each_parsed_key_as_the_label() {
+        let raw = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nKAGGLE_API_TOKEN=KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nrelease.flag=enabled\n9PATCH=value\n";
+        let r = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Env,
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(
+            r.masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            r.masked.contains("KAGGLE_API_TOKEN=<<KAGGLE_API_TOKEN_"),
+            "{}",
+            r.masked
+        );
+        assert!(
+            r.masked.contains("release.flag=<<RELEASE_FLAG_"),
+            "{}",
+            r.masked
+        );
+        assert!(r.masked.contains("9PATCH=<<ENV_9PATCH_"), "{}", r.masked);
     }
 
     #[test]
@@ -2329,7 +2401,7 @@ mod tests {
         assert!(!r
             .masked
             .contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
-        assert!(r.masked.contains("<<RUNPOD_API_KEY_"), "{}", r.masked);
+        assert!(r.masked.contains("<<SECRET_"), "{}", r.masked);
     }
 
     #[test]

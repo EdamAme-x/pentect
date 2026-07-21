@@ -1,24 +1,22 @@
 import { spawn } from "node:child_process";
+import { delimiter, dirname } from "node:path";
 import {
   createBashTool,
   createLocalBashOperations,
 } from "@earendil-works/pi-coding-agent";
 
-const SAFE_TEXT = "[Pentect: content unavailable]";
-const SAFE_RESULT = {
-  content: [{ type: "text", text: SAFE_TEXT }],
-  details: undefined,
-  isError: true,
-};
+const SAFE_TEXT = "[Content unavailable]";
 const BRIDGE_REQUEST_TIMEOUT_MS = 10_000;
-const SESSION_ENVIRONMENT = new Set([
+const REQUIRED_SESSION_ENVIRONMENT = [
   "PENTECT_BIN",
   "PENTECT_MEMORY_STORE_ADDR",
   "PENTECT_MEMORY_STORE_TOKEN",
-  "PENTECT_PROCESS_HOST_READ_TOKEN",
-  "PENTECT_PROCESS_HOST_WRITE_TOKEN",
-  "PENTECT_PROCESS_HOST_ROOT",
   "PENTECT_AGENT_LAUNCHED",
+];
+const SESSION_ENVIRONMENT = new Set([
+  ...REQUIRED_SESSION_ENVIRONMENT,
+  "PENTECT_EXTENSION_CONFIGS",
+  "PENTECT_EXTENSION_ADAPTERS",
 ]);
 
 function replaceObject(target, source) {
@@ -27,7 +25,7 @@ function replaceObject(target, source) {
 }
 
 function createPentectBridge() {
-  const child = spawn(process.env.PENTECT_BIN || "pentect", ["bridge"], {
+  const child = spawn("pentect", ["bridge"], {
     stdio: ["pipe", "pipe", "ignore"],
     windowsHide: true,
   });
@@ -66,8 +64,15 @@ function createPentectBridge() {
       if (!waiter) continue;
       pending.delete(response.id);
       clearTimeout(waiter.timer);
-      if (response.ok) waiter.resolve(response.value);
-      else waiter.reject(new Error("Pentect rejected the operation"));
+      if (response.ok) {
+        waiter.resolve(response.value);
+      } else {
+        const error = new Error(response.error?.message || "Operation unavailable");
+        error.code = response.error?.code;
+        error.phase = response.error?.phase;
+        error.executed = response.error?.executed === true;
+        waiter.reject(error);
+      }
     }
   });
   child.on("error", fail);
@@ -121,6 +126,20 @@ function createPentectBridge() {
   };
 }
 
+function protectedChildEnvironment(optionsEnvironment, sessionEnvironment) {
+  const environment = { ...process.env, ...optionsEnvironment };
+  for (const name of Object.keys(environment)) {
+    if (name.toUpperCase().startsWith("PENTECT_")) delete environment[name];
+  }
+  Object.assign(environment, sessionEnvironment);
+  const pathName =
+    Object.keys(environment).find((name) => name.toUpperCase() === "PATH") ||
+    "PATH";
+  const currentPath = environment[pathName] || "";
+  environment[pathName] = `${dirname(sessionEnvironment.PENTECT_BIN)}${delimiter}${currentPath}`;
+  return environment;
+}
+
 function readSessionEnvironment(values) {
   if (!values || typeof values !== "object" || Array.isArray(values)) {
     throw new Error("Pentect returned an invalid session");
@@ -130,8 +149,7 @@ function readSessionEnvironment(values) {
       throw new Error("Pentect returned an invalid session");
     }
   }
-  for (const required of SESSION_ENVIRONMENT) {
-    if (required === "PENTECT_BIN") continue;
+  for (const required of REQUIRED_SESSION_ENVIRONMENT) {
     if (typeof values[required] !== "string" || !values[required]) {
       throw new Error("Pentect returned an incomplete session");
     }
@@ -160,11 +178,11 @@ export default function pentectExtension(pi) {
         throw new Error("Pentect rejected the command");
       }
       if (!sessionEnvironment) throw new Error("Pentect unavailable");
-      // The bridge wraps the command with `pentect exec`, which masks each
-      // streamed chunk before Pi's onData callback receives it.
+      // The bridge keeps execution in Pi's Bash and masks each streamed chunk
+      // before Pi's onData callback receives it.
       return localBash.exec(next.command, cwd, {
         ...options,
-        env: { ...options.env, ...sessionEnvironment },
+        env: protectedChildEnvironment(options?.env, sessionEnvironment),
       });
     },
   };
@@ -220,8 +238,8 @@ export default function pentectExtension(pi) {
       });
       replaceObject(event.input, next);
       return {};
-    } catch {
-      return { block: true, reason: "Pentect unavailable" };
+    } catch (error) {
+      return { block: true, reason: error?.message || "Tool unavailable" };
     }
   });
 
@@ -236,8 +254,19 @@ export default function pentectExtension(pi) {
           isError: event.isError,
         },
       });
-    } catch {
-      return SAFE_RESULT;
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: error?.executed
+              ? "Tool completed, but its output was unavailable. Check side effects before retrying."
+              : SAFE_TEXT,
+          },
+        ],
+        details: event.details,
+        isError: event.isError,
+      };
     }
   });
 

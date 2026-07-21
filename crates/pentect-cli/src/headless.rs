@@ -399,11 +399,6 @@ pub(crate) fn run_noninteractive_command(
     protect_stdin: bool,
 ) -> Result<ExitStatus, String> {
     let protected_stdin = protect_stdin;
-    let buffered_stdin = if protected_stdin && input_mode == InputMode::Buffered {
-        Some(read_masked_buffered_stdin()?)
-    } else {
-        None
-    };
     let streaming_masker = if protected_stdin && input_mode == InputMode::JsonLines {
         Some(pentect_agent::ActiveToolOutputMasker::new()?)
     } else {
@@ -436,10 +431,13 @@ pub(crate) fn run_noninteractive_command(
             .stdin
             .take()
             .ok_or_else(|| format!("could not open '{}' stdin", display.display()))?;
-        if let Some(buffered) = buffered_stdin {
+        if input_mode == InputMode::Buffered {
             let cancelled = Arc::clone(&cancelled);
             stdin_thread = Some(thread::spawn(move || {
-                let result = write_buffered_stdin(stdin, buffered);
+                // Start the agent before waiting for inherited stdin. A positional
+                // prompt can finish while an unrelated automation pipe stays open.
+                let result = read_masked_buffered_stdin()
+                    .and_then(|buffered| write_buffered_stdin(stdin, buffered));
                 if result.is_err() {
                     cancelled.store(true, Ordering::Release);
                 }
@@ -568,7 +566,11 @@ pub(crate) fn run_noninteractive_command(
     join_output(stdout_thread, "stdout")?;
     join_output(stderr_thread, "stderr")?;
     if let Some(stdin_thread) = stdin_thread {
-        join_input(stdin_thread)?;
+        // An agent with a complete positional prompt need not consume inherited
+        // stdin. Do not keep Pentect alive solely for an unrelated open pipe.
+        if stdin_thread.is_finished() {
+            join_input(stdin_thread)?;
+        }
     }
     if let Some(error) = streaming_input_error {
         return Err(error);
@@ -898,22 +900,55 @@ fn mask_json_value<F>(
 where
     F: FnMut(&str) -> Result<Option<String>, String>,
 {
+    mask_json_value_scoped(value, scan_string, JsonProtocolScope::Root, mask)
+}
+
+#[derive(Clone, Copy)]
+enum JsonProtocolScope {
+    Root,
+    Message,
+    MessageContent,
+    Other,
+}
+
+fn mask_json_value_scoped<F>(
+    value: &mut serde_json::Value,
+    scan_string: bool,
+    scope: JsonProtocolScope,
+    mask: &mut F,
+) -> Result<bool, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
     match value {
         serde_json::Value::Object(object) => {
+            let object_type = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
             let mut changed = false;
             for (key, value) in object {
-                let scan_child = !value.as_str().is_some_and(looks_like_image_payload_string)
+                let scan_child = scan_string
+                    && !value.as_str().is_some_and(looks_like_image_payload_string)
                     && !value
                         .as_str()
-                        .is_some_and(|text| safe_protocol_path(key, text));
-                changed |= mask_json_value(value, scan_child, mask)?;
+                        .is_some_and(|text| safe_protocol_path(key, text))
+                    && !value.as_str().is_some_and(|text| {
+                        safe_agent_protocol_metadata(scope, object_type.as_deref(), key, text)
+                    });
+                let child_scope = match (scope, key.as_str()) {
+                    (JsonProtocolScope::Root, "message") => JsonProtocolScope::Message,
+                    (JsonProtocolScope::Message, "content") => JsonProtocolScope::MessageContent,
+                    _ => JsonProtocolScope::Other,
+                };
+                changed |= mask_json_value_scoped(value, scan_child, child_scope, mask)?;
             }
             Ok(changed)
         }
         serde_json::Value::Array(values) => {
             let mut changed = false;
             for value in values {
-                changed |= mask_json_value(value, scan_string, mask)?;
+                changed |= mask_json_value_scoped(value, scan_string, scope, mask)?;
             }
             Ok(changed)
         }
@@ -930,6 +965,59 @@ where
         }
         _ => Ok(false),
     }
+}
+
+fn safe_agent_protocol_metadata(
+    scope: JsonProtocolScope,
+    object_type: Option<&str>,
+    key: &str,
+    text: &str,
+) -> bool {
+    match scope {
+        JsonProtocolScope::Root => match key {
+            "uuid" | "session_id" | "sessionId" | "hook_id" | "hookId" | "prompt_id"
+            | "promptId" | "parent_uuid" | "parentUuid" | "leaf_uuid" | "leafUuid" => {
+                uuid_shape(text)
+            }
+            "request_id" | "requestId" => protocol_id(text, "req_"),
+            "response_id" | "responseId" => protocol_id(text, "resp_"),
+            "parent_tool_use_id" | "parentToolUseId" => protocol_id(text, "toolu_"),
+            _ => false,
+        },
+        JsonProtocolScope::Message => key == "id" && protocol_id(text, "msg_"),
+        JsonProtocolScope::MessageContent => {
+            (key == "id" && protocol_id(text, "toolu_"))
+                || (matches!(key, "tool_use_id" | "toolUseId") && protocol_id(text, "toolu_"))
+                || (key == "signature"
+                    && object_type == Some("thinking")
+                    && thinking_signature(text))
+        }
+        JsonProtocolScope::Other => false,
+    }
+}
+
+fn protocol_id(text: &str, prefix: &str) -> bool {
+    let Some(tail) = text.strip_prefix(prefix) else {
+        return false;
+    };
+    (20..=64).contains(&tail.len()) && tail.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn thinking_signature(text: &str) -> bool {
+    (64..=16 * 1024).contains(&text.len())
+        && text.len().is_multiple_of(4)
+        && data_encoding::BASE64.decode(text.as_bytes()).is_ok()
+}
+
+fn uuid_shape(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 fn safe_protocol_path(key: &str, text: &str) -> bool {
@@ -1454,12 +1542,14 @@ fn claude_reads_prompt_from_stdin(
     {
         return false;
     }
+    if let Some(prompt) = claude_prompt_index(args) {
+        return args[prompt] == "-" || !stdin_is_terminal;
+    }
     !stdin_is_terminal
-        || (claude_prompt_index(args).is_none()
-            && (args
-                .iter()
-                .any(|arg| matches!(arg.as_str(), "-p" | "--print"))
-                || !stdout_is_terminal))
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-p" | "--print"))
+        || !stdout_is_terminal
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1934,6 +2024,74 @@ mod tests {
     }
 
     #[test]
+    fn structured_output_keeps_only_contextual_agent_protocol_metadata() {
+        let signature = "Es0HCokBCA8YAipAWCkIbWnhWvXGSzbzfDUe9zlTS3NWm5lxvwRIrEHE9xdyn94F";
+        let mut value = serde_json::json!({
+            "type": "assistant",
+            "uuid": "a18f48ad-fefb-47be-a6ac-4448de1b0485",
+            "request_id": "req_011CdA1L1mNyKdPJUnGC2P8S",
+            "message": {
+                "id": "msg_011CdA1L4pvzK9sHJpEdvmd8",
+                "content": [
+                    {"type": "thinking", "signature": signature},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01JqZnVvjYnsgRq4noGzy8xG",
+                        "input": {"id": "secret-value", "signature": "secret-value"}
+                    },
+                    {"type": "tool_result", "tool_use_id": "toolu_01JqZnVvjYnsgRq4noGzy8xG"}
+                ]
+            }
+        });
+        let changed =
+            mask_json_value(&mut value, true, &mut |_| Ok(Some("SCANNED".to_string()))).unwrap();
+        assert!(changed);
+        assert_eq!(value["uuid"], "a18f48ad-fefb-47be-a6ac-4448de1b0485");
+        assert_eq!(value["request_id"], "req_011CdA1L1mNyKdPJUnGC2P8S");
+        assert_eq!(value["message"]["id"], "msg_011CdA1L4pvzK9sHJpEdvmd8");
+        assert_eq!(value["message"]["content"][0]["signature"], signature);
+        assert_eq!(
+            value["message"]["content"][1]["id"],
+            "toolu_01JqZnVvjYnsgRq4noGzy8xG"
+        );
+        assert_eq!(
+            value["message"]["content"][2]["tool_use_id"],
+            "toolu_01JqZnVvjYnsgRq4noGzy8xG"
+        );
+        assert_eq!(value["message"]["content"][1]["input"]["id"], "SCANNED");
+        assert_eq!(
+            value["message"]["content"][1]["input"]["signature"],
+            "SCANNED"
+        );
+        zeroize_json_strings(&mut value);
+    }
+
+    #[test]
+    fn structured_output_scans_malformed_protocol_metadata() {
+        let mut value = serde_json::json!({
+            "type": "assistant",
+            "uuid": "secret-value",
+            "request_id": "req_secret_value_with_underscores",
+            "message": {
+                "id": "msg_too-short",
+                "content": [
+                    {"type": "thinking", "signature": "secret-value"},
+                    {"type": "tool_use", "id": "toolu_secret_value_with_underscores"}
+                ]
+            }
+        });
+        let changed =
+            mask_json_value(&mut value, true, &mut |_| Ok(Some("SCANNED".to_string()))).unwrap();
+        assert!(changed);
+        assert_eq!(value["uuid"], "SCANNED");
+        assert_eq!(value["request_id"], "SCANNED");
+        assert_eq!(value["message"]["id"], "SCANNED");
+        assert_eq!(value["message"]["content"][0]["signature"], "SCANNED");
+        assert_eq!(value["message"]["content"][1]["id"], "SCANNED");
+        zeroize_json_strings(&mut value);
+    }
+
+    #[test]
     fn structured_output_suppresses_partial_deltas() {
         let mut value = serde_json::json!({
             "method": "item/agentMessage/delta",
@@ -2021,6 +2179,12 @@ mod tests {
             AgentKind::Claude,
             &["-p".into(), "hello".into()],
             true,
+            true
+        ));
+        assert!(protect_stdin(
+            AgentKind::Claude,
+            &["-p".into(), "-".into()],
+            false,
             true
         ));
         assert!(protect_stdin(

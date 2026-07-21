@@ -1,14 +1,11 @@
 use crate::memory_store::MemoryStoreClient;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-pub(crate) const ENV_ROOT: &str = "PENTECT_PROCESS_HOST_ROOT";
-pub(crate) const ENV_READ_TOKEN: &str = "PENTECT_PROCESS_HOST_READ_TOKEN";
-pub(crate) const ENV_WRITE_TOKEN: &str = "PENTECT_PROCESS_HOST_WRITE_TOKEN";
 
 const RUNTIME_DIR: &str = "runtime";
 const HOST_FILE: &str = "delegated-process-host.json";
@@ -21,6 +18,7 @@ const ELECTION_RETRY: Duration = Duration::from_millis(10);
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ProcessHostEndpoint {
     pub(crate) addr: String,
+    pub(crate) store_token_hash: String,
     pub(crate) read_token: String,
     pub(crate) write_token: String,
     pub(crate) pid: u32,
@@ -30,6 +28,7 @@ pub(crate) struct ProcessHostEndpoint {
 pub fn register_candidate(
     root: &Path,
     addr: &str,
+    store_token: &str,
     read_token: &str,
     write_token: &str,
     pid: u32,
@@ -46,6 +45,7 @@ pub fn register_candidate(
     };
     let endpoint = ProcessHostEndpoint {
         addr: addr.to_string(),
+        store_token_hash: store_token_hash(store_token),
         read_token: read_token.to_string(),
         write_token: write_token.to_string(),
         pid,
@@ -95,7 +95,7 @@ pub fn unregister_candidate(path: &Path) {
 }
 
 pub(crate) fn send_activity(event_json: &str, share: bool) -> Result<(), String> {
-    send_activity_at(&registry_root(), event_json, share)
+    send_activity_at(&process_host_root()?, event_json, share)
 }
 
 fn send_activity_at(root: &Path, event_json: &str, share: bool) -> Result<(), String> {
@@ -149,11 +149,13 @@ fn broadcast_activity_at(root: &Path, event_json: &str) -> Result<(), String> {
 }
 
 pub(crate) fn reader_endpoint() -> Result<ProcessHostEndpoint, String> {
-    ensure_host_at(&registry_root())
+    ensure_host_at(&process_host_root()?)
 }
 
 pub(crate) fn invalidate_host(endpoint: &ProcessHostEndpoint) {
-    invalidate_host_at(&registry_root(), Some(endpoint));
+    if let Ok(root) = process_host_root() {
+        invalidate_host_at(&root, Some(endpoint));
+    }
 }
 
 pub fn is_running(root: &Path) -> bool {
@@ -167,11 +169,87 @@ pub fn is_host(root: &Path, addr: &str) -> bool {
         .is_some_and(|endpoint| endpoint.addr == addr && endpoint_is_alive(&endpoint))
 }
 
-fn registry_root() -> PathBuf {
-    std::env::var_os(ENV_ROOT)
-        .filter(|value| !value.is_empty())
+/// Environment values are only transport for an already-registered host. Requiring
+/// the complete endpoint prevents one overwritten control variable from redirecting
+/// a child process to an arbitrary listener.
+pub fn matches_host(root: &Path, addr: &str, read_token: &str, write_token: &str) -> bool {
+    let matches = |endpoint: &ProcessHostEndpoint| {
+        endpoint.addr == addr
+            && endpoint.read_token == read_token
+            && endpoint.write_token == write_token
+            && endpoint_is_alive(endpoint)
+    };
+    current_host_at(root)
+        .ok()
+        .flatten()
+        .as_ref()
+        .is_some_and(&matches)
+        || candidates_at(root)
+            .is_ok_and(|candidates| candidates.iter().any(|(endpoint, _)| matches(endpoint)))
+}
+
+pub fn contains_host(root: &Path, addr: &str, store_token: &str) -> bool {
+    let expected_hash = store_token_hash(store_token);
+    let matches = |endpoint: &ProcessHostEndpoint| {
+        endpoint.addr == addr
+            && endpoint.store_token_hash == expected_hash
+            && endpoint_is_alive(endpoint)
+    };
+    current_host_at(root)
+        .ok()
+        .flatten()
+        .as_ref()
+        .is_some_and(&matches)
+        || candidates_at(root)
+            .is_ok_and(|candidates| candidates.iter().any(|(endpoint, _)| matches(endpoint)))
+}
+
+fn store_token_hash(token: &str) -> String {
+    data_encoding::HEXLOWER.encode(&Sha256::digest(token.as_bytes()))
+}
+
+/// Derive the host registry independently in every process. A bearer value in
+/// `PENTECT_PROCESS_HOST_ROOT` must not be able to redirect authentication.
+pub fn process_host_root() -> Result<PathBuf, String> {
+    platform_process_host_root()
+}
+
+#[cfg(windows)]
+fn platform_process_host_root() -> Result<PathBuf, String> {
+    std::env::var_os("LOCALAPPDATA")
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|home| {
+                PathBuf::from(home)
+                    .join("AppData")
+                    .join("Local")
+                    .into_os_string()
+            })
+        })
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .map(|root| root.join("pentect"))
+        .ok_or_else(|| "could not locate local application data".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn platform_process_host_root() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library").join("Caches").join("pentect"))
+        .ok_or_else(|| "could not locate the user cache directory".to_string())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_process_host_root() -> Result<PathBuf, String> {
+    if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(root).join("pentect"));
+    }
+    if let Some(root) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(root).join("pentect"));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".cache").join("pentect"))
+        .ok_or_else(|| "could not locate the user cache directory".to_string())
 }
 
 fn ensure_host_at(root: &Path) -> Result<ProcessHostEndpoint, String> {
@@ -403,9 +481,17 @@ mod tests {
             "read-1".to_string(),
             "write-1".to_string(),
         );
-        let first = register_candidate(&root, &first_addr, "read-1", "write-1", 101, false)
-            .unwrap()
-            .unwrap();
+        let first = register_candidate(
+            &root,
+            &first_addr,
+            "memory-1",
+            "read-1",
+            "write-1",
+            101,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(ensure_host_at(&root).unwrap().addr, first_addr);
 
         let second_addr = spawn_test_memory_store_with_activity(
@@ -413,10 +499,21 @@ mod tests {
             "read-2".to_string(),
             "write-2".to_string(),
         );
-        let second = register_candidate(&root, &second_addr, "read-2", "write-2", 202, false)
-            .unwrap()
-            .unwrap();
+        let second = register_candidate(
+            &root,
+            &second_addr,
+            "memory-2",
+            "read-2",
+            "write-2",
+            202,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(ensure_host_at(&root).unwrap().addr, first_addr);
+        assert!(matches_host(&root, &second_addr, "read-2", "write-2"));
+        assert!(contains_host(&root, &second_addr, "memory-2"));
+        assert!(!contains_host(&root, &second_addr, "replaced-memory"));
 
         unregister_candidate(&first);
         assert_eq!(ensure_host_at(&root).unwrap().addr, second_addr);
@@ -433,7 +530,7 @@ mod tests {
             "read".to_string(),
             "write".to_string(),
         );
-        let candidate = register_candidate(&root, &addr, "read", "write", 303, false)
+        let candidate = register_candidate(&root, &addr, "memory", "read", "write", 303, false)
             .unwrap()
             .unwrap();
         let candidate_json = std::fs::read_to_string(&candidate).unwrap();
@@ -455,20 +552,34 @@ mod tests {
             "read-1".to_string(),
             "write-1".to_string(),
         );
-        let first = register_candidate(&root, &first_addr, "read-1", "write-1", 401, true)
-            .unwrap()
-            .unwrap();
+        let first = register_candidate(
+            &root,
+            &first_addr,
+            "memory-1",
+            "read-1",
+            "write-1",
+            401,
+            true,
+        )
+        .unwrap()
+        .unwrap();
         let second_addr = spawn_test_memory_store_with_activity(
             "memory-2".to_string(),
             "read-2".to_string(),
             "write-2".to_string(),
         );
 
-        assert!(
-            register_candidate(&root, &second_addr, "read-2", "write-2", 402, true)
-                .unwrap()
-                .is_none()
-        );
+        assert!(register_candidate(
+            &root,
+            &second_addr,
+            "memory-2",
+            "read-2",
+            "write-2",
+            402,
+            true,
+        )
+        .unwrap()
+        .is_none());
         assert!(persistent_candidate_is_running(&root));
 
         unregister_candidate(&first);
@@ -483,17 +594,33 @@ mod tests {
             "read-1".to_string(),
             "write-1".to_string(),
         );
-        let first = register_candidate(&root, &first_addr, "read-1", "write-1", 501, false)
-            .unwrap()
-            .unwrap();
+        let first = register_candidate(
+            &root,
+            &first_addr,
+            "memory-1",
+            "read-1",
+            "write-1",
+            501,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         let second_addr = spawn_test_memory_store_with_activity(
             "memory-2".to_string(),
             "read-2".to_string(),
             "write-2".to_string(),
         );
-        let second = register_candidate(&root, &second_addr, "read-2", "write-2", 502, false)
-            .unwrap()
-            .unwrap();
+        let second = register_candidate(
+            &root,
+            &second_addr,
+            "memory-2",
+            "read-2",
+            "write-2",
+            502,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         let first_reader = MemoryStoreClient::for_activity(first_addr, "read-1".to_string());
         let second_reader = MemoryStoreClient::for_activity(second_addr, "read-2".to_string());
 

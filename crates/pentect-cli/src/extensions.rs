@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 pub(crate) const CONFIGS_ENV: &str = "PENTECT_EXTENSION_CONFIGS";
 pub(crate) const ADAPTERS_ENV: &str = "PENTECT_EXTENSION_ADAPTERS";
+pub(crate) const EXTENSION_MANIFEST_FILE: &str = "extension.toml";
 
 const PENTECT_DIR: &str = ".pentect";
 const EXTENSIONS_DIR: &str = "extensions";
@@ -25,6 +26,13 @@ const REMOTE_EXTENSION_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 pub(crate) struct ActiveExtensions {
     config_paths: Vec<PathBuf>,
     adapter_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExtensionSource {
+    pub(crate) name: String,
+    pub(crate) root: PathBuf,
+    pub(crate) manifest_path: Option<PathBuf>,
 }
 
 impl ActiveExtensions {
@@ -265,7 +273,7 @@ fn extension_paths_for_specs(
     let mut configs = Vec::new();
     let mut adapters = Vec::new();
     for spec in specs {
-        if is_url_spec(spec) {
+        if is_remote_spec(spec) {
             let found = extension_paths_for_url(spec)?;
             configs.extend(found.config_paths);
             adapters.extend(found.adapter_paths);
@@ -430,6 +438,120 @@ fn official_extensions_root() -> PathBuf {
     PathBuf::from(OFFICIAL_EXTENSIONS_DIR)
 }
 
+pub(crate) fn extension_source(spec: &str) -> Result<ExtensionSource> {
+    validate_extension_spec(spec)?;
+    if is_remote_spec(spec) {
+        let normalized = normalize_github_extension_url(spec)?;
+        let (base, manifest_url) = if normalized.ends_with("/extension.toml") {
+            let base = normalized
+                .strip_suffix("/extension.toml")
+                .unwrap_or(&normalized)
+                .to_string();
+            (base, normalized)
+        } else if normalized.ends_with(".toml") {
+            bail!("extension metadata must be an extension.toml file: {spec}");
+        } else {
+            let base = normalized.trim_end_matches('/').to_string();
+            let manifest = format!("{base}/{EXTENSION_MANIFEST_FILE}");
+            (base, manifest)
+        };
+        let manifest_path = fetch_remote_extension_file(&manifest_url)?;
+        let name = remote_extension_name(&base)?;
+        let root = manifest_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| {
+                remote_cache_file(&format!("{base}/config.toml"))
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            });
+        return Ok(ExtensionSource {
+            name,
+            root,
+            manifest_path,
+        });
+    }
+    if is_path_spec(spec) {
+        let path = Path::new(spec);
+        let root = if path.is_dir() {
+            path.to_path_buf()
+        } else if path.file_name().and_then(|name| name.to_str()) == Some(EXTENSION_MANIFEST_FILE) {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        } else if path.is_file() {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        } else {
+            bail!("extension path does not exist: {}", path.display());
+        };
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("could not resolve '{}'", root.display()))?;
+        let manifest = root.join(EXTENSION_MANIFEST_FILE);
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("extension")
+            .to_string();
+        return Ok(ExtensionSource {
+            name,
+            root,
+            manifest_path: manifest.is_file().then_some(manifest),
+        });
+    }
+
+    validate_extension_name(spec)?;
+    for root in [
+        extensions_root().join(spec),
+        official_extensions_root().join(spec),
+    ] {
+        if root.is_dir() {
+            let root = root
+                .canonicalize()
+                .with_context(|| format!("could not resolve '{}'", root.display()))?;
+            let manifest = root.join(EXTENSION_MANIFEST_FILE);
+            return Ok(ExtensionSource {
+                name: spec.to_string(),
+                root,
+                manifest_path: manifest.is_file().then_some(manifest),
+            });
+        }
+    }
+    let base = format!("{DEFAULT_REMOTE_EXTENSIONS_BASE}/{spec}");
+    let manifest_path = fetch_remote_extension_file(&format!("{base}/{EXTENSION_MANIFEST_FILE}"))?;
+    let root = manifest_path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            remote_cache_file(&format!("{base}/config.toml"))
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        });
+    Ok(ExtensionSource {
+        name: spec.to_string(),
+        root,
+        manifest_path,
+    })
+}
+
+fn remote_extension_name(base: &str) -> Result<String> {
+    let name = base
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("remote extension path has no name: {base}"))?;
+    validate_extension_name(name)?;
+    Ok(name.to_string())
+}
+
 fn looks_like_adapter_file(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some("adapter.toml")
         || path
@@ -440,7 +562,7 @@ fn looks_like_adapter_file(path: &Path) -> bool {
 }
 
 fn validate_extension_spec(spec: &str) -> Result<()> {
-    if is_url_spec(spec) {
+    if is_remote_spec(spec) {
         normalize_github_extension_url(spec).map(|_| ())?;
         return Ok(());
     }
@@ -481,8 +603,9 @@ fn is_path_spec(spec: &str) -> bool {
         || spec.starts_with('.')
 }
 
-fn is_url_spec(spec: &str) -> bool {
-    spec.starts_with("https://github.com/")
+fn is_remote_spec(spec: &str) -> bool {
+    spec.starts_with("github:")
+        || spec.starts_with("https://github.com/")
         || spec.starts_with("https://raw.githubusercontent.com/")
 }
 
@@ -567,6 +690,22 @@ fn remote_cache_file(url: &str) -> PathBuf {
 }
 
 fn normalize_github_extension_url(url: &str) -> Result<String> {
+    if let Some(rest) = url.strip_prefix("github:") {
+        let rest = rest.strip_prefix('@').unwrap_or(rest).trim_matches('/');
+        let parts = rest.split('/').collect::<Vec<_>>();
+        if parts.len() < 3 || parts.iter().any(|part| part.is_empty()) {
+            bail!("GitHub extension shorthand must be github:@OWNER/REPO/PATH: {url}");
+        }
+        let owner = parts[0];
+        let repo = parts[1];
+        let path = parts[2..].join("/");
+        if !valid_github_segment(owner) || !valid_github_segment(repo) {
+            bail!("invalid GitHub owner or repository in extension shorthand: {url}");
+        }
+        return Ok(format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/main/{path}"
+        ));
+    }
     if let Some(rest) = url.strip_prefix("https://raw.githubusercontent.com/") {
         if rest.split('/').count() < 4 {
             bail!("GitHub raw extension URL is incomplete: {url}");
@@ -592,6 +731,14 @@ fn normalize_github_extension_url(url: &str) -> Result<String> {
         )),
         _ => bail!("GitHub extension URL must use /blob/ or /tree/: {url}"),
     }
+}
+
+fn valid_github_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
 fn looks_like_adapter_url(url: &str) -> bool {
@@ -649,6 +796,10 @@ mod tests {
         assert!(parse_extension_value("../x.toml").is_err());
         assert!(parse_extension_value("../x").is_err());
         assert!(parse_extension_value("").is_err());
+        assert_eq!(
+            parse_extension_value("github:@EdamAme-x/pentect/extensions/jp-pii").unwrap(),
+            ["github:@EdamAme-x/pentect/extensions/jp-pii"]
+        );
     }
 
     #[test]
@@ -739,6 +890,11 @@ mod tests {
         assert!(
             normalize_github_extension_url("https://raw.githubusercontent.com/owner/repo").is_err()
         );
+        assert_eq!(
+            normalize_github_extension_url("github:@EdamAme-x/pentect/extensions/jp-pii").unwrap(),
+            "https://raw.githubusercontent.com/EdamAme-x/pentect/main/extensions/jp-pii"
+        );
+        assert!(normalize_github_extension_url("github:@owner/repo").is_err());
     }
 
     #[test]

@@ -25,6 +25,73 @@ fn shell_pty_inherits_and_tracks_parent_dimensions() {
 }
 
 #[test]
+fn default_shell_accepts_backspace_enter_and_masks_command_output() {
+    let _serial = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+
+    let pty = native_pty_system();
+    let pair = pty.openpty(pty_size(INITIAL_SIZE)).unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_pentect"));
+    command.arg("shell");
+    command.cwd(&root);
+    command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("LOCALAPPDATA", root.join("runtime-base"));
+    for name in [
+        "PENTECT_MEMORY_STORE_ADDR",
+        "PENTECT_MEMORY_STORE_TOKEN",
+        "PENTECT_PROCESS_HOST_READ_TOKEN",
+        "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+        "PENTECT_AGENT_LAUNCHED",
+    ] {
+        command.env_remove(name);
+    }
+
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().unwrap();
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+    let terminal_size = Arc::new(AtomicU32::new(pack_size(INITIAL_SIZE)));
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = {
+        let writer = writer.clone();
+        std::thread::spawn(move || forward_output(reader, writer, terminal_size, tx))
+    };
+
+    let mut output = String::new();
+    wait_for_text(&rx, &mut output, "PS ");
+    let raw_secret = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    {
+        let mut input = writer.lock().unwrap();
+        input.write_all(b"Write-Outpuz").unwrap();
+        input
+            .write_all(b"\x1b[8;14;8;1;0;1_\x1b[8;14;8;0;0;1_")
+            .unwrap();
+        input.write_all(b"t ").unwrap();
+        input.write_all(raw_secret.as_bytes()).unwrap();
+        input.write_all(b"\r").unwrap();
+        input.flush().unwrap();
+    }
+    wait_for_text(&rx, &mut output, "<<SECRET_");
+    child.kill().unwrap();
+    let _ = wait_for_child(child.as_mut());
+    drop(pair.master);
+    join_reader(reader_thread);
+    output.extend(rx.try_iter());
+    assert!(output.contains("<<SECRET_"), "{output:?}");
+    assert!(!output.contains(raw_secret), "{output:?}");
+    assert!(!output.contains("rpa_"), "{output:?}");
+    assert!(
+        !output.contains("[555;"),
+        "mouse input leaked into the shell: {output:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn agent_pty_inherits_and_tracks_parent_dimensions() {
     assert_pty_dimensions(&[
         "opencode",
@@ -66,7 +133,8 @@ fn agent_pty_preserves_backspace_as_one_key_event() {
     ));
     command.cwd(&root);
     command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
-    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("LOCALAPPDATA", root.join("runtime-base"));
     for name in [
         "PENTECT_MEMORY_STORE_ADDR",
         "PENTECT_MEMORY_STORE_TOKEN",
@@ -107,7 +175,7 @@ fn agent_pty_preserves_backspace_as_one_key_event() {
 }
 
 #[test]
-fn agent_pty_does_not_forward_nested_win32_input_mode() {
+fn parent_conpty_consumes_forwarded_nested_win32_input_mode() {
     let _serial = PTY_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -130,7 +198,8 @@ fn agent_pty_does_not_forward_nested_win32_input_mode() {
     ]);
     command.cwd(&root);
     command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
-    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("LOCALAPPDATA", root.join("runtime-base"));
     for name in [
         "PENTECT_MEMORY_STORE_ADDR",
         "PENTECT_MEMORY_STORE_TOKEN",
@@ -161,12 +230,132 @@ fn agent_pty_does_not_forward_nested_win32_input_mode() {
     let end = find_bytes(&output[start..], b"AFTER")
         .map(|offset| start + offset + b"AFTER".len())
         .expect("child output was truncated");
+    // The runtime unit test verifies that Pentect forwards these controls.
+    // The parent ConPTY consumes them to select its input encoding, so they
+    // must not appear as printable output at this outer boundary.
     assert!(!output[start..end]
         .windows(b"\x1b[?9001h".len())
         .any(|window| window == b"\x1b[?9001h"));
     assert!(!output[start..end]
         .windows(b"\x1b[?9001l".len())
         .any(|window| window == b"\x1b[?9001l"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_pty_preserves_parent_process_path() {
+    let _serial = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = root.join("pentect-process-path-marker");
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let child_path = format!("{};{}", marker.display(), inherited_path.to_string_lossy());
+
+    let pty = native_pty_system();
+    let pair = pty.openpty(pty_size(INITIAL_SIZE)).unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_pentect"));
+    command.args([
+        "opencode",
+        "--tool",
+        "powershell.exe",
+        "--",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Write-Output ('PATH_MARKER:' + ($env:PATH -like '*pentect-process-path-marker*'))",
+    ]);
+    command.cwd(&root);
+    command.env("PATH", child_path);
+    command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("LOCALAPPDATA", root.join("runtime-base"));
+    for name in [
+        "PENTECT_MEMORY_STORE_ADDR",
+        "PENTECT_MEMORY_STORE_TOKEN",
+        "PENTECT_PROCESS_HOST_READ_TOKEN",
+        "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+        "PENTECT_AGENT_LAUNCHED",
+    ] {
+        command.env_remove(name);
+    }
+
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().unwrap();
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+    let terminal_size = Arc::new(AtomicU32::new(pack_size(INITIAL_SIZE)));
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = {
+        let writer = writer.clone();
+        std::thread::spawn(move || forward_output(reader, writer, terminal_size, tx))
+    };
+
+    let mut output = String::new();
+    wait_for_text(&rx, &mut output, "PATH_MARKER:True");
+    let status = wait_for_child(child.as_mut());
+    assert_eq!(status.exit_code(), 0, "{output:?}");
+    drop(pair.master);
+    join_reader(reader_thread);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_pty_streams_large_terminal_control_strings() {
+    let _serial = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = test_root();
+    std::fs::create_dir_all(&root).unwrap();
+
+    let pty = native_pty_system();
+    let pair = pty.openpty(pty_size(INITIAL_SIZE)).unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_pentect"));
+    command.args([
+        "opencode",
+        "--tool",
+        "powershell.exe",
+        "--",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$esc=[char]27;[Console]::Out.Write($esc+']1337;File='+('a'*(2*1024*1024))+$esc+'\\');Write-Output 'READY'",
+    ]);
+    command.cwd(&root);
+    command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("LOCALAPPDATA", root.join("runtime-base"));
+    for name in [
+        "PENTECT_MEMORY_STORE_ADDR",
+        "PENTECT_MEMORY_STORE_TOKEN",
+        "PENTECT_PROCESS_HOST_READ_TOKEN",
+        "PENTECT_PROCESS_HOST_WRITE_TOKEN",
+        "PENTECT_AGENT_LAUNCHED",
+    ] {
+        command.env_remove(name);
+    }
+
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().unwrap();
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+    let terminal_size = Arc::new(AtomicU32::new(pack_size(INITIAL_SIZE)));
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = {
+        let writer = writer.clone();
+        std::thread::spawn(move || forward_output(reader, writer, terminal_size, tx))
+    };
+
+    let status = wait_for_child(child.as_mut());
+    assert_eq!(status.exit_code(), 0);
+    drop(pair.master);
+    join_reader(reader_thread);
+    let output = rx.try_iter().collect::<String>();
+    assert!(output.contains("READY"));
+    assert!(output.len() > 2 * 1024 * 1024, "{}", output.len());
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -199,7 +388,8 @@ fn agent_pty_does_not_leak_mouse_reports_to_parent_shell() {
     command.arg(&parent_script);
     command.cwd(&root);
     command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
-    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("LOCALAPPDATA", root.join("runtime-base"));
     command.env("PENTECT_TEST_RELEASE", &release_file);
     for name in [
         "PENTECT_MEMORY_STORE_ADDR",
@@ -309,7 +499,8 @@ fn agent_pty_stops_background_processes_on_exit() {
     ]);
     command.cwd(&root);
     command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
-    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("LOCALAPPDATA", root.join("runtime-base"));
     for name in [
         "PENTECT_MEMORY_STORE_ADDR",
         "PENTECT_MEMORY_STORE_TOKEN",
@@ -354,7 +545,8 @@ fn assert_pty_dimensions(command_prefix: &[&str]) {
     command.arg(size_probe_script());
     command.cwd(&root);
     command.env("PENTECT_BIN", env!("CARGO_BIN_EXE_pentect"));
-    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    command.env("LOCALAPPDATA", root.join("runtime-base"));
     for name in [
         "PENTECT_MEMORY_STORE_ADDR",
         "PENTECT_MEMORY_STORE_TOKEN",
@@ -383,7 +575,7 @@ fn assert_pty_dimensions(command_prefix: &[&str]) {
     pair.master.resize(pty_size(RESIZED_SIZE)).unwrap();
     wait_for_text(&rx, &mut output, "SIZE:101x31");
 
-    let status = wait_for_child(child.as_mut());
+    let status = wait_for_child_with_output(child.as_mut(), &rx, &mut output);
     assert_eq!(status.exit_code(), 0, "{output:?}");
     drop(pair.master);
     join_reader(reader_thread);
@@ -492,6 +684,25 @@ fn join_reader(thread: std::thread::JoinHandle<()>) {
     }
     assert!(thread.is_finished(), "PTY reader did not reach EOF");
     thread.join().unwrap();
+}
+
+fn wait_for_child_with_output(
+    child: &mut dyn portable_pty::Child,
+    rx: &mpsc::Receiver<String>,
+    output: &mut String,
+) -> portable_pty::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        output.extend(rx.try_iter());
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("PTY child did not exit within 15 seconds: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct InputThreadGuard {

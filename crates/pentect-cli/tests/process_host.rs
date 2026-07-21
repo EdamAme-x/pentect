@@ -25,8 +25,7 @@ fn up_returns_keeps_one_host_and_is_idempotent() {
     };
 
     run_up(&root);
-    let host_file = root
-        .join("host")
+    let host_file = host_root(&root)
         .join("runtime")
         .join("delegated-process-host.json");
     wait_until(Duration::from_secs(10), || host_file.is_file());
@@ -58,8 +57,7 @@ fn concurrent_up_keeps_one_persistent_host() {
     wait_for_up(first);
     wait_for_up(second);
 
-    let host_file = root
-        .join("host")
+    let host_file = host_root(&root)
         .join("runtime")
         .join("delegated-process-host.json");
     wait_until(Duration::from_secs(10), || host_file.is_file());
@@ -102,9 +100,9 @@ fn codex_dry_run_uses_project_environment_prefix() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(rendered.contains("SAFE_<LABEL>_<HASH>"), "{rendered}");
-    assert!(rendered.contains("$env:SAFE_NAME_hash"), "{rendered}");
-    assert!(!rendered.contains("PENTECT_NAME_hash"), "{rendered}");
+    assert!(rendered.contains("$env:SAFE_KEY_hash"), "{rendered}");
+    assert!(rendered.contains("$SAFE_KEY_hash"), "{rendered}");
+    assert!(!rendered.contains("PENTECT_KEY_hash"), "{rendered}");
 }
 
 #[test]
@@ -119,8 +117,7 @@ fn log_hosts_while_running_but_help_does_not() {
 
     let mut log = spawn_command(&root, &["log", "--json"]);
     cleanup.command_pids.push(log.id());
-    let host_file = root
-        .join("host")
+    let host_file = host_root(&root)
         .join("runtime")
         .join("delegated-process-host.json");
     wait_until(Duration::from_secs(10), || host_file.is_file());
@@ -138,7 +135,7 @@ fn log_hosts_while_running_but_help_does_not() {
     let mut help = spawn_command(&help_root, &["help"]);
     let status = help.wait().unwrap();
     assert!(status.success(), "pentect help failed: {status}");
-    assert!(!help_root.join("host").join("runtime").exists());
+    assert!(!host_root(&help_root).join("runtime").exists());
 }
 
 fn run_up(root: &Path) {
@@ -160,7 +157,8 @@ fn spawn_command(root: &Path, args: &[&str]) -> std::process::Child {
     for name in PRIVATE_ENV {
         command.env_remove(name);
     }
-    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("host"));
+    command.env("PENTECT_PROCESS_HOST_ROOT", root.join("untrusted-override"));
+    configure_runtime_root(&mut command, root);
     command.spawn().unwrap()
 }
 
@@ -192,7 +190,7 @@ fn assert_host_alive(host: &Value) {
 }
 
 fn candidate_count(root: &Path) -> usize {
-    std::fs::read_dir(root.join("host").join("runtime"))
+    std::fs::read_dir(host_root(root).join("runtime"))
         .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| {
@@ -202,6 +200,36 @@ fn candidate_count(root: &Path) -> usize {
             })
         })
         .count()
+}
+
+#[cfg(windows)]
+fn configure_runtime_root(command: &mut Command, root: &Path) {
+    command.env("LOCALAPPDATA", root);
+}
+
+#[cfg(windows)]
+fn host_root(root: &Path) -> PathBuf {
+    root.join("pentect")
+}
+
+#[cfg(target_os = "macos")]
+fn configure_runtime_root(command: &mut Command, root: &Path) {
+    command.env("HOME", root);
+}
+
+#[cfg(target_os = "macos")]
+fn host_root(root: &Path) -> PathBuf {
+    root.join("Library").join("Caches").join("pentect")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn configure_runtime_root(command: &mut Command, root: &Path) {
+    command.env("XDG_RUNTIME_DIR", root);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn host_root(root: &Path) -> PathBuf {
+    root.join("pentect")
 }
 
 fn read_json(path: &Path) -> Value {

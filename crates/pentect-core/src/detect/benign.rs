@@ -568,15 +568,12 @@ pub(crate) fn is_crypto_test_vector_identifier_value(value: &str) -> bool {
 /// True for byte-pattern fixtures such as `000102...` or repeated-byte blocks.
 ///
 /// Rationale: published crypto fixtures and RFC examples often use visual byte
-/// sequences, repeated sentinels, or canonical nibble patterns to make expected
+/// sequences, repeated sentinels, or regular byte progressions to make expected
 /// values auditable. Generated secrets can contain these locally, but not as
 /// the whole value split into obvious runs. This is used only to suppress raw
 /// entropy/keyed guesses; specific private-key and vendor validators still run.
 pub(crate) fn is_synthetic_hex_test_vector_value(value: &str) -> bool {
     let value = value.trim();
-    if is_canonical_hex_fixture_literal(value) {
-        return true;
-    }
     let Some(bytes) = decode_hex_literal(value) else {
         return false;
     };
@@ -605,7 +602,11 @@ fn is_crypto_test_vector_identifier_part(value: &str) -> bool {
 }
 
 fn decode_hex_literal(value: &str) -> Option<Vec<u8>> {
-    let bytes = value.as_bytes();
+    let bytes = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value)
+        .as_bytes();
     if bytes.len() < 16
         || bytes.len() > 1024
         || !bytes.len().is_multiple_of(2)
@@ -632,7 +633,7 @@ fn is_segmented_hex_fixture_bytes(bytes: &[u8]) -> bool {
             segments += 1;
             continue;
         }
-        let stepped = byte_step_run_len(&bytes[pos..], 1).max(byte_step_run_len(&bytes[pos..], -1));
+        let stepped = byte_progression_run_len(&bytes[pos..]);
         if stepped >= 8 {
             pos += stepped;
             segments += 1;
@@ -650,9 +651,16 @@ fn same_byte_run_len(bytes: &[u8]) -> usize {
     bytes.iter().take_while(|byte| *byte == first).count()
 }
 
-fn byte_step_run_len(bytes: &[u8], step: i16) -> usize {
-    if bytes.is_empty() {
+fn byte_progression_run_len(bytes: &[u8]) -> usize {
+    let Some(first) = bytes.first() else {
         return 0;
+    };
+    let Some(second) = bytes.get(1) else {
+        return 1;
+    };
+    let step = i16::from(*second) - i16::from(*first);
+    if step == 0 {
+        return 1;
     }
     let mut len = 1;
     for pair in bytes.windows(2) {
@@ -662,19 +670,6 @@ fn byte_step_run_len(bytes: &[u8], step: i16) -> usize {
         len += 1;
     }
     len
-}
-
-fn is_canonical_hex_fixture_literal(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        &[
-            "0123456789abcdef",
-            "fedcba9876543210",
-            "00112233445566778899aabbccddeeff",
-            "ffeeddccbbaa99887766554433221100",
-        ],
-    )
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -1239,6 +1234,9 @@ mod tests {
         ));
         assert!(!is_synthetic_hex_test_vector_value(
             "A3F19C80E4B27D51F09A6C33D8E74215"
+        ));
+        assert!(!is_synthetic_hex_test_vector_value(
+            "ACME_SECRET_TOKEN_0123456789abcdef"
         ));
         assert!(!is_synthetic_hex_test_vector_value("tenant-7-trial"));
     }
