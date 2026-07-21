@@ -2377,6 +2377,7 @@ dependencies = [
  "pentect-runtime",
  "portable-pty",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

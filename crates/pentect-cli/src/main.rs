@@ -11,6 +11,7 @@ mod headless;
 mod input;
 mod scan;
 mod terminal;
+mod update;
 
 use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
 use pentect_core::{
@@ -100,6 +101,9 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
     match args.get(1).map(String::as_str) {
         None => usage(),
         Some("help" | "--help" | "-h") => cmd_help(),
+        Some("version" | "--version" | "-V") => update::cmd_version(),
+        Some("update") => update::cmd_update(&args),
+        Some("__apply-update") => return Some(update::cmd_apply_update(&args)),
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
@@ -164,7 +168,8 @@ fn usage() {
          pentect shell\n\
          pentect up\n\
          pentect doctor\n\
-         pentect extensions list|inspect|test [NAME]\n\
+         pentect update [--check]\n\
+         pentect extensions list|inspect|test|config|setup|update [NAME]\n\
          pentect eval [--json]\n\
          pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\
          pentect view <HANDLE>\n\
@@ -200,7 +205,11 @@ fn help_text() -> &'static str {
         "  pentect shell\n\n",
         "  pentect up\n\n",
         "  pentect doctor [--json]\n",
+        "  pentect update [--check | --force]\n",
         "  pentect extensions list|inspect|test [NAME|PATH] [--json]\n",
+        "  pentect extensions config NAME|PATH [KEY=VALUE | --unset KEY]\n",
+        "  pentect extensions setup NAME|PATH [--yes]\n",
+        "  pentect extensions update NAME|PATH\n",
         "  pentect eval [--json]\n\n",
         "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
@@ -217,7 +226,8 @@ fn help_text() -> &'static str {
         "scan: secrets; gitignore on; --no-gitignore broadens\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness\n",
-        "extensions: list, inspect, test\n",
+        "update: verified GitHub Release binary\n",
+        "extensions: list, inspect, test, config, setup, update\n",
         "eval: precision, recall\n",
     )
 }

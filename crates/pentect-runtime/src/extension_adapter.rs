@@ -161,7 +161,7 @@ impl ModelAdapter {
 
     fn run(&self, request: &str) -> Result<String, String> {
         let cwd = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let program = adapter_program(&self.command[0], cwd);
+        let program = adapter_program(&self.command[0], cwd, &self.id);
         let mut cmd = Command::new(program);
         apply_adapter_child_env(&mut cmd, &self.id)?;
         cmd.args(&self.command[1..])
@@ -346,7 +346,7 @@ fn adapter_default_name(path: &Path) -> String {
         .to_string()
 }
 
-fn adapter_program(program: &str, cwd: &Path) -> PathBuf {
+fn adapter_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
     let path = Path::new(program);
     if path.is_absolute() {
         return path.to_path_buf();
@@ -354,7 +354,23 @@ fn adapter_program(program: &str, cwd: &Path) -> PathBuf {
     if looks_like_path_command(program) {
         return cwd.join(path);
     }
-    adapter_sidecar_program(program).unwrap_or_else(|| path.to_path_buf())
+    installed_extension_program(program, id)
+        .or_else(|| adapter_sidecar_program(program))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn installed_extension_program(program: &str, id: &str) -> Option<PathBuf> {
+    let bin = PathBuf::from(PENTECT_DIR)
+        .join(EXTENSIONS_DATA_DIR)
+        .join(extension_id(id))
+        .join("bin");
+    for name in command_names(program) {
+        let candidate = bin.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn looks_like_path_command(program: &str) -> bool {
@@ -691,11 +707,11 @@ command = ["pentect-pii-ner"]
     fn relative_adapter_program_is_resolved_from_adapter_dir() {
         let cwd = Path::new("extensions/pii-ner");
         assert_eq!(
-            adapter_program("./bin/pentect-pii-ner", cwd),
+            adapter_program("./bin/pentect-pii-ner", cwd, "pii-ner"),
             cwd.join("./bin/pentect-pii-ner")
         );
         assert_eq!(
-            adapter_program("pentect-pii-ner", cwd),
+            adapter_program("pentect-pii-ner", cwd, "pii-ner"),
             PathBuf::from("pentect-pii-ner")
         );
     }

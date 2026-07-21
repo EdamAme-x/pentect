@@ -1,0 +1,3 @@
+schema = "pentect.extension.v1"
+name = "openai-privacy-filter"
+description = "Local privacy-filter model adapter."
