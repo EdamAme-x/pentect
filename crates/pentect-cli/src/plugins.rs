@@ -486,16 +486,7 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
         };
         let manifest_path = fetch_remote_plugin_file(&manifest_url)?;
         let name = remote_plugin_name(&base)?;
-        let root = manifest_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| {
-                remote_cache_file(&format!("{base}/config.toml"))
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf()
-            });
+        let root = remote_plugin_cache_root(manifest_path.as_deref(), &base)?;
         return Ok(PluginSource {
             name,
             root,
@@ -553,16 +544,7 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
     }
     let base = format!("{DEFAULT_REMOTE_PLUGINS_BASE}/{spec}");
     let manifest_path = fetch_remote_plugin_file(&format!("{base}/{PLUGIN_MANIFEST_FILE}"))?;
-    let root = manifest_path
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| {
-            remote_cache_file(&format!("{base}/config.toml"))
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        });
+    let root = remote_plugin_cache_root(manifest_path.as_deref(), &base)?;
     Ok(PluginSource {
         name: spec.to_string(),
         root,
@@ -675,7 +657,7 @@ fn remote_plugin_paths_for_base_url(base_url: &str) -> Result<PluginPaths> {
 }
 
 fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
-    let path = remote_cache_file(url);
+    let path = remote_cache_file(url)?;
     if cached_remote_plugin_is_fresh(&path) {
         return Ok(Some(path));
     }
@@ -708,6 +690,7 @@ fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create plugin cache '{}'", parent.display()))?;
+        restrict_cache_dir(parent)?;
     }
     std::fs::write(&path, &bytes)
         .with_context(|| format!("could not write plugin cache '{}'", path.display()))?;
@@ -723,7 +706,21 @@ fn cached_remote_plugin_is_fresh(path: &Path) -> bool {
         .is_ok_and(|age| age < REMOTE_PLUGIN_CACHE_TTL)
 }
 
-fn remote_cache_file(url: &str) -> PathBuf {
+fn remote_plugin_cache_root(manifest_path: Option<&Path>, base: &str) -> Result<PathBuf> {
+    if let Some(parent) = manifest_path.and_then(Path::parent) {
+        return Ok(parent.to_path_buf());
+    }
+    remote_cache_file(&format!("{base}/config.toml"))?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("remote plugin cache path has no parent"))
+}
+
+fn remote_cache_file(url: &str) -> Result<PathBuf> {
+    Ok(remote_cache_file_under(&platform_plugin_cache_root()?, url))
+}
+
+fn remote_cache_file_under(root: &Path, url: &str) -> PathBuf {
     let mut hash = Sha256::new();
     hash.update(url.as_bytes());
     let digest = hash.finalize();
@@ -733,10 +730,39 @@ fn remote_cache_file(url: &str) -> PathBuf {
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("plugin.toml");
-    PathBuf::from(PENTECT_DIR)
-        .join(PLUGINS_CACHE_DIR)
-        .join(hex)
-        .join(filename)
+    root.join(PLUGINS_CACHE_DIR).join(hex).join(filename)
+}
+
+fn platform_plugin_cache_root() -> Result<PathBuf> {
+    #[cfg(windows)]
+    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library").join("Caches"));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        });
+    root.map(|root| root.join("pentect"))
+        .ok_or_else(|| anyhow!("could not locate the user cache directory for remote plugins"))
+}
+
+fn restrict_cache_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("could not secure plugin cache '{}'", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn normalize_github_plugin_url(url: &str) -> Result<String> {
@@ -970,6 +996,17 @@ label = "INLINE_SECRET"
             "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins/pii-ner"
         );
         assert!(normalize_github_plugin_url("github:@owner/repo").is_err());
+    }
+
+    #[test]
+    fn remote_plugin_cache_is_rooted_outside_project_state() {
+        let trusted_root = Path::new("trusted-user-cache");
+        let path = remote_cache_file_under(
+            trusted_root,
+            "https://raw.githubusercontent.com/owner/repo/main/plugin.toml",
+        );
+        assert!(path.starts_with(trusted_root));
+        assert!(!path.starts_with(Path::new(PENTECT_DIR)));
     }
 
     #[test]

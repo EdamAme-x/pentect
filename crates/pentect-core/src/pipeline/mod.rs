@@ -403,6 +403,12 @@ impl Engine {
                     found.extend(d.detect(&view));
                 }
             }
+            found.retain(|span| {
+                span.range.start <= span.range.end
+                    && span.range.end <= work.len()
+                    && work.is_char_boundary(span.range.start)
+                    && work.is_char_boundary(span.range.end)
+            });
             found.retain(|s| !seen_ranges.contains(&s.range));
             if found.is_empty() {
                 break;
@@ -420,11 +426,10 @@ impl Engine {
                 })
             };
             if more {
-                // SAFETY: writing ASCII spaces over any byte range keeps the
-                // string valid UTF-8, and same length keeps span offsets correct.
-                let bytes = unsafe { work.to_mut().as_bytes_mut() };
+                let work = work.to_mut();
                 for s in &found {
-                    bytes[s.range.start..s.range.end].fill(b' ');
+                    let spaces = " ".repeat(s.range.end - s.range.start);
+                    work.replace_range(s.range.start..s.range.end, &spaces);
                 }
             }
             seen_ranges.extend(found.iter().map(|s| s.range));
@@ -753,6 +758,36 @@ fn scan_placeholders(raw: &str) -> Vec<ByteRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct InvalidUtf8BoundaryDetector;
+
+    impl Detector for InvalidUtf8BoundaryDetector {
+        fn detect(&self, _view: &NormalizedView) -> Vec<Span> {
+            vec![Span {
+                range: ByteRange::new(1, 2),
+                category: Category::Secret,
+                label: "INVALID".to_string(),
+                confidence: Confidence::High,
+                source: DetectorId::Plugin,
+            }]
+        }
+    }
+
+    #[test]
+    fn invalid_detector_utf8_boundaries_are_rejected_safely() {
+        let engine = Engine::builder()
+            .detector(Box::new(InvalidUtf8BoundaryDetector))
+            .build();
+        let result = engine.mask(
+            Input {
+                kind: Kind::Text,
+                data: "aéb".to_string(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert_eq!(result.masked, "aéb");
+        assert_eq!(result.summary.masked_count, 0);
+    }
 
     #[test]
     fn identity_key_controls_handles_independently_of_recovery_key() {
