@@ -15,10 +15,6 @@ TODO
 
 - local llm mask exts
 - app, http host
-- pentect shellの毎実行
-- 貼り付け置換
-- 環境変数が入らない
-- PENTECT_ prefixがきかない場合がある
 - approval ui?
 - ext apikey get
 - orc layer (api, swarm, langchain)

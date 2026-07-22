@@ -632,30 +632,6 @@ fn pentect_engine() -> Result<&'static Engine, String> {
     }
 }
 
-pub(crate) fn prewarm_pentect_engine() {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
-        let _ = std::thread::Builder::new()
-            .name("pentect-mask-prewarm".to_string())
-            .spawn(|| {
-                let _ = pentect_engine();
-            });
-    });
-}
-
-pub(crate) fn first_pentect_secret_range_if_ready(text: &str) -> Option<ByteRange> {
-    let engine = PENTECT_ENGINE.get()?.as_ref().ok()?;
-    engine
-        .analyze_spans(Input {
-            kind: Kind::Text,
-            data: text.to_string(),
-        })
-        .spans
-        .into_iter()
-        .map(|span| span.range)
-        .min_by_key(|range| range.start)
-}
-
 fn build_pentect_engine() -> Result<Engine, String> {
     let mut builder = Engine::builder()
         .parser(Kind::Json, Box::new(JsonParser))

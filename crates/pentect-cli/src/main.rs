@@ -43,7 +43,6 @@ const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
 const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
 const PENTECT_STATUS_LINE_ENV: &str = "PENTECT_STATUS_LINE";
-const PENTECT_SHELL_ENV: &str = "PENTECT_SHELL";
 const PENTECT_DIR: &str = ".pentect";
 const PENTECT_CONFIG_FILE: &str = "config.toml";
 const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,21 +63,14 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Option<i32> {
-    if should_passthrough_shell(&args, std::env::var_os(PENTECT_SHELL_ENV).as_deref()) {
-        return Some(0);
-    }
     let inherited_env_is_trusted = pentect_agent::active_memory_store_ready();
     if is_memory_store_server(&args) || !supports_process_host(&args) {
         return dispatch(args, inherited_env_is_trusted);
     }
     let pentect = default_pentect_path();
-    let process_host = if is_shell_command(&args) && !inherited_env_is_trusted {
-        MemoryStoreGuard::start_in_process()
-    } else {
-        MemoryStoreGuard::start(&pentect, false)
-    }
-    .unwrap_or_else(|error| die_with_issue(error))
-    .unwrap_or_else(|| die_with_issue("could not start process host candidate"));
+    let process_host = MemoryStoreGuard::start(&pentect, false)
+        .unwrap_or_else(|error| die_with_issue(error))
+        .unwrap_or_else(|| die_with_issue("could not start process host candidate"));
     let _process_host_env = memory_store_parent_env_guard(&pentect, &process_host);
     let exit_code = dispatch(args, inherited_env_is_trusted);
     drop(_process_host_env);
@@ -120,14 +112,17 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("eval") => eval::cmd_eval(&args),
         Some("scan") => scan::cmd_scan(&args),
         Some(
-            "exec" | "shell" | "resolve" | "log" | "hook" | "bridge" | "memory-store" | "purge"
+            "exec" | "resolve" | "log" | "hook" | "bridge" | "memory-store" | "purge"
             | "__agent-script" | "__agent-stream",
         ) => return Some(cmd_agent_from(1, &args, inherited_env_is_trusted)),
         Some("agent") => return Some(cmd_agent_from(2, &args, inherited_env_is_trusted)),
         Some("codex") => return Some(cmd_agent_tool(AgentTool::Codex, &args)),
         Some("claude") => return Some(cmd_agent_tool(AgentTool::Claude, &args)),
         Some("opencode") => return Some(cmd_agent_tool(AgentTool::OpenCode, &args)),
-        _ => usage(),
+        _ => {
+            usage();
+            return Some(2);
+        }
     }
     None
 }
@@ -151,23 +146,8 @@ fn supports_process_host(args: &[String]) -> bool {
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
         ),
-        (Some("exec" | "shell" | "log" | "bridge"), _)
-            | (Some("agent"), Some("exec" | "shell" | "log" | "bridge"))
+        (Some("exec" | "log" | "bridge"), _) | (Some("agent"), Some("exec" | "log" | "bridge"))
     )
-}
-
-fn is_shell_command(args: &[String]) -> bool {
-    matches!(
-        (
-            args.get(1).map(String::as_str),
-            args.get(2).map(String::as_str),
-        ),
-        (Some("shell"), _) | (Some("agent"), Some("shell"))
-    )
-}
-
-fn should_passthrough_shell(args: &[String], shell_marker: Option<&std::ffi::OsStr>) -> bool {
-    is_shell_command(args) && shell_marker == Some(std::ffi::OsStr::new("1"))
 }
 
 fn usage() {
@@ -175,7 +155,6 @@ fn usage() {
         "pentect\n\
          pentect codex|claude|opencode\n\
          pentect exec \"<command>\"\n\
-         pentect shell\n\
          pentect up\n\
          pentect doctor\n\
          pentect update [VERSION] [--check]\n\
@@ -190,7 +169,6 @@ fn usage() {
          pentect help\n\
          \n\
          exec: masked output\n\
-         shell: masked shell\n\
          up: process host\n\
          doctor: readiness\n\
          eval: metrics\n\
@@ -213,7 +191,6 @@ fn help_text() -> &'static str {
         "  pentect\n",
         "  pentect codex|claude|opencode [--plugins NAME|PATH.toml]\n",
         "  pentect exec \"<command>\"\n\n",
-        "  pentect shell\n\n",
         "  pentect up\n\n",
         "  pentect doctor [--json]\n",
         "  pentect update [VERSION] [--check | --force]\n",
@@ -228,7 +205,6 @@ fn help_text() -> &'static str {
         "  pentect statusline\n\n",
         "  pentect log [--json]\n\n",
         "exec: masked stdout/stderr\n",
-        "shell: masked shell\n",
         "up: process host\n",
         "read: masked file preview\n",
         "view: handle\n",
@@ -322,16 +298,13 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
             .unwrap_or_else(|| "pentect".to_string()),
     );
     agent_args.extend(forward_args);
-    let shell_store = if agent_args
-        .get(1)
-        .is_some_and(|arg| matches!(arg.as_str(), "shell" | "log"))
-    {
+    let log_store = if agent_args.get(1).is_some_and(|arg| arg == "log") {
         let pentect = default_pentect_path();
         Some(start_memory_store(&pentect).unwrap_or_else(|e| die_with_issue(e)))
     } else {
         None
     };
-    let _shell_store_env = shell_store.as_ref().map(|store| {
+    let _log_store_env = log_store.as_ref().map(|store| {
         EnvVarGuard::set_optional([
             (
                 PENTECT_MEMORY_STORE_ADDR_ENV,
@@ -348,8 +321,8 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
         ])
     });
     let code = pentect_agent::run_from(agent_args);
-    drop(_shell_store_env);
-    drop(shell_store);
+    drop(_log_store_env);
+    drop(log_store);
     drop(plugin_env);
     code
 }
@@ -2323,7 +2296,6 @@ fn partial_suffix_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
 struct MemoryStoreGuard {
     child: Option<Child>,
     lease: Option<pentect_agent::MemoryStoreLease>,
-    _in_process: Option<pentect_agent::InProcessMemoryStore>,
     addr: String,
     token: String,
     process_host_candidate: Option<PathBuf>,
@@ -2357,7 +2329,6 @@ impl MemoryStoreGuard {
                     return Ok(Some(Self {
                         child: None,
                         lease: None,
-                        _in_process: None,
                         addr,
                         token,
                         process_host_candidate: None,
@@ -2460,34 +2431,6 @@ impl MemoryStoreGuard {
         Ok(Some(Self {
             child: Some(child),
             lease,
-            _in_process: None,
-            addr,
-            token,
-            process_host_candidate: Some(process_host_candidate),
-        }))
-    }
-
-    fn start_in_process() -> Result<Option<Self>, String> {
-        let server = pentect_agent::start_in_process_memory_store().map_err(|e| e.to_string())?;
-        let addr = server.addr().to_string();
-        let token = server.token().to_string();
-        let process_host_root = process_host_root()?;
-        let process_host_candidate = pentect_agent::register_process_host_candidate(
-            &process_host_root,
-            &addr,
-            &token,
-            server.process_host_read_token(),
-            server.process_host_write_token(),
-            std::process::id(),
-            false,
-        )?;
-        let Some(process_host_candidate) = process_host_candidate else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            child: None,
-            lease: None,
-            _in_process: Some(server),
             addr,
             token,
             process_host_candidate: Some(process_host_candidate),
@@ -3889,7 +3832,7 @@ mod tests {
     fn help_text_is_compact() {
         let help = help_text();
         assert!(help.contains("pentect exec"), "{help}");
-        assert!(help.contains("pentect shell"), "{help}");
+        assert!(!help.contains("pentect shell"), "{help}");
         assert!(!help.contains("agent exec"), "{help}");
         assert!(!help.contains("bench"), "{help}");
         assert!(help.contains("doctor: readiness"), "{help}");
@@ -4594,7 +4537,7 @@ mod tests {
 
     #[test]
     fn only_session_commands_support_process_host_handoff() {
-        for command in ["exec", "shell", "log", "bridge"] {
+        for command in ["exec", "log", "bridge"] {
             let args = vec!["pentect".to_string(), command.to_string()];
             assert!(supports_process_host(&args), "{command}");
         }
@@ -4616,38 +4559,10 @@ mod tests {
             let args = vec!["pentect".to_string(), command.to_string()];
             assert!(!supports_process_host(&args), "{command}");
         }
-        assert!(supports_process_host(&[
-            "pentect".to_string(),
-            "agent".to_string(),
-            "shell".to_string(),
-        ]));
         assert!(!supports_process_host(&[
             "pentect".to_string(),
             "agent".to_string(),
             "hook".to_string(),
         ]));
-    }
-
-    #[test]
-    fn shell_commands_use_the_in_process_startup_path() {
-        assert!(is_shell_command(&["pentect".into(), "shell".into()]));
-        assert!(is_shell_command(&[
-            "pentect".into(),
-            "agent".into(),
-            "shell".into()
-        ]));
-        assert!(!is_shell_command(&["pentect".into(), "exec".into()]));
-        assert!(should_passthrough_shell(
-            &["pentect".into(), "shell".into()],
-            Some(std::ffi::OsStr::new("1"))
-        ));
-        assert!(should_passthrough_shell(
-            &["pentect".into(), "agent".into(), "shell".into()],
-            Some(std::ffi::OsStr::new("1"))
-        ));
-        assert!(!should_passthrough_shell(
-            &["pentect".into(), "shell".into()],
-            None
-        ));
     }
 }
