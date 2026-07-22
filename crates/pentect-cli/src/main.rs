@@ -113,7 +113,7 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
-        Some("status" | "statusline") => cmd_statusline(&args),
+        Some("statusline") => cmd_statusline(&args),
         Some("up") => cmd_up(&args),
         Some("doctor") => doctor::cmd_doctor(&args),
         Some("plugins") => plugins_cmd::cmd_plugins(&args),
