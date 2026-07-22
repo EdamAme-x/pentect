@@ -44,23 +44,22 @@ fn windows_shell_repairs_stale_virtual_terminal_input_mode() {
 #[cfg(windows)]
 #[test]
 fn windows_shell_routes_tty_commands_outside_the_protocol_pipe() {
-    assert!(is_windows_shell_tty_command("codex"));
-    assert!(is_windows_shell_tty_command("claude --resume"));
-    assert!(is_windows_shell_tty_command("opencode"));
-    assert_eq!(
-        windows_shell_tty_command_args("claude --resume").unwrap(),
-        ["claude", "--resume"]
-    );
-    assert_eq!(
-        windows_shell_tty_command_args("pentect scan .").unwrap(),
-        ["scan", "."]
-    );
-    assert!(windows_shell_tty_command_args("pentect status").is_none());
-    assert!(windows_shell_tty_command_args("pentect view SECRET").is_none());
-    assert!(windows_shell_tty_command_args("pentect shell").is_none());
-    assert!(!is_windows_shell_tty_command("codex; whoami"));
-    assert!(!is_windows_shell_tty_command("Write-Output codex"));
-    assert!(windows_shell_tty_command_args("pentect scan . > scan.txt").is_none());
+    let cwd = std::env::current_dir().unwrap();
+    let cwd = cwd.to_string_lossy();
+    assert!(windows_shell_should_use_pty("codex", &cwd));
+    assert!(windows_shell_should_use_pty("claude --resume", &cwd));
+    assert!(windows_shell_should_use_pty("opencode", &cwd));
+    assert!(windows_shell_should_use_pty("pentect scan .", &cwd));
+    assert!(windows_shell_should_use_pty("pentect status", &cwd));
+    assert!(windows_shell_should_use_pty("pentect view SECRET", &cwd));
+    assert!(windows_shell_should_use_pty("pentect shell", &cwd));
+    assert!(windows_shell_should_use_pty("git status", &cwd));
+    assert!(!windows_shell_should_use_pty("codex; whoami", &cwd));
+    assert!(!windows_shell_should_use_pty("Write-Output codex", &cwd));
+    assert!(!windows_shell_should_use_pty(
+        "pentect scan . > scan.txt",
+        &cwd
+    ));
 }
 
 #[cfg(windows)]

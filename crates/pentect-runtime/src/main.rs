@@ -1718,9 +1718,8 @@ fn run_masked_windows_powershell(
         stream_windows_shell_stdout(stdout_store, stdout, &stdout_marker, completion_tx)
     });
     let stderr_store = store.clone();
-    let stderr_thread = std::thread::spawn(move || {
-        stream_masked_reader_deferred(stderr_store, stderr, StreamTarget::Stderr)
-    });
+    let stderr_thread =
+        std::thread::spawn(move || stream_windows_shell_stderr(stderr_store, stderr));
     masking::prewarm_pentect_engine();
     let status = pump_windows_shell_input(
         &mut child,
@@ -1728,11 +1727,43 @@ fn run_masked_windows_powershell(
         store,
         &completion_rx,
         &drain_marker,
+        &opts.session,
+        shim,
     )?;
     drop(child_stdin);
     join_stream_thread(stdout_thread)?;
     join_stream_thread(stderr_thread)?;
     Ok(exit_code(status))
+}
+
+#[cfg(windows)]
+fn stream_windows_shell_stderr(
+    store: MemoryStore,
+    stderr: std::process::ChildStderr,
+) -> Result<(), String> {
+    let mut reader = BufReader::new(stderr);
+    let mut masker = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("could not read PowerShell stderr: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        let kind = live_output_kind(&line);
+        flush_masked_chunk(
+            deferred_masker(&mut masker, &store)?,
+            StreamTarget::Stderr,
+            &mut line,
+            kind,
+        )?;
+    }
+    if let Some(masker) = &mut masker {
+        masker.flush()?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1831,6 +1862,8 @@ fn pump_windows_shell_input(
     store: MemoryStore,
     completion_rx: &mpsc::Receiver<WindowsShellCompletion>,
     drain_marker: &str,
+    session: &str,
+    shim: &ShellShimDir,
 ) -> Result<ExitStatus, String> {
     normalize_windows_shell_console_input_mode()?;
     let display = WindowsShellDisplay::new(store.clone())?;
@@ -1846,7 +1879,7 @@ fn pump_windows_shell_input(
     if history_path.exists() {
         let _ = editor.load_history(&history_path);
     }
-    let mut protector = ShellInputProtector::new(store)?;
+    let mut protector = ShellInputProtector::new(store.clone())?;
     let mut cwd = std::env::current_dir()
         .map_err(|e| format!("could not read current directory: {e}"))?
         .to_string_lossy()
@@ -1876,21 +1909,18 @@ fn pump_windows_shell_input(
             raw.zeroize();
             continue;
         }
-        if let Some(tty_args) = windows_shell_tty_command_args(&raw) {
-            let mut history_probe = protector.prepare_paste(&raw)?;
-            if windows_shell_history_is_safe(&raw, history_probe.changed) {
-                remember_windows_shell_history(&mut editor, &history_path, &raw);
-            }
-            history_probe.child.zeroize();
-            history_probe.injected_prefix.zeroize();
-            let result = run_windows_shell_tty_command(&tty_args, &cwd);
-            raw.zeroize();
-            result?;
-            continue;
-        }
         let mut protected = protector.prepare_paste(&raw)?;
         if windows_shell_history_is_safe(&raw, protected.changed) {
             remember_windows_shell_history(&mut editor, &history_path, &raw);
+        }
+        if windows_shell_should_use_pty(&raw, &cwd) {
+            raw.zeroize();
+            let result =
+                run_windows_shell_command_pty(store.clone(), &protected.child, &cwd, session, shim);
+            protected.child.zeroize();
+            protected.injected_prefix.zeroize();
+            result?;
+            continue;
         }
         raw.zeroize();
         let mut encoded = data_encoding::BASE64.encode(protected.child.as_bytes());
@@ -1982,55 +2012,48 @@ fn windows_shell_history_is_safe(command: &str, protected: bool) -> bool {
         && !command.to_ascii_lowercase().contains("pentect_")
 }
 
-#[cfg(all(windows, test))]
-fn is_windows_shell_tty_command(command: &str) -> bool {
-    windows_shell_tty_command_args(command).is_some()
-}
-
 #[cfg(windows)]
-fn windows_shell_tty_command_args(command: &str) -> Option<Vec<String>> {
+fn windows_shell_should_use_pty(command: &str, cwd: &str) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() || trimmed.contains([';', '|', '&', '>', '<', '\r', '\n']) {
-        return None;
+        return false;
     }
-    let (program, _, mut cursor) = next_shell_word(trimmed, 0)?;
-    let program = program.to_ascii_lowercase();
-    let is_pentect = matches!(program.as_str(), "pentect" | "pentect.exe");
-    if !is_pentect && !matches!(program.as_str(), "codex" | "claude" | "opencode") {
-        return None;
-    }
-    let mut args = if is_pentect {
-        Vec::new()
-    } else {
-        vec![program]
+    let Some((program, _, _)) = next_shell_word(trimmed, 0) else {
+        return false;
     };
-    while let Some((arg, _, next)) = next_shell_word(trimmed, cursor) {
-        args.push(arg);
-        cursor = next;
+    let program = program.to_ascii_lowercase();
+    if matches!(
+        program.as_str(),
+        "pentect" | "pentect.exe" | "codex" | "claude" | "opencode"
+    ) {
+        return true;
     }
-    // `scan` owns its masking and terminal UI. Other Pentect commands stay in
-    // the outer masking path; notably, `view` must never bypass remasking.
-    if is_pentect && !args.first().is_some_and(|arg| arg == "scan") {
-        return None;
+    let candidate = Path::new(&program);
+    if candidate.components().count() > 1 {
+        return windows_shell_executable_exists(&Path::new(cwd).join(candidate));
     }
-    Some(args)
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for directory in std::env::split_paths(&path) {
+        if windows_shell_executable_exists(&directory.join(&program)) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(windows)]
-fn run_windows_shell_tty_command(args: &[String], cwd: &str) -> Result<(), String> {
-    let executable =
-        std::env::current_exe().map_err(|e| format!("could not locate pentect executable: {e}"))?;
-    let mut command = Command::new(executable);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    command
-        .status()
-        .map_err(|e| format!("could not start interactive command: {e}"))?;
-    Ok(())
+fn windows_shell_executable_exists(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    if path.extension().is_some() {
+        return false;
+    }
+    ["com", "exe", "bat", "cmd", "ps1"]
+        .iter()
+        .any(|extension| path.with_extension(extension).is_file())
 }
 
 #[cfg(windows)]
@@ -2594,6 +2617,72 @@ fn run_masked_shell_pty(
     drop(pair.master);
     join_stream_thread(output_thread)?;
     Ok(pty_exit_code(status))
+}
+
+#[cfg(windows)]
+fn run_windows_shell_command_pty(
+    store: MemoryStore,
+    command_text: &str,
+    cwd: &str,
+    session: &str,
+    shim: &ShellShimDir,
+) -> Result<(), String> {
+    const COMMAND_ENV: &str = "PENTECT_TTY_COMMAND_B64";
+    const COMMAND_BOOTSTRAP: &str = concat!(
+        "$encoded=$env:PENTECT_TTY_COMMAND_B64;",
+        "Remove-Item Env:PENTECT_TTY_COMMAND_B64 -ErrorAction SilentlyContinue;",
+        "$text=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded));",
+        "$encoded=$null;",
+        "& ([ScriptBlock]::Create($text))"
+    );
+    let pty_system = native_pty_system();
+    let (cols, rows) = current_pty_size();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("could not start command pty: {e}"))?;
+    let mut encoded_command = data_encoding::BASE64.encode(command_text.as_bytes());
+    let mut command = CommandBuilder::new(windows_powershell_path());
+    command.args(["-NoLogo", "-NoProfile", "-Command", COMMAND_BOOTSTRAP]);
+    command.env(COMMAND_ENV, &encoded_command);
+    command.cwd(Path::new(cwd).as_os_str());
+    apply_shell_env_builder(&mut command, session, shim);
+    let spawned = pair.slave.spawn_command(command);
+    encoded_command.zeroize();
+    let mut child = spawned.map_err(|e| format!("could not start interactive command: {e}"))?;
+    drop(pair.slave);
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("could not capture interactive command output: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("could not open interactive command input: {e}"))?;
+    let writer = Arc::new(Mutex::new(writer));
+    let suppressor = PtyEchoSuppressor::default();
+    let input_store = store.clone();
+    let output_suppressor = suppressor.clone();
+    let terminal_responder = writer.clone();
+    let output_thread = std::thread::spawn(move || {
+        let mut masker = OutputMasker::new_deferred(store)?;
+        stream_masked_pty_reader(&mut masker, reader, output_suppressor, terminal_responder)?;
+        masker.flush()
+    });
+    let _status = pump_masked_pty_terminal_stdin(
+        child.as_mut(),
+        writer,
+        input_store,
+        suppressor,
+        pair.master.as_ref(),
+        (cols, rows),
+    )?;
+    drop(pair.master);
+    join_stream_thread(output_thread)
 }
 
 fn current_pty_size() -> (u16, u16) {
