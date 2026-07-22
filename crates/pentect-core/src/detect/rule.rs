@@ -261,13 +261,6 @@ impl RuleDetector {
                 "PHONE_NANP",
                 Medium,
             ),
-            // URL (scheme required, so it doesn't match bare hostnames).
-            (
-                r#"(?i)\b(?:https?|ftp|ftps|wss?)://[^\s"'<>()]*[^\s"'<>().,;:!?]"#,
-                Endpoint,
-                "URL",
-                Medium,
-            ),
             // Context-gated like Presidio: a bare number/ID only fires next to its
             // keyword, so these don't flood. The match includes the keyword.
             (
@@ -762,17 +755,11 @@ mod tests {
     }
 
     #[test]
-    fn url_rule_keeps_sentence_punctuation_literal() {
+    fn public_urls_are_not_builtin_endpoint_findings() {
         let det = RuleDetector::builtin();
         let raw = "see https://example.com/api/issues/1234. next";
         let spans = det.detect(&NormalizedView::build(&region(raw), raw));
-        let Some(span) = spans.iter().find(|s| s.label == "URL") else {
-            panic!("URL should be detected: {spans:?}");
-        };
-        assert_eq!(
-            &raw[span.range.start..span.range.end],
-            "https://example.com/api/issues/1234"
-        );
+        assert!(spans.iter().all(|span| span.label != "URL"), "{spans:?}");
     }
 
     #[test]

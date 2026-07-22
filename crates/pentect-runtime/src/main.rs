@@ -1319,17 +1319,29 @@ fn requested_env_bindings(
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    let mut by_name = BTreeMap::new();
+    let prefix = config::environment_variable_prefix()?;
+    Ok(select_referenced_env_bindings(available, &names, &prefix))
+}
+
+fn select_referenced_env_bindings(
+    available: Vec<(String, String)>,
+    referenced: &BTreeSet<String>,
+    prefix: &str,
+) -> Vec<(String, String)> {
+    let mut selected = Vec::new();
     for (name, value) in available {
-        by_name.insert(name.to_ascii_lowercase(), (name, value));
-    }
-    let mut out = Vec::new();
-    for name in names {
-        if let Some(binding) = by_name.get(&name) {
-            out.push(binding.clone());
+        let full_requested = referenced.contains(&name.to_ascii_lowercase());
+        let short = name.strip_prefix(prefix).filter(|short| !short.is_empty());
+        let short_requested = short
+            .is_some_and(|short| short != name && referenced.contains(&short.to_ascii_lowercase()));
+        if full_requested {
+            selected.push((name.clone(), value.clone()));
+        }
+        if short_requested {
+            selected.push((short.unwrap().to_string(), value));
         }
     }
-    Ok(out)
+    selected
 }
 
 fn referenced_env_names(mode: &ExecMode) -> BTreeSet<String> {
@@ -1647,7 +1659,7 @@ const WINDOWS_SHELL_HOST_SCRIPT: &str = concat!(
     "while (($line=[Console]::In.ReadLine()) -ne $null) {",
     "try {",
     "$text=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line));",
-    "Invoke-Expression $text *>&1 | Out-String -Stream | ForEach-Object { [Console]::Out.WriteLine($_) }",
+    "if (-not [String]::IsNullOrWhiteSpace($text)) { Invoke-Expression $text *>&1 | Out-String -Stream | ForEach-Object { [Console]::Out.WriteLine($_) } }",
     "} catch {",
     "$message=$_ | Out-String;[Console]::Out.WriteLine($message)",
     "};",
@@ -1762,6 +1774,10 @@ fn stream_windows_shell_stdout(
                     live_output_kind(prefix),
                 )?;
             }
+            // Publish handles and their environment aliases before the input
+            // loop exposes the next prompt. Deferred output otherwise keeps a
+            // freshly printed dotenv handle unusable until the shell exits.
+            masker.flush()?;
             let encoded = line[start + marker.len()..].trim_end_matches(['\r', '\n']);
             if encoded == "DRAIN" {
                 if completion_tx
@@ -1845,6 +1861,10 @@ fn pump_windows_shell_input(
             }
             Err(e) => return Err(format!("could not read shell input: {e}")),
         };
+        if raw.trim().is_empty() {
+            raw.zeroize();
+            continue;
+        }
         if let Some(agent_args) = windows_shell_interactive_agent_args(&raw) {
             let mut history_probe = protector.prepare_paste(&raw)?;
             if windows_shell_history_is_safe(&raw, history_probe.changed) {
@@ -1996,15 +2016,13 @@ fn run_windows_shell_interactive_agent(args: &[String], cwd: &str) -> Result<(),
 
 #[cfg(windows)]
 struct WindowsShellDisplay {
-    protector: Mutex<ShellInputProtector>,
     completer: FilenameCompleter,
 }
 
 #[cfg(windows)]
 impl WindowsShellDisplay {
-    fn new(store: MemoryStore) -> Result<Self, String> {
+    fn new(_store: MemoryStore) -> Result<Self, String> {
         Ok(Self {
-            protector: Mutex::new(ShellInputProtector::new(store)?),
             completer: FilenameCompleter::new(),
         })
     }
@@ -2038,27 +2056,9 @@ impl Helper for WindowsShellDisplay {}
 #[cfg(windows)]
 impl Highlighter for WindowsShellDisplay {
     fn highlight<'line>(&self, line: &'line str, _pos: usize) -> std::borrow::Cow<'line, str> {
-        let Ok(mut protector) = self.protector.lock() else {
-            return provisional_shell_secret_display(line)
-                .map(std::borrow::Cow::Owned)
-                .unwrap_or(std::borrow::Cow::Borrowed(line));
-        };
-        let Ok(mut protected) = protector.prepare_paste(line) else {
-            return provisional_shell_secret_display(line)
-                .map(std::borrow::Cow::Owned)
-                .unwrap_or(std::borrow::Cow::Borrowed(line));
-        };
-        if !protected.changed {
-            return provisional_shell_secret_display(line)
-                .map(std::borrow::Cow::Owned)
-                .unwrap_or(std::borrow::Cow::Borrowed(line));
-        }
-        let visible = canonical_shell_secret_display(line, &protected.visible)
-            .unwrap_or_else(|| protected.visible.clone());
-        let display = shell_display_with_same_width(line, &visible);
-        protected.child.zeroize();
-        protected.injected_prefix.zeroize();
-        std::borrow::Cow::Owned(display)
+        provisional_shell_secret_display(line)
+            .map(std::borrow::Cow::Owned)
+            .unwrap_or(std::borrow::Cow::Borrowed(line))
     }
 
     fn highlight_char(
@@ -2069,22 +2069,6 @@ impl Highlighter for WindowsShellDisplay {
     ) -> bool {
         true
     }
-}
-
-#[cfg(windows)]
-fn canonical_shell_secret_display(raw: &str, protected: &str) -> Option<String> {
-    let (start, end) = likely_shell_secret_range(raw)?;
-    let env_start = protected.find("$env:PENTECT_")?;
-    let env_end = protected[env_start..]
-        .bytes()
-        .position(|byte| !is_env_name_byte(byte) && byte != b'$' && byte != b':')
-        .map(|offset| env_start + offset)
-        .unwrap_or(protected.len());
-    let mut display = String::new();
-    display.push_str(&raw[..start]);
-    display.push_str(&protected[env_start..env_end]);
-    display.push_str(&raw[end..]);
-    Some(display)
 }
 
 #[cfg(windows)]
@@ -2119,26 +2103,6 @@ fn likely_shell_secret_range(text: &str) -> Option<(usize, usize)> {
         end = start + offset + ch.len_utf8();
     }
     Some((start, end))
-}
-
-#[cfg(windows)]
-fn shell_display_with_same_width(raw: &str, protected: &str) -> String {
-    let raw_chars = raw.chars().count();
-    let protected_chars = protected.chars().count();
-    if protected_chars <= raw_chars {
-        let mut display = protected.to_string();
-        display.extend(std::iter::repeat_n(' ', raw_chars - protected_chars));
-        return display;
-    }
-    if raw_chars == 0 {
-        return String::new();
-    }
-    let mut display = protected
-        .chars()
-        .take(raw_chars.saturating_sub(1))
-        .collect::<String>();
-    display.push('…');
-    display
 }
 
 #[cfg(windows)]
@@ -3337,6 +3301,21 @@ impl ShellInputProtector {
     }
 
     fn prepare_paste(&mut self, text: &str) -> Result<ProtectedPaste, String> {
+        let referenced = referenced_env_names_in_text(text);
+        let available = self.store.auto_env_bindings().map_err(|e| e.to_string())?;
+        if stale_env_handle(&referenced, &available, self.masker.environment_prefix()) {
+            return Ok(ProtectedPaste {
+                child: self.syntax.stale_handle_error(),
+                visible: text.to_string(),
+                changed: true,
+                injected_prefix: String::new(),
+            });
+        }
+        let selected = select_referenced_env_bindings(
+            available,
+            &referenced,
+            self.masker.environment_prefix(),
+        );
         let masked = self.masker.mask_text(text, live_output_kind(text))?;
         let (mut visible, mut bindings) = replace_masked_handles_with_env_refs(
             &masked,
@@ -3344,6 +3323,7 @@ impl ShellInputProtector {
             self.syntax,
             self.masker.environment_prefix(),
         )?;
+        restore_safe_shell_literals(text, &mut visible, &mut bindings, self.syntax);
         if bindings.len() == 1 {
             if let Some((start, end)) = likely_shell_secret_range(text) {
                 bindings[0].value.zeroize();
@@ -3367,18 +3347,13 @@ impl ShellInputProtector {
             }
             binding.value.zeroize();
         }
-        let referenced = referenced_env_names_in_text(command_text);
-        if !referenced.is_empty() {
-            for (name, mut value) in self.store.auto_env_bindings().map_err(|e| e.to_string())? {
-                if referenced.contains(&name.to_ascii_lowercase())
-                    && self.defined_env.insert(name.clone())
-                {
-                    let assignment = self.syntax.env_assignment(&name, &value);
-                    injected_prefix.push_str(&assignment);
-                    child.push_str(&assignment);
-                }
-                value.zeroize();
+        for (name, mut value) in selected {
+            if self.defined_env.insert(name.clone()) {
+                let assignment = self.syntax.env_assignment(&name, &value);
+                injected_prefix.push_str(&assignment);
+                child.push_str(&assignment);
             }
+            value.zeroize();
         }
         child.push_str(command_text);
         Ok(ProtectedPaste {
@@ -3387,6 +3362,65 @@ impl ShellInputProtector {
             changed: replaced_secret || !injected_prefix.is_empty(),
             injected_prefix,
         })
+    }
+}
+
+fn stale_env_handle(
+    referenced: &BTreeSet<String>,
+    available: &[(String, String)],
+    prefix: &str,
+) -> bool {
+    let mut current = BTreeSet::new();
+    let mut labels = BTreeSet::new();
+    for (name, _) in available {
+        let Some((label, hash)) = env_handle_name_parts(name, prefix) else {
+            continue;
+        };
+        labels.insert(label.clone());
+        current.insert(format!("{label}_{hash}"));
+    }
+    referenced.iter().any(|name| {
+        env_handle_name_parts(name, prefix).is_some_and(|(label, hash)| {
+            labels.contains(&label) && !current.contains(&format!("{label}_{hash}"))
+        })
+    })
+}
+
+fn env_handle_name_parts(name: &str, prefix: &str) -> Option<(String, String)> {
+    let lower = name.to_ascii_lowercase();
+    let prefix = prefix.to_ascii_lowercase();
+    let core = lower.strip_prefix(&prefix).unwrap_or(&lower);
+    let (label, hash) = core.rsplit_once('_')?;
+    if label.is_empty()
+        || hash.len() != 16
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return None;
+    }
+    Some((label.to_string(), hash.to_string()))
+}
+
+fn restore_safe_shell_literals(
+    original: &str,
+    visible: &mut String,
+    bindings: &mut Vec<ShellEnvBinding>,
+    syntax: ShellSyntax,
+) {
+    let mut index = 0usize;
+    while index < bindings.len() {
+        let value = bindings[index].value.as_str();
+        let is_existing_env_ref = !referenced_env_names_in_text(value).is_empty();
+        let is_public_url = (value.starts_with("https://") || value.starts_with("http://"))
+            && !value.chars().any(|ch| matches!(ch, '@' | '?' | '#'));
+        if original.contains(value) && (is_existing_env_ref || is_public_url) {
+            let binding = bindings.remove(index);
+            *visible = visible.replace(&syntax.env_ref(&binding.name), &binding.value);
+        } else {
+            index += 1;
+        }
     }
 }
 
@@ -3428,6 +3462,15 @@ impl ShellSyntax {
                 format!("$env:{name}={}; ", powershell_string_literal(value))
             }
             Self::Posix => format!("export {name}={}; ", shell_quote_unix(value)),
+        }
+    }
+
+    fn stale_handle_error(self) -> String {
+        const MESSAGE: &str =
+            "Pentect: stale environment handle; run cat .env again and use the new handle.";
+        match self {
+            Self::PowerShell => format!("Write-Error {}", powershell_string_literal(MESSAGE)),
+            Self::Posix => format!("printf '%s\\n' {} >&2", shell_quote_unix(MESSAGE)),
         }
     }
 }
