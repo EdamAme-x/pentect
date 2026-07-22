@@ -1,9 +1,14 @@
+use hmac::{Hmac, Mac};
 use pentect_core::{DecodeConfig, Profile};
-use std::fs;
-use std::path::PathBuf;
+use sha2::Sha256;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
+const IDENTITY_KEY_FILE: &str = "handle-identity.key";
 const DEFAULT_ENVIRONMENT_PREFIX: &str = "PENTECT_";
 const MAX_ENVIRONMENT_PREFIX_BYTES: usize = 64;
 const DEFAULT_IMAGE_OCR_MAX_EDGE: u32 = 2_048;
@@ -13,6 +18,153 @@ const DEFAULT_IMAGE_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_IMAGE_MAX_SECONDS: u64 = 20;
 const DEFAULT_IMAGE_MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_IMAGE_FETCH_SECONDS: u64 = 8;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum HandleHashScope {
+    #[default]
+    Machine,
+    Project,
+    Session,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn handle_identity_key() -> Result<[u8; 32], String> {
+    let project = read_handle_hash_scope(project_config_path())?;
+    let global = read_handle_hash_scope(global_config_path()?)?;
+    match project.or(global).unwrap_or_default() {
+        HandleHashScope::Machine => machine_identity_key(),
+        HandleHashScope::Project => {
+            let root = project_identity_root()?;
+            Ok(derive_project_identity_key(&machine_identity_key()?, &root))
+        }
+        HandleHashScope::Session => random_identity_key(),
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn read_handle_hash_scope(path: PathBuf) -> Result<Option<HandleHashScope>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let src = fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(None);
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    handle_hash_scope_value(&value)
+}
+
+fn handle_hash_scope_value(value: &toml::Value) -> Result<Option<HandleHashScope>, String> {
+    let Some(handles) = value.get("handles") else {
+        return Ok(None);
+    };
+    let Some(table) = handles.as_table() else {
+        return Err("handles config must be a table".to_string());
+    };
+    let Some(raw) = table.get("hash_scope") else {
+        return Ok(None);
+    };
+    let Some(raw) = raw.as_str() else {
+        return Err("handles.hash_scope must be a string".to_string());
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "machine" => Ok(Some(HandleHashScope::Machine)),
+        "project" => Ok(Some(HandleHashScope::Project)),
+        "session" => Ok(Some(HandleHashScope::Session)),
+        _ => Err("handles.hash_scope must be machine, project, or session".to_string()),
+    }
+}
+
+fn random_identity_key() -> Result<[u8; 32], String> {
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).map_err(|e| format!("OS CSPRNG unavailable: {e}"))?;
+    Ok(key)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn machine_identity_key() -> Result<[u8; 32], String> {
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    if let Some(key) = KEY.get() {
+        return Ok(*key);
+    }
+    let key = load_or_create_identity_key(&machine_identity_key_path()?)?;
+    let _ = KEY.set(key);
+    Ok(*KEY.get().unwrap_or(&key))
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn machine_identity_key_path() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base = home_dir().map(|home| home.join("Library").join("Application Support"));
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".local").join("state")));
+    base.map(|base| base.join("pentect").join(IDENTITY_KEY_FILE))
+        .ok_or_else(|| "could not find a local data directory for Pentect".to_string())
+}
+
+fn load_or_create_identity_key(path: &Path) -> Result<[u8; 32], String> {
+    if !path.exists() {
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("identity key path '{}' has no parent", path.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
+        let key = random_identity_key()?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(&key)
+                    .and_then(|_| file.sync_data())
+                    .map_err(|e| format!("could not write '{}': {e}", path.display()))?;
+                return Ok(key);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!("could not create '{}': {error}", path.display()));
+            }
+        }
+    }
+    let bytes = fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        format!(
+            "identity key '{}' must contain exactly 32 bytes (found {})",
+            path.display(),
+            bytes.len()
+        )
+    })
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn project_identity_root() -> Result<PathBuf, String> {
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("could not read current directory: {e}"))?;
+    let root = cwd
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists() || candidate.join(PENTECT_DIR).exists())
+        .unwrap_or(&cwd);
+    root.canonicalize()
+        .map_err(|e| format!("could not canonicalize '{}': {e}", root.display()))
+}
+
+fn derive_project_identity_key(machine_key: &[u8; 32], root: &Path) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(machine_key).expect("fixed-size HMAC key");
+    mac.update(b"pentect:handle-identity:project:v1\0");
+    mac.update(root.to_string_lossy().as_bytes());
+    mac.finalize().into_bytes().into()
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImageOcrMode {
     Off,
@@ -612,6 +764,69 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pentect-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn handle_hash_scope_accepts_all_scopes_and_rejects_unknown_values() {
+        for (raw, expected) in [
+            ("machine", HandleHashScope::Machine),
+            ("project", HandleHashScope::Project),
+            ("session", HandleHashScope::Session),
+        ] {
+            let value = format!("[handles]\nhash_scope = {raw:?}")
+                .parse::<toml::Value>()
+                .unwrap();
+            assert_eq!(handle_hash_scope_value(&value).unwrap(), Some(expected));
+        }
+        let value = "[handles]\nhash_scope = \"daily\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert!(handle_hash_scope_value(&value).is_err());
+    }
+
+    #[test]
+    fn machine_identity_key_is_stable_and_invalid_files_fail_closed() {
+        let root = temp_test_dir("handle-identity-key");
+        let path = root.join(IDENTITY_KEY_FILE);
+        let first = load_or_create_identity_key(&path).unwrap();
+        let second = load_or_create_identity_key(&path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&path).unwrap().len(), 32);
+
+        let invalid = root.join("invalid.key");
+        std::fs::write(&invalid, b"short").unwrap();
+        assert!(load_or_create_identity_key(&invalid).is_err());
+        assert_eq!(std::fs::read(&invalid).unwrap(), b"short");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_identity_key_is_stable_but_project_scoped() {
+        let machine = [42u8; 32];
+        let a = derive_project_identity_key(&machine, Path::new("project-a"));
+        assert_eq!(
+            a,
+            derive_project_identity_key(&machine, Path::new("project-a"))
+        );
+        assert_ne!(
+            a,
+            derive_project_identity_key(&machine, Path::new("project-b"))
+        );
+        assert_ne!(
+            a,
+            derive_project_identity_key(&[43u8; 32], Path::new("project-a"))
+        );
+    }
 
     #[test]
     fn agent_require_pentect_accepts_top_level_and_table_forms() {

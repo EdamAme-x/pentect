@@ -113,8 +113,9 @@ impl OutputMasker {
 
     pub(crate) fn mask_prompt_text(&mut self, text: &str) -> Result<String, String> {
         let remasked = self.remask_all(text)?;
-        let result = mask_read_input_with_profile(
+        let result = mask_read_input_with_profile_and_identity(
             self.store.session.key,
+            self.store.session.identity_key,
             Input {
                 kind: Kind::Text,
                 data: remasked,
@@ -142,7 +143,7 @@ impl OutputMasker {
         let needs_text_pass = !matches!(kind, Kind::Text | Kind::ToolResult);
         let cfg = Config {
             disclose_length: false,
-            ..Config::new(self.store.session.key)
+            ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         let endpoint_unchanged = remasked.clone();
         let result = self.engine.mask(
@@ -205,7 +206,7 @@ impl OutputMasker {
             self.mask_model_adapter_input(remasked, Kind::ToolResult, Some(context.clone()))?;
         let cfg = Config {
             disclose_length: false,
-            ..Config::new(self.store.session.key)
+            ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         let endpoint_unchanged = remasked.clone();
         let result = self.engine.mask_context(remasked, context, &cfg);
@@ -275,7 +276,7 @@ impl OutputMasker {
 
         let cfg = Config {
             disclose_length: false,
-            ..Config::new(self.store.session.key)
+            ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         let result = self.engine.mask_regions(raw, regions, &cfg);
         if masks_only_endpoint_metadata(&result) {
@@ -356,7 +357,7 @@ impl OutputMasker {
         let unchanged = data.clone();
         let cfg = Config {
             disclose_length: false,
-            ..Config::new(self.store.session.key)
+            ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         match self
             .model_adapters
@@ -554,11 +555,12 @@ fn is_path_sep_char(ch: char) -> bool {
 
 pub(crate) fn mask_read_data(
     key: [u8; 32],
+    identity_key: [u8; 32],
     data: String,
     kind: Kind,
 ) -> Result<MaskResult, String> {
     let engine = tool_boundary_engine()?;
-    mask_read_input_with_engine(key, engine, Input { kind, data })
+    mask_read_input_with_engine_and_identity(key, identity_key, engine, Input { kind, data })
 }
 
 pub(crate) fn mask_read_input_with_profile(
@@ -567,20 +569,31 @@ pub(crate) fn mask_read_input_with_profile(
     profile: Profile,
     packs: Vec<pentect_core::Pack>,
 ) -> Result<MaskResult, String> {
-    let decode = config::decode_config(profile)?;
-    let engine = Engine::with_profile_and_packs_and_decode_config(profile, packs, false, decode);
-    mask_read_input_with_engine(key, &engine, input)
+    mask_read_input_with_profile_and_identity(key, key, input, profile, packs)
 }
 
-pub(crate) fn mask_read_input_with_engine(
+pub(crate) fn mask_read_input_with_profile_and_identity(
     key: [u8; 32],
+    identity_key: [u8; 32],
+    input: Input,
+    profile: Profile,
+    packs: Vec<pentect_core::Pack>,
+) -> Result<MaskResult, String> {
+    let decode = config::decode_config(profile)?;
+    let engine = Engine::with_profile_and_packs_and_decode_config(profile, packs, false, decode);
+    mask_read_input_with_engine_and_identity(key, identity_key, &engine, input)
+}
+
+pub(crate) fn mask_read_input_with_engine_and_identity(
+    key: [u8; 32],
+    identity_key: [u8; 32],
     engine: &Engine,
     input: Input,
 ) -> Result<MaskResult, String> {
     let adapters = ModelAdapters::from_env()?;
     let cfg = Config {
         disclose_length: false,
-        ..Config::new(key)
+        ..Config::new(key).with_identity_key(identity_key)
     };
     let mut adapter_count = 0usize;
     let mut adapter_recovery = Recovery::empty_for_key(&key);

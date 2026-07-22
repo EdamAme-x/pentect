@@ -27,11 +27,12 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 use sweep::identity_sweep;
 
-/// Per-call parameters (not behaviour). `key` is the HMAC key for identity
-/// hashing; the adapter generates and persists it.
+/// Per-call parameters (not behaviour). `key` seals local recovery data while
+/// `identity_key` creates stable, non-reversible handle identifiers.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub key: [u8; 32],
+    pub identity_key: [u8; 32],
     pub locale: String,
     /// Opt-in exact length disclosure (off by default).
     pub disclose_length: bool,
@@ -41,9 +42,14 @@ impl Config {
     pub fn new(key: [u8; 32]) -> Self {
         Self {
             key,
+            identity_key: key,
             locale: "en".into(),
             disclose_length: false,
         }
+    }
+    pub fn with_identity_key(mut self, identity_key: [u8; 32]) -> Self {
+        self.identity_key = identity_key;
+        self
     }
     /// Fixed key for tests and demos only.
     pub fn insecure_testing() -> Self {
@@ -322,7 +328,12 @@ impl Engine {
     /// An adapter can build the same `Ir` and call this directly.
     pub fn mask_ir(&self, ir: Ir, config: &Config) -> MaskResult {
         let (swept, residual) = self.masked_spans(&ir);
-        let rendered = render(&ir.raw, &config.key, swept.clone(), config.disclose_length);
+        let rendered = render(
+            &ir.raw,
+            &config.identity_key,
+            swept.clone(),
+            config.disclose_length,
+        );
 
         // parser_fallback is set by mask(); mask_ir takes a ready-made Ir.
         let summary = Summary {
@@ -350,7 +361,12 @@ impl Engine {
     pub fn mask_spans(&self, input: Input, spans: Vec<Span>, config: &Config) -> MaskResult {
         let (ir, fell_back) = self.parse(input);
         let (swept, residual) = self.mask_supplied_spans(&ir, spans);
-        let rendered = render(&ir.raw, &config.key, swept.clone(), config.disclose_length);
+        let rendered = render(
+            &ir.raw,
+            &config.identity_key,
+            swept.clone(),
+            config.disclose_length,
+        );
 
         let summary = Summary {
             masked_count: rendered.map.len(),
@@ -737,6 +753,36 @@ fn scan_placeholders(raw: &str) -> Vec<ByteRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_key_controls_handles_independently_of_recovery_key() {
+        let engine = Engine::with_profile(Profile::Strict);
+        let input = Input {
+            kind: Kind::Env,
+            data: "TOKEN=super-secret-value-123456".to_string(),
+        };
+        let first = engine.mask(
+            input.clone(),
+            &Config::new([1u8; 32]).with_identity_key([9u8; 32]),
+        );
+        let second = engine.mask(
+            input.clone(),
+            &Config::new([2u8; 32]).with_identity_key([9u8; 32]),
+        );
+        let other_identity =
+            engine.mask(input, &Config::new([1u8; 32]).with_identity_key([8u8; 32]));
+
+        assert_eq!(first.masked, second.masked);
+        assert_ne!(first.masked, other_identity.masked);
+        assert_eq!(
+            first.recovery.resolve(&first.masked),
+            "TOKEN=super-secret-value-123456"
+        );
+        assert_eq!(
+            second.recovery.resolve(&second.masked),
+            "TOKEN=super-secret-value-123456"
+        );
+    }
     use crate::recovery::restore;
     use proptest::prelude::*;
     use sha2::Digest as _;

@@ -178,8 +178,14 @@ fn mask_input_into_memory_store_client(
     profile: Profile,
     packs: Vec<Pack>,
 ) -> Result<MaskResult, String> {
-    let key = client.key().map_err(|e| e.to_string())?;
-    let result = masking::mask_read_input_with_profile(key, input, profile, packs)?;
+    let (key, identity_key) = client.keys().map_err(|e| e.to_string())?;
+    let result = masking::mask_read_input_with_profile_and_identity(
+        key,
+        identity_key,
+        input,
+        profile,
+        packs,
+    )?;
     let mut recovery = result.recovery.clone();
     let prefix = config::environment_variable_prefix()?;
     recovery.extend_same_key(env_alias_recovery(&result.masked, &key, &prefix));
@@ -4971,7 +4977,12 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
     let path = Path::new(path_text);
     let data = read_input(path, InputFormat::Text)
         .map_err(|_| "read target could not be scanned.".to_string())?;
-    let result = mask_read_data(session.key, data.clone(), infer_kind(path))?;
+    let result = mask_read_data(
+        session.key,
+        session.identity_key,
+        data.clone(),
+        infer_kind(path),
+    )?;
     if result.summary.masked_count == 0 {
         return Ok(None);
     }

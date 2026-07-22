@@ -19,6 +19,16 @@ pub fn n_id(s: &str) -> String {
     s.nfc().collect()
 }
 
+/// ASCII is already NFC, which covers the common secret/token path without an
+/// allocation. Non-ASCII values retain the exact normalization semantics.
+pub fn n_id_cow(s: &str) -> Cow<'_, str> {
+    if s.is_ascii() {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(n_id(s))
+    }
+}
+
 fn is_zero_width(c: char) -> bool {
     matches!(c, '\u{200B}'..='\u{200D}' | '\u{FEFF}')
 }

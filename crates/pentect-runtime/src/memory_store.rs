@@ -185,6 +185,7 @@ pub(crate) struct MemoryStoreClient {
 
 pub(crate) struct MemoryStoreSnapshot {
     pub(crate) key: [u8; 32],
+    pub(crate) identity_key: [u8; 32],
     pub(crate) recovery: Recovery,
 }
 
@@ -233,6 +234,7 @@ impl InProcessMemoryStore {
 
 struct MemoryStoreState {
     key: [u8; 32],
+    identity_key: [u8; 32],
     recovery: Recovery,
     masked_count: u64,
     activity: VecDeque<(u64, String)>,
@@ -249,6 +251,7 @@ struct AgentScript {
 impl Drop for MemoryStoreState {
     fn drop(&mut self) {
         self.key.zeroize();
+        self.identity_key.zeroize();
     }
 }
 
@@ -304,6 +307,15 @@ impl MemoryStoreClient {
             bail!("memory store key response is malformed");
         }
         decode_key_hex(fields[1])
+    }
+
+    pub(crate) fn keys(&self) -> Result<([u8; 32], [u8; 32])> {
+        let line = self.request("KEYS", "")?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 3 || fields[0] != "OK" {
+            bail!("memory store keys response is malformed");
+        }
+        Ok((decode_key_hex(fields[1])?, decode_key_hex(fields[2])?))
     }
 
     pub(crate) fn add_recovery(&self, key: &[u8; 32], recovery: &Recovery) -> Result<()> {
@@ -491,16 +503,21 @@ impl MemoryStoreClient {
 
 fn decode_snapshot_response(line: &str) -> Result<MemoryStoreSnapshot> {
     let fields = response_fields(line)?;
-    if fields.len() != 3 || fields[0] != "OK" {
+    if fields.len() != 4 || fields[0] != "OK" {
         bail!("memory store snapshot response is malformed");
     }
     let key = decode_key_hex(fields[1])?;
+    let identity_key = decode_key_hex(fields[2])?;
     let recovery_blob = data_encoding::BASE64
-        .decode(fields[2].as_bytes())
+        .decode(fields[3].as_bytes())
         .context("memory store snapshot is not valid base64")?;
     let recovery = Recovery::load(&recovery_blob, &key)
         .map_err(|e| anyhow!("memory store snapshot is invalid: {e}"))?;
-    Ok(MemoryStoreSnapshot { key, recovery })
+    Ok(MemoryStoreSnapshot {
+        key,
+        identity_key,
+        recovery,
+    })
 }
 
 fn decode_masked_count_response(line: &str) -> Result<u64> {
@@ -576,8 +593,10 @@ fn serve_memory_store_inner() -> Result<()> {
     let process_host_read_token = Arc::new(Zeroizing::new(random_token_hex()?));
     let process_host_write_token = Arc::new(Zeroizing::new(random_token_hex()?));
     let key = Config::generate().key;
+    let identity_key = runtime_identity_key()?;
     let state = Arc::new(Mutex::new(MemoryStoreState {
         key,
+        identity_key,
         recovery: Recovery::empty_for_key(&key),
         masked_count: 0,
         activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
@@ -627,8 +646,10 @@ pub fn start_in_process_memory_store() -> Result<InProcessMemoryStore> {
     let process_host_read_token = Zeroizing::new(random_token_hex()?);
     let process_host_write_token = Zeroizing::new(random_token_hex()?);
     let key = Config::generate().key;
+    let identity_key = runtime_identity_key()?;
     let state = Arc::new(Mutex::new(MemoryStoreState {
         key,
+        identity_key,
         recovery: Recovery::empty_for_key(&key),
         masked_count: 0,
         activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
@@ -669,6 +690,16 @@ pub fn start_in_process_memory_store() -> Result<InProcessMemoryStore> {
     })
 }
 
+#[cfg(not(test))]
+fn runtime_identity_key() -> Result<[u8; 32]> {
+    crate::config::handle_identity_key().map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+fn runtime_identity_key() -> Result<[u8; 32]> {
+    Ok(Config::generate().identity_key)
+}
+
 #[cfg(test)]
 pub(crate) fn spawn_test_memory_store(token: String) -> String {
     let read_token = format!("{token}-activity-read");
@@ -686,8 +717,10 @@ pub(crate) fn spawn_test_memory_store_with_activity(
     let read_token = Arc::new(Zeroizing::new(read_token));
     let write_token = Arc::new(Zeroizing::new(write_token));
     let key = Config::generate().key;
+    let identity_key = Config::generate().identity_key;
     let state = Arc::new(Mutex::new(MemoryStoreState {
         key,
+        identity_key,
         recovery: Recovery::empty_for_key(&key),
         masked_count: 0,
         activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
@@ -743,6 +776,7 @@ fn handle_client(
         let fields = request_fields(&line);
         let response = match fields.as_slice() {
             [provided_token, "KEY", ""] if *provided_token == token => key_response(state),
+            [provided_token, "KEYS", ""] if *provided_token == token => keys_response(state),
             [provided_token, "COUNT", ""] if *provided_token == token => count_response(state),
             [provided_token, "SNAPSHOT", ""] if *provided_token == token => {
                 snapshot_response(state)
@@ -805,13 +839,25 @@ fn key_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
     ))
 }
 
-fn snapshot_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
+fn keys_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
     let guard = state
         .lock()
         .map_err(|_| anyhow!("memory store lock poisoned"))?;
     Ok(format!(
         "OK\t{}\t{}",
         data_encoding::HEXLOWER.encode(&guard.key),
+        data_encoding::HEXLOWER.encode(&guard.identity_key)
+    ))
+}
+
+fn snapshot_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    Ok(format!(
+        "OK\t{}\t{}\t{}",
+        data_encoding::HEXLOWER.encode(&guard.key),
+        data_encoding::HEXLOWER.encode(&guard.identity_key),
         data_encoding::BASE64.encode(&guard.recovery.serialize(&guard.key))
     ))
 }
@@ -1052,14 +1098,18 @@ mod tests {
     fn client_round_trips_recovery_through_memory_store_state() {
         let token = "test-token".to_string();
         let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
-        assert_eq!(client.key().unwrap(), client.snapshot().unwrap().key);
         let snapshot = client.snapshot().unwrap();
+        assert_eq!(client.key().unwrap(), snapshot.key);
+        assert_eq!(
+            client.keys().unwrap(),
+            (snapshot.key, snapshot.identity_key)
+        );
         let result = Engine::with_profile(Profile::Strict).mask(
             Input {
                 kind: Kind::Env,
                 data: "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n".to_string(),
             },
-            &Config::new(snapshot.key),
+            &Config::new(snapshot.key).with_identity_key(snapshot.identity_key),
         );
         let masked = result.masked.clone();
         client
@@ -1184,6 +1234,10 @@ mod tests {
             reader.key().is_err(),
             "activity token exposed the store key"
         );
+        assert!(
+            reader.keys().is_err(),
+            "activity token exposed the store keys"
+        );
 
         writer
             .add_activity(r#"{"action":"resolve","count":1}"#)
@@ -1199,6 +1253,7 @@ mod tests {
         let key = Config::generate().key;
         let state = Arc::new(Mutex::new(MemoryStoreState {
             key,
+            identity_key: key,
             recovery: Recovery::empty_for_key(&key),
             masked_count: 0,
             activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),

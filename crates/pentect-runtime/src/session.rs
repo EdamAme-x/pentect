@@ -16,6 +16,7 @@ const AGENT_DIR: &str = "agent";
 #[derive(Clone)]
 pub(crate) struct Session {
     pub(crate) key: [u8; 32],
+    pub(crate) identity_key: [u8; 32],
     pub(crate) recoveries: Arc<Mutex<Vec<Recovery>>>,
     backend: SessionBackend,
 }
@@ -37,21 +38,28 @@ impl Session {
         Self::open_active()
     }
 
-    fn in_memory() -> Self {
-        Self {
-            key: Config::generate().key,
+    fn in_memory() -> Result<Self> {
+        let generated = Config::generate();
+        #[cfg(not(test))]
+        let identity_key = crate::config::handle_identity_key().map_err(anyhow::Error::msg)?;
+        #[cfg(test)]
+        let identity_key = generated.identity_key;
+        Ok(Self {
+            key: generated.key,
+            identity_key,
             recoveries: Arc::new(Mutex::new(Vec::new())),
             backend: SessionBackend::Local,
-        }
+        })
     }
 
     fn open_active() -> Result<Self> {
         let Some(client) = MemoryStoreClient::from_env() else {
-            return Ok(Self::in_memory());
+            return Self::in_memory();
         };
         let snapshot = client.snapshot()?;
         Ok(Self {
             key: snapshot.key,
+            identity_key: snapshot.identity_key,
             recoveries: Arc::new(Mutex::new(if snapshot.recovery.is_empty() {
                 Vec::new()
             } else {
@@ -72,14 +80,14 @@ impl Session {
     pub(crate) fn open_at(base: &Path, name: &str) -> Result<Self> {
         let _ = base;
         checked_session_name(name)?;
-        Ok(Self::in_memory())
+        Self::in_memory()
     }
 
     #[cfg(test)]
     pub(crate) fn open_capability_at(base: &Path, name: &str) -> Result<Self> {
         let _ = base;
         checked_session_name(name)?;
-        Ok(Self::in_memory())
+        Self::in_memory()
     }
 
     #[cfg(test)]
@@ -125,6 +133,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.key.zeroize();
+        self.identity_key.zeroize();
     }
 }
 
