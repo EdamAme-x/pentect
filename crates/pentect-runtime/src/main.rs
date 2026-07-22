@@ -1876,14 +1876,14 @@ fn pump_windows_shell_input(
             raw.zeroize();
             continue;
         }
-        if let Some(agent_args) = windows_shell_interactive_agent_args(&raw) {
+        if let Some(tty_args) = windows_shell_tty_command_args(&raw) {
             let mut history_probe = protector.prepare_paste(&raw)?;
             if windows_shell_history_is_safe(&raw, history_probe.changed) {
                 remember_windows_shell_history(&mut editor, &history_path, &raw);
             }
             history_probe.child.zeroize();
             history_probe.injected_prefix.zeroize();
-            let result = run_windows_shell_interactive_agent(&agent_args, &cwd);
+            let result = run_windows_shell_tty_command(&tty_args, &cwd);
             raw.zeroize();
             result?;
             continue;
@@ -1983,33 +1983,41 @@ fn windows_shell_history_is_safe(command: &str, protected: bool) -> bool {
 }
 
 #[cfg(all(windows, test))]
-fn is_windows_shell_interactive_agent_command(command: &str) -> bool {
-    windows_shell_interactive_agent_args(command).is_some()
+fn is_windows_shell_tty_command(command: &str) -> bool {
+    windows_shell_tty_command_args(command).is_some()
 }
 
 #[cfg(windows)]
-fn windows_shell_interactive_agent_args(command: &str) -> Option<Vec<String>> {
+fn windows_shell_tty_command_args(command: &str) -> Option<Vec<String>> {
     let trimmed = command.trim();
-    if trimmed.is_empty() || trimmed.contains([';', '|', '&', '\r', '\n']) {
+    if trimmed.is_empty() || trimmed.contains([';', '|', '&', '>', '<', '\r', '\n']) {
         return None;
     }
     let (program, _, mut cursor) = next_shell_word(trimmed, 0)?;
-    if !matches!(
-        program.to_ascii_lowercase().as_str(),
-        "codex" | "claude" | "opencode"
-    ) {
+    let program = program.to_ascii_lowercase();
+    let is_pentect = matches!(program.as_str(), "pentect" | "pentect.exe");
+    if !is_pentect && !matches!(program.as_str(), "codex" | "claude" | "opencode") {
         return None;
     }
-    let mut args = vec![program.to_ascii_lowercase()];
+    let mut args = if is_pentect {
+        Vec::new()
+    } else {
+        vec![program]
+    };
     while let Some((arg, _, next)) = next_shell_word(trimmed, cursor) {
         args.push(arg);
         cursor = next;
+    }
+    // `scan` owns its masking and terminal UI. Other Pentect commands stay in
+    // the outer masking path; notably, `view` must never bypass remasking.
+    if is_pentect && !args.first().is_some_and(|arg| arg == "scan") {
+        return None;
     }
     Some(args)
 }
 
 #[cfg(windows)]
-fn run_windows_shell_interactive_agent(args: &[String], cwd: &str) -> Result<(), String> {
+fn run_windows_shell_tty_command(args: &[String], cwd: &str) -> Result<(), String> {
     let executable =
         std::env::current_exe().map_err(|e| format!("could not locate pentect executable: {e}"))?;
     let mut command = Command::new(executable);
@@ -2021,7 +2029,7 @@ fn run_windows_shell_interactive_agent(args: &[String], cwd: &str) -> Result<(),
         .stderr(Stdio::inherit());
     command
         .status()
-        .map_err(|e| format!("could not start interactive agent: {e}"))?;
+        .map_err(|e| format!("could not start interactive command: {e}"))?;
     Ok(())
 }
 

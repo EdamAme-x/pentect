@@ -43,20 +43,24 @@ fn windows_shell_repairs_stale_virtual_terminal_input_mode() {
 
 #[cfg(windows)]
 #[test]
-fn windows_shell_routes_interactive_agents_outside_the_protocol_pipe() {
-    assert!(is_windows_shell_interactive_agent_command("codex"));
-    assert!(is_windows_shell_interactive_agent_command(
-        "claude --resume"
-    ));
-    assert!(is_windows_shell_interactive_agent_command("opencode"));
+fn windows_shell_routes_tty_commands_outside_the_protocol_pipe() {
+    assert!(is_windows_shell_tty_command("codex"));
+    assert!(is_windows_shell_tty_command("claude --resume"));
+    assert!(is_windows_shell_tty_command("opencode"));
     assert_eq!(
-        windows_shell_interactive_agent_args("claude --resume").unwrap(),
+        windows_shell_tty_command_args("claude --resume").unwrap(),
         ["claude", "--resume"]
     );
-    assert!(!is_windows_shell_interactive_agent_command("codex; whoami"));
-    assert!(!is_windows_shell_interactive_agent_command(
-        "Write-Output codex"
-    ));
+    assert_eq!(
+        windows_shell_tty_command_args("pentect scan .").unwrap(),
+        ["scan", "."]
+    );
+    assert!(windows_shell_tty_command_args("pentect status").is_none());
+    assert!(windows_shell_tty_command_args("pentect view SECRET").is_none());
+    assert!(windows_shell_tty_command_args("pentect shell").is_none());
+    assert!(!is_windows_shell_tty_command("codex; whoami"));
+    assert!(!is_windows_shell_tty_command("Write-Output codex"));
+    assert!(windows_shell_tty_command_args("pentect scan . > scan.txt").is_none());
 }
 
 #[cfg(windows)]
