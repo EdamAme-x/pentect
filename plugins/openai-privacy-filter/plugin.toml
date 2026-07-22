@@ -1,3 +1,9 @@
 schema = "pentect.plugin.v1"
 name = "openai-privacy-filter"
 description = "Local privacy-filter model adapter."
+
+[adapter]
+command = ["pentect-pii-ner"]
+timeout_ms = 10000
+max_input_bytes = 262144
+max_spans = 512

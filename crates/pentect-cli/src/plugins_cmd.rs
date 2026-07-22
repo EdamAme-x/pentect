@@ -289,6 +289,7 @@ struct PluginManifest {
     schema: Option<String>,
     name: Option<String>,
     description: Option<String>,
+    adapter: Option<AdapterToml>,
     #[serde(default)]
     postscript: Vec<Postscript>,
     #[serde(default)]
@@ -852,9 +853,6 @@ fn test_adapter(path: &Path) -> Check {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdapterToml {
-    schema: Option<String>,
-    kind: Option<String>,
-    name: Option<String>,
     command: Option<Vec<String>>,
     timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
@@ -876,19 +874,17 @@ impl AdapterFile {
     fn load(path: &Path) -> Result<Self, String> {
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("could not read adapter '{}': {e}", display_path(path)))?;
-        let manifest: AdapterToml = toml::from_str(&src)
+        let manifest: PluginManifest = toml::from_str(&src)
             .map_err(|e| format!("invalid adapter '{}': {e}", display_path(path)))?;
-        if manifest.schema.as_deref() != Some("pentect.model_adapter.v1") {
+        if manifest.schema.as_deref() != Some("pentect.plugin.v1") {
             return Err("schema".to_string());
         }
-        if manifest.kind.as_deref() != Some("model") {
-            return Err("kind".to_string());
-        }
+        let adapter = manifest.adapter.ok_or_else(|| "adapter".to_string())?;
         let cwd = path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let command = adapter_command_from_manifest(manifest.command)?;
+        let command = adapter_command_from_manifest(adapter.command)?;
         let name = manifest
             .name
             .filter(|name| !name.trim().is_empty())
@@ -903,9 +899,9 @@ impl AdapterFile {
             id,
             cwd,
             command,
-            timeout: Duration::from_millis(manifest.timeout_ms.unwrap_or(3_000)),
-            max_input_bytes: manifest.max_input_bytes.unwrap_or(256 * 1024),
-            max_spans: manifest.max_spans.unwrap_or(512),
+            timeout: Duration::from_millis(adapter.timeout_ms.unwrap_or(3_000)),
+            max_input_bytes: adapter.max_input_bytes.unwrap_or(256 * 1024),
+            max_spans: adapter.max_spans.unwrap_or(512),
         })
     }
 
@@ -1081,7 +1077,7 @@ fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
 }
 
 fn adapter_default_name(path: &Path) -> String {
-    if path.file_name().and_then(|name| name.to_str()) == Some("adapter.toml") {
+    if path.file_name().and_then(|name| name.to_str()) == Some("plugin.toml") {
         if let Some(name) = path
             .parent()
             .and_then(|parent| parent.file_name())
@@ -1602,17 +1598,18 @@ permissions = ["filesystem", "process"]
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("tool"), "").unwrap();
         std::fs::write(
-            root.join("adapter.toml"),
+            root.join("plugin.toml"),
             r#"
-schema = "pentect.model_adapter.v1"
-kind = "model"
+schema = "pentect.plugin.v1"
 name = "relative"
+
+[adapter]
 command = ["./tool"]
 "#,
         )
         .unwrap();
 
-        let loaded = AdapterFile::load(&root.join("adapter.toml"));
+        let loaded = AdapterFile::load(&root.join("plugin.toml"));
         std::fs::remove_dir_all(root).unwrap();
         assert!(loaded.is_ok(), "{loaded:?}");
     }

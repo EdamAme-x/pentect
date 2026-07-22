@@ -87,22 +87,19 @@ impl ModelAdapter {
         }
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("could not read plugin adapter '{}': {e}", path.display()))?;
-        let file: AdapterFile = toml::from_str(&src)
-            .map_err(|e| format!("plugin adapter '{}' is invalid: {e}", path.display()))?;
-        if file.schema.as_deref() != Some("pentect.model_adapter.v1") {
+        let manifest: PluginManifest = toml::from_str(&src)
+            .map_err(|e| format!("plugin manifest '{}' is invalid: {e}", path.display()))?;
+        if manifest.schema.as_deref() != Some("pentect.plugin.v1") {
             return Err(format!(
-                "plugin adapter '{}' requires schema = \"pentect.model_adapter.v1\"",
+                "plugin manifest '{}' requires schema = \"pentect.plugin.v1\"",
                 path.display()
             ));
         }
-        if file.kind.as_deref() != Some("model") {
-            return Err(format!(
-                "plugin adapter '{}' requires kind = \"model\"",
-                path.display()
-            ));
-        }
+        let file = manifest
+            .adapter
+            .ok_or_else(|| format!("plugin manifest '{}' requires [adapter]", path.display()))?;
         let command = adapter_command_from_file(path, file.command)?;
-        let name = file
+        let name = manifest
             .name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| adapter_default_name(path));
@@ -316,7 +313,7 @@ fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
 }
 
 fn adapter_default_name(path: &Path) -> String {
-    if path.file_name().and_then(|name| name.to_str()) == Some("adapter.toml") {
+    if path.file_name().and_then(|name| name.to_str()) == Some("plugin.toml") {
         if let Some(name) = path
             .parent()
             .and_then(|parent| parent.file_name())
@@ -450,11 +447,15 @@ fn safe_adapter_env_names() -> &'static [&'static str] {
 }
 
 #[derive(Debug, Deserialize)]
+struct PluginManifest {
+    schema: Option<String>,
+    name: Option<String>,
+    adapter: Option<AdapterFile>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdapterFile {
-    schema: Option<String>,
-    kind: Option<String>,
-    name: Option<String>,
     command: Option<Vec<String>>,
     timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
@@ -595,7 +596,7 @@ mod tests {
         let adapter = ModelAdapter {
             name: "test-ner".to_string(),
             id: "test-ner".to_string(),
-            path: std::env::current_dir().unwrap().join("adapter.toml"),
+            path: std::env::current_dir().unwrap().join("plugin.toml"),
             command: echo_adapter_command(
                 r#"{"spans":[{"start":0,"end":5,"label":"person name","category":"pii","confidence":"high"}]}"#,
             ),
@@ -649,13 +650,15 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("adapter.toml");
+        let path = root.join("plugin.toml");
         std::fs::write(
             &path,
             r#"
-schema = "pentect.model_adapter.v1"
-kind = "model"
+schema = "pentect.plugin.v1"
 name = "bad"
+
+[adapter]
+command = ["pentect-pii-ner"]
 builtin = "pii-ner"
 "#,
         )
@@ -666,18 +669,20 @@ builtin = "pii-ner"
     }
 
     #[test]
-    fn adapter_manifest_requires_schema_and_kind() {
+    fn plugin_adapter_requires_plugin_schema() {
         let root = std::env::temp_dir().join(format!(
             "pentect-adapter-requires-schema-kind-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("adapter.toml");
+        let path = root.join("plugin.toml");
         std::fs::write(
             &path,
             r#"
 name = "bad"
+
+[adapter]
 command = ["pentect-pii-ner"]
 "#,
         )
@@ -685,7 +690,7 @@ command = ["pentect-pii-ner"]
         let err = ModelAdapter::load(&path).unwrap_err();
         std::fs::remove_dir_all(root).unwrap();
         assert!(
-            err.contains("requires schema = \"pentect.model_adapter.v1\""),
+            err.contains("requires schema = \"pentect.plugin.v1\""),
             "{err}"
         );
     }
