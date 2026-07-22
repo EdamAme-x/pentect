@@ -1,3 +1,4 @@
 schema = "pentect.plugin.v1"
 name = "openai-privacy-filter"
-description = "Local privacy-filter model adapter."
+description = "Local privacy-filter model."
+binary = "pentect-pii-ner"

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 pub(crate) const CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
-pub(crate) const ADAPTERS_ENV: &str = "PENTECT_PLUGIN_ADAPTERS";
+pub(crate) const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
 pub(crate) const PLUGIN_MANIFEST_FILE: &str = "plugin.toml";
 
 const PENTECT_DIR: &str = ".pentect";
@@ -19,6 +19,7 @@ const PLUGIN_CONFIGS_DIR: &str = "configs";
 const OFFICIAL_PLUGINS_DIR: &str = "plugins";
 const DEFAULT_REMOTE_PLUGINS_BASE: &str =
     "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins";
+const DEFAULT_PLUGIN_REPOSITORY: &str = "EdamAme-x/pentect";
 const REMOTE_PLUGIN_TIMEOUT: Duration = Duration::from_secs(8);
 const REMOTE_PLUGIN_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_REMOTE_PLUGIN_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -26,7 +27,7 @@ const MAX_REMOTE_PLUGIN_FILE_BYTES: u64 = 2 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub(crate) struct ActivePlugins {
     config_paths: Vec<PathBuf>,
-    adapter_paths: Vec<PathBuf>,
+    binary_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -34,6 +35,7 @@ pub(crate) struct PluginSource {
     pub(crate) name: String,
     pub(crate) root: PathBuf,
     pub(crate) manifest_path: Option<PathBuf>,
+    pub(crate) repository: Option<String>,
 }
 
 impl ActivePlugins {
@@ -41,8 +43,8 @@ impl ActivePlugins {
         &self.config_paths
     }
 
-    pub(crate) fn adapter_paths(&self) -> &[PathBuf] {
-        &self.adapter_paths
+    pub(crate) fn binary_paths(&self) -> &[PathBuf] {
+        &self.binary_paths
     }
 
     pub(crate) fn config_env_value(&self) -> Result<Option<OsString>> {
@@ -54,13 +56,13 @@ impl ActivePlugins {
             .context("could not encode plugin config paths")
     }
 
-    pub(crate) fn adapter_env_value(&self) -> Result<Option<OsString>> {
-        if self.adapter_paths.is_empty() {
+    pub(crate) fn binary_env_value(&self) -> Result<Option<OsString>> {
+        if self.binary_paths.is_empty() {
             return Ok(None);
         }
-        std::env::join_paths(&self.adapter_paths)
+        std::env::join_paths(&self.binary_paths)
             .map(Some)
-            .context("could not encode plugin adapter paths")
+            .context("could not encode plugin binary manifests")
     }
 }
 
@@ -193,10 +195,10 @@ pub(crate) fn active_from_explicit_specs(
     specs: Vec<String>,
     create_named: bool,
 ) -> Result<ActivePlugins> {
-    let (config_paths, adapter_paths) = plugin_paths_for_specs(&specs, create_named)?;
+    let (config_paths, binary_paths) = plugin_paths_for_specs(&specs, create_named)?;
     Ok(ActivePlugins {
         config_paths,
-        adapter_paths,
+        binary_paths,
     })
 }
 
@@ -212,8 +214,8 @@ pub(crate) fn load_config_packs_from_specs(
     create_named: bool,
 ) -> Result<Vec<Pack>> {
     let active = active_from_specs(explicit_specs, create_named)?;
-    if !active.adapter_paths.is_empty() {
-        bail!("model adapter plugins are only used by agent tool-boundary commands");
+    if !active.binary_paths.is_empty() {
+        bail!("executable plugins are only used by agent tool-boundary commands");
     }
     load_config_packs_from_active(&active)
 }
@@ -280,33 +282,33 @@ fn plugin_paths_for_specs(
     create_named: bool,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut configs = Vec::new();
-    let mut adapters = Vec::new();
+    let mut binaries = Vec::new();
     for spec in specs {
         if is_remote_spec(spec) {
             let found = plugin_paths_for_url(spec)?;
             configs.extend(found.config_paths);
-            adapters.extend(found.adapter_paths);
+            binaries.extend(found.binary_paths);
         } else if is_path_spec(spec) {
             let found = plugin_paths_for_path(Path::new(spec))?;
             configs.extend(found.config_paths);
-            adapters.extend(found.adapter_paths);
+            binaries.extend(found.binary_paths);
         } else {
             let found = plugin_paths_for_named(spec, create_named)?;
             configs.extend(found.config_paths);
-            adapters.extend(found.adapter_paths);
+            binaries.extend(found.binary_paths);
         }
     }
     configs.sort();
     configs.dedup();
-    adapters.sort();
-    adapters.dedup();
-    Ok((configs, adapters))
+    binaries.sort();
+    binaries.dedup();
+    Ok((configs, binaries))
 }
 
 #[derive(Debug, Default)]
 struct PluginPaths {
     config_paths: Vec<PathBuf>,
-    adapter_paths: Vec<PathBuf>,
+    binary_paths: Vec<PathBuf>,
 }
 
 fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
@@ -344,11 +346,9 @@ fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
             &official_dir
         };
         let mut message = format!(
-            "plugin '{name}' has no configs or adapters; add '{}', '{}', '{}', or '{}'",
+            "plugin '{name}' has no detectors or binary; add '{}' or '{}'",
             suggestion_dir.join(PLUGIN_CONFIG_FILE).display(),
-            suggestion_dir.join(PLUGIN_CONFIGS_DIR).display(),
-            suggestion_dir.join("adapter.toml").display(),
-            suggestion_dir.join("adapters").display()
+            suggestion_dir.join(PLUGIN_MANIFEST_FILE).display()
         );
         if let Some(error) = remote_error {
             message.push_str(&format!("; remote lookup failed: {error}"));
@@ -373,8 +373,8 @@ fn plugin_paths_for_url(url: &str) -> Result<PluginPaths> {
         let mut paths = PluginPaths::default();
         let file = fetch_remote_plugin_file(&normalized)?
             .ok_or_else(|| anyhow!("remote plugin file was not found: {normalized}"))?;
-        if looks_like_adapter_url(&normalized) {
-            paths.adapter_paths.push(file);
+        if normalized.ends_with("/plugin.toml") {
+            add_manifest_paths(&file, &mut paths)?;
         } else {
             paths.config_paths.push(file);
         }
@@ -390,8 +390,8 @@ fn plugin_paths_for_path(path: &Path) -> Result<PluginPaths> {
         }
         let mut paths = PluginPaths::default();
         let file = canonical_file(path)?;
-        if looks_like_adapter_file(path) {
-            paths.adapter_paths.push(file);
+        if is_plugin_manifest(path) {
+            add_manifest_paths(&file, &mut paths)?;
         } else {
             paths.config_paths.push(file);
         }
@@ -406,8 +406,9 @@ fn plugin_paths_for_path(path: &Path) -> Result<PluginPaths> {
 fn plugin_paths_in_dir(dir: &Path) -> Result<PluginPaths> {
     let mut paths = PluginPaths::default();
     let manifest = dir.join(PLUGIN_MANIFEST_FILE);
-    if manifest.is_file() && plugin_manifest_has_detectors(&manifest)? {
-        paths.config_paths.push(canonical_file(&manifest)?);
+    if manifest.is_file() {
+        let manifest = canonical_file(&manifest)?;
+        add_manifest_paths(&manifest, &mut paths)?;
     }
     let config = dir.join(PLUGIN_CONFIG_FILE);
     if config.exists() {
@@ -417,18 +418,8 @@ fn plugin_paths_in_dir(dir: &Path) -> Result<PluginPaths> {
     if configs_dir.exists() {
         paths.config_paths.extend(toml_files_in_dir(&configs_dir)?);
     }
-    let adapter = dir.join("adapter.toml");
-    if adapter.exists() {
-        paths.adapter_paths.push(canonical_file(&adapter)?);
-    }
-    let adapters_dir = dir.join("adapters");
-    if adapters_dir.exists() {
-        paths
-            .adapter_paths
-            .extend(toml_files_in_dir(&adapters_dir)?);
-    }
     paths.config_paths.sort();
-    paths.adapter_paths.sort();
+    paths.binary_paths.sort();
     Ok(paths)
 }
 
@@ -436,21 +427,32 @@ fn is_plugin_manifest(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some(PLUGIN_MANIFEST_FILE)
 }
 
-fn plugin_manifest_has_detectors(path: &Path) -> Result<bool> {
+fn add_manifest_paths(path: &Path, paths: &mut PluginPaths) -> Result<()> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("could not read plugin manifest '{}'", path.display()))?;
     let value = source
         .parse::<toml::Value>()
         .with_context(|| format!("could not parse plugin manifest '{}'", path.display()))?;
-    Ok(value
+    if value
         .get("detector")
         .and_then(toml::Value::as_array)
-        .is_some_and(|detectors| !detectors.is_empty()))
+        .is_some_and(|detectors| !detectors.is_empty())
+    {
+        paths.config_paths.push(path.to_path_buf());
+    }
+    if value
+        .get("binary")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|binary| !binary.is_empty())
+    {
+        paths.binary_paths.push(path.to_path_buf());
+    }
+    Ok(())
 }
 
 impl PluginPaths {
     fn is_empty(&self) -> bool {
-        self.config_paths.is_empty() && self.adapter_paths.is_empty()
+        self.config_paths.is_empty() && self.binary_paths.is_empty()
     }
 }
 
@@ -471,6 +473,7 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
     validate_plugin_spec(spec)?;
     if is_remote_spec(spec) {
         let normalized = normalize_github_plugin_url(spec)?;
+        let repository = github_repository(&normalized);
         let (base, manifest_url) = if normalized.ends_with("/plugin.toml") {
             let base = normalized
                 .strip_suffix("/plugin.toml")
@@ -500,6 +503,7 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
             name,
             root,
             manifest_path,
+            repository,
         });
     }
     if is_path_spec(spec) {
@@ -531,13 +535,17 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
             name,
             root,
             manifest_path: manifest.is_file().then_some(manifest),
+            repository: None,
         });
     }
 
     validate_plugin_name(spec)?;
-    for root in [
-        plugins_root().join(spec),
-        official_plugins_root().join(spec),
+    for (root, repository) in [
+        (plugins_root().join(spec), None),
+        (
+            official_plugins_root().join(spec),
+            Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
+        ),
     ] {
         if root.is_dir() {
             let root = root
@@ -548,6 +556,7 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
                 name: spec.to_string(),
                 root,
                 manifest_path: manifest.is_file().then_some(manifest),
+                repository,
             });
         }
     }
@@ -567,7 +576,14 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
         name: spec.to_string(),
         root,
         manifest_path,
+        repository: Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
     })
+}
+
+fn github_repository(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://raw.githubusercontent.com/")?;
+    let mut parts = rest.split('/');
+    Some(format!("{}/{}", parts.next()?, parts.next()?))
 }
 
 fn remote_plugin_name(base: &str) -> Result<String> {
@@ -579,15 +595,6 @@ fn remote_plugin_name(base: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("remote plugin path has no name: {base}"))?;
     validate_plugin_name(name)?;
     Ok(name.to_string())
-}
-
-fn looks_like_adapter_file(path: &Path) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some("adapter.toml")
-        || path
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-            == Some("adapters")
 }
 
 fn validate_plugin_spec(spec: &str) -> Result<()> {
@@ -647,29 +654,22 @@ fn remote_plugin_paths_for_base_url(base_url: &str) -> Result<PluginPaths> {
     let base = base_url.trim_end_matches('/');
     let manifest_url = format!("{base}/{PLUGIN_MANIFEST_FILE}");
     let config_url = format!("{base}/{PLUGIN_CONFIG_FILE}");
-    let adapter_url = format!("{base}/adapter.toml");
-    let (manifest, config, adapter) = std::thread::scope(|scope| {
+    let (manifest, config) = std::thread::scope(|scope| {
         let manifest = scope.spawn(|| fetch_remote_plugin_file(&manifest_url));
         let config = scope.spawn(|| fetch_remote_plugin_file(&config_url));
-        let adapter = scope.spawn(|| fetch_remote_plugin_file(&adapter_url));
-        (manifest.join(), config.join(), adapter.join())
+        (manifest.join(), config.join())
     });
     let join = |result: std::thread::Result<Result<Option<PathBuf>>>| {
         result.map_err(|_| anyhow!("remote plugin fetch worker panicked"))?
     };
     if let Some(manifest) = join(manifest)? {
-        if plugin_manifest_has_detectors(&manifest)? {
-            paths.config_paths.push(manifest);
-        }
+        add_manifest_paths(&manifest, &mut paths)?;
     }
     if let Some(config) = join(config)? {
         paths.config_paths.push(config);
     }
-    if let Some(adapter) = join(adapter)? {
-        paths.adapter_paths.push(adapter);
-    }
     if paths.is_empty() {
-        bail!("remote plugin has no inline detectors, config.toml, or adapter.toml: {base_url}");
+        bail!("remote plugin has no inline detectors, config.toml, or binary: {base_url}");
     }
     Ok(paths)
 }
@@ -789,14 +789,6 @@ fn valid_github_segment(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-}
-
-fn looks_like_adapter_url(url: &str) -> bool {
-    url.rsplit('/').next() == Some("adapter.toml")
-        || url
-            .trim_end_matches('/')
-            .rsplit_once('/')
-            .is_some_and(|(parent, _)| parent.ends_with("/adapters"))
 }
 
 #[cfg(not(test))]
@@ -970,6 +962,13 @@ label = "INLINE_SECRET"
             "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins/pii-ner"
         );
         assert!(normalize_github_plugin_url("github:@owner/repo").is_err());
+        assert_eq!(
+            github_repository(
+                "https://raw.githubusercontent.com/owner/repo/main/plugins/example/plugin.toml"
+            )
+            .as_deref(),
+            Some("owner/repo")
+        );
     }
 
     #[test]
@@ -990,11 +989,11 @@ label = "INLINE_SECRET"
         let _ = std::fs::remove_dir_all(&official);
 
         assert_eq!(paths.config_paths, vec![expected]);
-        assert!(paths.adapter_paths.is_empty());
+        assert!(paths.binary_paths.is_empty());
     }
 
     #[test]
-    fn official_openai_privacy_filter_is_model_adapter() {
+    fn official_openai_privacy_filter_has_binary() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
@@ -1002,18 +1001,22 @@ label = "INLINE_SECRET"
         let opf = repo.join("plugins").join("openai-privacy-filter");
         let active = active_from_explicit_specs(vec![opf.display().to_string()], true).unwrap();
         assert!(active.config_paths().is_empty());
-        assert_eq!(active.adapter_paths().len(), 1);
-        assert!(active.adapter_paths()[0].ends_with("adapter.toml"));
+        assert_eq!(active.binary_paths().len(), 1);
+        assert!(active.binary_paths()[0].ends_with("plugin.toml"));
     }
 
     #[test]
-    fn directory_plugins_can_contain_configs_and_adapters() {
+    fn directory_plugins_can_contain_configs_and_binaries() {
         let root =
             std::env::temp_dir().join(format!("pentect-plugin-paths-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("config.toml"), "").unwrap();
-        std::fs::write(root.join("adapter.toml"), "").unwrap();
+        std::fs::write(
+            root.join("plugin.toml"),
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
+        )
+        .unwrap();
 
         let paths = plugin_paths_for_path(&root).unwrap();
         assert_eq!(
@@ -1021,37 +1024,44 @@ label = "INLINE_SECRET"
             vec![root.join("config.toml").canonicalize().unwrap()]
         );
         assert_eq!(
-            paths.adapter_paths,
-            vec![root.join("adapter.toml").canonicalize().unwrap()]
+            paths.binary_paths,
+            vec![root.join("plugin.toml").canonicalize().unwrap()]
         );
 
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn adapter_only_plugins_are_rejected_for_pack_only_loading() {
-        let root =
-            std::env::temp_dir().join(format!("pentect-adapter-only-{}", std::process::id()));
+    fn binary_only_plugins_are_rejected_for_pack_only_loading() {
+        let root = std::env::temp_dir().join(format!("pentect-binary-only-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("adapter.toml"), "").unwrap();
+        std::fs::write(
+            root.join("plugin.toml"),
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
+        )
+        .unwrap();
 
         let err = match load_config_packs_from_specs(vec![root.display().to_string()], true) {
-            Ok(_) => panic!("expected adapter-only plugin to be rejected"),
+            Ok(_) => panic!("expected binary-only plugin to be rejected"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("model adapter plugins"), "{err}");
+        assert!(err.contains("executable plugins"), "{err}");
 
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn active_loader_ignores_adapter_paths_for_config_packs() {
+    fn active_loader_ignores_binary_paths_for_config_packs() {
         let root =
-            std::env::temp_dir().join(format!("pentect-active-adapter-{}", std::process::id()));
+            std::env::temp_dir().join(format!("pentect-active-binary-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("adapter.toml"), "").unwrap();
+        std::fs::write(
+            root.join("plugin.toml"),
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
+        )
+        .unwrap();
 
         let active = active_from_explicit_specs(vec![root.display().to_string()], true).unwrap();
         let packs = load_config_packs_from_active(&active).unwrap();
