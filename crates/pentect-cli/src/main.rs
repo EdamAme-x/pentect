@@ -43,6 +43,7 @@ const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
 const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
 const PENTECT_STATUS_LINE_ENV: &str = "PENTECT_STATUS_LINE";
+const PENTECT_SHELL_ENV: &str = "PENTECT_SHELL";
 const PENTECT_DIR: &str = ".pentect";
 const PENTECT_CONFIG_FILE: &str = "config.toml";
 const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,6 +64,9 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Option<i32> {
+    if should_passthrough_shell(&args, std::env::var_os(PENTECT_SHELL_ENV).as_deref()) {
+        return Some(0);
+    }
     let inherited_env_is_trusted = pentect_agent::active_memory_store_ready();
     if is_memory_store_server(&args) || !supports_process_host(&args) {
         return dispatch(args, inherited_env_is_trusted);
@@ -160,6 +164,10 @@ fn is_shell_command(args: &[String]) -> bool {
         ),
         (Some("shell"), _) | (Some("agent"), Some("shell"))
     )
+}
+
+fn should_passthrough_shell(args: &[String], shell_marker: Option<&std::ffi::OsStr>) -> bool {
+    is_shell_command(args) && shell_marker == Some(std::ffi::OsStr::new("1"))
 }
 
 fn usage() {
@@ -4648,5 +4656,17 @@ mod tests {
             "shell".into()
         ]));
         assert!(!is_shell_command(&["pentect".into(), "exec".into()]));
+        assert!(should_passthrough_shell(
+            &["pentect".into(), "shell".into()],
+            Some(std::ffi::OsStr::new("1"))
+        ));
+        assert!(should_passthrough_shell(
+            &["pentect".into(), "agent".into(), "shell".into()],
+            Some(std::ffi::OsStr::new("1"))
+        ));
+        assert!(!should_passthrough_shell(
+            &["pentect".into(), "shell".into()],
+            None
+        ));
     }
 }
