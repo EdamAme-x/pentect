@@ -1628,14 +1628,10 @@ fn run_live_command(
     let stdout_store = store.clone();
     let stderr_store = store.clone();
     let stdout_thread = std::thread::spawn(move || {
-        let mut masker = OutputMasker::new_deferred(stdout_store)?;
-        stream_masked_reader(&mut masker, stdout, StreamTarget::Stdout)?;
-        masker.flush()
+        stream_masked_reader_deferred(stdout_store, stdout, StreamTarget::Stdout)
     });
     let stderr_thread = std::thread::spawn(move || {
-        let mut masker = OutputMasker::new_deferred(stderr_store)?;
-        stream_masked_reader(&mut masker, stderr, StreamTarget::Stderr)?;
-        masker.flush()
+        stream_masked_reader_deferred(stderr_store, stderr, StreamTarget::Stderr)
     });
     let status = child
         .wait()
@@ -1723,9 +1719,7 @@ fn run_masked_windows_powershell(
     });
     let stderr_store = store.clone();
     let stderr_thread = std::thread::spawn(move || {
-        let mut masker = OutputMasker::new_deferred(stderr_store)?;
-        stream_masked_reader(&mut masker, stderr, StreamTarget::Stderr)?;
-        masker.flush()
+        stream_masked_reader_deferred(stderr_store, stderr, StreamTarget::Stderr)
     });
     let status = pump_windows_shell_input(
         &mut child,
@@ -1759,7 +1753,7 @@ fn stream_windows_shell_stdout(
     completion_tx: mpsc::Sender<WindowsShellCompletion>,
 ) -> Result<(), String> {
     let mut reader = BufReader::new(stdout);
-    let mut masker = OutputMasker::new_deferred(store)?;
+    let mut masker = None;
     let mut line = String::new();
     loop {
         line.clear();
@@ -1774,7 +1768,7 @@ fn stream_windows_shell_stdout(
             if !prefix.is_empty() {
                 let mut chunk = prefix.to_string();
                 flush_masked_chunk(
-                    &mut masker,
+                    deferred_masker(&mut masker, &store)?,
                     StreamTarget::Stdout,
                     &mut chunk,
                     live_output_kind(prefix),
@@ -1783,7 +1777,9 @@ fn stream_windows_shell_stdout(
             // Publish handles and their environment aliases before the input
             // loop exposes the next prompt. Deferred output otherwise keeps a
             // freshly printed dotenv handle unusable until the shell exits.
-            masker.flush()?;
+            if let Some(masker) = &mut masker {
+                masker.flush()?;
+            }
             let encoded = line[start + marker.len()..].trim_end_matches(['\r', '\n']);
             if encoded == "DRAIN" {
                 if completion_tx
@@ -1808,9 +1804,17 @@ fn stream_windows_shell_stdout(
             continue;
         }
         let kind = live_output_kind(&line);
-        flush_masked_chunk(&mut masker, StreamTarget::Stdout, &mut line, kind)?;
+        flush_masked_chunk(
+            deferred_masker(&mut masker, &store)?,
+            StreamTarget::Stdout,
+            &mut line,
+            kind,
+        )?;
     }
-    masker.flush()
+    if let Some(masker) = &mut masker {
+        masker.flush()?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2529,14 +2533,10 @@ fn run_masked_shell_pipe(
     let stdout_store = store.clone();
     let stderr_store = store.clone();
     let stdout_thread = std::thread::spawn(move || {
-        let mut masker = OutputMasker::new_deferred(stdout_store)?;
-        stream_masked_reader(&mut masker, stdout, StreamTarget::Stdout)?;
-        masker.flush()
+        stream_masked_reader_deferred(stdout_store, stdout, StreamTarget::Stdout)
     });
     let stderr_thread = std::thread::spawn(move || {
-        let mut masker = OutputMasker::new_deferred(stderr_store)?;
-        stream_masked_reader(&mut masker, stderr, StreamTarget::Stderr)?;
-        masker.flush()
+        stream_masked_reader_deferred(stderr_store, stderr, StreamTarget::Stderr)
     });
     let status = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         pump_masked_terminal_stdin(&mut child, child_stdin, store.clone())?
@@ -3286,9 +3286,10 @@ struct ProtectedPaste {
 }
 
 struct ShellInputProtector {
-    masker: OutputMasker,
+    masker: Option<OutputMasker>,
     store: MemoryStore,
     syntax: ShellSyntax,
+    environment_prefix: String,
     defined_env: BTreeSet<String>,
     pty_pending: Vec<u8>,
     in_bracketed_paste: bool,
@@ -3297,9 +3298,10 @@ struct ShellInputProtector {
 impl ShellInputProtector {
     fn new(store: MemoryStore) -> Result<Self, String> {
         Ok(Self {
-            masker: OutputMasker::new_shared(store.clone())?,
+            masker: None,
             store,
             syntax: ShellSyntax::current(),
+            environment_prefix: config::environment_variable_prefix()?,
             defined_env: BTreeSet::new(),
             pty_pending: Vec::new(),
             in_bracketed_paste: false,
@@ -3309,7 +3311,7 @@ impl ShellInputProtector {
     fn prepare_paste(&mut self, text: &str) -> Result<ProtectedPaste, String> {
         let referenced = referenced_env_names_in_text(text);
         let available = self.store.auto_env_bindings().map_err(|e| e.to_string())?;
-        if stale_env_handle(&referenced, &available, self.masker.environment_prefix()) {
+        if stale_env_handle(&referenced, &available, &self.environment_prefix) {
             return Ok(ProtectedPaste {
                 child: self.syntax.stale_handle_error(),
                 visible: text.to_string(),
@@ -3317,17 +3319,18 @@ impl ShellInputProtector {
                 injected_prefix: String::new(),
             });
         }
-        let selected = select_referenced_env_bindings(
-            available,
-            &referenced,
-            self.masker.environment_prefix(),
-        );
-        let masked = self.masker.mask_text(text, live_output_kind(text))?;
+        let selected =
+            select_referenced_env_bindings(available, &referenced, &self.environment_prefix);
+        if self.masker.is_none() {
+            self.masker = Some(OutputMasker::new_shared(self.store.clone())?);
+        }
+        let masker = self.masker.as_mut().expect("masker was initialized");
+        let masked = masker.mask_text(text, live_output_kind(text))?;
         let (mut visible, mut bindings) = replace_masked_handles_with_env_refs(
             &masked,
             &self.store,
             self.syntax,
-            self.masker.environment_prefix(),
+            &self.environment_prefix,
         )?;
         restore_safe_shell_literals(text, &mut visible, &mut bindings, self.syntax);
         if bindings.len() == 1 {
@@ -3760,6 +3763,38 @@ fn stream_masked_reader<R: Read>(
     target: StreamTarget,
 ) -> Result<(), String> {
     stream_masked_bufread(masker, BufReader::new(reader), target, None)
+}
+
+fn stream_masked_reader_deferred<R: Read>(
+    store: MemoryStore,
+    reader: R,
+    target: StreamTarget,
+) -> Result<(), String> {
+    let mut reader = BufReader::new(reader);
+    let mut first = Vec::new();
+    let read = reader
+        .read_until(b'\n', &mut first)
+        .map_err(|e| format!("could not read command output: {e}"))?;
+    if read == 0 {
+        return Ok(());
+    }
+    let mut masker = OutputMasker::new_deferred(store)?;
+    stream_masked_reader(
+        &mut masker,
+        std::io::Cursor::new(first).chain(reader),
+        target,
+    )?;
+    masker.flush()
+}
+
+fn deferred_masker<'a>(
+    masker: &'a mut Option<OutputMasker>,
+    store: &MemoryStore,
+) -> Result<&'a mut OutputMasker, String> {
+    if masker.is_none() {
+        *masker = Some(OutputMasker::new_deferred(store.clone())?);
+    }
+    Ok(masker.as_mut().expect("masker was initialized"))
 }
 
 fn stream_masked_reader_until_marker<R: Read>(

@@ -95,6 +95,17 @@ fn windows_shell_display_never_renders_the_pasted_secret() {
 
 #[cfg(windows)]
 #[test]
+fn windows_shell_defers_masker_until_command_submission() {
+    let (root, session) = empty_session("windows-shell-lazy-masker");
+    let store = MemoryStore::for_session(&session);
+    let protector = ShellInputProtector::new(store).unwrap();
+
+    assert!(protector.masker.is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_shell_env_reference_injects_its_recovered_value() {
     let (root, session) = empty_session("windows-shell-env-injection");
     let store = MemoryStore::for_session(&session);
