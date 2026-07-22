@@ -87,7 +87,8 @@ fn windows_shell_display_never_renders_the_pasted_secret() {
     let rendered = Highlighter::highlight(&display, raw, raw.len()).into_owned();
 
     assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
-    assert!(rendered.contains("$env:PENTECT_"), "{rendered}");
+    assert!(rendered.contains('•'), "{rendered}");
+    assert!(!rendered.contains('…'), "{rendered}");
     assert_eq!(rendered.chars().count(), raw.chars().count());
     let _ = std::fs::remove_dir_all(root);
 }
@@ -150,6 +151,7 @@ fn windows_shell_host_preserves_state_without_terminal_control_sequences() {
 
     let mut output = String::new();
     for (index, command) in [
+        "",
         "$global:PentectShellState=41",
         "Write-Output ($global:PentectShellState + 1)",
     ]
@@ -162,7 +164,7 @@ fn windows_shell_host_preserves_state_without_terminal_control_sequences() {
             data_encoding::BASE64.encode(command.as_bytes())
         )
         .unwrap();
-        if index == 0 {
+        if index == 1 {
             writeln!(stdin, "stale interactive input").unwrap();
         }
         stdin.flush().unwrap();
@@ -182,6 +184,7 @@ fn windows_shell_host_preserves_state_without_terminal_control_sequences() {
     }
 
     assert!(output.lines().any(|line| line.trim() == "42"), "{output:?}");
+    assert!(!output.contains("Cannot bind argument"), "{output:?}");
     assert!(!output.contains('\u{1b}'), "{output:?}");
     drop(stdin);
     assert!(child.wait().unwrap().success());
@@ -1320,6 +1323,122 @@ fn exec_auto_binds_masked_env_output_in_running_session() {
     assert!(!safe.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ"), "{safe}");
     assert!(!safe.contains("114514810"), "{safe}");
     assert!(!safe.contains("hello world"), "{safe}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn handle_core_is_also_a_valid_environment_binding() {
+    let root = temp_root("capability-short-env-binding");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let value = "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("KAGGLE_API_TOKEN={value}\n")).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "KAGGLE_API_TOKEN");
+    let short_name = handle
+        .strip_prefix("<<")
+        .and_then(|value| value.strip_suffix(">>"))
+        .unwrap();
+    let store = MemoryStore::for_session(&session);
+
+    let bindings = requested_env_bindings(
+        &store,
+        &ExecMode::Shell(format!("Write-Output $env:{short_name}")),
+    )
+    .unwrap();
+    assert_eq!(bindings, vec![(short_name.to_string(), value.to_string())]);
+
+    let mut protector = ShellInputProtector::new(store).unwrap();
+    let mut protected = protector
+        .prepare_paste(&format!("echo $env:{short_name}"))
+        .unwrap();
+    assert!(protected.child.contains(value), "{}", protected.child);
+    assert!(protected.child.ends_with(&protected.visible));
+    protected.child.zeroize();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_command_keeps_known_env_reference_and_public_url_verbatim() {
+    let root = temp_root("shell-env-reference-command");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let value = "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let masked = mask_tool_output(&session, &format!("KAGGLE_API_TOKEN={value}\n")).unwrap();
+    let handle = masked_handle_from_assignment(&masked, "KAGGLE_API_TOKEN");
+    let short_name = handle
+        .strip_prefix("<<")
+        .and_then(|value| value.strip_suffix(">>"))
+        .unwrap();
+    let command = format!(
+        "irm https://www.kaggle.com/api/v1/competitions/list -Headers @{{Authorization=\"Bearer $env:{short_name}\"}}"
+    );
+    let store = MemoryStore::for_session(&session);
+    let mut protector = ShellInputProtector::new(store).unwrap();
+    let mut protected = protector.prepare_paste(&command).unwrap();
+
+    assert_eq!(protected.visible, command);
+    assert!(protected.child.ends_with(&command), "{}", protected.child);
+    assert!(protected.child.contains(value), "{}", protected.child);
+    assert!(
+        !protected.child.contains("PENTECT_URL_"),
+        "{}",
+        protected.child
+    );
+    assert!(
+        !protected.child.contains("PENTECT_KEYED_SECRET_"),
+        "{}",
+        protected.child
+    );
+    protected.child.zeroize();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn stale_shell_handle_fails_before_running_the_command() {
+    let root = temp_root("stale-shell-env-reference");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let value = "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let _ = mask_tool_output(&session, &format!("KAGGLE_API_TOKEN={value}\n")).unwrap();
+    let command = concat!(
+        "irm https://www.kaggle.com/api/v1/competitions/list ",
+        "-Headers @{Authorization=\"Bearer $env:KAGGLE_API_TOKEN_b818890b85f7482a\"}"
+    );
+    let store = MemoryStore::for_session(&session);
+    let mut protector = ShellInputProtector::new(store).unwrap();
+    let protected = protector.prepare_paste(command).unwrap();
+
+    assert!(protected.child.contains("stale environment handle"));
+    assert!(protected.child.contains("cat .env"));
+    assert!(!protected.child.contains("Invoke-RestMethod"));
+    assert!(!protected.child.contains("https://www.kaggle.com"));
+    assert!(!protected.child.contains(value));
+    assert_eq!(protected.visible, command);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn deferred_shell_output_publishes_bindings_when_flushed() {
+    let root = temp_root("deferred-shell-env-binding");
+    let session = Session::open_capability_at(&root, "t").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let value = "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let mut masker = OutputMasker::new_deferred(store.clone()).unwrap();
+    let masked = masker
+        .mask_text(
+            &format!("KAGGLE_API_TOKEN={value}\n"),
+            pentect_core::Kind::Env,
+        )
+        .unwrap();
+    let handle = masked_handle_from_assignment(&masked, "KAGGLE_API_TOKEN");
+    let short_name = handle
+        .strip_prefix("<<")
+        .and_then(|value| value.strip_suffix(">>"))
+        .unwrap();
+
+    assert!(store.auto_env_bindings().unwrap().is_empty());
+    masker.flush().unwrap();
+    let bindings =
+        requested_env_bindings(&store, &ExecMode::Shell(format!("echo $env:{short_name}")))
+            .unwrap();
+    assert_eq!(bindings, vec![(short_name.to_string(), value.to_string())]);
     let _ = std::fs::remove_dir_all(root);
 }
 

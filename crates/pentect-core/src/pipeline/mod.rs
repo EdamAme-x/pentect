@@ -1276,12 +1276,10 @@ mod tests {
     }
 
     #[test]
-    fn external_url_still_masks_as_whole_url() {
+    fn public_url_without_sensitive_material_stays_visible() {
         let input = "see https://example.com/api/issues/1234 now";
         let r = m(input);
-        assert!(r.masked.contains("<<URL_"), "{}", r.masked);
-        assert!(!r.masked.contains("example.com"), "{}", r.masked);
-        assert!(!r.masked.contains("/api/issues/1234"), "{}", r.masked);
+        assert_eq!(r.masked, input);
     }
 
     #[test]
@@ -1354,8 +1352,7 @@ mod tests {
         assert!(!internal.masked.contains("1234."), "{}", internal.masked);
 
         let external = m("https://example.com/api/issues/1234.");
-        assert!(external.masked.ends_with('.'), "{}", external.masked);
-        assert!(external.masked.contains("<<URL_"), "{}", external.masked);
+        assert_eq!(external.masked, "https://example.com/api/issues/1234.");
     }
 
     #[test]
@@ -1860,7 +1857,7 @@ mod tests {
         ("IT_FISCAL_CODE", "RSSMRA85T10A562S", Core),
         ("US_DRIVER_LICENSE", "driver's license D1234567", Core),
         ("US_BANK_NUMBER", "account number 1234567890", Core),
-        ("URL", "https://example.com/x", Core),
+        ("URL", "https://example.com/x", Todo),
         ("UK_POSTCODE", "SW1A 1AA", Core),
         ("UK_DRIVING_LICENCE", "MORGA657054SM9IJ", Core),
         ("UK_VEHICLE_REGISTRATION", "reg AB12 CDE", Core),
@@ -1916,7 +1913,7 @@ mod tests {
         ("USDriversLicense", "driver's license D1234567", Core),
         ("USBankAccountNumber", "account number 1234567890", Core),
         ("ItalyFiscalCode", "RSSMRA85T10A562S", Core),
-        ("URL", "https://example.com/x", Core),
+        ("URL", "https://example.com/x", Todo),
         ("FrenchINSEE", "180047509112541", Core),
         ("DateTime", "2025-06-11", Todo),
         ("Age", "35 years old", Plugin),
