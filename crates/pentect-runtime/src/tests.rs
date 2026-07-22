@@ -82,6 +82,7 @@ fn windows_shell_history_excludes_protected_commands() {
 fn windows_shell_display_never_renders_the_pasted_secret() {
     let (root, session) = empty_session("windows-shell-safe-display");
     let store = MemoryStore::for_session(&session);
+    let _engine = OutputMasker::new_shared(store.clone()).unwrap();
     let display = WindowsShellDisplay::new(store).unwrap();
     let raw = "Write-Output rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
     let rendered = Highlighter::highlight(&display, raw, raw.len()).into_owned();

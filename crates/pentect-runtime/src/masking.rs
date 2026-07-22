@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
 const PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
-static TOOL_BOUNDARY_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
+static PENTECT_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 const BATCH_DELIMITERS: [&str; 4] = [
     "\u{1f}pentect-batch-0\u{1e}",
     "\u{1f}pentect-batch-1\u{1d}",
@@ -41,7 +41,6 @@ pub(crate) struct OutputMasker {
     pending: Recovery,
     masked_count: u64,
     activity: BTreeMap<&'static str, ActivitySummary>,
-    shell_input_fast: bool,
 }
 
 #[derive(Default)]
@@ -60,14 +59,13 @@ impl OutputMasker {
         let key = store.session.key;
         Ok(Self {
             store,
-            engine: tool_boundary_engine()?,
+            engine: pentect_engine()?,
             model_adapters: ModelAdapters::from_env()?,
             environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Shared,
             pending: Recovery::empty_for_key(&key),
             masked_count: 0,
             activity: BTreeMap::new(),
-            shell_input_fast: false,
         })
     }
 
@@ -76,29 +74,13 @@ impl OutputMasker {
         let remask_recoveries = store.snapshot().map_err(|e| e.to_string())?;
         Ok(Self {
             store,
-            engine: tool_boundary_engine()?,
+            engine: pentect_engine()?,
             model_adapters: ModelAdapters::from_env()?,
             environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Deferred { remask_recoveries },
             pending: Recovery::empty_for_key(&key),
             masked_count: 0,
             activity: BTreeMap::new(),
-            shell_input_fast: false,
-        })
-    }
-
-    pub(crate) fn new_shell_input(store: MemoryStore) -> Result<Self, String> {
-        let key = store.session.key;
-        Ok(Self {
-            store,
-            engine: shell_input_engine(),
-            model_adapters: ModelAdapters::default(),
-            environment_prefix: config::environment_variable_prefix()?,
-            mode: OutputMaskerMode::Shared,
-            pending: Recovery::empty_for_key(&key),
-            masked_count: 0,
-            activity: BTreeMap::new(),
-            shell_input_fast: true,
         })
     }
 
@@ -153,7 +135,6 @@ impl OutputMasker {
     }
 
     pub(crate) fn mask_text(&mut self, text: &str, kind: Kind) -> Result<String, String> {
-        self.upgrade_shell_input_engine()?;
         let redacted = redact_env_derivative_lines(text);
         let remasked = self.remask_all(&redacted)?;
         let remasked = self.mask_model_adapter_input(remasked, kind.clone(), None)?;
@@ -200,19 +181,6 @@ impl OutputMasker {
         ));
         self.record_recovery(recovery)?;
         Ok(masked)
-    }
-
-    fn upgrade_shell_input_engine(&mut self) -> Result<(), String> {
-        if !self.shell_input_fast {
-            return Ok(());
-        }
-        let Some(engine) = TOOL_BOUNDARY_ENGINE.get() else {
-            return Ok(());
-        };
-        self.engine = engine.as_ref().map_err(Clone::clone)?;
-        self.model_adapters = ModelAdapters::from_env()?;
-        self.shell_input_fast = false;
-        Ok(())
     }
 
     pub(crate) fn mask_tool_result_scalar(
@@ -589,7 +557,7 @@ pub(crate) fn mask_read_data(
     data: String,
     kind: Kind,
 ) -> Result<MaskResult, String> {
-    let engine = tool_boundary_engine()?;
+    let engine = pentect_engine()?;
     mask_read_input_with_engine_and_identity(key, identity_key, engine, Input { kind, data })
 }
 
@@ -657,41 +625,27 @@ fn choose_batch_delimiter(values: &[String]) -> Option<&'static str> {
         .find(|delimiter| values.iter().all(|value| !value.contains(delimiter)))
 }
 
-fn tool_boundary_engine() -> Result<&'static Engine, String> {
-    match TOOL_BOUNDARY_ENGINE.get_or_init(build_tool_boundary_engine) {
+fn pentect_engine() -> Result<&'static Engine, String> {
+    match PENTECT_ENGINE.get_or_init(build_pentect_engine) {
         Ok(engine) => Ok(engine),
         Err(error) => Err(error.clone()),
     }
 }
 
-pub(crate) fn prewarm_tool_boundary_engine() {
+pub(crate) fn prewarm_pentect_engine() {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
         let _ = std::thread::Builder::new()
             .name("pentect-mask-prewarm".to_string())
             .spawn(|| {
-                let _ = tool_boundary_engine();
+                let _ = pentect_engine();
             });
     });
 }
 
-fn shell_input_engine() -> &'static Engine {
-    static CACHE: OnceLock<Engine> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        Engine::builder()
-            .parser(Kind::Env, Box::new(EnvParser))
-            .detector(Box::new(EnvValueDetector))
-            .detector(Box::new(PemDetector::default()))
-            .detector(Box::new(EntropyDetector::default()))
-            .detector(Box::new(SensitiveKeyDetector))
-            .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
-            .guard(Box::new(ShapeGuard::builtin()))
-            .build()
-    })
-}
-
-pub(crate) fn first_shell_input_secret_range(text: &str) -> Option<ByteRange> {
-    shell_input_engine()
+pub(crate) fn first_pentect_secret_range_if_ready(text: &str) -> Option<ByteRange> {
+    let engine = PENTECT_ENGINE.get()?.as_ref().ok()?;
+    engine
         .analyze_spans(Input {
             kind: Kind::Text,
             data: text.to_string(),
@@ -702,7 +656,7 @@ pub(crate) fn first_shell_input_secret_range(text: &str) -> Option<ByteRange> {
         .min_by_key(|range| range.start)
 }
 
-fn build_tool_boundary_engine() -> Result<Engine, String> {
+fn build_pentect_engine() -> Result<Engine, String> {
     let mut builder = Engine::builder()
         .parser(Kind::Json, Box::new(JsonParser))
         .parser(Kind::Ndjson, Box::new(NdjsonParser))

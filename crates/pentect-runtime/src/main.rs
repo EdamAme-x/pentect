@@ -1721,7 +1721,7 @@ fn run_masked_windows_powershell(
     let stderr_thread = std::thread::spawn(move || {
         stream_masked_reader_deferred(stderr_store, stderr, StreamTarget::Stderr)
     });
-    masking::prewarm_tool_boundary_engine();
+    masking::prewarm_pentect_engine();
     let status = pump_windows_shell_input(
         &mut child,
         &mut child_stdin,
@@ -2091,7 +2091,7 @@ fn provisional_shell_secret_display(raw: &str) -> Option<String> {
 }
 
 fn likely_shell_secret_range(text: &str) -> Option<(usize, usize)> {
-    let range = masking::first_shell_input_secret_range(text)?;
+    let range = masking::first_pentect_secret_range_if_ready(text)?;
     Some((range.start, range.end))
 }
 
@@ -3302,7 +3302,7 @@ impl ShellInputProtector {
         let selected =
             select_referenced_env_bindings(available, &referenced, &self.environment_prefix);
         if self.masker.is_none() {
-            self.masker = Some(OutputMasker::new_shell_input(self.store.clone())?);
+            self.masker = Some(OutputMasker::new_shared(self.store.clone())?);
         }
         let masker = self.masker.as_mut().expect("masker was initialized");
         let masked = masker.mask_text(text, live_output_kind(text))?;
