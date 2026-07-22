@@ -22,3 +22,5 @@ TODO
 - approval ui?
 - ext apikey get
 - orc layer (api, swarm, langchain)
+- ssl inspection
+- full
