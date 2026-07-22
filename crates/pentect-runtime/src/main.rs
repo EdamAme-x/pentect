@@ -2091,7 +2091,7 @@ fn provisional_shell_secret_display(raw: &str) -> Option<String> {
 }
 
 fn likely_shell_secret_range(text: &str) -> Option<(usize, usize)> {
-    let range = pentect_core::first_shell_secret_range(text)?;
+    let range = masking::first_shell_input_secret_range(text)?;
     Some((range.start, range.end))
 }
 

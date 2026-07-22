@@ -109,10 +109,11 @@ fn windows_shell_defers_masker_until_command_submission() {
 fn windows_shell_env_reference_injects_its_recovered_value() {
     let (root, session) = empty_session("windows-shell-env-injection");
     let store = MemoryStore::for_session(&session);
-    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+    let raw = "rpa_q7Zp2Lm9Vx4Kn8Rw3Hs6Yt1Bc5Df0GjA";
     let mut preview = ShellInputProtector::new(store.clone()).unwrap();
     let displayed = preview.prepare_paste(raw).unwrap();
-    assert!(displayed.visible.starts_with("$env:PENTECT_SECRET_"));
+    assert!(displayed.visible.starts_with("$env:PENTECT_"));
+    assert!(!displayed.visible.contains(raw));
 
     let mut executor = ShellInputProtector::new(store).unwrap();
     let mut submitted = executor.prepare_paste(&displayed.visible).unwrap();
@@ -518,19 +519,16 @@ fn windows_shell_keeps_previewed_secret_assignment_until_submit() {
     let (root, session) = empty_session("windows-shell-preview-submit");
     let store = MemoryStore::for_session(&session);
     let mut protector = ShellInputProtector::new(store).unwrap();
-    let raw = "Write-Output sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-    let mut submitted = protector.prepare_paste(raw).unwrap();
-    assert!(
-        submitted.child.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
-        "{}",
-        submitted.child
-    );
+    let secret = "sk-q7Zp2Lm9Vx4Kn8Rw3Hs6Yt1Bc5Df0GjA";
+    let raw = format!("Write-Output {secret}");
+    let mut submitted = protector.prepare_paste(&raw).unwrap();
+    assert!(submitted.child.contains(secret), "{}", submitted.child);
     assert!(
         submitted.child.contains("$env:PENTECT_"),
         "{}",
         submitted.child
     );
-    assert!(!submitted.visible.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
+    assert!(!submitted.visible.contains(secret));
     submitted.child.zeroize();
     let _ = std::fs::remove_dir_all(root);
 }

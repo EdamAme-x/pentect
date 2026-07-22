@@ -5,10 +5,10 @@ use crate::plugin_adapter::ModelAdapters;
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
-    load_pack, ByteRange, Category, CliCredentialDetector, Config, Context, Engine,
-    EntropyDetector, EnvParser, Input, KeyValueDetector, Kind, MaskResult, PemDetector, Profile,
-    ProfilePolicy, Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard,
-    ShellPrefixDetector, ToolResultParser,
+    load_pack, ByteRange, Category, Config, Context, CredSweeperNativeDetector, Engine,
+    EntropyDetector, EnvParser, EnvValueDetector, Input, JsonParser, Kind, MaskResult,
+    NdjsonParser, PemDetector, Profile, ProfilePolicy, Recovery, Region, RegionKind,
+    SensitiveKeyDetector, ShapeGuard, ToolResultParser,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -680,9 +680,7 @@ fn shell_input_engine() -> &'static Engine {
     CACHE.get_or_init(|| {
         Engine::builder()
             .parser(Kind::Env, Box::new(EnvParser))
-            .detector(Box::new(ShellPrefixDetector))
-            .detector(Box::new(CliCredentialDetector))
-            .detector(Box::new(KeyValueDetector))
+            .detector(Box::new(EnvValueDetector))
             .detector(Box::new(PemDetector::default()))
             .detector(Box::new(EntropyDetector::default()))
             .detector(Box::new(SensitiveKeyDetector))
@@ -692,11 +690,29 @@ fn shell_input_engine() -> &'static Engine {
     })
 }
 
+pub(crate) fn first_shell_input_secret_range(text: &str) -> Option<ByteRange> {
+    shell_input_engine()
+        .analyze_spans(Input {
+            kind: Kind::Text,
+            data: text.to_string(),
+        })
+        .spans
+        .into_iter()
+        .map(|span| span.range)
+        .min_by_key(|range| range.start)
+}
+
 fn build_tool_boundary_engine() -> Result<Engine, String> {
-    let decode = config::decode_config(Profile::Strict)?;
     let mut builder = Engine::builder()
-        .standard_stack_with_decode(Profile::Strict.knobs(), decode)
+        .parser(Kind::Json, Box::new(JsonParser))
+        .parser(Kind::Ndjson, Box::new(NdjsonParser))
+        .parser(Kind::Env, Box::new(EnvParser))
+        .parser(Kind::Har, Box::new(JsonParser))
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
+        .detector(Box::new(CredSweeperNativeDetector::builtin()))
+        .detector(Box::new(EnvValueDetector))
+        .detector(Box::new(PemDetector::default()))
+        .detector(Box::new(EntropyDetector::default()))
         .detector(Box::new(SensitiveKeyDetector));
     for config_pack in plugin_configs_from_env()? {
         builder = builder
