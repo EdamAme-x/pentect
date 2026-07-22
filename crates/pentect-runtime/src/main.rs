@@ -1721,6 +1721,7 @@ fn run_masked_windows_powershell(
     let stderr_thread = std::thread::spawn(move || {
         stream_masked_reader_deferred(stderr_store, stderr, StreamTarget::Stderr)
     });
+    masking::prewarm_tool_boundary_engine();
     let status = pump_windows_shell_input(
         &mut child,
         &mut child_stdin,
@@ -2090,29 +2091,8 @@ fn provisional_shell_secret_display(raw: &str) -> Option<String> {
 }
 
 fn likely_shell_secret_range(text: &str) -> Option<(usize, usize)> {
-    const PREFIXES: &[&str] = &[
-        "rpa_",
-        "KGAT_",
-        "sk-",
-        "ghp_",
-        "github_pat_",
-        "xoxb-",
-        "AKIA",
-    ];
-    let start = PREFIXES
-        .iter()
-        .filter_map(|prefix| text.find(prefix))
-        .min()?;
-    let mut end = start;
-    for (offset, ch) in text[start..].char_indices() {
-        if offset > 0
-            && (ch.is_whitespace() || matches!(ch, '\'' | '"' | ';' | '|' | ')' | ']' | '}'))
-        {
-            break;
-        }
-        end = start + offset + ch.len_utf8();
-    }
-    Some((start, end))
+    let range = pentect_core::first_shell_secret_range(text)?;
+    Some((range.start, range.end))
 }
 
 #[cfg(windows)]
@@ -3322,7 +3302,7 @@ impl ShellInputProtector {
         let selected =
             select_referenced_env_bindings(available, &referenced, &self.environment_prefix);
         if self.masker.is_none() {
-            self.masker = Some(OutputMasker::new_shared(self.store.clone())?);
+            self.masker = Some(OutputMasker::new_shell_input(self.store.clone())?);
         }
         let masker = self.masker.as_mut().expect("masker was initialized");
         let masked = masker.mask_text(text, live_output_kind(text))?;
@@ -4225,7 +4205,6 @@ const EDIT_NEW_FIELDS: &[&str] = &["new_string", "newString", "new_text", "newTe
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputFormat {
     Text,
-    Pdf,
     Image,
 }
 
@@ -6401,7 +6380,6 @@ fn read_input(path: &Path, format: InputFormat) -> Result<String, String> {
     match format {
         InputFormat::Text => String::from_utf8(bytes)
             .map_err(|_| format!("input '{}' is not UTF-8 text", path.display())),
-        InputFormat::Pdf => pdf_text(&bytes),
         InputFormat::Image => image_ocr::ocr_image_bytes(&bytes),
     }
 }
@@ -6427,23 +6405,6 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
         ));
     }
     std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))
-}
-
-#[cfg(feature = "pdf")]
-fn pdf_text(bytes: &[u8]) -> Result<String, String> {
-    let text = pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|e| format!("could not extract PDF text: {e}"))?;
-    if text.trim().is_empty() {
-        return Err(
-            "PDF contains no extractable text; scanned/image-only PDFs need OCR".to_string(),
-        );
-    }
-    Ok(text)
-}
-
-#[cfg(not(feature = "pdf"))]
-fn pdf_text(_bytes: &[u8]) -> Result<String, String> {
-    Err("PDF input requires a build with `--features pdf`".to_string())
 }
 
 fn read_stdin_text() -> Result<String, String> {
@@ -6529,7 +6490,6 @@ fn parse_hook_provider(value: &str) -> Result<HookProvider, String> {
 fn parse_input_format(value: &str) -> Result<InputFormat, String> {
     match value {
         "text" => Ok(InputFormat::Text),
-        "pdf" => Ok(InputFormat::Pdf),
         "image" | "ocr" => Ok(InputFormat::Image),
         other => Err(format!("unknown input format: {other}")),
     }

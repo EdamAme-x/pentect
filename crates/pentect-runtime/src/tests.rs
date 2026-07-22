@@ -3866,7 +3866,7 @@ fn file_pointer_manager_skips_non_text_read_inputs() {
         &path,
         &result.masked,
         &result,
-        InputFormat::Pdf
+        InputFormat::Image
     ));
     assert!(!Path::new(".pentect")
         .join("file-pointer-manager")
@@ -3874,6 +3874,11 @@ fn file_pointer_manager_skips_non_text_read_inputs() {
         .exists());
     drop(_cwd);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pdf_input_is_not_supported() {
+    assert!(parse_input_format("pdf").is_err());
 }
 
 #[test]

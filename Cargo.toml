@@ -43,7 +43,6 @@ jiff = "0.2"
 toml = "0.8"
 phonenumber = "0.3.10"
 prost = "0.14"
-pdf-extract = "0.12.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
 rxing = { version = "0.9.1", default-features = false, features = ["decoders", "full_barcode_format_support", "multi_barcode_readers", "encoding_rs"] }
 ocrs = "0.12.2"

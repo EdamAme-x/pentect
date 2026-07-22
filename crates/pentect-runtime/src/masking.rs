@@ -5,9 +5,10 @@ use crate::plugin_adapter::ModelAdapters;
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
-    load_pack, ByteRange, Category, Config, Context, Engine, Input, Kind, MaskResult, Profile,
+    load_pack, ByteRange, Category, CliCredentialDetector, Config, Context, Engine,
+    EntropyDetector, EnvParser, Input, KeyValueDetector, Kind, MaskResult, PemDetector, Profile,
     ProfilePolicy, Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard,
-    ToolResultParser,
+    ShellPrefixDetector, ToolResultParser,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -15,6 +16,7 @@ use std::sync::OnceLock;
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
 const PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
+static TOOL_BOUNDARY_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 const BATCH_DELIMITERS: [&str; 4] = [
     "\u{1f}pentect-batch-0\u{1e}",
     "\u{1f}pentect-batch-1\u{1d}",
@@ -39,6 +41,7 @@ pub(crate) struct OutputMasker {
     pending: Recovery,
     masked_count: u64,
     activity: BTreeMap<&'static str, ActivitySummary>,
+    shell_input_fast: bool,
 }
 
 #[derive(Default)]
@@ -64,6 +67,7 @@ impl OutputMasker {
             pending: Recovery::empty_for_key(&key),
             masked_count: 0,
             activity: BTreeMap::new(),
+            shell_input_fast: false,
         })
     }
 
@@ -79,6 +83,22 @@ impl OutputMasker {
             pending: Recovery::empty_for_key(&key),
             masked_count: 0,
             activity: BTreeMap::new(),
+            shell_input_fast: false,
+        })
+    }
+
+    pub(crate) fn new_shell_input(store: MemoryStore) -> Result<Self, String> {
+        let key = store.session.key;
+        Ok(Self {
+            store,
+            engine: shell_input_engine(),
+            model_adapters: ModelAdapters::default(),
+            environment_prefix: config::environment_variable_prefix()?,
+            mode: OutputMaskerMode::Shared,
+            pending: Recovery::empty_for_key(&key),
+            masked_count: 0,
+            activity: BTreeMap::new(),
+            shell_input_fast: true,
         })
     }
 
@@ -133,6 +153,7 @@ impl OutputMasker {
     }
 
     pub(crate) fn mask_text(&mut self, text: &str, kind: Kind) -> Result<String, String> {
+        self.upgrade_shell_input_engine()?;
         let redacted = redact_env_derivative_lines(text);
         let remasked = self.remask_all(&redacted)?;
         let remasked = self.mask_model_adapter_input(remasked, kind.clone(), None)?;
@@ -179,6 +200,19 @@ impl OutputMasker {
         ));
         self.record_recovery(recovery)?;
         Ok(masked)
+    }
+
+    fn upgrade_shell_input_engine(&mut self) -> Result<(), String> {
+        if !self.shell_input_fast {
+            return Ok(());
+        }
+        let Some(engine) = TOOL_BOUNDARY_ENGINE.get() else {
+            return Ok(());
+        };
+        self.engine = engine.as_ref().map_err(Clone::clone)?;
+        self.model_adapters = ModelAdapters::from_env()?;
+        self.shell_input_fast = false;
+        Ok(())
     }
 
     pub(crate) fn mask_tool_result_scalar(
@@ -624,11 +658,38 @@ fn choose_batch_delimiter(values: &[String]) -> Option<&'static str> {
 }
 
 fn tool_boundary_engine() -> Result<&'static Engine, String> {
-    static CACHE: OnceLock<Result<Engine, String>> = OnceLock::new();
-    match CACHE.get_or_init(build_tool_boundary_engine) {
+    match TOOL_BOUNDARY_ENGINE.get_or_init(build_tool_boundary_engine) {
         Ok(engine) => Ok(engine),
         Err(error) => Err(error.clone()),
     }
+}
+
+pub(crate) fn prewarm_tool_boundary_engine() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("pentect-mask-prewarm".to_string())
+            .spawn(|| {
+                let _ = tool_boundary_engine();
+            });
+    });
+}
+
+fn shell_input_engine() -> &'static Engine {
+    static CACHE: OnceLock<Engine> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Engine::builder()
+            .parser(Kind::Env, Box::new(EnvParser))
+            .detector(Box::new(ShellPrefixDetector))
+            .detector(Box::new(CliCredentialDetector))
+            .detector(Box::new(KeyValueDetector))
+            .detector(Box::new(PemDetector::default()))
+            .detector(Box::new(EntropyDetector::default()))
+            .detector(Box::new(SensitiveKeyDetector))
+            .policy(Box::new(ProfilePolicy::new(Profile::Strict)))
+            .guard(Box::new(ShapeGuard::builtin()))
+            .build()
+    })
 }
 
 fn build_tool_boundary_engine() -> Result<Engine, String> {

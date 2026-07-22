@@ -12,8 +12,7 @@ name = "pentect_agent"
 path = "src/main.rs"
 
 [features]
-default = ["pdf", "ocr"]
-pdf = ["dep:pdf-extract"]
+default = ["ocr"]
 ocr = ["dep:reqwest", "dep:flate2", "native-ocr", "bundled-ocr", "barcode"]
 barcode = ["dep:image", "dep:rxing"]
 native-ocr = [
@@ -29,7 +28,6 @@ bundled-ocr = ["dep:image", "dep:ocrs", "dep:rten"]
 pentect-core = { path = "../pentect-core" }
 anyhow = { workspace = true }
 data-encoding = { workspace = true }
-pdf-extract = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 image = { workspace = true, optional = true }

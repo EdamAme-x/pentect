@@ -33,7 +33,7 @@ Fixed in `crates/pentect-cli/src/plugins.rs`: remote cache data now lives in the
 
 The lockfile contained actionable advisories affecting `lopdf`, `quick-xml`, `crossbeam-epoch`, and `anyhow`. In particular, affected PDF/XML parsers could be driven into excessive resource use by hostile documents.
 
-Fixed by upgrading `pdf-extract`/`lopdf`, `phonenumber`/`quick-xml`, `crossbeam-epoch`, and `anyhow`. A follow-up OSV scan found no remaining known actionable vulnerability advisories. Informational unmaintained transitive packages remain: `atomic-polyfill`, `paste`, `proc-macro-error2`, and `ttf-parser`.
+Fixed by removing the PDF parser dependency entirely and upgrading `phonenumber`/`quick-xml`, `crossbeam-epoch`, and `anyhow`. A follow-up OSV scan found no remaining known actionable vulnerability advisories. Informational unmaintained transitive packages remain: `atomic-polyfill`, `paste`, and `proc-macro-error2`.
 
 References: <https://rustsec.org/advisories/RUSTSEC-2026-0187.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0190.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0194.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0195.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0204.html>.
 

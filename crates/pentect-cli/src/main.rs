@@ -615,7 +615,6 @@ enum AgentTool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadInputFormat {
     Text,
-    Pdf,
     Image,
 }
 
@@ -3545,7 +3544,6 @@ fn checked_agent_session_name(name: &str) -> Result<String, String> {
 
 fn input_adapter(args: &[String]) -> Result<Box<dyn InputAdapter>, String> {
     match arg_value(args, "--input").as_deref() {
-        Some("pdf") => pdf_input_adapter(),
         Some("image" | "ocr") => Ok(Box::new(ImageOcrInput)),
         Some("text") | None => Ok(Box::new(TextInput)),
         Some(other) => Err(format!("unknown --input: {other}")),
@@ -3555,7 +3553,6 @@ fn input_adapter(args: &[String]) -> Result<Box<dyn InputAdapter>, String> {
 fn parse_read_input_format(value: &str) -> Result<ReadInputFormat, String> {
     match value {
         "text" => Ok(ReadInputFormat::Text),
-        "pdf" => Ok(ReadInputFormat::Pdf),
         "image" | "ocr" => Ok(ReadInputFormat::Image),
         other => Err(format!("unknown --input: {other}")),
     }
@@ -3579,7 +3576,6 @@ fn read_input(path: &Path, format: ReadInputFormat) -> Result<String, String> {
             bytes,
             format!("input '{}' is not UTF-8 text", path.display()),
         ),
-        ReadInputFormat::Pdf => pdf_text(&bytes),
         ReadInputFormat::Image => pentect_agent::ocr_image_bytes(&bytes),
     }
 }
@@ -3605,33 +3601,6 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
         ));
     }
     std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))
-}
-
-#[cfg(feature = "pdf")]
-fn pdf_text(bytes: &[u8]) -> Result<String, String> {
-    let text = pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|e| format!("could not extract PDF text: {e}"))?;
-    if text.trim().is_empty() {
-        return Err(
-            "PDF contains no extractable text; scanned/image-only PDFs need OCR".to_string(),
-        );
-    }
-    Ok(text)
-}
-
-#[cfg(not(feature = "pdf"))]
-fn pdf_text(_bytes: &[u8]) -> Result<String, String> {
-    Err("PDF input requires a build with `--features pdf`".to_string())
-}
-
-#[cfg(feature = "pdf")]
-fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
-    Ok(Box::new(input::PdfTextInput))
-}
-
-#[cfg(not(feature = "pdf"))]
-fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
-    Err("PDF input requires a build with `--features pdf`".to_string())
 }
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
@@ -3720,6 +3689,18 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_input_is_not_supported() {
+        assert!(parse_read_input_format("pdf").is_err());
+        assert!(input_adapter(&[
+            "pentect".into(),
+            "mask".into(),
+            "--input".into(),
+            "pdf".into(),
+        ])
+        .is_err());
+    }
 
     #[test]
     fn pty_size_tracks_the_real_terminal_before_fallbacks() {
