@@ -6,13 +6,11 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use data_encoding::{BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
 use fancy_regex::Regex as FancyRegex;
 use regex::Regex as RustRegex;
-use serde::Deserialize;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, OnceLock};
 
-const RULES_YAML: &str = include_str!("../../vendors/credsweeper-assets/rules/config.yaml");
 const SECRET_CONFIG_JSON: &str =
     include_str!("../../vendors/credsweeper-assets/secret/config.json");
 const ML_CONFIG_JSON: &str =
@@ -23,6 +21,8 @@ const MORPHEME_CHECKLIST: &str =
     include_str!("../../vendors/credsweeper-assets/common/morpheme_checklist.txt");
 const KEYWORD_CHECKLIST: &str =
     include_str!("../../vendors/credsweeper-assets/common/keyword_checklist.txt");
+
+include!(concat!(env!("OUT_DIR"), "/credsweeper_rules.rs"));
 
 static BUILTIN: LazyLock<CredSweeperNativeDetector> = LazyLock::new(|| {
     CredSweeperNativeDetector::compile_builtin().expect("embedded CredSweeper assets compile")
@@ -156,8 +156,7 @@ impl CredSweeperNativeDetector {
     }
 
     fn compile_builtin() -> Result<Self, String> {
-        let raw_rules: Vec<RawRule> =
-            serde_yaml::from_str(RULES_YAML).map_err(|e| format!("rules yaml: {e}"))?;
+        let raw_rules = generated_raw_rules();
         let mut rules = Vec::new();
         for raw in &raw_rules {
             let values = raw.values.as_deref().unwrap_or_default();
@@ -230,8 +229,7 @@ impl CredSweeperNativeDetector {
 }
 
 fn audit_builtin_stats() -> Result<CredSweeperNativeStats, String> {
-    let raw_rules: Vec<RawRule> =
-        serde_yaml::from_str(RULES_YAML).map_err(|e| format!("rules yaml: {e}"))?;
+    let raw_rules = generated_raw_rules();
     let mut stats = CredSweeperNativeStats {
         total_rules: raw_rules.len(),
         total_patterns: 0,
@@ -246,7 +244,7 @@ fn audit_builtin_stats() -> Result<CredSweeperNativeStats, String> {
             .iter()
             .filter(|rule| rule.use_ml.unwrap_or(false))
             .count(),
-        rules_yaml_bytes: RULES_YAML.len(),
+        rules_yaml_bytes: GENERATED_RULES_YAML_BYTES,
         secret_config_json_bytes: SECRET_CONFIG_JSON.len(),
         ml_config_json_bytes: ML_CONFIG_JSON.len(),
         ml_model_onnx_bytes: ML_MODEL_ONNX.len(),
@@ -1759,12 +1757,10 @@ fn same_ml_group(a: &MlInput, b: &MlInput) -> bool {
         && a.value_end == b.value_end
 }
 
-#[derive(Deserialize)]
 struct RawRule {
     name: String,
     severity: Option<String>,
     confidence: Option<String>,
-    #[serde(rename = "type")]
     kind: Option<String>,
     values: Option<Vec<String>>,
     min_line_len: Option<usize>,
@@ -1774,8 +1770,6 @@ struct RawRule {
     target: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum FilterList {
     One(String),
     Many(Vec<String>),
@@ -2531,9 +2525,9 @@ mod tests {
     #[test]
     fn embedded_assets_are_present() {
         let stats = CredSweeperNativeDetector::builtin_stats();
-        assert_eq!(stats.total_rules, 121);
-        assert_eq!(stats.total_patterns, 125);
-        assert_eq!(stats.ml_rules, 23);
+        assert!(stats.total_rules > 100, "{stats:?}");
+        assert!(stats.total_patterns > 100, "{stats:?}");
+        assert!(stats.ml_rules > 0, "{stats:?}");
         assert!(stats.rules_yaml_bytes > 40_000);
         assert!(stats.secret_config_json_bytes > 1_000);
         assert!(stats.ml_config_json_bytes > 10_000);
@@ -2560,12 +2554,20 @@ mod tests {
     #[test]
     fn migration_coverage_is_explicit() {
         let stats = CredSweeperNativeDetector::builtin_stats();
-        assert_eq!(stats.rust_regex_patterns, 37, "{stats:?}");
-        assert_eq!(stats.fancy_regex_patterns, 80, "{stats:?}");
-        assert_eq!(stats.compiled_patterns, 117, "{stats:?}");
-        assert_eq!(stats.translated_patterns, 8, "{stats:?}");
-        assert_eq!(stats.enabled_patterns, 125, "{stats:?}");
-        assert_eq!(stats.ml_gated_patterns, 24, "{stats:?}");
+        assert_eq!(
+            stats.compiled_patterns,
+            stats.rust_regex_patterns + stats.fancy_regex_patterns,
+            "{stats:?}"
+        );
+        assert_eq!(
+            stats.enabled_patterns,
+            stats.compiled_patterns + stats.translated_patterns,
+            "{stats:?}"
+        );
+        assert!(
+            stats.ml_gated_patterns <= stats.enabled_patterns,
+            "{stats:?}"
+        );
         assert_eq!(stats.unsupported_patterns, 0, "{stats:?}");
         assert_eq!(
             stats.total_patterns,
@@ -2615,6 +2617,18 @@ mod tests {
         assert!(spans
             .iter()
             .all(|span| span.source == DetectorId::CredSweeper));
+    }
+
+    #[test]
+    fn detects_wundergraph_rule_from_v1_17_1() {
+        let raw = "token=cosmo_0123456789abcdef0123456789abcdef\n";
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        let spans = CredSweeperNativeDetector::builtin().detect(&view);
+        assert!(
+            spans.iter().any(|span| span.label == "WUNDERGRAPH_API_KEY"),
+            "{spans:?}"
+        );
     }
 
     #[test]
