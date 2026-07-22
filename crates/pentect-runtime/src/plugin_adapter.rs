@@ -294,7 +294,11 @@ struct PluginRuntimeDirs {
 
 fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
     let id = plugin_id(id_or_name);
-    let data_dir = PathBuf::from(PENTECT_DIR).join(PLUGINS_DATA_DIR).join(&id);
+    let data_dir = std::env::current_dir()
+        .map_err(|e| format!("could not resolve plugin data directory: {e}"))?
+        .join(PENTECT_DIR)
+        .join(PLUGINS_DATA_DIR)
+        .join(&id);
     let cache_dir = data_dir.join(PLUGIN_CACHE_DIR);
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
         format!(
@@ -479,9 +483,8 @@ fn binary_command(name: &str, binary: &str, args: Vec<String>) -> Result<Vec<Str
     } else {
         binary.to_string()
     };
-    let program = PathBuf::from(PENTECT_DIR)
-        .join(PLUGINS_DATA_DIR)
-        .join(plugin_id(name))
+    let program = plugin_runtime_dirs(name)?
+        .data_dir
         .join("bin")
         .join(filename);
     let mut command = Vec::with_capacity(args.len() + 1);
@@ -691,7 +694,9 @@ mod tests {
     #[test]
     fn binary_is_scoped_to_plugin_data() {
         let command = binary_command("pii-ner", "pentect-pii-ner", Vec::new()).unwrap();
-        let expected = PathBuf::from(".pentect")
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join(".pentect")
             .join("plugins-data")
             .join("pii-ner")
             .join("bin")

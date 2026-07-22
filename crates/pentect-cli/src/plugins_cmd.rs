@@ -1128,7 +1128,11 @@ struct PluginRuntimeDirs {
 
 fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
     let id = plugin_id(id_or_name);
-    let data_dir = PathBuf::from(PENTECT_DIR).join(PLUGINS_DATA_DIR).join(&id);
+    let data_dir = std::env::current_dir()
+        .map_err(|e| format!("could not resolve plugin data directory: {e}"))?
+        .join(PENTECT_DIR)
+        .join(PLUGINS_DATA_DIR)
+        .join(&id);
     let cache_dir = data_dir.join(PLUGIN_CACHE_DIR);
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
         format!(
@@ -1564,6 +1568,7 @@ permissions = ["filesystem", "process"]
         let overrides = BTreeMap::from([(platform, "custom.bin".to_string())]);
         assert_eq!(binary_asset("helper", &overrides), "custom.bin");
         assert!(binary_destination("test", "../outside").is_err());
+        assert!(binary_destination("test", "helper").unwrap().is_absolute());
     }
 
     #[test]
