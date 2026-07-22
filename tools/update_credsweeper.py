@@ -96,7 +96,7 @@ def sync_assets(submodule: Path, destination: Path, tag: str, commit: str) -> No
     }
     manifest_path = destination / "SOURCE.json"
     temporary = manifest_path.with_name(".SOURCE.json.pentect-update")
-    temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    temporary.write_bytes((json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
     os.replace(temporary, manifest_path)
 
 
