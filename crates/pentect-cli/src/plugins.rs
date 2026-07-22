@@ -60,7 +60,7 @@ impl ActivePlugins {
         }
         std::env::join_paths(&self.adapter_paths)
             .map(Some)
-            .context("could not encode plugin adapter paths")
+            .context("could not encode plugin runtime paths")
     }
 }
 
@@ -213,7 +213,7 @@ pub(crate) fn load_config_packs_from_specs(
 ) -> Result<Vec<Pack>> {
     let active = active_from_specs(explicit_specs, create_named)?;
     if !active.adapter_paths.is_empty() {
-        bail!("model adapter plugins are only used by agent tool-boundary commands");
+        bail!("runtime plugins are only used by agent tool-boundary commands");
     }
     load_config_packs_from_active(&active)
 }
@@ -344,7 +344,7 @@ fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
             &official_dir
         };
         let mut message = format!(
-            "plugin '{name}' has no detectors or adapter; add them to '{}', or add '{}'/'{}'",
+            "plugin '{name}' has no detectors or runtime; add them to '{}', or add '{}'/'{}'",
             suggestion_dir.join(PLUGIN_MANIFEST_FILE).display(),
             suggestion_dir.join(PLUGIN_CONFIG_FILE).display(),
             suggestion_dir.join(PLUGIN_CONFIGS_DIR).display()
@@ -442,14 +442,14 @@ fn add_plugin_manifest_paths(paths: &mut PluginPaths, path: &Path) -> Result<()>
         .get("detector")
         .and_then(toml::Value::as_array)
         .is_some_and(|detectors| !detectors.is_empty());
-    let has_adapter = value
-        .get("adapter")
+    let has_runtime = value
+        .get("runtime")
         .and_then(toml::Value::as_table)
         .is_some();
     if has_detectors {
         paths.config_paths.push(path.to_path_buf());
     }
-    if has_adapter {
+    if has_runtime {
         paths.adapter_paths.push(path.to_path_buf());
     }
     Ok(())
@@ -642,7 +642,7 @@ fn remote_plugin_paths_for_base_url(base_url: &str) -> Result<PluginPaths> {
         paths.config_paths.push(config);
     }
     if paths.is_empty() {
-        bail!("remote plugin has no inline detectors, [adapter], or config.toml: {base_url}");
+        bail!("remote plugin has no inline detectors, [runtime], or config.toml: {base_url}");
     }
     Ok(paths)
 }
@@ -1014,7 +1014,7 @@ label = "INLINE_SECRET"
     }
 
     #[test]
-    fn official_openai_privacy_filter_is_model_adapter() {
+    fn official_openai_privacy_filter_has_runtime() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
@@ -1027,7 +1027,7 @@ label = "INLINE_SECRET"
     }
 
     #[test]
-    fn plugin_manifest_can_contain_detectors_and_adapter() {
+    fn plugin_manifest_can_contain_detectors_and_runtime() {
         let root =
             std::env::temp_dir().join(format!("pentect-plugin-paths-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1037,7 +1037,7 @@ label = "INLINE_SECRET"
             r#"schema = "pentect.plugin.v1"
 name = "combined"
 
-[adapter]
+[runtime]
 command = ["tool"]
 
 [[detector]]
@@ -1056,22 +1056,22 @@ label = "SECRET"
     }
 
     #[test]
-    fn adapter_only_plugins_are_rejected_for_pack_only_loading() {
+    fn runtime_only_plugins_are_rejected_for_pack_only_loading() {
         let root =
-            std::env::temp_dir().join(format!("pentect-adapter-only-{}", std::process::id()));
+            std::env::temp_dir().join(format!("pentect-runtime-only-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nname = \"adapter-only\"\n[adapter]\ncommand = [\"tool\"]\n",
+            "schema = \"pentect.plugin.v1\"\nname = \"runtime-only\"\n[runtime]\ncommand = [\"tool\"]\n",
         )
         .unwrap();
 
         let err = match load_config_packs_from_specs(vec![root.display().to_string()], true) {
-            Ok(_) => panic!("expected adapter-only plugin to be rejected"),
+            Ok(_) => panic!("expected runtime-only plugin to be rejected"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("model adapter plugins"), "{err}");
+        assert!(err.contains("runtime plugins"), "{err}");
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1084,7 +1084,7 @@ label = "SECRET"
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nname = \"active-adapter\"\n[adapter]\ncommand = [\"tool\"]\n",
+            "schema = \"pentect.plugin.v1\"\nname = \"active-runtime\"\n[runtime]\ncommand = [\"tool\"]\n",
         )
         .unwrap();
 

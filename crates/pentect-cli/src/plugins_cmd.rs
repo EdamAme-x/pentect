@@ -173,7 +173,7 @@ fn list_plugins(json_output: bool) -> Result<(), String> {
                     "source": row.source,
                     "status": row.status(),
                     "configs": row.configs,
-                    "adapters": row.adapters,
+                    "runtimes": row.runtimes,
                 })).collect::<Vec<_>>()
             })
         );
@@ -185,12 +185,12 @@ fn list_plugins(json_output: bool) -> Result<(), String> {
     }
     for row in rows {
         println!(
-            "{}: {} {} configs={} adapters={}",
+            "{}: {} {} configs={} runtimes={}",
             row.name,
             row.source,
             row.status(),
             row.configs,
-            row.adapters
+            row.runtimes
         );
     }
     Ok(())
@@ -208,7 +208,7 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
                 "description": manifest.as_ref().and_then(|manifest| manifest.description.as_deref()),
                 "manifest": source.manifest_path.as_deref().map(display_path),
                 "configs": active.config_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
-                "adapters": active.adapter_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
+                "runtimes": active.adapter_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
                 "postscripts": manifest.as_ref().map(|manifest| manifest.postscript.len()).unwrap_or(0),
                 "artifacts": manifest.as_ref().map(|manifest| manifest.artifact.len()).unwrap_or(0),
             })
@@ -229,9 +229,9 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     for path in active.config_paths() {
         println!("config: {}", display_path(path));
     }
-    println!("adapters: {}", active.adapter_paths().len());
+    println!("runtimes: {}", active.adapter_paths().len());
     for path in active.adapter_paths() {
-        println!("adapter: {}", display_path(path));
+        println!("runtime: {}", display_path(path));
     }
     println!(
         "postscripts: {}",
@@ -289,7 +289,7 @@ struct PluginManifest {
     schema: Option<String>,
     name: Option<String>,
     description: Option<String>,
-    adapter: Option<AdapterToml>,
+    runtime: Option<RuntimeToml>,
     #[serde(default)]
     postscript: Vec<Postscript>,
     #[serde(default)]
@@ -842,17 +842,17 @@ fn test_pack(path: &Path) -> Check {
 fn test_adapter(path: &Path) -> Check {
     let adapter = match AdapterFile::load(path) {
         Ok(adapter) => adapter,
-        Err(e) => return Check::fail("adapter", e),
+        Err(e) => return Check::fail("runtime", e),
     };
     match adapter.run_probe() {
-        Ok(count) => Check::ok("adapter", format!("spans={count}")),
-        Err(e) => Check::fail("adapter", e),
+        Ok(count) => Check::ok("runtime", format!("spans={count}")),
+        Err(e) => Check::fail("runtime", e),
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AdapterToml {
+struct RuntimeToml {
     command: Option<Vec<String>>,
     timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
@@ -873,18 +873,18 @@ struct AdapterFile {
 impl AdapterFile {
     fn load(path: &Path) -> Result<Self, String> {
         let src = std::fs::read_to_string(path)
-            .map_err(|e| format!("could not read adapter '{}': {e}", display_path(path)))?;
+            .map_err(|e| format!("could not read runtime '{}': {e}", display_path(path)))?;
         let manifest: PluginManifest = toml::from_str(&src)
-            .map_err(|e| format!("invalid adapter '{}': {e}", display_path(path)))?;
+            .map_err(|e| format!("invalid runtime '{}': {e}", display_path(path)))?;
         if manifest.schema.as_deref() != Some("pentect.plugin.v1") {
             return Err("schema".to_string());
         }
-        let adapter = manifest.adapter.ok_or_else(|| "adapter".to_string())?;
+        let runtime = manifest.runtime.ok_or_else(|| "runtime".to_string())?;
         let cwd = path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let command = adapter_command_from_manifest(adapter.command)?;
+        let command = adapter_command_from_manifest(runtime.command)?;
         let name = manifest
             .name
             .filter(|name| !name.trim().is_empty())
@@ -899,9 +899,9 @@ impl AdapterFile {
             id,
             cwd,
             command,
-            timeout: Duration::from_millis(adapter.timeout_ms.unwrap_or(3_000)),
-            max_input_bytes: adapter.max_input_bytes.unwrap_or(256 * 1024),
-            max_spans: adapter.max_spans.unwrap_or(512),
+            timeout: Duration::from_millis(runtime.timeout_ms.unwrap_or(3_000)),
+            max_input_bytes: runtime.max_input_bytes.unwrap_or(256 * 1024),
+            max_spans: runtime.max_spans.unwrap_or(512),
         })
     }
 
@@ -1155,12 +1155,12 @@ struct PluginRow {
     name: String,
     source: &'static str,
     configs: usize,
-    adapters: usize,
+    runtimes: usize,
 }
 
 impl PluginRow {
     fn status(&self) -> &'static str {
-        if self.configs == 0 && self.adapters == 0 {
+        if self.configs == 0 && self.runtimes == 0 {
             "empty"
         } else {
             "ok"
@@ -1208,7 +1208,7 @@ fn plugin_rows_in(root: PathBuf, source: &'static str) -> Result<Vec<PluginRow>,
             name,
             source,
             configs: active.config_paths().len(),
-            adapters: active.adapter_paths().len(),
+            runtimes: active.adapter_paths().len(),
         });
     }
     Ok(rows)
@@ -1568,7 +1568,7 @@ permissions = ["filesystem", "process"]
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "rules");
         assert_eq!(rows[0].configs, 1);
-        assert_eq!(rows[0].adapters, 0);
+        assert_eq!(rows[0].runtimes, 0);
     }
 
     #[test]
@@ -1603,7 +1603,7 @@ permissions = ["filesystem", "process"]
 schema = "pentect.plugin.v1"
 name = "relative"
 
-[adapter]
+[runtime]
 command = ["./tool"]
 "#,
         )

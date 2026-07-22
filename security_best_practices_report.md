@@ -45,11 +45,11 @@ Fixed in `.github/workflows/ci.yml` and `.github/workflows/release.yml`: third-p
 
 ## Decisions required
 
-### PNT-SEC-D01 — Remote adapters can execute arbitrary commands (high)
+### PNT-SEC-D01 — Remote runtimes can execute arbitrary commands (high)
 
 `adapter_program` falls back to a relative command or `PATH`. A remote TOML plugin can therefore name `powershell`, `sh`, or another installed executable and receive unmasked input through stdin without going through the setup approval used for downloaded binaries. Clearing the child environment reduces exposure but is not a sandbox.
 
-Recommended decision: TOML-only remote plugins may define regex detectors, but executable/model adapters must resolve to an explicitly installed, checksum-verified plugin artifact or an explicitly trusted local absolute path. A less restrictive alternative is a per-source/digest approval store.
+Recommended decision: TOML-only remote plugins may define regex detectors, but executable/model runtimes must resolve to an explicitly installed, checksum-verified plugin artifact or an explicitly trusted local absolute path. A less restrictive alternative is a per-source/digest approval store.
 
 Relevant code: `crates/pentect-cli/src/plugins_cmd.rs` and `crates/pentect-runtime/src/plugin_adapter.rs` (`adapter_program`).
 

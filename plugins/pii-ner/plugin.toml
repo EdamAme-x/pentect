@@ -1,8 +1,8 @@
 schema = "pentect.plugin.v1"
 name = "pii-ner"
-description = "Local ONNX PII named-entity recognition adapter."
+description = "Local ONNX PII named-entity recognition runtime."
 
-[adapter]
+[runtime]
 command = ["pentect-pii-ner"]
 timeout_ms = 10000
 max_input_bytes = 262144

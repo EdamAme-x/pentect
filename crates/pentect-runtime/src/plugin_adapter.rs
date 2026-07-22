@@ -83,10 +83,10 @@ struct ModelAdapter {
 impl ModelAdapter {
     fn load(path: &Path) -> Result<Self, String> {
         if !path.is_file() {
-            return Err(format!("plugin adapter does not exist: {}", path.display()));
+            return Err(format!("plugin runtime does not exist: {}", path.display()));
         }
         let src = std::fs::read_to_string(path)
-            .map_err(|e| format!("could not read plugin adapter '{}': {e}", path.display()))?;
+            .map_err(|e| format!("could not read plugin runtime '{}': {e}", path.display()))?;
         let manifest: PluginManifest = toml::from_str(&src)
             .map_err(|e| format!("plugin manifest '{}' is invalid: {e}", path.display()))?;
         if manifest.schema.as_deref() != Some("pentect.plugin.v1") {
@@ -96,8 +96,8 @@ impl ModelAdapter {
             ));
         }
         let file = manifest
-            .adapter
-            .ok_or_else(|| format!("plugin manifest '{}' requires [adapter]", path.display()))?;
+            .runtime
+            .ok_or_else(|| format!("plugin manifest '{}' requires [runtime]", path.display()))?;
         let command = adapter_command_from_file(path, file.command)?;
         let name = manifest
             .name
@@ -133,10 +133,10 @@ impl ModelAdapter {
         .to_string();
         let response = self.run(&request)?;
         let parsed: AdapterResponse = serde_json::from_str(&response)
-            .map_err(|e| format!("plugin adapter '{}' returned invalid JSON: {e}", self.name))?;
+            .map_err(|e| format!("plugin runtime '{}' returned invalid JSON: {e}", self.name))?;
         if parsed.spans.len() > self.max_spans {
             return Err(format!(
-                "plugin adapter '{}' returned too many spans: {} > {}",
+                "plugin runtime '{}' returned too many spans: {} > {}",
                 self.name,
                 parsed.spans.len(),
                 self.max_spans
@@ -163,16 +163,16 @@ impl ModelAdapter {
         }
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("could not start plugin adapter '{}': {e}", self.name))?;
+            .map_err(|e| format!("could not start plugin runtime '{}': {e}", self.name))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| format!("could not open stdout for plugin adapter '{}'", self.name))?;
+            .ok_or_else(|| format!("could not open stdout for plugin runtime '{}'", self.name))?;
         let stdout_reader = spawn_adapter_stdout_reader(stdout);
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| format!("could not open stdin for plugin adapter '{}'", self.name))?;
+            .ok_or_else(|| format!("could not open stdin for plugin runtime '{}'", self.name))?;
         let stdin_writer = spawn_adapter_stdin_writer(stdin, request.as_bytes().to_vec());
 
         let status = match wait_for_adapter_child(&mut child, &self.name, self.timeout) {
@@ -187,19 +187,19 @@ impl ModelAdapter {
         let stdout = join_adapter_stdout(stdout_reader, &self.name)?;
         if stdout.len() > MAX_STDOUT_BYTES {
             return Err(format!(
-                "plugin adapter '{}' returned too much output",
+                "plugin runtime '{}' returned too much output",
                 self.name
             ));
         }
         if !status.success() {
             return Err(format!(
-                "plugin adapter '{}' exited with status {status}",
+                "plugin runtime '{}' exited with status {status}",
                 self.name
             ));
         }
         String::from_utf8(stdout).map_err(|e| {
             format!(
-                "plugin adapter '{}' returned non-UTF-8 output: {e}",
+                "plugin runtime '{}' returned non-UTF-8 output: {e}",
                 self.name
             )
         })
@@ -242,13 +242,13 @@ fn wait_for_adapter_child(
             Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("plugin adapter '{name}' timed out"));
+                return Err(format!("plugin runtime '{name}' timed out"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("could not wait for plugin adapter '{name}': {e}"));
+                return Err(format!("could not wait for plugin runtime '{name}': {e}"));
             }
         }
     }
@@ -257,8 +257,8 @@ fn wait_for_adapter_child(
 fn join_adapter_stdin(writer: JoinHandle<Result<(), String>>, name: &str) -> Result<(), String> {
     writer
         .join()
-        .map_err(|_| format!("plugin adapter '{name}' stdin writer panicked"))?
-        .map_err(|e| format!("plugin adapter '{name}' {e}"))
+        .map_err(|_| format!("plugin runtime '{name}' stdin writer panicked"))?
+        .map_err(|e| format!("plugin runtime '{name}' {e}"))
 }
 
 fn join_adapter_stdout(
@@ -267,8 +267,8 @@ fn join_adapter_stdout(
 ) -> Result<Vec<u8>, String> {
     reader
         .join()
-        .map_err(|_| format!("plugin adapter '{name}' stdout reader panicked"))?
-        .map_err(|e| format!("plugin adapter '{name}' {e}"))
+        .map_err(|_| format!("plugin runtime '{name}' stdout reader panicked"))?
+        .map_err(|e| format!("plugin runtime '{name}' {e}"))
 }
 
 fn apply_adapter_child_env(command: &mut Command, id_or_name: &str) -> Result<(), String> {
@@ -450,7 +450,7 @@ fn safe_adapter_env_names() -> &'static [&'static str] {
 struct PluginManifest {
     schema: Option<String>,
     name: Option<String>,
-    adapter: Option<AdapterFile>,
+    runtime: Option<AdapterFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -468,13 +468,13 @@ fn adapter_command_from_file(
 ) -> Result<Vec<String>, String> {
     let Some(command) = command else {
         return Err(format!(
-            "plugin adapter '{}' requires command",
+            "plugin runtime '{}' requires command",
             path.display()
         ));
     };
     if command.is_empty() || command.iter().any(|part| part.is_empty()) {
         return Err(format!(
-            "plugin adapter '{}' requires a non-empty command array",
+            "plugin runtime '{}' requires a non-empty command array",
             path.display()
         ));
     }
@@ -505,7 +505,7 @@ fn adapter_span(raw: &str, span: AdapterSpan, adapter: &str) -> Result<Span, Str
         || !raw.is_char_boundary(span.end)
     {
         return Err(format!(
-            "plugin adapter '{adapter}' returned an invalid byte span {}..{}",
+            "plugin runtime '{adapter}' returned an invalid byte span {}..{}",
             span.start, span.end
         ));
     }
@@ -556,7 +556,7 @@ fn parse_category(value: &str, adapter: &str) -> Result<Category, String> {
         "pii" => Ok(Category::Pii),
         "other" => Ok(Category::Other),
         other => Err(format!(
-            "plugin adapter '{adapter}' returned unknown category: {other}"
+            "plugin runtime '{adapter}' returned unknown category: {other}"
         )),
     }
 }
@@ -567,7 +567,7 @@ fn parse_confidence(value: &str, adapter: &str) -> Result<Confidence, String> {
         "medium" => Ok(Confidence::Medium),
         "low" => Ok(Confidence::Low),
         other => Err(format!(
-            "plugin adapter '{adapter}' returned unknown confidence: {other}"
+            "plugin runtime '{adapter}' returned unknown confidence: {other}"
         )),
     }
 }
@@ -657,7 +657,7 @@ mod tests {
 schema = "pentect.plugin.v1"
 name = "bad"
 
-[adapter]
+[runtime]
 command = ["pentect-pii-ner"]
 builtin = "pii-ner"
 "#,
@@ -682,7 +682,7 @@ builtin = "pii-ner"
             r#"
 name = "bad"
 
-[adapter]
+[runtime]
 command = ["pentect-pii-ner"]
 "#,
         )
