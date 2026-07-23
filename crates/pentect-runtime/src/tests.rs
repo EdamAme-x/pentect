@@ -1,6 +1,25 @@
 use super::*;
 
-static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+struct RecoveringTestMutex(std::sync::Mutex<()>);
+
+impl RecoveringTestMutex {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, std::convert::Infallible> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+}
+
+// A failing assertion must not turn every later environment-isolated test
+// into a misleading PoisonError. Tests still fail at their original assertion.
+static TEST_ENV_LOCK: RecoveringTestMutex = RecoveringTestMutex(std::sync::Mutex::new(()));
+
+#[test]
+fn claude_hook_cli_is_retired_in_favor_of_http_gateway() {
+    let error = parse_hook_provider("claude").unwrap_err();
+    assert!(error.contains("HTTP gateway"), "{error}");
+}
 
 struct ActiveMemoryStoreEnv {
     candidate: std::path::PathBuf,
@@ -755,6 +774,91 @@ fn prompt_masking_uses_strict_input_detection_for_env_lines_in_prose() {
 }
 
 #[test]
+fn active_prompt_masker_reuses_bounded_cached_result() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-cache");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let prompt = format!("OPENAI_API_KEY={raw}");
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+
+    let first = masker.mask_prompt_text(&prompt).unwrap().unwrap();
+    assert!(!first.contains(raw), "{first}");
+    assert_eq!(masker.prompt_cache.len(), 1);
+    assert_eq!(masker.prompt_cache_order.len(), 1);
+
+    let second = masker.mask_prompt_text(&prompt).unwrap().unwrap();
+    assert_eq!(second, first);
+    assert_eq!(masker.prompt_cache.len(), 1);
+    assert_eq!(masker.prompt_cache_order.len(), 1);
+}
+
+#[test]
+fn embedded_env_assignment_detection_is_structural_and_sensitive() {
+    assert_eq!(
+        masking::embedded_sensitive_env_assignment_start("output: RUNPOD_API_KEY=rpa_example"),
+        Some("output: ".len())
+    );
+    assert_eq!(
+        masking::embedded_sensitive_env_assignment_start("created OPENAI_API_KEY=sk-example"),
+        Some("created ".len())
+    );
+    assert_eq!(
+        masking::embedded_sensitive_env_assignment_start("status=created"),
+        None
+    );
+}
+
+#[test]
+fn active_memory_store_resolver_reuses_one_snapshot_for_many_scalars() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("resolver-snapshot");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_prompt_text_into_active_memory_store(&format!("OPENAI_API_KEY={raw}"))
+        .unwrap()
+        .unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+
+    assert_eq!(
+        resolver.resolve_known_text(&handle).unwrap().as_deref(),
+        Some(raw)
+    );
+    assert_eq!(
+        resolver
+            .resolve_known_text("before <<UNKNOWN_0123456789abcdef>> after")
+            .unwrap()
+            .as_deref(),
+        Some("before <<UNKNOWN_0123456789abcdef>> after")
+    );
+}
+
+#[test]
+fn ocr_off_obeys_block_policy_for_active_image_redaction() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("ocr-off-block-active");
+    write_project_config(
+        &root,
+        "[image]\nocr = \"off\"\nunscanned_images = \"block\"\n",
+    );
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("ocr-off-block-store");
+    let _cwd = enter_temp_cwd(&root);
+    let image = json!({
+        "content": [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "aGVsbG8="
+            }
+        }]
+    });
+
+    let error = redact_tool_images_into_active_memory_store(&image).unwrap_err();
+    assert_eq!(error, "image blocked: OCR is off.");
+    assert!(unscanned_images_should_block().unwrap());
+}
+
+#[test]
 fn exec_capability_env_does_not_shadow_parent_environment() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("env-overlay");
@@ -1110,9 +1214,14 @@ fn resolve_path_refuses_parent_traversal() {
 fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
     let root = temp_root("capability-generic-pentect-env");
     let session = Session::open_capability_at(&root, "t").unwrap();
-    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let raw = [
+        "sk-qa25MV9c7Qu0EjDIEWdcT3",
+        "Blbk",
+        "FJ83uCF0K4yw7RzpY39bio",
+    ]
+    .concat();
     let masked = mask_tool_output(&session, &format!("created token: {raw}\n")).unwrap();
-    assert!(!masked.contains(raw), "{masked}");
+    assert!(!masked.contains(&raw), "{masked}");
     let handle = first_masked_handle(&masked);
     let env_name = pentect_env_name_for_handle(&handle);
 
@@ -1120,7 +1229,7 @@ fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
     let env = store.auto_env_bindings().unwrap();
     assert!(
         env.iter()
-            .any(|(name, value)| name == &env_name && value == raw),
+            .any(|(name, value)| name == &env_name && value == &raw),
         "{env:?}"
     );
 
@@ -1794,8 +1903,9 @@ fn generic_posttool_masks_external_tool_response_aliases() {
     let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("<<SECRET_"), "{rendered}");
-    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<RUNPOD_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<APIKEY_"), "{rendered}");
+    assert!(rendered.contains("<<AUTHORIZATION_"), "{rendered}");
     assert!(!rendered.contains(raw_runpod), "{rendered}");
     assert!(!rendered.contains(raw_openai), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
@@ -2416,7 +2526,15 @@ fn browser_wallet_seed_phrase_masks_plain_and_numbered_shapes() {
 #[test]
 fn posttool_masks_secret_object_keys() {
     let (root, session) = empty_session("hook-post-secret-key");
-    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    // Use the shape owned by the embedded CredSweeper definition. The old
+    // sequential alphabet fixture was accepted only by Pentect's retired
+    // provider-specific OpenAI regex.
+    let raw = [
+        "sk-qa25MV9c7Qu0EjDIEWdcT3",
+        "Blbk",
+        "FJ83uCF0K4yw7RzpY39bio",
+    ]
+    .concat();
     let mut structured = serde_json::Map::new();
     structured.insert(raw.to_string(), json!({"status": "created"}));
     structured.insert("token".to_string(), json!("hunter2"));
@@ -2430,8 +2548,8 @@ fn posttool_masks_secret_object_keys() {
 
     let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
-    assert!(!rendered.contains(raw), "{rendered}");
-    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(!rendered.contains(&raw), "{rendered}");
+    assert!(rendered.contains("<<"), "{rendered}");
     assert!(!rendered.contains("hunter2"), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2873,7 +2991,7 @@ fn encoded_env_derivatives_do_not_leak() {
     assert!(!masked.contains(&b64), "{masked}");
     assert!(!masked.contains("7270615f46414b"), "{masked}");
     assert!(!masked.contains("68656c6c6f20776f726c64"), "{masked}");
-    assert!(masked.contains("<<SECRET_"), "{masked}");
+    assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
     assert!(
         masked.contains("RUNPOD_API_KEY=<<REDACTED_DERIVED>>"),
         "{masked}"
@@ -2895,7 +3013,7 @@ fn mixed_env_output_still_masks_encoded_non_env_lines() {
         masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
         "{masked}"
     );
-    assert!(masked.contains("B64_FILE:\n<<SECRET_"), "{masked}");
+    assert!(masked.contains("B64_FILE:\n<<LIKELY_SECRET_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -4213,7 +4331,7 @@ fn hook_text_masks_runpod_token_as_plain_text() {
     let raw = concat!("RUNPOD=", "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
     let masked = mask_tool_output(&session, raw).unwrap();
     assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
-    assert!(masked.contains("<<SECRET_"), "{masked}");
+    assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 

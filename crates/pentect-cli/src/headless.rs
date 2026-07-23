@@ -320,25 +320,6 @@ pub(crate) fn protect_prompt_args(
     })
 }
 
-pub(crate) fn claude_input_mode(args: &[String]) -> InputMode {
-    for (index, arg) in args.iter().enumerate() {
-        if arg == "--" {
-            break;
-        }
-        if arg == "--input-format"
-            && args
-                .get(index + 1)
-                .is_some_and(|value| value == "stream-json")
-        {
-            return InputMode::JsonLines;
-        }
-        if arg == "--input-format=stream-json" {
-            return InputMode::JsonLines;
-        }
-    }
-    InputMode::Buffered
-}
-
 pub(crate) fn codex_output_mode(args: &[String]) -> OutputMode {
     if args
         .iter()
@@ -349,29 +330,6 @@ pub(crate) fn codex_output_mode(args: &[String]) -> OutputMode {
     } else {
         OutputMode::Text
     }
-}
-
-pub(crate) fn claude_output_mode(args: &[String]) -> OutputMode {
-    for (index, arg) in args.iter().enumerate() {
-        if arg == "--" {
-            break;
-        }
-        let value = if arg == "--output-format" {
-            args.get(index + 1).map(String::as_str)
-        } else {
-            arg.strip_prefix("--output-format=")
-        };
-        if value.is_some_and(|value| matches!(value, "json" | "stream-json")) {
-            return OutputMode::JsonRecords;
-        }
-    }
-    OutputMode::Text
-}
-
-pub(crate) fn claude_uses_partial_output(args: &[String]) -> bool {
-    args.iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "--include-partial-messages")
 }
 
 pub(crate) fn protect_stdin(
@@ -1932,49 +1890,15 @@ mod tests {
     }
 
     #[test]
-    fn claude_stream_json_selects_line_mode() {
-        assert_eq!(
-            claude_input_mode(&["-p".into(), "--input-format=stream-json".into()]),
-            InputMode::JsonLines
-        );
-        assert_eq!(
-            claude_input_mode(&["-p".into(), "--input-format".into(), "stream-json".into()]),
-            InputMode::JsonLines
-        );
-    }
-
-    #[test]
     fn machine_readable_output_modes_are_detected() {
         assert_eq!(
             codex_output_mode(&["exec".into(), "--json".into()]),
             OutputMode::JsonRecords
         );
         assert_eq!(
-            claude_output_mode(&["-p".into(), "--output-format=json".into()]),
-            OutputMode::JsonRecords
-        );
-        assert_eq!(
-            claude_output_mode(&["-p".into(), "--output-format".into(), "stream-json".into()]),
-            OutputMode::JsonRecords
-        );
-        assert!(claude_uses_partial_output(&[
-            "-p".into(),
-            "--include-partial-messages".into()
-        ]));
-        assert!(!claude_uses_partial_output(&["-p".into()]));
-        assert_eq!(
             codex_output_mode(&["exec".into(), "--".into(), "--json".into()]),
             OutputMode::Text
         );
-        assert_eq!(
-            claude_output_mode(&["-p".into(), "--".into(), "--output-format=json".into()]),
-            OutputMode::Text
-        );
-        assert!(!claude_uses_partial_output(&[
-            "-p".into(),
-            "--".into(),
-            "--include-partial-messages".into()
-        ]));
     }
 
     #[test]

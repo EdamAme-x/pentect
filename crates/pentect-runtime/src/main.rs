@@ -205,6 +205,9 @@ pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Opti
     }
     let cfg = config::image_ocr_config()?;
     if matches!(cfg.mode, config::ImageOcrMode::Off) {
+        if matches!(cfg.unscanned_images, config::UnscannedImagePolicy::Block) {
+            return Err("image blocked: OCR is off.".to_string());
+        }
         return Ok(None);
     }
     let session = Session::open_capability("default").map_err(|e| e.to_string())?;
@@ -228,6 +231,17 @@ pub fn redact_tool_images_into_active_memory_store(value: &Value) -> Result<Opti
         redaction.updated,
         &redaction.notes,
     )))
+}
+
+/// Returns whether content that Pentect cannot inspect must be rejected.
+///
+/// HTTP gateways use the same project/global policy as the runtime image
+/// pipeline for remote, malformed, and otherwise unsupported media sources.
+pub fn unscanned_images_should_block() -> Result<bool, String> {
+    Ok(matches!(
+        config::image_ocr_config()?.unscanned_images,
+        config::UnscannedImagePolicy::Block
+    ))
 }
 
 pub fn redact_image_bytes_into_active_memory_store(
@@ -291,6 +305,42 @@ pub fn resolve_text_from_active_memory_store(text: &str) -> Result<Option<String
     Ok(Some(resolved))
 }
 
+/// Resolve every handle known to the active capability and preserve unknown
+/// handle-shaped text. HTTP model gateways use this for model-authored tool
+/// arguments: a hallucinated handle must stay inert without preventing other,
+/// valid handles in the same argument from resolving.
+pub fn resolve_known_text_from_active_memory_store(text: &str) -> Result<Option<String>, String> {
+    ActiveMemoryStoreResolver::new()?.resolve_known_text(text)
+}
+
+/// A point-in-time resolver for one model-authored object or request.
+///
+/// Constructing this value takes one memory-store snapshot. Callers should
+/// then reuse it for every scalar in the same completed tool input, avoiding
+/// one IPC round trip and recovery rebuild per JSON string.
+pub struct ActiveMemoryStoreResolver {
+    recovery: Option<pentect_core::Recovery>,
+}
+
+impl ActiveMemoryStoreResolver {
+    pub fn new() -> Result<Self, String> {
+        let Some(client) = MemoryStoreClient::from_env() else {
+            return Ok(Self { recovery: None });
+        };
+        let snapshot = client.snapshot().map_err(|e| e.to_string())?;
+        Ok(Self {
+            recovery: Some(snapshot.recovery),
+        })
+    }
+
+    pub fn resolve_known_text(&self, text: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.resolve(text)))
+    }
+}
+
 pub fn preflight_exec_server_process_start_from_active_memory_store(
     argv: &[String],
     env: &[(String, String)],
@@ -329,6 +379,8 @@ pub struct ActiveToolOutputMasker {
     reported_masked_count: u64,
     cache: HashMap<[u8; 32], CachedToolOutput>,
     cache_order: VecDeque<[u8; 32]>,
+    prompt_cache: HashMap<[u8; 32], CachedToolOutput>,
+    prompt_cache_order: VecDeque<[u8; 32]>,
 }
 
 struct CachedToolOutput {
@@ -345,6 +397,8 @@ impl ActiveToolOutputMasker {
                 reported_masked_count: 0,
                 cache: HashMap::new(),
                 cache_order: VecDeque::new(),
+                prompt_cache: HashMap::new(),
+                prompt_cache_order: VecDeque::new(),
             });
         };
         let session = Session::open_capability("default").map_err(|e| e.to_string())?;
@@ -355,6 +409,8 @@ impl ActiveToolOutputMasker {
             reported_masked_count: 0,
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
+            prompt_cache: HashMap::new(),
+            prompt_cache_order: VecDeque::new(),
         })
     }
 
@@ -384,6 +440,8 @@ impl ActiveToolOutputMasker {
         if delta > 0 {
             self.cache.clear();
             self.cache_order.clear();
+            self.prompt_cache.clear();
+            self.prompt_cache_order.clear();
             if let Some(client) = &self.client {
                 client.add_masked_count(delta).map_err(|e| e.to_string())?;
             }
@@ -398,6 +456,20 @@ impl ActiveToolOutputMasker {
         let Some(masker) = &mut self.masker else {
             return Ok(None);
         };
+        let cache_key =
+            (text.len() <= ACTIVE_TOOL_OUTPUT_CACHE_MAX_BYTES).then(|| tool_output_cache_key(text));
+        if let Some(key) = cache_key {
+            if let Some(cached) = self.prompt_cache.get(&key) {
+                if cached.masked_count > 0 {
+                    if let Some(client) = &self.client {
+                        client
+                            .add_masked_count(cached.masked_count)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                return Ok(Some(cached.masked.clone()));
+            }
+        }
         let masked = masker.mask_prompt_text(text)?;
         masker.flush_activity();
         let total = masker.masked_count();
@@ -406,33 +478,60 @@ impl ActiveToolOutputMasker {
         if delta > 0 {
             self.cache.clear();
             self.cache_order.clear();
+            self.prompt_cache.clear();
+            self.prompt_cache_order.clear();
             if let Some(client) = &self.client {
                 client.add_masked_count(delta).map_err(|e| e.to_string())?;
             }
+        }
+        if let Some(key) = cache_key {
+            remember_cached_output(
+                &mut self.prompt_cache,
+                &mut self.prompt_cache_order,
+                key,
+                &masked,
+                delta,
+            );
         }
         Ok(Some(masked))
     }
 
     fn remember(&mut self, key: [u8; 32], masked: &str, masked_count: u64) {
-        if self.cache.contains_key(&key) {
-            return;
-        }
-        while self.cache.len() >= ACTIVE_TOOL_OUTPUT_CACHE_LIMIT {
-            let Some(oldest) = self.cache_order.pop_front() else {
-                self.cache.clear();
-                break;
-            };
-            self.cache.remove(&oldest);
-        }
-        self.cache.insert(
+        remember_cached_output(
+            &mut self.cache,
+            &mut self.cache_order,
             key,
-            CachedToolOutput {
-                masked: masked.to_string(),
-                masked_count,
-            },
+            masked,
+            masked_count,
         );
-        self.cache_order.push_back(key);
     }
+}
+
+fn remember_cached_output(
+    cache: &mut HashMap<[u8; 32], CachedToolOutput>,
+    order: &mut VecDeque<[u8; 32]>,
+    key: [u8; 32],
+    masked: &str,
+    masked_count: u64,
+) {
+    if cache.contains_key(&key) {
+        return;
+    }
+    while cache.len() >= ACTIVE_TOOL_OUTPUT_CACHE_LIMIT {
+        let Some(oldest) = order.pop_front() else {
+            cache.clear();
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    cache.insert(
+        key,
+        CachedToolOutput {
+            masked: masked.to_string(),
+            masked_count,
+        },
+    );
+    order.push_back(key);
 }
 
 fn tool_output_cache_key(text: &str) -> [u8; 32] {
@@ -1075,7 +1174,7 @@ fn handle_bridge_request(
             if let Some(tool_input) = request.get("input") {
                 repair_masked_write_after_tool(session, tool_name, tool_input)?;
             }
-            match mask_tool_text_output(HookProvider::Claude, session, value)? {
+            match mask_tool_text_output(HookProvider::Generic, session, value)? {
                 ToolTextOutput::Unchanged => Ok(value.clone()),
                 ToolTextOutput::Updated(updated) => Ok(updated),
                 ToolTextOutput::Block(reason) => Err(reason),
@@ -1978,7 +2077,7 @@ impl HookOpts {
         }
         Ok(Self {
             provider: provider.ok_or_else(|| {
-                "hook requires a provider after --cli: codex, claude, or generic".to_string()
+                "hook requires a provider after --cli: codex or generic".to_string()
             })?,
             session,
             cli,
@@ -4121,7 +4220,10 @@ fn parse_kind(value: &str) -> Result<Kind, String> {
 fn parse_hook_provider(value: &str) -> Result<HookProvider, String> {
     match value {
         "codex" => Ok(HookProvider::Codex),
-        "claude" => Ok(HookProvider::Claude),
+        "claude" => Err(
+            "Claude hook mode was replaced by the HTTP gateway; start with `pentect claude`"
+                .to_string(),
+        ),
         "generic" | "external" | "update" => Ok(HookProvider::Generic),
         other => Err(format!("unknown hook provider: {other}")),
     }

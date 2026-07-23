@@ -111,16 +111,35 @@ impl OutputMasker {
 
     pub(crate) fn mask_prompt_text(&mut self, text: &str) -> Result<String, String> {
         let remasked = self.remask_all(text)?;
-        let result = mask_read_input_with_profile_and_identity(
-            self.store.session.key,
-            self.store.session.identity_key,
+        // Prompt scalars are structurally text, but dotenv assignments can be
+        // embedded in prose. Run the Env parser first so assignment labels are
+        // preserved, then feed the result through the same cached text engine.
+        let env_result = self.engine.mask(
             Input {
-                kind: Kind::Text,
+                kind: Kind::Env,
                 data: remasked,
             },
-            Profile::Strict,
-            Vec::new(),
+            &Config {
+                disclose_length: false,
+                ..Config::new(self.store.session.key)
+                    .with_identity_key(self.store.session.identity_key)
+            },
+        );
+        let mut result = mask_read_input_with_engine_adapters_and_identity(
+            self.store.session.key,
+            self.store.session.identity_key,
+            self.engine,
+            &self.model_adapters,
+            Input {
+                kind: Kind::Text,
+                data: env_result.masked,
+            },
         )?;
+        result.summary.masked_count = result
+            .summary
+            .masked_count
+            .saturating_add(env_result.summary.masked_count);
+        result.recovery.extend_same_key(env_result.recovery);
         self.track_mask_result("prompt", &result);
         self.add_masked_count(result.summary.masked_count);
         let masked = compact_local_home_paths(&result.masked);
@@ -191,7 +210,14 @@ impl OutputMasker {
         path: Option<&str>,
         hints: &[String],
     ) -> Result<String, String> {
-        let redacted = redact_env_derivative_lines(text);
+        if scalar_is_env_assignment(text) {
+            let protected = self.mask_text(text, Kind::Env)?;
+            if protected != text {
+                return Ok(protected);
+            }
+        }
+        let protected_assignments = self.mask_embedded_env_assignments(text)?;
+        let redacted = redact_env_derivative_lines(&protected_assignments);
         let remasked = self.remask_all(&redacted)?;
         let context = Context {
             path: path.map(str::to_string),
@@ -218,7 +244,11 @@ impl OutputMasker {
         if scalars.is_empty() {
             return Ok(Vec::new());
         }
-        if !self.model_adapters.is_empty() {
+        if !self.model_adapters.is_empty()
+            || scalars
+                .iter()
+                .any(|scalar| contains_sensitive_env_assignment(&scalar.text))
+        {
             let mut out = Vec::with_capacity(scalars.len());
             for scalar in scalars {
                 out.push(self.mask_tool_result_scalar(
@@ -300,6 +330,31 @@ impl OutputMasker {
         ));
         self.record_recovery(recovery)?;
         Ok(masked)
+    }
+
+    fn mask_embedded_env_assignments(&mut self, text: &str) -> Result<String, String> {
+        let mut out = String::with_capacity(text.len());
+        let mut changed = false;
+        for segment in text.split_inclusive('\n') {
+            let (line, ending) = segment
+                .strip_suffix('\n')
+                .map_or((segment, ""), |line| (line, "\n"));
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let carriage_return = segment.ends_with("\r\n");
+            if let Some(start) = embedded_sensitive_env_assignment_start(line) {
+                out.push_str(&line[..start]);
+                let protected = self.mask_text(&line[start..], Kind::Env)?;
+                changed |= protected != line[start..];
+                out.push_str(&protected);
+            } else {
+                out.push_str(line);
+            }
+            if carriage_return {
+                out.push('\r');
+            }
+            out.push_str(ending);
+        }
+        Ok(if changed { out } else { text.to_string() })
     }
 
     fn record_tool_result_mask_result(
@@ -392,6 +447,37 @@ impl OutputMasker {
             }
         }
     }
+}
+
+fn scalar_is_env_assignment(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && !trimmed.contains(['\r', '\n']) && is_env_assignment_line(trimmed)
+}
+
+fn contains_sensitive_env_assignment(text: &str) -> bool {
+    scalar_is_env_assignment(text)
+        || text
+            .lines()
+            .any(|line| embedded_sensitive_env_assignment_start(line).is_some())
+}
+
+pub(crate) fn embedded_sensitive_env_assignment_start(line: &str) -> Option<usize> {
+    line.char_indices().find_map(|(start, ch)| {
+        if !(ch.is_ascii_alphabetic() || ch == '_') {
+            return None;
+        }
+        if start > 0
+            && line[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|previous| previous.is_ascii_alphanumeric() || previous == '_')
+        {
+            return None;
+        }
+        let candidate = line[start..].trim_end();
+        let key = env_assignment_key(candidate)?;
+        is_sensitive_env_name(&key.to_ascii_lowercase()).then_some(start)
+    })
 }
 
 impl Drop for OutputMasker {
@@ -589,6 +675,16 @@ pub(crate) fn mask_read_input_with_engine_and_identity(
     input: Input,
 ) -> Result<MaskResult, String> {
     let adapters = ModelAdapters::from_env()?;
+    mask_read_input_with_engine_adapters_and_identity(key, identity_key, engine, &adapters, input)
+}
+
+fn mask_read_input_with_engine_adapters_and_identity(
+    key: [u8; 32],
+    identity_key: [u8; 32],
+    engine: &Engine,
+    adapters: &ModelAdapters,
+    input: Input,
+) -> Result<MaskResult, String> {
     let cfg = Config {
         disclose_length: false,
         ..Config::new(key).with_identity_key(identity_key)

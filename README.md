@@ -1,4 +1,6 @@
-Pentect is a local secret-capability boundary for AI agents: it masks tool/file/MCP/browser output before the model sees it.
+Pentect is a local, protocol-aware gateway for AI agents. Existing hosts keep
+working with plaintext locally; model-bound requests contain reversible handles,
+and completed tool-call inputs are resolved on the way back to the local host.
 
 作り途中
 
@@ -21,3 +23,4 @@ TODO
 - ssl inspection
 - full
 - Input, Output Realtime Masking
+- optional Claude Files API content protection

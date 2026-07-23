@@ -2,6 +2,7 @@
 
 mod agent_integrations;
 mod app_server_proxy;
+mod claude_http_proxy;
 mod doctor;
 mod eval;
 mod exec_proxy;
@@ -19,7 +20,7 @@ use pentect_core::{
     infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
 };
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
@@ -686,6 +687,7 @@ struct AgentToolOpts {
     plugins: Vec<String>,
     dry_run: bool,
     codex_app_server_proxy_disabled: bool,
+    anthropic_upstream: Option<String>,
     tool_args: Vec<String>,
 }
 
@@ -697,6 +699,7 @@ impl AgentToolOpts {
         let mut plugins = Vec::new();
         let mut dry_run = false;
         let mut codex_app_server_proxy_disabled = false;
+        let mut anthropic_upstream = None;
         let mut tool_args = Vec::new();
         let mut i = 2;
         while i < args.len() {
@@ -739,6 +742,9 @@ impl AgentToolOpts {
                     codex_app_server_proxy_disabled = true;
                     i += 1;
                 }
+                "--upstream" if tool == AgentTool::Claude => {
+                    anthropic_upstream = Some(required_value(args, &mut i, "--upstream")?);
+                }
                 "--prompt-proxy" | "--no-prompt-proxy" => {
                     return Err("prompt protection is automatic".to_string());
                 }
@@ -755,6 +761,7 @@ impl AgentToolOpts {
             plugins,
             dry_run,
             codex_app_server_proxy_disabled,
+            anthropic_upstream,
             tool_args,
         })
     }
@@ -855,40 +862,617 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
 }
 
 fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
-    if headless::claude_uses_partial_output(&opts.tool_args) {
-        return Err("Claude partial output cannot be protected".to_string());
+    let args = opts.tool_args.clone();
+    if opts.dry_run {
+        print_dry_run(&opts.command, &args);
+        return Ok(success_status());
     }
-    let settings = claude_settings_json(pentect, opts.session.as_deref());
-    let contract = pentect_agent::agent_contract_instructions(
-        &pentect_agent::load_environment_variable_prefix()?,
-    );
+    let caller_settings = ClaudeCallerSettings::from_args(&args)?;
+    reject_unsupported_claude_provider(&caller_settings)?;
+    preflight_managed_claude_routing()?;
+    let upstream = claude_effective_upstream(opts, &caller_settings)?;
+    let enable_tool_search = is_official_anthropic_upstream(&upstream)
+        && caller_settings.env_string("ENABLE_TOOL_SEARCH")?.is_none()
+        && std::env::var_os("ENABLE_TOOL_SEARCH").is_none();
+
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
     let status_line_enabled = status_line_enabled_by_config()?;
     let _parent_env =
         agent_parent_env_guard(pentect, &memory_store, status_line_enabled, &active_plugins)?;
-    let tool_args = headless::protect_prompt_args(headless::AgentKind::Claude, &opts.tool_args)?;
-    let input_mode = headless::claude_input_mode(&tool_args);
-    let output_mode = headless::claude_output_mode(&tool_args);
-    let protect_stdin = headless::protect_stdin(
-        headless::AgentKind::Claude,
-        &tool_args,
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-    );
-    let args = claude_args(&settings, &tool_args, &contract);
-    if opts.dry_run {
-        print_dry_run(&opts.command, &args);
-        return Ok(success_status());
-    }
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
     apply_plugin_env(&mut cmd, &active_plugins)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
     apply_status_line_env(&mut cmd, status_line_enabled);
-    cmd.args(&args);
-    run_interactive_command(cmd, &opts.command, input_mode, output_mode, protect_stdin)
+    let http_proxy = claude_http_proxy::ClaudeHttpProxyGuard::start(upstream)?;
+    cmd.env("ANTHROPIC_BASE_URL", http_proxy.base_url());
+    // Claude Code reapplies settings.env after process start. Put the local
+    // route in the CLI settings layer as well, while preserving a caller's
+    // existing --settings payload. The provider-managed-host switch is not
+    // used here because it also disables normal Claude subscription auth.
+    let gateway_settings =
+        caller_settings.with_gateway(&args, http_proxy.base_url(), enable_tool_search)?;
+    cmd.args(gateway_settings.args());
+    run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
+}
+
+const CLAUDE_CLOUD_PROVIDER_FLAGS: &[&str] = &[
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+];
+
+#[derive(Debug)]
+struct ClaudeCallerSettings {
+    value: serde_json::Value,
+    effective_env: serde_json::Map<String, serde_json::Value>,
+    settings_at: Option<usize>,
+    inline: bool,
+    source_path: Option<PathBuf>,
+}
+
+impl ClaudeCallerSettings {
+    fn from_args(args: &[String]) -> Result<Self, String> {
+        let mut settings_at = None;
+        let mut inline = false;
+        for (index, arg) in args.iter().enumerate() {
+            if arg == "--settings" {
+                if settings_at.is_some() {
+                    return Err(
+                        "Claude accepts only one --settings value through Pentect".to_string()
+                    );
+                }
+                settings_at = Some(index);
+            } else if arg.starts_with("--settings=") {
+                if settings_at.is_some() {
+                    return Err(
+                        "Claude accepts only one --settings value through Pentect".to_string()
+                    );
+                }
+                settings_at = Some(index);
+                inline = true;
+            }
+        }
+
+        let (value, source_path) = if let Some(index) = settings_at {
+            let raw = if inline {
+                args[index]
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                args.get(index + 1)
+                    .cloned()
+                    .ok_or_else(|| "--settings requires a value".to_string())?
+            };
+            read_claude_settings_value(&raw)?
+        } else {
+            (serde_json::json!({}), None)
+        };
+        if !value.is_object() {
+            return Err("Claude --settings must contain a JSON object".to_string());
+        }
+        let mut effective_env = load_claude_nonmanaged_env()?;
+        if let Some(env) = value.get("env") {
+            let env = env
+                .as_object()
+                .ok_or_else(|| "Claude --settings env must be a JSON object".to_string())?;
+            for (name, value) in env {
+                effective_env.insert(name.clone(), value.clone());
+            }
+        }
+        Ok(Self {
+            value,
+            effective_env,
+            settings_at,
+            inline,
+            source_path,
+        })
+    }
+
+    fn env_string(&self, name: &str) -> Result<Option<&str>, String> {
+        let Some(value) = self.effective_env.get(name) else {
+            return Ok(None);
+        };
+        value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| format!("Claude --settings env.{name} must be a string"))
+    }
+
+    fn with_gateway(
+        &self,
+        args: &[String],
+        base_url: &str,
+        enable_tool_search: bool,
+    ) -> Result<ClaudeGatewaySettings, String> {
+        let mut settings = self.value.clone();
+        let object = settings
+            .as_object_mut()
+            .ok_or_else(|| "Claude --settings must contain a JSON object".to_string())?;
+        let env = object
+            .entry("env")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| "Claude --settings env must be a JSON object".to_string())?;
+        env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            serde_json::Value::String(base_url.to_string()),
+        );
+        if enable_tool_search {
+            env.insert(
+                "ENABLE_TOOL_SEARCH".to_string(),
+                serde_json::Value::String("true".to_string()),
+            );
+        }
+
+        let directory = self
+            .source_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or(std::env::current_dir().map_err(|error| {
+                format!("could not locate the working directory for Claude settings: {error}")
+            })?);
+        let file = ClaudeSettingsFile::create(&directory, &settings)?;
+        let path = file.path().to_string_lossy().into_owned();
+        let mut out = args.to_vec();
+        if let Some(index) = self.settings_at {
+            if self.inline {
+                out[index] = format!("--settings={path}");
+            } else {
+                out[index + 1] = path;
+            }
+        } else {
+            out.insert(0, path);
+            out.insert(0, "--settings".to_string());
+        }
+        Ok(ClaudeGatewaySettings {
+            args: out,
+            _file: file,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ClaudeGatewaySettings {
+    args: Vec<String>,
+    _file: ClaudeSettingsFile,
+}
+
+impl ClaudeGatewaySettings {
+    fn args(&self) -> &[String] {
+        &self.args
+    }
+}
+
+#[derive(Debug)]
+struct ClaudeSettingsFile {
+    path: PathBuf,
+}
+
+impl ClaudeSettingsFile {
+    fn create(directory: &Path, settings: &serde_json::Value) -> Result<Self, String> {
+        cleanup_stale_claude_settings_files(directory);
+        let mut nonce = [0_u8; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|error| format!("OS CSPRNG unavailable for Claude settings: {error}"))?;
+        let name = format!(
+            ".pentect-claude-settings-{}-{}.json",
+            std::process::id(),
+            data_encoding::HEXLOWER.encode(&nonce)
+        );
+        let path = directory.join(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|error| {
+            format!(
+                "could not create protected Claude settings beside the caller settings ({}): {error}",
+                path.display()
+            )
+        })?;
+        if let Err(error) = serde_json::to_writer(&mut file, settings) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!(
+                "could not encode protected Claude settings: {error}"
+            ));
+        }
+        if let Err(error) = file.flush() {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!(
+                "could not flush protected Claude settings: {error}"
+            ));
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn cleanup_stale_claude_settings_files(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name
+            .strip_prefix(".pentect-claude-settings-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        // Builds before PID ownership used a single 128-bit hex nonce. No
+        // current process creates that shape, so it is always crash residue.
+        if stem.len() == 32 && stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        let Some(owner) = stem
+            .split_once('-')
+            .map(|(owner, _)| owner)
+            .and_then(|owner| owner.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if owner != std::process::id() && !process_id_is_alive(owner) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn process_id_is_alive(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).is_some()
+}
+
+impl Drop for ClaudeSettingsFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn read_claude_settings_value(raw: &str) -> Result<(serde_json::Value, Option<PathBuf>), String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return serde_json::from_str(trimmed)
+            .map(|value| (value, None))
+            .map_err(|error| format!("Claude --settings JSON is invalid: {error}"));
+    }
+    let path = PathBuf::from(trimmed);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read Claude --settings file {trimmed}: {error}"))?;
+    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map(|value| (value, Some(path)))
+        .map_err(|error| format!("Claude --settings file is invalid JSON: {error}"))
+}
+
+fn claude_effective_upstream(
+    opts: &AgentToolOpts,
+    settings: &ClaudeCallerSettings,
+) -> Result<String, String> {
+    if let Some(explicit) = opts
+        .anthropic_upstream
+        .clone()
+        .or_else(|| nonempty_env("PENTECT_ANTHROPIC_UPSTREAM"))
+    {
+        return Ok(explicit);
+    }
+    // Claude settings override the inherited environment. An empty setting
+    // explicitly unsets the provider override rather than revealing a lower
+    // layer, so route to the official endpoint in that case.
+    if let Some(configured) = settings.env_string("ANTHROPIC_BASE_URL")? {
+        return Ok(if configured.trim().is_empty() {
+            "https://api.anthropic.com".to_string()
+        } else {
+            configured.to_string()
+        });
+    }
+    Ok(nonempty_env("ANTHROPIC_BASE_URL")
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string()))
+}
+
+fn load_claude_nonmanaged_env() -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("could not locate the Claude working directory: {error}"))?;
+    let project = find_project_root(&cwd);
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home_directory().map(|home| home.join(".claude")));
+    let mut env = serde_json::Map::new();
+    if let Some(config_dir) = config_dir {
+        merge_claude_env_file(&mut env, &config_dir.join("settings.json"))?;
+    }
+    merge_claude_env_file(&mut env, &project.join(".claude/settings.json"))?;
+    // Claude Code still reads a legacy local file in the launch directory,
+    // while the repository-root file wins when both exist.
+    if cwd != project {
+        merge_claude_env_file(&mut env, &cwd.join(".claude/settings.local.json"))?;
+    }
+    merge_claude_env_file(&mut env, &project.join(".claude/settings.local.json"))?;
+    Ok(env)
+}
+
+fn merge_claude_env_file(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+) -> Result<(), String> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let settings = read_json_file(path)?;
+    let Some(env) = settings.get("env") else {
+        return Ok(());
+    };
+    let env = env.as_object().ok_or_else(|| {
+        format!(
+            "Claude settings {} env must be a JSON object",
+            path.display()
+        )
+    })?;
+    for (name, value) in env {
+        target.insert(name.clone(), value.clone());
+    }
+    Ok(())
+}
+
+fn find_project_root(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|path| path.join(".git").exists())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+fn home_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+fn reject_unsupported_claude_provider(settings: &ClaudeCallerSettings) -> Result<(), String> {
+    for name in CLAUDE_CLOUD_PROVIDER_FLAGS {
+        let configured = settings
+            .env_string(name)?
+            .map(cloud_provider_enabled)
+            .unwrap_or_else(|| {
+                std::env::var(name).is_ok_and(|value| cloud_provider_enabled(&value))
+            });
+        if configured {
+            return Err(format!(
+                "{name} cannot be routed through the Pentect Anthropic HTTP proxy; unset it or use Claude Code without `pentect claude`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn preflight_managed_claude_routing() -> Result<(), String> {
+    if let Some(settings) = managed_claude_settings()? {
+        reject_managed_routing_value(&settings)?;
+    }
+    Ok(())
+}
+
+fn reject_managed_routing_value(settings: &serde_json::Value) -> Result<(), String> {
+    if settings.get("policyHelper").is_some() {
+        return Err(
+            "Claude managed settings use policyHelper, so Pentect cannot verify that API traffic will stay on its HTTP proxy; run Claude without `pentect claude` or remove the managed provider override"
+                .to_string(),
+        );
+    }
+    let Some(env) = settings.get("env") else {
+        return Ok(());
+    };
+    let env = env
+        .as_object()
+        .ok_or_else(|| "Claude managed settings env must be a JSON object".to_string())?;
+    if env
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(
+            "Claude managed settings override ANTHROPIC_BASE_URL and would bypass Pentect's HTTP proxy; use Claude without `pentect claude` or ask the administrator to remove that override"
+                .to_string(),
+        );
+    }
+    for name in CLAUDE_CLOUD_PROVIDER_FLAGS {
+        if env
+            .get(*name)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(cloud_provider_enabled)
+        {
+            return Err(format!(
+                "Claude managed settings enable {name}, which cannot be routed through Pentect's Anthropic HTTP proxy"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn managed_claude_settings() -> Result<Option<serde_json::Value>, String> {
+    let directory = if cfg!(windows) {
+        let Some(program_files) = std::env::var_os("ProgramFiles") else {
+            return Ok(None);
+        };
+        PathBuf::from(program_files).join("ClaudeCode")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from("/Library/Application Support/ClaudeCode")
+    } else {
+        PathBuf::from("/etc/claude-code")
+    };
+    let file_settings = read_file_managed_claude_settings(&directory)?;
+
+    #[cfg(windows)]
+    {
+        if file_settings
+            .as_ref()
+            .is_some_and(|settings| settings.get("policyHelper").is_some())
+        {
+            return Ok(file_settings);
+        }
+        if let Some(settings) = read_windows_claude_policy("HKLM\\SOFTWARE\\Policies\\ClaudeCode")?
+        {
+            return Ok(Some(settings));
+        }
+        if file_settings.is_some() {
+            return Ok(file_settings);
+        }
+        return read_windows_claude_policy("HKCU\\SOFTWARE\\Policies\\ClaudeCode");
+    }
+    #[allow(unreachable_code)]
+    Ok(file_settings)
+}
+
+fn read_file_managed_claude_settings(
+    directory: &Path,
+) -> Result<Option<serde_json::Value>, String> {
+    let mut merged = serde_json::json!({});
+    let mut found = false;
+    let base = directory.join("managed-settings.json");
+    if base.is_file() {
+        merge_json_object(&mut merged, &read_json_file(&base)?)?;
+        found = true;
+    }
+    let drop_in = directory.join("managed-settings.d");
+    if drop_in.is_dir() {
+        let mut paths = std::fs::read_dir(&drop_in)
+            .map_err(|error| format!("could not inspect {}: {error}", drop_in.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension().and_then(|value| value.to_str()) == Some("json")
+                    && !path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.starts_with('.'))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            merge_json_object(&mut merged, &read_json_file(&path)?)?;
+            found = true;
+        }
+    }
+    Ok(found.then_some(merged))
+}
+
+fn read_json_file(path: &Path) -> Result<serde_json::Value, String> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "could not read Claude managed settings {}: {error}",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Claude managed settings {} contain invalid JSON: {error}",
+            path.display()
+        )
+    })
+}
+
+fn merge_json_object(
+    target: &mut serde_json::Value,
+    source: &serde_json::Value,
+) -> Result<(), String> {
+    let target = target
+        .as_object_mut()
+        .ok_or_else(|| "internal Claude managed settings merge target is invalid".to_string())?;
+    let source = source
+        .as_object()
+        .ok_or_else(|| "Claude managed settings must contain a JSON object".to_string())?;
+    for (key, value) in source {
+        if let (Some(existing @ serde_json::Value::Object(_)), serde_json::Value::Object(_)) =
+            (target.get_mut(key), value)
+        {
+            merge_json_object(existing, value)?;
+        } else {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_windows_claude_policy(key: &str) -> Result<Option<serde_json::Value>, String> {
+    let output = Command::new("reg.exe")
+        .args(["query", key, "/v", "Settings"])
+        .output()
+        .map_err(|error| format!("could not inspect Claude managed registry policy: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = stdout.lines().find_map(|line| {
+        line.split_once("REG_SZ")
+            .or_else(|| line.split_once("REG_EXPAND_SZ"))
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+    });
+    let Some(json) = json else {
+        return Err(format!(
+            "Claude managed registry policy {key} has an unreadable Settings value"
+        ));
+    };
+    serde_json::from_str(json)
+        .map(Some)
+        .map_err(|error| format!("Claude managed registry policy {key} is invalid JSON: {error}"))
+}
+
+fn is_official_anthropic_upstream(upstream: &str) -> bool {
+    reqwest::Url::parse(upstream).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("api.anthropic.com")
+            && url.port_or_known_default() == Some(443)
+    })
+}
+
+fn cloud_provider_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn run_native_command_with_guards<G>(
+    mut cmd: Command,
+    display: &Path,
+    _guards: G,
+) -> Result<std::process::ExitStatus, String> {
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    cmd.status()
+        .map_err(|error| format!("could not run '{}': {error}", display.display()))
 }
 
 fn run_bridge_agent(
@@ -3047,17 +3631,6 @@ fn codex_args_feature_value(args: &[String], flag: &str, feature: &str) -> bool 
     false
 }
 
-fn claude_args(settings: &str, tool_args: &[String], contract: &str) -> Vec<String> {
-    let mut args = vec![
-        "--settings".to_string(),
-        settings.to_string(),
-        "--append-system-prompt".to_string(),
-        contract.to_string(),
-    ];
-    args.extend(tool_args.iter().cloned());
-    args
-}
-
 fn codex_hook_config_args(agent: &Path, session: Option<&str>) -> Result<Vec<String>, String> {
     let command = hook_command(agent, "codex", session);
     let windows = hook_command_windows(agent, "codex", session);
@@ -3277,35 +3850,6 @@ fn codex_long_option_takes_value(arg: &str) -> bool {
 
 fn codex_short_option_takes_value(arg: &str) -> bool {
     matches!(arg, "-m" | "-c" | "-p" | "-s" | "-a" | "-C" | "-o")
-}
-
-fn claude_settings_json(agent: &Path, session: Option<&str>) -> String {
-    let words = hook_words(agent, "claude", session);
-    let command = words[0].clone();
-    let args = words[1..].to_vec();
-    json!({
-        "hooks": {
-            "PreToolUse": [{
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": command.clone(),
-                    "args": args.clone(),
-                    "timeout": 30
-                }]
-            }],
-            "PostToolUse": [{
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": command.clone(),
-                    "args": args.clone(),
-                    "timeout": 30
-                }]
-            }]
-        }
-    })
-    .to_string()
 }
 
 #[cfg(not(windows))]
@@ -3632,6 +4176,128 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_accepts_an_explicit_upstream_before_tool_arguments() {
+        let strings = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+        let args = strings(&[
+            "pentect",
+            "claude",
+            "--upstream",
+            "https://gateway.example/anthropic",
+            "--",
+            "--version",
+        ]);
+        let opts = AgentToolOpts::parse(AgentTool::Claude, &args).unwrap();
+        assert_eq!(
+            opts.anthropic_upstream.as_deref(),
+            Some("https://gateway.example/anthropic")
+        );
+        assert_eq!(opts.tool_args, strings(&["--version"]));
+    }
+
+    #[test]
+    fn claude_gateway_settings_preserve_caller_settings_and_own_the_route() {
+        let args = vec![
+            "--settings".to_string(),
+            r#"{"env":{"KEEP":"yes","ANTHROPIC_BASE_URL":"https://bypass.invalid"},"model":"sonnet"}"#
+                .to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ];
+        let caller = ClaudeCallerSettings::from_args(&args).unwrap();
+        assert_eq!(
+            caller.env_string("ANTHROPIC_BASE_URL").unwrap(),
+            Some("https://bypass.invalid")
+        );
+        let protected = caller
+            .with_gateway(&args, "http://127.0.0.1:1234/token", true)
+            .unwrap();
+        assert_ne!(protected.args()[1], args[1]);
+        assert!(!protected.args()[1].contains("bypass.invalid"));
+        let settings_path = PathBuf::from(&protected.args()[1]);
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(settings["env"]["KEEP"], "yes");
+        assert_eq!(settings["model"], "sonnet");
+        assert_eq!(settings["env"]["ENABLE_TOOL_SEARCH"], "true");
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:1234/token"
+        );
+        assert_eq!(&protected.args()[2..], &args[2..]);
+        drop(protected);
+        assert!(!settings_path.exists());
+    }
+
+    #[test]
+    fn claude_settings_cleanup_removes_only_dead_process_files() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-claude-settings-cleanup-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let stale = root.join(format!(".pentect-claude-settings-{}-stale.json", u32::MAX));
+        let live = root.join(format!(
+            ".pentect-claude-settings-{}-live.json",
+            std::process::id()
+        ));
+        let legacy = root.join(".pentect-claude-settings-0123456789abcdef0123456789abcdef.json");
+        std::fs::write(&stale, b"{}").unwrap();
+        std::fs::write(&live, b"{}").unwrap();
+        std::fs::write(&legacy, b"{}").unwrap();
+
+        cleanup_stale_claude_settings_files(&root);
+
+        assert!(!stale.exists());
+        assert!(!legacy.exists());
+        assert!(live.exists());
+        std::fs::remove_file(live).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn claude_cloud_provider_settings_are_rejected_before_launch() {
+        let args = vec![
+            "--settings".to_string(),
+            r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"1"}}"#.to_string(),
+        ];
+        let settings = ClaudeCallerSettings::from_args(&args).unwrap();
+        let error = reject_unsupported_claude_provider(&settings).unwrap_err();
+        assert!(error.contains("CLAUDE_CODE_USE_VERTEX"), "{error}");
+        assert!(!cloud_provider_enabled("false"));
+        assert!(!cloud_provider_enabled("0"));
+        assert!(cloud_provider_enabled("1"));
+    }
+
+    #[test]
+    fn claude_recognizes_only_the_official_https_api_for_tool_search_default() {
+        assert!(is_official_anthropic_upstream("https://api.anthropic.com"));
+        assert!(!is_official_anthropic_upstream("http://api.anthropic.com"));
+        assert!(!is_official_anthropic_upstream("https://gateway.example"));
+    }
+
+    #[test]
+    fn claude_rejects_detectable_managed_routing_overrides() {
+        let custom = serde_json::json!({
+            "env": {"ANTHROPIC_BASE_URL": "https://gateway.example"}
+        });
+        assert!(reject_managed_routing_value(&custom).is_err());
+        let vertex = serde_json::json!({
+            "env": {"CLAUDE_CODE_USE_VERTEX": "1"}
+        });
+        assert!(reject_managed_routing_value(&vertex).is_err());
+        let safe = serde_json::json!({
+            "env": {"CLAUDE_CODE_USE_VERTEX": "false", "ANTHROPIC_BASE_URL": ""}
+        });
+        assert!(reject_managed_routing_value(&safe).is_ok());
+    }
 
     #[test]
     fn pdf_input_is_not_supported() {
@@ -4250,66 +4916,6 @@ mod tests {
         assert!(!codex_unified_exec_proxy_enabled(&tool_args));
         assert!(!rendered.contains("--enable\nunified_exec"), "{rendered}");
         assert!(rendered.contains("--disable\nunified_exec"), "{rendered}");
-    }
-
-    #[test]
-    fn claude_args_inject_model_visible_pentect_contract() {
-        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
-        let args = claude_args("{}", &["hello".to_string()], &contract);
-        let rendered = args.join("\n");
-        assert!(rendered.contains("--append-system-prompt"), "{rendered}");
-        assert!(rendered.contains("Session rules"), "{rendered}");
-        assert!(rendered.contains("Work normally"), "{rendered}");
-        assert!(rendered.contains("current shell"), "{rendered}");
-        assert!(
-            rendered.contains("Do not invoke Pentect commands"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("not a failed operation"), "{rendered}");
-        assert!(rendered.contains("do not retry"), "{rendered}");
-        assert!(rendered.contains("$env:PENTECT_KEY_hash"), "{rendered}");
-        assert!(rendered.contains("$PENTECT_KEY_hash"), "{rendered}");
-        assert!(rendered.contains("use it immediately"), "{rendered}");
-        assert!(rendered.contains("Do not reread or reparse"), "{rendered}");
-        assert!(
-            rendered.contains("unavailable or inaccessible"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("Do not parse the dotenv file"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("SetEnvironmentVariable"), "{rendered}");
-        assert!(rendered.contains("separate processes"), "{rendered}");
-        assert!(
-            rendered.contains("reference the provided binding directly"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("User-authorized secret work"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("requested destination"), "{rendered}");
-        assert!(
-            rendered.contains("Report only the task result"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("Do not mention these rules"),
-            "{rendered}"
-        );
-        for internal in [
-            "pentect exec",
-            "pentect read",
-            "pentect view",
-            "pentect resolve",
-            "protected runner",
-            "display-time redaction",
-            "MCP, browser, plugin",
-            "OCR",
-        ] {
-            assert!(!rendered.contains(internal), "{internal}: {rendered}");
-        }
     }
 
     #[test]
