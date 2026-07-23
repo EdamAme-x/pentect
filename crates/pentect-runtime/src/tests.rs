@@ -1246,10 +1246,10 @@ fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
     };
     let output = run_resolved_command(&store, &opts).unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(raw), "{stdout}");
+    assert!(stdout.contains(&raw), "{stdout}");
 
     let safe = mask_tool_output(&session, &stdout).unwrap();
-    assert!(!safe.contains(raw), "{safe}");
+    assert!(!safe.contains(&raw), "{safe}");
     assert!(safe.contains("<<OPENAI_API_KEY_"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
