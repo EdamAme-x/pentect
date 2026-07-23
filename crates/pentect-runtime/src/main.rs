@@ -61,7 +61,7 @@ const DEFAULT_SESSION: &str = "default";
 const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_CODEX_EXEC_PROXY_ENV: &str = "PENTECT_CODEX_EXEC_PROXY";
 const PENTECT_PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
-const PENTECT_PLUGIN_ADAPTERS_ENV: &str = "PENTECT_PLUGIN_ADAPTERS";
+const PENTECT_PLUGIN_BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
 const LIVE_MASK_CHUNK_LINES: usize = 2048;
 const ACTIVE_TOOL_OUTPUT_CACHE_LIMIT: usize = 128;
@@ -1210,7 +1210,7 @@ fn bridge_owned_environment(
     for name in [
         "PENTECT_BIN",
         PENTECT_PLUGIN_CONFIGS_ENV,
-        PENTECT_PLUGIN_ADAPTERS_ENV,
+        PENTECT_PLUGIN_BINARIES_ENV,
     ] {
         if let Some(value) = read(name) {
             if !value.is_empty() {

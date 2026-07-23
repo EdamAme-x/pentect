@@ -1,9 +1,4 @@
 schema = "pentect.plugin.v1"
 name = "openai-privacy-filter"
-description = "Local privacy-filter model runtime."
-
-[runtime]
-command = ["pentect-pii-ner"]
-timeout_ms = 10000
-max_input_bytes = 262144
-max_spans = 512
+description = "Local privacy-filter model."
+binary = "pentect-pii-ner"

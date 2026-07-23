@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-pub(crate) const ADAPTERS_ENV: &str = "PENTECT_PLUGIN_ADAPTERS";
+pub(crate) const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
 
 const PENTECT_DIR: &str = ".pentect";
 const PLUGINS_DATA_DIR: &str = "plugins-data";
@@ -19,7 +19,7 @@ const PLUGIN_NAME_ENV: &str = "PENTECT_PLUGIN_NAME";
 const PLUGIN_DATA_DIR_ENV: &str = "PENTECT_PLUGIN_DATA_DIR";
 const PLUGIN_CACHE_DIR_ENV: &str = "PENTECT_PLUGIN_CACHE_DIR";
 const PLUGIN_CONFIG_ENV: &str = "PENTECT_PLUGIN_CONFIG";
-const DEFAULT_TIMEOUT_MS: u64 = 3_000;
+const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MAX_INPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_SPANS: usize = 512;
 const MAX_STDOUT_BYTES: usize = 1024 * 1024;
@@ -35,7 +35,7 @@ impl ModelAdapters {
     }
 
     pub(crate) fn from_env() -> Result<Self, String> {
-        let Some(value) = std::env::var_os(ADAPTERS_ENV) else {
+        let Some(value) = std::env::var_os(BINARIES_ENV) else {
             return Ok(Self::default());
         };
         let mut adapters = Vec::new();
@@ -83,35 +83,40 @@ struct ModelAdapter {
 impl ModelAdapter {
     fn load(path: &Path) -> Result<Self, String> {
         if !path.is_file() {
-            return Err(format!("plugin runtime does not exist: {}", path.display()));
+            return Err(format!(
+                "plugin manifest does not exist: {}",
+                path.display()
+            ));
         }
         let src = std::fs::read_to_string(path)
-            .map_err(|e| format!("could not read plugin runtime '{}': {e}", path.display()))?;
-        let manifest: PluginManifest = toml::from_str(&src)
+            .map_err(|e| format!("could not read plugin manifest '{}': {e}", path.display()))?;
+        let file: PluginFile = toml::from_str(&src)
             .map_err(|e| format!("plugin manifest '{}' is invalid: {e}", path.display()))?;
-        if manifest.schema.as_deref() != Some("pentect.plugin.v1") {
+        if file.schema.as_deref() != Some("pentect.plugin.v1") {
             return Err(format!(
                 "plugin manifest '{}' requires schema = \"pentect.plugin.v1\"",
                 path.display()
             ));
         }
-        let file = manifest
-            .runtime
-            .ok_or_else(|| format!("plugin manifest '{}' requires [runtime]", path.display()))?;
-        let command = adapter_command_from_file(path, file.command)?;
-        let name = manifest
+        let name = file
             .name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| adapter_default_name(path));
         let id = plugin_id(&name);
+        let binary = file
+            .binary
+            .filter(|binary| !binary.trim().is_empty())
+            .ok_or_else(|| format!("plugin '{name}' requires binary"))?;
+        let execution = file.execution.unwrap_or_default();
+        let command = binary_command(&name, &binary, execution.args)?;
         Ok(Self {
             name,
             id,
             path: path.to_path_buf(),
             command,
-            timeout: Duration::from_millis(file.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
-            max_input_bytes: file.max_input_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES),
-            max_spans: file.max_spans.unwrap_or(DEFAULT_MAX_SPANS),
+            timeout: Duration::from_millis(execution.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
+            max_input_bytes: execution.max_input_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES),
+            max_spans: execution.max_spans.unwrap_or(DEFAULT_MAX_SPANS),
         })
     }
 
@@ -133,10 +138,10 @@ impl ModelAdapter {
         .to_string();
         let response = self.run(&request)?;
         let parsed: AdapterResponse = serde_json::from_str(&response)
-            .map_err(|e| format!("plugin runtime '{}' returned invalid JSON: {e}", self.name))?;
+            .map_err(|e| format!("plugin '{}' returned invalid JSON: {e}", self.name))?;
         if parsed.spans.len() > self.max_spans {
             return Err(format!(
-                "plugin runtime '{}' returned too many spans: {} > {}",
+                "plugin '{}' returned too many spans: {} > {}",
                 self.name,
                 parsed.spans.len(),
                 self.max_spans
@@ -163,16 +168,16 @@ impl ModelAdapter {
         }
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("could not start plugin runtime '{}': {e}", self.name))?;
+            .map_err(|e| format!("could not start plugin '{}': {e}", self.name))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| format!("could not open stdout for plugin runtime '{}'", self.name))?;
+            .ok_or_else(|| format!("could not open stdout for plugin '{}'", self.name))?;
         let stdout_reader = spawn_adapter_stdout_reader(stdout);
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| format!("could not open stdin for plugin runtime '{}'", self.name))?;
+            .ok_or_else(|| format!("could not open stdin for plugin '{}'", self.name))?;
         let stdin_writer = spawn_adapter_stdin_writer(stdin, request.as_bytes().to_vec());
 
         let status = match wait_for_adapter_child(&mut child, &self.name, self.timeout) {
@@ -186,23 +191,16 @@ impl ModelAdapter {
         join_adapter_stdin(stdin_writer, &self.name)?;
         let stdout = join_adapter_stdout(stdout_reader, &self.name)?;
         if stdout.len() > MAX_STDOUT_BYTES {
-            return Err(format!(
-                "plugin runtime '{}' returned too much output",
-                self.name
-            ));
+            return Err(format!("plugin '{}' returned too much output", self.name));
         }
         if !status.success() {
             return Err(format!(
-                "plugin runtime '{}' exited with status {status}",
+                "plugin '{}' exited with status {status}",
                 self.name
             ));
         }
-        String::from_utf8(stdout).map_err(|e| {
-            format!(
-                "plugin runtime '{}' returned non-UTF-8 output: {e}",
-                self.name
-            )
-        })
+        String::from_utf8(stdout)
+            .map_err(|e| format!("plugin '{}' returned non-UTF-8 output: {e}", self.name))
     }
 }
 
@@ -214,7 +212,7 @@ fn spawn_adapter_stdin_writer(
         use std::io::Write as _;
         stdin
             .write_all(&request)
-            .map_err(|e| format!("could not write adapter stdin: {e}"))
+            .map_err(|e| format!("could not write plugin stdin: {e}"))
     })
 }
 
@@ -225,7 +223,7 @@ fn spawn_adapter_stdout_reader(stdout: ChildStdout) -> JoinHandle<Result<Vec<u8>
         let mut out = Vec::new();
         stdout
             .read_to_end(&mut out)
-            .map_err(|e| format!("could not read adapter stdout: {e}"))?;
+            .map_err(|e| format!("could not read plugin stdout: {e}"))?;
         Ok(out)
     })
 }
@@ -242,13 +240,13 @@ fn wait_for_adapter_child(
             Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("plugin runtime '{name}' timed out"));
+                return Err(format!("plugin '{name}' timed out"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("could not wait for plugin runtime '{name}': {e}"));
+                return Err(format!("could not wait for plugin '{name}': {e}"));
             }
         }
     }
@@ -257,8 +255,8 @@ fn wait_for_adapter_child(
 fn join_adapter_stdin(writer: JoinHandle<Result<(), String>>, name: &str) -> Result<(), String> {
     writer
         .join()
-        .map_err(|_| format!("plugin runtime '{name}' stdin writer panicked"))?
-        .map_err(|e| format!("plugin runtime '{name}' {e}"))
+        .map_err(|_| format!("plugin '{name}' stdin writer panicked"))?
+        .map_err(|e| format!("plugin '{name}' {e}"))
 }
 
 fn join_adapter_stdout(
@@ -267,8 +265,8 @@ fn join_adapter_stdout(
 ) -> Result<Vec<u8>, String> {
     reader
         .join()
-        .map_err(|_| format!("plugin runtime '{name}' stdout reader panicked"))?
-        .map_err(|e| format!("plugin runtime '{name}' {e}"))
+        .map_err(|_| format!("plugin '{name}' stdout reader panicked"))?
+        .map_err(|e| format!("plugin '{name}' {e}"))
 }
 
 fn apply_adapter_child_env(command: &mut Command, id_or_name: &str) -> Result<(), String> {
@@ -296,7 +294,11 @@ struct PluginRuntimeDirs {
 
 fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
     let id = plugin_id(id_or_name);
-    let data_dir = PathBuf::from(PENTECT_DIR).join(PLUGINS_DATA_DIR).join(&id);
+    let data_dir = std::env::current_dir()
+        .map_err(|e| format!("could not resolve plugin data directory: {e}"))?
+        .join(PENTECT_DIR)
+        .join(PLUGINS_DATA_DIR)
+        .join(&id);
     let cache_dir = data_dir.join(PLUGIN_CACHE_DIR);
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
         format!(
@@ -447,37 +449,47 @@ fn safe_adapter_env_names() -> &'static [&'static str] {
 }
 
 #[derive(Debug, Deserialize)]
-struct PluginManifest {
+struct PluginFile {
     schema: Option<String>,
     name: Option<String>,
-    runtime: Option<AdapterFile>,
+    binary: Option<String>,
+    execution: Option<ExecutionFile>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AdapterFile {
-    command: Option<Vec<String>>,
+struct ExecutionFile {
+    #[serde(default)]
+    args: Vec<String>,
     timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
     max_spans: Option<usize>,
 }
 
-fn adapter_command_from_file(
-    path: &Path,
-    command: Option<Vec<String>>,
-) -> Result<Vec<String>, String> {
-    let Some(command) = command else {
-        return Err(format!(
-            "plugin runtime '{}' requires command",
-            path.display()
-        ));
-    };
-    if command.is_empty() || command.iter().any(|part| part.is_empty()) {
-        return Err(format!(
-            "plugin runtime '{}' requires a non-empty command array",
-            path.display()
-        ));
+fn binary_command(name: &str, binary: &str, args: Vec<String>) -> Result<Vec<String>, String> {
+    if binary.is_empty()
+        || binary.len() > 128
+        || binary.contains('/')
+        || binary.contains('\\')
+        || !binary
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        || args.iter().any(|arg| arg.contains('\0'))
+    {
+        return Err(format!("plugin '{name}' has an invalid binary name"));
     }
+    let filename = if cfg!(windows) && !binary.to_ascii_lowercase().ends_with(".exe") {
+        format!("{binary}.exe")
+    } else {
+        binary.to_string()
+    };
+    let program = plugin_runtime_dirs(name)?
+        .data_dir
+        .join("bin")
+        .join(filename);
+    let mut command = Vec::with_capacity(args.len() + 1);
+    command.push(program.to_string_lossy().into_owned());
+    command.extend(args);
     Ok(command)
 }
 
@@ -505,7 +517,7 @@ fn adapter_span(raw: &str, span: AdapterSpan, adapter: &str) -> Result<Span, Str
         || !raw.is_char_boundary(span.end)
     {
         return Err(format!(
-            "plugin runtime '{adapter}' returned an invalid byte span {}..{}",
+            "plugin '{adapter}' returned an invalid byte span {}..{}",
             span.start, span.end
         ));
     }
@@ -556,7 +568,7 @@ fn parse_category(value: &str, adapter: &str) -> Result<Category, String> {
         "pii" => Ok(Category::Pii),
         "other" => Ok(Category::Other),
         other => Err(format!(
-            "plugin runtime '{adapter}' returned unknown category: {other}"
+            "plugin '{adapter}' returned unknown category: {other}"
         )),
     }
 }
@@ -567,7 +579,7 @@ fn parse_confidence(value: &str, adapter: &str) -> Result<Confidence, String> {
         "medium" => Ok(Confidence::Medium),
         "low" => Ok(Confidence::Low),
         other => Err(format!(
-            "plugin runtime '{adapter}' returned unknown confidence: {other}"
+            "plugin '{adapter}' returned unknown confidence: {other}"
         )),
     }
 }
@@ -643,9 +655,9 @@ mod tests {
     }
 
     #[test]
-    fn adapter_manifest_rejects_builtin_field() {
+    fn plugin_manifest_rejects_invalid_binary() {
         let root = std::env::temp_dir().join(format!(
-            "pentect-builtin-adapter-reject-{}",
+            "pentect-invalid-binary-reject-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -653,40 +665,24 @@ mod tests {
         let path = root.join("plugin.toml");
         std::fs::write(
             &path,
-            r#"
-schema = "pentect.plugin.v1"
-name = "bad"
-
-[runtime]
-command = ["pentect-pii-ner"]
-builtin = "pii-ner"
-"#,
+            "schema = \"pentect.plugin.v1\"\nname = \"bad\"\nbinary = \"../tool\"\n",
         )
         .unwrap();
         let err = ModelAdapter::load(&path).unwrap_err();
         std::fs::remove_dir_all(root).unwrap();
-        assert!(err.contains("unknown field `builtin`"), "{err}");
+        assert!(err.contains("invalid binary name"), "{err}");
     }
 
     #[test]
-    fn plugin_adapter_requires_plugin_schema() {
+    fn plugin_manifest_requires_schema() {
         let root = std::env::temp_dir().join(format!(
-            "pentect-adapter-requires-schema-kind-{}",
+            "pentect-plugin-requires-schema-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("plugin.toml");
-        std::fs::write(
-            &path,
-            r#"
-name = "bad"
-
-[runtime]
-command = ["pentect-pii-ner"]
-"#,
-        )
-        .unwrap();
+        std::fs::write(&path, "name = \"bad\"\nbinary = \"tool\"\n").unwrap();
         let err = ModelAdapter::load(&path).unwrap_err();
         std::fs::remove_dir_all(root).unwrap();
         assert!(
@@ -696,16 +692,20 @@ command = ["pentect-pii-ner"]
     }
 
     #[test]
-    fn relative_adapter_program_is_resolved_from_adapter_dir() {
-        let cwd = Path::new("plugins/pii-ner");
-        assert_eq!(
-            adapter_program("./bin/pentect-pii-ner", cwd, "pii-ner"),
-            cwd.join("./bin/pentect-pii-ner")
-        );
-        assert_eq!(
-            adapter_program("pentect-pii-ner", cwd, "pii-ner"),
-            PathBuf::from("pentect-pii-ner")
-        );
+    fn binary_is_scoped_to_plugin_data() {
+        let command = binary_command("pii-ner", "pentect-pii-ner", Vec::new()).unwrap();
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join(".pentect")
+            .join("plugins-data")
+            .join("pii-ner")
+            .join("bin")
+            .join(if cfg!(windows) {
+                "pentect-pii-ner.exe"
+            } else {
+                "pentect-pii-ner"
+            });
+        assert_eq!(PathBuf::from(&command[0]), expected);
     }
 
     #[test]

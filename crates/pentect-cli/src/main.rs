@@ -279,18 +279,18 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
             .then(|| std::env::var_os(plugins::CONFIGS_ENV))
             .flatten()
     });
-    let adapter_env = match active_plugins.adapter_env_value() {
+    let binary_env = match active_plugins.binary_env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     }
     .or_else(|| {
         inherited_env_is_trusted
-            .then(|| std::env::var_os(plugins::ADAPTERS_ENV))
+            .then(|| std::env::var_os(plugins::BINARIES_ENV))
             .flatten()
     });
     let plugin_env = EnvVarGuard::set_optional([
         (plugins::CONFIGS_ENV, config_env),
-        (plugins::ADAPTERS_ENV, adapter_env),
+        (plugins::BINARIES_ENV, binary_env),
     ]);
     let mut agent_args = Vec::with_capacity(forward_args.len() + 1);
     agent_args.push(
@@ -508,13 +508,13 @@ fn cmd_read(args: &[String]) {
         Ok(value) => value,
         Err(e) => die(&e),
     };
-    let adapter_env = match active_plugins.adapter_env_value() {
+    let binary_env = match active_plugins.binary_env_value() {
         Ok(value) => value,
         Err(e) => die(&e),
     };
     let _plugin_env = EnvVarGuard::set_optional([
         (plugins::CONFIGS_ENV, config_env),
-        (plugins::ADAPTERS_ENV, adapter_env),
+        (plugins::BINARIES_ENV, binary_env),
     ]);
     let input = Input { kind, data };
     match pentect_agent::mask_input_into_active_memory_store(
@@ -3147,8 +3147,8 @@ fn agent_parent_env_guard(
     let config_env = active_plugins
         .config_env_value()
         .map_err(|e| e.to_string())?;
-    let adapter_env = active_plugins
-        .adapter_env_value()
+    let binary_env = active_plugins
+        .binary_env_value()
         .map_err(|e| e.to_string())?;
     Ok(EnvVarGuard::set_optional([
         (
@@ -3169,7 +3169,7 @@ fn agent_parent_env_guard(
             Some(OsString::from(if status_line_enabled { "1" } else { "0" })),
         ),
         (plugins::CONFIGS_ENV, config_env),
-        (plugins::ADAPTERS_ENV, adapter_env),
+        (plugins::BINARIES_ENV, binary_env),
     ]))
 }
 
@@ -3430,8 +3430,8 @@ fn apply_plugin_env(cmd: &mut Command, active: &plugins::ActivePlugins) -> Resul
     if let Some(value) = active.config_env_value().map_err(|e| e.to_string())? {
         cmd.env(plugins::CONFIGS_ENV, value);
     }
-    if let Some(value) = active.adapter_env_value().map_err(|e| e.to_string())? {
-        cmd.env(plugins::ADAPTERS_ENV, value);
+    if let Some(value) = active.binary_env_value().map_err(|e| e.to_string())? {
+        cmd.env(plugins::BINARIES_ENV, value);
     }
     Ok(())
 }

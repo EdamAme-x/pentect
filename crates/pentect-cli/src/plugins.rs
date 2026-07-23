@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 pub(crate) const CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
-pub(crate) const ADAPTERS_ENV: &str = "PENTECT_PLUGIN_ADAPTERS";
+pub(crate) const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
 pub(crate) const PLUGIN_MANIFEST_FILE: &str = "plugin.toml";
 
 const PENTECT_DIR: &str = ".pentect";
@@ -19,6 +19,7 @@ const PLUGIN_CONFIGS_DIR: &str = "configs";
 const OFFICIAL_PLUGINS_DIR: &str = "plugins";
 const DEFAULT_REMOTE_PLUGINS_BASE: &str =
     "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins";
+const DEFAULT_PLUGIN_REPOSITORY: &str = "EdamAme-x/pentect";
 const REMOTE_PLUGIN_TIMEOUT: Duration = Duration::from_secs(8);
 const REMOTE_PLUGIN_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_REMOTE_PLUGIN_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -26,7 +27,7 @@ const MAX_REMOTE_PLUGIN_FILE_BYTES: u64 = 2 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub(crate) struct ActivePlugins {
     config_paths: Vec<PathBuf>,
-    adapter_paths: Vec<PathBuf>,
+    binary_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -34,6 +35,7 @@ pub(crate) struct PluginSource {
     pub(crate) name: String,
     pub(crate) root: PathBuf,
     pub(crate) manifest_path: Option<PathBuf>,
+    pub(crate) repository: Option<String>,
 }
 
 impl ActivePlugins {
@@ -41,8 +43,8 @@ impl ActivePlugins {
         &self.config_paths
     }
 
-    pub(crate) fn adapter_paths(&self) -> &[PathBuf] {
-        &self.adapter_paths
+    pub(crate) fn binary_paths(&self) -> &[PathBuf] {
+        &self.binary_paths
     }
 
     pub(crate) fn config_env_value(&self) -> Result<Option<OsString>> {
@@ -54,13 +56,13 @@ impl ActivePlugins {
             .context("could not encode plugin config paths")
     }
 
-    pub(crate) fn adapter_env_value(&self) -> Result<Option<OsString>> {
-        if self.adapter_paths.is_empty() {
+    pub(crate) fn binary_env_value(&self) -> Result<Option<OsString>> {
+        if self.binary_paths.is_empty() {
             return Ok(None);
         }
-        std::env::join_paths(&self.adapter_paths)
+        std::env::join_paths(&self.binary_paths)
             .map(Some)
-            .context("could not encode plugin runtime paths")
+            .context("could not encode plugin binary manifests")
     }
 }
 
@@ -193,10 +195,10 @@ pub(crate) fn active_from_explicit_specs(
     specs: Vec<String>,
     create_named: bool,
 ) -> Result<ActivePlugins> {
-    let (config_paths, adapter_paths) = plugin_paths_for_specs(&specs, create_named)?;
+    let (config_paths, binary_paths) = plugin_paths_for_specs(&specs, create_named)?;
     Ok(ActivePlugins {
         config_paths,
-        adapter_paths,
+        binary_paths,
     })
 }
 
@@ -212,8 +214,8 @@ pub(crate) fn load_config_packs_from_specs(
     create_named: bool,
 ) -> Result<Vec<Pack>> {
     let active = active_from_specs(explicit_specs, create_named)?;
-    if !active.adapter_paths.is_empty() {
-        bail!("runtime plugins are only used by agent tool-boundary commands");
+    if !active.binary_paths.is_empty() {
+        bail!("executable plugins are only used by agent tool-boundary commands");
     }
     load_config_packs_from_active(&active)
 }
@@ -280,33 +282,33 @@ fn plugin_paths_for_specs(
     create_named: bool,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut configs = Vec::new();
-    let mut adapters = Vec::new();
+    let mut binaries = Vec::new();
     for spec in specs {
         if is_remote_spec(spec) {
             let found = plugin_paths_for_url(spec)?;
             configs.extend(found.config_paths);
-            adapters.extend(found.adapter_paths);
+            binaries.extend(found.binary_paths);
         } else if is_path_spec(spec) {
             let found = plugin_paths_for_path(Path::new(spec))?;
             configs.extend(found.config_paths);
-            adapters.extend(found.adapter_paths);
+            binaries.extend(found.binary_paths);
         } else {
             let found = plugin_paths_for_named(spec, create_named)?;
             configs.extend(found.config_paths);
-            adapters.extend(found.adapter_paths);
+            binaries.extend(found.binary_paths);
         }
     }
     configs.sort();
     configs.dedup();
-    adapters.sort();
-    adapters.dedup();
-    Ok((configs, adapters))
+    binaries.sort();
+    binaries.dedup();
+    Ok((configs, binaries))
 }
 
 #[derive(Debug, Default)]
 struct PluginPaths {
     config_paths: Vec<PathBuf>,
-    adapter_paths: Vec<PathBuf>,
+    binary_paths: Vec<PathBuf>,
 }
 
 fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
@@ -344,10 +346,9 @@ fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
             &official_dir
         };
         let mut message = format!(
-            "plugin '{name}' has no detectors or runtime; add them to '{}', or add '{}'/'{}'",
-            suggestion_dir.join(PLUGIN_MANIFEST_FILE).display(),
+            "plugin '{name}' has no detectors or binary; add '{}' or '{}'",
             suggestion_dir.join(PLUGIN_CONFIG_FILE).display(),
-            suggestion_dir.join(PLUGIN_CONFIGS_DIR).display()
+            suggestion_dir.join(PLUGIN_MANIFEST_FILE).display()
         );
         if let Some(error) = remote_error {
             message.push_str(&format!("; remote lookup failed: {error}"));
@@ -372,8 +373,8 @@ fn plugin_paths_for_url(url: &str) -> Result<PluginPaths> {
         let mut paths = PluginPaths::default();
         let file = fetch_remote_plugin_file(&normalized)?
             .ok_or_else(|| anyhow!("remote plugin file was not found: {normalized}"))?;
-        if normalized.rsplit('/').next() == Some(PLUGIN_MANIFEST_FILE) {
-            add_plugin_manifest_paths(&mut paths, &file)?;
+        if normalized.ends_with("/plugin.toml") {
+            add_manifest_paths(&file, &mut paths)?;
         } else {
             paths.config_paths.push(file);
         }
@@ -390,7 +391,7 @@ fn plugin_paths_for_path(path: &Path) -> Result<PluginPaths> {
         let mut paths = PluginPaths::default();
         let file = canonical_file(path)?;
         if is_plugin_manifest(path) {
-            add_plugin_manifest_paths(&mut paths, &file)?;
+            add_manifest_paths(&file, &mut paths)?;
         } else {
             paths.config_paths.push(file);
         }
@@ -407,7 +408,7 @@ fn plugin_paths_in_dir(dir: &Path) -> Result<PluginPaths> {
     let manifest = dir.join(PLUGIN_MANIFEST_FILE);
     if manifest.is_file() {
         let manifest = canonical_file(&manifest)?;
-        add_plugin_manifest_paths(&mut paths, &manifest)?;
+        add_manifest_paths(&manifest, &mut paths)?;
     }
     let config = dir.join(PLUGIN_CONFIG_FILE);
     if config.exists() {
@@ -418,7 +419,7 @@ fn plugin_paths_in_dir(dir: &Path) -> Result<PluginPaths> {
         paths.config_paths.extend(toml_files_in_dir(&configs_dir)?);
     }
     paths.config_paths.sort();
-    paths.adapter_paths.sort();
+    paths.binary_paths.sort();
     Ok(paths)
 }
 
@@ -426,38 +427,32 @@ fn is_plugin_manifest(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some(PLUGIN_MANIFEST_FILE)
 }
 
-fn add_plugin_manifest_paths(paths: &mut PluginPaths, path: &Path) -> Result<()> {
+fn add_manifest_paths(path: &Path, paths: &mut PluginPaths) -> Result<()> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("could not read plugin manifest '{}'", path.display()))?;
     let value = source
         .parse::<toml::Value>()
         .with_context(|| format!("could not parse plugin manifest '{}'", path.display()))?;
-    if value.get("schema").and_then(toml::Value::as_str) != Some("pentect.plugin.v1") {
-        bail!(
-            "plugin manifest '{}' requires schema = \"pentect.plugin.v1\"",
-            path.display()
-        );
-    }
-    let has_detectors = value
+    if value
         .get("detector")
         .and_then(toml::Value::as_array)
-        .is_some_and(|detectors| !detectors.is_empty());
-    let has_runtime = value
-        .get("runtime")
-        .and_then(toml::Value::as_table)
-        .is_some();
-    if has_detectors {
+        .is_some_and(|detectors| !detectors.is_empty())
+    {
         paths.config_paths.push(path.to_path_buf());
     }
-    if has_runtime {
-        paths.adapter_paths.push(path.to_path_buf());
+    if value
+        .get("binary")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|binary| !binary.is_empty())
+    {
+        paths.binary_paths.push(path.to_path_buf());
     }
     Ok(())
 }
 
 impl PluginPaths {
     fn is_empty(&self) -> bool {
-        self.config_paths.is_empty() && self.adapter_paths.is_empty()
+        self.config_paths.is_empty() && self.binary_paths.is_empty()
     }
 }
 
@@ -478,6 +473,7 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
     validate_plugin_spec(spec)?;
     if is_remote_spec(spec) {
         let normalized = normalize_github_plugin_url(spec)?;
+        let repository = github_repository(&normalized);
         let (base, manifest_url) = if normalized.ends_with("/plugin.toml") {
             let base = normalized
                 .strip_suffix("/plugin.toml")
@@ -493,11 +489,21 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
         };
         let manifest_path = fetch_remote_plugin_file(&manifest_url)?;
         let name = remote_plugin_name(&base)?;
-        let root = remote_plugin_cache_root(manifest_path.as_deref(), &base)?;
+        let root = manifest_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| {
+                remote_cache_file(&format!("{base}/config.toml"))
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            });
         return Ok(PluginSource {
             name,
             root,
             manifest_path,
+            repository,
         });
     }
     if is_path_spec(spec) {
@@ -529,13 +535,17 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
             name,
             root,
             manifest_path: manifest.is_file().then_some(manifest),
+            repository: None,
         });
     }
 
     validate_plugin_name(spec)?;
-    for root in [
-        plugins_root().join(spec),
-        official_plugins_root().join(spec),
+    for (root, repository) in [
+        (plugins_root().join(spec), None),
+        (
+            official_plugins_root().join(spec),
+            Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
+        ),
     ] {
         if root.is_dir() {
             let root = root
@@ -546,17 +556,34 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
                 name: spec.to_string(),
                 root,
                 manifest_path: manifest.is_file().then_some(manifest),
+                repository,
             });
         }
     }
     let base = format!("{DEFAULT_REMOTE_PLUGINS_BASE}/{spec}");
     let manifest_path = fetch_remote_plugin_file(&format!("{base}/{PLUGIN_MANIFEST_FILE}"))?;
-    let root = remote_plugin_cache_root(manifest_path.as_deref(), &base)?;
+    let root = manifest_path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            remote_cache_file(&format!("{base}/config.toml"))
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        });
     Ok(PluginSource {
         name: spec.to_string(),
         root,
         manifest_path,
+        repository: Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
     })
+}
+
+fn github_repository(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://raw.githubusercontent.com/")?;
+    let mut parts = rest.split('/');
+    Some(format!("{}/{}", parts.next()?, parts.next()?))
 }
 
 fn remote_plugin_name(base: &str) -> Result<String> {
@@ -636,19 +663,19 @@ fn remote_plugin_paths_for_base_url(base_url: &str) -> Result<PluginPaths> {
         result.map_err(|_| anyhow!("remote plugin fetch worker panicked"))?
     };
     if let Some(manifest) = join(manifest)? {
-        add_plugin_manifest_paths(&mut paths, &manifest)?;
+        add_manifest_paths(&manifest, &mut paths)?;
     }
     if let Some(config) = join(config)? {
         paths.config_paths.push(config);
     }
     if paths.is_empty() {
-        bail!("remote plugin has no inline detectors, [runtime], or config.toml: {base_url}");
+        bail!("remote plugin has no inline detectors, config.toml, or binary: {base_url}");
     }
     Ok(paths)
 }
 
 fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
-    let path = remote_cache_file(url)?;
+    let path = remote_cache_file(url);
     if cached_remote_plugin_is_fresh(&path) {
         return Ok(Some(path));
     }
@@ -681,7 +708,6 @@ fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create plugin cache '{}'", parent.display()))?;
-        restrict_cache_dir(parent)?;
     }
     std::fs::write(&path, &bytes)
         .with_context(|| format!("could not write plugin cache '{}'", path.display()))?;
@@ -697,21 +723,7 @@ fn cached_remote_plugin_is_fresh(path: &Path) -> bool {
         .is_ok_and(|age| age < REMOTE_PLUGIN_CACHE_TTL)
 }
 
-fn remote_plugin_cache_root(manifest_path: Option<&Path>, base: &str) -> Result<PathBuf> {
-    if let Some(parent) = manifest_path.and_then(Path::parent) {
-        return Ok(parent.to_path_buf());
-    }
-    remote_cache_file(&format!("{base}/config.toml"))?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("remote plugin cache path has no parent"))
-}
-
-fn remote_cache_file(url: &str) -> Result<PathBuf> {
-    Ok(remote_cache_file_under(&platform_plugin_cache_root()?, url))
-}
-
-fn remote_cache_file_under(root: &Path, url: &str) -> PathBuf {
+fn remote_cache_file(url: &str) -> PathBuf {
     let mut hash = Sha256::new();
     hash.update(url.as_bytes());
     let digest = hash.finalize();
@@ -721,39 +733,10 @@ fn remote_cache_file_under(root: &Path, url: &str) -> PathBuf {
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("plugin.toml");
-    root.join(PLUGINS_CACHE_DIR).join(hex).join(filename)
-}
-
-fn platform_plugin_cache_root() -> Result<PathBuf> {
-    #[cfg(windows)]
-    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(target_os = "macos")]
-    let root = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Library").join("Caches"));
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let root = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        });
-    root.map(|root| root.join("pentect"))
-        .ok_or_else(|| anyhow!("could not locate the user cache directory for remote plugins"))
-}
-
-fn restrict_cache_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("could not secure plugin cache '{}'", path.display()))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    PathBuf::from(PENTECT_DIR)
+        .join(PLUGINS_CACHE_DIR)
+        .join(hex)
+        .join(filename)
 }
 
 fn normalize_github_plugin_url(url: &str) -> Result<String> {
@@ -979,17 +962,13 @@ label = "INLINE_SECRET"
             "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins/pii-ner"
         );
         assert!(normalize_github_plugin_url("github:@owner/repo").is_err());
-    }
-
-    #[test]
-    fn remote_plugin_cache_is_rooted_outside_project_state() {
-        let trusted_root = Path::new("trusted-user-cache");
-        let path = remote_cache_file_under(
-            trusted_root,
-            "https://raw.githubusercontent.com/owner/repo/main/plugin.toml",
+        assert_eq!(
+            github_repository(
+                "https://raw.githubusercontent.com/owner/repo/main/plugins/example/plugin.toml"
+            )
+            .as_deref(),
+            Some("owner/repo")
         );
-        assert!(path.starts_with(trusted_root));
-        assert!(!path.starts_with(Path::new(PENTECT_DIR)));
     }
 
     #[test]
@@ -1010,11 +989,11 @@ label = "INLINE_SECRET"
         let _ = std::fs::remove_dir_all(&official);
 
         assert_eq!(paths.config_paths, vec![expected]);
-        assert!(paths.adapter_paths.is_empty());
+        assert!(paths.binary_paths.is_empty());
     }
 
     #[test]
-    fn official_openai_privacy_filter_has_runtime() {
+    fn official_openai_privacy_filter_has_binary() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
@@ -1022,69 +1001,65 @@ label = "INLINE_SECRET"
         let opf = repo.join("plugins").join("openai-privacy-filter");
         let active = active_from_explicit_specs(vec![opf.display().to_string()], true).unwrap();
         assert!(active.config_paths().is_empty());
-        assert_eq!(active.adapter_paths().len(), 1);
-        assert!(active.adapter_paths()[0].ends_with("plugin.toml"));
+        assert_eq!(active.binary_paths().len(), 1);
+        assert!(active.binary_paths()[0].ends_with("plugin.toml"));
     }
 
     #[test]
-    fn plugin_manifest_can_contain_detectors_and_runtime() {
+    fn directory_plugins_can_contain_configs_and_binaries() {
         let root =
             std::env::temp_dir().join(format!("pentect-plugin-paths-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("config.toml"), "").unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            r#"schema = "pentect.plugin.v1"
-name = "combined"
-
-[runtime]
-command = ["tool"]
-
-[[detector]]
-pattern = "secret-[0-9]+"
-label = "SECRET"
-"#,
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
         )
         .unwrap();
 
         let paths = plugin_paths_for_path(&root).unwrap();
-        let manifest = root.join("plugin.toml").canonicalize().unwrap();
-        assert_eq!(paths.config_paths, vec![manifest.clone()]);
-        assert_eq!(paths.adapter_paths, vec![manifest]);
+        assert_eq!(
+            paths.config_paths,
+            vec![root.join("config.toml").canonicalize().unwrap()]
+        );
+        assert_eq!(
+            paths.binary_paths,
+            vec![root.join("plugin.toml").canonicalize().unwrap()]
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn runtime_only_plugins_are_rejected_for_pack_only_loading() {
-        let root =
-            std::env::temp_dir().join(format!("pentect-runtime-only-{}", std::process::id()));
+    fn binary_only_plugins_are_rejected_for_pack_only_loading() {
+        let root = std::env::temp_dir().join(format!("pentect-binary-only-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nname = \"runtime-only\"\n[runtime]\ncommand = [\"tool\"]\n",
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
         )
         .unwrap();
 
         let err = match load_config_packs_from_specs(vec![root.display().to_string()], true) {
-            Ok(_) => panic!("expected runtime-only plugin to be rejected"),
+            Ok(_) => panic!("expected binary-only plugin to be rejected"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("runtime plugins"), "{err}");
+        assert!(err.contains("executable plugins"), "{err}");
 
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn active_loader_ignores_adapter_paths_for_config_packs() {
+    fn active_loader_ignores_binary_paths_for_config_packs() {
         let root =
-            std::env::temp_dir().join(format!("pentect-active-adapter-{}", std::process::id()));
+            std::env::temp_dir().join(format!("pentect-active-binary-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nname = \"active-runtime\"\n[runtime]\ncommand = [\"tool\"]\n",
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
         )
         .unwrap();
 
