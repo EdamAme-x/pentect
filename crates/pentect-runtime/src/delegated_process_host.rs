@@ -14,6 +14,9 @@ const CANDIDATE_SUFFIX: &str = ".json";
 const PERSISTENT_CANDIDATE_FILE: &str = "process-host-persistent.json";
 const ELECTION_ATTEMPTS: usize = 8;
 const ELECTION_RETRY: Duration = Duration::from_millis(10);
+// A second `pentect up` can observe the winner's candidate while its registry
+// file or health endpoint is still becoming visible on a loaded CI host.
+const PERSISTENT_STARTUP_ATTEMPTS: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ProcessHostEndpoint {
@@ -66,16 +69,19 @@ pub fn register_candidate(
 
 pub fn persistent_candidate_is_running(root: &Path) -> bool {
     let path = runtime_dir(root).join(PERSISTENT_CANDIDATE_FILE);
-    for attempt in 0..ELECTION_ATTEMPTS {
+    let mut observed = None;
+    for attempt in 0..PERSISTENT_STARTUP_ATTEMPTS {
         match read_endpoint(&path) {
             Ok(endpoint) if endpoint.persistent && endpoint_is_alive(&endpoint) => return true,
-            Ok(_) => break,
+            Ok(endpoint) => observed = Some(endpoint),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-            Err(_) if attempt + 1 < ELECTION_ATTEMPTS => std::thread::sleep(ELECTION_RETRY),
-            Err(_) => break,
+            Err(_) => observed = None,
+        }
+        if attempt + 1 < PERSISTENT_STARTUP_ATTEMPTS {
+            std::thread::sleep(ELECTION_RETRY);
         }
     }
-    let _ = std::fs::remove_file(path);
+    remove_candidate_if_unchanged(&path, observed.as_ref());
     false
 }
 
@@ -398,7 +404,9 @@ fn write_endpoint(path: &Path, endpoint: &ProcessHostEndpoint) -> Result<(), Str
 fn claim_persistent_candidate(path: &Path, endpoint: &ProcessHostEndpoint) -> Result<bool, String> {
     let bytes = serde_json::to_vec(endpoint)
         .map_err(|error| format!("could not serialize process host candidate: {error}"))?;
-    for attempt in 0..ELECTION_ATTEMPTS {
+    // The extra iteration lets this contender claim the path after it removed
+    // an unchanged, unresponsive candidate on the preceding iteration.
+    for attempt in 0..=(PERSISTENT_STARTUP_ATTEMPTS + 1) {
         match OpenOptions::new().create_new(true).write(true).open(path) {
             Ok(mut file) => {
                 restrict_file(&file);
@@ -413,19 +421,21 @@ fn claim_persistent_candidate(path: &Path, endpoint: &ProcessHostEndpoint) -> Re
                     Ok(current) if current.persistent && endpoint_is_alive(&current) => {
                         return Ok(false);
                     }
-                    Ok(_) => {
-                        let _ = std::fs::remove_file(path);
+                    Ok(current) if attempt == PERSISTENT_STARTUP_ATTEMPTS => {
+                        remove_candidate_if_unchanged(path, Some(&current));
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) if attempt + 1 < ELECTION_ATTEMPTS => {
-                        std::thread::sleep(ELECTION_RETRY);
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         continue;
                     }
-                    Err(_) => {
-                        let _ = std::fs::remove_file(path);
+                    Err(_) if attempt == PERSISTENT_STARTUP_ATTEMPTS => {
+                        remove_candidate_if_unchanged(path, None);
                     }
+                    Err(_) => {}
                 }
-                std::thread::sleep(ELECTION_RETRY);
+                if attempt < PERSISTENT_STARTUP_ATTEMPTS {
+                    std::thread::sleep(ELECTION_RETRY);
+                }
             }
             Err(error) => {
                 return Err(format!("could not claim persistent process host: {error}"));
@@ -433,6 +443,18 @@ fn claim_persistent_candidate(path: &Path, endpoint: &ProcessHostEndpoint) -> Re
         }
     }
     Err("could not claim persistent process host".to_string())
+}
+
+fn remove_candidate_if_unchanged(path: &Path, expected: Option<&ProcessHostEndpoint>) {
+    match (expected, read_endpoint(path)) {
+        (Some(expected), Ok(current)) if &current == expected => {
+            let _ = std::fs::remove_file(path);
+        }
+        (None, Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+            let _ = std::fs::remove_file(path);
+        }
+        _ => {}
+    }
 }
 
 fn read_endpoint(path: &Path) -> std::io::Result<ProcessHostEndpoint> {
