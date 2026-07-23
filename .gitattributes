@@ -1,0 +1,3 @@
+# Embedded upstream assets are verified byte-for-byte during the build. Never
+# let checkout-time line-ending conversion change their signed manifest bytes.
+crates/pentect-core/vendors/credsweeper-assets/** -text
