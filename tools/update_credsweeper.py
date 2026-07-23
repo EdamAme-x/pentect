@@ -100,6 +100,24 @@ def sync_assets(submodule: Path, destination: Path, tag: str, commit: str) -> No
     os.replace(temporary, manifest_path)
 
 
+def sync_runtime_requirements(submodule: Path, destination: Path) -> None:
+    source = submodule / "requirements.txt"
+    lines = source.read_text(encoding="utf-8").splitlines()
+    try:
+        start = lines.index("# Common requirements") + 1
+        end = lines.index("# Auxiliary packages for development")
+    except ValueError as error:
+        raise RuntimeError(
+            "CredSweeper requirements.txt no longer exposes the runtime dependency section"
+        ) from error
+    runtime = [line.rstrip() for line in lines[start:end]]
+    while runtime and not runtime[-1]:
+        runtime.pop()
+    temporary = destination.with_name(f".{destination.name}.pentect-update")
+    temporary.write_text("\n".join(runtime) + "\n", encoding="utf-8", newline="\n")
+    os.replace(temporary, destination)
+
+
 def validate(repo: Path) -> None:
     run("cargo", "check", "-p", "pentect-core", cwd=repo)
     run("cargo", "test", "-p", "pentect-core", "migration_coverage_is_explicit", cwd=repo)
@@ -139,6 +157,7 @@ def main() -> int:
     repo = Path(__file__).resolve().parents[1]
     submodule = repo / "crates/pentect-core/vendors/CredSweeper"
     assets = repo / "crates/pentect-core/vendors/credsweeper-assets"
+    runtime_requirements = repo / "tools/credsweeper-sidecar/runtime-requirements.txt"
     requested = latest_tag(repo) if args.version == "latest" else args.version
     if not TAG_RE.fullmatch(requested):
         raise RuntimeError(f"invalid CredSweeper version: {requested!r}")
@@ -172,6 +191,7 @@ def main() -> int:
     run("git", "checkout", "--detach", requested, cwd=submodule)
     commit = run("git", "rev-parse", "HEAD", cwd=submodule, capture=True)
     sync_assets(submodule, assets, requested, commit)
+    sync_runtime_requirements(submodule, runtime_requirements)
     if not args.skip_validation:
         validate(repo)
     print(f"CredSweeper {requested} synced at {commit}")
