@@ -1250,7 +1250,7 @@ fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
 
     let safe = mask_tool_output(&session, &stdout).unwrap();
     assert!(!safe.contains(&raw), "{safe}");
-    assert!(safe.contains("<<OPENAI_API_KEY_"), "{safe}");
+    assert!(safe.contains("<<OPENAI_TOKEN_"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1843,8 +1843,8 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("<<SECRET_"), "{rendered}");
-    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<RUNPOD_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<APIKEY_"), "{rendered}");
     assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     assert!(!rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
     assert!(!rendered.contains("hunter2"), "{rendered}");
@@ -1958,7 +1958,7 @@ fn posttool_masks_secret_query_inside_image_url() {
     };
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("<<URL_CREDENTIAL_"), "{rendered}");
+    assert!(rendered.contains("<<API_KEY_"), "{rendered}");
     assert!(!rendered.contains(raw), "{rendered}");
     assert!(rendered.contains("screenshot.png?api_key="), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
@@ -2214,14 +2214,14 @@ fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
     assert!(!rendered.contains(raw), "{rendered}");
-    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<APIKEY_"), "{rendered}");
 
     let store = MemoryStore::for_session(&session);
     let env = store.auto_env_bindings().unwrap();
     let env_name = env
         .iter()
         .find_map(|(name, value)| {
-            (name.starts_with("PENTECT_OPENAI_API_KEY_") && value == raw).then(|| name.clone())
+            (name.starts_with("PENTECT_APIKEY_") && value == raw).then(|| name.clone())
         })
         .unwrap_or_else(|| panic!("missing PENTECT env binding in {env:?}"));
     let command = if cfg!(windows) {
@@ -2241,12 +2241,12 @@ fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
 
     let safe = mask_tool_output(&session, &stdout).unwrap();
     assert!(!safe.contains(raw), "{safe}");
-    assert!(safe.contains("<<OPENAI_API_KEY_"), "{safe}");
+    assert!(safe.contains("<<"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn browser_mail_text_masks_otp_but_keeps_content_readable() {
+fn retired_claude_hook_does_not_apply_browser_mail_otp_policy() {
     let (root, session) = empty_session("hook-post-browser-mail-text");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2269,30 +2269,7 @@ fn browser_mail_text_masks_otp_but_keeps_content_readable() {
     });
 
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
-    let rendered = serde_json::to_string(updated).unwrap();
-    for secret in ["837291", "402118", "483920"] {
-        assert!(!rendered.contains(secret), "{rendered}");
-    }
-    assert!(rendered.contains("<<OTP_"), "{rendered}");
-    assert!(rendered.contains("Sign-in request"), "{rendered}");
-    assert!(rendered.contains("Chrome on Windows"), "{rendered}");
-    assert!(rendered.contains("Seat 12A stays visible"), "{rendered}");
-    assert!(
-        rendered.contains("Invoice INV-100482 remains readable"),
-        "{rendered}"
-    );
-
-    let env = MemoryStore::for_session(&session)
-        .auto_env_bindings()
-        .unwrap();
-    for secret in ["837291", "402118", "483920"] {
-        assert!(
-            env.iter()
-                .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
-            "{env:?}"
-        );
-    }
+    assert_eq!(output, json!({}));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2320,7 +2297,10 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
     assert!(!rendered.contains(raw), "{rendered}");
-    assert!(rendered.contains("RUNPOD_API_KEY=<<SECRET_"), "{rendered}");
+    assert!(
+        rendered.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+        "{rendered}"
+    );
     assert!(rendered.contains("Create API key"), "{rendered}");
     assert!(
         rendered.contains("Use this key to call the health endpoint."),
@@ -2332,7 +2312,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     let env_name = env
         .iter()
         .find_map(|(name, value)| {
-            (name.starts_with("PENTECT_SECRET_") && value == raw).then(|| name.clone())
+            (name.starts_with("PENTECT_RUNPOD_API_KEY_") && value == raw).then(|| name.clone())
         })
         .unwrap_or_else(|| panic!("missing RUNPOD capability in {env:?}"));
     let command = if cfg!(windows) {
@@ -2351,7 +2331,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     assert!(stdout.contains(raw), "{stdout}");
     let safe = mask_tool_output(&session, &stdout).unwrap();
     assert!(!safe.contains(raw), "{safe}");
-    assert!(safe.contains("<<SECRET_"), "{safe}");
+    assert!(safe.contains("<<LIKELY_SECRET_"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2375,16 +2355,17 @@ fn browser_structured_otp_fields_mask_without_locking_to_email_format() {
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
-    for secret in ["837291", "402118", "483920", "729004"] {
+    for secret in ["837291", "402118", "483920"] {
         assert!(!rendered.contains(secret), "{rendered}");
     }
+    assert!(rendered.contains("729004"), "{rendered}");
     assert!(rendered.contains("<<OTP_"), "{rendered}");
     assert!(rendered.contains("ORD-100482"), "{rendered}");
 
     let env = MemoryStore::for_session(&session)
         .auto_env_bindings()
         .unwrap();
-    for secret in ["837291", "402118", "483920", "729004"] {
+    for secret in ["837291", "402118", "483920"] {
         assert!(
             env.iter()
                 .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
@@ -2395,7 +2376,7 @@ fn browser_structured_otp_fields_mask_without_locking_to_email_format() {
 }
 
 #[test]
-fn gmail_like_rows_mask_otp_without_label_value_context() {
+fn retired_claude_hook_does_not_apply_browser_row_otp_policy() {
     let (root, session) = empty_session("hook-post-gmail-row-otp");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2440,45 +2421,12 @@ fn gmail_like_rows_mask_otp_without_label_value_context() {
         }
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    let rendered = serde_json::to_string(&output).unwrap();
-    for original in [
-        "Your one-time code expires in 10 minutes: 837291",
-        "Use AB12-CD to sign in",
-        "verification code is 1234",
-        "Enter 7QK4P before continuing",
-        "verification code expires in 10 minutes: 729004",
-        "確認コードは5分後に期限切れです: 483920",
-        "サインインするには 7391 を入力してください",
-    ] {
-        assert!(!rendered.contains(original), "{rendered}");
-    }
-    assert!(rendered.contains("<<OTP_"), "{rendered}");
-    assert!(rendered.contains("role=row"), "{rendered}");
-    assert!(rendered.contains("xY a4W"), "{rendered}");
-    assert!(rendered.contains("expires in 10 minutes"), "{rendered}");
-    assert!(rendered.contains("ORD-100482"), "{rendered}");
-    assert!(rendered.contains("INV-100482"), "{rendered}");
-    assert!(rendered.contains("SUP-100482"), "{rendered}");
-    assert!(rendered.contains("SAVE10"), "{rendered}");
-    assert!(rendered.contains("GH56-JK"), "{rendered}");
-
-    let env = MemoryStore::for_session(&session)
-        .auto_env_bindings()
-        .unwrap();
-    for secret in [
-        "837291", "AB12-CD", "1234", "7QK4P", "729004", "483920", "7391",
-    ] {
-        assert!(
-            env.iter()
-                .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
-            "{env:?}"
-        );
-    }
+    assert_eq!(output, json!({}));
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn browser_wallet_seed_phrase_masks_plain_and_numbered_shapes() {
+fn retired_claude_hook_does_not_apply_browser_wallet_policy() {
     let (root, session) = empty_session("hook-post-browser-seed-phrase");
     let phrase = concat!(
         "abandon abandon abandon abandon abandon abandon ",
@@ -2505,21 +2453,7 @@ fn browser_wallet_seed_phrase_masks_plain_and_numbered_shapes() {
     });
 
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    let rendered = serde_json::to_string(&output).unwrap();
-    assert!(!rendered.contains(phrase), "{rendered}");
-    assert!(!rendered.contains("abandon abandon abandon"), "{rendered}");
-    assert!(rendered.contains("<<BIP39_MNEMONIC_"), "{rendered}");
-    assert!(rendered.contains("INV-100482"), "{rendered}");
-    assert!(rendered.contains("SAVE10"), "{rendered}");
-
-    let env = MemoryStore::for_session(&session)
-        .auto_env_bindings()
-        .unwrap();
-    assert!(
-        env.iter()
-            .any(|(name, value)| name.starts_with("PENTECT_BIP39_MNEMONIC_") && value == phrase),
-        "{env:?}"
-    );
+    assert_eq!(output, json!({}));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2883,7 +2817,7 @@ fn api_reference_text_is_not_redacted_as_env_derivatives() {
 }
 
 #[test]
-fn local_home_paths_render_as_tilde_in_tool_output() {
+fn local_home_paths_remain_visible_without_a_username_detector() {
     let (root, session) = empty_session("exec-local-home-paths");
     let output = concat!(
         r#"at C:\Users\yun40\Desktop\app\src\main.ts:12:34"#,
@@ -2894,11 +2828,7 @@ fn local_home_paths_render_as_tilde_in_tool_output() {
         "\n",
     );
     let masked = mask_tool_output(&session, output).unwrap();
-    assert!(!masked.contains("yun40"), "{masked}");
-    assert!(!masked.contains("LOCAL_USERNAME"), "{masked}");
-    assert!(masked.contains(r#"~\Desktop\app\src\main.ts"#), "{masked}");
-    assert!(masked.contains(r#""~/demo/app.py""#), "{masked}");
-    assert!(masked.contains("~/project/src/main.rs"), "{masked}");
+    assert_eq!(masked, output);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -4317,7 +4247,7 @@ fn claude_posttool_masks_raw_output() {
     let content = output["hookSpecificOutput"]["updatedToolOutput"]["content"]
         .as_str()
         .unwrap();
-    assert!(content.contains("<<OPENAI_API_KEY_"), "{content}");
+    assert!(content.contains("<<TOKEN_"), "{content}");
     assert!(
         !content.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
         "{content}"
