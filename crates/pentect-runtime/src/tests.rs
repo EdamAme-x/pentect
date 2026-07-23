@@ -2331,7 +2331,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     assert!(stdout.contains(raw), "{stdout}");
     let safe = mask_tool_output(&session, &stdout).unwrap();
     assert!(!safe.contains(raw), "{safe}");
-    assert!(safe.contains("<<LIKELY_SECRET_"), "{safe}");
+    assert!(safe.contains("<<RUNPOD_API_KEY_"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 
