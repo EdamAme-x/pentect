@@ -117,6 +117,7 @@ fn load_or_create_identity_key(path: &Path) -> Result<[u8; 32], String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("could not create '{}': {e}", parent.display()))?;
         let key = random_identity_key()?;
+        let temporary = identity_key_temporary_path(path);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -124,17 +125,43 @@ fn load_or_create_identity_key(path: &Path) -> Result<[u8; 32], String> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        match options.open(path) {
+        match options.open(&temporary) {
             Ok(mut file) => {
-                restrict_identity_file(path)?;
-                file.write_all(&key)
-                    .and_then(|_| file.sync_data())
-                    .map_err(|e| format!("could not write '{}': {e}", path.display()))?;
-                return Ok(key);
+                if let Err(error) = file.write_all(&key).and_then(|_| file.sync_data()) {
+                    drop(file);
+                    remove_identity_temporary(&temporary);
+                    return Err(format!(
+                        "could not write '{}': {error}",
+                        temporary.display()
+                    ));
+                }
+                drop(file);
+                if let Err(error) = restrict_identity_file(&temporary) {
+                    remove_identity_temporary(&temporary);
+                    return Err(error);
+                }
+                let published = match fs::hard_link(&temporary, path) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(error) => {
+                        remove_identity_temporary(&temporary);
+                        return Err(format!(
+                            "could not publish identity key '{}': {error}",
+                            path.display()
+                        ));
+                    }
+                };
+                remove_identity_temporary(&temporary);
+                if published {
+                    restrict_identity_file(path)?;
+                    return Ok(key);
+                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
-                return Err(format!("could not create '{}': {error}", path.display()));
+                return Err(format!(
+                    "could not create temporary identity key '{}': {error}",
+                    temporary.display()
+                ));
             }
         }
     }
@@ -147,6 +174,20 @@ fn load_or_create_identity_key(path: &Path) -> Result<[u8; 32], String> {
             bytes.len()
         )
     })
+}
+
+fn identity_key_temporary_path(path: &Path) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!("key.tmp-{}-{nonce}", std::process::id()))
+}
+
+fn remove_identity_temporary(path: &Path) {
+    let _ = fs::remove_file(path);
+    #[cfg(windows)]
+    let _ = fs::remove_file(path.with_extension("acl-v1"));
 }
 
 #[cfg(windows)]
@@ -849,6 +890,31 @@ mod tests {
         std::fs::write(&invalid, b"short").unwrap();
         assert!(load_or_create_identity_key(&invalid).is_err());
         assert_eq!(std::fs::read(&invalid).unwrap(), b"short");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_identity_key_creation_publishes_one_complete_key() {
+        let root = temp_test_dir("concurrent-handle-identity-key");
+        let path = std::sync::Arc::new(root.join(IDENTITY_KEY_FILE));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let path = std::sync::Arc::clone(&path);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create_identity_key(&path).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let keys = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(keys.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(std::fs::read(path.as_ref()).unwrap().len(), 32);
         let _ = std::fs::remove_dir_all(root);
     }
 
