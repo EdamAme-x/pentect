@@ -1,6 +1,6 @@
 use crate::config;
 use crate::memory_store::MemoryStore;
-use crate::plugin_adapter::ModelAdapters;
+use crate::plugin_middleware::PluginMiddleware;
 #[cfg(test)]
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
@@ -35,7 +35,7 @@ pub(crate) struct ToolScalarInput {
 pub(crate) struct OutputMasker {
     store: MemoryStore,
     engine: &'static Engine,
-    model_adapters: ModelAdapters,
+    plugin_middleware: PluginMiddleware,
     environment_prefix: String,
     mode: OutputMaskerMode,
     pending: Recovery,
@@ -56,11 +56,18 @@ enum OutputMaskerMode {
 
 impl OutputMasker {
     pub(crate) fn new_shared(store: MemoryStore) -> Result<Self, String> {
+        Self::new_shared_with_plugins(store, PluginMiddleware::from_env()?)
+    }
+
+    pub(crate) fn new_shared_with_plugins(
+        store: MemoryStore,
+        plugin_middleware: PluginMiddleware,
+    ) -> Result<Self, String> {
         let key = store.session.key;
         Ok(Self {
             store,
             engine: pentect_engine()?,
-            model_adapters: ModelAdapters::from_env()?,
+            plugin_middleware,
             environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Shared,
             pending: Recovery::empty_for_key(&key),
@@ -75,7 +82,7 @@ impl OutputMasker {
         Ok(Self {
             store,
             engine: pentect_engine()?,
-            model_adapters: ModelAdapters::from_env()?,
+            plugin_middleware: PluginMiddleware::from_env()?,
             environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Deferred { remask_recoveries },
             pending: Recovery::empty_for_key(&key),
@@ -111,6 +118,21 @@ impl OutputMasker {
 
     pub(crate) fn mask_prompt_text(&mut self, text: &str) -> Result<String, String> {
         let remasked = self.remask_all(text)?;
+        let remasked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Ingest,
+            remasked,
+            &Kind::Text,
+        )?;
+        let remasked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Decode,
+            remasked,
+            &Kind::Text,
+        )?;
+        let remasked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Policy,
+            remasked,
+            &Kind::Text,
+        )?;
         // Prompt scalars are structurally text, but dotenv assignments can be
         // embedded in prose. Run the Env parser first so assignment labels are
         // preserved, then feed the result through the same cached text engine.
@@ -126,21 +148,44 @@ impl OutputMasker {
             },
         );
         self.track_mask_result("prompt", &env_result);
-        let mut result = mask_read_input_with_engine_adapters_and_identity(
+        let mut result = mask_read_input_with_engine_plugins_and_identity(
             self.store.session.key,
             self.store.session.identity_key,
             self.engine,
-            &self.model_adapters,
+            &self.plugin_middleware,
             Input {
                 kind: Kind::Text,
                 data: env_result.masked,
             },
         )?;
+        result.recovery.extend_same_key(env_result.recovery);
+        let initially_masked = std::mem::take(&mut result.masked);
+        let masked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Mask,
+            initially_masked,
+            &Kind::Text,
+        )?;
+        let masked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Output,
+            masked,
+            &Kind::Text,
+        )?;
+        let final_result = self.engine.mask(
+            Input {
+                kind: Kind::Text,
+                data: masked,
+            },
+            &Config {
+                disclose_length: false,
+                ..Config::new(self.store.session.key)
+                    .with_identity_key(self.store.session.identity_key)
+            },
+        );
+        merge_final_mask_result(&mut result, final_result);
         let masked_count = result
             .summary
             .masked_count
             .saturating_add(env_result.summary.masked_count);
-        result.recovery.extend_same_key(env_result.recovery);
         self.track_mask_result("prompt", &result);
         self.add_masked_count(masked_count);
         let masked = compact_local_home_paths(&result.masked);
@@ -157,7 +202,22 @@ impl OutputMasker {
     pub(crate) fn mask_text(&mut self, text: &str, kind: Kind) -> Result<String, String> {
         let redacted = redact_env_derivative_lines(text);
         let remasked = self.remask_all(&redacted)?;
-        let remasked = self.mask_model_adapter_input(remasked, kind.clone(), None)?;
+        let remasked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Ingest,
+            remasked,
+            &kind,
+        )?;
+        let remasked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Decode,
+            remasked,
+            &kind,
+        )?;
+        let remasked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Policy,
+            remasked,
+            &kind,
+        )?;
+        let remasked = self.mask_plugin_input(remasked, kind.clone(), None)?;
         let needs_text_pass = !matches!(kind, Kind::Text | Kind::ToolResult);
         let cfg = Config {
             disclose_length: false,
@@ -166,7 +226,7 @@ impl OutputMasker {
         let endpoint_unchanged = remasked.clone();
         let result = self.engine.mask(
             Input {
-                kind,
+                kind: kind.clone(),
                 data: remasked,
             },
             &cfg,
@@ -193,7 +253,29 @@ impl OutputMasker {
                 recovery.extend_same_key(text_result.recovery);
             }
         }
-        let masked = compact_local_home_paths(&masked);
+        let masked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Mask,
+            masked,
+            &kind,
+        )?;
+        let masked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Output,
+            masked,
+            &kind,
+        )?;
+        // Plugins may transform text, but they cannot bypass the deterministic
+        // engine: re-run it after the final plugin stage.
+        let final_result = self.engine.mask(
+            Input {
+                kind: kind.clone(),
+                data: masked,
+            },
+            &cfg,
+        );
+        self.track_mask_result("output", &final_result);
+        self.add_masked_count(final_result.summary.masked_count);
+        recovery.extend_same_key(final_result.recovery);
+        let masked = compact_local_home_paths(&final_result.masked);
         recovery.extend_same_key(env_alias_recovery(
             &masked,
             &self.store.session.key,
@@ -201,6 +283,33 @@ impl OutputMasker {
         ));
         self.record_recovery(recovery)?;
         Ok(masked)
+    }
+
+    fn run_text_plugins(
+        &self,
+        stage: crate::plugin_middleware::MiddlewareStage,
+        text: String,
+        kind: &Kind,
+    ) -> Result<String, String> {
+        let run = self.plugin_middleware.run(
+            stage,
+            serde_json::json!({
+                "kind": kind_name_for_plugin(kind),
+                "text": text,
+            }),
+            Some(serde_json::json!({"surface": "masking"})),
+        )?;
+        if run.stopped.is_some() {
+            return Err(format!(
+                "plugin blocked: {}",
+                run.message.unwrap_or_else(|| "masking blocked".to_string())
+            ));
+        }
+        run.payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "text plugin payload requires text".to_string())
     }
 
     pub(crate) fn mask_tool_result_scalar(
@@ -220,6 +329,21 @@ impl OutputMasker {
         let protected_assignments = self.mask_embedded_env_assignments(text)?;
         let redacted = redact_env_derivative_lines(&protected_assignments);
         let remasked = self.remask_all(&redacted)?;
+        let remasked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Ingest,
+            remasked,
+            &Kind::ToolResult,
+        )?;
+        let remasked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Decode,
+            remasked,
+            &Kind::ToolResult,
+        )?;
+        let remasked = self.run_text_plugins(
+            crate::plugin_middleware::MiddlewareStage::Policy,
+            remasked,
+            &Kind::ToolResult,
+        )?;
         let context = Context {
             path: path.map(str::to_string),
             key: key.map(str::to_string),
@@ -227,14 +351,28 @@ impl OutputMasker {
             kind: region_kind,
             format: Kind::ToolResult,
         };
-        let remasked =
-            self.mask_model_adapter_input(remasked, Kind::ToolResult, Some(context.clone()))?;
+        let remasked = self.mask_plugin_input(remasked, Kind::ToolResult, Some(context.clone()))?;
         let cfg = Config {
             disclose_length: false,
             ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         let endpoint_unchanged = remasked.clone();
-        let result = self.engine.mask_context(remasked, context, &cfg);
+        let mut result = self.engine.mask_context(remasked, context.clone(), &cfg);
+        if !masks_only_endpoint_metadata(&result) {
+            let initially_masked = std::mem::take(&mut result.masked);
+            let masked = self.run_text_plugins(
+                crate::plugin_middleware::MiddlewareStage::Mask,
+                initially_masked,
+                &Kind::ToolResult,
+            )?;
+            let masked = self.run_text_plugins(
+                crate::plugin_middleware::MiddlewareStage::Output,
+                masked,
+                &Kind::ToolResult,
+            )?;
+            let final_result = self.engine.mask_context(masked, context, &cfg);
+            merge_final_mask_result(&mut result, final_result);
+        }
         self.record_tool_result_mask_result(result, endpoint_unchanged)
     }
 
@@ -245,7 +383,7 @@ impl OutputMasker {
         if scalars.is_empty() {
             return Ok(Vec::new());
         }
-        if !self.model_adapters.is_empty()
+        if !self.plugin_middleware.is_empty()
             || scalars
                 .iter()
                 .any(|scalar| contains_sensitive_env_assignment(&scalar.text))
@@ -400,13 +538,13 @@ impl OutputMasker {
         }
     }
 
-    fn mask_model_adapter_input(
+    fn mask_plugin_input(
         &mut self,
         data: String,
         kind: Kind,
         context: Option<Context>,
     ) -> Result<String, String> {
-        if self.model_adapters.is_empty() {
+        if self.plugin_middleware.is_empty() {
             return Ok(data);
         }
         let unchanged = data.clone();
@@ -415,8 +553,9 @@ impl OutputMasker {
             ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         match self
-            .model_adapters
-            .mask(self.engine, Input { kind, data }, context.as_ref(), &cfg)?
+            .plugin_middleware
+            .detect_and_mask(self.engine, Input { kind, data }, context.as_ref(), &cfg)?
+            .result
         {
             Some(result) => self.record_mask_result(result),
             None => Ok(unchanged),
@@ -676,25 +815,25 @@ pub(crate) fn mask_read_input_with_engine_and_identity(
     engine: &Engine,
     input: Input,
 ) -> Result<MaskResult, String> {
-    let adapters = ModelAdapters::from_env()?;
-    mask_read_input_with_engine_adapters_and_identity(key, identity_key, engine, &adapters, input)
+    let plugins = PluginMiddleware::from_env()?;
+    mask_read_input_with_engine_plugins_and_identity(key, identity_key, engine, &plugins, input)
 }
 
-fn mask_read_input_with_engine_adapters_and_identity(
+fn mask_read_input_with_engine_plugins_and_identity(
     key: [u8; 32],
     identity_key: [u8; 32],
     engine: &Engine,
-    adapters: &ModelAdapters,
+    plugins: &PluginMiddleware,
     input: Input,
 ) -> Result<MaskResult, String> {
     let cfg = Config {
         disclose_length: false,
         ..Config::new(key).with_identity_key(identity_key)
     };
-    let mut adapter_count = 0usize;
-    let mut adapter_recovery = Recovery::empty_for_key(&key);
+    let mut plugin_count = 0usize;
+    let mut plugin_recovery = Recovery::empty_for_key(&key);
     let kind = input.kind;
-    let data = match adapters.mask(
+    let data = match plugins.detect_and_mask(
         engine,
         Input {
             kind: kind.clone(),
@@ -703,17 +842,52 @@ fn mask_read_input_with_engine_adapters_and_identity(
         None,
         &cfg,
     )? {
-        Some(result) => {
-            adapter_count = result.summary.masked_count;
-            adapter_recovery = result.recovery;
+        run if run.result.is_some() => {
+            let result = run.result.expect("result checked");
+            plugin_count = result.summary.masked_count;
+            plugin_recovery = result.recovery;
             result.masked
         }
-        None => input.data,
+        _ => input.data,
     };
     let mut result = engine.mask(Input { kind, data }, &cfg);
-    result.summary.masked_count = result.summary.masked_count.saturating_add(adapter_count);
-    result.recovery.extend_same_key(adapter_recovery);
+    result.summary.masked_count = result.summary.masked_count.saturating_add(plugin_count);
+    result.recovery.extend_same_key(plugin_recovery);
     Ok(result)
+}
+
+fn kind_name_for_plugin(kind: &Kind) -> &str {
+    match kind {
+        Kind::Text => "text",
+        Kind::Json => "json",
+        Kind::Ndjson => "ndjson",
+        Kind::ToolResult => "tool_result",
+        Kind::Env => "env",
+        Kind::Har => "har",
+        Kind::Curl => "curl",
+        Kind::Markdown => "markdown",
+        Kind::Other(_) => "other",
+    }
+}
+
+fn merge_final_mask_result(result: &mut MaskResult, final_result: MaskResult) {
+    result.masked = final_result.masked;
+    result.segments = final_result.segments;
+    result.items.extend(final_result.items);
+    result.summary.masked_count = result
+        .summary
+        .masked_count
+        .saturating_add(final_result.summary.masked_count);
+    result
+        .summary
+        .residual
+        .extend(final_result.summary.residual);
+    result
+        .summary
+        .collisions
+        .extend(final_result.summary.collisions);
+    result.summary.parser_fallback |= final_result.summary.parser_fallback;
+    result.recovery.extend_same_key(final_result.recovery);
 }
 
 fn choose_batch_delimiter(values: &[String]) -> Option<&'static str> {

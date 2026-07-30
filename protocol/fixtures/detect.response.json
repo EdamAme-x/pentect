@@ -1,0 +1,1 @@
+{"schema":"pentect.plugin.v1","id":2,"type":"result","action":"next","spans":[{"start":0,"end":5,"label":"PERSON","category":"pii","confidence":"high"}]}

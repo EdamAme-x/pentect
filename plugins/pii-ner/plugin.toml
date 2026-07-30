@@ -2,3 +2,12 @@ schema = "pentect.plugin.v1"
 name = "pii-ner"
 description = "Local ONNX PII named-entity recognition."
 binary = "pentect-pii-ner"
+repository = "EdamAme-x/pentect"
+
+[execution]
+mode = "persistent"
+
+[middleware]
+stages = ["detect"]
+permissions = ["input:read"]
+required = false

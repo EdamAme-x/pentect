@@ -2,3 +2,12 @@ schema = "pentect.plugin.v1"
 name = "openai-privacy-filter"
 description = "Local privacy-filter model."
 binary = "pentect-pii-ner"
+repository = "EdamAme-x/pentect"
+
+[execution]
+mode = "persistent"
+
+[middleware]
+stages = ["detect"]
+permissions = ["input:read"]
+required = false
