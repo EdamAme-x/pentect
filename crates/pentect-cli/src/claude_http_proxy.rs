@@ -815,23 +815,36 @@ fn redact_base64_image_block(block: &mut Value) -> Result<(), String> {
     let Some(encoded) = source.get("data").and_then(Value::as_str) else {
         return block_unscanned();
     };
-    let mut bytes = match data_encoding::BASE64.decode(encoded.as_bytes()) {
-        Ok(bytes) => bytes,
-        Err(_) => return block_unscanned(),
-    };
-    let redacted = pentect_agent::redact_image_bytes_into_active_memory_store(&bytes);
-    bytes.zeroize();
-    let Some(mut redacted) = redacted? else {
+    let Some(protected) = redact_inline_image_data(encoded)? else {
         // A successfully scanned image with no detected secret is unchanged.
         // The runtime returns an error for unscannable images when policy is
         // block, so `None` here is the clean-image result.
         return Ok(());
     };
-    let protected = data_encoding::BASE64.encode(&redacted);
-    redacted.zeroize();
     source["data"] = Value::String(protected);
     source["media_type"] = Value::String("image/png".to_string());
     Ok(())
+}
+
+pub(crate) fn redact_inline_image_data(encoded: &str) -> Result<Option<String>, String> {
+    let mut bytes = match data_encoding::BASE64.decode(encoded.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return if pentect_agent::unscanned_images_should_block()? {
+                Err("image blocked: image source could not be scanned".to_string())
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    let redacted = pentect_agent::redact_image_bytes_into_active_memory_store(&bytes);
+    bytes.zeroize();
+    let Some(mut redacted) = redacted? else {
+        return Ok(None);
+    };
+    let protected = data_encoding::BASE64.encode(&redacted);
+    redacted.zeroize();
+    Ok(Some(protected))
 }
 
 fn mask_tool_definition(
@@ -985,7 +998,7 @@ fn mask_document_block(
     }
 }
 
-fn inspect_base64_document(
+pub(crate) fn inspect_base64_document(
     source: &Value,
     tool_result: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
@@ -1036,7 +1049,7 @@ fn inspect_base64_document(
     enforce_unscanned_document_policy()
 }
 
-fn enforce_unscanned_document_policy() -> Result<(), String> {
+pub(crate) fn enforce_unscanned_document_policy() -> Result<(), String> {
     if pentect_agent::unscanned_images_should_block()? {
         Err("document blocked: document could not be scanned".to_string())
     } else {
@@ -1059,7 +1072,7 @@ fn mask_named_text(
     Ok(())
 }
 
-fn mask_string(
+pub(crate) fn mask_string(
     text: &mut String,
     tool_result: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
@@ -1305,7 +1318,7 @@ where
     }
 }
 
-fn resolve_tool_input_json<R>(
+pub(crate) fn resolve_tool_input_json<R>(
     input: &str,
     tool_name: Option<&str>,
     resolve: &mut R,
@@ -1409,7 +1422,7 @@ fn resolve_known_text(text: &str) -> Result<String, String> {
     }
 }
 
-fn request_scoped_resolver() -> impl FnMut(&str) -> Result<String, String> + Send {
+pub(crate) fn request_scoped_resolver() -> impl FnMut(&str) -> Result<String, String> + Send {
     let resolver = pentect_agent::ActiveMemoryStoreResolver::new();
     move |text| match &resolver {
         Ok(resolver) => match resolver.resolve_known_text(text) {

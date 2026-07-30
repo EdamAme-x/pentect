@@ -102,24 +102,6 @@ fn test_process_host_root(base: &std::path::Path) -> (&'static str, std::path::P
     ("XDG_RUNTIME_DIR", base.join("pentect"))
 }
 
-struct ScopedCodexExecProxy {
-    previous: Option<bool>,
-}
-
-impl ScopedCodexExecProxy {
-    fn set(value: bool) -> Self {
-        Self {
-            previous: set_codex_exec_proxy_test_override(Some(value)),
-        }
-    }
-}
-
-impl Drop for ScopedCodexExecProxy {
-    fn drop(&mut self) {
-        set_codex_exec_proxy_test_override(self.previous.take());
-    }
-}
-
 fn first_handle_with_prefix(text: &str, prefix: &str) -> String {
     let start = text.find(prefix).unwrap_or_else(|| panic!("{text}"));
     let end = text[start..]
@@ -720,7 +702,7 @@ fn bridge_error_preserves_phase_and_execution_state() {
 }
 
 #[test]
-fn prompt_masked_env_is_available_to_exec_proxy_without_visible_pentect_exec() {
+fn prompt_masked_env_is_available_to_direct_execution() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-exec-proxy");
 
@@ -2524,7 +2506,6 @@ fn env_like_tool_output_masks_all_env_values() {
 
 #[test]
 fn codex_posttool_does_not_block_already_masked_exec_output() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-already-masked");
     let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
     let masked = mask_tool_output(&session, output).unwrap();
@@ -2543,7 +2524,6 @@ fn codex_posttool_does_not_block_already_masked_exec_output() {
 
 #[test]
 fn codex_posttool_masks_raw_output_even_if_command_claims_pentect_exec() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-fake-pentect-exec");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2566,47 +2546,7 @@ fn codex_posttool_masks_raw_output_even_if_command_claims_pentect_exec() {
 }
 
 #[test]
-fn codex_posttool_skips_shell_block_when_exec_proxy_is_active() {
-    let _proxy = ScopedCodexExecProxy::set(true);
-    let (root, session) = empty_session("hook-post-codex-proxy-shell");
-    let input = json!({
-        "hook_event_name": "PostToolUse",
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "Get-Content .env"
-        },
-        "tool_response": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
-    });
-    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
-    assert_eq!(output, json!({}));
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn codex_posttool_still_blocks_mcp_when_exec_proxy_is_active() {
-    let _proxy = ScopedCodexExecProxy::set(true);
-    let (root, session) = empty_session("hook-post-codex-proxy-mcp");
-    let input = json!({
-        "hook_event_name": "PostToolUse",
-        "tool_name": "mcp__demo__read",
-        "tool_input": {},
-        "tool_response": {
-            "content": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
-        }
-    });
-    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
-    let rendered = serde_json::to_string(&output).unwrap();
-    assert_eq!(output["decision"], "block");
-    assert!(
-        !rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
-        "{rendered}"
-    );
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
 fn codex_posttool_does_not_block_short_exec_footer() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-legacy-footer");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2623,7 +2563,6 @@ fn codex_posttool_does_not_block_short_exec_footer() {
 
 #[test]
 fn codex_posttool_masks_pentect_exec_with_trailing_shell_escape() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-exec-trailing-shell");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2834,7 +2773,6 @@ fn local_home_paths_remain_visible_without_a_username_detector() {
 
 #[test]
 fn common_dev_tool_output_does_not_block_codex_posttool() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let cases = [
         (
             "next",
@@ -2890,7 +2828,6 @@ fn common_dev_tool_output_does_not_block_codex_posttool() {
 
 #[test]
 fn codex_posttool_does_not_block_vite_dev_server_banner() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-vite-banner");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -3832,53 +3769,6 @@ fn pretool_does_not_treat_mcp_command_fields_as_shell_commands() {
 }
 
 #[test]
-fn codex_app_server_proxy_wraps_shell_even_when_exec_proxy_is_enabled() {
-    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    std::env::set_var("PENTECT_CODEX_APP_SERVER_PROXY", "1");
-    struct Cleanup;
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            std::env::remove_var("PENTECT_CODEX_APP_SERVER_PROXY");
-        }
-    }
-    let _cleanup = Cleanup;
-    let _exec_proxy = ScopedCodexExecProxy::set(true);
-    let (root, session) = empty_session("hook-pre-codex-app-server");
-    let input = json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "Write-Output $env:OPENAI_API_KEY"
-        }
-    });
-    let output = handle_hook(HookProvider::Codex, DEFAULT_SESSION, &session, input).unwrap();
-    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
-        .unwrap();
-    assert!(command.starts_with("pentect exec "), "{command}");
-    assert_eq!(wrapped_payload(command), "Write-Output $env:OPENAI_API_KEY");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn codex_exec_proxy_keeps_plain_shell_unwrapped_without_app_server_proxy() {
-    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    std::env::remove_var("PENTECT_CODEX_APP_SERVER_PROXY");
-    let _exec_proxy = ScopedCodexExecProxy::set(true);
-    let (root, session) = empty_session("hook-pre-codex-exec-proxy");
-    let input = json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "echo hello"
-        }
-    });
-    let output = handle_hook(HookProvider::Codex, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output, json!({}));
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
 fn display_command_without_pentect_exec_wrapper_returns_shell_payload() {
     let wrapped =
         wrap_shell_command(HookProvider::Codex, DEFAULT_SESSION, "Bash", "cat .env").unwrap();
@@ -4267,7 +4157,6 @@ fn hook_text_masks_runpod_token_as_plain_text() {
 
 #[test]
 fn codex_posttool_blocks_with_masked_feedback() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -4289,7 +4178,6 @@ fn codex_posttool_blocks_with_masked_feedback() {
 
 #[test]
 fn codex_mcp_posttool_blocks_with_masked_feedback() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-mcp");
     let input = json!({
         "hook_event_name": "PostToolUse",

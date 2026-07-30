@@ -8,16 +8,6 @@ fn one_shot_process_host_is_removed_after_command_exit() {
 }
 
 #[test]
-fn agent_process_host_is_removed_after_command_exit() {
-    run_and_assert_clean(agent_args(), "agent", false);
-}
-
-#[test]
-fn agent_replaces_stale_inherited_memory_store() {
-    run_and_assert_clean(agent_args(), "stale-agent", true);
-}
-
-#[test]
 fn process_host_is_removed_after_argument_error() {
     run_and_assert_clean(vec!["exec", "--plugins"], "argument-error", false);
 }
@@ -105,26 +95,6 @@ fn configure_runtime_root(command: &mut Command, root: &std::path::Path) -> Path
 fn configure_runtime_root(command: &mut Command, root: &std::path::Path) -> PathBuf {
     command.env("XDG_RUNTIME_DIR", root);
     root.join("pentect")
-}
-
-#[cfg(windows)]
-fn agent_args() -> Vec<&'static str> {
-    vec![
-        "opencode",
-        "--tool",
-        "powershell.exe",
-        "--",
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Write-Output OK",
-    ]
-}
-
-#[cfg(not(windows))]
-fn agent_args() -> Vec<&'static str> {
-    vec!["opencode", "--tool", "sh", "--", "-c", "printf OK"]
 }
 
 #[cfg(windows)]

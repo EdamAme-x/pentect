@@ -1,0 +1,1005 @@
+//! OpenAI Responses API gateway used by unmodified Codex hosts.
+//!
+//! Model-bound prompts and local function outputs are masked on requests.
+//! Completed client function-call arguments are resolved on responses. Local
+//! UI and provider-generated text remain unchanged.
+
+use futures_util::{stream, Stream, StreamExt};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use hyper::body::{Bytes, Frame, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use serde_json::Value;
+use std::collections::{HashSet, VecDeque};
+use std::convert::Infallible;
+use std::error::Error;
+use std::io;
+use std::pin::Pin;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use tokio::net::TcpListener;
+use tokio::sync::{oneshot, Semaphore};
+use zeroize::Zeroize;
+
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PENDING_SSE_BYTES: usize = 8 * 1024 * 1024;
+const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local capability handles. Copy a handle byte-for-byte into a client function call when that function needs the represented value. Do not alter, expand, guess, or expose it. Pentect resolves handles only in completed client function-call arguments.";
+
+type ProxyBodyError = Box<dyn Error + Send + Sync>;
+type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
+type UpstreamByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+
+pub(crate) struct OpenAiHttpProxyGuard {
+    base_url: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl OpenAiHttpProxyGuard {
+    pub(crate) fn start(upstream: String) -> Result<Self, String> {
+        let upstream = parse_upstream_base(&upstream)?;
+        let auth = random_auth_token()?;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let thread_auth = auth.clone();
+        let thread = thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "could not start OpenAI HTTP gateway runtime: {error}"
+                    )));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                if let Err(error) = run_proxy(upstream, thread_auth, ready_tx, shutdown_rx).await {
+                    eprintln!("[pentect] OpenAI HTTP gateway stopped: {error}");
+                }
+            });
+        });
+        let base_url = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "OpenAI HTTP gateway did not start within 5 seconds".to_string())??;
+        Ok(Self {
+            base_url,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+impl Drop for OpenAiHttpProxyGuard {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.base_url.zeroize();
+    }
+}
+
+struct ProxyState {
+    upstream: reqwest::Url,
+    auth: String,
+    client: reqwest::Client,
+    masker: Arc<Mutex<pentect_agent::ActiveToolOutputMasker>>,
+    requests: Arc<Semaphore>,
+}
+
+impl Drop for ProxyState {
+    fn drop(&mut self) {
+        self.auth.zeroize();
+    }
+}
+
+async fn run_proxy(
+    upstream: reqwest::Url,
+    auth: String,
+    ready_tx: mpsc::Sender<Result<String, String>>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> Result<(), String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("could not bind OpenAI HTTP gateway: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("could not read OpenAI HTTP gateway address: {error}"))?;
+    let state = Arc::new(ProxyState {
+        upstream,
+        auth: auth.clone(),
+        client: build_upstream_client()?,
+        masker: Arc::new(Mutex::new(pentect_agent::ActiveToolOutputMasker::new()?)),
+        requests: Arc::new(Semaphore::new(32)),
+    });
+    let _ = ready_tx.send(Ok(format!("http://{address}/{auth}")));
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => break,
+            accepted = listener.accept() => {
+                let (socket, _) = accepted
+                    .map_err(|error| format!("OpenAI HTTP gateway accept failed: {error}"))?;
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(socket);
+                    let service = service_fn(move |request| {
+                        proxy_request(request, Arc::clone(&state))
+                    });
+                    if let Err(error) = http1::Builder::new()
+                        .max_buf_size(64 * 1024)
+                        .max_headers(128)
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        eprintln!("[pentect] OpenAI HTTP gateway connection failed: {error}");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_upstream_client() -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .tcp_nodelay(true);
+    if let Some(path) = std::env::var_os("PENTECT_OPENAI_CA_CERT") {
+        let pem = std::fs::read(&path)
+            .map_err(|_| "could not read PENTECT_OPENAI_CA_CERT".to_string())?;
+        let certificate = reqwest::Certificate::from_pem(&pem)
+            .map_err(|_| "PENTECT_OPENAI_CA_CERT is not a valid PEM certificate".to_string())?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .map_err(|_| "could not build OpenAI HTTP gateway client".to_string())
+}
+
+async fn proxy_request(
+    request: Request<Incoming>,
+    state: Arc<ProxyState>,
+) -> Result<Response<ProxyBody>, Infallible> {
+    let Ok(_permit) = Arc::clone(&state.requests).try_acquire_owned() else {
+        return Ok(text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Pentect gateway is busy",
+        ));
+    };
+    match proxy_request_inner(request, &state).await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            eprintln!("[pentect] OpenAI HTTP gateway request failed: {error}");
+            Ok(text_response(
+                StatusCode::BAD_GATEWAY,
+                "Pentect gateway request failed",
+            ))
+        }
+    }
+}
+
+async fn proxy_request_inner(
+    request: Request<Incoming>,
+    state: &ProxyState,
+) -> Result<Response<ProxyBody>, String> {
+    let request_path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    let Some(path_and_query) = authenticated_request_path(request_path, &state.auth) else {
+        return Ok(text_response(StatusCode::FORBIDDEN, "Forbidden"));
+    };
+    let responses_path = is_responses_path(path_and_query);
+    let method = request.method().clone();
+    let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
+    let headers = request.headers().clone();
+    let body = if responses_path {
+        let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
+            .collect()
+            .await
+        {
+            Ok(body) => body.to_bytes(),
+            Err(error) if error.is::<http_body_util::LengthLimitError>() => {
+                return Ok(text_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Request body too large",
+                ));
+            }
+            Err(error) => return Err(format!("could not read OpenAI request body: {error}")),
+        };
+        if body.is_empty() {
+            reqwest::Body::from(body)
+        } else {
+            let masker = Arc::clone(&state.masker);
+            let original = body.clone();
+            let protected = tokio::task::spawn_blocking(move || {
+                protect_openai_request_body(&original, &masker)
+            })
+            .await
+            .map_err(|_| "OpenAI request protection task failed".to_string())??;
+            reqwest::Body::from(protected)
+        }
+    } else {
+        let stream = request.into_body().into_data_stream().map(|chunk| {
+            chunk.map_err(|error| io::Error::new(io::ErrorKind::ConnectionAborted, error))
+        });
+        reqwest::Body::wrap_stream(stream)
+    };
+
+    let mut upstream_request = state.client.request(method, upstream_url);
+    let connection_headers = connection_named_headers(&headers);
+    for (name, value) in &headers {
+        if ((!responses_path && name == hyper::header::CONTENT_LENGTH)
+            || should_forward_request_header(name.as_str()))
+            && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
+        {
+            upstream_request = upstream_request.header(name, value);
+        }
+    }
+    let upstream = upstream_request
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| reqwest_error_message("could not reach OpenAI upstream", &error))?;
+    let status = upstream.status();
+    let response_headers = upstream.headers().clone();
+    if response_headers
+        .get(hyper::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+    {
+        return Err("OpenAI upstream returned an unsupported content encoding".to_string());
+    }
+    let is_event_stream = response_headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    let mut builder = Response::builder().status(status);
+    let connection_headers = connection_named_headers(&response_headers);
+    for (name, value) in &response_headers {
+        if should_forward_response_header(name.as_str())
+            && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
+        {
+            builder = builder.header(name, value);
+        }
+    }
+    if is_event_stream || !responses_path {
+        return builder
+            .body(streaming_response_body(
+                upstream,
+                status.is_success() && responses_path && is_event_stream,
+            ))
+            .map_err(|error| format!("could not build OpenAI streaming response: {error}"));
+    }
+
+    let Some(response_body) = read_response_capped(upstream).await? else {
+        return Ok(text_response(
+            StatusCode::BAD_GATEWAY,
+            "Upstream response body too large",
+        ));
+    };
+    let response_body = if status.is_success() {
+        match rewrite_openai_json_response(&response_body) {
+            Ok(rewritten) => Bytes::from(rewritten),
+            Err(error) => {
+                eprintln!("[pentect] OpenAI response restoration skipped: {error}");
+                response_body
+            }
+        }
+    } else {
+        response_body
+    };
+    builder
+        .body(full_body(response_body))
+        .map_err(|error| format!("could not build OpenAI response: {error}"))
+}
+
+fn protect_openai_request_body(
+    body: &Bytes,
+    masker: &Mutex<pentect_agent::ActiveToolOutputMasker>,
+) -> Result<Bytes, String> {
+    let mut value: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[pentect] OpenAI request protection skipped: invalid JSON: {error}");
+            return Ok(body.clone());
+        }
+    };
+    inject_handle_contract(&mut value);
+    let mut masker = masker
+        .lock()
+        .map_err(|_| "OpenAI request masker lock was poisoned".to_string())?;
+    if let Err(error) = mask_openai_request(&mut value, &mut masker) {
+        if error.starts_with("image blocked:") || error.starts_with("document blocked:") {
+            return Err(error);
+        }
+        eprintln!("[pentect] OpenAI request protection skipped: {error}");
+        return Ok(body.clone());
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| format!("could not encode protected OpenAI request: {error}"))
+}
+
+fn inject_handle_contract(value: &mut Value) {
+    match value.get_mut("instructions") {
+        Some(Value::String(instructions)) if !instructions.contains(HANDLE_CONTRACT) => {
+            let existing = std::mem::take(instructions);
+            *instructions = format!("{HANDLE_CONTRACT}\n\n{existing}");
+        }
+        Some(Value::Null) | None => {
+            value["instructions"] = Value::String(HANDLE_CONTRACT.to_string());
+        }
+        _ => {}
+    }
+}
+
+fn mask_openai_request(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    if let Some(Value::String(instructions)) = value.get_mut("instructions") {
+        mask_text(instructions, false, masker)?;
+    }
+    if let Some(input) = value.get_mut("input") {
+        mask_openai_input(input, false, masker)?;
+    }
+    if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            mask_schema_annotations(tool, masker)?;
+        }
+    }
+    Ok(())
+}
+
+fn mask_openai_input(
+    value: &mut Value,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    match value {
+        Value::String(text) => mask_text(text, tool_result, masker),
+        Value::Array(items) => {
+            for item in items {
+                mask_openai_input(item, tool_result, masker)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            let item_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            match item_type.as_str() {
+                "function_call_output" | "custom_tool_call_output" => {
+                    if let Some(output) = object.get_mut("output") {
+                        mask_openai_input(output, true, masker)?;
+                    }
+                }
+                "input_text" | "output_text" => {
+                    if let Some(Value::String(text)) = object.get_mut("text") {
+                        mask_text(text, tool_result, masker)?;
+                    }
+                }
+                "input_image" => inspect_openai_image(object)?,
+                "input_file" => inspect_openai_file(object, tool_result, masker)?,
+                "message" => {
+                    if let Some(content) = object.get_mut("content") {
+                        mask_openai_input(content, tool_result, masker)?;
+                    }
+                }
+                _ => {
+                    for key in ["content", "text", "output"] {
+                        if let Some(nested) = object.get_mut(key) {
+                            mask_openai_input(nested, tool_result, masker)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn inspect_openai_image(object: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    let Some(Value::String(url)) = object.get_mut("image_url") else {
+        return unscanned_image_policy();
+    };
+    let Some((metadata, encoded)) = url.split_once(',') else {
+        return unscanned_image_policy();
+    };
+    if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") {
+        return unscanned_image_policy();
+    }
+    if let Some(protected) = crate::claude_http_proxy::redact_inline_image_data(encoded)? {
+        *url = format!("data:image/png;base64,{protected}");
+    }
+    Ok(())
+}
+
+fn inspect_openai_file(
+    object: &mut serde_json::Map<String, Value>,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    if object.get("file_id").is_some() || object.get("file_url").is_some() {
+        return crate::claude_http_proxy::enforce_unscanned_document_policy();
+    }
+    let Some(Value::String(data)) = object.get("file_data") else {
+        return crate::claude_http_proxy::enforce_unscanned_document_policy();
+    };
+    let (media_type, encoded) = data
+        .split_once(',')
+        .and_then(|(metadata, encoded)| {
+            metadata
+                .strip_prefix("data:")
+                .and_then(|metadata| metadata.strip_suffix(";base64"))
+                .map(|media_type| (media_type, encoded))
+        })
+        .unwrap_or(("application/octet-stream", data.as_str()));
+    let source = serde_json::json!({
+        "type": "base64",
+        "media_type": media_type,
+        "data": encoded,
+    });
+    crate::claude_http_proxy::inspect_base64_document(&source, tool_result, masker)
+}
+
+fn unscanned_image_policy() -> Result<(), String> {
+    if pentect_agent::unscanned_images_should_block()? {
+        Err("image blocked: image source could not be scanned".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn mask_schema_annotations(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                mask_schema_annotations(value, masker)?;
+            }
+        }
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(
+                    key.as_str(),
+                    "description" | "title" | "default" | "const" | "examples" | "enum"
+                ) {
+                    mask_all_strings(value, false, masker)?;
+                } else {
+                    mask_schema_annotations(value, masker)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn mask_all_strings(
+    value: &mut Value,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    match value {
+        Value::String(text) => mask_text(text, tool_result, masker),
+        Value::Array(values) => {
+            for value in values {
+                mask_all_strings(value, tool_result, masker)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                mask_all_strings(value, tool_result, masker)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn mask_text(
+    text: &mut String,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    crate::claude_http_proxy::mask_string(text, tool_result, masker)
+}
+
+fn rewrite_openai_json_response(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("OpenAI response was not valid JSON: {error}"))?;
+    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+    rewrite_function_calls(&mut value, &mut resolve)?;
+    serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored OpenAI response: {error}"))
+}
+
+fn rewrite_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                rewrite_function_calls(value, resolve)?;
+            }
+        }
+        Value::Object(object) => {
+            let is_function_call = object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "function_call"
+                            | "response.function_call_arguments.done"
+                            | "response.custom_tool_call_input.done"
+                    )
+                });
+            if is_function_call {
+                let tool_name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        object
+                            .get("item")
+                            .and_then(|item| item.get("name"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                for key in ["arguments", "input"] {
+                    if let Some(Value::String(arguments)) = object.get_mut(key) {
+                        *arguments = crate::claude_http_proxy::resolve_tool_input_json(
+                            arguments,
+                            tool_name.as_deref(),
+                            resolve,
+                        )?;
+                    }
+                }
+            }
+            if let Some(item) = object.get_mut("item") {
+                rewrite_function_calls(item, resolve)?;
+            }
+            if let Some(response) = object.get_mut("response") {
+                rewrite_function_calls(response, resolve)?;
+            }
+            if let Some(output) = object.get_mut("output") {
+                rewrite_function_calls(output, resolve)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn read_response_capped(response: reqwest::Response) -> Result<Option<Bytes>, String> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| reqwest_error_message("could not read OpenAI response", &error))?;
+        if body.len().saturating_add(chunk.len()) > MAX_HTTP_BODY_BYTES {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(Bytes::from(body)))
+}
+
+struct StreamState {
+    upstream: UpstreamByteStream,
+    pending: Vec<u8>,
+    ready: VecDeque<Result<Frame<Bytes>, ProxyBodyError>>,
+    transform: bool,
+    finished: bool,
+}
+
+fn streaming_response_body(response: reqwest::Response, transform: bool) -> ProxyBody {
+    let state = StreamState {
+        upstream: Box::pin(response.bytes_stream()),
+        pending: Vec::new(),
+        ready: VecDeque::new(),
+        transform,
+        finished: false,
+    };
+    let stream = stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(item) = state.ready.pop_front() {
+                return Some((item, state));
+            }
+            if state.finished {
+                return None;
+            }
+            match state.upstream.next().await {
+                Some(Ok(chunk)) if !state.transform => {
+                    return Some((Ok(Frame::data(chunk)), state));
+                }
+                Some(Ok(chunk)) => {
+                    if state.pending.len().saturating_add(chunk.len()) > MAX_PENDING_SSE_BYTES {
+                        eprintln!(
+                            "[pentect] OpenAI SSE restoration disabled: event exceeded limit"
+                        );
+                        state.transform = false;
+                        let mut pending = std::mem::take(&mut state.pending);
+                        pending.extend_from_slice(&chunk);
+                        state.ready.push_back(Ok(Frame::data(Bytes::from(pending))));
+                        continue;
+                    }
+                    state.pending.extend_from_slice(&chunk);
+                    while let Some(end) = first_sse_block_end(&state.pending) {
+                        let block = state.pending.drain(..end).collect::<Vec<_>>();
+                        state
+                            .ready
+                            .push_back(Ok(Frame::data(rewrite_openai_sse_block(&block))));
+                    }
+                }
+                Some(Err(error)) => {
+                    state.finished = true;
+                    state.ready.push_back(Err(Box::new(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        reqwest_error_message("OpenAI upstream stream failed", &error),
+                    ))));
+                }
+                None => {
+                    state.finished = true;
+                    if !state.pending.is_empty() {
+                        state
+                            .ready
+                            .push_back(Ok(Frame::data(Bytes::from(std::mem::take(
+                                &mut state.pending,
+                            )))));
+                    }
+                }
+            }
+        }
+    });
+    StreamBody::new(stream).boxed_unsync()
+}
+
+fn rewrite_openai_sse_block(block: &[u8]) -> Bytes {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return Bytes::copy_from_slice(block);
+    };
+    let Some(data_line) = text.lines().find(|line| line.starts_with("data:")) else {
+        return Bytes::copy_from_slice(block);
+    };
+    let data = data_line
+        .strip_prefix("data:")
+        .unwrap_or_default()
+        .trim_start();
+    if data == "[DONE]" {
+        return Bytes::copy_from_slice(block);
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+        return Bytes::copy_from_slice(block);
+    };
+    if !contains_completed_function_call(&value) {
+        return Bytes::copy_from_slice(block);
+    }
+    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+    if let Err(error) = rewrite_function_calls(&mut value, &mut resolve) {
+        eprintln!("[pentect] OpenAI SSE restoration skipped: {error}");
+        return Bytes::copy_from_slice(block);
+    }
+    let Ok(encoded) = serde_json::to_string(&value) else {
+        return Bytes::copy_from_slice(block);
+    };
+    let mut replaced = false;
+    let mut output = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if !replaced && line.trim_end_matches(['\r', '\n']).starts_with("data:") {
+            output.push_str("data: ");
+            output.push_str(&encoded);
+            if line.ends_with("\r\n") {
+                output.push_str("\r\n");
+            } else if line.ends_with('\n') {
+                output.push('\n');
+            }
+            replaced = true;
+        } else {
+            output.push_str(line);
+        }
+    }
+    Bytes::from(output)
+}
+
+fn contains_completed_function_call(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(contains_completed_function_call),
+        Value::Object(object) => {
+            let is_completed_call =
+                object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            "function_call"
+                                | "response.function_call_arguments.done"
+                                | "response.custom_tool_call_input.done"
+                        )
+                    })
+                    && ["arguments", "input"]
+                        .into_iter()
+                        .any(|key| object.get(key).is_some_and(Value::is_string));
+            is_completed_call
+                || ["item", "response", "output"].into_iter().any(|key| {
+                    object
+                        .get(key)
+                        .is_some_and(contains_completed_function_call)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
+    let lf = bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|at| at + 2);
+    let crlf = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4);
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(end), None) | (None, Some(end)) => Some(end),
+        (None, None) => None,
+    }
+}
+
+fn is_responses_path(path_and_query: &str) -> bool {
+    path_and_query
+        .split('?')
+        .next()
+        .is_some_and(|path| path.ends_with("/responses"))
+}
+
+fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Option<&'a str> {
+    let prefix_len = token.len().checked_add(1)?;
+    let prefix = path_and_query.get(..prefix_len)?;
+    if !prefix.starts_with('/') || prefix.get(1..)? != token {
+        return None;
+    }
+    let rest = path_and_query.get(prefix_len..)?;
+    if rest.is_empty() {
+        Some("/")
+    } else if rest.starts_with('/') || rest.starts_with('?') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value.trim())
+        .map_err(|_| "OpenAI upstream is not a valid URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("OpenAI upstream must use http or https and include a host".to_string());
+    }
+    if url.fragment().is_some() || !url.username().is_empty() || url.password().is_some() {
+        return Err("OpenAI upstream must not contain credentials or a fragment".to_string());
+    }
+    if url.scheme() == "http"
+        && !url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+        && std::env::var("PENTECT_ALLOW_INSECURE_UPSTREAM").as_deref() != Ok("1")
+    {
+        return Err(
+            "remote OpenAI upstream must use https (set PENTECT_ALLOW_INSECURE_UPSTREAM=1 to override)"
+                .to_string(),
+        );
+    }
+    Ok(url)
+}
+
+fn join_upstream_url(base: &reqwest::Url, path_and_query: &str) -> Result<reqwest::Url, String> {
+    let (request_path, request_query) = path_and_query
+        .split_once('?')
+        .map_or((path_and_query, None), |(path, query)| (path, Some(query)));
+    let base_query = base.query().map(str::to_string);
+    let mut without_query = base.clone();
+    without_query.set_query(None);
+    let mut joined = without_query.as_str().trim_end_matches('/').to_string();
+    if !request_path.starts_with('/') {
+        joined.push('/');
+    }
+    joined.push_str(request_path);
+    let mut joined = reqwest::Url::parse(&joined)
+        .map_err(|_| "could not construct OpenAI upstream URL".to_string())?;
+    let query = match (base_query.as_deref(), request_query) {
+        (Some(base), Some(request)) if !base.is_empty() && !request.is_empty() => {
+            Some(format!("{base}&{request}"))
+        }
+        (Some(base), _) if !base.is_empty() => Some(base.to_string()),
+        (_, Some(request)) if !request.is_empty() => Some(request.to_string()),
+        _ => None,
+    };
+    joined.set_query(query.as_deref());
+    Ok(joined)
+}
+
+fn should_forward_request_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "accept-encoding"
+    )
+}
+
+fn should_forward_response_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "content-encoding"
+    )
+}
+
+fn connection_named_headers(headers: &hyper::HeaderMap) -> HashSet<String> {
+    headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn reqwest_error_message(context: &str, error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        format!("{context}: timed out")
+    } else if error.is_connect() {
+        format!("{context}: connection failed")
+    } else if error.is_body() || error.is_decode() {
+        format!("{context}: invalid response body")
+    } else {
+        format!("{context}: request failed")
+    }
+}
+
+fn full_body(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn text_response(status: StatusCode, text: &'static str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full_body(Bytes::from_static(text.as_bytes())))
+        .expect("static response is valid")
+}
+
+fn random_auth_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| format!("could not create OpenAI HTTP gateway token: {error}"))?;
+    let token = data_encoding::HEXLOWER.encode(&bytes);
+    bytes.zeroize();
+    Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_responses_endpoint_is_transformed() {
+        assert!(is_responses_path("/v1/responses"));
+        assert!(is_responses_path(
+            "/backend-api/codex/responses?stream=true"
+        ));
+        assert!(!is_responses_path("/v1/files"));
+        assert!(!is_responses_path("/v1/responses/input_tokens"));
+    }
+
+    #[test]
+    fn response_function_arguments_are_restored() {
+        let input = br#"{"output":[{"type":"function_call","name":"shell","arguments":"{\"command\":\"echo <<SECRET_0123456789abcdef>>\"}"}]}"#;
+        let mut value: Value = serde_json::from_slice(input).unwrap();
+        let mut resolve =
+            |text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "safe-secret-token"));
+        rewrite_function_calls(&mut value, &mut resolve).unwrap();
+        assert_eq!(
+            value["output"][0]["arguments"],
+            r#"{"command":"echo safe-secret-token"}"#
+        );
+    }
+
+    #[test]
+    fn response_text_is_not_resolved() {
+        let mut value = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "<<SECRET_0123456789abcdef>>"}]
+            }]
+        });
+        let mut resolve = |text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "secret"));
+        rewrite_function_calls(&mut value, &mut resolve).unwrap();
+        assert_eq!(
+            value["output"][0]["content"][0]["text"],
+            "<<SECRET_0123456789abcdef>>"
+        );
+    }
+
+    #[test]
+    fn authenticated_path_does_not_accept_prefix_confusion() {
+        assert_eq!(
+            authenticated_request_path("/token/v1/responses", "token"),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            authenticated_request_path("/tokenx/v1/responses", "token"),
+            None
+        );
+    }
+
+    #[test]
+    fn custom_upstream_keeps_base_path() {
+        let base = parse_upstream_base("https://gateway.example/openai/v1").unwrap();
+        let joined = join_upstream_url(&base, "/responses?stream=true").unwrap();
+        assert_eq!(
+            joined.as_str(),
+            "https://gateway.example/openai/v1/responses?stream=true"
+        );
+    }
+
+    #[test]
+    fn untouched_sse_framing_is_preserved() {
+        let input = b"event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\r\n\r\n";
+        assert_eq!(rewrite_openai_sse_block(input).as_ref(), input);
+    }
+}

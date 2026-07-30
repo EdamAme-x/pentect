@@ -48,8 +48,6 @@ use serde_json::{json, Value};
 use session::{checked_session_name, session_root, Session};
 use sha2::{Digest, Sha256};
 use shell::{next_shell_word, powershell_string_literal, powershell_word, shell_quote_unix};
-#[cfg(test)]
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -59,7 +57,6 @@ use zeroize::{Zeroize, Zeroizing};
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_SESSION: &str = "default";
 const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
-const PENTECT_CODEX_EXEC_PROXY_ENV: &str = "PENTECT_CODEX_EXEC_PROXY";
 const PENTECT_PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
 const PENTECT_PLUGIN_BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
 const LIVE_MASK_CHUNK_BYTES: usize = 64 * 1024;
@@ -82,11 +79,6 @@ pub fn agent_contract_instructions(environment_prefix: &str) -> String {
         ),
         environment_prefix = environment_prefix
     )
-}
-
-#[cfg(test)]
-thread_local! {
-    static CODEX_EXEC_PROXY_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
@@ -2436,9 +2428,6 @@ fn handle_hook_with_launch_requirement(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
-            if codex_exec_proxy_owns_shell_output(provider, tool_name) {
-                return Ok(json!({}));
-            }
             match mask_tool_text_output(provider, session, tool_response)? {
                 ToolTextOutput::Unchanged => Ok(json!({})),
                 ToolTextOutput::Updated(updated) => Ok(after_tool_output(provider, updated)),
@@ -2499,9 +2488,6 @@ fn handle_hook_lazy(
             let Some(tool_response) = hook_tool_result(&input) else {
                 return Ok(json!({}));
             };
-            if codex_exec_proxy_owns_shell_output(provider, tool_name) {
-                return Ok(json!({}));
-            }
             match mask_tool_text_output(provider, &session, tool_response)? {
                 ToolTextOutput::Unchanged => Ok(json!({})),
                 ToolTextOutput::Updated(updated) => Ok(after_tool_output(provider, updated)),
@@ -2534,9 +2520,6 @@ fn before_tool_updated_input(
         if let Some(command) = tool_input.get("command").and_then(Value::as_str) {
             if let Some(reason) = pentect_human_only_command_reason(command) {
                 return Err(reason);
-            }
-            if codex_exec_proxy_should_own_shell_tool(provider) {
-                return Ok((tool_input.clone(), false));
             }
             let command = canonical_hook_shell_command(command)?;
             let mut updated = tool_input.clone();
@@ -2584,9 +2567,6 @@ fn before_tool_updated_input_lazy(
             if let Some(reason) = pentect_human_only_command_reason(command) {
                 return Err(reason);
             }
-            if codex_exec_proxy_should_own_shell_tool(provider) {
-                return Ok((tool_input.clone(), false));
-            }
             let command = canonical_hook_shell_command(command)?;
             let mut updated = tool_input.clone();
             if let Some(object) = updated.as_object_mut() {
@@ -2608,37 +2588,6 @@ fn before_tool_updated_input_lazy(
 
 fn ensure_pentect_agent_launch(provider: HookProvider) -> Result<(), String> {
     ensure_pentect_agent_launch_required(provider, config::require_pentect_agent_by_config()?)
-}
-
-fn codex_exec_proxy_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(value) = CODEX_EXEC_PROXY_TEST_OVERRIDE.with(Cell::get) {
-        return value;
-    }
-    std::env::var(PENTECT_CODEX_EXEC_PROXY_ENV).is_ok_and(|value| value == "1")
-}
-
-fn codex_app_server_proxy_active() -> bool {
-    std::env::var("PENTECT_CODEX_APP_SERVER_PROXY").is_ok_and(|value| value == "1")
-}
-
-fn codex_exec_proxy_should_own_shell_tool(provider: HookProvider) -> bool {
-    provider == HookProvider::Codex
-        && codex_exec_proxy_enabled()
-        && !codex_app_server_proxy_active()
-}
-
-#[cfg(test)]
-fn set_codex_exec_proxy_test_override(value: Option<bool>) -> Option<bool> {
-    CODEX_EXEC_PROXY_TEST_OVERRIDE.with(|cell| {
-        let previous = cell.get();
-        cell.set(value);
-        previous
-    })
-}
-
-fn codex_exec_proxy_owns_shell_output(provider: HookProvider, tool_name: &str) -> bool {
-    codex_exec_proxy_should_own_shell_tool(provider) && is_shell_tool_name(tool_name)
 }
 
 fn is_shell_tool_name(tool_name: &str) -> bool {

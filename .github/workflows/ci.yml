@@ -22,8 +22,6 @@ jobs:
     outputs:
       detector: ${{ steps.filter.outputs.detector }}
       ocr: ${{ steps.filter.outputs.ocr }}
-      pi: ${{ steps.filter.outputs.pi }}
-      pty: ${{ steps.filter.outputs.pty }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -55,52 +53,6 @@ jobs:
               - 'rust-toolchain*'
               - 'crates/pentect-runtime/assets/ocr/**'
               - 'crates/pentect-runtime/src/image_ocr.rs'
-            pi:
-              - '.github/workflows/ci.yml'
-              - '.cargo/**'
-              - 'Cargo.lock'
-              - 'Cargo.toml'
-              - 'crates/*/Cargo.toml'
-              - 'rust-toolchain*'
-              - 'crates/pentect-cli/src/app_server_proxy.rs'
-              - 'crates/pentect-cli/src/exec_proxy.rs'
-              - 'crates/pentect-cli/src/headless.rs'
-              - 'crates/pentect-cli/src/main.rs'
-              - 'crates/pentect-runtime/**'
-              - 'integrations/pi/**'
-            pty:
-              - '.github/workflows/ci.yml'
-              - '.cargo/**'
-              - 'Cargo.lock'
-              - 'Cargo.toml'
-              - 'crates/*/Cargo.toml'
-              - 'rust-toolchain*'
-              - 'crates/pentect-cli/src/agent_integrations.rs'
-              - 'crates/pentect-cli/src/app_server_proxy.rs'
-              - 'crates/pentect-cli/src/doctor.rs'
-              - 'crates/pentect-cli/src/eval.rs'
-              - 'crates/pentect-cli/src/exec_proxy.rs'
-              - 'crates/pentect-cli/src/plugins.rs'
-              - 'crates/pentect-cli/src/plugins_cmd.rs'
-              - 'crates/pentect-cli/src/headless.rs'
-              - 'crates/pentect-cli/src/input.rs'
-              - 'crates/pentect-cli/src/main.rs'
-              - 'crates/pentect-cli/src/terminal.rs'
-              - 'crates/pentect-cli/tests/process_host.rs'
-              - 'crates/pentect-cli/tests/pty_dimensions.rs'
-              - 'crates/pentect-cli/tests/pty_unix.rs'
-              - 'crates/pentect-runtime/src/activity_log.rs'
-              - 'crates/pentect-runtime/src/config.rs'
-              - 'crates/pentect-runtime/src/delegated_process_host.rs'
-              - 'crates/pentect-runtime/src/plugin_adapter.rs'
-              - 'crates/pentect-runtime/src/file_pointer_manager.rs'
-              - 'crates/pentect-runtime/src/main.rs'
-              - 'crates/pentect-runtime/src/masking.rs'
-              - 'crates/pentect-runtime/src/memory_store.rs'
-              - 'crates/pentect-runtime/src/output_remask.rs'
-              - 'crates/pentect-runtime/src/session.rs'
-              - 'crates/pentect-runtime/src/shell.rs'
-              - 'crates/pentect-runtime/src/tests.rs'
 
   native-ocr:
     name: Native OCR (${{ matrix.os }})
@@ -117,45 +69,21 @@ jobs:
         if: needs.changes.result != 'success'
         run: exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: needs.changes.outputs.ocr == 'true' || needs.changes.outputs.pi == 'true' || needs.changes.outputs.pty == 'true'
+        if: needs.changes.outputs.ocr == 'true'
         with:
           submodules: recursive
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
-        if: needs.changes.outputs.ocr == 'true' || needs.changes.outputs.pi == 'true' || needs.changes.outputs.pty == 'true'
+        if: needs.changes.outputs.ocr == 'true'
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: needs.changes.outputs.ocr == 'true' || needs.changes.outputs.pi == 'true' || needs.changes.outputs.pty == 'true'
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: needs.changes.outputs.pi == 'true'
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: integrations/pi/package-lock.json
+        if: needs.changes.outputs.ocr == 'true'
       - name: Build native OCR
         if: needs.changes.outputs.ocr == 'true'
         run: cargo build -p pentect-cli --features ocr --locked
-      - name: Build Pi host
-        if: needs.changes.outputs.pi == 'true' && needs.changes.outputs.ocr != 'true'
-        run: cargo build -p pentect-cli --locked
-      - name: Test Pi extension
-        if: needs.changes.outputs.pi == 'true'
-        working-directory: integrations/pi
-        env:
-          PENTECT_E2E_BIN: ${{ github.workspace }}/target/debug/pentect
-        run: |
-          npm ci --ignore-scripts --no-audit --no-fund
-          npm run check
-          npm test
-      - name: Test Windows ConPTY
-        if: runner.os == 'Windows' && needs.changes.outputs.pty == 'true'
-        run: cargo test -p pentect-cli --no-default-features --test pty_dimensions --locked
-      - name: Test macOS PTY
-        if: runner.os == 'macOS' && needs.changes.outputs.pty == 'true'
-        run: cargo test -p pentect-cli --no-default-features --test pty_unix --locked
       - name: No native changes
-        if: needs.changes.outputs.ocr != 'true' && needs.changes.outputs.pi != 'true' && needs.changes.outputs.pty != 'true'
+        if: needs.changes.outputs.ocr != 'true'
         run: echo "No native changes"
 
   test:
@@ -186,23 +114,6 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-features
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: needs.changes.outputs.pi == 'true'
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: integrations/pi/package-lock.json
-      - name: Test Pi extension
-        if: needs.changes.outputs.pi == 'true'
-        working-directory: integrations/pi
-        env:
-          PENTECT_E2E_BIN: ${{ github.workspace }}/target/debug/pentect
-        run: |
-          cargo build -p pentect-cli --all-features --locked --manifest-path ../../Cargo.toml
-          npm ci --ignore-scripts --no-audit --no-fund
-          npm run check
-          npm test
-          npm pack --dry-run
       - name: Test (rules-only, no default features)
         if: needs.changes.outputs.detector == 'true'
         run: cargo test -p pentect-core --no-default-features
