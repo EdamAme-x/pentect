@@ -154,7 +154,7 @@ fn usage() {
          pentect doctor\n\
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
-         pentect plugins list|inspect|test|config|setup|update [NAME]\n\
+         pentect plugins list|search|inspect|test|config|setup|update [NAME]\n\
          pentect eval [--json]\n\
          pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\
          pentect view <HANDLE>\n\
@@ -193,7 +193,7 @@ fn help_text() -> &'static str {
         "  pentect doctor [--json]\n",
         "  pentect update [VERSION] [--check | --force]\n",
         "  pentect uninstall\n",
-        "  pentect plugins list|inspect|test [NAME|PATH] [--json]\n",
+        "  pentect plugins list|search|inspect|test [NAME|PATH] [--json]\n",
         "  pentect plugins config NAME|PATH [KEY=VALUE | --unset KEY]\n",
         "  pentect plugins setup NAME|PATH [--yes]\n",
         "  pentect plugins update NAME|PATH\n",

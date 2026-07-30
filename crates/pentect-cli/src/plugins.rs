@@ -33,7 +33,6 @@ pub(crate) struct ActivePlugins {
 #[derive(Debug)]
 pub(crate) struct PluginSource {
     pub(crate) name: String,
-    pub(crate) root: PathBuf,
     pub(crate) manifest_path: Option<PathBuf>,
     pub(crate) repository: Option<String>,
 }
@@ -489,19 +488,8 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
         };
         let manifest_path = fetch_remote_plugin_file(&manifest_url)?;
         let name = remote_plugin_name(&base)?;
-        let root = manifest_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| {
-                remote_cache_file(&format!("{base}/config.toml"))
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf()
-            });
         return Ok(PluginSource {
             name,
-            root,
             manifest_path,
             repository,
         });
@@ -533,7 +521,6 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
             .to_string();
         return Ok(PluginSource {
             name,
-            root,
             manifest_path: manifest.is_file().then_some(manifest),
             repository: None,
         });
@@ -554,7 +541,6 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
             let manifest = root.join(PLUGIN_MANIFEST_FILE);
             return Ok(PluginSource {
                 name: spec.to_string(),
-                root,
                 manifest_path: manifest.is_file().then_some(manifest),
                 repository,
             });
@@ -562,19 +548,8 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
     }
     let base = format!("{DEFAULT_REMOTE_PLUGINS_BASE}/{spec}");
     let manifest_path = fetch_remote_plugin_file(&format!("{base}/{PLUGIN_MANIFEST_FILE}"))?;
-    let root = manifest_path
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| {
-            remote_cache_file(&format!("{base}/config.toml"))
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        });
     Ok(PluginSource {
         name: spec.to_string(),
-        root,
         manifest_path,
         repository: Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
     })

@@ -35,3 +35,4 @@ docs/
 # Rust build output
 /target/
 **/target/
+/sdk/rust/pentect-plugin/Cargo.lock

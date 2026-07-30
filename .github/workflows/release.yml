@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      backfill_tag:
+        description: Existing release tag whose assets should receive attestations
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,7 +20,7 @@ concurrency:
 
 jobs:
   verify:
-    if: github.repository == 'EdamAme-x/pentect'
+    if: github.repository == 'EdamAme-x/pentect' && github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -58,6 +64,10 @@ jobs:
 
   build:
     needs: verify
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +122,12 @@ jobs:
           Copy-Item '${{ matrix.helper_binary }}' $helperDestination
           $helperHash = (Get-FileHash -Algorithm SHA256 $helperDestination).Hash.ToLowerInvariant()
           "$helperHash  $helperAsset" | Set-Content -NoNewline -Encoding utf8 "$helperDestination.sha256"
+      - name: Attest release binaries
+        uses: actions/attest-build-provenance@e3fe62ef559997059fe8380e7d2b4c909e2d65f4 # v3
+        with:
+          subject-path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.helper_asset }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.asset }}
@@ -145,3 +161,38 @@ jobs:
               --title "Pentect $GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY"
           fi
+
+  backfill-attestations:
+    if: github.repository == 'EdamAme-x/pentect' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download existing release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.backfill_tag }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir dist
+      - name: Verify published checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          for checksum in dist/*.sha256; do
+            (cd dist && sha256sum --check "$(basename "$checksum")")
+          done
+      - name: Attest existing executable assets
+        uses: actions/attest-build-provenance@e3fe62ef559997059fe8380e7d2b4c909e2d65f4 # v3
+        with:
+          subject-path: |
+            dist/pentect-linux-*
+            dist/pentect-macos-*
+            dist/pentect-windows-*
+            dist/pentect-pii-ner-*

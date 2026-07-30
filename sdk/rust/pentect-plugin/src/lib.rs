@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
 pub const SCHEMA: &str = "pentect.plugin.v1";
+#[doc(hidden)]
+pub use serde_json as __serde_json;
 
 pub fn config_path() -> Option<std::path::PathBuf> {
     std::env::var_os("PENTECT_PLUGIN_CONFIG").map(Into::into)
@@ -96,4 +98,38 @@ pub fn serve(
         stdout.flush()?;
     }
     Ok(())
+}
+
+/// Export Pentect's capability-sandboxed WebAssembly ABI for a typed handler.
+///
+/// The resulting module imports nothing from the host. Build the plugin as a
+/// `cdylib` for `wasm32-unknown-unknown` and use `execution.runtime = "wasm"`.
+#[macro_export]
+macro_rules! export_wasm_plugin {
+    ($handler:path) => {
+        #[no_mangle]
+        pub extern "C" fn pentect_alloc(len: i32) -> i32 {
+            let len = usize::try_from(len).expect("negative Pentect input length");
+            let mut input = Vec::<u8>::with_capacity(len);
+            let pointer = input.as_mut_ptr();
+            std::mem::forget(input);
+            pointer as i32
+        }
+
+        #[no_mangle]
+        pub unsafe extern "C" fn pentect_handle(pointer: i32, len: i32) -> i64 {
+            let pointer = usize::try_from(pointer).expect("negative Pentect input pointer");
+            let len = usize::try_from(len).expect("negative Pentect input length");
+            let input = unsafe { Vec::from_raw_parts(pointer as *mut u8, len, len) };
+            let request: $crate::Request = $crate::__serde_json::from_slice(&input)
+                .expect("invalid Pentect request");
+            let response = $handler(request).expect("Pentect plugin handler failed");
+            let mut output =
+                $crate::__serde_json::to_vec(&response).expect("Pentect response failed");
+            let output_pointer = output.as_mut_ptr() as u32;
+            let output_len = u32::try_from(output.len()).expect("Pentect response too large");
+            std::mem::forget(output);
+            (((output_pointer as u64) << 32) | output_len as u64) as i64
+        }
+    };
 }

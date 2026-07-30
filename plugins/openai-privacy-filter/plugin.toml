@@ -4,7 +4,11 @@ description = "Local privacy-filter model."
 binary = "pentect-pii-ner"
 repository = "EdamAme-x/pentect"
 
+[publisher]
+workflow = ".github/workflows/release.yml"
+
 [execution]
+runtime = "native"
 mode = "persistent"
 
 [middleware]

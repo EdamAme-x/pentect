@@ -1,10 +1,12 @@
 # Plugins
 
-Pentect plugins have two deliberately small forms:
+Pentect plugins have three deliberately small forms:
 
 1. A declarative `plugin.toml` can add regex detectors without executable code.
-2. A binary plugin is persistent middleware that exchanges one JSON object per
-   line over stdin/stdout.
+2. A sandboxed WebAssembly plugin uses a tiny request/response ABI and receives
+   no host imports.
+3. A publisher-trusted native plugin exchanges one JSON object per line over
+   stdin/stdout.
 
 The host owns ordering and the core masking pass. A plugin returns `next` to
 continue, or `stop` with `block`, `respond`, or `handled`. Plugins never call
@@ -18,7 +20,11 @@ name = "company-policy"
 binary = "company-policy"
 repository = "owner/company-policy"
 
+[publisher]
+workflow = ".github/workflows/release.yml"
+
 [execution]
+runtime = "native" # use "wasm" for capability-sandboxed modules
 mode = "persistent" # default; "oneshot" is supported
 timeout_ms = 10000
 max_input_bytes = 262144
@@ -54,13 +60,45 @@ response for each request and flush stdout. The canonical schema and fixtures
 live in [`protocol/`](../protocol/); small Rust, Python, TypeScript, and Go
 helpers live in [`sdk/`](../sdk/).
 
+For an untrusted third-party plugin, publish one portable `.wasm` asset:
+
+```toml
+binary = "company-policy.wasm"
+repository = "owner/company-policy"
+
+[publisher]
+workflow = ".github/workflows/release.yml"
+
+[execution]
+runtime = "wasm"
+mode = "oneshot"
+```
+
+The module exports `memory`, `pentect_alloc(i32) -> i32`, and
+`pentect_handle(i32, i32) -> i64`. The high 32 bits of the result are the
+response pointer and the low 32 bits are its byte length. The Rust SDK's
+`export_wasm_plugin!` macro implements this ABI. WebAssembly plugins cannot
+request `config:read` or `cache:write`; future host capabilities can be added
+without granting ambient filesystem or network access.
+
+Rust publishers set `crate-type = ["cdylib"]`, use
+`pentect_plugin::export_wasm_plugin!(handler)`, and build with:
+
+```text
+cargo build --release --target wasm32-unknown-unknown
+```
+
 ## Security and approval
 
-Executable plugins are trusted native code, not an OS sandbox. `pentect plugins
-setup` shows the binary source, middleware stages, permissions, postscripts,
-and destinations before approval. Approval records the manifest SHA-256;
-changing stages, permissions, or any other manifest content requires approval
-again.
+WebAssembly plugins run in a capability sandbox with a 64 MiB memory ceiling,
+fuel metering, and no filesystem, environment, process, or network imports.
+Native plugins remain an explicit publisher-trusted compatibility path for
+workloads such as local ONNX inference.
+
+`pentect plugins setup` shows the binary source, runtime, middleware stages,
+permissions, and destination before approval. Approval records the manifest
+SHA-256; changing any manifest content requires approval again. Arbitrary
+postscripts are rejected—setup output must be a release asset.
 
 Plugin children receive a cleared environment plus a small platform allowlist.
 They never inherit Pentect's memory-store credentials. `PENTECT_PLUGIN_CONFIG`
@@ -103,12 +141,21 @@ To keep an ordered project-wide list, add it to `.pentect/config.toml`:
 plugins = ["./plugins/company-policy", "company-identifiers"]
 ```
 
-Release binaries are selected by OS and architecture. Unsupported platforms
-produce an explicit missing-asset error rather than compiling on the user's
-machine. Postscripts are separately declared and approved. `plugins update`
-only replaces the release binary described by the exact approved manifest.
-Any manifest change—including its repository, command, stages, or
-permissions—must go through `plugins setup` again.
+Native release binaries are selected by OS and architecture; a WebAssembly
+asset is portable. Unsupported native platforms produce an explicit
+missing-asset error rather than compiling on the user's machine.
+
+Every executable asset must carry GitHub artifact provenance. Setup and update
+verify its Sigstore attestation with `gh`, pinning both the publisher repository
+and the workflow declared in `[publisher]`, and reject attestations from
+self-hosted runners. SHA-256 is still checked for transport corruption.
+`plugins update` only replaces the release binary described by the exact
+approved manifest.
+
+The registry shipped inside the signed Pentect binary is searchable with
+`pentect plugins search [QUERY]`. A plugin does not need to be in that registry:
+any publisher can distribute a `github:@owner/repository/path` spec, provided
+its executable assets carry matching provenance.
 
 The protocol exposes masking, provider, tool, file, finding, and reporting
 stages. HTTP provider requests, JSON responses, completed streaming and
