@@ -58,6 +58,10 @@ jobs:
 
   build:
     needs: verify
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +116,12 @@ jobs:
           Copy-Item '${{ matrix.helper_binary }}' $helperDestination
           $helperHash = (Get-FileHash -Algorithm SHA256 $helperDestination).Hash.ToLowerInvariant()
           "$helperHash  $helperAsset" | Set-Content -NoNewline -Encoding utf8 "$helperDestination.sha256"
+      - name: Attest release binaries
+        uses: actions/attest-build-provenance@e3fe62ef559997059fe8380e7d2b4c909e2d65f4 # v3
+        with:
+          subject-path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.helper_asset }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.asset }}

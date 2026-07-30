@@ -359,6 +359,8 @@ struct PluginBinary {
     id: String,
     path: PathBuf,
     command: Vec<String>,
+    runtime: PluginRuntime,
+    wasm: Option<WasmProgram>,
     stages: BTreeSet<MiddlewareStage>,
     permissions: BTreeSet<String>,
     required: bool,
@@ -397,9 +399,47 @@ impl PluginBinary {
             .binary
             .filter(|binary| !binary.trim().is_empty())
             .ok_or_else(|| format!("plugin '{name}' requires binary"))?;
+        let publisher_workflow = file
+            .publisher
+            .as_ref()
+            .and_then(|publisher| publisher.workflow.as_deref())
+            .ok_or_else(|| format!("plugin '{name}' requires [publisher] workflow"))?;
+        if !valid_plugin_publisher_workflow(publisher_workflow) {
+            return Err(format!(
+                "plugin '{name}' publisher workflow must be a repository-relative YAML path"
+            ));
+        }
         let execution = file.execution.unwrap_or_default();
+        let runtime = execution.runtime.unwrap_or_else(|| {
+            if binary.to_ascii_lowercase().ends_with(".wasm") {
+                PluginRuntime::Wasm
+            } else {
+                PluginRuntime::Native
+            }
+        });
         let mode = execution.mode.unwrap_or_default();
-        let command = binary_command(&name, &binary, execution.args)?;
+        if runtime == PluginRuntime::Wasm && mode != ExecutionMode::Oneshot {
+            return Err(format!(
+                "plugin '{name}' WebAssembly execution requires mode = \"oneshot\""
+            ));
+        }
+        if runtime == PluginRuntime::Wasm
+            && (!execution.args.is_empty()
+                || file.middleware.as_ref().is_some_and(|middleware| {
+                    middleware.permissions.contains(&"config:read".to_string())
+                        || middleware.permissions.contains(&"cache:write".to_string())
+                }))
+        {
+            return Err(format!(
+                "plugin '{name}' WebAssembly execution cannot use args, config:read, or cache:write"
+            ));
+        }
+        let command = binary_command(&name, &binary, execution.args, runtime)?;
+        let wasm = if runtime == PluginRuntime::Wasm {
+            Some(WasmProgram::load(Path::new(&command[0]), &name)?)
+        } else {
+            None
+        };
         let middleware = file
             .middleware
             .ok_or_else(|| format!("plugin '{name}' requires [middleware]"))?;
@@ -426,6 +466,8 @@ impl PluginBinary {
             id,
             path: path.to_path_buf(),
             command,
+            runtime,
+            wasm,
             stages,
             permissions,
             required: middleware.required,
@@ -467,9 +509,14 @@ impl PluginBinary {
         if encoded.len() > self.max_input_bytes {
             return Err(format!("plugin '{}' input exceeds its limit", self.name));
         }
-        let output = match self.mode {
-            ExecutionMode::Persistent => self.run_persistent(&encoded)?,
-            ExecutionMode::Oneshot => self.run_once(&encoded)?,
+        let output = match (self.runtime, self.mode) {
+            (PluginRuntime::Wasm, _) => self
+                .wasm
+                .as_ref()
+                .ok_or_else(|| format!("plugin '{}' has no WebAssembly program", self.name))?
+                .invoke(&encoded, self.timeout, self.max_output_bytes, &self.name)?,
+            (PluginRuntime::Native, ExecutionMode::Persistent) => self.run_persistent(&encoded)?,
+            (PluginRuntime::Native, ExecutionMode::Oneshot) => self.run_once(&encoded)?,
         };
         let response: PluginResponse = serde_json::from_slice(&output)
             .map_err(|error| format!("plugin '{}' returned invalid JSON: {error}", self.name))?;
@@ -563,6 +610,22 @@ impl PluginBinary {
     }
 }
 
+pub fn valid_plugin_publisher_workflow(workflow: &str) -> bool {
+    !workflow.is_empty()
+        && workflow.len() <= 256
+        && !workflow.starts_with('/')
+        && !workflow.contains('\\')
+        && workflow.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+        })
+        && (workflow.ends_with(".yml") || workflow.ends_with(".yaml"))
+}
+
 #[derive(Deserialize)]
 struct PluginApproval {
     schema: String,
@@ -608,6 +671,123 @@ fn verify_plugin_approval(
         ));
     }
     Ok(())
+}
+
+const WASM_ABI_ALLOC: &str = "pentect_alloc";
+const WASM_ABI_HANDLE: &str = "pentect_handle";
+const WASM_ABI_MEMORY: &str = "memory";
+const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+// Fuel is a short scheduling quantum. The wall clock below is authoritative.
+const WASM_FUEL_SLICE: u64 = 100_000;
+
+#[derive(Clone, Debug)]
+struct WasmProgram {
+    engine: wasmi::Engine,
+    module: wasmi::Module,
+}
+
+impl WasmProgram {
+    fn load(path: &Path, name: &str) -> Result<Self, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("could not read WebAssembly plugin '{name}': {error}"))?;
+        let mut config = wasmi::Config::default();
+        config.consume_fuel(true);
+        let engine = wasmi::Engine::new(&config);
+        let module = wasmi::Module::new(&engine, &bytes[..])
+            .map_err(|error| format!("plugin '{name}' WebAssembly is invalid: {error}"))?;
+        if module.imports().next().is_some() {
+            return Err(format!(
+                "plugin '{name}' WebAssembly must not import host capabilities"
+            ));
+        }
+        Ok(Self { engine, module })
+    }
+
+    fn invoke(
+        &self,
+        request: &[u8],
+        timeout: Duration,
+        max_output_bytes: usize,
+        name: &str,
+    ) -> Result<Vec<u8>, String> {
+        let limits = wasmi::StoreLimitsBuilder::new()
+            .memory_size(WASM_MAX_MEMORY_BYTES)
+            .memories(1)
+            .instances(1)
+            .tables(1)
+            .build();
+        let mut store = wasmi::Store::new(&self.engine, limits);
+        store.limiter(|limits| limits);
+        store
+            .set_fuel(WASM_FUEL_SLICE)
+            .map_err(|error| format!("plugin '{name}' fuel setup failed: {error}"))?;
+        let linker = wasmi::Linker::new(&self.engine);
+        let instance = linker
+            .instantiate_and_start(&mut store, &self.module)
+            .map_err(|error| format!("plugin '{name}' WebAssembly start failed: {error}"))?;
+        let memory = instance
+            .get_memory(&store, WASM_ABI_MEMORY)
+            .ok_or_else(|| format!("plugin '{name}' does not export memory"))?;
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&store, WASM_ABI_ALLOC)
+            .map_err(|_| format!("plugin '{name}' does not export {WASM_ABI_ALLOC}(i32) -> i32"))?;
+        let handle = instance
+            .get_typed_func::<(i32, i32), i64>(&store, WASM_ABI_HANDLE)
+            .map_err(|_| {
+                format!("plugin '{name}' does not export {WASM_ABI_HANDLE}(i32, i32) -> i64")
+            })?;
+        let request_len = i32::try_from(request.len())
+            .map_err(|_| format!("plugin '{name}' request is too large"))?;
+        let request_ptr = alloc
+            .call(&mut store, request_len)
+            .map_err(|error| format!("plugin '{name}' allocation failed: {error}"))?;
+        let request_offset = usize::try_from(request_ptr)
+            .map_err(|_| format!("plugin '{name}' returned an invalid allocation"))?;
+        memory
+            .write(&mut store, request_offset, request)
+            .map_err(|error| format!("plugin '{name}' request write failed: {error}"))?;
+        store
+            .set_fuel(WASM_FUEL_SLICE)
+            .map_err(|error| format!("plugin '{name}' fuel setup failed: {error}"))?;
+        let started = Instant::now();
+        let mut call = handle
+            .call_resumable(&mut store, (request_ptr, request_len))
+            .map_err(|error| format!("plugin '{name}' execution failed: {error}"))?;
+        let packed = loop {
+            match call {
+                wasmi::TypedResumableCall::Finished(value) => break value as u64,
+                wasmi::TypedResumableCall::HostTrap(trap) => {
+                    return Err(format!(
+                        "plugin '{name}' host call failed: {}",
+                        trap.host_error()
+                    ));
+                }
+                wasmi::TypedResumableCall::OutOfFuel(pending) => {
+                    if started.elapsed() >= timeout {
+                        return Err(format!("plugin '{name}' timed out"));
+                    }
+                    store
+                        .set_fuel(WASM_FUEL_SLICE.max(pending.required_fuel()))
+                        .map_err(|error| format!("plugin '{name}' fuel resume failed: {error}"))?;
+                    call = pending
+                        .resume(&mut store)
+                        .map_err(|error| format!("plugin '{name}' execution failed: {error}"))?;
+                }
+            }
+        };
+        let output_ptr = usize::try_from(packed >> 32)
+            .map_err(|_| format!("plugin '{name}' returned an invalid output pointer"))?;
+        let output_len = usize::try_from(packed & u64::from(u32::MAX))
+            .map_err(|_| format!("plugin '{name}' returned an invalid output length"))?;
+        if output_len > max_output_bytes {
+            return Err(format!("plugin '{name}' returned too much output"));
+        }
+        let mut output = vec![0; output_len];
+        memory
+            .read(&store, output_ptr, &mut output)
+            .map_err(|error| format!("plugin '{name}' output read failed: {error}"))?;
+        Ok(output)
+    }
 }
 
 struct PersistentProcess {
@@ -783,8 +963,15 @@ struct PluginFile {
     schema: Option<String>,
     name: Option<String>,
     binary: Option<String>,
+    publisher: Option<PublisherFile>,
     execution: Option<ExecutionFile>,
     middleware: Option<MiddlewareFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublisherFile {
+    workflow: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -792,6 +979,7 @@ struct PluginFile {
 struct ExecutionFile {
     #[serde(default)]
     args: Vec<String>,
+    runtime: Option<PluginRuntime>,
     mode: Option<ExecutionMode>,
     timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
@@ -805,6 +993,13 @@ enum ExecutionMode {
     #[default]
     Persistent,
     Oneshot,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum PluginRuntime {
+    Native,
+    Wasm,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1151,7 +1346,12 @@ fn restrict_plugin_directory(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn binary_command(name: &str, binary: &str, args: Vec<String>) -> Result<Vec<String>, String> {
+fn binary_command(
+    name: &str,
+    binary: &str,
+    args: Vec<String>,
+    runtime: PluginRuntime,
+) -> Result<Vec<String>, String> {
     if binary.is_empty()
         || binary.len() > 128
         || binary.contains('/')
@@ -1163,7 +1363,10 @@ fn binary_command(name: &str, binary: &str, args: Vec<String>) -> Result<Vec<Str
     {
         return Err(format!("plugin '{name}' has an invalid binary name"));
     }
-    let filename = if cfg!(windows) && !binary.to_ascii_lowercase().ends_with(".exe") {
+    let filename = if runtime == PluginRuntime::Native
+        && cfg!(windows)
+        && !binary.to_ascii_lowercase().ends_with(".exe")
+    {
         format!("{binary}.exe")
     } else {
         binary.to_string()
@@ -1324,6 +1527,8 @@ mod tests {
             id: "fixture".to_string(),
             path: std::env::current_dir().unwrap().join("plugin.toml"),
             command: persistent_fixture_command(),
+            runtime: PluginRuntime::Native,
+            wasm: None,
             stages: BTreeSet::from([MiddlewareStage::ProviderRequest]),
             permissions: BTreeSet::from(["input:read".to_string(), "payload:write".to_string()]),
             required: true,
@@ -1347,6 +1552,63 @@ mod tests {
                 .unwrap();
             assert_eq!(run.payload["sequence"], sequence);
         }
+    }
+
+    #[test]
+    fn wasm_plugin_runs_without_host_capabilities() {
+        let output = br#"{"schema":"pentect.plugin.v1","id":7,"type":"result","action":"next"}"#;
+        let packed = ((2048_u64) << 32) | output.len() as u64;
+        let wat = format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 2048) "{}")
+                (func (export "pentect_alloc") (param i32) (result i32)
+                    (i32.const 1024))
+                (func (export "pentect_handle") (param i32 i32) (result i64)
+                    (i64.const {packed}))
+            )"#,
+            String::from_utf8_lossy(output).replace('"', "\\22")
+        );
+        let bytes = wat::parse_str(wat).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "pentect-plugin-wasm-{}-{}.wasm",
+            std::process::id(),
+            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let program = WasmProgram::load(&path, "fixture").unwrap();
+        let result = program
+            .invoke(b"{}", Duration::from_secs(1), 4096, "fixture")
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(result, output);
+    }
+
+    #[test]
+    fn wasm_plugin_enforces_wall_clock_timeout() {
+        let bytes = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "pentect_alloc") (param i32) (result i32)
+                    (i32.const 1024))
+                (func (export "pentect_handle") (param i32 i32) (result i64)
+                    (loop (br 0))
+                    (i64.const 0))
+            )"#,
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "pentect-plugin-wasm-timeout-{}-{}.wasm",
+            std::process::id(),
+            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let program = WasmProgram::load(&path, "fixture").unwrap();
+        let error = program
+            .invoke(b"{}", Duration::from_millis(1), 4096, "fixture")
+            .unwrap_err();
+        let _ = std::fs::remove_file(path);
+        assert!(error.contains("timed out"), "{error}");
     }
 
     #[cfg(windows)]

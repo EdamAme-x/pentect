@@ -21,7 +21,7 @@ TODO
 - [ ] 止めた後になんか重なる
 
 - [x] pluginsの責務・配布・権限モデルを再設計する
-- [ ] plugin registry・署名付きpublisher identity・OS sandboxを検討する
+- [x] plugin registry・署名付きpublisher identity・capability sandbox
 - [ ] local llm mask exts
 - [ ] app, http host
 - [ ] approval ui?

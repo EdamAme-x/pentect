@@ -44,6 +44,7 @@ zeroize = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 jiff = { workspace = true }
+wasmi = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
@@ -84,3 +85,4 @@ rten = { workspace = true, optional = true }
 
 [dev-dependencies]
 rxing = { workspace = true, features = ["encoders"] }
+wat = "1"

@@ -154,7 +154,7 @@ fn usage() {
          pentect doctor\n\
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
-         pentect plugins list|inspect|test|config|setup|update [NAME]\n\
+         pentect plugins list|search|inspect|test|config|setup|update [NAME]\n\
          pentect eval [--json]\n\
          pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\
          pentect view <HANDLE>\n\
@@ -193,7 +193,7 @@ fn help_text() -> &'static str {
         "  pentect doctor [--json]\n",
         "  pentect update [VERSION] [--check | --force]\n",
         "  pentect uninstall\n",
-        "  pentect plugins list|inspect|test [NAME|PATH] [--json]\n",
+        "  pentect plugins list|search|inspect|test [NAME|PATH] [--json]\n",
         "  pentect plugins config NAME|PATH [KEY=VALUE | --unset KEY]\n",
         "  pentect plugins setup NAME|PATH [--yes]\n",
         "  pentect plugins update NAME|PATH\n",
@@ -214,7 +214,7 @@ fn help_text() -> &'static str {
         "doctor: readiness\n",
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
-        "plugins: list, inspect, test, config, setup, update\n",
+        "plugins: list, search, inspect, test, config, setup, update\n",
         "codex-app: launch Codex App through the Responses API gateway\n",
         "claude-app: launch Claude Desktop through the Chat and Anthropic gateways\n",
         "eval: precision, recall\n",

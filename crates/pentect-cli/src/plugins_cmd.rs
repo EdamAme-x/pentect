@@ -4,15 +4,10 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
 
 const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
 const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
-const PLUGIN_NAME_ENV: &str = "PENTECT_PLUGIN_NAME";
-const PLUGIN_DATA_DIR_ENV: &str = "PENTECT_PLUGIN_DATA_DIR";
-const PLUGIN_CACHE_DIR_ENV: &str = "PENTECT_PLUGIN_CACHE_DIR";
-const PLUGIN_CONFIG_ENV: &str = "PENTECT_PLUGIN_CONFIG";
 
 pub(crate) fn cmd_plugins(args: &[String]) {
     let opts = match PluginCmd::parse(args) {
@@ -21,6 +16,7 @@ pub(crate) fn cmd_plugins(args: &[String]) {
     };
     let result = match opts.action {
         Action::List => list_plugins(opts.json),
+        Action::Search { query } => search_plugins(query.as_deref(), opts.json),
         Action::Inspect { spec } => inspect_plugin(&spec, opts.json),
         Action::Test { spec } => test_plugin(&spec, opts.json),
         Action::Config { spec, change } => config_plugin(&spec, change, opts.json),
@@ -41,6 +37,7 @@ struct PluginCmd {
 #[derive(Debug)]
 enum Action {
     List,
+    Search { query: Option<String> },
     Inspect { spec: String },
     Test { spec: String },
     Config { spec: String, change: ConfigChange },
@@ -58,7 +55,7 @@ enum ConfigChange {
 impl PluginCmd {
     fn parse(args: &[String]) -> Result<Self, String> {
         let Some(action) = args.get(2).map(String::as_str) else {
-            return Err("plugins list|inspect|test|config|setup|update".to_string());
+            return Err("plugins list|search|inspect|test|config|setup|update".to_string());
         };
         let mut json = false;
         let mut approved = false;
@@ -88,6 +85,15 @@ impl PluginCmd {
                     return Err("plugins list".to_string());
                 }
                 Action::List
+            }
+            "search" => {
+                reject_action_flags(approved, unset.as_deref())?;
+                let query = match values.as_slice() {
+                    [] => None,
+                    [query] => Some(query.clone()),
+                    _ => return Err("plugins search [QUERY]".to_string()),
+                };
+                Action::Search { query }
             }
             "inspect" => {
                 reject_action_flags(approved, unset.as_deref())?;
@@ -138,6 +144,78 @@ impl PluginCmd {
         };
         Ok(Self { action, json })
     }
+}
+
+const BUILTIN_PLUGIN_REGISTRY: &str = include_str!("../../../plugins/registry.toml");
+
+#[derive(Debug, Deserialize)]
+struct PluginRegistry {
+    schema: String,
+    #[serde(default)]
+    plugin: Vec<RegistryPlugin>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RegistryPlugin {
+    name: String,
+    description: String,
+    source: String,
+    publisher: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<PluginRuntime>,
+}
+
+fn search_plugins(query: Option<&str>, json_output: bool) -> Result<(), String> {
+    let registry: PluginRegistry = toml::from_str(BUILTIN_PLUGIN_REGISTRY)
+        .map_err(|error| format!("built-in plugin registry is invalid: {error}"))?;
+    if registry.schema != "pentect.plugin-registry.v1" {
+        return Err("built-in plugin registry schema is unsupported".to_string());
+    }
+    for plugin in &registry.plugin {
+        let expected = format!("github:@{}/", plugin.publisher);
+        if !plugin.source.starts_with(&expected) {
+            return Err(format!(
+                "built-in plugin '{}' source does not match publisher '{}'",
+                plugin.name, plugin.publisher
+            ));
+        }
+    }
+    let query = query.unwrap_or_default().trim().to_ascii_lowercase();
+    let plugins = registry
+        .plugin
+        .into_iter()
+        .filter(|plugin| {
+            query.is_empty()
+                || plugin.name.to_ascii_lowercase().contains(&query)
+                || plugin.description.to_ascii_lowercase().contains(&query)
+                || plugin.publisher.to_ascii_lowercase().contains(&query)
+        })
+        .collect::<Vec<_>>();
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "schema": registry.schema,
+                "plugins": plugins,
+            })
+        );
+        return Ok(());
+    }
+    if plugins.is_empty() {
+        println!("none");
+        return Ok(());
+    }
+    for plugin in plugins {
+        println!(
+            "{}: {} [{}; {}]\n  {}",
+            plugin.name,
+            plugin.description,
+            plugin.runtime.map(runtime_name).unwrap_or("declarative"),
+            plugin.publisher,
+            plugin.source
+        );
+    }
+    Ok(())
 }
 
 fn reject_action_flags(approved: bool, unset: Option<&str>) -> Result<(), String> {
@@ -206,7 +284,13 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
             .as_deref()
             .or(source.repository.as_deref())
     });
-    let asset = binary.map(|binary| binary_asset(binary, &manifest.as_ref().unwrap().assets));
+    let asset = binary.map(|binary| {
+        binary_asset(
+            binary,
+            plugin_runtime(manifest.as_ref().unwrap()),
+            &manifest.as_ref().unwrap().assets,
+        )
+    });
     if json_output {
         println!(
             "{}",
@@ -219,6 +303,8 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
                 "binary": binary,
                 "repository": repository,
                 "asset": asset,
+                "runtime": manifest.as_ref().map(plugin_runtime),
+                "publisher_workflow": manifest.as_ref().and_then(|manifest| manifest.publisher.as_ref()).and_then(|publisher| publisher.workflow.as_deref()),
                 "middleware": manifest.as_ref().and_then(|manifest| manifest.middleware.as_ref()).map(|middleware| json!({
                     "stages": middleware.stages,
                     "permissions": middleware.permissions,
@@ -245,10 +331,21 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         println!("config: {}", display_path(path));
     }
     if let Some(binary) = binary {
+        println!(
+            "runtime: {}",
+            runtime_name(plugin_runtime(manifest.as_ref().unwrap()))
+        );
         println!("platform: {platform}");
         println!("binary: {binary}");
         if let Some(repository) = repository {
             println!("repository: {repository}");
+        }
+        if let Some(workflow) = manifest
+            .as_ref()
+            .and_then(|manifest| manifest.publisher.as_ref())
+            .and_then(|publisher| publisher.workflow.as_deref())
+        {
+            println!("publisher-workflow: {workflow}");
         }
         if let Some(asset) = asset {
             println!("asset: {asset}");
@@ -312,9 +409,10 @@ struct PluginManifest {
     name: Option<String>,
     description: Option<String>,
     #[serde(default)]
-    postscript: Vec<Postscript>,
+    postscript: Vec<toml::Value>,
     binary: Option<String>,
     repository: Option<String>,
+    publisher: Option<PublisherConfig>,
     #[serde(default)]
     assets: BTreeMap<String, String>,
     execution: Option<ExecutionConfig>,
@@ -322,9 +420,15 @@ struct PluginManifest {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PublisherConfig {
+    workflow: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct ExecutionConfig {
     #[serde(default, rename = "args")]
-    _args: Vec<String>,
+    args: Vec<String>,
+    runtime: Option<PluginRuntime>,
     mode: Option<String>,
     #[serde(rename = "timeout_ms")]
     _timeout_ms: Option<u64>,
@@ -336,6 +440,39 @@ struct ExecutionConfig {
     _max_spans: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PluginRuntime {
+    #[default]
+    Native,
+    Wasm,
+}
+
+fn plugin_runtime(manifest: &PluginManifest) -> PluginRuntime {
+    manifest
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.runtime)
+        .unwrap_or_else(|| {
+            if manifest
+                .binary
+                .as_deref()
+                .is_some_and(|binary| binary.to_ascii_lowercase().ends_with(".wasm"))
+            {
+                PluginRuntime::Wasm
+            } else {
+                PluginRuntime::Native
+            }
+        })
+}
+
+fn runtime_name(runtime: PluginRuntime) -> &'static str {
+    match runtime {
+        PluginRuntime::Native => "native",
+        PluginRuntime::Wasm => "wasm",
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct MiddlewareConfig {
     #[serde(default)]
@@ -344,17 +481,6 @@ struct MiddlewareConfig {
     permissions: Vec<String>,
     #[serde(default)]
     required: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct Postscript {
-    name: Option<String>,
-    command: Vec<String>,
-    #[serde(default)]
-    platforms: Vec<String>,
-    #[serde(default)]
-    permissions: Vec<String>,
-    timeout_ms: Option<u64>,
 }
 
 fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginManifest>, String> {
@@ -376,6 +502,12 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
             manifest.schema.as_deref().unwrap_or_default()
         ));
     }
+    if !manifest.postscript.is_empty() {
+        return Err(
+            "plugin postscripts are not supported; publish setup output as a signed release asset"
+                .to_string(),
+        );
+    }
     if let Some(binary) = manifest.binary.as_deref() {
         let name = manifest
             .name
@@ -383,6 +515,29 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(&source.name);
         validate_binary_name(binary, name)?;
+        if plugin_runtime(&manifest) == PluginRuntime::Wasm {
+            let execution = manifest.execution.as_ref();
+            if execution
+                .and_then(|execution| execution.mode.as_deref())
+                .unwrap_or("persistent")
+                != "oneshot"
+            {
+                return Err("WebAssembly plugins require execution.mode = \"oneshot\"".to_string());
+            }
+            if execution.is_some_and(|execution| !execution.args.is_empty()) {
+                return Err("WebAssembly plugins cannot declare execution.args".to_string());
+            }
+            if manifest.middleware.as_ref().is_some_and(|middleware| {
+                middleware
+                    .permissions
+                    .iter()
+                    .any(|permission| matches!(permission.as_str(), "config:read" | "cache:write"))
+            }) {
+                return Err(
+                    "WebAssembly plugins cannot request config:read or cache:write".to_string(),
+                );
+            }
+        }
         if let Some(repository) = manifest
             .repository
             .as_deref()
@@ -390,9 +545,26 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
         {
             update::validate_repository(repository)?;
         }
+        validate_publisher(&manifest)?;
     }
     validate_middleware(&manifest)?;
     Ok(Some(manifest))
+}
+
+fn validate_publisher(manifest: &PluginManifest) -> Result<(), String> {
+    let workflow = publisher_workflow(manifest)?;
+    if !pentect_agent::valid_plugin_publisher_workflow(workflow) {
+        return Err("publisher workflow must be a repository-relative YAML path".to_string());
+    }
+    Ok(())
+}
+
+fn publisher_workflow(manifest: &PluginManifest) -> Result<&str, String> {
+    manifest
+        .publisher
+        .as_ref()
+        .and_then(|publisher| publisher.workflow.as_deref())
+        .ok_or_else(|| "binary plugins require [publisher] workflow".to_string())
 }
 
 fn validate_middleware(manifest: &PluginManifest) -> Result<(), String> {
@@ -643,13 +815,8 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
         .map(sha256_path)
         .transpose()?;
     let name = plugin_name(&source, Some(&manifest));
-    let steps = manifest
-        .postscript
-        .iter()
-        .filter(|step| postscript_matches_platform(step))
-        .collect::<Vec<_>>();
-    if steps.is_empty() && manifest.binary.is_none() {
-        println!("setup: nothing to do for {}", current_platform());
+    if manifest.binary.is_none() {
+        println!("setup: nothing to do");
         return Ok(());
     }
     println!("plugin: {name}");
@@ -666,13 +833,15 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
     );
     if let Some(binary) = manifest.binary.as_deref() {
         let repository = binary_repository(&source, &manifest)?;
-        let asset = binary_asset(binary, &manifest.assets);
+        let runtime = plugin_runtime(&manifest);
+        let asset = binary_asset(binary, runtime, &manifest.assets);
         println!("binary: {binary}");
         println!("  release: github:{repository}");
+        println!("  publisher-workflow: {}", publisher_workflow(&manifest)?);
         println!("  asset: {asset}");
         println!(
             "  destination: {}",
-            binary_destination(&name, binary)?.display()
+            binary_destination(&name, binary, runtime)?.display()
         );
     }
     if let Some(middleware) = &manifest.middleware {
@@ -688,27 +857,28 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
                 .and_then(|execution| execution.mode.as_deref())
                 .unwrap_or("persistent")
         );
-        println!("  trust: executable code (no OS sandbox)");
-    }
-    for (index, step) in steps.iter().enumerate() {
-        validate_postscript(step)?;
         println!(
-            "postscript {}: {}",
-            index + 1,
-            step.name.as_deref().unwrap_or("setup")
+            "  isolation: {}",
+            if plugin_runtime(&manifest) == PluginRuntime::Wasm {
+                "capability sandbox (no host imports)"
+            } else {
+                "trusted native publisher"
+            }
         );
-        println!("  command: {}", display_command(&step.command));
-        println!("  permissions: {}", step.permissions.join(", "));
     }
     if !approved && !confirm_setup()? {
         return Err("plugin setup was not approved".to_string());
     }
     if let Some(binary) = manifest.binary.as_deref() {
         let repository = binary_repository(&source, &manifest)?;
-        install_release_binary(&name, &repository, binary, &manifest.assets)?;
-    }
-    for step in steps {
-        run_postscript(&name, &source.root, step)?;
+        install_release_binary(
+            &name,
+            &repository,
+            binary,
+            plugin_runtime(&manifest),
+            publisher_workflow(&manifest)?,
+            &manifest.assets,
+        )?;
     }
     if manifest.middleware.is_some() {
         let current_hash = source
@@ -777,7 +947,14 @@ fn update_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     };
     let repository = binary_repository(&source, &manifest)?;
     verify_plugin_update_approval(&name, &source, &manifest)?;
-    install_release_binary(&name, &repository, binary, &manifest.assets)?;
+    install_release_binary(
+        &name,
+        &repository,
+        binary,
+        plugin_runtime(&manifest),
+        publisher_workflow(&manifest)?,
+        &manifest.assets,
+    )?;
     // Updating a release binary must not rewrite the user's manifest approval.
     // Keeping the original digest makes any concurrent or later edit require setup again.
     println!("update: complete");
@@ -872,7 +1049,17 @@ fn validate_binary_name(binary: &str, plugin: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn binary_asset(binary: &str, overrides: &BTreeMap<String, String>) -> String {
+fn binary_asset(
+    binary: &str,
+    runtime: PluginRuntime,
+    overrides: &BTreeMap<String, String>,
+) -> String {
+    if runtime == PluginRuntime::Wasm {
+        return overrides
+            .get("wasm32")
+            .cloned()
+            .unwrap_or_else(|| binary.to_string());
+    }
     let platform = binary_platform();
     overrides.get(&platform).cloned().unwrap_or_else(|| {
         let suffix = if platform.starts_with("windows-") && !binary.ends_with(".exe") {
@@ -884,9 +1071,12 @@ fn binary_asset(binary: &str, overrides: &BTreeMap<String, String>) -> String {
     })
 }
 
-fn binary_destination(name: &str, binary: &str) -> Result<PathBuf, String> {
+fn binary_destination(name: &str, binary: &str, runtime: PluginRuntime) -> Result<PathBuf, String> {
     validate_binary_name(binary, name)?;
-    let filename = if cfg!(windows) && !binary.to_ascii_lowercase().ends_with(".exe") {
+    let filename = if runtime == PluginRuntime::Native
+        && cfg!(windows)
+        && !binary.to_ascii_lowercase().ends_with(".exe")
+    {
         format!("{binary}.exe")
     } else {
         binary.to_string()
@@ -899,15 +1089,18 @@ fn install_release_binary(
     name: &str,
     repository: &str,
     binary: &str,
+    runtime: PluginRuntime,
+    publisher_workflow: &str,
     overrides: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let platform = binary_platform();
-    let asset = binary_asset(binary, overrides);
-    let destination = binary_destination(name, binary)?;
+    let asset = binary_asset(binary, runtime, overrides);
+    let destination = binary_destination(name, binary, runtime)?;
     let download = update::download_latest_release_asset(repository, &asset)
         .map_err(|error| map_binary_download_error(name, &platform, &asset, error))?;
     if destination.is_file() && sha256_path(&destination)? == download.sha256 {
-        write_binary_lock(name, repository, &asset, &download)?;
+        verify_github_attestation(&destination, repository, publisher_workflow, name)?;
+        write_binary_lock(name, repository, publisher_workflow, &asset, &download)?;
         println!("binary {binary}: up to date ({})", download.version);
         return Ok(());
     }
@@ -931,14 +1124,79 @@ fn install_release_binary(
     ));
     std::fs::write(&staged, &download.bytes)
         .map_err(|e| format!("could not stage plugin binary: {e}"))?;
-    mark_binary_executable(&staged)?;
     if sha256_path(&staged)? != download.sha256 {
         let _ = std::fs::remove_file(&staged);
         return Err("staged plugin binary checksum mismatch".to_string());
     }
+    if let Err(error) = verify_github_attestation(&staged, repository, publisher_workflow, name) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    mark_binary_executable(&staged)?;
     replace_binary(&staged, &destination)?;
-    write_binary_lock(name, repository, &asset, &download)?;
+    write_binary_lock(name, repository, publisher_workflow, &asset, &download)?;
     println!("binary {binary}: installed {}", download.version);
+    Ok(())
+}
+
+fn verify_github_attestation(
+    path: &Path,
+    repository: &str,
+    workflow: &str,
+    name: &str,
+) -> Result<(), String> {
+    let gh = find_command(Path::new("gh")).ok_or_else(|| {
+        "signed plugin verification requires GitHub CLI v2.51.0 or newer: https://cli.github.com/"
+            .to_string()
+    })?;
+    verify_gh_attestation_version(&gh)?;
+    let signer_workflow = format!("{repository}/{workflow}");
+    let output = Command::new(gh)
+        .arg("attestation")
+        .arg("verify")
+        .arg(path)
+        .arg("--repo")
+        .arg(repository)
+        .arg("--signer-workflow")
+        .arg(&signer_workflow)
+        .arg("--deny-self-hosted-runners")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("could not run GitHub attestation verification: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.trim();
+    Err(if detail.is_empty() {
+        format!("plugin '{name}' has no valid GitHub build attestation from {signer_workflow}")
+    } else {
+        format!("plugin '{name}' GitHub build attestation failed for {signer_workflow}: {detail}")
+    })
+}
+
+fn verify_gh_attestation_version(gh: &Path) -> Result<(), String> {
+    const MINIMUM: semver::Version = semver::Version::new(2, 51, 0);
+    let output = Command::new(gh)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not inspect GitHub CLI version: {error}"))?;
+    let version = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(2))
+        .and_then(|version| semver::Version::parse(version.trim_start_matches('v')).ok())
+        .ok_or_else(|| {
+            "could not determine GitHub CLI version; v2.51.0 or newer is required".to_string()
+        })?;
+    if version < MINIMUM {
+        return Err(format!(
+            "GitHub CLI v{version} is too old; signed plugin verification requires v{MINIMUM} or newer"
+        ));
+    }
     Ok(())
 }
 
@@ -954,6 +1212,7 @@ fn map_binary_download_error(name: &str, platform: &str, asset: &str, error: Str
 struct BinaryLock<'a> {
     schema: &'static str,
     repository: &'a str,
+    publisher_workflow: &'a str,
     version: String,
     asset: &'a str,
     sha256: &'a str,
@@ -962,6 +1221,7 @@ struct BinaryLock<'a> {
 fn write_binary_lock(
     name: &str,
     repository: &str,
+    publisher_workflow: &str,
     asset: &str,
     download: &update::DownloadedReleaseAsset,
 ) -> Result<(), String> {
@@ -969,6 +1229,7 @@ fn write_binary_lock(
     let lock = BinaryLock {
         schema: "pentect.plugin-lock.v1",
         repository,
+        publisher_workflow,
         version: download.version.to_string(),
         asset,
         sha256: &download.sha256,
@@ -1028,40 +1289,6 @@ fn mark_binary_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn current_platform() -> &'static str {
-    if cfg!(windows) {
-        "windows"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else {
-        "linux"
-    }
-}
-
-fn postscript_matches_platform(step: &Postscript) -> bool {
-    step.platforms.is_empty()
-        || step
-            .platforms
-            .iter()
-            .any(|platform| platform.eq_ignore_ascii_case(current_platform()))
-}
-
-fn validate_postscript(step: &Postscript) -> Result<(), String> {
-    if step.command.is_empty() || step.command.iter().any(|part| part.is_empty()) {
-        return Err("postscript command must be a non-empty string array".to_string());
-    }
-    if step.permissions.is_empty() {
-        return Err("postscript must declare at least one permission".to_string());
-    }
-    const PERMISSIONS: &[&str] = &["filesystem", "network", "process", "environment"];
-    for permission in &step.permissions {
-        if !PERMISSIONS.contains(&permission.as_str()) {
-            return Err(format!("unknown postscript permission: {permission}"));
-        }
-    }
-    Ok(())
-}
-
 fn confirm_setup() -> Result<bool, String> {
     if !std::io::stdin().is_terminal() {
         return Err("plugin setup requires interactive approval or --yes".to_string());
@@ -1076,49 +1303,6 @@ fn confirm_setup() -> Result<bool, String> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
-}
-
-fn display_command(command: &[String]) -> String {
-    command
-        .iter()
-        .map(|part| {
-            if part
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || "-._/:\\".contains(ch))
-            {
-                part.clone()
-            } else {
-                format!("{:?}", part)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn run_postscript(name: &str, cwd: &Path, step: &Postscript) -> Result<(), String> {
-    let program = plugin_program(&step.command[0], cwd, &plugin_id(name));
-    if find_command(&program).is_none() {
-        return Err(format!("postscript command not found: {}", step.command[0]));
-    }
-    let mut command = plugin_command(&program, &plugin_id(name))?;
-    command
-        .args(&step.command[1..])
-        .current_dir(cwd)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("could not start postscript: {e}"))?;
-    let status = wait_for_plugin_child(
-        &mut child,
-        step.name.as_deref().unwrap_or("postscript"),
-        Duration::from_millis(step.timeout_ms.unwrap_or(120_000)),
-    )?;
-    if !status.success() {
-        return Err(format!("postscript failed: {status}"));
-    }
-    Ok(())
 }
 
 fn active_for_one(spec: &str) -> Result<plugins::ActivePlugins, String> {
@@ -1162,47 +1346,6 @@ fn test_binary(path: &Path) -> Check {
     }
 }
 
-fn wait_for_plugin_child(
-    child: &mut Child,
-    name: &str,
-    timeout: Duration,
-) -> Result<ExitStatus, String> {
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{name}: timeout"));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{name}: {e}"));
-            }
-        }
-    }
-}
-
-fn plugin_command(program: &Path, id_or_name: &str) -> Result<Command, String> {
-    let mut command = Command::new(program);
-    command.env_clear();
-    for env_name in safe_plugin_env_names() {
-        if let Some(value) = std::env::var_os(env_name) {
-            command.env(env_name, value);
-        }
-    }
-    let id = plugin_id(id_or_name);
-    let dirs = plugin_runtime_dirs(&id)?;
-    command.env(PLUGIN_NAME_ENV, id);
-    command.env(PLUGIN_DATA_DIR_ENV, dirs.data_dir);
-    command.env(PLUGIN_CACHE_DIR_ENV, dirs.cache_dir);
-    command.env(PLUGIN_CONFIG_ENV, dirs.config_file);
-    Ok(command)
-}
-
 fn plugin_runtime_dirs(id_or_name: &str) -> Result<pentect_agent::PluginRuntimeDirs, String> {
     pentect_agent::plugin_runtime_dirs(id_or_name)
 }
@@ -1241,25 +1384,6 @@ fn plugin_id(value: &str) -> String {
         "plugin".to_string()
     } else {
         out
-    }
-}
-
-fn safe_plugin_env_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &[
-            "Path",
-            "PATH",
-            "PATHEXT",
-            "SystemRoot",
-            "SYSTEMROOT",
-            "WINDIR",
-            "COMSPEC",
-            "TEMP",
-            "TMP",
-            "USERPROFILE",
-        ]
-    } else {
-        &["PATH", "HOME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR"]
     }
 }
 
@@ -1367,47 +1491,8 @@ impl Check {
     }
 }
 
-fn plugin_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
-    let path = Path::new(program);
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    if looks_like_path_command(program) {
-        return cwd.join(path);
-    }
-    installed_plugin_program(program, id)
-        .or_else(|| plugin_sidecar_program(program))
-        .unwrap_or_else(|| path.to_path_buf())
-}
-
-fn installed_plugin_program(program: &str, id: &str) -> Option<PathBuf> {
-    let bin = plugin_runtime_dirs(id).ok()?.data_dir.join("bin");
-    for name in command_names(program) {
-        let candidate = bin.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn looks_like_path_command(program: &str) -> bool {
-    program.contains('/') || program.contains('\\')
-}
-
-fn plugin_sidecar_program(program: &str) -> Option<PathBuf> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    for name in command_names(program) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 fn find_command(path: &Path) -> Option<PathBuf> {
-    if path.is_file() {
+    if path.is_absolute() && path.is_file() {
         return Some(path.to_path_buf());
     }
     if path.is_absolute()
@@ -1420,6 +1505,9 @@ fn find_command(path: &Path) -> Option<PathBuf> {
     let name = path.to_str()?;
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
+        if !dir.is_absolute() {
+            continue;
+        }
         for candidate in command_names(name) {
             let full = dir.join(candidate);
             if full.is_file() {
@@ -1542,56 +1630,20 @@ mod tests {
     }
 
     #[test]
-    fn postscript_requires_declared_known_permissions() {
-        let missing = Postscript {
-            name: None,
-            command: vec!["tool".into()],
-            platforms: Vec::new(),
-            permissions: Vec::new(),
-            timeout_ms: None,
-        };
-        assert!(validate_postscript(&missing).is_err());
-
-        let valid = Postscript {
-            permissions: vec!["network".into(), "filesystem".into()],
-            ..missing
-        };
-        assert!(validate_postscript(&valid).is_ok());
-    }
-
-    #[test]
-    fn postscript_does_not_run_before_approval() {
+    fn postscripts_are_rejected() {
         let root =
-            std::env::temp_dir().join(format!("pentect-plugin-approval-{}", std::process::id()));
+            std::env::temp_dir().join(format!("pentect-plugin-postscript-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let marker = root.join("approved.txt");
-        #[cfg(windows)]
-        let command = r#"["cmd", "/C", "echo approved>approved.txt"]"#;
-        #[cfg(not(windows))]
-        let command = r#"["sh", "-c", "printf approved > approved.txt"]"#;
         std::fs::write(
             root.join("plugin.toml"),
-            format!(
-                r#"
-schema = "pentect.plugin.v1"
-name = "approval-test"
-
-[[postscript]]
-command = {command}
-permissions = ["filesystem", "process"]
-"#
-            ),
+            "schema = \"pentect.plugin.v1\"\nname = \"unsafe\"\n[[postscript]]\ncommand = [\"tool\"]\n",
         )
         .unwrap();
-
-        let spec = root.to_string_lossy();
-        assert!(setup_plugin(&spec, false, false).is_err());
-        assert!(!marker.exists());
-        setup_plugin(&spec, true, false).unwrap();
-        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "approved");
-
-        std::fs::remove_dir_all(root).unwrap();
+        let source = plugins::plugin_source(&root.to_string_lossy()).unwrap();
+        let error = load_plugin_manifest(&source).unwrap_err();
+        let _ = std::fs::remove_dir_all(root);
+        assert!(error.contains("postscripts are not supported"), "{error}");
     }
 
     #[test]
@@ -1602,11 +1654,23 @@ permissions = ["filesystem", "process"]
         } else {
             format!("helper-{platform}")
         };
-        assert_eq!(binary_asset("helper", &BTreeMap::new()), expected);
+        assert_eq!(
+            binary_asset("helper", PluginRuntime::Native, &BTreeMap::new()),
+            expected
+        );
         let overrides = BTreeMap::from([(platform, "custom.bin".to_string())]);
-        assert_eq!(binary_asset("helper", &overrides), "custom.bin");
-        assert!(binary_destination("test", "../outside").is_err());
-        assert!(binary_destination("test", "helper").unwrap().is_absolute());
+        assert_eq!(
+            binary_asset("helper", PluginRuntime::Native, &overrides),
+            "custom.bin"
+        );
+        assert_eq!(
+            binary_asset("helper.wasm", PluginRuntime::Wasm, &BTreeMap::new()),
+            "helper.wasm"
+        );
+        assert!(binary_destination("test", "../outside", PluginRuntime::Native).is_err());
+        assert!(binary_destination("test", "helper", PluginRuntime::Native)
+            .unwrap()
+            .is_absolute());
     }
 
     #[test]
@@ -1631,6 +1695,7 @@ permissions = ["filesystem", "process"]
         let lock = BinaryLock {
             schema: "pentect.plugin-lock.v1",
             repository: "owner/repo",
+            publisher_workflow: ".github/workflows/release.yml",
             version: "v1.2.3".to_string(),
             asset: "helper-linux-x86_64",
             sha256: "0123456789abcdef",
@@ -1638,6 +1703,10 @@ permissions = ["filesystem", "process"]
         let encoded = toml::to_string(&lock).unwrap();
         let decoded: toml::Value = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded["repository"].as_str(), Some("owner/repo"));
+        assert_eq!(
+            decoded["publisher_workflow"].as_str(),
+            Some(".github/workflows/release.yml")
+        );
         assert_eq!(decoded["version"].as_str(), Some("v1.2.3"));
         assert_eq!(decoded["asset"].as_str(), Some("helper-linux-x86_64"));
         assert_eq!(decoded["sha256"].as_str(), Some("0123456789abcdef"));
@@ -1654,12 +1723,11 @@ permissions = ["filesystem", "process"]
         std::fs::create_dir_all(&root).unwrap();
         let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
         let manifest_source = format!(
-            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper\"\nrepository = \"owner/repo\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n"
+            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper\"\nrepository = \"owner/repo\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n"
         );
         std::fs::write(&manifest_path, &manifest_source).unwrap();
         let source = plugins::PluginSource {
             name: name.clone(),
-            root: root.clone(),
             manifest_path: Some(manifest_path.clone()),
             repository: None,
         };
@@ -1678,68 +1746,6 @@ permissions = ["filesystem", "process"]
         let data_dir = plugin_runtime_dirs(&plugin_id(&name)).unwrap().data_dir;
         let _ = std::fs::remove_dir_all(data_dir);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn plugin_env_does_not_inherit_memory_store_credentials() {
-        let command = plugin_command(Path::new("echo"), "test-env").unwrap();
-        let names = command
-            .get_envs()
-            .map(|(name, _)| name.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-
-        assert!(!names.iter().any(|name| name == "PENTECT_MEMORY_STORE_ADDR"));
-        assert!(!names
-            .iter()
-            .any(|name| name == "PENTECT_MEMORY_STORE_TOKEN"));
-        assert!(!names
-            .iter()
-            .any(|name| name == "PENTECT_PROCESS_HOST_READ_TOKEN"));
-        assert!(!names
-            .iter()
-            .any(|name| name == "PENTECT_PROCESS_HOST_WRITE_TOKEN"));
-    }
-
-    #[test]
-    fn plugin_env_exposes_project_scoped_user_data() {
-        let command = plugin_command(Path::new("echo"), "My Ext!").unwrap();
-        let dirs = plugin_runtime_dirs("my-ext").unwrap();
-        let data_dir = dirs.data_dir.to_string_lossy().replace('\\', "/");
-        let cache_dir = dirs.cache_dir.to_string_lossy().replace('\\', "/");
-        let config_file = dirs.config_file.to_string_lossy().replace('\\', "/");
-        let envs = command
-            .get_envs()
-            .map(|(name, value)| {
-                (
-                    name.to_string_lossy().to_string(),
-                    value
-                        .map(|value| value.to_string_lossy().replace('\\', "/"))
-                        .unwrap_or_default(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(
-            envs.get(PLUGIN_NAME_ENV).map(String::as_str),
-            Some("my-ext")
-        );
-        assert!(
-            envs.get(PLUGIN_DATA_DIR_ENV)
-                .is_some_and(|path| path == &data_dir),
-            "{envs:?}"
-        );
-        assert!(
-            envs.get(PLUGIN_CACHE_DIR_ENV)
-                .is_some_and(|path| path == &cache_dir),
-            "{envs:?}"
-        );
-        assert!(
-            envs.get(PLUGIN_CONFIG_ENV)
-                .is_some_and(|path| path == &config_file),
-            "{envs:?}"
-        );
-        let project = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-        assert!(!dirs.data_dir.starts_with(project), "{dirs:?}");
-        let _ = std::fs::remove_dir_all(dirs.data_dir);
     }
 
     #[test]
@@ -1784,13 +1790,12 @@ permissions = ["filesystem", "process"]
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join(plugins::PLUGIN_MANIFEST_FILE),
-            "schema = \"pentect.plugin.v1\"\nname = \"local\"\nbinary = \"tool\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
+            "schema = \"pentect.plugin.v1\"\nname = \"local\"\nbinary = \"tool\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
         )
         .unwrap();
 
         let source = plugins::PluginSource {
             name: "local".to_string(),
-            root: root.clone(),
             manifest_path: Some(root.join(plugins::PLUGIN_MANIFEST_FILE)),
             repository: None,
         };

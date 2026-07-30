@@ -7,7 +7,7 @@ Scope: Rust workspace, shell/runtime IPC, masking pipeline, plugins, installers/
 
 Seven clear security issues were fixed in this review: an unsafe UTF-8 mutation reachable through the public detector API, local memory-store connection/request exhaustion, a project-controlled remote plugin cache, mutable GitHub Actions dependencies, the dependency advisories known at the time of the review, executable-plugin approval bypasses, and project-controlled plugin runtime artifacts. Targeted tests and `cargo check -p pentect-cli` pass.
 
-Executable plugins remain deliberately trusted native code rather than sandboxed code. Their manifest, stages, permissions, postscripts, source repository, and destinations are shown before setup approval. Approval state and installed artifacts are kept outside the repository in project-scoped OS user data. The largest remaining decisions are enforceable postscript sandboxing and independently signed release artifacts.
+Third-party executable plugins can now use a capability-sandboxed WebAssembly runtime with no host imports, bounded memory, and fuel metering. Native plugins remain an explicit publisher-trusted compatibility path. Arbitrary postscripts are rejected. Plugin release assets are verified with GitHub's Sigstore artifact attestations, pinned to the publisher repository and workflow, in addition to SHA-256.
 
 ## Fixed findings
 
@@ -59,17 +59,13 @@ Fixed by moving approval, binaries, configuration, cache, and mutable plugin dat
 
 ## Decisions required
 
-### PNT-SEC-D03 — Postscript permissions are descriptive, not enforced (medium/high)
+### PNT-SEC-D03 — Postscript permissions were descriptive, not enforced (resolved)
 
-The setup prompt displays declared permissions, but approved postscript commands run with the user's normal filesystem, process, and network access. `--yes` intentionally removes the interactive gate.
+Resolved by rejecting arbitrary postscripts. Plugin setup is limited to host-owned installation of a signed release asset.
 
-Recommended decision: either implement enforceable platform sandboxes/capabilities, or rename the field/UI to `declared_permissions` and clearly state that approval grants full user-level execution.
+### PNT-SEC-D04 — Plugin release checksums were not independent signatures (resolved)
 
-### PNT-SEC-D04 — Release checksums are not independent signatures (medium/high)
-
-Install, update, and plugin downloads verify SHA-256, but the checksum and binary come from the same GitHub release. This detects corruption, not compromise of the repository, release workflow, or release token.
-
-Recommended decision: add Sigstore keyless signing/attestations, or choose an offline Ed25519 release key with an explicit rotation and recovery policy.
+Resolved with GitHub Actions keyless artifact attestations. Verification pins the expected repository and signer workflow and denies self-hosted runners; SHA-256 remains a transport-integrity check.
 
 ### PNT-SEC-D05 — Stable machine-scoped handles allow equality correlation (medium/privacy)
 
