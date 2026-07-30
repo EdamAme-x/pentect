@@ -3842,6 +3842,7 @@ fn pretool_non_default_session_is_inserted_before_command() {
 
 #[test]
 fn implicit_directory_session_is_not_rendered_in_wrapped_command() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let implicit = default_directory_session_name().unwrap();
     let command =
         wrap_shell_command(HookProvider::Claude, &implicit, "Bash", "echo hello").unwrap();
@@ -3872,6 +3873,7 @@ fn hook_exec_wrapper_is_lossless_and_display_decodable() {
 
 #[test]
 fn hook_shell_transport_round_trips_powershell_without_outer_shell_quoting() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let script = concat!(
         "$token = $env:PENTECT_KAGGLE_API_TOKEN_deadbeef; ",
         "$parts = $token -split ':'; ",
