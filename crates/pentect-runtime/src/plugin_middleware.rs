@@ -4,30 +4,30 @@ use pentect_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
 
-const PLUGIN_CONFIG_FILE: &str = "config.toml";
 const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
 const PLUGIN_CACHE_DIR: &str = "cache";
-const PLUGIN_NAME_ENV: &str = "PENTECT_PLUGIN_NAME";
-const PLUGIN_DATA_DIR_ENV: &str = "PENTECT_PLUGIN_DATA_DIR";
-const PLUGIN_CACHE_DIR_ENV: &str = "PENTECT_PLUGIN_CACHE_DIR";
-const PLUGIN_CONFIG_ENV: &str = "PENTECT_PLUGIN_CONFIG";
+const PLUGIN_CONFIG_FILE: &str = "config.toml";
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MAX_INPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_SPANS: usize = 512;
+const MAX_TIMEOUT_MS: u64 = 60_000;
+const MAX_PLUGIN_INPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PLUGIN_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PLUGIN_SPANS: usize = 4096;
 const PROTOCOL_SCHEMA: &str = "pentect.plugin.v1";
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_PLUGIN_DNS_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -356,20 +356,14 @@ impl PluginMiddleware {
 #[derive(Clone, Debug)]
 struct PluginBinary {
     name: String,
-    id: String,
-    path: PathBuf,
-    command: Vec<String>,
-    runtime: PluginRuntime,
-    wasm: Option<WasmProgram>,
+    wasm: WasmProgram,
     stages: BTreeSet<MiddlewareStage>,
     permissions: BTreeSet<String>,
     required: bool,
-    mode: ExecutionMode,
     timeout: Duration,
     max_input_bytes: usize,
     max_output_bytes: usize,
     max_spans: usize,
-    process: Arc<Mutex<Option<PersistentProcess>>>,
 }
 
 impl PluginBinary {
@@ -409,37 +403,60 @@ impl PluginBinary {
                 "plugin '{name}' publisher workflow must be a repository-relative YAML path"
             ));
         }
-        let execution = file.execution.unwrap_or_default();
-        let runtime = execution.runtime.unwrap_or_else(|| {
-            if binary.to_ascii_lowercase().ends_with(".wasm") {
-                PluginRuntime::Wasm
-            } else {
-                PluginRuntime::Native
-            }
-        });
-        let mode = execution.mode.unwrap_or_default();
-        if runtime == PluginRuntime::Wasm && mode != ExecutionMode::Oneshot {
+        if !binary.to_ascii_lowercase().ends_with(".wasm") {
             return Err(format!(
-                "plugin '{name}' WebAssembly execution requires mode = \"oneshot\""
+                "plugin '{name}' binary must be a portable .wasm module"
             ));
         }
-        if runtime == PluginRuntime::Wasm
-            && (!execution.args.is_empty()
-                || file.middleware.as_ref().is_some_and(|middleware| {
-                    middleware.permissions.contains(&"config:read".to_string())
-                        || middleware.permissions.contains(&"cache:write".to_string())
-                }))
+        let execution = file.execution.unwrap_or_default();
+        if execution
+            .runtime
+            .as_deref()
+            .is_some_and(|value| value != "wasm")
         {
             return Err(format!(
-                "plugin '{name}' WebAssembly execution cannot use args, config:read, or cache:write"
+                "plugin '{name}' only supports execution.runtime = \"wasm\""
             ));
         }
-        let command = binary_command(&name, &binary, execution.args, runtime)?;
-        let wasm = if runtime == PluginRuntime::Wasm {
-            Some(WasmProgram::load(Path::new(&command[0]), &name)?)
-        } else {
-            None
-        };
+        if execution
+            .mode
+            .as_deref()
+            .is_some_and(|value| value != "oneshot")
+        {
+            return Err(format!(
+                "plugin '{name}' only supports execution.mode = \"oneshot\""
+            ));
+        }
+        if !execution.args.is_empty()
+            || file.middleware.as_ref().is_some_and(|middleware| {
+                middleware.permissions.contains(&"cache:write".to_string())
+            })
+        {
+            return Err(format!(
+                "plugin '{name}' WebAssembly execution cannot use args or cache:write"
+            ));
+        }
+        let timeout_ms = execution.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+        let max_input_bytes = execution.max_input_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES);
+        let max_output_bytes = execution
+            .max_output_bytes
+            .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
+        let max_spans = execution.max_spans.unwrap_or(DEFAULT_MAX_SPANS);
+        if timeout_ms == 0
+            || timeout_ms > MAX_TIMEOUT_MS
+            || max_input_bytes == 0
+            || max_input_bytes > MAX_PLUGIN_INPUT_BYTES
+            || max_output_bytes == 0
+            || max_output_bytes > MAX_PLUGIN_OUTPUT_BYTES
+            || max_spans == 0
+            || max_spans > MAX_PLUGIN_SPANS
+        {
+            return Err(format!(
+                "plugin '{name}' execution limits exceed Pentect's sandbox limits"
+            ));
+        }
+        let network = validate_network(&name, file.network)?;
+        let wasm_path = wasm_binary_path(&name, &binary)?;
         let middleware = file
             .middleware
             .ok_or_else(|| format!("plugin '{name}' requires [middleware]"))?;
@@ -460,25 +477,22 @@ impl PluginBinary {
                 "plugin '{name}' middleware requires input:read permission"
             ));
         }
+        let config = permissions
+            .contains("config:read")
+            .then(|| load_plugin_config(&id))
+            .transpose()?;
+        let wasm = WasmProgram::load(&wasm_path, &name, network, config)?;
         verify_plugin_approval(path, &id, &stages, &permissions)?;
         Ok(Self {
             name,
-            id,
-            path: path.to_path_buf(),
-            command,
-            runtime,
             wasm,
             stages,
             permissions,
             required: middleware.required,
-            mode,
-            timeout: Duration::from_millis(execution.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
-            max_input_bytes: execution.max_input_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES),
-            max_output_bytes: execution
-                .max_output_bytes
-                .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
-            max_spans: execution.max_spans.unwrap_or(DEFAULT_MAX_SPANS),
-            process: Arc::new(Mutex::new(None)),
+            timeout: Duration::from_millis(timeout_ms),
+            max_input_bytes,
+            max_output_bytes,
+            max_spans,
         })
     }
 
@@ -509,15 +523,9 @@ impl PluginBinary {
         if encoded.len() > self.max_input_bytes {
             return Err(format!("plugin '{}' input exceeds its limit", self.name));
         }
-        let output = match (self.runtime, self.mode) {
-            (PluginRuntime::Wasm, _) => self
-                .wasm
-                .as_ref()
-                .ok_or_else(|| format!("plugin '{}' has no WebAssembly program", self.name))?
-                .invoke(&encoded, self.timeout, self.max_output_bytes, &self.name)?,
-            (PluginRuntime::Native, ExecutionMode::Persistent) => self.run_persistent(&encoded)?,
-            (PluginRuntime::Native, ExecutionMode::Oneshot) => self.run_once(&encoded)?,
-        };
+        let output = self
+            .wasm
+            .invoke(&encoded, self.timeout, self.max_output_bytes, &self.name)?;
         let response: PluginResponse = serde_json::from_slice(&output)
             .map_err(|error| format!("plugin '{}' returned invalid JSON: {error}", self.name))?;
         if response.schema.as_deref() != Some(PROTOCOL_SCHEMA)
@@ -530,83 +538,6 @@ impl PluginBinary {
             ));
         }
         Ok(response)
-    }
-
-    fn run_persistent(&self, request: &[u8]) -> Result<Vec<u8>, String> {
-        let mut slot = self
-            .process
-            .lock()
-            .map_err(|_| format!("plugin '{}' process lock is poisoned", self.name))?;
-        if slot.is_none() {
-            *slot = Some(PersistentProcess::start(self)?);
-        }
-        let result = slot
-            .as_mut()
-            .expect("persistent process initialized")
-            .exchange(request, self.timeout, self.max_output_bytes);
-        if result.is_err() {
-            if let Some(mut process) = slot.take() {
-                process.terminate();
-            }
-        }
-        result.map_err(|error| format!("plugin '{}' {error}", self.name))
-    }
-
-    fn run_once(&self, request: &[u8]) -> Result<Vec<u8>, String> {
-        let cwd = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let program = plugin_program(&self.command[0], cwd, &self.id);
-        let mut command = Command::new(program);
-        apply_plugin_env(&mut command, &self.id, &self.permissions)?;
-        command
-            .args(&self.command[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if let Some(parent) = self.path.parent() {
-            command.current_dir(parent);
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("could not start plugin '{}': {error}", self.name))?;
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("could not open stdout for plugin '{}'", self.name));
-            }
-        };
-        let stdout_reader = spawn_stdout_reader(stdout, self.max_output_bytes);
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = join_stdout(stdout_reader, &self.name);
-                return Err(format!("could not open stdin for plugin '{}'", self.name));
-            }
-        };
-        let stdin_writer = spawn_stdin_writer(stdin, request.to_vec());
-        let status = match wait_for_child(&mut child, &self.name, self.timeout) {
-            Ok(status) => status,
-            Err(error) => {
-                let _ = join_stdin(stdin_writer, &self.name);
-                let _ = join_stdout(stdout_reader, &self.name);
-                return Err(error);
-            }
-        };
-        join_stdin(stdin_writer, &self.name)?;
-        let output = join_stdout(stdout_reader, &self.name)?;
-        if output.len() > self.max_output_bytes {
-            return Err(format!("plugin '{}' returned too much output", self.name));
-        }
-        if !status.success() {
-            return Err(format!(
-                "plugin '{}' exited with status {status}",
-                self.name
-            ));
-        }
-        Ok(output)
     }
 }
 
@@ -676,7 +607,19 @@ fn verify_plugin_approval(
 const WASM_ABI_ALLOC: &str = "pentect_alloc";
 const WASM_ABI_HANDLE: &str = "pentect_handle";
 const WASM_ABI_MEMORY: &str = "memory";
+const WASM_HTTP_MODULE: &str = "pentect:http";
+const WASM_HTTP_REQUEST: &str = "request";
+const WASM_CONFIG_MODULE: &str = "pentect:config";
+const WASM_CONFIG_READ: &str = "read";
 const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const HTTP_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const HTTP_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const HTTP_MAX_REQUESTS: usize = 16;
+const HTTP_DEFAULT_REQUESTS: usize = 4;
+const HTTP_MAX_ORIGINS: usize = 64;
+const HTTP_MAX_HEADERS: usize = 64;
+const HTTP_MAX_HEADER_BYTES: usize = 64 * 1024;
+const HTTP_MAX_DNS_THREADS: usize = 32;
 // Fuel is a short scheduling quantum. The wall clock below is authoritative.
 const WASM_FUEL_SLICE: u64 = 100_000;
 
@@ -684,23 +627,45 @@ const WASM_FUEL_SLICE: u64 = 100_000;
 struct WasmProgram {
     engine: wasmi::Engine,
     module: wasmi::Module,
+    network: Option<NetworkPolicy>,
+    config: Option<toml::Value>,
 }
 
 impl WasmProgram {
-    fn load(path: &Path, name: &str) -> Result<Self, String> {
+    fn load(
+        path: &Path,
+        name: &str,
+        network: Option<NetworkPolicy>,
+        config: Option<toml::Value>,
+    ) -> Result<Self, String> {
         let bytes = std::fs::read(path)
             .map_err(|error| format!("could not read WebAssembly plugin '{name}': {error}"))?;
-        let mut config = wasmi::Config::default();
-        config.consume_fuel(true);
-        let engine = wasmi::Engine::new(&config);
+        let mut engine_config = wasmi::Config::default();
+        engine_config.consume_fuel(true);
+        let engine = wasmi::Engine::new(&engine_config);
         let module = wasmi::Module::new(&engine, &bytes[..])
             .map_err(|error| format!("plugin '{name}' WebAssembly is invalid: {error}"))?;
-        if module.imports().next().is_some() {
-            return Err(format!(
-                "plugin '{name}' WebAssembly must not import host capabilities"
-            ));
+        for import in module.imports() {
+            let permitted = (import.module() == WASM_HTTP_MODULE
+                && import.name() == WASM_HTTP_REQUEST
+                && network.is_some())
+                || (import.module() == WASM_CONFIG_MODULE
+                    && import.name() == WASM_CONFIG_READ
+                    && config.is_some());
+            if !permitted {
+                return Err(format!(
+                    "plugin '{name}' imports unapproved host function '{}:{}'",
+                    import.module(),
+                    import.name()
+                ));
+            }
         }
-        Ok(Self { engine, module })
+        Ok(Self {
+            engine,
+            module,
+            network,
+            config,
+        })
     }
 
     fn invoke(
@@ -716,12 +681,32 @@ impl WasmProgram {
             .instances(1)
             .tables(1)
             .build();
-        let mut store = wasmi::Store::new(&self.engine, limits);
-        store.limiter(|limits| limits);
+        let started = Instant::now();
+        let mut store = wasmi::Store::new(
+            &self.engine,
+            WasmHostState {
+                limits,
+                network: self.network.clone(),
+                network_requests: 0,
+                config: self.config.clone(),
+                deadline: started + timeout,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
         store
             .set_fuel(WASM_FUEL_SLICE)
             .map_err(|error| format!("plugin '{name}' fuel setup failed: {error}"))?;
-        let linker = wasmi::Linker::new(&self.engine);
+        let mut linker = wasmi::Linker::new(&self.engine);
+        if self.network.is_some() {
+            linker
+                .func_wrap(WASM_HTTP_MODULE, WASM_HTTP_REQUEST, wasm_http_request)
+                .map_err(|error| format!("plugin '{name}' network setup failed: {error}"))?;
+        }
+        if self.config.is_some() {
+            linker
+                .func_wrap(WASM_CONFIG_MODULE, WASM_CONFIG_READ, wasm_config_read)
+                .map_err(|error| format!("plugin '{name}' config setup failed: {error}"))?;
+        }
         let instance = linker
             .instantiate_and_start(&mut store, &self.module)
             .map_err(|error| format!("plugin '{name}' WebAssembly start failed: {error}"))?;
@@ -749,7 +734,6 @@ impl WasmProgram {
         store
             .set_fuel(WASM_FUEL_SLICE)
             .map_err(|error| format!("plugin '{name}' fuel setup failed: {error}"))?;
-        let started = Instant::now();
         let mut call = handle
             .call_resumable(&mut store, (request_ptr, request_len))
             .map_err(|error| format!("plugin '{name}' execution failed: {error}"))?;
@@ -790,172 +774,431 @@ impl WasmProgram {
     }
 }
 
-struct PersistentProcess {
-    child: Child,
-    stdin: ChildStdin,
-    output: mpsc::Receiver<Result<Vec<u8>, String>>,
+struct WasmHostState {
+    limits: wasmi::StoreLimits,
+    network: Option<NetworkPolicy>,
+    network_requests: usize,
+    config: Option<toml::Value>,
+    deadline: Instant,
 }
 
-impl std::fmt::Debug for PersistentProcess {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PersistentProcess")
-            .field("pid", &self.child.id())
-            .finish_non_exhaustive()
-    }
+#[derive(Clone, Debug)]
+struct NetworkPolicy {
+    origins: BTreeSet<HttpOrigin>,
+    methods: BTreeSet<String>,
+    private_network: bool,
+    allow_insecure: bool,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
+    max_requests: usize,
 }
 
-impl PersistentProcess {
-    fn start(plugin: &PluginBinary) -> Result<Self, String> {
-        let cwd = plugin.path.parent().unwrap_or_else(|| Path::new("."));
-        let program = plugin_program(&plugin.command[0], cwd, &plugin.id);
-        let mut command = Command::new(program);
-        apply_plugin_env(&mut command, &plugin.id, &plugin.permissions)?;
-        command
-            .args(&plugin.command[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if let Some(parent) = plugin.path.parent() {
-            command.current_dir(parent);
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("could not start plugin '{}': {error}", plugin.name))?;
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("could not open stdin for plugin '{}'", plugin.name));
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "could not open stdout for plugin '{}'",
-                    plugin.name
-                ));
-            }
-        };
-        let output = spawn_line_reader(stdout, plugin.max_output_bytes);
-        let mut process = Self {
-            child,
-            stdin,
-            output,
-        };
-        let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let initialize = serde_json::to_vec(&json!({
-            "schema": PROTOCOL_SCHEMA,
-            "id": request_id,
-            "type": "initialize",
-            "host": {
-                "name": "pentect",
-                "protocol": 1,
-            },
-            "plugin": {
-                "name": plugin.name,
-                "stages": plugin.stages,
-                "permissions": plugin.permissions,
-            },
-        }))
-        .map_err(|error| format!("initialize request encode failed: {error}"))?;
-        let response = process
-            .exchange(&initialize, plugin.timeout, plugin.max_output_bytes)
-            .map_err(|error| format!("plugin '{}' initialization failed: {error}", plugin.name))?;
-        let response: PluginResponse = serde_json::from_slice(&response).map_err(|error| {
-            format!(
-                "plugin '{}' initialize response is invalid: {error}",
-                plugin.name
-            )
-        })?;
-        if response.schema.as_deref() != Some(PROTOCOL_SCHEMA)
-            || response.id != Some(request_id)
-            || response.kind.as_deref() != Some("initialized")
-        {
-            process.terminate();
-            return Err(format!(
-                "plugin '{}' returned a mismatched initialize response",
-                plugin.name
-            ));
-        }
-        Ok(process)
-    }
-
-    fn exchange(
-        &mut self,
-        request: &[u8],
-        timeout: Duration,
-        max_output_bytes: usize,
-    ) -> Result<Vec<u8>, String> {
-        self.stdin
-            .write_all(request)
-            .and_then(|()| self.stdin.write_all(b"\n"))
-            .and_then(|()| self.stdin.flush())
-            .map_err(|error| format!("could not write stdin: {error}"))?;
-        let output = self
-            .output
-            .recv_timeout(timeout)
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => "timed out".to_string(),
-                mpsc::RecvTimeoutError::Disconnected => "closed stdout before replying".to_string(),
-            })??;
-        if output.len() > max_output_bytes {
-            return Err("returned too much output".to_string());
-        }
-        Ok(output)
-    }
-
-    fn terminate(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HttpOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
 }
 
-impl Drop for PersistentProcess {
-    fn drop(&mut self) {
-        self.terminate();
-    }
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginHttpRequest {
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub body: String,
 }
 
-fn spawn_line_reader(
-    stdout: ChildStdout,
-    max_output_bytes: usize,
-) -> mpsc::Receiver<Result<Vec<u8>, String>> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        loop {
-            let mut line = Vec::new();
-            let result = match reader
-                .by_ref()
-                .take(max_output_bytes as u64 + 2)
-                .read_until(b'\n', &mut line)
-            {
-                Ok(0) => break,
-                Ok(_) if line.len() > max_output_bytes + 1 => {
-                    Err("returned a line larger than its output limit".to_string())
-                }
-                Ok(_) => {
-                    if line.last() == Some(&b'\n') {
-                        line.pop();
-                    }
-                    if line.last() == Some(&b'\r') {
-                        line.pop();
-                    }
-                    Ok(line)
-                }
-                Err(error) => Err(format!("could not read stdout: {error}")),
-            };
-            if sender.send(result).is_err() {
-                break;
-            }
+#[derive(Debug, Serialize)]
+pub struct PluginHttpResponse {
+    pub status: Option<u16>,
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+    pub error: Option<String>,
+}
+
+fn load_plugin_config(id: &str) -> Result<toml::Value, String> {
+    let path = plugin_runtime_dirs(id)?.config_file;
+    if !path.is_file() {
+        return Ok(toml::Value::Table(toml::Table::new()));
+    }
+    let source = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read plugin config '{}': {error}", path.display()))?;
+    toml::from_str(&source)
+        .map_err(|error| format!("plugin config '{}' is invalid: {error}", path.display()))
+}
+
+fn wasm_config_read(
+    mut caller: wasmi::Caller<'_, WasmHostState>,
+    key_ptr: i32,
+    key_len: i32,
+    response_ptr: i32,
+    response_capacity: i32,
+) -> i32 {
+    let Some(memory) = caller
+        .get_export(WASM_ABI_MEMORY)
+        .and_then(wasmi::Extern::into_memory)
+    else {
+        return -1;
+    };
+    let (Ok(key_offset), Ok(key_len), Ok(response_offset), Ok(response_capacity)) = (
+        usize::try_from(key_ptr),
+        usize::try_from(key_len),
+        usize::try_from(response_ptr),
+        usize::try_from(response_capacity),
+    ) else {
+        return -1;
+    };
+    if key_len == 0 || key_len > 256 || response_capacity > DEFAULT_MAX_OUTPUT_BYTES {
+        return -2;
+    }
+    let mut key = vec![0; key_len];
+    if memory.read(&caller, key_offset, &mut key).is_err() {
+        return -1;
+    }
+    let Ok(key) = std::str::from_utf8(&key) else {
+        return -2;
+    };
+    if key.split('.').any(|part| {
+        part.is_empty()
+            || !part.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+    }) {
+        return -2;
+    }
+    let value = caller
+        .data()
+        .config
+        .as_ref()
+        .and_then(|root| config_value(root, key))
+        .cloned();
+    let Ok(encoded) = serde_json::to_vec(&value) else {
+        return -3;
+    };
+    if encoded.len() > response_capacity {
+        return -2;
+    }
+    if memory
+        .write(&mut caller, response_offset, &encoded)
+        .is_err()
+    {
+        return -1;
+    }
+    i32::try_from(encoded.len()).unwrap_or(-2)
+}
+
+fn config_value<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
+    key.split('.')
+        .try_fold(root, |value, part| value.as_table()?.get(part))
+}
+
+fn wasm_http_request(
+    mut caller: wasmi::Caller<'_, WasmHostState>,
+    request_ptr: i32,
+    request_len: i32,
+    response_ptr: i32,
+    response_capacity: i32,
+) -> i32 {
+    let Some(memory) = caller
+        .get_export(WASM_ABI_MEMORY)
+        .and_then(wasmi::Extern::into_memory)
+    else {
+        return -1;
+    };
+    let Ok(request_offset) = usize::try_from(request_ptr) else {
+        return -1;
+    };
+    let Ok(request_len) = usize::try_from(request_len) else {
+        return -1;
+    };
+    let Ok(response_offset) = usize::try_from(response_ptr) else {
+        return -1;
+    };
+    let Ok(response_capacity) = usize::try_from(response_capacity) else {
+        return -1;
+    };
+    if request_len > HTTP_MAX_REQUEST_BYTES || response_capacity > HTTP_MAX_RESPONSE_BYTES {
+        return -2;
+    }
+    let mut request = vec![0; request_len];
+    if memory.read(&caller, request_offset, &mut request).is_err() {
+        return -1;
+    }
+    let policy = caller.data().network.clone();
+    let request_allowed = policy.as_ref().is_some_and(|policy| {
+        if caller.data().network_requests >= policy.max_requests {
+            return false;
         }
+        caller.data_mut().network_requests += 1;
+        true
     });
-    receiver
+    let response = match (policy.as_ref(), request_allowed) {
+        (Some(_), false) => PluginHttpResponse {
+            status: None,
+            headers: BTreeMap::new(),
+            body: String::new(),
+            error: Some("network request limit exceeded".to_string()),
+        },
+        (Some(policy), true) => match serde_json::from_slice::<PluginHttpRequest>(&request) {
+            Ok(request) => match perform_plugin_http(policy, caller.data().deadline, request) {
+                Ok(response) => response,
+                Err(error) => PluginHttpResponse {
+                    status: None,
+                    headers: BTreeMap::new(),
+                    body: String::new(),
+                    error: Some(error),
+                },
+            },
+            Err(_) => PluginHttpResponse {
+                status: None,
+                headers: BTreeMap::new(),
+                body: String::new(),
+                error: Some("invalid network request".to_string()),
+            },
+        },
+        (None, _) => PluginHttpResponse {
+            status: None,
+            headers: BTreeMap::new(),
+            body: String::new(),
+            error: Some("network access is not approved".to_string()),
+        },
+    };
+    let Ok(encoded) = serde_json::to_vec(&response) else {
+        return -3;
+    };
+    if encoded.len() > response_capacity {
+        return -2;
+    }
+    if memory
+        .write(&mut caller, response_offset, &encoded)
+        .is_err()
+    {
+        return -1;
+    }
+    i32::try_from(encoded.len()).unwrap_or(-2)
+}
+
+fn perform_plugin_http(
+    policy: &NetworkPolicy,
+    deadline: Instant,
+    request: PluginHttpRequest,
+) -> Result<PluginHttpResponse, String> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err("plugin HTTP request timed out".to_string());
+    }
+    if request.body.len() > policy.max_request_bytes {
+        return Err("plugin HTTP request body exceeds its approved limit".to_string());
+    }
+    let method = request.method.trim().to_ascii_uppercase();
+    if !policy.methods.contains(&method) {
+        return Err(format!("HTTP method {method} is not approved"));
+    }
+    let url = reqwest::Url::parse(&request.url)
+        .map_err(|_| "plugin HTTP request URL is invalid".to_string())?;
+    let origin = http_origin(&url)?;
+    if !policy.origins.contains(&origin) {
+        return Err("plugin HTTP request origin is not approved".to_string());
+    }
+    if origin.scheme == "http" && !policy.allow_insecure {
+        return Err("insecure HTTP is not approved".to_string());
+    }
+    let addresses = resolve_http_origin(&origin, policy.private_network, deadline)?;
+    let request_timeout = deadline.saturating_duration_since(Instant::now());
+    if request_timeout.is_zero() {
+        return Err("plugin HTTP request timed out".to_string());
+    }
+    let mut builder = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(request_timeout)
+        .resolve_to_addrs(&origin.host, &addresses);
+    builder = builder.user_agent("pentect-plugin-http/1");
+    let client = builder
+        .build()
+        .map_err(|_| "could not initialize plugin HTTP client".to_string())?;
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|_| "plugin HTTP method is invalid".to_string())?;
+    let mut pending = client.request(method, url);
+    if request.headers.len() > HTTP_MAX_HEADERS
+        || request
+            .headers
+            .iter()
+            .any(|(name, value)| name.len().saturating_add(value.len()) > HTTP_MAX_HEADER_BYTES)
+        || request
+            .headers
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .sum::<usize>()
+            > HTTP_MAX_HEADER_BYTES
+    {
+        return Err("plugin HTTP request headers exceed their limit".to_string());
+    }
+    for (name, value) in request.headers {
+        if transport_controlled_header(&name) {
+            return Err(format!("HTTP header {name} is controlled by Pentect"));
+        }
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| "plugin HTTP header name is invalid".to_string())?;
+        let value = reqwest::header::HeaderValue::from_str(&value)
+            .map_err(|_| "plugin HTTP header value is invalid".to_string())?;
+        pending = pending.header(name, value);
+    }
+    if !request.body.is_empty() {
+        pending = pending.body(request.body);
+    }
+    let mut response = pending
+        .send()
+        .map_err(|_| "plugin HTTP request failed".to_string())?;
+    let status = response.status().as_u16();
+    let mut headers = BTreeMap::new();
+    let mut header_bytes = 0_usize;
+    let mut header_count = 0_usize;
+    for (name, value) in response.headers() {
+        if let Ok(value) = value.to_str() {
+            header_count += 1;
+            header_bytes =
+                header_bytes.saturating_add(name.as_str().len().saturating_add(value.len()));
+            if header_count > HTTP_MAX_HEADERS || header_bytes > HTTP_MAX_HEADER_BYTES {
+                return Err("plugin HTTP response headers exceed their limit".to_string());
+            }
+            headers.insert(name.as_str().to_string(), value.to_string());
+        }
+    }
+    let mut body = Vec::new();
+    response
+        .by_ref()
+        .take(policy.max_response_bytes as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| "could not read plugin HTTP response".to_string())?;
+    if body.len() > policy.max_response_bytes {
+        return Err("plugin HTTP response exceeds its approved limit".to_string());
+    }
+    let body =
+        String::from_utf8(body).map_err(|_| "plugin HTTP response is not UTF-8".to_string())?;
+    Ok(PluginHttpResponse {
+        status: Some(status),
+        headers,
+        body,
+        error: None,
+    })
+}
+
+fn transport_controlled_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "upgrade"
+    )
+}
+
+fn resolve_http_origin(
+    origin: &HttpOrigin,
+    private_network: bool,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("plugin HTTP request timed out".to_string());
+    }
+    if ACTIVE_PLUGIN_DNS_THREADS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < HTTP_MAX_DNS_THREADS).then_some(active + 1)
+        })
+        .is_err()
+    {
+        return Err("plugin HTTP origin resolution is busy".to_string());
+    }
+    let host = origin.host.clone();
+    let port = origin.port;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("pentect-plugin-dns".to_string())
+        .spawn(move || {
+            let result = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addresses| {
+                    addresses
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|_| ());
+            let _ = sender.send(result);
+            ACTIVE_PLUGIN_DNS_THREADS.fetch_sub(1, Ordering::AcqRel);
+        })
+        .is_err()
+    {
+        ACTIVE_PLUGIN_DNS_THREADS.fetch_sub(1, Ordering::AcqRel);
+        return Err("plugin HTTP origin resolution could not start".to_string());
+    }
+    let addresses = receiver
+        .recv_timeout(remaining)
+        .map_err(|_| "plugin HTTP origin resolution timed out".to_string())?
+        .map_err(|()| "plugin HTTP origin could not be resolved".to_string())?;
+    if addresses.is_empty() {
+        return Err("plugin HTTP origin resolved to no addresses".to_string());
+    }
+    if !private_network && addresses.iter().any(|address| !public_ip(address.ip())) {
+        return Err("plugin HTTP origin resolved to a non-public address".to_string());
+    }
+    Ok(addresses)
+}
+
+fn public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+                || octets[0] >= 240)
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return public_ip(IpAddr::V4(mapped));
+            }
+            !(ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+        }
+    }
+}
+
+fn http_origin(url: &reqwest::Url) -> Result<HttpOrigin, String> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("plugin HTTP URLs cannot contain user information".to_string());
+    }
+    let scheme = url.scheme().to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return Err("plugin HTTP URL must use http or https".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "plugin HTTP URL requires a host".to_string())?
+        .to_ascii_lowercase();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "plugin HTTP URL requires a port".to_string())?;
+    Ok(HttpOrigin { scheme, host, port })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -966,6 +1209,7 @@ struct PluginFile {
     publisher: Option<PublisherFile>,
     execution: Option<ExecutionFile>,
     middleware: Option<MiddlewareFile>,
+    network: Option<NetworkFile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -979,27 +1223,111 @@ struct PublisherFile {
 struct ExecutionFile {
     #[serde(default)]
     args: Vec<String>,
-    runtime: Option<PluginRuntime>,
-    mode: Option<ExecutionMode>,
+    runtime: Option<String>,
+    mode: Option<String>,
     timeout_ms: Option<u64>,
     max_input_bytes: Option<usize>,
     max_output_bytes: Option<usize>,
     max_spans: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum ExecutionMode {
-    #[default]
-    Persistent,
-    Oneshot,
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkFile {
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    private_network: bool,
+    #[serde(default)]
+    allow_insecure: bool,
+    max_request_bytes: Option<usize>,
+    max_response_bytes: Option<usize>,
+    max_requests: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum PluginRuntime {
-    Native,
-    Wasm,
+fn validate_network(
+    name: &str,
+    network: Option<NetworkFile>,
+) -> Result<Option<NetworkPolicy>, String> {
+    let Some(network) = network else {
+        return Ok(None);
+    };
+    if network.allow.is_empty() || network.allow.len() > HTTP_MAX_ORIGINS {
+        return Err(format!(
+            "plugin '{name}' network access requires 1 to {HTTP_MAX_ORIGINS} allowed origins"
+        ));
+    }
+    if network.methods.is_empty() {
+        return Err(format!(
+            "plugin '{name}' network access requires at least one method"
+        ));
+    }
+    let mut origins = BTreeSet::new();
+    for raw in network.allow {
+        let url = reqwest::Url::parse(&raw)
+            .map_err(|_| format!("plugin '{name}' has an invalid HTTP origin"))?;
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return Err(format!(
+                "plugin '{name}' HTTP origins must not contain a path, query, or fragment"
+            ));
+        }
+        let origin = http_origin(&url)?;
+        if origin.scheme == "http" && !network.allow_insecure {
+            return Err(format!(
+                "plugin '{name}' must set allow_insecure = true to approve an http origin"
+            ));
+        }
+        origins.insert(origin);
+    }
+    let mut methods = BTreeSet::new();
+    for method in network.methods {
+        let method = method.trim().to_ascii_uppercase();
+        reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| format!("plugin '{name}' has an invalid HTTP method"))?;
+        if !allowed_network_method(&method) {
+            return Err(format!(
+                "plugin '{name}' requests unsupported HTTP method {method}"
+            ));
+        }
+        methods.insert(method);
+    }
+    let max_request_bytes = network.max_request_bytes.unwrap_or(DEFAULT_MAX_INPUT_BYTES);
+    let max_response_bytes = network
+        .max_response_bytes
+        .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
+    let max_requests = network.max_requests.unwrap_or(HTTP_DEFAULT_REQUESTS);
+    if max_request_bytes == 0 || max_response_bytes == 0 {
+        return Err(format!(
+            "plugin '{name}' HTTP byte limits must be greater than zero"
+        ));
+    }
+    if max_request_bytes > HTTP_MAX_REQUEST_BYTES
+        || max_response_bytes > HTTP_MAX_RESPONSE_BYTES
+        || max_requests == 0
+        || max_requests > HTTP_MAX_REQUESTS
+    {
+        return Err(format!(
+            "plugin '{name}' network limits exceed Pentect's sandbox limits"
+        ));
+    }
+    Ok(Some(NetworkPolicy {
+        origins,
+        methods,
+        private_network: network.private_network,
+        allow_insecure: network.allow_insecure,
+        max_request_bytes,
+        max_response_bytes,
+        max_requests,
+    }))
+}
+
+fn allowed_network_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+    )
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1174,107 +1502,6 @@ fn kind_name(kind: &Kind) -> String {
     }
 }
 
-fn spawn_stdin_writer(mut stdin: ChildStdin, request: Vec<u8>) -> JoinHandle<Result<(), String>> {
-    std::thread::spawn(move || {
-        use std::io::Write as _;
-        stdin
-            .write_all(&request)
-            .map_err(|error| format!("could not write plugin stdin: {error}"))
-    })
-}
-
-fn spawn_stdout_reader(
-    stdout: ChildStdout,
-    max_output_bytes: usize,
-) -> JoinHandle<Result<Vec<u8>, String>> {
-    std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut stdout = stdout.take(max_output_bytes as u64 + 1);
-        let mut output = Vec::new();
-        stdout
-            .read_to_end(&mut output)
-            .map_err(|error| format!("could not read plugin stdout: {error}"))?;
-        Ok(output)
-    })
-}
-
-fn wait_for_child(child: &mut Child, name: &str, timeout: Duration) -> Result<ExitStatus, String> {
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("plugin '{name}' timed out"));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("could not wait for plugin '{name}': {error}"));
-            }
-        }
-    }
-}
-
-fn join_stdin(writer: JoinHandle<Result<(), String>>, name: &str) -> Result<(), String> {
-    writer
-        .join()
-        .map_err(|_| format!("plugin '{name}' stdin writer panicked"))?
-        .map_err(|error| format!("plugin '{name}' {error}"))
-}
-
-fn join_stdout(reader: JoinHandle<Result<Vec<u8>, String>>, name: &str) -> Result<Vec<u8>, String> {
-    reader
-        .join()
-        .map_err(|_| format!("plugin '{name}' stdout reader panicked"))?
-        .map_err(|error| format!("plugin '{name}' {error}"))
-}
-
-fn apply_plugin_env(
-    command: &mut Command,
-    id_or_name: &str,
-    permissions: &BTreeSet<String>,
-) -> Result<(), String> {
-    command.env_clear();
-    for name in safe_plugin_env_names() {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    let id = plugin_id(id_or_name);
-    let dirs = plugin_runtime_dirs(&id)?;
-    command.env(PLUGIN_NAME_ENV, id);
-    command.env(PLUGIN_DATA_DIR_ENV, dirs.data_dir);
-    if permissions.contains("cache:write") {
-        command.env(PLUGIN_CACHE_DIR_ENV, dirs.cache_dir);
-    }
-    if permissions.contains("config:read") {
-        command.env(PLUGIN_CONFIG_ENV, dirs.config_file);
-    }
-    Ok(())
-}
-
-fn safe_plugin_env_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &[
-            "Path",
-            "PATH",
-            "PATHEXT",
-            "SystemRoot",
-            "SYSTEMROOT",
-            "WINDIR",
-            "COMSPEC",
-            "TEMP",
-            "TMP",
-            "USERPROFILE",
-        ]
-    } else {
-        &["PATH", "HOME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR"]
-    }
-}
-
 #[derive(Debug)]
 pub struct PluginRuntimeDirs {
     pub data_dir: PathBuf,
@@ -1346,39 +1573,19 @@ fn restrict_plugin_directory(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn binary_command(
-    name: &str,
-    binary: &str,
-    args: Vec<String>,
-    runtime: PluginRuntime,
-) -> Result<Vec<String>, String> {
+fn wasm_binary_path(name: &str, binary: &str) -> Result<PathBuf, String> {
     if binary.is_empty()
         || binary.len() > 128
         || binary.contains('/')
         || binary.contains('\\')
+        || !binary.to_ascii_lowercase().ends_with(".wasm")
         || !binary.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
         })
-        || args.iter().any(|argument| argument.contains('\0'))
     {
         return Err(format!("plugin '{name}' has an invalid binary name"));
     }
-    let filename = if runtime == PluginRuntime::Native
-        && cfg!(windows)
-        && !binary.to_ascii_lowercase().ends_with(".exe")
-    {
-        format!("{binary}.exe")
-    } else {
-        binary.to_string()
-    };
-    let program = plugin_runtime_dirs(name)?
-        .data_dir
-        .join("bin")
-        .join(filename);
-    let mut command = Vec::with_capacity(args.len() + 1);
-    command.push(program.to_string_lossy().into_owned());
-    command.extend(args);
-    Ok(command)
+    Ok(plugin_runtime_dirs(name)?.data_dir.join("bin").join(binary))
 }
 
 fn plugin_default_name(path: &Path) -> String {
@@ -1397,49 +1604,6 @@ fn plugin_default_name(path: &Path) -> String {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("plugin")
         .to_string()
-}
-
-fn plugin_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
-    let path = Path::new(program);
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    if program.contains('/') || program.contains('\\') {
-        return cwd.join(path);
-    }
-    installed_plugin_program(program, id)
-        .or_else(|| sidecar_program(program))
-        .unwrap_or_else(|| path.to_path_buf())
-}
-
-fn installed_plugin_program(program: &str, id: &str) -> Option<PathBuf> {
-    let bin = plugin_runtime_dirs(id).ok()?.data_dir.join("bin");
-    command_names(program)
-        .into_iter()
-        .map(|name| bin.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-fn sidecar_program(program: &str) -> Option<PathBuf> {
-    let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    command_names(program)
-        .into_iter()
-        .map(|name| directory.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-#[cfg(windows)]
-fn command_names(name: &str) -> Vec<String> {
-    if Path::new(name).extension().is_some() {
-        vec![name.to_string()]
-    } else {
-        vec![format!("{name}.exe"), name.to_string()]
-    }
-}
-
-#[cfg(not(windows))]
-fn command_names(name: &str) -> Vec<String> {
-    vec![name.to_string()]
 }
 
 fn plugin_id(value: &str) -> String {
@@ -1521,41 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_plugin_handles_multiple_events() {
-        let plugin = PluginBinary {
-            name: "fixture".to_string(),
-            id: "fixture".to_string(),
-            path: std::env::current_dir().unwrap().join("plugin.toml"),
-            command: persistent_fixture_command(),
-            runtime: PluginRuntime::Native,
-            wasm: None,
-            stages: BTreeSet::from([MiddlewareStage::ProviderRequest]),
-            permissions: BTreeSet::from(["input:read".to_string(), "payload:write".to_string()]),
-            required: true,
-            mode: ExecutionMode::Persistent,
-            timeout: Duration::from_secs(5),
-            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
-            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
-            max_spans: DEFAULT_MAX_SPANS,
-            process: Arc::new(Mutex::new(None)),
-        };
-        let middleware = PluginMiddleware {
-            plugins: vec![plugin],
-        };
-        for sequence in [1, 2] {
-            let run = middleware
-                .run(
-                    MiddlewareStage::ProviderRequest,
-                    json!({"sequence": sequence}),
-                    None,
-                )
-                .unwrap();
-            assert_eq!(run.payload["sequence"], sequence);
-        }
-    }
-
-    #[test]
-    fn wasm_plugin_runs_without_host_capabilities() {
+    fn wasm_plugin_runs_without_host_imports() {
         let output = br#"{"schema":"pentect.plugin.v1","id":7,"type":"result","action":"next"}"#;
         let packed = ((2048_u64) << 32) | output.len() as u64;
         let wat = format!(
@@ -1576,7 +1706,7 @@ mod tests {
             REQUEST_ID.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&path, bytes).unwrap();
-        let program = WasmProgram::load(&path, "fixture").unwrap();
+        let program = WasmProgram::load(&path, "fixture", None, None).unwrap();
         let result = program
             .invoke(b"{}", Duration::from_secs(1), 4096, "fixture")
             .unwrap();
@@ -1603,7 +1733,7 @@ mod tests {
             REQUEST_ID.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&path, bytes).unwrap();
-        let program = WasmProgram::load(&path, "fixture").unwrap();
+        let program = WasmProgram::load(&path, "fixture", None, None).unwrap();
         let error = program
             .invoke(b"{}", Duration::from_millis(1), 4096, "fixture")
             .unwrap_err();
@@ -1611,41 +1741,135 @@ mod tests {
         assert!(error.contains("timed out"), "{error}");
     }
 
-    #[cfg(windows)]
-    fn persistent_fixture_command() -> Vec<String> {
-        vec![
-            "powershell".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            concat!(
-                "$input | ForEach-Object { ",
-                "$r = $_ | ConvertFrom-Json; ",
-                "if ($r.type -eq 'initialize') { ",
-                "$o = @{schema='pentect.plugin.v1';id=[long]$r.id;type='initialized'} ",
-                "} else { ",
-                "$o = @{schema='pentect.plugin.v1';id=[long]$r.id;type='result';action='next';payload=$r.payload} ",
-                "}; [Console]::Out.WriteLine(($o | ConvertTo-Json -Compress -Depth 20)); ",
-                "[Console]::Out.Flush() }"
-            )
-            .to_string(),
-        ]
+    #[test]
+    fn wasm_host_imports_require_matching_network_approval() {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "pentect:http" "request"
+                    (func $request (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "pentect_alloc") (param i32) (result i32)
+                    (i32.const 1024))
+                (func (export "pentect_handle") (param i32 i32) (result i64)
+                    (i64.const 0))
+            )"#,
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "pentect-plugin-wasm-network-{}-{}.wasm",
+            std::process::id(),
+            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let denied = WasmProgram::load(&path, "fixture", None, None).unwrap_err();
+        assert!(denied.contains("unapproved host function"), "{denied}");
+
+        let policy = NetworkPolicy {
+            origins: BTreeSet::from([HttpOrigin {
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                port: 443,
+            }]),
+            methods: BTreeSet::from(["GET".to_string()]),
+            private_network: false,
+            allow_insecure: false,
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
+            max_requests: 1,
+        };
+        WasmProgram::load(&path, "fixture", Some(policy), None).unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(not(windows))]
-    fn persistent_fixture_command() -> Vec<String> {
-        vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            concat!(
-                "while IFS= read -r line; do ",
-                "id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p'); ",
-                "if printf '%s' \"$line\" | grep -q '\"type\":\"initialize\"'; then ",
-                "printf '{\"schema\":\"pentect.plugin.v1\",\"id\":%s,\"type\":\"initialized\"}\\n' \"$id\"; ",
-                "else sequence=$(printf '%s' \"$line\" | sed -n 's/.*\"sequence\":\\([0-9][0-9]*\\).*/\\1/p'); ",
-                "printf '{\"schema\":\"pentect.plugin.v1\",\"id\":%s,\"type\":\"result\",\"action\":\"next\",\"payload\":{\"sequence\":%s}}\\n' \"$id\" \"$sequence\"; fi; ",
-                "done"
-            )
-            .to_string(),
-        ]
+    #[test]
+    fn wasm_config_import_requires_config_read_approval() {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "pentect:config" "read"
+                    (func $read (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "pentect_alloc") (param i32) (result i32)
+                    (i32.const 1024))
+                (func (export "pentect_handle") (param i32 i32) (result i64)
+                    (i64.const 0))
+            )"#,
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "pentect-plugin-wasm-config-{}-{}.wasm",
+            std::process::id(),
+            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let denied = WasmProgram::load(&path, "fixture", None, None).unwrap_err();
+        assert!(denied.contains("unapproved host function"), "{denied}");
+        let config = toml::Value::Table(toml::Table::from_iter([(
+            "model".to_string(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "threshold".to_string(),
+                toml::Value::Float(0.8),
+            )])),
+        )]));
+        assert_eq!(
+            config_value(&config, "model.threshold").and_then(toml::Value::as_float),
+            Some(0.8)
+        );
+        WasmProgram::load(&path, "fixture", None, Some(config)).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn network_policy_blocks_private_addresses_by_default() {
+        assert!(!public_ip("127.0.0.1".parse().unwrap()));
+        assert!(!public_ip("10.0.0.1".parse().unwrap()));
+        assert!(!public_ip("::1".parse().unwrap()));
+        assert!(public_ip("1.1.1.1".parse().unwrap()));
+        assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn approved_private_network_request_is_bounded_and_direct() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        });
+        let origin = HttpOrigin {
+            scheme: "http".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: address.port(),
+        };
+        let policy = NetworkPolicy {
+            origins: BTreeSet::from([origin]),
+            methods: BTreeSet::from(["GET".to_string()]),
+            private_network: true,
+            allow_insecure: true,
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
+            max_requests: 1,
+        };
+        let response = perform_plugin_http(
+            &policy,
+            Instant::now() + Duration::from_secs(2),
+            PluginHttpRequest {
+                method: "GET".to_string(),
+                url: format!("http://127.0.0.1:{}/health", address.port()),
+                headers: BTreeMap::new(),
+                body: String::new(),
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status, Some(200));
+        assert_eq!(response.body, "ok");
+        assert!(response.error.is_none());
     }
 }

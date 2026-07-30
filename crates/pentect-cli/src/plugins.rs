@@ -968,19 +968,6 @@ label = "INLINE_SECRET"
     }
 
     #[test]
-    fn official_openai_privacy_filter_has_binary() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .unwrap();
-        let opf = repo.join("plugins").join("openai-privacy-filter");
-        let active = active_from_explicit_specs(vec![opf.display().to_string()], true).unwrap();
-        assert!(active.config_paths().is_empty());
-        assert_eq!(active.binary_paths().len(), 1);
-        assert!(active.binary_paths()[0].ends_with("plugin.toml"));
-    }
-
-    #[test]
     fn directory_plugins_can_contain_configs_and_binaries() {
         let root =
             std::env::temp_dir().join(format!("pentect-plugin-paths-{}", std::process::id()));
@@ -989,7 +976,7 @@ label = "INLINE_SECRET"
         std::fs::write(root.join("config.toml"), "").unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool.wasm\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
         )
         .unwrap();
 

@@ -1,20 +1,12 @@
-//! Small, synchronous helpers for persistent Pentect stdio plugins.
+//! Small helpers for sandboxed Pentect WebAssembly plugins.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{self, BufRead, Write};
+use std::collections::BTreeMap;
 
 pub const SCHEMA: &str = "pentect.plugin.v1";
 #[doc(hidden)]
 pub use serde_json as __serde_json;
-
-pub fn config_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("PENTECT_PLUGIN_CONFIG").map(Into::into)
-}
-
-pub fn cache_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("PENTECT_PLUGIN_CACHE_DIR").map(Into::into)
-}
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -45,6 +37,129 @@ pub struct Response {
     pub spans: Option<Value>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub body: String,
+}
+
+impl HttpRequest {
+    pub fn get(url: impl Into<String>) -> Self {
+        Self {
+            method: "GET".to_string(),
+            url: url.into(),
+            headers: BTreeMap::new(),
+            body: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HttpResponse {
+    pub status: Option<u16>,
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+    pub error: Option<String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "pentect:http")]
+extern "C" {
+    #[link_name = "request"]
+    fn pentect_http_request(
+        request_ptr: i32,
+        request_len: i32,
+        response_ptr: i32,
+        response_capacity: i32,
+    ) -> i32;
+}
+
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "pentect:config")]
+extern "C" {
+    #[link_name = "read"]
+    fn pentect_config_read(
+        key_ptr: i32,
+        key_len: i32,
+        response_ptr: i32,
+        response_capacity: i32,
+    ) -> i32;
+}
+
+/// Read one approved plugin configuration key.
+///
+/// The plugin must declare `config:read` in `[middleware].permissions`.
+#[cfg(target_arch = "wasm32")]
+pub fn config(key: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+    const RESPONSE_CAPACITY: usize = 1024 * 1024;
+    let key_len = i32::try_from(key.len())?;
+    let mut output = vec![0_u8; RESPONSE_CAPACITY];
+    let output_len = unsafe {
+        pentect_config_read(
+            key.as_ptr() as i32,
+            key_len,
+            output.as_mut_ptr() as i32,
+            RESPONSE_CAPACITY as i32,
+        )
+    };
+    if output_len < 0 {
+        return Err(format!("Pentect config read failed with code {output_len}").into());
+    }
+    output.truncate(usize::try_from(output_len)?);
+    let value: Value = serde_json::from_slice(&output)?;
+    Ok((value != Value::Null).then_some(value))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn config(_key: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+    Err("Pentect config access is only available inside WebAssembly plugins".into())
+}
+
+/// Perform an outbound request through Pentect's approved network access.
+///
+/// The origin and method must be declared in `[network]`. Pentect
+/// performs the request without granting the module ambient socket access.
+#[cfg(target_arch = "wasm32")]
+pub fn http_request(
+    request: &HttpRequest,
+    response_capacity: usize,
+) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    const MAX_RESPONSE_CAPACITY: usize = 4 * 1024 * 1024;
+    if response_capacity == 0 || response_capacity > MAX_RESPONSE_CAPACITY {
+        return Err("invalid Pentect HTTP response capacity".into());
+    }
+    let encoded = serde_json::to_vec(request)?;
+    let request_len = i32::try_from(encoded.len())?;
+    let response_capacity_i32 = i32::try_from(response_capacity)?;
+    let mut output = vec![0_u8; response_capacity];
+    let output_len = unsafe {
+        pentect_http_request(
+            encoded.as_ptr() as i32,
+            request_len,
+            output.as_mut_ptr() as i32,
+            response_capacity_i32,
+        )
+    };
+    if output_len < 0 {
+        return Err(format!("Pentect network request failed with code {output_len}").into());
+    }
+    let output_len = usize::try_from(output_len)?;
+    output.truncate(output_len);
+    Ok(serde_json::from_slice(&output)?)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn http_request(
+    _request: &HttpRequest,
+    _response_capacity: usize,
+) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    Err("Pentect network access is only available inside WebAssembly plugins".into())
+}
+
 impl Response {
     pub fn next(id: u64) -> Self {
         Self {
@@ -69,41 +184,11 @@ impl Response {
     }
 }
 
-pub fn serve(
-    mut handler: impl FnMut(Request) -> Result<Response, Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let request: Request = serde_json::from_str(&line?)?;
-        if request.schema != SCHEMA {
-            return Err("unsupported Pentect plugin schema".into());
-        }
-        let response = if request.kind == "initialize" {
-            Response {
-                schema: SCHEMA,
-                id: request.id,
-                kind: "initialized",
-                action: None,
-                outcome: None,
-                payload: None,
-                message: None,
-                spans: None,
-            }
-        } else {
-            handler(request)?
-        };
-        serde_json::to_writer(&mut stdout, &response)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-    }
-    Ok(())
-}
-
-/// Export Pentect's capability-sandboxed WebAssembly ABI for a typed handler.
+/// Export Pentect's sandboxed WebAssembly ABI for a typed handler.
 ///
-/// The resulting module imports nothing from the host. Build the plugin as a
-/// `cdylib` for `wasm32-unknown-unknown` and use `execution.runtime = "wasm"`.
+/// The macro itself adds no host imports. Calling [`config`] or
+/// [`http_request`] adds only that narrow Pentect host import. Build the plugin
+/// as a `cdylib` for `wasm32-unknown-unknown`.
 #[macro_export]
 macro_rules! export_wasm_plugin {
     ($handler:path) => {

@@ -118,7 +118,7 @@ fn positive_cases() -> &'static [Case] {
 
 fn negative_cases() -> &'static [&'static str] {
     &[
-        "secret capability boundary design note",
+        "secret handle boundary design note",
         "token budget and api design notes",
         "password field docs describe input type=password",
         "BIP39 wordlist excerpt: abandon ability able about above absent absorb abstract absurd abuse access accident",

@@ -26,7 +26,7 @@ use zeroize::Zeroize;
 
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_SSE_BYTES: usize = 8 * 1024 * 1024;
-const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local capability handles. Copy a handle byte-for-byte into a client function call when that function needs the represented value. Do not alter, expand, guess, or expose it. Pentect resolves handles only in completed client function-call arguments.";
+const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local secret handles. Copy a handle byte-for-byte into a client function call when that function needs the represented value. Do not alter, expand, guess, or expose it. Pentect resolves handles only in completed client function-call arguments.";
 
 type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;

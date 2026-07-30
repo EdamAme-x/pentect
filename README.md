@@ -21,7 +21,7 @@ TODO
 - [ ] 止めた後になんか重なる
 
 - [x] pluginsの責務・配布・権限モデルを再設計する
-- [x] plugin registry・署名付きpublisher identity・capability sandbox
+- [x] WebAssembly plugin registry・署名付きpublisher identity・明示許可型sandbox
 - [ ] local llm mask exts
 - [ ] app, http host
 - [ ] approval ui?
@@ -50,12 +50,13 @@ gateway.
 
 ## Plugins
 
-Plugins can be manifest-only regex detectors or approved executable middleware
-written in any language. Executable plugins use a persistent NDJSON stdio
-protocol, preserve declared order, and return `next` or `stop`; Pentect keeps
-control of the chain and the final masking pass. See
+Plugins can be manifest-only regex detectors or approved WebAssembly
+middleware. Executable plugins are portable `.wasm` modules with no ambient
+system access. Optional network origins and methods are shown and approved
+during setup. Plugins preserve declared order and return `next` or `stop`;
+Pentect keeps control of the chain and final masking pass. See
 [the plugin guide](guides/plugins.md), [protocol fixtures](protocol/fixtures),
-and the lightweight [Rust, Python, TypeScript, and Go SDKs](sdk).
+and the lightweight [Rust WebAssembly SDK](sdk/rust/pentect-plugin).
 
 ### Desktop apps
 
