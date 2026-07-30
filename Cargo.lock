@@ -2388,6 +2388,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "toml_edit",
  "windows-sys 0.61.2",
  "zerocopy",
  "zeroize",

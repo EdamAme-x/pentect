@@ -36,6 +36,7 @@ data-encoding.workspace = true
 getrandom = { workspace = true }
 ctrlc.workspace = true
 reqwest.workspace = true
+toml_edit.workspace = true
 futures-util = { workspace = true }
 pdf-extract = "0.9"
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }

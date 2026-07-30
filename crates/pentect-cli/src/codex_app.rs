@@ -158,10 +158,10 @@ impl CodexConfigOverride {
             String::new()
         };
         let mut parsed = if original.trim().is_empty() {
-            toml::Value::Table(toml::map::Map::new())
+            toml_edit::DocumentMut::new()
         } else {
             original
-                .parse::<toml::Value>()
+                .parse::<toml_edit::DocumentMut>()
                 .map_err(|error| format!("could not parse '{}': {error}", config.display()))?
         };
         set_provider_base_url(&mut parsed, provider, gateway)?;
@@ -235,34 +235,25 @@ impl Drop for CodexConfigOverride {
 }
 
 fn set_provider_base_url(
-    config: &mut toml::Value,
+    config: &mut toml_edit::DocumentMut,
     provider: &str,
     gateway: &str,
 ) -> Result<(), String> {
-    let root = config
-        .as_table_mut()
-        .ok_or_else(|| "Codex config root is not a TOML table".to_string())?;
     if provider == "openai" {
-        root.insert(
-            "openai_base_url".to_string(),
-            toml::Value::String(gateway.to_string()),
-        );
+        config["openai_base_url"] = toml_edit::value(gateway);
         return Ok(());
     }
-    let providers = root
+    let providers = config
         .entry("model_providers")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_mut()
         .ok_or_else(|| "model_providers is not a TOML table".to_string())?;
     let provider = providers
-        .entry(provider.to_string())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .entry(provider)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_mut()
         .ok_or_else(|| "selected model provider is not a TOML table".to_string())?;
-    provider.insert(
-        "base_url".to_string(),
-        toml::Value::String(gateway.to_string()),
-    );
+    provider.insert("base_url", toml_edit::value(gateway));
     Ok(())
 }
 
@@ -483,7 +474,7 @@ mod tests {
 
     #[test]
     fn rewrites_only_the_selected_custom_provider() {
-        let mut config: toml::Value = r#"
+        let mut config: toml_edit::DocumentMut = r#"
 model_provider = "proxy"
 
 [model_providers.proxy]
@@ -503,6 +494,23 @@ base_url = "https://other.example/v1"
         assert_eq!(
             config["model_providers"]["other"]["base_url"].as_str(),
             Some("https://other.example/v1")
+        );
+    }
+
+    #[test]
+    fn provider_override_preserves_comments_and_valid_toml() {
+        let mut config =
+            "# keep this comment\n[model_providers.proxy]\nbase_url = \"https://old.example/v1\"\n"
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+        set_provider_base_url(&mut config, "openai", "http://127.0.0.1:47781").unwrap();
+        let encoded = config.to_string();
+
+        assert!(encoded.contains("# keep this comment"), "{encoded}");
+        let parsed = encoded.parse::<toml::Value>().unwrap();
+        assert_eq!(
+            parsed["openai_base_url"].as_str(),
+            Some("http://127.0.0.1:47781")
         );
     }
 

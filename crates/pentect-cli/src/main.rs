@@ -2143,7 +2143,7 @@ fn codex_cli_config_string(args: &[String], wanted: &str) -> Option<String> {
         let Some((key, raw)) = config.and_then(|config| config.split_once('=')) else {
             continue;
         };
-        if key.trim() != wanted {
+        if !toml_key_paths_equal(key.trim(), wanted) {
             continue;
         }
         let parsed = format!("value={raw}").parse::<toml::Value>().ok();
@@ -2155,6 +2155,28 @@ fn codex_cli_config_string(args: &[String], wanted: &str) -> Option<String> {
             .or_else(|| Some(raw.trim().trim_matches(['"', '\'']).to_string()));
     }
     found
+}
+
+fn toml_key_paths_equal(left: &str, right: &str) -> bool {
+    fn path(value: &toml::Value, out: &mut Vec<String>) -> bool {
+        match value {
+            toml::Value::Table(table) if table.len() == 1 => {
+                let (key, value) = table.iter().next().expect("single TOML key");
+                out.push(key.clone());
+                path(value, out)
+            }
+            toml::Value::String(_) => true,
+            _ => false,
+        }
+    }
+
+    fn parse(key: &str) -> Option<Vec<String>> {
+        let value = format!("{key} = \"pentect\"").parse::<toml::Value>().ok()?;
+        let mut segments = Vec::new();
+        path(&value, &mut segments).then_some(segments)
+    }
+
+    parse(left).is_some_and(|left| parse(right).as_ref() == Some(&left))
 }
 
 fn codex_toml_key_segment(value: &str) -> String {
@@ -2498,6 +2520,18 @@ mod tests {
         assert_eq!(
             codex_cli_config_string(&args, "openai_base_url").as_deref(),
             Some("https://last.example/v1")
+        );
+    }
+
+    #[test]
+    fn codex_cli_config_compares_toml_key_segments_semantically() {
+        let args = vec![
+            "-c".to_string(),
+            "model_providers.'team.proxy'.base_url=\"https://proxy.example/v1\"".to_string(),
+        ];
+        assert_eq!(
+            codex_cli_config_string(&args, "model_providers.\"team.proxy\".base_url").as_deref(),
+            Some("https://proxy.example/v1")
         );
     }
 

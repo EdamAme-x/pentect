@@ -41,6 +41,7 @@ getrandom = "0.2"
 ignore = "0.4"
 jiff = "0.2"
 toml = "0.8"
+toml_edit = "0.22"
 phonenumber = "0.3.10"
 prost = "0.14"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }

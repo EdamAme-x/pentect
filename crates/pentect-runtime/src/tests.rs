@@ -767,11 +767,13 @@ fn active_prompt_masker_reuses_bounded_cached_result() {
     assert!(!first.contains(raw), "{first}");
     assert_eq!(masker.prompt_cache.len(), 1);
     assert_eq!(masker.prompt_cache_order.len(), 1);
+    let reported_after_first = masker.reported_masked_count;
 
     let second = masker.mask_prompt_text(&prompt).unwrap().unwrap();
     assert_eq!(second, first);
     assert_eq!(masker.prompt_cache.len(), 1);
     assert_eq!(masker.prompt_cache_order.len(), 1);
+    assert_eq!(masker.reported_masked_count, reported_after_first);
 }
 
 #[test]
