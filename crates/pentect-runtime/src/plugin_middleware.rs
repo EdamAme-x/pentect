@@ -15,8 +15,6 @@ use std::time::{Duration, Instant};
 
 pub const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
 
-const PENTECT_DIR: &str = ".pentect";
-const PLUGINS_DATA_DIR: &str = "plugins-data";
 const PLUGIN_CONFIG_FILE: &str = "config.toml";
 const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
 const PLUGIN_CACHE_DIR: &str = "cache";
@@ -1082,27 +1080,75 @@ fn safe_plugin_env_names() -> &'static [&'static str] {
     }
 }
 
-struct PluginRuntimeDirs {
-    data_dir: PathBuf,
-    cache_dir: PathBuf,
-    config_file: PathBuf,
+#[derive(Debug)]
+pub struct PluginRuntimeDirs {
+    pub data_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub config_file: PathBuf,
 }
 
-fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
+pub fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
     let id = plugin_id(id_or_name);
-    let data_dir = std::env::current_dir()
-        .map_err(|error| format!("could not resolve plugin data directory: {error}"))?
-        .join(PENTECT_DIR)
-        .join(PLUGINS_DATA_DIR)
-        .join(&id);
+    let project = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| format!("could not resolve plugin project directory: {error}"))?;
+    let mut digest = sha2::Sha256::new();
+    use sha2::Digest as _;
+    digest.update(b"pentect-plugin-project-v1");
+    digest.update(project.to_string_lossy().as_bytes());
+    let project_id = data_encoding::HEXLOWER.encode(&digest.finalize());
+    let user_root = plugin_user_data_root()?;
+    if !user_root.is_absolute() {
+        return Err("Pentect plugin data directory must be absolute".to_string());
+    }
+    std::fs::create_dir_all(&user_root)
+        .map_err(|error| format!("could not create '{}': {error}", user_root.display()))?;
+    let user_root = std::fs::canonicalize(&user_root)
+        .map_err(|error| format!("could not resolve '{}': {error}", user_root.display()))?;
+    if user_root.starts_with(&project) {
+        return Err("Pentect plugin data directory must be outside the project".to_string());
+    }
+    restrict_plugin_directory(&user_root)?;
+    let data_dir = user_root.join("projects").join(project_id).join(&id);
     let cache_dir = data_dir.join(PLUGIN_CACHE_DIR);
     std::fs::create_dir_all(&cache_dir)
         .map_err(|error| format!("could not create '{}': {error}", cache_dir.display()))?;
+    restrict_plugin_directory(&data_dir)?;
     Ok(PluginRuntimeDirs {
         config_file: data_dir.join(PLUGIN_CONFIG_FILE),
         data_dir,
         cache_dir,
     })
+}
+
+fn plugin_user_data_root() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base = home_dir().map(|home| home.join("Library").join("Application Support"));
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".local").join("share")));
+    base.map(|base| base.join("pentect").join("plugins"))
+        .ok_or_else(|| "could not find a local data directory for Pentect plugins".to_string())
+}
+
+#[cfg(not(windows))]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(unix)]
+fn restrict_plugin_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("could not restrict '{}': {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_plugin_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn binary_command(name: &str, binary: &str, args: Vec<String>) -> Result<Vec<String>, String> {
@@ -1164,10 +1210,7 @@ fn plugin_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
 }
 
 fn installed_plugin_program(program: &str, id: &str) -> Option<PathBuf> {
-    let bin = PathBuf::from(PENTECT_DIR)
-        .join(PLUGINS_DATA_DIR)
-        .join(plugin_id(id))
-        .join("bin");
+    let bin = plugin_runtime_dirs(id).ok()?.data_dir.join("bin");
     command_names(program)
         .into_iter()
         .map(|name| bin.join(name))

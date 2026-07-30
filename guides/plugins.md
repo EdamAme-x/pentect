@@ -66,6 +66,9 @@ Plugin children receive a cleared environment plus a small platform allowlist.
 They never inherit Pentect's memory-store credentials. `PENTECT_PLUGIN_CONFIG`
 is exposed only with `config:read`; `PENTECT_PLUGIN_CACHE_DIR` only with
 `cache:write`. `PENTECT_PLUGIN_DATA_DIR` is always scoped to that plugin.
+Approval files, installed binaries, configuration, cache, and mutable data live
+in project-scoped OS user data outside the repository, so a clone cannot
+pre-seed an approved executable.
 
 `input:read` is mandatory. Payload replacement requires `payload:write`;
 blocking requires `pipeline:block`; local responses require

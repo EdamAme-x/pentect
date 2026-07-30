@@ -7,12 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-const PENTECT_DIR: &str = ".pentect";
-const PLUGINS_DATA_DIR: &str = "plugins-data";
-const PLUGIN_CONFIG_FILE: &str = "config.toml";
 const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
 const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
-const PLUGIN_CACHE_DIR: &str = "cache";
 const PLUGIN_NAME_ENV: &str = "PENTECT_PLUGIN_NAME";
 const PLUGIN_DATA_DIR_ENV: &str = "PENTECT_PLUGIN_DATA_DIR";
 const PLUGIN_CACHE_DIR_ENV: &str = "PENTECT_PLUGIN_CACHE_DIR";
@@ -1207,33 +1203,8 @@ fn plugin_command(program: &Path, id_or_name: &str) -> Result<Command, String> {
     Ok(command)
 }
 
-#[derive(Debug)]
-struct PluginRuntimeDirs {
-    data_dir: PathBuf,
-    cache_dir: PathBuf,
-    config_file: PathBuf,
-}
-
-fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
-    let id = plugin_id(id_or_name);
-    let data_dir = std::env::current_dir()
-        .map_err(|e| format!("could not resolve plugin data directory: {e}"))?
-        .join(PENTECT_DIR)
-        .join(PLUGINS_DATA_DIR)
-        .join(&id);
-    let cache_dir = data_dir.join(PLUGIN_CACHE_DIR);
-    std::fs::create_dir_all(&cache_dir).map_err(|e| {
-        format!(
-            "could not create plugin data '{}': {e}",
-            cache_dir.display()
-        )
-    })?;
-    let config_file = data_dir.join(PLUGIN_CONFIG_FILE);
-    Ok(PluginRuntimeDirs {
-        data_dir,
-        cache_dir,
-        config_file,
-    })
+fn plugin_runtime_dirs(id_or_name: &str) -> Result<pentect_agent::PluginRuntimeDirs, String> {
+    pentect_agent::plugin_runtime_dirs(id_or_name)
 }
 
 fn plugin_id(value: &str) -> String {
@@ -1410,10 +1381,7 @@ fn plugin_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
 }
 
 fn installed_plugin_program(program: &str, id: &str) -> Option<PathBuf> {
-    let bin = PathBuf::from(PENTECT_DIR)
-        .join(PLUGINS_DATA_DIR)
-        .join(plugin_id(id))
-        .join("bin");
+    let bin = plugin_runtime_dirs(id).ok()?.data_dir.join("bin");
     for name in command_names(program) {
         let candidate = bin.join(name);
         if candidate.is_file() {
@@ -1733,8 +1701,12 @@ permissions = ["filesystem", "process"]
     }
 
     #[test]
-    fn plugin_env_exposes_project_local_plugin_data() {
+    fn plugin_env_exposes_project_scoped_user_data() {
         let command = plugin_command(Path::new("echo"), "My Ext!").unwrap();
+        let dirs = plugin_runtime_dirs("my-ext").unwrap();
+        let data_dir = dirs.data_dir.to_string_lossy().replace('\\', "/");
+        let cache_dir = dirs.cache_dir.to_string_lossy().replace('\\', "/");
+        let config_file = dirs.config_file.to_string_lossy().replace('\\', "/");
         let envs = command
             .get_envs()
             .map(|(name, value)| {
@@ -1752,19 +1724,22 @@ permissions = ["filesystem", "process"]
         );
         assert!(
             envs.get(PLUGIN_DATA_DIR_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext")),
+                .is_some_and(|path| path == &data_dir),
             "{envs:?}"
         );
         assert!(
             envs.get(PLUGIN_CACHE_DIR_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext/cache")),
+                .is_some_and(|path| path == &cache_dir),
             "{envs:?}"
         );
         assert!(
             envs.get(PLUGIN_CONFIG_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext/config.toml")),
+                .is_some_and(|path| path == &config_file),
             "{envs:?}"
         );
+        let project = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert!(!dirs.data_dir.starts_with(project), "{dirs:?}");
+        let _ = std::fs::remove_dir_all(dirs.data_dir);
     }
 
     #[test]

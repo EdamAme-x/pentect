@@ -67,10 +67,10 @@ windows-x86_64 = "example-helper-win64.exe"
 
 A missing asset is reported as unsupported. Pentect verifies the sibling
 `.sha256`, then installs the executable at the deterministic
-`.pentect/plugins-data/<plugin>/bin/<binary>` path and records its repository,
-version, asset, and digest in `binary.lock`. Optional process limits and
-arguments can be placed under `[execution]`, but the defaults require no extra
-configuration.
+project-scoped Pentect user-data path outside the repository and records its
+repository, version, asset, and digest in `binary.lock`. Optional process
+limits and arguments can be placed under `[execution]`, but the defaults
+require no extra configuration.
 
 Postscripts never run while loading a plugin. They only run through
 `pentect plugins setup NAME`. Pentect prints every command and its declared
@@ -98,4 +98,5 @@ pentect plugins config example --unset model.name
 ```
 
 The no-value form prints the config path and key names only. Configuration is
-stored under `.pentect/plugins-data/<plugin>/config.toml`.
+stored beside the plugin's approval and binary in project-scoped OS user data,
+not in the repository.

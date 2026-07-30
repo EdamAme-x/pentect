@@ -5,9 +5,9 @@ Scope: Rust workspace, shell/runtime IPC, masking pipeline, plugins, installers/
 
 ## Executive summary
 
-Five clear security issues were fixed in this review: an unsafe UTF-8 mutation reachable through the public detector API, local memory-store connection/request exhaustion, a project-controlled remote plugin cache, mutable GitHub Actions dependencies, and the dependency advisories known at the time of the review. Targeted tests and `cargo check -p pentect-cli` pass.
+Seven clear security issues were fixed in this review: an unsafe UTF-8 mutation reachable through the public detector API, local memory-store connection/request exhaustion, a project-controlled remote plugin cache, mutable GitHub Actions dependencies, the dependency advisories known at the time of the review, executable-plugin approval bypasses, and project-controlled plugin runtime artifacts. Targeted tests and `cargo check -p pentect-cli` pass.
 
-The largest remaining risk is the plugin execution trust model. A remote adapter can currently select a command from `PATH`, and plugin binaries are stored below the current project's `.pentect` directory. Fixing that safely changes plugin compatibility and storage semantics, so it is intentionally held for an explicit product decision.
+Executable plugins remain deliberately trusted native code rather than sandboxed code. Their manifest, stages, permissions, postscripts, source repository, and destinations are shown before setup approval. Approval state and installed artifacts are kept outside the repository in project-scoped OS user data. The largest remaining decisions are enforceable postscript sandboxing and independently signed release artifacts.
 
 ## Fixed findings
 
@@ -43,21 +43,21 @@ CI and release workflows used mutable action tags. A compromised or moved upstre
 
 Fixed in `.github/workflows/ci.yml` and `.github/workflows/release.yml`: third-party actions are pinned to full commit SHAs, CI defaults to read-only repository permissions, and checkout credentials are not persisted.
 
+### PNT-SEC-006 — Executable plugin activation could bypass setup (high)
+
+The retired adapter runtime could fall back to a relative command or `PATH`. A remote TOML file could therefore select an installed interpreter and receive input without the release-binary setup path.
+
+Fixed in the plugin middleware runtime: TOML-only plugins may add regex detectors, while executable plugins resolve only to the project-scoped installed release artifact or a Pentect sidecar. Runtime startup requires an exact SHA-256 match with the approved `plugin.toml`, including repository, command, stages, permissions, and postscripts. Plugin updates preserve that approval instead of rewriting it.
+
+Relevant code: `crates/pentect-cli/src/plugins_cmd.rs` and `crates/pentect-runtime/src/plugin_middleware.rs`.
+
+### PNT-SEC-007 — Plugin executables were project-controlled (high)
+
+Installed binaries and approval files previously lived below `.pentect/plugins-data/<plugin>`. A cloned repository could pre-place both a same-named executable and unauthenticated approval metadata.
+
+Fixed by moving approval, binaries, configuration, cache, and mutable plugin data to an OS user-data directory outside the repository, scoped by the canonical project identity and plugin ID. Unix plugin data directories are restricted to mode `0700`. Existing project-local approvals are intentionally not migrated; executable plugins require setup once under the new layout.
+
 ## Decisions required
-
-### PNT-SEC-D01 — Remote runtimes can execute arbitrary commands (high)
-
-`adapter_program` falls back to a relative command or `PATH`. A remote TOML plugin can therefore name `powershell`, `sh`, or another installed executable and receive unmasked input through stdin without going through the setup approval used for downloaded binaries. Clearing the child environment reduces exposure but is not a sandbox.
-
-Recommended decision: TOML-only remote plugins may define regex detectors, but executable/model runtimes must resolve to an explicitly installed, checksum-verified plugin artifact or an explicitly trusted local absolute path. A less restrictive alternative is a per-source/digest approval store.
-
-Relevant code: `crates/pentect-cli/src/plugins_cmd.rs` and `crates/pentect-runtime/src/plugin_adapter.rs` (`adapter_program`).
-
-### PNT-SEC-D02 — Plugin executables are project-controlled (high)
-
-Installed binaries are resolved from `.pentect/plugins-data/<plugin>/bin`. A cloned repository can pre-place a same-named executable, which may then be selected before an approved setup artifact.
-
-Recommended decision: keep project plugin configuration in the repository, but move executable artifacts and mutable plugin data to an OS user-data directory keyed by plugin identity and artifact digest. This needs migration and re-setup behavior to be chosen.
 
 ### PNT-SEC-D03 — Postscript permissions are descriptive, not enforced (medium/high)
 
