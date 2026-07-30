@@ -225,6 +225,21 @@ fn disposition_parameter(header: &str, expected: &str) -> Option<String> {
     })
 }
 
+const MAX_TRACKED_FILE_IDS: usize = 1024;
+
+pub(crate) fn remember_file_coverage(
+    files: &mut HashMap<String, Coverage>,
+    id: String,
+    coverage: Coverage,
+) {
+    if !files.contains_key(&id) && files.len() >= MAX_TRACKED_FILE_IDS {
+        if let Some(expired) = files.keys().next().cloned() {
+            files.remove(&expired);
+        }
+    }
+    files.insert(id, coverage);
+}
+
 pub(crate) fn supported_text_file(filename: &str, media_type: Option<&str>) -> bool {
     if media_type.is_some_and(|value| {
         let value = value.to_ascii_lowercase();
@@ -299,18 +314,4 @@ mod tests {
             Some("user_data")
         );
     }
-}
-const MAX_TRACKED_FILE_IDS: usize = 1024;
-
-pub(crate) fn remember_file_coverage(
-    files: &mut HashMap<String, Coverage>,
-    id: String,
-    coverage: Coverage,
-) {
-    if !files.contains_key(&id) && files.len() >= MAX_TRACKED_FILE_IDS {
-        if let Some(expired) = files.keys().next().cloned() {
-            files.remove(&expired);
-        }
-    }
-    files.insert(id, coverage);
 }
