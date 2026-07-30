@@ -20,7 +20,8 @@ TODO
 - [ ] HTTPファイル検査の上限をstreaming spoolで512MB級まで拡張する
 - [ ] 止めた後になんか重なる
 
-- [ ] pluginsの責務・配布・権限モデルを再考する
+- [x] pluginsの責務・配布・権限モデルを再設計する
+- [ ] plugin registry・署名付きpublisher identity・OS sandboxを検討する
 - [ ] local llm mask exts
 - [ ] app, http host
 - [ ] approval ui?
@@ -46,6 +47,15 @@ pentect claude
 Both commands preserve an existing upstream with `--upstream URL`. Codex uses
 the OpenAI Responses API gateway. Claude Code uses the Anthropic Messages API
 gateway.
+
+## Plugins
+
+Plugins can be manifest-only regex detectors or approved executable middleware
+written in any language. Executable plugins use a persistent NDJSON stdio
+protocol, preserve declared order, and return `next` or `stop`; Pentect keeps
+control of the chain and the final masking pass. See
+[the plugin guide](guides/plugins.md), [protocol fixtures](protocol/fixtures),
+and the lightweight [Rust, Python, TypeScript, and Go SDKs](sdk).
 
 ### Desktop apps
 

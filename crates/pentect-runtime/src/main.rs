@@ -15,7 +15,11 @@ mod image_ocr;
 mod masking;
 mod memory_store;
 mod output_remask;
-mod plugin_adapter;
+mod plugin_middleware;
+pub use plugin_middleware::{
+    plugin_runtime_dirs, MiddlewareCoverage, MiddlewareRun, MiddlewareStage, PluginMiddleware,
+    PluginRuntimeDirs, StopOutcome,
+};
 mod session;
 mod shell;
 
@@ -382,6 +386,10 @@ struct CachedToolOutput {
 
 impl ActiveToolOutputMasker {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_plugins(PluginMiddleware::from_env()?)
+    }
+
+    pub fn new_with_plugins(plugins: PluginMiddleware) -> Result<Self, String> {
         let Some(client) = MemoryStoreClient::from_env() else {
             return Ok(Self {
                 client: None,
@@ -397,7 +405,7 @@ impl ActiveToolOutputMasker {
         let store = MemoryStore::for_session(&session);
         Ok(Self {
             client: Some(client),
-            masker: Some(OutputMasker::new_shared(store)?),
+            masker: Some(OutputMasker::new_shared_with_plugins(store, plugins)?),
             reported_masked_count: 0,
             cache: HashMap::new(),
             cache_order: VecDeque::new(),

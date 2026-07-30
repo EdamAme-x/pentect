@@ -1,0 +1,9 @@
+schema = "pentect.plugin.v1"
+name = "example-regex"
+description = "Manifest-only example; no binary or setup script."
+
+[[detector]]
+label = "ACME_CASE"
+pattern = '''\bACME-[0-9]{8}\b'''
+category = "identifier"
+confidence = "high"

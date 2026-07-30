@@ -6,7 +6,7 @@ mod report;
 mod rules;
 mod walk;
 
-use crate::{die, load_packs};
+use crate::{die, load_packs, plugins};
 use engine::{scan_files, ScanFile};
 use options::{BinaryMode, ScanOpts};
 use progress::ScanProgress;
@@ -30,8 +30,12 @@ pub(crate) fn cmd_scan(args: &[String]) {
         }
     }
     pentect_agent::record_scan_activity(report.files_scanned, report.findings, labels);
+    let plugin_report = match dispatch_scan_plugins(args, &report) {
+        Ok(report) => report,
+        Err(error) => die(error),
+    };
     if opts.json {
-        println!("{}", report_json(&report));
+        println!("{plugin_report}");
     } else {
         print_report(&report);
     }
@@ -39,6 +43,46 @@ pub(crate) fn cmd_scan(args: &[String]) {
     if report.findings > 0 && !opts.no_fail {
         std::process::exit(1);
     }
+}
+
+fn dispatch_scan_plugins(args: &[String], report: &ScanReport) -> Result<String, String> {
+    let specs = plugins::collect_from_args(args).map_err(|error| error.to_string())?;
+    let active = plugins::active_from_specs(specs, true).map_err(|error| error.to_string())?;
+    let middleware =
+        pentect_agent::PluginMiddleware::from_paths(active.binary_paths().iter().cloned())?;
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&report_json(report)).map_err(|error| error.to_string())?;
+    if let Some(files) = payload
+        .get_mut("files")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for file in files {
+            let run = middleware.run(
+                pentect_agent::MiddlewareStage::Finding,
+                file.take(),
+                Some(serde_json::json!({"surface": "scan"})),
+            )?;
+            if run.stopped.is_some() {
+                return Err(format!(
+                    "scan blocked by plugin: {}",
+                    run.message.unwrap_or_else(|| "finding blocked".to_string())
+                ));
+            }
+            *file = run.payload;
+        }
+    }
+    let run = middleware.run(
+        pentect_agent::MiddlewareStage::Report,
+        payload,
+        Some(serde_json::json!({"surface": "scan"})),
+    )?;
+    if run.stopped.is_some() {
+        return Err(format!(
+            "scan blocked by plugin: {}",
+            run.message.unwrap_or_else(|| "report blocked".to_string())
+        ));
+    }
+    serde_json::to_string(&run.payload).map_err(|error| error.to_string())
 }
 
 fn run_scan(args: &[String], opts: &ScanOpts) -> Result<ScanReport, String> {

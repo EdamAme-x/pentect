@@ -214,9 +214,6 @@ pub(crate) fn load_config_packs_from_specs(
     create_named: bool,
 ) -> Result<Vec<Pack>> {
     let active = active_from_specs(explicit_specs, create_named)?;
-    if !active.binary_paths.is_empty() {
-        bail!("executable plugins are only used by agent tool-boundary commands");
-    }
     load_config_packs_from_active(&active)
 }
 
@@ -298,11 +295,14 @@ fn plugin_paths_for_specs(
             binaries.extend(found.binary_paths);
         }
     }
-    configs.sort();
-    configs.dedup();
-    binaries.sort();
-    binaries.dedup();
+    dedup_paths(&mut configs);
+    dedup_paths(&mut binaries);
     Ok((configs, binaries))
+}
+
+fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
 }
 
 #[derive(Debug, Default)]
@@ -1014,7 +1014,7 @@ label = "INLINE_SECRET"
         std::fs::write(root.join("config.toml"), "").unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
         )
         .unwrap();
 
@@ -1032,21 +1032,18 @@ label = "INLINE_SECRET"
     }
 
     #[test]
-    fn binary_only_plugins_are_rejected_for_pack_only_loading() {
+    fn binary_only_plugins_add_no_declarative_packs() {
         let root = std::env::temp_dir().join(format!("pentect-binary-only-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
         )
         .unwrap();
 
-        let err = match load_config_packs_from_specs(vec![root.display().to_string()], true) {
-            Ok(_) => panic!("expected binary-only plugin to be rejected"),
-            Err(err) => err.to_string(),
-        };
-        assert!(err.contains("executable plugins"), "{err}");
+        let packs = load_config_packs_from_specs(vec![root.display().to_string()], true).unwrap();
+        assert!(packs.is_empty());
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1059,7 +1056,7 @@ label = "INLINE_SECRET"
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
         )
         .unwrap();
 

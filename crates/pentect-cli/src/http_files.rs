@@ -31,10 +31,25 @@ pub(crate) struct ProtectedUpload {
     pub(crate) coverage: Coverage,
 }
 
+#[cfg(test)]
 pub(crate) fn protect_multipart_upload(
     content_type: &str,
     body: &Bytes,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<ProtectedUpload, String> {
+    protect_multipart_upload_with_plugins(
+        content_type,
+        body,
+        masker,
+        &pentect_agent::PluginMiddleware::default(),
+    )
+}
+
+pub(crate) fn protect_multipart_upload_with_plugins(
+    content_type: &str,
+    body: &Bytes,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    plugins: &pentect_agent::PluginMiddleware,
 ) -> Result<ProtectedUpload, String> {
     let boundary = multipart_boundary(content_type)
         .ok_or_else(|| "Files API upload is missing a multipart boundary".to_string())?;
@@ -51,6 +66,7 @@ pub(crate) fn protect_multipart_upload(
     let mut output = Vec::with_capacity(body.len());
     let mut saw_file = false;
     let mut coverage = Coverage::Full;
+    let mut plugin_partial = false;
 
     while let Some(relative_start) = memmem::find(&body[cursor..], &delimiter) {
         let part_start = cursor + relative_start;
@@ -86,27 +102,65 @@ pub(crate) fn protect_multipart_upload(
         output.extend_from_slice(&body[cursor..content_start]);
         if let Some(file) = file_part(headers) {
             saw_file = true;
+            let metadata = serde_json::json!({
+                "filename": file.filename,
+                "media_type": file.media_type,
+                "size": content.len(),
+            });
+            run_file_stage(
+                plugins,
+                pentect_agent::MiddlewareStage::FileDiscover,
+                metadata,
+                &mut plugin_partial,
+            )?;
             if file.is_supported_text {
                 match std::str::from_utf8(content) {
-                    Ok(text) => match masker.mask_tool_output(text) {
-                        Ok(Some(masked)) => {
-                            if immutable_dataset && masked != text {
-                                return Err(
-                                    "file upload blocked: secret detected in a structured dataset"
-                                        .to_string(),
-                                );
+                    Ok(text) => {
+                        let decoded = run_file_text_stage(
+                            plugins,
+                            pentect_agent::MiddlewareStage::FileDecode,
+                            &file,
+                            text,
+                            &mut plugin_partial,
+                        )?;
+                        let detected = run_file_text_stage(
+                            plugins,
+                            pentect_agent::MiddlewareStage::FileDetect,
+                            &file,
+                            &decoded,
+                            &mut plugin_partial,
+                        )?;
+                        match masker.mask_tool_output(&detected) {
+                            Ok(Some(masked)) => {
+                                let transformed = run_file_text_stage(
+                                    plugins,
+                                    pentect_agent::MiddlewareStage::FileTransform,
+                                    &file,
+                                    &masked,
+                                    &mut plugin_partial,
+                                )?;
+                                let final_masked =
+                                    masker.mask_tool_output(&transformed)?.ok_or_else(|| {
+                                        "file upload blocked: text inspection is unavailable"
+                                            .to_string()
+                                    })?;
+                                if immutable_dataset && final_masked != text {
+                                    return Err(
+                                        "file upload blocked: secret detected in a structured dataset"
+                                            .to_string(),
+                                    );
+                                }
+                                output.extend_from_slice(final_masked.as_bytes());
                             }
-                            output.extend_from_slice(masked.as_bytes());
+                            Ok(None) => {
+                                return Err("file upload blocked: text inspection is unavailable"
+                                    .to_string());
+                            }
+                            Err(error) => {
+                                return Err(format!("file upload blocked: {error}"));
+                            }
                         }
-                        Ok(None) => {
-                            return Err(
-                                "file upload blocked: text inspection is unavailable".to_string()
-                            );
-                        }
-                        Err(error) => {
-                            return Err(format!("file upload blocked: {error}"));
-                        }
-                    },
+                    }
                     Err(_) => {
                         return Err(
                             "file upload blocked: declared text is not valid UTF-8".to_string()
@@ -130,6 +184,8 @@ pub(crate) fn protect_multipart_upload(
     }
     if !saw_file {
         coverage = Coverage::None;
+    } else if plugin_partial {
+        coverage = Coverage::Partial;
     }
     Ok(ProtectedUpload {
         body: Bytes::from(output),
@@ -196,6 +252,8 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
 
 struct FilePart {
     is_supported_text: bool,
+    filename: String,
+    media_type: Option<String>,
 }
 
 fn file_part(headers: &[u8]) -> Option<FilePart> {
@@ -213,7 +271,55 @@ fn file_part(headers: &[u8]) -> Option<FilePart> {
     });
     Some(FilePart {
         is_supported_text: supported_text_file(&filename, media_type),
+        filename,
+        media_type: media_type.map(str::to_string),
     })
+}
+
+fn run_file_stage(
+    plugins: &pentect_agent::PluginMiddleware,
+    stage: pentect_agent::MiddlewareStage,
+    payload: serde_json::Value,
+    partial: &mut bool,
+) -> Result<serde_json::Value, String> {
+    let run = plugins.run(
+        stage,
+        payload,
+        Some(serde_json::json!({"transport": "http_multipart"})),
+    )?;
+    *partial |= run.coverage == pentect_agent::MiddlewareCoverage::Partial;
+    if run.stopped.is_some() {
+        return Err(format!(
+            "file upload blocked: {}",
+            run.message
+                .unwrap_or_else(|| "blocked by plugin".to_string())
+        ));
+    }
+    Ok(run.payload)
+}
+
+fn run_file_text_stage(
+    plugins: &pentect_agent::PluginMiddleware,
+    stage: pentect_agent::MiddlewareStage,
+    file: &FilePart,
+    text: &str,
+    partial: &mut bool,
+) -> Result<String, String> {
+    let payload = run_file_stage(
+        plugins,
+        stage,
+        serde_json::json!({
+            "filename": file.filename,
+            "media_type": file.media_type,
+            "text": text,
+        }),
+        partial,
+    )?;
+    payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "file plugin payload requires text".to_string())
 }
 
 fn disposition_parameter(header: &str, expected: &str) -> Option<String> {

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pentect.dev/schema/plugin.v1.json",
+  "title": "Pentect plugin protocol v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["schema", "id", "type", "host", "plugin"],
+      "properties": {
+        "schema": { "const": "pentect.plugin.v1" },
+        "id": { "type": "integer", "minimum": 1 },
+        "type": { "const": "initialize" },
+        "host": { "type": "object" },
+        "plugin": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["schema", "id", "type", "stage", "payload", "chain"],
+      "properties": {
+        "schema": { "const": "pentect.plugin.v1" },
+        "id": { "type": "integer", "minimum": 1 },
+        "type": { "const": "event" },
+        "stage": {
+          "enum": [
+            "ingest", "decode", "detect", "policy", "mask",
+            "provider_request", "provider_response", "tool_call", "output",
+            "file_discover", "file_decode", "file_detect", "file_transform",
+            "finding", "report"
+          ]
+        },
+        "payload": {},
+        "context": {},
+        "chain": {
+          "type": "object",
+          "required": ["index", "total", "has_next"],
+          "properties": {
+            "index": { "type": "integer", "minimum": 0 },
+            "total": { "type": "integer", "minimum": 1 },
+            "has_next": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["schema", "id", "type"],
+      "properties": {
+        "schema": { "const": "pentect.plugin.v1" },
+        "id": { "type": "integer", "minimum": 1 },
+        "type": { "enum": ["initialized", "result"] },
+        "action": { "enum": ["next", "stop"] },
+        "outcome": { "enum": ["block", "respond", "handled"] },
+        "payload": {},
+        "message": { "type": "string" },
+        "spans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["start", "end", "label"],
+            "properties": {
+              "start": { "type": "integer", "minimum": 0 },
+              "end": { "type": "integer", "minimum": 1 },
+              "label": { "type": "string", "minLength": 1 },
+              "category": { "enum": ["secret", "identifier", "endpoint", "pii", "other"] },
+              "confidence": { "enum": ["high", "medium", "low"] }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

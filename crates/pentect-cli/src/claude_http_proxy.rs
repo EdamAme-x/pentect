@@ -116,6 +116,7 @@ struct ProxyState {
     auth: String,
     client: reqwest::Client,
     masker: Arc<StdMutex<pentect_agent::ActiveToolOutputMasker>>,
+    plugins: Arc<StdMutex<pentect_agent::PluginMiddleware>>,
     files: StdMutex<HashMap<String, crate::http_files::Coverage>>,
     requests: Arc<Semaphore>,
 }
@@ -140,11 +141,15 @@ async fn run_proxy(
         .map_err(|error| format!("could not read Claude HTTP proxy address: {error}"))?;
     let local_base_url = format!("http://{address}/{auth}");
     let client = build_upstream_client()?;
+    let plugins = pentect_agent::PluginMiddleware::from_env()?;
     let state = Arc::new(ProxyState {
         upstream,
         auth,
         client,
-        masker: Arc::new(StdMutex::new(pentect_agent::ActiveToolOutputMasker::new()?)),
+        masker: Arc::new(StdMutex::new(
+            pentect_agent::ActiveToolOutputMasker::new_with_plugins(plugins.clone())?,
+        )),
+        plugins: Arc::new(StdMutex::new(plugins)),
         files: StdMutex::new(HashMap::new()),
         requests: Arc::new(Semaphore::new(32)),
     });
@@ -213,7 +218,8 @@ async fn proxy_request(
                 || error.starts_with("document blocked:")
                 || error.starts_with("remote ")
                 || error.starts_with("file upload blocked:")
-                || error.starts_with("Files API upload ");
+                || error.starts_with("Files API upload ")
+                || error.starts_with("plugin blocked:");
             Ok(if local_rejection {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
@@ -278,11 +284,20 @@ async fn proxy_request_inner(
                 .ok_or_else(|| "Files API upload is missing Content-Type".to_string())?
                 .to_string();
             let masker = Arc::clone(&state.masker);
+            let plugins = Arc::clone(&state.plugins);
             let protected = tokio::task::spawn_blocking(move || {
                 let mut masker = masker
                     .lock()
                     .map_err(|_| "Claude request masker lock was poisoned".to_string())?;
-                crate::http_files::protect_multipart_upload(&content_type, &body, &mut masker)
+                let plugins = plugins
+                    .lock()
+                    .map_err(|_| "Claude plugin lock was poisoned".to_string())?;
+                crate::http_files::protect_multipart_upload_with_plugins(
+                    &content_type,
+                    &body,
+                    &mut masker,
+                    &plugins,
+                )
             })
             .await
             .map_err(|_| "Claude file protection task failed".to_string())??;
@@ -291,17 +306,21 @@ async fn proxy_request_inner(
         } else {
             let body = resolve_anthropic_remote_content(body).await?;
             let masker = Arc::clone(&state.masker);
+            let plugins = Arc::clone(&state.plugins);
             let files = state
                 .files
                 .lock()
                 .map_err(|_| "Claude file registry lock was poisoned".to_string())?
                 .clone();
             let protected = tokio::task::spawn_blocking(move || {
-                protect_anthropic_request_body(&body, &masker, &files)
+                protect_anthropic_request_body(&body, &masker, &plugins, &files)
             })
             .await
             .map_err(|_| "Claude request protection task failed".to_string())??;
             request_coverage = Some(protected.coverage);
+            if let Some(response) = protected.local_response {
+                return Ok(json_response(StatusCode::OK, response));
+            }
             reqwest::Body::from(protected.body)
         }
     } else {
@@ -358,7 +377,11 @@ async fn proxy_request_inner(
     if is_event_stream || (!messages_path && !files_upload) {
         let transform = status.is_success() && messages_path && is_event_stream;
         return builder
-            .body(streaming_response_body(upstream_response, transform))
+            .body(streaming_response_body(
+                upstream_response,
+                transform,
+                Arc::clone(&state.plugins),
+            ))
             .map_err(|error| format!("could not build Claude streaming response: {error}"));
     }
 
@@ -383,6 +406,7 @@ async fn proxy_request_inner(
         }
     }
     let response_body = if status.is_success() && messages_path {
+        let response_body = run_response_plugins(response_body, &state.plugins)?;
         match rewrite_anthropic_json_response(&response_body) {
             Ok(rewritten) => Bytes::from(rewritten),
             Err(error) => {
@@ -396,6 +420,77 @@ async fn proxy_request_inner(
     builder
         .body(full_body(response_body))
         .map_err(|error| format!("could not build Claude proxy response: {error}"))
+}
+
+fn run_response_plugins(
+    body: Bytes,
+    plugins: &StdMutex<pentect_agent::PluginMiddleware>,
+) -> Result<Bytes, String> {
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return Ok(body),
+    };
+    let plugins = plugins
+        .lock()
+        .map_err(|_| "Claude plugin lock was poisoned".to_string())?;
+    let run = plugins.run(
+        pentect_agent::MiddlewareStage::ProviderResponse,
+        value,
+        Some(serde_json::json!({"provider": "anthropic", "transport": "http"})),
+    )?;
+    if run.stopped == Some(pentect_agent::StopOutcome::Block) {
+        return Err(format!(
+            "plugin blocked: {}",
+            run.message
+                .unwrap_or_else(|| "response blocked".to_string())
+        ));
+    }
+    let mut payload = run.payload;
+    run_anthropic_tool_plugins(&mut payload, &plugins)?;
+    serde_json::to_vec(&payload)
+        .map(Bytes::from)
+        .map_err(|error| format!("could not encode plugin response payload: {error}"))
+}
+
+fn run_anthropic_tool_plugins(
+    value: &mut Value,
+    plugins: &pentect_agent::PluginMiddleware,
+) -> Result<(), String> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                run_anthropic_tool_plugins(value, plugins)?;
+            }
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("tool_use")
+                && object.get("input").is_some()
+            {
+                let run = plugins.run(
+                    pentect_agent::MiddlewareStage::ToolCall,
+                    Value::Object(object.clone()),
+                    Some(serde_json::json!({"provider": "anthropic", "transport": "http"})),
+                )?;
+                if run.stopped == Some(pentect_agent::StopOutcome::Block) {
+                    return Err(format!(
+                        "plugin blocked: {}",
+                        run.message
+                            .unwrap_or_else(|| "tool call blocked".to_string())
+                    ));
+                }
+                *object = run
+                    .payload
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| "tool_call plugin payload must be an object".to_string())?;
+            }
+            for child in object.values_mut() {
+                run_anthropic_tool_plugins(child, plugins)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn resolve_anthropic_remote_content(body: Bytes) -> Result<Bytes, String> {
@@ -477,11 +572,13 @@ fn resolve_anthropic_remote_values(
 struct ProtectedJsonBody {
     body: Bytes,
     coverage: crate::http_files::Coverage,
+    local_response: Option<Bytes>,
 }
 
 fn protect_anthropic_request_body(
     body: &Bytes,
     masker: &StdMutex<pentect_agent::ActiveToolOutputMasker>,
+    plugins: &StdMutex<pentect_agent::PluginMiddleware>,
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<ProtectedJsonBody, String> {
     let mut value: Value = match serde_json::from_slice(body) {
@@ -491,9 +588,35 @@ fn protect_anthropic_request_body(
             return Ok(ProtectedJsonBody {
                 body: body.clone(),
                 coverage: crate::http_files::Coverage::Partial,
+                local_response: None,
             });
         }
     };
+    let run = plugins
+        .lock()
+        .map_err(|_| "Claude plugin lock was poisoned".to_string())?
+        .run(
+            pentect_agent::MiddlewareStage::ProviderRequest,
+            value,
+            Some(serde_json::json!({"provider": "anthropic", "transport": "http"})),
+        )?;
+    let plugin_partial = run.coverage == pentect_agent::MiddlewareCoverage::Partial;
+    value = run.payload;
+    if let Some(outcome) = run.stopped {
+        if outcome == pentect_agent::StopOutcome::Block {
+            return Err(format!(
+                "plugin blocked: {}",
+                run.message.unwrap_or_else(|| "request blocked".to_string())
+            ));
+        }
+        return serde_json::to_vec(&value)
+            .map(|body| ProtectedJsonBody {
+                body: Bytes::new(),
+                coverage: crate::http_files::Coverage::Full,
+                local_response: Some(Bytes::from(body)),
+            })
+            .map_err(|error| format!("could not encode plugin response: {error}"));
+    }
     let partial_schema = anthropic_request_has_unknown_content(&value);
     warn_provider_mcp_credentials(&value);
     inject_handle_contract(&mut value);
@@ -515,22 +638,25 @@ fn protect_anthropic_request_body(
         return Ok(ProtectedJsonBody {
             body: body.clone(),
             coverage: crate::http_files::Coverage::Partial,
+            local_response: None,
         });
     }
     match serde_json::to_vec(&value) {
         Ok(protected) => Ok(ProtectedJsonBody {
             body: Bytes::from(protected),
-            coverage: if partial_schema {
+            coverage: if partial_schema || plugin_partial {
                 crate::http_files::Coverage::Partial
             } else {
                 crate::http_files::Coverage::Full
             },
+            local_response: None,
         }),
         Err(error) => {
             eprintln!("[pentect] Claude request protection skipped: encode failed: {error}");
             Ok(ProtectedJsonBody {
                 body: body.clone(),
                 coverage: crate::http_files::Coverage::Partial,
+                local_response: None,
             })
         }
     }
@@ -663,7 +789,11 @@ struct TransformedStreamState {
     finished: bool,
 }
 
-fn streaming_response_body(response: reqwest::Response, transform: bool) -> ProxyBody {
+fn streaming_response_body(
+    response: reqwest::Response,
+    transform: bool,
+    plugins: Arc<StdMutex<pentect_agent::PluginMiddleware>>,
+) -> ProxyBody {
     if !transform {
         let stream = response.bytes_stream().map(|item| {
             item.map(Frame::data)
@@ -674,7 +804,7 @@ fn streaming_response_body(response: reqwest::Response, transform: bool) -> Prox
 
     let state = TransformedStreamState {
         upstream: Box::pin(response.bytes_stream()),
-        transformer: SseStreamTransformer::new(Box::new(request_scoped_resolver())),
+        transformer: SseStreamTransformer::new(Box::new(request_scoped_resolver()), Some(plugins)),
         ready: VecDeque::new(),
         finished: false,
     };
@@ -726,6 +856,7 @@ struct SseStreamTransformer<R> {
     pending: Vec<u8>,
     active_tool: Option<ActiveToolStream>,
     passthrough: bool,
+    plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>,
 }
 
 struct ActiveToolStream {
@@ -744,12 +875,13 @@ impl<R> SseStreamTransformer<R>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
-    fn new(resolve: R) -> Self {
+    fn new(resolve: R, plugins: Option<Arc<StdMutex<pentect_agent::PluginMiddleware>>>) -> Self {
         Self {
             resolve,
             pending: Vec::new(),
             active_tool: None,
             passthrough: false,
+            plugins,
         }
     }
 
@@ -818,10 +950,14 @@ where
                             text,
                             active.name.as_deref(),
                             &mut self.resolve,
+                            self.plugins.as_deref(),
                         )
                     }) {
                     Ok(rewritten) => output.push(Bytes::from(rewritten)),
                     Err(error) => {
+                        if error.starts_with("plugin middleware:") {
+                            return Err(error);
+                        }
                         eprintln!("[pentect] Claude SSE restoration skipped: {error}");
                         output.push(Bytes::from(active.bytes));
                     }
@@ -1387,13 +1523,14 @@ fn rewrite_anthropic_sse_with<R>(input: &str, resolve: &mut R) -> Result<String,
 where
     R: FnMut(&str) -> Result<String, String>,
 {
-    rewrite_anthropic_sse_with_tool_name(input, None, resolve)
+    rewrite_anthropic_sse_with_tool_name(input, None, resolve, None)
 }
 
 fn rewrite_anthropic_sse_with_tool_name<R>(
     input: &str,
     forced_tool_name: Option<&str>,
     resolve: &mut R,
+    plugins: Option<&StdMutex<pentect_agent::PluginMiddleware>>,
 ) -> Result<String, String>
 where
     R: FnMut(&str) -> Result<String, String>,
@@ -1458,11 +1595,41 @@ where
             let Some(tool) = pending.remove(&index) else {
                 continue;
             };
-            let joined = tool
+            let mut joined = tool
                 .chunks
                 .iter()
                 .map(|(_, chunk)| chunk.as_str())
                 .collect::<String>();
+            if let Some(plugins) = plugins {
+                let input_value: Value = serde_json::from_str(&joined)
+                    .map_err(|error| format!("tool input is invalid JSON: {error}"))?;
+                let tool_call = serde_json::json!({
+                    "type": "tool_use",
+                    "name": tool.name,
+                    "input": input_value,
+                });
+                let run = plugins
+                    .lock()
+                    .map_err(|_| "plugin middleware: lock was poisoned".to_string())?
+                    .run(
+                        pentect_agent::MiddlewareStage::ToolCall,
+                        tool_call,
+                        Some(serde_json::json!({"provider": "anthropic", "transport": "http_sse"})),
+                    )
+                    .map_err(|error| format!("plugin middleware: {error}"))?;
+                if run.stopped == Some(pentect_agent::StopOutcome::Block) {
+                    return Err(format!(
+                        "plugin middleware: blocked: {}",
+                        run.message
+                            .unwrap_or_else(|| "tool call blocked".to_string())
+                    ));
+                }
+                let input = run.payload.get("input").ok_or_else(|| {
+                    "plugin middleware: tool_call payload requires input".to_string()
+                })?;
+                joined = serde_json::to_string(input)
+                    .map_err(|error| format!("plugin middleware: encode failed: {error}"))?;
+            }
             let resolved = resolve_tool_input_json(&joined, tool.name.as_deref(), resolve)?;
             for (position, (chunk_index, _)) in tool.chunks.iter().enumerate() {
                 if let Some(partial_json) = blocks[*chunk_index]
@@ -1853,6 +2020,14 @@ fn owned_text_response(status: StatusCode, text: &str) -> Response<ProxyBody> {
         .expect("text response is valid")
 }
 
+fn json_response(status: StatusCode, body: Bytes) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(full_body(body))
+        .expect("JSON response is valid")
+}
+
 fn random_auth_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes)
@@ -2003,7 +2178,7 @@ mod tests {
             "event: content_block_delta\r\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\r\n\r\n"
         );
-        let mut transformer = SseStreamTransformer::new(|text: &str| Ok(text.to_string()));
+        let mut transformer = SseStreamTransformer::new(|text: &str| Ok(text.to_string()), None);
         let split = event.len() - 2;
         assert!(transformer
             .push(&event.as_bytes()[..split])
@@ -2031,9 +2206,10 @@ mod tests {
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
         );
-        let mut transformer = SseStreamTransformer::new(|text: &str| {
-            Ok(text.replace("<<SECRET_deadbeef>>", "actual-secret"))
-        });
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "actual-secret")),
+            None,
+        );
         assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
         assert!(transformer.push(delta_one.as_bytes()).unwrap().is_empty());
         let split = delta_two.len() / 2;
@@ -2059,9 +2235,10 @@ mod tests {
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"key\\\":\\\"<<SECRET_deadbeef>>\"}}\n\n"
         );
-        let mut transformer = SseStreamTransformer::new(|text: &str| {
-            Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear"))
-        });
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear")),
+            None,
+        );
         assert!(transformer.push(incomplete.as_bytes()).unwrap().is_empty());
         let output = join_bytes(transformer.finish());
         assert!(output.contains("<<SECRET_deadbeef>>"));
@@ -2077,11 +2254,14 @@ mod tests {
                  event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}\n\n"
             )
         };
-        let mut transformer = SseStreamTransformer::new(|text: &str| {
-            Ok(text
-                .replace("<<SECRET_one>>", "first")
-                .replace("<<SECRET_two>>", "second"))
-        });
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| {
+                Ok(text
+                    .replace("<<SECRET_one>>", "first")
+                    .replace("<<SECRET_two>>", "second"))
+            },
+            None,
+        );
         let mut output = transformer
             .push(tool(1, "<<SECRET_one>>").as_bytes())
             .unwrap();
@@ -2105,9 +2285,10 @@ mod tests {
         let ping = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
         let error =
             "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n";
-        let mut transformer = SseStreamTransformer::new(|text: &str| {
-            Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear"))
-        });
+        let mut transformer = SseStreamTransformer::new(
+            |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear")),
+            None,
+        );
         assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
         assert_eq!(join_bytes(transformer.push(ping.as_bytes()).unwrap()), ping);
         let flushed = join_bytes(transformer.push(error.as_bytes()).unwrap());

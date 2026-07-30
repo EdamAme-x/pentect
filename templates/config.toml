@@ -1,7 +1,7 @@
 # Copy to .pentect/config.toml.
 
 plugins = []
-# plugin data: .pentect/plugins-data/<plugin-id>
+# plugin runtime data is stored outside the repository in OS user data.
 
 [environment]
 prefix = "PENTECT_"

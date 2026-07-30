@@ -98,6 +98,7 @@ struct ProxyState {
     auth: String,
     client: reqwest::Client,
     masker: Arc<Mutex<pentect_agent::ActiveToolOutputMasker>>,
+    plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     files: Mutex<HashMap<String, crate::http_files::Coverage>>,
     requests: Arc<Semaphore>,
 }
@@ -121,11 +122,15 @@ async fn run_proxy(
         .local_addr()
         .map_err(|error| format!("could not read OpenAI HTTP gateway address: {error}"))?;
     let local_base_url = format!("http://{address}/{auth}");
+    let plugins = pentect_agent::PluginMiddleware::from_env()?;
     let state = Arc::new(ProxyState {
         upstream,
         auth,
         client: build_upstream_client()?,
-        masker: Arc::new(Mutex::new(pentect_agent::ActiveToolOutputMasker::new()?)),
+        masker: Arc::new(Mutex::new(
+            pentect_agent::ActiveToolOutputMasker::new_with_plugins(plugins.clone())?,
+        )),
+        plugins: Arc::new(Mutex::new(plugins)),
         files: Mutex::new(HashMap::new()),
         requests: Arc::new(Semaphore::new(32)),
     });
@@ -196,7 +201,8 @@ async fn proxy_request(
                 || error.starts_with("remote ")
                 || error.starts_with("OpenAI file ")
                 || error.starts_with("file upload blocked:")
-                || error.starts_with("Files API upload ");
+                || error.starts_with("Files API upload ")
+                || error.starts_with("plugin blocked:");
             Ok(if local_rejection {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
@@ -247,11 +253,20 @@ async fn proxy_request_inner(
                 .ok_or_else(|| "Files API upload is missing Content-Type".to_string())?
                 .to_string();
             let masker = Arc::clone(&state.masker);
+            let plugins = Arc::clone(&state.plugins);
             let protected = tokio::task::spawn_blocking(move || {
                 let mut masker = masker
                     .lock()
                     .map_err(|_| "OpenAI request masker lock was poisoned".to_string())?;
-                crate::http_files::protect_multipart_upload(&content_type, &body, &mut masker)
+                let plugins = plugins
+                    .lock()
+                    .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
+                crate::http_files::protect_multipart_upload_with_plugins(
+                    &content_type,
+                    &body,
+                    &mut masker,
+                    &plugins,
+                )
             })
             .await
             .map_err(|_| "OpenAI file protection task failed".to_string())??;
@@ -261,17 +276,21 @@ async fn proxy_request_inner(
             let original = resolve_openai_file_references(body, state, &headers).await?;
             let original = resolve_openai_remote_files(original).await?;
             let masker = Arc::clone(&state.masker);
+            let plugins = Arc::clone(&state.plugins);
             let files = state
                 .files
                 .lock()
                 .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
                 .clone();
             let protected = tokio::task::spawn_blocking(move || {
-                protect_openai_request_body(&original, &masker, &files)
+                protect_openai_request_body(&original, &masker, &plugins, &files)
             })
             .await
             .map_err(|_| "OpenAI request protection task failed".to_string())??;
             request_coverage = Some(protected.coverage);
+            if let Some(response) = protected.local_response {
+                return Ok(json_response(StatusCode::OK, response));
+            }
             reqwest::Body::from(protected.body)
         }
     } else {
@@ -330,6 +349,7 @@ async fn proxy_request_inner(
             .body(streaming_response_body(
                 upstream,
                 status.is_success() && responses_path && is_event_stream,
+                Arc::clone(&state.plugins),
             ))
             .map_err(|error| format!("could not build OpenAI streaming response: {error}"));
     }
@@ -355,6 +375,7 @@ async fn proxy_request_inner(
         }
     }
     let response_body = if responses_path && status.is_success() {
+        let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
         match rewrite_openai_json_response(&response_body) {
             Ok(rewritten) => Bytes::from(rewritten),
             Err(error) => {
@@ -370,14 +391,98 @@ async fn proxy_request_inner(
         .map_err(|error| format!("could not build OpenAI response: {error}"))
 }
 
+fn run_response_plugins(
+    body: Bytes,
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    provider: &str,
+) -> Result<Bytes, String> {
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return Ok(body),
+    };
+    let plugins = plugins
+        .lock()
+        .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
+    let run = plugins.run(
+        pentect_agent::MiddlewareStage::ProviderResponse,
+        value,
+        Some(serde_json::json!({"provider": provider, "transport": "http"})),
+    )?;
+    if run.stopped == Some(pentect_agent::StopOutcome::Block) {
+        return Err(format!(
+            "plugin blocked: {}",
+            run.message
+                .unwrap_or_else(|| "response blocked".to_string())
+        ));
+    }
+    let mut payload = run.payload;
+    run_openai_tool_plugins(&mut payload, &plugins)?;
+    serde_json::to_vec(&payload)
+        .map(Bytes::from)
+        .map_err(|error| format!("could not encode plugin response payload: {error}"))
+}
+
+fn run_openai_tool_plugins(
+    value: &mut Value,
+    plugins: &pentect_agent::PluginMiddleware,
+) -> Result<(), String> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                run_openai_tool_plugins(value, plugins)?;
+            }
+        }
+        Value::Object(object) => {
+            let is_call = object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "function_call" | "response.function_call_arguments.done"
+                    )
+                })
+                && ["arguments", "input"]
+                    .iter()
+                    .any(|key| object.get(*key).is_some());
+            if is_call {
+                let run = plugins.run(
+                    pentect_agent::MiddlewareStage::ToolCall,
+                    Value::Object(object.clone()),
+                    Some(serde_json::json!({"provider": "openai", "transport": "http"})),
+                )?;
+                if run.stopped == Some(pentect_agent::StopOutcome::Block) {
+                    return Err(format!(
+                        "plugin blocked: {}",
+                        run.message
+                            .unwrap_or_else(|| "tool call blocked".to_string())
+                    ));
+                }
+                *object = run
+                    .payload
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| "tool_call plugin payload must be an object".to_string())?;
+            }
+            for child in object.values_mut() {
+                run_openai_tool_plugins(child, plugins)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 struct ProtectedJsonBody {
     body: Bytes,
     coverage: crate::http_files::Coverage,
+    local_response: Option<Bytes>,
 }
 
 fn protect_openai_request_body(
     body: &Bytes,
     masker: &Mutex<pentect_agent::ActiveToolOutputMasker>,
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<ProtectedJsonBody, String> {
     let mut value: Value = match serde_json::from_slice(body) {
@@ -387,9 +492,35 @@ fn protect_openai_request_body(
             return Ok(ProtectedJsonBody {
                 body: body.clone(),
                 coverage: crate::http_files::Coverage::Partial,
+                local_response: None,
             });
         }
     };
+    let run = plugins
+        .lock()
+        .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?
+        .run(
+            pentect_agent::MiddlewareStage::ProviderRequest,
+            value,
+            Some(serde_json::json!({"provider": "openai", "transport": "http"})),
+        )?;
+    let plugin_partial = run.coverage == pentect_agent::MiddlewareCoverage::Partial;
+    value = run.payload;
+    if let Some(outcome) = run.stopped {
+        if outcome == pentect_agent::StopOutcome::Block {
+            return Err(format!(
+                "plugin blocked: {}",
+                run.message.unwrap_or_else(|| "request blocked".to_string())
+            ));
+        }
+        return serde_json::to_vec(&value)
+            .map(|body| ProtectedJsonBody {
+                body: Bytes::new(),
+                coverage: crate::http_files::Coverage::Full,
+                local_response: Some(Bytes::from(body)),
+            })
+            .map_err(|error| format!("could not encode plugin response: {error}"));
+    }
     let partial_schema = openai_request_has_unknown_content(&value);
     inject_handle_contract(&mut value);
     let mut masker = masker
@@ -403,16 +534,18 @@ fn protect_openai_request_body(
         return Ok(ProtectedJsonBody {
             body: body.clone(),
             coverage: crate::http_files::Coverage::Partial,
+            local_response: None,
         });
     }
     serde_json::to_vec(&value)
         .map(|body| ProtectedJsonBody {
             body: Bytes::from(body),
-            coverage: if partial_schema {
+            coverage: if partial_schema || plugin_partial {
                 crate::http_files::Coverage::Partial
             } else {
                 crate::http_files::Coverage::Full
             },
+            local_response: None,
         })
         .map_err(|error| format!("could not encode protected OpenAI request: {error}"))
 }
@@ -986,15 +1119,21 @@ struct StreamState {
     ready: VecDeque<Result<Frame<Bytes>, ProxyBodyError>>,
     transform: bool,
     finished: bool,
+    plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
 }
 
-fn streaming_response_body(response: reqwest::Response, transform: bool) -> ProxyBody {
+fn streaming_response_body(
+    response: reqwest::Response,
+    transform: bool,
+    plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
+) -> ProxyBody {
     let state = StreamState {
         upstream: Box::pin(response.bytes_stream()),
         pending: Vec::new(),
         ready: VecDeque::new(),
         transform,
         finished: false,
+        plugins,
     };
     let stream = stream::unfold(state, |mut state| async move {
         loop {
@@ -1022,9 +1161,17 @@ fn streaming_response_body(response: reqwest::Response, transform: bool) -> Prox
                     state.pending.extend_from_slice(&chunk);
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
-                        state
-                            .ready
-                            .push_back(Ok(Frame::data(rewrite_openai_sse_block(&block))));
+                        match rewrite_openai_sse_block(&block, &state.plugins) {
+                            Ok(block) => state.ready.push_back(Ok(Frame::data(block))),
+                            Err(error) => {
+                                state.finished = true;
+                                state.ready.push_back(Err(Box::new(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    error,
+                                ))));
+                                break;
+                            }
+                        }
                     }
                 }
                 Some(Err(error)) => {
@@ -1050,33 +1197,40 @@ fn streaming_response_body(response: reqwest::Response, transform: bool) -> Prox
     StreamBody::new(stream).boxed_unsync()
 }
 
-fn rewrite_openai_sse_block(block: &[u8]) -> Bytes {
+fn rewrite_openai_sse_block(
+    block: &[u8],
+    plugins: &Mutex<pentect_agent::PluginMiddleware>,
+) -> Result<Bytes, String> {
     let Ok(text) = std::str::from_utf8(block) else {
-        return Bytes::copy_from_slice(block);
+        return Ok(Bytes::copy_from_slice(block));
     };
     let Some(data_line) = text.lines().find(|line| line.starts_with("data:")) else {
-        return Bytes::copy_from_slice(block);
+        return Ok(Bytes::copy_from_slice(block));
     };
     let data = data_line
         .strip_prefix("data:")
         .unwrap_or_default()
         .trim_start();
     if data == "[DONE]" {
-        return Bytes::copy_from_slice(block);
+        return Ok(Bytes::copy_from_slice(block));
     }
     let Ok(mut value) = serde_json::from_str::<Value>(data) else {
-        return Bytes::copy_from_slice(block);
+        return Ok(Bytes::copy_from_slice(block));
     };
     if !contains_completed_function_call(&value) {
-        return Bytes::copy_from_slice(block);
+        return Ok(Bytes::copy_from_slice(block));
     }
+    let plugins = plugins
+        .lock()
+        .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
+    run_openai_tool_plugins(&mut value, &plugins)?;
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
     if let Err(error) = rewrite_function_calls(&mut value, &mut resolve) {
         eprintln!("[pentect] OpenAI SSE restoration skipped: {error}");
-        return Bytes::copy_from_slice(block);
+        return Ok(Bytes::copy_from_slice(block));
     }
     let Ok(encoded) = serde_json::to_string(&value) else {
-        return Bytes::copy_from_slice(block);
+        return Ok(Bytes::copy_from_slice(block));
     };
     let mut replaced = false;
     let mut output = String::with_capacity(text.len());
@@ -1094,7 +1248,7 @@ fn rewrite_openai_sse_block(block: &[u8]) -> Bytes {
             output.push_str(line);
         }
     }
-    Bytes::from(output)
+    Ok(Bytes::from(output))
 }
 
 fn contains_completed_function_call(value: &Value) -> bool {
@@ -1306,6 +1460,14 @@ fn owned_text_response(status: StatusCode, text: &str) -> Response<ProxyBody> {
         .expect("text response is valid")
 }
 
+fn json_response(status: StatusCode, body: Bytes) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(full_body(body))
+        .expect("JSON response is valid")
+}
+
 fn random_auth_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes)
@@ -1383,6 +1545,10 @@ mod tests {
     #[test]
     fn untouched_sse_framing_is_preserved() {
         let input = b"event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\r\n\r\n";
-        assert_eq!(rewrite_openai_sse_block(input).as_ref(), input);
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        assert_eq!(
+            rewrite_openai_sse_block(input, &plugins).unwrap().as_ref(),
+            input
+        );
     }
 }

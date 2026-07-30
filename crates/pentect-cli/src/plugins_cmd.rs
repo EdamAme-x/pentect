@@ -2,22 +2,17 @@ use crate::{plugins, update};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::thread::JoinHandle;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-const PENTECT_DIR: &str = ".pentect";
-const PLUGINS_DATA_DIR: &str = "plugins-data";
-const PLUGIN_CONFIG_FILE: &str = "config.toml";
 const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
-const PLUGIN_CACHE_DIR: &str = "cache";
+const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
 const PLUGIN_NAME_ENV: &str = "PENTECT_PLUGIN_NAME";
 const PLUGIN_DATA_DIR_ENV: &str = "PENTECT_PLUGIN_DATA_DIR";
 const PLUGIN_CACHE_DIR_ENV: &str = "PENTECT_PLUGIN_CACHE_DIR";
 const PLUGIN_CONFIG_ENV: &str = "PENTECT_PLUGIN_CONFIG";
-const MAX_STDOUT_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn cmd_plugins(args: &[String]) {
     let opts = match PluginCmd::parse(args) {
@@ -224,6 +219,12 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
                 "binary": binary,
                 "repository": repository,
                 "asset": asset,
+                "middleware": manifest.as_ref().and_then(|manifest| manifest.middleware.as_ref()).map(|middleware| json!({
+                    "stages": middleware.stages,
+                    "permissions": middleware.permissions,
+                    "required": middleware.required,
+                    "mode": manifest.as_ref().and_then(|manifest| manifest.execution.as_ref()).and_then(|execution| execution.mode.as_deref()).unwrap_or("persistent"),
+                })),
                 "postscripts": manifest.as_ref().map(|manifest| manifest.postscript.len()).unwrap_or(0),
             })
         );
@@ -252,6 +253,14 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         if let Some(asset) = asset {
             println!("asset: {asset}");
         }
+    }
+    if let Some(middleware) = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.middleware.as_ref())
+    {
+        println!("stages: {}", middleware.stages.join(", "));
+        println!("permissions: {}", middleware.permissions.join(", "));
+        println!("required: {}", middleware.required);
     }
     println!(
         "postscripts: {}",
@@ -309,15 +318,32 @@ struct PluginManifest {
     #[serde(default)]
     assets: BTreeMap<String, String>,
     execution: Option<ExecutionConfig>,
+    middleware: Option<MiddlewareConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ExecutionConfig {
+    #[serde(default, rename = "args")]
+    _args: Vec<String>,
+    mode: Option<String>,
+    #[serde(rename = "timeout_ms")]
+    _timeout_ms: Option<u64>,
+    #[serde(rename = "max_input_bytes")]
+    _max_input_bytes: Option<usize>,
+    #[serde(rename = "max_output_bytes")]
+    _max_output_bytes: Option<usize>,
+    #[serde(rename = "max_spans")]
+    _max_spans: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MiddlewareConfig {
     #[serde(default)]
-    args: Vec<String>,
-    timeout_ms: Option<u64>,
-    max_input_bytes: Option<usize>,
-    max_spans: Option<usize>,
+    stages: Vec<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
+    #[serde(default)]
+    required: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,7 +391,72 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
             update::validate_repository(repository)?;
         }
     }
+    validate_middleware(&manifest)?;
     Ok(Some(manifest))
+}
+
+fn validate_middleware(manifest: &PluginManifest) -> Result<(), String> {
+    let Some(middleware) = &manifest.middleware else {
+        if manifest.binary.is_some() {
+            return Err("binary plugins require [middleware]".to_string());
+        }
+        return Ok(());
+    };
+    const STAGES: &[&str] = &[
+        "ingest",
+        "decode",
+        "detect",
+        "policy",
+        "mask",
+        "provider_request",
+        "provider_response",
+        "tool_call",
+        "output",
+        "file_discover",
+        "file_decode",
+        "file_detect",
+        "file_transform",
+        "finding",
+        "report",
+    ];
+    const PERMISSIONS: &[&str] = &[
+        "input:read",
+        "payload:write",
+        "pipeline:block",
+        "pipeline:respond",
+        "config:read",
+        "cache:write",
+    ];
+    if middleware.stages.is_empty() {
+        return Err("middleware must declare at least one stage".to_string());
+    }
+    if !middleware
+        .permissions
+        .iter()
+        .any(|value| value == "input:read")
+    {
+        return Err("middleware requires input:read permission".to_string());
+    }
+    for stage in &middleware.stages {
+        if !STAGES.contains(&stage.as_str()) {
+            return Err(format!("unknown middleware stage: {stage}"));
+        }
+    }
+    for permission in &middleware.permissions {
+        if !PERMISSIONS.contains(&permission.as_str()) {
+            return Err(format!("unknown middleware permission: {permission}"));
+        }
+    }
+    if let Some(mode) = manifest
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.mode.as_deref())
+    {
+        if !matches!(mode, "persistent" | "oneshot") {
+            return Err(format!("unknown plugin execution mode: {mode}"));
+        }
+    }
+    Ok(())
 }
 
 fn plugin_name(source: &plugins::PluginSource, manifest: Option<&PluginManifest>) -> String {
@@ -546,6 +637,11 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
     let source = plugins::plugin_source(spec).map_err(|e| e.to_string())?;
     let manifest = load_plugin_manifest(&source)?
         .ok_or_else(|| format!("plugin '{}' has no plugin.toml", source.name))?;
+    let manifest_hash = source
+        .manifest_path
+        .as_deref()
+        .map(sha256_path)
+        .transpose()?;
     let name = plugin_name(&source, Some(&manifest));
     let steps = manifest
         .postscript
@@ -579,6 +675,21 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
             binary_destination(&name, binary)?.display()
         );
     }
+    if let Some(middleware) = &manifest.middleware {
+        println!("middleware:");
+        println!("  stages: {}", middleware.stages.join(", "));
+        println!("  permissions: {}", middleware.permissions.join(", "));
+        println!("  required: {}", middleware.required);
+        println!(
+            "  execution: {}",
+            manifest
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.mode.as_deref())
+                .unwrap_or("persistent")
+        );
+        println!("  trust: executable code (no OS sandbox)");
+    }
     for (index, step) in steps.iter().enumerate() {
         validate_postscript(step)?;
         println!(
@@ -599,8 +710,57 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
     for step in steps {
         run_postscript(&name, &source.root, step)?;
     }
+    if manifest.middleware.is_some() {
+        let current_hash = source
+            .manifest_path
+            .as_deref()
+            .map(sha256_path)
+            .transpose()?;
+        if current_hash != manifest_hash {
+            return Err("plugin.toml changed during setup; approval was not recorded".to_string());
+        }
+        write_plugin_approval(&name, &source, &manifest)?;
+    }
     println!("setup: complete");
     Ok(())
+}
+
+#[derive(Serialize)]
+struct PluginApproval<'a> {
+    schema: &'static str,
+    manifest_sha256: String,
+    stages: &'a [String],
+    permissions: &'a [String],
+}
+
+fn write_plugin_approval(
+    name: &str,
+    source: &plugins::PluginSource,
+    manifest: &PluginManifest,
+) -> Result<(), String> {
+    let path = source
+        .manifest_path
+        .as_deref()
+        .ok_or_else(|| "middleware approval requires plugin.toml".to_string())?;
+    let middleware = manifest
+        .middleware
+        .as_ref()
+        .ok_or_else(|| "middleware approval requires [middleware]".to_string())?;
+    let approval = PluginApproval {
+        schema: "pentect.plugin-approval.v1",
+        manifest_sha256: sha256_path(path)?,
+        stages: &middleware.stages,
+        permissions: &middleware.permissions,
+    };
+    let encoded = toml::to_string(&approval)
+        .map_err(|error| format!("could not encode plugin approval: {error}"))?;
+    let dirs = plugin_runtime_dirs(&plugin_id(name))?;
+    let path = dirs.data_dir.join(PLUGIN_APPROVAL_FILE);
+    let temporary = path.with_extension("toml.tmp");
+    std::fs::write(&temporary, encoded)
+        .map_err(|error| format!("could not write plugin approval: {error}"))?;
+    replace_binary(&temporary, &path)
+        .map_err(|error| format!("could not activate plugin approval: {error}"))
 }
 
 fn update_plugin(spec: &str, json_output: bool) -> Result<(), String> {
@@ -616,8 +776,66 @@ fn update_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         return Ok(());
     };
     let repository = binary_repository(&source, &manifest)?;
+    verify_plugin_update_approval(&name, &source, &manifest)?;
     install_release_binary(&name, &repository, binary, &manifest.assets)?;
+    // Updating a release binary must not rewrite the user's manifest approval.
+    // Keeping the original digest makes any concurrent or later edit require setup again.
     println!("update: complete");
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct StoredPluginApproval {
+    schema: String,
+    manifest_sha256: String,
+    stages: Vec<String>,
+    permissions: Vec<String>,
+}
+
+fn verify_plugin_update_approval(
+    name: &str,
+    plugin: &plugins::PluginSource,
+    manifest: &PluginManifest,
+) -> Result<(), String> {
+    let Some(middleware) = &manifest.middleware else {
+        return Ok(());
+    };
+    let manifest_path = plugin
+        .manifest_path
+        .as_deref()
+        .ok_or_else(|| "plugin update requires plugin.toml".to_string())?;
+    let path = plugin_runtime_dirs(&plugin_id(name))?
+        .data_dir
+        .join(PLUGIN_APPROVAL_FILE);
+    let source_text = std::fs::read_to_string(&path)
+        .map_err(|_| "plugin update requires prior setup approval".to_string())?;
+    let approval: StoredPluginApproval = toml::from_str(&source_text)
+        .map_err(|_| "plugin approval is invalid; run `pentect plugins setup`".to_string())?;
+    let approved_stages = approval
+        .stages
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let approved_permissions = approval
+        .permissions
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let stages = middleware
+        .stages
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let permissions = middleware
+        .permissions
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if approval.schema != "pentect.plugin-approval.v1"
+        || approval.manifest_sha256 != sha256_path(manifest_path)?
+        || approved_stages != stages
+        || approved_permissions != permissions
+    {
+        return Err("plugin manifest changed; review it with `pentect plugins setup`".to_string());
+    }
     Ok(())
 }
 
@@ -878,11 +1096,11 @@ fn display_command(command: &[String]) -> String {
 }
 
 fn run_postscript(name: &str, cwd: &Path, step: &Postscript) -> Result<(), String> {
-    let program = adapter_program(&step.command[0], cwd, &plugin_id(name));
+    let program = plugin_program(&step.command[0], cwd, &plugin_id(name));
     if find_command(&program).is_none() {
         return Err(format!("postscript command not found: {}", step.command[0]));
     }
-    let mut command = adapter_command(&program, &plugin_id(name))?;
+    let mut command = plugin_command(&program, &plugin_id(name))?;
     command
         .args(&step.command[1..])
         .current_dir(cwd)
@@ -892,7 +1110,7 @@ fn run_postscript(name: &str, cwd: &Path, step: &Postscript) -> Result<(), Strin
     let mut child = command
         .spawn()
         .map_err(|e| format!("could not start postscript: {e}"))?;
-    let status = wait_for_adapter_child(
+    let status = wait_for_plugin_child(
         &mut child,
         step.name.as_deref().unwrap_or("postscript"),
         Duration::from_millis(step.timeout_ms.unwrap_or(120_000)),
@@ -920,148 +1138,31 @@ fn test_pack(path: &Path) -> Check {
 }
 
 fn test_binary(path: &Path) -> Check {
-    let binary = match BinaryFile::load(path) {
-        Ok(binary) => binary,
+    let middleware = match pentect_agent::PluginMiddleware::from_paths([path.to_path_buf()]) {
+        Ok(middleware) => middleware,
         Err(e) => return Check::fail("binary", e),
     };
-    match binary.run_probe() {
-        Ok(count) => Check::ok("binary", format!("spans={count}")),
+    match middleware.detect_and_mask(
+        &pentect_core::Engine::with_profile(pentect_core::Profile::Strict),
+        pentect_core::Input::text("Alice Smith"),
+        None,
+        &pentect_core::Config::insecure_testing(),
+    ) {
+        Ok(run) => Check::ok(
+            "binary",
+            format!(
+                "masked={}",
+                run.result
+                    .as_ref()
+                    .map(|result| result.summary.masked_count)
+                    .unwrap_or_default()
+            ),
+        ),
         Err(e) => Check::fail("binary", e),
     }
 }
 
-#[derive(Debug)]
-struct BinaryFile {
-    name: String,
-    id: String,
-    cwd: PathBuf,
-    command: Vec<String>,
-    timeout: Duration,
-    max_input_bytes: usize,
-    max_spans: usize,
-}
-
-impl BinaryFile {
-    fn load(path: &Path) -> Result<Self, String> {
-        let src = std::fs::read_to_string(path).map_err(|e| {
-            format!(
-                "could not read plugin manifest '{}': {e}",
-                display_path(path)
-            )
-        })?;
-        let manifest: PluginManifest = toml::from_str(&src)
-            .map_err(|e| format!("invalid plugin manifest '{}': {e}", display_path(path)))?;
-        if manifest.schema.as_deref() != Some("pentect.plugin.v1") {
-            return Err("schema".to_string());
-        }
-        let name = manifest
-            .name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| adapter_default_name(path));
-        let id = plugin_id(&name);
-        let binary = manifest
-            .binary
-            .filter(|binary| !binary.trim().is_empty())
-            .ok_or_else(|| format!("plugin '{name}' requires binary"))?;
-        let execution = manifest.execution.unwrap_or_default();
-        let dirs = plugin_runtime_dirs(&id)?;
-        let program = binary_destination(&name, &binary)?;
-        let mut command = Vec::with_capacity(execution.args.len() + 1);
-        command.push(program.to_string_lossy().into_owned());
-        command.extend(execution.args);
-        if find_command(&program).is_none() {
-            return Err("binary not installed; run `pentect plugins setup`".to_string());
-        }
-        Ok(Self {
-            name,
-            id,
-            cwd: dirs.data_dir,
-            command,
-            timeout: Duration::from_millis(execution.timeout_ms.unwrap_or(10_000)),
-            max_input_bytes: execution.max_input_bytes.unwrap_or(256 * 1024),
-            max_spans: execution.max_spans.unwrap_or(512),
-        })
-    }
-
-    fn run_probe(&self) -> Result<usize, String> {
-        let request = json!({
-            "schema": "pentect.model_adapter.v1",
-            "kind": "text",
-            "text": "Alice Smith",
-            "context": null,
-        })
-        .to_string();
-        if request.len() > self.max_input_bytes {
-            return Err(format!("{}: input limit", self.name));
-        }
-        let program = adapter_program(&self.command[0], &self.cwd, &self.id);
-        let mut command = adapter_command(&program, &self.id)?;
-        command
-            .args(&self.command[1..])
-            .current_dir(&self.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().map_err(|e| format!("{}: {e}", self.name))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("{}: stdout", self.name))?;
-        let stdout_reader = spawn_adapter_stdout_reader(stdout);
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("{}: stdin", self.name))?;
-        let stdin_writer = spawn_adapter_stdin_writer(stdin, request.as_bytes().to_vec());
-        let status = match wait_for_adapter_child(&mut child, &self.name, self.timeout) {
-            Ok(status) => status,
-            Err(err) => {
-                let _ = join_adapter_stdin(stdin_writer, &self.name);
-                let _ = join_adapter_stdout(stdout_reader, &self.name);
-                return Err(err);
-            }
-        };
-        join_adapter_stdin(stdin_writer, &self.name)?;
-        let stdout = join_adapter_stdout(stdout_reader, &self.name)?;
-        if stdout.len() > MAX_STDOUT_BYTES {
-            return Err(format!("{}: output limit", self.name));
-        }
-        if !status.success() {
-            return Err(format!("{}: {status}", self.name));
-        }
-        let value: serde_json::Value =
-            serde_json::from_slice(&stdout).map_err(|e| format!("{}: {e}", self.name))?;
-        let count = value
-            .get("spans")
-            .and_then(|spans| spans.as_array())
-            .map(Vec::len)
-            .unwrap_or(0);
-        if count > self.max_spans {
-            return Err(format!("{}: span limit", self.name));
-        }
-        Ok(count)
-    }
-}
-
-fn spawn_adapter_stdin_writer(
-    mut stdin: ChildStdin,
-    request: Vec<u8>,
-) -> JoinHandle<Result<(), String>> {
-    std::thread::spawn(move || stdin.write_all(&request).map_err(|e| format!("stdin: {e}")))
-}
-
-fn spawn_adapter_stdout_reader(stdout: ChildStdout) -> JoinHandle<Result<Vec<u8>, String>> {
-    std::thread::spawn(move || {
-        let mut stdout = stdout.take(MAX_STDOUT_BYTES as u64 + 1);
-        let mut out = Vec::new();
-        stdout
-            .read_to_end(&mut out)
-            .map_err(|e| format!("stdout: {e}"))?;
-        Ok(out)
-    })
-}
-
-fn wait_for_adapter_child(
+fn wait_for_plugin_child(
     child: &mut Child,
     name: &str,
     timeout: Duration,
@@ -1085,27 +1186,10 @@ fn wait_for_adapter_child(
     }
 }
 
-fn join_adapter_stdin(writer: JoinHandle<Result<(), String>>, name: &str) -> Result<(), String> {
-    writer
-        .join()
-        .map_err(|_| format!("{name}: stdin writer panicked"))?
-        .map_err(|e| format!("{name}: {e}"))
-}
-
-fn join_adapter_stdout(
-    reader: JoinHandle<Result<Vec<u8>, String>>,
-    name: &str,
-) -> Result<Vec<u8>, String> {
-    reader
-        .join()
-        .map_err(|_| format!("{name}: stdout reader panicked"))?
-        .map_err(|e| format!("{name}: {e}"))
-}
-
-fn adapter_command(program: &Path, id_or_name: &str) -> Result<Command, String> {
+fn plugin_command(program: &Path, id_or_name: &str) -> Result<Command, String> {
     let mut command = Command::new(program);
     command.env_clear();
-    for env_name in safe_adapter_env_names() {
+    for env_name in safe_plugin_env_names() {
         if let Some(value) = std::env::var_os(env_name) {
             command.env(env_name, value);
         }
@@ -1119,51 +1203,8 @@ fn adapter_command(program: &Path, id_or_name: &str) -> Result<Command, String> 
     Ok(command)
 }
 
-#[derive(Debug)]
-struct PluginRuntimeDirs {
-    data_dir: PathBuf,
-    cache_dir: PathBuf,
-    config_file: PathBuf,
-}
-
-fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String> {
-    let id = plugin_id(id_or_name);
-    let data_dir = std::env::current_dir()
-        .map_err(|e| format!("could not resolve plugin data directory: {e}"))?
-        .join(PENTECT_DIR)
-        .join(PLUGINS_DATA_DIR)
-        .join(&id);
-    let cache_dir = data_dir.join(PLUGIN_CACHE_DIR);
-    std::fs::create_dir_all(&cache_dir).map_err(|e| {
-        format!(
-            "could not create plugin data '{}': {e}",
-            cache_dir.display()
-        )
-    })?;
-    let config_file = data_dir.join(PLUGIN_CONFIG_FILE);
-    Ok(PluginRuntimeDirs {
-        data_dir,
-        cache_dir,
-        config_file,
-    })
-}
-
-fn adapter_default_name(path: &Path) -> String {
-    if path.file_name().and_then(|name| name.to_str()) == Some("plugin.toml") {
-        if let Some(name) = path
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.trim().is_empty())
-        {
-            return name.to_string();
-        }
-    }
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("plugin")
-        .to_string()
+fn plugin_runtime_dirs(id_or_name: &str) -> Result<pentect_agent::PluginRuntimeDirs, String> {
+    pentect_agent::plugin_runtime_dirs(id_or_name)
 }
 
 fn plugin_id(value: &str) -> String {
@@ -1203,7 +1244,7 @@ fn plugin_id(value: &str) -> String {
     }
 }
 
-fn safe_adapter_env_names() -> &'static [&'static str] {
+fn safe_plugin_env_names() -> &'static [&'static str] {
     if cfg!(windows) {
         &[
             "Path",
@@ -1326,7 +1367,7 @@ impl Check {
     }
 }
 
-fn adapter_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
+fn plugin_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
     let path = Path::new(program);
     if path.is_absolute() {
         return path.to_path_buf();
@@ -1335,15 +1376,12 @@ fn adapter_program(program: &str, cwd: &Path, id: &str) -> PathBuf {
         return cwd.join(path);
     }
     installed_plugin_program(program, id)
-        .or_else(|| adapter_sidecar_program(program))
+        .or_else(|| plugin_sidecar_program(program))
         .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn installed_plugin_program(program: &str, id: &str) -> Option<PathBuf> {
-    let bin = PathBuf::from(PENTECT_DIR)
-        .join(PLUGINS_DATA_DIR)
-        .join(plugin_id(id))
-        .join("bin");
+    let bin = plugin_runtime_dirs(id).ok()?.data_dir.join("bin");
     for name in command_names(program) {
         let candidate = bin.join(name);
         if candidate.is_file() {
@@ -1357,7 +1395,7 @@ fn looks_like_path_command(program: &str) -> bool {
     program.contains('/') || program.contains('\\')
 }
 
-fn adapter_sidecar_program(program: &str) -> Option<PathBuf> {
+fn plugin_sidecar_program(program: &str) -> Option<PathBuf> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     for name in command_names(program) {
         let candidate = dir.join(name);
@@ -1606,8 +1644,45 @@ permissions = ["filesystem", "process"]
     }
 
     #[test]
-    fn adapter_probe_env_does_not_inherit_memory_store_credentials() {
-        let command = adapter_command(Path::new("echo"), "test-env").unwrap();
+    fn plugin_update_requires_the_exact_approved_manifest() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("update-approval-{nonce}");
+        let root = std::env::temp_dir().join(&name);
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
+        let manifest_source = format!(
+            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper\"\nrepository = \"owner/repo\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n"
+        );
+        std::fs::write(&manifest_path, &manifest_source).unwrap();
+        let source = plugins::PluginSource {
+            name: name.clone(),
+            root: root.clone(),
+            manifest_path: Some(manifest_path.clone()),
+            repository: None,
+        };
+        let manifest = load_plugin_manifest(&source).unwrap().unwrap();
+        write_plugin_approval(&name, &source, &manifest).unwrap();
+        verify_plugin_update_approval(&name, &source, &manifest).unwrap();
+
+        std::fs::write(
+            &manifest_path,
+            manifest_source.replace("owner/repo", "other/repo"),
+        )
+        .unwrap();
+        let changed = load_plugin_manifest(&source).unwrap().unwrap();
+        assert!(verify_plugin_update_approval(&name, &source, &changed).is_err());
+
+        let data_dir = plugin_runtime_dirs(&plugin_id(&name)).unwrap().data_dir;
+        let _ = std::fs::remove_dir_all(data_dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_env_does_not_inherit_memory_store_credentials() {
+        let command = plugin_command(Path::new("echo"), "test-env").unwrap();
         let names = command
             .get_envs()
             .map(|(name, _)| name.to_string_lossy().to_string())
@@ -1626,8 +1701,12 @@ permissions = ["filesystem", "process"]
     }
 
     #[test]
-    fn adapter_probe_env_exposes_project_local_plugin_data() {
-        let command = adapter_command(Path::new("echo"), "My Ext!").unwrap();
+    fn plugin_env_exposes_project_scoped_user_data() {
+        let command = plugin_command(Path::new("echo"), "My Ext!").unwrap();
+        let dirs = plugin_runtime_dirs("my-ext").unwrap();
+        let data_dir = dirs.data_dir.to_string_lossy().replace('\\', "/");
+        let cache_dir = dirs.cache_dir.to_string_lossy().replace('\\', "/");
+        let config_file = dirs.config_file.to_string_lossy().replace('\\', "/");
         let envs = command
             .get_envs()
             .map(|(name, value)| {
@@ -1645,19 +1724,22 @@ permissions = ["filesystem", "process"]
         );
         assert!(
             envs.get(PLUGIN_DATA_DIR_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext")),
+                .is_some_and(|path| path == &data_dir),
             "{envs:?}"
         );
         assert!(
             envs.get(PLUGIN_CACHE_DIR_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext/cache")),
+                .is_some_and(|path| path == &cache_dir),
             "{envs:?}"
         );
         assert!(
             envs.get(PLUGIN_CONFIG_ENV)
-                .is_some_and(|path| path.ends_with(".pentect/plugins-data/my-ext/config.toml")),
+                .is_some_and(|path| path == &config_file),
             "{envs:?}"
         );
+        let project = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert!(!dirs.data_dir.starts_with(project), "{dirs:?}");
+        let _ = std::fs::remove_dir_all(dirs.data_dir);
     }
 
     #[test]
@@ -1702,7 +1784,7 @@ permissions = ["filesystem", "process"]
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join(plugins::PLUGIN_MANIFEST_FILE),
-            "schema = \"pentect.plugin.v1\"\nname = \"local\"\nbinary = \"tool\"\n",
+            "schema = \"pentect.plugin.v1\"\nname = \"local\"\nbinary = \"tool\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
         )
         .unwrap();
 
