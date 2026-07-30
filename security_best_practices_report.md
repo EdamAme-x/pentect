@@ -5,7 +5,7 @@ Scope: Rust workspace, shell/runtime IPC, masking pipeline, plugins, installers/
 
 ## Executive summary
 
-Four clear security issues were fixed in this review: an unsafe UTF-8 mutation reachable through the public detector API, local memory-store connection/request exhaustion, a project-controlled remote plugin cache, and mutable GitHub Actions dependencies. Dependencies with current actionable RustSec/OSV advisories were upgraded. Targeted tests and `cargo check -p pentect-cli` pass.
+Five clear security issues were fixed in this review: an unsafe UTF-8 mutation reachable through the public detector API, local memory-store connection/request exhaustion, a project-controlled remote plugin cache, mutable GitHub Actions dependencies, and the dependency advisories known at the time of the review. Targeted tests and `cargo check -p pentect-cli` pass.
 
 The largest remaining risk is the plugin execution trust model. A remote adapter can currently select a command from `PATH`, and plugin binaries are stored below the current project's `.pentect` directory. Fixing that safely changes plugin compatibility and storage semantics, so it is intentionally held for an explicit product decision.
 
@@ -33,7 +33,7 @@ Fixed in `crates/pentect-cli/src/plugins.rs`: remote cache data now lives in the
 
 The lockfile contained actionable advisories affecting `lopdf`, `quick-xml`, `crossbeam-epoch`, and `anyhow`. In particular, affected PDF/XML parsers could be driven into excessive resource use by hostile documents.
 
-Fixed by removing the PDF parser dependency entirely and upgrading `phonenumber`/`quick-xml`, `crossbeam-epoch`, and `anyhow`. A follow-up OSV scan found no remaining known actionable vulnerability advisories. Informational unmaintained transitive packages remain: `atomic-polyfill`, `paste`, and `proc-macro-error2`.
+The vulnerable dependency versions found by this review were removed or upgraded, including `phonenumber`/`quick-xml`, `crossbeam-epoch`, and `anyhow`. PDF inspection was subsequently restored as a product requirement using a newer parser stack; it remains subject to normal lockfile audit and input-size limits and must not be described as dependency-free. A follow-up OSV scan at the time found no remaining known actionable vulnerability advisories. Informational unmaintained transitive packages remained: `atomic-polyfill`, `paste`, and `proc-macro-error2`.
 
 References: <https://rustsec.org/advisories/RUSTSEC-2026-0187.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0190.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0194.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0195.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0204.html>.
 

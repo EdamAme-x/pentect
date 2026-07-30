@@ -125,6 +125,7 @@ impl OutputMasker {
                     .with_identity_key(self.store.session.identity_key)
             },
         );
+        self.track_mask_result("prompt", &env_result);
         let mut result = mask_read_input_with_engine_adapters_and_identity(
             self.store.session.key,
             self.store.session.identity_key,
@@ -135,13 +136,13 @@ impl OutputMasker {
                 data: env_result.masked,
             },
         )?;
-        result.summary.masked_count = result
+        let masked_count = result
             .summary
             .masked_count
             .saturating_add(env_result.summary.masked_count);
         result.recovery.extend_same_key(env_result.recovery);
         self.track_mask_result("prompt", &result);
-        self.add_masked_count(result.summary.masked_count);
+        self.add_masked_count(masked_count);
         let masked = compact_local_home_paths(&result.masked);
         let mut recovery = result.recovery;
         recovery.extend_same_key(env_alias_recovery(
@@ -332,15 +333,16 @@ impl OutputMasker {
         Ok(masked)
     }
 
-    fn mask_embedded_env_assignments(&mut self, text: &str) -> Result<String, String> {
+    pub(crate) fn mask_embedded_env_assignments(&mut self, text: &str) -> Result<String, String> {
         let mut out = String::with_capacity(text.len());
         let mut changed = false;
         for segment in text.split_inclusive('\n') {
             let (line, ending) = segment
                 .strip_suffix('\n')
                 .map_or((segment, ""), |line| (line, "\n"));
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let carriage_return = segment.ends_with("\r\n");
+            let (line, carriage_return) = line
+                .strip_suffix('\r')
+                .map_or((line, false), |line| (line, true));
             if let Some(start) = embedded_sensitive_env_assignment_start(line) {
                 out.push_str(&line[..start]);
                 let protected = self.mask_text(&line[start..], Kind::Env)?;

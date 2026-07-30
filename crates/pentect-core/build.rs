@@ -50,10 +50,27 @@ fn main() {
     println!("cargo:rerun-if-changed={}", source.display());
     let yaml = fs::read_to_string(source).expect("read embedded CredSweeper rules");
     let rules: Vec<Rule> = serde_yaml::from_str(&yaml).expect("parse embedded CredSweeper rules");
+    validate_patterns(&rules);
     let generated = generate(&rules, yaml.len());
     let output =
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("credsweeper_rules.rs");
     fs::write(output, generated).expect("write generated CredSweeper rules");
+}
+
+fn validate_patterns(rules: &[Rule]) {
+    for rule in rules {
+        if rule.kind.as_deref() != Some("pattern") || rule.name == "BASE64 Private Key" {
+            continue;
+        }
+        for pattern in rule.values.as_deref().unwrap_or_default() {
+            if regex::Regex::new(pattern).is_err() && fancy_regex::Regex::new(pattern).is_err() {
+                panic!(
+                    "embedded CredSweeper regex for rule {:?} is unsupported; update the generated assets",
+                    rule.name
+                );
+            }
+        }
+    }
 }
 
 fn verify_assets() {

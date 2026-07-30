@@ -34,7 +34,8 @@ http-body-util = "0.1"
 tokio = { workspace = true, features = ["io-util", "macros", "process", "sync"] }
 data-encoding.workspace = true
 getrandom = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+ctrlc.workspace = true
+reqwest.workspace = true
 futures-util = { workspace = true }
 pdf-extract = "0.9"
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }

@@ -120,15 +120,16 @@ async fn run_proxy(
     let address = listener
         .local_addr()
         .map_err(|error| format!("could not read OpenAI HTTP gateway address: {error}"))?;
+    let local_base_url = format!("http://{address}/{auth}");
     let state = Arc::new(ProxyState {
         upstream,
-        auth: auth.clone(),
+        auth,
         client: build_upstream_client()?,
         masker: Arc::new(Mutex::new(pentect_agent::ActiveToolOutputMasker::new()?)),
         files: Mutex::new(HashMap::new()),
         requests: Arc::new(Semaphore::new(32)),
     });
-    let _ = ready_tx.send(Ok(format!("http://{address}/{auth}")));
+    let _ = ready_tx.send(Ok(local_base_url));
 
     loop {
         tokio::select! {
@@ -161,6 +162,8 @@ fn build_upstream_client() -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
         .tcp_nodelay(true);
     if let Some(path) = std::env::var_os("PENTECT_OPENAI_CA_CERT") {
         let pem = std::fs::read(&path)
@@ -343,11 +346,11 @@ async fn proxy_request_inner(
             serde_json::from_slice::<Value>(&response_body),
         ) {
             if let Some(id) = value.get("id").and_then(Value::as_str) {
-                state
+                let mut files = state
                     .files
                     .lock()
-                    .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
-                    .insert(id.to_string(), coverage);
+                    .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?;
+                crate::http_files::remember_file_coverage(&mut files, id.to_string(), coverage);
             }
         }
     }

@@ -814,50 +814,54 @@ fn handle_client(
         }
         let fields = request_fields(&line);
         let provided_token = fields.first().copied().unwrap_or_default();
-        if provided_token != token
-            && provided_token != process_host_read_token
-            && provided_token != process_host_write_token
-        {
+        let access = if constant_time_token_eq(provided_token, token) {
+            Some(RequestAccess::Primary)
+        } else if constant_time_token_eq(provided_token, process_host_read_token) {
+            Some(RequestAccess::ProcessRead)
+        } else if constant_time_token_eq(provided_token, process_host_write_token) {
+            Some(RequestAccess::ProcessWrite)
+        } else {
+            None
+        };
+        let Some(access) = access else {
             let stream = reader.get_mut();
             writeln!(stream, "ERR\tbad token")
                 .and_then(|_| stream.flush())
                 .context("could not write memory store error")?;
             return Ok(());
-        }
+        };
         if !authenticated {
             authenticated = true;
             let _ = reader.get_mut().set_read_timeout(None);
         }
         let response = match fields.as_slice() {
-            [provided_token, "KEY", ""] if *provided_token == token => key_response(state),
-            [provided_token, "KEYS", ""] if *provided_token == token => keys_response(state),
-            [provided_token, "COUNT", ""] if *provided_token == token => count_response(state),
-            [provided_token, "SNAPSHOT", ""] if *provided_token == token => {
-                snapshot_response(state)
-            }
-            [provided_token, "ADD", payload] if *provided_token == token => {
+            [_, "KEY", ""] if access == RequestAccess::Primary => key_response(state),
+            [_, "KEYS", ""] if access == RequestAccess::Primary => keys_response(state),
+            [_, "COUNT", ""] if access == RequestAccess::Primary => count_response(state),
+            [_, "SNAPSHOT", ""] if access == RequestAccess::Primary => snapshot_response(state),
+            [_, "ADD", payload] if access == RequestAccess::Primary => {
                 add_recovery_request(state, payload)
             }
-            [provided_token, "ADD_COUNT", payload] if *provided_token == token => {
+            [_, "ADD_COUNT", payload] if access == RequestAccess::Primary => {
                 add_masked_count_request(state, payload)
             }
-            [provided_token, "SCRIPT_PUT", payload] if *provided_token == token => {
+            [_, "SCRIPT_PUT", payload] if access == RequestAccess::Primary => {
                 put_agent_script_request(state, payload)
             }
-            [provided_token, "SCRIPT_TAKE", id] if *provided_token == token => {
+            [_, "SCRIPT_TAKE", id] if access == RequestAccess::Primary => {
                 take_agent_script_request(state, id)
             }
-            [provided_token, "SCRIPT_RENDER", id] if *provided_token == token => {
+            [_, "SCRIPT_RENDER", id] if access == RequestAccess::Primary => {
                 render_agent_script_request(state, id)
             }
-            [provided_token, "LEASE", ""] if *provided_token == token => {
+            [_, "LEASE", ""] if access == RequestAccess::Primary => {
                 exit_on_disconnect = true;
                 Ok("OK".to_string())
             }
-            [provided_token, "LOG_ADD", payload] if *provided_token == process_host_write_token => {
+            [_, "LOG_ADD", payload] if access == RequestAccess::ProcessWrite => {
                 add_activity_request(state, payload)
             }
-            [provided_token, "LOGS", payload] if *provided_token == process_host_read_token => {
+            [_, "LOGS", payload] if access == RequestAccess::ProcessRead => {
                 activity_response(state, payload)
             }
             _ => Err(anyhow!("malformed request")),
@@ -874,6 +878,27 @@ fn handle_client(
                 .context("could not write memory store error")?,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestAccess {
+    Primary,
+    ProcessRead,
+    ProcessWrite,
+}
+
+fn constant_time_token_eq(provided: &str, expected: &str) -> bool {
+    if provided.len() != expected.len() {
+        return false;
+    }
+    provided
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 fn key_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {

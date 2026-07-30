@@ -6,6 +6,7 @@
 
 use hyper::body::Bytes;
 use memchr::memmem;
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,28 +65,19 @@ pub(crate) fn protect_multipart_upload(
             break;
         }
         if body.get(cursor..cursor + 2) != Some(b"\r\n") {
-            coverage = Coverage::Partial;
-            output.extend_from_slice(&body[cursor..]);
-            cursor = body.len();
-            break;
+            return Err("file upload blocked: malformed multipart body".to_string());
         }
 
         let headers_start = cursor + 2;
         let Some(headers_relative_end) = memmem::find(&body[headers_start..], body_separator)
         else {
-            coverage = Coverage::Partial;
-            output.extend_from_slice(&body[cursor..]);
-            cursor = body.len();
-            break;
+            return Err("file upload blocked: malformed multipart headers".to_string());
         };
         let headers_end = headers_start + headers_relative_end;
         let content_start = headers_end + body_separator.len();
         let Some(content_relative_end) = memmem::find(&body[content_start..], &next_part_prefix)
         else {
-            coverage = Coverage::Partial;
-            output.extend_from_slice(&body[cursor..]);
-            cursor = body.len();
-            break;
+            return Err("file upload blocked: unterminated multipart file".to_string());
         };
         let content_end = content_start + content_relative_end;
         let headers = &body[headers_start..headers_end];
@@ -107,22 +99,25 @@ pub(crate) fn protect_multipart_upload(
                             output.extend_from_slice(masked.as_bytes());
                         }
                         Ok(None) => {
-                            coverage = Coverage::Partial;
-                            output.extend_from_slice(content);
+                            return Err(
+                                "file upload blocked: text inspection is unavailable".to_string()
+                            );
                         }
-                        Err(_) => {
-                            coverage = Coverage::Partial;
-                            output.extend_from_slice(content);
+                        Err(error) => {
+                            return Err(format!("file upload blocked: {error}"));
                         }
                     },
                     Err(_) => {
-                        coverage = Coverage::Partial;
-                        output.extend_from_slice(content);
+                        return Err(
+                            "file upload blocked: declared text is not valid UTF-8".to_string()
+                        );
                     }
                 }
             } else {
-                coverage = Coverage::Partial;
-                output.extend_from_slice(content);
+                return Err(
+                    "file upload blocked: this binary format cannot be inspected safely"
+                        .to_string(),
+                );
             }
         } else {
             output.extend_from_slice(content);
@@ -232,9 +227,10 @@ fn disposition_parameter(header: &str, expected: &str) -> Option<String> {
 
 pub(crate) fn supported_text_file(filename: &str, media_type: Option<&str>) -> bool {
     if media_type.is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
         value.starts_with("text/")
             || matches!(
-                value.to_ascii_lowercase().as_str(),
+                value.as_str(),
                 "application/json"
                     | "application/jsonl"
                     | "application/x-ndjson"
@@ -288,19 +284,33 @@ mod tests {
     }
 
     #[test]
-    fn multipart_parser_preserves_an_unavailable_masker_upload() {
+    fn multipart_parser_blocks_an_unavailable_masker_upload() {
         let body = Bytes::from_static(
             b"--boundary\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nuser_data\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--boundary--\r\n",
         );
         let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
-        let protected =
+        let error =
             protect_multipart_upload("multipart/form-data; boundary=boundary", &body, &mut masker)
+                .err()
                 .unwrap();
-        assert_eq!(protected.body, body);
-        assert_ne!(protected.coverage, Coverage::None);
+        assert!(error.contains("inspection is unavailable"), "{error}");
         assert_eq!(
             multipart_field(&body, b"--boundary", b"\r\n--boundary", "purpose").as_deref(),
             Some("user_data")
         );
     }
+}
+const MAX_TRACKED_FILE_IDS: usize = 1024;
+
+pub(crate) fn remember_file_coverage(
+    files: &mut HashMap<String, Coverage>,
+    id: String,
+    coverage: Coverage,
+) {
+    if !files.contains_key(&id) && files.len() >= MAX_TRACKED_FILE_IDS {
+        if let Some(expired) = files.keys().next().cloned() {
+            files.remove(&expired);
+        }
+    }
+    files.insert(id, coverage);
 }

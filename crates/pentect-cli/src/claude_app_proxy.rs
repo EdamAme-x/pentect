@@ -29,8 +29,7 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tokio::io::copy_bidirectional;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::ServerConfig;
@@ -312,6 +311,8 @@ async fn run_proxy(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(60))
+        .pool_idle_timeout(Duration::from_secs(30))
         .tcp_nodelay(true)
         .build()
         .map_err(|error| format!("could not build Claude App upstream client: {error}"))?;
@@ -368,6 +369,9 @@ async fn connect_request(
     };
     let host = authority.host().to_ascii_lowercase();
     let port = authority.port_u16().unwrap_or(443);
+    if !should_inspect(&host, port) {
+        return Ok(empty_response(StatusCode::FORBIDDEN));
+    }
     let upgraded = hyper::upgrade::on(&mut request);
     tokio::spawn(async move {
         let result = async {
@@ -375,11 +379,7 @@ async fn connect_request(
                 .await
                 .map_err(|error| format!("CONNECT upgrade failed: {error}"))?;
             let stream = hyper_util::rt::TokioIo::new(upgraded);
-            if should_inspect(&host, port) {
-                serve_inspected(stream, host, state).await
-            } else {
-                tunnel(stream, authority.as_str()).await
-            }
+            serve_inspected(stream, host, state).await
         }
         .await;
         if let Err(error) = result {
@@ -395,19 +395,6 @@ fn should_inspect(host: &str, port: u16) -> bool {
             || host.ends_with(".claude.ai")
             || host == "claude.com"
             || host.ends_with(".claude.com"))
-}
-
-async fn tunnel<T>(mut client: T, authority: &str) -> Result<(), String>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let mut upstream = TcpStream::connect(authority)
-        .await
-        .map_err(|error| format!("could not connect to {authority}: {error}"))?;
-    copy_bidirectional(&mut client, &mut upstream)
-        .await
-        .map_err(|error| format!("tunnel copy failed for {authority}: {error}"))?;
-    Ok(())
 }
 
 async fn serve_inspected<T>(stream: T, host: String, state: Arc<ProxyState>) -> Result<(), String>

@@ -47,10 +47,11 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 rxing = { version = "0.9.1", default-features = false, features = ["decoders", "full_barcode_format_support", "multi_barcode_readers", "encoding_rs"] }
 ocrs = "0.12.2"
 rten = { version = "0.24.0", default-features = false, features = ["rten_format"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots", "stream"] }
 futures-util = "0.3"
 anstream = "0.6"
 crossterm = "0.28"
+ctrlc = { version = "3.4", features = ["termination"] }
 portable-pty = "0.9.0"
 ed25519-dalek = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }

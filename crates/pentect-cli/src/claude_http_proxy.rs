@@ -180,6 +180,8 @@ fn build_upstream_client() -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
         .tcp_nodelay(true);
     if let Some(path) = std::env::var_os("PENTECT_ANTHROPIC_CA_CERT") {
         let pem = std::fs::read(&path)
@@ -372,11 +374,11 @@ async fn proxy_request_inner(
             serde_json::from_slice::<Value>(&response_body),
         ) {
             if let Some(id) = value.get("id").and_then(Value::as_str) {
-                state
+                let mut files = state
                     .files
                     .lock()
-                    .map_err(|_| "Claude file registry lock was poisoned".to_string())?
-                    .insert(id.to_string(), coverage);
+                    .map_err(|_| "Claude file registry lock was poisoned".to_string())?;
+                crate::http_files::remember_file_coverage(&mut files, id.to_string(), coverage);
             }
         }
     }

@@ -990,9 +990,12 @@ impl ClaudeCallerSettings {
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf)
-            .unwrap_or(std::env::current_dir().map_err(|error| {
-                format!("could not locate the working directory for Claude settings: {error}")
-            })?);
+            .map(Ok)
+            .unwrap_or_else(|| {
+                std::env::current_dir().map_err(|error| {
+                    format!("could not locate the working directory for Claude settings: {error}")
+                })
+            })?;
         let file = ClaudeSettingsFile::create(&directory, &settings)?;
         let path = file.path().to_string_lossy().into_owned();
         let mut out = args.to_vec();
@@ -1055,6 +1058,10 @@ impl ClaudeSettingsFile {
                 path.display()
             )
         })?;
+        if let Err(error) = restrict_sensitive_file(&path) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
         if let Err(error) = serde_json::to_writer(&mut file, settings) {
             let _ = std::fs::remove_file(&path);
             return Err(format!(
@@ -1075,10 +1082,48 @@ impl ClaudeSettingsFile {
     }
 }
 
+#[cfg(windows)]
+fn restrict_sensitive_file(path: &Path) -> Result<(), String> {
+    let identity = Command::new("whoami.exe")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not resolve the Windows account for ACL setup: {error}"))?;
+    if !identity.status.success() {
+        return Err("could not resolve the Windows account for ACL setup".to_string());
+    }
+    let identity = String::from_utf8(identity.stdout)
+        .map_err(|_| "Windows account name is not UTF-8".to_string())?;
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return Err("Windows account name is empty".to_string());
+    }
+    let grant = format!("{identity}:(F)");
+    let status = Command::new("icacls.exe")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", &grant])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("could not restrict Claude settings ACL: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("could not restrict Claude settings ACL".to_string())
+    }
+}
+
+#[cfg(not(windows))]
+fn restrict_sensitive_file(_: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn cleanup_stale_claude_settings_files(directory: &Path) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
+    let mut candidates = Vec::new();
     for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -1102,21 +1147,25 @@ fn cleanup_stale_claude_settings_files(directory: &Path) {
         else {
             continue;
         };
-        if owner != std::process::id() && !process_id_is_alive(owner) {
-            let _ = std::fs::remove_file(path);
+        if owner != std::process::id() {
+            candidates.push((path, sysinfo::Pid::from_u32(owner)));
         }
     }
-}
-
-fn process_id_is_alive(pid: u32) -> bool {
-    let pid = sysinfo::Pid::from_u32(pid);
+    if candidates.is_empty() {
+        return;
+    }
+    let pids = candidates.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
     let mut system = sysinfo::System::new();
     system.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        sysinfo::ProcessesToUpdate::Some(&pids),
         true,
         sysinfo::ProcessRefreshKind::nothing(),
     );
-    system.process(pid).is_some()
+    for (path, pid) in candidates {
+        if system.process(pid).is_none() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl Drop for ClaudeSettingsFile {

@@ -791,6 +791,21 @@ fn embedded_env_assignment_detection_is_structural_and_sensitive() {
 }
 
 #[test]
+fn embedded_env_masking_preserves_a_trailing_carriage_return() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-carriage-return");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let input = format!("output: OPENAI_API_KEY={raw}\r");
+    let session = Session::open_capability("default").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let mut masker = masking::OutputMasker::new_shared(store).unwrap();
+
+    let masked = masker.mask_embedded_env_assignments(&input).unwrap();
+    assert!(masked.ends_with('\r'), "{masked:?}");
+    assert!(!masked.contains(raw), "{masked}");
+}
+
+#[test]
 fn active_memory_store_resolver_reuses_one_snapshot_for_many_scalars() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("resolver-snapshot");

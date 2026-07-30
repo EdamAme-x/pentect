@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 pub(crate) fn cmd_codex_app(args: &[String]) -> i32 {
     match run_codex_app(args) {
@@ -59,12 +60,51 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("could not start Codex App: {error}"))?;
+    let config_cleanup = Arc::new(Mutex::new(config_override));
+    let signal_cleanup = Arc::clone(&config_cleanup);
+    let child_id = child.id();
+    if let Err(error) = ctrlc::set_handler(move || {
+        terminate_child_process(child_id);
+        if let Ok(mut cleanup) = signal_cleanup.lock() {
+            cleanup.take();
+        }
+        std::process::exit(130);
+    }) {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Ok(mut cleanup) = config_cleanup.lock() {
+            cleanup.take();
+        }
+        return Err(format!(
+            "could not install Codex App config recovery handler: {error}"
+        ));
+    }
     let status = child
         .wait()
         .map_err(|error| format!("could not wait for Codex App: {error}"))?;
-    drop(config_override);
+    config_cleanup
+        .lock()
+        .map_err(|_| "Codex App config recovery lock is unavailable".to_string())?
+        .take();
     drop(proxy);
     Ok(status)
+}
+
+#[cfg(windows)]
+fn terminate_child_process(pid: u32) {
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+fn terminate_child_process(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
 }
 
 struct CodexConfigOverride {

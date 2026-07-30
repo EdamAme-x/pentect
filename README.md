@@ -10,12 +10,12 @@ TODO
 - [ ] starter
 - [ ] docs site
 - [ ] easy install
-- [ ] output fil
+- [ ] output file
 - [ ] antigravity cli, pico, https://github.com/usestrix/strix
 - [ ] codex app / claude appを各リリースで回帰検証する
 - [ ] PDF・画像・Officeをマスク済みバイナリとして安全に再生成する
 - [ ] 前セッションのAnthropic file IDを安全に扱う再アップロード導線
-- [ ] `pentect codex app`異常終了時のconfig復元watchdog
+- [x] `pentect codex app`異常終了時のconfig復元
 - [ ] OpenAI/Anthropic実providerを使ったFiles・URL・AppのライブE2E
 - [ ] HTTPファイル検査の上限をstreaming spoolで512MB級まで拡張する
 - [ ] 止めた後になんか重なる

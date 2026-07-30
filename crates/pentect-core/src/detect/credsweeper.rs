@@ -122,7 +122,7 @@ enum PatternMatcher {
 
 struct DeferredRegex {
     source: String,
-    compiled: OnceLock<CompiledRegex>,
+    compiled: OnceLock<Option<CompiledRegex>>,
 }
 
 enum CompiledRegex {
@@ -258,7 +258,13 @@ fn audit_builtin_stats() -> Result<CredSweeperNativeStats, String> {
                 for pattern in values {
                     match compile_pattern(pattern) {
                         Ok(PatternMatcher::Deferred(regex)) => {
-                            match regex.compiled.get().expect("audit compiles regex") {
+                            match regex
+                                .compiled
+                                .get()
+                                .expect("audit compiles regex")
+                                .as_ref()
+                                .expect("compile_pattern stores a compiled regex")
+                            {
                                 CompiledRegex::Rust(_) => stats.rust_regex_patterns += 1,
                                 CompiledRegex::Fancy(_) => stats.fancy_regex_patterns += 1,
                             }
@@ -414,26 +420,29 @@ impl PatternMatcher {
 }
 
 impl DeferredRegex {
-    fn compiled(&self) -> &CompiledRegex {
-        self.compiled.get_or_init(|| {
-            RustRegex::new(&self.source)
-                .map(CompiledRegex::Rust)
-                .or_else(|_| FancyRegex::new(&self.source).map(CompiledRegex::Fancy))
-                .unwrap_or_else(|error| panic!("embedded CredSweeper regex failed: {error}"))
-        })
+    fn compiled(&self) -> Option<&CompiledRegex> {
+        self.compiled
+            .get_or_init(|| {
+                RustRegex::new(&self.source)
+                    .map(CompiledRegex::Rust)
+                    .or_else(|_| FancyRegex::new(&self.source).map(CompiledRegex::Fancy))
+                    .ok()
+            })
+            .as_ref()
     }
 
     fn find<'a>(&self, text: &'a str, value_capture: bool) -> Vec<Candidate<'a>> {
         match self.compiled() {
-            CompiledRegex::Rust(regex) => regex
+            Some(CompiledRegex::Rust(regex)) => regex
                 .captures_iter(text)
                 .filter_map(|captures| rust_candidate(&captures, value_capture))
                 .collect(),
-            CompiledRegex::Fancy(regex) => regex
+            Some(CompiledRegex::Fancy(regex)) => regex
                 .captures_iter(text)
                 .filter_map(Result::ok)
                 .filter_map(|captures| fancy_candidate(&captures, value_capture))
                 .collect(),
+            None => Vec::new(),
         }
     }
 }
@@ -706,13 +715,13 @@ fn compile_pattern(pattern: &str) -> Result<PatternMatcher, ()> {
     match RustRegex::new(pattern) {
         Ok(regex) => Ok(PatternMatcher::Deferred(Arc::new(DeferredRegex {
             source: pattern.to_string(),
-            compiled: OnceLock::from(CompiledRegex::Rust(regex)),
+            compiled: OnceLock::from(Some(CompiledRegex::Rust(regex))),
         }))),
         Err(_) => FancyRegex::new(pattern)
             .map(|regex| {
                 PatternMatcher::Deferred(Arc::new(DeferredRegex {
                     source: pattern.to_string(),
-                    compiled: OnceLock::from(CompiledRegex::Fancy(regex)),
+                    compiled: OnceLock::from(Some(CompiledRegex::Fancy(regex))),
                 }))
             })
             .map_err(|_| ()),

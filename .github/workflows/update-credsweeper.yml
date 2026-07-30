@@ -46,7 +46,8 @@ jobs:
           git checkout -B "$branch"
           git add -- \
             crates/pentect-core/vendors/CredSweeper \
-            crates/pentect-core/vendors/credsweeper-assets
+            crates/pentect-core/vendors/credsweeper-assets \
+            tools/credsweeper-sidecar/runtime-requirements.txt
           git commit -m "chore: update CredSweeper to $version"
           git push --force-with-lease origin "HEAD:$branch"
 

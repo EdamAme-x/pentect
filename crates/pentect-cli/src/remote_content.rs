@@ -3,6 +3,7 @@
 use futures_util::StreamExt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+use zeroize::Zeroize;
 
 const MAX_REMOTE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 3;
@@ -85,6 +86,7 @@ pub(crate) async fn fetch(url: &str) -> Result<RemoteContent, String> {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| "remote attachment body failed".to_string())?;
             if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_BYTES {
+                bytes.zeroize();
                 return Err("remote attachment is too large".to_string());
             }
             bytes.extend_from_slice(&chunk);

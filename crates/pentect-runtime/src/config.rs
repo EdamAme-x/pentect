@@ -126,6 +126,7 @@ fn load_or_create_identity_key(path: &Path) -> Result<[u8; 32], String> {
         }
         match options.open(path) {
             Ok(mut file) => {
+                restrict_identity_file(path)?;
                 file.write_all(&key)
                     .and_then(|_| file.sync_data())
                     .map_err(|e| format!("could not write '{}': {e}", path.display()))?;
@@ -137,6 +138,7 @@ fn load_or_create_identity_key(path: &Path) -> Result<[u8; 32], String> {
             }
         }
     }
+    restrict_identity_file(path)?;
     let bytes = fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))?;
     bytes.try_into().map_err(|bytes: Vec<u8>| {
         format!(
@@ -145,6 +147,46 @@ fn load_or_create_identity_key(path: &Path) -> Result<[u8; 32], String> {
             bytes.len()
         )
     })
+}
+
+#[cfg(windows)]
+fn restrict_identity_file(path: &Path) -> Result<(), String> {
+    let marker = path.with_extension("acl-v1");
+    if marker.is_file() {
+        return Ok(());
+    }
+    let identity = std::process::Command::new("whoami.exe")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("could not resolve the Windows account for ACL setup: {error}"))?;
+    if !identity.status.success() {
+        return Err("could not resolve the Windows account for ACL setup".to_string());
+    }
+    let identity = String::from_utf8(identity.stdout)
+        .map_err(|_| "Windows account name is not UTF-8".to_string())?;
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return Err("Windows account name is empty".to_string());
+    }
+    let status = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", &format!("{identity}:(F)")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("could not restrict identity key ACL: {error}"))?;
+    if !status.success() {
+        return Err("could not restrict identity key ACL".to_string());
+    }
+    fs::write(&marker, b"")
+        .map_err(|error| format!("could not record identity key ACL setup: {error}"))
+}
+
+#[cfg(not(windows))]
+fn restrict_identity_file(_: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg_attr(test, allow(dead_code))]
