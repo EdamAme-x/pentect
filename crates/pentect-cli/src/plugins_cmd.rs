@@ -782,9 +782,8 @@ fn update_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let repository = binary_repository(&source, &manifest)?;
     verify_plugin_update_approval(&name, &source, &manifest)?;
     install_release_binary(&name, &repository, binary, &manifest.assets)?;
-    if manifest.middleware.is_some() {
-        write_plugin_approval(&name, &source, &manifest)?;
-    }
+    // Updating a release binary must not rewrite the user's manifest approval.
+    // Keeping the original digest makes any concurrent or later edit require setup again.
     println!("update: complete");
     Ok(())
 }
