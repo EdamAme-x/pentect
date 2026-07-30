@@ -2,12 +2,16 @@ use crate::{plugins, update};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
 const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
+const MAX_PLUGIN_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_PLUGIN_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_PLUGIN_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_PLUGIN_WASM_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) fn cmd_plugins(args: &[String]) {
     let opts = match PluginCmd::parse(args) {
@@ -505,12 +509,7 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
     let Some(path) = &source.manifest_path else {
         return Ok(None);
     };
-    let src = std::fs::read_to_string(path).map_err(|e| {
-        format!(
-            "could not read plugin manifest '{}': {e}",
-            display_path(path)
-        )
-    })?;
+    let src = read_bounded_utf8(path, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest")?;
     let manifest: PluginManifest = toml::from_str(&src)
         .map_err(|e| format!("invalid plugin manifest '{}': {e}", display_path(path)))?;
     if manifest.schema.as_deref() != Some("pentect.plugin.v1") {
@@ -808,8 +807,7 @@ fn read_plugin_config(path: &Path) -> Result<toml::Table, String> {
     if !path.exists() {
         return Ok(toml::Table::new());
     }
-    let src = std::fs::read_to_string(path)
-        .map_err(|e| format!("could not read plugin config '{}': {e}", display_path(path)))?;
+    let src = read_bounded_utf8(path, MAX_PLUGIN_CONFIG_BYTES, "plugin config")?;
     toml::from_str(&src).map_err(|e| format!("invalid plugin config '{}': {e}", display_path(path)))
 }
 
@@ -995,6 +993,26 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
             "  request-count-limit: {}",
             network.max_requests.unwrap_or(4)
         );
+        if manifest.middleware.as_ref().is_some_and(|middleware| {
+            middleware
+                .permissions
+                .iter()
+                .any(|permission| permission == "input:read")
+        }) {
+            println!(
+                "WARNING: this plugin can read unmasked input and send data to approved network origins"
+            );
+        }
+        if manifest.middleware.as_ref().is_some_and(|middleware| {
+            middleware
+                .permissions
+                .iter()
+                .any(|permission| permission == "config:read")
+        }) {
+            println!(
+                "WARNING: this plugin can read approved configuration and send data to approved network origins"
+            );
+        }
     }
     if !approved && !confirm_setup()? {
         return Err("plugin setup was not approved".to_string());
@@ -1114,7 +1132,7 @@ fn verify_plugin_update_approval(
     let path = plugin_runtime_dirs(&plugin_id(name))?
         .data_dir
         .join(PLUGIN_APPROVAL_FILE);
-    let source_text = std::fs::read_to_string(&path)
+    let source_text = read_bounded_utf8(&path, MAX_PLUGIN_METADATA_BYTES, "plugin approval")
         .map_err(|_| "plugin update requires prior setup approval".to_string())?;
     let approval: StoredPluginApproval = toml::from_str(&source_text)
         .map_err(|_| "plugin approval is invalid; run `pentect plugins setup`".to_string())?;
@@ -1154,6 +1172,15 @@ fn binary_repository(
     source: &plugins::PluginSource,
     manifest: &PluginManifest,
 ) -> Result<String, String> {
+    if let (Some(source_repository), Some(manifest_repository)) =
+        (source.repository.as_deref(), manifest.repository.as_deref())
+    {
+        if !source_repository.eq_ignore_ascii_case(manifest_repository) {
+            return Err(format!(
+                "remote plugin repository mismatch: source is {source_repository}, manifest requests {manifest_repository}"
+            ));
+        }
+    }
     let repository = manifest
         .repository
         .as_deref()
@@ -1214,8 +1241,9 @@ fn install_release_binary(
     let platform = binary_platform();
     let asset = binary_asset(binary, runtime, overrides);
     let destination = binary_destination(name, binary, runtime)?;
-    let download = update::download_latest_release_asset(repository, &asset)
+    let download = update::download_latest_release_asset(repository, &asset, MAX_PLUGIN_WASM_BYTES)
         .map_err(|error| map_binary_download_error(name, &platform, &asset, error))?;
+    reject_plugin_downgrade(name, &download.version)?;
     if destination.is_file() && sha256_path(&destination)? == download.sha256 {
         verify_github_attestation(&destination, repository, publisher_workflow, name)?;
         write_binary_lock(name, repository, publisher_workflow, &asset, &download)?;
@@ -1336,6 +1364,35 @@ struct BinaryLock<'a> {
     sha256: &'a str,
 }
 
+#[derive(Deserialize)]
+struct StoredBinaryLock {
+    schema: String,
+    version: String,
+}
+
+fn reject_plugin_downgrade(name: &str, candidate: &semver::Version) -> Result<(), String> {
+    let path = plugin_runtime_dirs(&plugin_id(name))?
+        .data_dir
+        .join(PLUGIN_BINARY_LOCK_FILE);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let source = read_bounded_utf8(&path, MAX_PLUGIN_METADATA_BYTES, "plugin binary lock")?;
+    let lock: StoredBinaryLock = toml::from_str(&source)
+        .map_err(|_| "plugin binary lock is invalid; run setup again".to_string())?;
+    let current = semver::Version::parse(&lock.version)
+        .map_err(|_| "plugin binary lock has an invalid version; run setup again".to_string())?;
+    if lock.schema != "pentect.plugin-lock.v1" {
+        return Err("plugin binary lock has an unsupported schema; run setup again".to_string());
+    }
+    if candidate < &current {
+        return Err(format!(
+            "plugin update would downgrade {name} from {current} to {candidate}"
+        ));
+    }
+    Ok(())
+}
+
 fn write_binary_lock(
     name: &str,
     repository: &str,
@@ -1354,15 +1411,61 @@ fn write_binary_lock(
     };
     let source =
         toml::to_string(&lock).map_err(|e| format!("could not encode binary lock: {e}"))?;
-    std::fs::write(dirs.data_dir.join(PLUGIN_BINARY_LOCK_FILE), source)
-        .map_err(|e| format!("could not write plugin binary lock: {e}"))
+    let destination = dirs.data_dir.join(PLUGIN_BINARY_LOCK_FILE);
+    let temporary = dirs.data_dir.join(format!(
+        "{PLUGIN_BINARY_LOCK_FILE}.tmp-{}",
+        std::process::id()
+    ));
+    std::fs::write(&temporary, source)
+        .map_err(|e| format!("could not write plugin binary lock: {e}"))?;
+    if let Err(error) = replace_binary(&temporary, &destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn read_bounded_utf8(path: &Path, max_bytes: u64, kind: &str) -> Result<String, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("could not read {kind} '{}': {error}", display_path(path)))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect {kind} '{}': {error}", display_path(path)))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(format!(
+            "{kind} '{}' exceeds its size limit",
+            display_path(path)
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read {kind} '{}': {error}", display_path(path)))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{kind} '{}' exceeds its size limit",
+            display_path(path)
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{kind} '{}' is not UTF-8", display_path(path)))
 }
 
 fn sha256_path(path: &Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("could not verify plugin binary '{}': {e}", path.display()))?;
-    Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)))
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("could not verify plugin file '{}': {e}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|e| format!("could not verify plugin file '{}': {e}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(data_encoding::HEXLOWER.encode(&digest.finalize()))
 }
 
 fn replace_binary(staged: &Path, destination: &Path) -> Result<(), String> {
@@ -1944,5 +2047,42 @@ mod tests {
         assert!(err.contains("require repository"), "{err}");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_binary_cannot_redirect_to_another_repository() {
+        let source = plugins::PluginSource {
+            name: "remote".to_string(),
+            manifest_path: None,
+            repository: Some("trusted/owner".to_string()),
+        };
+        let manifest: PluginManifest = toml::from_str(
+            "schema = \"pentect.plugin.v1\"\nname = \"remote\"\nrepository = \"attacker/repo\"\n",
+        )
+        .unwrap();
+
+        let error = binary_repository(&source, &manifest).unwrap_err();
+        assert!(error.contains("repository mismatch"), "{error}");
+    }
+
+    #[test]
+    fn plugin_update_rejects_release_downgrades() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("downgrade-{nonce}");
+        let data_dir = plugin_runtime_dirs(&plugin_id(&name)).unwrap().data_dir;
+        std::fs::write(
+            data_dir.join(PLUGIN_BINARY_LOCK_FILE),
+            "schema = \"pentect.plugin-lock.v1\"\nversion = \"2.0.0\"\n",
+        )
+        .unwrap();
+
+        assert!(reject_plugin_downgrade(&name, &semver::Version::new(1, 9, 9)).is_err());
+        assert!(reject_plugin_downgrade(&name, &semver::Version::new(2, 0, 0)).is_ok());
+        assert!(reject_plugin_downgrade(&name, &semver::Version::new(2, 1, 0)).is_ok());
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

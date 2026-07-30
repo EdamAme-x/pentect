@@ -15,8 +15,13 @@ use std::time::{Duration, Instant};
 pub const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
 
 const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
+const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
 const PLUGIN_CACHE_DIR: &str = "cache";
 const PLUGIN_CONFIG_FILE: &str = "config.toml";
+const MAX_PLUGIN_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_PLUGIN_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_PLUGIN_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_PLUGIN_WASM_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MAX_INPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -374,8 +379,7 @@ impl PluginBinary {
                 path.display()
             ));
         }
-        let source = std::fs::read_to_string(path)
-            .map_err(|error| format!("could not read '{}': {error}", path.display()))?;
+        let source = read_bounded_utf8(path, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest")?;
         let file: PluginFile = toml::from_str(&source)
             .map_err(|error| format!("plugin manifest '{}' is invalid: {error}", path.display()))?;
         if file.schema.as_deref() != Some("pentect.plugin.v1") {
@@ -477,12 +481,13 @@ impl PluginBinary {
                 "plugin '{name}' middleware requires input:read permission"
             ));
         }
+        verify_plugin_approval(path, &id, &stages, &permissions)?;
+        let wasm_bytes = load_approved_plugin_binary(&wasm_path, &id, &name)?;
         let config = permissions
             .contains("config:read")
             .then(|| load_plugin_config(&id))
             .transpose()?;
-        let wasm = WasmProgram::load(&wasm_path, &name, network, config)?;
-        verify_plugin_approval(path, &id, &stages, &permissions)?;
+        let wasm = WasmProgram::load_bytes(&wasm_bytes, &name, network, config)?;
         Ok(Self {
             name,
             wasm,
@@ -565,6 +570,12 @@ struct PluginApproval {
     permissions: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct PluginBinaryLock {
+    schema: String,
+    sha256: String,
+}
+
 fn verify_plugin_approval(
     manifest: &Path,
     id: &str,
@@ -573,16 +584,17 @@ fn verify_plugin_approval(
 ) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let path = plugin_runtime_dirs(id)?.data_dir.join(PLUGIN_APPROVAL_FILE);
-    let source = std::fs::read_to_string(&path).map_err(|_| {
-        format!(
-            "plugin '{}' is not approved; run `pentect plugins setup {} --yes`",
-            id,
-            manifest.display()
-        )
-    })?;
+    let source =
+        read_bounded_utf8(&path, MAX_PLUGIN_METADATA_BYTES, "plugin approval").map_err(|_| {
+            format!(
+                "plugin '{}' is not approved; run `pentect plugins setup {} --yes`",
+                id,
+                manifest.display()
+            )
+        })?;
     let approval: PluginApproval = toml::from_str(&source)
         .map_err(|error| format!("plugin '{id}' approval is invalid: {error}"))?;
-    let bytes = std::fs::read(manifest)
+    let bytes = read_bounded_bytes(manifest, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest")
         .map_err(|error| format!("could not verify plugin '{id}' manifest: {error}"))?;
     let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
     let approved_stages = approval
@@ -602,6 +614,68 @@ fn verify_plugin_approval(
         ));
     }
     Ok(())
+}
+
+fn load_approved_plugin_binary(path: &Path, id: &str, name: &str) -> Result<Vec<u8>, String> {
+    use sha2::{Digest, Sha256};
+
+    let lock_path = plugin_runtime_dirs(id)?
+        .data_dir
+        .join(PLUGIN_BINARY_LOCK_FILE);
+    let source = read_bounded_utf8(&lock_path, MAX_PLUGIN_METADATA_BYTES, "plugin binary lock")
+        .map_err(|_| {
+            format!("plugin '{name}' binary is not locked; run `pentect plugins setup` again")
+        })?;
+    let lock: PluginBinaryLock =
+        toml::from_str(&source).map_err(|_| format!("plugin '{name}' binary lock is invalid"))?;
+    if lock.schema != "pentect.plugin-lock.v1"
+        || lock.sha256.len() != 64
+        || !lock.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!("plugin '{name}' binary lock is invalid"));
+    }
+    let bytes = read_bounded_bytes(path, MAX_PLUGIN_WASM_BYTES, "WebAssembly plugin")
+        .map_err(|error| format!("could not load plugin '{name}': {error}"))?;
+    let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes));
+    if !digest.eq_ignore_ascii_case(&lock.sha256) {
+        return Err(format!(
+            "plugin '{name}' binary changed after verification; run `pentect plugins setup` again"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_utf8(path: &Path, max_bytes: u64, kind: &str) -> Result<String, String> {
+    let bytes = read_bounded_bytes(path, max_bytes, kind)?;
+    String::from_utf8(bytes).map_err(|_| format!("{kind} '{}' is not UTF-8", path.display()))
+}
+
+fn read_bounded_bytes(path: &Path, max_bytes: u64, kind: &str) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("could not read {kind} '{}': {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect {kind} '{}': {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{kind} '{}' is not a regular file", path.display()));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{kind} '{}' exceeds {max_bytes} bytes",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read {kind} '{}': {error}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{kind} '{}' exceeds {max_bytes} bytes",
+            path.display()
+        ));
+    }
+    Ok(bytes)
 }
 
 const WASM_ABI_ALLOC: &str = "pentect_alloc";
@@ -632,18 +706,16 @@ struct WasmProgram {
 }
 
 impl WasmProgram {
-    fn load(
-        path: &Path,
+    fn load_bytes(
+        bytes: &[u8],
         name: &str,
         network: Option<NetworkPolicy>,
         config: Option<toml::Value>,
     ) -> Result<Self, String> {
-        let bytes = std::fs::read(path)
-            .map_err(|error| format!("could not read WebAssembly plugin '{name}': {error}"))?;
         let mut engine_config = wasmi::Config::default();
         engine_config.consume_fuel(true);
         let engine = wasmi::Engine::new(&engine_config);
-        let module = wasmi::Module::new(&engine, &bytes[..])
+        let module = wasmi::Module::new(&engine, bytes)
             .map_err(|error| format!("plugin '{name}' WebAssembly is invalid: {error}"))?;
         for import in module.imports() {
             let permitted = (import.module() == WASM_HTTP_MODULE
@@ -824,8 +896,7 @@ fn load_plugin_config(id: &str) -> Result<toml::Value, String> {
     if !path.is_file() {
         return Ok(toml::Value::Table(toml::Table::new()));
     }
-    let source = std::fs::read_to_string(&path)
-        .map_err(|error| format!("could not read plugin config '{}': {error}", path.display()))?;
+    let source = read_bounded_utf8(&path, MAX_PLUGIN_CONFIG_BYTES, "plugin config")?;
     toml::from_str(&source)
         .map_err(|error| format!("plugin config '{}' is invalid: {error}", path.display()))
 }
@@ -1146,19 +1217,25 @@ fn resolve_http_origin(
     if addresses.is_empty() {
         return Err("plugin HTTP origin resolved to no addresses".to_string());
     }
-    if !private_network && addresses.iter().any(|address| !public_ip(address.ip())) {
-        return Err("plugin HTTP origin resolved to a non-public address".to_string());
+    if addresses
+        .iter()
+        .any(|address| !plugin_network_ip_allowed(address.ip(), private_network))
+    {
+        return Err("plugin HTTP origin resolved to a disallowed address".to_string());
     }
     Ok(addresses)
 }
 
+#[cfg(test)]
 fn public_ip(ip: IpAddr) -> bool {
+    plugin_network_ip_allowed(ip, false)
+}
+
+fn plugin_network_ip_allowed(ip: IpAddr, private_network: bool) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
-            !(ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
+            if ip.is_link_local()
                 || ip.is_broadcast()
                 || ip.is_documentation()
                 || ip.is_multicast()
@@ -1166,21 +1243,62 @@ fn public_ip(ip: IpAddr) -> bool {
                 || octets[0] == 0
                 || (octets[0] == 100 && (64..=127).contains(&octets[1]))
                 || (octets[0] == 198 && matches!(octets[1], 18 | 19))
-                || octets[0] >= 240)
+                || octets[0] >= 240
+            {
+                return false;
+            }
+            if ip.is_private() || ip.is_loopback() {
+                return private_network;
+            }
+            true
         }
         IpAddr::V6(ip) => {
             let segments = ip.segments();
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return public_ip(IpAddr::V4(mapped));
+            if let Some(embedded) = embedded_ipv4(ip) {
+                return plugin_network_ip_allowed(IpAddr::V4(embedded), private_network);
             }
-            !(ip.is_loopback()
-                || ip.is_multicast()
+            if ip.is_multicast()
                 || ip.is_unspecified()
-                || (segments[0] & 0xfe00) == 0xfc00
                 || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+                || (segments[0] & 0xffc0) == 0xfec0
+                || (segments[0] == 0x2001 && segments[1] == 0)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+            {
+                return false;
+            }
+            if ip.is_loopback() || (segments[0] & 0xfe00) == 0xfc00 {
+                return private_network;
+            }
+            true
         }
     }
+}
+
+fn embedded_ipv4(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let octets = ip.octets();
+    if octets[..12] == [0; 12]
+        || octets[..12]
+            == [
+                0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        || octets[..12]
+            == [
+                0x00, 0x64, 0xff, 0x9b, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+    {
+        return Some(std::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    if octets[..2] == [0x20, 0x02] {
+        return Some(std::net::Ipv4Addr::new(
+            octets[2], octets[3], octets[4], octets[5],
+        ));
+    }
+    None
 }
 
 fn http_origin(url: &reqwest::Url) -> Result<HttpOrigin, String> {
@@ -1656,6 +1774,18 @@ mod tests {
     }
 
     #[test]
+    fn plugin_files_are_read_with_a_hard_size_limit() {
+        let path =
+            std::env::temp_dir().join(format!("pentect-plugin-size-limit-{}", std::process::id()));
+        std::fs::write(&path, b"12345").unwrap();
+
+        let error = read_bounded_bytes(&path, 4, "test plugin").unwrap_err();
+        assert!(error.contains("exceeds 4 bytes"), "{error}");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn plugin_spans_are_byte_checked_and_normalized() {
         let span = plugin_span(
             "Alice",
@@ -1700,17 +1830,10 @@ mod tests {
             String::from_utf8_lossy(output).replace('"', "\\22")
         );
         let bytes = wat::parse_str(wat).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "pentect-plugin-wasm-{}-{}.wasm",
-            std::process::id(),
-            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, bytes).unwrap();
-        let program = WasmProgram::load(&path, "fixture", None, None).unwrap();
+        let program = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap();
         let result = program
             .invoke(b"{}", Duration::from_secs(1), 4096, "fixture")
             .unwrap();
-        let _ = std::fs::remove_file(path);
         assert_eq!(result, output);
     }
 
@@ -1727,17 +1850,10 @@ mod tests {
             )"#,
         )
         .unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "pentect-plugin-wasm-timeout-{}-{}.wasm",
-            std::process::id(),
-            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, bytes).unwrap();
-        let program = WasmProgram::load(&path, "fixture", None, None).unwrap();
+        let program = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap();
         let error = program
             .invoke(b"{}", Duration::from_millis(1), 4096, "fixture")
             .unwrap_err();
-        let _ = std::fs::remove_file(path);
         assert!(error.contains("timed out"), "{error}");
     }
 
@@ -1755,13 +1871,7 @@ mod tests {
             )"#,
         )
         .unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "pentect-plugin-wasm-network-{}-{}.wasm",
-            std::process::id(),
-            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, bytes).unwrap();
-        let denied = WasmProgram::load(&path, "fixture", None, None).unwrap_err();
+        let denied = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap_err();
         assert!(denied.contains("unapproved host function"), "{denied}");
 
         let policy = NetworkPolicy {
@@ -1777,8 +1887,7 @@ mod tests {
             max_response_bytes: 1024,
             max_requests: 1,
         };
-        WasmProgram::load(&path, "fixture", Some(policy), None).unwrap();
-        let _ = std::fs::remove_file(path);
+        WasmProgram::load_bytes(&bytes, "fixture", Some(policy), None).unwrap();
     }
 
     #[test]
@@ -1795,13 +1904,7 @@ mod tests {
             )"#,
         )
         .unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "pentect-plugin-wasm-config-{}-{}.wasm",
-            std::process::id(),
-            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, bytes).unwrap();
-        let denied = WasmProgram::load(&path, "fixture", None, None).unwrap_err();
+        let denied = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap_err();
         assert!(denied.contains("unapproved host function"), "{denied}");
         let config = toml::Value::Table(toml::Table::from_iter([(
             "model".to_string(),
@@ -1814,8 +1917,7 @@ mod tests {
             config_value(&config, "model.threshold").and_then(toml::Value::as_float),
             Some(0.8)
         );
-        WasmProgram::load(&path, "fixture", None, Some(config)).unwrap();
-        let _ = std::fs::remove_file(path);
+        WasmProgram::load_bytes(&bytes, "fixture", None, Some(config)).unwrap();
     }
 
     #[test]
@@ -1823,8 +1925,26 @@ mod tests {
         assert!(!public_ip("127.0.0.1".parse().unwrap()));
         assert!(!public_ip("10.0.0.1".parse().unwrap()));
         assert!(!public_ip("::1".parse().unwrap()));
+        assert!(!public_ip("::127.0.0.1".parse().unwrap()));
+        assert!(!public_ip("64:ff9b::127.0.0.1".parse().unwrap()));
         assert!(public_ip("1.1.1.1".parse().unwrap()));
         assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_network_never_allows_link_local_or_special_addresses() {
+        assert!(plugin_network_ip_allowed(
+            "127.0.0.1".parse().unwrap(),
+            true
+        ));
+        assert!(plugin_network_ip_allowed("10.0.0.1".parse().unwrap(), true));
+        assert!(!plugin_network_ip_allowed(
+            "169.254.169.254".parse().unwrap(),
+            true
+        ));
+        assert!(!plugin_network_ip_allowed("0.0.0.0".parse().unwrap(), true));
+        assert!(!plugin_network_ip_allowed("ff02::1".parse().unwrap(), true));
+        assert!(!plugin_network_ip_allowed("fe80::1".parse().unwrap(), true));
     }
 
     #[test]

@@ -1,11 +1,11 @@
 # Pentect security review
 
-Date: 2026-07-22
+Date: 2026-07-30
 Scope: Rust workspace, shell/runtime IPC, masking pipeline, plugins, installers/updater, and GitHub Actions.
 
 ## Executive summary
 
-Seven clear security issues were fixed in this review: an unsafe UTF-8 mutation reachable through the public detector API, local memory-store connection/request exhaustion, a project-controlled remote plugin cache, mutable GitHub Actions dependencies, the dependency advisories known at the time of the review, executable-plugin approval bypasses, and project-controlled plugin runtime artifacts. Targeted tests and `cargo check -p pentect-cli` pass.
+This review has fixed twelve concrete security issues across the masking engine, local IPC, dependencies, remote content fetching, updates, and WebAssembly plugins. The latest pass removed an actionable PDF parser advisory, bounded network/file inputs before allocation, strengthened SSRF filtering, verified installed Wasm again at every load, prevented plugin repository substitution and release downgrades, and added continuous RustSec auditing.
 
 Executable plugins now use a WebAssembly-only runtime with bounded memory, fuel metering, wall-clock deadlines, and no ambient filesystem, environment, process, or socket access. Optional network access is restricted to explicitly approved origins and methods, with redirect denial, pinned DNS resolution, private-address filtering, and byte limits. Native plugin execution and arbitrary postscripts are rejected. Plugin release assets are verified with GitHub's Sigstore artifact attestations, pinned to the publisher repository and workflow, in addition to SHA-256.
 
@@ -33,7 +33,7 @@ Fixed in `crates/pentect-cli/src/plugins.rs`: remote cache data now lives in the
 
 The lockfile contained actionable advisories affecting `lopdf`, `quick-xml`, `crossbeam-epoch`, and `anyhow`. In particular, affected PDF/XML parsers could be driven into excessive resource use by hostile documents.
 
-The vulnerable dependency versions found by this review were removed or upgraded, including `phonenumber`/`quick-xml`, `crossbeam-epoch`, and `anyhow`. PDF inspection was subsequently restored as a product requirement using a newer parser stack; it remains subject to normal lockfile audit and input-size limits and must not be described as dependency-free. A follow-up OSV scan at the time found no remaining known actionable vulnerability advisories. Informational unmaintained transitive packages remained: `atomic-polyfill`, `paste`, and `proc-macro-error2`.
+The vulnerable dependency versions found by this review were removed or upgraded, including `phonenumber`/`quick-xml`, `crossbeam-epoch`, and `anyhow`. The July 30 follow-up also upgraded `pdf-extract` to 0.12 and `lopdf` to 0.42.0, which fixes the deeply nested PDF stack-overflow advisory RUSTSEC-2026-0187. An OSV scan of the resulting lockfile found no remaining known actionable vulnerability advisories. Informational unmaintained transitives remain: `atomic-polyfill`, `proc-macro-error2`, and `ttf-parser`.
 
 References: <https://rustsec.org/advisories/RUSTSEC-2026-0187.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0190.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0194.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0195.html>, <https://rustsec.org/advisories/RUSTSEC-2026-0204.html>.
 
@@ -56,6 +56,36 @@ Relevant code: `crates/pentect-cli/src/plugins_cmd.rs` and `crates/pentect-runti
 Installed binaries and approval files previously lived below `.pentect/plugins-data/<plugin>`. A cloned repository could pre-place both a same-named executable and unauthenticated approval metadata.
 
 Fixed by moving approval, binaries, configuration, cache, and mutable plugin data to an OS user-data directory outside the repository, scoped by the canonical project identity and plugin ID. Unix plugin data directories are restricted to mode `0700`. Existing project-local approvals are intentionally not migrated; executable plugins require setup once under the new layout.
+
+### PNT-SEC-008 — Installed plugin binary was not re-authenticated at load time (high)
+
+Setup verified the downloaded release asset, but runtime approval covered only `plugin.toml`. A same-user process or compromised local tool could replace the installed Wasm after setup and retain the approved manifest.
+
+Fixed by storing the verified binary digest in `binary.lock`, bounding Wasm at 32 MiB, hashing the exact bytes loaded, and compiling those same in-memory bytes. A changed or missing binary lock stops that plugin and requires setup again.
+
+### PNT-SEC-009 — Plugin release substitution and rollback (high)
+
+A remote plugin manifest could name a release repository different from the repository selected by the user. Updates also accepted older semver releases if GitHub's latest-release state moved backwards.
+
+Fixed by requiring the source and manifest repositories to match, pinning attestation verification to that repository and publisher workflow, and rejecting versions older than the installed lock.
+
+### PNT-SEC-010 — Unbounded chunked downloads could exhaust memory (high)
+
+Several release and plugin download paths checked `Content-Length`, then used an API that could collect an arbitrarily large chunked response before applying the post-download size check.
+
+Fixed with streaming readers capped at `limit + 1`, per-input limits for manifests, metadata, config, Wasm, checksums, and update assets, and streaming SHA-256 for files already on disk.
+
+### PNT-SEC-011 — SSRF filters had IPv6 and proxy bypasses (high)
+
+Remote content, plugin HTTP, and image fetches could inherit ambient proxy settings, bypassing the code's DNS pinning boundary. IPv4-compatible, NAT64, and 6to4 IPv6 forms could also encode a private IPv4 destination. Enabling private plugin networking was broader than necessary and included link-local metadata ranges.
+
+Fixed by disabling ambient proxies on security-filtered fetchers, classifying embedded IPv4 across relevant IPv6 forms, permanently denying link-local/special/documentation ranges, and bounding image DNS resolution by deadline and a global thread cap.
+
+### PNT-SEC-012 — Dependency advisories were not continuously enforced (medium)
+
+Lockfile scans were manual, so a newly published RustSec advisory could remain unnoticed until the next review.
+
+Fixed with a SHA-pinned RustSec audit workflow on dependency changes, weekly schedules, and manual dispatch. The workflow has only read access to repository contents and write access to check results.
 
 ## Decisions required
 
@@ -88,9 +118,12 @@ Recommended decision: scope activity sharing by project or default it off if cro
 ## Validation
 
 - `cargo check -p pentect-cli`
+- `cargo check -p pentect-cli --no-default-features`
+- `cargo check -p pentect-runtime --no-default-features`
+- `cargo clippy -p pentect-cli --all-targets --no-default-features -- -D warnings`
 - Targeted `pentect-runtime` memory-store tests: 11 passed
 - Invalid UTF-8 detector regression: passed
-- Remote plugin cache regression: passed
+- Seven focused regressions for plugin cache, repository substitution, downgrade prevention, bounded reads, and SSRF address forms: passed
 - Phone detector test after dependency upgrade: passed
 - `cargo fmt --all -- --check`
 - `git diff --check`

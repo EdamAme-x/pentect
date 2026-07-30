@@ -10,11 +10,17 @@ use pentect_core::ByteRange;
 use serde_json::Value;
 #[cfg(feature = "ocr")]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(feature = "ocr")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "ocr")]
 const IMAGE_URL_MAX_REDIRECTS: usize = 5;
 #[cfg(feature = "ocr")]
+const IMAGE_URL_MAX_DNS_THREADS: usize = 16;
+#[cfg(feature = "ocr")]
 const IMAGE_METADATA_MAX_INFLATED_BYTES: u64 = 1024 * 1024;
+#[cfg(feature = "ocr")]
+static ACTIVE_IMAGE_DNS_THREADS: AtomicUsize = AtomicUsize::new(0);
 const IMAGE_OBJECT_BYTE_FIELDS: &[&str] = &[
     "data",
     "bytes",
@@ -2217,11 +2223,12 @@ fn send_image_url_request(
     let host = url
         .host_str()
         .ok_or_else(|| "image URL has no host".to_string())?;
-    let addrs = resolve_remote_image_url_target(url)?;
+    let addrs = resolve_remote_image_url_target(url, deadline)?;
     let timeout = remaining_fetch_timeout(cfg, deadline)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .resolve_to_addrs(host, &addrs)
         .build()
         .map_err(|e| format!("could not initialize image fetcher: {e}"))?;
@@ -2282,8 +2289,12 @@ fn remaining_fetch_timeout(
 }
 
 #[cfg(feature = "ocr")]
-fn resolve_remote_image_url_target(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
+fn resolve_remote_image_url_target(
+    url: &reqwest::Url,
+    deadline: std::time::Instant,
+) -> Result<Vec<SocketAddr>, String> {
     use std::net::ToSocketAddrs;
+    use std::sync::mpsc;
 
     let host = url
         .host_str()
@@ -2300,10 +2311,44 @@ fn resolve_remote_image_url_target(url: &reqwest::Url) -> Result<Vec<SocketAddr>
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("could not resolve image URL host: {e}"))?
-        .collect::<Vec<_>>();
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| "image scan time limit reached".to_string())?;
+    if ACTIVE_IMAGE_DNS_THREADS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < IMAGE_URL_MAX_DNS_THREADS).then_some(active + 1)
+        })
+        .is_err()
+    {
+        return Err("image URL resolution is busy".to_string());
+    }
+    let host = host.to_string();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("pentect-image-dns".to_string())
+        .spawn(move || {
+            let result = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addresses| {
+                    let mut addresses = addresses.collect::<Vec<_>>();
+                    addresses.sort_unstable();
+                    addresses.dedup();
+                    addresses
+                })
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            ACTIVE_IMAGE_DNS_THREADS.fetch_sub(1, Ordering::AcqRel);
+        })
+        .is_err()
+    {
+        ACTIVE_IMAGE_DNS_THREADS.fetch_sub(1, Ordering::AcqRel);
+        return Err("image URL resolution could not start".to_string());
+    }
+    let addrs = receiver
+        .recv_timeout(remaining)
+        .map_err(|_| "image URL resolution timed out".to_string())?
+        .map_err(|error| format!("could not resolve image URL host: {error}"))?;
     if addrs.is_empty() {
         return Err("image URL host did not resolve".to_string());
     }

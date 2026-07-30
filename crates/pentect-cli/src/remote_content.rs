@@ -34,6 +34,7 @@ pub(crate) async fn fetch(url: &str) -> Result<RemoteContent, String> {
         let pinned = SocketAddr::new(addresses[0].ip(), port);
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
             .resolve(&host, pinned)
@@ -139,16 +140,46 @@ fn public_ip(address: IpAddr) -> bool {
                 || (address.octets()[0] == 198 && (18..=19).contains(&address.octets()[1])))
         }
         IpAddr::V6(address) => {
+            if let Some(embedded) = embedded_ipv4(address) {
+                return public_ip(IpAddr::V4(embedded));
+            }
             !(address.is_loopback()
                 || address.is_unspecified()
                 || address.is_multicast()
                 || (address.segments()[0] & 0xfe00) == 0xfc00
                 || (address.segments()[0] & 0xffc0) == 0xfe80
-                || address
-                    .to_ipv4_mapped()
-                    .is_some_and(|address| !public_ip(IpAddr::V4(address))))
+                || (address.segments()[0] & 0xffc0) == 0xfec0
+                || (address.segments()[0] == 0x2001 && address.segments()[1] == 0)
+                || (address.segments()[0] == 0x2001 && address.segments()[1] == 0x0db8))
         }
     }
+}
+
+fn embedded_ipv4(address: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let octets = address.octets();
+    if octets[..12] == [0; 12]
+        || octets[..12]
+            == [
+                0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        || octets[..12]
+            == [
+                0x00, 0x64, 0xff, 0x9b, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+    {
+        return Some(std::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    if octets[..2] == [0x20, 0x02] {
+        return Some(std::net::Ipv4Addr::new(
+            octets[2], octets[3], octets[4], octets[5],
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -162,6 +193,8 @@ mod tests {
         assert!(!public_ip("127.0.0.1".parse().unwrap()));
         assert!(!public_ip("169.254.169.254".parse().unwrap()));
         assert!(!public_ip("::1".parse().unwrap()));
+        assert!(!public_ip("::127.0.0.1".parse().unwrap()));
+        assert!(!public_ip("64:ff9b::127.0.0.1".parse().unwrap()));
         assert!(public_ip("1.1.1.1".parse().unwrap()));
     }
 }
