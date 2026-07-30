@@ -13,7 +13,14 @@ path = "src/main.rs"
 
 [features]
 default = ["ocr"]
-ocr = ["dep:flate2", "native-ocr", "bundled-ocr", "barcode"]
+ocr = [
+    "dep:flate2",
+    "dep:hickory-resolver",
+    "dep:tokio",
+    "native-ocr",
+    "bundled-ocr",
+    "barcode",
+]
 barcode = ["dep:image", "dep:rxing"]
 native-ocr = [
     "dep:windows",
@@ -45,6 +52,8 @@ ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 jiff = { workspace = true }
 wasmi = { workspace = true }
+hickory-resolver = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }

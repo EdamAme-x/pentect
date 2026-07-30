@@ -1,8 +1,9 @@
 use crate::{plugins, update};
+use pentect_agent::read_bounded_utf8;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -1425,47 +1426,8 @@ fn write_binary_lock(
     Ok(())
 }
 
-fn read_bounded_utf8(path: &Path, max_bytes: u64, kind: &str) -> Result<String, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| format!("could not read {kind} '{}': {error}", display_path(path)))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("could not inspect {kind} '{}': {error}", display_path(path)))?;
-    if !metadata.is_file() || metadata.len() > max_bytes {
-        return Err(format!(
-            "{kind} '{}' exceeds its size limit",
-            display_path(path)
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("could not read {kind} '{}': {error}", display_path(path)))?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(format!(
-            "{kind} '{}' exceeds its size limit",
-            display_path(path)
-        ));
-    }
-    String::from_utf8(bytes).map_err(|_| format!("{kind} '{}' is not UTF-8", display_path(path)))
-}
-
 fn sha256_path(path: &Path) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("could not verify plugin file '{}': {e}", path.display()))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|e| format!("could not verify plugin file '{}': {e}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(data_encoding::HEXLOWER.encode(&digest.finalize()))
+    pentect_agent::sha256_file(path, "plugin file")
 }
 
 fn replace_binary(staged: &Path, destination: &Path) -> Result<(), String> {

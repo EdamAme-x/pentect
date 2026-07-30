@@ -392,20 +392,7 @@ fn install_update(bytes: &[u8], latest: &Version, expected: &str) -> Result<(), 
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("could not verify '{}': {e}", path.display()))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|e| format!("could not verify '{}': {e}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(data_encoding::HEXLOWER.encode(&digest.finalize()))
+    pentect_agent::sha256_file(path, "release asset")
 }
 
 fn backup_path(current: &Path) -> Result<PathBuf, String> {

@@ -140,7 +140,7 @@ fn public_ip(address: IpAddr) -> bool {
                 || (address.octets()[0] == 198 && (18..=19).contains(&address.octets()[1])))
         }
         IpAddr::V6(address) => {
-            if let Some(embedded) = embedded_ipv4(address) {
+            if let Some(embedded) = pentect_agent::embedded_ipv4(address) {
                 return public_ip(IpAddr::V4(embedded));
             }
             !(address.is_loopback()
@@ -153,33 +153,6 @@ fn public_ip(address: IpAddr) -> bool {
                 || (address.segments()[0] == 0x2001 && address.segments()[1] == 0x0db8))
         }
     }
-}
-
-fn embedded_ipv4(address: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    if let Some(mapped) = address.to_ipv4_mapped() {
-        return Some(mapped);
-    }
-    let octets = address.octets();
-    if octets[..12] == [0; 12]
-        || octets[..12]
-            == [
-                0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ]
-        || octets[..12]
-            == [
-                0x00, 0x64, 0xff, 0x9b, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ]
-    {
-        return Some(std::net::Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ));
-    }
-    if octets[..2] == [0x20, 0x02] {
-        return Some(std::net::Ipv4Addr::new(
-            octets[2], octets[3], octets[4], octets[5],
-        ));
-    }
-    None
 }
 
 #[cfg(test)]
@@ -195,6 +168,7 @@ mod tests {
         assert!(!public_ip("::1".parse().unwrap()));
         assert!(!public_ip("::127.0.0.1".parse().unwrap()));
         assert!(!public_ip("64:ff9b::127.0.0.1".parse().unwrap()));
+        assert!(!public_ip("2002:7f00:0001::".parse().unwrap()));
         assert!(public_ip("1.1.1.1".parse().unwrap()));
     }
 }

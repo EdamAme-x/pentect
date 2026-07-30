@@ -428,7 +428,9 @@ fn is_plugin_manifest(path: &Path) -> bool {
 }
 
 fn add_manifest_paths(path: &Path, paths: &mut PluginPaths) -> Result<()> {
-    let source = read_bounded_plugin_file(path)?;
+    let source =
+        pentect_agent::read_bounded_utf8(path, MAX_REMOTE_PLUGIN_FILE_BYTES, "plugin manifest")
+            .map_err(anyhow::Error::msg)?;
     let value = source
         .parse::<toml::Value>()
         .with_context(|| format!("could not parse plugin manifest '{}'", path.display()))?;
@@ -689,26 +691,6 @@ fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
     std::fs::write(&path, &bytes)
         .with_context(|| format!("could not write plugin cache '{}'", path.display()))?;
     Ok(Some(path))
-}
-
-fn read_bounded_plugin_file(path: &Path) -> Result<String> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("could not read plugin manifest '{}'", path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("could not inspect plugin manifest '{}'", path.display()))?;
-    if !metadata.is_file() || metadata.len() > MAX_REMOTE_PLUGIN_FILE_BYTES {
-        bail!("plugin manifest is too large: {}", path.display());
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_REMOTE_PLUGIN_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("could not read plugin manifest '{}'", path.display()))?;
-    if bytes.len() as u64 > MAX_REMOTE_PLUGIN_FILE_BYTES {
-        bail!("plugin manifest is too large: {}", path.display());
-    }
-    String::from_utf8(bytes)
-        .with_context(|| format!("plugin manifest is not UTF-8: {}", path.display()))
 }
 
 fn cached_remote_plugin_is_fresh(path: &Path) -> bool {

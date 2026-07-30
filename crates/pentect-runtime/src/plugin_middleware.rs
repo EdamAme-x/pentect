@@ -1,3 +1,4 @@
+use crate::{embedded_ipv4, read_bounded_bytes, read_bounded_utf8};
 use pentect_core::{
     ByteRange, Category, Confidence, Config, Context, DetectorId, Engine, Input, Kind, MaskResult,
     Span,
@@ -645,39 +646,6 @@ fn load_approved_plugin_binary(path: &Path, id: &str, name: &str) -> Result<Vec<
     Ok(bytes)
 }
 
-fn read_bounded_utf8(path: &Path, max_bytes: u64, kind: &str) -> Result<String, String> {
-    let bytes = read_bounded_bytes(path, max_bytes, kind)?;
-    String::from_utf8(bytes).map_err(|_| format!("{kind} '{}' is not UTF-8", path.display()))
-}
-
-fn read_bounded_bytes(path: &Path, max_bytes: u64, kind: &str) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| format!("could not read {kind} '{}': {error}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("could not inspect {kind} '{}': {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!("{kind} '{}' is not a regular file", path.display()));
-    }
-    if metadata.len() > max_bytes {
-        return Err(format!(
-            "{kind} '{}' exceeds {max_bytes} bytes",
-            path.display()
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("could not read {kind} '{}': {error}", path.display()))?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(format!(
-            "{kind} '{}' exceeds {max_bytes} bytes",
-            path.display()
-        ));
-    }
-    Ok(bytes)
-}
-
 const WASM_ABI_ALLOC: &str = "pentect_alloc";
 const WASM_ABI_HANDLE: &str = "pentect_handle";
 const WASM_ABI_MEMORY: &str = "memory";
@@ -1254,6 +1222,9 @@ fn plugin_network_ip_allowed(ip: IpAddr, private_network: bool) -> bool {
         }
         IpAddr::V6(ip) => {
             let segments = ip.segments();
+            if ip.is_loopback() {
+                return private_network;
+            }
             if let Some(embedded) = embedded_ipv4(ip) {
                 return plugin_network_ip_allowed(IpAddr::V4(embedded), private_network);
             }
@@ -1266,39 +1237,12 @@ fn plugin_network_ip_allowed(ip: IpAddr, private_network: bool) -> bool {
             {
                 return false;
             }
-            if ip.is_loopback() || (segments[0] & 0xfe00) == 0xfc00 {
+            if (segments[0] & 0xfe00) == 0xfc00 {
                 return private_network;
             }
             true
         }
     }
-}
-
-fn embedded_ipv4(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return Some(mapped);
-    }
-    let octets = ip.octets();
-    if octets[..12] == [0; 12]
-        || octets[..12]
-            == [
-                0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ]
-        || octets[..12]
-            == [
-                0x00, 0x64, 0xff, 0x9b, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ]
-    {
-        return Some(std::net::Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ));
-    }
-    if octets[..2] == [0x20, 0x02] {
-        return Some(std::net::Ipv4Addr::new(
-            octets[2], octets[3], octets[4], octets[5],
-        ));
-    }
-    None
 }
 
 fn http_origin(url: &reqwest::Url) -> Result<HttpOrigin, String> {
@@ -1937,6 +1881,7 @@ mod tests {
             "127.0.0.1".parse().unwrap(),
             true
         ));
+        assert!(plugin_network_ip_allowed("::1".parse().unwrap(), true));
         assert!(plugin_network_ip_allowed("10.0.0.1".parse().unwrap(), true));
         assert!(!plugin_network_ip_allowed(
             "169.254.169.254".parse().unwrap(),

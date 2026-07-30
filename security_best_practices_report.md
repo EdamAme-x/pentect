@@ -79,13 +79,13 @@ Fixed with streaming readers capped at `limit + 1`, per-input limits for manifes
 
 Remote content, plugin HTTP, and image fetches could inherit ambient proxy settings, bypassing the code's DNS pinning boundary. IPv4-compatible, NAT64, and 6to4 IPv6 forms could also encode a private IPv4 destination. Enabling private plugin networking was broader than necessary and included link-local metadata ranges.
 
-Fixed by disabling ambient proxies on security-filtered fetchers, classifying embedded IPv4 across relevant IPv6 forms, permanently denying link-local/special/documentation ranges, and bounding image DNS resolution by deadline and a global thread cap.
+Fixed by disabling ambient proxies on security-filtered fetchers, classifying embedded IPv4 across relevant IPv6 forms through one shared helper, permanently denying link-local/special/documentation ranges, and replacing uncancellable OS resolver threads with an in-process asynchronous DNS resolver bounded by the image deadline.
 
 ### PNT-SEC-012 — Dependency advisories were not continuously enforced (medium)
 
 Lockfile scans were manual, so a newly published RustSec advisory could remain unnoticed until the next review.
 
-Fixed with a SHA-pinned RustSec audit workflow on dependency changes, weekly schedules, and manual dispatch. The workflow has only read access to repository contents and write access to check results.
+Fixed with a SHA-pinned RustSec audit workflow on dependency changes, weekly schedules, and manual dispatch. Pull request and push runs have only repository read and check-result write access. Scheduled/manual reporting is isolated in a separate job that additionally has `issues: write`, allowing actionable findings to create tracking issues without granting that permission to ordinary CI runs.
 
 ## Decisions required
 

@@ -14,12 +14,18 @@ mod file_pointer_manager;
 mod image_ocr;
 mod masking;
 mod memory_store;
+mod network_address;
 mod output_remask;
 mod plugin_middleware;
+mod secure_io;
+#[doc(hidden)]
+pub use network_address::embedded_ipv4;
 pub use plugin_middleware::{
     plugin_runtime_dirs, valid_plugin_publisher_workflow, MiddlewareCoverage, MiddlewareRun,
     MiddlewareStage, PluginMiddleware, PluginRuntimeDirs, StopOutcome,
 };
+#[doc(hidden)]
+pub use secure_io::{read_bounded_bytes, read_bounded_utf8, sha256_file};
 mod session;
 mod shell;
 
