@@ -3,6 +3,7 @@ use anyhow::{anyhow, bail, Context};
 use pentect_core::{load_pack, load_plugin_pack, Pack};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -427,8 +428,9 @@ fn is_plugin_manifest(path: &Path) -> bool {
 }
 
 fn add_manifest_paths(path: &Path, paths: &mut PluginPaths) -> Result<()> {
-    let source = std::fs::read_to_string(path)
-        .with_context(|| format!("could not read plugin manifest '{}'", path.display()))?;
+    let source =
+        pentect_agent::read_bounded_utf8(path, MAX_REMOTE_PLUGIN_FILE_BYTES, "plugin manifest")
+            .map_err(anyhow::Error::msg)?;
     let value = source
         .parse::<toml::Value>()
         .with_context(|| format!("could not parse plugin manifest '{}'", path.display()))?;
@@ -650,7 +652,7 @@ fn remote_plugin_paths_for_base_url(base_url: &str) -> Result<PluginPaths> {
 }
 
 fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
-    let path = remote_cache_file(url);
+    let path = remote_cache_file(url)?;
     if cached_remote_plugin_is_fresh(&path) {
         return Ok(Some(path));
     }
@@ -674,8 +676,10 @@ fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
     {
         bail!("remote plugin file is too large: {url}");
     }
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_REMOTE_PLUGIN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("could not read plugin '{url}'"))?;
     if bytes.len() as u64 > MAX_REMOTE_PLUGIN_FILE_BYTES {
         bail!("remote plugin file is too large: {url}");
@@ -698,7 +702,7 @@ fn cached_remote_plugin_is_fresh(path: &Path) -> bool {
         .is_ok_and(|age| age < REMOTE_PLUGIN_CACHE_TTL)
 }
 
-fn remote_cache_file(url: &str) -> PathBuf {
+fn remote_cache_file(url: &str) -> Result<PathBuf> {
     let mut hash = Sha256::new();
     hash.update(url.as_bytes());
     let digest = hash.finalize();
@@ -708,10 +712,10 @@ fn remote_cache_file(url: &str) -> PathBuf {
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("plugin.toml");
-    PathBuf::from(PENTECT_DIR)
-        .join(PLUGINS_CACHE_DIR)
-        .join(hex)
-        .join(filename)
+    let cache_root = pentect_agent::plugin_runtime_dirs(PLUGINS_CACHE_DIR)
+        .map_err(anyhow::Error::msg)?
+        .cache_dir;
+    Ok(cache_root.join(hex).join(filename))
 }
 
 fn normalize_github_plugin_url(url: &str) -> Result<String> {
@@ -843,6 +847,21 @@ label = "INLINE_SECRET"
         assert_eq!(
             parse_plugin_value("github:@EdamAme-x/pentect/plugins/pii-ner").unwrap(),
             ["github:@EdamAme-x/pentect/plugins/pii-ner"]
+        );
+    }
+
+    #[test]
+    fn remote_plugin_cache_is_not_project_controlled() {
+        let cache = remote_cache_file(
+            "https://raw.githubusercontent.com/example/project/main/plugins/sample/plugin.toml",
+        )
+        .unwrap();
+        let project = std::env::current_dir().unwrap();
+
+        assert!(
+            !cache.starts_with(&project),
+            "remote cache must be outside the project: {}",
+            cache.display()
         );
     }
 

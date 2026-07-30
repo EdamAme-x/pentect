@@ -9,7 +9,7 @@ use pentect_core::model::labels;
 use pentect_core::ByteRange;
 use serde_json::Value;
 #[cfg(feature = "ocr")]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 #[cfg(feature = "ocr")]
 const IMAGE_URL_MAX_REDIRECTS: usize = 5;
@@ -2217,11 +2217,12 @@ fn send_image_url_request(
     let host = url
         .host_str()
         .ok_or_else(|| "image URL has no host".to_string())?;
-    let addrs = resolve_remote_image_url_target(url)?;
+    let addrs = resolve_remote_image_url_target(url, deadline)?;
     let timeout = remaining_fetch_timeout(cfg, deadline)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .resolve_to_addrs(host, &addrs)
         .build()
         .map_err(|e| format!("could not initialize image fetcher: {e}"))?;
@@ -2282,9 +2283,10 @@ fn remaining_fetch_timeout(
 }
 
 #[cfg(feature = "ocr")]
-fn resolve_remote_image_url_target(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
-    use std::net::ToSocketAddrs;
-
+fn resolve_remote_image_url_target(
+    url: &reqwest::Url,
+    deadline: std::time::Instant,
+) -> Result<Vec<SocketAddr>, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "image URL has no host".to_string())?;
@@ -2300,10 +2302,30 @@ fn resolve_remote_image_url_target(url: &reqwest::Url) -> Result<Vec<SocketAddr>
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("could not resolve image URL host: {e}"))?
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| "image scan time limit reached".to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("image URL resolution could not start: {error}"))?;
+    let lookup = runtime.block_on(async {
+        let resolver = hickory_resolver::Resolver::builder_tokio()
+            .map_err(|error| error.to_string())?
+            .build()
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout(remaining, resolver.lookup_ip(host))
+            .await
+            .map_err(|_| "image URL resolution timed out".to_string())?
+            .map_err(|error| error.to_string())
+    })?;
+    let mut addrs = lookup
+        .iter()
+        .map(|ip| SocketAddr::new(ip, port))
         .collect::<Vec<_>>();
+    addrs.sort_unstable();
+    addrs.dedup();
     if addrs.is_empty() {
         return Err("image URL host did not resolve".to_string());
     }
@@ -2343,39 +2365,18 @@ fn remote_image_ip_is_private(ip: IpAddr) -> bool {
                 || ip.is_multicast()
         }
         IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return remote_image_ip_is_private(IpAddr::V4(mapped));
+            if ip.is_loopback() {
+                return true;
             }
-            if let Some(embedded) = ipv6_embedded_ipv4(ip) {
+            if let Some(embedded) = crate::embedded_ipv4(ip) {
                 return remote_image_ip_is_private(IpAddr::V4(embedded));
             }
-            ip.is_loopback()
-                || ip.is_unspecified()
+            ip.is_unspecified()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
                 || ip.is_multicast()
         }
     }
-}
-
-#[cfg(feature = "ocr")]
-fn ipv6_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
-    let octets = ip.octets();
-    if octets[..12] == [0; 12] {
-        return Some(Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ));
-    }
-    if octets[..12]
-        == [
-            0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ]
-    {
-        return Some(Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ));
-    }
-    None
 }
 
 #[cfg(not(feature = "ocr"))]
@@ -3598,6 +3599,9 @@ mod tests {
         assert!(remote_image_ip_is_private("::10.0.0.1".parse().unwrap()));
         assert!(remote_image_ip_is_private(
             "64:ff9b::a00:1".parse().unwrap()
+        ));
+        assert!(remote_image_ip_is_private(
+            "2002:7f00:0001::".parse().unwrap()
         ));
         assert!(!remote_image_ip_is_private(
             "::ffff:8.8.8.8".parse().unwrap()

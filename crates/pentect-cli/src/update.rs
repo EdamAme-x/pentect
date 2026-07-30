@@ -1,6 +1,7 @@
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
@@ -159,6 +160,7 @@ fn update(options: UpdateOptions) -> Result<(), String> {
 pub(crate) fn download_latest_release_asset(
     repository: &str,
     asset_name: &str,
+    max_asset_bytes: u64,
 ) -> Result<DownloadedReleaseAsset, String> {
     validate_repository(repository)?;
     if asset_name.is_empty()
@@ -181,14 +183,17 @@ pub(crate) fn download_latest_release_asset(
     let version = release_version(&release.tag_name)?;
     let binary = find_asset(&release, asset_name)?;
     let checksum = find_asset(&release, &format!("{asset_name}.sha256"))?;
-    if binary.size == 0 || binary.size > MAX_BINARY_BYTES {
+    if max_asset_bytes == 0 || max_asset_bytes > MAX_BINARY_BYTES {
+        return Err("release asset limit is invalid".to_string());
+    }
+    if binary.size == 0 || binary.size > max_asset_bytes {
         return Err(format!(
             "release asset has invalid size: {} bytes",
             binary.size
         ));
     }
     let expected = parse_sha256(&download_text(&client, checksum, MAX_CHECKSUM_BYTES)?)?;
-    let bytes = download_bytes(&client, binary, MAX_BINARY_BYTES)?;
+    let bytes = download_bytes(&client, binary, max_asset_bytes)?;
     if bytes.len() as u64 != binary.size {
         return Err(format!(
             "release asset size mismatch: expected {}, received {}",
@@ -246,8 +251,10 @@ fn get_response<T: for<'de> Deserialize<'de>>(
     {
         return Err("GitHub release response is too large".to_string());
     }
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    response
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("could not read GitHub release: {e}"))?;
     if bytes.len() as u64 > max_bytes {
         return Err("GitHub release response is too large".to_string());
@@ -311,13 +318,16 @@ fn download_bytes(
     {
         return Err(format!("release asset '{}' is too large", asset.name));
     }
-    let bytes = response
-        .bytes()
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(asset.size.min(max_bytes)).unwrap_or_default());
+    response
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("could not read '{}': {e}", asset.name))?;
     if bytes.len() as u64 > max_bytes {
         return Err(format!("release asset '{}' is too large", asset.name));
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 fn parse_sha256(value: &str) -> Result<String, String> {
@@ -382,9 +392,7 @@ fn install_update(bytes: &[u8], latest: &Version, expected: &str) -> Result<(), 
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("could not verify '{}': {e}", path.display()))?;
-    Ok(sha256_hex(&bytes))
+    pentect_agent::sha256_file(path, "release asset")
 }
 
 fn backup_path(current: &Path) -> Result<PathBuf, String> {

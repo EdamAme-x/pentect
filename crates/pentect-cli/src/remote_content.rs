@@ -34,6 +34,7 @@ pub(crate) async fn fetch(url: &str) -> Result<RemoteContent, String> {
         let pinned = SocketAddr::new(addresses[0].ip(), port);
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
             .resolve(&host, pinned)
@@ -139,14 +140,17 @@ fn public_ip(address: IpAddr) -> bool {
                 || (address.octets()[0] == 198 && (18..=19).contains(&address.octets()[1])))
         }
         IpAddr::V6(address) => {
+            if let Some(embedded) = pentect_agent::embedded_ipv4(address) {
+                return public_ip(IpAddr::V4(embedded));
+            }
             !(address.is_loopback()
                 || address.is_unspecified()
                 || address.is_multicast()
                 || (address.segments()[0] & 0xfe00) == 0xfc00
                 || (address.segments()[0] & 0xffc0) == 0xfe80
-                || address
-                    .to_ipv4_mapped()
-                    .is_some_and(|address| !public_ip(IpAddr::V4(address))))
+                || (address.segments()[0] & 0xffc0) == 0xfec0
+                || (address.segments()[0] == 0x2001 && address.segments()[1] == 0)
+                || (address.segments()[0] == 0x2001 && address.segments()[1] == 0x0db8))
         }
     }
 }
@@ -162,6 +166,9 @@ mod tests {
         assert!(!public_ip("127.0.0.1".parse().unwrap()));
         assert!(!public_ip("169.254.169.254".parse().unwrap()));
         assert!(!public_ip("::1".parse().unwrap()));
+        assert!(!public_ip("::127.0.0.1".parse().unwrap()));
+        assert!(!public_ip("64:ff9b::127.0.0.1".parse().unwrap()));
+        assert!(!public_ip("2002:7f00:0001::".parse().unwrap()));
         assert!(public_ip("1.1.1.1".parse().unwrap()));
     }
 }
