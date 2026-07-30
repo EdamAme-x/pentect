@@ -42,7 +42,7 @@ type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 128;
 const MAX_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
-const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local capability handles. Copy a handle byte-for-byte into a client tool call when the tool needs the represented value. Do not alter, expand, guess, or expose it.";
+const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local secret handles. Copy a handle byte-for-byte into a client tool call when the tool needs the represented value. Do not alter, expand, guess, or expose it.";
 
 pub(crate) fn cmd_claude_app(args: &[String]) -> i32 {
     match run_claude_app(args) {

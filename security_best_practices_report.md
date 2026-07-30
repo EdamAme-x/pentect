@@ -7,7 +7,7 @@ Scope: Rust workspace, shell/runtime IPC, masking pipeline, plugins, installers/
 
 Seven clear security issues were fixed in this review: an unsafe UTF-8 mutation reachable through the public detector API, local memory-store connection/request exhaustion, a project-controlled remote plugin cache, mutable GitHub Actions dependencies, the dependency advisories known at the time of the review, executable-plugin approval bypasses, and project-controlled plugin runtime artifacts. Targeted tests and `cargo check -p pentect-cli` pass.
 
-Third-party executable plugins can now use a capability-sandboxed WebAssembly runtime with no host imports, bounded memory, and fuel metering. Native plugins remain an explicit publisher-trusted compatibility path. Arbitrary postscripts are rejected. Plugin release assets are verified with GitHub's Sigstore artifact attestations, pinned to the publisher repository and workflow, in addition to SHA-256.
+Executable plugins now use a WebAssembly-only runtime with bounded memory, fuel metering, wall-clock deadlines, and no ambient filesystem, environment, process, or socket access. Optional network access is restricted to explicitly approved origins and methods, with redirect denial, pinned DNS resolution, private-address filtering, and byte limits. Native plugin execution and arbitrary postscripts are rejected. Plugin release assets are verified with GitHub's Sigstore artifact attestations, pinned to the publisher repository and workflow, in addition to SHA-256.
 
 ## Fixed findings
 

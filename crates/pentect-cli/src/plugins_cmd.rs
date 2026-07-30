@@ -274,10 +274,14 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let active = active_for_one(spec)?;
     let source = plugins::plugin_source(spec).map_err(|e| e.to_string())?;
     let manifest = load_plugin_manifest(&source)?;
-    let platform = binary_platform();
     let binary = manifest
         .as_ref()
         .and_then(|manifest| manifest.binary.as_deref());
+    let platform = if binary.is_some() {
+        "portable-wasm".to_string()
+    } else {
+        binary_platform()
+    };
     let repository = manifest.as_ref().and_then(|manifest| {
         manifest
             .repository
@@ -309,8 +313,9 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
                     "stages": middleware.stages,
                     "permissions": middleware.permissions,
                     "required": middleware.required,
-                    "mode": manifest.as_ref().and_then(|manifest| manifest.execution.as_ref()).and_then(|execution| execution.mode.as_deref()).unwrap_or("persistent"),
+                    "mode": manifest.as_ref().and_then(|manifest| manifest.execution.as_ref()).and_then(|execution| execution.mode.as_deref()).unwrap_or("oneshot"),
                 })),
+                "network": manifest.as_ref().and_then(|manifest| manifest.network.as_ref()),
                 "postscripts": manifest.as_ref().map(|manifest| manifest.postscript.len()).unwrap_or(0),
             })
         );
@@ -358,6 +363,23 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         println!("stages: {}", middleware.stages.join(", "));
         println!("permissions: {}", middleware.permissions.join(", "));
         println!("required: {}", middleware.required);
+    }
+    if let Some(network) = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.network.as_ref())
+    {
+        println!("network-allow: {}", network.allow.join(", "));
+        println!(
+            "network-methods: {}",
+            network
+                .methods
+                .iter()
+                .map(|method| method.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("network-private: {}", network.private_network);
+        println!("network-insecure: {}", network.allow_insecure);
     }
     println!(
         "postscripts: {}",
@@ -417,6 +439,7 @@ struct PluginManifest {
     assets: BTreeMap<String, String>,
     execution: Option<ExecutionConfig>,
     middleware: Option<MiddlewareConfig>,
+    network: Option<NetworkConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -428,47 +451,42 @@ struct PublisherConfig {
 struct ExecutionConfig {
     #[serde(default, rename = "args")]
     args: Vec<String>,
-    runtime: Option<PluginRuntime>,
+    runtime: Option<String>,
     mode: Option<String>,
-    #[serde(rename = "timeout_ms")]
-    _timeout_ms: Option<u64>,
-    #[serde(rename = "max_input_bytes")]
-    _max_input_bytes: Option<usize>,
-    #[serde(rename = "max_output_bytes")]
-    _max_output_bytes: Option<usize>,
-    #[serde(rename = "max_spans")]
-    _max_spans: Option<usize>,
+    timeout_ms: Option<u64>,
+    max_input_bytes: Option<usize>,
+    max_output_bytes: Option<usize>,
+    max_spans: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct NetworkConfig {
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    private_network: bool,
+    #[serde(default)]
+    allow_insecure: bool,
+    max_request_bytes: Option<usize>,
+    max_response_bytes: Option<usize>,
+    max_requests: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PluginRuntime {
     #[default]
-    Native,
     Wasm,
 }
 
-fn plugin_runtime(manifest: &PluginManifest) -> PluginRuntime {
-    manifest
-        .execution
-        .as_ref()
-        .and_then(|execution| execution.runtime)
-        .unwrap_or_else(|| {
-            if manifest
-                .binary
-                .as_deref()
-                .is_some_and(|binary| binary.to_ascii_lowercase().ends_with(".wasm"))
-            {
-                PluginRuntime::Wasm
-            } else {
-                PluginRuntime::Native
-            }
-        })
+fn plugin_runtime(_manifest: &PluginManifest) -> PluginRuntime {
+    PluginRuntime::Wasm
 }
 
 fn runtime_name(runtime: PluginRuntime) -> &'static str {
     match runtime {
-        PluginRuntime::Native => "native",
         PluginRuntime::Wasm => "wasm",
     }
 }
@@ -515,28 +533,32 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(&source.name);
         validate_binary_name(binary, name)?;
-        if plugin_runtime(&manifest) == PluginRuntime::Wasm {
-            let execution = manifest.execution.as_ref();
-            if execution
-                .and_then(|execution| execution.mode.as_deref())
-                .unwrap_or("persistent")
-                != "oneshot"
-            {
-                return Err("WebAssembly plugins require execution.mode = \"oneshot\"".to_string());
-            }
-            if execution.is_some_and(|execution| !execution.args.is_empty()) {
-                return Err("WebAssembly plugins cannot declare execution.args".to_string());
-            }
-            if manifest.middleware.as_ref().is_some_and(|middleware| {
-                middleware
-                    .permissions
-                    .iter()
-                    .any(|permission| matches!(permission.as_str(), "config:read" | "cache:write"))
-            }) {
-                return Err(
-                    "WebAssembly plugins cannot request config:read or cache:write".to_string(),
-                );
-            }
+        if !binary.to_ascii_lowercase().ends_with(".wasm") {
+            return Err("executable plugins must publish a portable .wasm module".to_string());
+        }
+        let execution = manifest.execution.as_ref();
+        if execution
+            .and_then(|execution| execution.runtime.as_deref())
+            .is_some_and(|runtime| runtime != "wasm")
+        {
+            return Err("plugins only support execution.runtime = \"wasm\"".to_string());
+        }
+        if execution
+            .and_then(|execution| execution.mode.as_deref())
+            .is_some_and(|mode| mode != "oneshot")
+        {
+            return Err("plugins only support execution.mode = \"oneshot\"".to_string());
+        }
+        if execution.is_some_and(|execution| !execution.args.is_empty()) {
+            return Err("WebAssembly plugins cannot declare execution.args".to_string());
+        }
+        if manifest.middleware.as_ref().is_some_and(|middleware| {
+            middleware
+                .permissions
+                .iter()
+                .any(|permission| permission == "cache:write")
+        }) {
+            return Err("WebAssembly plugins cannot request cache:write".to_string());
         }
         if let Some(repository) = manifest
             .repository
@@ -547,6 +569,8 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
         }
         validate_publisher(&manifest)?;
     }
+    validate_network(&manifest)?;
+    validate_execution(&manifest)?;
     validate_middleware(&manifest)?;
     Ok(Some(manifest))
 }
@@ -555,6 +579,92 @@ fn validate_publisher(manifest: &PluginManifest) -> Result<(), String> {
     let workflow = publisher_workflow(manifest)?;
     if !pentect_agent::valid_plugin_publisher_workflow(workflow) {
         return Err("publisher workflow must be a repository-relative YAML path".to_string());
+    }
+    Ok(())
+}
+
+fn validate_network(manifest: &PluginManifest) -> Result<(), String> {
+    let Some(network) = manifest.network.as_ref() else {
+        return Ok(());
+    };
+    if network.allow.is_empty() || network.allow.len() > 64 {
+        return Err("network access requires 1 to 64 allowed origins".to_string());
+    }
+    if network.methods.is_empty() {
+        return Err("network access requires at least one method".to_string());
+    }
+    for origin in &network.allow {
+        let url = reqwest::Url::parse(origin)
+            .map_err(|_| "network allow list contains an invalid origin".to_string())?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(
+                "HTTP origins must be scheme://host[:port] without credentials or paths"
+                    .to_string(),
+            );
+        }
+        if url.scheme() == "http" && !network.allow_insecure {
+            return Err("HTTP origins require network.allow_insecure = true".to_string());
+        }
+    }
+    for method in &network.methods {
+        let method = method.trim().to_ascii_uppercase();
+        reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| format!("invalid network method: {method}"))?;
+        if !matches!(
+            method.as_str(),
+            "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+        ) {
+            return Err(format!("unsupported network method: {method}"));
+        }
+    }
+    for (name, limit) in [
+        ("max_request_bytes", network.max_request_bytes),
+        ("max_response_bytes", network.max_response_bytes),
+    ] {
+        if limit == Some(0) {
+            return Err(format!("network.{name} must be greater than zero"));
+        }
+    }
+    if network
+        .max_request_bytes
+        .is_some_and(|limit| limit > 1024 * 1024)
+        || network
+            .max_response_bytes
+            .is_some_and(|limit| limit > 4 * 1024 * 1024)
+        || network
+            .max_requests
+            .is_some_and(|limit| limit == 0 || limit > 16)
+    {
+        return Err("network limits exceed Pentect's sandbox limits".to_string());
+    }
+    Ok(())
+}
+
+fn validate_execution(manifest: &PluginManifest) -> Result<(), String> {
+    let Some(execution) = manifest.execution.as_ref() else {
+        return Ok(());
+    };
+    if execution
+        .timeout_ms
+        .is_some_and(|value| value == 0 || value > 60_000)
+        || execution
+            .max_input_bytes
+            .is_some_and(|value| value == 0 || value > 4 * 1024 * 1024)
+        || execution
+            .max_output_bytes
+            .is_some_and(|value| value == 0 || value > 4 * 1024 * 1024)
+        || execution
+            .max_spans
+            .is_some_and(|value| value == 0 || value > 4096)
+    {
+        return Err("execution limits exceed Pentect's sandbox limits".to_string());
     }
     Ok(())
 }
@@ -624,8 +734,8 @@ fn validate_middleware(manifest: &PluginManifest) -> Result<(), String> {
         .as_ref()
         .and_then(|execution| execution.mode.as_deref())
     {
-        if !matches!(mode, "persistent" | "oneshot") {
-            return Err(format!("unknown plugin execution mode: {mode}"));
+        if mode != "oneshot" {
+            return Err("plugins only support execution.mode = \"oneshot\"".to_string());
         }
     }
     Ok(())
@@ -855,15 +965,35 @@ fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Str
                 .execution
                 .as_ref()
                 .and_then(|execution| execution.mode.as_deref())
-                .unwrap_or("persistent")
+                .unwrap_or("oneshot")
+        );
+        println!("  isolation: WebAssembly sandbox (explicit access only)");
+    }
+    if let Some(network) = manifest.network.as_ref() {
+        println!("requested network access:");
+        println!("  allow: {}", network.allow.join(", "));
+        println!(
+            "  methods: {}",
+            network
+                .methods
+                .iter()
+                .map(|method| method.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("  private-network: {}", network.private_network);
+        println!("  insecure-http: {}", network.allow_insecure);
+        println!(
+            "  request-limit: {} bytes",
+            network.max_request_bytes.unwrap_or(262_144)
         );
         println!(
-            "  isolation: {}",
-            if plugin_runtime(&manifest) == PluginRuntime::Wasm {
-                "capability sandbox (no host imports)"
-            } else {
-                "trusted native publisher"
-            }
+            "  response-limit: {} bytes",
+            network.max_response_bytes.unwrap_or(1_048_576)
+        );
+        println!(
+            "  request-count-limit: {}",
+            network.max_requests.unwrap_or(4)
         );
     }
     if !approved && !confirm_setup()? {
@@ -1051,38 +1181,26 @@ fn validate_binary_name(binary: &str, plugin: &str) -> Result<(), String> {
 
 fn binary_asset(
     binary: &str,
-    runtime: PluginRuntime,
+    _runtime: PluginRuntime,
     overrides: &BTreeMap<String, String>,
 ) -> String {
-    if runtime == PluginRuntime::Wasm {
-        return overrides
-            .get("wasm32")
-            .cloned()
-            .unwrap_or_else(|| binary.to_string());
-    }
-    let platform = binary_platform();
-    overrides.get(&platform).cloned().unwrap_or_else(|| {
-        let suffix = if platform.starts_with("windows-") && !binary.ends_with(".exe") {
-            ".exe"
-        } else {
-            ""
-        };
-        format!("{binary}-{platform}{suffix}")
-    })
+    overrides
+        .get("wasm32")
+        .cloned()
+        .unwrap_or_else(|| binary.to_string())
 }
 
-fn binary_destination(name: &str, binary: &str, runtime: PluginRuntime) -> Result<PathBuf, String> {
+fn binary_destination(
+    name: &str,
+    binary: &str,
+    _runtime: PluginRuntime,
+) -> Result<PathBuf, String> {
     validate_binary_name(binary, name)?;
-    let filename = if runtime == PluginRuntime::Native
-        && cfg!(windows)
-        && !binary.to_ascii_lowercase().ends_with(".exe")
-    {
-        format!("{binary}.exe")
-    } else {
-        binary.to_string()
-    };
+    if !binary.to_ascii_lowercase().ends_with(".wasm") {
+        return Err(format!("plugin '{name}' binary must end in .wasm"));
+    }
     let dirs = plugin_runtime_dirs(&plugin_id(name))?;
-    Ok(dirs.data_dir.join("bin").join(filename))
+    Ok(dirs.data_dir.join("bin").join(binary))
 }
 
 fn install_release_binary(
@@ -1132,7 +1250,6 @@ fn install_release_binary(
         let _ = std::fs::remove_file(&staged);
         return Err(error);
     }
-    mark_binary_executable(&staged)?;
     replace_binary(&staged, &destination)?;
     write_binary_lock(name, repository, publisher_workflow, &asset, &download)?;
     println!("binary {binary}: installed {}", download.version);
@@ -1202,7 +1319,8 @@ fn verify_gh_attestation_version(gh: &Path) -> Result<(), String> {
 
 fn map_binary_download_error(name: &str, platform: &str, asset: &str, error: String) -> String {
     if error.contains(&format!("missing asset '{asset}'")) {
-        format!("plugin '{name}' is unsupported on {platform}")
+        let _ = platform;
+        format!("plugin '{name}' does not publish the portable WebAssembly asset '{asset}'")
     } else {
         error
     }
@@ -1274,18 +1392,6 @@ fn replace_binary(staged: &Path, destination: &Path) -> Result<(), String> {
         let _ = std::fs::rename(&backup, destination);
         return Err(format!("could not install plugin binary: {error}"));
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn mark_binary_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("could not mark plugin binary executable: {e}"))
-}
-
-#[cfg(windows)]
-fn mark_binary_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -1573,7 +1679,7 @@ mod tests {
             "pentect".into(),
             "plugins".into(),
             "config".into(),
-            "pii-ner".into(),
+            "example-plugin".into(),
             "model.threshold=0.8".into(),
         ];
         assert!(matches!(
@@ -1588,7 +1694,7 @@ mod tests {
             "pentect".into(),
             "plugins".into(),
             "setup".into(),
-            "pii-ner".into(),
+            "example-plugin".into(),
             "--yes".into(),
         ];
         assert!(matches!(
@@ -1600,7 +1706,7 @@ mod tests {
             "pentect".into(),
             "plugins".into(),
             "update".into(),
-            "pii-ner".into(),
+            "example-plugin".into(),
         ];
         assert!(matches!(
             PluginCmd::parse(&args).unwrap().action,
@@ -1647,45 +1753,78 @@ mod tests {
     }
 
     #[test]
-    fn release_binary_uses_convention_and_optional_override() {
-        let platform = binary_platform();
-        let expected = if cfg!(windows) {
-            format!("helper-{platform}.exe")
-        } else {
-            format!("helper-{platform}")
-        };
-        assert_eq!(
-            binary_asset("helper", PluginRuntime::Native, &BTreeMap::new()),
-            expected
-        );
-        let overrides = BTreeMap::from([(platform, "custom.bin".to_string())]);
-        assert_eq!(
-            binary_asset("helper", PluginRuntime::Native, &overrides),
-            "custom.bin"
-        );
+    fn network_access_requires_explicit_safe_scope() {
+        let valid: PluginManifest = toml::from_str(
+            r#"
+                schema = "pentect.plugin.v1"
+                [network]
+                allow = ["https://api.example.com"]
+                methods = ["get", "POST"]
+            "#,
+        )
+        .unwrap();
+        validate_network(&valid).unwrap();
+
+        let path: PluginManifest = toml::from_str(
+            r#"
+                schema = "pentect.plugin.v1"
+                [network]
+                allow = ["https://api.example.com/private"]
+                methods = ["GET"]
+            "#,
+        )
+        .unwrap();
+        assert!(validate_network(&path).is_err());
+
+        let insecure: PluginManifest = toml::from_str(
+            r#"
+                schema = "pentect.plugin.v1"
+                [network]
+                allow = ["http://127.0.0.1:8080"]
+                methods = ["GET"]
+                private_network = true
+            "#,
+        )
+        .unwrap();
+        assert!(validate_network(&insecure).is_err());
+    }
+
+    #[test]
+    fn release_binary_is_portable_wasm_with_optional_override() {
         assert_eq!(
             binary_asset("helper.wasm", PluginRuntime::Wasm, &BTreeMap::new()),
             "helper.wasm"
         );
-        assert!(binary_destination("test", "../outside", PluginRuntime::Native).is_err());
-        assert!(binary_destination("test", "helper", PluginRuntime::Native)
-            .unwrap()
-            .is_absolute());
+        let overrides = BTreeMap::from([("wasm32".to_string(), "custom.wasm".to_string())]);
+        assert_eq!(
+            binary_asset("helper.wasm", PluginRuntime::Wasm, &overrides),
+            "custom.wasm"
+        );
+        assert!(binary_destination("test", "../outside.wasm", PluginRuntime::Wasm).is_err());
+        assert!(binary_destination("test", "helper", PluginRuntime::Wasm).is_err());
+        assert!(
+            binary_destination("test", "helper.wasm", PluginRuntime::Wasm)
+                .unwrap()
+                .is_absolute()
+        );
     }
 
     #[test]
-    fn missing_platform_binary_is_reported_as_unsupported() {
+    fn missing_wasm_binary_is_reported_as_unsupported() {
         let error = map_binary_download_error(
-            "pii-ner",
-            "linux-riscv64",
-            "pentect-pii-ner-linux-riscv64",
-            "release is missing asset 'pentect-pii-ner-linux-riscv64'".to_string(),
+            "policy",
+            "windows-x86_64",
+            "policy.wasm",
+            "release is missing asset 'policy.wasm'".to_string(),
         );
-        assert_eq!(error, "plugin 'pii-ner' is unsupported on linux-riscv64");
+        assert_eq!(
+            error,
+            "plugin 'policy' does not publish the portable WebAssembly asset 'policy.wasm'"
+        );
 
         let checksum_error = "release is missing checksum asset".to_string();
         assert_eq!(
-            map_binary_download_error("pii-ner", "linux-x86_64", "binary", checksum_error.clone()),
+            map_binary_download_error("policy", "linux-x86_64", "binary", checksum_error.clone()),
             checksum_error
         );
     }
@@ -1723,7 +1862,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
         let manifest_source = format!(
-            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper\"\nrepository = \"owner/repo\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n"
+            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper.wasm\"\nrepository = \"owner/repo\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n"
         );
         std::fs::write(&manifest_path, &manifest_source).unwrap();
         let source = plugins::PluginSource {
@@ -1766,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn list_plugins_includes_official_model_and_rule_plugins() {
+    fn list_plugins_includes_official_rule_plugins_only() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
@@ -1778,8 +1917,9 @@ mod tests {
             .map(|row| row.name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
 
-        assert!(names.contains("openai-privacy-filter"), "{names:?}");
-        assert!(names.contains("pii-ner"), "{names:?}");
+        assert!(names.contains("example-regex"), "{names:?}");
+        assert!(!names.contains("openai-privacy-filter"), "{names:?}");
+        assert!(!names.contains("pii-ner"), "{names:?}");
     }
 
     #[test]
@@ -1790,7 +1930,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join(plugins::PLUGIN_MANIFEST_FILE),
-            "schema = \"pentect.plugin.v1\"\nname = \"local\"\nbinary = \"tool\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
+            "schema = \"pentect.plugin.v1\"\nname = \"local\"\nbinary = \"tool.wasm\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
         )
         .unwrap();
 

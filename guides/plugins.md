@@ -1,31 +1,27 @@
 # Plugins
 
-Pentect plugins have three deliberately small forms:
+Pentect plugins have two forms:
 
 1. A declarative `plugin.toml` can add regex detectors without executable code.
-2. A sandboxed WebAssembly plugin uses a tiny request/response ABI and receives
-   no host imports.
-3. A publisher-trusted native plugin exchanges one JSON object per line over
-   stdin/stdout.
+2. Executable plugins are portable WebAssembly modules running inside Pentect's
+   sandbox.
 
-The host owns ordering and the core masking pass. A plugin returns `next` to
-continue, or `stop` with `block`, `respond`, or `handled`. Plugins never call
-the next plugin themselves.
+There is no native executable plugin mode. A `.wasm` module receives no
+filesystem, environment, process, or socket access. Optional network requests
+go through a narrow Pentect host function and only after explicit approval.
 
 ## Manifest
 
 ```toml
 schema = "pentect.plugin.v1"
 name = "company-policy"
-binary = "company-policy"
+binary = "company-policy.wasm"
 repository = "owner/company-policy"
 
 [publisher]
 workflow = ".github/workflows/release.yml"
 
 [execution]
-runtime = "native" # use "wasm" for capability-sandboxed modules
-mode = "persistent" # default; "oneshot" is supported
 timeout_ms = 10000
 max_input_bytes = 262144
 max_output_bytes = 1048576
@@ -36,10 +32,11 @@ permissions = ["input:read", "payload:write", "pipeline:block"]
 required = true
 
 [assets]
-windows-x86_64 = "company-policy-windows-x86_64.exe"
-linux-x86_64 = "company-policy-linux-x86_64"
-macos-aarch64 = "company-policy-macos-aarch64"
+wasm32 = "company-policy.wasm"
 ```
+
+`execution.runtime = "wasm"` and `execution.mode = "oneshot"` are accepted for
+older manifests but are unnecessary. Any other runtime or mode is rejected.
 
 Simple detectors need no binary:
 
@@ -54,59 +51,120 @@ category = "identifier"
 confidence = "high"
 ```
 
-Explicit plugin order is preserved. The persistent process receives an
-`initialize` request, then `event` requests. It must return exactly one NDJSON
-response for each request and flush stdout. The canonical schema and fixtures
-live in [`protocol/`](../protocol/); small Rust, Python, TypeScript, and Go
-helpers live in [`sdk/`](../sdk/).
+## Network access
 
-For an untrusted third-party plugin, publish one portable `.wasm` asset:
+Network access is off by default. A plugin that needs HTTP declares exactly
+which origins and methods it wants:
 
 ```toml
-binary = "company-policy.wasm"
-repository = "owner/company-policy"
-
-[publisher]
-workflow = ".github/workflows/release.yml"
-
-[execution]
-runtime = "wasm"
-mode = "oneshot"
+[network]
+allow = ["https://api.example.com"]
+methods = ["GET", "POST"]
+max_request_bytes = 262144
+max_response_bytes = 1048576
+max_requests = 4
 ```
 
-The module exports `memory`, `pentect_alloc(i32) -> i32`, and
-`pentect_handle(i32, i32) -> i64`. The high 32 bits of the result are the
-response pointer and the low 32 bits are its byte length. The Rust SDK's
-`export_wasm_plugin!` macro implements this ABI. WebAssembly plugins cannot
-request `config:read` or `cache:write`; future host capabilities can be added
-without granting ambient filesystem or network access.
+An allowed origin is only `scheme://host[:port]`; paths, queries, fragments,
+and embedded credentials are rejected. Requests cannot follow redirects.
+Pentect pins the approved DNS result for each request and rejects loopback,
+private, link-local, multicast, documentation, and reserved addresses.
+DNS resolution, requests, and response reads share the plugin's wall-clock
+deadline. A plugin can make at most four requests per invocation by default
+and never more than sixteen.
 
-Rust publishers set `crate-type = ["cdylib"]`, use
-`pentect_plugin::export_wasm_plugin!(handler)`, and build with:
+Local services require visibly stronger approval:
+
+```toml
+[network]
+allow = ["http://127.0.0.1:8080"]
+methods = ["GET"]
+private_network = true
+allow_insecure = true
+```
+
+The module imports only:
 
 ```text
-cargo build --release --target wasm32-unknown-unknown
+pentect:http/request(i32, i32, i32, i32) -> i32
 ```
+
+The Rust SDK exposes this as the typed `http_request` helper. Pentect performs
+the request on behalf of the module; the module never receives a raw socket.
+Unknown imports and network imports without a matching `[network]` section are
+rejected before execution.
+
+## Plugin configuration
+
+Configuration remains outside the module and is read one key at a time through
+Pentect:
+
+```toml
+[middleware]
+permissions = ["input:read", "config:read"]
+```
+
+```text
+pentect plugins config PATH model.threshold=0.8
+```
+
+The Rust SDK exposes `config("model.threshold")`. Pentect imports
+`pentect:config/read` only for an approved `config:read` plugin. The module
+never receives a configuration file path or general filesystem access.
+Mutable plugin cache access is not currently supported.
+
+## WebAssembly ABI
+
+The module exports:
+
+```text
+memory
+pentect_alloc(i32) -> i32
+pentect_handle(i32, i32) -> i64
+```
+
+The high 32 bits of `pentect_handle`'s result are the response pointer and the
+low 32 bits are its byte length. The Rust SDK's `export_wasm_plugin!` macro
+implements this ABI:
+
+```rust
+use pentect_plugin::{Request, Response};
+
+fn handle(request: Request) -> Result<Response, Box<dyn std::error::Error>> {
+    Ok(Response::next(request.id))
+}
+
+pentect_plugin::export_wasm_plugin!(handle);
+```
+
+Build a Rust plugin as a `cdylib`:
+
+```text
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown
+wasm-tools validate target/wasm32-unknown-unknown/release/company_policy.wasm
+```
+
+`wasm-tools` is recommended for validation and inspection. The ABI remains a
+small Core WebAssembly interface today so Pentect can keep the lightweight
+`wasmi` runtime. WIT is the intended source format for a future Component Model
+revision once that migration does not require replacing the lightweight host.
 
 ## Security and approval
 
-WebAssembly plugins run in a capability sandbox with a 64 MiB memory ceiling,
-fuel metering, and no filesystem, environment, process, or network imports.
-Native plugins remain an explicit publisher-trusted compatibility path for
-workloads such as local ONNX inference.
+Every module has a 64 MiB memory ceiling, fuel scheduling, a real wall-clock
+deadline, input/output limits, and a bounded detector-span count. No WASI
+interfaces are linked. Manifests cannot raise execution past 60 seconds,
+4 MiB input, 4 MiB output, or 4096 spans.
 
-`pentect plugins setup` shows the binary source, runtime, middleware stages,
-permissions, and destination before approval. Approval records the manifest
-SHA-256; changing any manifest content requires approval again. Arbitrary
-postscripts are rejected—setup output must be a release asset.
+`pentect plugins setup` shows the release, publisher workflow, middleware
+permissions, and requested network access before approval. Approval records
+the complete manifest SHA-256. Any change to a network origin, method, limit,
+middleware stage, or permission requires approval again.
 
-Plugin children receive a cleared environment plus a small platform allowlist.
-They never inherit Pentect's memory-store credentials. `PENTECT_PLUGIN_CONFIG`
-is exposed only with `config:read`; `PENTECT_PLUGIN_CACHE_DIR` only with
-`cache:write`. `PENTECT_PLUGIN_DATA_DIR` is always scoped to that plugin.
-Approval files, installed binaries, configuration, cache, and mutable data live
-in project-scoped OS user data outside the repository, so a clone cannot
-pre-seed an approved executable.
+Arbitrary postscripts are rejected. Executable assets must be GitHub Release
+assets with Sigstore build provenance matching both the publisher repository
+and `[publisher].workflow`; attestations from self-hosted runners are rejected.
 
 `input:read` is mandatory. Payload replacement requires `payload:write`;
 blocking requires `pipeline:block`; local responses require
@@ -123,43 +181,29 @@ plaintext values to third-party middleware.
 pentect plugins inspect PATH
 pentect plugins setup PATH
 pentect plugins test PATH
-pentect plugins config PATH key='"value"'
 pentect plugins update PATH
 ```
 
-`setup` installs and approves executable parts; it does not silently enable a
-plugin for every command. Activate it explicitly for one agent run:
+Setup installs and approves the module; it does not silently enable it for
+every command. Activate it for one run:
 
 ```text
 pentect claude --plugins PATH
 pentect codex --plugins PATH
 ```
 
-To keep an ordered project-wide list, add it to `.pentect/config.toml`:
+Or preserve an ordered project list in `.pentect/config.toml`:
 
 ```toml
 plugins = ["./plugins/company-policy", "company-identifiers"]
 ```
 
-Native release binaries are selected by OS and architecture; a WebAssembly
-asset is portable. Unsupported native platforms produce an explicit
-missing-asset error rather than compiling on the user's machine.
+The signed built-in registry is searchable with:
 
-Every executable asset must carry GitHub artifact provenance. Setup and update
-verify its Sigstore attestation with `gh`, pinning both the publisher repository
-and the workflow declared in `[publisher]`, and reject attestations from
-self-hosted runners. SHA-256 is still checked for transport corruption.
-`plugins update` only replaces the release binary described by the exact
-approved manifest.
+```text
+pentect plugins search [QUERY]
+```
 
-The registry shipped inside the signed Pentect binary is searchable with
-`pentect plugins search [QUERY]`. A plugin does not need to be in that registry:
-any publisher can distribute a `github:@owner/repository/path` spec, provided
-its executable assets carry matching provenance.
-
-The protocol exposes masking, provider, tool, file, finding, and reporting
-stages. HTTP provider requests, JSON responses, completed streaming and
-non-streaming tool calls, and multipart file discovery/decoding/detection/
-transformation are connected. Streaming provider text is not dispatched as a
-`provider_response` event per token; only its completed tool calls are held and
-dispatched before local handle restoration.
+Registry inclusion is optional. Any publisher can distribute a
+`github:@owner/repository/path` plugin when its `.wasm` release asset has
+matching provenance.
