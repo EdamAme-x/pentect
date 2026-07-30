@@ -37,10 +37,20 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         );
     }
 
-    let upstream = crate::codex_app_upstream(options.upstream)?;
-    let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start(upstream)?;
+    let routing = crate::codex_app_routing(options.upstream)?;
+    let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream)?;
+    let config_override = routing
+        .requires_config_override
+        .then(|| CodexConfigOverride::install(&routing.provider, proxy.base_url()))
+        .transpose()?;
     eprintln!("[pentect] Codex App gateway ready at {}", proxy.base_url());
-    eprintln!("[pentect] Responses API prompts and completed tool calls are protected");
+    if config_override.is_some() {
+        eprintln!(
+            "[pentect] Codex provider '{}' is routed through the gateway for this App session",
+            routing.provider
+        );
+    }
+    eprintln!("[pentect] Responses API prompts, files, and completed tool calls are protected");
 
     let mut child = Command::new(&app)
         .env("OPENAI_BASE_URL", proxy.base_url())
@@ -52,8 +62,168 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let status = child
         .wait()
         .map_err(|error| format!("could not wait for Codex App: {error}"))?;
+    drop(config_override);
     drop(proxy);
     Ok(status)
+}
+
+struct CodexConfigOverride {
+    config: PathBuf,
+    backup: PathBuf,
+    no_original_marker: PathBuf,
+}
+
+impl CodexConfigOverride {
+    fn install(provider: &str, gateway: &str) -> Result<Self, String> {
+        let home = crate::codex_home_dir()?;
+        Self::install_in(&home, provider, gateway)
+    }
+
+    fn install_in(home: &Path, provider: &str, gateway: &str) -> Result<Self, String> {
+        std::fs::create_dir_all(&home)
+            .map_err(|error| format!("could not create '{}': {error}", home.display()))?;
+        let config = home.join("config.toml");
+        let backup = home.join("config.toml.pentect-backup");
+        let no_original_marker = home.join("config.toml.pentect-no-original");
+        if backup.is_file() {
+            if config.is_file() {
+                std::fs::remove_file(&config).map_err(|error| {
+                    format!(
+                        "could not recover Codex config '{}': {error}",
+                        config.display()
+                    )
+                })?;
+            }
+            if no_original_marker.is_file() {
+                std::fs::remove_file(&backup).map_err(|error| {
+                    format!("could not clear interrupted Codex backup: {error}")
+                })?;
+                let _ = std::fs::remove_file(&no_original_marker);
+            } else {
+                std::fs::rename(&backup, &config).map_err(|error| {
+                    format!(
+                        "could not restore interrupted Codex config override '{}': {error}",
+                        backup.display()
+                    )
+                })?;
+            }
+            eprintln!("[pentect] restored Codex config left by an interrupted App session");
+        }
+
+        let had_original = config.is_file();
+        let original = if had_original {
+            std::fs::read_to_string(&config)
+                .map_err(|error| format!("could not read '{}': {error}", config.display()))?
+        } else {
+            String::new()
+        };
+        let mut parsed = if original.trim().is_empty() {
+            toml::Value::Table(toml::map::Map::new())
+        } else {
+            original
+                .parse::<toml::Value>()
+                .map_err(|error| format!("could not parse '{}': {error}", config.display()))?
+        };
+        set_provider_base_url(&mut parsed, provider, gateway)?;
+
+        std::fs::write(&backup, original.as_bytes())
+            .map_err(|error| format!("could not back up '{}': {error}", config.display()))?;
+        if !had_original {
+            std::fs::write(&no_original_marker, b"")
+                .map_err(|error| format!("could not create Codex recovery marker: {error}"))?;
+        }
+        let temporary = home.join(format!("config.toml.pentect-{}.tmp", std::process::id()));
+        std::fs::write(&temporary, parsed.to_string())
+            .map_err(|error| format!("could not write '{}': {error}", temporary.display()))?;
+        if config.is_file() {
+            std::fs::remove_file(&config)
+                .map_err(|error| format!("could not replace '{}': {error}", config.display()))?;
+        }
+        if let Err(error) = std::fs::rename(&temporary, &config) {
+            if had_original {
+                let _ = std::fs::rename(&backup, &config);
+            } else {
+                let _ = std::fs::remove_file(&backup);
+                let _ = std::fs::remove_file(&no_original_marker);
+            }
+            return Err(format!(
+                "could not activate Codex config override '{}': {error}",
+                config.display()
+            ));
+        }
+        Ok(Self {
+            config,
+            backup,
+            no_original_marker,
+        })
+    }
+
+    fn restore(&self) -> Result<(), String> {
+        if !self.backup.is_file() {
+            return Ok(());
+        }
+        if self.config.is_file() {
+            std::fs::remove_file(&self.config).map_err(|error| {
+                format!(
+                    "could not remove temporary Codex config '{}': {error}",
+                    self.config.display()
+                )
+            })?;
+        }
+        if self.no_original_marker.is_file() {
+            std::fs::remove_file(&self.backup)
+                .map_err(|error| format!("could not remove Codex backup: {error}"))?;
+            std::fs::remove_file(&self.no_original_marker)
+                .map_err(|error| format!("could not remove Codex recovery marker: {error}"))
+        } else {
+            std::fs::rename(&self.backup, &self.config).map_err(|error| {
+                format!(
+                    "could not restore Codex config '{}': {error}",
+                    self.config.display()
+                )
+            })
+        }
+    }
+}
+
+impl Drop for CodexConfigOverride {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("[pentect] {error}");
+        }
+    }
+}
+
+fn set_provider_base_url(
+    config: &mut toml::Value,
+    provider: &str,
+    gateway: &str,
+) -> Result<(), String> {
+    let root = config
+        .as_table_mut()
+        .ok_or_else(|| "Codex config root is not a TOML table".to_string())?;
+    if provider == "openai" {
+        root.insert(
+            "openai_base_url".to_string(),
+            toml::Value::String(gateway.to_string()),
+        );
+        return Ok(());
+    }
+    let providers = root
+        .entry("model_providers")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "model_providers is not a TOML table".to_string())?;
+    let provider = providers
+        .entry(provider.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "selected model provider is not a TOML table".to_string())?;
+    provider.insert(
+        "base_url".to_string(),
+        toml::Value::String(gateway.to_string()),
+    );
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -269,5 +439,60 @@ mod tests {
     #[test]
     fn version_sort_is_numeric() {
         assert!(version_components("26.10.0") > version_components("26.9.99"));
+    }
+
+    #[test]
+    fn rewrites_only_the_selected_custom_provider() {
+        let mut config: toml::Value = r#"
+model_provider = "proxy"
+
+[model_providers.proxy]
+base_url = "https://upstream.example/v1"
+wire_api = "responses"
+
+[model_providers.other]
+base_url = "https://other.example/v1"
+"#
+        .parse()
+        .unwrap();
+        set_provider_base_url(&mut config, "proxy", "http://127.0.0.1:47781").unwrap();
+        assert_eq!(
+            config["model_providers"]["proxy"]["base_url"].as_str(),
+            Some("http://127.0.0.1:47781")
+        );
+        assert_eq!(
+            config["model_providers"]["other"]["base_url"].as_str(),
+            Some("https://other.example/v1")
+        );
+    }
+
+    #[test]
+    fn temporary_config_override_restores_the_exact_original() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let original = "# keep this comment\nopenai_base_url = \"https://example.test/v1\"\n";
+        std::fs::write(root.join("config.toml"), original).unwrap();
+        {
+            let guard =
+                CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
+            let active = std::fs::read_to_string(root.join("config.toml")).unwrap();
+            assert!(active.contains("http://127.0.0.1:47781"));
+            assert!(root.join("config.toml.pentect-backup").is_file());
+            drop(guard);
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("config.toml")).unwrap(),
+            original
+        );
+        assert!(!root.join("config.toml.pentect-backup").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

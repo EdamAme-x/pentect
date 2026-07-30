@@ -12,9 +12,10 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::{mpsc, Arc, Mutex};
@@ -97,6 +98,7 @@ struct ProxyState {
     auth: String,
     client: reqwest::Client,
     masker: Arc<Mutex<pentect_agent::ActiveToolOutputMasker>>,
+    files: Mutex<HashMap<String, crate::http_files::Coverage>>,
     requests: Arc<Semaphore>,
 }
 
@@ -123,6 +125,7 @@ async fn run_proxy(
         auth: auth.clone(),
         client: build_upstream_client()?,
         masker: Arc::new(Mutex::new(pentect_agent::ActiveToolOutputMasker::new()?)),
+        files: Mutex::new(HashMap::new()),
         requests: Arc::new(Semaphore::new(32)),
     });
     let _ = ready_tx.send(Ok(format!("http://{address}/{auth}")));
@@ -185,10 +188,17 @@ async fn proxy_request(
         Ok(response) => Ok(response),
         Err(error) => {
             eprintln!("[pentect] OpenAI HTTP gateway request failed: {error}");
-            Ok(text_response(
-                StatusCode::BAD_GATEWAY,
-                "Pentect gateway request failed",
-            ))
+            let local_rejection = error.starts_with("image blocked:")
+                || error.starts_with("document blocked:")
+                || error.starts_with("remote ")
+                || error.starts_with("OpenAI file ")
+                || error.starts_with("file upload blocked:")
+                || error.starts_with("Files API upload ");
+            Ok(if local_rejection {
+                owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
+            } else {
+                text_response(StatusCode::BAD_GATEWAY, "Pentect gateway request failed")
+            })
         }
     }
 }
@@ -207,9 +217,11 @@ async fn proxy_request_inner(
     };
     let responses_path = is_responses_path(path_and_query);
     let method = request.method().clone();
+    let files_upload = method == hyper::Method::POST && is_files_collection_path(path_and_query);
     let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
     let headers = request.headers().clone();
-    let body = if responses_path {
+    let mut request_coverage = None;
+    let body = if responses_path || files_upload {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
             .await
@@ -225,15 +237,39 @@ async fn proxy_request_inner(
         };
         if body.is_empty() {
             reqwest::Body::from(body)
-        } else {
+        } else if files_upload {
+            let content_type = headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "Files API upload is missing Content-Type".to_string())?
+                .to_string();
             let masker = Arc::clone(&state.masker);
-            let original = body.clone();
             let protected = tokio::task::spawn_blocking(move || {
-                protect_openai_request_body(&original, &masker)
+                let mut masker = masker
+                    .lock()
+                    .map_err(|_| "OpenAI request masker lock was poisoned".to_string())?;
+                crate::http_files::protect_multipart_upload(&content_type, &body, &mut masker)
+            })
+            .await
+            .map_err(|_| "OpenAI file protection task failed".to_string())??;
+            request_coverage = Some(protected.coverage);
+            reqwest::Body::from(protected.body)
+        } else {
+            let original = resolve_openai_file_references(body, state, &headers).await?;
+            let original = resolve_openai_remote_files(original).await?;
+            let masker = Arc::clone(&state.masker);
+            let files = state
+                .files
+                .lock()
+                .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
+                .clone();
+            let protected = tokio::task::spawn_blocking(move || {
+                protect_openai_request_body(&original, &masker, &files)
             })
             .await
             .map_err(|_| "OpenAI request protection task failed".to_string())??;
-            reqwest::Body::from(protected)
+            request_coverage = Some(protected.coverage);
+            reqwest::Body::from(protected.body)
         }
     } else {
         let stream = request.into_body().into_data_stream().map(|chunk| {
@@ -245,7 +281,7 @@ async fn proxy_request_inner(
     let mut upstream_request = state.client.request(method, upstream_url);
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
-        if ((!responses_path && name == hyper::header::CONTENT_LENGTH)
+        if ((!(responses_path || files_upload) && name == hyper::header::CONTENT_LENGTH)
             || should_forward_request_header(name.as_str()))
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
         {
@@ -280,7 +316,13 @@ async fn proxy_request_inner(
             builder = builder.header(name, value);
         }
     }
-    if is_event_stream || !responses_path {
+    builder = builder.header(
+        "x-pentect-coverage",
+        request_coverage
+            .unwrap_or(crate::http_files::Coverage::None)
+            .as_header(),
+    );
+    if is_event_stream || (!responses_path && !files_upload) {
         return builder
             .body(streaming_response_body(
                 upstream,
@@ -295,7 +337,21 @@ async fn proxy_request_inner(
             "Upstream response body too large",
         ));
     };
-    let response_body = if status.is_success() {
+    if files_upload && status.is_success() {
+        if let (Some(coverage), Ok(value)) = (
+            request_coverage,
+            serde_json::from_slice::<Value>(&response_body),
+        ) {
+            if let Some(id) = value.get("id").and_then(Value::as_str) {
+                state
+                    .files
+                    .lock()
+                    .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
+                    .insert(id.to_string(), coverage);
+            }
+        }
+    }
+    let response_body = if responses_path && status.is_success() {
         match rewrite_openai_json_response(&response_body) {
             Ok(rewritten) => Bytes::from(rewritten),
             Err(error) => {
@@ -311,31 +367,304 @@ async fn proxy_request_inner(
         .map_err(|error| format!("could not build OpenAI response: {error}"))
 }
 
+struct ProtectedJsonBody {
+    body: Bytes,
+    coverage: crate::http_files::Coverage,
+}
+
 fn protect_openai_request_body(
     body: &Bytes,
     masker: &Mutex<pentect_agent::ActiveToolOutputMasker>,
-) -> Result<Bytes, String> {
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<ProtectedJsonBody, String> {
     let mut value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("[pentect] OpenAI request protection skipped: invalid JSON: {error}");
-            return Ok(body.clone());
+            return Ok(ProtectedJsonBody {
+                body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
+            });
         }
     };
+    let partial_schema = openai_request_has_unknown_content(&value);
     inject_handle_contract(&mut value);
     let mut masker = masker
         .lock()
         .map_err(|_| "OpenAI request masker lock was poisoned".to_string())?;
-    if let Err(error) = mask_openai_request(&mut value, &mut masker) {
+    if let Err(error) = mask_openai_request(&mut value, &mut masker, files) {
         if error.starts_with("image blocked:") || error.starts_with("document blocked:") {
             return Err(error);
         }
         eprintln!("[pentect] OpenAI request protection skipped: {error}");
-        return Ok(body.clone());
+        return Ok(ProtectedJsonBody {
+            body: body.clone(),
+            coverage: crate::http_files::Coverage::Partial,
+        });
     }
     serde_json::to_vec(&value)
-        .map(Bytes::from)
+        .map(|body| ProtectedJsonBody {
+            body: Bytes::from(body),
+            coverage: if partial_schema {
+                crate::http_files::Coverage::Partial
+            } else {
+                crate::http_files::Coverage::Full
+            },
+        })
         .map_err(|error| format!("could not encode protected OpenAI request: {error}"))
+}
+
+async fn resolve_openai_file_references(
+    body: Bytes,
+    state: &ProxyState,
+    request_headers: &hyper::HeaderMap,
+) -> Result<Bytes, String> {
+    let mut value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return Ok(body),
+    };
+    resolve_openai_file_reference_values(&mut value, state, request_headers).await?;
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| "could not encode resolved file reference".to_string())
+}
+
+fn resolve_openai_file_reference_values<'a>(
+    value: &'a mut Value,
+    state: &'a ProxyState,
+    request_headers: &'a hyper::HeaderMap,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    resolve_openai_file_reference_values(value, state, request_headers).await?;
+                }
+            }
+            Value::Object(object) => {
+                if object.get("type").and_then(Value::as_str) == Some("input_file") {
+                    if let Some(file_id) = object
+                        .get("file_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    {
+                        let known = state
+                            .files
+                            .lock()
+                            .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
+                            .get(&file_id)
+                            .copied();
+                        if known == Some(crate::http_files::Coverage::Full) {
+                            return Ok(());
+                        }
+                        let mut remote =
+                            fetch_openai_file_content(&file_id, state, request_headers).await?;
+                        let encoded = data_encoding::BASE64.encode(&remote.bytes);
+                        remote.bytes.zeroize();
+                        object.remove("file_id");
+                        object.insert(
+                            "file_data".to_string(),
+                            Value::String(format!("data:{};base64,{encoded}", remote.media_type)),
+                        );
+                        object
+                            .entry("filename".to_string())
+                            .or_insert(Value::String(remote.filename));
+                        return Ok(());
+                    }
+                }
+                for value in object.values_mut() {
+                    resolve_openai_file_reference_values(value, state, request_headers).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+}
+
+async fn fetch_openai_file_content(
+    file_id: &str,
+    state: &ProxyState,
+    request_headers: &hyper::HeaderMap,
+) -> Result<crate::remote_content::RemoteContent, String> {
+    if file_id.is_empty()
+        || file_id.len() > 200
+        || !file_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("OpenAI file ID is invalid".to_string());
+    }
+    let path = format!("/files/{file_id}/content");
+    let url = join_upstream_url(&state.upstream, &path)?;
+    let mut request = state.client.get(url);
+    let connection_headers = connection_named_headers(request_headers);
+    for (name, value) in request_headers {
+        if should_forward_request_header(name.as_str())
+            && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
+        {
+            request = request.header(name, value);
+        }
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| reqwest_error_message("could not fetch OpenAI file", &error))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "OpenAI file content returned HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_HTTP_BODY_BYTES as u64)
+    {
+        return Err("OpenAI file is too large to inspect".to_string());
+    }
+    let media_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_string();
+    let filename = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(';').find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                name.eq_ignore_ascii_case("filename")
+                    .then(|| value.trim_matches('"').to_string())
+            })
+        })
+        .unwrap_or_else(|| format!("{file_id}.bin"));
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "OpenAI file body failed".to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_HTTP_BODY_BYTES {
+            bytes.zeroize();
+            return Err("OpenAI file is too large to inspect".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(crate::remote_content::RemoteContent {
+        bytes,
+        media_type,
+        filename,
+    })
+}
+
+async fn resolve_openai_remote_files(body: Bytes) -> Result<Bytes, String> {
+    let mut value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return Ok(body),
+    };
+    resolve_openai_remote_file_values(&mut value).await?;
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| "could not encode resolved remote attachment".to_string())
+}
+
+fn resolve_openai_remote_file_values(
+    value: &mut Value,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+    Box::pin(async move {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    resolve_openai_remote_file_values(value).await?;
+                }
+            }
+            Value::Object(object) => {
+                let input_type = object.get("type").and_then(Value::as_str);
+                if input_type == Some("input_file") {
+                    if let Some(url) = object
+                        .get("file_url")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    {
+                        let mut remote = crate::remote_content::fetch(&url).await?;
+                        let encoded = data_encoding::BASE64.encode(&remote.bytes);
+                        remote.bytes.zeroize();
+                        object.remove("file_url");
+                        object.insert(
+                            "file_data".to_string(),
+                            Value::String(format!("data:{};base64,{encoded}", remote.media_type)),
+                        );
+                        object
+                            .entry("filename".to_string())
+                            .or_insert(Value::String(remote.filename));
+                        return Ok(());
+                    }
+                } else if input_type == Some("input_image") {
+                    if let Some(url) = object
+                        .get("image_url")
+                        .and_then(Value::as_str)
+                        .filter(|url| !url.starts_with("data:"))
+                        .map(str::to_string)
+                    {
+                        let mut remote = crate::remote_content::fetch(&url).await?;
+                        if !remote.media_type.starts_with("image/") {
+                            remote.bytes.zeroize();
+                            return Err("remote image URL did not return an image".to_string());
+                        }
+                        let encoded = data_encoding::BASE64.encode(&remote.bytes);
+                        remote.bytes.zeroize();
+                        object.insert(
+                            "image_url".to_string(),
+                            Value::String(format!("data:{};base64,{encoded}", remote.media_type)),
+                        );
+                        return Ok(());
+                    }
+                }
+                for value in object.values_mut() {
+                    resolve_openai_remote_file_values(value).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+}
+
+fn openai_request_has_unknown_content(value: &Value) -> bool {
+    fn visit(value: &Value) -> bool {
+        match value {
+            Value::Array(items) => items.iter().any(visit),
+            Value::Object(object) => {
+                if let Some(kind) = object.get("type").and_then(Value::as_str) {
+                    if !matches!(
+                        kind,
+                        "message"
+                            | "input_text"
+                            | "output_text"
+                            | "input_image"
+                            | "input_file"
+                            | "function_call"
+                            | "function_call_output"
+                            | "custom_tool_call"
+                            | "custom_tool_call_output"
+                            | "computer_call"
+                            | "computer_call_output"
+                            | "reasoning"
+                    ) {
+                        return true;
+                    }
+                }
+                ["content", "input", "output"]
+                    .into_iter()
+                    .filter_map(|key| object.get(key))
+                    .any(visit)
+            }
+            _ => false,
+        }
+    }
+    value.get("input").is_some_and(visit)
 }
 
 fn inject_handle_contract(value: &mut Value) {
@@ -354,12 +683,13 @@ fn inject_handle_contract(value: &mut Value) {
 fn mask_openai_request(
     value: &mut Value,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
     if let Some(Value::String(instructions)) = value.get_mut("instructions") {
         mask_text(instructions, false, masker)?;
     }
     if let Some(input) = value.get_mut("input") {
-        mask_openai_input(input, false, masker)?;
+        mask_openai_input(input, false, masker, files)?;
     }
     if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
@@ -373,12 +703,13 @@ fn mask_openai_input(
     value: &mut Value,
     tool_result: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
     match value {
         Value::String(text) => mask_text(text, tool_result, masker),
         Value::Array(items) => {
             for item in items {
-                mask_openai_input(item, tool_result, masker)?;
+                mask_openai_input(item, tool_result, masker, files)?;
             }
             Ok(())
         }
@@ -391,7 +722,7 @@ fn mask_openai_input(
             match item_type.as_str() {
                 "function_call_output" | "custom_tool_call_output" => {
                     if let Some(output) = object.get_mut("output") {
-                        mask_openai_input(output, true, masker)?;
+                        mask_openai_input(output, true, masker, files)?;
                     }
                 }
                 "input_text" | "output_text" => {
@@ -400,16 +731,16 @@ fn mask_openai_input(
                     }
                 }
                 "input_image" => inspect_openai_image(object)?,
-                "input_file" => inspect_openai_file(object, tool_result, masker)?,
+                "input_file" => inspect_openai_file(object, tool_result, masker, files)?,
                 "message" => {
                     if let Some(content) = object.get_mut("content") {
-                        mask_openai_input(content, tool_result, masker)?;
+                        mask_openai_input(content, tool_result, masker, files)?;
                     }
                 }
                 _ => {
                     for key in ["content", "text", "output"] {
                         if let Some(nested) = object.get_mut(key) {
-                            mask_openai_input(nested, tool_result, masker)?;
+                            mask_openai_input(nested, tool_result, masker, files)?;
                         }
                     }
                 }
@@ -440,11 +771,22 @@ fn inspect_openai_file(
     object: &mut serde_json::Map<String, Value>,
     tool_result: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
-    if object.get("file_id").is_some() || object.get("file_url").is_some() {
+    if let Some(file_id) = object.get("file_id").and_then(Value::as_str) {
+        if files.get(file_id) == Some(&crate::http_files::Coverage::Full) {
+            return Ok(());
+        }
         return crate::claude_http_proxy::enforce_unscanned_document_policy();
     }
-    let Some(Value::String(data)) = object.get("file_data") else {
+    if object.get("file_url").is_some() {
+        return crate::claude_http_proxy::enforce_unscanned_document_policy();
+    }
+    let Some(data) = object
+        .get("file_data")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
         return crate::claude_http_proxy::enforce_unscanned_document_policy();
     };
     let (media_type, encoded) = data
@@ -456,6 +798,29 @@ fn inspect_openai_file(
                 .map(|media_type| (media_type, encoded))
         })
         .unwrap_or(("application/octet-stream", data.as_str()));
+    let filename = object
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or("attachment");
+    if crate::http_files::supported_text_file(filename, Some(media_type)) {
+        let mut bytes = data_encoding::BASE64
+            .decode(encoded.as_bytes())
+            .map_err(|_| "document blocked: invalid base64 text file".to_string())?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| "document blocked: text file is not UTF-8".to_string())?;
+        let mut protected = text.to_string();
+        mask_text(&mut protected, tool_result, masker)?;
+        bytes.zeroize();
+        object.insert(
+            "file_data".to_string(),
+            Value::String(format!(
+                "data:{media_type};base64,{}",
+                data_encoding::BASE64.encode(protected.as_bytes())
+            )),
+        );
+        protected.zeroize();
+        return Ok(());
+    }
     let source = serde_json::json!({
         "type": "base64",
         "media_type": media_type,
@@ -782,6 +1147,13 @@ fn is_responses_path(path_and_query: &str) -> bool {
         .is_some_and(|path| path.ends_with("/responses"))
 }
 
+fn is_files_collection_path(path_and_query: &str) -> bool {
+    path_and_query
+        .split('?')
+        .next()
+        .is_some_and(|path| path.ends_with("/files"))
+}
+
 fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Option<&'a str> {
     let prefix_len = token.len().checked_add(1)?;
     let prefix = path_and_query.get(..prefix_len)?;
@@ -921,6 +1293,14 @@ fn text_response(status: StatusCode, text: &'static str) -> Response<ProxyBody> 
         .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(full_body(Bytes::from_static(text.as_bytes())))
         .expect("static response is valid")
+}
+
+fn owned_text_response(status: StatusCode, text: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full_body(Bytes::copy_from_slice(text.as_bytes())))
+        .expect("text response is valid")
 }
 
 fn random_auth_token() -> Result<String, String> {

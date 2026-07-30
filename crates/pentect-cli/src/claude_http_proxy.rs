@@ -21,6 +21,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,6 +116,7 @@ struct ProxyState {
     auth: String,
     client: reqwest::Client,
     masker: Arc<StdMutex<pentect_agent::ActiveToolOutputMasker>>,
+    files: StdMutex<HashMap<String, crate::http_files::Coverage>>,
     requests: Arc<Semaphore>,
 }
 
@@ -143,6 +145,7 @@ async fn run_proxy(
         auth,
         client,
         masker: Arc::new(StdMutex::new(pentect_agent::ActiveToolOutputMasker::new()?)),
+        files: StdMutex::new(HashMap::new()),
         requests: Arc::new(Semaphore::new(32)),
     });
     // Keep authentication in the base URL path. Claude settings can replace
@@ -204,10 +207,16 @@ async fn proxy_request(
         Ok(response) => Ok(response),
         Err(error) => {
             eprintln!("[pentect] Claude HTTP proxy request failed: {error}");
-            Ok(text_response(
-                StatusCode::BAD_GATEWAY,
-                "Pentect proxy request failed",
-            ))
+            let local_rejection = error.starts_with("image blocked:")
+                || error.starts_with("document blocked:")
+                || error.starts_with("remote ")
+                || error.starts_with("file upload blocked:")
+                || error.starts_with("Files API upload ");
+            Ok(if local_rejection {
+                owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
+            } else {
+                text_response(StatusCode::BAD_GATEWAY, "Pentect proxy request failed")
+            })
         }
     }
 }
@@ -237,7 +246,14 @@ async fn proxy_request_inner(
     let upstream_url = join_upstream_url(&state.upstream, &path_and_query)?;
     let headers = request.headers().clone();
     let messages_path = endpoint == AnthropicEndpoint::Messages;
-    let body = if messages_path {
+    let files_upload = endpoint == AnthropicEndpoint::Files
+        && method == hyper::Method::POST
+        && path_and_query
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("/v1/files"));
+    let mut request_coverage = None;
+    let body = if messages_path || files_upload {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
             .await
@@ -253,13 +269,38 @@ async fn proxy_request_inner(
         };
         if body.is_empty() {
             reqwest::Body::from(body)
-        } else {
+        } else if files_upload {
+            let content_type = headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "Files API upload is missing Content-Type".to_string())?
+                .to_string();
             let masker = Arc::clone(&state.masker);
-            let protected =
-                tokio::task::spawn_blocking(move || protect_anthropic_request_body(&body, &masker))
-                    .await
-                    .map_err(|_| "Claude request protection task failed".to_string())??;
-            reqwest::Body::from(protected)
+            let protected = tokio::task::spawn_blocking(move || {
+                let mut masker = masker
+                    .lock()
+                    .map_err(|_| "Claude request masker lock was poisoned".to_string())?;
+                crate::http_files::protect_multipart_upload(&content_type, &body, &mut masker)
+            })
+            .await
+            .map_err(|_| "Claude file protection task failed".to_string())??;
+            request_coverage = Some(protected.coverage);
+            reqwest::Body::from(protected.body)
+        } else {
+            let body = resolve_anthropic_remote_content(body).await?;
+            let masker = Arc::clone(&state.masker);
+            let files = state
+                .files
+                .lock()
+                .map_err(|_| "Claude file registry lock was poisoned".to_string())?
+                .clone();
+            let protected = tokio::task::spawn_blocking(move || {
+                protect_anthropic_request_body(&body, &masker, &files)
+            })
+            .await
+            .map_err(|_| "Claude request protection task failed".to_string())??;
+            request_coverage = Some(protected.coverage);
+            reqwest::Body::from(protected.body)
         }
     } else {
         let stream = request.into_body().into_data_stream().map(|chunk| {
@@ -271,7 +312,7 @@ async fn proxy_request_inner(
     let mut upstream_request = state.client.request(method, upstream_url);
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
-        if ((!messages_path && name == hyper::header::CONTENT_LENGTH)
+        if ((!(messages_path || files_upload) && name == hyper::header::CONTENT_LENGTH)
             || should_forward_request_header(name.as_str()))
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
         {
@@ -306,7 +347,13 @@ async fn proxy_request_inner(
             builder = builder.header(name, value);
         }
     }
-    if is_event_stream || !messages_path {
+    builder = builder.header(
+        "x-pentect-coverage",
+        request_coverage
+            .unwrap_or(crate::http_files::Coverage::None)
+            .as_header(),
+    );
+    if is_event_stream || (!messages_path && !files_upload) {
         let transform = status.is_success() && messages_path && is_event_stream;
         return builder
             .body(streaming_response_body(upstream_response, transform))
@@ -319,6 +366,20 @@ async fn proxy_request_inner(
             "Upstream response body too large",
         ));
     };
+    if files_upload && status.is_success() {
+        if let (Some(coverage), Ok(value)) = (
+            request_coverage,
+            serde_json::from_slice::<Value>(&response_body),
+        ) {
+            if let Some(id) = value.get("id").and_then(Value::as_str) {
+                state
+                    .files
+                    .lock()
+                    .map_err(|_| "Claude file registry lock was poisoned".to_string())?
+                    .insert(id.to_string(), coverage);
+            }
+        }
+    }
     let response_body = if status.is_success() && messages_path {
         match rewrite_anthropic_json_response(&response_body) {
             Ok(rewritten) => Bytes::from(rewritten),
@@ -335,27 +396,113 @@ async fn proxy_request_inner(
         .map_err(|error| format!("could not build Claude proxy response: {error}"))
 }
 
+async fn resolve_anthropic_remote_content(body: Bytes) -> Result<Bytes, String> {
+    let mut value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return Ok(body),
+    };
+    resolve_anthropic_remote_values(&mut value).await?;
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| "could not encode resolved remote attachment".to_string())
+}
+
+fn resolve_anthropic_remote_values(
+    value: &mut Value,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+    Box::pin(async move {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    resolve_anthropic_remote_values(value).await?;
+                }
+            }
+            Value::Object(object) => {
+                let block_type = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if matches!(block_type.as_deref(), Some("document" | "image")) {
+                    if let Some(source) = object.get_mut("source").and_then(Value::as_object_mut) {
+                        if source.get("type").and_then(Value::as_str) == Some("url") {
+                            if let Some(url) = source
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                            {
+                                let mut remote = crate::remote_content::fetch(&url).await?;
+                                if block_type.as_deref() == Some("document")
+                                    && crate::http_files::supported_text_file(
+                                        &remote.filename,
+                                        Some(&remote.media_type),
+                                    )
+                                {
+                                    let text =
+                                        std::str::from_utf8(&remote.bytes).map_err(|_| {
+                                            "remote text attachment is not UTF-8".to_string()
+                                        })?;
+                                    *source = serde_json::Map::from_iter([
+                                        ("type".to_string(), Value::String("text".to_string())),
+                                        ("data".to_string(), Value::String(text.to_string())),
+                                    ]);
+                                } else {
+                                    let encoded = data_encoding::BASE64.encode(&remote.bytes);
+                                    *source = serde_json::Map::from_iter([
+                                        ("type".to_string(), Value::String("base64".to_string())),
+                                        (
+                                            "media_type".to_string(),
+                                            Value::String(remote.media_type),
+                                        ),
+                                        ("data".to_string(), Value::String(encoded)),
+                                    ]);
+                                }
+                                remote.bytes.zeroize();
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                for value in object.values_mut() {
+                    resolve_anthropic_remote_values(value).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+}
+
+struct ProtectedJsonBody {
+    body: Bytes,
+    coverage: crate::http_files::Coverage,
+}
+
 fn protect_anthropic_request_body(
     body: &Bytes,
     masker: &StdMutex<pentect_agent::ActiveToolOutputMasker>,
-) -> Result<Bytes, String> {
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<ProtectedJsonBody, String> {
     let mut value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("[pentect] Claude request protection skipped: invalid JSON: {error}");
-            return Ok(body.clone());
+            return Ok(ProtectedJsonBody {
+                body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
+            });
         }
     };
+    let partial_schema = anthropic_request_has_unknown_content(&value);
     warn_provider_mcp_credentials(&value);
     inject_handle_contract(&mut value);
     // Image handling deliberately follows the existing image policy. With
     // the default unscanned_images="block", an uninspectable image is an
     // error; users can explicitly choose allow in configuration.
-    redact_anthropic_base64_images(&mut value)?;
+    redact_anthropic_base64_images(&mut value, files)?;
     let mut masker = masker
         .lock()
         .map_err(|_| "Claude request masker lock was poisoned".to_string())?;
-    if let Err(error) = mask_anthropic_request(&mut value, &mut masker) {
+    if let Err(error) = mask_anthropic_request(&mut value, &mut masker, files) {
         // Explicit media-policy decisions are not detector failures. Letting
         // them enter the general fail-open path would send the very PDF/image
         // that the configured policy rejected.
@@ -363,15 +510,74 @@ fn protect_anthropic_request_body(
             return Err(error);
         }
         eprintln!("[pentect] Claude request protection skipped: {error}");
-        return Ok(body.clone());
+        return Ok(ProtectedJsonBody {
+            body: body.clone(),
+            coverage: crate::http_files::Coverage::Partial,
+        });
     }
     match serde_json::to_vec(&value) {
-        Ok(protected) => Ok(Bytes::from(protected)),
+        Ok(protected) => Ok(ProtectedJsonBody {
+            body: Bytes::from(protected),
+            coverage: if partial_schema {
+                crate::http_files::Coverage::Partial
+            } else {
+                crate::http_files::Coverage::Full
+            },
+        }),
         Err(error) => {
             eprintln!("[pentect] Claude request protection skipped: encode failed: {error}");
-            Ok(body.clone())
+            Ok(ProtectedJsonBody {
+                body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
+            })
         }
     }
+}
+
+fn anthropic_request_has_unknown_content(value: &Value) -> bool {
+    let mut roots = Vec::new();
+    if let Some(system) = value.get("system") {
+        roots.push(system);
+    }
+    if let Some(messages) = value.get("messages").and_then(Value::as_array) {
+        roots.extend(messages.iter().filter_map(|message| message.get("content")));
+    }
+    roots.into_iter().any(anthropic_content_has_unknown_block)
+}
+
+fn anthropic_content_has_unknown_block(value: &Value) -> bool {
+    let Some(blocks) = value.as_array() else {
+        return false;
+    };
+    blocks.iter().any(|block| {
+        let Some(kind) = block.get("type").and_then(Value::as_str) else {
+            return true;
+        };
+        let known = matches!(
+            kind,
+            "text"
+                | "tool_result"
+                | "tool_use"
+                | "document"
+                | "search_result"
+                | "image"
+                | "thinking"
+                | "redacted_thinking"
+                | "server_tool_use"
+                | "mcp_tool_use"
+                | "mcp_tool_result"
+                | "web_search_tool_result"
+                | "web_fetch_tool_result"
+                | "code_execution_tool_result"
+                | "bash_code_execution_tool_result"
+                | "text_editor_code_execution_tool_result"
+        );
+        !known
+            || (kind == "tool_result"
+                && block
+                    .get("content")
+                    .is_some_and(anthropic_content_has_unknown_block))
+    })
 }
 
 fn is_media_policy_rejection(error: &str) -> bool {
@@ -740,14 +946,15 @@ fn sse_tool_boundary(block: &[u8]) -> SseToolBoundary {
 fn mask_anthropic_request(
     value: &mut Value,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
     if let Some(system) = value.get_mut("system") {
-        mask_content(system, false, masker)?;
+        mask_content(system, false, masker, files)?;
     }
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
             if let Some(content) = message.get_mut("content") {
-                mask_content(content, false, masker)?;
+                mask_content(content, false, masker, files)?;
             }
         }
     }
@@ -759,30 +966,36 @@ fn mask_anthropic_request(
     Ok(())
 }
 
-fn redact_anthropic_base64_images(value: &mut Value) -> Result<(), String> {
+fn redact_anthropic_base64_images(
+    value: &mut Value,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
     if let Some(system) = value.get_mut("system") {
-        redact_content_images(system)?;
+        redact_content_images(system, files)?;
     }
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
             if let Some(content) = message.get_mut("content") {
-                redact_content_images(content)?;
+                redact_content_images(content, files)?;
             }
         }
     }
     Ok(())
 }
 
-fn redact_content_images(content: &mut Value) -> Result<(), String> {
+fn redact_content_images(
+    content: &mut Value,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
     let Value::Array(blocks) = content else {
         return Ok(());
     };
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
-            Some("image") => redact_base64_image_block(block)?,
+            Some("image") => redact_base64_image_block(block, files)?,
             Some("tool_result") => {
                 if let Some(nested) = block.get_mut("content") {
-                    redact_content_images(nested)?;
+                    redact_content_images(nested, files)?;
                 }
             }
             _ => {}
@@ -791,7 +1004,10 @@ fn redact_content_images(content: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
-fn redact_base64_image_block(block: &mut Value) -> Result<(), String> {
+fn redact_base64_image_block(
+    block: &mut Value,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
     let block_unscanned = || -> Result<(), String> {
         if pentect_agent::unscanned_images_should_block()? {
             Err("image blocked: image source could not be scanned".to_string())
@@ -804,9 +1020,17 @@ fn redact_base64_image_block(block: &mut Value) -> Result<(), String> {
     };
     match source.get("type").and_then(Value::as_str) {
         Some("base64") => {}
-        // URL and Files API references are intentionally not fetched here:
-        // doing so would introduce a second, privileged SSRF-capable client.
-        // Their handling follows the configured unscanned-image policy.
+        Some("file" | "file_id" | "file_reference")
+            if source
+                .get("file_id")
+                .or_else(|| source.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| files.get(id) == Some(&crate::http_files::Coverage::Full)) =>
+        {
+            return Ok(());
+        }
+        // URL sources have already been replaced by the constrained remote
+        // fetcher. Unknown Files API references follow the media policy.
         Some("url" | "file") | Some("file_id") | Some("file_reference") | None => {
             return block_unscanned();
         }
@@ -899,6 +1123,7 @@ fn mask_content(
     value: &mut Value,
     tool_result: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
     match value {
         Value::String(text) => mask_string(text, tool_result, masker),
@@ -921,7 +1146,7 @@ fn mask_content(
                     }
                     "tool_result" => {
                         if let Some(content) = block.get_mut("content") {
-                            mask_content(content, true, masker)?;
+                            mask_content(content, true, masker, files)?;
                         }
                     }
                     "tool_use" => {
@@ -929,7 +1154,7 @@ fn mask_content(
                             mask_value_strings(input, masker)?;
                         }
                     }
-                    "document" => mask_document_block(block, tool_result, masker)?,
+                    "document" => mask_document_block(block, tool_result, masker, files)?,
                     "search_result" => {
                         mask_named_text(block, "title", tool_result, masker)?;
                         // UrlDetector preserves ordinary public URLs while
@@ -937,7 +1162,7 @@ fn mask_content(
                         // sensitive query/path components.
                         mask_named_text(block, "source", tool_result, masker)?;
                         if let Some(content) = block.get_mut("content") {
-                            mask_content(content, tool_result, masker)?;
+                            mask_content(content, tool_result, masker, files)?;
                         }
                     }
                     // These blocks are provider-produced or binary protocol
@@ -973,6 +1198,7 @@ fn mask_document_block(
     block: &mut Value,
     tool_result: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
     mask_named_text(block, "title", tool_result, masker)?;
     mask_named_text(block, "context", tool_result, masker)?;
@@ -983,14 +1209,22 @@ fn mask_document_block(
         Some("text") => mask_named_text(source, "data", tool_result, masker),
         Some("content") => {
             if let Some(content) = source.get_mut("content") {
-                mask_content(content, tool_result, masker)?;
+                mask_content(content, tool_result, masker, files)?;
             }
             Ok(())
         }
         Some("base64") => inspect_base64_document(source, tool_result, masker),
-        // Remote and Files API documents cannot be inspected without either
-        // privileged fetching or another provider request. Respect the same
-        // explicit allow/block policy as unscanned images.
+        // URL sources have already been replaced by the constrained remote
+        // fetcher. Unknown Files API references follow the media policy.
+        Some("file" | "file_id" | "file_reference")
+            if source
+                .get("file_id")
+                .or_else(|| source.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| files.get(id) == Some(&crate::http_files::Coverage::Full)) =>
+        {
+            Ok(())
+        }
         Some("url" | "file" | "file_id" | "file_reference") | None => {
             enforce_unscanned_document_policy()
         }
@@ -1607,6 +1841,14 @@ fn text_response(status: StatusCode, text: &'static str) -> Response<ProxyBody> 
         .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(full_body(Bytes::from_static(text.as_bytes())))
         .expect("static response is valid")
+}
+
+fn owned_text_response(status: StatusCode, text: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full_body(Bytes::copy_from_slice(text.as_bytes())))
+        .expect("text response is valid")
 }
 
 fn random_auth_token() -> Result<String, String> {

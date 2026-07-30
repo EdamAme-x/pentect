@@ -5,10 +5,12 @@ mod claude_http_proxy;
 mod codex_app;
 mod doctor;
 mod eval;
+mod http_files;
 mod input;
 mod openai_http_proxy;
 mod plugins;
 mod plugins_cmd;
+mod remote_content;
 mod scan;
 mod uninstall;
 mod update;
@@ -1949,39 +1951,69 @@ fn codex_effective_routing(opts: &AgentToolOpts) -> Result<CodexHttpRouting, Str
     })
 }
 
-/// Codex App does not expose the CLI's `--config` override. Its bundled Codex
-/// process can therefore be routed through an inherited environment variable
-/// only when the built-in provider has not been redirected in user config.
-pub(crate) fn codex_app_upstream(explicit: Option<String>) -> Result<String, String> {
+pub(crate) struct CodexAppRouting {
+    upstream: String,
+    provider: String,
+    requires_config_override: bool,
+}
+
+/// Resolve the App's selected provider without changing user configuration.
+/// The launcher installs a short-lived, recoverable base-url override only
+/// when the selected provider cannot be redirected by OPENAI_BASE_URL.
+pub(crate) fn codex_app_routing(explicit: Option<String>) -> Result<CodexAppRouting, String> {
     let config = load_codex_user_config(&[])?;
     let provider = config
         .get("model_provider")
         .and_then(toml::Value::as_str)
-        .unwrap_or("openai");
-    if provider != "openai" {
-        return Err(format!(
-            "Codex App provider '{provider}' is not supported by the launcher yet; use `pentect codex --upstream URL`"
-        ));
-    }
-    if config
-        .get("openai_base_url")
-        .and_then(toml::Value::as_str)
-        .is_some()
-    {
-        return Err(
-            "Codex App has openai_base_url in ~/.codex/config.toml, which takes precedence over the launcher environment; remove that setting before using `pentect codex-app`"
-                .to_string(),
-        );
-    }
-    Ok(explicit
-        .or_else(|| nonempty_env("OPENAI_BASE_URL"))
-        .unwrap_or_else(|| {
+        .unwrap_or("openai")
+        .to_string();
+    let configured_upstream = if provider == "openai" {
+        config
+            .get("openai_base_url")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    } else {
+        let provider_config = config
+            .get("model_providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get(&provider))
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| format!("Codex provider '{provider}' has no configuration"))?;
+        let wire_api = provider_config
+            .get("wire_api")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("responses");
+        if wire_api != "responses" {
+            return Err(format!(
+                "Codex App provider '{provider}' uses unsupported wire_api '{wire_api}'; Pentect currently supports Responses-compatible providers"
+            ));
+        }
+        provider_config
+            .get("base_url")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    let requires_config_override = provider != "openai" || configured_upstream.is_some();
+    let upstream = explicit
+        .or(configured_upstream)
+        .or_else(|| (provider == "openai").then(|| nonempty_env("OPENAI_BASE_URL")).flatten())
+        .or_else(|| (provider == "openai").then(|| {
             if codex_uses_chatgpt_auth() {
                 "https://chatgpt.com/backend-api/codex".to_string()
             } else {
                 "https://api.openai.com/v1".to_string()
             }
         }))
+        .ok_or_else(|| {
+            format!(
+                "could not determine upstream for Codex App provider '{provider}'; pass --upstream URL"
+            )
+        })?;
+    Ok(CodexAppRouting {
+        upstream,
+        provider,
+        requires_config_override,
+    })
 }
 
 fn load_codex_user_config(args: &[String]) -> Result<toml::Value, String> {
