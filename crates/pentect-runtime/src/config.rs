@@ -177,26 +177,33 @@ fn load_or_create_identity_key(path: &Path) -> Result<[u8; 32], String> {
 }
 
 fn identity_key_temporary_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    path.with_extension(format!("key.tmp-{}-{nonce}", std::process::id()))
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("key.tmp-{}-{nonce}-{sequence}", std::process::id()))
 }
 
 fn remove_identity_temporary(path: &Path) {
     let _ = fs::remove_file(path);
     #[cfg(windows)]
-    let _ = fs::remove_file(path.with_extension("acl-v1"));
+    let _ = fs::remove_file(identity_acl_marker_path(path));
 }
 
 #[cfg(windows)]
 fn restrict_identity_file(path: &Path) -> Result<(), String> {
-    let marker = path.with_extension("acl-v1");
-    if marker.is_file() {
+    let marker = identity_acl_marker_path(path);
+    let expected_marker = identity_acl_marker(path)?;
+    if fs::metadata(&marker).is_ok_and(|metadata| metadata.len() == expected_marker.len() as u64)
+        && fs::read(&marker).is_ok_and(|stored| stored == expected_marker.as_bytes())
+    {
         return Ok(());
     }
-    let identity = std::process::Command::new("whoami.exe")
+    let system32 = windows_system32()?;
+    let identity = std::process::Command::new(system32.join("whoami.exe"))
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
@@ -210,7 +217,7 @@ fn restrict_identity_file(path: &Path) -> Result<(), String> {
     if identity.is_empty() {
         return Err("Windows account name is empty".to_string());
     }
-    let status = std::process::Command::new("icacls.exe")
+    let status = std::process::Command::new(system32.join("icacls.exe"))
         .arg(path)
         .args(["/inheritance:r", "/grant:r", &format!("{identity}:(F)")])
         .stdin(std::process::Stdio::null())
@@ -221,8 +228,51 @@ fn restrict_identity_file(path: &Path) -> Result<(), String> {
     if !status.success() {
         return Err("could not restrict identity key ACL".to_string());
     }
-    fs::write(&marker, b"")
+    fs::write(&marker, expected_marker)
         .map_err(|error| format!("could not record identity key ACL setup: {error}"))
+}
+
+#[cfg(windows)]
+fn identity_acl_marker_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.acl-v1"))
+}
+
+#[cfg(windows)]
+fn identity_acl_marker(path: &Path) -> Result<String, String> {
+    let key: [u8; 32] = fs::read(path)
+        .map_err(|error| format!("could not read '{}': {error}", path.display()))?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| {
+            format!(
+                "identity key '{}' must contain exactly 32 bytes (found {})",
+                path.display(),
+                bytes.len()
+            )
+        })?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("fixed-size HMAC key");
+    mac.update(b"pentect:windows-acl-marker:v1\0");
+    mac.update(path.as_os_str().to_string_lossy().as_bytes());
+    Ok(data_encoding::HEXLOWER.encode(&mac.finalize().into_bytes()))
+}
+
+#[cfg(windows)]
+fn windows_system32() -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+
+    let mut buffer = [0u16; 32_768];
+    // SAFETY: `buffer` is writable for the advertised length and remains alive
+    // for the duration of the Win32 call.
+    let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length == 0 || length as usize >= buffer.len() {
+        return Err("could not resolve the Windows system directory".to_string());
+    }
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..length as usize])).join("System32"))
 }
 
 #[cfg(not(windows))]
@@ -885,6 +935,20 @@ mod tests {
         let second = load_or_create_identity_key(&path).unwrap();
         assert_eq!(first, second);
         assert_eq!(std::fs::read(&path).unwrap().len(), 32);
+        #[cfg(windows)]
+        {
+            let marker = identity_acl_marker_path(&path);
+            assert_eq!(
+                marker.file_name().and_then(|name| name.to_str()),
+                Some("handle-identity.key.acl-v1")
+            );
+            std::fs::write(&marker, "forged").unwrap();
+            restrict_identity_file(&path).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(marker).unwrap(),
+                identity_acl_marker(&path).unwrap()
+            );
+        }
 
         let invalid = root.join("invalid.key");
         std::fs::write(&invalid, b"short").unwrap();

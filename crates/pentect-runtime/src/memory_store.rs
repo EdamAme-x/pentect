@@ -550,6 +550,18 @@ fn valid_runtime_token(token: &str) -> bool {
     token.len() == TOKEN_BYTES * 2 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[cfg(not(test))]
+fn valid_request_token(token: &str) -> bool {
+    valid_runtime_token(token)
+}
+
+#[cfg(test)]
+fn valid_request_token(token: &str) -> bool {
+    // Unit-test stores use readable fixture tokens; production accepts only
+    // CSPRNG-generated fixed-width tokens.
+    !token.is_empty()
+}
+
 impl Drop for MemoryStoreClient {
     fn drop(&mut self) {
         self.token.zeroize();
@@ -814,7 +826,9 @@ fn handle_client(
         }
         let fields = request_fields(&line);
         let provided_token = fields.first().copied().unwrap_or_default();
-        let access = if constant_time_token_eq(provided_token, token) {
+        let access = if !valid_request_token(provided_token) {
+            None
+        } else if constant_time_token_eq(provided_token, token) {
             Some(RequestAccess::Primary)
         } else if constant_time_token_eq(provided_token, process_host_read_token) {
             Some(RequestAccess::ProcessRead)
@@ -1193,6 +1207,23 @@ mod tests {
         assert_eq!(line.trim(), "ERR\tbad token");
         line.clear();
         assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_request_token_never_matches_empty_server_tokens() {
+        let addr =
+            spawn_test_memory_store_with_activity(String::new(), String::new(), String::new());
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        writeln!(stream, "\tCOUNT\t").unwrap();
+        stream.flush().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ERR\tbad token");
+        assert!(valid_runtime_token(&"a".repeat(TOKEN_BYTES * 2)));
+        assert!(!valid_runtime_token(""));
     }
 
     #[test]

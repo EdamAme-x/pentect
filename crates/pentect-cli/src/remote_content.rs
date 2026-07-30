@@ -84,7 +84,13 @@ pub(crate) async fn fetch(url: &str) -> Result<RemoteContent, String> {
         let mut bytes = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| "remote attachment body failed".to_string())?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    bytes.zeroize();
+                    return Err("remote attachment body failed".to_string());
+                }
+            };
             if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_BYTES {
                 bytes.zeroize();
                 return Err("remote attachment is too large".to_string());
