@@ -68,7 +68,7 @@ fn concurrent_up_keeps_one_persistent_host() {
 }
 
 #[test]
-fn codex_dry_run_uses_project_environment_prefix() {
+fn codex_dry_run_routes_through_the_http_gateway() {
     let root = test_root();
     let config_dir = root.join(".pentect");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -100,8 +100,9 @@ fn codex_dry_run_uses_project_environment_prefix() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(rendered.contains("$env:SAFE_KEY_hash"), "{rendered}");
-    assert!(rendered.contains("$SAFE_KEY_hash"), "{rendered}");
+    assert!(rendered.contains("openai_base_url="), "{rendered}");
+    assert!(rendered.contains("<pentect-gateway>"), "{rendered}");
+    assert!(!rendered.contains("SAFE_KEY_hash"), "{rendered}");
     assert!(!rendered.contains("PENTECT_KEY_hash"), "{rendered}");
 }
 
