@@ -108,6 +108,7 @@ impl Recovery {
             .filter_map(|ph| self.reveal(ph).map(|v| (v, ph.as_str())))
             .filter(|(v, _)| is_remaskable_echo(v))
             .collect();
+        sort_and_deduplicate_remask_pairs(&mut pairs);
         if pairs.is_empty() {
             return text.to_string();
         }
@@ -242,6 +243,10 @@ impl RecoveryStreamRemasker {
         self.patterns.sort_by(|left, right| {
             left.value
                 .cmp(&right.value)
+                .then_with(|| {
+                    remask_placeholder_priority_bytes(&right.placeholder)
+                        .cmp(&remask_placeholder_priority_bytes(&left.placeholder))
+                })
                 .then_with(|| left.placeholder.cmp(&right.placeholder))
         });
         let mut deduplicated = Vec::with_capacity(self.patterns.len());
@@ -419,6 +424,50 @@ impl Drop for RecoveryStreamRemasker {
 fn is_remaskable_echo(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed.len() >= 6 && !matches!(trimmed, "true" | "false" | "null")
+}
+
+fn sort_and_deduplicate_remask_pairs(pairs: &mut Vec<(String, &str)>) {
+    pairs.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| {
+                remask_placeholder_priority(right.1).cmp(&remask_placeholder_priority(left.1))
+            })
+            .then_with(|| left.1.cmp(right.1))
+    });
+    let mut write = 0usize;
+    for read in 0..pairs.len() {
+        if write > 0 && pairs[write - 1].0 == pairs[read].0 {
+            pairs[read].0.zeroize();
+            continue;
+        }
+        if write != read {
+            pairs.swap(write, read);
+        }
+        write += 1;
+    }
+    for (value, _) in &mut pairs[write..] {
+        value.zeroize();
+    }
+    pairs.truncate(write);
+}
+
+fn remask_placeholder_priority_bytes(placeholder: &[u8]) -> u8 {
+    std::str::from_utf8(placeholder)
+        .map(remask_placeholder_priority)
+        .unwrap_or(0)
+}
+
+fn remask_placeholder_priority(placeholder: &str) -> u8 {
+    let Ok(parts) = crate::placeholder::parse_placeholder(placeholder) else {
+        return 0;
+    };
+    match parts.label.as_str() {
+        crate::model::labels::LIKELY_SECRET => 0,
+        crate::model::labels::SECRET => 1,
+        crate::model::labels::KEYED_SECRET => 2,
+        _ => 3,
+    }
 }
 
 impl Drop for Recovery {
@@ -672,6 +721,45 @@ mod tests {
             rec.remask("AKIA3EXAMPLE has a digit"),
             "AKIA3EXAMPLE has a digit"
         );
+    }
+
+    #[test]
+    fn remask_prefers_a_contextual_handle_for_the_same_value() {
+        let secret = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+        let contextual = "<<RUNPOD_API_KEY_0011223344556677>>";
+        let rec = Recovery::seal(
+            HashMap::from([
+                (contextual.to_string(), secret.to_string()),
+                (
+                    "<<LIKELY_SECRET_8899aabbccddeeff>>".to_string(),
+                    secret.to_string(),
+                ),
+            ]),
+            &[5u8; 32],
+        );
+
+        assert_eq!(rec.remask(secret), contextual);
+    }
+
+    #[test]
+    fn stream_remasker_prefers_a_contextual_handle_for_the_same_value() {
+        let secret = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
+        let contextual = "<<RUNPOD_API_KEY_0011223344556677>>";
+        let recovery = Recovery::seal(
+            HashMap::from([
+                (contextual.to_string(), secret.to_string()),
+                (
+                    "<<LIKELY_SECRET_8899aabbccddeeff>>".to_string(),
+                    secret.to_string(),
+                ),
+            ]),
+            &[5u8; 32],
+        );
+        let mut remasker = recovery.stream_remasker();
+        let mut out = remasker.push_text(secret.as_bytes());
+        out.extend(remasker.finish());
+
+        assert_eq!(String::from_utf8(out).unwrap(), contextual);
     }
 
     #[test]
