@@ -161,7 +161,8 @@ struct RegistryPlugin {
     description: String,
     source: String,
     publisher: String,
-    runtime: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<PluginRuntime>,
 }
 
 fn search_plugins(query: Option<&str>, json_output: bool) -> Result<(), String> {
@@ -207,7 +208,11 @@ fn search_plugins(query: Option<&str>, json_output: bool) -> Result<(), String> 
     for plugin in plugins {
         println!(
             "{}: {} [{}; {}]\n  {}",
-            plugin.name, plugin.description, plugin.runtime, plugin.publisher, plugin.source
+            plugin.name,
+            plugin.description,
+            plugin.runtime.map(runtime_name).unwrap_or("declarative"),
+            plugin.publisher,
+            plugin.source
         );
     }
     Ok(())
@@ -548,20 +553,7 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
 
 fn validate_publisher(manifest: &PluginManifest) -> Result<(), String> {
     let workflow = publisher_workflow(manifest)?;
-    if workflow.is_empty()
-        || workflow.len() > 256
-        || workflow.starts_with('/')
-        || workflow.contains('\\')
-        || workflow.split('/').any(|part| {
-            part.is_empty()
-                || part == "."
-                || part == ".."
-                || !part
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
-        })
-        || !workflow.ends_with(".yml") && !workflow.ends_with(".yaml")
-    {
+    if !pentect_agent::valid_plugin_publisher_workflow(workflow) {
         return Err("publisher workflow must be a repository-relative YAML path".to_string());
     }
     Ok(())
@@ -1154,8 +1146,10 @@ fn verify_github_attestation(
     name: &str,
 ) -> Result<(), String> {
     let gh = find_command(Path::new("gh")).ok_or_else(|| {
-        "signed plugin verification requires GitHub CLI (`gh`): https://cli.github.com/".to_string()
+        "signed plugin verification requires GitHub CLI v2.51.0 or newer: https://cli.github.com/"
+            .to_string()
     })?;
+    verify_gh_attestation_version(&gh)?;
     let signer_workflow = format!("{repository}/{workflow}");
     let output = Command::new(gh)
         .arg("attestation")
@@ -1181,6 +1175,29 @@ fn verify_github_attestation(
     } else {
         format!("plugin '{name}' GitHub build attestation failed for {signer_workflow}: {detail}")
     })
+}
+
+fn verify_gh_attestation_version(gh: &Path) -> Result<(), String> {
+    const MINIMUM: semver::Version = semver::Version::new(2, 51, 0);
+    let output = Command::new(gh)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not inspect GitHub CLI version: {error}"))?;
+    let version = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(2))
+        .and_then(|version| semver::Version::parse(version.trim_start_matches('v')).ok())
+        .ok_or_else(|| {
+            "could not determine GitHub CLI version; v2.51.0 or newer is required".to_string()
+        })?;
+    if version < MINIMUM {
+        return Err(format!(
+            "GitHub CLI v{version} is too old; signed plugin verification requires v{MINIMUM} or newer"
+        ));
+    }
+    Ok(())
 }
 
 fn map_binary_download_error(name: &str, platform: &str, asset: &str, error: String) -> String {

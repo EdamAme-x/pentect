@@ -110,25 +110,28 @@ macro_rules! export_wasm_plugin {
         #[no_mangle]
         pub extern "C" fn pentect_alloc(len: i32) -> i32 {
             let len = usize::try_from(len).expect("negative Pentect input length");
-            let mut input = Vec::<u8>::with_capacity(len);
-            let pointer = input.as_mut_ptr();
-            std::mem::forget(input);
-            pointer as i32
+            let input = vec![0_u8; len].into_boxed_slice();
+            std::boxed::Box::into_raw(input) as *mut u8 as i32
         }
 
         #[no_mangle]
         pub unsafe extern "C" fn pentect_handle(pointer: i32, len: i32) -> i64 {
             let pointer = usize::try_from(pointer).expect("negative Pentect input pointer");
             let len = usize::try_from(len).expect("negative Pentect input length");
-            let input = unsafe { Vec::from_raw_parts(pointer as *mut u8, len, len) };
+            let input = unsafe {
+                std::boxed::Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    pointer as *mut u8,
+                    len,
+                ))
+            };
             let request: $crate::Request = $crate::__serde_json::from_slice(&input)
                 .expect("invalid Pentect request");
             let response = $handler(request).expect("Pentect plugin handler failed");
-            let mut output =
-                $crate::__serde_json::to_vec(&response).expect("Pentect response failed");
-            let output_pointer = output.as_mut_ptr() as u32;
+            let output = $crate::__serde_json::to_vec(&response)
+                .expect("Pentect response failed")
+                .into_boxed_slice();
             let output_len = u32::try_from(output.len()).expect("Pentect response too large");
-            std::mem::forget(output);
+            let output_pointer = std::boxed::Box::into_raw(output) as *mut u8 as u32;
             (((output_pointer as u64) << 32) | output_len as u64) as i64
         }
     };

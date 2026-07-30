@@ -5,18 +5,16 @@ name = "example-regex"
 description = "Manifest-only example for deterministic regex detectors."
 source = "github:@EdamAme-x/pentect/plugins/example-regex"
 publisher = "EdamAme-x/pentect"
-runtime = "manifest"
 
 [[plugin]]
 name = "openai-privacy-filter"
 description = "Deterministic privacy policy middleware for OpenAI-compatible traffic."
 source = "github:@EdamAme-x/pentect/plugins/openai-privacy-filter"
 publisher = "EdamAme-x/pentect"
-runtime = "manifest"
 
 [[plugin]]
 name = "pii-ner"
 description = "Local ONNX named-entity recognition maintained by the Pentect publisher."
 source = "github:@EdamAme-x/pentect/plugins/pii-ner"
 publisher = "EdamAme-x/pentect"
-runtime = "trusted_native"
+runtime = "native"

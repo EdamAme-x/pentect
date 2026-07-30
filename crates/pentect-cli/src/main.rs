@@ -214,7 +214,7 @@ fn help_text() -> &'static str {
         "doctor: readiness\n",
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
-        "plugins: list, inspect, test, config, setup, update\n",
+        "plugins: list, search, inspect, test, config, setup, update\n",
         "codex-app: launch Codex App through the Responses API gateway\n",
         "claude-app: launch Claude Desktop through the Chat and Anthropic gateways\n",
         "eval: precision, recall\n",

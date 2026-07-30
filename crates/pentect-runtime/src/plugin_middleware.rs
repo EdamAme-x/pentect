@@ -404,7 +404,7 @@ impl PluginBinary {
             .as_ref()
             .and_then(|publisher| publisher.workflow.as_deref())
             .ok_or_else(|| format!("plugin '{name}' requires [publisher] workflow"))?;
-        if !valid_publisher_workflow(publisher_workflow) {
+        if !valid_plugin_publisher_workflow(publisher_workflow) {
             return Err(format!(
                 "plugin '{name}' publisher workflow must be a repository-relative YAML path"
             ));
@@ -513,7 +513,7 @@ impl PluginBinary {
             (PluginRuntime::Wasm, _) => self
                 .wasm
                 .as_ref()
-                .expect("WebAssembly program loaded")
+                .ok_or_else(|| format!("plugin '{}' has no WebAssembly program", self.name))?
                 .invoke(&encoded, self.timeout, self.max_output_bytes, &self.name)?,
             (PluginRuntime::Native, ExecutionMode::Persistent) => self.run_persistent(&encoded)?,
             (PluginRuntime::Native, ExecutionMode::Oneshot) => self.run_once(&encoded)?,
@@ -610,7 +610,7 @@ impl PluginBinary {
     }
 }
 
-fn valid_publisher_workflow(workflow: &str) -> bool {
+pub fn valid_plugin_publisher_workflow(workflow: &str) -> bool {
     !workflow.is_empty()
         && workflow.len() <= 256
         && !workflow.starts_with('/')
@@ -677,7 +677,8 @@ const WASM_ABI_ALLOC: &str = "pentect_alloc";
 const WASM_ABI_HANDLE: &str = "pentect_handle";
 const WASM_ABI_MEMORY: &str = "memory";
 const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
-const WASM_FUEL_PER_MILLISECOND: u64 = 100_000;
+// Fuel is a short scheduling quantum. The wall clock below is authoritative.
+const WASM_FUEL_SLICE: u64 = 100_000;
 
 #[derive(Clone, Debug)]
 struct WasmProgram {
@@ -717,12 +718,8 @@ impl WasmProgram {
             .build();
         let mut store = wasmi::Store::new(&self.engine, limits);
         store.limiter(|limits| limits);
-        let fuel = u64::try_from(timeout.as_millis())
-            .unwrap_or(u64::MAX)
-            .saturating_mul(WASM_FUEL_PER_MILLISECOND)
-            .max(WASM_FUEL_PER_MILLISECOND);
         store
-            .set_fuel(fuel)
+            .set_fuel(WASM_FUEL_SLICE)
             .map_err(|error| format!("plugin '{name}' fuel setup failed: {error}"))?;
         let linker = wasmi::Linker::new(&self.engine);
         let instance = linker
@@ -749,10 +746,35 @@ impl WasmProgram {
         memory
             .write(&mut store, request_offset, request)
             .map_err(|error| format!("plugin '{name}' request write failed: {error}"))?;
-        let packed = handle
-            .call(&mut store, (request_ptr, request_len))
-            .map_err(|error| format!("plugin '{name}' execution failed: {error}"))?
-            as u64;
+        store
+            .set_fuel(WASM_FUEL_SLICE)
+            .map_err(|error| format!("plugin '{name}' fuel setup failed: {error}"))?;
+        let started = Instant::now();
+        let mut call = handle
+            .call_resumable(&mut store, (request_ptr, request_len))
+            .map_err(|error| format!("plugin '{name}' execution failed: {error}"))?;
+        let packed = loop {
+            match call {
+                wasmi::TypedResumableCall::Finished(value) => break value as u64,
+                wasmi::TypedResumableCall::HostTrap(trap) => {
+                    return Err(format!(
+                        "plugin '{name}' host call failed: {}",
+                        trap.host_error()
+                    ));
+                }
+                wasmi::TypedResumableCall::OutOfFuel(pending) => {
+                    if started.elapsed() >= timeout {
+                        return Err(format!("plugin '{name}' timed out"));
+                    }
+                    store
+                        .set_fuel(WASM_FUEL_SLICE.max(pending.required_fuel()))
+                        .map_err(|error| format!("plugin '{name}' fuel resume failed: {error}"))?;
+                    call = pending
+                        .resume(&mut store)
+                        .map_err(|error| format!("plugin '{name}' execution failed: {error}"))?;
+                }
+            }
+        };
         let output_ptr = usize::try_from(packed >> 32)
             .map_err(|_| format!("plugin '{name}' returned an invalid output pointer"))?;
         let output_len = usize::try_from(packed & u64::from(u32::MAX))
@@ -1560,6 +1582,33 @@ mod tests {
             .unwrap();
         let _ = std::fs::remove_file(path);
         assert_eq!(result, output);
+    }
+
+    #[test]
+    fn wasm_plugin_enforces_wall_clock_timeout() {
+        let bytes = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "pentect_alloc") (param i32) (result i32)
+                    (i32.const 1024))
+                (func (export "pentect_handle") (param i32 i32) (result i64)
+                    (loop (br 0))
+                    (i64.const 0))
+            )"#,
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "pentect-plugin-wasm-timeout-{}-{}.wasm",
+            std::process::id(),
+            REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let program = WasmProgram::load(&path, "fixture").unwrap();
+        let error = program
+            .invoke(b"{}", Duration::from_millis(1), 4096, "fixture")
+            .unwrap_err();
+        let _ = std::fs::remove_file(path);
+        assert!(error.contains("timed out"), "{error}");
     }
 
     #[cfg(windows)]

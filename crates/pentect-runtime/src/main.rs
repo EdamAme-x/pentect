@@ -17,8 +17,8 @@ mod memory_store;
 mod output_remask;
 mod plugin_middleware;
 pub use plugin_middleware::{
-    plugin_runtime_dirs, MiddlewareCoverage, MiddlewareRun, MiddlewareStage, PluginMiddleware,
-    PluginRuntimeDirs, StopOutcome,
+    plugin_runtime_dirs, valid_plugin_publisher_workflow, MiddlewareCoverage, MiddlewareRun,
+    MiddlewareStage, PluginMiddleware, PluginRuntimeDirs, StopOutcome,
 };
 mod session;
 mod shell;
