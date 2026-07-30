@@ -186,8 +186,9 @@ impl Response {
 
 /// Export Pentect's sandboxed WebAssembly ABI for a typed handler.
 ///
-/// The resulting module imports nothing from the host. Build the plugin as a
-/// `cdylib` for `wasm32-unknown-unknown` and use `execution.runtime = "wasm"`.
+/// The macro itself adds no host imports. Calling [`config`] or
+/// [`http_request`] adds only that narrow Pentect host import. Build the plugin
+/// as a `cdylib` for `wasm32-unknown-unknown`.
 #[macro_export]
 macro_rules! export_wasm_plugin {
     ($handler:path) => {
