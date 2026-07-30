@@ -86,6 +86,20 @@ pentect plugins config PATH key='"value"'
 pentect plugins update PATH
 ```
 
+`setup` installs and approves executable parts; it does not silently enable a
+plugin for every command. Activate it explicitly for one agent run:
+
+```text
+pentect claude --plugins PATH
+pentect codex --plugins PATH
+```
+
+To keep an ordered project-wide list, add it to `.pentect/config.toml`:
+
+```toml
+plugins = ["./plugins/company-policy", "company-identifiers"]
+```
+
 Release binaries are selected by OS and architecture. Unsupported platforms
 produce an explicit missing-asset error rather than compiling on the user's
 machine. Postscripts are separately declared and approved. `plugins update`
