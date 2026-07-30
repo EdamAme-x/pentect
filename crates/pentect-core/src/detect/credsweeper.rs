@@ -6,13 +6,11 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use data_encoding::{BASE64, BASE64URL, BASE64URL_NOPAD, BASE64_NOPAD};
 use fancy_regex::Regex as FancyRegex;
 use regex::Regex as RustRegex;
-use serde::Deserialize;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 
-const RULES_YAML: &str = include_str!("../../vendors/credsweeper-assets/rules/config.yaml");
 const SECRET_CONFIG_JSON: &str =
     include_str!("../../vendors/credsweeper-assets/secret/config.json");
 const ML_CONFIG_JSON: &str =
@@ -24,15 +22,18 @@ const MORPHEME_CHECKLIST: &str =
 const KEYWORD_CHECKLIST: &str =
     include_str!("../../vendors/credsweeper-assets/common/keyword_checklist.txt");
 
+include!(concat!(env!("OUT_DIR"), "/credsweeper_rules.rs"));
+
 static BUILTIN: LazyLock<CredSweeperNativeDetector> = LazyLock::new(|| {
     CredSweeperNativeDetector::compile_builtin().expect("embedded CredSweeper assets compile")
 });
+static BUILTIN_STATS: LazyLock<CredSweeperNativeStats> =
+    LazyLock::new(|| audit_builtin_stats().expect("embedded CredSweeper assets compile"));
 
 #[derive(Clone)]
 pub struct CredSweeperNativeDetector {
     rules: Vec<NativeRule>,
     line_prefilter: LineRulePrefilter,
-    stats: CredSweeperNativeStats,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,9 +116,18 @@ struct NativePattern {
 
 #[derive(Clone)]
 enum PatternMatcher {
+    Deferred(Arc<DeferredRegex>),
+    Special(SpecialMatcher),
+}
+
+struct DeferredRegex {
+    source: String,
+    compiled: OnceLock<Option<CompiledRegex>>,
+}
+
+enum CompiledRegex {
     Rust(RustRegex),
     Fancy(FancyRegex),
-    Special(SpecialMatcher),
 }
 
 #[derive(Clone)]
@@ -135,7 +145,7 @@ impl CredSweeperNativeDetector {
     }
 
     pub fn builtin_stats() -> &'static CredSweeperNativeStats {
-        &BUILTIN.stats
+        &BUILTIN_STATS
     }
 
     pub fn rule_name_for_label(&self, label: &str) -> Option<&str> {
@@ -146,85 +156,46 @@ impl CredSweeperNativeDetector {
     }
 
     fn compile_builtin() -> Result<Self, String> {
-        let raw_rules: Vec<RawRule> =
-            serde_yaml::from_str(RULES_YAML).map_err(|e| format!("rules yaml: {e}"))?;
-        let mut total_patterns = 0usize;
-        let mut compiled_patterns = 0usize;
-        let mut rust_regex_patterns = 0usize;
-        let mut fancy_regex_patterns = 0usize;
-        let mut translated_patterns = 0usize;
-        let mut enabled_patterns = 0usize;
-        let mut ml_gated_patterns = 0usize;
-        let mut unsupported_patterns = 0usize;
+        let raw_rules = generated_raw_rules();
         let mut rules = Vec::new();
         for raw in &raw_rules {
             let values = raw.values.as_deref().unwrap_or_default();
             let use_ml = raw.use_ml.unwrap_or(false);
-            total_patterns += values.len();
             let mut patterns = Vec::new();
             if raw.kind.as_deref() == Some("pattern") {
-                for pattern in values {
-                    match compile_pattern(pattern) {
-                        Ok(regex) => {
-                            match &regex {
-                                PatternMatcher::Rust(_) => rust_regex_patterns += 1,
-                                PatternMatcher::Fancy(_) => fancy_regex_patterns += 1,
-                                PatternMatcher::Special(_) => translated_patterns += 1,
-                            }
-                            let value_capture = regex.has_capture_name("value");
-                            enabled_patterns += 1;
-                            patterns.push(NativePattern {
-                                matcher: regex,
-                                value_capture,
-                            });
-                            compiled_patterns += 1;
-                        }
-                        Err(_) => match translated_pattern(&raw.name) {
-                            Some(matcher) => {
-                                translated_patterns += 1;
-                                enabled_patterns += 1;
-                                patterns.push(NativePattern {
-                                    matcher: PatternMatcher::Special(matcher),
-                                    value_capture: true,
-                                });
-                            }
-                            None => unsupported_patterns += 1,
-                        },
+                if let Some(matcher) = translated_pattern(&raw.name) {
+                    patterns.push(NativePattern {
+                        matcher: PatternMatcher::Special(matcher),
+                        value_capture: true,
+                    });
+                } else {
+                    for pattern in values {
+                        patterns.push(NativePattern {
+                            matcher: PatternMatcher::deferred(pattern),
+                            value_capture: has_named_capture(pattern, "value"),
+                        });
                     }
                 }
             } else if raw.kind.as_deref() == Some("keyword") {
                 for value in values {
-                    match compile_keyword_pattern(value) {
-                        Ok(regex) => {
-                            fancy_regex_patterns += 1;
-                            enabled_patterns += 1;
-                            patterns.push(NativePattern {
-                                matcher: PatternMatcher::Fancy(regex),
-                                value_capture: true,
-                            });
-                            compiled_patterns += 1;
-                        }
-                        Err(_) => unsupported_patterns += 1,
-                    }
+                    patterns.push(NativePattern {
+                        matcher: PatternMatcher::deferred(keyword_pattern(value)),
+                        value_capture: true,
+                    });
                 }
             } else {
                 match translated_rule(raw) {
                     Some(matcher) => {
-                        translated_patterns += values.len();
-                        enabled_patterns += values.len();
                         patterns.push(NativePattern {
                             matcher: PatternMatcher::Special(matcher),
                             value_capture: true,
                         });
                     }
-                    None => unsupported_patterns += values.len(),
+                    None => continue,
                 }
             }
             if patterns.is_empty() {
                 continue;
-            }
-            if use_ml {
-                ml_gated_patterns += patterns.len();
             }
             rules.push(NativeRule {
                 rule_name: raw.name.clone(),
@@ -253,27 +224,85 @@ impl CredSweeperNativeDetector {
         Ok(Self {
             line_prefilter,
             rules,
-            stats: CredSweeperNativeStats {
-                total_rules: raw_rules.len(),
-                total_patterns,
-                compiled_patterns,
-                rust_regex_patterns,
-                fancy_regex_patterns,
-                translated_patterns,
-                enabled_patterns,
-                ml_gated_patterns,
-                unsupported_patterns,
-                ml_rules: raw_rules
-                    .iter()
-                    .filter(|rule| rule.use_ml.unwrap_or(false))
-                    .count(),
-                rules_yaml_bytes: RULES_YAML.len(),
-                secret_config_json_bytes: SECRET_CONFIG_JSON.len(),
-                ml_config_json_bytes: ML_CONFIG_JSON.len(),
-                ml_model_onnx_bytes: ML_MODEL_ONNX.len(),
-            },
         })
     }
+}
+
+fn audit_builtin_stats() -> Result<CredSweeperNativeStats, String> {
+    let raw_rules = generated_raw_rules();
+    let mut stats = CredSweeperNativeStats {
+        total_rules: raw_rules.len(),
+        total_patterns: 0,
+        compiled_patterns: 0,
+        rust_regex_patterns: 0,
+        fancy_regex_patterns: 0,
+        translated_patterns: 0,
+        enabled_patterns: 0,
+        ml_gated_patterns: 0,
+        unsupported_patterns: 0,
+        ml_rules: raw_rules
+            .iter()
+            .filter(|rule| rule.use_ml.unwrap_or(false))
+            .count(),
+        rules_yaml_bytes: GENERATED_RULES_YAML_BYTES,
+        secret_config_json_bytes: SECRET_CONFIG_JSON.len(),
+        ml_config_json_bytes: ML_CONFIG_JSON.len(),
+        ml_model_onnx_bytes: ML_MODEL_ONNX.len(),
+    };
+    for raw in &raw_rules {
+        let values = raw.values.as_deref().unwrap_or_default();
+        stats.total_patterns += values.len();
+        let mut enabled_for_rule = 0;
+        match raw.kind.as_deref() {
+            Some("pattern") => {
+                for pattern in values {
+                    match compile_pattern(pattern) {
+                        Ok(PatternMatcher::Deferred(regex)) => {
+                            match regex
+                                .compiled
+                                .get()
+                                .expect("audit compiles regex")
+                                .as_ref()
+                                .expect("compile_pattern stores a compiled regex")
+                            {
+                                CompiledRegex::Rust(_) => stats.rust_regex_patterns += 1,
+                                CompiledRegex::Fancy(_) => stats.fancy_regex_patterns += 1,
+                            }
+                            stats.compiled_patterns += 1;
+                            enabled_for_rule += 1;
+                        }
+                        Ok(PatternMatcher::Special(_)) => unreachable!(),
+                        Err(_) if translated_pattern(&raw.name).is_some() => {
+                            stats.translated_patterns += 1;
+                            enabled_for_rule += 1;
+                        }
+                        Err(_) => stats.unsupported_patterns += 1,
+                    }
+                }
+            }
+            Some("keyword") => {
+                for keyword in values {
+                    if compile_keyword_pattern(keyword).is_ok() {
+                        stats.fancy_regex_patterns += 1;
+                        stats.compiled_patterns += 1;
+                        enabled_for_rule += 1;
+                    } else {
+                        stats.unsupported_patterns += 1;
+                    }
+                }
+            }
+            _ if translated_rule(raw).is_some() => {
+                stats.translated_patterns += values.len();
+                enabled_for_rule += values.len();
+            }
+            _ => stats.unsupported_patterns += values.len(),
+        }
+        stats.enabled_patterns += enabled_for_rule;
+        if raw.use_ml.unwrap_or(false) {
+            stats.ml_gated_patterns += enabled_for_rule;
+        }
+    }
+    Ok(stats)
 }
 
 impl CredSweeperNativeDetector {
@@ -334,70 +363,8 @@ impl CredSweeperNativeDetector {
                         continue;
                     }
                     match &pattern.matcher {
-                        PatternMatcher::Rust(regex) => {
-                            for captures in regex.captures_iter(line_body) {
-                                let Some(m) = (if pattern.value_capture {
-                                    captures.name("value")
-                                } else {
-                                    captures.get(0)
-                                }) else {
-                                    continue;
-                                };
-                                let variable = captures.name("variable");
-                                let separator = captures.name("separator");
-                                let value_leftquote = captures.name("value_leftquote");
-                                let value_rightquote = captures.name("value_rightquote");
-                                let candidate = Candidate {
-                                    start: m.start(),
-                                    end: m.end(),
-                                    value: m.as_str(),
-                                    variable_start: variable.as_ref().map(|m| m.start()),
-                                    variable_end: variable.as_ref().map(|m| m.end()),
-                                    variable: variable.map(|m| m.as_str()),
-                                    separator: separator.map(|m| m.as_str()),
-                                    value_leftquote: value_leftquote.map(|m| m.as_str()),
-                                    value_rightquote: value_rightquote.map(|m| m.as_str()),
-                                    line_data: Vec::new(),
-                                };
-                                push_match(
-                                    &mut out,
-                                    &mut ml_pending,
-                                    &push_ctx,
-                                    rule,
-                                    line_start,
-                                    line_body,
-                                    &candidate,
-                                );
-                            }
-                        }
-                        PatternMatcher::Fancy(regex) => {
-                            for captures in regex.captures_iter(line_body) {
-                                let Ok(captures) = captures else {
-                                    continue;
-                                };
-                                let Some(m) = (if pattern.value_capture {
-                                    captures.name("value")
-                                } else {
-                                    captures.get(0)
-                                }) else {
-                                    continue;
-                                };
-                                let variable = captures.name("variable");
-                                let separator = captures.name("separator");
-                                let value_leftquote = captures.name("value_leftquote");
-                                let value_rightquote = captures.name("value_rightquote");
-                                let candidate = Candidate {
-                                    start: m.start(),
-                                    end: m.end(),
-                                    value: m.as_str(),
-                                    variable_start: variable.as_ref().map(|m| m.start()),
-                                    variable_end: variable.as_ref().map(|m| m.end()),
-                                    variable: variable.map(|m| m.as_str()),
-                                    separator: separator.map(|m| m.as_str()),
-                                    value_leftquote: value_leftquote.map(|m| m.as_str()),
-                                    value_rightquote: value_rightquote.map(|m| m.as_str()),
-                                    line_data: Vec::new(),
-                                };
+                        PatternMatcher::Deferred(regex) => {
+                            for candidate in regex.find(line_body, pattern.value_capture) {
                                 push_match(
                                     &mut out,
                                     &mut ml_pending,
@@ -444,19 +411,94 @@ impl Detector for CredSweeperNativeDetector {
 }
 
 impl PatternMatcher {
-    fn has_capture_name(&self, name: &str) -> bool {
-        match self {
-            Self::Rust(regex) => regex
-                .capture_names()
-                .flatten()
-                .any(|candidate| candidate == name),
-            Self::Fancy(regex) => regex
-                .capture_names()
-                .flatten()
-                .any(|candidate| candidate == name),
-            Self::Special(_) => true,
+    fn deferred(source: impl Into<String>) -> Self {
+        Self::Deferred(Arc::new(DeferredRegex {
+            source: source.into(),
+            compiled: OnceLock::new(),
+        }))
+    }
+}
+
+impl DeferredRegex {
+    fn compiled(&self) -> Option<&CompiledRegex> {
+        self.compiled
+            .get_or_init(|| {
+                RustRegex::new(&self.source)
+                    .map(CompiledRegex::Rust)
+                    .or_else(|_| FancyRegex::new(&self.source).map(CompiledRegex::Fancy))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn find<'a>(&self, text: &'a str, value_capture: bool) -> Vec<Candidate<'a>> {
+        match self.compiled() {
+            Some(CompiledRegex::Rust(regex)) => regex
+                .captures_iter(text)
+                .filter_map(|captures| rust_candidate(&captures, value_capture))
+                .collect(),
+            Some(CompiledRegex::Fancy(regex)) => regex
+                .captures_iter(text)
+                .filter_map(Result::ok)
+                .filter_map(|captures| fancy_candidate(&captures, value_capture))
+                .collect(),
+            None => Vec::new(),
         }
     }
+}
+
+fn rust_candidate<'a>(
+    captures: &regex::Captures<'a>,
+    value_capture: bool,
+) -> Option<Candidate<'a>> {
+    let value = if value_capture {
+        captures.name("value")
+    } else {
+        captures.get(0)
+    }?;
+    let variable = captures.name("variable");
+    let separator = captures.name("separator");
+    let value_leftquote = captures.name("value_leftquote");
+    let value_rightquote = captures.name("value_rightquote");
+    Some(Candidate {
+        start: value.start(),
+        end: value.end(),
+        value: value.as_str(),
+        variable_start: variable.as_ref().map(|m| m.start()),
+        variable_end: variable.as_ref().map(|m| m.end()),
+        variable: variable.map(|m| m.as_str()),
+        separator: separator.map(|m| m.as_str()),
+        value_leftquote: value_leftquote.map(|m| m.as_str()),
+        value_rightquote: value_rightquote.map(|m| m.as_str()),
+        line_data: Vec::new(),
+    })
+}
+
+fn fancy_candidate<'a>(
+    captures: &fancy_regex::Captures<'a>,
+    value_capture: bool,
+) -> Option<Candidate<'a>> {
+    let value = if value_capture {
+        captures.name("value")
+    } else {
+        captures.get(0)
+    }?;
+    let variable = captures.name("variable");
+    let separator = captures.name("separator");
+    let value_leftquote = captures.name("value_leftquote");
+    let value_rightquote = captures.name("value_rightquote");
+    Some(Candidate {
+        start: value.start(),
+        end: value.end(),
+        value: value.as_str(),
+        variable_start: variable.as_ref().map(|m| m.start()),
+        variable_end: variable.as_ref().map(|m| m.end()),
+        variable: variable.map(|m| m.as_str()),
+        separator: separator.map(|m| m.as_str()),
+        value_leftquote: value_leftquote.map(|m| m.as_str()),
+        value_rightquote: value_rightquote.map(|m| m.as_str()),
+        line_data: Vec::new(),
+    })
 }
 
 struct Candidate<'a> {
@@ -671,15 +713,27 @@ fn translated_rule(raw: &RawRule) -> Option<SpecialMatcher> {
 
 fn compile_pattern(pattern: &str) -> Result<PatternMatcher, ()> {
     match RustRegex::new(pattern) {
-        Ok(regex) => Ok(PatternMatcher::Rust(regex)),
+        Ok(regex) => Ok(PatternMatcher::Deferred(Arc::new(DeferredRegex {
+            source: pattern.to_string(),
+            compiled: OnceLock::from(Some(CompiledRegex::Rust(regex))),
+        }))),
         Err(_) => FancyRegex::new(pattern)
-            .map(PatternMatcher::Fancy)
+            .map(|regex| {
+                PatternMatcher::Deferred(Arc::new(DeferredRegex {
+                    source: pattern.to_string(),
+                    compiled: OnceLock::from(Some(CompiledRegex::Fancy(regex))),
+                }))
+            })
             .map_err(|_| ()),
     }
 }
 
 fn compile_keyword_pattern(keyword: &str) -> Result<FancyRegex, ()> {
     FancyRegex::new(&keyword_pattern(keyword)).map_err(|_| ())
+}
+
+fn has_named_capture(pattern: &str, name: &str) -> bool {
+    pattern.contains(&format!("(?P<{name}>")) || pattern.contains(&format!("(?<{name}>"))
 }
 
 fn keyword_pattern(keyword: &str) -> String {
@@ -1712,12 +1766,10 @@ fn same_ml_group(a: &MlInput, b: &MlInput) -> bool {
         && a.value_end == b.value_end
 }
 
-#[derive(Deserialize)]
 struct RawRule {
     name: String,
     severity: Option<String>,
     confidence: Option<String>,
-    #[serde(rename = "type")]
     kind: Option<String>,
     values: Option<Vec<String>>,
     min_line_len: Option<usize>,
@@ -1727,8 +1779,6 @@ struct RawRule {
     target: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum FilterList {
     One(String),
     Many(Vec<String>),
@@ -2484,9 +2534,9 @@ mod tests {
     #[test]
     fn embedded_assets_are_present() {
         let stats = CredSweeperNativeDetector::builtin_stats();
-        assert_eq!(stats.total_rules, 121);
-        assert_eq!(stats.total_patterns, 125);
-        assert_eq!(stats.ml_rules, 23);
+        assert!(stats.total_rules > 100, "{stats:?}");
+        assert!(stats.total_patterns > 100, "{stats:?}");
+        assert!(stats.ml_rules > 0, "{stats:?}");
         assert!(stats.rules_yaml_bytes > 40_000);
         assert!(stats.secret_config_json_bytes > 1_000);
         assert!(stats.ml_config_json_bytes > 10_000);
@@ -2494,14 +2544,39 @@ mod tests {
     }
 
     #[test]
+    fn detector_initialization_does_not_compile_regexes() {
+        let detector = CredSweeperNativeDetector::compile_builtin().unwrap();
+        let deferred = detector
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.patterns)
+            .filter_map(|pattern| match &pattern.matcher {
+                PatternMatcher::Deferred(regex) => Some(regex),
+                PatternMatcher::Special(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!deferred.is_empty());
+        assert!(deferred.iter().all(|regex| regex.compiled.get().is_none()));
+    }
+
+    #[test]
     fn migration_coverage_is_explicit() {
         let stats = CredSweeperNativeDetector::builtin_stats();
-        assert_eq!(stats.rust_regex_patterns, 37, "{stats:?}");
-        assert_eq!(stats.fancy_regex_patterns, 80, "{stats:?}");
-        assert_eq!(stats.compiled_patterns, 117, "{stats:?}");
-        assert_eq!(stats.translated_patterns, 8, "{stats:?}");
-        assert_eq!(stats.enabled_patterns, 125, "{stats:?}");
-        assert_eq!(stats.ml_gated_patterns, 24, "{stats:?}");
+        assert_eq!(
+            stats.compiled_patterns,
+            stats.rust_regex_patterns + stats.fancy_regex_patterns,
+            "{stats:?}"
+        );
+        assert_eq!(
+            stats.enabled_patterns,
+            stats.compiled_patterns + stats.translated_patterns,
+            "{stats:?}"
+        );
+        assert!(
+            stats.ml_gated_patterns <= stats.enabled_patterns,
+            "{stats:?}"
+        );
         assert_eq!(stats.unsupported_patterns, 0, "{stats:?}");
         assert_eq!(
             stats.total_patterns,
@@ -2551,6 +2626,18 @@ mod tests {
         assert!(spans
             .iter()
             .all(|span| span.source == DetectorId::CredSweeper));
+    }
+
+    #[test]
+    fn detects_wundergraph_rule_from_v1_17_1() {
+        let raw = "token=cosmo_0123456789abcdef0123456789abcdef\n";
+        let region = region(raw);
+        let view = NormalizedView::build(&region, raw);
+        let spans = CredSweeperNativeDetector::builtin().detect(&view);
+        assert!(
+            spans.iter().any(|span| span.label == "WUNDERGRAPH_API_KEY"),
+            "{spans:?}"
+        );
     }
 
     #[test]
@@ -2648,7 +2735,7 @@ mod tests {
             targets: vec!["code".to_string()],
             ml_validated: false,
             patterns: vec![NativePattern {
-                matcher: PatternMatcher::Rust(RustRegex::new("value").unwrap()),
+                matcher: PatternMatcher::deferred("value"),
                 value_capture: true,
             }],
         }

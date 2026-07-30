@@ -3,6 +3,22 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Pre-keyed HMAC template. Rendering clones the initialized SHA-256 state for
+/// each distinct value, avoiding key setup in the per-placeholder hot path.
+pub(crate) struct IdentityHasher(HmacSha256);
+
+impl IdentityHasher {
+    pub(crate) fn new(key: &[u8; 32]) -> Self {
+        Self(HmacSha256::new_from_slice(key).expect("HMAC accepts any key length"))
+    }
+
+    pub(crate) fn hash(&self, n_id_value: &str) -> String {
+        let mut mac = self.0.clone();
+        mac.update(n_id_value.as_bytes());
+        encode_hash(mac.finalize().into_bytes().as_slice())
+    }
+}
+
 /// Hash width in hex chars. Fixed (not collision-adaptive) so it stays a pure
 /// function of (key, value), independent of scan order.
 pub const HASH_HEX_WIDTH: usize = 16;
@@ -41,9 +57,10 @@ impl LengthHint {
 /// Keyed so the cloud side cannot dictionary-attack low-entropy values such as
 /// emails, names, or "admin"; an unkeyed digest would be a reversible commitment.
 pub fn identity_hash(key: &[u8; 32], n_id_value: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(n_id_value.as_bytes());
-    let out = mac.finalize().into_bytes();
+    IdentityHasher::new(key).hash(n_id_value)
+}
+
+fn encode_hash(out: &[u8]) -> String {
     let mut s = String::with_capacity(HASH_HEX_WIDTH);
     for b in out.iter().take(HASH_HEX_WIDTH / 2) {
         const HEX: &[u8; 16] = b"0123456789abcdef";

@@ -68,7 +68,7 @@ fn concurrent_up_keeps_one_persistent_host() {
 }
 
 #[test]
-fn codex_dry_run_uses_project_environment_prefix() {
+fn codex_dry_run_routes_through_the_http_gateway() {
     let root = test_root();
     let config_dir = root.join(".pentect");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -100,8 +100,9 @@ fn codex_dry_run_uses_project_environment_prefix() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(rendered.contains("$env:SAFE_KEY_hash"), "{rendered}");
-    assert!(rendered.contains("$SAFE_KEY_hash"), "{rendered}");
+    assert!(rendered.contains("openai_base_url="), "{rendered}");
+    assert!(rendered.contains("<pentect-gateway>"), "{rendered}");
+    assert!(!rendered.contains("SAFE_KEY_hash"), "{rendered}");
     assert!(!rendered.contains("PENTECT_KEY_hash"), "{rendered}");
 }
 
@@ -153,7 +154,7 @@ fn spawn_command(root: &Path, args: &[&str]) -> std::process::Child {
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::inherit());
     for name in PRIVATE_ENV {
         command.env_remove(name);
     }
@@ -263,10 +264,27 @@ struct Cleanup {
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        for pid in self.command_pids.drain(..) {
-            stop_process(pid);
-        }
+        let runtime = host_root(&self.root).join("runtime");
+        let mut pids = self.command_pids.drain(..).collect::<Vec<_>>();
         if let Some(pid) = self.host_pid {
+            pids.push(pid);
+        }
+        for name in [
+            "delegated-process-host.json",
+            "process-host-persistent.json",
+        ] {
+            if let Some(endpoint) = std::fs::read(runtime.join(name))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            {
+                if let Some(pid) = endpoint["pid"].as_u64() {
+                    pids.push(pid as u32);
+                }
+            }
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        for pid in pids {
             stop_process(pid);
         }
         let _ = std::fs::remove_dir_all(&self.root);

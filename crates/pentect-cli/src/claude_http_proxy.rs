@@ -1,0 +1,2164 @@
+//! Anthropic Messages gateway used by the unmodified Claude Code host.
+//!
+//! Security boundary:
+//! - outbound model-visible text and client tool results are masked;
+//! - inbound assistant text stays masked;
+//! - only completed client `tool_use.input` values are resolved;
+//! - unknown events and incomplete/invalid tool JSON remain unresolved.
+//!
+//! The local host and its tools are trusted to handle plaintext. The remote
+//! model provider is not. This intentionally replaces Claude hook overrides;
+//! it does not attempt to redact Claude Code's local UI or local logs.
+
+use futures_util::{stream, Stream, StreamExt};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use hyper::body::{Bytes, Frame, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::Infallible;
+use std::error::Error;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex as StdMutex};
+use std::thread;
+use tokio::net::TcpListener;
+use tokio::sync::{oneshot, Semaphore};
+use zeroize::Zeroize;
+
+const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PENDING_SSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_INLINE_PDF_BYTES: usize = 8 * 1024 * 1024;
+const MAX_EXTRACTED_PDF_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local capability handles. When a client tool needs the represented value, copy the handle byte-for-byte into the tool input. Do not alter, expand, guess, or expose the represented value. Handles are resolved only for client tool calls.";
+static WARNED_UNKNOWN_CONTENT_BLOCK: AtomicBool = AtomicBool::new(false);
+static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
+static WARNED_PROVIDER_MCP_CREDENTIALS: AtomicBool = AtomicBool::new(false);
+
+type ProxyBodyError = Box<dyn Error + Send + Sync>;
+type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnthropicEndpoint {
+    Messages,
+    Files,
+    Models,
+    Unknown,
+}
+
+pub(crate) struct ClaudeHttpProxyGuard {
+    base_url: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ClaudeHttpProxyGuard {
+    pub(crate) fn start(upstream: String) -> Result<Self, String> {
+        let upstream = parse_upstream_base(&upstream)?;
+        let auth = random_auth_token()?;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let thread_auth = auth.clone();
+        let thread = thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "could not start Claude HTTP proxy runtime: {error}"
+                    )));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                if let Err(error) = run_proxy(upstream, thread_auth, ready_tx, shutdown_rx).await {
+                    eprintln!("[pentect] Claude HTTP proxy stopped: {error}");
+                }
+            });
+        });
+        let base_url = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "Claude HTTP proxy did not start within 5 seconds".to_string())??;
+        Ok(Self {
+            base_url,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+impl Drop for ClaudeHttpProxyGuard {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.base_url.zeroize();
+    }
+}
+
+struct ProxyState {
+    upstream: reqwest::Url,
+    auth: String,
+    client: reqwest::Client,
+    masker: Arc<StdMutex<pentect_agent::ActiveToolOutputMasker>>,
+    files: StdMutex<HashMap<String, crate::http_files::Coverage>>,
+    requests: Arc<Semaphore>,
+}
+
+impl Drop for ProxyState {
+    fn drop(&mut self) {
+        self.auth.zeroize();
+    }
+}
+
+async fn run_proxy(
+    upstream: reqwest::Url,
+    auth: String,
+    ready_tx: mpsc::Sender<Result<String, String>>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> Result<(), String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("could not bind Claude HTTP proxy: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("could not read Claude HTTP proxy address: {error}"))?;
+    let local_base_url = format!("http://{address}/{auth}");
+    let client = build_upstream_client()?;
+    let state = Arc::new(ProxyState {
+        upstream,
+        auth,
+        client,
+        masker: Arc::new(StdMutex::new(pentect_agent::ActiveToolOutputMasker::new()?)),
+        files: StdMutex::new(HashMap::new()),
+        requests: Arc::new(Semaphore::new(32)),
+    });
+    // Keep authentication in the base URL path. Claude settings can replace
+    // ANTHROPIC_CUSTOM_HEADERS after process start, so a header token is not
+    // a reliable local boundary. The random path is stripped before upstream
+    // forwarding and is never sent to the provider.
+    let _ = ready_tx.send(Ok(local_base_url));
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted
+                    .map_err(|error| format!("Claude HTTP proxy accept failed: {error}"))?;
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let service = service_fn(move |request| proxy_request(request, Arc::clone(&state)));
+                    let mut builder = http1::Builder::new();
+                    builder.max_buf_size(64 * 1024).max_headers(128);
+                    if let Err(error) = builder.serve_connection(io, service).await {
+                        eprintln!("[pentect] Claude HTTP proxy connection failed: {error}");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_upstream_client() -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .tcp_nodelay(true);
+    if let Some(path) = std::env::var_os("PENTECT_ANTHROPIC_CA_CERT") {
+        let pem = std::fs::read(&path)
+            .map_err(|_| "could not read PENTECT_ANTHROPIC_CA_CERT".to_string())?;
+        let certificate = reqwest::Certificate::from_pem(&pem)
+            .map_err(|_| "PENTECT_ANTHROPIC_CA_CERT is not a valid PEM certificate".to_string())?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .map_err(|_| "could not build Claude HTTP proxy client".to_string())
+}
+
+async fn proxy_request(
+    request: Request<Incoming>,
+    state: Arc<ProxyState>,
+) -> Result<Response<ProxyBody>, Infallible> {
+    let Ok(_permit) = Arc::clone(&state.requests).try_acquire_owned() else {
+        return Ok(text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Pentect proxy is busy",
+        ));
+    };
+    match proxy_request_inner(request, &state).await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            eprintln!("[pentect] Claude HTTP proxy request failed: {error}");
+            let local_rejection = error.starts_with("image blocked:")
+                || error.starts_with("document blocked:")
+                || error.starts_with("remote ")
+                || error.starts_with("file upload blocked:")
+                || error.starts_with("Files API upload ");
+            Ok(if local_rejection {
+                owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
+            } else {
+                text_response(StatusCode::BAD_GATEWAY, "Pentect proxy request failed")
+            })
+        }
+    }
+}
+
+async fn proxy_request_inner(
+    request: Request<Incoming>,
+    state: &ProxyState,
+) -> Result<Response<ProxyBody>, String> {
+    let request_path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    let Some(path_and_query) = authenticated_request_path(request_path_and_query, &state.auth)
+    else {
+        return Ok(text_response(StatusCode::FORBIDDEN, "Forbidden"));
+    };
+
+    let endpoint = classify_anthropic_endpoint(path_and_query);
+    if endpoint == AnthropicEndpoint::Unknown
+        && !WARNED_UNKNOWN_ENDPOINT.swap(true, Ordering::Relaxed)
+    {
+        eprintln!("[pentect] unknown Anthropic endpoint passed through without content inspection");
+    }
+    let method = request.method().clone();
+    let path_and_query = path_and_query.to_string();
+    let upstream_url = join_upstream_url(&state.upstream, &path_and_query)?;
+    let headers = request.headers().clone();
+    let messages_path = endpoint == AnthropicEndpoint::Messages;
+    let files_upload = endpoint == AnthropicEndpoint::Files
+        && method == hyper::Method::POST
+        && path_and_query
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("/v1/files"));
+    let mut request_coverage = None;
+    let body = if messages_path || files_upload {
+        let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
+            .collect()
+            .await
+        {
+            Ok(body) => body.to_bytes(),
+            Err(error) if error.is::<http_body_util::LengthLimitError>() => {
+                return Ok(text_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Request body too large",
+                ));
+            }
+            Err(error) => return Err(format!("could not read Claude request body: {error}")),
+        };
+        if body.is_empty() {
+            reqwest::Body::from(body)
+        } else if files_upload {
+            let content_type = headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "Files API upload is missing Content-Type".to_string())?
+                .to_string();
+            let masker = Arc::clone(&state.masker);
+            let protected = tokio::task::spawn_blocking(move || {
+                let mut masker = masker
+                    .lock()
+                    .map_err(|_| "Claude request masker lock was poisoned".to_string())?;
+                crate::http_files::protect_multipart_upload(&content_type, &body, &mut masker)
+            })
+            .await
+            .map_err(|_| "Claude file protection task failed".to_string())??;
+            request_coverage = Some(protected.coverage);
+            reqwest::Body::from(protected.body)
+        } else {
+            let body = resolve_anthropic_remote_content(body).await?;
+            let masker = Arc::clone(&state.masker);
+            let files = state
+                .files
+                .lock()
+                .map_err(|_| "Claude file registry lock was poisoned".to_string())?
+                .clone();
+            let protected = tokio::task::spawn_blocking(move || {
+                protect_anthropic_request_body(&body, &masker, &files)
+            })
+            .await
+            .map_err(|_| "Claude request protection task failed".to_string())??;
+            request_coverage = Some(protected.coverage);
+            reqwest::Body::from(protected.body)
+        }
+    } else {
+        let stream = request.into_body().into_data_stream().map(|chunk| {
+            chunk.map_err(|error| io::Error::new(io::ErrorKind::ConnectionAborted, error))
+        });
+        reqwest::Body::wrap_stream(stream)
+    };
+
+    let mut upstream_request = state.client.request(method, upstream_url);
+    let connection_headers = connection_named_headers(&headers);
+    for (name, value) in &headers {
+        if ((!(messages_path || files_upload) && name == hyper::header::CONTENT_LENGTH)
+            || should_forward_request_header(name.as_str()))
+            && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
+        {
+            upstream_request = upstream_request.header(name, value);
+        }
+    }
+    let upstream_response = upstream_request
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| reqwest_error_message("could not reach Claude upstream", &error))?;
+    let status = upstream_response.status();
+    let response_headers = upstream_response.headers().clone();
+    if response_headers
+        .get(hyper::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+    {
+        return Err("Claude upstream returned an unsupported content encoding".to_string());
+    }
+    let is_event_stream = response_headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    let mut builder = Response::builder().status(status);
+    let connection_headers = connection_named_headers(&response_headers);
+    for (name, value) in &response_headers {
+        if should_forward_response_header(name.as_str())
+            && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
+        {
+            builder = builder.header(name, value);
+        }
+    }
+    builder = builder.header(
+        "x-pentect-coverage",
+        request_coverage
+            .unwrap_or(crate::http_files::Coverage::None)
+            .as_header(),
+    );
+    if is_event_stream || (!messages_path && !files_upload) {
+        let transform = status.is_success() && messages_path && is_event_stream;
+        return builder
+            .body(streaming_response_body(upstream_response, transform))
+            .map_err(|error| format!("could not build Claude streaming response: {error}"));
+    }
+
+    let Some(response_body) = read_response_capped(upstream_response).await? else {
+        return Ok(text_response(
+            StatusCode::BAD_GATEWAY,
+            "Upstream response body too large",
+        ));
+    };
+    if files_upload && status.is_success() {
+        if let (Some(coverage), Ok(value)) = (
+            request_coverage,
+            serde_json::from_slice::<Value>(&response_body),
+        ) {
+            if let Some(id) = value.get("id").and_then(Value::as_str) {
+                let mut files = state
+                    .files
+                    .lock()
+                    .map_err(|_| "Claude file registry lock was poisoned".to_string())?;
+                crate::http_files::remember_file_coverage(&mut files, id.to_string(), coverage);
+            }
+        }
+    }
+    let response_body = if status.is_success() && messages_path {
+        match rewrite_anthropic_json_response(&response_body) {
+            Ok(rewritten) => Bytes::from(rewritten),
+            Err(error) => {
+                eprintln!("[pentect] Claude response restoration skipped: {error}");
+                response_body
+            }
+        }
+    } else {
+        response_body
+    };
+    builder
+        .body(full_body(response_body))
+        .map_err(|error| format!("could not build Claude proxy response: {error}"))
+}
+
+async fn resolve_anthropic_remote_content(body: Bytes) -> Result<Bytes, String> {
+    let mut value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return Ok(body),
+    };
+    resolve_anthropic_remote_values(&mut value).await?;
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| "could not encode resolved remote attachment".to_string())
+}
+
+fn resolve_anthropic_remote_values(
+    value: &mut Value,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+    Box::pin(async move {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    resolve_anthropic_remote_values(value).await?;
+                }
+            }
+            Value::Object(object) => {
+                let block_type = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if matches!(block_type.as_deref(), Some("document" | "image")) {
+                    if let Some(source) = object.get_mut("source").and_then(Value::as_object_mut) {
+                        if source.get("type").and_then(Value::as_str) == Some("url") {
+                            if let Some(url) = source
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                            {
+                                let mut remote = crate::remote_content::fetch(&url).await?;
+                                if block_type.as_deref() == Some("document")
+                                    && crate::http_files::supported_text_file(
+                                        &remote.filename,
+                                        Some(&remote.media_type),
+                                    )
+                                {
+                                    let text =
+                                        std::str::from_utf8(&remote.bytes).map_err(|_| {
+                                            "remote text attachment is not UTF-8".to_string()
+                                        })?;
+                                    *source = serde_json::Map::from_iter([
+                                        ("type".to_string(), Value::String("text".to_string())),
+                                        ("data".to_string(), Value::String(text.to_string())),
+                                    ]);
+                                } else {
+                                    let encoded = data_encoding::BASE64.encode(&remote.bytes);
+                                    *source = serde_json::Map::from_iter([
+                                        ("type".to_string(), Value::String("base64".to_string())),
+                                        (
+                                            "media_type".to_string(),
+                                            Value::String(remote.media_type),
+                                        ),
+                                        ("data".to_string(), Value::String(encoded)),
+                                    ]);
+                                }
+                                remote.bytes.zeroize();
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                for value in object.values_mut() {
+                    resolve_anthropic_remote_values(value).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+}
+
+struct ProtectedJsonBody {
+    body: Bytes,
+    coverage: crate::http_files::Coverage,
+}
+
+fn protect_anthropic_request_body(
+    body: &Bytes,
+    masker: &StdMutex<pentect_agent::ActiveToolOutputMasker>,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<ProtectedJsonBody, String> {
+    let mut value: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[pentect] Claude request protection skipped: invalid JSON: {error}");
+            return Ok(ProtectedJsonBody {
+                body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
+            });
+        }
+    };
+    let partial_schema = anthropic_request_has_unknown_content(&value);
+    warn_provider_mcp_credentials(&value);
+    inject_handle_contract(&mut value);
+    // Image handling deliberately follows the existing image policy. With
+    // the default unscanned_images="block", an uninspectable image is an
+    // error; users can explicitly choose allow in configuration.
+    redact_anthropic_base64_images(&mut value, files)?;
+    let mut masker = masker
+        .lock()
+        .map_err(|_| "Claude request masker lock was poisoned".to_string())?;
+    if let Err(error) = mask_anthropic_request(&mut value, &mut masker, files) {
+        // Explicit media-policy decisions are not detector failures. Letting
+        // them enter the general fail-open path would send the very PDF/image
+        // that the configured policy rejected.
+        if is_media_policy_rejection(&error) {
+            return Err(error);
+        }
+        eprintln!("[pentect] Claude request protection skipped: {error}");
+        return Ok(ProtectedJsonBody {
+            body: body.clone(),
+            coverage: crate::http_files::Coverage::Partial,
+        });
+    }
+    match serde_json::to_vec(&value) {
+        Ok(protected) => Ok(ProtectedJsonBody {
+            body: Bytes::from(protected),
+            coverage: if partial_schema {
+                crate::http_files::Coverage::Partial
+            } else {
+                crate::http_files::Coverage::Full
+            },
+        }),
+        Err(error) => {
+            eprintln!("[pentect] Claude request protection skipped: encode failed: {error}");
+            Ok(ProtectedJsonBody {
+                body: body.clone(),
+                coverage: crate::http_files::Coverage::Partial,
+            })
+        }
+    }
+}
+
+fn anthropic_request_has_unknown_content(value: &Value) -> bool {
+    let mut roots = Vec::new();
+    if let Some(system) = value.get("system") {
+        roots.push(system);
+    }
+    if let Some(messages) = value.get("messages").and_then(Value::as_array) {
+        roots.extend(messages.iter().filter_map(|message| message.get("content")));
+    }
+    roots.into_iter().any(anthropic_content_has_unknown_block)
+}
+
+fn anthropic_content_has_unknown_block(value: &Value) -> bool {
+    let Some(blocks) = value.as_array() else {
+        return false;
+    };
+    blocks.iter().any(|block| {
+        let Some(kind) = block.get("type").and_then(Value::as_str) else {
+            return true;
+        };
+        let known = matches!(
+            kind,
+            "text"
+                | "tool_result"
+                | "tool_use"
+                | "document"
+                | "search_result"
+                | "image"
+                | "thinking"
+                | "redacted_thinking"
+                | "server_tool_use"
+                | "mcp_tool_use"
+                | "mcp_tool_result"
+                | "web_search_tool_result"
+                | "web_fetch_tool_result"
+                | "code_execution_tool_result"
+                | "bash_code_execution_tool_result"
+                | "text_editor_code_execution_tool_result"
+        );
+        !known
+            || (kind == "tool_result"
+                && block
+                    .get("content")
+                    .is_some_and(anthropic_content_has_unknown_block))
+    })
+}
+
+fn is_media_policy_rejection(error: &str) -> bool {
+    error.starts_with("document blocked:") || error.starts_with("image blocked:")
+}
+
+fn warn_provider_mcp_credentials(value: &Value) {
+    if value
+        .get("mcp_servers")
+        .and_then(Value::as_array)
+        .is_some_and(|servers| {
+            servers.iter().any(|server| {
+                server
+                    .get("authorization_token")
+                    .and_then(Value::as_str)
+                    .is_some_and(|token| !token.is_empty())
+            })
+        })
+        && !WARNED_PROVIDER_MCP_CREDENTIALS.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "[pentect] provider-side MCP authorization token is sent to the configured upstream"
+        );
+    }
+}
+
+fn inject_handle_contract(value: &mut Value) {
+    let contract = serde_json::json!({
+        "type": "text",
+        "text": HANDLE_CONTRACT,
+    });
+    match value.get_mut("system") {
+        Some(Value::Array(blocks)) => {
+            let already_present = blocks.iter().any(|block| {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block.get("text").and_then(Value::as_str) == Some(HANDLE_CONTRACT)
+            });
+            if !already_present {
+                blocks.insert(0, contract);
+            }
+        }
+        Some(Value::String(system)) => {
+            let existing = std::mem::take(system);
+            value["system"] = Value::Array(vec![
+                contract,
+                serde_json::json!({"type": "text", "text": existing}),
+            ]);
+        }
+        Some(Value::Null) | None => {
+            value["system"] = Value::Array(vec![contract]);
+        }
+        // Preserve unknown future system representations rather than making
+        // an otherwise valid request unusable.
+        Some(_) => {}
+    }
+}
+
+type UpstreamByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+type HandleResolver = Box<dyn FnMut(&str) -> Result<String, String> + Send>;
+
+async fn read_response_capped(response: reqwest::Response) -> Result<Option<Bytes>, String> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            reqwest_error_message("could not read Claude upstream response", &error)
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_HTTP_BODY_BYTES {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(Bytes::from(body)))
+}
+
+struct TransformedStreamState {
+    upstream: UpstreamByteStream,
+    transformer: SseStreamTransformer<HandleResolver>,
+    ready: VecDeque<Result<Frame<Bytes>, ProxyBodyError>>,
+    finished: bool,
+}
+
+fn streaming_response_body(response: reqwest::Response, transform: bool) -> ProxyBody {
+    if !transform {
+        let stream = response.bytes_stream().map(|item| {
+            item.map(Frame::data)
+                .map_err(|error| Box::new(reqwest_stream_error(&error)) as ProxyBodyError)
+        });
+        return StreamBody::new(stream).boxed_unsync();
+    }
+
+    let state = TransformedStreamState {
+        upstream: Box::pin(response.bytes_stream()),
+        transformer: SseStreamTransformer::new(Box::new(request_scoped_resolver())),
+        ready: VecDeque::new(),
+        finished: false,
+    };
+    let stream = stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(item) = state.ready.pop_front() {
+                return Some((item, state));
+            }
+            if state.finished {
+                return None;
+            }
+            match state.upstream.next().await {
+                Some(Ok(chunk)) => match state.transformer.push(&chunk) {
+                    Ok(chunks) => state
+                        .ready
+                        .extend(chunks.into_iter().map(|chunk| Ok(Frame::data(chunk)))),
+                    Err(error) => {
+                        state.finished = true;
+                        state.ready.push_back(Err(Box::new(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            error,
+                        ))));
+                    }
+                },
+                Some(Err(error)) => {
+                    state.finished = true;
+                    state
+                        .ready
+                        .push_back(Err(Box::new(reqwest_stream_error(&error))));
+                }
+                None => {
+                    state.finished = true;
+                    state.ready.extend(
+                        state
+                            .transformer
+                            .finish()
+                            .into_iter()
+                            .map(|chunk| Ok(Frame::data(chunk))),
+                    );
+                }
+            }
+        }
+    });
+    StreamBody::new(stream).boxed_unsync()
+}
+
+struct SseStreamTransformer<R> {
+    resolve: R,
+    pending: Vec<u8>,
+    active_tool: Option<ActiveToolStream>,
+    passthrough: bool,
+}
+
+struct ActiveToolStream {
+    index: u64,
+    name: Option<String>,
+    bytes: Vec<u8>,
+}
+
+enum SseToolBoundary {
+    Start { index: u64, name: Option<String> },
+    Stop(u64),
+    Other,
+}
+
+impl<R> SseStreamTransformer<R>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    fn new(resolve: R) -> Self {
+        Self {
+            resolve,
+            pending: Vec::new(),
+            active_tool: None,
+            passthrough: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, String> {
+        if self.passthrough {
+            return Ok(vec![Bytes::copy_from_slice(chunk)]);
+        }
+        if self.pending.len().saturating_add(chunk.len()) > MAX_PENDING_SSE_BYTES {
+            eprintln!("[pentect] Claude SSE restoration disabled: pending event exceeded limit");
+            return Ok(self.fail_open_with(chunk));
+        }
+        self.pending.extend_from_slice(chunk);
+        let mut output = Vec::new();
+        while let Some(end) = first_sse_block_end(&self.pending) {
+            let block = self.pending.drain(..end).collect::<Vec<_>>();
+            self.process_block(block, &mut output)?;
+        }
+        Ok(output)
+    }
+
+    fn finish(&mut self) -> Vec<Bytes> {
+        let mut output = Vec::new();
+        if let Some(mut tool) = self.active_tool.take() {
+            tool.bytes.append(&mut self.pending);
+            if !tool.bytes.is_empty() {
+                output.push(Bytes::from(tool.bytes));
+            }
+        } else if !self.pending.is_empty() {
+            output.push(Bytes::from(std::mem::take(&mut self.pending)));
+        }
+        output
+    }
+
+    fn process_block(&mut self, block: Vec<u8>, output: &mut Vec<Bytes>) -> Result<(), String> {
+        if let Some(active) = &mut self.active_tool {
+            match sse_control_event(&block) {
+                SseControlEvent::Ping => {
+                    output.push(Bytes::from(block));
+                    return Ok(());
+                }
+                SseControlEvent::Error => {
+                    let active = self.active_tool.take().expect("active tool exists");
+                    output.push(Bytes::from(active.bytes));
+                    output.push(Bytes::from(block));
+                    self.passthrough = true;
+                    return Ok(());
+                }
+                SseControlEvent::Other => {}
+            }
+            if active.bytes.len().saturating_add(block.len()) > MAX_PENDING_SSE_BYTES {
+                eprintln!("[pentect] Claude SSE restoration disabled: tool input exceeded limit");
+                let active = self.active_tool.take().expect("active tool exists");
+                output.push(Bytes::from(active.bytes));
+                output.push(Bytes::from(block));
+                self.passthrough = true;
+                return Ok(());
+            }
+            let boundary = sse_tool_boundary(&block);
+            active.bytes.extend_from_slice(&block);
+            if matches!(boundary, SseToolBoundary::Stop(index) if index == active.index) {
+                let active = self.active_tool.take().expect("active tool exists");
+                match std::str::from_utf8(&active.bytes)
+                    .map_err(|error| format!("Claude tool SSE was not UTF-8: {error}"))
+                    .and_then(|text| {
+                        rewrite_anthropic_sse_with_tool_name(
+                            text,
+                            active.name.as_deref(),
+                            &mut self.resolve,
+                        )
+                    }) {
+                    Ok(rewritten) => output.push(Bytes::from(rewritten)),
+                    Err(error) => {
+                        eprintln!("[pentect] Claude SSE restoration skipped: {error}");
+                        output.push(Bytes::from(active.bytes));
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        match sse_tool_boundary(&block) {
+            SseToolBoundary::Start { index, name } => {
+                self.active_tool = Some(ActiveToolStream {
+                    index,
+                    name,
+                    bytes: block,
+                });
+            }
+            _ => output.push(Bytes::from(block)),
+        }
+        Ok(())
+    }
+
+    fn fail_open_with(&mut self, chunk: &[u8]) -> Vec<Bytes> {
+        let mut bytes = self
+            .active_tool
+            .take()
+            .map_or_else(Vec::new, |active| active.bytes);
+        bytes.append(&mut self.pending);
+        bytes.extend_from_slice(chunk);
+        self.passthrough = true;
+        vec![Bytes::from(bytes)]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SseControlEvent {
+    Ping,
+    Error,
+    Other,
+}
+
+fn sse_control_event(block: &[u8]) -> SseControlEvent {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return SseControlEvent::Other;
+    };
+    let event = text.lines().find_map(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix("event:")
+            .map(str::trim)
+    });
+    let data_type = text.lines().find_map(|line| {
+        let data = line
+            .trim_end_matches('\r')
+            .strip_prefix("data:")?
+            .trim_start();
+        serde_json::from_str::<Value>(data)
+            .ok()?
+            .get("type")?
+            .as_str()
+            .map(str::to_owned)
+    });
+    match event.or(data_type.as_deref()) {
+        Some("ping") => SseControlEvent::Ping,
+        Some("error") => SseControlEvent::Error,
+        _ => SseControlEvent::Other,
+    }
+}
+
+fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
+    let lf = bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|at| at + 2);
+    let crlf = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4);
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(end), None) | (None, Some(end)) => Some(end),
+        (None, None) => None,
+    }
+}
+
+fn sse_tool_boundary(block: &[u8]) -> SseToolBoundary {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return SseToolBoundary::Other;
+    };
+    let Some(data) = text.lines().find_map(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix("data:")
+            .map(str::trim_start)
+    }) else {
+        return SseToolBoundary::Other;
+    };
+    let Ok(data) = serde_json::from_str::<Value>(data) else {
+        return SseToolBoundary::Other;
+    };
+    let event_type = data.get("type").and_then(Value::as_str);
+    let Some(index) = data.get("index").and_then(Value::as_u64) else {
+        return SseToolBoundary::Other;
+    };
+    if event_type == Some("content_block_start")
+        && data
+            .get("content_block")
+            .and_then(|content| content.get("type"))
+            .and_then(Value::as_str)
+            == Some("tool_use")
+    {
+        SseToolBoundary::Start {
+            index,
+            name: data
+                .get("content_block")
+                .and_then(|content| content.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }
+    } else if event_type == Some("content_block_stop") {
+        SseToolBoundary::Stop(index)
+    } else {
+        SseToolBoundary::Other
+    }
+}
+
+fn mask_anthropic_request(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    if let Some(system) = value.get_mut("system") {
+        mask_content(system, false, masker, files)?;
+    }
+    if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(content) = message.get_mut("content") {
+                mask_content(content, false, masker, files)?;
+            }
+        }
+    }
+    if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            mask_tool_definition(tool, masker)?;
+        }
+    }
+    Ok(())
+}
+
+fn redact_anthropic_base64_images(
+    value: &mut Value,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    if let Some(system) = value.get_mut("system") {
+        redact_content_images(system, files)?;
+    }
+    if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(content) = message.get_mut("content") {
+                redact_content_images(content, files)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn redact_content_images(
+    content: &mut Value,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    let Value::Array(blocks) = content else {
+        return Ok(());
+    };
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("image") => redact_base64_image_block(block, files)?,
+            Some("tool_result") => {
+                if let Some(nested) = block.get_mut("content") {
+                    redact_content_images(nested, files)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn redact_base64_image_block(
+    block: &mut Value,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    let block_unscanned = || -> Result<(), String> {
+        if pentect_agent::unscanned_images_should_block()? {
+            Err("image blocked: image source could not be scanned".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    let Some(source) = block.get_mut("source") else {
+        return block_unscanned();
+    };
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {}
+        Some("file" | "file_id" | "file_reference")
+            if source
+                .get("file_id")
+                .or_else(|| source.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| files.get(id) == Some(&crate::http_files::Coverage::Full)) =>
+        {
+            return Ok(());
+        }
+        // URL sources have already been replaced by the constrained remote
+        // fetcher. Unknown Files API references follow the media policy.
+        Some("url" | "file") | Some("file_id") | Some("file_reference") | None => {
+            return block_unscanned();
+        }
+        Some(_) => return block_unscanned(),
+    }
+    let Some(encoded) = source.get("data").and_then(Value::as_str) else {
+        return block_unscanned();
+    };
+    let Some(protected) = redact_inline_image_data(encoded)? else {
+        // A successfully scanned image with no detected secret is unchanged.
+        // The runtime returns an error for unscannable images when policy is
+        // block, so `None` here is the clean-image result.
+        return Ok(());
+    };
+    source["data"] = Value::String(protected);
+    source["media_type"] = Value::String("image/png".to_string());
+    Ok(())
+}
+
+pub(crate) fn redact_inline_image_data(encoded: &str) -> Result<Option<String>, String> {
+    let mut bytes = match data_encoding::BASE64.decode(encoded.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return if pentect_agent::unscanned_images_should_block()? {
+                Err("image blocked: image source could not be scanned".to_string())
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    let redacted = pentect_agent::redact_image_bytes_into_active_memory_store(&bytes);
+    bytes.zeroize();
+    let Some(mut redacted) = redacted? else {
+        return Ok(None);
+    };
+    let protected = data_encoding::BASE64.encode(&redacted);
+    redacted.zeroize();
+    Ok(Some(protected))
+}
+
+fn mask_tool_definition(
+    tool: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let Some(tool) = tool.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(description) = tool.get("description").and_then(Value::as_str) {
+        let mut protected = description.to_string();
+        mask_string(&mut protected, false, masker)?;
+        tool.insert("description".to_string(), Value::String(protected));
+    }
+    if let Some(examples) = tool.get_mut("input_examples") {
+        mask_value_strings(examples, masker)?;
+    }
+    if let Some(schema) = tool.get_mut("input_schema") {
+        mask_json_schema_annotations(schema, masker)?;
+    }
+    Ok(())
+}
+
+fn mask_json_schema_annotations(
+    schema: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    match schema {
+        Value::Array(values) => {
+            for value in values {
+                mask_json_schema_annotations(value, masker)?;
+            }
+        }
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(
+                    key.as_str(),
+                    "description" | "title" | "default" | "const" | "examples" | "enum"
+                ) {
+                    mask_value_strings(value, masker)?;
+                } else {
+                    mask_json_schema_annotations(value, masker)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn mask_content(
+    value: &mut Value,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    match value {
+        Value::String(text) => mask_string(text, tool_result, masker),
+        Value::Array(blocks) => {
+            for block in blocks {
+                let block_type = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match block_type {
+                    "text" => {
+                        if let Some(text) = block.get_mut("text") {
+                            let Some(text) = text.as_str() else {
+                                continue;
+                            };
+                            let mut protected = text.to_string();
+                            mask_string(&mut protected, tool_result, masker)?;
+                            block["text"] = Value::String(protected);
+                        }
+                    }
+                    "tool_result" => {
+                        if let Some(content) = block.get_mut("content") {
+                            mask_content(content, true, masker, files)?;
+                        }
+                    }
+                    "tool_use" => {
+                        if let Some(input) = block.get_mut("input") {
+                            mask_value_strings(input, masker)?;
+                        }
+                    }
+                    "document" => mask_document_block(block, tool_result, masker, files)?,
+                    "search_result" => {
+                        mask_named_text(block, "title", tool_result, masker)?;
+                        // UrlDetector preserves ordinary public URLs while
+                        // protecting internal authorities, credentials and
+                        // sensitive query/path components.
+                        mask_named_text(block, "source", tool_result, masker)?;
+                        if let Some(content) = block.get_mut("content") {
+                            mask_content(content, tool_result, masker, files)?;
+                        }
+                    }
+                    // These blocks are provider-produced or binary protocol
+                    // payloads. They are either handled by the media pass
+                    // above or intentionally remain opaque here.
+                    "image"
+                    | "thinking"
+                    | "redacted_thinking"
+                    | "server_tool_use"
+                    | "mcp_tool_use"
+                    | "mcp_tool_result"
+                    | "web_search_tool_result"
+                    | "web_fetch_tool_result"
+                    | "code_execution_tool_result"
+                    | "bash_code_execution_tool_result"
+                    | "text_editor_code_execution_tool_result" => {}
+                    _ => {
+                        if !WARNED_UNKNOWN_CONTENT_BLOCK.swap(true, Ordering::Relaxed) {
+                            eprintln!(
+                                "[pentect] unknown Anthropic content block passed through without text inspection"
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn mask_document_block(
+    block: &mut Value,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    mask_named_text(block, "title", tool_result, masker)?;
+    mask_named_text(block, "context", tool_result, masker)?;
+    let Some(source) = block.get_mut("source") else {
+        return Ok(());
+    };
+    match source.get("type").and_then(Value::as_str) {
+        Some("text") => mask_named_text(source, "data", tool_result, masker),
+        Some("content") => {
+            if let Some(content) = source.get_mut("content") {
+                mask_content(content, tool_result, masker, files)?;
+            }
+            Ok(())
+        }
+        Some("base64") => inspect_base64_document(source, tool_result, masker),
+        // URL sources have already been replaced by the constrained remote
+        // fetcher. Unknown Files API references follow the media policy.
+        Some("file" | "file_id" | "file_reference")
+            if source
+                .get("file_id")
+                .or_else(|| source.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| files.get(id) == Some(&crate::http_files::Coverage::Full)) =>
+        {
+            Ok(())
+        }
+        Some("url" | "file" | "file_id" | "file_reference") | None => {
+            enforce_unscanned_document_policy()
+        }
+        Some(_) => enforce_unscanned_document_policy(),
+    }
+}
+
+pub(crate) fn inspect_base64_document(
+    source: &Value,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let media_type = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !media_type.eq_ignore_ascii_case("application/pdf") {
+        return enforce_unscanned_document_policy();
+    }
+    let Some(encoded) = source.get("data").and_then(Value::as_str) else {
+        return enforce_unscanned_document_policy();
+    };
+    let mut bytes = match data_encoding::BASE64.decode(encoded.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return enforce_unscanned_document_policy(),
+    };
+    if bytes.len() > MAX_INLINE_PDF_BYTES {
+        bytes.zeroize();
+        return enforce_unscanned_document_policy();
+    }
+    // PDF parsers operate on attacker-controlled binary structures. Keep a
+    // strict input/output budget and contain parser panics inside the blocking
+    // protection task; an OOM cannot be recovered, so oversized inputs never
+    // enter the parser.
+    let extracted = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes));
+    bytes.zeroize();
+    let Ok(Ok(mut text)) = extracted else {
+        return enforce_unscanned_document_policy();
+    };
+    if text.len() > MAX_EXTRACTED_PDF_TEXT_BYTES || text.trim().is_empty() {
+        text.zeroize();
+        return enforce_unscanned_document_policy();
+    }
+    let original = text.clone();
+    mask_string(&mut text, tool_result, masker)?;
+    let contains_secret = text != original;
+    text.zeroize();
+    let mut original = original;
+    original.zeroize();
+    if contains_secret {
+        return Err("document blocked: secret text detected in PDF".to_string());
+    }
+    // Extracted text does not cover embedded images, attachments, scripts or
+    // every metadata/object encoding. Treat even a clean extraction as an
+    // unscanned binary document unless the user explicitly allows it.
+    enforce_unscanned_document_policy()
+}
+
+pub(crate) fn enforce_unscanned_document_policy() -> Result<(), String> {
+    if pentect_agent::unscanned_images_should_block()? {
+        Err("document blocked: document could not be scanned".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn mask_named_text(
+    object: &mut Value,
+    key: &str,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let Some(text) = object.get(key).and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let mut protected = text.to_string();
+    mask_string(&mut protected, tool_result, masker)?;
+    object[key] = Value::String(protected);
+    Ok(())
+}
+
+pub(crate) fn mask_string(
+    text: &mut String,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    let masked = if tool_result {
+        masker.mask_tool_output(text)?
+    } else {
+        masker.mask_prompt_text(text)?
+    };
+    if let Some(masked) = masked {
+        *text = masked;
+    }
+    Ok(())
+}
+
+fn mask_value_strings(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    match value {
+        Value::String(text) => mask_string(text, false, masker),
+        Value::Array(values) => {
+            for value in values {
+                mask_value_strings(value, masker)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                mask_value_strings(value, masker)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn rewrite_anthropic_json_response(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("Claude response was not valid JSON: {error}"))?;
+    let mut resolve = request_scoped_resolver();
+    if let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) {
+        for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                let tool_name = block.get("name").and_then(Value::as_str).map(str::to_owned);
+                if let Some(input) = block.get_mut("input") {
+                    resolve_tool_input_value(input, tool_name.as_deref(), &mut resolve)?;
+                }
+            }
+        }
+    }
+    serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored Claude response: {error}"))
+}
+
+#[derive(Default)]
+struct SseBlock {
+    event: Option<String>,
+    data: Option<Value>,
+    passthrough: Vec<String>,
+}
+
+#[derive(Default)]
+struct PendingToolInput {
+    name: Option<String>,
+    chunks: Vec<(usize, String)>,
+}
+
+#[cfg(test)]
+fn rewrite_anthropic_sse(input: &str) -> Result<String, String> {
+    rewrite_anthropic_sse_with(input, &mut resolve_known_text)
+}
+
+#[cfg(test)]
+fn rewrite_anthropic_sse_with<R>(input: &str, resolve: &mut R) -> Result<String, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    rewrite_anthropic_sse_with_tool_name(input, None, resolve)
+}
+
+fn rewrite_anthropic_sse_with_tool_name<R>(
+    input: &str,
+    forced_tool_name: Option<&str>,
+    resolve: &mut R,
+) -> Result<String, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let mut blocks = parse_sse(input);
+    let mut tool_indices = HashSet::new();
+    let mut pending: HashMap<u64, PendingToolInput> = HashMap::new();
+
+    for block_index in 0..blocks.len() {
+        let Some(data) = blocks[block_index].data.as_ref() else {
+            continue;
+        };
+        let event_type = data.get("type").and_then(Value::as_str);
+        let index = data.get("index").and_then(Value::as_u64);
+        if event_type == Some("content_block_start")
+            && data
+                .get("content_block")
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str)
+                == Some("tool_use")
+        {
+            if let Some(index) = index {
+                tool_indices.insert(index);
+                let entry = pending.entry(index).or_default();
+                entry.name = forced_tool_name.map(str::to_owned).or_else(|| {
+                    data.get("content_block")
+                        .and_then(|block| block.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            }
+            continue;
+        }
+        if event_type == Some("content_block_delta") {
+            let Some(index) = index.filter(|index| tool_indices.contains(index)) else {
+                continue;
+            };
+            if data
+                .get("delta")
+                .and_then(|delta| delta.get("type"))
+                .and_then(Value::as_str)
+                == Some("input_json_delta")
+            {
+                let chunk = data
+                    .get("delta")
+                    .and_then(|delta| delta.get("partial_json"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                pending
+                    .entry(index)
+                    .or_default()
+                    .chunks
+                    .push((block_index, chunk));
+            }
+            continue;
+        }
+        if event_type == Some("content_block_stop") {
+            let Some(index) = index.filter(|index| tool_indices.remove(index)) else {
+                continue;
+            };
+            let Some(tool) = pending.remove(&index) else {
+                continue;
+            };
+            let joined = tool
+                .chunks
+                .iter()
+                .map(|(_, chunk)| chunk.as_str())
+                .collect::<String>();
+            let resolved = resolve_tool_input_json(&joined, tool.name.as_deref(), resolve)?;
+            for (position, (chunk_index, _)) in tool.chunks.iter().enumerate() {
+                if let Some(partial_json) = blocks[*chunk_index]
+                    .data
+                    .as_mut()
+                    .and_then(|data| data.get_mut("delta"))
+                    .and_then(|delta| delta.get_mut("partial_json"))
+                {
+                    *partial_json = Value::String(if position == 0 {
+                        resolved.clone()
+                    } else {
+                        String::new()
+                    });
+                }
+            }
+        }
+    }
+    Ok(render_sse(&blocks))
+}
+
+fn parse_sse(input: &str) -> Vec<SseBlock> {
+    input
+        .replace("\r\n", "\n")
+        .split("\n\n")
+        .filter(|block| !block.is_empty())
+        .map(|block| {
+            let mut parsed = SseBlock::default();
+            for line in block.lines() {
+                if let Some(event) = line.strip_prefix("event:") {
+                    parsed.event = Some(event.trim_start().to_string());
+                } else if let Some(data) = line.strip_prefix("data:") {
+                    match serde_json::from_str(data.trim_start()) {
+                        Ok(value) => parsed.data = Some(value),
+                        Err(_) => parsed.passthrough.push(line.to_string()),
+                    }
+                } else {
+                    parsed.passthrough.push(line.to_string());
+                }
+            }
+            parsed
+        })
+        .collect()
+}
+
+fn render_sse(blocks: &[SseBlock]) -> String {
+    let mut output = String::new();
+    for block in blocks {
+        if let Some(event) = &block.event {
+            output.push_str("event: ");
+            output.push_str(event);
+            output.push('\n');
+        }
+        if let Some(data) = &block.data {
+            output.push_str("data: ");
+            output.push_str(&serde_json::to_string(data).expect("JSON value is serializable"));
+            output.push('\n');
+        }
+        for line in &block.passthrough {
+            output.push_str(line);
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn resolve_value_strings_with<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    match value {
+        Value::String(text) => {
+            *text = resolve(text)?;
+            Ok(())
+        }
+        Value::Array(values) => {
+            for value in values {
+                resolve_value_strings_with(value, resolve)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                resolve_value_strings_with(value, resolve)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn resolve_tool_input_json<R>(
+    input: &str,
+    tool_name: Option<&str>,
+    resolve: &mut R,
+) -> Result<String, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let Ok(mut value) = serde_json::from_str::<Value>(input) else {
+        // Fine-grained tool streaming can end with invalid JSON. Keep handles
+        // inert rather than resolving into a malformed or injectable payload.
+        return Ok(input.to_string());
+    };
+    resolve_tool_input_value(&mut value, tool_name, resolve)?;
+    serde_json::to_string(&value)
+        .map_err(|error| format!("could not encode restored Claude tool input: {error}"))
+}
+
+fn resolve_tool_input_value<R>(
+    value: &mut Value,
+    tool_name: Option<&str>,
+    resolve: &mut R,
+) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    if is_free_form_shell_tool(tool_name) {
+        if let Some(object) = value.as_object_mut() {
+            for key in ["command", "script", "code"] {
+                if let Some(Value::String(text)) = object.get_mut(key) {
+                    *text = resolve_shell_text_safely(text, resolve)?;
+                }
+            }
+            // Non-command metadata is structured data and remains safe to
+            // resolve through JSON serialization.
+            for (key, nested) in object {
+                if !matches!(key.as_str(), "command" | "script" | "code") {
+                    resolve_value_strings_with(nested, resolve)?;
+                }
+            }
+            return Ok(());
+        }
+    }
+    resolve_value_strings_with(value, resolve)
+}
+
+fn is_free_form_shell_tool(name: Option<&str>) -> bool {
+    name.is_some_and(|name| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "bash" | "shell" | "powershell" | "pwsh" | "cmd"
+        )
+    })
+}
+
+fn resolve_shell_text_safely<R>(text: &str, resolve: &mut R) -> Result<String, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<<") {
+        out.push_str(&rest[..start]);
+        let candidate = &rest[start..];
+        let Some(relative_end) = candidate.find(">>") else {
+            out.push_str(candidate);
+            return Ok(out);
+        };
+        let end = relative_end + 2;
+        let handle = &candidate[..end];
+        let resolved = resolve(handle)?;
+        if resolved == handle || shell_safe_secret_token(&resolved) {
+            out.push_str(&resolved);
+        } else {
+            eprintln!(
+                "[pentect] shell tool handle left unresolved: represented value is not shell-safe"
+            );
+            out.push_str(handle);
+        }
+        rest = &candidate[end..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn shell_safe_secret_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'+' | b'=')
+        })
+}
+
+#[cfg(test)]
+fn resolve_known_text(text: &str) -> Result<String, String> {
+    match pentect_agent::resolve_known_text_from_active_memory_store(text) {
+        Ok(Some(resolved)) => Ok(resolved),
+        Ok(None) => Ok(text.to_string()),
+        Err(error) => {
+            eprintln!("[pentect] Claude tool input restoration skipped: {error}");
+            Ok(text.to_string())
+        }
+    }
+}
+
+pub(crate) fn request_scoped_resolver() -> impl FnMut(&str) -> Result<String, String> + Send {
+    let resolver = pentect_agent::ActiveMemoryStoreResolver::new();
+    move |text| match &resolver {
+        Ok(resolver) => match resolver.resolve_known_text(text) {
+            Ok(Some(resolved)) => Ok(resolved),
+            Ok(None) => Ok(text.to_string()),
+            Err(error) => {
+                eprintln!("[pentect] Claude tool input restoration skipped: {error}");
+                Ok(text.to_string())
+            }
+        },
+        Err(error) => {
+            eprintln!("[pentect] Claude tool input restoration skipped: {error}");
+            Ok(text.to_string())
+        }
+    }
+}
+
+fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value.trim())
+        .map_err(|_| "ANTHROPIC_BASE_URL is not a valid URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("ANTHROPIC_BASE_URL must use http or https and include a host".to_string());
+    }
+    if url.fragment().is_some() {
+        return Err("ANTHROPIC_BASE_URL must not contain a fragment".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("ANTHROPIC_BASE_URL must not contain URL credentials".to_string());
+    }
+    if url.scheme() == "http"
+        && !url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+        && std::env::var("PENTECT_ALLOW_INSECURE_UPSTREAM").as_deref() != Ok("1")
+    {
+        return Err(
+            "remote ANTHROPIC_BASE_URL must use https (set PENTECT_ALLOW_INSECURE_UPSTREAM=1 to override)"
+                .to_string(),
+        );
+    }
+    Ok(url)
+}
+
+fn reqwest_error_message(context: &str, error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        format!("{context}: timed out")
+    } else if error.is_connect() {
+        format!("{context}: connection failed")
+    } else if error.is_body() || error.is_decode() {
+        format!("{context}: invalid response body")
+    } else {
+        format!("{context}: request failed")
+    }
+}
+
+fn reqwest_stream_error(error: &reqwest::Error) -> io::Error {
+    let message = reqwest_error_message("Claude upstream stream failed", error);
+    io::Error::new(io::ErrorKind::ConnectionAborted, message)
+}
+
+fn join_upstream_url(base: &reqwest::Url, path_and_query: &str) -> Result<reqwest::Url, String> {
+    let (request_path, request_query) = path_and_query
+        .split_once('?')
+        .map_or((path_and_query, None), |(path, query)| (path, Some(query)));
+    let base_query = base.query().map(str::to_string);
+    let mut without_query = base.clone();
+    without_query.set_query(None);
+    let mut joined = without_query.as_str().trim_end_matches('/').to_string();
+    if !request_path.starts_with('/') {
+        joined.push('/');
+    }
+    joined.push_str(request_path);
+    let mut joined = reqwest::Url::parse(&joined)
+        .map_err(|_| "could not construct Claude upstream URL".to_string())?;
+    let query = match (base_query.as_deref(), request_query) {
+        (Some(base), Some(request)) if !base.is_empty() && !request.is_empty() => {
+            Some(format!("{base}&{request}"))
+        }
+        (Some(base), _) if !base.is_empty() => Some(base.to_string()),
+        (_, Some(request)) if !request.is_empty() => Some(request.to_string()),
+        _ => None,
+    };
+    joined.set_query(query.as_deref());
+    Ok(joined)
+}
+
+#[cfg(test)]
+fn is_anthropic_messages_path(path: &str) -> bool {
+    path.split('?').next().is_some_and(|path| {
+        path.ends_with("/v1/messages") || path.ends_with("/v1/messages/count_tokens")
+    })
+}
+
+fn classify_anthropic_endpoint(path_and_query: &str) -> AnthropicEndpoint {
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    if path.ends_with("/v1/messages") || path.ends_with("/v1/messages/count_tokens") {
+        AnthropicEndpoint::Messages
+    } else if path.ends_with("/v1/files") || path.contains("/v1/files/") {
+        AnthropicEndpoint::Files
+    } else if path.ends_with("/v1/models") || path.contains("/v1/models/") {
+        AnthropicEndpoint::Models
+    } else {
+        AnthropicEndpoint::Unknown
+    }
+}
+
+fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Option<&'a str> {
+    let prefix_len = token.len().checked_add(1)?;
+    let prefix = path_and_query.get(..prefix_len)?;
+    if !prefix.starts_with('/') || prefix.get(1..)? != token {
+        return None;
+    }
+    let rest = path_and_query.get(prefix_len..)?;
+    if rest.is_empty() {
+        Some("/")
+    } else if rest.starts_with('/') || rest.starts_with('?') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn should_forward_request_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "accept-encoding"
+    )
+}
+
+fn should_forward_response_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "content-encoding"
+    )
+}
+
+fn connection_named_headers(headers: &hyper::HeaderMap) -> HashSet<String> {
+    headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn full_body(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn text_response(status: StatusCode, text: &'static str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full_body(Bytes::from_static(text.as_bytes())))
+        .expect("static response is valid")
+}
+
+fn owned_text_response(status: StatusCode, text: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full_body(Bytes::copy_from_slice(text.as_bytes())))
+        .expect("text response is valid")
+}
+
+fn random_auth_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| format!("could not create Claude HTTP proxy token: {error}"))?;
+    let token = data_encoding::HEXLOWER.encode(&bytes);
+    bytes.zeroize();
+    Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_parser_preserves_normal_text() {
+        let input = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello <<SECRET_deadbeef>>\"}}\n\n"
+        );
+        let output = rewrite_anthropic_sse(input).unwrap();
+        assert!(output.contains("hello <<SECRET_deadbeef>>"));
+    }
+
+    #[test]
+    fn only_messages_endpoints_are_transformed() {
+        assert!(is_anthropic_messages_path("/v1/messages"));
+        assert!(is_anthropic_messages_path(
+            "/v1/messages/count_tokens?beta=1"
+        ));
+        assert!(!is_anthropic_messages_path("/v1/models"));
+        assert_eq!(
+            classify_anthropic_endpoint("/v1/files/file_123?beta=files-api"),
+            AnthropicEndpoint::Files
+        );
+        assert_eq!(
+            classify_anthropic_endpoint("/v1/models/model_123"),
+            AnthropicEndpoint::Models
+        );
+        assert_eq!(
+            classify_anthropic_endpoint("/v1/messages/batches"),
+            AnthropicEndpoint::Unknown
+        );
+    }
+
+    #[test]
+    fn local_auth_path_is_exact_and_removed_before_forwarding() {
+        let token = "0123456789abcdef";
+        assert_eq!(
+            authenticated_request_path("/0123456789abcdef/v1/messages?beta=1", token),
+            Some("/v1/messages?beta=1")
+        );
+        assert_eq!(
+            authenticated_request_path("/0123456789abcdef", token),
+            Some("/")
+        );
+        assert_eq!(
+            authenticated_request_path("/0123456789abcdefevil/v1/messages", token),
+            None
+        );
+        assert_eq!(
+            authenticated_request_path("/wrong/v1/messages", token),
+            None
+        );
+    }
+
+    #[test]
+    fn handle_contract_is_stable_preserves_system_and_is_not_duplicated() {
+        let mut request = serde_json::json!({"system": "existing", "messages": []});
+        inject_handle_contract(&mut request);
+        assert_eq!(request["system"][0]["text"], HANDLE_CONTRACT);
+        assert_eq!(request["system"][1]["text"], "existing");
+        inject_handle_contract(&mut request);
+        assert_eq!(request["system"].as_array().unwrap().len(), 2);
+
+        let mut empty = serde_json::json!({"messages": []});
+        inject_handle_contract(&mut empty);
+        assert_eq!(empty["system"][0]["text"], HANDLE_CONTRACT);
+    }
+
+    #[test]
+    fn custom_upstream_keeps_base_path_and_merges_queries() {
+        let base = parse_upstream_base("https://gateway.example/anthropic?tenant=one").unwrap();
+        let joined = join_upstream_url(&base, "/v1/messages?beta=two").unwrap();
+        assert_eq!(
+            joined.as_str(),
+            "https://gateway.example/anthropic/v1/messages?tenant=one&beta=two"
+        );
+    }
+
+    #[test]
+    fn invalid_upstream_schemes_and_fragments_are_rejected() {
+        assert!(parse_upstream_base("file:///tmp/socket").is_err());
+        assert!(parse_upstream_base("https://gateway.example/#fragment").is_err());
+        assert!(parse_upstream_base("https://user:password@gateway.example").is_err());
+        assert!(parse_upstream_base("http://127.0.0.1:8080").is_ok());
+    }
+
+    #[test]
+    fn restored_tool_values_are_json_escaped_and_invalid_json_stays_inert() {
+        let mut resolve =
+            |text: &str| Ok(text.replace("<<SECRET_one>>", "quoted \" value\\with\nnewline"));
+        let restored = resolve_tool_input_json(
+            r#"{"command":"use <<SECRET_one>>","nested":["<<SECRET_one>>"]}"#,
+            None,
+            &mut resolve,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(
+            value["command"],
+            Value::String("use quoted \" value\\with\nnewline".to_string())
+        );
+        assert_eq!(
+            value["nested"][0],
+            Value::String("quoted \" value\\with\nnewline".to_string())
+        );
+
+        let invalid = r#"{"command":"<<SECRET_one>>"#;
+        assert_eq!(
+            resolve_tool_input_json(invalid, None, &mut resolve).unwrap(),
+            invalid
+        );
+    }
+
+    #[test]
+    fn sse_tool_input_is_reassembled_and_resolved_without_touching_text() {
+        let input = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"curl <<SE\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"CRET_deadbeef>>\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"keep <<SECRET_deadbeef>>\"}}\n\n"
+        );
+        let mut resolve = |text: &str| Ok(text.replace("<<SECRET_deadbeef>>", "actual-secret"));
+        let output = rewrite_anthropic_sse_with(input, &mut resolve).unwrap();
+        assert!(output.contains("actual-secret"));
+        assert!(output.contains("keep <<SECRET_deadbeef>>"));
+    }
+
+    #[test]
+    fn streaming_text_passes_as_soon_as_an_event_is_complete() {
+        let event = concat!(
+            "event: content_block_delta\r\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\r\n\r\n"
+        );
+        let mut transformer = SseStreamTransformer::new(|text: &str| Ok(text.to_string()));
+        let split = event.len() - 2;
+        assert!(transformer
+            .push(&event.as_bytes()[..split])
+            .unwrap()
+            .is_empty());
+        let output = transformer.push(&event.as_bytes()[split..]).unwrap();
+        assert_eq!(output, vec![Bytes::from(event)]);
+    }
+
+    #[test]
+    fn streaming_tool_is_held_then_resolved_across_http_chunks() {
+        let start = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"Bash\",\"input\":{}}}\n\n"
+        );
+        let delta_one = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"use <<SE\"}}\n\n"
+        );
+        let delta_two = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"CRET_deadbeef>>\\\"}\"}}\n\n"
+        );
+        let stop = concat!(
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+        );
+        let mut transformer = SseStreamTransformer::new(|text: &str| {
+            Ok(text.replace("<<SECRET_deadbeef>>", "actual-secret"))
+        });
+        assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
+        assert!(transformer.push(delta_one.as_bytes()).unwrap().is_empty());
+        let split = delta_two.len() / 2;
+        assert!(transformer
+            .push(&delta_two.as_bytes()[..split])
+            .unwrap()
+            .is_empty());
+        assert!(transformer
+            .push(&delta_two.as_bytes()[split..])
+            .unwrap()
+            .is_empty());
+        let output = transformer.push(stop.as_bytes()).unwrap();
+        let output = join_bytes(output);
+        assert!(output.contains("actual-secret"));
+        assert!(!output.contains("<<SECRET_deadbeef>>"));
+    }
+
+    #[test]
+    fn interrupted_tool_stream_keeps_handles_unresolved() {
+        let incomplete = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"key\\\":\\\"<<SECRET_deadbeef>>\"}}\n\n"
+        );
+        let mut transformer = SseStreamTransformer::new(|text: &str| {
+            Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear"))
+        });
+        assert!(transformer.push(incomplete.as_bytes()).unwrap().is_empty());
+        let output = join_bytes(transformer.finish());
+        assert!(output.contains("<<SECRET_deadbeef>>"));
+        assert!(!output.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn sequential_tool_blocks_are_resolved_independently() {
+        let tool = |index: u64, handle: &str| {
+            format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"tool_use\",\"input\":{{}}}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"value\\\":\\\"{handle}\\\"}}\"}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}\n\n"
+            )
+        };
+        let mut transformer = SseStreamTransformer::new(|text: &str| {
+            Ok(text
+                .replace("<<SECRET_one>>", "first")
+                .replace("<<SECRET_two>>", "second"))
+        });
+        let mut output = transformer
+            .push(tool(1, "<<SECRET_one>>").as_bytes())
+            .unwrap();
+        output.extend(
+            transformer
+                .push(tool(2, "<<SECRET_two>>").as_bytes())
+                .unwrap(),
+        );
+        let output = join_bytes(output);
+        assert!(output.contains("first"));
+        assert!(output.contains("second"));
+        assert!(!output.contains("<<SECRET_"));
+    }
+
+    #[test]
+    fn ping_is_emitted_while_tool_input_is_held_and_error_flushes_unresolved() {
+        let start = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}}\n\n"
+        );
+        let ping = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        let error =
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n";
+        let mut transformer = SseStreamTransformer::new(|text: &str| {
+            Ok(text.replace("<<SECRET_deadbeef>>", "must-not-appear"))
+        });
+        assert!(transformer.push(start.as_bytes()).unwrap().is_empty());
+        assert_eq!(join_bytes(transformer.push(ping.as_bytes()).unwrap()), ping);
+        let flushed = join_bytes(transformer.push(error.as_bytes()).unwrap());
+        assert!(flushed.contains("content_block_start"));
+        assert!(flushed.contains("event: error"));
+        assert!(!flushed.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn shell_tool_only_resolves_conservative_token_values() {
+        let mut safe = |text: &str| Ok(text.replace("<<SECRET_safe>>", "abc_DEF-123+/="));
+        let restored = resolve_tool_input_json(
+            r#"{"command":"curl <<SECRET_safe>>"}"#,
+            Some("Bash"),
+            &mut safe,
+        )
+        .unwrap();
+        assert!(restored.contains("abc_DEF-123+/="));
+
+        let dangerous_value = "quoted \"; Remove-Item x\nnext";
+        let mut dangerous = |text: &str| Ok(text.replace("<<SECRET_danger>>", dangerous_value));
+        let restored = resolve_tool_input_json(
+            r#"{"command":"echo <<SECRET_danger>>"}"#,
+            Some("PowerShell"),
+            &mut dangerous,
+        )
+        .unwrap();
+        assert!(restored.contains("<<SECRET_danger>>"));
+        assert!(!restored.contains(dangerous_value));
+    }
+
+    #[test]
+    fn media_policy_rejections_never_enter_general_fail_open() {
+        assert!(is_media_policy_rejection(
+            "document blocked: secret text detected in PDF"
+        ));
+        assert!(is_media_policy_rejection(
+            "image blocked: image source could not be scanned"
+        ));
+        assert!(!is_media_policy_rejection(
+            "detector temporarily unavailable"
+        ));
+    }
+
+    fn join_bytes(chunks: Vec<Bytes>) -> String {
+        String::from_utf8(
+            chunks
+                .into_iter()
+                .flat_map(|chunk| chunk.to_vec())
+                .collect(),
+        )
+        .unwrap()
+    }
+}

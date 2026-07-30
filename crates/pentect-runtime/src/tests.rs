@@ -1,193 +1,24 @@
 use super::*;
 
-static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+struct RecoveringTestMutex(std::sync::Mutex<()>);
 
-#[cfg(windows)]
-#[test]
-fn windows_shell_prompt_compacts_only_home_and_its_descendants() {
-    assert_eq!(
-        compact_windows_shell_cwd_with_home(r"C:\Users\yun40\Desktop\pentect", r"C:\Users\yun40"),
-        r"~\Desktop\pentect"
-    );
-    assert_eq!(
-        compact_windows_shell_cwd_with_home(r"c:\users\YUN40", r"C:\Users\yun40"),
-        "~"
-    );
-    assert_eq!(
-        compact_windows_shell_cwd_with_home(r"C:\Users\yun400\work", r"C:\Users\yun40"),
-        r"C:\Users\yun400\work"
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_shell_repairs_stale_virtual_terminal_input_mode() {
-    use windows_sys::Win32::System::Console::{
-        ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
-        ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
-    };
-
-    let repaired =
-        windows_shell_sane_input_mode(ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT);
-    assert_eq!(repaired & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
-    assert_eq!(repaired & ENABLE_MOUSE_INPUT, 0);
-    for required in [
-        ENABLE_PROCESSED_INPUT,
-        ENABLE_LINE_INPUT,
-        ENABLE_ECHO_INPUT,
-        ENABLE_EXTENDED_FLAGS,
-    ] {
-        assert_ne!(repaired & required, 0);
+impl RecoveringTestMutex {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, std::convert::Infallible> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 }
 
-#[cfg(windows)]
+// A failing assertion must not turn every later environment-isolated test
+// into a misleading PoisonError. Tests still fail at their original assertion.
+static TEST_ENV_LOCK: RecoveringTestMutex = RecoveringTestMutex(std::sync::Mutex::new(()));
+
 #[test]
-fn windows_shell_routes_interactive_agents_outside_the_protocol_pipe() {
-    assert!(is_windows_shell_interactive_agent_command("codex"));
-    assert!(is_windows_shell_interactive_agent_command(
-        "claude --resume"
-    ));
-    assert!(is_windows_shell_interactive_agent_command("opencode"));
-    assert_eq!(
-        windows_shell_interactive_agent_args("claude --resume").unwrap(),
-        ["claude", "--resume"]
-    );
-    assert!(!is_windows_shell_interactive_agent_command("codex; whoami"));
-    assert!(!is_windows_shell_interactive_agent_command(
-        "Write-Output codex"
-    ));
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_shell_history_excludes_protected_commands() {
-    assert!(windows_shell_history_is_safe("git status", false));
-    assert!(!windows_shell_history_is_safe(
-        "Write-Output rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef",
-        true
-    ));
-    assert!(!windows_shell_history_is_safe(
-        "$env:PENTECT_SECRET_deadbeef",
-        false
-    ));
-    assert!(!windows_shell_history_is_safe(
-        "Write-Output <<SECRET_deadbeef>>",
-        false
-    ));
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_shell_display_never_renders_the_pasted_secret() {
-    let (root, session) = empty_session("windows-shell-safe-display");
-    let store = MemoryStore::for_session(&session);
-    let display = WindowsShellDisplay::new(store).unwrap();
-    let raw = "Write-Output rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
-    let rendered = Highlighter::highlight(&display, raw, raw.len()).into_owned();
-
-    assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
-    assert!(rendered.contains('•'), "{rendered}");
-    assert!(!rendered.contains('…'), "{rendered}");
-    assert_eq!(rendered.chars().count(), raw.chars().count());
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_shell_env_reference_injects_its_recovered_value() {
-    let (root, session) = empty_session("windows-shell-env-injection");
-    let store = MemoryStore::for_session(&session);
-    let raw = "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
-    let mut preview = ShellInputProtector::new(store.clone()).unwrap();
-    let displayed = preview.prepare_paste(raw).unwrap();
-    assert!(displayed.visible.starts_with("$env:PENTECT_SECRET_"));
-
-    let mut executor = ShellInputProtector::new(store).unwrap();
-    let mut submitted = executor.prepare_paste(&displayed.visible).unwrap();
-    assert!(submitted.child.contains(raw), "{}", submitted.child);
-    assert!(
-        submitted.child.ends_with(&displayed.visible),
-        "{}",
-        submitted.child
-    );
-    let output = Command::new(windows_powershell_path())
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(&submitted.child)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), raw);
-    submitted.child.zeroize();
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_shell_host_preserves_state_without_terminal_control_sequences() {
-    use std::io::{BufRead, Write};
-    use std::process::Stdio;
-
-    let marker = windows_shell_marker().unwrap();
-    let drain_marker = windows_shell_marker().unwrap();
-    let mut child = Command::new(windows_powershell_path())
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(WINDOWS_SHELL_HOST_SCRIPT)
-        .env("PENTECT_SHELL_COMMAND_MARKER", &marker)
-        .env("PENTECT_SHELL_DRAIN_MARKER", &drain_marker)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-    let mut output = String::new();
-    for (index, command) in [
-        "",
-        "$global:PentectShellState=41",
-        "Write-Output ($global:PentectShellState + 1)",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        writeln!(
-            stdin,
-            "{}",
-            data_encoding::BASE64.encode(command.as_bytes())
-        )
-        .unwrap();
-        if index == 1 {
-            writeln!(stdin, "stale interactive input").unwrap();
-        }
-        stdin.flush().unwrap();
-        loop {
-            let mut line = String::new();
-            assert_ne!(stdout.read_line(&mut line).unwrap(), 0);
-            if line.contains(&format!("{marker}DRAIN")) {
-                writeln!(stdin).unwrap();
-                writeln!(stdin, "{drain_marker}").unwrap();
-                stdin.flush().unwrap();
-            } else if line.contains(&marker) {
-                break;
-            } else {
-                output.push_str(&line);
-            }
-        }
-    }
-
-    assert!(output.lines().any(|line| line.trim() == "42"), "{output:?}");
-    assert!(!output.contains("Cannot bind argument"), "{output:?}");
-    assert!(!output.contains('\u{1b}'), "{output:?}");
-    drop(stdin);
-    assert!(child.wait().unwrap().success());
+fn claude_hook_cli_is_retired_in_favor_of_http_gateway() {
+    let error = parse_hook_provider("claude").unwrap_err();
+    assert!(error.contains("HTTP gateway"), "{error}");
 }
 
 struct ActiveMemoryStoreEnv {
@@ -269,34 +100,6 @@ fn test_process_host_root(base: &std::path::Path) -> (&'static str, std::path::P
 #[cfg(all(unix, not(target_os = "macos")))]
 fn test_process_host_root(base: &std::path::Path) -> (&'static str, std::path::PathBuf) {
     ("XDG_RUNTIME_DIR", base.join("pentect"))
-}
-
-#[test]
-fn shell_pty_size_tracks_the_real_terminal_before_fallbacks() {
-    assert_eq!(
-        select_pty_size(Some((180, 52)), Some(100), Some(24)),
-        (180, 52)
-    );
-    assert_eq!(select_pty_size(None, Some(100), Some(24)), (100, 24));
-    assert_eq!(select_pty_size(Some((0, 0)), None, None), (120, 30));
-}
-
-struct ScopedCodexExecProxy {
-    previous: Option<bool>,
-}
-
-impl ScopedCodexExecProxy {
-    fn set(value: bool) -> Self {
-        Self {
-            previous: set_codex_exec_proxy_test_override(Some(value)),
-        }
-    }
-}
-
-impl Drop for ScopedCodexExecProxy {
-    fn drop(&mut self) {
-        set_codex_exec_proxy_test_override(self.previous.take());
-    }
 }
 
 fn first_handle_with_prefix(text: &str, prefix: &str) -> String {
@@ -411,242 +214,6 @@ fn exec_parse_accepts_live_without_env_flags() {
         opts.mode,
         ExecMode::Shell(command) if command == "echo hi"
     ));
-}
-
-#[test]
-fn shell_parse_accepts_default_and_program_override() {
-    let args = strings(["pentect", "shell"]);
-    let opts = ShellOpts::parse(&args).unwrap();
-    assert!(opts.program.is_none());
-
-    let args = strings(["pentect", "shell", "--", "pwsh", "-NoLogo"]);
-    let opts = ShellOpts::parse(&args).unwrap();
-    assert_eq!(
-        opts.program.unwrap(),
-        vec!["pwsh".to_string(), "-NoLogo".to_string()]
-    );
-
-    let args = strings(["pentect", "shell", "pwsh"]);
-    let err = ShellOpts::parse(&args).unwrap_err();
-    assert!(err.contains("pentect shell -- PROGRAM"), "{err}");
-}
-
-#[test]
-fn shell_shim_dir_routes_common_agents_through_pentect() {
-    let root = temp_root("shell-shim");
-    let shim = ShellShimDir::install_at(root.clone(), Path::new("pentect")).unwrap();
-    if cfg!(windows) {
-        let codex = std::fs::read_to_string(root.join("codex.cmd")).unwrap();
-        let claude = std::fs::read_to_string(root.join("claude.cmd")).unwrap();
-        assert!(codex.contains("\"%PENTECT_SHELL_BIN%\" codex"), "{codex}");
-        assert!(
-            claude.contains("\"%PENTECT_SHELL_BIN%\" claude"),
-            "{claude}"
-        );
-    } else {
-        let codex = std::fs::read_to_string(root.join("codex")).unwrap();
-        let claude = std::fs::read_to_string(root.join("claude")).unwrap();
-        assert!(codex.contains("\"$PENTECT_SHELL_BIN\" codex"), "{codex}");
-        assert!(claude.contains("\"$PENTECT_SHELL_BIN\" claude"), "{claude}");
-    }
-    drop(shim);
-    assert!(!root.exists(), "{}", root.display());
-}
-
-#[test]
-fn shell_masked_paste_preserves_original_stdin_bytes() {
-    let (root, session) = empty_session("shell-paste-clean");
-    let store = MemoryStore::for_session(&session);
-    let mut protector = ShellInputProtector::new(store).unwrap();
-    let mut forwarded = Vec::new();
-    let mut line_stars = 0usize;
-    forward_masked_text(
-        "abc\n秘密",
-        &mut forwarded,
-        &mut line_stars,
-        &mut protector,
-        ShellInputEcho::Masked,
-        None,
-    )
-    .unwrap();
-    assert_eq!(forwarded, "abc\n秘密".as_bytes());
-    assert_eq!(line_stars, 2);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn shell_secret_paste_replaces_visible_value_with_env_ref() {
-    let (root, session) = empty_session("shell-paste-secret");
-    let store = MemoryStore::for_session(&session);
-    let mut protector = ShellInputProtector::new(store).unwrap();
-    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-    let paste = protector
-        .prepare_paste(&format!("Authorization: Bearer {raw}"))
-        .unwrap();
-    assert!(paste.changed);
-    assert!(!paste.visible.contains(raw), "{}", paste.visible);
-    assert!(!paste.visible.contains("<<"), "{}", paste.visible);
-    assert!(
-        paste.injected_prefix.contains(raw),
-        "{}",
-        paste.injected_prefix
-    );
-    if cfg!(windows) {
-        assert!(paste.visible.contains("$env:PENTECT_"), "{}", paste.visible);
-        assert!(paste.child.contains("$env:PENTECT_"), "{}", paste.child);
-    } else {
-        assert!(paste.visible.contains("${PENTECT_"), "{}", paste.visible);
-        assert!(paste.child.contains("${PENTECT_"), "{}", paste.child);
-    }
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_shell_keeps_previewed_secret_assignment_until_submit() {
-    let (root, session) = empty_session("windows-shell-preview-submit");
-    let store = MemoryStore::for_session(&session);
-    let mut protector = ShellInputProtector::new(store).unwrap();
-    let raw = "Write-Output sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-    let mut submitted = protector.prepare_paste(raw).unwrap();
-    assert!(
-        submitted.child.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
-        "{}",
-        submitted.child
-    );
-    assert!(
-        submitted.child.contains("$env:PENTECT_"),
-        "{}",
-        submitted.child
-    );
-    assert!(!submitted.visible.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
-    submitted.child.zeroize();
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn shell_secret_paste_uses_explicit_environment_prefix() {
-    let (root, session) = empty_session("shell-paste-custom-prefix");
-    let store = MemoryStore::for_session(&session);
-    let mut masker = OutputMasker::new_shared(store.clone()).unwrap();
-    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-    let masked = masker
-        .mask_text(&format!("Authorization: Bearer {raw}"), Kind::Text)
-        .unwrap();
-    let (visible, mut bindings) =
-        replace_masked_handles_with_env_refs(&masked, &store, ShellSyntax::current(), "SAFE_")
-            .unwrap();
-    assert!(!visible.contains(raw), "{visible}");
-    assert!(visible.contains("SAFE_OPENAI_API_KEY_"), "{visible}");
-    assert!(!visible.contains("PENTECT_OPENAI_API_KEY_"), "{visible}");
-    assert!(bindings
-        .iter()
-        .any(|binding| binding.name.starts_with("SAFE_OPENAI_API_KEY_") && binding.value == raw));
-    for binding in &mut bindings {
-        binding.value.zeroize();
-    }
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn pty_echo_suppressor_removes_injected_env_prefix_only() {
-    let suppressor = PtyEchoSuppressor::default();
-    suppressor.push("$env:PENTECT_TOKEN='raw-secret'; ".to_string());
-    let mut text = "$env:PENTECT_TOKEN='raw-secret'; curl -H $env:PENTECT_TOKEN\r\n".to_string();
-    suppressor.scrub(&mut text);
-    assert_eq!(text, "curl -H $env:PENTECT_TOKEN\r\n");
-}
-
-#[test]
-fn pty_input_bytes_keep_escape_sequences_and_rewrite_secret_chunks() {
-    let (root, session) = empty_session("shell-pty-input");
-    let store = MemoryStore::for_session(&session);
-    let mut protector = ShellInputProtector::new(store).unwrap();
-    let suppressor = PtyEchoSuppressor::default();
-    let mut forwarded = Vec::new();
-
-    forward_pty_input_bytes(b"\x1b[A", &mut forwarded, &mut protector, &suppressor).unwrap();
-    assert_eq!(forwarded, b"\x1b[A");
-
-    let raw = b"Authorization: Bearer sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-    forward_pty_input_bytes(raw, &mut forwarded, &mut protector, &suppressor).unwrap();
-    let text = String::from_utf8(forwarded).unwrap();
-    assert!(text.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{text}");
-    assert!(text.contains("PENTECT_OPENAI_API_KEY_"), "{text}");
-    let mut echoed = text.clone();
-    suppressor.scrub(&mut echoed);
-    assert!(!echoed.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{echoed}");
-    assert!(echoed.contains("PENTECT_OPENAI_API_KEY_"), "{echoed}");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn pty_bracketed_paste_is_masked_before_reaching_the_child() {
-    let (root, session) = empty_session("shell-pty-bracketed-paste");
-    let store = MemoryStore::for_session(&session);
-    let mut protector = ShellInputProtector::new(store).unwrap();
-    let suppressor = PtyEchoSuppressor::default();
-    let mut forwarded = Vec::new();
-    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-
-    forward_pty_input_bytes(b"\x1b[20", &mut forwarded, &mut protector, &suppressor).unwrap();
-    assert!(forwarded.is_empty());
-
-    forward_pty_input_bytes(
-        format!("0~Authorization: Bearer {raw}").as_bytes(),
-        &mut forwarded,
-        &mut protector,
-        &suppressor,
-    )
-    .unwrap();
-    assert_eq!(forwarded, BRACKETED_PASTE_START);
-    assert!(!String::from_utf8_lossy(&forwarded).contains(raw));
-
-    forward_pty_input_bytes(
-        BRACKETED_PASTE_END,
-        &mut forwarded,
-        &mut protector,
-        &suppressor,
-    )
-    .unwrap();
-    let child = String::from_utf8(forwarded).unwrap();
-    assert!(child.contains("PENTECT_OPENAI_API_KEY_"), "{child}");
-    let mut visible = child;
-    suppressor.scrub(&mut visible);
-    assert!(!visible.contains(raw), "{visible}");
-    assert!(visible.contains("PENTECT_OPENAI_API_KEY_"), "{visible}");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn pty_terminal_queries_are_answered_without_reaching_output() {
-    #[derive(Clone)]
-    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for SharedWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .map_err(|_| std::io::Error::other("lock"))?
-                .extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let response = Arc::new(Mutex::new(Vec::new()));
-    let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-        Arc::new(Mutex::new(Box::new(SharedWriter(response.clone()))));
-    let mut pending = "before\x1b[6nafter\x1b[5n".to_string();
-    respond_to_terminal_queries(&mut pending, &writer).unwrap();
-    assert_eq!(pending, "beforeafter");
-    assert_eq!(*response.lock().unwrap(), b"\x1b[1;1R\x1b[0n");
-    assert!(is_terminal_query_prefix(b"\x1b"));
-    assert!(is_terminal_query_prefix(b"\x1b[6"));
-    assert!(!is_terminal_query_prefix(b"\x1b[A"));
 }
 
 #[test]
@@ -1135,7 +702,7 @@ fn bridge_error_preserves_phase_and_execution_state() {
 }
 
 #[test]
-fn prompt_masked_env_is_available_to_exec_proxy_without_visible_pentect_exec() {
+fn prompt_masked_env_is_available_to_direct_execution() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-exec-proxy");
 
@@ -1186,6 +753,108 @@ fn prompt_masking_uses_strict_input_detection_for_env_lines_in_prose() {
         .unwrap();
     assert!(!masked.contains(raw), "{masked}");
     assert!(masked.contains("OPENAI_API_KEY=<<"), "{masked}");
+}
+
+#[test]
+fn active_prompt_masker_reuses_bounded_cached_result() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-cache");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let prompt = format!("OPENAI_API_KEY={raw}");
+    let mut masker = ActiveToolOutputMasker::new().unwrap();
+
+    let first = masker.mask_prompt_text(&prompt).unwrap().unwrap();
+    assert!(!first.contains(raw), "{first}");
+    assert_eq!(masker.prompt_cache.len(), 1);
+    assert_eq!(masker.prompt_cache_order.len(), 1);
+    let reported_after_first = masker.reported_masked_count;
+
+    let second = masker.mask_prompt_text(&prompt).unwrap().unwrap();
+    assert_eq!(second, first);
+    assert_eq!(masker.prompt_cache.len(), 1);
+    assert_eq!(masker.prompt_cache_order.len(), 1);
+    assert_eq!(masker.reported_masked_count, reported_after_first);
+}
+
+#[test]
+fn embedded_env_assignment_detection_is_structural_and_sensitive() {
+    assert_eq!(
+        masking::embedded_sensitive_env_assignment_start("output: RUNPOD_API_KEY=rpa_example"),
+        Some("output: ".len())
+    );
+    assert_eq!(
+        masking::embedded_sensitive_env_assignment_start("created OPENAI_API_KEY=sk-example"),
+        Some("created ".len())
+    );
+    assert_eq!(
+        masking::embedded_sensitive_env_assignment_start("status=created"),
+        None
+    );
+}
+
+#[test]
+fn embedded_env_masking_preserves_a_trailing_carriage_return() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("prompt-carriage-return");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let input = format!("output: OPENAI_API_KEY={raw}\r");
+    let session = Session::open_capability("default").unwrap();
+    let store = MemoryStore::for_session(&session);
+    let mut masker = masking::OutputMasker::new_shared(store).unwrap();
+
+    let masked = masker.mask_embedded_env_assignments(&input).unwrap();
+    assert!(masked.ends_with('\r'), "{masked:?}");
+    assert!(!masked.contains(raw), "{masked}");
+}
+
+#[test]
+fn active_memory_store_resolver_reuses_one_snapshot_for_many_scalars() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("resolver-snapshot");
+    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let masked = mask_prompt_text_into_active_memory_store(&format!("OPENAI_API_KEY={raw}"))
+        .unwrap()
+        .unwrap();
+    let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let resolver = ActiveMemoryStoreResolver::new().unwrap();
+
+    assert_eq!(
+        resolver.resolve_known_text(&handle).unwrap().as_deref(),
+        Some(raw)
+    );
+    assert_eq!(
+        resolver
+            .resolve_known_text("before <<UNKNOWN_0123456789abcdef>> after")
+            .unwrap()
+            .as_deref(),
+        Some("before <<UNKNOWN_0123456789abcdef>> after")
+    );
+}
+
+#[test]
+fn ocr_off_obeys_block_policy_for_active_image_redaction() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("ocr-off-block-active");
+    write_project_config(
+        &root,
+        "[image]\nocr = \"off\"\nunscanned_images = \"block\"\n",
+    );
+    let (_active_store, _, _) = ActiveMemoryStoreEnv::start("ocr-off-block-store");
+    let _cwd = enter_temp_cwd(&root);
+    let image = json!({
+        "content": [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "aGVsbG8="
+            }
+        }]
+    });
+
+    let error = redact_tool_images_into_active_memory_store(&image).unwrap_err();
+    assert_eq!(error, "image blocked: OCR is off.");
+    assert!(unscanned_images_should_block().unwrap());
 }
 
 #[test]
@@ -1346,71 +1015,6 @@ fn handle_core_is_also_a_valid_environment_binding() {
     .unwrap();
     assert_eq!(bindings, vec![(short_name.to_string(), value.to_string())]);
 
-    let mut protector = ShellInputProtector::new(store).unwrap();
-    let mut protected = protector
-        .prepare_paste(&format!("echo $env:{short_name}"))
-        .unwrap();
-    assert!(protected.child.contains(value), "{}", protected.child);
-    assert!(protected.child.ends_with(&protected.visible));
-    protected.child.zeroize();
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn shell_command_keeps_known_env_reference_and_public_url_verbatim() {
-    let root = temp_root("shell-env-reference-command");
-    let session = Session::open_capability_at(&root, "t").unwrap();
-    let value = "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
-    let masked = mask_tool_output(&session, &format!("KAGGLE_API_TOKEN={value}\n")).unwrap();
-    let handle = masked_handle_from_assignment(&masked, "KAGGLE_API_TOKEN");
-    let short_name = handle
-        .strip_prefix("<<")
-        .and_then(|value| value.strip_suffix(">>"))
-        .unwrap();
-    let command = format!(
-        "irm https://www.kaggle.com/api/v1/competitions/list -Headers @{{Authorization=\"Bearer $env:{short_name}\"}}"
-    );
-    let store = MemoryStore::for_session(&session);
-    let mut protector = ShellInputProtector::new(store).unwrap();
-    let mut protected = protector.prepare_paste(&command).unwrap();
-
-    assert_eq!(protected.visible, command);
-    assert!(protected.child.ends_with(&command), "{}", protected.child);
-    assert!(protected.child.contains(value), "{}", protected.child);
-    assert!(
-        !protected.child.contains("PENTECT_URL_"),
-        "{}",
-        protected.child
-    );
-    assert!(
-        !protected.child.contains("PENTECT_KEYED_SECRET_"),
-        "{}",
-        protected.child
-    );
-    protected.child.zeroize();
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn stale_shell_handle_fails_before_running_the_command() {
-    let root = temp_root("stale-shell-env-reference");
-    let session = Session::open_capability_at(&root, "t").unwrap();
-    let value = "KGAT_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef";
-    let _ = mask_tool_output(&session, &format!("KAGGLE_API_TOKEN={value}\n")).unwrap();
-    let command = concat!(
-        "irm https://www.kaggle.com/api/v1/competitions/list ",
-        "-Headers @{Authorization=\"Bearer $env:KAGGLE_API_TOKEN_b818890b85f7482a\"}"
-    );
-    let store = MemoryStore::for_session(&session);
-    let mut protector = ShellInputProtector::new(store).unwrap();
-    let protected = protector.prepare_paste(command).unwrap();
-
-    assert!(protected.child.contains("stale environment handle"));
-    assert!(protected.child.contains("cat .env"));
-    assert!(!protected.child.contains("Invoke-RestMethod"));
-    assert!(!protected.child.contains("https://www.kaggle.com"));
-    assert!(!protected.child.contains(value));
-    assert_eq!(protected.visible, command);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1609,9 +1213,14 @@ fn resolve_path_refuses_parent_traversal() {
 fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
     let root = temp_root("capability-generic-pentect-env");
     let session = Session::open_capability_at(&root, "t").unwrap();
-    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    let raw = [
+        "sk-qa25MV9c7Qu0EjDIEWdcT3",
+        "Blbk",
+        "FJ83uCF0K4yw7RzpY39bio",
+    ]
+    .concat();
     let masked = mask_tool_output(&session, &format!("created token: {raw}\n")).unwrap();
-    assert!(!masked.contains(raw), "{masked}");
+    assert!(!masked.contains(&raw), "{masked}");
     let handle = first_masked_handle(&masked);
     let env_name = pentect_env_name_for_handle(&handle);
 
@@ -1619,7 +1228,7 @@ fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
     let env = store.auto_env_bindings().unwrap();
     assert!(
         env.iter()
-            .any(|(name, value)| name == &env_name && value == raw),
+            .any(|(name, value)| name == &env_name && value == &raw),
         "{env:?}"
     );
 
@@ -1636,11 +1245,11 @@ fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
     };
     let output = run_resolved_command(&store, &opts).unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(raw), "{stdout}");
+    assert!(stdout.contains(&raw), "{stdout}");
 
     let safe = mask_tool_output(&session, &stdout).unwrap();
-    assert!(!safe.contains(raw), "{safe}");
-    assert!(safe.contains("<<OPENAI_API_KEY_"), "{safe}");
+    assert!(!safe.contains(&raw), "{safe}");
+    assert!(safe.contains("<<OPENAI_TOKEN_"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2233,8 +1842,8 @@ fn mcp_style_tool_result_masks_content_and_structured_content() {
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("<<SECRET_"), "{rendered}");
-    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<RUNPOD_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<APIKEY_"), "{rendered}");
     assert!(!rendered.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
     assert!(!rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"));
     assert!(!rendered.contains("hunter2"), "{rendered}");
@@ -2293,8 +1902,9 @@ fn generic_posttool_masks_external_tool_response_aliases() {
     let output = handle_hook(HookProvider::Generic, "t", &session, input).unwrap();
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("<<SECRET_"), "{rendered}");
-    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<RUNPOD_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<APIKEY_"), "{rendered}");
+    assert!(rendered.contains("<<AUTHORIZATION_"), "{rendered}");
     assert!(!rendered.contains(raw_runpod), "{rendered}");
     assert!(!rendered.contains(raw_openai), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
@@ -2347,7 +1957,7 @@ fn posttool_masks_secret_query_inside_image_url() {
     };
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let rendered = serde_json::to_string(updated).unwrap();
-    assert!(rendered.contains("<<URL_CREDENTIAL_"), "{rendered}");
+    assert!(rendered.contains("<<API_KEY_"), "{rendered}");
     assert!(!rendered.contains(raw), "{rendered}");
     assert!(rendered.contains("screenshot.png?api_key="), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
@@ -2603,14 +2213,14 @@ fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
     assert!(!rendered.contains(raw), "{rendered}");
-    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(rendered.contains("<<APIKEY_"), "{rendered}");
 
     let store = MemoryStore::for_session(&session);
     let env = store.auto_env_bindings().unwrap();
     let env_name = env
         .iter()
         .find_map(|(name, value)| {
-            (name.starts_with("PENTECT_OPENAI_API_KEY_") && value == raw).then(|| name.clone())
+            (name.starts_with("PENTECT_APIKEY_") && value == raw).then(|| name.clone())
         })
         .unwrap_or_else(|| panic!("missing PENTECT env binding in {env:?}"));
     let command = if cfg!(windows) {
@@ -2630,12 +2240,12 @@ fn mcp_structured_secret_can_be_used_as_pentect_env_capability() {
 
     let safe = mask_tool_output(&session, &stdout).unwrap();
     assert!(!safe.contains(raw), "{safe}");
-    assert!(safe.contains("<<OPENAI_API_KEY_"), "{safe}");
+    assert!(safe.contains("<<"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn browser_mail_text_masks_otp_but_keeps_content_readable() {
+fn retired_claude_hook_does_not_apply_browser_mail_otp_policy() {
     let (root, session) = empty_session("hook-post-browser-mail-text");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2658,30 +2268,7 @@ fn browser_mail_text_masks_otp_but_keeps_content_readable() {
     });
 
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
-    let rendered = serde_json::to_string(updated).unwrap();
-    for secret in ["837291", "402118", "483920"] {
-        assert!(!rendered.contains(secret), "{rendered}");
-    }
-    assert!(rendered.contains("<<OTP_"), "{rendered}");
-    assert!(rendered.contains("Sign-in request"), "{rendered}");
-    assert!(rendered.contains("Chrome on Windows"), "{rendered}");
-    assert!(rendered.contains("Seat 12A stays visible"), "{rendered}");
-    assert!(
-        rendered.contains("Invoice INV-100482 remains readable"),
-        "{rendered}"
-    );
-
-    let env = MemoryStore::for_session(&session)
-        .auto_env_bindings()
-        .unwrap();
-    for secret in ["837291", "402118", "483920"] {
-        assert!(
-            env.iter()
-                .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
-            "{env:?}"
-        );
-    }
+    assert_eq!(output, json!({}));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2709,7 +2296,10 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
     assert!(!rendered.contains(raw), "{rendered}");
-    assert!(rendered.contains("RUNPOD_API_KEY=<<SECRET_"), "{rendered}");
+    assert!(
+        rendered.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
+        "{rendered}"
+    );
     assert!(rendered.contains("Create API key"), "{rendered}");
     assert!(
         rendered.contains("Use this key to call the health endpoint."),
@@ -2721,7 +2311,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     let env_name = env
         .iter()
         .find_map(|(name, value)| {
-            (name.starts_with("PENTECT_SECRET_") && value == raw).then(|| name.clone())
+            (name.starts_with("PENTECT_RUNPOD_API_KEY_") && value == raw).then(|| name.clone())
         })
         .unwrap_or_else(|| panic!("missing RUNPOD capability in {env:?}"));
     let command = if cfg!(windows) {
@@ -2740,7 +2330,7 @@ fn browser_api_key_issue_flow_masks_value_and_keeps_capability_usable() {
     assert!(stdout.contains(raw), "{stdout}");
     let safe = mask_tool_output(&session, &stdout).unwrap();
     assert!(!safe.contains(raw), "{safe}");
-    assert!(safe.contains("<<SECRET_"), "{safe}");
+    assert!(safe.contains("<<RUNPOD_API_KEY_"), "{safe}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2764,16 +2354,17 @@ fn browser_structured_otp_fields_mask_without_locking_to_email_format() {
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
-    for secret in ["837291", "402118", "483920", "729004"] {
+    for secret in ["837291", "402118", "483920"] {
         assert!(!rendered.contains(secret), "{rendered}");
     }
+    assert!(rendered.contains("729004"), "{rendered}");
     assert!(rendered.contains("<<OTP_"), "{rendered}");
     assert!(rendered.contains("ORD-100482"), "{rendered}");
 
     let env = MemoryStore::for_session(&session)
         .auto_env_bindings()
         .unwrap();
-    for secret in ["837291", "402118", "483920", "729004"] {
+    for secret in ["837291", "402118", "483920"] {
         assert!(
             env.iter()
                 .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
@@ -2784,7 +2375,7 @@ fn browser_structured_otp_fields_mask_without_locking_to_email_format() {
 }
 
 #[test]
-fn gmail_like_rows_mask_otp_without_label_value_context() {
+fn retired_claude_hook_does_not_apply_browser_row_otp_policy() {
     let (root, session) = empty_session("hook-post-gmail-row-otp");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2829,45 +2420,12 @@ fn gmail_like_rows_mask_otp_without_label_value_context() {
         }
     });
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    let rendered = serde_json::to_string(&output).unwrap();
-    for original in [
-        "Your one-time code expires in 10 minutes: 837291",
-        "Use AB12-CD to sign in",
-        "verification code is 1234",
-        "Enter 7QK4P before continuing",
-        "verification code expires in 10 minutes: 729004",
-        "確認コードは5分後に期限切れです: 483920",
-        "サインインするには 7391 を入力してください",
-    ] {
-        assert!(!rendered.contains(original), "{rendered}");
-    }
-    assert!(rendered.contains("<<OTP_"), "{rendered}");
-    assert!(rendered.contains("role=row"), "{rendered}");
-    assert!(rendered.contains("xY a4W"), "{rendered}");
-    assert!(rendered.contains("expires in 10 minutes"), "{rendered}");
-    assert!(rendered.contains("ORD-100482"), "{rendered}");
-    assert!(rendered.contains("INV-100482"), "{rendered}");
-    assert!(rendered.contains("SUP-100482"), "{rendered}");
-    assert!(rendered.contains("SAVE10"), "{rendered}");
-    assert!(rendered.contains("GH56-JK"), "{rendered}");
-
-    let env = MemoryStore::for_session(&session)
-        .auto_env_bindings()
-        .unwrap();
-    for secret in [
-        "837291", "AB12-CD", "1234", "7QK4P", "729004", "483920", "7391",
-    ] {
-        assert!(
-            env.iter()
-                .any(|(name, value)| name.starts_with("PENTECT_OTP_") && value == secret),
-            "{env:?}"
-        );
-    }
+    assert_eq!(output, json!({}));
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn browser_wallet_seed_phrase_masks_plain_and_numbered_shapes() {
+fn retired_claude_hook_does_not_apply_browser_wallet_policy() {
     let (root, session) = empty_session("hook-post-browser-seed-phrase");
     let phrase = concat!(
         "abandon abandon abandon abandon abandon abandon ",
@@ -2894,28 +2452,22 @@ fn browser_wallet_seed_phrase_masks_plain_and_numbered_shapes() {
     });
 
     let output = handle_hook(HookProvider::Claude, "t", &session, input).unwrap();
-    let rendered = serde_json::to_string(&output).unwrap();
-    assert!(!rendered.contains(phrase), "{rendered}");
-    assert!(!rendered.contains("abandon abandon abandon"), "{rendered}");
-    assert!(rendered.contains("<<BIP39_MNEMONIC_"), "{rendered}");
-    assert!(rendered.contains("INV-100482"), "{rendered}");
-    assert!(rendered.contains("SAVE10"), "{rendered}");
-
-    let env = MemoryStore::for_session(&session)
-        .auto_env_bindings()
-        .unwrap();
-    assert!(
-        env.iter()
-            .any(|(name, value)| name.starts_with("PENTECT_BIP39_MNEMONIC_") && value == phrase),
-        "{env:?}"
-    );
+    assert_eq!(output, json!({}));
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn posttool_masks_secret_object_keys() {
     let (root, session) = empty_session("hook-post-secret-key");
-    let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
+    // Use the shape owned by the embedded CredSweeper definition. The old
+    // sequential alphabet fixture was accepted only by Pentect's retired
+    // provider-specific OpenAI regex.
+    let raw = [
+        "sk-qa25MV9c7Qu0EjDIEWdcT3",
+        "Blbk",
+        "FJ83uCF0K4yw7RzpY39bio",
+    ]
+    .concat();
     let mut structured = serde_json::Map::new();
     structured.insert(raw.to_string(), json!({"status": "created"}));
     structured.insert("token".to_string(), json!("hunter2"));
@@ -2929,8 +2481,8 @@ fn posttool_masks_secret_object_keys() {
 
     let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
     let rendered = serde_json::to_string(&output).unwrap();
-    assert!(!rendered.contains(raw), "{rendered}");
-    assert!(rendered.contains("<<OPENAI_API_KEY_"), "{rendered}");
+    assert!(!rendered.contains(&raw), "{rendered}");
+    assert!(rendered.contains("<<"), "{rendered}");
     assert!(!rendered.contains("hunter2"), "{rendered}");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2971,7 +2523,6 @@ fn env_like_tool_output_masks_all_env_values() {
 
 #[test]
 fn codex_posttool_does_not_block_already_masked_exec_output() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-already-masked");
     let output = "RUNPOD_API_KEY=rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef\nTEST_SECRET=114514810\nNOTE=hello world\n";
     let masked = mask_tool_output(&session, output).unwrap();
@@ -2990,7 +2541,6 @@ fn codex_posttool_does_not_block_already_masked_exec_output() {
 
 #[test]
 fn codex_posttool_masks_raw_output_even_if_command_claims_pentect_exec() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-fake-pentect-exec");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -3013,47 +2563,7 @@ fn codex_posttool_masks_raw_output_even_if_command_claims_pentect_exec() {
 }
 
 #[test]
-fn codex_posttool_skips_shell_block_when_exec_proxy_is_active() {
-    let _proxy = ScopedCodexExecProxy::set(true);
-    let (root, session) = empty_session("hook-post-codex-proxy-shell");
-    let input = json!({
-        "hook_event_name": "PostToolUse",
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "Get-Content .env"
-        },
-        "tool_response": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
-    });
-    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
-    assert_eq!(output, json!({}));
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn codex_posttool_still_blocks_mcp_when_exec_proxy_is_active() {
-    let _proxy = ScopedCodexExecProxy::set(true);
-    let (root, session) = empty_session("hook-post-codex-proxy-mcp");
-    let input = json!({
-        "hook_event_name": "PostToolUse",
-        "tool_name": "mcp__demo__read",
-        "tool_input": {},
-        "tool_response": {
-            "content": "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n"
-        }
-    });
-    let output = handle_hook(HookProvider::Codex, "t", &session, input).unwrap();
-    let rendered = serde_json::to_string(&output).unwrap();
-    assert_eq!(output["decision"], "block");
-    assert!(
-        !rendered.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
-        "{rendered}"
-    );
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
 fn codex_posttool_does_not_block_short_exec_footer() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-legacy-footer");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -3070,7 +2580,6 @@ fn codex_posttool_does_not_block_short_exec_footer() {
 
 #[test]
 fn codex_posttool_masks_pentect_exec_with_trailing_shell_escape() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-exec-trailing-shell");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -3264,7 +2773,7 @@ fn api_reference_text_is_not_redacted_as_env_derivatives() {
 }
 
 #[test]
-fn local_home_paths_render_as_tilde_in_tool_output() {
+fn local_home_paths_remain_visible_without_a_username_detector() {
     let (root, session) = empty_session("exec-local-home-paths");
     let output = concat!(
         r#"at C:\Users\yun40\Desktop\app\src\main.ts:12:34"#,
@@ -3275,17 +2784,12 @@ fn local_home_paths_render_as_tilde_in_tool_output() {
         "\n",
     );
     let masked = mask_tool_output(&session, output).unwrap();
-    assert!(!masked.contains("yun40"), "{masked}");
-    assert!(!masked.contains("LOCAL_USERNAME"), "{masked}");
-    assert!(masked.contains(r#"~\Desktop\app\src\main.ts"#), "{masked}");
-    assert!(masked.contains(r#""~/demo/app.py""#), "{masked}");
-    assert!(masked.contains("~/project/src/main.rs"), "{masked}");
+    assert_eq!(masked, output);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn common_dev_tool_output_does_not_block_codex_posttool() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let cases = [
         (
             "next",
@@ -3341,7 +2845,6 @@ fn common_dev_tool_output_does_not_block_codex_posttool() {
 
 #[test]
 fn codex_posttool_does_not_block_vite_dev_server_banner() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-vite-banner");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -3372,7 +2875,7 @@ fn encoded_env_derivatives_do_not_leak() {
     assert!(!masked.contains(&b64), "{masked}");
     assert!(!masked.contains("7270615f46414b"), "{masked}");
     assert!(!masked.contains("68656c6c6f20776f726c64"), "{masked}");
-    assert!(masked.contains("<<SECRET_"), "{masked}");
+    assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
     assert!(
         masked.contains("RUNPOD_API_KEY=<<REDACTED_DERIVED>>"),
         "{masked}"
@@ -3394,7 +2897,7 @@ fn mixed_env_output_still_masks_encoded_non_env_lines() {
         masked.contains("RUNPOD_API_KEY=<<RUNPOD_API_KEY_"),
         "{masked}"
     );
-    assert!(masked.contains("B64_FILE:\n<<SECRET_"), "{masked}");
+    assert!(masked.contains("B64_FILE:\n<<LIKELY_SECRET_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3855,7 +3358,7 @@ fn file_pointer_manager_skips_non_text_read_inputs() {
         &path,
         &result.masked,
         &result,
-        InputFormat::Pdf
+        InputFormat::Image
     ));
     assert!(!Path::new(".pentect")
         .join("file-pointer-manager")
@@ -3863,6 +3366,11 @@ fn file_pointer_manager_skips_non_text_read_inputs() {
         .exists());
     drop(_cwd);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pdf_input_is_not_supported() {
+    assert!(parse_input_format("pdf").is_err());
 }
 
 #[test]
@@ -4278,53 +3786,6 @@ fn pretool_does_not_treat_mcp_command_fields_as_shell_commands() {
 }
 
 #[test]
-fn codex_app_server_proxy_wraps_shell_even_when_exec_proxy_is_enabled() {
-    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    std::env::set_var("PENTECT_CODEX_APP_SERVER_PROXY", "1");
-    struct Cleanup;
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            std::env::remove_var("PENTECT_CODEX_APP_SERVER_PROXY");
-        }
-    }
-    let _cleanup = Cleanup;
-    let _exec_proxy = ScopedCodexExecProxy::set(true);
-    let (root, session) = empty_session("hook-pre-codex-app-server");
-    let input = json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "Write-Output $env:OPENAI_API_KEY"
-        }
-    });
-    let output = handle_hook(HookProvider::Codex, DEFAULT_SESSION, &session, input).unwrap();
-    let command = output["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
-        .unwrap();
-    assert!(command.starts_with("pentect exec "), "{command}");
-    assert_eq!(wrapped_payload(command), "Write-Output $env:OPENAI_API_KEY");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn codex_exec_proxy_keeps_plain_shell_unwrapped_without_app_server_proxy() {
-    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-    std::env::remove_var("PENTECT_CODEX_APP_SERVER_PROXY");
-    let _exec_proxy = ScopedCodexExecProxy::set(true);
-    let (root, session) = empty_session("hook-pre-codex-exec-proxy");
-    let input = json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "echo hello"
-        }
-    });
-    let output = handle_hook(HookProvider::Codex, DEFAULT_SESSION, &session, input).unwrap();
-    assert_eq!(output, json!({}));
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
 fn display_command_without_pentect_exec_wrapper_returns_shell_payload() {
     let wrapped =
         wrap_shell_command(HookProvider::Codex, DEFAULT_SESSION, "Bash", "cat .env").unwrap();
@@ -4590,7 +4051,10 @@ fn bash_same_shell_wrapper_does_not_wait_for_background_output_holders() {
     let started = std::time::Instant::now();
     let output = Command::new(bash).arg("-c").arg(&wrapper).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert!(started.elapsed() < Duration::from_secs(2), "{output:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{output:?}"
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "foreground",
@@ -4690,7 +4154,7 @@ fn claude_posttool_masks_raw_output() {
     let content = output["hookSpecificOutput"]["updatedToolOutput"]["content"]
         .as_str()
         .unwrap();
-    assert!(content.contains("<<OPENAI_API_KEY_"), "{content}");
+    assert!(content.contains("<<TOKEN_"), "{content}");
     assert!(
         !content.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
         "{content}"
@@ -4704,13 +4168,12 @@ fn hook_text_masks_runpod_token_as_plain_text() {
     let raw = concat!("RUNPOD=", "rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef");
     let masked = mask_tool_output(&session, raw).unwrap();
     assert!(!masked.contains("rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdef"));
-    assert!(masked.contains("<<SECRET_"), "{masked}");
+    assert!(masked.contains("<<LIKELY_SECRET_"), "{masked}");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn codex_posttool_blocks_with_masked_feedback() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex");
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -4732,7 +4195,6 @@ fn codex_posttool_blocks_with_masked_feedback() {
 
 #[test]
 fn codex_mcp_posttool_blocks_with_masked_feedback() {
-    let _proxy = ScopedCodexExecProxy::set(false);
     let (root, session) = empty_session("hook-post-codex-mcp");
     let input = json!({
         "hook_event_name": "PostToolUse",

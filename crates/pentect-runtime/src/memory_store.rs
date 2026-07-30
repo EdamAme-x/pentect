@@ -4,8 +4,9 @@ use crate::Result;
 use anyhow::{anyhow, bail, Context};
 use pentect_core::{Config, Recovery};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
@@ -15,6 +16,8 @@ pub(crate) const ENV_TOKEN: &str = "PENTECT_MEMORY_STORE_TOKEN";
 
 const TOKEN_BYTES: usize = 32;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CLIENT_CONNECTIONS: usize = 32;
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVITY_EVENTS: usize = 4_096;
 const MAX_ACTIVITY_EVENT_BYTES: usize = 16 * 1024;
 const MAX_ACTIVITY_POLL_EVENTS: usize = 256;
@@ -150,20 +153,13 @@ const PENTECT_CONTROL_ENV_NAMES: &[&str] = &[
     "PENTECT_PLUGIN_DATA_DIR",
     "PENTECT_PLUGIN_CACHE_DIR",
     "PENTECT_PLUGIN_CONFIG",
-    "PENTECT_CODEX_EXEC_PROXY",
-    "PENTECT_CODEX_APP_SERVER_PROXY",
-    "PENTECT_EXEC_PROXY_DEBUG",
-    "PENTECT_APP_PROXY_DEBUG",
     "PENTECT_AGENT_CONTRACT",
     "PENTECT_STATUS_LINE",
     "PENTECT_HOME",
     "PENTECT_SESSION",
-    "PENTECT_SHELL",
-    "PENTECT_SHELL_BIN",
     "PENTECT_FILE_POINTER_MANAGER_DIR",
     "PENTECT_CODEX",
     "PENTECT_CLAUDE",
-    "PENTECT_OPENCODE",
 ];
 
 pub fn pentect_control_env_names() -> &'static [&'static str] {
@@ -185,6 +181,7 @@ pub(crate) struct MemoryStoreClient {
 
 pub(crate) struct MemoryStoreSnapshot {
     pub(crate) key: [u8; 32],
+    pub(crate) identity_key: [u8; 32],
     pub(crate) recovery: Recovery,
 }
 
@@ -233,6 +230,7 @@ impl InProcessMemoryStore {
 
 struct MemoryStoreState {
     key: [u8; 32],
+    identity_key: [u8; 32],
     recovery: Recovery,
     masked_count: u64,
     activity: VecDeque<(u64, String)>,
@@ -246,9 +244,30 @@ struct AgentScript {
     expires_at: Instant,
 }
 
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl ConnectionPermit {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        let previous = active.fetch_add(1, Ordering::AcqRel);
+        if previous >= MAX_CLIENT_CONNECTIONS {
+            active.fetch_sub(1, Ordering::AcqRel);
+            None
+        } else {
+            Some(Self(Arc::clone(active)))
+        }
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl Drop for MemoryStoreState {
     fn drop(&mut self) {
         self.key.zeroize();
+        self.identity_key.zeroize();
     }
 }
 
@@ -304,6 +323,15 @@ impl MemoryStoreClient {
             bail!("memory store key response is malformed");
         }
         decode_key_hex(fields[1])
+    }
+
+    pub(crate) fn keys(&self) -> Result<([u8; 32], [u8; 32])> {
+        let line = self.request("KEYS", "")?;
+        let fields = response_fields(&line)?;
+        if fields.len() != 3 || fields[0] != "OK" {
+            bail!("memory store keys response is malformed");
+        }
+        Ok((decode_key_hex(fields[1])?, decode_key_hex(fields[2])?))
     }
 
     pub(crate) fn add_recovery(&self, key: &[u8; 32], recovery: &Recovery) -> Result<()> {
@@ -491,16 +519,21 @@ impl MemoryStoreClient {
 
 fn decode_snapshot_response(line: &str) -> Result<MemoryStoreSnapshot> {
     let fields = response_fields(line)?;
-    if fields.len() != 3 || fields[0] != "OK" {
+    if fields.len() != 4 || fields[0] != "OK" {
         bail!("memory store snapshot response is malformed");
     }
     let key = decode_key_hex(fields[1])?;
+    let identity_key = decode_key_hex(fields[2])?;
     let recovery_blob = data_encoding::BASE64
-        .decode(fields[2].as_bytes())
+        .decode(fields[3].as_bytes())
         .context("memory store snapshot is not valid base64")?;
     let recovery = Recovery::load(&recovery_blob, &key)
         .map_err(|e| anyhow!("memory store snapshot is invalid: {e}"))?;
-    Ok(MemoryStoreSnapshot { key, recovery })
+    Ok(MemoryStoreSnapshot {
+        key,
+        identity_key,
+        recovery,
+    })
 }
 
 fn decode_masked_count_response(line: &str) -> Result<u64> {
@@ -515,6 +548,18 @@ fn decode_masked_count_response(line: &str) -> Result<u64> {
 
 fn valid_runtime_token(token: &str) -> bool {
     token.len() == TOKEN_BYTES * 2 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(not(test))]
+fn valid_request_token(token: &str) -> bool {
+    valid_runtime_token(token)
+}
+
+#[cfg(test)]
+fn valid_request_token(token: &str) -> bool {
+    // Unit-test stores use readable fixture tokens; production accepts only
+    // CSPRNG-generated fixed-width tokens.
+    !token.is_empty()
 }
 
 impl Drop for MemoryStoreClient {
@@ -576,8 +621,10 @@ fn serve_memory_store_inner() -> Result<()> {
     let process_host_read_token = Arc::new(Zeroizing::new(random_token_hex()?));
     let process_host_write_token = Arc::new(Zeroizing::new(random_token_hex()?));
     let key = Config::generate().key;
+    let identity_key = runtime_identity_key()?;
     let state = Arc::new(Mutex::new(MemoryStoreState {
         key,
+        identity_key,
         recovery: Recovery::empty_for_key(&key),
         masked_count: 0,
         activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
@@ -594,9 +641,13 @@ fn serve_memory_store_inner() -> Result<()> {
         })
     );
     let _ = std::io::stdout().flush();
+    let active_connections = Arc::new(AtomicUsize::new(0));
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
+            continue;
+        };
+        let Some(permit) = ConnectionPermit::acquire(&active_connections) else {
             continue;
         };
         let state = state.clone();
@@ -604,6 +655,7 @@ fn serve_memory_store_inner() -> Result<()> {
         let process_host_read_token = Arc::clone(&process_host_read_token);
         let process_host_write_token = Arc::clone(&process_host_write_token);
         std::thread::spawn(move || {
+            let _permit = permit;
             let _ = handle_client(
                 stream,
                 token.as_str(),
@@ -627,8 +679,10 @@ pub fn start_in_process_memory_store() -> Result<InProcessMemoryStore> {
     let process_host_read_token = Zeroizing::new(random_token_hex()?);
     let process_host_write_token = Zeroizing::new(random_token_hex()?);
     let key = Config::generate().key;
+    let identity_key = runtime_identity_key()?;
     let state = Arc::new(Mutex::new(MemoryStoreState {
         key,
+        identity_key,
         recovery: Recovery::empty_for_key(&key),
         masked_count: 0,
         activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
@@ -638,17 +692,22 @@ pub fn start_in_process_memory_store() -> Result<InProcessMemoryStore> {
     let server_token = Arc::new(Zeroizing::new(token.to_string()));
     let server_read_token = Arc::new(Zeroizing::new(process_host_read_token.to_string()));
     let server_write_token = Arc::new(Zeroizing::new(process_host_write_token.to_string()));
+    let active_connections = Arc::new(AtomicUsize::new(0));
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let server_thread = std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             if shutdown_rx.try_recv().is_ok() {
                 break;
             }
+            let Some(permit) = ConnectionPermit::acquire(&active_connections) else {
+                continue;
+            };
             let state = Arc::clone(&state);
             let token = Arc::clone(&server_token);
             let read_token = Arc::clone(&server_read_token);
             let write_token = Arc::clone(&server_write_token);
             std::thread::spawn(move || {
+                let _permit = permit;
                 let _ = handle_client(
                     stream,
                     token.as_str(),
@@ -669,6 +728,16 @@ pub fn start_in_process_memory_store() -> Result<InProcessMemoryStore> {
     })
 }
 
+#[cfg(not(test))]
+fn runtime_identity_key() -> Result<[u8; 32]> {
+    crate::config::handle_identity_key().map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+fn runtime_identity_key() -> Result<[u8; 32]> {
+    Ok(Config::generate().identity_key)
+}
+
 #[cfg(test)]
 pub(crate) fn spawn_test_memory_store(token: String) -> String {
     let read_token = format!("{token}-activity-read");
@@ -686,8 +755,10 @@ pub(crate) fn spawn_test_memory_store_with_activity(
     let read_token = Arc::new(Zeroizing::new(read_token));
     let write_token = Arc::new(Zeroizing::new(write_token));
     let key = Config::generate().key;
+    let identity_key = Config::generate().identity_key;
     let state = Arc::new(Mutex::new(MemoryStoreState {
         key,
+        identity_key,
         recovery: Recovery::empty_for_key(&key),
         masked_count: 0,
         activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),
@@ -696,13 +767,18 @@ pub(crate) fn spawn_test_memory_store_with_activity(
     }));
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+    let active_connections = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let Some(permit) = ConnectionPermit::acquire(&active_connections) else {
+                continue;
+            };
             let token = Arc::clone(&token);
             let read_token = Arc::clone(&read_token);
             let write_token = Arc::clone(&write_token);
             let state = state.clone();
             std::thread::spawn(move || {
+                let _permit = permit;
                 handle_client(
                     stream,
                     token.as_str(),
@@ -724,12 +800,17 @@ fn handle_client(
     process_host_write_token: &str,
     state: &Arc<Mutex<MemoryStoreState>>,
 ) -> Result<()> {
+    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let mut exit_on_disconnect = false;
+    let mut authenticated = false;
     loop {
         line.clear();
-        let read = match reader.read_line(&mut line) {
+        let read = match Read::take(reader.by_ref(), MAX_REQUEST_LINE_BYTES as u64 + 1)
+            .read_line(&mut line)
+        {
             Ok(read) => read,
             Err(_) if exit_on_disconnect => std::process::exit(0),
             Err(error) => return Err(error).context("could not read memory store request"),
@@ -740,44 +821,62 @@ fn handle_client(
             }
             return Ok(());
         }
+        if read > MAX_REQUEST_LINE_BYTES {
+            bail!("memory store request is too large");
+        }
         let fields = request_fields(&line);
+        let provided_token = fields.first().copied().unwrap_or_default();
+        let access = if !valid_request_token(provided_token) {
+            None
+        } else if constant_time_token_eq(provided_token, token) {
+            Some(RequestAccess::Primary)
+        } else if constant_time_token_eq(provided_token, process_host_read_token) {
+            Some(RequestAccess::ProcessRead)
+        } else if constant_time_token_eq(provided_token, process_host_write_token) {
+            Some(RequestAccess::ProcessWrite)
+        } else {
+            None
+        };
+        let Some(access) = access else {
+            let stream = reader.get_mut();
+            writeln!(stream, "ERR\tbad token")
+                .and_then(|_| stream.flush())
+                .context("could not write memory store error")?;
+            return Ok(());
+        };
+        if !authenticated {
+            authenticated = true;
+            let _ = reader.get_mut().set_read_timeout(None);
+        }
         let response = match fields.as_slice() {
-            [provided_token, "KEY", ""] if *provided_token == token => key_response(state),
-            [provided_token, "COUNT", ""] if *provided_token == token => count_response(state),
-            [provided_token, "SNAPSHOT", ""] if *provided_token == token => {
-                snapshot_response(state)
-            }
-            [provided_token, "ADD", payload] if *provided_token == token => {
+            [_, "KEY", ""] if access == RequestAccess::Primary => key_response(state),
+            [_, "KEYS", ""] if access == RequestAccess::Primary => keys_response(state),
+            [_, "COUNT", ""] if access == RequestAccess::Primary => count_response(state),
+            [_, "SNAPSHOT", ""] if access == RequestAccess::Primary => snapshot_response(state),
+            [_, "ADD", payload] if access == RequestAccess::Primary => {
                 add_recovery_request(state, payload)
             }
-            [provided_token, "ADD_COUNT", payload] if *provided_token == token => {
+            [_, "ADD_COUNT", payload] if access == RequestAccess::Primary => {
                 add_masked_count_request(state, payload)
             }
-            [provided_token, "SCRIPT_PUT", payload] if *provided_token == token => {
+            [_, "SCRIPT_PUT", payload] if access == RequestAccess::Primary => {
                 put_agent_script_request(state, payload)
             }
-            [provided_token, "SCRIPT_TAKE", id] if *provided_token == token => {
+            [_, "SCRIPT_TAKE", id] if access == RequestAccess::Primary => {
                 take_agent_script_request(state, id)
             }
-            [provided_token, "SCRIPT_RENDER", id] if *provided_token == token => {
+            [_, "SCRIPT_RENDER", id] if access == RequestAccess::Primary => {
                 render_agent_script_request(state, id)
             }
-            [provided_token, "LEASE", ""] if *provided_token == token => {
+            [_, "LEASE", ""] if access == RequestAccess::Primary => {
                 exit_on_disconnect = true;
                 Ok("OK".to_string())
             }
-            [provided_token, "LOG_ADD", payload] if *provided_token == process_host_write_token => {
+            [_, "LOG_ADD", payload] if access == RequestAccess::ProcessWrite => {
                 add_activity_request(state, payload)
             }
-            [provided_token, "LOGS", payload] if *provided_token == process_host_read_token => {
+            [_, "LOGS", payload] if access == RequestAccess::ProcessRead => {
                 activity_response(state, payload)
-            }
-            [provided_token, ..]
-                if *provided_token != token
-                    && *provided_token != process_host_read_token
-                    && *provided_token != process_host_write_token =>
-            {
-                Err(anyhow!("bad token"))
             }
             _ => Err(anyhow!("malformed request")),
         };
@@ -795,6 +894,27 @@ fn handle_client(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestAccess {
+    Primary,
+    ProcessRead,
+    ProcessWrite,
+}
+
+fn constant_time_token_eq(provided: &str, expected: &str) -> bool {
+    if provided.len() != expected.len() {
+        return false;
+    }
+    provided
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
 fn key_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
     let guard = state
         .lock()
@@ -805,13 +925,25 @@ fn key_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
     ))
 }
 
-fn snapshot_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
+fn keys_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
     let guard = state
         .lock()
         .map_err(|_| anyhow!("memory store lock poisoned"))?;
     Ok(format!(
         "OK\t{}\t{}",
         data_encoding::HEXLOWER.encode(&guard.key),
+        data_encoding::HEXLOWER.encode(&guard.identity_key)
+    ))
+}
+
+fn snapshot_response(state: &Arc<Mutex<MemoryStoreState>>) -> Result<String> {
+    let guard = state
+        .lock()
+        .map_err(|_| anyhow!("memory store lock poisoned"))?;
+    Ok(format!(
+        "OK\t{}\t{}\t{}",
+        data_encoding::HEXLOWER.encode(&guard.key),
+        data_encoding::HEXLOWER.encode(&guard.identity_key),
         data_encoding::BASE64.encode(&guard.recovery.serialize(&guard.key))
     ))
 }
@@ -1049,17 +1181,67 @@ mod tests {
     use pentect_core::{Engine, Input, Kind, Profile};
 
     #[test]
+    fn connection_limit_is_enforced_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let permits = (0..MAX_CLIENT_CONNECTIONS)
+            .map(|_| ConnectionPermit::acquire(&active).expect("within connection limit"))
+            .collect::<Vec<_>>();
+        assert!(ConnectionPermit::acquire(&active).is_none());
+        drop(permits);
+        assert!(ConnectionPermit::acquire(&active).is_some());
+    }
+
+    #[test]
+    fn bad_token_connection_is_closed_after_one_error() {
+        let token = "good-token-close".to_string();
+        let addr = spawn_test_memory_store(token);
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        writeln!(stream, "bad-token\tCOUNT\t").unwrap();
+        stream.flush().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        assert_eq!(line.trim(), "ERR\tbad token");
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_request_token_never_matches_empty_server_tokens() {
+        let addr =
+            spawn_test_memory_store_with_activity(String::new(), String::new(), String::new());
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        writeln!(stream, "\tCOUNT\t").unwrap();
+        stream.flush().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ERR\tbad token");
+        assert!(valid_runtime_token(&"a".repeat(TOKEN_BYTES * 2)));
+        assert!(!valid_runtime_token(""));
+    }
+
+    #[test]
     fn client_round_trips_recovery_through_memory_store_state() {
         let token = "test-token".to_string();
         let client = MemoryStoreClient::new(spawn_test_memory_store(token.clone()), token);
-        assert_eq!(client.key().unwrap(), client.snapshot().unwrap().key);
         let snapshot = client.snapshot().unwrap();
+        assert_eq!(client.key().unwrap(), snapshot.key);
+        assert_eq!(
+            client.keys().unwrap(),
+            (snapshot.key, snapshot.identity_key)
+        );
         let result = Engine::with_profile(Profile::Strict).mask(
             Input {
                 kind: Kind::Env,
                 data: "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n".to_string(),
             },
-            &Config::new(snapshot.key),
+            &Config::new(snapshot.key).with_identity_key(snapshot.identity_key),
         );
         let masked = result.masked.clone();
         client
@@ -1184,6 +1366,10 @@ mod tests {
             reader.key().is_err(),
             "activity token exposed the store key"
         );
+        assert!(
+            reader.keys().is_err(),
+            "activity token exposed the store keys"
+        );
 
         writer
             .add_activity(r#"{"action":"resolve","count":1}"#)
@@ -1199,6 +1385,7 @@ mod tests {
         let key = Config::generate().key;
         let state = Arc::new(Mutex::new(MemoryStoreState {
             key,
+            identity_key: key,
             recovery: Recovery::empty_for_key(&key),
             masked_count: 0,
             activity: VecDeque::with_capacity(MAX_ACTIVITY_EVENTS),

@@ -1,26 +1,38 @@
-numpy
-onnxruntime
-humanfriendly
-PyYAML
-colorama
-lxml
-cryptography
-base58
-pybase62
-beautifulsoup4
-GitPython
-odfpy
-openpyxl
-pandas
-pdfminer.six
-pyjks
-python-dateutil
-python-docx
-python-pptx
-PySquashfsImage
-pyxlsb
-rpmfile
-striprtf
-whatthepatch
-xlrd
-zstandard; python_version < "3.14"
+base58==2.1.1
+beautifulsoup4==4.15.0
+colorama==0.4.6
+cryptography==49.0.0
+GitPython==3.1.50
+humanfriendly==10.0
+lxml==6.1.1
+numpy==2.2.6; python_version == '3.10'
+numpy==2.4.6; python_version == '3.11'
+numpy==2.5.0; python_version > '3.11'
+odfpy==1.4.1
+xlrd==2.0.2
+striprtf==0.0.32
+PySquashfsImage==0.9.0
+
+# onnxruntime - ML engine
+onnxruntime==1.23.2; python_version < '3.14'
+onnxruntime==1.27.0; python_version >= '3.14'
+
+# openpyxl - A Python library to read/write Excel 2010 xlsx/xlsm files
+openpyxl==3.1.5
+
+# pandas - ML requirement and excel data reading
+pandas==2.3.3; python_version == '3.10'
+pandas==3.0.3; python_version > '3.10'
+
+pdfminer.six==20260107
+pybase62==1.0.0
+pyjks==20.0.0
+python-dateutil==2.9.0.post0
+python-docx==1.2.0
+python-pptx==1.0.2
+PyYAML==6.0.3
+pyxlsb==1.0.10
+rpmfile==2.2.1
+whatthepatch==1.0.7
+zstandard==0.25.0; python_version < '3.14'
+brotli==1.2.0

@@ -12,8 +12,7 @@ name = "pentect_agent"
 path = "src/main.rs"
 
 [features]
-default = ["pdf", "ocr"]
-pdf = ["dep:pdf-extract"]
+default = ["ocr"]
 ocr = ["dep:reqwest", "dep:flate2", "native-ocr", "bundled-ocr", "barcode"]
 barcode = ["dep:image", "dep:rxing"]
 native-ocr = [
@@ -29,7 +28,6 @@ bundled-ocr = ["dep:image", "dep:ocrs", "dep:rten"]
 pentect-core = { path = "../pentect-core" }
 anyhow = { workspace = true }
 data-encoding = { workspace = true }
-pdf-extract = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
@@ -42,16 +40,13 @@ hmac = { workspace = true }
 chacha20 = { workspace = true }
 toml = { workspace = true }
 anstream = { workspace = true }
-crossterm = { workspace = true }
-rustyline = { workspace = true }
-portable-pty = { workspace = true }
 zeroize = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 jiff = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
 windows = { workspace = true, optional = true, features = [
     "Foundation",
     "Graphics_Imaging",

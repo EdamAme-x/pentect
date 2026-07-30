@@ -1,6 +1,6 @@
 use crate::model::*;
-use crate::normalize::n_id;
-use crate::placeholder::{identity_hash, render_placeholder};
+use crate::normalize::n_id_cow;
+use crate::placeholder::{render_placeholder, IdentityHasher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -69,6 +69,7 @@ fn split_email(v: &str) -> Option<(&str, &str)> {
 /// disclosed only when opted in.
 pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: bool) -> Rendered {
     spans.sort_by_key(|s| s.range.start);
+    let hasher = IdentityHasher::new(key);
     let mut segments: Vec<RenderSegment> =
         Vec::with_capacity(spans.len().saturating_mul(2).saturating_add(1));
     let mut masked = String::with_capacity(raw.len());
@@ -94,7 +95,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                 push_masked(
                     &mut segments,
                     &mut masked,
-                    key,
+                    &hasher,
                     s,
                     local,
                     local_len,
@@ -106,7 +107,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                 push_masked(
                     &mut segments,
                     &mut masked,
-                    key,
+                    &hasher,
                     s,
                     domain,
                     domain_len,
@@ -124,7 +125,7 @@ pub fn render(raw: &str, key: &[u8; 32], mut spans: Vec<Span>, disclose_length: 
                 push_masked(
                     &mut segments,
                     &mut masked,
-                    key,
+                    &hasher,
                     s,
                     val,
                     len,
@@ -162,7 +163,7 @@ fn push_literal(segments: &mut Vec<RenderSegment>, masked: &mut String, text: &s
 fn push_masked(
     segments: &mut Vec<RenderSegment>,
     masked: &mut String,
-    key: &[u8; 32],
+    hasher: &IdentityHasher,
     span: &Span,
     val: &str,
     len: Option<u32>,
@@ -170,7 +171,7 @@ fn push_masked(
     placeholder_cache: &mut HashMap<(String, String, Option<u32>), String>,
     collisions: &mut Vec<String>,
 ) {
-    let segment = masked_seg(key, span, val, len, map, placeholder_cache, collisions);
+    let segment = masked_seg(hasher, span, val, len, map, placeholder_cache, collisions);
     masked.push_str(segment.text());
     segments.push(segment);
 }
@@ -178,7 +179,7 @@ fn push_masked(
 /// Build a masked segment for `val`, recording its mapping and noting a collision
 /// if a different value already claimed the placeholder.
 fn masked_seg(
-    key: &[u8; 32],
+    hasher: &IdentityHasher,
     span: &Span,
     val: &str,
     len: Option<u32>,
@@ -190,7 +191,7 @@ fn masked_seg(
     let ph = match placeholder_cache.get(&cache_key) {
         Some(ph) => ph.clone(),
         None => {
-            let hash = identity_hash(key, &n_id(val));
+            let hash = hasher.hash(&n_id_cow(val));
             let ph = render_placeholder(&span.label, &hash, len);
             if record(map, &ph, val) {
                 collisions.push(ph.clone());

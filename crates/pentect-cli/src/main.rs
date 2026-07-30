@@ -1,16 +1,17 @@
 //! Pentect CLI: local secret masking boundary for AI agents.
 
-mod agent_integrations;
-mod app_server_proxy;
+mod claude_app_proxy;
+mod claude_http_proxy;
+mod codex_app;
 mod doctor;
 mod eval;
-mod exec_proxy;
-mod headless;
+mod http_files;
 mod input;
+mod openai_http_proxy;
 mod plugins;
 mod plugins_cmd;
+mod remote_content;
 mod scan;
-mod terminal;
 mod uninstall;
 mod update;
 
@@ -18,17 +19,12 @@ use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
 use pentect_core::{
     infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
 };
-use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use serde_json::Value;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
-};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use zeroize::Zeroize;
@@ -43,18 +39,10 @@ const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
 const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
 const PENTECT_STATUS_LINE_ENV: &str = "PENTECT_STATUS_LINE";
-const PENTECT_SHELL_ENV: &str = "PENTECT_SHELL";
 const PENTECT_DIR: &str = ".pentect";
 const PENTECT_CONFIG_FILE: &str = "config.toml";
 const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
-const CODEX_ENVIRONMENT_OVERLAY_MARKER: &[u8] = b"# pentect-managed-environments\n";
-const PROMPT_PASTE_START: &[u8] = b"\x1b[200~";
-const PROMPT_PASTE_END: &[u8] = b"\x1b[201~";
-const PROMPT_INPUT_POLL: Duration = Duration::from_millis(50);
-const PROMPT_INPUT_MAX_PENDING_BYTES: usize = 1024 * 1024;
-#[cfg(windows)]
-const WIN32_BACKSPACE_INPUT: &[u8] = b"\x1b[8;14;8;1;0;1_\x1b[8;14;8;0;0;1_";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -64,21 +52,14 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Option<i32> {
-    if should_passthrough_shell(&args, std::env::var_os(PENTECT_SHELL_ENV).as_deref()) {
-        return Some(0);
-    }
     let inherited_env_is_trusted = pentect_agent::active_memory_store_ready();
     if is_memory_store_server(&args) || !supports_process_host(&args) {
         return dispatch(args, inherited_env_is_trusted);
     }
     let pentect = default_pentect_path();
-    let process_host = if is_shell_command(&args) && !inherited_env_is_trusted {
-        MemoryStoreGuard::start_in_process()
-    } else {
-        MemoryStoreGuard::start(&pentect, false)
-    }
-    .unwrap_or_else(|error| die_with_issue(error))
-    .unwrap_or_else(|| die_with_issue("could not start process host candidate"));
+    let process_host = MemoryStoreGuard::start(&pentect, false)
+        .unwrap_or_else(|error| die_with_issue(error))
+        .unwrap_or_else(|| die_with_issue("could not start process host candidate"));
     let _process_host_env = memory_store_parent_env_guard(&pentect, &process_host);
     let exit_code = dispatch(args, inherited_env_is_trusted);
     drop(_process_host_env);
@@ -120,14 +101,21 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("eval") => eval::cmd_eval(&args),
         Some("scan") => scan::cmd_scan(&args),
         Some(
-            "exec" | "shell" | "resolve" | "log" | "hook" | "bridge" | "memory-store" | "purge"
+            "exec" | "resolve" | "log" | "hook" | "bridge" | "memory-store" | "purge"
             | "__agent-script" | "__agent-stream",
         ) => return Some(cmd_agent_from(1, &args, inherited_env_is_trusted)),
         Some("agent") => return Some(cmd_agent_from(2, &args, inherited_env_is_trusted)),
+        Some("codex") if args.get(2).is_some_and(|arg| arg == "app") => {
+            return Some(cmd_codex_app(&args));
+        }
         Some("codex") => return Some(cmd_agent_tool(AgentTool::Codex, &args)),
         Some("claude") => return Some(cmd_agent_tool(AgentTool::Claude, &args)),
-        Some("opencode") => return Some(cmd_agent_tool(AgentTool::OpenCode, &args)),
-        _ => usage(),
+        Some("claude-app") => return Some(cmd_claude_app(&args)),
+        Some("codex-app") => return Some(cmd_codex_app(&args)),
+        _ => {
+            usage();
+            return Some(2);
+        }
     }
     None
 }
@@ -151,31 +139,17 @@ fn supports_process_host(args: &[String]) -> bool {
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
         ),
-        (Some("exec" | "shell" | "log" | "bridge"), _)
-            | (Some("agent"), Some("exec" | "shell" | "log" | "bridge"))
+        (Some("exec" | "log" | "bridge"), _) | (Some("agent"), Some("exec" | "log" | "bridge"))
     )
-}
-
-fn is_shell_command(args: &[String]) -> bool {
-    matches!(
-        (
-            args.get(1).map(String::as_str),
-            args.get(2).map(String::as_str),
-        ),
-        (Some("shell"), _) | (Some("agent"), Some("shell"))
-    )
-}
-
-fn should_passthrough_shell(args: &[String], shell_marker: Option<&std::ffi::OsStr>) -> bool {
-    is_shell_command(args) && shell_marker == Some(std::ffi::OsStr::new("1"))
 }
 
 fn usage() {
     eprintln!(
         "pentect\n\
-         pentect codex|claude|opencode\n\
+         pentect codex|claude\n\
+         pentect codex app\n\
+         pentect claude-app\n\
          pentect exec \"<command>\"\n\
-         pentect shell\n\
          pentect up\n\
          pentect doctor\n\
          pentect update [VERSION] [--check]\n\
@@ -190,7 +164,6 @@ fn usage() {
          pentect help\n\
          \n\
          exec: masked output\n\
-         shell: masked shell\n\
          up: process host\n\
          doctor: readiness\n\
          eval: metrics\n\
@@ -211,9 +184,11 @@ fn help_text() -> &'static str {
         "pentect protects AI tool boundaries.\n\n",
         "Use:\n",
         "  pentect\n",
-        "  pentect codex|claude|opencode [--plugins NAME|PATH.toml]\n",
+        "  pentect codex|claude [--plugins NAME|PATH.toml]\n",
+        "  pentect codex app [--app PATH] [--upstream URL] [--dry-run]\n",
+        "  pentect codex-app [--app PATH] [--upstream URL] [--dry-run]  (alias)\n",
+        "  pentect claude-app [--app PATH] [--upstream URL] [--dry-run]\n",
         "  pentect exec \"<command>\"\n\n",
-        "  pentect shell\n\n",
         "  pentect up\n\n",
         "  pentect doctor [--json]\n",
         "  pentect update [VERSION] [--check | --force]\n",
@@ -228,7 +203,6 @@ fn help_text() -> &'static str {
         "  pentect statusline\n\n",
         "  pentect log [--json]\n\n",
         "exec: masked stdout/stderr\n",
-        "shell: masked shell\n",
         "up: process host\n",
         "read: masked file preview\n",
         "view: handle\n",
@@ -241,6 +215,8 @@ fn help_text() -> &'static str {
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
         "plugins: list, inspect, test, config, setup, update\n",
+        "codex-app: launch Codex App through the Responses API gateway\n",
+        "claude-app: launch Claude Desktop through the Chat and Anthropic gateways\n",
         "eval: precision, recall\n",
     )
 }
@@ -322,16 +298,13 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
             .unwrap_or_else(|| "pentect".to_string()),
     );
     agent_args.extend(forward_args);
-    let shell_store = if agent_args
-        .get(1)
-        .is_some_and(|arg| matches!(arg.as_str(), "shell" | "log"))
-    {
+    let log_store = if agent_args.get(1).is_some_and(|arg| arg == "log") {
         let pentect = default_pentect_path();
         Some(start_memory_store(&pentect).unwrap_or_else(|e| die_with_issue(e)))
     } else {
         None
     };
-    let _shell_store_env = shell_store.as_ref().map(|store| {
+    let _log_store_env = log_store.as_ref().map(|store| {
         EnvVarGuard::set_optional([
             (
                 PENTECT_MEMORY_STORE_ADDR_ENV,
@@ -348,8 +321,8 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
         ])
     });
     let code = pentect_agent::run_from(agent_args);
-    drop(_shell_store_env);
-    drop(shell_store);
+    drop(_log_store_env);
+    drop(log_store);
     drop(plugin_env);
     code
 }
@@ -369,10 +342,41 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
     let status = match tool {
         AgentTool::Codex => run_codex(&opts, &pentect),
         AgentTool::Claude => run_claude(&opts, &pentect),
-        AgentTool::OpenCode => run_bridge_agent(&opts, &pentect),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     status.code().unwrap_or(1)
+}
+
+fn cmd_claude_app(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "--dry-run") {
+        return claude_app_proxy::cmd_claude_app(args);
+    }
+    let pentect = default_pentect_path();
+    let memory_store = match start_memory_store(&pentect) {
+        Ok(store) => store,
+        Err(error) => die_with_issue(error),
+    };
+    let _parent_env = memory_store_parent_env_guard(&pentect, &memory_store);
+    let code = claude_app_proxy::cmd_claude_app(args);
+    drop(_parent_env);
+    drop(memory_store);
+    code
+}
+
+fn cmd_codex_app(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "--dry-run") {
+        return codex_app::cmd_codex_app(args);
+    }
+    let pentect = default_pentect_path();
+    let memory_store = match start_memory_store(&pentect) {
+        Ok(store) => store,
+        Err(error) => die_with_issue(error),
+    };
+    let _parent_env = memory_store_parent_env_guard(&pentect, &memory_store);
+    let code = codex_app::cmd_codex_app(args);
+    drop(_parent_env);
+    drop(memory_store);
+    code
 }
 
 fn start_memory_store(pentect: &Path) -> Result<MemoryStoreGuard, String> {
@@ -609,13 +613,11 @@ fn cmd_statusline(args: &[String]) {
 enum AgentTool {
     Codex,
     Claude,
-    OpenCode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadInputFormat {
     Text,
-    Pdf,
     Image,
 }
 
@@ -689,7 +691,6 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "codex",
             AgentTool::Claude => "claude",
-            AgentTool::OpenCode => "opencode",
         }
     }
 
@@ -701,30 +702,29 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "--codex",
             AgentTool::Claude => "--claude",
-            AgentTool::OpenCode => "--opencode",
         }
     }
 }
 
 #[derive(Debug)]
 struct AgentToolOpts {
-    session: Option<String>,
     pentect: Option<PathBuf>,
     command: PathBuf,
     plugins: Vec<String>,
     dry_run: bool,
-    codex_app_server_proxy_disabled: bool,
+    anthropic_upstream: Option<String>,
+    openai_upstream: Option<String>,
     tool_args: Vec<String>,
 }
 
 impl AgentToolOpts {
     fn parse(tool: AgentTool, args: &[String]) -> Result<Self, String> {
-        let mut session = None;
         let mut pentect = None;
         let mut command = PathBuf::from(tool.default_command());
         let mut plugins = Vec::new();
         let mut dry_run = false;
-        let mut codex_app_server_proxy_disabled = false;
+        let mut anthropic_upstream = None;
+        let mut openai_upstream = None;
         let mut tool_args = Vec::new();
         let mut i = 2;
         while i < args.len() {
@@ -732,13 +732,6 @@ impl AgentToolOpts {
                 "--" => {
                     tool_args.extend(args[i + 1..].iter().cloned());
                     break;
-                }
-                "--session" => {
-                    session = Some(checked_agent_session_name(&required_value(
-                        args,
-                        &mut i,
-                        "--session",
-                    )?)?);
                 }
                 "--pentect" => {
                     pentect = Some(PathBuf::from(required_value(args, &mut i, "--pentect")?));
@@ -764,8 +757,16 @@ impl AgentToolOpts {
                     i += 1;
                 }
                 "--no-app-server-proxy" if tool == AgentTool::Codex => {
-                    codex_app_server_proxy_disabled = true;
-                    i += 1;
+                    return Err(
+                        "Codex app-server interception was removed; HTTP protection is automatic"
+                            .to_string(),
+                    );
+                }
+                "--upstream" if tool == AgentTool::Claude => {
+                    anthropic_upstream = Some(required_value(args, &mut i, "--upstream")?);
+                }
+                "--upstream" if tool == AgentTool::Codex => {
+                    openai_upstream = Some(required_value(args, &mut i, "--upstream")?);
                 }
                 "--prompt-proxy" | "--no-prompt-proxy" => {
                     return Err("prompt protection is automatic".to_string());
@@ -777,164 +778,77 @@ impl AgentToolOpts {
             }
         }
         Ok(Self {
-            session,
             pentect,
             command,
             plugins,
             dry_run,
-            codex_app_server_proxy_disabled,
+            anthropic_upstream,
+            openai_upstream,
             tool_args,
         })
     }
 }
 
 fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
-    let configs = codex_hook_config_args(pentect, opts.session.as_deref())?;
-    let contract = pentect_agent::agent_contract_instructions(
-        &pentect_agent::load_environment_variable_prefix()?,
-    );
+    let routing = codex_effective_routing(opts)?;
+    let mut args = opts.tool_args.clone();
+    if opts.dry_run {
+        args.splice(
+            0..0,
+            [
+                "--config".to_string(),
+                format!(
+                    "{}={}",
+                    routing.config_key,
+                    toml_string("<pentect-gateway>")
+                ),
+            ],
+        );
+        print_dry_run(&opts.command, &args);
+        return Ok(success_status());
+    }
+
     let status_line_enabled = status_line_enabled_by_config()?;
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
     let _parent_env =
         agent_parent_env_guard(pentect, &memory_store, status_line_enabled, &active_plugins)?;
-    let tool_args = headless::protect_prompt_args(headless::AgentKind::Codex, &opts.tool_args)?;
-    let headless_command = codex_headless_agent_command(&tool_args);
-    let (tool_args, _protected_images) = if headless_command && !opts.dry_run {
-        headless::protect_codex_image_args(&tool_args)?
-    } else {
-        (tool_args, headless::ProtectedImageFiles::default())
-    };
-    let app_server_enabled = !headless_command
-        && codex_app_server_proxy_enabled(&tool_args, opts.codex_app_server_proxy_disabled)?;
-    let protect_stdin = headless::protect_stdin(
-        headless::AgentKind::Codex,
-        &tool_args,
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
+    let http_proxy = openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream)?;
+    args.splice(
+        0..0,
+        [
+            "--config".to_string(),
+            format!(
+                "{}={}",
+                routing.config_key,
+                toml_string(http_proxy.base_url())
+            ),
+        ],
     );
-    let output_mode = headless::codex_output_mode(&tool_args);
-    if opts.dry_run {
-        print_dry_run(&opts.command, &codex_args(&configs, &tool_args, &contract));
-        return Ok(success_status());
-    }
+
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
     apply_plugin_env(&mut cmd, &active_plugins)?;
-    let exec_proxy = if codex_unified_exec_proxy_enabled(&tool_args) {
-        Some(exec_proxy::ExecProxyGuard::start(&opts.command)?)
-    } else {
-        None
-    };
-    let _exec_proxy_env = exec_proxy.as_ref().map(|exec_proxy| {
-        EnvVarGuard::set_optional([
-            (
-                "CODEX_EXEC_SERVER_URL",
-                Some(OsString::from(exec_proxy.url())),
-            ),
-            (
-                exec_proxy::PENTECT_CODEX_EXEC_PROXY_ENV,
-                Some(OsString::from("1")),
-            ),
-        ])
-    });
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
     apply_status_line_env(&mut cmd, status_line_enabled);
-    if let Some(exec_proxy) = &exec_proxy {
-        cmd.env("CODEX_EXEC_SERVER_URL", exec_proxy.url());
-        cmd.env(exec_proxy::PENTECT_CODEX_EXEC_PROXY_ENV, "1");
-    }
-    let _codex_environment_overlay = exec_proxy
-        .as_ref()
-        .map(|exec_proxy| CodexEnvironmentOverlayGuard::install(exec_proxy.url()))
-        .transpose()?;
-    let codex_args = if app_server_enabled {
-        let _app_server_proxy_env = EnvVarGuard::set_optional([(
-            app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV,
-            Some(OsString::from("1")),
-        )]);
-        cmd.env(app_server_proxy::PENTECT_CODEX_APP_SERVER_PROXY_ENV, "1");
-        let proxy = app_server_proxy::AppServerProxyGuard::start(
-            &opts.command,
-            codex_app_server_args(&configs, &tool_args, &contract),
-        )?;
-        let args = codex_args_with_remote(&configs, &tool_args, Some(proxy.url()), &contract);
-        cmd.args(args);
-        return run_interactive_command_with_guard(
-            cmd,
-            &opts.command,
-            headless::InputMode::Buffered,
-            output_mode,
-            protect_stdin,
-            proxy,
-        );
-    } else {
-        codex_args(&configs, &tool_args, &contract)
-    };
-    cmd.args(codex_args);
-    run_interactive_command(
-        cmd,
-        &opts.command,
-        headless::InputMode::Buffered,
-        output_mode,
-        protect_stdin,
-    )
+    cmd.args(args);
+    run_native_command_with_guards(cmd, &opts.command, (http_proxy, memory_store))
 }
 
 fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
-    if headless::claude_uses_partial_output(&opts.tool_args) {
-        return Err("Claude partial output cannot be protected".to_string());
-    }
-    let settings = claude_settings_json(pentect, opts.session.as_deref());
-    let contract = pentect_agent::agent_contract_instructions(
-        &pentect_agent::load_environment_variable_prefix()?,
-    );
-    let active_plugins = agent_tool_plugins(opts)?;
-    let memory_store = start_memory_store(pentect)?;
-    let status_line_enabled = status_line_enabled_by_config()?;
-    let _parent_env =
-        agent_parent_env_guard(pentect, &memory_store, status_line_enabled, &active_plugins)?;
-    let tool_args = headless::protect_prompt_args(headless::AgentKind::Claude, &opts.tool_args)?;
-    let input_mode = headless::claude_input_mode(&tool_args);
-    let output_mode = headless::claude_output_mode(&tool_args);
-    let protect_stdin = headless::protect_stdin(
-        headless::AgentKind::Claude,
-        &tool_args,
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-    );
-    let args = claude_args(&settings, &tool_args, &contract);
+    let args = opts.tool_args.clone();
     if opts.dry_run {
         print_dry_run(&opts.command, &args);
         return Ok(success_status());
     }
-    let mut cmd = Command::new(&opts.command);
-    clear_pentect_control_env(&mut cmd);
-    apply_plugin_env(&mut cmd, &active_plugins)?;
-    apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
-    apply_memory_store_env(&mut cmd, Some(&memory_store));
-    apply_status_line_env(&mut cmd, status_line_enabled);
-    cmd.args(&args);
-    run_interactive_command(cmd, &opts.command, input_mode, output_mode, protect_stdin)
-}
-
-fn run_bridge_agent(
-    opts: &AgentToolOpts,
-    pentect: &Path,
-) -> Result<std::process::ExitStatus, String> {
-    use agent_integrations::{IntegrationKind, TempAgentIntegration};
-
-    let integration = TempAgentIntegration::create(IntegrationKind::OpenCode)?;
-    let contract = pentect_agent::agent_contract_instructions(
-        &pentect_agent::load_environment_variable_prefix()?,
-    );
-    let mut args = Vec::new();
-    args.extend(opts.tool_args.iter().cloned());
-    if opts.dry_run {
-        print_dry_run(&opts.command, &args);
-        return Ok(success_status());
-    }
+    let caller_settings = ClaudeCallerSettings::from_args(&args)?;
+    reject_unsupported_claude_provider(&caller_settings)?;
+    preflight_managed_claude_routing()?;
+    let upstream = claude_effective_upstream(opts, &caller_settings)?;
+    let enable_tool_search = is_official_anthropic_upstream(&upstream)
+        && caller_settings.env_string("ENABLE_TOOL_SEARCH")?.is_none()
+        && std::env::var_os("ENABLE_TOOL_SEARCH").is_none();
 
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
@@ -947,1384 +861,647 @@ fn run_bridge_agent(
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
     apply_status_line_env(&mut cmd, status_line_enabled);
-    cmd.env("PENTECT_AGENT_CONTRACT", contract);
-    let existing = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
-    let config =
-        agent_integrations::opencode_config_with_plugin(existing.as_deref(), integration.path())?;
-    cmd.env("OPENCODE_CONFIG_CONTENT", config);
-    cmd.args(args);
-    run_interactive_command_with_guard(
-        cmd,
-        &opts.command,
-        headless::InputMode::Buffered,
-        headless::OutputMode::Text,
-        !std::io::stdin().is_terminal(),
-        (integration, memory_store),
-    )
+    let http_proxy = claude_http_proxy::ClaudeHttpProxyGuard::start(upstream)?;
+    cmd.env("ANTHROPIC_BASE_URL", http_proxy.base_url());
+    // Claude Code reapplies settings.env after process start. Put the local
+    // route in the CLI settings layer as well, while preserving a caller's
+    // existing --settings payload. The provider-managed-host switch is not
+    // used here because it also disables normal Claude subscription auth.
+    let gateway_settings =
+        caller_settings.with_gateway(&args, http_proxy.base_url(), enable_tool_search)?;
+    cmd.args(gateway_settings.args());
+    run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
 }
 
-fn run_interactive_command(
-    mut cmd: Command,
-    display: &Path,
-    input_mode: headless::InputMode,
-    output_mode: headless::OutputMode,
-    protect_stdin: bool,
-) -> Result<std::process::ExitStatus, String> {
-    run_interactive_command_inner(&mut cmd, display, input_mode, output_mode, protect_stdin)
+const CLAUDE_CLOUD_PROVIDER_FLAGS: &[&str] = &[
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+];
+
+#[derive(Debug)]
+struct ClaudeCallerSettings {
+    value: serde_json::Value,
+    effective_env: serde_json::Map<String, serde_json::Value>,
+    settings_at: Option<usize>,
+    inline: bool,
+    source_path: Option<PathBuf>,
 }
 
-fn run_interactive_command_with_guard<G>(
-    mut cmd: Command,
-    display: &Path,
-    input_mode: headless::InputMode,
-    output_mode: headless::OutputMode,
-    protect_stdin: bool,
-    _guard: G,
-) -> Result<std::process::ExitStatus, String> {
-    run_interactive_command_inner(&mut cmd, display, input_mode, output_mode, protect_stdin)
-}
+impl ClaudeCallerSettings {
+    fn from_args(args: &[String]) -> Result<Self, String> {
+        let mut settings_at = None;
+        let mut inline = false;
+        for (index, arg) in args.iter().enumerate() {
+            if arg == "--settings" {
+                if settings_at.is_some() {
+                    return Err(
+                        "Claude accepts only one --settings value through Pentect".to_string()
+                    );
+                }
+                settings_at = Some(index);
+            } else if arg.starts_with("--settings=") {
+                if settings_at.is_some() {
+                    return Err(
+                        "Claude accepts only one --settings value through Pentect".to_string()
+                    );
+                }
+                settings_at = Some(index);
+                inline = true;
+            }
+        }
 
-fn run_interactive_command_inner(
-    cmd: &mut Command,
-    display: &Path,
-    input_mode: headless::InputMode,
-    output_mode: headless::OutputMode,
-    protect_stdin: bool,
-) -> Result<std::process::ExitStatus, String> {
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        let mut terminal_guard = terminal::TuiSessionGuard::enter();
-        let status = run_interactive_command_pty(cmd, display, &mut terminal_guard);
-        return status;
-    }
-    headless::run_noninteractive_command(cmd, display, input_mode, output_mode, protect_stdin)
-}
-
-fn run_interactive_command_pty(
-    cmd: &Command,
-    display: &Path,
-    terminal_guard: &mut terminal::TuiSessionGuard,
-) -> Result<std::process::ExitStatus, String> {
-    let pty_system = native_pty_system();
-    let (cols, rows) = current_pty_size();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
+        let (value, source_path) = if let Some(index) = settings_at {
+            let raw = if inline {
+                args[index]
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                args.get(index + 1)
+                    .cloned()
+                    .ok_or_else(|| "--settings requires a value".to_string())?
+            };
+            read_claude_settings_value(&raw)?
+        } else {
+            (serde_json::json!({}), None)
+        };
+        if !value.is_object() {
+            return Err("Claude --settings must contain a JSON object".to_string());
+        }
+        let mut effective_env = load_claude_nonmanaged_env()?;
+        if let Some(env) = value.get("env") {
+            let env = env
+                .as_object()
+                .ok_or_else(|| "Claude --settings env must be a JSON object".to_string())?;
+            for (name, value) in env {
+                effective_env.insert(name.clone(), value.clone());
+            }
+        }
+        Ok(Self {
+            value,
+            effective_env,
+            settings_at,
+            inline,
+            source_path,
         })
-        .map_err(|e| format!("could not start pty for '{}': {e}", display.display()))?;
-    let command = command_builder_from_process_command(cmd)?;
-    let mut child = match pair.slave.spawn_command(command) {
-        Ok(child) => child,
-        Err(e) => {
-            terminal_guard.restore_without_prompt();
-            return Err(format!("could not start '{}': {e}", display.display()));
-        }
-    };
-    let mut process_supervisor = PtyProcessSupervisor::new(child.as_ref());
-    drop(pair.slave);
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| format!("could not capture '{}': {e}", display.display()))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| format!("could not open '{}': {e}", display.display()))?;
-    let mode_tracker = terminal_guard.mode_tracker();
-    let output_error = Arc::new(Mutex::new(None));
-    let output_error_writer = output_error.clone();
-    let output_control = Arc::new(PtyOutputControl::new());
-    let output_control_writer = Arc::clone(&output_control);
-    let output_thread = thread::spawn(move || {
-        proxy_pty_output(
-            reader,
-            mode_tracker,
-            output_error_writer,
-            output_control_writer,
-        )
-    });
-    let ctrl_c_guard = terminal::IgnoreCtrlCGuard::new();
-    let status = pump_prompt_guarded_pty_input(
-        child.as_mut(),
-        writer,
-        pair.master.as_ref(),
-        (cols, rows),
-        &output_error,
-    );
-    terminal_guard.quiesce_input_reporting();
-    if status.is_err() {
-        let _ = child.kill();
     }
-    process_supervisor.terminate();
-    finish_pty_child(child.as_mut());
-    drop(ctrl_c_guard);
-    drop(pair.master);
-    match join_pty_output(output_thread, &output_control) {
-        Ok(()) => {}
-        Err(e) => {
-            terminal_guard.restore_after_tui();
-            return Err(e);
-        }
+
+    fn env_string(&self, name: &str) -> Result<Option<&str>, String> {
+        let Some(value) = self.effective_env.get(name) else {
+            return Ok(None);
+        };
+        value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| format!("Claude --settings env.{name} must be a string"))
     }
-    let status = match status {
-        Ok(status) => status,
-        Err(e) => {
-            terminal_guard.restore_after_tui();
-            return Err(e);
+
+    fn with_gateway(
+        &self,
+        args: &[String],
+        base_url: &str,
+        enable_tool_search: bool,
+    ) -> Result<ClaudeGatewaySettings, String> {
+        let mut settings = self.value.clone();
+        let object = settings
+            .as_object_mut()
+            .ok_or_else(|| "Claude --settings must contain a JSON object".to_string())?;
+        let env = object
+            .entry("env")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| "Claude --settings env must be a JSON object".to_string())?;
+        env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            serde_json::Value::String(base_url.to_string()),
+        );
+        if enable_tool_search {
+            env.insert(
+                "ENABLE_TOOL_SEARCH".to_string(),
+                serde_json::Value::String("true".to_string()),
+            );
         }
-    };
-    terminal_guard.restore_after_tui();
-    Ok(exit_status_from_code(status.exit_code()))
+
+        let directory = self
+            .source_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .map(Ok)
+            .unwrap_or_else(|| {
+                std::env::current_dir().map_err(|error| {
+                    format!("could not locate the working directory for Claude settings: {error}")
+                })
+            })?;
+        let file = ClaudeSettingsFile::create(&directory, &settings)?;
+        let path = file.path().to_string_lossy().into_owned();
+        let mut out = args.to_vec();
+        if let Some(index) = self.settings_at {
+            if self.inline {
+                out[index] = format!("--settings={path}");
+            } else {
+                out[index + 1] = path;
+            }
+        } else {
+            out.insert(0, path);
+            out.insert(0, "--settings".to_string());
+        }
+        Ok(ClaudeGatewaySettings {
+            args: out,
+            _file: file,
+        })
+    }
 }
 
-fn current_pty_size() -> (u16, u16) {
-    select_pty_size(
-        observed_terminal_size(),
-        pty_dimension_from_env("COLUMNS"),
-        pty_dimension_from_env("LINES"),
-    )
+#[derive(Debug)]
+struct ClaudeGatewaySettings {
+    args: Vec<String>,
+    _file: ClaudeSettingsFile,
 }
 
-#[cfg(not(windows))]
-fn observed_terminal_size() -> Option<(u16, u16)> {
-    crossterm::terminal::size()
-        .ok()
-        .filter(|(cols, rows)| *cols >= 2 && *rows >= 2)
+impl ClaudeGatewaySettings {
+    fn args(&self) -> &[String] {
+        &self.args
+    }
+}
+
+#[derive(Debug)]
+struct ClaudeSettingsFile {
+    path: PathBuf,
+}
+
+impl ClaudeSettingsFile {
+    fn create(directory: &Path, settings: &serde_json::Value) -> Result<Self, String> {
+        cleanup_stale_claude_settings_files(directory);
+        let mut nonce = [0_u8; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|error| format!("OS CSPRNG unavailable for Claude settings: {error}"))?;
+        let name = format!(
+            ".pentect-claude-settings-{}-{}.json",
+            std::process::id(),
+            data_encoding::HEXLOWER.encode(&nonce)
+        );
+        let path = directory.join(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|error| {
+            format!(
+                "could not create protected Claude settings beside the caller settings ({}): {error}",
+                path.display()
+            )
+        })?;
+        if let Err(error) = restrict_sensitive_file(&path) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        if let Err(error) = serde_json::to_writer(&mut file, settings) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!(
+                "could not encode protected Claude settings: {error}"
+            ));
+        }
+        if let Err(error) = file.flush() {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!(
+                "could not flush protected Claude settings: {error}"
+            ));
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 #[cfg(windows)]
-fn observed_terminal_size() -> Option<(u16, u16)> {
-    use windows_sys::Win32::System::Console::{
-        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
-    };
-
-    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    let mut info = unsafe { std::mem::zeroed::<CONSOLE_SCREEN_BUFFER_INFO>() };
-    if unsafe { GetConsoleScreenBufferInfo(handle, &mut info) } == 0 {
-        return None;
+fn restrict_sensitive_file(path: &Path) -> Result<(), String> {
+    let identity = Command::new("whoami.exe")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not resolve the Windows account for ACL setup: {error}"))?;
+    if !identity.status.success() {
+        return Err("could not resolve the Windows account for ACL setup".to_string());
     }
-    let cols = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
-    let rows = i32::from(info.srWindow.Bottom) - i32::from(info.srWindow.Top) + 1;
-    let cols = u16::try_from(cols).ok()?;
-    let rows = u16::try_from(rows).ok()?;
-    (cols >= 2 && rows >= 2).then_some((cols, rows))
-}
-
-fn select_pty_size(
-    terminal: Option<(u16, u16)>,
-    env_cols: Option<u16>,
-    env_rows: Option<u16>,
-) -> (u16, u16) {
-    let terminal = terminal.filter(|(cols, rows)| *cols >= 2 && *rows >= 2);
-    let cols = terminal.map(|size| size.0).or(env_cols).unwrap_or(120);
-    let rows = terminal.map(|size| size.1).or(env_rows).unwrap_or(30);
-    (cols, rows)
-}
-
-fn pty_dimension_from_env(name: &str) -> Option<u16> {
-    std::env::var(name)
-        .ok()?
-        .parse::<u16>()
-        .ok()
-        .filter(|value| *value >= 2)
-}
-
-fn command_builder_from_process_command(cmd: &Command) -> Result<CommandBuilder, String> {
-    let mut command = CommandBuilder::new(cmd.get_program());
-    command.args(cmd.get_args());
-    let cwd = match cmd.get_current_dir() {
-        Some(cwd) => cwd.to_path_buf(),
-        None => std::env::current_dir().map_err(|e| format!("could not read current dir: {e}"))?,
-    };
-    command.cwd(cwd.as_os_str());
-    // portable-pty rebuilds the Windows base environment from the registry,
-    // which drops process-local PATH entries installed by tools such as fnm.
-    command.env_clear();
-    for (name, value) in std::env::vars_os() {
-        command.env(name, value);
+    let identity = String::from_utf8(identity.stdout)
+        .map_err(|_| "Windows account name is not UTF-8".to_string())?;
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return Err("Windows account name is empty".to_string());
     }
-    for (name, value) in cmd.get_envs() {
-        match value {
-            Some(value) => command.env(name, value),
-            None => command.env_remove(name),
-        }
+    let grant = format!("{identity}:(F)");
+    let status = Command::new("icacls.exe")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", &grant])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("could not restrict Claude settings ACL: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("could not restrict Claude settings ACL".to_string())
     }
-    Ok(command)
 }
 
-fn proxy_pty_output(
-    mut reader: Box<dyn Read + Send>,
-    mode_tracker: terminal::TerminalModeTracker,
-    output_error: Arc<Mutex<Option<String>>>,
-    output_control: Arc<PtyOutputControl>,
-) -> Result<(), String> {
-    let mut buf = [0u8; 64 * 1024];
-    let mut remasker = match pentect_agent::ActiveTerminalOutputRemasker::new() {
-        Ok(remasker) => remasker,
-        Err(error) => {
-            record_output_error(&output_error, &error);
-            drain_pty_reader(&mut reader, &mut buf);
-            return Err(error);
-        }
+#[cfg(not(windows))]
+fn restrict_sensitive_file(_: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn cleanup_stale_claude_settings_files(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
     };
-    let mut first_error = None;
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(n) => n,
-            Err(error) => {
-                let error = format!("could not read pty output: {error}");
-                record_output_error(&output_error, &error);
-                first_error = Some(error);
-                break;
-            }
+    let mut candidates = Vec::new();
+    for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
         };
-        if n == 0 {
-            break;
-        }
-        if first_error.is_some() {
-            buf[..n].zeroize();
+        let Some(stem) = name
+            .strip_prefix(".pentect-claude-settings-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        // Builds before PID ownership used a single 128-bit hex nonce. No
+        // current process creates that shape, so it is always crash residue.
+        if stem.len() == 32 && stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            let _ = std::fs::remove_file(path);
             continue;
         }
-        let remasked = match remasker.push(&buf[..n]) {
-            Ok(remasked) => remasked,
-            Err(error) => {
-                buf[..n].zeroize();
-                record_output_error(&output_error, &error);
-                first_error = Some(error);
-                continue;
-            }
+        let Some(owner) = stem
+            .split_once('-')
+            .map(|(owner, _)| owner)
+            .and_then(|owner| owner.parse::<u32>().ok())
+        else {
+            continue;
         };
-        buf[..n].zeroize();
-        match write_pty_output(&remasked, &output_control) {
-            Ok(true) => mode_tracker.observe(&remasked),
-            Ok(false) => {}
-            Err(error) => {
-                record_output_error(&output_error, &error);
-                first_error = Some(error);
-            }
+        if owner != std::process::id() {
+            candidates.push((path, sysinfo::Pid::from_u32(owner)));
         }
     }
-    if let Some(error) = first_error {
-        let tail = remasker.finish_after_error();
-        let _ = write_pty_output(&tail, &output_control);
-        return Err(error);
+    if candidates.is_empty() {
+        return;
     }
-    let tail = match remasker.finish() {
-        Ok(tail) => tail,
-        Err(error) => {
-            record_output_error(&output_error, &error);
-            let tail = remasker.finish_after_error();
-            let _ = write_pty_output(&tail, &output_control);
-            return Err(error);
+    let pids = candidates.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&pids),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    for (path, pid) in candidates {
+        if system.process(pid).is_none() {
+            let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+impl Drop for ClaudeSettingsFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn read_claude_settings_value(raw: &str) -> Result<(serde_json::Value, Option<PathBuf>), String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return serde_json::from_str(trimmed)
+            .map(|value| (value, None))
+            .map_err(|error| format!("Claude --settings JSON is invalid: {error}"));
+    }
+    let path = PathBuf::from(trimmed);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read Claude --settings file {trimmed}: {error}"))?;
+    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map(|value| (value, Some(path)))
+        .map_err(|error| format!("Claude --settings file is invalid JSON: {error}"))
+}
+
+fn claude_effective_upstream(
+    opts: &AgentToolOpts,
+    settings: &ClaudeCallerSettings,
+) -> Result<String, String> {
+    if let Some(explicit) = opts
+        .anthropic_upstream
+        .clone()
+        .or_else(|| nonempty_env("PENTECT_ANTHROPIC_UPSTREAM"))
+    {
+        return Ok(explicit);
+    }
+    // Claude settings override the inherited environment. An empty setting
+    // explicitly unsets the provider override rather than revealing a lower
+    // layer, so route to the official endpoint in that case.
+    if let Some(configured) = settings.env_string("ANTHROPIC_BASE_URL")? {
+        return Ok(if configured.trim().is_empty() {
+            "https://api.anthropic.com".to_string()
+        } else {
+            configured.to_string()
+        });
+    }
+    Ok(nonempty_env("ANTHROPIC_BASE_URL")
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string()))
+}
+
+fn load_claude_nonmanaged_env() -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("could not locate the Claude working directory: {error}"))?;
+    let project = find_project_root(&cwd);
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home_directory().map(|home| home.join(".claude")));
+    let mut env = serde_json::Map::new();
+    if let Some(config_dir) = config_dir {
+        merge_claude_env_file(&mut env, &config_dir.join("settings.json"))?;
+    }
+    merge_claude_env_file(&mut env, &project.join(".claude/settings.json"))?;
+    // Claude Code still reads a legacy local file in the launch directory,
+    // while the repository-root file wins when both exist.
+    if cwd != project {
+        merge_claude_env_file(&mut env, &cwd.join(".claude/settings.local.json"))?;
+    }
+    merge_claude_env_file(&mut env, &project.join(".claude/settings.local.json"))?;
+    Ok(env)
+}
+
+fn merge_claude_env_file(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+) -> Result<(), String> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let settings = read_json_file(path)?;
+    let Some(env) = settings.get("env") else {
+        return Ok(());
     };
-    match write_pty_output(&tail, &output_control) {
-        Ok(true) => mode_tracker.observe(&tail),
-        Ok(false) => {}
-        Err(error) => {
-            record_output_error(&output_error, &error);
-            return Err(error);
+    let env = env.as_object().ok_or_else(|| {
+        format!(
+            "Claude settings {} env must be a JSON object",
+            path.display()
+        )
+    })?;
+    for (name, value) in env {
+        target.insert(name.clone(), value.clone());
+    }
+    Ok(())
+}
+
+fn find_project_root(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|path| path.join(".git").exists())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+fn home_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+fn reject_unsupported_claude_provider(settings: &ClaudeCallerSettings) -> Result<(), String> {
+    for name in CLAUDE_CLOUD_PROVIDER_FLAGS {
+        let configured = settings
+            .env_string(name)?
+            .map(cloud_provider_enabled)
+            .unwrap_or_else(|| {
+                std::env::var(name).is_ok_and(|value| cloud_provider_enabled(&value))
+            });
+        if configured {
+            return Err(format!(
+                "{name} cannot be routed through the Pentect Anthropic HTTP proxy; unset it or use Claude Code without `pentect claude`"
+            ));
         }
     }
     Ok(())
 }
 
-fn drain_pty_reader(reader: &mut dyn Read, buf: &mut [u8]) {
-    loop {
-        match reader.read(buf) {
-            Ok(0) | Err(_) => break,
-            Ok(read) => buf[..read].zeroize(),
-        }
+fn preflight_managed_claude_routing() -> Result<(), String> {
+    if let Some(settings) = managed_claude_settings()? {
+        reject_managed_routing_value(&settings)?;
     }
-    buf.zeroize();
+    Ok(())
 }
 
-fn record_output_error(output_error: &Arc<Mutex<Option<String>>>, error: &str) {
-    let mut pending = match output_error.lock() {
-        Ok(pending) => pending,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if pending.is_none() {
-        *pending = Some(error.to_string());
-    }
-}
-
-struct PtyOutputControl {
-    enabled: AtomicBool,
-    write_gate: Mutex<()>,
-}
-
-impl PtyOutputControl {
-    fn new() -> Self {
-        Self {
-            enabled: AtomicBool::new(true),
-            write_gate: Mutex::new(()),
-        }
-    }
-
-    fn disable(&self) {
-        let _gate = match self.write_gate.lock() {
-            Ok(gate) => gate,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if self.enabled.load(Ordering::Acquire) {
-            let mut out = std::io::stdout().lock();
-            let _ = out.write_all(b"\x1b\\");
-            let _ = out.flush();
-        }
-        self.enabled.store(false, Ordering::Release);
-    }
-}
-
-fn write_pty_output(bytes: &[u8], control: &PtyOutputControl) -> Result<bool, String> {
-    if bytes.is_empty() {
-        return Ok(true);
-    }
-    let _gate = match control.write_gate.lock() {
-        Ok(gate) => gate,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if !control.enabled.load(Ordering::Acquire) {
-        return Ok(false);
-    }
-    let mut out = std::io::stdout().lock();
-    out.write_all(bytes)
-        .map_err(|e| format!("could not write pty output: {e}"))?;
-    out.flush()
-        .map_err(|e| format!("could not flush pty output: {e}"))?;
-    Ok(true)
-}
-
-fn join_pty_output(
-    output_thread: thread::JoinHandle<Result<(), String>>,
-    control: &PtyOutputControl,
-) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !output_thread.is_finished() && std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let timed_out = !output_thread.is_finished();
-    if timed_out {
-        control.disable();
-        let cancel_deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while !output_thread.is_finished() && std::time::Instant::now() < cancel_deadline {
-            cancel_pty_output_read(&output_thread);
-            thread::sleep(Duration::from_millis(25));
-        }
-    }
-    if !output_thread.is_finished() {
-        return Err("pty output did not close".to_string());
-    }
-    if timed_out {
-        let _ = output_thread.join();
-        return Err("pty output did not close".to_string());
-    }
-    match output_thread.join() {
-        Ok(result) => result,
-        Err(_) => Err("pty output thread panicked".to_string()),
-    }
-}
-
-#[cfg(windows)]
-fn cancel_pty_output_read(output_thread: &thread::JoinHandle<Result<(), String>>) {
-    use std::os::windows::io::AsRawHandle;
-    unsafe {
-        let _ = windows_sys::Win32::System::IO::CancelSynchronousIo(
-            output_thread.as_raw_handle().cast(),
+fn reject_managed_routing_value(settings: &serde_json::Value) -> Result<(), String> {
+    if settings.get("policyHelper").is_some() {
+        return Err(
+            "Claude managed settings use policyHelper, so Pentect cannot verify that API traffic will stay on its HTTP proxy; run Claude without `pentect claude` or remove the managed provider override"
+                .to_string(),
         );
     }
-}
-
-#[cfg(not(windows))]
-fn cancel_pty_output_read(_output_thread: &thread::JoinHandle<Result<(), String>>) {}
-
-fn finish_pty_child(child: &mut dyn PtyChild) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        match poll_pty_child(child) {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-        }
+    let Some(env) = settings.get("env") else {
+        return Ok(());
+    };
+    let env = env
+        .as_object()
+        .ok_or_else(|| "Claude managed settings env must be a JSON object".to_string())?;
+    if env
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(
+            "Claude managed settings override ANTHROPIC_BASE_URL and would bypass Pentect's HTTP proxy; use Claude without `pentect claude` or ask the administrator to remove that override"
+                .to_string(),
+        );
     }
-}
-
-#[cfg(windows)]
-fn poll_pty_child(child: &mut dyn PtyChild) -> Result<Option<portable_pty::ExitStatus>, String> {
-    use windows_sys::Win32::{
-        Foundation::{WAIT_FAILED, WAIT_OBJECT_0},
-        System::Threading::{GetExitCodeProcess, WaitForSingleObject},
-    };
-
-    let Some(handle) = child.as_raw_handle() else {
-        return child
-            .try_wait()
-            .map_err(|e| format!("could not poll agent: {e}"));
-    };
-    let wait = unsafe { WaitForSingleObject(handle.cast(), 0) };
-    if wait == WAIT_OBJECT_0 {
-        let mut code = 0u32;
-        if unsafe { GetExitCodeProcess(handle.cast(), &mut code) } == 0 {
+    for name in CLAUDE_CLOUD_PROVIDER_FLAGS {
+        if env
+            .get(*name)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(cloud_provider_enabled)
+        {
             return Err(format!(
-                "could not read agent exit status: {}",
-                std::io::Error::last_os_error()
+                "Claude managed settings enable {name}, which cannot be routed through Pentect's Anthropic HTTP proxy"
             ));
         }
-        return Ok(Some(portable_pty::ExitStatus::with_exit_code(code)));
     }
-    if wait == WAIT_FAILED {
-        return Err(format!(
-            "could not poll agent process: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(None)
+    Ok(())
 }
 
-#[cfg(not(windows))]
-fn poll_pty_child(child: &mut dyn PtyChild) -> Result<Option<portable_pty::ExitStatus>, String> {
-    child
-        .try_wait()
-        .map_err(|e| format!("could not poll agent: {e}"))
-}
-
-#[cfg(unix)]
-struct PtyProcessSupervisor {
-    root: Option<SupervisedRoot>,
-}
-
-#[cfg(unix)]
-impl PtyProcessSupervisor {
-    fn new(child: &dyn PtyChild) -> Self {
-        Self {
-            root: capture_supervised_root(child),
-        }
-    }
-
-    fn terminate(&mut self) {
-        let Some(root) = self.root.take() else {
-            return;
+fn managed_claude_settings() -> Result<Option<serde_json::Value>, String> {
+    let directory = if cfg!(windows) {
+        let Some(program_files) = std::env::var_os("ProgramFiles") else {
+            return Ok(None);
         };
-        terminate_supervised_processes(root);
-    }
-}
-
-#[cfg(unix)]
-impl Drop for PtyProcessSupervisor {
-    fn drop(&mut self) {
-        self.terminate();
-    }
-}
-
-fn process_descends_from(
-    mut pid: sysinfo::Pid,
-    root: sysinfo::Pid,
-    processes: &std::collections::HashMap<sysinfo::Pid, sysinfo::Process>,
-) -> bool {
-    for _ in 0..64 {
-        let Some(parent) = processes.get(&pid).and_then(sysinfo::Process::parent) else {
-            return false;
-        };
-        if parent == root {
-            return true;
-        }
-        if parent == pid {
-            return false;
-        }
-        pid = parent;
-    }
-    false
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct SupervisedRoot {
-    pub(crate) pid: sysinfo::Pid,
-    start_time: Option<u64>,
-}
-
-fn capture_supervised_root(child: &dyn PtyChild) -> Option<SupervisedRoot> {
-    capture_supervised_root_pid(child.process_id())
-}
-
-pub(crate) fn capture_supervised_root_pid(pid: Option<u32>) -> Option<SupervisedRoot> {
-    let pid = pid.map(sysinfo::Pid::from_u32)?;
-    let mut system = sysinfo::System::new();
-    system.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::Some(&[pid]),
-        true,
-        sysinfo::ProcessRefreshKind::nothing(),
-    );
-    Some(SupervisedRoot {
-        pid,
-        start_time: system.process(pid).map(sysinfo::Process::start_time),
-    })
-}
-
-pub(crate) fn terminate_supervised_processes(root: SupervisedRoot) {
-    for _ in 0..4 {
-        let mut system = sysinfo::System::new();
-        system.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::All,
-            true,
-            sysinfo::ProcessRefreshKind::nothing(),
-        );
-        let root_process = system.process(root.pid);
-        let root_matches = root
-            .start_time
-            .zip(root_process)
-            .is_some_and(|(start_time, process)| start_time == process.start_time());
-        let root_reused = root.start_time.is_none() || (root_process.is_some() && !root_matches);
-        let mut targets = system
-            .processes()
-            .iter()
-            .filter_map(|(pid, process)| {
-                is_supervised_process(
-                    *pid,
-                    process,
-                    root,
-                    root_matches,
-                    root_reused,
-                    system.processes(),
-                )
-                .then_some(*pid)
-            })
-            .filter(|pid| pid.as_u32() > 1 && pid.as_u32() != std::process::id())
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            break;
-        }
-        targets.sort_unstable_by_key(|pid| std::cmp::Reverse(pid.as_u32()));
-        for pid in targets {
-            if let Some(process) = system.process(pid) {
-                let _ = process.kill();
-            }
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn is_supervised_process(
-    pid: sysinfo::Pid,
-    _process: &sysinfo::Process,
-    root: SupervisedRoot,
-    _root_matches: bool,
-    _root_reused: bool,
-    _processes: &std::collections::HashMap<sysinfo::Pid, sysinfo::Process>,
-) -> bool {
-    if pid == root.pid {
-        return false;
-    }
-    if !_root_reused && process_descends_from(pid, root.pid, _processes) {
-        return true;
-    }
-    #[cfg(unix)]
-    if _process.session_id() == Some(root.pid) {
-        return true;
-    }
-    false
-}
-
-#[cfg(windows)]
-struct PtyProcessSupervisor {
-    job: windows_sys::Win32::Foundation::HANDLE,
-    root: Option<SupervisedRoot>,
-}
-
-#[cfg(windows)]
-impl PtyProcessSupervisor {
-    fn new(child: &dyn PtyChild) -> Self {
-        use windows_sys::Win32::{
-            Foundation::CloseHandle,
-            System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            },
-        };
-
-        let root = capture_supervised_root(child);
-        let Some(process) = child.as_raw_handle() else {
-            return Self {
-                job: std::ptr::null_mut(),
-                root,
-            };
-        };
-        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if job.is_null() {
-            return Self { job, root };
-        }
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&limits).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        } != 0;
-        let assigned = configured && unsafe { AssignProcessToJobObject(job, process.cast()) } != 0;
-        if !assigned {
-            unsafe {
-                let _ = CloseHandle(job);
-            }
-            return Self {
-                job: std::ptr::null_mut(),
-                root,
-            };
-        }
-        Self { job, root }
-    }
-
-    fn terminate(&mut self) {
-        use windows_sys::Win32::{Foundation::CloseHandle, System::JobObjects::TerminateJobObject};
-        let mut job_terminated = false;
-        if !self.job.is_null() {
-            unsafe {
-                job_terminated = TerminateJobObject(self.job, 1) != 0;
-                let _ = CloseHandle(self.job);
-            }
-            self.job = std::ptr::null_mut();
-        }
-        if let (false, Some(root)) = (job_terminated, self.root.take()) {
-            terminate_supervised_processes(root);
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for PtyProcessSupervisor {
-    fn drop(&mut self) {
-        self.terminate();
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct PtyProcessSupervisor;
-
-#[cfg(not(any(unix, windows)))]
-impl PtyProcessSupervisor {
-    fn new(_child: &dyn PtyChild) -> Self {
-        Self
-    }
-
-    fn terminate(&mut self) {}
-}
-
-fn pump_prompt_guarded_pty_input(
-    child: &mut dyn PtyChild,
-    child_stdin: Box<dyn Write + Send>,
-    master: &dyn MasterPty,
-    mut pty_size: (u16, u16),
-    output_error: &Arc<Mutex<Option<String>>>,
-) -> Result<portable_pty::ExitStatus, String> {
-    let _raw = RawModeGuard::enable()?;
-    let mut protector = PromptInputProtector::default();
-    let mut child_input = PtyInputWriter::start(child_stdin);
-    let mut child_input_open = true;
-    let input = PtyInputReader::start();
-    loop {
-        if let Some(error) = current_output_error(output_error) {
-            return Err(error);
-        }
-        if let Some(error) = child_input.take_error() {
-            return Err(error);
-        }
-        sync_pty_size(master, &mut pty_size);
-        if let Some(status) = poll_pty_child(child)? {
-            drop(input);
-            drop(child_input);
-            return Ok(status);
-        }
-        if !child_input_open {
-            thread::sleep(PROMPT_INPUT_POLL);
-            continue;
-        }
-        match input.receiver.recv_timeout(PROMPT_INPUT_POLL) {
-            Ok(PtyInputEvent::Eof) => {
-                let tail = protector.flush()?;
-                child_input.send(tail)?;
-                child_input.close();
-                child_input_open = false;
-            }
-            Ok(PtyInputEvent::Data(bytes)) => {
-                let rewritten = protector.rewrite_bytes(&bytes)?;
-                child_input.send(rewritten)?;
-            }
-            Ok(PtyInputEvent::Error(error)) => return Err(error),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let idle = protector.flush_idle()?;
-                child_input.send(idle)?;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let tail = protector.flush()?;
-                child_input.send(tail)?;
-                child_input.close();
-                child_input_open = false;
-            }
-        }
-    }
-}
-
-struct PtyInputWriter {
-    sender: Option<mpsc::SyncSender<Vec<u8>>>,
-    error: Arc<Mutex<Option<String>>>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl PtyInputWriter {
-    fn start(mut writer: Box<dyn Write + Send>) -> Self {
-        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(64);
-        let error = Arc::new(Mutex::new(None));
-        let worker_error = Arc::clone(&error);
-        let thread = thread::spawn(move || {
-            while let Ok(mut bytes) = receiver.recv() {
-                let result = writer.write_all(&bytes).and_then(|_| writer.flush());
-                bytes.zeroize();
-                if let Err(error) = result {
-                    record_output_error(
-                        &worker_error,
-                        &format!("could not write agent input: {error}"),
-                    );
-                    break;
-                }
-            }
-        });
-        Self {
-            sender: Some(sender),
-            error,
-            thread: Some(thread),
-        }
-    }
-
-    fn send(&self, mut bytes: Vec<u8>) -> Result<(), String> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let Some(sender) = self.sender.as_ref() else {
-            bytes.zeroize();
-            return Err("agent input is closed".to_string());
-        };
-        match sender.try_send(bytes) {
-            Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(mut bytes)) => {
-                bytes.zeroize();
-                Err("agent input is not being consumed".to_string())
-            }
-            Err(mpsc::TrySendError::Disconnected(mut bytes)) => {
-                bytes.zeroize();
-                Err(self
-                    .take_error()
-                    .unwrap_or_else(|| "agent input is closed".to_string()))
-            }
-        }
-    }
-
-    fn close(&mut self) {
-        self.sender.take();
-    }
-
-    fn take_error(&self) -> Option<String> {
-        let mut error = match self.error.lock() {
-            Ok(error) => error,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        error.take()
-    }
-}
-
-impl Drop for PtyInputWriter {
-    fn drop(&mut self) {
-        self.close();
-        self.thread.take();
-    }
-}
-
-enum PtyInputEvent {
-    Data(Vec<u8>),
-    Eof,
-    Error(String),
-}
-
-struct PtyInputReader {
-    receiver: mpsc::Receiver<PtyInputEvent>,
-    stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl PtyInputReader {
-    fn start() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
-        let thread = thread::spawn(move || {
-            let mut input = std::io::stdin().lock();
-            let mut buf = [0u8; 8192];
-            while !worker_stop.load(Ordering::Acquire) {
-                match wait_for_stdin_ready(PROMPT_INPUT_POLL) {
-                    Ok(false) => continue,
-                    Err(error) => {
-                        let _ = sender.send(PtyInputEvent::Error(error));
-                        break;
-                    }
-                    Ok(true) => {}
-                }
-                match input.read(&mut buf) {
-                    Ok(0) => {
-                        let _ = sender.send(PtyInputEvent::Eof);
-                        break;
-                    }
-                    Ok(n) => {
-                        if sender.send(PtyInputEvent::Data(buf[..n].to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        let _ = sender.send(PtyInputEvent::Error(format!(
-                            "could not read terminal input: {error}"
-                        )));
-                        break;
-                    }
-                }
-            }
-            buf.zeroize();
-        });
-        Self {
-            receiver,
-            stop,
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Drop for PtyInputReader {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        self.thread.take();
-    }
-}
-
-#[cfg(unix)]
-fn wait_for_stdin_ready(timeout: Duration) -> Result<bool, String> {
-    let mut descriptor = libc::pollfd {
-        fd: libc::STDIN_FILENO,
-        events: libc::POLLIN | libc::POLLHUP,
-        revents: 0,
+        PathBuf::from(program_files).join("ClaudeCode")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from("/Library/Application Support/ClaudeCode")
+    } else {
+        PathBuf::from("/etc/claude-code")
     };
-    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    let result = unsafe { libc::poll(std::ptr::from_mut(&mut descriptor), 1, timeout_ms) };
-    if result > 0 {
-        return Ok(true);
-    }
-    if result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-        return Ok(false);
-    }
-    Err(format!(
-        "could not poll terminal input: {}",
-        std::io::Error::last_os_error()
-    ))
-}
+    let file_settings = read_file_managed_claude_settings(&directory)?;
 
-#[cfg(windows)]
-fn wait_for_stdin_ready(timeout: Duration) -> Result<bool, String> {
-    use windows_sys::Win32::{
-        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::{
-            Console::GetStdHandle, Console::STD_INPUT_HANDLE, Threading::WaitForSingleObject,
-        },
-    };
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-    match unsafe { WaitForSingleObject(handle, timeout_ms) } {
-        WAIT_OBJECT_0 => Ok(true),
-        WAIT_TIMEOUT => Ok(false),
-        _ => Err(format!(
-            "could not poll terminal input: {}",
-            std::io::Error::last_os_error()
-        )),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn wait_for_stdin_ready(timeout: Duration) -> Result<bool, String> {
-    thread::sleep(timeout);
-    Ok(true)
-}
-
-fn current_output_error(error: &Arc<Mutex<Option<String>>>) -> Option<String> {
-    match error.lock() {
-        Ok(error) => error.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
-}
-
-fn sync_pty_size(master: &dyn MasterPty, current: &mut (u16, u16)) {
-    let Some(next) = observed_terminal_size() else {
-        return;
-    };
-    if next == *current {
-        return;
-    }
-    if master
-        .resize(PtySize {
-            rows: next.1,
-            cols: next.0,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .is_ok()
+    #[cfg(windows)]
     {
-        *current = next;
-    }
-}
-
-struct RawModeGuard {
-    #[cfg(windows)]
-    previous: Option<(*mut std::ffi::c_void, u32)>,
-}
-
-impl RawModeGuard {
-    fn enable() -> Result<Self, String> {
-        #[cfg(windows)]
+        if file_settings
+            .as_ref()
+            .is_some_and(|settings| settings.get("policyHelper").is_some())
         {
-            use windows_sys::Win32::System::Console::{
-                GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
-                ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, STD_INPUT_HANDLE,
-            };
+            return Ok(file_settings);
+        }
+        if let Some(settings) = read_windows_claude_policy("HKLM\\SOFTWARE\\Policies\\ClaudeCode")?
+        {
+            return Ok(Some(settings));
+        }
+        if file_settings.is_some() {
+            return Ok(file_settings);
+        }
+        return read_windows_claude_policy("HKCU\\SOFTWARE\\Policies\\ClaudeCode");
+    }
+    #[allow(unreachable_code)]
+    Ok(file_settings)
+}
 
-            let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-            let mut previous = 0;
-            if unsafe { GetConsoleMode(handle, &mut previous) } == 0 {
-                return Ok(Self { previous: None });
-            }
-            let mode = (previous
-                & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
-                | ENABLE_VIRTUAL_TERMINAL_INPUT;
-            if unsafe { SetConsoleMode(handle, mode) } == 0 {
-                return Err("could not enter raw terminal mode".to_string());
-            }
-            Ok(Self {
-                previous: Some((handle, previous)),
+fn read_file_managed_claude_settings(
+    directory: &Path,
+) -> Result<Option<serde_json::Value>, String> {
+    let mut merged = serde_json::json!({});
+    let mut found = false;
+    let base = directory.join("managed-settings.json");
+    if base.is_file() {
+        merge_json_object(&mut merged, &read_json_file(&base)?)?;
+        found = true;
+    }
+    let drop_in = directory.join("managed-settings.d");
+    if drop_in.is_dir() {
+        let mut paths = std::fs::read_dir(&drop_in)
+            .map_err(|error| format!("could not inspect {}: {error}", drop_in.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension().and_then(|value| value.to_str()) == Some("json")
+                    && !path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.starts_with('.'))
             })
-        }
-        #[cfg(not(windows))]
-        {
-            crossterm::terminal::enable_raw_mode()
-                .map_err(|e| format!("could not enter raw terminal mode: {e}"))?;
-            Ok(Self {})
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            merge_json_object(&mut merged, &read_json_file(&path)?)?;
+            found = true;
         }
     }
+    Ok(found.then_some(merged))
 }
 
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        if let Some((handle, mode)) = self.previous {
-            unsafe {
-                let _ = windows_sys::Win32::System::Console::SetConsoleMode(handle, mode);
-            }
-        }
-        #[cfg(not(windows))]
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
-
-#[derive(Default)]
-struct PromptInputProtector {
-    state: PromptInputState,
-    #[cfg(windows)]
-    win32: Win32PromptInputState,
-}
-
-impl PromptInputProtector {
-    fn rewrite_bytes(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
-        let mut mask = |text: &str| pentect_agent::mask_prompt_text_into_active_memory_store(text);
-        #[cfg(windows)]
-        {
-            rewrite_win32_prompt_input_bytes_with(
-                &mut self.state,
-                &mut self.win32,
-                bytes,
-                &mut mask,
-            )
-        }
-        #[cfg(not(windows))]
-        {
-            rewrite_prompt_input_bytes_with(&mut self.state, bytes, &mut mask)
-        }
-    }
-
-    fn flush(&mut self) -> Result<Vec<u8>, String> {
-        let mut mask = |text: &str| pentect_agent::mask_prompt_text_into_active_memory_store(text);
-        #[cfg(windows)]
-        {
-            flush_win32_prompt_input_with(&mut self.state, &mut self.win32, &mut mask)
-        }
-        #[cfg(not(windows))]
-        {
-            flush_prompt_input_with(&mut self.state, &mut mask)
-        }
-    }
-
-    fn flush_idle(&mut self) -> Result<Vec<u8>, String> {
-        if self.state.in_bracketed_paste {
-            return Ok(Vec::new());
-        }
-        self.flush()
-    }
-}
-
-#[derive(Default)]
-struct PromptInputState {
-    pending: Vec<u8>,
-    in_bracketed_paste: bool,
-}
-
-#[cfg(windows)]
-#[derive(Default)]
-struct Win32PromptInputState {
-    decode_pending: Vec<u8>,
-    paste_prefix_raw: Vec<u8>,
-    paste_prefix_text: Vec<u8>,
-    drop_next_key_up: bool,
-}
-
-#[cfg(windows)]
-enum Win32InputRecord {
-    Text { units: Vec<u16>, virtual_key: u32 },
-    KeyUp,
-    NonText,
-}
-
-#[cfg(windows)]
-fn rewrite_win32_prompt_input_bytes_with<F>(
-    normal: &mut PromptInputState,
-    state: &mut Win32PromptInputState,
-    bytes: &[u8],
-    mask: &mut F,
-) -> Result<Vec<u8>, String>
-where
-    F: FnMut(&str) -> Result<Option<String>, String>,
-{
-    state.decode_pending.extend_from_slice(bytes);
-    let mut out = Vec::with_capacity(bytes.len());
-    loop {
-        let Some(start) = find_bytes(&state.decode_pending, b"\x1b[") else {
-            let keep = partial_suffix_prefix_len(&state.decode_pending, b"\x1b[");
-            let emit_len = state.decode_pending.len().saturating_sub(keep);
-            if emit_len > 0 {
-                let mut raw: Vec<u8> = state.decode_pending.drain(..emit_len).collect();
-                out.extend(rewrite_windows_vt_input_bytes_with(normal, &raw, mask)?);
-                raw.zeroize();
-            }
-            break;
-        };
-        if start > 0 {
-            let mut raw: Vec<u8> = state.decode_pending.drain(..start).collect();
-            out.extend(rewrite_windows_vt_input_bytes_with(normal, &raw, mask)?);
-            raw.zeroize();
-            continue;
-        }
-        let Some(final_offset) = state
-            .decode_pending
-            .iter()
-            .enumerate()
-            .skip(2)
-            .find_map(|(index, byte)| (b'@'..=b'~').contains(byte).then_some(index))
-        else {
-            break;
-        };
-        let mut sequence: Vec<u8> = state.decode_pending.drain(..=final_offset).collect();
-        match parse_win32_input_record(&sequence) {
-            Some(Win32InputRecord::Text { units, virtual_key }) => match String::from_utf16(&units)
-            {
-                Ok(mut text) => {
-                    if normal.in_bracketed_paste {
-                        let was_paste = normal.in_bracketed_paste;
-                        out.extend(rewrite_prompt_input_bytes_with(
-                            normal,
-                            text.as_bytes(),
-                            mask,
-                        )?);
-                        state.drop_next_key_up = was_paste && !normal.in_bracketed_paste;
-                    } else if !state.paste_prefix_raw.is_empty()
-                        || (matches!(virtual_key, 0 | 231)
-                            && text.as_bytes().first() == PROMPT_PASTE_START.first())
-                    {
-                        state.paste_prefix_raw.extend_from_slice(&sequence);
-                        state.paste_prefix_text.extend_from_slice(text.as_bytes());
-                        if !PROMPT_PASTE_START.starts_with(&state.paste_prefix_text) {
-                            flush_win32_paste_prefix(state, &mut out);
-                        } else if state.paste_prefix_text == PROMPT_PASTE_START {
-                            out.extend(rewrite_prompt_input_bytes_with(
-                                normal,
-                                PROMPT_PASTE_START,
-                                mask,
-                            )?);
-                            state.paste_prefix_raw.zeroize();
-                            state.paste_prefix_raw.clear();
-                            state.paste_prefix_text.zeroize();
-                            state.paste_prefix_text.clear();
-                        }
-                    } else {
-                        out.extend_from_slice(&sequence);
-                    }
-                    text.zeroize();
-                }
-                Err(_) => {
-                    flush_win32_paste_prefix(state, &mut out);
-                    out.extend_from_slice(&sequence);
-                }
-            },
-            Some(Win32InputRecord::KeyUp) => {
-                if state.drop_next_key_up {
-                    state.drop_next_key_up = false;
-                } else if normal.in_bracketed_paste {
-                    // Pasted text is rewritten as one safe payload, so its original
-                    // key-up records must not reach the nested terminal.
-                } else if !state.paste_prefix_raw.is_empty() {
-                    state.paste_prefix_raw.extend_from_slice(&sequence);
-                } else {
-                    out.extend_from_slice(&sequence);
-                }
-            }
-            Some(Win32InputRecord::NonText) => {
-                flush_win32_paste_prefix(state, &mut out);
-                out.extend_from_slice(&sequence);
-            }
-            None => {
-                flush_win32_paste_prefix(state, &mut out);
-                out.extend(rewrite_prompt_input_bytes_with(normal, &sequence, mask)?);
-            }
-        }
-        sequence.zeroize();
-    }
-    if state.decode_pending.len() > PROMPT_INPUT_MAX_PENDING_BYTES {
-        state.decode_pending.zeroize();
-        state.decode_pending.clear();
-        return Err("terminal input sequence exceeds 1 MiB".to_string());
-    }
-    Ok(out)
-}
-
-#[cfg(windows)]
-fn rewrite_windows_vt_input_bytes_with<F>(
-    normal: &mut PromptInputState,
-    bytes: &[u8],
-    mask: &mut F,
-) -> Result<Vec<u8>, String>
-where
-    F: FnMut(&str) -> Result<Option<String>, String>,
-{
-    if normal.in_bracketed_paste {
-        return rewrite_prompt_input_bytes_with(normal, bytes, mask);
-    }
-
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut start = 0;
-    for (index, byte) in bytes.iter().enumerate() {
-        if !matches!(byte, 0x08 | 0x7f) {
-            continue;
-        }
-        out.extend(rewrite_prompt_input_bytes_with(
-            normal,
-            &bytes[start..index],
-            mask,
-        )?);
-        // Terminals without ?9001 support use BS/DEL. Normalize both to the
-        // Win32 key record required by the nested Windows ConPTY.
-        out.extend_from_slice(WIN32_BACKSPACE_INPUT);
-        start = index + 1;
-    }
-    out.extend(rewrite_prompt_input_bytes_with(
-        normal,
-        &bytes[start..],
-        mask,
-    )?);
-    Ok(out)
-}
-
-#[cfg(windows)]
-fn flush_win32_paste_prefix(state: &mut Win32PromptInputState, out: &mut Vec<u8>) {
-    out.append(&mut state.paste_prefix_raw);
-    state.paste_prefix_text.zeroize();
-    state.paste_prefix_text.clear();
-}
-
-#[cfg(windows)]
-fn parse_win32_input_record(sequence: &[u8]) -> Option<Win32InputRecord> {
-    let body = sequence.strip_prefix(b"\x1b[")?.strip_suffix(b"_")?;
-    let text = std::str::from_utf8(body).ok()?;
-    let fields = text
-        .split(';')
-        .map(|field| field.parse::<u32>().ok())
-        .collect::<Option<Vec<_>>>()?;
-    if fields.len() != 6 {
-        return None;
-    }
-    let virtual_key = *fields.first()?;
-    let unicode = u16::try_from(*fields.get(2)?).ok()?;
-    let key_down = *fields.get(3)?;
-    let repeat = usize::try_from(*fields.get(5)?).ok()?;
-    if repeat > 1024 {
-        return None;
-    }
-    if key_down == 0 {
-        return Some(Win32InputRecord::KeyUp);
-    }
-    if unicode == 0 {
-        return Some(Win32InputRecord::NonText);
-    }
-    Some(Win32InputRecord::Text {
-        units: vec![unicode; repeat.max(1)],
-        virtual_key,
+fn read_json_file(path: &Path) -> Result<serde_json::Value, String> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "could not read Claude managed settings {}: {error}",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Claude managed settings {} contain invalid JSON: {error}",
+            path.display()
+        )
     })
 }
 
+fn merge_json_object(
+    target: &mut serde_json::Value,
+    source: &serde_json::Value,
+) -> Result<(), String> {
+    let target = target
+        .as_object_mut()
+        .ok_or_else(|| "internal Claude managed settings merge target is invalid".to_string())?;
+    let source = source
+        .as_object()
+        .ok_or_else(|| "Claude managed settings must contain a JSON object".to_string())?;
+    for (key, value) in source {
+        if let (Some(existing @ serde_json::Value::Object(_)), serde_json::Value::Object(_)) =
+            (target.get_mut(key), value)
+        {
+            merge_json_object(existing, value)?;
+        } else {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
-#[cfg(test)]
-fn encode_win32_unicode_input(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len().saturating_mul(40));
-    for unit in text.encode_utf16() {
-        out.extend_from_slice(format!("\x1b[0;0;{unit};1;0;1_").as_bytes());
-        out.extend_from_slice(format!("\x1b[0;0;{unit};0;0;1_").as_bytes());
+fn read_windows_claude_policy(key: &str) -> Result<Option<serde_json::Value>, String> {
+    let output = Command::new("reg.exe")
+        .args(["query", key, "/v", "Settings"])
+        .output()
+        .map_err(|error| format!("could not inspect Claude managed registry policy: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
     }
-    out
-}
-
-#[cfg(windows)]
-fn flush_win32_prompt_input_with<F>(
-    normal: &mut PromptInputState,
-    state: &mut Win32PromptInputState,
-    mask: &mut F,
-) -> Result<Vec<u8>, String>
-where
-    F: FnMut(&str) -> Result<Option<String>, String>,
-{
-    let mut out = Vec::new();
-    flush_win32_paste_prefix(state, &mut out);
-    if !state.decode_pending.is_empty() {
-        let mut raw = std::mem::take(&mut state.decode_pending);
-        out.extend(rewrite_windows_vt_input_bytes_with(normal, &raw, mask)?);
-        raw.zeroize();
-    }
-    out.extend(flush_prompt_input_with(normal, mask)?);
-    Ok(out)
-}
-
-fn rewrite_prompt_input_bytes_with<F>(
-    state: &mut PromptInputState,
-    bytes: &[u8],
-    mask: &mut F,
-) -> Result<Vec<u8>, String>
-where
-    F: FnMut(&str) -> Result<Option<String>, String>,
-{
-    state.pending.extend_from_slice(bytes);
-    let mut out = Vec::with_capacity(bytes.len());
-    loop {
-        if state.in_bracketed_paste {
-            if let Some(end) = find_bytes(&state.pending, PROMPT_PASTE_END) {
-                let mut content: Vec<u8> = state.pending.drain(..end).collect();
-                out.extend(rewrite_prompt_plain_bytes_with(&content, true, mask)?);
-                content.zeroize();
-                state.pending.drain(..PROMPT_PASTE_END.len());
-                out.extend_from_slice(PROMPT_PASTE_END);
-                state.in_bracketed_paste = false;
-                continue;
-            }
-            if state.pending.len() > PROMPT_INPUT_MAX_PENDING_BYTES {
-                let mut content = std::mem::take(&mut state.pending);
-                out.extend(rewrite_prompt_plain_bytes_with(&content, true, mask)?);
-                content.zeroize();
-                state.in_bracketed_paste = false;
-            }
-            break;
-        }
-
-        if let Some(start) = find_bytes(&state.pending, PROMPT_PASTE_START) {
-            let mut before: Vec<u8> = state.pending.drain(..start).collect();
-            out.extend(rewrite_prompt_plain_bytes_with(&before, false, mask)?);
-            before.zeroize();
-            state.pending.drain(..PROMPT_PASTE_START.len());
-            out.extend_from_slice(PROMPT_PASTE_START);
-            state.in_bracketed_paste = true;
-            continue;
-        }
-
-        let keep = partial_suffix_prefix_len(&state.pending, PROMPT_PASTE_START);
-        let emit_len = state.pending.len().saturating_sub(keep);
-        if emit_len > 0 {
-            let mut plain: Vec<u8> = state.pending.drain(..emit_len).collect();
-            out.extend(rewrite_prompt_plain_bytes_with(&plain, false, mask)?);
-            plain.zeroize();
-        }
-        break;
-    }
-    Ok(out)
-}
-
-fn flush_prompt_input_with<F>(state: &mut PromptInputState, mask: &mut F) -> Result<Vec<u8>, String>
-where
-    F: FnMut(&str) -> Result<Option<String>, String>,
-{
-    if state.pending.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut pending = std::mem::take(&mut state.pending);
-    let out = rewrite_prompt_plain_bytes_with(&pending, state.in_bracketed_paste, mask)?;
-    pending.zeroize();
-    state.in_bracketed_paste = false;
-    Ok(out)
-}
-
-fn rewrite_prompt_plain_bytes_with<F>(
-    bytes: &[u8],
-    force_scan: bool,
-    mask: &mut F,
-) -> Result<Vec<u8>, String>
-where
-    F: FnMut(&str) -> Result<Option<String>, String>,
-{
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return Ok(bytes.to_vec());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = stdout.lines().find_map(|line| {
+        line.split_once("REG_SZ")
+            .or_else(|| line.split_once("REG_EXPAND_SZ"))
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+    });
+    let Some(json) = json else {
+        return Err(format!(
+            "Claude managed registry policy {key} has an unreadable Settings value"
+        ));
     };
-    if !force_scan && !should_scan_prompt_input_text(text) {
-        return Ok(bytes.to_vec());
-    }
-    match mask(text)? {
-        Some(masked) if masked != text => Ok(masked.into_bytes()),
-        _ => Ok(bytes.to_vec()),
-    }
+    serde_json::from_str(json)
+        .map(Some)
+        .map_err(|error| format!("Claude managed registry policy {key} is invalid JSON: {error}"))
 }
 
-fn should_scan_prompt_input_text(text: &str) -> bool {
-    text.len() >= 32 && !text.contains('\x1b')
+fn is_official_anthropic_upstream(upstream: &str) -> bool {
+    reqwest::Url::parse(upstream).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("api.anthropic.com")
+            && url.port_or_known_default() == Some(443)
+    })
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+fn cloud_provider_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
 }
 
-fn partial_suffix_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
-    let max = bytes.len().min(prefix.len().saturating_sub(1));
-    (1..=max)
-        .rev()
-        .find(|len| bytes[bytes.len() - len..] == prefix[..*len])
-        .unwrap_or(0)
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn run_native_command_with_guards<G>(
+    mut cmd: Command,
+    display: &Path,
+    _guards: G,
+) -> Result<std::process::ExitStatus, String> {
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    cmd.status()
+        .map_err(|error| format!("could not run '{}': {error}", display.display()))
 }
 
 struct MemoryStoreGuard {
     child: Option<Child>,
     lease: Option<pentect_agent::MemoryStoreLease>,
-    _in_process: Option<pentect_agent::InProcessMemoryStore>,
     addr: String,
     token: String,
     process_host_candidate: Option<PathBuf>,
@@ -2358,7 +1535,6 @@ impl MemoryStoreGuard {
                     return Ok(Some(Self {
                         child: None,
                         lease: None,
-                        _in_process: None,
                         addr,
                         token,
                         process_host_candidate: None,
@@ -2461,34 +1637,6 @@ impl MemoryStoreGuard {
         Ok(Some(Self {
             child: Some(child),
             lease,
-            _in_process: None,
-            addr,
-            token,
-            process_host_candidate: Some(process_host_candidate),
-        }))
-    }
-
-    fn start_in_process() -> Result<Option<Self>, String> {
-        let server = pentect_agent::start_in_process_memory_store().map_err(|e| e.to_string())?;
-        let addr = server.addr().to_string();
-        let token = server.token().to_string();
-        let process_host_root = process_host_root()?;
-        let process_host_candidate = pentect_agent::register_process_host_candidate(
-            &process_host_root,
-            &addr,
-            &token,
-            server.process_host_read_token(),
-            server.process_host_write_token(),
-            std::process::id(),
-            false,
-        )?;
-        let Some(process_host_candidate) = process_host_candidate else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            child: None,
-            lease: None,
-            _in_process: Some(server),
             addr,
             token,
             process_host_candidate: Some(process_host_candidate),
@@ -2761,115 +1909,6 @@ impl Drop for EnvVarGuard {
     }
 }
 
-struct CodexEnvironmentOverlayGuard {
-    path: PathBuf,
-    backup_path: PathBuf,
-    previous: Option<Vec<u8>>,
-}
-
-impl CodexEnvironmentOverlayGuard {
-    fn install(exec_proxy_url: &str) -> Result<Self, String> {
-        let codex_home = codex_home_dir()?;
-        std::fs::create_dir_all(&codex_home).map_err(|e| {
-            format!(
-                "could not create Codex home '{}': {e}",
-                codex_home.display()
-            )
-        })?;
-        let path = codex_home.join("environments.toml");
-        let backup_path = codex_home.join("environments.toml.pentect.bak");
-        recover_stale_codex_environment_overlay(&path, &backup_path)?;
-        let previous = match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(format!(
-                    "could not read Codex environments '{}': {e}",
-                    path.display()
-                ));
-            }
-        };
-        match previous.as_ref() {
-            Some(previous) => std::fs::write(&backup_path, previous).map_err(|e| {
-                format!(
-                    "could not write Codex environments backup '{}': {e}",
-                    backup_path.display()
-                )
-            })?,
-            None => {
-                let _ = std::fs::remove_file(&backup_path);
-            }
-        }
-        std::fs::write(&path, codex_environments_toml(exec_proxy_url)).map_err(|e| {
-            format!(
-                "could not write Codex environments '{}': {e}",
-                path.display()
-            )
-        })?;
-        Ok(Self {
-            path,
-            backup_path,
-            previous,
-        })
-    }
-}
-
-impl Drop for CodexEnvironmentOverlayGuard {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(previous) => {
-                let _ = std::fs::write(&self.path, previous);
-            }
-            None => {
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
-        let _ = std::fs::remove_file(&self.backup_path);
-    }
-}
-
-fn recover_stale_codex_environment_overlay(path: &Path, backup_path: &Path) -> Result<(), String> {
-    let current = match std::fs::read(path) {
-        Ok(current) => current,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(format!(
-                "could not inspect Codex environments '{}': {e}",
-                path.display()
-            ));
-        }
-    };
-    if !current.starts_with(CODEX_ENVIRONMENT_OVERLAY_MARKER) {
-        return Ok(());
-    }
-    match std::fs::read(backup_path) {
-        Ok(previous) => {
-            std::fs::write(path, previous).map_err(|e| {
-                format!(
-                    "could not restore Codex environments '{}': {e}",
-                    path.display()
-                )
-            })?;
-            let _ = std::fs::remove_file(backup_path);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::remove_file(path).map_err(|e| {
-                format!(
-                    "could not remove stale Codex environments '{}': {e}",
-                    path.display()
-                )
-            })?;
-        }
-        Err(e) => {
-            return Err(format!(
-                "could not read Codex environments backup '{}': {e}",
-                backup_path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn codex_home_dir() -> Result<PathBuf, String> {
     if let Some(value) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(value));
@@ -2892,12 +1931,285 @@ fn codex_home_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "could not resolve Codex home".to_string())
 }
 
-fn codex_environments_toml(exec_proxy_url: &str) -> String {
-    format!(
-        "{}default = \"pentect\"\ninclude_local = true\n\n[[environments]]\nid = \"pentect\"\nurl = {}\n",
-        String::from_utf8_lossy(CODEX_ENVIRONMENT_OVERLAY_MARKER),
-        toml_string(exec_proxy_url)
-    )
+struct CodexHttpRouting {
+    upstream: String,
+    config_key: String,
+}
+
+fn codex_effective_routing(opts: &AgentToolOpts) -> Result<CodexHttpRouting, String> {
+    let config = load_codex_user_config(&opts.tool_args)?;
+    let provider = codex_cli_config_string(&opts.tool_args, "model_provider")
+        .or_else(|| {
+            config
+                .get("model_provider")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "openai".to_string());
+    let config_key = if provider == "openai" {
+        "openai_base_url".to_string()
+    } else {
+        format!(
+            "model_providers.{}.base_url",
+            codex_toml_key_segment(&provider)
+        )
+    };
+    let configured_upstream = codex_cli_config_string(&opts.tool_args, &config_key).or_else(|| {
+        if provider == "openai" {
+            config
+                .get("openai_base_url")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        } else {
+            config
+                .get("model_providers")
+                .and_then(toml::Value::as_table)
+                .and_then(|providers| providers.get(&provider))
+                .and_then(toml::Value::as_table)
+                .and_then(|provider| provider.get("base_url"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        }
+    });
+    let upstream = opts
+        .openai_upstream
+        .clone()
+        .or(configured_upstream)
+        .or_else(|| {
+            (provider == "openai")
+                .then(|| nonempty_env("OPENAI_BASE_URL"))
+                .flatten()
+        })
+        .or_else(|| {
+            (provider == "openai").then(|| {
+                if codex_uses_chatgpt_auth() {
+                    "https://chatgpt.com/backend-api/codex".to_string()
+                } else {
+                    "https://api.openai.com/v1".to_string()
+                }
+            })
+        })
+        .ok_or_else(|| {
+            format!(
+                "could not determine upstream for Codex provider '{provider}'; pass `pentect codex --upstream URL -- ...`"
+            )
+        })?;
+    Ok(CodexHttpRouting {
+        upstream,
+        config_key,
+    })
+}
+
+pub(crate) struct CodexAppRouting {
+    upstream: String,
+    provider: String,
+    requires_config_override: bool,
+}
+
+/// Resolve the App's selected provider without changing user configuration.
+/// The launcher installs a short-lived, recoverable base-url override only
+/// when the selected provider cannot be redirected by OPENAI_BASE_URL.
+pub(crate) fn codex_app_routing(explicit: Option<String>) -> Result<CodexAppRouting, String> {
+    let config = load_codex_user_config(&[])?;
+    let provider = config
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("openai")
+        .to_string();
+    let configured_upstream = if provider == "openai" {
+        config
+            .get("openai_base_url")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    } else {
+        let provider_config = config
+            .get("model_providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get(&provider))
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| format!("Codex provider '{provider}' has no configuration"))?;
+        let wire_api = provider_config
+            .get("wire_api")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("responses");
+        if wire_api != "responses" {
+            return Err(format!(
+                "Codex App provider '{provider}' uses unsupported wire_api '{wire_api}'; Pentect currently supports Responses-compatible providers"
+            ));
+        }
+        provider_config
+            .get("base_url")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    let requires_config_override = provider != "openai" || configured_upstream.is_some();
+    let upstream = explicit
+        .or(configured_upstream)
+        .or_else(|| (provider == "openai").then(|| nonempty_env("OPENAI_BASE_URL")).flatten())
+        .or_else(|| (provider == "openai").then(|| {
+            if codex_uses_chatgpt_auth() {
+                "https://chatgpt.com/backend-api/codex".to_string()
+            } else {
+                "https://api.openai.com/v1".to_string()
+            }
+        }))
+        .ok_or_else(|| {
+            format!(
+                "could not determine upstream for Codex App provider '{provider}'; pass --upstream URL"
+            )
+        })?;
+    Ok(CodexAppRouting {
+        upstream,
+        provider,
+        requires_config_override,
+    })
+}
+
+fn load_codex_user_config(args: &[String]) -> Result<toml::Value, String> {
+    let home = codex_home_dir()?;
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+    let base = home.join("config.toml");
+    if base.is_file() {
+        merge_toml_value(&mut merged, &read_toml_file(&base)?);
+    }
+    if let Some(profile) = codex_profile_arg(args) {
+        let profile_path = home.join(format!("{profile}.config.toml"));
+        if profile_path.is_file() {
+            merge_toml_value(&mut merged, &read_toml_file(&profile_path)?);
+        }
+    }
+    Ok(merged)
+}
+
+fn read_toml_file(path: &Path) -> Result<toml::Value, String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read '{}': {error}", path.display()))?
+        .parse::<toml::Value>()
+        .map_err(|error| format!("could not parse '{}': {error}", path.display()))
+}
+
+fn merge_toml_value(target: &mut toml::Value, source: &toml::Value) {
+    match (target, source) {
+        (toml::Value::Table(target), toml::Value::Table(source)) => {
+            for (key, value) in source {
+                if let Some(existing) = target.get_mut(key) {
+                    merge_toml_value(existing, value);
+                } else {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (target, source) => *target = source.clone(),
+    }
+}
+
+fn codex_profile_arg(args: &[String]) -> Option<&str> {
+    let mut profile = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--profile" => {
+                profile = args.get(index + 1).map(String::as_str);
+                index += 2;
+            }
+            value if value.starts_with("--profile=") => {
+                profile = value.split_once('=').map(|(_, value)| value);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    profile
+}
+
+fn codex_cli_config_string(args: &[String], wanted: &str) -> Option<String> {
+    let mut found = None;
+    let mut index = 0;
+    while index < args.len() {
+        let config = match args[index].as_str() {
+            "-c" | "--config" => {
+                index += 2;
+                args.get(index - 1).map(String::as_str)
+            }
+            value if value.starts_with("--config=") => {
+                index += 1;
+                value.split_once('=').map(|(_, value)| value)
+            }
+            _ => {
+                index += 1;
+                None
+            }
+        };
+        let Some((key, raw)) = config.and_then(|config| config.split_once('=')) else {
+            continue;
+        };
+        if !toml_key_paths_equal(key.trim(), wanted) {
+            continue;
+        }
+        let parsed = format!("value={raw}").parse::<toml::Value>().ok();
+        found = parsed
+            .as_ref()
+            .and_then(|value| value.get("value"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| Some(raw.trim().trim_matches(['"', '\'']).to_string()));
+    }
+    found
+}
+
+fn toml_key_paths_equal(left: &str, right: &str) -> bool {
+    fn path(value: &toml::Value, out: &mut Vec<String>) -> bool {
+        match value {
+            toml::Value::Table(table) if table.len() == 1 => {
+                let (key, value) = table.iter().next().expect("single TOML key");
+                out.push(key.clone());
+                path(value, out)
+            }
+            toml::Value::String(_) => true,
+            _ => false,
+        }
+    }
+
+    fn parse(key: &str) -> Option<Vec<String>> {
+        let value = format!("{key} = \"pentect\"").parse::<toml::Value>().ok()?;
+        let mut segments = Vec::new();
+        path(&value, &mut segments).then_some(segments)
+    }
+
+    parse(left).is_some_and(|left| parse(right).as_ref() == Some(&left))
+}
+
+fn codex_toml_key_segment(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        value.to_string()
+    } else {
+        toml_string(value)
+    }
+}
+
+fn codex_uses_chatgpt_auth() -> bool {
+    if nonempty_env("OPENAI_API_KEY").is_some() {
+        return false;
+    }
+    let Ok(home) = codex_home_dir() else {
+        return true;
+    };
+    let Ok(bytes) = std::fs::read(home.join("auth.json")) else {
+        return true;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("auth_mode")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_none_or(|mode| mode.eq_ignore_ascii_case("chatgpt"))
 }
 
 fn apply_plugin_env(cmd: &mut Command, active: &plugins::ActivePlugins) -> Result<(), String> {
@@ -2908,531 +2220,6 @@ fn apply_plugin_env(cmd: &mut Command, active: &plugins::ActivePlugins) -> Resul
         cmd.env(plugins::BINARIES_ENV, value);
     }
     Ok(())
-}
-
-fn codex_args(configs: &[String], tool_args: &[String], contract: &str) -> Vec<String> {
-    codex_args_with_remote(configs, tool_args, None, contract)
-}
-
-fn codex_args_with_remote(
-    configs: &[String],
-    tool_args: &[String],
-    remote: Option<&str>,
-    contract: &str,
-) -> Vec<String> {
-    let mut args = Vec::with_capacity(configs.len() * 2 + 5 + tool_args.len());
-    if !codex_args_disable_unified_exec(tool_args) && !codex_args_enable_unified_exec(tool_args) {
-        args.push("--enable".to_string());
-        args.push("unified_exec".to_string());
-    }
-    for config in configs {
-        args.push("--config".to_string());
-        args.push(config.clone());
-    }
-    args.push("--config".to_string());
-    args.push(format!("developer_instructions={}", toml_string(contract)));
-    if let Some(remote) = remote {
-        args.push("--remote".to_string());
-        args.push(remote.to_string());
-    }
-    args.extend(tool_args.iter().cloned());
-    args
-}
-
-fn codex_app_server_args(configs: &[String], tool_args: &[String], contract: &str) -> Vec<String> {
-    let mut args = Vec::with_capacity(configs.len() * 2 + 5);
-    if !codex_args_disable_unified_exec(tool_args) && !codex_args_enable_unified_exec(tool_args) {
-        args.push("--enable".to_string());
-        args.push("unified_exec".to_string());
-    }
-    for config in configs {
-        args.push("--config".to_string());
-        args.push(config.clone());
-    }
-    args.push("--config".to_string());
-    args.push(format!("developer_instructions={}", toml_string(contract)));
-    for (flag, value) in codex_root_config_args(tool_args) {
-        args.push(flag);
-        if let Some(value) = value {
-            args.push(value);
-        }
-    }
-    args
-}
-
-fn codex_root_config_args(args: &[String]) -> Vec<(String, Option<String>)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "--" {
-            break;
-        }
-        match arg {
-            "-c" | "--config" | "--enable" | "--disable" => {
-                if let Some(value) = args.get(i + 1) {
-                    out.push((arg.to_string(), Some(value.clone())));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "--strict-config" => {
-                out.push((arg.to_string(), None));
-                i += 1;
-            }
-            _ if arg.starts_with("--config=")
-                || arg.starts_with("--enable=")
-                || arg.starts_with("--disable=") =>
-            {
-                out.push((arg.to_string(), None));
-                i += 1;
-            }
-            _ if arg.starts_with('-') => {
-                i += if codex_long_option_takes_value(arg) || codex_short_option_takes_value(arg) {
-                    2
-                } else {
-                    1
-                };
-            }
-            _ => {
-                break;
-            }
-        }
-    }
-    out
-}
-
-fn codex_args_enable_unified_exec(args: &[String]) -> bool {
-    codex_args_feature_value(args, "--enable", "unified_exec")
-}
-
-fn codex_args_disable_unified_exec(args: &[String]) -> bool {
-    codex_args_feature_value(args, "--disable", "unified_exec")
-}
-
-fn codex_unified_exec_proxy_enabled(args: &[String]) -> bool {
-    !codex_args_disable_unified_exec(args)
-}
-
-fn codex_app_server_proxy_enabled(args: &[String], disabled: bool) -> Result<bool, String> {
-    if disabled {
-        return Ok(false);
-    }
-    if codex_metadata_only_args(args) {
-        return Ok(false);
-    }
-    if codex_args_remote_value(args).is_some() {
-        return Err(
-            "`pentect codex` owns Codex --remote; remove --remote or pass --no-app-server-proxy"
-                .to_string(),
-        );
-    }
-    let path = Path::new(PENTECT_DIR).join(PENTECT_CONFIG_FILE);
-    if !path.exists() {
-        return Ok(true);
-    }
-    let src = std::fs::read_to_string(&path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    if src.trim().is_empty() {
-        return Ok(true);
-    }
-    let value = src
-        .parse::<toml::Value>()
-        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-    Ok(codex_app_server_proxy_config_value(&value)?.unwrap_or(true))
-}
-
-fn codex_app_server_proxy_config_value(value: &toml::Value) -> Result<Option<bool>, String> {
-    let Some(raw) = value.get("agent") else {
-        return Ok(None);
-    };
-    let Some(table) = raw.as_table() else {
-        return Err("agent config must be a table".to_string());
-    };
-    if let Some(raw) = table.get("codex_app_server_proxy") {
-        return status_line_config_bool(raw, "agent.codex_app_server_proxy").map(Some);
-    }
-    Ok(None)
-}
-
-fn codex_args_remote_value(args: &[String]) -> Option<&str> {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "--" {
-            return None;
-        }
-        if arg == "--remote" {
-            return args.get(i + 1).map(String::as_str);
-        }
-        if let Some(value) = arg.strip_prefix("--remote=") {
-            return Some(value);
-        }
-        i += if codex_long_option_takes_value(arg) || codex_short_option_takes_value(arg) {
-            2
-        } else {
-            1
-        };
-    }
-    None
-}
-
-fn codex_metadata_only_args(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
-        || matches!(codex_first_positional(args), Some("help"))
-}
-
-fn codex_args_feature_value(args: &[String], flag: &str, feature: &str) -> bool {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == flag {
-            if args.get(i + 1).is_some_and(|value| value == feature) {
-                return true;
-            }
-            i += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
-            if value == feature {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
-fn claude_args(settings: &str, tool_args: &[String], contract: &str) -> Vec<String> {
-    let mut args = vec![
-        "--settings".to_string(),
-        settings.to_string(),
-        "--append-system-prompt".to_string(),
-        contract.to_string(),
-    ];
-    args.extend(tool_args.iter().cloned());
-    args
-}
-
-fn codex_hook_config_args(agent: &Path, session: Option<&str>) -> Result<Vec<String>, String> {
-    let command = hook_command(agent, "codex", session);
-    let windows = hook_command_windows(agent, "codex", session);
-    let hooks = codex_hooks_inline_table(&command, &windows)?;
-    Ok(vec![
-        "features.hooks=true".to_string(),
-        format!("hooks={hooks}"),
-    ])
-}
-
-fn codex_hooks_inline_table(command: &str, windows: &str) -> Result<String, String> {
-    const MATCHER: &str = "*";
-    const TIMEOUT: u64 = 30;
-    let pre_hash = codex_command_hook_hash("pre_tool_use", MATCHER, command, windows, TIMEOUT)?;
-    let post_hash = codex_command_hook_hash("post_tool_use", MATCHER, command, windows, TIMEOUT)?;
-    let pre_key = codex_session_flags_hook_key("pre_tool_use", 0, 0);
-    let post_key = codex_session_flags_hook_key("post_tool_use", 0, 0);
-    let hook = format!(
-        "{{matcher={},hooks=[{{type=\"command\",command={},commandWindows={},timeout={TIMEOUT}}}]}}",
-        toml_string(MATCHER),
-        toml_string(command),
-        toml_string(windows)
-    );
-    Ok(format!(
-        "{{PreToolUse=[{hook}],PostToolUse=[{hook}],state={{{}={{trusted_hash={}}},{}={{trusted_hash={}}}}}}}",
-        toml_string(&pre_key),
-        toml_string(&pre_hash),
-        toml_string(&post_key),
-        toml_string(&post_hash)
-    ))
-}
-
-fn codex_session_flags_hook_key(
-    event_label: &str,
-    group_index: usize,
-    handler_index: usize,
-) -> String {
-    format!(
-        "{}:{event_label}:{group_index}:{handler_index}",
-        codex_session_flags_config_path()
-    )
-}
-
-fn codex_session_flags_config_path() -> &'static str {
-    if cfg!(windows) {
-        r"C:\<session-flags>\config.toml"
-    } else {
-        "/<session-flags>/config.toml"
-    }
-}
-
-#[derive(serde::Serialize)]
-struct CodexNormalizedHookIdentity<'a> {
-    event_name: &'a str,
-    #[serde(flatten)]
-    group: CodexMatcherGroup<'a>,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct CodexMatcherGroup<'a> {
-    matcher: Option<&'a str>,
-    hooks: Vec<CodexHookHandlerConfig<'a>>,
-}
-
-#[derive(Clone, serde::Serialize)]
-#[serde(tag = "type")]
-enum CodexHookHandlerConfig<'a> {
-    #[serde(rename = "command")]
-    Command {
-        command: &'a str,
-        #[serde(rename = "commandWindows", skip_serializing_if = "Option::is_none")]
-        command_windows: Option<&'a str>,
-        #[serde(rename = "timeout", skip_serializing_if = "Option::is_none")]
-        timeout_sec: Option<u64>,
-        #[serde(rename = "async")]
-        r#async: bool,
-        #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
-        status_message: Option<&'a str>,
-    },
-}
-
-fn codex_command_hook_hash(
-    event_label: &str,
-    matcher: &str,
-    command: &str,
-    windows: &str,
-    timeout_sec: u64,
-) -> Result<String, String> {
-    let platform_command = if cfg!(windows) { windows } else { command };
-    let identity = CodexNormalizedHookIdentity {
-        event_name: event_label,
-        group: CodexMatcherGroup {
-            matcher: Some(matcher),
-            hooks: vec![CodexHookHandlerConfig::Command {
-                command: platform_command,
-                command_windows: None,
-                timeout_sec: Some(timeout_sec),
-                r#async: false,
-                status_message: None,
-            }],
-        },
-    };
-    let value = toml::Value::try_from(identity)
-        .map_err(|e| format!("could not build Codex hook trust identity: {e}"))?;
-    version_for_toml_value(&value)
-}
-
-fn version_for_toml_value(value: &toml::Value) -> Result<String, String> {
-    let json = serde_json::to_value(value)
-        .map_err(|e| format!("could not serialize Codex hook trust identity: {e}"))?;
-    let canonical = canonical_json_value(&json);
-    let serialized = serde_json::to_vec(&canonical)
-        .map_err(|e| format!("could not encode Codex hook trust identity: {e}"))?;
-    let mut hasher = Sha256::new();
-    hasher.update(serialized);
-    let hash = hasher.finalize();
-    let hex = hash
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(format!("sha256:{hex}"))
-}
-
-fn canonical_json_value(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut sorted = serde_json::Map::new();
-            let mut keys = map.keys().collect::<Vec<_>>();
-            keys.sort();
-            for key in keys {
-                if let Some(value) = map.get(key) {
-                    sorted.insert(key.clone(), canonical_json_value(value));
-                }
-            }
-            Value::Object(sorted)
-        }
-        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
-        other => other.clone(),
-    }
-}
-
-fn codex_headless_agent_command(tool_args: &[String]) -> bool {
-    if tool_args
-        .iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
-    {
-        return false;
-    }
-    matches!(
-        codex_first_positional(tool_args),
-        Some("exec" | "e" | "review")
-    )
-}
-
-fn codex_first_positional(args: &[String]) -> Option<&str> {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "--" {
-            return args.get(i + 1).map(String::as_str);
-        }
-        if matches!(arg, "-i" | "--image") {
-            i += 1;
-            while i < args.len() && !args[i].starts_with('-') {
-                if headless::is_codex_command(&args[i]) {
-                    return Some(args[i].as_str());
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if arg.starts_with("--") {
-            i += if codex_long_option_takes_value(arg) {
-                2
-            } else {
-                1
-            };
-            continue;
-        }
-        if arg.starts_with('-') && arg.len() > 1 {
-            i += if codex_short_option_takes_value(arg) {
-                2
-            } else {
-                1
-            };
-            continue;
-        }
-        return Some(arg);
-    }
-    None
-}
-
-fn codex_long_option_takes_value(arg: &str) -> bool {
-    if arg.contains('=') {
-        return false;
-    }
-    matches!(
-        arg,
-        "--model"
-            | "--config"
-            | "--profile"
-            | "--sandbox"
-            | "--ask-for-approval"
-            | "--cd"
-            | "--add-dir"
-            | "--enable"
-            | "--disable"
-            | "--remote"
-            | "--remote-auth-token-env"
-            | "--image"
-            | "--local-provider"
-            | "--output-last-message"
-            | "--color"
-    )
-}
-
-fn codex_short_option_takes_value(arg: &str) -> bool {
-    matches!(arg, "-m" | "-c" | "-p" | "-s" | "-a" | "-C" | "-o")
-}
-
-fn claude_settings_json(agent: &Path, session: Option<&str>) -> String {
-    let words = hook_words(agent, "claude", session);
-    let command = words[0].clone();
-    let args = words[1..].to_vec();
-    json!({
-        "hooks": {
-            "PreToolUse": [{
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": command.clone(),
-                    "args": args.clone(),
-                    "timeout": 30
-                }]
-            }],
-            "PostToolUse": [{
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": command.clone(),
-                    "args": args.clone(),
-                    "timeout": 30
-                }]
-            }]
-        }
-    })
-    .to_string()
-}
-
-#[cfg(not(windows))]
-fn hook_command_unix(agent: &Path, provider: &str, session: Option<&str>) -> String {
-    hook_words(agent, provider, session)
-        .iter()
-        .map(|word| shell_quote_unix(word))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn hook_command_windows(agent: &Path, provider: &str, session: Option<&str>) -> String {
-    let words = hook_words(agent, provider, session);
-    let command = words
-        .iter()
-        .map(|word| cmd_quote(word))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("cmd /D /S /C {command}")
-}
-
-#[cfg(windows)]
-fn hook_command(agent: &Path, provider: &str, session: Option<&str>) -> String {
-    hook_command_windows(agent, provider, session)
-}
-
-#[cfg(not(windows))]
-fn hook_command(agent: &Path, provider: &str, session: Option<&str>) -> String {
-    hook_command_unix(agent, provider, session)
-}
-
-fn cmd_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'\\' | b':')
-        })
-    {
-        return value.to_string();
-    }
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-fn hook_words(agent: &Path, provider: &str, session: Option<&str>) -> Vec<String> {
-    let agent = agent_command_path(agent);
-    let mut words = vec![
-        agent.to_string_lossy().into_owned(),
-        "hook".to_string(),
-        "--cli".to_string(),
-        provider.to_string(),
-    ];
-    add_explicit_session(&mut words, session);
-    words
-}
-
-fn add_explicit_session(words: &mut Vec<String>, session: Option<&str>) {
-    let Some(session) = session else {
-        return;
-    };
-    words.push("--session".to_string());
-    words.push(session.to_string());
-}
-
-fn agent_command_path(agent: &Path) -> PathBuf {
-    if agent.is_absolute() {
-        return agent.to_path_buf();
-    }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(agent))
-        .unwrap_or_else(|_| agent.to_path_buf())
 }
 
 fn default_pentect_path() -> PathBuf {
@@ -3528,24 +2315,8 @@ fn toml_string(value: &str) -> String {
     out
 }
 
-fn checked_agent_session_name(name: &str) -> Result<String, String> {
-    if name.is_empty() {
-        return Err("session name must not be empty".to_string());
-    }
-    if matches!(name, "." | "..") {
-        return Err("session name must not be a dot path segment".to_string());
-    }
-    if name.chars().any(|c| {
-        c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
-    }) {
-        return Err("session name must be a simple file-name segment".to_string());
-    }
-    Ok(name.to_string())
-}
-
 fn input_adapter(args: &[String]) -> Result<Box<dyn InputAdapter>, String> {
     match arg_value(args, "--input").as_deref() {
-        Some("pdf") => pdf_input_adapter(),
         Some("image" | "ocr") => Ok(Box::new(ImageOcrInput)),
         Some("text") | None => Ok(Box::new(TextInput)),
         Some(other) => Err(format!("unknown --input: {other}")),
@@ -3555,7 +2326,6 @@ fn input_adapter(args: &[String]) -> Result<Box<dyn InputAdapter>, String> {
 fn parse_read_input_format(value: &str) -> Result<ReadInputFormat, String> {
     match value {
         "text" => Ok(ReadInputFormat::Text),
-        "pdf" => Ok(ReadInputFormat::Pdf),
         "image" | "ocr" => Ok(ReadInputFormat::Image),
         other => Err(format!("unknown --input: {other}")),
     }
@@ -3579,7 +2349,6 @@ fn read_input(path: &Path, format: ReadInputFormat) -> Result<String, String> {
             bytes,
             format!("input '{}' is not UTF-8 text", path.display()),
         ),
-        ReadInputFormat::Pdf => pdf_text(&bytes),
         ReadInputFormat::Image => pentect_agent::ocr_image_bytes(&bytes),
     }
 }
@@ -3605,33 +2374,6 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
         ));
     }
     std::fs::read(path).map_err(|e| format!("could not read '{}': {e}", path.display()))
-}
-
-#[cfg(feature = "pdf")]
-fn pdf_text(bytes: &[u8]) -> Result<String, String> {
-    let text = pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|e| format!("could not extract PDF text: {e}"))?;
-    if text.trim().is_empty() {
-        return Err(
-            "PDF contains no extractable text; scanned/image-only PDFs need OCR".to_string(),
-        );
-    }
-    Ok(text)
-}
-
-#[cfg(not(feature = "pdf"))]
-fn pdf_text(_bytes: &[u8]) -> Result<String, String> {
-    Err("PDF input requires a build with `--features pdf`".to_string())
-}
-
-#[cfg(feature = "pdf")]
-fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
-    Ok(Box::new(input::PdfTextInput))
-}
-
-#[cfg(not(feature = "pdf"))]
-fn pdf_input_adapter() -> Result<Box<dyn InputAdapter>, String> {
-    Err("PDF input requires a build with `--features pdf`".to_string())
 }
 
 /// `--aggressive` disables the benign-shape guard, so even UUIDs/hashes get
@@ -3722,951 +2464,92 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pty_size_tracks_the_real_terminal_before_fallbacks() {
-        assert_eq!(
-            select_pty_size(Some((180, 52)), Some(100), Some(24)),
-            (180, 52)
-        );
-        assert_eq!(select_pty_size(None, Some(100), Some(24)), (100, 24));
-        assert_eq!(select_pty_size(Some((0, 0)), None, None), (120, 30));
-    }
-
-    #[test]
-    fn read_parse_infers_dotenv_and_defaults_to_strict() {
-        let args = vec!["pentect".into(), "read".into(), r".\.env".into()];
-        let opts = ReadOpts::parse(&args).unwrap();
-        assert_eq!(opts.profile, Profile::Strict);
-        assert_eq!(infer_kind(&opts.path), Kind::Env);
-        assert!(!opts.emit_meta);
-
-        let args = vec![
-            "pentect".into(),
-            "read".into(),
-            "--meta".into(),
-            "--kind".into(),
-            "env".into(),
-            r".\.env".into(),
-        ];
-        let opts = ReadOpts::parse(&args).unwrap();
-        assert_eq!(opts.kind, Some(Kind::Env));
-        assert!(opts.emit_meta);
-
-        let args = vec![
-            "pentect".into(),
-            "read".into(),
-            "--persist".into(),
-            r".\.env".into(),
-        ];
-        let err = match ReadOpts::parse(&args) {
-            Ok(_) => panic!("expected --persist to be rejected"),
-            Err(err) => err,
-        };
-        assert!(err.contains("unknown option"), "{err}");
-    }
-
-    #[test]
-    fn mask_rejects_unknown_kind_and_accepts_profile_modes() {
-        let args = vec![
-            "pentect".into(),
-            "mask".into(),
-            "--kind".into(),
-            "yaml".into(),
-        ];
-        assert!(validate_mask_args(&args)
-            .unwrap_err()
-            .contains("unknown kind"));
-
-        let args = vec![
-            "pentect".into(),
-            "mask".into(),
-            "--profile".into(),
-            "extra".into(),
-        ];
-        assert!(validate_mask_args(&args)
-            .unwrap_err()
-            .contains("unknown profile"));
-
-        let args = vec![
-            "pentect".into(),
-            "mask".into(),
-            "--profile".into(),
-            "balanced".into(),
-            "--aggressive".into(),
-        ];
-        assert!(validate_mask_args(&args).is_ok());
-    }
-
-    #[test]
-    fn mask_accepts_plugin_names() {
-        let args = vec![
-            "pentect".into(),
-            "mask".into(),
-            "--plugins".into(),
-            "openai-privacy-filter,local.rules".into(),
-        ];
-        assert!(validate_mask_args(&args).is_ok());
-    }
-
-    #[test]
-    fn pack_dir_expands_toml_files_in_stable_order() {
-        let root =
-            std::env::temp_dir().join(format!("pentect-pack-dir-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("b.toml"), "").unwrap();
-        std::fs::write(root.join("a.toml"), "").unwrap();
-        std::fs::write(root.join("skip.txt"), "").unwrap();
-
-        let args = vec![
-            "pentect".to_string(),
-            "mask".to_string(),
-            "--pack-dir".to_string(),
-            root.display().to_string(),
-        ];
-        let paths = pack_paths(&args).unwrap();
-        assert_eq!(
-            paths,
-            vec![root.join("a.toml"), root.join("b.toml")],
-            "{paths:?}"
-        );
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn agent_tool_parse_consumes_codex_app_server_proxy_toggle() {
-        let args = vec![
-            "pentect".to_string(),
-            "codex".to_string(),
-            "--no-app-server-proxy".to_string(),
-            "hello".to_string(),
-        ];
-        let opts = AgentToolOpts::parse(AgentTool::Codex, &args).unwrap();
-        assert!(opts.codex_app_server_proxy_disabled);
-        assert_eq!(opts.tool_args, vec!["hello"]);
-    }
-
-    #[test]
-    fn agent_tool_parse_consumes_plugins_before_tool_args() {
-        let args = vec![
-            "pentect".to_string(),
-            "codex".to_string(),
-            "--plugins".to_string(),
-            "openai-privacy-filter,local.rules".to_string(),
-            "--".to_string(),
-            "hello".to_string(),
-        ];
-        let opts = AgentToolOpts::parse(AgentTool::Codex, &args).unwrap();
-        assert_eq!(
-            opts.plugins,
-            vec![
-                "openai-privacy-filter".to_string(),
-                "local.rules".to_string()
-            ]
-        );
-        assert_eq!(opts.tool_args, vec!["hello"]);
-    }
-
-    #[test]
-    fn agent_tool_parse_reports_automatic_prompt_protection() {
-        for tool in [AgentTool::Codex, AgentTool::Claude, AgentTool::OpenCode] {
-            let args = vec![
-                "pentect".to_string(),
-                tool.name().to_string(),
-                "--prompt-proxy".to_string(),
-            ];
-            let err = AgentToolOpts::parse(tool, &args).unwrap_err();
-            assert!(err.contains("protection is automatic"), "{tool:?}: {err}");
-        }
-    }
-
-    #[test]
-    fn opencode_has_distinct_command_and_path_flag() {
-        assert_eq!(AgentTool::OpenCode.default_command(), "opencode");
-        assert_eq!(AgentTool::OpenCode.path_flag(), "--opencode");
-    }
-
-    #[test]
-    fn runtime_tokens_require_full_random_hex() {
-        assert!(valid_runtime_token(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        ));
-        assert!(!valid_runtime_token("user-selected"));
-        assert!(!valid_runtime_token(
-            "z123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        ));
-    }
-
-    #[test]
-    fn codex_metadata_commands_do_not_need_verified_hooks() {
-        assert!(!codex_headless_agent_command(&["--version".to_string()]));
-        assert!(!codex_headless_agent_command(&["--help".to_string()]));
-        assert!(!codex_headless_agent_command(&["help".to_string()]));
-    }
-
-    #[test]
-    fn help_text_is_compact() {
+    fn help_lists_only_active_agent_integrations() {
         let help = help_text();
-        assert!(help.contains("pentect exec"), "{help}");
-        assert!(help.contains("pentect shell"), "{help}");
-        assert!(!help.contains("agent exec"), "{help}");
-        assert!(!help.contains("bench"), "{help}");
-        assert!(help.contains("doctor: readiness"), "{help}");
-        assert!(help.contains("plugins: list, inspect, test"), "{help}");
-        assert!(help.contains("eval: precision, recall"), "{help}");
-        assert!(
-            help.contains("scan: secrets; gitignore on; --no-gitignore broadens"),
-            "{help}"
-        );
-        assert!(help.contains("statusline: masked count"), "{help}");
-        assert!(!help.contains("pentect purge"), "{help}");
-        assert!(!help.contains("authenticated browser/API/MCP"), "{help}");
+        assert!(help.contains("pentect codex|claude"));
+        assert!(help.contains("pentect codex app"));
+        assert!(help.contains("pentect claude-app"));
+        assert!(!help.contains("opencode"));
+        assert!(!help.contains("pentect shell"));
     }
 
     #[test]
-    fn issue_report_url_is_compact() {
-        let url = issue_report_url();
-        assert!(url.starts_with("https://github.com/EdamAme-x/pentect/issues/new?"));
-        assert!(url.contains("title=Pentect%20error"), "{url}");
-        assert!(!url.contains("body="), "{url}");
-        assert!(url.len() < 100, "{url}");
-    }
-
-    #[test]
-    fn agent_session_names_reject_dot_segments() {
-        assert!(checked_agent_session_name(".").is_err());
-        assert!(checked_agent_session_name("..").is_err());
-        assert!(checked_agent_session_name("../x").is_err());
-        assert_eq!(checked_agent_session_name("demo").unwrap(), "demo");
-    }
-
-    #[test]
-    fn hook_words_use_pentect_hook_subcommand() {
-        let pentect = absolute_pentect_fixture_path();
-        let words = hook_words(&pentect, "codex", Some("demo"));
-        assert_eq!(words[0], pentect.to_string_lossy().as_ref());
-        assert_eq!(
-            words[1..].to_vec(),
-            vec![
-                "hook".to_string(),
-                "--cli".to_string(),
-                "codex".to_string(),
-                "--session".to_string(),
-                "demo".to_string()
-            ]
-        );
-    }
-
-    fn absolute_pentect_fixture_path() -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(r"C:\repo\target\debug\pentect.exe")
-        } else {
-            PathBuf::from("/repo/target/debug/pentect")
-        }
-    }
-
-    #[test]
-    fn hook_words_use_pentect_path_without_session() {
-        let pentect = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("debug")
-            .join(if cfg!(windows) {
-                "pentect.exe"
-            } else {
-                "pentect"
-            });
-        let words = hook_words(&pentect, "codex", None);
-        assert_eq!(words[0], pentect.to_string_lossy().as_ref());
-        assert_eq!(
-            words[1..].to_vec(),
-            vec!["hook".to_string(), "--cli".to_string(), "codex".to_string()]
-        );
-    }
-
-    #[test]
-    fn launched_agent_tools_export_pentect_path_for_hooks() {
-        let pentect = absolute_pentect_fixture_path();
-        let launch_proof = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut cmd = Command::new("codex");
-        apply_pentect_env(&mut cmd, &pentect, Some(launch_proof)).unwrap();
-        let actual = cmd
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_BIN_ENV))
-            .and_then(|(_, value)| value)
-            .unwrap();
-        assert_eq!(actual, pentect.as_os_str());
-        let launched = cmd
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_AGENT_LAUNCHED_ENV))
-            .and_then(|(_, value)| value)
-            .unwrap();
-        assert_eq!(launched, std::ffi::OsStr::new(launch_proof));
-        let path = cmd
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
-            .and_then(|(_, value)| value)
-            .unwrap();
-        assert_eq!(
-            std::env::split_paths(path).next().as_deref(),
-            pentect.parent()
-        );
-    }
-
-    #[test]
-    fn status_line_config_defaults_on_and_accepts_agent_toggle() {
-        let empty = ""
-            .parse::<toml::Value>()
-            .unwrap_or(toml::Value::Table(Default::default()));
-        assert_eq!(status_line_config_value(&empty).unwrap(), None);
-
-        let value = "[agent]\nstatus_line = false"
-            .parse::<toml::Value>()
-            .unwrap();
-        assert_eq!(status_line_config_value(&value).unwrap(), Some(false));
-
-        let value = "status_line = \"on\"".parse::<toml::Value>().unwrap();
-        assert_eq!(status_line_config_value(&value).unwrap(), Some(true));
-    }
-
-    #[test]
-    fn memory_store_startup_requires_process_host_tokens() {
-        let parsed = parse_memory_store_startup(
-            r#"{"addr":"127.0.0.1:1234","token":"memory","process_host_read_token":"read","process_host_write_token":"write"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            parsed,
-            (
-                "127.0.0.1:1234".to_string(),
-                "memory".to_string(),
-                "read".to_string(),
-                "write".to_string(),
-            )
-        );
-        assert!(
-            parse_memory_store_startup(r#"{"addr":"127.0.0.1:1234","token":"write"}"#).is_err()
-        );
-    }
-
-    #[test]
-    fn status_line_env_is_compact() {
-        let mut cmd = Command::new("codex");
-        apply_status_line_env(&mut cmd, true);
-        let enabled = cmd
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_STATUS_LINE_ENV))
-            .and_then(|(_, value)| value)
-            .unwrap();
-        assert_eq!(enabled, std::ffi::OsStr::new("1"));
-
-        apply_status_line_env(&mut cmd, false);
-        let disabled = cmd
-            .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new(PENTECT_STATUS_LINE_ENV))
-            .and_then(|(_, value)| value)
-            .unwrap();
-        assert_eq!(disabled, std::ffi::OsStr::new("0"));
-    }
-
-    #[test]
-    fn codex_args_place_remote_before_prompt() {
-        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
-        let args = codex_args_with_remote(
-            &["features.hooks=true".to_string()],
-            &["hello".to_string()],
-            Some("ws://127.0.0.1:12345"),
-            &contract,
-        );
-        let remote = args.iter().position(|arg| arg == "--remote").unwrap();
-        let prompt = args.iter().position(|arg| arg == "hello").unwrap();
-        assert!(remote < prompt, "{args:?}");
-        assert_eq!(args[remote + 1], "ws://127.0.0.1:12345");
-    }
-
-    #[test]
-    fn codex_remote_scan_skips_short_option_values() {
-        assert_eq!(
-            codex_args_remote_value(&["-m".to_string(), "--remote".to_string()]),
-            None
-        );
-        assert_eq!(
-            codex_args_remote_value(&[
-                "-m".to_string(),
-                "gpt-5.5".to_string(),
-                "--remote".to_string(),
-                "ws://127.0.0.1:12345".to_string()
-            ]),
-            Some("ws://127.0.0.1:12345")
-        );
-    }
-
-    #[test]
-    fn codex_app_server_args_keep_pentect_and_root_config_only() {
-        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
-        let args = codex_app_server_args(
-            &["features.hooks=true".to_string()],
+    fn agent_options_keep_provider_upstreams_out_of_tool_args() {
+        let codex = AgentToolOpts::parse(
+            AgentTool::Codex,
             &[
-                "-m".to_string(),
-                "gpt-5.3-codex".to_string(),
-                "--config".to_string(),
-                "model_reasoning_effort=\"high\"".to_string(),
+                "pentect".to_string(),
+                "codex".to_string(),
+                "--upstream".to_string(),
+                "https://gateway.example/v1".to_string(),
+                "--".to_string(),
+                "exec".to_string(),
                 "hello".to_string(),
             ],
-            &contract,
-        );
-        assert!(args.contains(&"--enable".to_string()), "{args:?}");
-        assert!(args.contains(&"unified_exec".to_string()), "{args:?}");
-        assert!(
-            args.contains(&"features.hooks=true".to_string()),
-            "{args:?}"
-        );
-        assert!(
-            args.contains(&"model_reasoning_effort=\"high\"".to_string()),
-            "{args:?}"
-        );
-        assert!(!args.contains(&"-m".to_string()), "{args:?}");
-        assert!(!args.contains(&"hello".to_string()), "{args:?}");
-    }
-
-    #[test]
-    fn codex_app_server_proxy_config_defaults_and_can_disable() {
-        let empty = ""
-            .parse::<toml::Value>()
-            .unwrap_or(toml::Value::Table(Default::default()));
-        assert_eq!(codex_app_server_proxy_config_value(&empty).unwrap(), None);
-
-        let value = "[agent]\ncodex_app_server_proxy = false"
-            .parse::<toml::Value>()
-            .unwrap();
-        assert_eq!(
-            codex_app_server_proxy_config_value(&value).unwrap(),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn codex_environments_toml_keeps_local_available() {
-        let rendered = codex_environments_toml("ws://127.0.0.1:12345/pentect");
-        assert!(rendered.contains("default = \"pentect\""), "{rendered}");
-        assert!(rendered.contains("include_local = true"), "{rendered}");
-        assert!(rendered.contains("id = \"pentect\""), "{rendered}");
-        assert!(
-            rendered.contains("url = \"ws://127.0.0.1:12345/pentect\""),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn codex_environment_overlay_restores_existing_file() {
-        let root = std::env::temp_dir().join(format!(
-            "pentect-codex-env-overlay-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("environments.toml");
-        std::fs::write(&path, b"default = \"local\"\n").unwrap();
-        let _env = EnvVarGuard::set_optional([("CODEX_HOME", Some(root.clone().into_os_string()))]);
-        {
-            let _guard =
-                CodexEnvironmentOverlayGuard::install("ws://127.0.0.1:12345/pentect").unwrap();
-            let current = std::fs::read_to_string(&path).unwrap();
-            assert!(current.contains("default = \"pentect\""), "{current}");
-        }
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "default = \"local\"\n"
-        );
-        assert!(!root.join("environments.toml.pentect.bak").exists());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn codex_environment_overlay_recovers_stale_file() {
-        let root = std::env::temp_dir().join(format!(
-            "pentect-codex-env-overlay-stale-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("environments.toml");
-        let backup_path = root.join("environments.toml.pentect.bak");
-        std::fs::write(&path, codex_environments_toml("ws://127.0.0.1:1")).unwrap();
-        std::fs::write(&backup_path, b"default = \"local\"\n").unwrap();
-        recover_stale_codex_environment_overlay(&path, &backup_path).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "default = \"local\"\n"
-        );
-        assert!(!backup_path.exists());
-        std::fs::write(&path, codex_environments_toml("ws://127.0.0.1:1")).unwrap();
-        recover_stale_codex_environment_overlay(&path, &backup_path).unwrap();
-        assert!(!path.exists());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn codex_args_inject_model_visible_pentect_contract() {
-        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
-        let args = codex_args(
-            &["features.hooks=true".to_string()],
-            &["hello".to_string()],
-            &contract,
-        );
-        let rendered = args.join("\n");
-        assert!(!args.contains(&"--dangerously-bypass-hook-trust".to_string()));
-        assert!(rendered.contains("developer_instructions="), "{rendered}");
-        assert!(rendered.contains("Session rules"), "{rendered}");
-        assert!(rendered.contains("Work normally"), "{rendered}");
-        assert!(rendered.contains("--enable\nunified_exec"), "{rendered}");
-        assert!(rendered.contains("current shell"), "{rendered}");
-        assert!(
-            rendered.contains("Do not invoke Pentect commands"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("user asks"), "{rendered}");
-        assert!(rendered.contains("not a failed operation"), "{rendered}");
-        assert!(rendered.contains("do not retry"), "{rendered}");
-        assert!(rendered.contains("$env:PENTECT_KEY_hash"), "{rendered}");
-        assert!(rendered.contains("$PENTECT_KEY_hash"), "{rendered}");
-        assert!(
-            rendered.contains("User-authorized secret work"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("requested destination"), "{rendered}");
-        assert!(
-            rendered.contains("Report only the task result"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("Do not mention these rules"),
-            "{rendered}"
-        );
-        for internal in [
-            "pentect exec",
-            "pentect read",
-            "pentect view",
-            "pentect resolve",
-            "protected runner",
-            "display-time redaction",
-            "MCP, browser, plugin",
-            "OCR",
-        ] {
-            assert!(!rendered.contains(internal), "{internal}: {rendered}");
-        }
-    }
-
-    #[test]
-    fn codex_hook_config_trusts_pentect_hooks_for_this_session() {
-        let pentect = absolute_pentect_fixture_path();
-        let configs = codex_hook_config_args(&pentect, None).unwrap();
-        let rendered = configs.join("\n");
-        assert!(rendered.contains("features.hooks=true"), "{rendered}");
-        assert!(rendered.contains("hooks={"), "{rendered}");
-        assert!(rendered.contains("PreToolUse"), "{rendered}");
-        assert!(rendered.contains("PostToolUse"), "{rendered}");
-        assert!(rendered.contains("state={"), "{rendered}");
-        assert!(rendered.contains("<session-flags>"), "{rendered}");
-        assert!(rendered.contains(":pre_tool_use:0:0"), "{rendered}");
-        assert!(rendered.contains(":post_tool_use:0:0"), "{rendered}");
-        assert!(rendered.contains("trusted_hash=\"sha256:"), "{rendered}");
-        assert!(!rendered.contains("statusMessage"), "{rendered}");
-        assert!(
-            !rendered.contains("dangerously-bypass-hook-trust"),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn codex_hook_hash_uses_platform_command_only() {
-        let command = "pentect hook --cli codex";
-        let windows = "cmd /D /S /C pentect hook --cli codex";
-        let selected = if cfg!(windows) { windows } else { command };
-        let expected = version_for_toml_value(
-            &toml::Value::try_from(CodexNormalizedHookIdentity {
-                event_name: "pre_tool_use",
-                group: CodexMatcherGroup {
-                    matcher: Some("*"),
-                    hooks: vec![CodexHookHandlerConfig::Command {
-                        command: selected,
-                        command_windows: None,
-                        timeout_sec: Some(30),
-                        r#async: false,
-                        status_message: None,
-                    }],
-                },
-            })
-            .unwrap(),
         )
         .unwrap();
         assert_eq!(
-            codex_command_hook_hash("pre_tool_use", "*", command, windows, 30).unwrap(),
-            expected
+            codex.openai_upstream.as_deref(),
+            Some("https://gateway.example/v1")
+        );
+        assert_eq!(codex.tool_args, ["exec", "hello"]);
+
+        let claude = AgentToolOpts::parse(
+            AgentTool::Claude,
+            &[
+                "pentect".to_string(),
+                "claude".to_string(),
+                "--upstream".to_string(),
+                "https://gateway.example/anthropic".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            claude.anthropic_upstream.as_deref(),
+            Some("https://gateway.example/anthropic")
         );
     }
 
     #[test]
-    fn codex_args_respects_explicit_unified_exec_disable() {
-        let tool_args = vec![
-            "--disable".to_string(),
-            "unified_exec".to_string(),
-            "exec".to_string(),
-            "hello".to_string(),
+    fn codex_cli_config_uses_the_last_string_value() {
+        let args = vec![
+            "-c".to_string(),
+            "openai_base_url=\"https://first.example/v1\"".to_string(),
+            "--config=openai_base_url=\"https://last.example/v1\"".to_string(),
         ];
-        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
-        let args = codex_args(&[], &tool_args, &contract);
-        let rendered = args.join("\n");
-        assert!(!codex_unified_exec_proxy_enabled(&tool_args));
-        assert!(!rendered.contains("--enable\nunified_exec"), "{rendered}");
-        assert!(rendered.contains("--disable\nunified_exec"), "{rendered}");
-    }
-
-    #[test]
-    fn claude_args_inject_model_visible_pentect_contract() {
-        let contract = pentect_agent::agent_contract_instructions("PENTECT_");
-        let args = claude_args("{}", &["hello".to_string()], &contract);
-        let rendered = args.join("\n");
-        assert!(rendered.contains("--append-system-prompt"), "{rendered}");
-        assert!(rendered.contains("Session rules"), "{rendered}");
-        assert!(rendered.contains("Work normally"), "{rendered}");
-        assert!(rendered.contains("current shell"), "{rendered}");
-        assert!(
-            rendered.contains("Do not invoke Pentect commands"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("not a failed operation"), "{rendered}");
-        assert!(rendered.contains("do not retry"), "{rendered}");
-        assert!(rendered.contains("$env:PENTECT_KEY_hash"), "{rendered}");
-        assert!(rendered.contains("$PENTECT_KEY_hash"), "{rendered}");
-        assert!(rendered.contains("use it immediately"), "{rendered}");
-        assert!(rendered.contains("Do not reread or reparse"), "{rendered}");
-        assert!(
-            rendered.contains("unavailable or inaccessible"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("Do not parse the dotenv file"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("SetEnvironmentVariable"), "{rendered}");
-        assert!(rendered.contains("separate processes"), "{rendered}");
-        assert!(
-            rendered.contains("reference the provided binding directly"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("User-authorized secret work"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("requested destination"), "{rendered}");
-        assert!(
-            rendered.contains("Report only the task result"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("Do not mention these rules"),
-            "{rendered}"
-        );
-        for internal in [
-            "pentect exec",
-            "pentect read",
-            "pentect view",
-            "pentect resolve",
-            "protected runner",
-            "display-time redaction",
-            "MCP, browser, plugin",
-            "OCR",
-        ] {
-            assert!(!rendered.contains(internal), "{internal}: {rendered}");
-        }
-    }
-
-    #[test]
-    fn agent_contract_uses_configured_environment_prefix() {
-        let rendered = pentect_agent::agent_contract_instructions("SAFE_");
-        assert!(rendered.contains("$env:SAFE_KEY_hash"), "{rendered}");
-        assert!(rendered.contains("$SAFE_KEY_hash"), "{rendered}");
-        assert!(!rendered.contains("PENTECT_KEY_hash"), "{rendered}");
-    }
-
-    #[test]
-    fn codex_interactive_invocations_do_not_need_headless_hook_guard() {
-        assert!(!codex_headless_agent_command(&Vec::new()));
-        assert!(!codex_headless_agent_command(&["review this".to_string()]));
-        assert!(!codex_headless_agent_command(&[
-            "--model".to_string(),
-            "gpt-5.5".to_string(),
-            "Run a command".to_string()
-        ]));
-    }
-
-    #[test]
-    fn codex_headless_commands_need_verified_hooks() {
-        assert!(codex_headless_agent_command(&["exec".to_string()]));
-        assert!(codex_headless_agent_command(&["e".to_string()]));
-        assert!(codex_headless_agent_command(&["review".to_string()]));
-        assert!(codex_headless_agent_command(&[
-            "--model".to_string(),
-            "gpt-5.5".to_string(),
-            "exec".to_string()
-        ]));
-        assert!(codex_headless_agent_command(&[
-            "--".to_string(),
-            "exec".to_string()
-        ]));
-        assert!(codex_headless_agent_command(&[
-            "--enable".to_string(),
-            "foo".to_string(),
-            "exec".to_string()
-        ]));
-        assert!(codex_headless_agent_command(&[
-            "-a".to_string(),
-            "never".to_string(),
-            "exec".to_string()
-        ]));
-        assert!(codex_headless_agent_command(&[
-            "exec".to_string(),
-            "--".to_string(),
-            "--help".to_string()
-        ]));
-    }
-
-    #[test]
-    fn prompt_input_rewrites_bracketed_paste_payload() {
-        let mut state = PromptInputState::default();
-        let mut mask = |text: &str| {
-            Ok(Some(text.replace(
-                "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
-                "<<OPENAI_API_KEY_demo>>",
-            )))
-        };
-        let out = rewrite_prompt_input_bytes_with(
-            &mut state,
-            b"\x1b[200~OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\x1b[201~",
-            &mut mask,
-        )
-        .unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.starts_with("\x1b[200~"), "{text:?}");
-        assert!(text.ends_with("\x1b[201~"), "{text:?}");
-        assert!(!text.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"), "{text}");
-        assert!(text.contains("<<OPENAI_API_KEY_demo>>"), "{text}");
-    }
-
-    #[test]
-    fn prompt_input_rewrites_split_bracketed_paste() {
-        let mut state = PromptInputState::default();
-        let mut mask = |text: &str| Ok(Some(text.replace("secret-value", "<<TOKEN_demo>>")));
-        let first = rewrite_prompt_input_bytes_with(&mut state, b"\x1b[20", &mut mask).unwrap();
-        assert!(first.is_empty(), "{first:?}");
-        let second =
-            rewrite_prompt_input_bytes_with(&mut state, b"0~token=secret-", &mut mask).unwrap();
-        assert_eq!(second, b"\x1b[200~");
-        let third =
-            rewrite_prompt_input_bytes_with(&mut state, b"value\x1b[201~", &mut mask).unwrap();
         assert_eq!(
-            String::from_utf8(third).unwrap(),
-            "token=<<TOKEN_demo>>\x1b[201~"
+            codex_cli_config_string(&args, "openai_base_url").as_deref(),
+            Some("https://last.example/v1")
         );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn prompt_input_rewrites_win32_encoded_bracketed_paste() {
-        let raw = "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX";
-        let mut encoded = encode_win32_unicode_input("\x1b[200~");
-        encoded.extend(encode_win32_unicode_input(raw));
-        encoded.extend(encode_win32_unicode_input("\x1b[201~"));
-        let split = encoded.len() / 2;
-        let mut normal = PromptInputState::default();
-        let mut win32 = Win32PromptInputState::default();
-        let mut mask = |text: &str| {
-            Ok(Some(text.replace(
-                "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
-                "<<OPENAI_API_KEY_demo>>",
-            )))
-        };
-        let mut out = rewrite_win32_prompt_input_bytes_with(
-            &mut normal,
-            &mut win32,
-            &encoded[..split],
-            &mut mask,
-        )
-        .unwrap();
-        out.extend(
-            rewrite_win32_prompt_input_bytes_with(
-                &mut normal,
-                &mut win32,
-                &encoded[split..],
-                &mut mask,
-            )
-            .unwrap(),
+    fn codex_cli_config_compares_toml_key_segments_semantically() {
+        let args = vec![
+            "-c".to_string(),
+            "model_providers.'team.proxy'.base_url=\"https://proxy.example/v1\"".to_string(),
+        ];
+        assert_eq!(
+            codex_cli_config_string(&args, "model_providers.\"team.proxy\".base_url").as_deref(),
+            Some("https://proxy.example/v1")
         );
-        let decoded = String::from_utf8_lossy(&out);
-        assert!(
-            !decoded.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
-            "{decoded}"
-        );
-        assert!(decoded.contains("<<OPENAI_API_KEY_demo>>"), "{decoded}");
-        assert!(decoded.starts_with("\x1b[200~"), "{decoded:?}");
-        assert!(decoded.contains("\x1b[201~"), "{decoded:?}");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn prompt_input_preserves_non_win32_terminal_responses() {
-        let mut normal = PromptInputState::default();
-        let mut win32 = Win32PromptInputState::default();
-        let mut mask = |_: &str| Ok(Some("masked".to_string()));
-        let out =
-            rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, b"\x1b[2;1R", &mut mask)
-                .unwrap();
-        assert_eq!(out, b"\x1b[2;1R");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn prompt_input_preserves_win32_key_records_outside_paste() {
-        let encoded = encode_win32_unicode_input("tools\r");
-        let mut normal = PromptInputState::default();
-        let mut win32 = Win32PromptInputState::default();
-        let mut mask = |_: &str| Ok(None);
-        let out =
-            rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, &encoded, &mut mask)
-                .unwrap();
-        assert_eq!(out, encoded);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn prompt_input_preserves_one_backspace_as_one_win32_key_press() {
-        let encoded = b"\x1b[8;14;8;1;0;1_\x1b[8;14;8;0;0;1_";
-        let mut normal = PromptInputState::default();
-        let mut win32 = Win32PromptInputState::default();
-        let mut mask = |_: &str| Ok(None);
-        let out =
-            rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, encoded, &mut mask)
-                .unwrap();
-        assert_eq!(out, encoded);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn prompt_input_normalizes_vt_backspace_for_nested_conpty() {
-        for encoded in [b"abc\x08".as_slice(), b"abc\x7f".as_slice()] {
-            let mut normal = PromptInputState::default();
-            let mut win32 = Win32PromptInputState::default();
-            let mut mask = |_: &str| Ok(None);
-            let out =
-                rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, encoded, &mut mask)
-                    .unwrap();
-            let mut expected = b"abc".to_vec();
-            expected.extend_from_slice(WIN32_BACKSPACE_INPUT);
-            assert_eq!(out, expected);
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn prompt_input_preserves_escape_and_navigation_without_waiting_for_paste() {
-        for encoded in [
-            b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_".as_slice(),
-            b"\x1b[37;75;0;1;256;1_\x1b[37;75;0;0;256;1_".as_slice(),
-            b"\x1b[46;83;0;1;256;1_\x1b[46;83;0;0;256;1_".as_slice(),
-        ] {
-            let mut normal = PromptInputState::default();
-            let mut win32 = Win32PromptInputState::default();
-            let mut mask = |_: &str| Ok(None);
-            let out =
-                rewrite_win32_prompt_input_bytes_with(&mut normal, &mut win32, encoded, &mut mask)
-                    .unwrap();
-            assert_eq!(out, encoded);
-        }
     }
 
     #[test]
-    fn prompt_input_keeps_escape_sequences_raw() {
-        let mut state = PromptInputState::default();
-        let mut called = false;
-        let mut mask = |_: &str| {
-            called = true;
-            Ok(Some("masked".to_string()))
-        };
-        let out = rewrite_prompt_input_bytes_with(&mut state, b"\x1b[A", &mut mask).unwrap();
-        assert_eq!(out, b"\x1b[A");
-        assert!(!called);
+    fn codex_provider_key_segments_are_safe_toml() {
+        assert_eq!(codex_toml_key_segment("local-proxy"), "local-proxy");
+        assert_eq!(codex_toml_key_segment("team.proxy"), "\"team.proxy\"");
     }
 
     #[test]
-    fn prompt_input_releases_a_standalone_escape_after_idle_timeout() {
-        let mut protector = PromptInputProtector::default();
-        assert!(protector.rewrite_bytes(b"\x1b").unwrap().is_empty());
-        assert_eq!(protector.flush_idle().unwrap(), b"\x1b");
-    }
-
-    #[test]
-    fn only_session_commands_support_process_host_handoff() {
-        for command in ["exec", "shell", "log", "bridge"] {
+    fn only_long_lived_agent_commands_support_process_host_handoff() {
+        for command in ["exec", "log", "bridge"] {
             let args = vec!["pentect".to_string(), command.to_string()];
-            assert!(supports_process_host(&args), "{command}");
+            assert!(supports_process_host(&args));
         }
-        for command in [
-            "help",
-            "read",
-            "view",
-            "statusline",
-            "doctor",
-            "plugins",
-            "eval",
-            "scan",
-            "resolve",
-            "up",
-            "codex",
-            "claude",
-            "opencode",
-        ] {
+        for command in ["codex", "claude", "claude-app", "scan", "read"] {
             let args = vec!["pentect".to_string(), command.to_string()];
-            assert!(!supports_process_host(&args), "{command}");
+            assert!(!supports_process_host(&args));
         }
-        assert!(supports_process_host(&[
-            "pentect".to_string(),
-            "agent".to_string(),
-            "shell".to_string(),
-        ]));
-        assert!(!supports_process_host(&[
-            "pentect".to_string(),
-            "agent".to_string(),
-            "hook".to_string(),
-        ]));
-    }
-
-    #[test]
-    fn shell_commands_use_the_in_process_startup_path() {
-        assert!(is_shell_command(&["pentect".into(), "shell".into()]));
-        assert!(is_shell_command(&[
-            "pentect".into(),
-            "agent".into(),
-            "shell".into()
-        ]));
-        assert!(!is_shell_command(&["pentect".into(), "exec".into()]));
-        assert!(should_passthrough_shell(
-            &["pentect".into(), "shell".into()],
-            Some(std::ffi::OsStr::new("1"))
-        ));
-        assert!(should_passthrough_shell(
-            &["pentect".into(), "agent".into(), "shell".into()],
-            Some(std::ffi::OsStr::new("1"))
-        ));
-        assert!(!should_passthrough_shell(
-            &["pentect".into(), "shell".into()],
-            None
-        ));
     }
 }

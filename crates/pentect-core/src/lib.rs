@@ -35,14 +35,14 @@ pub use detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector,
     CredSweeperNativeDetector, CredSweeperNativeFinding, CredSweeperNativeRelatedFinding,
     CredSweeperNativeStats, DecodeConfig, DecodeDetector, Detector, EntropyDetector,
-    KeyValueDetector, PatternMatchDetector, PatternSpec, PemDetector, RuleDetector, RuleSpec,
-    SensitiveKeyDetector, StructuralDetector, UrlDetector,
+    EnvValueDetector, KeyValueDetector, PatternMatchDetector, PatternSpec, PemDetector,
+    RuleDetector, RuleSpec, SensitiveKeyDetector, StructuralDetector, UrlDetector,
 };
 pub use model::{
     ByteRange, Category, Confidence, Context, DetectorId, Input, Kind, Region, RegionKind, Span,
 };
 pub use pack::{load_pack, load_plugin_pack, Pack};
-pub use parse::{EnvParser, JsonParser, Parser, TextParser, ToolResultParser};
+pub use parse::{EnvParser, JsonParser, NdjsonParser, Parser, TextParser, ToolResultParser};
 pub use pipeline::{
     Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote,
     SpanAnalysisResult, Summary,

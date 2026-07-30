@@ -5,9 +5,10 @@ use crate::plugin_adapter::ModelAdapters;
 use crate::session::Session;
 use pentect_core::placeholder::{identity_hash, render_placeholder};
 use pentect_core::{
-    load_pack, ByteRange, Category, Config, Context, Engine, Input, Kind, MaskResult, Profile,
-    ProfilePolicy, Recovery, Region, RegionKind, SensitiveKeyDetector, ShapeGuard,
-    ToolResultParser,
+    load_pack, ByteRange, Category, Config, Context, CredSweeperNativeDetector, Engine,
+    EntropyDetector, EnvParser, EnvValueDetector, Input, JsonParser, Kind, MaskResult,
+    NdjsonParser, PemDetector, Profile, ProfilePolicy, Recovery, Region, RegionKind,
+    SensitiveKeyDetector, ShapeGuard, ToolResultParser,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -15,6 +16,7 @@ use std::sync::OnceLock;
 const ENV_ALIAS_LABEL: &str = "PENTECT_ENV_ALIAS";
 const ENV_ALIAS_RECORD_PREFIX: &str = "\u{1f}pentect-env\0";
 const PLUGIN_CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
+static PENTECT_ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 const BATCH_DELIMITERS: [&str; 4] = [
     "\u{1f}pentect-batch-0\u{1e}",
     "\u{1f}pentect-batch-1\u{1d}",
@@ -57,7 +59,7 @@ impl OutputMasker {
         let key = store.session.key;
         Ok(Self {
             store,
-            engine: tool_boundary_engine()?,
+            engine: pentect_engine()?,
             model_adapters: ModelAdapters::from_env()?,
             environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Shared,
@@ -72,7 +74,7 @@ impl OutputMasker {
         let remask_recoveries = store.snapshot().map_err(|e| e.to_string())?;
         Ok(Self {
             store,
-            engine: tool_boundary_engine()?,
+            engine: pentect_engine()?,
             model_adapters: ModelAdapters::from_env()?,
             environment_prefix: config::environment_variable_prefix()?,
             mode: OutputMaskerMode::Deferred { remask_recoveries },
@@ -84,10 +86,6 @@ impl OutputMasker {
 
     pub(crate) fn masked_count(&self) -> u64 {
         self.masked_count
-    }
-
-    pub(crate) fn environment_prefix(&self) -> &str {
-        &self.environment_prefix
     }
 
     pub(crate) fn flush(&mut self) -> Result<(), String> {
@@ -113,17 +111,38 @@ impl OutputMasker {
 
     pub(crate) fn mask_prompt_text(&mut self, text: &str) -> Result<String, String> {
         let remasked = self.remask_all(text)?;
-        let result = mask_read_input_with_profile(
-            self.store.session.key,
+        // Prompt scalars are structurally text, but dotenv assignments can be
+        // embedded in prose. Run the Env parser first so assignment labels are
+        // preserved, then feed the result through the same cached text engine.
+        let env_result = self.engine.mask(
             Input {
-                kind: Kind::Text,
+                kind: Kind::Env,
                 data: remasked,
             },
-            Profile::Strict,
-            Vec::new(),
+            &Config {
+                disclose_length: false,
+                ..Config::new(self.store.session.key)
+                    .with_identity_key(self.store.session.identity_key)
+            },
+        );
+        self.track_mask_result("prompt", &env_result);
+        let mut result = mask_read_input_with_engine_adapters_and_identity(
+            self.store.session.key,
+            self.store.session.identity_key,
+            self.engine,
+            &self.model_adapters,
+            Input {
+                kind: Kind::Text,
+                data: env_result.masked,
+            },
         )?;
+        let masked_count = result
+            .summary
+            .masked_count
+            .saturating_add(env_result.summary.masked_count);
+        result.recovery.extend_same_key(env_result.recovery);
         self.track_mask_result("prompt", &result);
-        self.add_masked_count(result.summary.masked_count);
+        self.add_masked_count(masked_count);
         let masked = compact_local_home_paths(&result.masked);
         let mut recovery = result.recovery;
         recovery.extend_same_key(env_alias_recovery(
@@ -142,7 +161,7 @@ impl OutputMasker {
         let needs_text_pass = !matches!(kind, Kind::Text | Kind::ToolResult);
         let cfg = Config {
             disclose_length: false,
-            ..Config::new(self.store.session.key)
+            ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         let endpoint_unchanged = remasked.clone();
         let result = self.engine.mask(
@@ -192,7 +211,14 @@ impl OutputMasker {
         path: Option<&str>,
         hints: &[String],
     ) -> Result<String, String> {
-        let redacted = redact_env_derivative_lines(text);
+        if scalar_is_env_assignment(text) {
+            let protected = self.mask_text(text, Kind::Env)?;
+            if protected != text {
+                return Ok(protected);
+            }
+        }
+        let protected_assignments = self.mask_embedded_env_assignments(text)?;
+        let redacted = redact_env_derivative_lines(&protected_assignments);
         let remasked = self.remask_all(&redacted)?;
         let context = Context {
             path: path.map(str::to_string),
@@ -205,7 +231,7 @@ impl OutputMasker {
             self.mask_model_adapter_input(remasked, Kind::ToolResult, Some(context.clone()))?;
         let cfg = Config {
             disclose_length: false,
-            ..Config::new(self.store.session.key)
+            ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         let endpoint_unchanged = remasked.clone();
         let result = self.engine.mask_context(remasked, context, &cfg);
@@ -219,7 +245,11 @@ impl OutputMasker {
         if scalars.is_empty() {
             return Ok(Vec::new());
         }
-        if !self.model_adapters.is_empty() {
+        if !self.model_adapters.is_empty()
+            || scalars
+                .iter()
+                .any(|scalar| contains_sensitive_env_assignment(&scalar.text))
+        {
             let mut out = Vec::with_capacity(scalars.len());
             for scalar in scalars {
                 out.push(self.mask_tool_result_scalar(
@@ -275,7 +305,7 @@ impl OutputMasker {
 
         let cfg = Config {
             disclose_length: false,
-            ..Config::new(self.store.session.key)
+            ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         let result = self.engine.mask_regions(raw, regions, &cfg);
         if masks_only_endpoint_metadata(&result) {
@@ -301,6 +331,32 @@ impl OutputMasker {
         ));
         self.record_recovery(recovery)?;
         Ok(masked)
+    }
+
+    pub(crate) fn mask_embedded_env_assignments(&mut self, text: &str) -> Result<String, String> {
+        let mut out = String::with_capacity(text.len());
+        let mut changed = false;
+        for segment in text.split_inclusive('\n') {
+            let (line, ending) = segment
+                .strip_suffix('\n')
+                .map_or((segment, ""), |line| (line, "\n"));
+            let (line, carriage_return) = line
+                .strip_suffix('\r')
+                .map_or((line, false), |line| (line, true));
+            if let Some(start) = embedded_sensitive_env_assignment_start(line) {
+                out.push_str(&line[..start]);
+                let protected = self.mask_text(&line[start..], Kind::Env)?;
+                changed |= protected != line[start..];
+                out.push_str(&protected);
+            } else {
+                out.push_str(line);
+            }
+            if carriage_return {
+                out.push('\r');
+            }
+            out.push_str(ending);
+        }
+        Ok(if changed { out } else { text.to_string() })
     }
 
     fn record_tool_result_mask_result(
@@ -356,7 +412,7 @@ impl OutputMasker {
         let unchanged = data.clone();
         let cfg = Config {
             disclose_length: false,
-            ..Config::new(self.store.session.key)
+            ..Config::new(self.store.session.key).with_identity_key(self.store.session.identity_key)
         };
         match self
             .model_adapters
@@ -393,6 +449,37 @@ impl OutputMasker {
             }
         }
     }
+}
+
+fn scalar_is_env_assignment(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && !trimmed.contains(['\r', '\n']) && is_env_assignment_line(trimmed)
+}
+
+fn contains_sensitive_env_assignment(text: &str) -> bool {
+    scalar_is_env_assignment(text)
+        || text
+            .lines()
+            .any(|line| embedded_sensitive_env_assignment_start(line).is_some())
+}
+
+pub(crate) fn embedded_sensitive_env_assignment_start(line: &str) -> Option<usize> {
+    line.char_indices().find_map(|(start, ch)| {
+        if !(ch.is_ascii_alphabetic() || ch == '_') {
+            return None;
+        }
+        if start > 0
+            && line[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|previous| previous.is_ascii_alphanumeric() || previous == '_')
+        {
+            return None;
+        }
+        let candidate = line[start..].trim_end();
+        let key = env_assignment_key(candidate)?;
+        is_sensitive_env_name(&key.to_ascii_lowercase()).then_some(start)
+    })
 }
 
 impl Drop for OutputMasker {
@@ -554,11 +641,12 @@ fn is_path_sep_char(ch: char) -> bool {
 
 pub(crate) fn mask_read_data(
     key: [u8; 32],
+    identity_key: [u8; 32],
     data: String,
     kind: Kind,
 ) -> Result<MaskResult, String> {
-    let engine = tool_boundary_engine()?;
-    mask_read_input_with_engine(key, engine, Input { kind, data })
+    let engine = pentect_engine()?;
+    mask_read_input_with_engine_and_identity(key, identity_key, engine, Input { kind, data })
 }
 
 pub(crate) fn mask_read_input_with_profile(
@@ -567,20 +655,41 @@ pub(crate) fn mask_read_input_with_profile(
     profile: Profile,
     packs: Vec<pentect_core::Pack>,
 ) -> Result<MaskResult, String> {
-    let decode = config::decode_config(profile)?;
-    let engine = Engine::with_profile_and_packs_and_decode_config(profile, packs, false, decode);
-    mask_read_input_with_engine(key, &engine, input)
+    mask_read_input_with_profile_and_identity(key, key, input, profile, packs)
 }
 
-pub(crate) fn mask_read_input_with_engine(
+pub(crate) fn mask_read_input_with_profile_and_identity(
     key: [u8; 32],
+    identity_key: [u8; 32],
+    input: Input,
+    profile: Profile,
+    packs: Vec<pentect_core::Pack>,
+) -> Result<MaskResult, String> {
+    let decode = config::decode_config(profile)?;
+    let engine = Engine::with_profile_and_packs_and_decode_config(profile, packs, false, decode);
+    mask_read_input_with_engine_and_identity(key, identity_key, &engine, input)
+}
+
+pub(crate) fn mask_read_input_with_engine_and_identity(
+    key: [u8; 32],
+    identity_key: [u8; 32],
     engine: &Engine,
     input: Input,
 ) -> Result<MaskResult, String> {
     let adapters = ModelAdapters::from_env()?;
+    mask_read_input_with_engine_adapters_and_identity(key, identity_key, engine, &adapters, input)
+}
+
+fn mask_read_input_with_engine_adapters_and_identity(
+    key: [u8; 32],
+    identity_key: [u8; 32],
+    engine: &Engine,
+    adapters: &ModelAdapters,
+    input: Input,
+) -> Result<MaskResult, String> {
     let cfg = Config {
         disclose_length: false,
-        ..Config::new(key)
+        ..Config::new(key).with_identity_key(identity_key)
     };
     let mut adapter_count = 0usize;
     let mut adapter_recovery = Recovery::empty_for_key(&key);
@@ -614,19 +723,24 @@ fn choose_batch_delimiter(values: &[String]) -> Option<&'static str> {
         .find(|delimiter| values.iter().all(|value| !value.contains(delimiter)))
 }
 
-fn tool_boundary_engine() -> Result<&'static Engine, String> {
-    static CACHE: OnceLock<Result<Engine, String>> = OnceLock::new();
-    match CACHE.get_or_init(build_tool_boundary_engine) {
+fn pentect_engine() -> Result<&'static Engine, String> {
+    match PENTECT_ENGINE.get_or_init(build_pentect_engine) {
         Ok(engine) => Ok(engine),
         Err(error) => Err(error.clone()),
     }
 }
 
-fn build_tool_boundary_engine() -> Result<Engine, String> {
-    let decode = config::decode_config(Profile::Strict)?;
+fn build_pentect_engine() -> Result<Engine, String> {
     let mut builder = Engine::builder()
-        .standard_stack_with_decode(Profile::Strict.knobs(), decode)
+        .parser(Kind::Json, Box::new(JsonParser))
+        .parser(Kind::Ndjson, Box::new(NdjsonParser))
+        .parser(Kind::Env, Box::new(EnvParser))
+        .parser(Kind::Har, Box::new(JsonParser))
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
+        .detector(Box::new(CredSweeperNativeDetector::builtin()))
+        .detector(Box::new(EnvValueDetector))
+        .detector(Box::new(PemDetector::default()))
+        .detector(Box::new(EntropyDetector::default()))
         .detector(Box::new(SensitiveKeyDetector));
     for config_pack in plugin_configs_from_env()? {
         builder = builder
