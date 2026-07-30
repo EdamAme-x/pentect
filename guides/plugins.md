@@ -89,8 +89,9 @@ pentect plugins update PATH
 Release binaries are selected by OS and architecture. Unsupported platforms
 produce an explicit missing-asset error rather than compiling on the user's
 machine. Postscripts are separately declared and approved. `plugins update`
-keeps approval only when stages and permissions are unchanged; capability
-changes must go through `plugins setup` again.
+only replaces the release binary described by the exact approved manifest.
+Any manifest change—including its repository, command, stages, or
+permissions—must go through `plugins setup` again.
 
 The protocol exposes masking, provider, tool, file, finding, and reporting
 stages. HTTP provider requests, JSON responses, completed streaming and

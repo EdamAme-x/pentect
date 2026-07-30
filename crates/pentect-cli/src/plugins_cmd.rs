@@ -780,7 +780,7 @@ fn update_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         return Ok(());
     };
     let repository = binary_repository(&source, &manifest)?;
-    verify_plugin_update_approval(&name, &manifest)?;
+    verify_plugin_update_approval(&name, &source, &manifest)?;
     install_release_binary(&name, &repository, binary, &manifest.assets)?;
     if manifest.middleware.is_some() {
         write_plugin_approval(&name, &source, &manifest)?;
@@ -792,14 +792,23 @@ fn update_plugin(spec: &str, json_output: bool) -> Result<(), String> {
 #[derive(Deserialize)]
 struct StoredPluginApproval {
     schema: String,
+    manifest_sha256: String,
     stages: Vec<String>,
     permissions: Vec<String>,
 }
 
-fn verify_plugin_update_approval(name: &str, manifest: &PluginManifest) -> Result<(), String> {
+fn verify_plugin_update_approval(
+    name: &str,
+    plugin: &plugins::PluginSource,
+    manifest: &PluginManifest,
+) -> Result<(), String> {
     let Some(middleware) = &manifest.middleware else {
         return Ok(());
     };
+    let manifest_path = plugin
+        .manifest_path
+        .as_deref()
+        .ok_or_else(|| "plugin update requires plugin.toml".to_string())?;
     let path = plugin_runtime_dirs(&plugin_id(name))?
         .data_dir
         .join(PLUGIN_APPROVAL_FILE);
@@ -826,12 +835,11 @@ fn verify_plugin_update_approval(name: &str, manifest: &PluginManifest) -> Resul
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     if approval.schema != "pentect.plugin-approval.v1"
+        || approval.manifest_sha256 != sha256_path(manifest_path)?
         || approved_stages != stages
         || approved_permissions != permissions
     {
-        return Err(
-            "plugin capabilities changed; review them with `pentect plugins setup`".to_string(),
-        );
+        return Err("plugin manifest changed; review it with `pentect plugins setup`".to_string());
     }
     Ok(())
 }
@@ -1666,6 +1674,43 @@ permissions = ["filesystem", "process"]
         assert_eq!(decoded["version"].as_str(), Some("v1.2.3"));
         assert_eq!(decoded["asset"].as_str(), Some("helper-linux-x86_64"));
         assert_eq!(decoded["sha256"].as_str(), Some("0123456789abcdef"));
+    }
+
+    #[test]
+    fn plugin_update_requires_the_exact_approved_manifest() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("update-approval-{nonce}");
+        let root = std::env::temp_dir().join(&name);
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
+        let manifest_source = format!(
+            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper\"\nrepository = \"owner/repo\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n"
+        );
+        std::fs::write(&manifest_path, &manifest_source).unwrap();
+        let source = plugins::PluginSource {
+            name: name.clone(),
+            root: root.clone(),
+            manifest_path: Some(manifest_path.clone()),
+            repository: None,
+        };
+        let manifest = load_plugin_manifest(&source).unwrap().unwrap();
+        write_plugin_approval(&name, &source, &manifest).unwrap();
+        verify_plugin_update_approval(&name, &source, &manifest).unwrap();
+
+        std::fs::write(
+            &manifest_path,
+            manifest_source.replace("owner/repo", "other/repo"),
+        )
+        .unwrap();
+        let changed = load_plugin_manifest(&source).unwrap().unwrap();
+        assert!(verify_plugin_update_approval(&name, &source, &changed).is_err());
+
+        let data_dir = plugin_runtime_dirs(&plugin_id(&name)).unwrap().data_dir;
+        let _ = std::fs::remove_dir_all(data_dir);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
