@@ -47,9 +47,11 @@ gateway.
 Experimental launchers are available for the installed desktop applications:
 
 ```powershell
-pentect codex-app
+pentect codex app
 pentect claude-app
 ```
+
+`pentect codex-app` remains available as a compatibility alias.
 
 Use `--dry-run` to show the detected executable, `--app PATH` for a
 non-standard installation, and `--upstream URL` to preserve a custom upstream.
@@ -62,7 +64,7 @@ completion bodies are rewritten in memory. Signed Claude Code and Cowork
 control-plane events are passed through unchanged, while their child Claude
 Code processes inherit the Anthropic gateway.
 
-`pentect codex-app` gives the app's bundled Codex process a loopback-only
+`pentect codex app` gives the app's bundled Codex process a loopback-only
 Responses API gateway through `OPENAI_BASE_URL`. It currently supports the
 built-in OpenAI provider only. A custom `model_provider` or an explicit
 `openai_base_url` in `~/.codex/config.toml` is reported as unsupported because

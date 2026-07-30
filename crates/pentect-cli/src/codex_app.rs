@@ -32,7 +32,7 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     }
     if codex_app_is_running(&app) {
         return Err(
-            "Codex App is already running; quit it before `pentect codex-app` so its bundled Codex process inherits the HTTP gateway"
+            "Codex App is already running; quit it before `pentect codex app` so its bundled Codex process inherits the HTTP gateway"
                 .to_string(),
         );
     }
@@ -68,7 +68,13 @@ impl CodexAppOptions {
         let mut app = None;
         let mut upstream = None;
         let mut dry_run = false;
-        let mut index = 2;
+        let mut index = if args.get(1).is_some_and(|arg| arg == "codex")
+            && args.get(2).is_some_and(|arg| arg == "app")
+        {
+            3
+        } else {
+            2
+        };
         while index < args.len() {
             match args[index].as_str() {
                 "--app" => {
@@ -236,6 +242,24 @@ mod tests {
             CodexAppOptions {
                 app: Some(PathBuf::from("Codex.exe")),
                 upstream: Some("https://example.test/v1".to_string()),
+                dry_run: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_nested_codex_app_command() {
+        let args = vec![
+            "pentect".to_string(),
+            "codex".to_string(),
+            "app".to_string(),
+            "--dry-run".to_string(),
+        ];
+        assert_eq!(
+            CodexAppOptions::parse(&args).unwrap(),
+            CodexAppOptions {
+                app: None,
+                upstream: None,
                 dry_run: true,
             }
         );

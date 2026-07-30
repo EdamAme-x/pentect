@@ -103,6 +103,9 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
             | "__agent-script" | "__agent-stream",
         ) => return Some(cmd_agent_from(1, &args, inherited_env_is_trusted)),
         Some("agent") => return Some(cmd_agent_from(2, &args, inherited_env_is_trusted)),
+        Some("codex") if args.get(2).is_some_and(|arg| arg == "app") => {
+            return Some(cmd_codex_app(&args));
+        }
         Some("codex") => return Some(cmd_agent_tool(AgentTool::Codex, &args)),
         Some("claude") => return Some(cmd_agent_tool(AgentTool::Claude, &args)),
         Some("claude-app") => return Some(cmd_claude_app(&args)),
@@ -141,7 +144,9 @@ fn supports_process_host(args: &[String]) -> bool {
 fn usage() {
     eprintln!(
         "pentect\n\
-         pentect codex|claude|codex-app|claude-app\n\
+         pentect codex|claude\n\
+         pentect codex app\n\
+         pentect claude-app\n\
          pentect exec \"<command>\"\n\
          pentect up\n\
          pentect doctor\n\
@@ -178,7 +183,8 @@ fn help_text() -> &'static str {
         "Use:\n",
         "  pentect\n",
         "  pentect codex|claude [--plugins NAME|PATH.toml]\n",
-        "  pentect codex-app [--app PATH] [--upstream URL] [--dry-run]\n",
+        "  pentect codex app [--app PATH] [--upstream URL] [--dry-run]\n",
+        "  pentect codex-app [--app PATH] [--upstream URL] [--dry-run]  (alias)\n",
         "  pentect claude-app [--app PATH] [--upstream URL] [--dry-run]\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect up\n\n",
@@ -2358,6 +2364,7 @@ mod tests {
     fn help_lists_only_active_agent_integrations() {
         let help = help_text();
         assert!(help.contains("pentect codex|claude"));
+        assert!(help.contains("pentect codex app"));
         assert!(help.contains("pentect claude-app"));
         assert!(!help.contains("opencode"));
         assert!(!help.contains("pentect shell"));
