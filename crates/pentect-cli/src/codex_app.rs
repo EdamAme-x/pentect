@@ -80,7 +80,7 @@ impl CodexConfigOverride {
     }
 
     fn install_in(home: &Path, provider: &str, gateway: &str) -> Result<Self, String> {
-        std::fs::create_dir_all(&home)
+        std::fs::create_dir_all(home)
             .map_err(|error| format!("could not create '{}': {error}", home.display()))?;
         let config = home.join("config.toml");
         let backup = home.join("config.toml.pentect-backup");

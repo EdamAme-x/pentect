@@ -91,7 +91,7 @@ pub(crate) async fn fetch(url: &str) -> Result<RemoteContent, String> {
         }
         let filename = current
             .path_segments()
-            .and_then(|segments| segments.filter(|part| !part.is_empty()).next_back())
+            .and_then(|mut segments| segments.rfind(|part| !part.is_empty()))
             .unwrap_or("attachment")
             .to_string();
         return Ok(RemoteContent {
