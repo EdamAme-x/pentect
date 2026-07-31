@@ -7,7 +7,7 @@
 use chacha20::cipher::StreamCipher;
 use chacha20::{ChaCha20, Key, KeyIvInit, Nonce};
 use hmac::{Hmac, Mac};
-use pentect_core::{parse_placeholder, MaskResult, Recovery, RenderSegment};
+use pentect_core::{parse_placeholder, MaskResult, Recovery};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -137,41 +137,39 @@ fn records_for_result(path: &Path, source: &str, result: &MaskResult) -> Vec<Fil
     let path = stored_path(path);
     let created_at = unix_seconds();
     let mut records = Vec::new();
-    let mut offset = 0usize;
-    for segment in &result.segments {
-        match segment {
-            RenderSegment::Literal { text } => {
-                offset = offset.saturating_add(text.len());
-            }
-            RenderSegment::Masked { text, label, .. } => {
-                let mut value = result.recovery.resolve(text);
-                if value == *text
-                    || value.is_empty()
-                    || label == ENV_ALIAS_LABEL
-                    || result
-                        .summary
-                        .collisions
-                        .iter()
-                        .any(|handle| handle == text)
-                {
-                    offset = offset.saturating_add(value.len());
-                    value.zeroize();
-                    continue;
-                }
-                records.push(FilePointerRecord {
-                    handle: text.clone(),
-                    path: path.clone(),
-                    file_size,
-                    file_hash: file_hash.clone(),
-                    offset: offset as u64,
-                    length: value.len() as u64,
-                    label: label.clone(),
-                    created_at,
-                });
-                offset = offset.saturating_add(value.len());
-                value.zeroize();
-            }
+    for handle in result.recovery.placeholders() {
+        let Ok(parts) = parse_placeholder(&handle) else {
+            continue;
+        };
+        if parts.label == ENV_ALIAS_LABEL
+            || result
+                .summary
+                .collisions
+                .iter()
+                .any(|collision| collision == &handle)
+        {
+            continue;
         }
+        let mut value = result.recovery.resolve(&handle);
+        if value.is_empty() || value == handle {
+            value.zeroize();
+            continue;
+        }
+        let Some(offset) = source.find(&value) else {
+            value.zeroize();
+            continue;
+        };
+        records.push(FilePointerRecord {
+            handle,
+            path: path.clone(),
+            file_size,
+            file_hash: file_hash.clone(),
+            offset: offset as u64,
+            length: value.len() as u64,
+            label: parts.label,
+            created_at,
+        });
+        value.zeroize();
     }
     records
 }

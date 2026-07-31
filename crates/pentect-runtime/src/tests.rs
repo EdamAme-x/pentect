@@ -3217,6 +3217,7 @@ fn file_pointer_manager_recovers_read_handle_after_restart() {
         .unwrap();
     let masked = std::fs::read_to_string(masked_path).unwrap();
     let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    assert_eq!(file_pointer_manager::handle_length(&handle), Some(27));
 
     let restarted = Session::open_at(&root.join("restart"), "t").unwrap();
     let store = MemoryStore::for_session(&restarted);
