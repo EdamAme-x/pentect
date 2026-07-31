@@ -42,7 +42,7 @@ pub(crate) fn cmd_scan(args: &[String]) {
         }
     }
     pentect_agent::record_scan_activity(report.files_scanned, report.findings, labels);
-    let plugin_report = match dispatch_scan_plugins(args, &report) {
+    let plugin_report = match dispatch_scan_plugins(&active, &report) {
         Ok(report) => report,
         Err(error) => die(error),
     };
@@ -57,9 +57,10 @@ pub(crate) fn cmd_scan(args: &[String]) {
     }
 }
 
-fn dispatch_scan_plugins(args: &[String], report: &ScanReport) -> Result<String, String> {
-    let specs = plugins::collect_from_args(args).map_err(|error| error.to_string())?;
-    let active = plugins::active_from_specs(specs, true).map_err(|error| error.to_string())?;
+fn dispatch_scan_plugins(
+    active: &plugins::ActivePlugins,
+    report: &ScanReport,
+) -> Result<String, String> {
     let middleware =
         pentect_agent::PluginMiddleware::from_paths(active.binary_paths().iter().cloned())?;
     let mut payload: serde_json::Value =

@@ -68,6 +68,7 @@ jobs:
               - 'crates/pentect-cli/src/scan/**'
               - 'crates/pentect-cli/src/codex_app.rs'
               - 'crates/pentect-cli/src/claude_app_proxy.rs'
+              - 'crates/pentect-cli/src/claude_http_proxy.rs'
               - 'crates/pentect-runtime/src/masking.rs'
               - 'crates/pentect-runtime/src/plugin_middleware.rs'
               - 'plugins/**'
@@ -109,7 +110,7 @@ jobs:
   plugin-platform:
     name: Plugins (${{ matrix.os }})
     needs: changes
-    if: needs.changes.outputs.plugins == 'true'
+    if: always()
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -117,22 +118,35 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     steps:
+      - name: Require change detection
+        if: needs.changes.result != 'success'
+        run: exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: needs.changes.outputs.plugins == 'true'
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        if: needs.changes.outputs.plugins == 'true'
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: needs.changes.outputs.plugins == 'true'
       - name: Test plugin runtime
+        if: needs.changes.outputs.plugins == 'true'
         run: cargo test -p pentect-runtime plugin_middleware::tests --locked
       - name: Test plugin CLI
+        if: needs.changes.outputs.plugins == 'true'
         run: cargo test -p pentect-cli plugins::tests --bin pentect --locked
       - name: Test plugin lifecycle CLI
+        if: needs.changes.outputs.plugins == 'true'
         run: cargo test -p pentect-cli plugins_cmd::tests --bin pentect --locked
       - name: Check plugin SDK
+        if: needs.changes.outputs.plugins == 'true'
         run: cargo check --manifest-path sdk/rust/pentect-plugin/Cargo.toml --target wasm32-unknown-unknown
+      - name: No plugin changes
+        if: needs.changes.outputs.plugins != 'true'
+        run: echo "No plugin changes"
 
   test:
     needs: changes

@@ -896,7 +896,7 @@ fn run_read_text_plugin_stage(
             "kind": kind_name_for_plugin(kind),
             "text": text,
         }),
-        Some(serde_json::json!({"surface": "mask"})),
+        Some(serde_json::json!({"surface": "masking"})),
     )?;
     if run.stopped.is_some() {
         return Err(format!(

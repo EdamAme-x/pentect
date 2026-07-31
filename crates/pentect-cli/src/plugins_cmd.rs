@@ -1,5 +1,5 @@
 use crate::{plugins, update};
-use pentect_agent::read_bounded_utf8;
+use pentect_agent::{read_bounded_utf8, DEFAULT_PUBLISHER_WORKFLOW};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -13,7 +13,6 @@ const MAX_PLUGIN_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_PLUGIN_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_PLUGIN_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PLUGIN_WASM_BYTES: u64 = 32 * 1024 * 1024;
-const DEFAULT_PUBLISHER_WORKFLOW: &str = ".github/workflows/release.yml";
 
 pub(crate) fn cmd_plugins(args: &[String]) {
     let opts = match PluginCmd::parse(args) {
@@ -1350,10 +1349,20 @@ fn update_all_plugins(approved: bool, json_output: bool) -> Result<(), String> {
         println!("none");
         return Ok(());
     }
+    let mut failures = Vec::new();
     for spec in specs {
-        update_plugin(&spec, approved, json_output)?;
+        if let Err(error) = update_plugin(&spec, approved, json_output) {
+            failures.push(format!("{spec}: {error}"));
+        }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "plugin updates failed:\n- {}",
+            failures.join("\n- ")
+        ))
+    }
 }
 
 #[derive(Deserialize)]

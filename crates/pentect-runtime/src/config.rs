@@ -42,18 +42,21 @@ pub(crate) fn handle_identity_key() -> Result<[u8; 32], String> {
 
 #[cfg_attr(test, allow(dead_code))]
 fn read_handle_scope(path: PathBuf) -> Result<Option<HandleScope>, String> {
+    parse_config_file(&path)?.map_or(Ok(None), |value| handle_scope_value(&value))
+}
+
+fn parse_config_file(path: &Path) -> Result<Option<toml::Value>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let src = fs::read_to_string(&path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    let src = fs::read_to_string(path)
+        .map_err(|error| format!("could not read '{}': {error}", path.display()))?;
     if src.trim().is_empty() {
         return Ok(None);
     }
-    let value = src
-        .parse::<toml::Value>()
-        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-    handle_scope_value(&value)
+    src.parse::<toml::Value>()
+        .map(Some)
+        .map_err(|error| format!("could not parse '{}': {error}", path.display()))
 }
 
 fn handle_scope_value(value: &toml::Value) -> Result<Option<HandleScope>, String> {
@@ -557,32 +560,13 @@ fn decode_config_value(value: &toml::Value) -> Result<DecodeConfigPartial, Strin
 }
 
 fn read_files_remember(path: PathBuf) -> Result<Option<bool>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let src = fs::read_to_string(&path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    if src.trim().is_empty() {
-        return Ok(None);
-    }
-    let value = src
-        .parse::<toml::Value>()
-        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-    files_remember_value(&value)
+    parse_config_file(&path)?.map_or(Ok(None), |value| files_remember_value(&value))
 }
 
 fn reject_removed_environment_config(path: PathBuf) -> Result<(), String> {
-    if !path.exists() {
+    let Some(value) = parse_config_file(&path)? else {
         return Ok(());
-    }
-    let src = fs::read_to_string(&path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    if src.trim().is_empty() {
-        return Ok(());
-    }
-    let value = src
-        .parse::<toml::Value>()
-        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    };
     if value.get("environment").is_some() {
         return Err(
             "environment.prefix was removed; handle variables always start with PENTECT_"
@@ -608,18 +592,7 @@ fn files_remember_value(value: &toml::Value) -> Result<Option<bool>, String> {
 }
 
 fn read_activity_share(path: PathBuf) -> Result<Option<bool>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let src = fs::read_to_string(&path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    if src.trim().is_empty() {
-        return Ok(None);
-    }
-    let value = src
-        .parse::<toml::Value>()
-        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-    activity_share_value(&value)
+    parse_config_file(&path)?.map_or(Ok(None), |value| activity_share_value(&value))
 }
 
 fn activity_share_value(value: &toml::Value) -> Result<Option<bool>, String> {

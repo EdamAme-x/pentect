@@ -502,22 +502,27 @@ fn scan_file_with_limits(
         .spans
         .into_iter()
         .filter(|span| span.category == Category::Secret)
+        .map(|span| (span, true))
         .collect::<Vec<_>>();
-    spans.extend(plugin_spans);
-    spans.sort_by(|left, right| right.cmp_strength(left));
-    let mut selected = Vec::<Span>::new();
-    for span in spans {
+    spans.extend(plugin_spans.into_iter().map(|span| (span, false)));
+    spans.sort_by(|(left, left_is_core), (right, right_is_core)| {
+        right_is_core
+            .cmp(left_is_core)
+            .then_with(|| right.cmp_strength(left))
+    });
+    let mut selected = Vec::<(Span, bool)>::new();
+    for (span, is_core) in spans {
         if selected
             .iter()
-            .all(|existing| !existing.range.overlaps(&span.range))
+            .all(|(existing, _)| !existing.range.overlaps(&span.range))
         {
-            selected.push(span);
+            selected.push((span, is_core));
         }
     }
-    selected.sort_by_key(|span| span.range.start);
+    selected.sort_by_key(|(span, _)| span.range.start);
     let hits = selected
         .iter()
-        .filter_map(|span| hit_from_span(span, &line_index))
+        .filter_map(|(span, _)| hit_from_span(span, &line_index))
         .collect::<Vec<_>>();
     let warnings = result
         .residual

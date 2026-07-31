@@ -485,8 +485,12 @@ fn resolve_configured_plugin_spec(spec: &str) -> Result<String> {
     if is_remote_spec(spec) || is_path_spec(spec) {
         return Ok(spec.to_string());
     }
+    let configured_specs = config_specs()?;
+    if configured_specs.iter().any(|configured| configured == spec) {
+        return Ok(spec.to_string());
+    }
     let mut matches = Vec::new();
-    for configured in config_specs()? {
+    for configured in configured_specs {
         let Ok(source) = plugin_source_with_refresh(&configured, false) else {
             continue;
         };

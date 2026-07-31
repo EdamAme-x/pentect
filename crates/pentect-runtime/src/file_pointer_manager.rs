@@ -4,6 +4,7 @@
 //! usable while the original file still has the exact same size and SHA-256, so
 //! stale handles fail closed instead of expanding to the wrong bytes.
 
+use aho_corasick::AhoCorasickBuilder;
 use chacha20::cipher::StreamCipher;
 use chacha20::{ChaCha20, Key, KeyIvInit, Nonce};
 use hmac::{Hmac, Mac};
@@ -132,11 +133,17 @@ pub(crate) fn handle_length(handle: &str) -> Option<usize> {
 }
 
 fn records_for_result(path: &Path, source: &str, result: &MaskResult) -> Vec<FilePointerRecord> {
+    struct PendingRecord {
+        handle: String,
+        label: String,
+        value: String,
+    }
+
     let file_size = source.len() as u64;
     let file_hash = sha256_hex(source.as_bytes());
     let path = stored_path(path);
     let created_at = unix_seconds();
-    let mut records = Vec::new();
+    let mut pending = Vec::new();
     for handle in result.recovery.placeholders() {
         let Ok(parts) = parse_placeholder(&handle) else {
             continue;
@@ -155,21 +162,64 @@ fn records_for_result(path: &Path, source: &str, result: &MaskResult) -> Vec<Fil
             value.zeroize();
             continue;
         }
-        let Some(offset) = source.find(&value) else {
-            value.zeroize();
-            continue;
-        };
-        records.push(FilePointerRecord {
+        pending.push(PendingRecord {
             handle,
-            path: path.clone(),
-            file_size,
-            file_hash: file_hash.clone(),
-            offset: offset as u64,
-            length: value.len() as u64,
             label: parts.label,
-            created_at,
+            value,
         });
-        value.zeroize();
+    }
+
+    let offsets = {
+        let mut patterns = Vec::<&str>::new();
+        let mut pattern_indices = Vec::with_capacity(pending.len());
+        let mut by_value = HashMap::<&str, usize>::new();
+        for entry in &pending {
+            let index = match by_value.get(entry.value.as_str()).copied() {
+                Some(index) => index,
+                None => {
+                    let index = patterns.len();
+                    patterns.push(entry.value.as_str());
+                    by_value.insert(entry.value.as_str(), index);
+                    index
+                }
+            };
+            pattern_indices.push(index);
+        }
+        let mut pattern_offsets = vec![None; patterns.len()];
+        if let Ok(matcher) = AhoCorasickBuilder::new().build(patterns) {
+            let mut remaining = pattern_offsets.len();
+            for found in matcher.find_overlapping_iter(source) {
+                let index = found.pattern().as_usize();
+                if pattern_offsets[index].is_none() {
+                    pattern_offsets[index] = Some(found.start());
+                    remaining -= 1;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        pattern_indices
+            .into_iter()
+            .map(|index| pattern_offsets[index])
+            .collect::<Vec<_>>()
+    };
+
+    let mut records = Vec::with_capacity(pending.len());
+    for (mut entry, offset) in pending.into_iter().zip(offsets) {
+        if let Some(offset) = offset {
+            records.push(FilePointerRecord {
+                handle: entry.handle,
+                path: path.clone(),
+                file_size,
+                file_hash: file_hash.clone(),
+                offset: offset as u64,
+                length: entry.value.len() as u64,
+                label: entry.label,
+                created_at,
+            });
+        }
+        entry.value.zeroize();
     }
     records
 }

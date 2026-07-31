@@ -32,7 +32,7 @@ const MAX_PLUGIN_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_SPANS: usize = 4096;
 const PROTOCOL_SCHEMA: &str = "pentect.plugin.v1";
-const DEFAULT_PUBLISHER_WORKFLOW: &str = ".github/workflows/release.yml";
+pub const DEFAULT_PUBLISHER_WORKFLOW: &str = ".github/workflows/release.yml";
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_PLUGIN_DNS_THREADS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1772,7 +1772,11 @@ pub fn plugin_runtime_dirs_for_manifest(
     digest.update(b"pentect-plugin-source-v1");
     digest.update(manifest.to_string_lossy().as_bytes());
     let source_id = data_encoding::HEXLOWER.encode(&digest.finalize()[..12]);
-    let name = plugin_id(name);
+    let mut name = plugin_id(name);
+    name.truncate(64usize.saturating_sub(source_id.len() + 1));
+    while name.ends_with('-') {
+        name.pop();
+    }
     plugin_runtime_dirs(&format!("{name}-{source_id}"))
 }
 
@@ -1896,7 +1900,7 @@ mod tests {
     }
 
     #[test]
-    fn same_name_from_different_sources_has_distinct_storage() {
+    fn long_same_name_from_different_sources_has_distinct_storage() {
         let root =
             std::env::temp_dir().join(format!("pentect-plugin-identity-{}", std::process::id()));
         let left = root.join("left").join("plugin.toml");
@@ -1905,8 +1909,9 @@ mod tests {
         std::fs::create_dir_all(right.parent().unwrap()).unwrap();
         std::fs::write(&left, "schema = \"pentect.plugin.v1\"\n").unwrap();
         std::fs::write(&right, "schema = \"pentect.plugin.v1\"\n").unwrap();
-        let left_dirs = plugin_runtime_dirs_for_manifest("shared", &left).unwrap();
-        let right_dirs = plugin_runtime_dirs_for_manifest("shared", &right).unwrap();
+        let name = "a".repeat(64);
+        let left_dirs = plugin_runtime_dirs_for_manifest(&name, &left).unwrap();
+        let right_dirs = plugin_runtime_dirs_for_manifest(&name, &right).unwrap();
         assert_ne!(left_dirs.data_dir, right_dirs.data_dir);
         let _ = std::fs::remove_dir_all(left_dirs.data_dir);
         let _ = std::fs::remove_dir_all(right_dirs.data_dir);
