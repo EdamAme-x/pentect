@@ -21,8 +21,9 @@ mod secure_io;
 #[doc(hidden)]
 pub use network_address::embedded_ipv4;
 pub use plugin_middleware::{
-    plugin_runtime_dirs, valid_plugin_publisher_workflow, MiddlewareCoverage, MiddlewareRun,
-    MiddlewareStage, PluginMiddleware, PluginRuntimeDirs, StopOutcome,
+    plugin_runtime_dirs, plugin_runtime_dirs_for_manifest, valid_plugin_publisher_workflow,
+    DetectSpansRun, MiddlewareCoverage, MiddlewareRun, MiddlewareStage, PluginMiddleware,
+    PluginRuntimeDirs, StopOutcome,
 };
 #[doc(hidden)]
 pub use secure_io::{read_bounded_bytes, read_bounded_utf8, sha256_file};
@@ -33,8 +34,7 @@ pub use activity_log::record_scan as record_scan_activity;
 pub use delegated_process_host::{
     contains_host as delegated_process_host_contains, is_host as delegated_process_host_owned_by,
     is_running as delegated_process_host_running, matches_host as delegated_process_host_matches,
-    persistent_candidate_is_running as persistent_process_host_running, process_host_root,
-    register_candidate as register_process_host_candidate,
+    process_host_root, register_candidate as register_process_host_candidate,
     unregister_candidate as unregister_process_host_candidate,
 };
 use masking::{
@@ -149,6 +149,14 @@ pub fn mask_input_for_read(
     masking::mask_read_input_with_profile(key, input, profile, packs)
 }
 
+pub fn mask_input_with_engine_for_read(
+    key: [u8; 32],
+    engine: &Engine,
+    input: Input,
+) -> Result<MaskResult, String> {
+    masking::mask_read_input_with_engine_and_identity(key, key, engine, input)
+}
+
 pub fn record_read_activity(result: &MaskResult, path: &Path) {
     activity_log::record_mask_result("read", result, Some(path));
 }
@@ -177,20 +185,6 @@ fn mask_input_into_memory_store_client(
         .add_masked_count(result.summary.masked_count as u64)
         .map_err(|e| e.to_string())?;
     Ok(result)
-}
-
-pub fn active_masked_count() -> Result<Option<u64>, String> {
-    let Some(client) = MemoryStoreClient::from_env() else {
-        return Ok(None);
-    };
-    client.masked_count().map(Some).map_err(|e| e.to_string())
-}
-
-pub fn status_line_text() -> String {
-    match active_masked_count() {
-        Ok(Some(count)) => format!("Pentect {count}"),
-        _ => "Pentect 0".to_string(),
-    }
 }
 
 pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {

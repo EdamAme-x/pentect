@@ -49,9 +49,7 @@ impl ActiveMemoryStoreEnv {
             &read_token,
             &write_token,
             std::process::id(),
-            false,
         )
-        .unwrap()
         .unwrap();
         for (env_name, value) in [
             (ENV_ADDR, addr.as_str()),
@@ -835,10 +833,7 @@ fn active_memory_store_resolver_reuses_one_snapshot_for_many_scalars() {
 fn ocr_off_obeys_block_policy_for_active_image_redaction() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("ocr-off-block-active");
-    write_project_config(
-        &root,
-        "[image]\nocr = \"off\"\nunscanned_images = \"block\"\n",
-    );
+    write_project_config(&root, "[image]\nocr = \"off\"\nunscanned = \"block\"\n");
     let (_active_store, _, _) = ActiveMemoryStoreEnv::start("ocr-off-block-store");
     let _cwd = enter_temp_cwd(&root);
     let image = json!({
@@ -1933,10 +1928,7 @@ fn generic_posttool_masks_payload_alias() {
 #[test]
 fn posttool_masks_secret_query_inside_image_url() {
     let (root, session) = empty_session("hook-post-image-url-query");
-    write_project_config(
-        &root,
-        "[image]\nocr = \"off\"\nunscanned_images = \"allow\"\n",
-    );
+    write_project_config(&root, "[image]\nocr = \"off\"\nunscanned = \"allow\"\n");
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -1966,10 +1958,7 @@ fn posttool_masks_secret_query_inside_image_url() {
 #[test]
 fn posttool_masks_text_in_invalid_image_shaped_object() {
     let (root, session) = empty_session("hook-post-invalid-image-object");
-    write_project_config(
-        &root,
-        "[image]\nocr = \"off\"\nunscanned_images = \"allow\"\n",
-    );
+    write_project_config(&root, "[image]\nocr = \"off\"\nunscanned = \"allow\"\n");
     let raw = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
     let input = json!({
         "hook_event_name": "PostToolUse",
@@ -2060,10 +2049,7 @@ fn tool_text_output_masks_mcp_connector_and_plugin_envelopes() {
 #[test]
 fn posttool_allows_unscanned_image_output_by_default() {
     let (root, session) = empty_session("hook-post-image-best-effort");
-    write_project_config(
-        &root,
-        "[image]\nocr = \"on\"\nunscanned_images = \"allow\"\n",
-    );
+    write_project_config(&root, "[image]\nocr = \"on\"\nunscanned = \"allow\"\n");
     let input = json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "mcp__chrome__screenshot",
@@ -2088,10 +2074,7 @@ fn posttool_allows_unscanned_image_output_by_default() {
 #[test]
 fn posttool_blocks_unscanned_image_output_when_configured() {
     let (root, session) = empty_session("hook-post-image-strict");
-    write_project_config(
-        &root,
-        "[image]\nocr = \"on\"\nunscanned_images = \"block\"\n",
-    );
+    write_project_config(&root, "[image]\nocr = \"on\"\nunscanned = \"block\"\n");
     let input = json!({
         "hookEventName": "PostToolUse",
         "toolName": "connector__browser__capture",
@@ -3222,7 +3205,7 @@ fn file_pointer_manager_recovers_read_handle_after_restart() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("file-pointer-recover");
     let _cwd = enter_temp_cwd(&root);
-    write_project_config(&root, "[file_pointer_manager]\nsave = true\n");
+    write_project_config(&root, "[files]\nremember = true\n");
     let project = PathBuf::from("project");
     std::fs::create_dir_all(&project).unwrap();
     let env = project.join(".env");
@@ -3262,7 +3245,7 @@ fn file_pointer_manager_refuses_changed_source_file() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("file-pointer-changed");
     let _cwd = enter_temp_cwd(&root);
-    write_project_config(&root, "[file_pointer_manager]\nsave = true\n");
+    write_project_config(&root, "[files]\nremember = true\n");
     let project = PathBuf::from("project");
     std::fs::create_dir_all(&project).unwrap();
     let env = project.join(".env");
@@ -3288,7 +3271,7 @@ fn file_pointer_manager_refuses_grown_source_before_reading_value() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("file-pointer-grown");
     let _cwd = enter_temp_cwd(&root);
-    write_project_config(&root, "[file_pointer_manager]\nsave = true\n");
+    write_project_config(&root, "[files]\nremember = true\n");
     let env = PathBuf::from(".env");
     std::fs::write(&env, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
 
@@ -3312,7 +3295,7 @@ fn file_pointer_manager_save_can_be_disabled() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("file-pointer-disabled");
     let _cwd = enter_temp_cwd(&root);
-    write_project_config(&root, "[file_pointer_manager]\nsave = false\n");
+    write_project_config(&root, "[files]\nremember = false\n");
     let env = PathBuf::from(".env");
     std::fs::write(&env, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
 
@@ -3343,7 +3326,7 @@ fn file_pointer_manager_skips_non_text_read_inputs() {
     let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let root = temp_root("file-pointer-non-text");
     let _cwd = enter_temp_cwd(&root);
-    write_project_config(&root, "[file_pointer_manager]\nsave = true\n");
+    write_project_config(&root, "[files]\nremember = true\n");
     let path = PathBuf::from("image.txt");
     std::fs::write(&path, "OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX\n").unwrap();
     let result = Engine::with_profile(Profile::Strict).mask(

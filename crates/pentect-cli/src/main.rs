@@ -4,7 +4,6 @@ mod claude_app_proxy;
 mod claude_http_proxy;
 mod codex_app;
 mod doctor;
-mod eval;
 mod http_files;
 mod input;
 mod openai_http_proxy;
@@ -38,9 +37,6 @@ const PENTECT_BIN_ENV: &str = "PENTECT_BIN";
 const PENTECT_AGENT_LAUNCHED_ENV: &str = "PENTECT_AGENT_LAUNCHED";
 const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
 const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
-const PENTECT_STATUS_LINE_ENV: &str = "PENTECT_STATUS_LINE";
-const PENTECT_DIR: &str = ".pentect";
-const PENTECT_CONFIG_FILE: &str = "config.toml";
 const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
 
@@ -57,9 +53,8 @@ fn run(args: Vec<String>) -> Option<i32> {
         return dispatch(args, inherited_env_is_trusted);
     }
     let pentect = default_pentect_path();
-    let process_host = MemoryStoreGuard::start(&pentect, false)
-        .unwrap_or_else(|error| die_with_issue(error))
-        .unwrap_or_else(|| die_with_issue("could not start process host candidate"));
+    let process_host =
+        MemoryStoreGuard::start(&pentect).unwrap_or_else(|error| die_with_issue(error));
     let _process_host_env = memory_store_parent_env_guard(&pentect, &process_host);
     let exit_code = dispatch(args, inherited_env_is_trusted);
     drop(_process_host_env);
@@ -94,11 +89,8 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("mask") => cmd_mask(&args),
         Some("read") => cmd_read(&args),
         Some("view") => cmd_view(&args),
-        Some("statusline") => cmd_statusline(&args),
-        Some("up") => cmd_up(&args),
         Some("doctor") => doctor::cmd_doctor(&args),
         Some("plugins") => plugins_cmd::cmd_plugins(&args),
-        Some("eval") => eval::cmd_eval(&args),
         Some("scan") => scan::cmd_scan(&args),
         Some(
             "exec" | "resolve" | "log" | "hook" | "bridge" | "memory-store" | "purge"
@@ -109,6 +101,9 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
             return Some(cmd_codex_app(&args));
         }
         Some("codex") => return Some(cmd_agent_tool(AgentTool::Codex, &args)),
+        Some("claude") if args.get(2).is_some_and(|arg| arg == "app") => {
+            return Some(cmd_claude_app(&args));
+        }
         Some("claude") => return Some(cmd_agent_tool(AgentTool::Claude, &args)),
         Some("claude-app") => return Some(cmd_claude_app(&args)),
         Some("codex-app") => return Some(cmd_codex_app(&args)),
@@ -148,28 +143,22 @@ fn usage() {
         "pentect\n\
          pentect codex|claude\n\
          pentect codex app\n\
-         pentect claude-app\n\
+         pentect claude app\n\
          pentect exec \"<command>\"\n\
-         pentect up\n\
          pentect doctor\n\
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
-         pentect plugins list|search|inspect|test|config|setup|update [NAME]\n\
-         pentect eval [--json]\n\
+         pentect plugins add|remove|list|search|inspect|test|config|setup|update [NAME]\n\
          pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\
          pentect view <HANDLE>\n\
-         pentect statusline\n\
          pentect resolve [PATH...]\n\
          pentect log [--json]\n\
          pentect help\n\
          \n\
          exec: masked output\n\
-         up: process host\n\
          doctor: readiness\n\
-         eval: metrics\n\
          scan: secrets\n\
          view: handle\n\
-         statusline: count\n\
          resolve: write handles\n\
          log: live events"
     );
@@ -185,28 +174,26 @@ fn help_text() -> &'static str {
         "Use:\n",
         "  pentect\n",
         "  pentect codex|claude [--plugins NAME|PATH.toml]\n",
-        "  pentect codex app [--app PATH] [--upstream URL] [--dry-run]\n",
+        "  pentect codex app [--app PATH] [--upstream URL] [--plugins SOURCE] [--dry-run]\n",
         "  pentect codex-app [--app PATH] [--upstream URL] [--dry-run]  (alias)\n",
-        "  pentect claude-app [--app PATH] [--upstream URL] [--dry-run]\n",
+        "  pentect claude app [--app PATH] [--upstream URL] [--plugins SOURCE] [--dry-run]\n",
+        "  pentect claude-app [--app PATH] [--upstream URL] [--dry-run]  (alias)\n",
         "  pentect exec \"<command>\"\n\n",
-        "  pentect up\n\n",
         "  pentect doctor [--json]\n",
         "  pentect update [VERSION] [--check | --force]\n",
         "  pentect uninstall\n",
+        "  pentect plugins add SOURCE [--yes]\n",
+        "  pentect plugins remove SOURCE\n",
         "  pentect plugins list|search|inspect|test [NAME|PATH] [--json]\n",
         "  pentect plugins config NAME|PATH [KEY=VALUE | --unset KEY]\n",
         "  pentect plugins setup NAME|PATH [--yes]\n",
-        "  pentect plugins update NAME|PATH\n",
-        "  pentect eval [--json]\n\n",
+        "  pentect plugins update [NAME|PATH] [--yes]\n",
         "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\n",
         "  pentect view '<HANDLE>'\n\n",
-        "  pentect statusline\n\n",
         "  pentect log [--json]\n\n",
         "exec: masked stdout/stderr\n",
-        "up: process host\n",
         "read: masked file preview\n",
         "view: handle\n",
-        "statusline: masked count\n",
         "log: live events\n",
         "resolve: write handles\n",
         "scan: secrets; gitignore on; --no-gitignore broadens\n",
@@ -214,10 +201,9 @@ fn help_text() -> &'static str {
         "doctor: readiness\n",
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
-        "plugins: list, search, inspect, test, config, setup, update\n",
+        "plugins: add, remove, list, search, inspect, test, config, setup, update\n",
         "codex-app: launch Codex App through the Responses API gateway\n",
-        "claude-app: launch Claude Desktop through the Chat and Anthropic gateways\n",
-        "eval: precision, recall\n",
+        "claude app: launch Claude Desktop through the Chat and Anthropic gateways\n",
     )
 }
 
@@ -351,6 +337,7 @@ fn cmd_claude_app(args: &[String]) -> i32 {
     if args.iter().any(|arg| arg == "--dry-run") {
         return claude_app_proxy::cmd_claude_app(args);
     }
+    let _plugin_env = app_plugin_env_guard(args).unwrap_or_else(|error| die(error));
     let pentect = default_pentect_path();
     let memory_store = match start_memory_store(&pentect) {
         Ok(store) => store,
@@ -367,6 +354,7 @@ fn cmd_codex_app(args: &[String]) -> i32 {
     if args.iter().any(|arg| arg == "--dry-run") {
         return codex_app::cmd_codex_app(args);
     }
+    let _plugin_env = app_plugin_env_guard(args).unwrap_or_else(|error| die(error));
     let pentect = default_pentect_path();
     let memory_store = match start_memory_store(&pentect) {
         Ok(store) => store,
@@ -379,25 +367,27 @@ fn cmd_codex_app(args: &[String]) -> i32 {
     code
 }
 
-fn start_memory_store(pentect: &Path) -> Result<MemoryStoreGuard, String> {
-    MemoryStoreGuard::start(pentect, false)?
-        .ok_or_else(|| "could not start Pentect memory store".to_string())
+fn app_plugin_env_guard(args: &[String]) -> Result<EnvVarGuard, String> {
+    let explicit = plugins::collect_from_args(args).map_err(|error| error.to_string())?;
+    let active = plugins::active_from_specs(explicit, true).map_err(|error| error.to_string())?;
+    Ok(EnvVarGuard::set_optional([
+        (
+            plugins::CONFIGS_ENV,
+            active
+                .config_env_value()
+                .map_err(|error| error.to_string())?,
+        ),
+        (
+            plugins::BINARIES_ENV,
+            active
+                .binary_env_value()
+                .map_err(|error| error.to_string())?,
+        ),
+    ]))
 }
 
-fn cmd_up(args: &[String]) {
-    if args.len() != 2 {
-        die("up");
-    }
-    let root = process_host_root().unwrap_or_else(|error| die_with_issue(error));
-    if pentect_agent::persistent_process_host_running(&root) {
-        return;
-    }
-    let pentect = default_pentect_path();
-    if let Some(host) =
-        MemoryStoreGuard::start(&pentect, true).unwrap_or_else(|error| die_with_issue(error))
-    {
-        host.detach();
-    }
+fn start_memory_store(pentect: &Path) -> Result<MemoryStoreGuard, String> {
+    MemoryStoreGuard::start(pentect)
 }
 
 fn agent_tool_plugins(opts: &AgentToolOpts) -> Result<plugins::ActivePlugins, String> {
@@ -439,6 +429,28 @@ fn cmd_mask(args: &[String]) {
         None => Profile::Strict,
     };
     let aggressive = has_flag(args, "--aggressive");
+    let explicit_plugins = match plugins::collect_from_args(args) {
+        Ok(specs) => specs,
+        Err(error) => die(error),
+    };
+    let active_plugins = match plugins::active_from_specs(explicit_plugins, true) {
+        Ok(active) => active,
+        Err(error) => die(error),
+    };
+    let _plugin_env = EnvVarGuard::set_optional([
+        (
+            plugins::CONFIGS_ENV,
+            active_plugins
+                .config_env_value()
+                .unwrap_or_else(|error| die(error)),
+        ),
+        (
+            plugins::BINARIES_ENV,
+            active_plugins
+                .binary_env_value()
+                .unwrap_or_else(|error| die(error)),
+        ),
+    ]);
     let packs = match load_packs(args) {
         Ok(p) => p,
         Err(e) => die(&e),
@@ -460,7 +472,14 @@ fn cmd_mask(args: &[String]) {
         Err(error) => die(error),
     };
     let cfg = Config::generate();
-    let result = engine.mask(Input { kind, data }, &cfg);
+    let result = match pentect_agent::mask_input_with_engine_for_read(
+        cfg.key,
+        &engine,
+        Input { kind, data },
+    ) {
+        Ok(result) => result,
+        Err(error) => die(error),
+    };
 
     print!("{}", result.masked);
     let _ = std::io::stdout().flush();
@@ -600,13 +619,6 @@ fn cmd_view(args: &[String]) {
         Some(length) => println!("length: {length}"),
         None => println!("length: -"),
     }
-}
-
-fn cmd_statusline(args: &[String]) {
-    if args.len() != 2 {
-        die("statusline");
-    }
-    println!("{}", pentect_agent::status_line_text());
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -808,11 +820,9 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
         return Ok(success_status());
     }
 
-    let status_line_enabled = status_line_enabled_by_config()?;
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
-    let _parent_env =
-        agent_parent_env_guard(pentect, &memory_store, status_line_enabled, &active_plugins)?;
+    let _parent_env = agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
     let http_proxy = openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream)?;
     args.splice(
         0..0,
@@ -831,7 +841,6 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     apply_plugin_env(&mut cmd, &active_plugins)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
-    apply_status_line_env(&mut cmd, status_line_enabled);
     cmd.args(args);
     run_native_command_with_guards(cmd, &opts.command, (http_proxy, memory_store))
 }
@@ -852,15 +861,12 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
 
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
-    let status_line_enabled = status_line_enabled_by_config()?;
-    let _parent_env =
-        agent_parent_env_guard(pentect, &memory_store, status_line_enabled, &active_plugins)?;
+    let _parent_env = agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
     apply_plugin_env(&mut cmd, &active_plugins)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
-    apply_status_line_env(&mut cmd, status_line_enabled);
     let http_proxy = claude_http_proxy::ClaudeHttpProxyGuard::start(upstream)?;
     cmd.env("ANTHROPIC_BASE_URL", http_proxy.base_url());
     // Claude Code reapplies settings.env after process start. Put the local
@@ -1501,45 +1507,39 @@ fn run_native_command_with_guards<G>(
 
 struct MemoryStoreGuard {
     child: Option<Child>,
-    lease: Option<pentect_agent::MemoryStoreLease>,
+    _lease: Option<pentect_agent::MemoryStoreLease>,
     addr: String,
     token: String,
     process_host_candidate: Option<PathBuf>,
 }
 
 impl MemoryStoreGuard {
-    fn start(pentect: &Path, persistent: bool) -> Result<Option<Self>, String> {
-        if !persistent {
-            if let (Some(addr), Some(token), Some(launch_proof)) = (
-                std::env::var_os(PENTECT_MEMORY_STORE_ADDR_ENV),
-                std::env::var_os(PENTECT_MEMORY_STORE_TOKEN_ENV),
-                std::env::var_os(PENTECT_AGENT_LAUNCHED_ENV),
-            ) {
-                let addr = addr.to_string_lossy().to_string();
-                let token = token.to_string_lossy().to_string();
-                let launch_proof = launch_proof.to_string_lossy();
-                let process_host_root = process_host_root()?;
-                if !addr.is_empty()
-                    && valid_runtime_token(&token)
-                    && launch_proof == token
-                    && addr
-                        .parse::<std::net::SocketAddr>()
-                        .is_ok_and(|addr| addr.ip().is_loopback())
-                    && pentect_agent::delegated_process_host_contains(
-                        &process_host_root,
-                        &addr,
-                        &token,
-                    )
-                    && pentect_agent::memory_store_ready(&addr, &token)
-                {
-                    return Ok(Some(Self {
-                        child: None,
-                        lease: None,
-                        addr,
-                        token,
-                        process_host_candidate: None,
-                    }));
-                }
+    fn start(pentect: &Path) -> Result<Self, String> {
+        if let (Some(addr), Some(token), Some(launch_proof)) = (
+            std::env::var_os(PENTECT_MEMORY_STORE_ADDR_ENV),
+            std::env::var_os(PENTECT_MEMORY_STORE_TOKEN_ENV),
+            std::env::var_os(PENTECT_AGENT_LAUNCHED_ENV),
+        ) {
+            let addr = addr.to_string_lossy().to_string();
+            let token = token.to_string_lossy().to_string();
+            let launch_proof = launch_proof.to_string_lossy();
+            let process_host_root = process_host_root()?;
+            if !addr.is_empty()
+                && valid_runtime_token(&token)
+                && launch_proof == token
+                && addr
+                    .parse::<std::net::SocketAddr>()
+                    .is_ok_and(|addr| addr.ip().is_loopback())
+                && pentect_agent::delegated_process_host_contains(&process_host_root, &addr, &token)
+                && pentect_agent::memory_store_ready(&addr, &token)
+            {
+                return Ok(Self {
+                    child: None,
+                    _lease: None,
+                    addr,
+                    token,
+                    process_host_candidate: None,
+                });
             }
         }
         let mut command = Command::new(pentect);
@@ -1551,9 +1551,6 @@ impl MemoryStoreGuard {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        if persistent {
-            configure_persistent_child(&mut command);
-        }
         let mut child = command
             .spawn()
             .map_err(|e| format!("could not start Pentect memory store: {e}"))?;
@@ -1598,16 +1595,12 @@ impl MemoryStoreGuard {
                     return Err(e);
                 }
             };
-        let lease = if persistent {
-            None
-        } else {
-            match pentect_agent::open_memory_store_lease(&addr, &token) {
-                Ok(lease) => Some(lease),
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.to_string());
-                }
+        let lease = match pentect_agent::open_memory_store_lease(&addr, &token) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
             }
         };
         let process_host_root = process_host_root()?;
@@ -1618,14 +1611,8 @@ impl MemoryStoreGuard {
             &process_host_read_token,
             &process_host_write_token,
             child.id(),
-            persistent,
         ) {
-            Ok(Some(path)) => path,
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(None);
-            }
+            Ok(path) => path,
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1634,19 +1621,13 @@ impl MemoryStoreGuard {
         };
         process_host_read_token.zeroize();
         process_host_write_token.zeroize();
-        Ok(Some(Self {
+        Ok(Self {
             child: Some(child),
-            lease,
+            _lease: lease,
             addr,
             token,
             process_host_candidate: Some(process_host_candidate),
-        }))
-    }
-
-    fn detach(mut self) {
-        self.lease.take();
-        self.child.take();
-        self.process_host_candidate.take();
+        })
     }
 }
 
@@ -1667,22 +1648,8 @@ impl Drop for MemoryStoreGuard {
     }
 }
 
-#[cfg(windows)]
-fn configure_persistent_child(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-}
-
 fn process_host_root() -> Result<PathBuf, String> {
     pentect_agent::process_host_root()
-}
-
-#[cfg(unix)]
-fn configure_persistent_child(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
 }
 
 fn apply_pentect_env(
@@ -1738,10 +1705,6 @@ fn apply_memory_store_env(cmd: &mut Command, memory_store: Option<&MemoryStoreGu
     cmd.env(PENTECT_MEMORY_STORE_TOKEN_ENV, &memory_store.token);
 }
 
-fn apply_status_line_env(cmd: &mut Command, enabled: bool) {
-    cmd.env(PENTECT_STATUS_LINE_ENV, if enabled { "1" } else { "0" });
-}
-
 fn memory_store_parent_env_guard(pentect: &Path, memory_store: &MemoryStoreGuard) -> EnvVarGuard {
     EnvVarGuard::set_optional([
         (
@@ -1763,7 +1726,6 @@ fn memory_store_parent_env_guard(pentect: &Path, memory_store: &MemoryStoreGuard
 fn agent_parent_env_guard(
     pentect: &Path,
     memory_store: &MemoryStoreGuard,
-    status_line_enabled: bool,
     active_plugins: &plugins::ActivePlugins,
 ) -> Result<EnvVarGuard, String> {
     let config_env = active_plugins
@@ -1786,59 +1748,9 @@ fn agent_parent_env_guard(
             PENTECT_AGENT_LAUNCHED_ENV,
             Some(OsString::from(memory_store.token.as_str())),
         ),
-        (
-            PENTECT_STATUS_LINE_ENV,
-            Some(OsString::from(if status_line_enabled { "1" } else { "0" })),
-        ),
         (plugins::CONFIGS_ENV, config_env),
         (plugins::BINARIES_ENV, binary_env),
     ]))
-}
-
-fn status_line_enabled_by_config() -> Result<bool, String> {
-    let path = Path::new(PENTECT_DIR).join(PENTECT_CONFIG_FILE);
-    if !path.exists() {
-        return Ok(true);
-    }
-    let src = std::fs::read_to_string(&path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    if src.trim().is_empty() {
-        return Ok(true);
-    }
-    let value = src
-        .parse::<toml::Value>()
-        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-    Ok(status_line_config_value(&value)?.unwrap_or(true))
-}
-
-fn status_line_config_value(value: &toml::Value) -> Result<Option<bool>, String> {
-    if let Some(raw) = value.get("status_line") {
-        return status_line_config_bool(raw, "status_line").map(Some);
-    }
-    let Some(raw) = value.get("agent") else {
-        return Ok(None);
-    };
-    let Some(table) = raw.as_table() else {
-        return Err("agent config must be a table".to_string());
-    };
-    if let Some(raw) = table.get("status_line") {
-        return status_line_config_bool(raw, "agent.status_line").map(Some);
-    }
-    Ok(None)
-}
-
-fn status_line_config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
-    if let Some(value) = value.as_bool() {
-        return Ok(value);
-    }
-    if let Some(value) = value.as_str() {
-        return match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            _ => Err(format!("config {field} must be boolean-like")),
-        };
-    }
-    Err(format!("config {field} must be a boolean"))
 }
 
 fn parse_memory_store_startup(line: &str) -> Result<(String, String, String, String), String> {
@@ -2468,9 +2380,11 @@ mod tests {
         let help = help_text();
         assert!(help.contains("pentect codex|claude"));
         assert!(help.contains("pentect codex app"));
-        assert!(help.contains("pentect claude-app"));
+        assert!(help.contains("pentect claude app"));
         assert!(!help.contains("opencode"));
         assert!(!help.contains("pentect shell"));
+        assert!(!help.contains("\n  pentect up\n"));
+        assert!(!help.contains("\n  pentect eval"));
     }
 
     #[test]

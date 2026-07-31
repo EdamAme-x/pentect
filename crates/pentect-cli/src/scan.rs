@@ -19,6 +19,18 @@ pub(crate) fn cmd_scan(args: &[String]) {
         Ok(opts) => opts,
         Err(e) => die(e),
     };
+    let explicit = plugins::collect_from_args(args).unwrap_or_else(|error| die(error));
+    let active = plugins::active_from_specs(explicit, true).unwrap_or_else(|error| die(error));
+    let _plugin_env = crate::EnvVarGuard::set_optional([
+        (
+            plugins::CONFIGS_ENV,
+            active.config_env_value().unwrap_or_else(|error| die(error)),
+        ),
+        (
+            plugins::BINARIES_ENV,
+            active.binary_env_value().unwrap_or_else(|error| die(error)),
+        ),
+    ]);
     let report = match run_scan(args, &opts) {
         Ok(report) => report,
         Err(e) => die(e),
@@ -156,6 +168,7 @@ fn run_scan_with_engine(
                 report.skipped_count += 1;
                 report.skipped.push(skipped);
             }
+            ScanFile::Error(error) => return Err(error),
         }
     }
     report.files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -522,6 +535,7 @@ label = "ACME_CASE"
                     panic!("retained skipped path: {}", file.path.display())
                 }
                 ScanFile::Finding(file) => panic!("unexpected finding: {}", file.path.display()),
+                ScanFile::Error(error) => panic!("unexpected scan error: {error}"),
             }
         }
         assert_eq!(64, scanned);

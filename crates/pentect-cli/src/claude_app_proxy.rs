@@ -69,7 +69,7 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     }
     if claude_desktop_is_running(&app) {
         return Err(
-            "Claude Desktop is already running; quit it before `pentect claude-app` so Chromium can apply the private proxy settings"
+            "Claude Desktop is already running; quit it before `pentect claude app` so Chromium can apply the private proxy settings"
                 .to_string(),
         );
     }
@@ -122,7 +122,13 @@ impl ClaudeAppOptions {
         let mut app = None;
         let mut upstream = None;
         let mut dry_run = false;
-        let mut index = 2;
+        let mut index = if args.get(1).is_some_and(|arg| arg == "claude")
+            && args.get(2).is_some_and(|arg| arg == "app")
+        {
+            3
+        } else {
+            2
+        };
         while index < args.len() {
             match args[index].as_str() {
                 "--app" => {
@@ -143,7 +149,16 @@ impl ClaudeAppOptions {
                     upstream = Some(value.clone());
                     index += 2;
                 }
-                value => return Err(format!("unknown claude-app option: {value}")),
+                "--plugins" => {
+                    if args
+                        .get(index + 1)
+                        .is_none_or(|value| value.starts_with("--"))
+                    {
+                        return Err("--plugins requires a value".to_string());
+                    }
+                    index += 2;
+                }
+                value => return Err(format!("unknown `pentect claude app` option: {value}")),
             }
         }
         Ok(Self {
@@ -1219,6 +1234,35 @@ mod tests {
         ];
         let options = ClaudeAppOptions::parse(&args).unwrap();
         assert_eq!(options.app, Some(PathBuf::from("Claude.exe")));
+    }
+
+    #[test]
+    fn options_accept_the_nested_claude_app_command() {
+        let args = vec![
+            "pentect".to_string(),
+            "claude".to_string(),
+            "app".to_string(),
+            "--plugins".to_string(),
+            "company-policy".to_string(),
+            "--app".to_string(),
+            "Claude.exe".to_string(),
+            "--dry-run".to_string(),
+        ];
+        let options = ClaudeAppOptions::parse(&args).unwrap();
+        assert_eq!(options.app, Some(PathBuf::from("Claude.exe")));
+        assert!(options.dry_run);
+    }
+
+    #[test]
+    fn options_reject_missing_plugin_value() {
+        let args = vec![
+            "pentect".to_string(),
+            "claude".to_string(),
+            "app".to_string(),
+            "--plugins".to_string(),
+            "--dry-run".to_string(),
+        ];
+        assert!(ClaudeAppOptions::parse(&args).is_err());
     }
 
     #[test]

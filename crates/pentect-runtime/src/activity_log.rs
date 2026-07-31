@@ -215,7 +215,7 @@ fn record(event: ActivityEvent) {
     let Ok(json) = serde_json::to_string(&event) else {
         return;
     };
-    let share = *LOG_SHARE.get_or_init(|| crate::config::log_share_enabled().unwrap_or(true));
+    let share = *LOG_SHARE.get_or_init(|| crate::config::activity_share_enabled().unwrap_or(true));
     let _ = delegated_process_host::send_activity(&json, share);
 }
 

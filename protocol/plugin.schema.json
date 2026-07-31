@@ -5,18 +5,6 @@
   "oneOf": [
     {
       "type": "object",
-      "required": ["schema", "id", "type", "host", "plugin"],
-      "properties": {
-        "schema": { "const": "pentect.plugin.v1" },
-        "id": { "type": "integer", "minimum": 1 },
-        "type": { "const": "initialize" },
-        "host": { "type": "object" },
-        "plugin": { "type": "object" }
-      },
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
       "required": ["schema", "id", "type", "stage", "payload", "chain"],
       "properties": {
         "schema": { "const": "pentect.plugin.v1" },
@@ -51,9 +39,9 @@
       "properties": {
         "schema": { "const": "pentect.plugin.v1" },
         "id": { "type": "integer", "minimum": 1 },
-        "type": { "enum": ["initialized", "result"] },
+        "type": { "const": "result" },
         "action": { "enum": ["next", "stop"] },
-        "outcome": { "enum": ["block", "respond", "handled"] },
+        "outcome": { "enum": ["block", "respond"] },
         "payload": {},
         "message": { "type": "string" },
         "spans": {

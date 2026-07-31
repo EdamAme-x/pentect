@@ -5,7 +5,8 @@ use super::report::{FileFinding, ScanScope, SkippedFile};
 use super::walk::ignored_file_reason;
 use memchr::memchr;
 use pentect_core::{
-    infer_kind, ByteRange, Category, DecodeConfig, Engine, Input, Kind, Profile, Span,
+    infer_kind, ByteRange, Category, Context, DecodeConfig, Engine, Input, Kind, Profile,
+    RegionKind, Span,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -29,7 +30,8 @@ pub(super) fn scan_files(
     let decode = pentect_agent::load_decode_config(Profile::Strict)?;
     #[cfg(test)]
     let decode = DecodeConfig::default();
-    ScanPipeline::pentect(packs, binary, decode)?.scan(files, &progress, retain_skipped)
+    let plugins = pentect_agent::PluginMiddleware::from_env()?;
+    ScanPipeline::pentect(packs, binary, decode, plugins)?.scan(files, &progress, retain_skipped)
 }
 
 #[cfg(test)]
@@ -52,6 +54,7 @@ pub(super) enum ScanFile {
     CleanPath(PathBuf),
     Finding(FileFinding),
     Skipped(SkippedFile),
+    Error(String),
 }
 
 /// One detector backend inside the Pentect scan engine.
@@ -83,10 +86,11 @@ impl ScanPipeline {
         packs: Vec<pentect_core::Pack>,
         binary: BinaryMode,
         decode: DecodeConfig,
+        plugins: pentect_agent::PluginMiddleware,
     ) -> Result<Self, String> {
         Ok(Self {
             name: ENGINE_NAME,
-            backends: vec![Box::new(CoreBackend::new(packs, binary, decode))],
+            backends: vec![Box::new(CoreBackend::new(packs, binary, decode, plugins))],
         })
     }
 
@@ -98,6 +102,7 @@ impl ScanPipeline {
                 packs,
                 binary,
                 DecodeConfig::default(),
+                pentect_agent::PluginMiddleware::default(),
             ))],
         }
     }
@@ -162,6 +167,7 @@ impl ScanPipeline {
                             skipped_paths.entry(skipped.path.clone()).or_insert(skipped);
                         }
                     }
+                    ScanFile::Error(error) => return Err(format!("{backend_name}: {error}")),
                 }
             }
         }
@@ -407,15 +413,22 @@ struct CoreBackend {
     engine: Option<Engine>,
     binary: BinaryMode,
     decode: DecodeConfig,
+    plugins: pentect_agent::PluginMiddleware,
 }
 
 impl CoreBackend {
-    fn new(packs: Vec<pentect_core::Pack>, binary: BinaryMode, decode: DecodeConfig) -> Self {
+    fn new(
+        packs: Vec<pentect_core::Pack>,
+        binary: BinaryMode,
+        decode: DecodeConfig,
+        plugins: pentect_agent::PluginMiddleware,
+    ) -> Self {
         Self {
             packs: Some(packs),
             engine: None,
             binary,
             decode,
+            plugins,
         }
     }
 
@@ -434,6 +447,7 @@ impl CoreBackend {
 
 fn scan_file_with_limits(
     engine: &Engine,
+    plugins: &pentect_agent::PluginMiddleware,
     path: &Path,
     binary: BinaryMode,
     large_files: &LargeFileLimiter,
@@ -458,6 +472,25 @@ fn scan_file_with_limits(
     let _large_file_permit = large_files.acquire(data.len());
     let kind = infer_kind(path);
     let line_index = LineIndex::new(&data);
+    let plugin_spans = if plugins.is_empty() {
+        Vec::new()
+    } else {
+        let input = Input {
+            kind: kind.clone(),
+            data: data.clone(),
+        };
+        let plugin_context = Context {
+            path: Some(path.to_string_lossy().into_owned()),
+            key: None,
+            hints: Vec::new(),
+            kind: RegionKind::PlainText,
+            format: kind.clone(),
+        };
+        match plugins.detect_spans(&input, Some(&plugin_context)) {
+            Ok(run) => run.spans,
+            Err(error) => return ScanFile::Error(format!("{}: {error}", path.display())),
+        }
+    };
     let result = engine.analyze_spans_with_path(
         Input {
             kind: kind.clone(),
@@ -465,10 +498,25 @@ fn scan_file_with_limits(
         },
         path.to_string_lossy().into_owned(),
     );
-    let hits = result
+    let mut spans = result
         .spans
-        .iter()
+        .into_iter()
         .filter(|span| span.category == Category::Secret)
+        .collect::<Vec<_>>();
+    spans.extend(plugin_spans);
+    spans.sort_by(|left, right| right.cmp_strength(left));
+    let mut selected = Vec::<Span>::new();
+    for span in spans {
+        if selected
+            .iter()
+            .all(|existing| !existing.range.overlaps(&span.range))
+        {
+            selected.push(span);
+        }
+    }
+    selected.sort_by_key(|span| span.range.start);
+    let hits = selected
+        .iter()
         .filter_map(|span| hit_from_span(span, &line_index))
         .collect::<Vec<_>>();
     let warnings = result
@@ -529,6 +577,7 @@ impl ScanBackend for CoreBackend {
         let Some(engine) = self.engine.as_ref() else {
             return Err("engine unavailable".to_string());
         };
+        let plugins = &self.plugins;
         let next = AtomicUsize::new(0);
         let large_files = LargeFileLimiter::new(LARGE_FILE_CONCURRENCY);
         let (tx, rx) = mpsc::channel();
@@ -547,6 +596,7 @@ impl ScanBackend for CoreBackend {
                         };
                         batch.push(scan_file_with_limits(
                             engine,
+                            plugins,
                             path,
                             binary,
                             large_files,
@@ -578,6 +628,7 @@ impl ScanBackend for CoreBackend {
                         files_scanned += count;
                         skipped += count_skipped;
                     }
+                    ScanFile::Error(error) => return Err(error),
                     result => out.push(result),
                 }
             }
@@ -587,9 +638,9 @@ impl ScanBackend for CoreBackend {
                     skipped,
                 });
             }
-            out
+            Ok(out)
         });
-        Ok(out)
+        out
     }
 }
 

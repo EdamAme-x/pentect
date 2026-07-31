@@ -830,30 +830,85 @@ fn mask_read_input_with_engine_plugins_and_identity(
         disclose_length: false,
         ..Config::new(key).with_identity_key(identity_key)
     };
-    let mut plugin_count = 0usize;
-    let mut plugin_recovery = Recovery::empty_for_key(&key);
     let kind = input.kind;
+    // Protect everything the deterministic engine already knows before
+    // third-party middleware can transform the payload. Plugins may still add
+    // coverage for values the built-in engine did not detect.
+    let mut result = engine.mask(
+        Input {
+            kind: kind.clone(),
+            data: input.data,
+        },
+        &cfg,
+    );
+    let mut data = std::mem::take(&mut result.masked);
+    for stage in [
+        crate::plugin_middleware::MiddlewareStage::Ingest,
+        crate::plugin_middleware::MiddlewareStage::Decode,
+        crate::plugin_middleware::MiddlewareStage::Policy,
+    ] {
+        data = run_read_text_plugin_stage(plugins, stage, data, &kind)?;
+    }
     let data = match plugins.detect_and_mask(
         engine,
         Input {
             kind: kind.clone(),
-            data: input.data.clone(),
+            data: data.clone(),
         },
         None,
         &cfg,
     )? {
         run if run.result.is_some() => {
-            let result = run.result.expect("result checked");
-            plugin_count = result.summary.masked_count;
-            plugin_recovery = result.recovery;
-            result.masked
+            let plugin_result = run.result.expect("result checked");
+            merge_final_mask_result(&mut result, plugin_result);
+            std::mem::take(&mut result.masked)
         }
-        _ => input.data,
+        _ => data,
     };
-    let mut result = engine.mask(Input { kind, data }, &cfg);
-    result.summary.masked_count = result.summary.masked_count.saturating_add(plugin_count);
-    result.recovery.extend_same_key(plugin_recovery);
+    let final_kind = kind.clone();
+    let mut masked = data;
+    for stage in [
+        crate::plugin_middleware::MiddlewareStage::Mask,
+        crate::plugin_middleware::MiddlewareStage::Output,
+    ] {
+        masked = run_read_text_plugin_stage(plugins, stage, masked, &final_kind)?;
+    }
+    let final_result = engine.mask(
+        Input {
+            kind: final_kind,
+            data: masked,
+        },
+        &cfg,
+    );
+    merge_final_mask_result(&mut result, final_result);
     Ok(result)
+}
+
+fn run_read_text_plugin_stage(
+    plugins: &PluginMiddleware,
+    stage: crate::plugin_middleware::MiddlewareStage,
+    text: String,
+    kind: &Kind,
+) -> Result<String, String> {
+    let run = plugins.run(
+        stage,
+        serde_json::json!({
+            "kind": kind_name_for_plugin(kind),
+            "text": text,
+        }),
+        Some(serde_json::json!({"surface": "mask"})),
+    )?;
+    if run.stopped.is_some() {
+        return Err(format!(
+            "plugin blocked: {}",
+            run.message.unwrap_or_else(|| "masking blocked".to_string())
+        ));
+    }
+    run.payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "text plugin payload requires text".to_string())
 }
 
 fn kind_name_for_plugin(kind: &Kind) -> &str {

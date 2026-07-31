@@ -396,11 +396,11 @@ fn save_enabled() -> bool {
     #[cfg(not(test))]
     {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| crate::config::file_pointer_manager_save_enabled().unwrap_or(false))
+        *ENABLED.get_or_init(|| crate::config::remember_files_enabled().unwrap_or(false))
     }
     #[cfg(test)]
     {
-        crate::config::file_pointer_manager_save_enabled().unwrap_or(false)
+        crate::config::remember_files_enabled().unwrap_or(false)
     }
 }
 

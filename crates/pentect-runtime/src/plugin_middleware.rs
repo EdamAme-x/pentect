@@ -32,6 +32,7 @@ const MAX_PLUGIN_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_SPANS: usize = 4096;
 const PROTOCOL_SCHEMA: &str = "pentect.plugin.v1";
+const DEFAULT_PUBLISHER_WORKFLOW: &str = ".github/workflows/release.yml";
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_PLUGIN_DNS_THREADS: AtomicUsize = AtomicUsize::new(0);
 
@@ -108,7 +109,6 @@ pub enum MiddlewareCoverage {
 pub enum StopOutcome {
     Block,
     Respond,
-    Handled,
 }
 
 #[derive(Debug)]
@@ -121,6 +121,11 @@ pub struct MiddlewareRun {
 
 pub struct DetectRun {
     pub result: Option<MaskResult>,
+    pub coverage: MiddlewareCoverage,
+}
+
+pub struct DetectSpansRun {
+    pub spans: Vec<Span>,
     pub coverage: MiddlewareCoverage,
 }
 
@@ -153,6 +158,56 @@ impl PluginMiddleware {
         self.plugins
             .iter()
             .any(|plugin| plugin.stages.contains(&stage))
+    }
+
+    /// Invoke every declared stage once with a value-free fixture. This checks
+    /// the actual ABI and handler, not only module loading.
+    pub fn test_declared_stages(&self) -> Result<usize, String> {
+        let mut invoked = 0;
+        for plugin in &self.plugins {
+            for stage in plugin.stages.iter().copied() {
+                let payload = stage_test_payload(stage);
+                let response = plugin.invoke(stage, &payload, None, 0, 1)?;
+                if response.payload.is_some() && !plugin.permissions.contains("payload:write") {
+                    return Err(format!(
+                        "plugin '{}' returned a payload without payload:write permission",
+                        plugin.name
+                    ));
+                }
+                if response.action == Action::Stop {
+                    let outcome = response.outcome.unwrap_or(StopOutcomeFile::Block);
+                    let permission = match outcome {
+                        StopOutcomeFile::Block => "pipeline:block",
+                        StopOutcomeFile::Respond => "pipeline:respond",
+                    };
+                    if !plugin.permissions.contains(permission) {
+                        return Err(format!(
+                            "plugin '{}' tried to stop without {permission} permission",
+                            plugin.name
+                        ));
+                    }
+                    if matches!(outcome, StopOutcomeFile::Respond)
+                        && stage != MiddlewareStage::ProviderRequest
+                    {
+                        return Err(format!(
+                            "plugin '{}' can only respond during provider_request",
+                            plugin.name
+                        ));
+                    }
+                }
+                if stage == MiddlewareStage::Detect {
+                    let text = payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    for span in response.spans {
+                        plugin_span(text, span, &plugin.name)?;
+                    }
+                }
+                invoked += 1;
+            }
+        }
+        Ok(invoked)
     }
 
     pub fn run(
@@ -203,8 +258,22 @@ impl PluginMiddleware {
                 let outcome = response.outcome.unwrap_or(StopOutcomeFile::Block);
                 let permission = match outcome {
                     StopOutcomeFile::Block => "pipeline:block",
-                    StopOutcomeFile::Respond | StopOutcomeFile::Handled => "pipeline:respond",
+                    StopOutcomeFile::Respond => "pipeline:respond",
                 };
+                if matches!(outcome, StopOutcomeFile::Respond)
+                    && stage != MiddlewareStage::ProviderRequest
+                {
+                    let error = format!(
+                        "plugin '{}' can only respond during provider_request",
+                        plugin.name
+                    );
+                    if plugin.required {
+                        return Err(error);
+                    }
+                    coverage = MiddlewareCoverage::Partial;
+                    eprintln!("[pentect] optional {error}");
+                    continue;
+                }
                 if !plugin.permissions.contains(permission) {
                     let error = format!(
                         "plugin '{}' tried to stop without {permission} permission",
@@ -248,6 +317,20 @@ impl PluginMiddleware {
         context: Option<&Context>,
         cfg: &Config,
     ) -> Result<DetectRun, String> {
+        let detected = self.detect_spans(&input, context)?;
+        let result =
+            (!detected.spans.is_empty()).then(|| engine.mask_spans(input, detected.spans, cfg));
+        Ok(DetectRun {
+            result,
+            coverage: detected.coverage,
+        })
+    }
+
+    pub fn detect_spans(
+        &self,
+        input: &Input,
+        context: Option<&Context>,
+    ) -> Result<DetectSpansRun, String> {
         let mut spans = Vec::new();
         let mut coverage = MiddlewareCoverage::Full;
         let plugins = self
@@ -287,9 +370,21 @@ impl PluginMiddleware {
                 };
             if response.action == Action::Stop {
                 let outcome = response.outcome.unwrap_or(StopOutcomeFile::Block);
+                if matches!(outcome, StopOutcomeFile::Respond) {
+                    let error = format!(
+                        "plugin '{}' can only respond during provider_request",
+                        plugin.name
+                    );
+                    if plugin.required {
+                        return Err(error);
+                    }
+                    coverage = MiddlewareCoverage::Partial;
+                    eprintln!("[pentect] optional {error}");
+                    continue;
+                }
                 let permission = match outcome {
                     StopOutcomeFile::Block => "pipeline:block",
-                    StopOutcomeFile::Respond | StopOutcomeFile::Handled => "pipeline:respond",
+                    StopOutcomeFile::Respond => "pipeline:respond",
                 };
                 if !plugin.permissions.contains(permission) {
                     let error = format!(
@@ -354,8 +449,29 @@ impl PluginMiddleware {
                 Err(error) => return Err(error),
             }
         }
-        let result = (!spans.is_empty()).then(|| engine.mask_spans(input, spans, cfg));
-        Ok(DetectRun { result, coverage })
+        Ok(DetectSpansRun { spans, coverage })
+    }
+}
+
+fn stage_test_payload(stage: MiddlewareStage) -> Value {
+    match stage {
+        MiddlewareStage::ProviderRequest | MiddlewareStage::ProviderResponse => {
+            json!({"model": "pentect-plugin-test", "messages": []})
+        }
+        MiddlewareStage::ToolCall => {
+            json!({"type": "function_call", "name": "pentect_plugin_test", "arguments": "{}"})
+        }
+        MiddlewareStage::FileDiscover => {
+            json!({"filename": "test.txt", "media_type": "text/plain", "size": 4})
+        }
+        MiddlewareStage::FileDecode
+        | MiddlewareStage::FileDetect
+        | MiddlewareStage::FileTransform => {
+            json!({"filename": "test.txt", "media_type": "text/plain", "text": "test"})
+        }
+        MiddlewareStage::Finding => json!({"path": "test.txt", "findings": 0}),
+        MiddlewareStage::Report => json!({"files": [], "findings": 0}),
+        _ => json!({"kind": "text", "text": "Alice Smith"}),
     }
 }
 
@@ -389,11 +505,16 @@ impl PluginBinary {
                 path.display()
             ));
         }
+        if !file.postscript.is_empty() {
+            return Err(format!(
+                "plugin '{}' contains unsupported postscripts",
+                path.display()
+            ));
+        }
         let name = file
             .name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| plugin_default_name(path));
-        let id = plugin_id(&name);
         let binary = file
             .binary
             .filter(|binary| !binary.trim().is_empty())
@@ -402,7 +523,7 @@ impl PluginBinary {
             .publisher
             .as_ref()
             .and_then(|publisher| publisher.workflow.as_deref())
-            .ok_or_else(|| format!("plugin '{name}' requires [publisher] workflow"))?;
+            .unwrap_or(DEFAULT_PUBLISHER_WORKFLOW);
         if !valid_plugin_publisher_workflow(publisher_workflow) {
             return Err(format!(
                 "plugin '{name}' publisher workflow must be a repository-relative YAML path"
@@ -461,7 +582,8 @@ impl PluginBinary {
             ));
         }
         let network = validate_network(&name, file.network)?;
-        let wasm_path = wasm_binary_path(&name, &binary)?;
+        let runtime_dirs = plugin_runtime_dirs_for_manifest(&name, path)?;
+        let wasm_path = wasm_binary_path(&name, &binary, &runtime_dirs)?;
         let middleware = file
             .middleware
             .ok_or_else(|| format!("plugin '{name}' requires [middleware]"))?;
@@ -477,16 +599,18 @@ impl PluginBinary {
             return Err(format!("plugin '{name}' must declare at least one stage"));
         }
         let permissions = validate_permissions(&name, middleware.permissions)?;
-        if !permissions.contains("input:read") {
+        if permissions.contains("pipeline:respond")
+            && !stages.contains(&MiddlewareStage::ProviderRequest)
+        {
             return Err(format!(
-                "plugin '{name}' middleware requires input:read permission"
+                "plugin '{name}' pipeline:respond requires provider_request stage"
             ));
         }
-        verify_plugin_approval(path, &id, &stages, &permissions)?;
-        let wasm_bytes = load_approved_plugin_binary(&wasm_path, &id, &name)?;
+        verify_plugin_approval(path, &runtime_dirs, &stages, &permissions)?;
+        let wasm_bytes = load_approved_plugin_binary(&wasm_path, &runtime_dirs, &name)?;
         let config = permissions
             .contains("config:read")
-            .then(|| load_plugin_config(&id))
+            .then(|| load_plugin_config(&runtime_dirs))
             .transpose()?;
         let wasm = WasmProgram::load_bytes(&wasm_bytes, &name, network, config)?;
         Ok(Self {
@@ -579,24 +703,24 @@ struct PluginBinaryLock {
 
 fn verify_plugin_approval(
     manifest: &Path,
-    id: &str,
+    runtime_dirs: &PluginRuntimeDirs,
     stages: &BTreeSet<MiddlewareStage>,
     permissions: &BTreeSet<String>,
 ) -> Result<(), String> {
     use sha2::{Digest, Sha256};
-    let path = plugin_runtime_dirs(id)?.data_dir.join(PLUGIN_APPROVAL_FILE);
+    let path = runtime_dirs.data_dir.join(PLUGIN_APPROVAL_FILE);
     let source =
         read_bounded_utf8(&path, MAX_PLUGIN_METADATA_BYTES, "plugin approval").map_err(|_| {
             format!(
                 "plugin '{}' is not approved; run `pentect plugins setup {} --yes`",
-                id,
+                plugin_default_name(manifest),
                 manifest.display()
             )
         })?;
-    let approval: PluginApproval = toml::from_str(&source)
-        .map_err(|error| format!("plugin '{id}' approval is invalid: {error}"))?;
+    let approval: PluginApproval =
+        toml::from_str(&source).map_err(|error| format!("plugin approval is invalid: {error}"))?;
     let bytes = read_bounded_bytes(manifest, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest")
-        .map_err(|error| format!("could not verify plugin '{id}' manifest: {error}"))?;
+        .map_err(|error| format!("could not verify plugin manifest: {error}"))?;
     let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
     let approved_stages = approval
         .stages
@@ -610,19 +734,22 @@ fn verify_plugin_approval(
         || &approved_permissions != permissions
     {
         return Err(format!(
-            "plugin '{id}' changed after approval; run `pentect plugins setup {} --yes` again",
+            "plugin '{}' changed after approval; run `pentect plugins setup {} --yes` again",
+            plugin_default_name(manifest),
             manifest.display()
         ));
     }
     Ok(())
 }
 
-fn load_approved_plugin_binary(path: &Path, id: &str, name: &str) -> Result<Vec<u8>, String> {
+fn load_approved_plugin_binary(
+    path: &Path,
+    runtime_dirs: &PluginRuntimeDirs,
+    name: &str,
+) -> Result<Vec<u8>, String> {
     use sha2::{Digest, Sha256};
 
-    let lock_path = plugin_runtime_dirs(id)?
-        .data_dir
-        .join(PLUGIN_BINARY_LOCK_FILE);
+    let lock_path = runtime_dirs.data_dir.join(PLUGIN_BINARY_LOCK_FILE);
     let source = read_bounded_utf8(&lock_path, MAX_PLUGIN_METADATA_BYTES, "plugin binary lock")
         .map_err(|_| {
             format!("plugin '{name}' binary is not locked; run `pentect plugins setup` again")
@@ -859,12 +986,12 @@ pub struct PluginHttpResponse {
     pub error: Option<String>,
 }
 
-fn load_plugin_config(id: &str) -> Result<toml::Value, String> {
-    let path = plugin_runtime_dirs(id)?.config_file;
+fn load_plugin_config(runtime_dirs: &PluginRuntimeDirs) -> Result<toml::Value, String> {
+    let path = &runtime_dirs.config_file;
     if !path.is_file() {
         return Ok(toml::Value::Table(toml::Table::new()));
     }
-    let source = read_bounded_utf8(&path, MAX_PLUGIN_CONFIG_BYTES, "plugin config")?;
+    let source = read_bounded_utf8(path, MAX_PLUGIN_CONFIG_BYTES, "plugin config")?;
     toml::from_str(&source)
         .map_err(|error| format!("plugin config '{}' is invalid: {error}", path.display()))
 }
@@ -1045,7 +1172,8 @@ fn perform_plugin_http(
     if origin.scheme == "http" && !policy.allow_insecure {
         return Err("insecure HTTP is not approved".to_string());
     }
-    let addresses = resolve_http_origin(&origin, policy.private_network, deadline)?;
+    let private_origin = private_access_for_origin(&origin, policy.private_network);
+    let addresses = resolve_http_origin(&origin, private_origin, deadline)?;
     let request_timeout = deadline.saturating_duration_since(Instant::now());
     if request_timeout.is_zero() {
         return Err("plugin HTTP request timed out".to_string());
@@ -1124,6 +1252,17 @@ fn perform_plugin_http(
         body,
         error: None,
     })
+}
+
+fn private_access_for_origin(origin: &HttpOrigin, approved: bool) -> bool {
+    approved
+        && origin.host.parse::<IpAddr>().is_ok_and(|ip| match ip {
+            IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
+            IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || (ip.segments().first().copied().unwrap_or_default() & 0xfe00) == 0xfc00
+            }
+        })
 }
 
 fn transport_controlled_header(name: &str) -> bool {
@@ -1264,9 +1403,22 @@ fn http_origin(url: &reqwest::Url) -> Result<HttpOrigin, String> {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PluginFile {
     schema: Option<String>,
     name: Option<String>,
+    #[serde(rename = "description")]
+    _description: Option<String>,
+    #[serde(rename = "repository")]
+    _repository: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "assets")]
+    _assets: BTreeMap<String, String>,
+    #[serde(default)]
+    #[serde(rename = "detector")]
+    _detector: Vec<toml::Value>,
+    #[serde(default)]
+    postscript: Vec<toml::Value>,
     binary: Option<String>,
     publisher: Option<PublisherFile>,
     execution: Option<ExecutionFile>,
@@ -1416,7 +1568,6 @@ enum Action {
 enum StopOutcomeFile {
     Block,
     Respond,
-    Handled,
 }
 
 impl From<StopOutcomeFile> for StopOutcome {
@@ -1424,7 +1575,6 @@ impl From<StopOutcomeFile> for StopOutcome {
         match value {
             StopOutcomeFile::Block => Self::Block,
             StopOutcomeFile::Respond => Self::Respond,
-            StopOutcomeFile::Handled => Self::Handled,
         }
     }
 }
@@ -1464,7 +1614,7 @@ fn validate_permissions(name: &str, values: Vec<String>) -> Result<BTreeSet<Stri
         "config:read",
         "cache:write",
     ];
-    let mut permissions = BTreeSet::new();
+    let mut permissions = BTreeSet::from(["input:read".to_string()]);
     for permission in values {
         if !allowed.contains(&permission.as_str()) {
             return Err(format!(
@@ -1605,6 +1755,27 @@ pub fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String
     })
 }
 
+/// Resolve storage for one concrete plugin source. The source path is part of
+/// the identity so two publishers may safely use the same display name.
+pub fn plugin_runtime_dirs_for_manifest(
+    name: &str,
+    manifest: &Path,
+) -> Result<PluginRuntimeDirs, String> {
+    let manifest = std::fs::canonicalize(manifest).map_err(|error| {
+        format!(
+            "could not resolve plugin manifest '{}': {error}",
+            manifest.display()
+        )
+    })?;
+    let mut digest = sha2::Sha256::new();
+    use sha2::Digest as _;
+    digest.update(b"pentect-plugin-source-v1");
+    digest.update(manifest.to_string_lossy().as_bytes());
+    let source_id = data_encoding::HEXLOWER.encode(&digest.finalize()[..12]);
+    let name = plugin_id(name);
+    plugin_runtime_dirs(&format!("{name}-{source_id}"))
+}
+
 fn plugin_user_data_root() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
@@ -1635,7 +1806,11 @@ fn restrict_plugin_directory(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn wasm_binary_path(name: &str, binary: &str) -> Result<PathBuf, String> {
+fn wasm_binary_path(
+    name: &str,
+    binary: &str,
+    runtime_dirs: &PluginRuntimeDirs,
+) -> Result<PathBuf, String> {
     if binary.is_empty()
         || binary.len() > 128
         || binary.contains('/')
@@ -1647,7 +1822,7 @@ fn wasm_binary_path(name: &str, binary: &str) -> Result<PathBuf, String> {
     {
         return Err(format!("plugin '{name}' has an invalid binary name"));
     }
-    Ok(plugin_runtime_dirs(name)?.data_dir.join("bin").join(binary))
+    Ok(runtime_dirs.data_dir.join("bin").join(binary))
 }
 
 fn plugin_default_name(path: &Path) -> String {
@@ -1678,6 +1853,9 @@ fn plugin_id(value: &str) -> String {
         } else if !separator && !id.is_empty() {
             id.push('-');
             separator = true;
+        }
+        if id.len() >= 64 {
+            break;
         }
     }
     while id.ends_with('-') {
@@ -1715,6 +1893,24 @@ mod tests {
         ] {
             assert_eq!(MiddlewareStage::parse(stage.as_str()), Some(stage));
         }
+    }
+
+    #[test]
+    fn same_name_from_different_sources_has_distinct_storage() {
+        let root =
+            std::env::temp_dir().join(format!("pentect-plugin-identity-{}", std::process::id()));
+        let left = root.join("left").join("plugin.toml");
+        let right = root.join("right").join("plugin.toml");
+        std::fs::create_dir_all(left.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(right.parent().unwrap()).unwrap();
+        std::fs::write(&left, "schema = \"pentect.plugin.v1\"\n").unwrap();
+        std::fs::write(&right, "schema = \"pentect.plugin.v1\"\n").unwrap();
+        let left_dirs = plugin_runtime_dirs_for_manifest("shared", &left).unwrap();
+        let right_dirs = plugin_runtime_dirs_for_manifest("shared", &right).unwrap();
+        assert_ne!(left_dirs.data_dir, right_dirs.data_dir);
+        let _ = std::fs::remove_dir_all(left_dirs.data_dir);
+        let _ = std::fs::remove_dir_all(right_dirs.data_dir);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1890,6 +2086,26 @@ mod tests {
         assert!(!plugin_network_ip_allowed("0.0.0.0".parse().unwrap(), true));
         assert!(!plugin_network_ip_allowed("ff02::1".parse().unwrap(), true));
         assert!(!plugin_network_ip_allowed("fe80::1".parse().unwrap(), true));
+    }
+
+    #[test]
+    fn private_network_approval_does_not_apply_to_dns_names() {
+        assert!(!private_access_for_origin(
+            &HttpOrigin {
+                scheme: "https".to_string(),
+                host: "example.com".to_string(),
+                port: 443,
+            },
+            true,
+        ));
+        assert!(private_access_for_origin(
+            &HttpOrigin {
+                scheme: "http".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            },
+            true,
+        ));
     }
 
     #[test]

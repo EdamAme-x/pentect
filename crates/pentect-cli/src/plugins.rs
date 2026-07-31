@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 pub(crate) const CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
 pub(crate) const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
@@ -22,7 +22,6 @@ const DEFAULT_REMOTE_PLUGINS_BASE: &str =
     "https://raw.githubusercontent.com/EdamAme-x/pentect/main/plugins";
 const DEFAULT_PLUGIN_REPOSITORY: &str = "EdamAme-x/pentect";
 const REMOTE_PLUGIN_TIMEOUT: Duration = Duration::from_secs(8);
-const REMOTE_PLUGIN_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_REMOTE_PLUGIN_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Default)]
@@ -241,7 +240,7 @@ pub(crate) fn load_plugin_config(path: &Path, source: &str) -> Result<Pack, Stri
     }
 }
 
-fn config_specs() -> Result<Vec<String>> {
+pub(crate) fn config_specs() -> Result<Vec<String>> {
     let path = PathBuf::from(PENTECT_DIR).join(PENTECT_CONFIG_FILE);
     if !path.exists() {
         return Ok(Vec::new());
@@ -281,6 +280,8 @@ fn plugin_paths_for_specs(
     let mut configs = Vec::new();
     let mut binaries = Vec::new();
     for spec in specs {
+        let resolved = resolve_configured_plugin_spec(spec)?;
+        let spec = resolved.as_str();
         if is_remote_spec(spec) {
             let found = plugin_paths_for_url(spec)?;
             configs.extend(found.config_paths);
@@ -471,6 +472,59 @@ fn official_plugins_root() -> PathBuf {
 }
 
 pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
+    let spec = resolve_configured_plugin_spec(spec)?;
+    plugin_source_with_refresh(&spec, false)
+}
+
+pub(crate) fn refresh_plugin_source(spec: &str) -> Result<PluginSource> {
+    let spec = resolve_configured_plugin_spec(spec)?;
+    plugin_source_with_refresh(&spec, true)
+}
+
+fn resolve_configured_plugin_spec(spec: &str) -> Result<String> {
+    if is_remote_spec(spec) || is_path_spec(spec) {
+        return Ok(spec.to_string());
+    }
+    let mut matches = Vec::new();
+    for configured in config_specs()? {
+        let Ok(source) = plugin_source_with_refresh(&configured, false) else {
+            continue;
+        };
+        let manifest_name = source
+            .manifest_path
+            .as_deref()
+            .and_then(|path| {
+                pentect_agent::read_bounded_utf8(
+                    path,
+                    MAX_REMOTE_PLUGIN_FILE_BYTES,
+                    "plugin manifest",
+                )
+                .ok()
+            })
+            .and_then(|text| text.parse::<toml::Value>().ok())
+            .and_then(|value| {
+                value
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_string)
+            });
+        if source.name == spec || manifest_name.as_deref() == Some(spec) {
+            matches.push(configured);
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => Ok(spec.to_string()),
+        [resolved] => Ok(resolved.clone()),
+        _ => bail!(
+            "plugin name '{spec}' is ambiguous; use one exact source: {}",
+            matches.join(", ")
+        ),
+    }
+}
+
+fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource> {
     validate_plugin_spec(spec)?;
     if is_remote_spec(spec) {
         let normalized = normalize_github_plugin_url(spec)?;
@@ -488,7 +542,13 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
             let manifest = format!("{base}/{PLUGIN_MANIFEST_FILE}");
             (base, manifest)
         };
-        let manifest_path = fetch_remote_plugin_file(&manifest_url)?;
+        if refresh {
+            let _ = fetch_remote_plugin_file_with_refresh(
+                &format!("{base}/{PLUGIN_CONFIG_FILE}"),
+                true,
+            )?;
+        }
+        let manifest_path = fetch_remote_plugin_file_with_refresh(&manifest_url, refresh)?;
         let name = remote_plugin_name(&base)?;
         return Ok(PluginSource {
             name,
@@ -549,7 +609,12 @@ pub(crate) fn plugin_source(spec: &str) -> Result<PluginSource> {
         }
     }
     let base = format!("{DEFAULT_REMOTE_PLUGINS_BASE}/{spec}");
-    let manifest_path = fetch_remote_plugin_file(&format!("{base}/{PLUGIN_MANIFEST_FILE}"))?;
+    if refresh {
+        let _ =
+            fetch_remote_plugin_file_with_refresh(&format!("{base}/{PLUGIN_CONFIG_FILE}"), true)?;
+    }
+    let manifest_path =
+        fetch_remote_plugin_file_with_refresh(&format!("{base}/{PLUGIN_MANIFEST_FILE}"), refresh)?;
     Ok(PluginSource {
         name: spec.to_string(),
         manifest_path,
@@ -652,9 +717,23 @@ fn remote_plugin_paths_for_base_url(base_url: &str) -> Result<PluginPaths> {
 }
 
 fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
+    fetch_remote_plugin_file_with_refresh(url, false)
+}
+
+fn fetch_remote_plugin_file_with_refresh(url: &str, refresh: bool) -> Result<Option<PathBuf>> {
     let path = remote_cache_file(url)?;
-    if cached_remote_plugin_is_fresh(&path) {
+    let missing = path.with_extension(format!(
+        "{}missing",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("{extension}."))
+            .unwrap_or_default()
+    ));
+    if !refresh && path.is_file() {
         return Ok(Some(path));
+    }
+    if !refresh && missing.is_file() {
+        return Ok(None);
     }
     let response = reqwest::blocking::Client::builder()
         .timeout(REMOTE_PLUGIN_TIMEOUT)
@@ -665,6 +744,13 @@ fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
         .with_context(|| format!("could not fetch plugin '{url}'"))?;
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
+        let _ = std::fs::remove_file(&path);
+        if let Some(parent) = missing.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create plugin cache '{}'", parent.display()))?;
+        }
+        std::fs::write(&missing, [])
+            .with_context(|| format!("could not write plugin cache '{}'", missing.display()))?;
         return Ok(None);
     }
     if !status.is_success() {
@@ -690,16 +776,8 @@ fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
     }
     std::fs::write(&path, &bytes)
         .with_context(|| format!("could not write plugin cache '{}'", path.display()))?;
+    let _ = std::fs::remove_file(missing);
     Ok(Some(path))
-}
-
-fn cached_remote_plugin_is_fresh(path: &Path) -> bool {
-    let Ok(modified) = path.metadata().and_then(|metadata| metadata.modified()) else {
-        return false;
-    };
-    SystemTime::now()
-        .duration_since(modified)
-        .is_ok_and(|age| age < REMOTE_PLUGIN_CACHE_TTL)
 }
 
 fn remote_cache_file(url: &str) -> Result<PathBuf> {

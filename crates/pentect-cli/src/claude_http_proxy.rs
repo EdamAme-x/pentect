@@ -621,7 +621,7 @@ fn protect_anthropic_request_body(
     warn_provider_mcp_credentials(&value);
     inject_handle_contract(&mut value);
     // Image handling deliberately follows the existing image policy. With
-    // the default unscanned_images="block", an uninspectable image is an
+    // With the default image.unscanned="block", an uninspectable image is an
     // error; users can explicitly choose allow in configuration.
     redact_anthropic_base64_images(&mut value, files)?;
     let mut masker = masker

@@ -10,7 +10,6 @@ const PENTECT_DIR: &str = ".pentect";
 const CONFIG_FILE: &str = "config.toml";
 const IDENTITY_KEY_FILE: &str = "handle-identity.key";
 const DEFAULT_ENVIRONMENT_PREFIX: &str = "PENTECT_";
-const MAX_ENVIRONMENT_PREFIX_BYTES: usize = 64;
 const DEFAULT_IMAGE_OCR_MAX_EDGE: u32 = 2_048;
 const DEFAULT_IMAGE_OCR_MAX_PIXELS: u64 = 64_000_000;
 const DEFAULT_IMAGE_MAX_IMAGES: usize = 64;
@@ -20,29 +19,29 @@ const DEFAULT_IMAGE_MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_IMAGE_FETCH_SECONDS: u64 = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum HandleHashScope {
+pub(crate) enum HandleScope {
     #[default]
-    Machine,
+    Device,
     Project,
     Session,
 }
 
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn handle_identity_key() -> Result<[u8; 32], String> {
-    let project = read_handle_hash_scope(project_config_path())?;
-    let global = read_handle_hash_scope(global_config_path()?)?;
+    let project = read_handle_scope(project_config_path())?;
+    let global = read_handle_scope(global_config_path()?)?;
     match project.or(global).unwrap_or_default() {
-        HandleHashScope::Machine => machine_identity_key(),
-        HandleHashScope::Project => {
+        HandleScope::Device => machine_identity_key(),
+        HandleScope::Project => {
             let root = project_identity_root()?;
             Ok(derive_project_identity_key(&machine_identity_key()?, &root))
         }
-        HandleHashScope::Session => random_identity_key(),
+        HandleScope::Session => random_identity_key(),
     }
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn read_handle_hash_scope(path: PathBuf) -> Result<Option<HandleHashScope>, String> {
+fn read_handle_scope(path: PathBuf) -> Result<Option<HandleScope>, String> {
     if !path.exists() {
         return Ok(None);
     }
@@ -54,27 +53,31 @@ fn read_handle_hash_scope(path: PathBuf) -> Result<Option<HandleHashScope>, Stri
     let value = src
         .parse::<toml::Value>()
         .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-    handle_hash_scope_value(&value)
+    handle_scope_value(&value)
 }
 
-fn handle_hash_scope_value(value: &toml::Value) -> Result<Option<HandleHashScope>, String> {
+fn handle_scope_value(value: &toml::Value) -> Result<Option<HandleScope>, String> {
     let Some(handles) = value.get("handles") else {
         return Ok(None);
     };
     let Some(table) = handles.as_table() else {
         return Err("handles config must be a table".to_string());
     };
-    let Some(raw) = table.get("hash_scope") else {
+    if table.contains_key("hash_scope") {
+        return Err("handles.hash_scope was removed; use handles.scope = \"device\"".to_string());
+    }
+    let raw = table.get("scope");
+    let Some(raw) = raw else {
         return Ok(None);
     };
     let Some(raw) = raw.as_str() else {
-        return Err("handles.hash_scope must be a string".to_string());
+        return Err("handles.scope must be device, project, or session".to_string());
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "machine" => Ok(Some(HandleHashScope::Machine)),
-        "project" => Ok(Some(HandleHashScope::Project)),
-        "session" => Ok(Some(HandleHashScope::Session)),
-        _ => Err("handles.hash_scope must be machine, project, or session".to_string()),
+        "device" => Ok(Some(HandleScope::Device)),
+        "project" => Ok(Some(HandleScope::Project)),
+        "session" => Ok(Some(HandleScope::Session)),
+        _ => Err("handles.scope must be device, project, or session".to_string()),
     }
 }
 
@@ -369,9 +372,9 @@ pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
 
 #[cfg(not(test))]
 pub(crate) fn environment_variable_prefix() -> Result<String, String> {
-    let project = read_environment_variable_prefix(project_config_path())?;
-    let global = read_environment_variable_prefix(global_config_path()?)?;
-    Ok(effective_environment_variable_prefix(project, global))
+    reject_removed_environment_config(project_config_path())?;
+    reject_removed_environment_config(global_config_path()?)?;
+    Ok(DEFAULT_ENVIRONMENT_PREFIX.to_string())
 }
 
 #[cfg(test)]
@@ -396,15 +399,15 @@ pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
     .validate()
 }
 
-pub(crate) fn file_pointer_manager_save_enabled() -> Result<bool, String> {
-    let project = read_file_pointer_manager_save(project_config_path())?;
-    let global = read_file_pointer_manager_save(global_config_path()?)?;
+pub(crate) fn remember_files_enabled() -> Result<bool, String> {
+    let project = read_files_remember(project_config_path())?;
+    let global = read_files_remember(global_config_path()?)?;
     Ok(project.or(global).unwrap_or(true))
 }
 
-pub(crate) fn log_share_enabled() -> Result<bool, String> {
-    let project = read_log_share(project_config_path())?;
-    let global = read_log_share(global_config_path()?)?;
+pub(crate) fn activity_share_enabled() -> Result<bool, String> {
+    let project = read_activity_share(project_config_path())?;
+    let global = read_activity_share(global_config_path()?)?;
     Ok(project.or(global).unwrap_or(true))
 }
 
@@ -428,22 +431,21 @@ fn read_agent_require_pentect(path: PathBuf) -> Result<Option<bool>, String> {
 }
 
 fn agent_require_pentect_value(value: &toml::Value) -> Result<Option<bool>, String> {
-    if let Some(raw) = value.get("require_pentect") {
-        return agent_config_bool(raw, "require_pentect").map(Some);
+    if value.get("require_pentect").is_some() {
+        return Err("require_pentect was removed; use agent.required".to_string());
     }
-    let Some(raw) = value.get("agent") else {
-        return Ok(None);
-    };
-    let Some(table) = raw.as_table() else {
-        return Err("agent config must be a table".to_string());
-    };
-    if let Some(raw) = table.get("require_pentect") {
-        return agent_config_bool(raw, "agent.require_pentect").map(Some);
+    let agent = value.get("agent").map(|raw| {
+        raw.as_table()
+            .ok_or_else(|| "agent config must be a table".to_string())
+    });
+    let agent = agent.transpose()?;
+    let required = agent.and_then(|table| table.get("required"));
+    if agent.is_some_and(|table| table.contains_key("require_pentect")) {
+        return Err("agent.require_pentect was removed; use agent.required".to_string());
     }
-    if let Some(raw) = table.get("required") {
-        return agent_config_bool(raw, "agent.required").map(Some);
-    }
-    Ok(None)
+    required
+        .map(|raw| agent_config_bool(raw, "agent.required"))
+        .transpose()
 }
 
 fn read_image_ocr_config(path: PathBuf) -> Result<ImageOcrConfigPartial, String> {
@@ -496,8 +498,13 @@ fn image_ocr_config_value(value: &toml::Value) -> Result<ImageOcrConfigPartial, 
     if let Some(raw) = table.get("fetch_seconds") {
         out.fetch_seconds = Some(config_u64(raw, "image.fetch_seconds")?);
     }
-    if let Some(raw) = table.get("unscanned_images") {
-        out.unscanned_images = Some(unscanned_image_policy(raw, "image.unscanned_images")?);
+    if table.contains_key("unscanned_images") {
+        return Err(
+            "image.unscanned_images was removed; use image.unscanned = \"block\"".to_string(),
+        );
+    }
+    if let Some(raw) = table.get("unscanned") {
+        out.unscanned_images = Some(unscanned_image_policy(raw, "image.unscanned")?);
     }
     Ok(out)
 }
@@ -549,7 +556,7 @@ fn decode_config_value(value: &toml::Value) -> Result<DecodeConfigPartial, Strin
     Ok(out)
 }
 
-fn read_file_pointer_manager_save(path: PathBuf) -> Result<Option<bool>, String> {
+fn read_files_remember(path: PathBuf) -> Result<Option<bool>, String> {
     if !path.exists() {
         return Ok(None);
     }
@@ -561,89 +568,46 @@ fn read_file_pointer_manager_save(path: PathBuf) -> Result<Option<bool>, String>
     let value = src
         .parse::<toml::Value>()
         .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-    file_pointer_manager_save_value(&value)
+    files_remember_value(&value)
 }
 
-fn read_environment_variable_prefix(path: PathBuf) -> Result<Option<String>, String> {
+fn reject_removed_environment_config(path: PathBuf) -> Result<(), String> {
     if !path.exists() {
-        return Ok(None);
-    }
-    let src = fs::read_to_string(&path)
-        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
-    if src.trim().is_empty() {
-        return Ok(None);
-    }
-    let value = src
-        .parse::<toml::Value>()
-        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-    environment_variable_prefix_value(&value)
-}
-
-fn environment_variable_prefix_value(value: &toml::Value) -> Result<Option<String>, String> {
-    let Some(raw) = value.get("environment") else {
-        return Ok(None);
-    };
-    let Some(table) = raw.as_table() else {
-        return Err("environment config must be a table".to_string());
-    };
-    let Some(raw) = table.get("prefix") else {
-        return Ok(None);
-    };
-    let Some(prefix) = raw.as_str() else {
-        return Err("environment.prefix must be a string".to_string());
-    };
-    validate_environment_variable_prefix(prefix)?;
-    Ok(Some(prefix.to_string()))
-}
-
-fn validate_environment_variable_prefix(prefix: &str) -> Result<(), String> {
-    if prefix.len() > MAX_ENVIRONMENT_PREFIX_BYTES {
-        return Err(format!(
-            "environment.prefix must be at most {MAX_ENVIRONMENT_PREFIX_BYTES} ASCII bytes"
-        ));
-    }
-    if prefix.is_empty() {
         return Ok(());
     }
-    let bytes = prefix.as_bytes();
-    if bytes[0].is_ascii_digit()
-        || !bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-    {
+    let src = fs::read_to_string(&path)
+        .map_err(|e| format!("could not read '{}': {e}", path.display()))?;
+    if src.trim().is_empty() {
+        return Ok(());
+    }
+    let value = src
+        .parse::<toml::Value>()
+        .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
+    if value.get("environment").is_some() {
         return Err(
-            "environment.prefix must be empty or an ASCII environment-name prefix".to_string(),
+            "environment.prefix was removed; handle variables always start with PENTECT_"
+                .to_string(),
         );
     }
     Ok(())
 }
 
-fn effective_environment_variable_prefix(
-    project: Option<String>,
-    global: Option<String>,
-) -> String {
-    project
-        .or(global)
-        .unwrap_or_else(|| DEFAULT_ENVIRONMENT_PREFIX.to_string())
-}
-
-fn file_pointer_manager_save_value(value: &toml::Value) -> Result<Option<bool>, String> {
-    let Some(raw) = value.get("file_pointer_manager") else {
-        return Ok(None);
-    };
-    if raw.is_bool() || raw.is_str() {
-        return config_bool(raw, "file_pointer_manager").map(Some);
+fn files_remember_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    if value.get("file_pointer_manager").is_some() {
+        return Err("file_pointer_manager was removed; use files.remember = true".to_string());
     }
-    let Some(table) = raw.as_table() else {
-        return Err("file_pointer_manager config must be a boolean or table".to_string());
-    };
-    let Some(raw) = table.get("save") else {
-        return Ok(None);
-    };
-    config_bool(raw, "file_pointer_manager.save").map(Some)
+    if let Some(raw) = value.get("files") {
+        let Some(table) = raw.as_table() else {
+            return Err("files config must be a table".to_string());
+        };
+        if let Some(raw) = table.get("remember") {
+            return config_bool(raw, "files.remember").map(Some);
+        }
+    }
+    Ok(None)
 }
 
-fn read_log_share(path: PathBuf) -> Result<Option<bool>, String> {
+fn read_activity_share(path: PathBuf) -> Result<Option<bool>, String> {
     if !path.exists() {
         return Ok(None);
     }
@@ -655,20 +619,22 @@ fn read_log_share(path: PathBuf) -> Result<Option<bool>, String> {
     let value = src
         .parse::<toml::Value>()
         .map_err(|e| format!("could not parse '{}': {e}", path.display()))?;
-    log_share_value(&value)
+    activity_share_value(&value)
 }
 
-fn log_share_value(value: &toml::Value) -> Result<Option<bool>, String> {
-    let Some(raw) = value.get("log") else {
-        return Ok(None);
-    };
-    let Some(table) = raw.as_table() else {
-        return Err("log config must be a table".to_string());
-    };
-    let Some(raw) = table.get("share") else {
-        return Ok(None);
-    };
-    config_bool(raw, "log.share").map(Some)
+fn activity_share_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    if value.get("log").is_some() {
+        return Err("log.share was removed; use activity.share = true".to_string());
+    }
+    if let Some(raw) = value.get("activity") {
+        let Some(table) = raw.as_table() else {
+            return Err("activity config must be a table".to_string());
+        };
+        if let Some(raw) = table.get("share") {
+            return config_bool(raw, "activity.share").map(Some);
+        }
+    }
+    Ok(None)
 }
 
 fn config_bool(value: &toml::Value, field: &str) -> Result<bool, String> {
@@ -910,21 +876,26 @@ mod tests {
     }
 
     #[test]
-    fn handle_hash_scope_accepts_all_scopes_and_rejects_unknown_values() {
+    fn handle_scope_accepts_all_scopes_and_rejects_old_or_unknown_values() {
         for (raw, expected) in [
-            ("machine", HandleHashScope::Machine),
-            ("project", HandleHashScope::Project),
-            ("session", HandleHashScope::Session),
+            ("device", HandleScope::Device),
+            ("project", HandleScope::Project),
+            ("session", HandleScope::Session),
         ] {
-            let value = format!("[handles]\nhash_scope = {raw:?}")
+            let value = format!("[handles]\nscope = {raw:?}")
                 .parse::<toml::Value>()
                 .unwrap();
-            assert_eq!(handle_hash_scope_value(&value).unwrap(), Some(expected));
+            assert_eq!(handle_scope_value(&value).unwrap(), Some(expected));
         }
-        let value = "[handles]\nhash_scope = \"daily\""
+        let value = "[handles]\nscope = \"daily\""
             .parse::<toml::Value>()
             .unwrap();
-        assert!(handle_hash_scope_value(&value).is_err());
+        assert!(handle_scope_value(&value).is_err());
+
+        let value = "[handles]\nhash_scope = \"machine\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert!(handle_scope_value(&value).is_err());
     }
 
     #[test]
@@ -1001,17 +972,17 @@ mod tests {
     }
 
     #[test]
-    fn agent_require_pentect_accepts_top_level_and_table_forms() {
+    fn agent_required_accepts_only_the_canonical_key() {
+        let value = "[agent]\nrequired = false".parse::<toml::Value>().unwrap();
+        assert_eq!(agent_require_pentect_value(&value).unwrap(), Some(false));
+
         let value = "require_pentect = true".parse::<toml::Value>().unwrap();
-        assert_eq!(agent_require_pentect_value(&value).unwrap(), Some(true));
+        assert!(agent_require_pentect_value(&value).is_err());
 
         let value = "[agent]\nrequire_pentect = \"on\""
             .parse::<toml::Value>()
             .unwrap();
-        assert_eq!(agent_require_pentect_value(&value).unwrap(), Some(true));
-
-        let value = "[agent]\nrequired = false".parse::<toml::Value>().unwrap();
-        assert_eq!(agent_require_pentect_value(&value).unwrap(), Some(false));
+        assert!(agent_require_pentect_value(&value).is_err());
     }
 
     #[test]
@@ -1037,7 +1008,7 @@ max_total_bytes = 268435456
 max_seconds = 15
 max_image_bytes = 33554432
 fetch_seconds = 4
-unscanned_images = \"block\""
+unscanned = \"block\""
             .parse::<toml::Value>()
             .unwrap();
         let cfg = image_ocr_config_value(&value).unwrap();
@@ -1082,75 +1053,13 @@ unknown_min_bytes = 32
     }
 
     #[test]
-    fn environment_prefix_accepts_namespaced_and_empty_values() {
-        let value = "[environment]\nprefix = \"SAFE_\""
-            .parse::<toml::Value>()
-            .unwrap();
-        assert_eq!(
-            environment_variable_prefix_value(&value).unwrap(),
-            Some("SAFE_".to_string())
-        );
-
-        let value = "[environment]\nprefix = \"\""
-            .parse::<toml::Value>()
-            .unwrap();
-        assert_eq!(
-            environment_variable_prefix_value(&value).unwrap(),
-            Some(String::new())
-        );
-    }
-
-    #[test]
-    fn environment_prefix_rejects_invalid_environment_names() {
-        let too_long = "A".repeat(MAX_ENVIRONMENT_PREFIX_BYTES + 1);
-        for prefix in ["9SAFE_", "SAFE-", "秘密_", &too_long] {
-            let value = format!("[environment]\nprefix = {prefix:?}")
-                .parse::<toml::Value>()
-                .unwrap();
-            assert!(environment_variable_prefix_value(&value).is_err());
-        }
-    }
-
-    #[test]
-    fn environment_prefix_prefers_project_then_global_then_default() {
-        assert_eq!(
-            effective_environment_variable_prefix(
-                Some("PROJECT_".to_string()),
-                Some("GLOBAL_".to_string())
-            ),
-            "PROJECT_"
-        );
-        assert_eq!(
-            effective_environment_variable_prefix(None, Some("GLOBAL_".to_string())),
-            "GLOBAL_"
-        );
-        assert_eq!(
-            effective_environment_variable_prefix(None, None),
-            "PENTECT_"
-        );
-        assert_eq!(
-            effective_environment_variable_prefix(Some(String::new()), Some("GLOBAL_".to_string())),
-            ""
-        );
-    }
-
-    #[test]
-    fn environment_prefix_reads_config_file() {
-        let root = std::env::temp_dir().join(format!(
-            "pentect-environment-prefix-config-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn removed_environment_config_has_a_clear_error() {
+        let root = temp_test_dir("removed-environment-config");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("config.toml");
         std::fs::write(&path, "[environment]\nprefix = \"SAFE_\"\n").unwrap();
-        assert_eq!(
-            read_environment_variable_prefix(path).unwrap(),
-            Some("SAFE_".to_string())
-        );
+        let error = reject_removed_environment_config(path).unwrap_err();
+        assert!(error.contains("always start with PENTECT_"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1272,30 +1181,25 @@ unknown_min_bytes = 32
     }
 
     #[test]
-    fn file_pointer_manager_save_config_accepts_table_and_bool() {
-        let value = "[file_pointer_manager]\nsave = false"
-            .parse::<toml::Value>()
-            .unwrap();
-        assert_eq!(
-            file_pointer_manager_save_value(&value).unwrap(),
-            Some(false)
-        );
+    fn files_remember_accepts_only_the_canonical_key() {
+        let value = "[files]\nremember = false".parse::<toml::Value>().unwrap();
+        assert_eq!(files_remember_value(&value).unwrap(), Some(false));
 
-        let value = "file_pointer_manager = \"on\""
+        let value = "[file_pointer_manager]\nsave = true"
             .parse::<toml::Value>()
             .unwrap();
-        assert_eq!(file_pointer_manager_save_value(&value).unwrap(), Some(true));
+        assert!(files_remember_value(&value).is_err());
     }
 
     #[test]
-    fn log_share_config_is_explicit_and_defaults_elsewhere() {
-        let value = "[log]\nshare = false".parse::<toml::Value>().unwrap();
-        assert_eq!(log_share_value(&value).unwrap(), Some(false));
+    fn activity_share_accepts_only_the_canonical_key() {
+        let value = "[activity]\nshare = false".parse::<toml::Value>().unwrap();
+        assert_eq!(activity_share_value(&value).unwrap(), Some(false));
 
-        let value = "[log]\nshare = \"on\"".parse::<toml::Value>().unwrap();
-        assert_eq!(log_share_value(&value).unwrap(), Some(true));
+        let value = "[activity]\nshare = \"on\"".parse::<toml::Value>().unwrap();
+        assert_eq!(activity_share_value(&value).unwrap(), Some(true));
 
-        let value = "log = true".parse::<toml::Value>().unwrap();
-        assert!(log_share_value(&value).is_err());
+        let value = "[log]\nshare = true".parse::<toml::Value>().unwrap();
+        assert!(activity_share_value(&value).is_err());
     }
 }
