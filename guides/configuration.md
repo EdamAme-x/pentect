@@ -4,7 +4,9 @@ Pentect needs no configuration for its default protection. Project settings
 live in `.pentect/config.toml`; global defaults live in
 `~/.pentect/config.toml`. Project values override global values.
 `agent.required` is the exception: a project cannot turn off a global
-requirement. The `plugins` list is project-only.
+requirement. `compatibility.unknown_formats = "ignore"` is also global-only,
+so a repository cannot silently weaken provider inspection. The `plugins` list
+is project-only.
 
 Start from [`templates/config.toml`](../templates/config.toml). The everyday
 settings are:
@@ -29,6 +31,7 @@ file so most users do not need to learn them.
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
+| `compatibility.unknown_formats` | `"error"` | Error on provider formats Pentect cannot safely inspect; `"ignore"` is a global-only escape hatch |
 | `image.max_edge` | `2048` | Largest OCR image edge in pixels |
 | `image.max_pixels` | `64000000` | Largest decoded image area |
 | `image.max_images` | `64` | Images inspected per request |

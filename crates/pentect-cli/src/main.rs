@@ -30,6 +30,9 @@ use zeroize::Zeroize;
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
+#[cfg(test)]
+pub(crate) static TEST_PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Refuse oversized input rather than emit partially-masked output (a masked
 /// head plus a raw tail would leak the tail).
 const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
@@ -150,6 +153,8 @@ fn usage() {
          pentect uninstall\n\
          pentect plugins add|remove|list|search|inspect|test|config|setup|update [NAME]\n\
          pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\
+         pentect mask [TEXT]\n\
+         pentect read PATH\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
          pentect log [--json]\n\
@@ -189,8 +194,12 @@ fn help_text() -> &'static str {
         "  pentect plugins setup NAME|PATH [--yes]\n",
         "  pentect plugins update [NAME|PATH] [--yes]\n",
         "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\n",
+        "  pentect mask [TEXT]\n",
+        "  pentect read PATH\n",
         "  pentect view '<HANDLE>'\n\n",
+        "  pentect resolve [PATH...]\n",
         "  pentect log [--json]\n\n",
+        "mask: mask text from arguments or stdin\n",
         "exec: masked stdout/stderr\n",
         "read: masked file preview\n",
         "view: handle\n",
@@ -805,17 +814,7 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     let routing = codex_effective_routing(opts)?;
     let mut args = opts.tool_args.clone();
     if opts.dry_run {
-        args.splice(
-            0..0,
-            [
-                "--config".to_string(),
-                format!(
-                    "{}={}",
-                    routing.config_key,
-                    toml_string("<pentect-gateway>")
-                ),
-            ],
-        );
+        args.extend(routing.gateway_args("<pentect-gateway>"));
         print_dry_run(&opts.command, &args);
         return Ok(success_status());
     }
@@ -823,18 +822,11 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
     let _parent_env = agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
-    let http_proxy = openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream)?;
-    args.splice(
-        0..0,
-        [
-            "--config".to_string(),
-            format!(
-                "{}={}",
-                routing.config_key,
-                toml_string(http_proxy.base_url())
-            ),
-        ],
-    );
+    let http_proxy = openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream.clone())?;
+    // These overrides are appended so a caller-supplied routing override
+    // cannot bypass the local gateway. Codex accepts global config flags after
+    // its subcommand and uses the last value for duplicate keys.
+    args.extend(routing.gateway_args(http_proxy.base_url()));
 
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
@@ -1845,7 +1837,46 @@ fn codex_home_dir() -> Result<PathBuf, String> {
 
 struct CodexHttpRouting {
     upstream: String,
-    config_key: String,
+    provider: String,
+}
+
+const CODEX_GATEWAY_PROVIDER: &str = "pentect-openai-gateway";
+
+impl CodexHttpRouting {
+    fn gateway_args(&self, gateway: &str) -> Vec<String> {
+        let entries = if self.provider == "openai" {
+            vec![
+                format!("model_provider={}", toml_string(CODEX_GATEWAY_PROVIDER)),
+                format!(
+                    "model_providers.{CODEX_GATEWAY_PROVIDER}.name={}",
+                    toml_string("OpenAI through Pentect")
+                ),
+                format!(
+                    "model_providers.{CODEX_GATEWAY_PROVIDER}.base_url={}",
+                    toml_string(gateway)
+                ),
+                format!(
+                    "model_providers.{CODEX_GATEWAY_PROVIDER}.wire_api={}",
+                    toml_string("responses")
+                ),
+                format!("model_providers.{CODEX_GATEWAY_PROVIDER}.requires_openai_auth=true"),
+                format!("model_providers.{CODEX_GATEWAY_PROVIDER}.supports_websockets=false"),
+            ]
+        } else {
+            let provider = codex_toml_key_segment(&self.provider);
+            vec![
+                format!(
+                    "model_providers.{provider}.base_url={}",
+                    toml_string(gateway)
+                ),
+                format!("model_providers.{provider}.supports_websockets=false"),
+            ]
+        };
+        entries
+            .into_iter()
+            .flat_map(|entry| ["--config".to_string(), entry])
+            .collect()
+    }
 }
 
 fn codex_effective_routing(opts: &AgentToolOpts) -> Result<CodexHttpRouting, String> {
@@ -1906,16 +1937,27 @@ fn codex_effective_routing(opts: &AgentToolOpts) -> Result<CodexHttpRouting, Str
                 "could not determine upstream for Codex provider '{provider}'; pass `pentect codex --upstream URL -- ...`"
             )
         })?;
-    Ok(CodexHttpRouting {
-        upstream,
-        config_key,
-    })
+    if provider != "openai" {
+        let wire_api = config
+            .get("model_providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get(&provider))
+            .and_then(toml::Value::as_table)
+            .and_then(|provider| provider.get("wire_api"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("responses");
+        if wire_api != "responses" {
+            return Err(format!(
+                "Codex provider '{provider}' uses unsupported wire_api '{wire_api}'; Pentect supports Responses-compatible providers"
+            ));
+        }
+    }
+    Ok(CodexHttpRouting { upstream, provider })
 }
 
 pub(crate) struct CodexAppRouting {
     upstream: String,
     provider: String,
-    requires_config_override: bool,
 }
 
 /// Resolve the App's selected provider without changing user configuration.
@@ -1954,7 +1996,6 @@ pub(crate) fn codex_app_routing(explicit: Option<String>) -> Result<CodexAppRout
             .and_then(toml::Value::as_str)
             .map(str::to_owned)
     };
-    let requires_config_override = provider != "openai" || configured_upstream.is_some();
     let upstream = explicit
         .or(configured_upstream)
         .or_else(|| (provider == "openai").then(|| nonempty_env("OPENAI_BASE_URL")).flatten())
@@ -1970,11 +2011,7 @@ pub(crate) fn codex_app_routing(explicit: Option<String>) -> Result<CodexAppRout
                 "could not determine upstream for Codex App provider '{provider}'; pass --upstream URL"
             )
         })?;
-    Ok(CodexAppRouting {
-        upstream,
-        provider,
-        requires_config_override,
-    })
+    Ok(CodexAppRouting { upstream, provider })
 }
 
 fn load_codex_user_config(args: &[String]) -> Result<toml::Value, String> {
@@ -2376,11 +2413,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn help_lists_only_active_agent_integrations() {
+    fn help_lists_public_commands_and_only_active_agent_integrations() {
         let help = help_text();
         assert!(help.contains("pentect codex|claude"));
         assert!(help.contains("pentect codex app"));
         assert!(help.contains("pentect claude app"));
+        assert!(help.contains("pentect mask [TEXT]"));
+        assert!(help.contains("pentect read PATH"));
+        assert!(help.contains("pentect resolve [PATH...]"));
         assert!(!help.contains("opencode"));
         assert!(!help.contains("pentect shell"));
         assert!(!help.contains("\n  pentect up\n"));

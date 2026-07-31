@@ -101,6 +101,7 @@ struct ProxyState {
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     files: Mutex<HashMap<String, crate::http_files::Coverage>>,
     requests: Arc<Semaphore>,
+    block_unknown_formats: bool,
 }
 
 impl Drop for ProxyState {
@@ -133,6 +134,7 @@ async fn run_proxy(
         plugins: Arc::new(Mutex::new(plugins)),
         files: Mutex::new(HashMap::new()),
         requests: Arc::new(Semaphore::new(32)),
+        block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
     });
     let _ = ready_tx.send(Ok(local_base_url));
 
@@ -154,7 +156,9 @@ async fn run_proxy(
                         .serve_connection(io, service)
                         .await
                     {
-                        eprintln!("[pentect] OpenAI HTTP gateway connection failed: {error}");
+                        if !error.is_incomplete_message() {
+                            eprintln!("[pentect] OpenAI HTTP gateway connection failed: {error}");
+                        }
                     }
                 });
             }
@@ -202,7 +206,8 @@ async fn proxy_request(
                 || error.starts_with("OpenAI file ")
                 || error.starts_with("file upload blocked:")
                 || error.starts_with("Files API upload ")
-                || error.starts_with("plugin blocked:");
+                || error.starts_with("plugin blocked:")
+                || error.starts_with("unknown format blocked:");
             Ok(if local_rejection {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
@@ -224,12 +229,13 @@ async fn proxy_request_inner(
     let Some(path_and_query) = authenticated_request_path(request_path, &state.auth) else {
         return Ok(text_response(StatusCode::FORBIDDEN, "Forbidden"));
     };
-    let responses_path = is_responses_path(path_and_query);
     let method = request.method().clone();
+    let responses_path = method == hyper::Method::POST && is_responses_path(path_and_query);
     let files_upload = method == hyper::Method::POST && is_files_collection_path(path_and_query);
     let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
     let headers = request.headers().clone();
     let mut request_coverage = None;
+    let mut request_streaming = false;
     let body = if responses_path || files_upload {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
@@ -273,6 +279,10 @@ async fn proxy_request_inner(
             request_coverage = Some(protected.coverage);
             reqwest::Body::from(protected.body)
         } else {
+            request_streaming = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|value| value.get("stream").and_then(Value::as_bool))
+                .unwrap_or(false);
             let original = resolve_openai_file_references(body, state, &headers).await?;
             let original = resolve_openai_remote_files(original).await?;
             let masker = Arc::clone(&state.masker);
@@ -282,8 +292,15 @@ async fn proxy_request_inner(
                 .lock()
                 .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
                 .clone();
+            let block_unknown_formats = state.block_unknown_formats;
             let protected = tokio::task::spawn_blocking(move || {
-                protect_openai_request_body(&original, &masker, &plugins, &files)
+                protect_openai_request_body(
+                    &original,
+                    &masker,
+                    &plugins,
+                    &files,
+                    block_unknown_formats,
+                )
             })
             .await
             .map_err(|_| "OpenAI request protection task failed".to_string())??;
@@ -324,11 +341,21 @@ async fn proxy_request_inner(
     {
         return Err("OpenAI upstream returned an unsupported content encoding".to_string());
     }
-    let is_event_stream = response_headers
+    let response_media_type = response_headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+        .map(str::trim);
+    // Some Responses-compatible upstreams omit Content-Type. The request's
+    // explicit stream flag is authoritative in that case.
+    let is_event_stream = response_media_type
+        .is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream"))
+        || (responses_path && request_streaming && response_media_type.is_none());
+    let is_json_response =
+        response_media_type.is_some_and(|value| {
+            value.eq_ignore_ascii_case("application/json")
+                || value.to_ascii_lowercase().ends_with("+json")
+        }) || (responses_path && !request_streaming && response_media_type.is_none());
     let mut builder = Response::builder().status(status);
     let connection_headers = connection_named_headers(&response_headers);
     for (name, value) in &response_headers {
@@ -374,7 +401,7 @@ async fn proxy_request_inner(
             }
         }
     }
-    let response_body = if responses_path && status.is_success() {
+    let response_body = if responses_path && status.is_success() && is_json_response {
         let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
         match rewrite_openai_json_response(&response_body) {
             Ok(rewritten) => Bytes::from(rewritten),
@@ -439,7 +466,10 @@ fn run_openai_tool_plugins(
                 .is_some_and(|kind| {
                     matches!(
                         kind,
-                        "function_call" | "response.function_call_arguments.done"
+                        "function_call"
+                            | "custom_tool_call"
+                            | "response.function_call_arguments.done"
+                            | "response.custom_tool_call_input.done"
                     )
                 })
                 && ["arguments", "input"]
@@ -484,10 +514,16 @@ fn protect_openai_request_body(
     masker: &Mutex<pentect_agent::ActiveToolOutputMasker>,
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     files: &HashMap<String, crate::http_files::Coverage>,
+    block_unknown_formats: bool,
 ) -> Result<ProtectedJsonBody, String> {
     let mut value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
+            if block_unknown_formats {
+                return Err(format!(
+                    "unknown format blocked: OpenAI request is not valid JSON ({error}); set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
+                ));
+            }
             eprintln!("[pentect] OpenAI request protection skipped: invalid JSON: {error}");
             return Ok(ProtectedJsonBody {
                 body: body.clone(),
@@ -521,8 +557,16 @@ fn protect_openai_request_body(
             })
             .map_err(|error| format!("could not encode plugin response: {error}"));
     }
-    let partial_schema = openai_request_has_unknown_content(&value);
-    inject_handle_contract(&mut value);
+    let unknown_content_kind = openai_request_unknown_content_kind(&value);
+    let partial_schema = unknown_content_kind.is_some();
+    if block_unknown_formats && (partial_schema || plugin_partial) {
+        let detail = unknown_content_kind
+            .map(|kind| format!("unsupported content type `{kind}`"))
+            .unwrap_or_else(|| "plugin reported partial coverage".to_string());
+        return Err(format!(
+            "unknown format blocked: OpenAI request contains {detail}; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
+        ));
+    }
     let mut masker = masker
         .lock()
         .map_err(|_| "OpenAI request masker lock was poisoned".to_string())?;
@@ -536,6 +580,9 @@ fn protect_openai_request_body(
             coverage: crate::http_files::Coverage::Partial,
             local_response: None,
         });
+    }
+    if crate::claude_http_proxy::value_contains_handle(&value) {
+        inject_handle_contract(&mut value);
     }
     serde_json::to_vec(&value)
         .map(|body| ProtectedJsonBody {
@@ -768,46 +815,61 @@ fn resolve_openai_remote_file_values(
     })
 }
 
-fn openai_request_has_unknown_content(value: &Value) -> bool {
-    fn visit(value: &Value) -> bool {
+fn openai_request_unknown_content_kind(value: &Value) -> Option<&str> {
+    fn visit(value: &Value) -> Option<&str> {
         match value {
-            Value::Array(items) => items.iter().any(visit),
+            Value::Array(items) => items.iter().find_map(visit),
             Value::Object(object) => {
                 if let Some(kind) = object.get("type").and_then(Value::as_str) {
                     if !matches!(
                         kind,
                         "message"
+                            | "additional_tools"
+                            | "agent_message"
                             | "input_text"
                             | "output_text"
                             | "input_image"
                             | "input_file"
+                            | "encrypted_content"
+                            | "summary_text"
+                            | "reasoning_text"
+                            | "text"
+                            | "local_shell_call"
                             | "function_call"
                             | "function_call_output"
                             | "custom_tool_call"
                             | "custom_tool_call_output"
+                            | "tool_search_call"
+                            | "tool_search_output"
+                            | "web_search_call"
+                            | "image_generation_call"
                             | "computer_call"
                             | "computer_call_output"
                             | "reasoning"
+                            | "compaction"
+                            | "compaction_summary"
+                            | "compaction_trigger"
+                            | "context_compaction"
                     ) {
-                        return true;
+                        return Some(kind);
                     }
                 }
                 ["content", "input", "output"]
                     .into_iter()
                     .filter_map(|key| object.get(key))
-                    .any(visit)
+                    .find_map(visit)
             }
-            _ => false,
+            _ => None,
         }
     }
-    value.get("input").is_some_and(visit)
+    value.get("input").and_then(visit)
 }
 
 fn inject_handle_contract(value: &mut Value) {
     match value.get_mut("instructions") {
         Some(Value::String(instructions)) if !instructions.contains(HANDLE_CONTRACT) => {
             let existing = std::mem::take(instructions);
-            *instructions = format!("{HANDLE_CONTRACT}\n\n{existing}");
+            *instructions = format!("{existing}\n\n{HANDLE_CONTRACT}");
         }
         Some(Value::Null) | None => {
             value["instructions"] = Value::String(HANDLE_CONTRACT.to_string());
@@ -821,16 +883,8 @@ fn mask_openai_request(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
-    if let Some(Value::String(instructions)) = value.get_mut("instructions") {
-        mask_text(instructions, false, masker)?;
-    }
     if let Some(input) = value.get_mut("input") {
         mask_openai_input(input, false, masker, files)?;
-    }
-    if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
-        for tool in tools {
-            mask_schema_annotations(tool, masker)?;
-        }
     }
     Ok(())
 }
@@ -973,56 +1027,6 @@ fn unscanned_image_policy() -> Result<(), String> {
     }
 }
 
-fn mask_schema_annotations(
-    value: &mut Value,
-    masker: &mut pentect_agent::ActiveToolOutputMasker,
-) -> Result<(), String> {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                mask_schema_annotations(value, masker)?;
-            }
-        }
-        Value::Object(object) => {
-            for (key, value) in object {
-                if matches!(
-                    key.as_str(),
-                    "description" | "title" | "default" | "const" | "examples" | "enum"
-                ) {
-                    mask_all_strings(value, false, masker)?;
-                } else {
-                    mask_schema_annotations(value, masker)?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn mask_all_strings(
-    value: &mut Value,
-    tool_result: bool,
-    masker: &mut pentect_agent::ActiveToolOutputMasker,
-) -> Result<(), String> {
-    match value {
-        Value::String(text) => mask_text(text, tool_result, masker),
-        Value::Array(values) => {
-            for value in values {
-                mask_all_strings(value, tool_result, masker)?;
-            }
-            Ok(())
-        }
-        Value::Object(object) => {
-            for value in object.values_mut() {
-                mask_all_strings(value, tool_result, masker)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
 fn mask_text(
     text: &mut String,
     tool_result: bool,
@@ -1058,11 +1062,22 @@ where
                     matches!(
                         kind,
                         "function_call"
+                            | "custom_tool_call"
                             | "response.function_call_arguments.done"
                             | "response.custom_tool_call_input.done"
                     )
                 });
             if is_function_call {
+                let is_custom_call =
+                    object
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| {
+                            matches!(
+                                kind,
+                                "custom_tool_call" | "response.custom_tool_call_input.done"
+                            )
+                        });
                 let tool_name = object
                     .get("name")
                     .and_then(Value::as_str)
@@ -1076,11 +1091,18 @@ where
                     });
                 for key in ["arguments", "input"] {
                     if let Some(Value::String(arguments)) = object.get_mut(key) {
-                        *arguments = crate::claude_http_proxy::resolve_tool_input_json(
-                            arguments,
-                            tool_name.as_deref(),
-                            resolve,
-                        )?;
+                        *arguments = if is_custom_call && key == "input" {
+                            // Custom tools carry completed free-form input rather than
+                            // JSON arguments. Resolve only shell-safe token values so a
+                            // represented value cannot inject syntax into the tool call.
+                            crate::claude_http_proxy::resolve_shell_text_safely(arguments, resolve)?
+                        } else {
+                            crate::claude_http_proxy::resolve_tool_input_json(
+                                arguments,
+                                tool_name.as_deref(),
+                                resolve,
+                            )?
+                        };
                     }
                 }
             }
@@ -1263,6 +1285,7 @@ fn contains_completed_function_call(value: &Value) -> bool {
                         matches!(
                             kind,
                             "function_call"
+                                | "custom_tool_call"
                                 | "response.function_call_arguments.done"
                                 | "response.custom_tool_call_input.done"
                         )
@@ -1502,6 +1525,106 @@ mod tests {
             value["output"][0]["arguments"],
             r#"{"command":"echo safe-secret-token"}"#
         );
+    }
+
+    #[test]
+    fn completed_custom_tool_input_is_restored_but_text_is_not() {
+        let mut value = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "custom_tool_call",
+                "name": "exec_command",
+                "input": "python hash.py <<SECRET_0123456789abcdef>>"
+            },
+            "visible_text": "keep <<SECRET_0123456789abcdef>>"
+        });
+        assert!(contains_completed_function_call(&value));
+        let mut resolve =
+            |text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "safe-secret-token"));
+        rewrite_function_calls(&mut value, &mut resolve).unwrap();
+        assert_eq!(value["item"]["input"], "python hash.py safe-secret-token");
+        assert_eq!(value["visible_text"], "keep <<SECRET_0123456789abcdef>>");
+    }
+
+    #[test]
+    fn unknown_openai_content_blocks_by_default_and_can_be_allowed() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let body = Bytes::from_static(br#"{"input":[{"type":"future_block","data":"opaque"}]}"#);
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let files = HashMap::new();
+        let error = match protect_openai_request_body(&body, &masker, &plugins, &files, true) {
+            Ok(_) => panic!("unknown OpenAI block should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("unknown format blocked:"), "{error}");
+        assert!(error.contains("future_block"), "{error}");
+
+        let allowed = protect_openai_request_body(&body, &masker, &plugins, &files, false).unwrap();
+        assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&allowed.body).unwrap(),
+            serde_json::from_slice::<Value>(&body).unwrap()
+        );
+    }
+
+    #[test]
+    fn current_codex_response_items_are_known() {
+        let value = serde_json::json!({
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{"type": "function", "name": "lookup"}]
+                },
+                {
+                    "type": "agent_message",
+                    "author": "agent",
+                    "recipient": "user",
+                    "content": [
+                        {"type": "input_text", "text": "done"},
+                        {"type": "encrypted_content", "encrypted_content": "opaque"}
+                    ]
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "summary"}],
+                    "content": [
+                        {"type": "reasoning_text", "text": "reasoning"},
+                        {"type": "text", "text": "legacy"}
+                    ]
+                },
+                {"type": "local_shell_call", "status": "completed", "action": {}},
+                {"type": "tool_search_call", "execution": "server", "arguments": {}},
+                {"type": "tool_search_output", "status": "completed", "execution": "server", "tools": []},
+                {"type": "web_search_call", "status": "completed"},
+                {"type": "image_generation_call", "status": "completed", "result": "opaque"},
+                {"type": "compaction", "encrypted_content": "opaque"},
+                {"type": "compaction_summary", "encrypted_content": "opaque"},
+                {"type": "compaction_trigger"},
+                {"type": "context_compaction", "encrypted_content": "opaque"}
+            ]
+        });
+        assert_eq!(openai_request_unknown_content_kind(&value), None);
+
+        let future = serde_json::json!({"input": [{"type": "future_block"}]});
+        assert_eq!(
+            openai_request_unknown_content_kind(&future),
+            Some("future_block")
+        );
+    }
+
+    #[test]
+    fn malformed_openai_json_obeys_unknown_format_policy() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let body = Bytes::from_static(b"{not-json");
+        let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let files = HashMap::new();
+        assert!(protect_openai_request_body(&body, &masker, &plugins, &files, true).is_err());
+        let allowed = protect_openai_request_body(&body, &masker, &plugins, &files, false).unwrap();
+        assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
+        assert_eq!(allowed.body, body);
     }
 
     #[test]

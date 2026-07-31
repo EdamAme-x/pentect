@@ -47,7 +47,8 @@ fn codex_dry_run_routes_through_the_http_gateway() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(rendered.contains("openai_base_url="), "{rendered}");
+    assert!(rendered.contains("pentect-openai-gateway"), "{rendered}");
+    assert!(rendered.contains("supports_websockets=false"), "{rendered}");
     assert!(rendered.contains("<pentect-gateway>"), "{rendered}");
     assert!(!rendered.contains("PENTECT_KEY_hash"), "{rendered}");
 }

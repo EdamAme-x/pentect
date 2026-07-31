@@ -129,6 +129,10 @@ pub fn load_environment_variable_prefix() -> Result<String, String> {
     config::environment_variable_prefix()
 }
 
+pub fn unknown_formats_should_block() -> Result<bool, String> {
+    config::unknown_formats_should_block()
+}
+
 pub fn mask_input_into_active_memory_store(
     input: Input,
     profile: Profile,
