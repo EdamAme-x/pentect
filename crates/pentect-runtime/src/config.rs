@@ -317,6 +317,12 @@ pub(crate) enum UnscannedImagePolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnknownFormatPolicy {
+    Ignore,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImageRedactionStyle {
     Black,
     Blur,
@@ -412,6 +418,26 @@ pub(crate) fn activity_share_enabled() -> Result<bool, String> {
     let project = read_activity_share(project_config_path())?;
     let global = read_activity_share(global_config_path()?)?;
     Ok(project.or(global).unwrap_or(true))
+}
+
+pub(crate) fn unknown_formats_should_block() -> Result<bool, String> {
+    let project = read_unknown_format_policy(project_config_path())?;
+    let global = read_unknown_format_policy(global_config_path()?)?;
+    unknown_formats_should_block_effective(project, global)
+}
+
+fn unknown_formats_should_block_effective(
+    project: Option<UnknownFormatPolicy>,
+    global: Option<UnknownFormatPolicy>,
+) -> Result<bool, String> {
+    if project == Some(UnknownFormatPolicy::Ignore) {
+        return Err(
+            "compatibility.unknown_formats = \"ignore\" may only be set in the user config at ~/.pentect/config.toml"
+                .to_string(),
+        );
+    }
+    Ok(project == Some(UnknownFormatPolicy::Error)
+        || global.unwrap_or(UnknownFormatPolicy::Error) == UnknownFormatPolicy::Error)
 }
 
 fn require_pentect_agent_effective(project: Option<bool>, global: Option<bool>) -> bool {
@@ -593,6 +619,30 @@ fn files_remember_value(value: &toml::Value) -> Result<Option<bool>, String> {
 
 fn read_activity_share(path: PathBuf) -> Result<Option<bool>, String> {
     parse_config_file(&path)?.map_or(Ok(None), |value| activity_share_value(&value))
+}
+
+fn read_unknown_format_policy(path: PathBuf) -> Result<Option<UnknownFormatPolicy>, String> {
+    parse_config_file(&path)?.map_or(Ok(None), |value| unknown_format_policy_value(&value))
+}
+
+fn unknown_format_policy_value(value: &toml::Value) -> Result<Option<UnknownFormatPolicy>, String> {
+    let Some(raw) = value.get("compatibility") else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("compatibility config must be a table".to_string());
+    };
+    let Some(raw) = table.get("unknown_formats") else {
+        return Ok(None);
+    };
+    let Some(raw) = raw.as_str() else {
+        return Err("compatibility.unknown_formats must be error or ignore".to_string());
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ignore" => Ok(Some(UnknownFormatPolicy::Ignore)),
+        "error" => Ok(Some(UnknownFormatPolicy::Error)),
+        _ => Err("compatibility.unknown_formats must be error or ignore".to_string()),
+    }
 }
 
 fn activity_share_value(value: &toml::Value) -> Result<Option<bool>, String> {
@@ -966,6 +1016,36 @@ mod tests {
         assert!(!require_pentect_agent_effective(Some(false), None));
         assert!(!require_pentect_agent_effective(None, Some(false)));
         assert!(!require_pentect_agent_effective(None, None));
+    }
+
+    #[test]
+    fn unknown_formats_block_by_default_and_only_global_config_can_relax() {
+        assert!(unknown_formats_should_block_effective(None, None).unwrap());
+        assert!(
+            !unknown_formats_should_block_effective(None, Some(UnknownFormatPolicy::Ignore))
+                .unwrap()
+        );
+        assert!(unknown_formats_should_block_effective(
+            Some(UnknownFormatPolicy::Error),
+            Some(UnknownFormatPolicy::Ignore)
+        )
+        .unwrap());
+        assert!(
+            unknown_formats_should_block_effective(Some(UnknownFormatPolicy::Ignore), None)
+                .is_err()
+        );
+
+        let ignore = "[compatibility]\nunknown_formats = \"ignore\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(
+            unknown_format_policy_value(&ignore).unwrap(),
+            Some(UnknownFormatPolicy::Ignore)
+        );
+        let invalid = "[compatibility]\nunknown_formats = \"allow\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert!(unknown_format_policy_value(&invalid).is_err());
     }
 
     #[test]

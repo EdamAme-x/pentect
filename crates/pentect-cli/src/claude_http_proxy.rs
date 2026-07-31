@@ -48,6 +48,7 @@ enum AnthropicEndpoint {
     Messages,
     Files,
     Models,
+    Health,
     Unknown,
 }
 
@@ -119,6 +120,7 @@ struct ProxyState {
     plugins: Arc<StdMutex<pentect_agent::PluginMiddleware>>,
     files: StdMutex<HashMap<String, crate::http_files::Coverage>>,
     requests: Arc<Semaphore>,
+    block_unknown_formats: bool,
 }
 
 impl Drop for ProxyState {
@@ -152,6 +154,7 @@ async fn run_proxy(
         plugins: Arc::new(StdMutex::new(plugins)),
         files: StdMutex::new(HashMap::new()),
         requests: Arc::new(Semaphore::new(32)),
+        block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
     });
     // Keep authentication in the base URL path. Claude settings can replace
     // ANTHROPIC_CUSTOM_HEADERS after process start, so a header token is not
@@ -172,7 +175,9 @@ async fn run_proxy(
                     let mut builder = http1::Builder::new();
                     builder.max_buf_size(64 * 1024).max_headers(128);
                     if let Err(error) = builder.serve_connection(io, service).await {
-                        eprintln!("[pentect] Claude HTTP proxy connection failed: {error}");
+                        if !error.is_incomplete_message() {
+                            eprintln!("[pentect] Claude HTTP proxy connection failed: {error}");
+                        }
                     }
                 });
             }
@@ -219,7 +224,8 @@ async fn proxy_request(
                 || error.starts_with("remote ")
                 || error.starts_with("file upload blocked:")
                 || error.starts_with("Files API upload ")
-                || error.starts_with("plugin blocked:");
+                || error.starts_with("plugin blocked:")
+                || error.starts_with("unknown format blocked:");
             Ok(if local_rejection {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
@@ -312,8 +318,15 @@ async fn proxy_request_inner(
                 .lock()
                 .map_err(|_| "Claude file registry lock was poisoned".to_string())?
                 .clone();
+            let block_unknown_formats = state.block_unknown_formats;
             let protected = tokio::task::spawn_blocking(move || {
-                protect_anthropic_request_body(&body, &masker, &plugins, &files)
+                protect_anthropic_request_body(
+                    &body,
+                    &masker,
+                    &plugins,
+                    &files,
+                    block_unknown_formats,
+                )
             })
             .await
             .map_err(|_| "Claude request protection task failed".to_string())??;
@@ -580,10 +593,16 @@ fn protect_anthropic_request_body(
     masker: &StdMutex<pentect_agent::ActiveToolOutputMasker>,
     plugins: &StdMutex<pentect_agent::PluginMiddleware>,
     files: &HashMap<String, crate::http_files::Coverage>,
+    block_unknown_formats: bool,
 ) -> Result<ProtectedJsonBody, String> {
     let mut value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
+            if block_unknown_formats {
+                return Err(format!(
+                    "unknown format blocked: Anthropic request is not valid JSON ({error}); set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
+                ));
+            }
             eprintln!("[pentect] Claude request protection skipped: invalid JSON: {error}");
             return Ok(ProtectedJsonBody {
                 body: body.clone(),
@@ -617,11 +636,19 @@ fn protect_anthropic_request_body(
             })
             .map_err(|error| format!("could not encode plugin response: {error}"));
     }
-    let partial_schema = anthropic_request_has_unknown_content(&value);
+    let unknown_content_kind = anthropic_request_unknown_content_kind(&value);
+    let partial_schema = unknown_content_kind.is_some();
+    if block_unknown_formats && (partial_schema || plugin_partial) {
+        let detail = unknown_content_kind
+            .map(|kind| format!("unsupported content type `{kind}`"))
+            .unwrap_or_else(|| "plugin reported partial coverage".to_string());
+        return Err(format!(
+            "unknown format blocked: Anthropic request contains {detail}; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
+        ));
+    }
     warn_provider_mcp_credentials(&value);
-    inject_handle_contract(&mut value);
     // Image handling deliberately follows the existing image policy. With
-    // With the default image.unscanned="block", an uninspectable image is an
+    // the default image.unscanned="block", an uninspectable image is an
     // error; users can explicitly choose allow in configuration.
     redact_anthropic_base64_images(&mut value, files)?;
     let mut masker = masker
@@ -641,6 +668,7 @@ fn protect_anthropic_request_body(
             local_response: None,
         });
     }
+    inject_handle_contract_if_needed(&mut value);
     match serde_json::to_vec(&value) {
         Ok(protected) => Ok(ProtectedJsonBody {
             body: Bytes::from(protected),
@@ -662,7 +690,7 @@ fn protect_anthropic_request_body(
     }
 }
 
-fn anthropic_request_has_unknown_content(value: &Value) -> bool {
+fn anthropic_request_unknown_content_kind(value: &Value) -> Option<&str> {
     let mut roots = Vec::new();
     if let Some(system) = value.get("system") {
         roots.push(system);
@@ -670,16 +698,16 @@ fn anthropic_request_has_unknown_content(value: &Value) -> bool {
     if let Some(messages) = value.get("messages").and_then(Value::as_array) {
         roots.extend(messages.iter().filter_map(|message| message.get("content")));
     }
-    roots.into_iter().any(anthropic_content_has_unknown_block)
+    roots
+        .into_iter()
+        .find_map(anthropic_content_unknown_block_kind)
 }
 
-fn anthropic_content_has_unknown_block(value: &Value) -> bool {
-    let Some(blocks) = value.as_array() else {
-        return false;
-    };
-    blocks.iter().any(|block| {
+fn anthropic_content_unknown_block_kind(value: &Value) -> Option<&str> {
+    let blocks = value.as_array()?;
+    blocks.iter().find_map(|block| {
         let Some(kind) = block.get("type").and_then(Value::as_str) else {
-            return true;
+            return Some("<missing>");
         };
         let known = matches!(
             kind,
@@ -694,17 +722,24 @@ fn anthropic_content_has_unknown_block(value: &Value) -> bool {
                 | "server_tool_use"
                 | "mcp_tool_use"
                 | "mcp_tool_result"
+                | "tool_search_tool_result"
                 | "web_search_tool_result"
                 | "web_fetch_tool_result"
                 | "code_execution_tool_result"
                 | "bash_code_execution_tool_result"
                 | "text_editor_code_execution_tool_result"
+                | "connector_text"
+                | "fallback"
         );
-        !known
-            || (kind == "tool_result"
-                && block
-                    .get("content")
-                    .is_some_and(anthropic_content_has_unknown_block))
+        if !known {
+            return Some(kind);
+        }
+        if kind == "tool_result" {
+            return block
+                .get("content")
+                .and_then(anthropic_content_unknown_block_kind);
+        }
+        None
     })
 }
 
@@ -744,14 +779,14 @@ fn inject_handle_contract(value: &mut Value) {
                     && block.get("text").and_then(Value::as_str) == Some(HANDLE_CONTRACT)
             });
             if !already_present {
-                blocks.insert(0, contract);
+                blocks.push(contract);
             }
         }
         Some(Value::String(system)) => {
             let existing = std::mem::take(system);
             value["system"] = Value::Array(vec![
-                contract,
                 serde_json::json!({"type": "text", "text": existing}),
+                contract,
             ]);
         }
         Some(Value::Null) | None => {
@@ -761,6 +796,37 @@ fn inject_handle_contract(value: &mut Value) {
         // an otherwise valid request unusable.
         Some(_) => {}
     }
+}
+
+fn inject_handle_contract_if_needed(value: &mut Value) {
+    if value_contains_handle(value) {
+        inject_handle_contract(value);
+    }
+}
+
+pub(crate) fn value_contains_handle(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text_contains_handle(text),
+        Value::Array(values) => values.iter().any(value_contains_handle),
+        Value::Object(object) => object.values().any(value_contains_handle),
+        _ => false,
+    }
+}
+
+fn text_contains_handle(text: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(start_rel) = text[offset..].find("<<") {
+        let start = offset + start_rel;
+        let Some(end_rel) = text[start + 2..].find(">>") else {
+            return false;
+        };
+        let end = start + 2 + end_rel + 2;
+        if pentect_core::parse_placeholder(&text[start..end]).is_ok() {
+            return true;
+        }
+        offset = end;
+    }
+    false
 }
 
 type UpstreamByteStream =
@@ -1086,19 +1152,11 @@ fn mask_anthropic_request(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
-    if let Some(system) = value.get_mut("system") {
-        mask_content(system, false, masker, files)?;
-    }
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
             if let Some(content) = message.get_mut("content") {
                 mask_content(content, false, masker, files)?;
             }
-        }
-    }
-    if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
-        for tool in tools {
-            mask_tool_definition(tool, masker)?;
         }
     }
     Ok(())
@@ -1209,54 +1267,6 @@ pub(crate) fn redact_inline_image_data(encoded: &str) -> Result<Option<String>, 
     Ok(Some(protected))
 }
 
-fn mask_tool_definition(
-    tool: &mut Value,
-    masker: &mut pentect_agent::ActiveToolOutputMasker,
-) -> Result<(), String> {
-    let Some(tool) = tool.as_object_mut() else {
-        return Ok(());
-    };
-    if let Some(description) = tool.get("description").and_then(Value::as_str) {
-        let mut protected = description.to_string();
-        mask_string(&mut protected, false, masker)?;
-        tool.insert("description".to_string(), Value::String(protected));
-    }
-    if let Some(examples) = tool.get_mut("input_examples") {
-        mask_value_strings(examples, masker)?;
-    }
-    if let Some(schema) = tool.get_mut("input_schema") {
-        mask_json_schema_annotations(schema, masker)?;
-    }
-    Ok(())
-}
-
-fn mask_json_schema_annotations(
-    schema: &mut Value,
-    masker: &mut pentect_agent::ActiveToolOutputMasker,
-) -> Result<(), String> {
-    match schema {
-        Value::Array(values) => {
-            for value in values {
-                mask_json_schema_annotations(value, masker)?;
-            }
-        }
-        Value::Object(object) => {
-            for (key, value) in object {
-                if matches!(
-                    key.as_str(),
-                    "description" | "title" | "default" | "const" | "examples" | "enum"
-                ) {
-                    mask_value_strings(value, masker)?;
-                } else {
-                    mask_json_schema_annotations(value, masker)?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 fn mask_content(
     value: &mut Value,
     tool_result: bool,
@@ -1312,11 +1322,14 @@ fn mask_content(
                     | "server_tool_use"
                     | "mcp_tool_use"
                     | "mcp_tool_result"
+                    | "tool_search_tool_result"
                     | "web_search_tool_result"
                     | "web_fetch_tool_result"
                     | "code_execution_tool_result"
                     | "bash_code_execution_tool_result"
-                    | "text_editor_code_execution_tool_result" => {}
+                    | "text_editor_code_execution_tool_result"
+                    | "connector_text"
+                    | "fallback" => {}
                     _ => {
                         if !WARNED_UNKNOWN_CONTENT_BLOCK.swap(true, Ordering::Relaxed) {
                             eprintln!(
@@ -1776,7 +1789,7 @@ fn is_free_form_shell_tool(name: Option<&str>) -> bool {
     })
 }
 
-fn resolve_shell_text_safely<R>(text: &str, resolve: &mut R) -> Result<String, String>
+pub(crate) fn resolve_shell_text_safely<R>(text: &str, resolve: &mut R) -> Result<String, String>
 where
     R: FnMut(&str) -> Result<String, String>,
 {
@@ -1930,6 +1943,8 @@ fn classify_anthropic_endpoint(path_and_query: &str) -> AnthropicEndpoint {
         AnthropicEndpoint::Files
     } else if path.ends_with("/v1/models") || path.contains("/v1/models/") {
         AnthropicEndpoint::Models
+    } else if path == "/api/hello" {
+        AnthropicEndpoint::Health
     } else {
         AnthropicEndpoint::Unknown
     }
@@ -2041,6 +2056,281 @@ fn random_auth_token() -> Result<String, String> {
 mod tests {
     use super::*;
 
+    struct TestEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        home: std::path::PathBuf,
+        process_host_candidate: Option<std::path::PathBuf>,
+    }
+
+    impl TestEnv {
+        fn install(store: &pentect_agent::InProcessMemoryStore) -> Self {
+            let names = [
+                "PENTECT_MEMORY_STORE_ADDR",
+                "PENTECT_MEMORY_STORE_TOKEN",
+                "PENTECT_AGENT_LAUNCHED",
+                "PENTECT_HOME",
+                "LOCALAPPDATA",
+            ];
+            let saved = names
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let home = std::env::temp_dir().join(format!(
+                "pentect-cli-http-e2e-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            std::env::set_var("PENTECT_MEMORY_STORE_ADDR", store.addr());
+            std::env::set_var("PENTECT_MEMORY_STORE_TOKEN", store.token());
+            std::env::set_var("PENTECT_AGENT_LAUNCHED", store.token());
+            std::env::set_var("PENTECT_HOME", &home);
+            std::env::set_var("LOCALAPPDATA", &home);
+            let process_host_candidate = Some(
+                pentect_agent::register_process_host_candidate(
+                    &pentect_agent::process_host_root().unwrap(),
+                    store.addr(),
+                    store.token(),
+                    store.process_host_read_token(),
+                    store.process_host_write_token(),
+                    std::process::id(),
+                )
+                .unwrap(),
+            );
+            Self {
+                saved,
+                home,
+                process_host_candidate,
+            }
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            if let Some(path) = self.process_host_candidate.take() {
+                pentect_agent::unregister_process_host_candidate(&path);
+            }
+            for (name, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockProvider {
+        Anthropic,
+        OpenAi,
+    }
+
+    fn first_valid_handle(text: &str) -> Option<&str> {
+        let mut offset = 0usize;
+        while let Some(start_rel) = text[offset..].find("<<") {
+            let start = offset + start_rel;
+            let end = start + 2 + text[start + 2..].find(">>")? + 2;
+            let candidate = &text[start..end];
+            if pentect_core::parse_placeholder(candidate).is_ok() {
+                return Some(candidate);
+            }
+            offset = end;
+        }
+        None
+    }
+
+    fn mock_upstream(
+        provider: MockProvider,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 8192];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "client closed before sending HTTP headers");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(at) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("proxy request must carry Content-Length");
+            while request.len() - header_end < content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "client closed before sending HTTP body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = String::from_utf8(request[header_end..header_end + content_length].to_vec())
+                .unwrap();
+            let handle = first_valid_handle(&body)
+                .expect("provider should receive a valid Pentect handle")
+                .to_string();
+            body_tx.send(body).unwrap();
+
+            let (response, content_type) = match provider {
+                MockProvider::Anthropic => (
+                    serde_json::to_vec(&serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "tool_test",
+                            "name": "SafeTool",
+                            "input": {"token": handle}
+                        }],
+                        "model": "test",
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                    .unwrap(),
+                    Some("application/json"),
+                ),
+                MockProvider::OpenAi => {
+                    let event = serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "custom_tool_call",
+                            "name": "exec_command",
+                            "input": format!("python hash.py {handle}")
+                        }
+                    });
+                    (
+                        format!("event: response.output_item.done\ndata: {event}\n\n").into_bytes(),
+                        None,
+                    )
+                }
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\n").unwrap();
+            if let Some(content_type) = content_type {
+                write!(stream, "Content-Type: {content_type}\r\n").unwrap();
+            }
+            write!(
+                stream,
+                "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )
+            .unwrap();
+            stream.write_all(&response).unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}"), body_rx, thread)
+    }
+
+    #[test]
+    fn provider_boundary_masks_plaintext_and_restores_only_tool_arguments() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        // Build the synthetic credential at runtime so repository scanners do
+        // not mistake test data for a committed live credential.
+        let secret = [
+            "rpa_",
+            "ZYXWVUTS",
+            "RQPONMLK",
+            "JIHGFEDC",
+            "BA098765",
+            "4321fedcba",
+        ]
+        .concat();
+        let dotenv = format!("RUNPOD_API_KEY={secret}\n");
+        let mut probe = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let protected = probe.mask_prompt_text(&dotenv).unwrap().unwrap();
+        assert!(
+            !protected.contains(secret.as_str()),
+            "dotenv probe was not masked"
+        );
+        assert!(first_valid_handle(&protected).is_some());
+
+        let (anthropic_upstream, anthropic_request, anthropic_thread) =
+            mock_upstream(MockProvider::Anthropic);
+        let anthropic_proxy = ClaudeHttpProxyGuard::start(anthropic_upstream).unwrap();
+        let anthropic_response: Value = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/messages", anthropic_proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                "model": "test",
+                "max_tokens": 32,
+                "messages": [{
+                    "role": "user",
+                    "content": format!("Use this dotenv value:\nRUNPOD_API_KEY={secret}\n")
+                }]
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .map(|body| serde_json::from_slice(&body).unwrap())
+            .unwrap();
+        let provider_body = anthropic_request
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(!provider_body.contains(secret.as_str()));
+        assert!(first_valid_handle(&provider_body).is_some());
+        assert_eq!(anthropic_response["content"][0]["input"]["token"], secret);
+        drop(anthropic_proxy);
+        anthropic_thread.join().unwrap();
+
+        let (openai_upstream, openai_request, openai_thread) = mock_upstream(MockProvider::OpenAi);
+        let openai_proxy =
+            crate::openai_http_proxy::OpenAiHttpProxyGuard::start(openai_upstream).unwrap();
+        let openai_response = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/responses", openai_proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                "model": "test",
+                "stream": true,
+                "input": format!("Use this dotenv value:\nRUNPOD_API_KEY={secret}\n")
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .unwrap();
+        let provider_body = openai_request
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(!provider_body.contains(secret.as_str()));
+        assert!(first_valid_handle(&provider_body).is_some());
+        assert!(openai_response.contains(&format!("python hash.py {secret}")));
+        assert!(!openai_response.contains("<<PENTECT_E2E_TOKEN_"));
+        drop(openai_proxy);
+        openai_thread.join().unwrap();
+    }
+
     #[test]
     fn sse_parser_preserves_normal_text() {
         let input = concat!(
@@ -2065,6 +2355,10 @@ mod tests {
         assert_eq!(
             classify_anthropic_endpoint("/v1/models/model_123"),
             AnthropicEndpoint::Models
+        );
+        assert_eq!(
+            classify_anthropic_endpoint("/api/hello"),
+            AnthropicEndpoint::Health
         );
         assert_eq!(
             classify_anthropic_endpoint("/v1/messages/batches"),
@@ -2097,14 +2391,89 @@ mod tests {
     fn handle_contract_is_stable_preserves_system_and_is_not_duplicated() {
         let mut request = serde_json::json!({"system": "existing", "messages": []});
         inject_handle_contract(&mut request);
-        assert_eq!(request["system"][0]["text"], HANDLE_CONTRACT);
-        assert_eq!(request["system"][1]["text"], "existing");
+        assert_eq!(request["system"][0]["text"], "existing");
+        assert_eq!(request["system"][1]["text"], HANDLE_CONTRACT);
         inject_handle_contract(&mut request);
         assert_eq!(request["system"].as_array().unwrap().len(), 2);
 
         let mut empty = serde_json::json!({"messages": []});
         inject_handle_contract(&mut empty);
         assert_eq!(empty["system"][0]["text"], HANDLE_CONTRACT);
+    }
+
+    #[test]
+    fn handle_contract_is_added_only_when_a_handle_exists() {
+        let mut clean = serde_json::json!({
+            "system": "existing",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        inject_handle_contract_if_needed(&mut clean);
+        assert_eq!(clean["system"], "existing");
+
+        let mut protected = serde_json::json!({
+            "system": "existing",
+            "messages": [{
+                "role": "user",
+                "content": "use <<SECRET_0123456789abcdef>>"
+            }]
+        });
+        inject_handle_contract_if_needed(&mut protected);
+        assert_eq!(protected["system"][0]["text"], "existing");
+        assert_eq!(protected["system"][1]["text"], HANDLE_CONTRACT);
+    }
+
+    #[test]
+    fn unknown_anthropic_content_blocks_by_default_and_can_be_allowed() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let body = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":[{"type":"future_block","data":"opaque"}]}]}"#,
+        );
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let files = HashMap::new();
+        let error = match protect_anthropic_request_body(&body, &masker, &plugins, &files, true) {
+            Ok(_) => panic!("unknown Anthropic block should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("unknown format blocked:"), "{error}");
+        assert!(error.contains("future_block"), "{error}");
+
+        let allowed =
+            protect_anthropic_request_body(&body, &masker, &plugins, &files, false).unwrap();
+        assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&allowed.body).unwrap(),
+            serde_json::from_slice::<Value>(&body).unwrap()
+        );
+    }
+
+    #[test]
+    fn current_anthropic_response_blocks_are_known() {
+        let value = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": {}},
+                    {"type": "connector_text", "text": "working"},
+                    {"type": "fallback", "from": {"model": "a"}, "to": {"model": "b"}}
+                ]
+            }]
+        });
+        assert_eq!(anthropic_request_unknown_content_kind(&value), None);
+    }
+
+    #[test]
+    fn malformed_anthropic_json_obeys_unknown_format_policy() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let body = Bytes::from_static(b"{not-json");
+        let masker = StdMutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
+        let plugins = StdMutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let files = HashMap::new();
+        assert!(protect_anthropic_request_body(&body, &masker, &plugins, &files, true).is_err());
+        let allowed =
+            protect_anthropic_request_body(&body, &masker, &plugins, &files, false).unwrap();
+        assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
+        assert_eq!(allowed.body, body);
     }
 
     #[test]

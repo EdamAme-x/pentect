@@ -406,6 +406,7 @@ mod tests {
 
     #[test]
     fn multipart_parser_blocks_an_unavailable_masker_upload() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let body = Bytes::from_static(
             b"--boundary\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nuser_data\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--boundary--\r\n",
         );

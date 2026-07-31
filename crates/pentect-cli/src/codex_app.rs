@@ -1,8 +1,9 @@
-//! Experimental launcher for the unmodified Codex desktop application.
+//! Launcher for the unmodified Codex desktop application.
 //!
-//! The app and its bundled Codex process inherit a loopback-only Responses API
-//! gateway through `OPENAI_BASE_URL`. Pentect never changes the user's Codex
-//! configuration or kills an existing app process.
+//! The app and its bundled Codex process use a loopback-only Responses API
+//! gateway. Pentect temporarily overrides the selected provider in the user's
+//! Codex configuration, restores the exact original when the App exits, and
+//! refuses to launch while another Codex App process is running.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,10 +41,10 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
 
     let routing = crate::codex_app_routing(options.upstream)?;
     let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream)?;
-    let config_override = routing
-        .requires_config_override
-        .then(|| CodexConfigOverride::install(&routing.provider, proxy.base_url()))
-        .transpose()?;
+    let config_override = Some(CodexConfigOverride::install(
+        &routing.provider,
+        proxy.base_url(),
+    )?);
     eprintln!("[pentect] Codex App gateway ready at {}", proxy.base_url());
     if config_override.is_some() {
         eprintln!(
@@ -164,7 +165,7 @@ impl CodexConfigOverride {
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|error| format!("could not parse '{}': {error}", config.display()))?
         };
-        set_provider_base_url(&mut parsed, provider, gateway)?;
+        set_provider_gateway(&mut parsed, provider, gateway)?;
 
         std::fs::write(&backup, original.as_bytes())
             .map_err(|error| format!("could not back up '{}': {error}", config.display()))?;
@@ -234,13 +235,28 @@ impl Drop for CodexConfigOverride {
     }
 }
 
-fn set_provider_base_url(
+fn set_provider_gateway(
     config: &mut toml_edit::DocumentMut,
     provider: &str,
     gateway: &str,
 ) -> Result<(), String> {
     if provider == "openai" {
-        config["openai_base_url"] = toml_edit::value(gateway);
+        config["model_provider"] = toml_edit::value(crate::CODEX_GATEWAY_PROVIDER);
+        let providers = config
+            .entry("model_providers")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| "model_providers is not a TOML table".to_string())?;
+        let mut gateway_provider = toml_edit::Table::new();
+        gateway_provider.insert("name", toml_edit::value("OpenAI through Pentect"));
+        gateway_provider.insert("base_url", toml_edit::value(gateway));
+        gateway_provider.insert("wire_api", toml_edit::value("responses"));
+        gateway_provider.insert("requires_openai_auth", toml_edit::value(true));
+        gateway_provider.insert("supports_websockets", toml_edit::value(false));
+        providers.insert(
+            crate::CODEX_GATEWAY_PROVIDER,
+            toml_edit::Item::Table(gateway_provider),
+        );
         return Ok(());
     }
     let providers = config
@@ -254,6 +270,7 @@ fn set_provider_base_url(
         .as_table_mut()
         .ok_or_else(|| "selected model provider is not a TOML table".to_string())?;
     provider.insert("base_url", toml_edit::value(gateway));
+    provider.insert("supports_websockets", toml_edit::value(false));
     Ok(())
 }
 
@@ -509,7 +526,7 @@ base_url = "https://other.example/v1"
 "#
         .parse()
         .unwrap();
-        set_provider_base_url(&mut config, "proxy", "http://127.0.0.1:47781").unwrap();
+        set_provider_gateway(&mut config, "proxy", "http://127.0.0.1:47781").unwrap();
         assert_eq!(
             config["model_providers"]["proxy"]["base_url"].as_str(),
             Some("http://127.0.0.1:47781")
@@ -517,6 +534,10 @@ base_url = "https://other.example/v1"
         assert_eq!(
             config["model_providers"]["other"]["base_url"].as_str(),
             Some("https://other.example/v1")
+        );
+        assert_eq!(
+            config["model_providers"]["proxy"]["supports_websockets"].as_bool(),
+            Some(false)
         );
     }
 
@@ -526,14 +547,23 @@ base_url = "https://other.example/v1"
             "# keep this comment\n[model_providers.proxy]\nbase_url = \"https://old.example/v1\"\n"
                 .parse::<toml_edit::DocumentMut>()
                 .unwrap();
-        set_provider_base_url(&mut config, "openai", "http://127.0.0.1:47781").unwrap();
+        set_provider_gateway(&mut config, "openai", "http://127.0.0.1:47781").unwrap();
         let encoded = config.to_string();
 
         assert!(encoded.contains("# keep this comment"), "{encoded}");
         let parsed = encoded.parse::<toml::Value>().unwrap();
         assert_eq!(
-            parsed["openai_base_url"].as_str(),
+            parsed["model_provider"].as_str(),
+            Some(crate::CODEX_GATEWAY_PROVIDER)
+        );
+        assert_eq!(
+            parsed["model_providers"][crate::CODEX_GATEWAY_PROVIDER]["base_url"].as_str(),
             Some("http://127.0.0.1:47781")
+        );
+        assert_eq!(
+            parsed["model_providers"][crate::CODEX_GATEWAY_PROVIDER]["supports_websockets"]
+                .as_bool(),
+            Some(false)
         );
     }
 
