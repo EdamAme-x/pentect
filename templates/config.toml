@@ -1,29 +1,18 @@
 # Copy to .pentect/config.toml.
 
 plugins = []
-# plugin runtime data is stored outside the repository in OS user data.
+# Plugin runtime data is stored outside the repository in OS user data.
 
-[environment]
-prefix = "PENTECT_"
-
-[log]
-share = true
+[handles]
+scope = "device"
 
 [agent]
-status_line = true
-require_pentect = false
+required = false
 
 [image]
-ocr = "on"
+ocr = true
 redaction = "black"
-unscanned_images = "allow"
-max_edge = 2048
-max_pixels = 64000000
-max_images = 64
-max_total_bytes = 536870912
-max_seconds = 20
-max_image_bytes = 67108864
-fetch_seconds = 8
+unscanned = "block"
 
-[file_pointer_manager]
-save = true
+[files]
+remember = true

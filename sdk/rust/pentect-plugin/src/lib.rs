@@ -14,9 +14,17 @@ pub struct Request {
     pub id: u64,
     #[serde(rename = "type")]
     pub kind: String,
-    pub stage: Option<String>,
-    pub payload: Option<Value>,
+    pub stage: String,
+    pub payload: Value,
     pub context: Option<Value>,
+    pub chain: Chain,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Chain {
+    pub index: usize,
+    pub total: usize,
+    pub has_next: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,7 +42,18 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub spans: Option<Value>,
+    pub spans: Option<Vec<Span>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,6 +198,29 @@ impl Response {
             outcome: Some("block"),
             message: Some(message.into()),
             action: Some("stop"),
+            ..Self::next(id)
+        }
+    }
+
+    pub fn replace(id: u64, payload: Value) -> Self {
+        Self {
+            payload: Some(payload),
+            ..Self::next(id)
+        }
+    }
+
+    pub fn respond(id: u64, payload: Value) -> Self {
+        Self {
+            action: Some("stop"),
+            outcome: Some("respond"),
+            payload: Some(payload),
+            ..Self::next(id)
+        }
+    }
+
+    pub fn detected(id: u64, spans: Vec<Span>) -> Self {
+        Self {
+            spans: Some(spans),
             ..Self::next(id)
         }
     }

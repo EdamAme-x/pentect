@@ -11,12 +11,8 @@ const RUNTIME_DIR: &str = "runtime";
 const HOST_FILE: &str = "delegated-process-host.json";
 const CANDIDATE_PREFIX: &str = "process-host-candidate-";
 const CANDIDATE_SUFFIX: &str = ".json";
-const PERSISTENT_CANDIDATE_FILE: &str = "process-host-persistent.json";
 const ELECTION_ATTEMPTS: usize = 8;
 const ELECTION_RETRY: Duration = Duration::from_millis(10);
-// A second `pentect up` can observe the winner's candidate while its registry
-// file or health endpoint is still becoming visible on a loaded CI host.
-const PERSISTENT_STARTUP_ATTEMPTS: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ProcessHostEndpoint {
@@ -25,7 +21,6 @@ pub(crate) struct ProcessHostEndpoint {
     pub(crate) read_token: String,
     pub(crate) write_token: String,
     pub(crate) pid: u32,
-    pub(crate) persistent: bool,
 }
 
 pub fn register_candidate(
@@ -35,54 +30,25 @@ pub fn register_candidate(
     read_token: &str,
     write_token: &str,
     pid: u32,
-    persistent: bool,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<PathBuf, String> {
     let dir = runtime_dir(root);
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("could not create Pentect runtime directory: {error}"))?;
     restrict_dir(&dir);
-    let path = if persistent {
-        dir.join(PERSISTENT_CANDIDATE_FILE)
-    } else {
-        dir.join(format!("{CANDIDATE_PREFIX}{pid}{CANDIDATE_SUFFIX}"))
-    };
+    let path = dir.join(format!("{CANDIDATE_PREFIX}{pid}{CANDIDATE_SUFFIX}"));
     let endpoint = ProcessHostEndpoint {
         addr: addr.to_string(),
         store_token_hash: store_token_hash(store_token),
         read_token: read_token.to_string(),
         write_token: write_token.to_string(),
         pid,
-        persistent,
     };
-    if persistent && !claim_persistent_candidate(&path, &endpoint)? {
-        return Ok(None);
-    }
-    if !persistent {
-        write_endpoint(&path, &endpoint)?;
-    }
+    write_endpoint(&path, &endpoint)?;
     if let Err(error) = ensure_host_at(root) {
         let _ = std::fs::remove_file(&path);
         return Err(error);
     }
-    Ok(Some(path))
-}
-
-pub fn persistent_candidate_is_running(root: &Path) -> bool {
-    let path = runtime_dir(root).join(PERSISTENT_CANDIDATE_FILE);
-    let mut observed = None;
-    for attempt in 0..PERSISTENT_STARTUP_ATTEMPTS {
-        match read_endpoint(&path) {
-            Ok(endpoint) if endpoint.persistent && endpoint_is_alive(&endpoint) => return true,
-            Ok(endpoint) => observed = Some(endpoint),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-            Err(_) => observed = None,
-        }
-        if attempt + 1 < PERSISTENT_STARTUP_ATTEMPTS {
-            std::thread::sleep(ELECTION_RETRY);
-        }
-    }
-    remove_candidate_if_unchanged(&path, observed.as_ref());
-    false
+    Ok(path)
 }
 
 pub fn unregister_candidate(path: &Path) {
@@ -322,8 +288,7 @@ fn candidates_at(root: &Path) -> Result<Vec<(ProcessHostEndpoint, PathBuf)>, Str
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
-                    (name.starts_with(CANDIDATE_PREFIX) && name.ends_with(CANDIDATE_SUFFIX))
-                        || name == PERSISTENT_CANDIDATE_FILE
+                    name.starts_with(CANDIDATE_PREFIX) && name.ends_with(CANDIDATE_SUFFIX)
                 })
         })
         .collect::<Vec<_>>();
@@ -401,62 +366,6 @@ fn write_endpoint(path: &Path, endpoint: &ProcessHostEndpoint) -> Result<(), Str
         .map_err(|error| format!("could not write process host candidate: {error}"))
 }
 
-fn claim_persistent_candidate(path: &Path, endpoint: &ProcessHostEndpoint) -> Result<bool, String> {
-    let bytes = serde_json::to_vec(endpoint)
-        .map_err(|error| format!("could not serialize process host candidate: {error}"))?;
-    // The extra iteration lets this contender claim the path after it removed
-    // an unchanged, unresponsive candidate on the preceding iteration.
-    for attempt in 0..=(PERSISTENT_STARTUP_ATTEMPTS + 1) {
-        match OpenOptions::new().create_new(true).write(true).open(path) {
-            Ok(mut file) => {
-                restrict_file(&file);
-                if let Err(error) = file.write_all(&bytes).and_then(|_| file.flush()) {
-                    let _ = std::fs::remove_file(path);
-                    return Err(format!("could not write process host candidate: {error}"));
-                }
-                return Ok(true);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                match read_endpoint(path) {
-                    Ok(current) if current.persistent && endpoint_is_alive(&current) => {
-                        return Ok(false);
-                    }
-                    Ok(current) if attempt == PERSISTENT_STARTUP_ATTEMPTS => {
-                        remove_candidate_if_unchanged(path, Some(&current));
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        continue;
-                    }
-                    Err(_) if attempt == PERSISTENT_STARTUP_ATTEMPTS => {
-                        remove_candidate_if_unchanged(path, None);
-                    }
-                    Err(_) => {}
-                }
-                if attempt < PERSISTENT_STARTUP_ATTEMPTS {
-                    std::thread::sleep(ELECTION_RETRY);
-                }
-            }
-            Err(error) => {
-                return Err(format!("could not claim persistent process host: {error}"));
-            }
-        }
-    }
-    Err("could not claim persistent process host".to_string())
-}
-
-fn remove_candidate_if_unchanged(path: &Path, expected: Option<&ProcessHostEndpoint>) {
-    match (expected, read_endpoint(path)) {
-        (Some(expected), Ok(current)) if &current == expected => {
-            let _ = std::fs::remove_file(path);
-        }
-        (None, Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
-            let _ = std::fs::remove_file(path);
-        }
-        _ => {}
-    }
-}
-
 fn read_endpoint(path: &Path) -> std::io::Result<ProcessHostEndpoint> {
     let bytes = std::fs::read(path)?;
     serde_json::from_slice(&bytes)
@@ -503,17 +412,8 @@ mod tests {
             "read-1".to_string(),
             "write-1".to_string(),
         );
-        let first = register_candidate(
-            &root,
-            &first_addr,
-            "memory-1",
-            "read-1",
-            "write-1",
-            101,
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let first =
+            register_candidate(&root, &first_addr, "memory-1", "read-1", "write-1", 101).unwrap();
         assert_eq!(ensure_host_at(&root).unwrap().addr, first_addr);
 
         let second_addr = spawn_test_memory_store_with_activity(
@@ -521,17 +421,8 @@ mod tests {
             "read-2".to_string(),
             "write-2".to_string(),
         );
-        let second = register_candidate(
-            &root,
-            &second_addr,
-            "memory-2",
-            "read-2",
-            "write-2",
-            202,
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let second =
+            register_candidate(&root, &second_addr, "memory-2", "read-2", "write-2", 202).unwrap();
         assert_eq!(ensure_host_at(&root).unwrap().addr, first_addr);
         assert!(matches_host(&root, &second_addr, "read-2", "write-2"));
         assert!(contains_host(&root, &second_addr, "memory-2"));
@@ -552,9 +443,7 @@ mod tests {
             "read".to_string(),
             "write".to_string(),
         );
-        let candidate = register_candidate(&root, &addr, "memory", "read", "write", 303, false)
-            .unwrap()
-            .unwrap();
+        let candidate = register_candidate(&root, &addr, "memory", "read", "write", 303).unwrap();
         let candidate_json = std::fs::read_to_string(&candidate).unwrap();
         let host_json = std::fs::read_to_string(runtime_dir(&root).join(HOST_FILE)).unwrap();
         for json in [candidate_json, host_json] {
@@ -567,48 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn only_one_persistent_candidate_can_be_claimed() {
-        let root = test_root("persistent");
-        let first_addr = spawn_test_memory_store_with_activity(
-            "memory-1".to_string(),
-            "read-1".to_string(),
-            "write-1".to_string(),
-        );
-        let first = register_candidate(
-            &root,
-            &first_addr,
-            "memory-1",
-            "read-1",
-            "write-1",
-            401,
-            true,
-        )
-        .unwrap()
-        .unwrap();
-        let second_addr = spawn_test_memory_store_with_activity(
-            "memory-2".to_string(),
-            "read-2".to_string(),
-            "write-2".to_string(),
-        );
-
-        assert!(register_candidate(
-            &root,
-            &second_addr,
-            "memory-2",
-            "read-2",
-            "write-2",
-            402,
-            true,
-        )
-        .unwrap()
-        .is_none());
-        assert!(persistent_candidate_is_running(&root));
-
-        unregister_candidate(&first);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn shared_activity_is_replicated_to_handoff_candidates() {
         let root = test_root("shared-activity");
         let first_addr = spawn_test_memory_store_with_activity(
@@ -616,33 +463,15 @@ mod tests {
             "read-1".to_string(),
             "write-1".to_string(),
         );
-        let first = register_candidate(
-            &root,
-            &first_addr,
-            "memory-1",
-            "read-1",
-            "write-1",
-            501,
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let first =
+            register_candidate(&root, &first_addr, "memory-1", "read-1", "write-1", 501).unwrap();
         let second_addr = spawn_test_memory_store_with_activity(
             "memory-2".to_string(),
             "read-2".to_string(),
             "write-2".to_string(),
         );
-        let second = register_candidate(
-            &root,
-            &second_addr,
-            "memory-2",
-            "read-2",
-            "write-2",
-            502,
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let second =
+            register_candidate(&root, &second_addr, "memory-2", "read-2", "write-2", 502).unwrap();
         let first_reader = MemoryStoreClient::for_activity(first_addr, "read-1".to_string());
         let second_reader = MemoryStoreClient::for_activity(second_addr, "read-2".to_string());
 

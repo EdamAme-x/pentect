@@ -296,6 +296,15 @@ impl CodexAppOptions {
                     dry_run = true;
                     index += 1;
                 }
+                "--plugins" => {
+                    if args
+                        .get(index + 1)
+                        .is_none_or(|value| value.starts_with("--"))
+                    {
+                        return Err("--plugins requires a value".to_string());
+                    }
+                    index += 2;
+                }
                 value => return Err(format!("unknown codex-app option: {value}")),
             }
         }
@@ -454,6 +463,8 @@ mod tests {
             "pentect".to_string(),
             "codex".to_string(),
             "app".to_string(),
+            "--plugins".to_string(),
+            "company-policy".to_string(),
             "--dry-run".to_string(),
         ];
         assert_eq!(
@@ -464,6 +475,18 @@ mod tests {
                 dry_run: true,
             }
         );
+    }
+
+    #[test]
+    fn options_reject_missing_plugin_value() {
+        let args = vec![
+            "pentect".to_string(),
+            "codex".to_string(),
+            "app".to_string(),
+            "--plugins".to_string(),
+            "--dry-run".to_string(),
+        ];
+        assert!(CodexAppOptions::parse(&args).is_err());
     }
 
     #[cfg(windows)]

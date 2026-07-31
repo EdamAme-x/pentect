@@ -33,6 +33,7 @@ bundled-ocr = ["dep:image", "dep:ocrs", "dep:rten"]
 
 [dependencies]
 pentect-core = { path = "../pentect-core" }
+aho-corasick = { workspace = true }
 anyhow = { workspace = true }
 data-encoding = { workspace = true }
 reqwest = { workspace = true }

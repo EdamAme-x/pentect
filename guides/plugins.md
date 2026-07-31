@@ -18,9 +18,6 @@ name = "company-policy"
 binary = "company-policy.wasm"
 repository = "owner/company-policy"
 
-[publisher]
-workflow = ".github/workflows/release.yml"
-
 [execution]
 timeout_ms = 10000
 max_input_bytes = 262144
@@ -28,15 +25,17 @@ max_output_bytes = 1048576
 
 [middleware]
 stages = ["provider_request", "tool_call"]
-permissions = ["input:read", "payload:write", "pipeline:block"]
+permissions = ["payload:write", "pipeline:block"]
 required = true
 
-[assets]
-wasm32 = "company-policy.wasm"
 ```
 
 `execution.runtime = "wasm"` and `execution.mode = "oneshot"` are accepted for
 older manifests but are unnecessary. Any other runtime or mode is rejected.
+Reading the event payload is implicit. The publisher workflow defaults to
+`.github/workflows/release.yml`; declare `[publisher].workflow` only when a
+different workflow publishes the release. `[assets]` is needed only when the
+Release asset name differs from `binary`.
 
 Simple detectors need no binary:
 
@@ -83,6 +82,11 @@ private_network = true
 allow_insecure = true
 ```
 
+Private-network approval applies only to literal private or loopback IP
+origins. A public hostname is never allowed to resolve into a private network,
+which prevents DNS rebinding from turning an approved public origin into an
+internal target.
+
 The module imports only:
 
 ```text
@@ -101,7 +105,7 @@ Pentect:
 
 ```toml
 [middleware]
-permissions = ["input:read", "config:read"]
+permissions = ["config:read"]
 ```
 
 ```text
@@ -166,10 +170,11 @@ Arbitrary postscripts are rejected. Executable assets must be GitHub Release
 assets with Sigstore build provenance matching both the publisher repository
 and `[publisher].workflow`; attestations from self-hosted runners are rejected.
 
-`input:read` is mandatory. Payload replacement requires `payload:write`;
-blocking requires `pipeline:block`; local responses require
-`pipeline:respond`. The deterministic Pentect masking engine remains the final
-authority for detector spans.
+Reading the event payload is implicit. Payload replacement requires
+`payload:write`; blocking requires `pipeline:block`. Local responses require
+`pipeline:respond` and are valid only during `provider_request`. The
+deterministic Pentect masking engine remains the final authority for detector
+spans.
 
 There is intentionally no post-resolution stage: plugins can inspect and
 transform opaque handles at `tool_call`, but Pentect does not hand their
@@ -178,14 +183,23 @@ plaintext values to third-party middleware.
 ## Lifecycle
 
 ```text
+pentect plugins add SOURCE
+pentect plugins list
 pentect plugins inspect PATH
 pentect plugins setup PATH
 pentect plugins test PATH
 pentect plugins update PATH
+pentect plugins remove SOURCE
 ```
 
-Setup installs and approves the module; it does not silently enable it for
-every command. Activate it for one run:
+`add` installs, approves, pins, and enables a plugin for the current project.
+`remove` disables it for that project. Shared installed data remains available
+to other projects. `setup` remains as a lower-level compatibility command that
+approves without enabling. Remote manifests remain pinned until `add`, `setup`,
+or `update` is explicitly run.
+Run `pentect plugins update` without a name to update every enabled plugin.
+
+Add a plugin for one run without changing the project:
 
 ```text
 pentect claude --plugins PATH

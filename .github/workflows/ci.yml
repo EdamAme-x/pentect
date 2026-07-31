@@ -22,6 +22,7 @@ jobs:
     outputs:
       detector: ${{ steps.filter.outputs.detector }}
       ocr: ${{ steps.filter.outputs.ocr }}
+      plugins: ${{ steps.filter.outputs.plugins }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -53,6 +54,26 @@ jobs:
               - 'rust-toolchain*'
               - 'crates/pentect-runtime/assets/ocr/**'
               - 'crates/pentect-runtime/src/image_ocr.rs'
+            plugins:
+              - '.github/workflows/ci.yml'
+              - '.cargo/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/*/Cargo.toml'
+              - 'rust-toolchain*'
+              - 'crates/pentect-cli/src/plugins.rs'
+              - 'crates/pentect-cli/src/plugins_cmd.rs'
+              - 'crates/pentect-cli/src/main.rs'
+              - 'crates/pentect-cli/src/scan.rs'
+              - 'crates/pentect-cli/src/scan/**'
+              - 'crates/pentect-cli/src/codex_app.rs'
+              - 'crates/pentect-cli/src/claude_app_proxy.rs'
+              - 'crates/pentect-cli/src/claude_http_proxy.rs'
+              - 'crates/pentect-runtime/src/masking.rs'
+              - 'crates/pentect-runtime/src/plugin_middleware.rs'
+              - 'plugins/**'
+              - 'protocol/**'
+              - 'sdk/rust/pentect-plugin/**'
 
   native-ocr:
     name: Native OCR (${{ matrix.os }})
@@ -85,6 +106,47 @@ jobs:
       - name: No native changes
         if: needs.changes.outputs.ocr != 'true'
         run: echo "No native changes"
+
+  plugin-platform:
+    name: Plugins (${{ matrix.os }})
+    needs: changes
+    if: always()
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - name: Require change detection
+        if: needs.changes.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: needs.changes.outputs.plugins == 'true'
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        if: needs.changes.outputs.plugins == 'true'
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: needs.changes.outputs.plugins == 'true'
+      - name: Test plugin runtime
+        if: needs.changes.outputs.plugins == 'true'
+        run: cargo test -p pentect-runtime plugin_middleware::tests --locked
+      - name: Test plugin CLI
+        if: needs.changes.outputs.plugins == 'true'
+        run: cargo test -p pentect-cli plugins::tests --bin pentect --locked
+      - name: Test plugin lifecycle CLI
+        if: needs.changes.outputs.plugins == 'true'
+        run: cargo test -p pentect-cli plugins_cmd::tests --bin pentect --locked
+      - name: Check plugin SDK
+        if: needs.changes.outputs.plugins == 'true'
+        run: cargo check --manifest-path sdk/rust/pentect-plugin/Cargo.toml --target wasm32-unknown-unknown
+      - name: No plugin changes
+        if: needs.changes.outputs.plugins != 'true'
+        run: echo "No plugin changes"
 
   test:
     needs: changes

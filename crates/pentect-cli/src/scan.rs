@@ -19,6 +19,18 @@ pub(crate) fn cmd_scan(args: &[String]) {
         Ok(opts) => opts,
         Err(e) => die(e),
     };
+    let explicit = plugins::collect_from_args(args).unwrap_or_else(|error| die(error));
+    let active = plugins::active_from_specs(explicit, true).unwrap_or_else(|error| die(error));
+    let _plugin_env = crate::EnvVarGuard::set_optional([
+        (
+            plugins::CONFIGS_ENV,
+            active.config_env_value().unwrap_or_else(|error| die(error)),
+        ),
+        (
+            plugins::BINARIES_ENV,
+            active.binary_env_value().unwrap_or_else(|error| die(error)),
+        ),
+    ]);
     let report = match run_scan(args, &opts) {
         Ok(report) => report,
         Err(e) => die(e),
@@ -30,7 +42,7 @@ pub(crate) fn cmd_scan(args: &[String]) {
         }
     }
     pentect_agent::record_scan_activity(report.files_scanned, report.findings, labels);
-    let plugin_report = match dispatch_scan_plugins(args, &report) {
+    let plugin_report = match dispatch_scan_plugins(&active, &report) {
         Ok(report) => report,
         Err(error) => die(error),
     };
@@ -45,9 +57,10 @@ pub(crate) fn cmd_scan(args: &[String]) {
     }
 }
 
-fn dispatch_scan_plugins(args: &[String], report: &ScanReport) -> Result<String, String> {
-    let specs = plugins::collect_from_args(args).map_err(|error| error.to_string())?;
-    let active = plugins::active_from_specs(specs, true).map_err(|error| error.to_string())?;
+fn dispatch_scan_plugins(
+    active: &plugins::ActivePlugins,
+    report: &ScanReport,
+) -> Result<String, String> {
     let middleware =
         pentect_agent::PluginMiddleware::from_paths(active.binary_paths().iter().cloned())?;
     let mut payload: serde_json::Value =
@@ -156,6 +169,7 @@ fn run_scan_with_engine(
                 report.skipped_count += 1;
                 report.skipped.push(skipped);
             }
+            ScanFile::Error(error) => return Err(error),
         }
     }
     report.files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -522,6 +536,7 @@ label = "ACME_CASE"
                     panic!("retained skipped path: {}", file.path.display())
                 }
                 ScanFile::Finding(file) => panic!("unexpected finding: {}", file.path.display()),
+                ScanFile::Error(error) => panic!("unexpected scan error: {error}"),
             }
         }
         assert_eq!(64, scanned);
