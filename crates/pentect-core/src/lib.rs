@@ -103,11 +103,152 @@ pub fn infer_kind(path: &std::path::Path) -> Kind {
 /// an all-values secret boundary.
 pub fn infer_kind_with_content(path: &std::path::Path, raw: &str) -> Kind {
     let inferred = infer_kind(path);
-    if inferred == Kind::Text && parse::looks_like_dotenv_document(raw) {
-        Kind::Env
-    } else {
-        inferred
+    if inferred != Kind::Text {
+        return inferred;
     }
+    if parse::looks_like_dotenv_document(raw) {
+        return Kind::Env;
+    }
+    let trimmed = raw.trim_start_matches('\u{feff}').trim_start();
+    if matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'['))
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+    {
+        return Kind::Json;
+    }
+    if looks_like_kubeconfig(raw) {
+        return Kind::Other("structured:kubeconfig".to_string());
+    }
+    if looks_like_kubernetes_yaml(raw) {
+        return Kind::Other("structured".to_string());
+    }
+    if looks_like_aws_config(raw) {
+        return Kind::Other("structured:aws".to_string());
+    }
+    if looks_like_npm_config(raw) {
+        return Kind::Other("structured:npm".to_string());
+    }
+    if looks_like_pypi_config(raw) {
+        return Kind::Other("structured:pypi".to_string());
+    }
+    if looks_like_structured_document(raw) {
+        return Kind::Other("structured".to_string());
+    }
+    Kind::Text
+}
+
+fn looks_like_kubernetes_yaml(raw: &str) -> bool {
+    has_yaml_key_value(raw, "apiVersion", None) && has_yaml_key_value(raw, "kind", Some("Secret"))
+}
+
+fn looks_like_kubeconfig(raw: &str) -> bool {
+    has_yaml_key_value(raw, "apiVersion", None)
+        && ["clusters", "contexts", "users"]
+            .iter()
+            .filter(|key| has_yaml_key_value(raw, key, None))
+            .count()
+            >= 2
+}
+
+fn has_yaml_key_value(raw: &str, expected_key: &str, expected_value: Option<&str>) -> bool {
+    raw.lines().any(|line| {
+        let line = line.trim().trim_start_matches("- ");
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        key.trim() == expected_key
+            && expected_value.is_none_or(|expected| value.trim().eq_ignore_ascii_case(expected))
+    })
+}
+
+fn looks_like_aws_config(raw: &str) -> bool {
+    has_ini_section(raw)
+        && raw.lines().any(|line| {
+            line.split_once('=').is_some_and(|(key, _)| {
+                matches!(
+                    key.trim().to_ascii_lowercase().as_str(),
+                    "aws_access_key_id" | "aws_secret_access_key" | "aws_session_token"
+                )
+            })
+        })
+}
+
+fn looks_like_npm_config(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        let key = line.split_once('=').map(|(key, _)| key.trim());
+        key.is_some_and(|key| {
+            matches!(key, "_auth" | "_authToken" | "_password")
+                || (key.starts_with("//")
+                    && matches!(
+                        key.rsplit(':').next().unwrap_or_default(),
+                        "_auth" | "_authToken" | "_password"
+                    ))
+        })
+    })
+}
+
+fn looks_like_pypi_config(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        matches!(
+            line.trim().to_ascii_lowercase().as_str(),
+            "[pypi]" | "[testpypi]" | "[distutils]"
+        )
+    }) && raw.lines().any(|line| {
+        line.split_once('=').is_some_and(|(key, _)| {
+            matches!(
+                key.trim().to_ascii_lowercase().as_str(),
+                "repository" | "username" | "password"
+            )
+        })
+    })
+}
+
+fn has_ini_section(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with('[') && line.ends_with(']') && line.len() > 2
+    })
+}
+
+fn looks_like_structured_document(raw: &str) -> bool {
+    let mut assignments = 0usize;
+    let mut yaml_entries = 0usize;
+    let mut sections = 0usize;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(['#', ';']) {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() > 2 {
+            sections += 1;
+            continue;
+        }
+        if matches!(trimmed, "{" | "}" | "[" | "]") {
+            continue;
+        }
+        let body = trimmed.trim_start_matches("- ");
+        if let Some((key, value)) = body.split_once('=') {
+            if structured_key(key.trim()) && !value.trim().is_empty() {
+                assignments += 1;
+                continue;
+            }
+        }
+        if let Some((key, _)) = body.split_once(':') {
+            if structured_key(key.trim()) {
+                yaml_entries += 1;
+                continue;
+            }
+        }
+        return false;
+    }
+    assignments >= 2 || yaml_entries >= 2 || (sections > 0 && yaml_entries + assignments > 0)
+}
+
+fn structured_key(key: &str) -> bool {
+    let key = key.trim_matches(['"', '\'']);
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_.-/".contains(character))
 }
 
 fn is_dotenv_name(name: &str) -> bool {
@@ -256,6 +397,60 @@ mod tests {
         );
         assert_eq!(
             infer_kind_with_content(Path::new("notes"), "example=value"),
+            Kind::Text
+        );
+    }
+
+    #[test]
+    fn content_sniffing_recognizes_structured_stdin_formats() {
+        assert_eq!(
+            infer_kind_with_content(Path::new("stdin"), r#"{"token":"x"}"#),
+            Kind::Json
+        );
+        assert_eq!(
+            infer_kind_with_content(
+                Path::new("stdin"),
+                "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\nstringData:\n  password: x\n"
+            ),
+            Kind::Other("structured".into())
+        );
+        assert_eq!(
+            infer_kind_with_content(
+                Path::new("stdin"),
+                "apiVersion: v1\nclusters: []\ncontexts: []\nusers: []\n"
+            ),
+            Kind::Other("structured:kubeconfig".into())
+        );
+        assert_eq!(
+            infer_kind_with_content(
+                Path::new("stdin"),
+                "[default]\naws_access_key_id=x\naws_secret_access_key=y\n"
+            ),
+            Kind::Other("structured:aws".into())
+        );
+        assert_eq!(
+            infer_kind_with_content(
+                Path::new("stdin"),
+                "_authToken=x\nregistry=https://example.com\n"
+            ),
+            Kind::Other("structured:npm".into())
+        );
+        assert_eq!(
+            infer_kind_with_content(
+                Path::new("stdin"),
+                "[pypi]\nrepository = https://upload.pypi.org/legacy/\npassword = x\n"
+            ),
+            Kind::Other("structured:pypi".into())
+        );
+        assert_eq!(
+            infer_kind_with_content(
+                Path::new("stdin"),
+                "region = \"us-east-1\"\ndb_password = \"x\"\n"
+            ),
+            Kind::Other("structured".into())
+        );
+        assert_eq!(
+            infer_kind_with_content(Path::new("stdin"), "This is ordinary prose.\nSecond line."),
             Kind::Text
         );
     }
