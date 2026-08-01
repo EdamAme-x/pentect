@@ -145,10 +145,12 @@ pentect_plugin::export!(inspect);
 
 Finding offsets are UTF-8 byte offsets into `context.input.text`. Overlapping
 findings are one sensitive value: Pentect masks their complete union with one
-handle and selects the strongest finding's label, using the label itself as the
-final deterministic tie-breaker. This prevents plugin order from changing the
-result or exposing a lower-priority finding's prefix or suffix. Findings that
-only touch at an edge remain separate.
+handle and selects the strongest finding's label. If equally strong findings
+disagree only on the label, Pentect uses their canonical category label such as
+`SECRET` or `PII`; plugin order never decides the result. This also prevents a
+lower-priority finding's prefix or suffix from remaining visible. Findings that
+only touch at an edge remain separate. Structural labels such as a `.env` key
+name are applied after merging and remain authoritative.
 
 Build a Rust plugin as a `cdylib`:
 
