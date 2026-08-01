@@ -29,8 +29,8 @@ curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/instal
 
 The installers detect the platform, download a GitHub Release asset, and verify
 its SHA-256 checksum. Run `pentect doctor` after installation. Version-specific
-installation is supported with `-Version 0.0.13` in PowerShell or
-`--version 0.0.13` for `install.sh`.
+installation is supported with `-Version 0.0.14` in PowerShell or
+`--version 0.0.14` for `install.sh`.
 
 ## Use
 
