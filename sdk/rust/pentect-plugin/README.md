@@ -32,7 +32,8 @@ result.
 
 Finding offsets are UTF-8 byte offsets. Overlapping findings become one masked
 union and one handle; edge-adjacent findings remain separate. When labels
-conflict, Pentect chooses one deterministically instead of depending on plugin
+conflict at otherwise equal strength, Pentect falls back to the canonical
+category label (for example, `SECRET` or `PII`) instead of depending on plugin
 execution order.
 
 Build with:

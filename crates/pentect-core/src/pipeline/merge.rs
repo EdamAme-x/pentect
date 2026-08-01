@@ -37,16 +37,18 @@ pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
     for span in spans {
         match component.take() {
             None => component = Some((span.range, span)),
-            Some((union, strongest)) if union.overlaps(&span.range) => {
+            Some((union, mut strongest)) if union.overlaps(&span.range) => {
                 let union = ByteRange::new(
                     union.start.min(span.range.start),
                     union.end.max(span.range.end),
                 );
-                let strongest = if span.cmp_strength(&strongest).is_gt() {
-                    span
-                } else {
-                    strongest
-                };
+                match span.cmp_strength(&strongest) {
+                    core::cmp::Ordering::Greater => strongest = span,
+                    core::cmp::Ordering::Equal if span.label != strongest.label => {
+                        strongest.label = canonical_category_label(strongest.category).into();
+                    }
+                    core::cmp::Ordering::Equal | core::cmp::Ordering::Less => {}
+                }
                 component = Some((union, strongest));
             }
             Some((union, mut strongest)) => {
@@ -61,6 +63,16 @@ pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
         merged.push(strongest);
     }
     merged
+}
+
+fn canonical_category_label(category: Category) -> &'static str {
+    match category {
+        Category::Secret => "SECRET",
+        Category::Pii => "PII",
+        Category::Identifier => "IDENTIFIER",
+        Category::Endpoint => "ENDPOINT",
+        Category::Other => "SENSITIVE",
+    }
 }
 
 fn touches_protected(range: &ByteRange, protected_edges: &HashSet<usize>) -> bool {
@@ -205,8 +217,20 @@ mod tests {
         let reverse = merge(vec![alpha, beta], &[]);
         assert_eq!(forward.len(), 1);
         assert_eq!(reverse.len(), 1);
-        assert_eq!(forward[0].label, "ALPHA");
+        assert_eq!(forward[0].label, "SECRET");
         assert_eq!(forward[0].label, reverse[0].label);
+    }
+
+    #[test]
+    fn unambiguous_stronger_finding_keeps_its_specific_label() {
+        let mut weak = span(0, 10, Confidence::Medium);
+        weak.label = "LIKELY_SECRET".into();
+        let mut strong = span(0, 10, Confidence::High);
+        strong.label = "API_KEY".into();
+
+        let out = merge(vec![weak, strong], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label, "API_KEY");
     }
 
     #[test]
