@@ -150,7 +150,9 @@ fn usage() {
          pentect doctor [--json | --fix [--yes]]\n\
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
-         pentect plugins new|dev|publish|add|remove|list|search|inspect|test|config|setup|update [NAME]\n\
+         pentect plugins new NAME | dev PATH | publish PATH\n\
+         pentect plugins add SOURCE | remove NAME | list | search [QUERY]\n\
+         pentect plugins inspect NAME | test NAME | config NAME [KEY=VALUE] | setup NAME | update [NAME]\n\
          pentect mask [TEXT]\n\
          pentect read PATH\n\
          pentect view <HANDLE>\n\

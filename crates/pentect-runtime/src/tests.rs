@@ -2886,6 +2886,7 @@ fn mixed_env_output_still_masks_encoded_non_env_lines() {
 
 #[test]
 fn claude_pretool_wraps_plain_shell_command() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (root, session) = empty_session("hook-pre-plain");
     let input = json!({
         "hook_event_name": "PreToolUse",
@@ -4104,6 +4105,7 @@ fn bash_for_wrapper_test() -> Option<PathBuf> {
 
 #[test]
 fn claude_pretool_wraps_masked_shell_command() {
+    let _env_guard = TEST_ENV_LOCK.lock().unwrap();
     let (root, session, masked) = masked_session("hook-pre");
     let input = json!({
         "hook_event_name": "PreToolUse",

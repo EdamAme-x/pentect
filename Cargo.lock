@@ -2343,6 +2343,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "toml_edit",
+ "wat",
  "windows-sys 0.61.2",
  "zeroize",
 ]

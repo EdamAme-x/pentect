@@ -53,3 +53,6 @@ windows-sys = { version = "0.61.2", features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+wat = "1"

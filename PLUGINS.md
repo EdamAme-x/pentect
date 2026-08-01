@@ -14,6 +14,9 @@ Claude Code, and their desktop-app launchers. Use `--plugins SOURCE` only for a
 one-off addition.
 
 ```text
+pentect plugins new NAME
+pentect plugins dev PATH
+pentect plugins publish PATH
 pentect plugins list
 pentect plugins inspect NAME
 pentect plugins config NAME key=value

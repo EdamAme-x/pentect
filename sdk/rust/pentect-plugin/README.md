@@ -16,8 +16,8 @@ pentect-plugin = "0.1"
 use pentect_plugin::{Finding, Inspect, PluginResult};
 
 fn inspect(context: &mut Inspect) -> PluginResult {
-    if let Some(start) = context.input.text.find("ACME-") {
-        context.add_finding(Finding::new(start, start + 5, "ACME_ID"));
+    if let Some(start) = context.input().text.find("ACME-") {
+        context.add_finding(Finding::new(start, start + 5, "ACME_ID"))?;
     }
     Ok(())
 }
@@ -26,9 +26,10 @@ pentect_plugin::export!(inspect);
 ```
 
 Available hooks are `prepare`, `inspect`, `finalize`, `request`, `response`,
-`tool_call`, and `file`. A successful handler continues automatically. It only
-needs to call `block`, `replace`, `respond`, or `add_finding` when changing the
-result.
+`tool_call`, and `file`. A successful handler continues automatically. Use
+`replace` from `prepare`, `finalize`, `request`, `response`, or `tool_call`;
+`add_finding` from `inspect`; and `respond` from `request`. `block` is available
+on every hook.
 
 Finding offsets are UTF-8 byte offsets. Overlapping findings become one masked
 union and one handle; edge-adjacent findings remain separate. When labels

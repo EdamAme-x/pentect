@@ -1929,13 +1929,6 @@ fn join_upstream_url(base: &reqwest::Url, path_and_query: &str) -> Result<reqwes
     Ok(joined)
 }
 
-#[cfg(test)]
-fn is_anthropic_protected_request_path(path: &str) -> bool {
-    path.split('?').next().is_some_and(|path| {
-        path.ends_with("/v1/messages") || path.ends_with("/v1/messages/count_tokens")
-    })
-}
-
 fn classify_anthropic_endpoint(path_and_query: &str) -> AnthropicEndpoint {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
     if path.ends_with("/v1/messages") {
@@ -2362,11 +2355,14 @@ mod tests {
 
     #[test]
     fn known_anthropic_endpoints_are_classified_before_forwarding() {
-        assert!(is_anthropic_protected_request_path("/v1/messages"));
-        assert!(is_anthropic_protected_request_path(
-            "/v1/messages/count_tokens?beta=1"
-        ));
-        assert!(!is_anthropic_protected_request_path("/v1/models"));
+        assert_eq!(
+            classify_anthropic_endpoint("/v1/messages"),
+            AnthropicEndpoint::Messages
+        );
+        assert_eq!(
+            classify_anthropic_endpoint("/v1/messages/count_tokens?beta=1"),
+            AnthropicEndpoint::CountTokens
+        );
         assert_eq!(
             classify_anthropic_endpoint("/v1/messages/count_tokens"),
             AnthropicEndpoint::CountTokens

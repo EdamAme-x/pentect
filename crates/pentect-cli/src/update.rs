@@ -93,7 +93,9 @@ fn update(options: UpdateOptions) -> Result<(), String> {
         },
     );
     let release: Release = get_response(&client, &release_api, MAX_CHECKSUM_BYTES * 16)?;
-    if release.draft || release.prerelease {
+    let allow_prerelease =
+        std::env::var("PENTECT_UPDATE_ALLOW_PRERELEASE").is_ok_and(|value| value == "1");
+    if release.draft || (release.prerelease && !allow_prerelease) {
         return Err("latest GitHub release is not a stable release".to_string());
     }
     let latest = release_version(&release.tag_name)?;

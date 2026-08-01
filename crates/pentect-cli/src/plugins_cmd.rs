@@ -495,6 +495,8 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let active = active_for_one(spec)?;
     let source = plugins::plugin_source(spec).map_err(|e| e.to_string())?;
     let manifest = load_plugin_manifest(&source)?;
+    let name = plugin_name(&source, manifest.as_ref());
+    let hooks = installed_wasm_hooks(&name, manifest.as_ref(), &source)?;
     let binary = manifest
         .as_ref()
         .and_then(|manifest| manifest.binary.as_deref());
@@ -520,7 +522,7 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         println!(
             "{}",
             json!({
-                "name": plugin_name(&source, manifest.as_ref()),
+                "name": name,
                 "description": manifest.as_ref().and_then(|manifest| manifest.description.as_deref()),
                 "manifest": source.manifest_path.as_deref().map(display_path),
                 "configs": active.config_paths().iter().map(|path| display_path(path)).collect::<Vec<_>>(),
@@ -530,7 +532,7 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
                 "asset": asset,
                 "runtime": manifest.as_ref().map(plugin_runtime),
                 "publisher_workflow": manifest.as_ref().filter(|manifest| manifest.binary.is_some()).and_then(|manifest| publisher_workflow(manifest).ok()),
-                "hooks": manifest.as_ref().and_then(|manifest| manifest.binary.as_ref()).map(|_| "wasm_exports"),
+                "hooks": hooks,
                 "execution": manifest.as_ref().and_then(|manifest| manifest.binary.as_ref()).map(|_| json!({
                     "required": manifest.as_ref().is_some_and(|manifest| manifest.required),
                     "mode": manifest.as_ref().and_then(|manifest| manifest.execution.as_ref()).and_then(|execution| execution.mode.as_deref()).unwrap_or("oneshot"),
@@ -541,7 +543,7 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         );
         return Ok(());
     }
-    println!("name: {}", plugin_name(&source, manifest.as_ref()));
+    println!("name: {name}");
     if let Some(description) = manifest
         .as_ref()
         .and_then(|manifest| manifest.description.as_deref())
@@ -577,11 +579,13 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
             println!("asset: {asset}");
         }
     }
+    if let Some(hooks) = hooks {
+        println!("hooks: {}", hooks.join(", "));
+    }
     if let Some(manifest) = manifest
         .as_ref()
         .filter(|manifest| manifest.binary.is_some())
     {
-        println!("hooks: detected from WebAssembly exports");
         println!("required: {}", manifest.required);
     }
     if let Some(network) = manifest
@@ -609,6 +613,25 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
             .unwrap_or(0)
     );
     Ok(())
+}
+
+fn installed_wasm_hooks(
+    name: &str,
+    manifest: Option<&PluginManifest>,
+    source: &plugins::PluginSource,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    let Some(binary) = manifest.binary.as_deref() else {
+        return Ok(None);
+    };
+    let destination = binary_destination(name, binary, plugin_runtime(manifest), source)?;
+    if !destination.is_file() {
+        return Ok(None);
+    }
+    let bytes = read_bounded_bytes(&destination, MAX_PLUGIN_WASM_BYTES, "WebAssembly plugin")?;
+    pentect_agent::inspect_wasm_plugin_hooks(&bytes).map(Some)
 }
 
 fn new_plugin(name: &str, json_output: bool) -> Result<(), String> {
@@ -644,12 +667,12 @@ fn new_plugin(name: &str, json_output: bool) -> Result<(), String> {
     .map_err(|error| format!("could not write Cargo.toml: {error}"))?;
     std::fs::write(
         root.join("src/lib.rs"),
-        "use pentect_plugin::{Finding, Inspect, PluginResult};\n\nfn inspect(context: &mut Inspect) -> PluginResult {\n    if let Some(start) = context.input.text.find(\"CHANGE_ME\") {\n        context.add_finding(Finding::new(start, start + 9, \"CUSTOM_SECRET\"));\n    }\n    Ok(())\n}\n\npentect_plugin::export!(inspect);\n",
+        "use pentect_plugin::{Finding, Inspect, PluginResult};\n\nfn inspect(context: &mut Inspect) -> PluginResult {\n    if let Some(start) = context.input().text.find(\"CHANGE_ME\") {\n        context.add_finding(Finding::new(start, start + 9, \"CUSTOM_SECRET\"))?;\n    }\n    Ok(())\n}\n\npentect_plugin::export!(inspect);\n",
     )
     .map_err(|error| format!("could not write plugin source: {error}"))?;
     std::fs::write(
         root.join("README.md"),
-        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\npentect plugins dev .\npentect plugins publish .\n```\n"),
+        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\npentect plugins dev .\npentect plugins publish .\n```\n\nCommit `Cargo.lock`. The release workflow builds with `--locked`.\n"),
     )
     .map_err(|error| format!("could not write plugin README: {error}"))?;
     std::fs::write(root.join(".gitignore"), "/target\n/dist\n")
@@ -687,7 +710,10 @@ fn dev_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     if json_output {
         return Err("plugins dev does not support --json".to_string());
     }
-    let built = build_local_plugin(spec)?;
+    let source = plugins::plugin_source(spec).map_err(|error| error.to_string())?;
+    let manifest = load_plugin_manifest(&source)?
+        .ok_or_else(|| "plugin development requires plugin.toml".to_string())?;
+    let built = build_local_plugin(&source, &manifest)?;
     let check = test_binary(&built);
     println!("binary: {}", check.status.as_str());
     if check.status == Status::Fail {
@@ -709,7 +735,7 @@ fn publish_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         .binary
         .as_deref()
         .ok_or_else(|| "declarative plugins do not need a release binary".to_string())?;
-    let built = build_local_plugin(spec)?;
+    let built = build_local_plugin(&source, &manifest)?;
     let check = test_binary(&built);
     if check.status == Status::Fail {
         return Err(format!("plugin test failed: {}", check.detail));
@@ -739,10 +765,10 @@ fn publish_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn build_local_plugin(spec: &str) -> Result<PathBuf, String> {
-    let source = plugins::plugin_source(spec).map_err(|error| error.to_string())?;
-    let manifest = load_plugin_manifest(&source)?
-        .ok_or_else(|| "plugin development requires plugin.toml".to_string())?;
+fn build_local_plugin(
+    source: &plugins::PluginSource,
+    manifest: &PluginManifest,
+) -> Result<PathBuf, String> {
     let binary = manifest
         .binary
         .as_deref()
@@ -755,6 +781,18 @@ fn build_local_plugin(spec: &str) -> Result<PathBuf, String> {
     if !root.join("Cargo.toml").is_file() {
         return Err("plugins dev currently supports Rust plugins with Cargo.toml".to_string());
     }
+    let metadata = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("could not inspect Cargo build directory: {error}"))?;
+    if !metadata.status.success() {
+        return Err("could not inspect Cargo build directory".to_string());
+    }
+    let target_directory = serde_json::from_slice::<serde_json::Value>(&metadata.stdout)
+        .ok()
+        .and_then(|value| value.get("target_directory")?.as_str().map(PathBuf::from))
+        .ok_or_else(|| "Cargo metadata did not report target_directory".to_string())?;
     let status = Command::new("cargo")
         .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
         .current_dir(root)
@@ -764,8 +802,8 @@ fn build_local_plugin(spec: &str) -> Result<PathBuf, String> {
         return Err("plugin build failed".to_string());
     }
     let crate_asset = binary.replace('-', "_");
-    let built = root
-        .join("target/wasm32-unknown-unknown/release")
+    let built = target_directory
+        .join("wasm32-unknown-unknown/release")
         .join(crate_asset);
     if !built.is_file() {
         return Err(format!(
@@ -1353,9 +1391,21 @@ fn setup_plugin_source(
             println!("WARNING: this plugin can send hook input to approved network origins");
         }
     }
+    let mut approved_hooks = Vec::new();
     if let Some(binary) = manifest.binary.as_deref() {
         let repository = binary_repository(&source, &manifest)?;
         let runtime = plugin_runtime(&manifest);
+        let destination = binary_destination(&name, binary, runtime, &source)?;
+        let lock_path = plugin_runtime_dirs_for_source(&name, &source)?
+            .data_dir
+            .join(PLUGIN_BINARY_LOCK_FILE);
+        let previous_binary = read_optional_bounded(
+            &destination,
+            MAX_PLUGIN_WASM_BYTES,
+            "installed WebAssembly plugin",
+        )?;
+        let previous_lock =
+            read_optional_bounded(&lock_path, MAX_PLUGIN_METADATA_BYTES, "plugin binary lock")?;
         install_release_binary(
             &name,
             &source,
@@ -1365,13 +1415,15 @@ fn setup_plugin_source(
             publisher_workflow(&manifest)?,
             &manifest.assets,
         )?;
-        let destination = binary_destination(&name, binary, runtime, &source)?;
         let bytes = read_bounded_bytes(&destination, MAX_PLUGIN_WASM_BYTES, "WebAssembly plugin")?;
         let hooks = pentect_agent::inspect_wasm_plugin_hooks(&bytes)?;
         println!("hooks: {}", hooks.join(", "));
-    }
-    if !approved && !confirm_setup()? {
-        return Err("plugin setup was not approved".to_string());
+        if !approved && !confirm_setup()? {
+            restore_optional_file(&destination, previous_binary.as_deref())?;
+            restore_optional_file(&lock_path, previous_lock.as_deref())?;
+            return Err("plugin setup was not approved".to_string());
+        }
+        approved_hooks = hooks;
     }
     if manifest.binary.is_some() {
         let current_hash = source
@@ -1382,7 +1434,7 @@ fn setup_plugin_source(
         if current_hash != manifest_hash {
             return Err("plugin.toml changed during setup; approval was not recorded".to_string());
         }
-        write_plugin_approval(&name, &source, &manifest)?;
+        write_plugin_approval(&name, &source, &manifest, &approved_hooks)?;
     }
     println!("setup: complete");
     Ok(())
@@ -1392,12 +1444,14 @@ fn setup_plugin_source(
 struct PluginApproval {
     schema: &'static str,
     manifest_sha256: String,
+    hooks: Vec<String>,
 }
 
 fn write_plugin_approval(
     name: &str,
     source: &plugins::PluginSource,
     _manifest: &PluginManifest,
+    hooks: &[String],
 ) -> Result<(), String> {
     let path = source
         .manifest_path
@@ -1406,6 +1460,7 @@ fn write_plugin_approval(
     let approval = PluginApproval {
         schema: "pentect.plugin-approval.v1",
         manifest_sha256: sha256_path(path)?,
+        hooks: hooks.to_vec(),
     };
     let encoded = toml::to_string(&approval)
         .map_err(|error| format!("could not encode plugin approval: {error}"))?;
@@ -1435,15 +1490,33 @@ fn update_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), St
         println!("plugin manifest changed; reviewing updated access");
         return setup_plugin_source(source, approved, false);
     }
+    let runtime = plugin_runtime(&manifest);
+    let destination = binary_destination(&name, binary, runtime, &source)?;
+    let lock_path = plugin_runtime_dirs_for_source(&name, &source)?
+        .data_dir
+        .join(PLUGIN_BINARY_LOCK_FILE);
+    let previous_binary = read_optional_bounded(
+        &destination,
+        MAX_PLUGIN_WASM_BYTES,
+        "installed WebAssembly plugin",
+    )?;
+    let previous_lock =
+        read_optional_bounded(&lock_path, MAX_PLUGIN_METADATA_BYTES, "plugin binary lock")?;
     install_release_binary(
         &name,
         &source,
         &repository,
         binary,
-        plugin_runtime(&manifest),
+        runtime,
         publisher_workflow(&manifest)?,
         &manifest.assets,
     )?;
+    if verify_plugin_update_approval(&name, &source, &manifest).is_err() {
+        restore_optional_file(&destination, previous_binary.as_deref())?;
+        restore_optional_file(&lock_path, previous_lock.as_deref())?;
+        println!("plugin hook access changed; reviewing updated access");
+        return setup_plugin_source(source, approved, false);
+    }
     // Updating a release binary must not rewrite the user's manifest approval.
     // Keeping the original digest makes any concurrent or later edit require setup again.
     println!("update: complete");
@@ -1476,6 +1549,7 @@ fn update_all_plugins(approved: bool, json_output: bool) -> Result<(), String> {
 struct StoredPluginApproval {
     schema: String,
     manifest_sha256: String,
+    hooks: Vec<String>,
 }
 
 fn verify_plugin_update_approval(
@@ -1502,7 +1576,44 @@ fn verify_plugin_update_approval(
     {
         return Err("plugin manifest changed; review it with `pentect plugins setup`".to_string());
     }
+    let hooks = installed_wasm_hooks(name, Some(manifest), plugin)?
+        .ok_or_else(|| "installed plugin binary is missing; run setup again".to_string())?;
+    if approval.hooks != hooks {
+        return Err(
+            "plugin hook access changed; review it with `pentect plugins setup`".to_string(),
+        );
+    }
     Ok(())
+}
+
+fn read_optional_bounded(path: &Path, max: u64, label: &str) -> Result<Option<Vec<u8>>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    read_bounded_bytes(path, max, label).map(Some)
+}
+
+fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> Result<(), String> {
+    let Some(contents) = contents else {
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|error| {
+                format!(
+                    "could not remove rejected plugin file '{}': {error}",
+                    path.display()
+                )
+            })?;
+        }
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| "plugin restore destination has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create plugin restore directory: {error}"))?;
+    let staged = path.with_extension(format!("restore-{}", std::process::id()));
+    std::fs::write(&staged, contents)
+        .map_err(|error| format!("could not stage plugin restore: {error}"))?;
+    replace_binary(&staged, path)
 }
 
 fn binary_platform() -> String {
@@ -2371,7 +2482,21 @@ mod tests {
             repository: None,
         };
         let manifest = load_plugin_manifest(&source).unwrap().unwrap();
-        write_plugin_approval(&name, &source, &manifest).unwrap();
+        let hooks = vec!["inspect".to_string()];
+        let data_dir = plugin_runtime_dirs_for_source(&name, &source)
+            .unwrap()
+            .data_dir;
+        std::fs::create_dir_all(data_dir.join("bin")).unwrap();
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "pentect_alloc") (param i32) (result i32) i32.const 0)
+                (func (export "pentect_inspect") (param i32 i32) (result i64) i64.const 0)
+            )"#,
+        )
+        .unwrap();
+        std::fs::write(data_dir.join("bin/helper.wasm"), wasm).unwrap();
+        write_plugin_approval(&name, &source, &manifest, &hooks).unwrap();
         verify_plugin_update_approval(&name, &source, &manifest).unwrap();
 
         std::fs::write(

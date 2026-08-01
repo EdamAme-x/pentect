@@ -126,7 +126,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Publish GitHub Release
+      - name: Stage prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -134,10 +134,12 @@ jobs:
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$GITHUB_REF_NAME" --prerelease --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$GITHUB_REF_NAME" dist/* \
               --verify-tag \
               --generate-notes \
+              --prerelease \
               --title "Pentect $GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY"
           fi
@@ -187,6 +189,7 @@ jobs:
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           $env:PENTECT_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'pentect-lifecycle\bin'
           $env:PENTECT_INSTALL_SKIP_PATH = '1'
+          $env:PENTECT_UPDATE_ALLOW_PRERELEASE = '1'
           ./tools/install.ps1 -Version $version
           $binary = Join-Path $env:PENTECT_INSTALL_DIR 'pentect.exe'
           if ((& $binary version) -ne "pentect $version") { throw 'installed version mismatch' }
@@ -208,6 +211,7 @@ jobs:
           set -eu
           version=${GITHUB_REF_NAME#v}
           export PENTECT_INSTALL_DIR="$RUNNER_TEMP/pentect-lifecycle/bin"
+          export PENTECT_UPDATE_ALLOW_PRERELEASE=1
           ./tools/install.sh --version "$version"
           binary="$PENTECT_INSTALL_DIR/pentect"
           test "$("$binary" version)" = "pentect $version"
@@ -215,3 +219,16 @@ jobs:
           test "$("$binary" version)" = "pentect $version"
           "$binary" uninstall
           test ! -e "$binary"
+
+  promote:
+    name: Publish stable release
+    needs: lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Promote validated release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --prerelease=false --repo "$GITHUB_REPOSITORY"

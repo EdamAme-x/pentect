@@ -235,6 +235,10 @@ async fn proxy_request_inner(
     let endpoint = classify_openai_endpoint(path_and_query);
     enforce_known_openai_endpoint(endpoint, state.block_unknown_formats)?;
     let responses_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Responses;
+    let responses_response = matches!(
+        endpoint,
+        OpenAiEndpoint::Responses | OpenAiEndpoint::ResponsesResource
+    );
     let protected_request = method == hyper::Method::POST
         && matches!(
             endpoint,
@@ -364,7 +368,7 @@ async fn proxy_request_inner(
         response_media_type.is_some_and(|value| {
             value.eq_ignore_ascii_case("application/json")
                 || value.to_ascii_lowercase().ends_with("+json")
-        }) || (responses_path && !request_streaming && response_media_type.is_none());
+        }) || (responses_response && !request_streaming && response_media_type.is_none());
     let mut builder = Response::builder().status(status);
     let connection_headers = connection_named_headers(&response_headers);
     for (name, value) in &response_headers {
@@ -380,7 +384,7 @@ async fn proxy_request_inner(
             .unwrap_or(crate::http_files::Coverage::None)
             .as_header(),
     );
-    if is_event_stream || (!responses_path && !files_upload) {
+    if is_event_stream || (!responses_response && !files_upload) {
         return builder
             .body(streaming_response_body(
                 upstream,
@@ -410,7 +414,7 @@ async fn proxy_request_inner(
             }
         }
     }
-    let response_body = if responses_path && status.is_success() && is_json_response {
+    let response_body = if responses_response && status.is_success() && is_json_response {
         let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
         match rewrite_openai_json_response(&response_body) {
             Ok(rewritten) => Bytes::from(rewritten),
@@ -1332,6 +1336,7 @@ fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OpenAiEndpoint {
     Responses,
+    ResponsesResource,
     InputTokens,
     FilesCollection,
     Files,
@@ -1342,10 +1347,12 @@ enum OpenAiEndpoint {
 
 fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
-    if path.ends_with("/responses") {
-        OpenAiEndpoint::Responses
-    } else if path.ends_with("/responses/input_tokens") {
+    if path.ends_with("/responses/input_tokens") {
         OpenAiEndpoint::InputTokens
+    } else if path.ends_with("/responses") {
+        OpenAiEndpoint::Responses
+    } else if path.contains("/responses/") {
+        OpenAiEndpoint::ResponsesResource
     } else if path.ends_with("/files") {
         OpenAiEndpoint::FilesCollection
     } else if path.contains("/files/") {
@@ -1558,6 +1565,18 @@ mod tests {
         assert_eq!(
             classify_openai_endpoint("/v1/responses/input_tokens"),
             OpenAiEndpoint::InputTokens
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/responses/resp_123"),
+            OpenAiEndpoint::ResponsesResource
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/responses/resp_123/cancel"),
+            OpenAiEndpoint::ResponsesResource
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/responses/resp_123/input_items"),
+            OpenAiEndpoint::ResponsesResource
         );
         assert_eq!(
             classify_openai_endpoint("/v1/files"),

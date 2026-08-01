@@ -10,7 +10,7 @@ documentation = "https://docs.rs/pentect-plugin"
 readme = "README.md"
 keywords = ["pentect", "wasm", "plugin", "security"]
 categories = ["wasm", "api-bindings"]
-include = ["src/**", "examples/**", "README.md", "Cargo.toml"]
+include = ["src/**", "examples/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -585,7 +585,7 @@ impl PluginBinary {
         let config = Some(load_plugin_config(&runtime_dirs)?);
         let wasm = WasmProgram::load_bytes(&wasm_bytes, &name, network, config)?;
         let hooks = wasm.hooks.clone();
-        verify_plugin_approval(path, &runtime_dirs)?;
+        verify_plugin_approval(path, &runtime_dirs, &hooks)?;
         Ok(Self {
             name,
             wasm,
@@ -675,6 +675,7 @@ pub fn valid_plugin_publisher_workflow(workflow: &str) -> bool {
 struct PluginApproval {
     schema: String,
     manifest_sha256: String,
+    hooks: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -683,7 +684,11 @@ struct PluginBinaryLock {
     sha256: String,
 }
 
-fn verify_plugin_approval(manifest: &Path, runtime_dirs: &PluginRuntimeDirs) -> Result<(), String> {
+fn verify_plugin_approval(
+    manifest: &Path,
+    runtime_dirs: &PluginRuntimeDirs,
+    hooks: &BTreeSet<MiddlewareStage>,
+) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let path = runtime_dirs.data_dir.join(PLUGIN_APPROVAL_FILE);
     let source =
@@ -699,9 +704,16 @@ fn verify_plugin_approval(manifest: &Path, runtime_dirs: &PluginRuntimeDirs) -> 
     let bytes = read_bounded_bytes(manifest, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest")
         .map_err(|error| format!("could not verify plugin manifest: {error}"))?;
     let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
-    if approval.schema != "pentect.plugin-approval.v1" || approval.manifest_sha256 != digest {
+    let installed_hooks = hooks
+        .iter()
+        .map(|hook| hook.as_str().to_string())
+        .collect::<Vec<_>>();
+    if approval.schema != "pentect.plugin-approval.v1"
+        || approval.manifest_sha256 != digest
+        || approval.hooks != installed_hooks
+    {
         return Err(format!(
-            "plugin '{}' changed after approval; run `pentect plugins setup {} --yes` again",
+            "plugin '{}' manifest or hook access changed after approval; run `pentect plugins setup {} --yes` again",
             plugin_default_name(manifest),
             manifest.display()
         ));
@@ -1014,7 +1026,7 @@ fn wasm_config_read(
         return -3;
     };
     if encoded.len() > response_capacity {
-        return -2;
+        return i32::try_from(encoded.len()).unwrap_or(-2);
     }
     if memory
         .write(&mut caller, response_offset, &encoded)

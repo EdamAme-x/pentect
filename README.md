@@ -100,6 +100,7 @@ approval.
 ```text
 pentect plugins new NAME
 pentect plugins dev PATH
+pentect plugins publish PATH
 pentect plugins add github:@owner/repository/path
 pentect plugins list
 pentect plugins inspect NAME

@@ -22,9 +22,27 @@ pub struct Finding {
     pub end: usize,
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
+    pub category: Option<Category>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<String>,
+    pub confidence: Option<Confidence>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Category {
+    Secret,
+    Identifier,
+    Endpoint,
+    Pii,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
 }
 
 impl Finding {
@@ -64,10 +82,14 @@ macro_rules! context {
             #[serde(flatten)]
             base: Base,
             #[serde(rename = "payload")]
-            pub input: $payload,
+            input: $payload,
         }
 
         impl $name {
+            pub fn input(&self) -> &$payload {
+                &self.input
+            }
+
             pub fn metadata(&self) -> Option<&Value> {
                 self.base.metadata.as_ref()
             }
@@ -121,8 +143,17 @@ impl Prepare {
 }
 
 impl Inspect {
-    pub fn add_finding(&mut self, finding: Finding) {
+    pub fn add_finding(&mut self, finding: Finding) -> PluginResult {
+        if finding.start >= finding.end
+            || finding.end > self.input.text.len()
+            || !self.input.text.is_char_boundary(finding.start)
+            || !self.input.text.is_char_boundary(finding.end)
+        {
+            return Err("finding offsets must be a non-empty UTF-8 byte range within input.text"
+                .into());
+        }
         self.base.output.findings.push(finding);
+        Ok(())
     }
 }
 
@@ -223,7 +254,7 @@ impl WireResponse {
         }
     }
 
-    fn failure(id: u64) -> Self {
+    fn failure(id: u64, code: &'static str) -> Self {
         Self {
             schema: SCHEMA,
             id,
@@ -234,7 +265,7 @@ impl WireResponse {
             message: None,
             spans: Vec::new(),
             error: Some(PluginError {
-                code: "handler_error",
+                code,
             }),
         }
     }
@@ -300,22 +331,32 @@ extern "C" {
 
 #[cfg(target_arch = "wasm32")]
 fn config(key: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
-    const CAPACITY: usize = 1024 * 1024;
-    let mut output = vec![0_u8; CAPACITY];
-    let len = unsafe {
-        pentect_config_read(
-            key.as_ptr() as i32,
-            i32::try_from(key.len())?,
-            output.as_mut_ptr() as i32,
-            CAPACITY as i32,
-        )
-    };
-    if len < 0 {
-        return Err(format!("Pentect config read failed with code {len}").into());
+    const INITIAL_CAPACITY: usize = 256;
+    const MAX_CAPACITY: usize = 1024 * 1024;
+    let mut output = vec![0_u8; INITIAL_CAPACITY];
+    loop {
+        let len = unsafe {
+            pentect_config_read(
+                key.as_ptr() as i32,
+                i32::try_from(key.len())?,
+                output.as_mut_ptr() as i32,
+                i32::try_from(output.len())?,
+            )
+        };
+        if len < 0 {
+            return Err(format!("Pentect config read failed with code {len}").into());
+        }
+        let len = usize::try_from(len)?;
+        if len <= output.len() {
+            output.truncate(len);
+            let value: Value = serde_json::from_slice(&output)?;
+            return Ok((value != Value::Null).then_some(value));
+        }
+        if len > MAX_CAPACITY {
+            return Err("Pentect config value exceeds its limit".into());
+        }
+        output.resize(len, 0);
     }
-    output.truncate(usize::try_from(len)?);
-    let value: Value = serde_json::from_slice(&output)?;
-    Ok((value != Value::Null).then_some(value))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -377,11 +418,14 @@ pub mod __private {
         let input =
             unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer as *mut u8, len)) };
         let mut context: C = serde_json::from_slice(&input).expect("invalid Pentect hook input");
-        assert_eq!(context.schema(), SCHEMA, "unsupported Pentect hook schema");
         let id = context.id();
-        let response = match handler(&mut context) {
-            Ok(()) => context.finish(),
-            Err(_) => WireResponse::failure(id),
+        let response = if context.schema() != SCHEMA {
+            WireResponse::failure(id, "unsupported_schema")
+        } else {
+            match handler(&mut context) {
+                Ok(()) => context.finish(),
+                Err(_) => WireResponse::failure(id, "handler_error"),
+            }
         };
         let output = serde_json::to_vec(&response)
             .expect("Pentect response failed")
@@ -452,4 +496,46 @@ macro_rules! export {
 
         $($crate::__export_hook!($hook);)+
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inspect(text: &str) -> Inspect {
+        serde_json::from_value(serde_json::json!({
+            "schema": SCHEMA,
+            "id": 1,
+            "payload": { "kind": "text", "text": text }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn findings_require_valid_utf8_byte_ranges() {
+        let mut context = inspect("aéz");
+        assert!(context
+            .add_finding(Finding::new(1, 3, "IDENTIFIER"))
+            .is_ok());
+        assert!(context
+            .add_finding(Finding::new(1, 2, "IDENTIFIER"))
+            .is_err());
+        assert!(context
+            .add_finding(Finding::new(0, 99, "IDENTIFIER"))
+            .is_err());
+    }
+
+    #[test]
+    fn finding_types_serialize_to_protocol_values() {
+        let finding = Finding {
+            start: 0,
+            end: 1,
+            label: "TOKEN".to_string(),
+            category: Some(Category::Secret),
+            confidence: Some(Confidence::High),
+        };
+        let value = serde_json::to_value(finding).unwrap();
+        assert_eq!(value["category"], "secret");
+        assert_eq!(value["confidence"], "high");
+    }
 }
