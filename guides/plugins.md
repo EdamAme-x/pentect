@@ -17,22 +17,19 @@ schema = "pentect.plugin.v1"
 name = "company-policy"
 binary = "company-policy.wasm"
 repository = "owner/company-policy"
+required = true
 
 [execution]
 timeout_ms = 10000
 max_input_bytes = 262144
 max_output_bytes = 1048576
 
-[middleware]
-stages = ["provider_request", "tool_call"]
-permissions = ["payload:write", "pipeline:block"]
-required = true
-
 ```
 
 `execution.runtime = "wasm"` and `execution.mode = "oneshot"` are accepted for
 older manifests but are unnecessary. Any other runtime or mode is rejected.
-Reading the event payload is implicit. The publisher workflow defaults to
+Hooks are discovered from the signed WebAssembly exports; they are not repeated
+in `plugin.toml`. Reading hook input is implicit. The publisher workflow defaults to
 `.github/workflows/release.yml`; declare `[publisher].workflow` only when a
 different workflow publishes the release. `[assets]` is needed only when the
 Release asset name differs from `binary`.
@@ -93,7 +90,7 @@ The module imports only:
 pentect:http/request(i32, i32, i32, i32) -> i32
 ```
 
-The Rust SDK exposes this as the typed `http_request` helper. Pentect performs
+The Rust SDK exposes this as `context.fetch(...)`. Pentect performs
 the request on behalf of the module; the module never receives a raw socket.
 Unknown imports and network imports without a matching `[network]` section are
 rejected before execution.
@@ -103,17 +100,12 @@ rejected before execution.
 Configuration remains outside the module and is read one key at a time through
 Pentect:
 
-```toml
-[middleware]
-permissions = ["config:read"]
-```
-
 ```text
 pentect plugins config PATH model.threshold=0.8
 ```
 
-The Rust SDK exposes `config("model.threshold")`. Pentect imports
-`pentect:config/read` only for an approved `config:read` plugin. The module
+The Rust SDK exposes `context.config("model.threshold")`. Pentect imports
+`pentect:config/read` only for the plugin's own isolated configuration. The module
 never receives a configuration file path or general filesystem access.
 Mutable plugin cache access is not currently supported.
 
@@ -124,22 +116,39 @@ The module exports:
 ```text
 memory
 pentect_alloc(i32) -> i32
-pentect_handle(i32, i32) -> i64
+one or more of:
+pentect_prepare(i32, i32) -> i64
+pentect_inspect(i32, i32) -> i64
+pentect_finalize(i32, i32) -> i64
+pentect_request(i32, i32) -> i64
+pentect_response(i32, i32) -> i64
+pentect_tool_call(i32, i32) -> i64
+pentect_file(i32, i32) -> i64
 ```
 
-The high 32 bits of `pentect_handle`'s result are the response pointer and the
-low 32 bits are its byte length. The Rust SDK's `export_wasm_plugin!` macro
-implements this ABI:
+The high 32 bits of a hook result are the response pointer and the low 32 bits
+are its byte length. A plugin exports only the hooks it implements. Successful
+handlers continue automatically:
 
 ```rust
-use pentect_plugin::{Request, Response};
+use pentect_plugin::{Finding, Inspect, PluginResult};
 
-fn handle(request: Request) -> Result<Response, Box<dyn std::error::Error>> {
-    Ok(Response::next(request.id))
+fn inspect(context: &mut Inspect) -> PluginResult {
+    if let Some(start) = context.input.text.find("ACME-") {
+        context.add_finding(Finding::new(start, start + 5, "ACME_ID"));
+    }
+    Ok(())
 }
 
-pentect_plugin::export_wasm_plugin!(handle);
+pentect_plugin::export!(inspect);
 ```
+
+Finding offsets are UTF-8 byte offsets into `context.input.text`. Overlapping
+findings are one sensitive value: Pentect masks their complete union with one
+handle and selects the strongest finding's label, using the label itself as the
+final deterministic tie-breaker. This prevents plugin order from changing the
+result or exposing a lower-priority finding's prefix or suffix. Findings that
+only touch at an edge remain separate.
 
 Build a Rust plugin as a `cdylib`:
 
@@ -161,22 +170,20 @@ deadline, input/output limits, and a bounded detector-span count. No WASI
 interfaces are linked. Manifests cannot raise execution past 60 seconds,
 4 MiB input, 4 MiB output, or 4096 spans.
 
-`pentect plugins setup` shows the release, publisher workflow, middleware
-permissions, and requested network access before approval. Approval records
-the complete manifest SHA-256. Any change to a network origin, method, limit,
-middleware stage, or permission requires approval again.
+`pentect plugins setup` shows the release, publisher workflow, discovered hooks,
+and requested network access before approval. Approval records the complete
+manifest SHA-256. Any manifest change requires approval again.
 
 Arbitrary postscripts are rejected. Executable assets must be GitHub Release
 assets with Sigstore build provenance matching both the publisher repository
 and `[publisher].workflow`; attestations from self-hosted runners are rejected.
 
-Reading the event payload is implicit. Payload replacement requires
-`payload:write`; blocking requires `pipeline:block`. Local responses require
-`pipeline:respond` and are valid only during `provider_request`. The
+Reading hook input is implicit. Hook-specific context types constrain which
+operations are available; local responses are valid only in the `request` hook. The
 deterministic Pentect masking engine remains the final authority for detector
 spans.
 
-There is intentionally no post-resolution stage: plugins can inspect and
+There is intentionally no post-resolution hook: plugins can inspect and
 transform opaque handles at `tool_call`, but Pentect does not hand their
 plaintext values to third-party middleware.
 

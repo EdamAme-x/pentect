@@ -36,24 +36,6 @@ impl RangeIndex {
         let idx = self.ranges.partition_point(|r| r.start < range.start);
         self.ranges.insert(idx, range);
     }
-
-    pub(super) fn overlapping(&self, range: &ByteRange) -> Vec<ByteRange> {
-        if range.is_empty() {
-            return Vec::new();
-        }
-        let mut idx = self.ranges.partition_point(|r| r.end <= range.start);
-        let mut out = Vec::new();
-        while let Some(r) = self.ranges.get(idx) {
-            if r.start >= range.end {
-                break;
-            }
-            if r.overlaps(range) {
-                out.push(*r);
-            }
-            idx += 1;
-        }
-        out
-    }
 }
 
 #[cfg(test)]
@@ -76,22 +58,5 @@ mod tests {
         assert!(!idx.contains(&ByteRange::new(1, 3)));
         assert!(!idx.contains(&ByteRange::new(4, 9)));
         assert!(!idx.contains(&ByteRange::new(12, 12)));
-    }
-
-    #[test]
-    fn overlapping_returns_sorted_intersections() {
-        let idx = RangeIndex::new(vec![
-            ByteRange::new(0, 2),
-            ByteRange::new(4, 6),
-            ByteRange::new(8, 10),
-        ]);
-        assert_eq!(
-            idx.overlapping(&ByteRange::new(1, 9)),
-            vec![
-                ByteRange::new(0, 2),
-                ByteRange::new(4, 6),
-                ByteRange::new(8, 10)
-            ]
-        );
     }
 }

@@ -39,64 +39,112 @@ static ACTIVE_PLUGIN_DNS_THREADS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MiddlewareStage {
-    Ingest,
-    Decode,
-    Detect,
-    Policy,
-    Mask,
-    ProviderRequest,
-    ProviderResponse,
+    Prepare,
+    Inspect,
+    Finalize,
+    Request,
+    Response,
     ToolCall,
-    Output,
-    FileDiscover,
-    FileDecode,
-    FileDetect,
-    FileTransform,
-    Finding,
-    Report,
+    File,
 }
 
 impl MiddlewareStage {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Ingest => "ingest",
-            Self::Decode => "decode",
-            Self::Detect => "detect",
-            Self::Policy => "policy",
-            Self::Mask => "mask",
-            Self::ProviderRequest => "provider_request",
-            Self::ProviderResponse => "provider_response",
+            Self::Prepare => "prepare",
+            Self::Inspect => "inspect",
+            Self::Finalize => "finalize",
+            Self::Request => "request",
+            Self::Response => "response",
             Self::ToolCall => "tool_call",
-            Self::Output => "output",
-            Self::FileDiscover => "file_discover",
-            Self::FileDecode => "file_decode",
-            Self::FileDetect => "file_detect",
-            Self::FileTransform => "file_transform",
-            Self::Finding => "finding",
-            Self::Report => "report",
+            Self::File => "file",
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "ingest" => Self::Ingest,
-            "decode" => Self::Decode,
-            "detect" => Self::Detect,
-            "policy" => Self::Policy,
-            "mask" => Self::Mask,
-            "provider_request" => Self::ProviderRequest,
-            "provider_response" => Self::ProviderResponse,
-            "tool_call" => Self::ToolCall,
-            "output" => Self::Output,
-            "file_discover" => Self::FileDiscover,
-            "file_decode" => Self::FileDecode,
-            "file_detect" => Self::FileDetect,
-            "file_transform" => Self::FileTransform,
-            "finding" => Self::Finding,
-            "report" => Self::Report,
-            _ => return None,
-        })
+    fn export_name(self) -> &'static str {
+        match self {
+            Self::Prepare => "pentect_prepare",
+            Self::Inspect => "pentect_inspect",
+            Self::Finalize => "pentect_finalize",
+            Self::Request => "pentect_request",
+            Self::Response => "pentect_response",
+            Self::ToolCall => "pentect_tool_call",
+            Self::File => "pentect_file",
+        }
     }
+
+    fn from_export_name(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|hook| hook.export_name() == value)
+    }
+
+    const ALL: [Self; 7] = [
+        Self::Prepare,
+        Self::Inspect,
+        Self::Finalize,
+        Self::Request,
+        Self::Response,
+        Self::ToolCall,
+        Self::File,
+    ];
+}
+
+pub fn inspect_wasm_plugin_hooks(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let engine = wasmi::Engine::default();
+    let module = wasmi::Module::new(&engine, bytes)
+        .map_err(|error| format!("WebAssembly plugin is invalid: {error}"))?;
+    Ok(validated_module_hooks(&module, "WebAssembly plugin")?
+        .into_iter()
+        .map(|hook| hook.as_str().to_string())
+        .collect())
+}
+
+fn validated_module_hooks(
+    module: &wasmi::Module,
+    name: &str,
+) -> Result<BTreeSet<MiddlewareStage>, String> {
+    let mut hooks = BTreeSet::new();
+    let mut has_memory = false;
+    let mut has_alloc = false;
+    for export in module.exports() {
+        if export.name() == WASM_ABI_MEMORY {
+            has_memory = export.ty().memory().is_some();
+        }
+        if export.name() == WASM_ABI_ALLOC {
+            has_alloc = export.ty().func().is_some_and(|function| {
+                function.params() == [wasmi::ValType::I32]
+                    && function.results() == [wasmi::ValType::I32]
+            });
+        }
+        let Some(hook) = MiddlewareStage::from_export_name(export.name()) else {
+            continue;
+        };
+        let valid = export.ty().func().is_some_and(|function| {
+            function.params() == [wasmi::ValType::I32, wasmi::ValType::I32]
+                && function.results() == [wasmi::ValType::I64]
+        });
+        if !valid {
+            return Err(format!(
+                "{name} exports {} with the wrong signature",
+                hook.export_name()
+            ));
+        }
+        hooks.insert(hook);
+    }
+    if !has_memory {
+        return Err(format!("{name} does not export memory"));
+    }
+    if !has_alloc {
+        return Err(format!(
+            "{name} does not export {WASM_ABI_ALLOC}(i32) -> i32"
+        ));
+    }
+    if hooks.is_empty() {
+        return Err(format!("{name} does not export a Pentect hook"));
+    }
+    Ok(hooks)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,48 +202,32 @@ impl PluginMiddleware {
         self.plugins.is_empty()
     }
 
-    pub fn has_stage(&self, stage: MiddlewareStage) -> bool {
+    pub fn has_hook(&self, hook: MiddlewareStage) -> bool {
         self.plugins
             .iter()
-            .any(|plugin| plugin.stages.contains(&stage))
+            .any(|plugin| plugin.hooks.contains(&hook))
     }
 
-    /// Invoke every declared stage once with a value-free fixture. This checks
+    /// Invoke every exported hook once with a value-free fixture. This checks
     /// the actual ABI and handler, not only module loading.
-    pub fn test_declared_stages(&self) -> Result<usize, String> {
+    pub fn test_hooks(&self) -> Result<usize, String> {
         let mut invoked = 0;
         for plugin in &self.plugins {
-            for stage in plugin.stages.iter().copied() {
-                let payload = stage_test_payload(stage);
-                let response = plugin.invoke(stage, &payload, None, 0, 1)?;
-                if response.payload.is_some() && !plugin.permissions.contains("payload:write") {
-                    return Err(format!(
-                        "plugin '{}' returned a payload without payload:write permission",
-                        plugin.name
-                    ));
-                }
+            for hook in plugin.hooks.iter().copied() {
+                let payload = hook_test_input(hook);
+                let response = plugin.invoke(hook, &payload, None)?;
                 if response.action == Action::Stop {
                     let outcome = response.outcome.unwrap_or(StopOutcomeFile::Block);
-                    let permission = match outcome {
-                        StopOutcomeFile::Block => "pipeline:block",
-                        StopOutcomeFile::Respond => "pipeline:respond",
-                    };
-                    if !plugin.permissions.contains(permission) {
-                        return Err(format!(
-                            "plugin '{}' tried to stop without {permission} permission",
-                            plugin.name
-                        ));
-                    }
                     if matches!(outcome, StopOutcomeFile::Respond)
-                        && stage != MiddlewareStage::ProviderRequest
+                        && hook != MiddlewareStage::Request
                     {
                         return Err(format!(
-                            "plugin '{}' can only respond during provider_request",
+                            "plugin '{}' can only respond from the request hook",
                             plugin.name
                         ));
                     }
                 }
-                if stage == MiddlewareStage::Detect {
+                if hook == MiddlewareStage::Inspect {
                     let text = payload
                         .get("text")
                         .and_then(Value::as_str)
@@ -212,23 +244,17 @@ impl PluginMiddleware {
 
     pub fn run(
         &self,
-        stage: MiddlewareStage,
+        hook: MiddlewareStage,
         mut payload: Value,
         context: Option<Value>,
     ) -> Result<MiddlewareRun, String> {
-        let total = self
-            .plugins
-            .iter()
-            .filter(|plugin| plugin.stages.contains(&stage))
-            .count();
         let mut coverage = MiddlewareCoverage::Full;
-        let mut index = 0usize;
         for plugin in self
             .plugins
             .iter()
-            .filter(|plugin| plugin.stages.contains(&stage))
+            .filter(|plugin| plugin.hooks.contains(&hook))
         {
-            let response = match plugin.invoke(stage, &payload, context.as_ref(), index, total) {
+            let response = match plugin.invoke(hook, &payload, context.as_ref()) {
                 Ok(response) => response,
                 Err(error) if !plugin.required => {
                     coverage = MiddlewareCoverage::Partial;
@@ -236,47 +262,15 @@ impl PluginMiddleware {
                         "[pentect] optional plugin '{}' skipped: {error}",
                         plugin.name
                     );
-                    index += 1;
                     continue;
                 }
                 Err(error) => return Err(error),
             };
-            index += 1;
-            if response.payload.is_some() && !plugin.permissions.contains("payload:write") {
-                let error = format!(
-                    "plugin '{}' returned a payload without payload:write permission",
-                    plugin.name
-                );
-                if plugin.required {
-                    return Err(error);
-                }
-                coverage = MiddlewareCoverage::Partial;
-                eprintln!("[pentect] optional {error}");
-                continue;
-            }
             let stop = if response.action == Action::Stop {
                 let outcome = response.outcome.unwrap_or(StopOutcomeFile::Block);
-                let permission = match outcome {
-                    StopOutcomeFile::Block => "pipeline:block",
-                    StopOutcomeFile::Respond => "pipeline:respond",
-                };
-                if matches!(outcome, StopOutcomeFile::Respond)
-                    && stage != MiddlewareStage::ProviderRequest
-                {
+                if matches!(outcome, StopOutcomeFile::Respond) && hook != MiddlewareStage::Request {
                     let error = format!(
-                        "plugin '{}' can only respond during provider_request",
-                        plugin.name
-                    );
-                    if plugin.required {
-                        return Err(error);
-                    }
-                    coverage = MiddlewareCoverage::Partial;
-                    eprintln!("[pentect] optional {error}");
-                    continue;
-                }
-                if !plugin.permissions.contains(permission) {
-                    let error = format!(
-                        "plugin '{}' tried to stop without {permission} permission",
+                        "plugin '{}' can only respond from the request hook",
                         plugin.name
                     );
                     if plugin.required {
@@ -336,10 +330,9 @@ impl PluginMiddleware {
         let plugins = self
             .plugins
             .iter()
-            .filter(|plugin| plugin.stages.contains(&MiddlewareStage::Detect))
+            .filter(|plugin| plugin.hooks.contains(&MiddlewareStage::Inspect))
             .collect::<Vec<_>>();
-        let total = plugins.len();
-        for (index, plugin) in plugins.into_iter().enumerate() {
+        for plugin in plugins {
             if input.data.len() > plugin.max_input_bytes {
                 if plugin.required {
                     return Err(format!(
@@ -353,10 +346,13 @@ impl PluginMiddleware {
             let payload = json!({
                 "kind": kind_name(&input.kind),
                 "text": input.data,
-                "context": context,
             });
+            let metadata = context
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| format!("plugin context encode failed: {error}"))?;
             let response =
-                match plugin.invoke(MiddlewareStage::Detect, &payload, None, index, total) {
+                match plugin.invoke(MiddlewareStage::Inspect, &payload, metadata.as_ref()) {
                     Ok(response) => response,
                     Err(error) if !plugin.required => {
                         coverage = MiddlewareCoverage::Partial;
@@ -372,23 +368,7 @@ impl PluginMiddleware {
                 let outcome = response.outcome.unwrap_or(StopOutcomeFile::Block);
                 if matches!(outcome, StopOutcomeFile::Respond) {
                     let error = format!(
-                        "plugin '{}' can only respond during provider_request",
-                        plugin.name
-                    );
-                    if plugin.required {
-                        return Err(error);
-                    }
-                    coverage = MiddlewareCoverage::Partial;
-                    eprintln!("[pentect] optional {error}");
-                    continue;
-                }
-                let permission = match outcome {
-                    StopOutcomeFile::Block => "pipeline:block",
-                    StopOutcomeFile::Respond => "pipeline:respond",
-                };
-                if !plugin.permissions.contains(permission) {
-                    let error = format!(
-                        "plugin '{}' tried to stop without {permission} permission",
+                        "plugin '{}' can only respond from the request hook",
                         plugin.name
                     );
                     if plugin.required {
@@ -408,7 +388,7 @@ impl PluginMiddleware {
             }
             if response.payload.is_some() {
                 let error = format!(
-                    "plugin '{}' cannot replace payload during detect; return spans instead",
+                    "plugin '{}' cannot replace input from the inspect hook; add findings instead",
                     plugin.name
                 );
                 if plugin.required {
@@ -453,25 +433,20 @@ impl PluginMiddleware {
     }
 }
 
-fn stage_test_payload(stage: MiddlewareStage) -> Value {
-    match stage {
-        MiddlewareStage::ProviderRequest | MiddlewareStage::ProviderResponse => {
+fn hook_test_input(hook: MiddlewareStage) -> Value {
+    match hook {
+        MiddlewareStage::Request | MiddlewareStage::Response => {
             json!({"model": "pentect-plugin-test", "messages": []})
         }
         MiddlewareStage::ToolCall => {
             json!({"type": "function_call", "name": "pentect_plugin_test", "arguments": "{}"})
         }
-        MiddlewareStage::FileDiscover => {
+        MiddlewareStage::File => {
             json!({"filename": "test.txt", "media_type": "text/plain", "size": 4})
         }
-        MiddlewareStage::FileDecode
-        | MiddlewareStage::FileDetect
-        | MiddlewareStage::FileTransform => {
-            json!({"filename": "test.txt", "media_type": "text/plain", "text": "test"})
+        MiddlewareStage::Prepare | MiddlewareStage::Finalize | MiddlewareStage::Inspect => {
+            json!({"kind": "text", "text": "Alice Smith"})
         }
-        MiddlewareStage::Finding => json!({"path": "test.txt", "findings": 0}),
-        MiddlewareStage::Report => json!({"files": [], "findings": 0}),
-        _ => json!({"kind": "text", "text": "Alice Smith"}),
     }
 }
 
@@ -479,8 +454,7 @@ fn stage_test_payload(stage: MiddlewareStage) -> Value {
 struct PluginBinary {
     name: String,
     wasm: WasmProgram,
-    stages: BTreeSet<MiddlewareStage>,
-    permissions: BTreeSet<String>,
+    hooks: BTreeSet<MiddlewareStage>,
     required: bool,
     timeout: Duration,
     max_input_bytes: usize,
@@ -553,13 +527,9 @@ impl PluginBinary {
                 "plugin '{name}' only supports execution.mode = \"oneshot\""
             ));
         }
-        if !execution.args.is_empty()
-            || file.middleware.as_ref().is_some_and(|middleware| {
-                middleware.permissions.contains(&"cache:write".to_string())
-            })
-        {
+        if !execution.args.is_empty() {
             return Err(format!(
-                "plugin '{name}' WebAssembly execution cannot use args or cache:write"
+                "plugin '{name}' WebAssembly execution cannot use args"
             ));
         }
         let timeout_ms = execution.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
@@ -584,41 +554,16 @@ impl PluginBinary {
         let network = validate_network(&name, file.network)?;
         let runtime_dirs = plugin_runtime_dirs_for_manifest(&name, path)?;
         let wasm_path = wasm_binary_path(&name, &binary, &runtime_dirs)?;
-        let middleware = file
-            .middleware
-            .ok_or_else(|| format!("plugin '{name}' requires [middleware]"))?;
-        let stages = middleware
-            .stages
-            .iter()
-            .map(|stage| {
-                MiddlewareStage::parse(stage)
-                    .ok_or_else(|| format!("plugin '{name}' has unknown stage: {stage}"))
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        if stages.is_empty() {
-            return Err(format!("plugin '{name}' must declare at least one stage"));
-        }
-        let permissions = validate_permissions(&name, middleware.permissions)?;
-        if permissions.contains("pipeline:respond")
-            && !stages.contains(&MiddlewareStage::ProviderRequest)
-        {
-            return Err(format!(
-                "plugin '{name}' pipeline:respond requires provider_request stage"
-            ));
-        }
-        verify_plugin_approval(path, &runtime_dirs, &stages, &permissions)?;
         let wasm_bytes = load_approved_plugin_binary(&wasm_path, &runtime_dirs, &name)?;
-        let config = permissions
-            .contains("config:read")
-            .then(|| load_plugin_config(&runtime_dirs))
-            .transpose()?;
+        let config = Some(load_plugin_config(&runtime_dirs)?);
         let wasm = WasmProgram::load_bytes(&wasm_bytes, &name, network, config)?;
+        let hooks = wasm.hooks.clone();
+        verify_plugin_approval(path, &runtime_dirs)?;
         Ok(Self {
             name,
             wasm,
-            stages,
-            permissions,
-            required: middleware.required,
+            hooks,
+            required: file.required,
             timeout: Duration::from_millis(timeout_ms),
             max_input_bytes,
             max_output_bytes,
@@ -628,34 +573,29 @@ impl PluginBinary {
 
     fn invoke(
         &self,
-        stage: MiddlewareStage,
+        hook: MiddlewareStage,
         payload: &Value,
         context: Option<&Value>,
-        index: usize,
-        total: usize,
     ) -> Result<PluginResponse, String> {
         let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let request = json!({
             "schema": PROTOCOL_SCHEMA,
             "id": request_id,
-            "type": "event",
-            "stage": stage,
             "payload": payload,
-            "context": context,
-            "chain": {
-                "index": index,
-                "total": total,
-                "has_next": index + 1 < total,
-            },
+            "metadata": context,
         });
         let encoded = serde_json::to_vec(&request)
             .map_err(|error| format!("plugin '{}' request encode failed: {error}", self.name))?;
         if encoded.len() > self.max_input_bytes {
             return Err(format!("plugin '{}' input exceeds its limit", self.name));
         }
-        let output = self
-            .wasm
-            .invoke(&encoded, self.timeout, self.max_output_bytes, &self.name)?;
+        let output = self.wasm.invoke(
+            hook,
+            &encoded,
+            self.timeout,
+            self.max_output_bytes,
+            &self.name,
+        )?;
         let response: PluginResponse = serde_json::from_slice(&output)
             .map_err(|error| format!("plugin '{}' returned invalid JSON: {error}", self.name))?;
         if response.schema.as_deref() != Some(PROTOCOL_SCHEMA)
@@ -665,6 +605,23 @@ impl PluginBinary {
             return Err(format!(
                 "plugin '{}' returned a mismatched protocol response",
                 self.name
+            ));
+        }
+        if let Some(error) = response.error.as_ref() {
+            if error.code.is_empty()
+                || error.code.len() > 64
+                || !error.code.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                })
+            {
+                return Err(format!(
+                    "plugin '{}' returned an invalid error code",
+                    self.name
+                ));
+            }
+            return Err(format!(
+                "plugin '{}' handler failed ({})",
+                self.name, error.code
             ));
         }
         Ok(response)
@@ -691,8 +648,6 @@ pub fn valid_plugin_publisher_workflow(workflow: &str) -> bool {
 struct PluginApproval {
     schema: String,
     manifest_sha256: String,
-    stages: Vec<String>,
-    permissions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -701,12 +656,7 @@ struct PluginBinaryLock {
     sha256: String,
 }
 
-fn verify_plugin_approval(
-    manifest: &Path,
-    runtime_dirs: &PluginRuntimeDirs,
-    stages: &BTreeSet<MiddlewareStage>,
-    permissions: &BTreeSet<String>,
-) -> Result<(), String> {
+fn verify_plugin_approval(manifest: &Path, runtime_dirs: &PluginRuntimeDirs) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let path = runtime_dirs.data_dir.join(PLUGIN_APPROVAL_FILE);
     let source =
@@ -722,17 +672,7 @@ fn verify_plugin_approval(
     let bytes = read_bounded_bytes(manifest, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest")
         .map_err(|error| format!("could not verify plugin manifest: {error}"))?;
     let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
-    let approved_stages = approval
-        .stages
-        .iter()
-        .filter_map(|stage| MiddlewareStage::parse(stage))
-        .collect::<BTreeSet<_>>();
-    let approved_permissions = approval.permissions.into_iter().collect::<BTreeSet<_>>();
-    if approval.schema != "pentect.plugin-approval.v1"
-        || approval.manifest_sha256 != digest
-        || &approved_stages != stages
-        || &approved_permissions != permissions
-    {
+    if approval.schema != "pentect.plugin-approval.v1" || approval.manifest_sha256 != digest {
         return Err(format!(
             "plugin '{}' changed after approval; run `pentect plugins setup {} --yes` again",
             plugin_default_name(manifest),
@@ -774,7 +714,6 @@ fn load_approved_plugin_binary(
 }
 
 const WASM_ABI_ALLOC: &str = "pentect_alloc";
-const WASM_ABI_HANDLE: &str = "pentect_handle";
 const WASM_ABI_MEMORY: &str = "memory";
 const WASM_HTTP_MODULE: &str = "pentect:http";
 const WASM_HTTP_REQUEST: &str = "request";
@@ -796,6 +735,7 @@ const WASM_FUEL_SLICE: u64 = 100_000;
 struct WasmProgram {
     engine: wasmi::Engine,
     module: wasmi::Module,
+    hooks: BTreeSet<MiddlewareStage>,
     network: Option<NetworkPolicy>,
     config: Option<toml::Value>,
 }
@@ -812,6 +752,7 @@ impl WasmProgram {
         let engine = wasmi::Engine::new(&engine_config);
         let module = wasmi::Module::new(&engine, bytes)
             .map_err(|error| format!("plugin '{name}' WebAssembly is invalid: {error}"))?;
+        let hooks = validated_module_hooks(&module, &format!("plugin '{name}'"))?;
         for import in module.imports() {
             let permitted = (import.module() == WASM_HTTP_MODULE
                 && import.name() == WASM_HTTP_REQUEST
@@ -830,6 +771,7 @@ impl WasmProgram {
         Ok(Self {
             engine,
             module,
+            hooks,
             network,
             config,
         })
@@ -837,6 +779,7 @@ impl WasmProgram {
 
     fn invoke(
         &self,
+        hook: MiddlewareStage,
         request: &[u8],
         timeout: Duration,
         max_output_bytes: usize,
@@ -883,11 +826,10 @@ impl WasmProgram {
         let alloc = instance
             .get_typed_func::<i32, i32>(&store, WASM_ABI_ALLOC)
             .map_err(|_| format!("plugin '{name}' does not export {WASM_ABI_ALLOC}(i32) -> i32"))?;
+        let export = hook.export_name();
         let handle = instance
-            .get_typed_func::<(i32, i32), i64>(&store, WASM_ABI_HANDLE)
-            .map_err(|_| {
-                format!("plugin '{name}' does not export {WASM_ABI_HANDLE}(i32, i32) -> i64")
-            })?;
+            .get_typed_func::<(i32, i32), i64>(&store, export)
+            .map_err(|_| format!("plugin '{name}' does not export {export}(i32, i32) -> i64"))?;
         let request_len = i32::try_from(request.len())
             .map_err(|_| format!("plugin '{name}' request is too large"))?;
         let request_ptr = alloc
@@ -1422,7 +1364,8 @@ struct PluginFile {
     binary: Option<String>,
     publisher: Option<PublisherFile>,
     execution: Option<ExecutionFile>,
-    middleware: Option<MiddlewareFile>,
+    #[serde(default)]
+    required: bool,
     network: Option<NetworkFile>,
 }
 
@@ -1544,17 +1487,6 @@ fn allowed_network_method(method: &str) -> bool {
     )
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MiddlewareFile {
-    #[serde(default)]
-    stages: Vec<String>,
-    #[serde(default)]
-    permissions: Vec<String>,
-    #[serde(default)]
-    required: bool,
-}
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Action {
@@ -1593,6 +1525,13 @@ struct PluginResponse {
     message: Option<String>,
     #[serde(default)]
     spans: Vec<PluginSpan>,
+    error: Option<PluginErrorFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginErrorFile {
+    code: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1603,27 +1542,6 @@ struct PluginSpan {
     label: String,
     category: Option<String>,
     confidence: Option<String>,
-}
-
-fn validate_permissions(name: &str, values: Vec<String>) -> Result<BTreeSet<String>, String> {
-    let allowed = [
-        "input:read",
-        "payload:write",
-        "pipeline:block",
-        "pipeline:respond",
-        "config:read",
-        "cache:write",
-    ];
-    let mut permissions = BTreeSet::from(["input:read".to_string()]);
-    for permission in values {
-        if !allowed.contains(&permission.as_str()) {
-            return Err(format!(
-                "plugin '{name}' has unknown middleware permission: {permission}"
-            ));
-        }
-        permissions.insert(permission);
-    }
-    Ok(permissions)
 }
 
 fn plugin_span(raw: &str, span: PluginSpan, plugin: &str) -> Result<Span, String> {
@@ -1877,25 +1795,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_all_public_stages() {
-        for stage in [
-            MiddlewareStage::Ingest,
-            MiddlewareStage::Decode,
-            MiddlewareStage::Detect,
-            MiddlewareStage::Policy,
-            MiddlewareStage::Mask,
-            MiddlewareStage::ProviderRequest,
-            MiddlewareStage::ProviderResponse,
-            MiddlewareStage::ToolCall,
-            MiddlewareStage::Output,
-            MiddlewareStage::FileDiscover,
-            MiddlewareStage::FileDecode,
-            MiddlewareStage::FileDetect,
-            MiddlewareStage::FileTransform,
-            MiddlewareStage::Finding,
-            MiddlewareStage::Report,
-        ] {
-            assert_eq!(MiddlewareStage::parse(stage.as_str()), Some(stage));
+    fn parses_all_public_hooks() {
+        for hook in MiddlewareStage::ALL {
+            assert_eq!(
+                MiddlewareStage::from_export_name(hook.export_name()),
+                Some(hook)
+            );
         }
     }
 
@@ -1969,7 +1874,7 @@ mod tests {
                 (data (i32.const 2048) "{}")
                 (func (export "pentect_alloc") (param i32) (result i32)
                     (i32.const 1024))
-                (func (export "pentect_handle") (param i32 i32) (result i64)
+                (func (export "pentect_inspect") (param i32 i32) (result i64)
                     (i64.const {packed}))
             )"#,
             String::from_utf8_lossy(output).replace('"', "\\22")
@@ -1977,7 +1882,13 @@ mod tests {
         let bytes = wat::parse_str(wat).unwrap();
         let program = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap();
         let result = program
-            .invoke(b"{}", Duration::from_secs(1), 4096, "fixture")
+            .invoke(
+                MiddlewareStage::Inspect,
+                b"{}",
+                Duration::from_secs(1),
+                4096,
+                "fixture",
+            )
             .unwrap();
         assert_eq!(result, output);
     }
@@ -1989,7 +1900,7 @@ mod tests {
                 (memory (export "memory") 1)
                 (func (export "pentect_alloc") (param i32) (result i32)
                     (i32.const 1024))
-                (func (export "pentect_handle") (param i32 i32) (result i64)
+                (func (export "pentect_inspect") (param i32 i32) (result i64)
                     (loop (br 0))
                     (i64.const 0))
             )"#,
@@ -1997,7 +1908,13 @@ mod tests {
         .unwrap();
         let program = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap();
         let error = program
-            .invoke(b"{}", Duration::from_millis(1), 4096, "fixture")
+            .invoke(
+                MiddlewareStage::Inspect,
+                b"{}",
+                Duration::from_millis(1),
+                4096,
+                "fixture",
+            )
             .unwrap_err();
         assert!(error.contains("timed out"), "{error}");
     }
@@ -2011,7 +1928,7 @@ mod tests {
                 (memory (export "memory") 1)
                 (func (export "pentect_alloc") (param i32) (result i32)
                     (i32.const 1024))
-                (func (export "pentect_handle") (param i32 i32) (result i64)
+                (func (export "pentect_inspect") (param i32 i32) (result i64)
                     (i64.const 0))
             )"#,
         )
@@ -2044,7 +1961,7 @@ mod tests {
                 (memory (export "memory") 1)
                 (func (export "pentect_alloc") (param i32) (result i32)
                     (i32.const 1024))
-                (func (export "pentect_handle") (param i32 i32) (result i64)
+                (func (export "pentect_inspect") (param i32 i32) (result i64)
                     (i64.const 0))
             )"#,
         )

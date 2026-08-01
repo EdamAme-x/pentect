@@ -27,53 +27,40 @@ pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
                 || can_touch_protected(s))
     });
 
-    // Strongest first (Span::cmp_strength is the one canonical ordering).
-    spans.sort_by(|a, b| b.cmp_strength(a));
-
-    let mut accepted: Vec<Span> = Vec::new();
-    let mut accepted_index = RangeIndex::default();
-    for s in spans {
-        if !accepted_index.overlaps(&s.range) {
-            accepted_index.insert(s.range);
-            accepted.push(s);
-            continue;
-        }
-        // A context-free span ("this whole run is opaque") keeps the part not
-        // already claimed by a stronger span, so the uncovered remainder is still
-        // masked. Without this, masking the overlap leaves a maskable tail in
-        // plaintext (a leak, and a break of idempotency: a second pass would mask
-        // it). Anchored weaker spans still drop whole, so a vendor token is never
-        // split into fragments.
-        if is_context_free(&s) {
-            let mut pieces = vec![s.range];
-            for a in accepted_index.overlapping(&s.range) {
-                pieces = pieces.into_iter().flat_map(|p| subtract(p, &a)).collect();
+    // A connected overlap is one sensitive value. Keeping only the strongest
+    // candidate can expose another candidate's prefix or suffix, while splitting
+    // candidates creates multiple handles for shared bytes. Mask the full union;
+    // ranges that merely touch at an edge remain independent.
+    spans.sort_by_key(|s| (s.range.start, s.range.end));
+    let mut merged: Vec<Span> = Vec::new();
+    let mut component: Option<(ByteRange, Span)> = None;
+    for span in spans {
+        match component.take() {
+            None => component = Some((span.range, span)),
+            Some((union, strongest)) if union.overlaps(&span.range) => {
+                let union = ByteRange::new(
+                    union.start.min(span.range.start),
+                    union.end.max(span.range.end),
+                );
+                let strongest = if span.cmp_strength(&strongest).is_gt() {
+                    span
+                } else {
+                    strongest
+                };
+                component = Some((union, strongest));
             }
-            for range in pieces {
-                if !range.is_empty() && !accepted_index.overlaps(&range) {
-                    accepted_index.insert(range);
-                    accepted.push(Span { range, ..s.clone() });
-                }
+            Some((union, mut strongest)) => {
+                strongest.range = union;
+                merged.push(strongest);
+                component = Some((span.range, span));
             }
         }
     }
-    accepted.sort_by_key(|s| s.range.start);
-    accepted
-}
-
-/// `p` minus `a`: the 0–2 sub-ranges of `p` that `a` does not cover.
-fn subtract(p: ByteRange, a: &ByteRange) -> Vec<ByteRange> {
-    if !p.overlaps(a) {
-        return vec![p];
+    if let Some((union, mut strongest)) = component {
+        strongest.range = union;
+        merged.push(strongest);
     }
-    let mut out = Vec::new();
-    if p.start < a.start {
-        out.push(ByteRange::new(p.start, a.start));
-    }
-    if a.end < p.end {
-        out.push(ByteRange::new(a.end, p.end));
-    }
-    out
+    merged
 }
 
 fn touches_protected(range: &ByteRange, protected_edges: &HashSet<usize>) -> bool {
@@ -101,13 +88,14 @@ mod tests {
     }
 
     #[test]
-    fn higher_confidence_wins_overlap() {
+    fn higher_confidence_selects_metadata_and_union_masks_the_range() {
         let out = merge(
             vec![span(0, 10, Confidence::Low), span(2, 8, Confidence::High)],
             &[],
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].confidence, Confidence::High);
+        assert_eq!(out[0].range, ByteRange::new(0, 10));
     }
 
     #[test]
@@ -189,23 +177,66 @@ mod tests {
     }
 
     #[test]
-    fn context_free_span_keeps_uncovered_remainder() {
-        // A strong anchored hit claims [0,6); the entropy run [4,30) keeps [6,30)
-        // so the tail is still masked (no leak, and idempotent).
+    fn overlapping_spans_become_one_handle_for_the_full_union() {
         let out = merge(vec![span(0, 6, Confidence::High), entropy_span(4, 30)], &[]);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].range, ByteRange::new(0, 6));
-        assert_eq!(out[1].range, ByteRange::new(6, 30));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].range, ByteRange::new(0, 30));
+        assert_eq!(out[0].confidence, Confidence::High);
     }
 
     #[test]
-    fn anchored_weaker_span_still_drops_whole() {
-        // A non-context-free (Rule) span is not fragmented around a stronger hit.
+    fn weaker_anchored_tail_is_not_left_in_plaintext() {
         let out = merge(
             vec![span(2, 8, Confidence::High), span(0, 10, Confidence::Low)],
             &[],
         );
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].range, ByteRange::new(2, 8));
+        assert_eq!(out[0].range, ByteRange::new(0, 10));
+    }
+
+    #[test]
+    fn same_range_conflicting_labels_are_order_independent() {
+        let mut alpha = span(0, 10, Confidence::High);
+        alpha.label = "ALPHA".into();
+        let mut beta = alpha.clone();
+        beta.label = "BETA".into();
+
+        let forward = merge(vec![beta.clone(), alpha.clone()], &[]);
+        let reverse = merge(vec![alpha, beta], &[]);
+        assert_eq!(forward.len(), 1);
+        assert_eq!(reverse.len(), 1);
+        assert_eq!(forward[0].label, "ALPHA");
+        assert_eq!(forward[0].label, reverse[0].label);
+    }
+
+    #[test]
+    fn transitive_overlaps_form_one_union_but_adjacent_range_stays_separate() {
+        let out = merge(
+            vec![
+                span(0, 4, Confidence::Medium),
+                span(3, 7, Confidence::Medium),
+                span(6, 9, Confidence::Medium),
+                span(9, 12, Confidence::Medium),
+            ],
+            &[],
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].range, ByteRange::new(0, 9));
+        assert_eq!(out[1].range, ByteRange::new(9, 12));
+    }
+
+    #[test]
+    fn union_length_does_not_distort_metadata_selection() {
+        let mut left = span(0, 60, Confidence::High);
+        left.label = "LEFT".into();
+        let mut bridge = span(59, 61, Confidence::High);
+        bridge.label = "BRIDGE".into();
+        let mut right = span(60, 121, Confidence::High);
+        right.label = "RIGHT".into();
+
+        let out = merge(vec![left, bridge, right], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].range, ByteRange::new(0, 121));
+        assert_eq!(out[0].label, "RIGHT");
     }
 }

@@ -109,58 +109,36 @@ pub(crate) fn protect_multipart_upload_with_plugins(
             });
             run_file_stage(
                 plugins,
-                pentect_agent::MiddlewareStage::FileDiscover,
+                pentect_agent::MiddlewareStage::File,
                 metadata,
                 &mut plugin_partial,
             )?;
             if file.is_supported_text {
                 match std::str::from_utf8(content) {
-                    Ok(text) => {
-                        let decoded = run_file_text_stage(
-                            plugins,
-                            pentect_agent::MiddlewareStage::FileDecode,
-                            &file,
-                            text,
-                            &mut plugin_partial,
-                        )?;
-                        let detected = run_file_text_stage(
-                            plugins,
-                            pentect_agent::MiddlewareStage::FileDetect,
-                            &file,
-                            &decoded,
-                            &mut plugin_partial,
-                        )?;
-                        match masker.mask_tool_output(&detected) {
-                            Ok(Some(masked)) => {
-                                let transformed = run_file_text_stage(
-                                    plugins,
-                                    pentect_agent::MiddlewareStage::FileTransform,
-                                    &file,
-                                    &masked,
-                                    &mut plugin_partial,
-                                )?;
-                                let final_masked =
-                                    masker.mask_tool_output(&transformed)?.ok_or_else(|| {
-                                        "file upload blocked: text inspection is unavailable"
-                                            .to_string()
-                                    })?;
-                                if immutable_dataset && final_masked != text {
-                                    return Err(
-                                        "file upload blocked: secret detected in a structured dataset"
-                                            .to_string(),
-                                    );
-                                }
-                                output.extend_from_slice(final_masked.as_bytes());
+                    Ok(text) => match masker.mask_tool_output(text) {
+                        Ok(Some(masked)) => {
+                            let final_masked =
+                                masker.mask_tool_output(&masked)?.ok_or_else(|| {
+                                    "file upload blocked: text inspection is unavailable"
+                                        .to_string()
+                                })?;
+                            if immutable_dataset && final_masked != text {
+                                return Err(
+                                    "file upload blocked: secret detected in a structured dataset"
+                                        .to_string(),
+                                );
                             }
-                            Ok(None) => {
-                                return Err("file upload blocked: text inspection is unavailable"
-                                    .to_string());
-                            }
-                            Err(error) => {
-                                return Err(format!("file upload blocked: {error}"));
-                            }
+                            output.extend_from_slice(final_masked.as_bytes());
                         }
-                    }
+                        Ok(None) => {
+                            return Err(
+                                "file upload blocked: text inspection is unavailable".to_string()
+                            );
+                        }
+                        Err(error) => {
+                            return Err(format!("file upload blocked: {error}"));
+                        }
+                    },
                     Err(_) => {
                         return Err(
                             "file upload blocked: declared text is not valid UTF-8".to_string()
@@ -296,30 +274,6 @@ fn run_file_stage(
         ));
     }
     Ok(run.payload)
-}
-
-fn run_file_text_stage(
-    plugins: &pentect_agent::PluginMiddleware,
-    stage: pentect_agent::MiddlewareStage,
-    file: &FilePart,
-    text: &str,
-    partial: &mut bool,
-) -> Result<String, String> {
-    let payload = run_file_stage(
-        plugins,
-        stage,
-        serde_json::json!({
-            "filename": file.filename,
-            "media_type": file.media_type,
-            "text": text,
-        }),
-        partial,
-    )?;
-    payload
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| "file plugin payload requires text".to_string())
 }
 
 fn disposition_parameter(header: &str, expected: &str) -> Option<String> {
