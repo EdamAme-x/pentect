@@ -41,6 +41,7 @@ pub use pattern::{PatternMatchDetector, PatternSpec};
 pub use pem::PemDetector;
 pub use phone::PhoneDetector;
 pub use rule::{RuleDetector, RuleSpec};
+pub(crate) use structural::SECRET_VALUE_HINT;
 pub use structural::{EnvValueDetector, SensitiveKeyDetector, StructuralDetector};
 pub use url::UrlDetector;
 pub use uuid::UuidDetector;

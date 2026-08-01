@@ -42,7 +42,9 @@ pub use model::{
     ByteRange, Category, Confidence, Context, DetectorId, Input, Kind, Region, RegionKind, Span,
 };
 pub use pack::{load_pack, load_plugin_pack, Pack};
-pub use parse::{EnvParser, JsonParser, NdjsonParser, Parser, TextParser, ToolResultParser};
+pub use parse::{
+    EnvParser, JsonParser, NdjsonParser, Parser, StructuredParser, TextParser, ToolResultParser,
+};
 pub use pipeline::{
     Config, Engine, EngineBuilder, MaskResult, MaskedItem, RenderSegment, ResidualNote,
     SpanAnalysisResult, Summary,
@@ -64,15 +66,19 @@ pub fn explain(result: &MaskResult) -> Summary {
 
 /// Infer the parser kind from a path without reading the file.
 pub fn infer_kind(path: &std::path::Path) -> Kind {
-    if path
+    let name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower == ".env" || lower.starts_with(".env.")
-        })
-    {
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if is_dotenv_name(&name) || is_aws_credentials_path(path) || is_github_env_path(path) {
         return Kind::Env;
+    }
+    if let Some(label) = mounted_secret_label(path) {
+        return Kind::Other(format!("secret-file:{label}"));
+    }
+    if let Some(kind) = structured_config_kind(path, &name) {
+        return Kind::Other(kind.to_string());
     }
     match path
         .extension()
@@ -84,8 +90,102 @@ pub fn infer_kind(path: &std::path::Path) -> Kind {
         Some("jsonl" | "ndjson") => Kind::Ndjson,
         Some("env") => Kind::Env,
         Some("har") => Kind::Har,
+        Some("yaml" | "yml" | "toml" | "ini" | "conf" | "properties" | "tfvars") => {
+            Kind::Other("structured".to_string())
+        }
         _ => Kind::Text,
     }
+}
+
+/// Infer a parser from both provenance and content. Content sniffing is used
+/// only for a high-confidence dotenv document; an arbitrary one-line
+/// assignment remains ordinary text to avoid turning prose or source code into
+/// an all-values secret boundary.
+pub fn infer_kind_with_content(path: &std::path::Path, raw: &str) -> Kind {
+    let inferred = infer_kind(path);
+    if inferred == Kind::Text && parse::looks_like_dotenv_document(raw) {
+        Kind::Env
+    } else {
+        inferred
+    }
+}
+
+fn is_dotenv_name(name: &str) -> bool {
+    name == ".env"
+        || name.starts_with(".env.")
+        || name == ".dev.vars"
+        || name.starts_with(".dev.vars.")
+        || name == ".secret.local"
+        || name.ends_with(".secret.local")
+}
+
+fn structured_config_kind(path: &std::path::Path, name: &str) -> Option<&'static str> {
+    if name == ".npmrc" {
+        return Some("structured:npm");
+    }
+    if name == ".pypirc" {
+        return Some("structured:pypi");
+    }
+    if name == "kubeconfig"
+        || (name == "config"
+            && path
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .is_some_and(|parent| parent.to_string_lossy().eq_ignore_ascii_case(".kube")))
+    {
+        return Some("structured:kubeconfig");
+    }
+    if name == "config"
+        && path
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|parent| parent.to_string_lossy().eq_ignore_ascii_case(".aws"))
+    {
+        return Some("structured:aws");
+    }
+    None
+}
+
+fn is_aws_credentials_path(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("credentials"))
+        && path
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|parent| parent.to_string_lossy().eq_ignore_ascii_case(".aws"))
+}
+
+fn is_github_env_path(path: &std::path::Path) -> bool {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("/_runner_file_commands/set_env_")
+}
+
+fn mounted_secret_label(path: &std::path::Path) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    let in_named_secret_dir = path
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .is_some_and(|parent| parent.to_string_lossy().eq_ignore_ascii_case("secrets"))
+        && path.extension().is_none();
+    let has_secret_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("secret"));
+    let in_secret_mount = lower.contains("/run/secrets/")
+        || lower.contains("/var/run/secrets/kubernetes.io/serviceaccount/")
+        || in_named_secret_dir
+        || has_secret_extension;
+    if !in_secret_mount {
+        return None;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -97,5 +197,66 @@ mod tests {
     fn infer_kind_recognizes_json_lines_files() {
         assert_eq!(infer_kind(Path::new("events.jsonl")), Kind::Ndjson);
         assert_eq!(infer_kind(Path::new("events.ndjson")), Kind::Ndjson);
+    }
+
+    #[test]
+    fn infer_kind_recognizes_official_dotenv_families() {
+        for path in [
+            ".env.local",
+            ".dev.vars",
+            ".dev.vars.staging",
+            ".secret.local",
+            "extensions/image-resizer.secret.local",
+            "service.env",
+        ] {
+            assert_eq!(infer_kind(Path::new(path)), Kind::Env, "{path}");
+        }
+    }
+
+    #[test]
+    fn infer_kind_recognizes_structured_and_mounted_sources() {
+        assert_eq!(
+            infer_kind(Path::new(".npmrc")),
+            Kind::Other("structured:npm".into())
+        );
+        assert_eq!(infer_kind(Path::new(".aws/credentials")), Kind::Env);
+        assert_eq!(
+            infer_kind(Path::new(".kube/config")),
+            Kind::Other("structured:kubeconfig".into())
+        );
+        assert_eq!(
+            infer_kind(Path::new(
+                "/home/runner/work/_temp/_runner_file_commands/set_env_1234"
+            )),
+            Kind::Env
+        );
+        assert_eq!(
+            infer_kind(Path::new("/run/secrets/database-password")),
+            Kind::Other("secret-file:database-password".into())
+        );
+        assert_eq!(
+            infer_kind(Path::new("deploy/secrets/api-token")),
+            Kind::Other("secret-file:api-token".into())
+        );
+        assert_eq!(
+            infer_kind(Path::new("deploy/secrets/app-secret.yaml")),
+            Kind::Other("structured".into())
+        );
+        assert_eq!(
+            infer_kind(Path::new("deploy/secrets/values.json")),
+            Kind::Json
+        );
+    }
+
+    #[test]
+    fn content_sniffing_requires_a_dotenv_document() {
+        assert_eq!(
+            infer_kind_with_content(Path::new("settings"), "API_KEY=abc\nMODE=dev\n"),
+            Kind::Env
+        );
+        assert_eq!(
+            infer_kind_with_content(Path::new("notes"), "example=value"),
+            Kind::Text
+        );
     }
 }

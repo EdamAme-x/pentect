@@ -50,9 +50,11 @@ pub use memory_store::{
 };
 use memory_store::{MemoryStore, MemoryStoreClient, ENV_ADDR, ENV_TOKEN};
 pub use output_remask::ActiveTerminalOutputRemasker;
+#[cfg(test)]
+use pentect_core::infer_kind;
 use pentect_core::{
-    infer_kind, parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack, Profile,
-    RegionKind,
+    infer_kind_with_content, parse_placeholder, Config, Engine, Input, Kind, MaskResult, Pack,
+    Profile, RegionKind,
 };
 use serde_json::{json, Value};
 use session::{checked_session_name, session_root, Session};
@@ -592,7 +594,9 @@ fn cmd_read(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => return die(&e),
     };
-    let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
+    let kind = opts
+        .kind
+        .unwrap_or_else(|| infer_kind_with_content(&opts.path, &data));
     let source = data.clone();
     let input = Input { kind, data };
     match mask_input_into_active_memory_store(input.clone(), Profile::Strict, Vec::new()) {
@@ -1532,7 +1536,7 @@ fn register_local_file_inputs(store: &MemoryStore, script: &str) -> Result<(), S
         let Ok(input) = read_input(&path, InputFormat::Text) else {
             continue;
         };
-        let kind = infer_kind(&path);
+        let kind = infer_kind_with_content(&path, &input);
         if kind == Kind::Text {
             let _ = masker.mask_tool_output(&input)?;
         } else {
@@ -2695,7 +2699,7 @@ fn masked_read_copy(session: &Session, path_text: &str) -> Result<Option<PathBuf
         session.key,
         session.identity_key,
         data.clone(),
-        infer_kind(path),
+        infer_kind_with_content(path, &data),
     )?;
     if result.summary.masked_count == 0 {
         return Ok(None);
@@ -4174,6 +4178,8 @@ fn parse_kind(value: &str) -> Result<Kind, String> {
         "ndjson" | "jsonl" => Ok(Kind::Ndjson),
         "env" => Ok(Kind::Env),
         "har" => Ok(Kind::Har),
+        "structured" | "config" => Ok(Kind::Other("structured".to_string())),
+        "secret" | "secret-file" => Ok(Kind::Other("secret-file:SECRET".to_string())),
         other => Err(format!("unknown kind: {other}")),
     }
 }

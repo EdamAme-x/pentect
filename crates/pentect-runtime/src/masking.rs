@@ -964,6 +964,7 @@ fn build_pentect_engine() -> Result<Engine, String> {
         .parser(Kind::Json, Box::new(JsonParser))
         .parser(Kind::Ndjson, Box::new(NdjsonParser))
         .parser(Kind::Env, Box::new(EnvParser))
+        .structured_parsers()
         .parser(Kind::Har, Box::new(JsonParser))
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
         .detector(Box::new(CredSweeperNativeDetector::builtin()))
