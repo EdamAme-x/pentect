@@ -2180,18 +2180,29 @@ fn apply_plugin_env(cmd: &mut Command, active: &plugins::ActivePlugins) -> Resul
 }
 
 fn default_pentect_path() -> PathBuf {
-    let exe_name = if cfg!(windows) {
-        "pentect.exe"
-    } else {
-        "pentect"
-    };
-    let mut candidates = Vec::new();
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(dir) = current.parent() {
-            candidates.push(dir.join(exe_name));
-        }
+    default_pentect_path_from(
+        std::env::current_exe().ok(),
+        std::env::current_dir().ok(),
+        cfg!(windows),
+    )
+}
+
+fn default_pentect_path_from(
+    current_exe: Option<PathBuf>,
+    current_dir: Option<PathBuf>,
+    windows: bool,
+) -> PathBuf {
+    // The release asset may be executed before installation, under a
+    // platform-qualified filename such as `pentect-linux-x86_64`.  Child
+    // services must relaunch that exact executable instead of assuming a
+    // sibling file named `pentect` exists.
+    if let Some(current) = current_exe {
+        return current;
     }
-    if let Ok(cwd) = std::env::current_dir() {
+
+    let exe_name = if windows { "pentect.exe" } else { "pentect" };
+    let mut candidates = Vec::new();
+    if let Some(cwd) = current_dir {
         candidates.push(cwd.join("target").join("debug").join(exe_name));
         candidates.push(cwd.join("target").join("release").join(exe_name));
     }
@@ -2516,5 +2527,18 @@ mod tests {
             let args = vec!["pentect".to_string(), command.to_string()];
             assert!(!supports_process_host(&args));
         }
+    }
+
+    #[test]
+    fn child_services_relaunch_the_exact_current_executable() {
+        let release_asset = PathBuf::from("/tmp/pentect-linux-x86_64");
+        assert_eq!(
+            default_pentect_path_from(
+                Some(release_asset.clone()),
+                Some(PathBuf::from("/workspace")),
+                false,
+            ),
+            release_asset
+        );
     }
 }
