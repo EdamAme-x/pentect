@@ -192,6 +192,9 @@ plaintext values to third-party middleware.
 ## Lifecycle
 
 ```text
+pentect plugins new NAME
+pentect plugins dev PATH
+pentect plugins publish PATH
 pentect plugins add SOURCE
 pentect plugins list
 pentect plugins inspect PATH
@@ -200,6 +203,14 @@ pentect plugins test PATH
 pentect plugins update PATH
 pentect plugins remove SOURCE
 ```
+
+`new` creates a minimal Rust plugin and a GitHub Actions release workflow.
+`dev` builds the WebAssembly module and invokes every exported hook inside the
+same sandbox used in production. `publish` repeats those checks and prepares a
+binary plus SHA-256 checksum in `dist/`; pushing a `v*` tag lets the generated
+workflow rebuild the module on GitHub, attest its provenance, and publish it.
+The local bundle is for inspection only: Pentect installs the attested asset
+built by GitHub Actions.
 
 `add` installs, approves, pins, and enables a plugin for the current project.
 `remove` disables it for that project. Shared installed data remains available

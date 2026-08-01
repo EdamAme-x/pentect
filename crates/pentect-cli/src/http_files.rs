@@ -99,7 +99,7 @@ pub(crate) fn protect_multipart_upload_with_plugins(
         let headers = &body[headers_start..headers_end];
         let content = &body[content_start..content_end];
 
-        output.extend_from_slice(&body[cursor..content_start]);
+        output.extend_from_slice(&body[cursor..headers_start]);
         if let Some(file) = file_part(headers) {
             saw_file = true;
             let metadata = serde_json::json!({
@@ -114,6 +114,8 @@ pub(crate) fn protect_multipart_upload_with_plugins(
                 &mut plugin_partial,
             )?;
             if file.is_supported_text {
+                output.extend_from_slice(headers);
+                output.extend_from_slice(body_separator);
                 match std::str::from_utf8(content) {
                     Ok(text) => match masker.mask_tool_output(text) {
                         Ok(Some(masked)) => {
@@ -145,6 +147,25 @@ pub(crate) fn protect_multipart_upload_with_plugins(
                         );
                     }
                 }
+            } else if file.is_supported_image {
+                let protected = pentect_agent::redact_image_bytes_into_active_memory_store(content)
+                    .map_err(|error| format!("file upload blocked: {error}"))?;
+                if let Some(protected) = protected {
+                    let media_type = image_media_type(&protected).ok_or_else(|| {
+                        "file upload blocked: protected image has an unknown format".to_string()
+                    })?;
+                    output.extend_from_slice(
+                        &headers_with_media_type(headers, media_type).ok_or_else(|| {
+                            "file upload blocked: invalid image headers".to_string()
+                        })?,
+                    );
+                    output.extend_from_slice(body_separator);
+                    output.extend_from_slice(&protected);
+                } else {
+                    output.extend_from_slice(headers);
+                    output.extend_from_slice(body_separator);
+                    output.extend_from_slice(content);
+                }
             } else {
                 return Err(
                     "file upload blocked: this binary format cannot be inspected safely"
@@ -152,6 +173,8 @@ pub(crate) fn protect_multipart_upload_with_plugins(
                 );
             }
         } else {
+            output.extend_from_slice(headers);
+            output.extend_from_slice(body_separator);
             output.extend_from_slice(content);
         }
         cursor = content_end;
@@ -230,6 +253,7 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
 
 struct FilePart {
     is_supported_text: bool,
+    is_supported_image: bool,
     filename: String,
     media_type: Option<String>,
 }
@@ -249,9 +273,72 @@ fn file_part(headers: &[u8]) -> Option<FilePart> {
     });
     Some(FilePart {
         is_supported_text: supported_text_file(&filename, media_type),
+        is_supported_image: supported_image_file(&filename, media_type),
         filename,
         media_type: media_type.map(str::to_string),
     })
+}
+
+fn supported_image_file(filename: &str, media_type: Option<&str>) -> bool {
+    if media_type.is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/bmp"
+        )
+    }) {
+        return true;
+    }
+    Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+            )
+        })
+}
+
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        None
+    }
+}
+
+fn headers_with_media_type(headers: &[u8], media_type: &str) -> Option<Vec<u8>> {
+    let headers = std::str::from_utf8(headers).ok()?;
+    let mut out = String::with_capacity(headers.len());
+    let mut replaced = false;
+    for (index, line) in headers.lines().enumerate() {
+        if index > 0 {
+            out.push_str("\r\n");
+        }
+        if line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("content-type"))
+        {
+            out.push_str("Content-Type: ");
+            out.push_str(media_type);
+            replaced = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    if !replaced {
+        out.push_str("\r\nContent-Type: ");
+        out.push_str(media_type);
+    }
+    Some(out.into_bytes())
 }
 
 fn run_file_stage(
@@ -356,6 +443,18 @@ mod tests {
         assert!(supported_text_file("secrets.env", None));
         assert!(supported_text_file("payload.bin", Some("application/json")));
         assert!(!supported_text_file("report.pdf", Some("application/pdf")));
+        assert!(supported_image_file("photo.jpg", None));
+        assert!(supported_image_file("upload.bin", Some("image/png")));
+        assert!(!supported_image_file("report.pdf", Some("application/pdf")));
+    }
+
+    #[test]
+    fn rewrites_image_content_type_after_safe_regeneration() {
+        let headers = b"Content-Disposition: form-data; name=\"file\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg";
+        let rewritten = headers_with_media_type(headers, "image/png").unwrap();
+        let rewritten = std::str::from_utf8(&rewritten).unwrap();
+        assert!(rewritten.contains("Content-Type: image/png"));
+        assert!(!rewritten.contains("Content-Type: image/jpeg"));
     }
 
     #[test]

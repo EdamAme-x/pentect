@@ -46,6 +46,7 @@ type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AnthropicEndpoint {
     Messages,
+    CountTokens,
     Files,
     Models,
     Health,
@@ -250,16 +251,16 @@ async fn proxy_request_inner(
     };
 
     let endpoint = classify_anthropic_endpoint(path_and_query);
-    if endpoint == AnthropicEndpoint::Unknown
-        && !WARNED_UNKNOWN_ENDPOINT.swap(true, Ordering::Relaxed)
-    {
-        eprintln!("[pentect] unknown Anthropic endpoint passed through without content inspection");
-    }
+    enforce_known_anthropic_endpoint(endpoint, state.block_unknown_formats)?;
     let method = request.method().clone();
     let path_and_query = path_and_query.to_string();
     let upstream_url = join_upstream_url(&state.upstream, &path_and_query)?;
     let headers = request.headers().clone();
     let messages_path = endpoint == AnthropicEndpoint::Messages;
+    let protected_request = matches!(
+        endpoint,
+        AnthropicEndpoint::Messages | AnthropicEndpoint::CountTokens
+    );
     let files_upload = endpoint == AnthropicEndpoint::Files
         && method == hyper::Method::POST
         && path_and_query
@@ -267,7 +268,7 @@ async fn proxy_request_inner(
             .next()
             .is_some_and(|path| path.ends_with("/v1/files"));
     let mut request_coverage = None;
-    let body = if messages_path || files_upload {
+    let body = if protected_request || files_upload {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
             .await
@@ -346,7 +347,7 @@ async fn proxy_request_inner(
     let mut upstream_request = state.client.request(method, upstream_url);
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
-        if ((!(messages_path || files_upload) && name == hyper::header::CONTENT_LENGTH)
+        if ((!(protected_request || files_upload) && name == hyper::header::CONTENT_LENGTH)
             || should_forward_request_header(name.as_str()))
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
         {
@@ -1929,7 +1930,7 @@ fn join_upstream_url(base: &reqwest::Url, path_and_query: &str) -> Result<reqwes
 }
 
 #[cfg(test)]
-fn is_anthropic_messages_path(path: &str) -> bool {
+fn is_anthropic_protected_request_path(path: &str) -> bool {
     path.split('?').next().is_some_and(|path| {
         path.ends_with("/v1/messages") || path.ends_with("/v1/messages/count_tokens")
     })
@@ -1937,8 +1938,10 @@ fn is_anthropic_messages_path(path: &str) -> bool {
 
 fn classify_anthropic_endpoint(path_and_query: &str) -> AnthropicEndpoint {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
-    if path.ends_with("/v1/messages") || path.ends_with("/v1/messages/count_tokens") {
+    if path.ends_with("/v1/messages") {
         AnthropicEndpoint::Messages
+    } else if path.ends_with("/v1/messages/count_tokens") {
+        AnthropicEndpoint::CountTokens
     } else if path.ends_with("/v1/files") || path.contains("/v1/files/") {
         AnthropicEndpoint::Files
     } else if path.ends_with("/v1/models") || path.contains("/v1/models/") {
@@ -1948,6 +1951,22 @@ fn classify_anthropic_endpoint(path_and_query: &str) -> AnthropicEndpoint {
     } else {
         AnthropicEndpoint::Unknown
     }
+}
+
+fn enforce_known_anthropic_endpoint(
+    endpoint: AnthropicEndpoint,
+    block_unknown_formats: bool,
+) -> Result<(), String> {
+    if endpoint != AnthropicEndpoint::Unknown {
+        return Ok(());
+    }
+    if block_unknown_formats {
+        return Err("unknown format blocked: Anthropic endpoint is not supported; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through".to_string());
+    }
+    if !WARNED_UNKNOWN_ENDPOINT.swap(true, Ordering::Relaxed) {
+        eprintln!("[pentect] unknown Anthropic endpoint passed through without content inspection");
+    }
+    Ok(())
 }
 
 fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Option<&'a str> {
@@ -2342,12 +2361,16 @@ mod tests {
     }
 
     #[test]
-    fn only_messages_endpoints_are_transformed() {
-        assert!(is_anthropic_messages_path("/v1/messages"));
-        assert!(is_anthropic_messages_path(
+    fn known_anthropic_endpoints_are_classified_before_forwarding() {
+        assert!(is_anthropic_protected_request_path("/v1/messages"));
+        assert!(is_anthropic_protected_request_path(
             "/v1/messages/count_tokens?beta=1"
         ));
-        assert!(!is_anthropic_messages_path("/v1/models"));
+        assert!(!is_anthropic_protected_request_path("/v1/models"));
+        assert_eq!(
+            classify_anthropic_endpoint("/v1/messages/count_tokens"),
+            AnthropicEndpoint::CountTokens
+        );
         assert_eq!(
             classify_anthropic_endpoint("/v1/files/file_123?beta=files-api"),
             AnthropicEndpoint::Files
@@ -2364,6 +2387,8 @@ mod tests {
             classify_anthropic_endpoint("/v1/messages/batches"),
             AnthropicEndpoint::Unknown
         );
+        assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, true).is_err());
+        assert!(enforce_known_anthropic_endpoint(AnthropicEndpoint::Unknown, false).is_ok());
     }
 
     #[test]

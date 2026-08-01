@@ -116,7 +116,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: build
+    needs: [build, compatibility-cli]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -141,3 +141,77 @@ jobs:
               --title "Pentect $GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY"
           fi
+
+  compatibility-cli:
+    name: CLI compatibility
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: pentect-linux-x86_64
+          path: dist
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Install supported agent CLIs
+        run: npm install --global @openai/codex@0.146.0 @anthropic-ai/claude-code@2.1.220
+      - name: Verify launchers
+        run: |
+          chmod +x dist/pentect-linux-x86_64
+          dist/pentect-linux-x86_64 codex -- --version
+          dist/pentect-linux-x86_64 claude -- --version
+
+  lifecycle:
+    name: Lifecycle (${{ matrix.os }})
+    needs: publish
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install, update, and uninstall (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $env:PENTECT_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'pentect-lifecycle\bin'
+          $env:PENTECT_INSTALL_SKIP_PATH = '1'
+          ./tools/install.ps1 -Version $version
+          $binary = Join-Path $env:PENTECT_INSTALL_DIR 'pentect.exe'
+          if ((& $binary version) -ne "pentect $version") { throw 'installed version mismatch' }
+          & $binary update $version --force
+          for ($attempt = 0; $attempt -lt 100; $attempt++) {
+            Start-Sleep -Milliseconds 100
+            if ((Test-Path -LiteralPath $binary) -and ((& $binary version) -eq "pentect $version")) { break }
+          }
+          if (-not (Test-Path -LiteralPath $binary)) { throw 'updated binary is missing' }
+          & $binary uninstall
+          for ($attempt = 0; $attempt -lt 100 -and (Test-Path -LiteralPath $binary); $attempt++) {
+            Start-Sleep -Milliseconds 100
+          }
+          if (Test-Path -LiteralPath $binary) { throw 'uninstall did not remove the binary' }
+      - name: Install, update, and uninstall (POSIX)
+        if: runner.os != 'Windows'
+        shell: sh
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          export PENTECT_INSTALL_DIR="$RUNNER_TEMP/pentect-lifecycle/bin"
+          ./tools/install.sh --version "$version"
+          binary="$PENTECT_INSTALL_DIR/pentect"
+          test "$("$binary" version)" = "pentect $version"
+          "$binary" update "$version" --force
+          test "$("$binary" version)" = "pentect $version"
+          "$binary" uninstall
+          test ! -e "$binary"

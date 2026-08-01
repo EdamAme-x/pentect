@@ -78,15 +78,23 @@ try {
     }
     $pathStatus = 'skipped by configuration'
     if ($env:PENTECT_INSTALL_SKIP_PATH -ne '1') {
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        $pathParts = @($userPath -split ';' | Where-Object { $_ })
-        if (-not ($pathParts | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
-            $nextPath = (@($pathParts) + $installDir) -join ';'
-            [Environment]::SetEnvironmentVariable('Path', $nextPath, 'User')
-            $pathAdded = $true
-            $pathStatus = 'added to user PATH'
-        } else {
-            $pathStatus = 'already on user PATH'
+        $pathKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+        if ($null -eq $pathKey) { throw 'Could not open HKCU\Environment' }
+        try {
+            try { $pathKind = $pathKey.GetValueKind('Path') } catch { $pathKind = [Microsoft.Win32.RegistryValueKind]::ExpandString }
+            $userPath = $pathKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $pathParts = if ($userPath -is [string[]]) { @($userPath) } else { @(([string]$userPath) -split ';' | Where-Object { $_ }) }
+            if (-not ($pathParts | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
+                $pathParts = @($pathParts) + $installDir
+                $nextPath = if ($pathKind -eq [Microsoft.Win32.RegistryValueKind]::MultiString) { [string[]]$pathParts } else { $pathParts -join ';' }
+                $pathKey.SetValue('Path', $nextPath, $pathKind)
+                $pathAdded = $true
+                $pathStatus = 'added to user PATH'
+            } else {
+                $pathStatus = 'already on user PATH'
+            }
+        } finally {
+            $pathKey.Dispose()
         }
         if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
             $env:Path = "$installDir;$env:Path"

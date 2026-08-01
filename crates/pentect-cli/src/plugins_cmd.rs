@@ -26,6 +26,9 @@ pub(crate) fn cmd_plugins(args: &[String]) {
         Action::Search { query } => search_plugins(query.as_deref(), opts.json),
         Action::Inspect { spec } => inspect_plugin(&spec, opts.json),
         Action::Test { spec } => test_plugin(&spec, opts.json),
+        Action::New { name } => new_plugin(&name, opts.json),
+        Action::Dev { spec } => dev_plugin(&spec, opts.json),
+        Action::Publish { spec } => publish_plugin(&spec, opts.json),
         Action::Config { spec, change } => config_plugin(&spec, change, opts.json),
         Action::Setup { spec, approved } => setup_plugin(&spec, approved, opts.json),
         Action::Update { spec, approved } => match spec {
@@ -63,6 +66,15 @@ enum Action {
     Test {
         spec: String,
     },
+    New {
+        name: String,
+    },
+    Dev {
+        spec: String,
+    },
+    Publish {
+        spec: String,
+    },
     Config {
         spec: String,
         change: ConfigChange,
@@ -88,7 +100,8 @@ impl PluginCmd {
     fn parse(args: &[String]) -> Result<Self, String> {
         let Some(action) = args.get(2).map(String::as_str) else {
             return Err(
-                "plugins add|remove|list|search|inspect|test|config|setup|update".to_string(),
+                "plugins new|dev|publish|add|remove|list|search|inspect|test|config|setup|update"
+                    .to_string(),
             );
         };
         let mut json = false;
@@ -154,6 +167,24 @@ impl PluginCmd {
                 reject_action_flags(approved, unset.as_deref())?;
                 Action::Test {
                     spec: one_value("plugins test", values)?,
+                }
+            }
+            "new" => {
+                reject_action_flags(approved, unset.as_deref())?;
+                Action::New {
+                    name: one_value("plugins new", values)?,
+                }
+            }
+            "dev" => {
+                reject_action_flags(approved, unset.as_deref())?;
+                Action::Dev {
+                    spec: one_value("plugins dev", values)?,
+                }
+            }
+            "publish" => {
+                reject_action_flags(approved, unset.as_deref())?;
+                Action::Publish {
+                    spec: one_value("plugins publish", values)?,
                 }
             }
             "config" => {
@@ -578,6 +609,212 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
             .unwrap_or(0)
     );
     Ok(())
+}
+
+fn new_plugin(name: &str, json_output: bool) -> Result<(), String> {
+    if json_output {
+        return Err("plugins new does not support --json".to_string());
+    }
+    validate_new_plugin_name(name)?;
+    let root = Path::new("plugins").join(name);
+    if root.exists() {
+        return Err(format!(
+            "plugin path already exists: {}",
+            display_path(&root)
+        ));
+    }
+    let crate_name = name.replace('-', "_");
+    std::fs::create_dir_all(root.join("src"))
+        .map_err(|error| format!("could not create plugin directory: {error}"))?;
+    std::fs::create_dir_all(root.join(".github/workflows"))
+        .map_err(|error| format!("could not create plugin workflow directory: {error}"))?;
+    std::fs::write(
+        root.join("plugin.toml"),
+        format!(
+            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ndescription = \"A Pentect plugin.\"\nbinary = \"{name}.wasm\"\n# Set this before publishing:\n# repository = \"OWNER/REPOSITORY\"\n"
+        ),
+    )
+    .map_err(|error| format!("could not write plugin.toml: {error}"))?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlicense = \"MIT\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\npentect-plugin = \"0.1.0\"\n\n[workspace]\n"
+        ),
+    )
+    .map_err(|error| format!("could not write Cargo.toml: {error}"))?;
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "use pentect_plugin::{Finding, Inspect, PluginResult};\n\nfn inspect(context: &mut Inspect) -> PluginResult {\n    if let Some(start) = context.input.text.find(\"CHANGE_ME\") {\n        context.add_finding(Finding::new(start, start + 9, \"CUSTOM_SECRET\"));\n    }\n    Ok(())\n}\n\npentect_plugin::export!(inspect);\n",
+    )
+    .map_err(|error| format!("could not write plugin source: {error}"))?;
+    std::fs::write(
+        root.join("README.md"),
+        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\npentect plugins dev .\npentect plugins publish .\n```\n"),
+    )
+    .map_err(|error| format!("could not write plugin README: {error}"))?;
+    std::fs::write(root.join(".gitignore"), "/target\n/dist\n")
+        .map_err(|error| format!("could not write plugin .gitignore: {error}"))?;
+    std::fs::write(
+        root.join(".github/workflows/release.yml"),
+        plugin_release_workflow(name, &crate_name),
+    )
+    .map_err(|error| format!("could not write plugin release workflow: {error}"))?;
+    println!("created: {}", display_path(&root));
+    println!("next: cd {} && pentect plugins dev .", display_path(&root));
+    Ok(())
+}
+
+fn validate_new_plugin_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with('-')
+        || name.ends_with('-')
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Err(
+            "plugin name must use lowercase letters, numbers, and single hyphens".to_string(),
+        );
+    }
+    if name.as_bytes().windows(2).any(|pair| pair == b"--") {
+        return Err("plugin name cannot contain consecutive hyphens".to_string());
+    }
+    Ok(())
+}
+
+fn dev_plugin(spec: &str, json_output: bool) -> Result<(), String> {
+    if json_output {
+        return Err("plugins dev does not support --json".to_string());
+    }
+    let built = build_local_plugin(spec)?;
+    let check = test_binary(&built);
+    println!("binary: {}", check.status.as_str());
+    if check.status == Status::Fail {
+        return Err(format!("plugin test failed: {}", check.detail));
+    }
+    println!("built: {}", display_path(&built));
+    Ok(())
+}
+
+fn publish_plugin(spec: &str, json_output: bool) -> Result<(), String> {
+    if json_output {
+        return Err("plugins publish does not support --json".to_string());
+    }
+    let source = plugins::plugin_source(spec).map_err(|error| error.to_string())?;
+    let manifest = load_plugin_manifest(&source)?
+        .ok_or_else(|| "plugins publish requires plugin.toml".to_string())?;
+    let repository = binary_repository(&source, &manifest)?;
+    let binary = manifest
+        .binary
+        .as_deref()
+        .ok_or_else(|| "declarative plugins do not need a release binary".to_string())?;
+    let built = build_local_plugin(spec)?;
+    let check = test_binary(&built);
+    if check.status == Status::Fail {
+        return Err(format!("plugin test failed: {}", check.detail));
+    }
+    let root = source
+        .manifest_path
+        .as_deref()
+        .and_then(Path::parent)
+        .ok_or_else(|| "plugin manifest has no parent directory".to_string())?;
+    let dist = root.join("dist");
+    std::fs::create_dir_all(&dist)
+        .map_err(|error| format!("could not create dist directory: {error}"))?;
+    let asset = dist.join(binary);
+    std::fs::copy(&built, &asset)
+        .map_err(|error| format!("could not stage plugin binary: {error}"))?;
+    let digest = sha256_path(&asset)?;
+    std::fs::write(
+        dist.join(format!("{binary}.sha256")),
+        format!("{digest}  {binary}\n"),
+    )
+    .map_err(|error| format!("could not write plugin checksum: {error}"))?;
+    println!("publish bundle: {}", display_path(&dist));
+    println!("repository: {repository}");
+    println!(
+        "release: push a v* tag; the generated workflow builds, attests, and uploads the asset"
+    );
+    Ok(())
+}
+
+fn build_local_plugin(spec: &str) -> Result<PathBuf, String> {
+    let source = plugins::plugin_source(spec).map_err(|error| error.to_string())?;
+    let manifest = load_plugin_manifest(&source)?
+        .ok_or_else(|| "plugin development requires plugin.toml".to_string())?;
+    let binary = manifest
+        .binary
+        .as_deref()
+        .ok_or_else(|| "declarative plugins do not need a WebAssembly build".to_string())?;
+    let root = source
+        .manifest_path
+        .as_deref()
+        .and_then(Path::parent)
+        .ok_or_else(|| "plugin manifest has no parent directory".to_string())?;
+    if !root.join("Cargo.toml").is_file() {
+        return Err("plugins dev currently supports Rust plugins with Cargo.toml".to_string());
+    }
+    let status = Command::new("cargo")
+        .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("could not start cargo: {error}"))?;
+    if !status.success() {
+        return Err("plugin build failed".to_string());
+    }
+    let crate_asset = binary.replace('-', "_");
+    let built = root
+        .join("target/wasm32-unknown-unknown/release")
+        .join(crate_asset);
+    if !built.is_file() {
+        return Err(format!(
+            "build completed but {} was not produced",
+            display_path(&built)
+        ));
+    }
+    Ok(built)
+}
+
+fn plugin_release_workflow(name: &str, crate_name: &str) -> String {
+    format!(
+        r#"name: Release plugin
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo build --release --locked --target wasm32-unknown-unknown
+      - name: Package
+        run: |
+          cp target/wasm32-unknown-unknown/release/{crate_name}.wasm {name}.wasm
+          sha256sum {name}.wasm > {name}.wasm.sha256
+      - uses: actions/attest-build-provenance@e3fe62ef559997059fe8380e7d2b4c909e2d65f4 # v3
+        with:
+          subject-path: {name}.wasm
+      - name: Publish
+        env:
+          GH_TOKEN: ${{{{ github.token }}}}
+        run: gh release create "$GITHUB_REF_NAME" {name}.wasm {name}.wasm.sha256 --verify-tag --generate-notes
+"#
+    )
 }
 
 fn test_plugin(spec: &str, json_output: bool) -> Result<(), String> {
@@ -1619,6 +1856,20 @@ fn test_pack(path: &Path) -> Check {
 }
 
 fn test_binary(path: &Path) -> Check {
+    if path.extension().and_then(|extension| extension.to_str()) == Some("wasm") {
+        let bytes = match read_bounded_bytes(path, MAX_PLUGIN_WASM_BYTES, "WebAssembly plugin") {
+            Ok(bytes) => bytes,
+            Err(error) => return Check::fail("binary", error),
+        };
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("local-plugin");
+        return match pentect_agent::test_local_wasm_plugin(&bytes, name) {
+            Ok(run) => Check::ok("binary", format!("hooks-invoked={run}")),
+            Err(error) => Check::fail("binary", error),
+        };
+    }
     let middleware = match pentect_agent::PluginMiddleware::from_paths([path.to_path_buf()]) {
         Ok(middleware) => middleware,
         Err(e) => return Check::fail("binary", e),
@@ -1815,6 +2066,28 @@ mod tests {
             PluginCmd::parse(&args).unwrap().action,
             Action::List
         ));
+    }
+
+    #[test]
+    fn parses_plugin_author_commands() {
+        for (command, expected) in [("new", "new"), ("dev", "dev"), ("publish", "publish")] {
+            let args = vec![
+                "pentect".into(),
+                "plugins".into(),
+                command.into(),
+                "example-plugin".into(),
+            ];
+            let action = PluginCmd::parse(&args).unwrap().action;
+            assert!(matches!(
+                (expected, action),
+                ("new", Action::New { .. })
+                    | ("dev", Action::Dev { .. })
+                    | ("publish", Action::Publish { .. })
+            ));
+        }
+        assert!(validate_new_plugin_name("safe-plugin-2").is_ok());
+        assert!(validate_new_plugin_name("../escape").is_err());
+        assert!(validate_new_plugin_name("double--hyphen").is_err());
     }
 
     #[test]

@@ -101,6 +101,33 @@ pub fn inspect_wasm_plugin_hooks(bytes: &[u8]) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Validate and invoke a local development module without installing it.
+///
+/// This intentionally grants no network access. Configuration reads return
+/// from an empty table, so author tests cannot reach user state.
+pub fn test_local_wasm_plugin(bytes: &[u8], name: &str) -> Result<usize, String> {
+    let wasm = WasmProgram::load_bytes(
+        bytes,
+        name,
+        None,
+        Some(toml::Value::Table(toml::map::Map::new())),
+    )?;
+    let hooks = wasm.hooks.clone();
+    PluginMiddleware {
+        plugins: vec![PluginBinary {
+            name: name.to_string(),
+            wasm,
+            hooks,
+            required: true,
+            timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_spans: DEFAULT_MAX_SPANS,
+        }],
+    }
+    .test_hooks()
+}
+
 fn validated_module_hooks(
     module: &wasmi::Module,
     name: &str,

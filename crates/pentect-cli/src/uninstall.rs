@@ -108,9 +108,22 @@ $name = Split-Path -Leaf $Target
 Get-ChildItem -LiteralPath $installDir -Filter "$name.previous-*" -File | Remove-Item -Force
 Remove-Item -LiteralPath $Marker -Force
 if ($pathAdded) {
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $parts = @($userPath -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ine $installDir.TrimEnd('\') })
-    [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
+    $pathKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    if ($null -ne $pathKey) {
+        try {
+            try { $pathKind = $pathKey.GetValueKind('Path') } catch { $pathKind = [Microsoft.Win32.RegistryValueKind]::ExpandString }
+            $userPath = $pathKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $parts = if ($userPath -is [string[]]) {
+                @($userPath | Where-Object { $_ -and $_.TrimEnd('\') -ine $installDir.TrimEnd('\') })
+            } else {
+                @(([string]$userPath) -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ine $installDir.TrimEnd('\') })
+            }
+            $nextPath = if ($pathKind -eq [Microsoft.Win32.RegistryValueKind]::MultiString) { [string[]]$parts } else { $parts -join ';' }
+            $pathKey.SetValue('Path', $nextPath, $pathKind)
+        } finally {
+            $pathKey.Dispose()
+        }
+    }
 }
 if ((Test-Path -LiteralPath $installDir) -and -not (Get-ChildItem -LiteralPath $installDir -Force | Select-Object -First 1)) {
     Remove-Item -LiteralPath $installDir -Force

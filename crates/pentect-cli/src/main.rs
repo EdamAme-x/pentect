@@ -150,7 +150,7 @@ fn usage() {
          pentect doctor [--json | --fix [--yes]]\n\
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
-         pentect plugins add|remove|list|search|inspect|test|config|setup|update [NAME]\n\
+         pentect plugins new|dev|publish|add|remove|list|search|inspect|test|config|setup|update [NAME]\n\
          pentect mask [TEXT]\n\
          pentect read PATH\n\
          pentect view <HANDLE>\n\
@@ -184,6 +184,8 @@ fn help_text() -> &'static str {
         "  pentect doctor [--json | --fix [--yes]]\n",
         "  pentect update [VERSION] [--check | --force]\n",
         "  pentect uninstall\n",
+        "  pentect plugins new NAME\n",
+        "  pentect plugins dev|publish PATH\n",
         "  pentect plugins add SOURCE [--yes]\n",
         "  pentect plugins remove SOURCE\n",
         "  pentect plugins list|search|inspect|test [NAME|PATH] [--json]\n",
