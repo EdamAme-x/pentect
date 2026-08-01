@@ -14,6 +14,14 @@ pub mod labels {
     pub const OPAQUE_BLOB: &str = "OPAQUE_BLOB";
     /// Value masked because its key name looks sensitive.
     pub const SECRET: &str = "SECRET";
+    /// Ambiguous personally identifying information.
+    pub const PII: &str = "PII";
+    /// Ambiguous identifier.
+    pub const IDENTIFIER: &str = "IDENTIFIER";
+    /// Ambiguous endpoint.
+    pub const ENDPOINT: &str = "ENDPOINT";
+    /// Sensitive value whose category could not be narrowed further.
+    pub const SENSITIVE: &str = "SENSITIVE";
     /// Value masked because a plaintext key/value structure carries a sensitive key.
     pub const KEYED_SECRET: &str = "KEYED_SECRET";
     /// One-time password or verification code.

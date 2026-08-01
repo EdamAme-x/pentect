@@ -1,3 +1,4 @@
+use crate::detect::SECRET_VALUE_HINT;
 use crate::model::*;
 
 mod json;
@@ -36,6 +37,9 @@ impl Parser for JsonParser {
 }
 
 fn mark_json_secret_schema(raw: &str, regions: &mut [Region]) {
+    if !raw.contains("sensitive_values") && !raw.contains("\"kind\"") {
+        return;
+    }
     let Ok(document) = serde_json::from_str::<serde_json::Value>(raw) else {
         return;
     };
@@ -65,7 +69,7 @@ fn mark_json_secret_schema(raw: &str, regions: &mut [Region]) {
             .as_ref()
             .is_some_and(|key| secret_keys.contains(key))
         {
-            region.ctx.hints.push("pentect:secret-value".to_string());
+            region.ctx.hints.push(SECRET_VALUE_HINT.to_string());
         }
     }
 }
@@ -186,9 +190,15 @@ fn parse_env_multiline(
     line_end: usize,
 ) -> Option<(String, ByteRange, usize)> {
     let header = raw[start..line_end].trim().trim_start_matches('\u{feff}');
-    let (key, delimiter) = header.split_once("<<")?;
+    let (key, raw_delimiter) = header.split_once("<<")?;
     let key = key.trim();
-    let delimiter = delimiter.trim();
+    let raw_delimiter = raw_delimiter.trim();
+    let strip_tabs = raw_delimiter.starts_with('-');
+    let delimiter = raw_delimiter
+        .strip_prefix('-')
+        .unwrap_or(raw_delimiter)
+        .trim();
+    let delimiter = matching_quote_contents(delimiter)?;
     if key.is_empty()
         || delimiter.is_empty()
         || delimiter.chars().any(char::is_whitespace)
@@ -200,7 +210,13 @@ fn parse_env_multiline(
     let mut pos = value_start;
     while pos <= raw.len() {
         let end = raw[pos..].find('\n').map_or(raw.len(), |i| pos + i);
-        if raw[pos..end].trim_end_matches('\r') == delimiter {
+        let terminator = raw[pos..end].trim_end_matches('\r');
+        let terminator = if strip_tabs {
+            terminator.trim_start_matches('\t')
+        } else {
+            terminator
+        };
+        if terminator == delimiter {
             let mut value_end = pos;
             if raw[..value_end].ends_with("\r\n") {
                 value_end -= 2;
@@ -222,6 +238,17 @@ fn parse_env_multiline(
         pos = end + 1;
     }
     None
+}
+
+fn matching_quote_contents(value: &str) -> Option<&str> {
+    for quote in ['\'', '"'] {
+        if value.starts_with(quote) || value.ends_with(quote) {
+            return value
+                .strip_prefix(quote)
+                .and_then(|inner| inner.strip_suffix(quote));
+        }
+    }
+    Some(value)
 }
 
 /// Parses line-oriented structured configuration without declaring every value
@@ -281,9 +308,12 @@ impl StructuredParser {
             ),
             StructuredSchema::Kubeconfig => matches!(
                 key.to_ascii_lowercase().as_str(),
-                "token" | "password" | "client-key-data"
+                "token" | "password" | "client-key-data" | "id-token" | "refresh-token"
             ),
-            StructuredSchema::Npm => matches!(key, "AUTH_TOKEN" | "PASSWORD" | "AUTH"),
+            StructuredSchema::Npm => matches!(
+                key.trim_start_matches('_').to_ascii_lowercase().as_str(),
+                "auth_token" | "authtoken" | "password" | "auth"
+            ),
             StructuredSchema::Pypi => key.eq_ignore_ascii_case("password"),
         }
     }
@@ -377,18 +407,20 @@ impl Parser for StructuredParser {
                     .is_some_and(|(_, parent)| matches!(parent.as_str(), "data" | "stringData"));
             let mut hints = Vec::new();
             if parent_is_kubernetes_secret_data {
-                hints.push("pentect:secret-value".to_string());
+                hints.push(SECRET_VALUE_HINT.to_string());
             }
             if self.is_schema_secret_key(&key) {
-                hints.push("pentect:secret-value".to_string());
+                hints.push(SECRET_VALUE_HINT.to_string());
             }
 
             let scalar_start = pos + value_offset + leading;
+            let mut next_pos = line_end.saturating_add(1);
             let scalar_span = if is_yaml_block_indicator(value) {
                 let Some(span) = yaml_block_span(raw, line_end.saturating_add(1), indent) else {
                     pos = line_end.saturating_add(1);
                     continue;
                 };
+                next_pos = span.end.saturating_add(1).min(raw.len());
                 span
             } else {
                 structured_scalar_span(raw, scalar_start, scalar_start + value.len())
@@ -405,7 +437,7 @@ impl Parser for StructuredParser {
                     },
                 });
             }
-            pos = line_end.saturating_add(1);
+            pos = next_pos;
         }
         Some(regions)
     }
@@ -743,6 +775,19 @@ mod tests {
     }
 
     #[test]
+    fn quoted_and_tab_stripping_heredocs_are_parsed_as_values() {
+        for raw in [
+            "TOKEN<<'EOF'\nfirst\nsecond\nEOF\n",
+            "TOKEN<<-\"EOF\"\nfirst\nsecond\n\tEOF\n",
+        ] {
+            assert_eq!(
+                parsed(raw),
+                [(Some("TOKEN".into()), "first\nsecond".into())]
+            );
+        }
+    }
+
+    #[test]
     fn dotenv_content_sniff_is_strict_and_order_independent() {
         assert!(looks_like_dotenv_document("API_KEY=abc\nMODE=dev\n"));
         assert!(looks_like_dotenv_document(
@@ -813,7 +858,7 @@ mod tests {
                     .ctx
                     .hints
                     .iter()
-                    .any(|hint| hint == "pentect:secret-value")
+                    .any(|hint| hint == SECRET_VALUE_HINT)
             })
             .map(|region| region.ctx.key.as_deref().unwrap())
             .collect::<Vec<_>>();
@@ -822,12 +867,26 @@ mod tests {
 
     #[test]
     fn yaml_block_scalar_is_kept_as_one_value() {
-        let raw = "client-key-data: |\n  line-one\n  line-two\nnext: public\n";
+        let raw = "client-key-data: |\n  line-one\n  nested: text\nnext: public\n";
         let regions = StructuredParser::generic().parse(raw).unwrap();
         assert_eq!(
             &raw[regions[0].span.start..regions[0].span.end],
-            "  line-one\n  line-two"
+            "  line-one\n  nested: text"
         );
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[1].ctx.path.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn official_schema_keys_include_top_level_npm_and_auth_provider_tokens() {
+        let npm = StructuredParser::npm();
+        for key in ["_auth", "_authToken", "_password", "AUTH_TOKEN"] {
+            assert!(npm.is_schema_secret_key(key), "{key}");
+        }
+        let kubeconfig = StructuredParser::kubeconfig();
+        for key in ["token", "id-token", "refresh-token", "client-key-data"] {
+            assert!(kubeconfig.is_schema_secret_key(key), "{key}");
+        }
     }
 
     #[test]

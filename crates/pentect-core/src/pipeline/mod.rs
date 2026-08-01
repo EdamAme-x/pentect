@@ -7,7 +7,7 @@ use crate::detect::{
     AuthCodeDetector, Bip39Detector, CardDetector, CliCredentialDetector,
     CredSweeperNativeDetector, DecodeConfig, DecodeDetector, Detector, EntropyDetector,
     EnvValueDetector, KeyValueDetector, PemDetector, PhoneDetector, RuleDetector,
-    SensitiveKeyDetector, StructuralDetector, UrlDetector, UuidDetector,
+    SensitiveKeyDetector, StructuralDetector, UrlDetector, UuidDetector, SECRET_VALUE_HINT,
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
@@ -553,7 +553,7 @@ impl Engine {
                         ctx: Context {
                             path: None,
                             key: Some(label.to_string()),
-                            hints: vec!["pentect:secret-value".to_string()],
+                            hints: vec![SECRET_VALUE_HINT.to_string()],
                             kind: RegionKind::Body,
                             format: kind.clone(),
                         },
@@ -597,7 +597,7 @@ fn relabel_env_spans(spans: &mut [Span], regions: &[Region]) {
                     .ctx
                     .hints
                     .iter()
-                    .any(|hint| hint == "pentect:secret-value"))
+                    .any(|hint| hint == SECRET_VALUE_HINT))
                 && region.span.contains(&span.range))
             .then_some(region.ctx.key.as_deref())
             .flatten()
@@ -675,30 +675,35 @@ impl EngineBuilder {
         self.standard_stack_with_decode(knobs, profile_decode_config(knobs))
     }
 
+    /// Register every structured configuration schema from one canonical list.
+    pub fn structured_parsers(self) -> Self {
+        self.parser(
+            Kind::Other("structured".to_string()),
+            Box::new(StructuredParser::generic()),
+        )
+        .parser(
+            Kind::Other("structured:aws".to_string()),
+            Box::new(StructuredParser::aws()),
+        )
+        .parser(
+            Kind::Other("structured:kubeconfig".to_string()),
+            Box::new(StructuredParser::kubeconfig()),
+        )
+        .parser(
+            Kind::Other("structured:npm".to_string()),
+            Box::new(StructuredParser::npm()),
+        )
+        .parser(
+            Kind::Other("structured:pypi".to_string()),
+            Box::new(StructuredParser::pypi()),
+        )
+    }
+
     pub fn standard_stack_with_decode(self, knobs: ProfileKnobs, decode: DecodeConfig) -> Self {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
-            .parser(
-                Kind::Other("structured".to_string()),
-                Box::new(StructuredParser::generic()),
-            )
-            .parser(
-                Kind::Other("structured:aws".to_string()),
-                Box::new(StructuredParser::aws()),
-            )
-            .parser(
-                Kind::Other("structured:kubeconfig".to_string()),
-                Box::new(StructuredParser::kubeconfig()),
-            )
-            .parser(
-                Kind::Other("structured:npm".to_string()),
-                Box::new(StructuredParser::npm()),
-            )
-            .parser(
-                Kind::Other("structured:pypi".to_string()),
-                Box::new(StructuredParser::pypi()),
-            )
+            .structured_parsers()
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(CliCredentialDetector))
@@ -728,26 +733,7 @@ impl EngineBuilder {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
-            .parser(
-                Kind::Other("structured".to_string()),
-                Box::new(StructuredParser::generic()),
-            )
-            .parser(
-                Kind::Other("structured:aws".to_string()),
-                Box::new(StructuredParser::aws()),
-            )
-            .parser(
-                Kind::Other("structured:kubeconfig".to_string()),
-                Box::new(StructuredParser::kubeconfig()),
-            )
-            .parser(
-                Kind::Other("structured:npm".to_string()),
-                Box::new(StructuredParser::npm()),
-            )
-            .parser(
-                Kind::Other("structured:pypi".to_string()),
-                Box::new(StructuredParser::pypi()),
-            )
+            .structured_parsers()
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(CredSweeperNativeDetector::builtin()))
             .detector(Box::new(KeyValueDetector))

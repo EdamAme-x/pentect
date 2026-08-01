@@ -143,7 +143,7 @@ fn structured_config_kind(path: &std::path::Path, name: &str) -> Option<&'static
     {
         return Some("structured:aws");
     }
-    name.ends_with(".auto.tfvars").then_some("structured")
+    None
 }
 
 fn is_aws_credentials_path(path: &std::path::Path) -> bool {
@@ -169,7 +169,8 @@ fn mounted_secret_label(path: &std::path::Path) -> Option<String> {
     let in_named_secret_dir = path
         .parent()
         .and_then(std::path::Path::file_name)
-        .is_some_and(|parent| parent.to_string_lossy().eq_ignore_ascii_case("secrets"));
+        .is_some_and(|parent| parent.to_string_lossy().eq_ignore_ascii_case("secrets"))
+        && path.extension().is_none();
     let has_secret_extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -236,6 +237,14 @@ mod tests {
         assert_eq!(
             infer_kind(Path::new("deploy/secrets/api-token")),
             Kind::Other("secret-file:api-token".into())
+        );
+        assert_eq!(
+            infer_kind(Path::new("deploy/secrets/app-secret.yaml")),
+            Kind::Other("structured".into())
+        );
+        assert_eq!(
+            infer_kind(Path::new("deploy/secrets/values.json")),
+            Kind::Json
         );
     }
 

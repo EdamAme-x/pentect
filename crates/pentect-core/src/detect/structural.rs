@@ -11,6 +11,9 @@ use std::sync::LazyLock;
 static SENSITIVE_HEADERS: LazyLock<Vec<String>> =
     LazyLock::new(|| parse_sensitive_headers(include_str!("sensitive_header_names.txt")));
 
+/// Marks a region whose value is secret by schema rather than by shape.
+pub(crate) const SECRET_VALUE_HINT: &str = "pentect:secret-value";
+
 /// Masks values that are sensitive by protocol-defined structural position: a
 /// cookie value or a credential-bearing HTTP header. Bounded and protocol-
 /// grounded, so it is separate from key-name based structured value masking.
@@ -78,7 +81,7 @@ impl Detector for EnvValueDetector {
                 .ctx
                 .hints
                 .iter()
-                .any(|hint| hint == "pentect:secret-value");
+                .any(|hint| hint == SECRET_VALUE_HINT);
         if region.span.is_empty() || !explicit_secret || is_rendered_placeholder(view.text()) {
             return vec![];
         }

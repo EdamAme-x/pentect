@@ -66,11 +66,11 @@ pub fn merge(mut spans: Vec<Span>, protected: &[ByteRange]) -> Vec<Span> {
 
 fn canonical_category_label(category: Category) -> &'static str {
     match category {
-        Category::Secret => "SECRET",
-        Category::Pii => "PII",
-        Category::Identifier => "IDENTIFIER",
-        Category::Endpoint => "ENDPOINT",
-        Category::Other => "SENSITIVE",
+        Category::Secret => labels::SECRET,
+        Category::Pii => labels::PII,
+        Category::Identifier => labels::IDENTIFIER,
+        Category::Endpoint => labels::ENDPOINT,
+        Category::Other => labels::SENSITIVE,
     }
 }
 
