@@ -5,8 +5,8 @@ use super::report::{FileFinding, ScanScope, SkippedFile};
 use super::walk::ignored_file_reason;
 use memchr::memchr;
 use pentect_core::{
-    infer_kind, ByteRange, Category, Context, DecodeConfig, Engine, Input, Kind, Profile,
-    RegionKind, Span,
+    infer_kind_with_content, ByteRange, Category, Context, DecodeConfig, Engine, Input, Kind,
+    Profile, RegionKind, Span,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -470,7 +470,7 @@ fn scan_file_with_limits(
     // Detectors can temporarily expand text several times. Keep small files
     // fully parallel while bounding the peak created by large inputs.
     let _large_file_permit = large_files.acquire(data.len());
-    let kind = infer_kind(path);
+    let kind = infer_kind_with_content(path, &data);
     let line_index = LineIndex::new(&data);
     let plugin_spans = if plugins.is_empty() {
         Vec::new()

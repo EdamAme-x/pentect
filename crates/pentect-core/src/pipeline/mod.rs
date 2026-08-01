@@ -11,7 +11,7 @@ use crate::detect::{
 };
 use crate::model::*;
 use crate::normalize::NormalizedView;
-use crate::parse::{EnvParser, JsonParser, NdjsonParser, Parser, TextParser};
+use crate::parse::{EnvParser, JsonParser, NdjsonParser, Parser, StructuredParser, TextParser};
 use crate::policy::guard::{NoGuard, OverMaskGuard, ShapeGuard};
 use crate::policy::{
     is_context_free, Action, MaskAll, Policy, Profile, ProfileKnobs, ProfilePolicy,
@@ -545,6 +545,31 @@ impl Engine {
         raw: String,
         protected: Vec<ByteRange>,
     ) -> (Ir, bool) {
+        if let Kind::Other(name) = &kind {
+            if let Some(label) = name.strip_prefix("secret-file:") {
+                let regions = (!raw.is_empty())
+                    .then(|| Region {
+                        span: ByteRange::new(0, raw.len()),
+                        ctx: Context {
+                            path: None,
+                            key: Some(label.to_string()),
+                            hints: vec!["pentect:secret-value".to_string()],
+                            kind: RegionKind::Body,
+                            format: kind.clone(),
+                        },
+                    })
+                    .into_iter()
+                    .collect();
+                return (
+                    Ir {
+                        raw,
+                        regions,
+                        protected,
+                    },
+                    false,
+                );
+            }
+        }
         let (regions, fell_back) = match self.parsers.iter().find(|(k, _)| *k == kind) {
             Some((_, p)) => match p.parse(&raw) {
                 Some(regions) => (regions, false),
@@ -566,9 +591,16 @@ impl Engine {
 fn relabel_env_spans(spans: &mut [Span], regions: &[Region]) {
     for span in spans {
         let Some(key) = regions.iter().find_map(|region| {
-            (region.ctx.format == Kind::Env && region.span.contains(&span.range))
-                .then_some(region.ctx.key.as_deref())
-                .flatten()
+            ((region.ctx.format == Kind::Env
+                || matches!(&region.ctx.format, Kind::Other(name) if name.starts_with("structured"))
+                || region
+                    .ctx
+                    .hints
+                    .iter()
+                    .any(|hint| hint == "pentect:secret-value"))
+                && region.span.contains(&span.range))
+            .then_some(region.ctx.key.as_deref())
+            .flatten()
         }) else {
             continue;
         };
@@ -647,6 +679,26 @@ impl EngineBuilder {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
+            .parser(
+                Kind::Other("structured".to_string()),
+                Box::new(StructuredParser::generic()),
+            )
+            .parser(
+                Kind::Other("structured:aws".to_string()),
+                Box::new(StructuredParser::aws()),
+            )
+            .parser(
+                Kind::Other("structured:kubeconfig".to_string()),
+                Box::new(StructuredParser::kubeconfig()),
+            )
+            .parser(
+                Kind::Other("structured:npm".to_string()),
+                Box::new(StructuredParser::npm()),
+            )
+            .parser(
+                Kind::Other("structured:pypi".to_string()),
+                Box::new(StructuredParser::pypi()),
+            )
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(UrlDetector))
             .detector(Box::new(CliCredentialDetector))
@@ -676,6 +728,26 @@ impl EngineBuilder {
         self.parser(Kind::Json, Box::new(JsonParser))
             .parser(Kind::Ndjson, Box::new(NdjsonParser))
             .parser(Kind::Env, Box::new(EnvParser))
+            .parser(
+                Kind::Other("structured".to_string()),
+                Box::new(StructuredParser::generic()),
+            )
+            .parser(
+                Kind::Other("structured:aws".to_string()),
+                Box::new(StructuredParser::aws()),
+            )
+            .parser(
+                Kind::Other("structured:kubeconfig".to_string()),
+                Box::new(StructuredParser::kubeconfig()),
+            )
+            .parser(
+                Kind::Other("structured:npm".to_string()),
+                Box::new(StructuredParser::npm()),
+            )
+            .parser(
+                Kind::Other("structured:pypi".to_string()),
+                Box::new(StructuredParser::pypi()),
+            )
             .parser(Kind::Har, Box::new(JsonParser))
             .detector(Box::new(CredSweeperNativeDetector::builtin()))
             .detector(Box::new(KeyValueDetector))
@@ -1387,11 +1459,10 @@ mod tests {
         let input = "open http://user:pass@local.jira.corp:8080/api/issues/ABC-123?token=s3cr3t&project=OPS#comment-456.";
         let r = m(input);
         assert!(
-            r.masked.starts_with("open http://<<URL_CREDENTIAL_"),
+            r.masked.starts_with("open http://<<INTERNAL_ENDPOINT_"),
             "{}",
             r.masked
         );
-        assert!(r.masked.contains("@<<INTERNAL_ENDPOINT_"), "{}", r.masked);
         assert!(
             r.masked.contains("/api/issues/<<RESOURCE_ID_"),
             "{}",
@@ -2469,6 +2540,246 @@ mod tests {
             r.masked
         );
         assert!(r.masked.contains("9PATCH=<<ENV_9PATCH_"), "{}", r.masked);
+    }
+
+    #[test]
+    fn structured_credentials_mask_only_credential_fields() {
+        let raw = concat!(
+            "[pypi]\n",
+            "repository = https://upload.pypi.org/legacy/\n",
+            "username = __token__\n",
+            "password = pypi-example-token\n",
+            "//registry.npmjs.org/:_authToken=npm-example-token\n",
+        );
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Other("structured".into()),
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(
+            result
+                .masked
+                .contains("repository = https://upload.pypi.org/legacy/"),
+            "{}",
+            result.masked
+        );
+        assert!(
+            result.masked.contains("password = <<PASSWORD_"),
+            "{}",
+            result.masked
+        );
+        assert!(
+            result.masked.contains("_authToken=<<AUTH_TOKEN_"),
+            "{}",
+            result.masked
+        );
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+    }
+
+    #[test]
+    fn kubernetes_secret_schema_masks_low_entropy_values_by_key() {
+        let raw = concat!(
+            "apiVersion: v1\n",
+            "kind: Secret\n",
+            "metadata:\n  name: app\n",
+            "stringData:\n  DB_PASSWORD: plain\n",
+            "data:\n  API_TOKEN: YWJj\n",
+        );
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Other("structured".into()),
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(result.masked.contains("name: app"), "{}", result.masked);
+        assert!(
+            result.masked.contains("DB_PASSWORD: <<DB_PASSWORD_"),
+            "{}",
+            result.masked
+        );
+        assert!(
+            result.masked.contains("API_TOKEN: <<API_TOKEN_"),
+            "{}",
+            result.masked
+        );
+        assert!(!result.masked.contains(": plain"), "{}", result.masked);
+        assert!(!result.masked.contains(": YWJj"), "{}", result.masked);
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+    }
+
+    #[test]
+    fn generic_structured_config_does_not_mask_benign_values() {
+        let raw = "mode: development\nregion: us-east-1\nretries = 3\n";
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Other("structured".into()),
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert_eq!(result.masked, raw);
+    }
+
+    #[test]
+    fn mounted_secret_file_masks_the_entire_payload_with_filename_label() {
+        let raw = "short value with spaces\nand another line";
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Other("secret-file:database-password".into()),
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(
+            result.masked.starts_with("<<DATABASE_PASSWORD_"),
+            "{}",
+            result.masked
+        );
+        assert!(!result.masked.contains("short value"), "{}", result.masked);
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+    }
+
+    #[test]
+    fn kubernetes_secret_json_uses_data_keys_as_labels() {
+        let raw = r#"{"apiVersion":"v1","kind":"Secret","metadata":{"name":"app"},"stringData":{"DB_PASSWORD":"plain"},"data":{"API_TOKEN":"YWJj"}}"#;
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Json,
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(
+            result.masked.contains("\"name\":\"app\""),
+            "{}",
+            result.masked
+        );
+        assert!(
+            result.masked.contains("\"DB_PASSWORD\":\"<<DB_PASSWORD_"),
+            "{}",
+            result.masked
+        );
+        assert!(
+            result.masked.contains("\"API_TOKEN\":\"<<API_TOKEN_"),
+            "{}",
+            result.masked
+        );
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+    }
+
+    #[test]
+    fn terraform_sensitive_values_metadata_forces_masking() {
+        let raw = r#"{"version":4,"resources":[{"instances":[{"attributes":{"password":"short","region":"us-east-1"},"sensitive_values":{"password":true}}]}]}"#;
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Json,
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert!(
+            !result.masked.contains("\"password\":\"short\""),
+            "{}",
+            result.masked
+        );
+        assert!(
+            result.masked.contains("\"region\":\"us-east-1\""),
+            "{}",
+            result.masked
+        );
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+    }
+
+    #[test]
+    fn kubeconfig_and_tfvars_keep_structural_credential_labels() {
+        for (raw, key, value, kind) in [
+            (
+                "users:\n  - name: admin\n    user:\n      token: kube-token-example\n",
+                "token",
+                "kube-token-example",
+                "structured:kubeconfig",
+            ),
+            (
+                "region = \"us-east-1\"\ndb_password = \"terraform-password\"\n",
+                "db_password",
+                "terraform-password",
+                "structured",
+            ),
+        ] {
+            let result = Engine::with_profile(Profile::Strict).mask(
+                Input {
+                    kind: Kind::Other(kind.into()),
+                    data: raw.into(),
+                },
+                &Config::insecure_testing(),
+            );
+            assert!(!result.masked.contains(value), "{}", result.masked);
+            assert!(
+                result
+                    .masked
+                    .contains(&format!("<<{}_", env_placeholder_label(key))),
+                "{}",
+                result.masked
+            );
+            assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn official_credential_schemas_mask_short_values_but_keep_public_config() {
+        for (kind, raw, visible, label) in [
+            (
+                "structured:aws",
+                "region = us-east-1\naws_session_token = x\n",
+                "region = us-east-1",
+                "AWS_SESSION_TOKEN",
+            ),
+            (
+                "structured:npm",
+                "registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=x\n",
+                "registry=https://registry.npmjs.org/",
+                "AUTH_TOKEN",
+            ),
+            (
+                "structured:pypi",
+                "[pypi]\nrepository = https://upload.pypi.org/legacy/\npassword = x\n",
+                "repository = https://upload.pypi.org/legacy/",
+                "PASSWORD",
+            ),
+        ] {
+            let result = Engine::with_profile(Profile::Strict).mask(
+                Input {
+                    kind: Kind::Other(kind.into()),
+                    data: raw.into(),
+                },
+                &Config::insecure_testing(),
+            );
+            assert!(result.masked.contains(visible), "{}", result.masked);
+            assert!(
+                result.masked.contains(&format!("<<{label}_")),
+                "{}",
+                result.masked
+            );
+            assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn duplicate_env_keys_keep_distinct_values_reversible() {
+        let raw = "TOKEN=first\nTOKEN=second\n";
+        let result = Engine::with_profile(Profile::Strict).mask(
+            Input {
+                kind: Kind::Env,
+                data: raw.into(),
+            },
+            &Config::insecure_testing(),
+        );
+        assert_eq!(result.summary.masked_count, 2);
+        assert_eq!(result.masked.matches("<<TOKEN_").count(), 2);
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), raw);
     }
 
     #[test]

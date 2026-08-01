@@ -16,9 +16,9 @@ static SENSITIVE_HEADERS: LazyLock<Vec<String>> =
 /// grounded, so it is separate from key-name based structured value masking.
 pub struct StructuralDetector;
 
-/// `.env` value regions are masked wholesale. The parser already strips the
-/// structural shell, so the core can treat every non-placeholder value as
-/// secret without key-name guessing.
+/// Values in an explicit secret-bearing source are masked wholesale. This
+/// includes dotenv boundaries and parser-verified schema slots or mounted
+/// one-secret files.
 pub struct EnvValueDetector;
 
 /// Masks values under explicit structured key/path context supplied by a parser.
@@ -73,10 +73,13 @@ fn is_sensitive_header_name(header: &str) -> bool {
 impl Detector for EnvValueDetector {
     fn detect(&self, view: &NormalizedView) -> Vec<Span> {
         let region = view.region;
-        if region.span.is_empty()
-            || region.ctx.format != Kind::Env
-            || is_rendered_placeholder(view.text())
-        {
+        let explicit_secret = region.ctx.format == Kind::Env
+            || region
+                .ctx
+                .hints
+                .iter()
+                .any(|hint| hint == "pentect:secret-value");
+        if region.span.is_empty() || !explicit_secret || is_rendered_placeholder(view.text()) {
             return vec![];
         }
         vec![Span {

@@ -1,6 +1,6 @@
 [package]
 name = "pentect-cli"
-version = "0.0.9"
+version = "0.0.10"
 description = "Pentect CLI"
 edition.workspace = true
 license.workspace = true

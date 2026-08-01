@@ -16,7 +16,8 @@ mod update;
 
 use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
 use pentect_core::{
-    infer_kind, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack, Profile,
+    infer_kind_with_content, load_pack, parse_placeholder, Config, Engine, Input, Kind, Pack,
+    Profile,
 };
 use serde_json::Value;
 use std::ffi::OsString;
@@ -553,7 +554,9 @@ fn cmd_read(args: &[String]) {
         Ok(s) => s,
         Err(e) => die(&e),
     };
-    let kind = opts.kind.unwrap_or_else(|| infer_kind(&opts.path));
+    let kind = opts
+        .kind
+        .unwrap_or_else(|| infer_kind_with_content(&opts.path, &data));
     let active_plugins = match plugins::active_from_specs(opts.plugins.clone(), true) {
         Ok(active) => active,
         Err(e) => die(&e),
@@ -2287,6 +2290,8 @@ fn parse_kind(value: &str) -> Result<Kind, String> {
         "ndjson" | "jsonl" => Ok(Kind::Ndjson),
         "env" => Ok(Kind::Env),
         "har" => Ok(Kind::Har),
+        "structured" | "config" => Ok(Kind::Other("structured".to_string())),
+        "secret" | "secret-file" => Ok(Kind::Other("secret-file:SECRET".to_string())),
         other => Err(format!("unknown kind: {other}")),
     }
 }

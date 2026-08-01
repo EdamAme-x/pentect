@@ -8,7 +8,7 @@ use pentect_core::{
     load_pack, ByteRange, Category, Config, Context, CredSweeperNativeDetector, Engine,
     EntropyDetector, EnvParser, EnvValueDetector, Input, JsonParser, Kind, MaskResult,
     NdjsonParser, PemDetector, Profile, ProfilePolicy, Recovery, Region, RegionKind,
-    SensitiveKeyDetector, ShapeGuard, ToolResultParser,
+    SensitiveKeyDetector, ShapeGuard, StructuredParser, ToolResultParser,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -964,6 +964,26 @@ fn build_pentect_engine() -> Result<Engine, String> {
         .parser(Kind::Json, Box::new(JsonParser))
         .parser(Kind::Ndjson, Box::new(NdjsonParser))
         .parser(Kind::Env, Box::new(EnvParser))
+        .parser(
+            Kind::Other("structured".to_string()),
+            Box::new(StructuredParser::generic()),
+        )
+        .parser(
+            Kind::Other("structured:aws".to_string()),
+            Box::new(StructuredParser::aws()),
+        )
+        .parser(
+            Kind::Other("structured:kubeconfig".to_string()),
+            Box::new(StructuredParser::kubeconfig()),
+        )
+        .parser(
+            Kind::Other("structured:npm".to_string()),
+            Box::new(StructuredParser::npm()),
+        )
+        .parser(
+            Kind::Other("structured:pypi".to_string()),
+            Box::new(StructuredParser::pypi()),
+        )
         .parser(Kind::Har, Box::new(JsonParser))
         .parser(Kind::ToolResult, Box::new(ToolResultParser))
         .detector(Box::new(CredSweeperNativeDetector::builtin()))
