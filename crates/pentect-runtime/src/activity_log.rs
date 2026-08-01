@@ -155,20 +155,6 @@ pub(crate) fn record_image(secret_images: usize, notes: &[String]) {
     ));
 }
 
-pub fn record_scan(files: usize, findings: usize, labels: BTreeMap<String, usize>) {
-    let labels = labels
-        .into_iter()
-        .map(|(label, count)| (label, count as u64))
-        .collect();
-    record(ActivityEvent::new(
-        "scan",
-        "files",
-        findings as u64,
-        labels,
-        Some(format!("{files} files")),
-    ));
-}
-
 pub(crate) fn follow(json: bool) -> Result<(), String> {
     let mut source = activity_source()?;
     let mut seen = SeenActivity::default();

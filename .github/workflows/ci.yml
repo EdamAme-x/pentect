@@ -64,8 +64,6 @@ jobs:
               - 'crates/pentect-cli/src/plugins.rs'
               - 'crates/pentect-cli/src/plugins_cmd.rs'
               - 'crates/pentect-cli/src/main.rs'
-              - 'crates/pentect-cli/src/scan.rs'
-              - 'crates/pentect-cli/src/scan/**'
               - 'crates/pentect-cli/src/codex_app.rs'
               - 'crates/pentect-cli/src/claude_app_proxy.rs'
               - 'crates/pentect-cli/src/claude_http_proxy.rs'

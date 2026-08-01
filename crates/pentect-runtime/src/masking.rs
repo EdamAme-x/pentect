@@ -119,17 +119,7 @@ impl OutputMasker {
     pub(crate) fn mask_prompt_text(&mut self, text: &str) -> Result<String, String> {
         let remasked = self.remask_all(text)?;
         let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Ingest,
-            remasked,
-            &Kind::Text,
-        )?;
-        let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Decode,
-            remasked,
-            &Kind::Text,
-        )?;
-        let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Policy,
+            crate::plugin_middleware::MiddlewareStage::Prepare,
             remasked,
             &Kind::Text,
         )?;
@@ -161,13 +151,8 @@ impl OutputMasker {
         result.recovery.extend_same_key(env_result.recovery);
         let initially_masked = std::mem::take(&mut result.masked);
         let masked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Mask,
+            crate::plugin_middleware::MiddlewareStage::Finalize,
             initially_masked,
-            &Kind::Text,
-        )?;
-        let masked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Output,
-            masked,
             &Kind::Text,
         )?;
         let final_result = self.engine.mask(
@@ -203,17 +188,7 @@ impl OutputMasker {
         let redacted = redact_env_derivative_lines(text);
         let remasked = self.remask_all(&redacted)?;
         let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Ingest,
-            remasked,
-            &kind,
-        )?;
-        let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Decode,
-            remasked,
-            &kind,
-        )?;
-        let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Policy,
+            crate::plugin_middleware::MiddlewareStage::Prepare,
             remasked,
             &kind,
         )?;
@@ -254,12 +229,7 @@ impl OutputMasker {
             }
         }
         let masked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Mask,
-            masked,
-            &kind,
-        )?;
-        let masked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Output,
+            crate::plugin_middleware::MiddlewareStage::Finalize,
             masked,
             &kind,
         )?;
@@ -330,17 +300,7 @@ impl OutputMasker {
         let redacted = redact_env_derivative_lines(&protected_assignments);
         let remasked = self.remask_all(&redacted)?;
         let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Ingest,
-            remasked,
-            &Kind::ToolResult,
-        )?;
-        let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Decode,
-            remasked,
-            &Kind::ToolResult,
-        )?;
-        let remasked = self.run_text_plugins(
-            crate::plugin_middleware::MiddlewareStage::Policy,
+            crate::plugin_middleware::MiddlewareStage::Prepare,
             remasked,
             &Kind::ToolResult,
         )?;
@@ -361,13 +321,8 @@ impl OutputMasker {
         if !masks_only_endpoint_metadata(&result) {
             let initially_masked = std::mem::take(&mut result.masked);
             let masked = self.run_text_plugins(
-                crate::plugin_middleware::MiddlewareStage::Mask,
+                crate::plugin_middleware::MiddlewareStage::Finalize,
                 initially_masked,
-                &Kind::ToolResult,
-            )?;
-            let masked = self.run_text_plugins(
-                crate::plugin_middleware::MiddlewareStage::Output,
-                masked,
                 &Kind::ToolResult,
             )?;
             let final_result = self.engine.mask_context(masked, context, &cfg);
@@ -841,14 +796,12 @@ fn mask_read_input_with_engine_plugins_and_identity(
         },
         &cfg,
     );
-    let mut data = std::mem::take(&mut result.masked);
-    for stage in [
-        crate::plugin_middleware::MiddlewareStage::Ingest,
-        crate::plugin_middleware::MiddlewareStage::Decode,
-        crate::plugin_middleware::MiddlewareStage::Policy,
-    ] {
-        data = run_read_text_plugin_stage(plugins, stage, data, &kind)?;
-    }
+    let data = run_read_text_plugin_stage(
+        plugins,
+        crate::plugin_middleware::MiddlewareStage::Prepare,
+        std::mem::take(&mut result.masked),
+        &kind,
+    )?;
     let data = match plugins.detect_and_mask(
         engine,
         Input {
@@ -866,13 +819,12 @@ fn mask_read_input_with_engine_plugins_and_identity(
         _ => data,
     };
     let final_kind = kind.clone();
-    let mut masked = data;
-    for stage in [
-        crate::plugin_middleware::MiddlewareStage::Mask,
-        crate::plugin_middleware::MiddlewareStage::Output,
-    ] {
-        masked = run_read_text_plugin_stage(plugins, stage, masked, &final_kind)?;
-    }
+    let masked = run_read_text_plugin_stage(
+        plugins,
+        crate::plugin_middleware::MiddlewareStage::Finalize,
+        data,
+        &final_kind,
+    )?;
     let final_result = engine.mask(
         Input {
             kind: final_kind,

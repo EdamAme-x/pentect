@@ -5,31 +5,12 @@
   "oneOf": [
     {
       "type": "object",
-      "required": ["schema", "id", "type", "stage", "payload", "chain"],
+      "required": ["schema", "id", "payload"],
       "properties": {
         "schema": { "const": "pentect.plugin.v1" },
         "id": { "type": "integer", "minimum": 1 },
-        "type": { "const": "event" },
-        "stage": {
-          "enum": [
-            "ingest", "decode", "detect", "policy", "mask",
-            "provider_request", "provider_response", "tool_call", "output",
-            "file_discover", "file_decode", "file_detect", "file_transform",
-            "finding", "report"
-          ]
-        },
         "payload": {},
-        "context": {},
-        "chain": {
-          "type": "object",
-          "required": ["index", "total", "has_next"],
-          "properties": {
-            "index": { "type": "integer", "minimum": 0 },
-            "total": { "type": "integer", "minimum": 1 },
-            "has_next": { "type": "boolean" }
-          },
-          "additionalProperties": false
-        }
+        "metadata": {}
       },
       "additionalProperties": false
     },
@@ -44,6 +25,14 @@
         "outcome": { "enum": ["block", "respond"] },
         "payload": {},
         "message": { "type": "string" },
+        "error": {
+          "type": "object",
+          "required": ["code"],
+          "properties": {
+            "code": { "type": "string", "pattern": "^[a-z0-9._-]{1,64}$" }
+          },
+          "additionalProperties": false
+        },
         "spans": {
           "type": "array",
           "items": {

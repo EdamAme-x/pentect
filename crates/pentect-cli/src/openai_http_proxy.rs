@@ -431,7 +431,7 @@ fn run_response_plugins(
         .lock()
         .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
     let run = plugins.run(
-        pentect_agent::MiddlewareStage::ProviderResponse,
+        pentect_agent::MiddlewareStage::Response,
         value,
         Some(serde_json::json!({"provider": provider, "transport": "http"})),
     )?;
@@ -536,7 +536,7 @@ fn protect_openai_request_body(
         .lock()
         .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?
         .run(
-            pentect_agent::MiddlewareStage::ProviderRequest,
+            pentect_agent::MiddlewareStage::Request,
             value,
             Some(serde_json::json!({"provider": "openai", "transport": "http"})),
         )?;

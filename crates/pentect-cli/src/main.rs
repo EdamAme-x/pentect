@@ -10,7 +10,6 @@ mod openai_http_proxy;
 mod plugins;
 mod plugins_cmd;
 mod remote_content;
-mod scan;
 mod uninstall;
 mod update;
 
@@ -95,7 +94,6 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("view") => cmd_view(&args),
         Some("doctor") => doctor::cmd_doctor(&args),
         Some("plugins") => plugins_cmd::cmd_plugins(&args),
-        Some("scan") => scan::cmd_scan(&args),
         Some(
             "exec" | "resolve" | "log" | "hook" | "bridge" | "memory-store" | "purge"
             | "__agent-script" | "__agent-stream",
@@ -153,7 +151,6 @@ fn usage() {
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
          pentect plugins add|remove|list|search|inspect|test|config|setup|update [NAME]\n\
-         pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\
          pentect mask [TEXT]\n\
          pentect read PATH\n\
          pentect view <HANDLE>\n\
@@ -163,7 +160,6 @@ fn usage() {
          \n\
          exec: masked output\n\
          doctor: readiness\n\
-         scan: secrets\n\
          view: handle\n\
          resolve: write handles\n\
          log: live events"
@@ -194,7 +190,6 @@ fn help_text() -> &'static str {
         "  pentect plugins config NAME|PATH [KEY=VALUE | --unset KEY]\n",
         "  pentect plugins setup NAME|PATH [--yes]\n",
         "  pentect plugins update [NAME|PATH] [--yes]\n",
-        "  pentect scan [--binary skip|text] [--exclude PATTERN|~GROUP|!PATTERN] [--no-gitignore] [PATH...]\n\n",
         "  pentect mask [TEXT]\n",
         "  pentect read PATH\n",
         "  pentect view '<HANDLE>'\n\n",
@@ -206,8 +201,6 @@ fn help_text() -> &'static str {
         "view: handle\n",
         "log: live events\n",
         "resolve: write handles\n",
-        "scan: secrets; gitignore on; --no-gitignore broadens\n",
-        "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
         "doctor: readiness; --fix offers safe repairs\n",
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
@@ -2434,6 +2427,7 @@ mod tests {
         assert!(help.contains("pentect mask [TEXT]"));
         assert!(help.contains("pentect read PATH"));
         assert!(help.contains("pentect resolve [PATH...]"));
+        assert!(!help.contains("pentect scan"));
         assert!(!help.contains("opencode"));
         assert!(!help.contains("pentect shell"));
         assert!(!help.contains("\n  pentect up\n"));

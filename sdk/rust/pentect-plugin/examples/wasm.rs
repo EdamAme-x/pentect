@@ -1,9 +1,12 @@
-use pentect_plugin::{Request, Response};
+use pentect_plugin::{Finding, Inspect, PluginResult};
 
-fn handle(request: Request) -> Result<Response, Box<dyn std::error::Error>> {
-    Ok(Response::next(request.id))
+fn inspect(context: &mut Inspect) -> PluginResult {
+    if let Some(start) = context.input.text.find("ACME-") {
+        context.add_finding(Finding::new(start, start + 5, "ACME_ID"));
+    }
+    Ok(())
 }
 
-pentect_plugin::export_wasm_plugin!(handle);
+pentect_plugin::export!(inspect);
 
 fn main() {}

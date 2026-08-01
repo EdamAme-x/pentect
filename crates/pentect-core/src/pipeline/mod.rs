@@ -1090,6 +1090,30 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_external_findings_render_as_one_reversible_handle() {
+        let input = "prefix-sensitive-value-suffix";
+        let finding = |start, end, label: &str| Span {
+            range: ByteRange::new(start, end),
+            category: Category::Secret,
+            label: label.into(),
+            confidence: Confidence::High,
+            source: DetectorId::Plugin,
+        };
+        let result = Engine::with_profile(Profile::Strict).mask_spans(
+            Input::text(input),
+            vec![finding(0, 22, "ZETA"), finding(7, input.len(), "ALPHA")],
+            &Config::insecure_testing(),
+        );
+
+        assert_eq!(result.summary.masked_count, 1);
+        assert_eq!(result.items.len(), 1);
+        assert!(result.masked.contains("<<ZETA_"), "{}", result.masked);
+        assert!(!result.masked.contains("prefix"), "{}", result.masked);
+        assert!(!result.masked.contains("suffix"), "{}", result.masked);
+        assert_eq!(restore(&result.masked, &result.recovery).unwrap(), input);
+    }
+
+    #[test]
     fn length_disclosed_for_encoded_entropy_blob_too() {
         use data_encoding::BASE64;
         let bytes: Vec<u8> = (0u8..24)

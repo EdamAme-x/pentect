@@ -1,5 +1,5 @@
 use crate::{plugins, update};
-use pentect_agent::{read_bounded_utf8, DEFAULT_PUBLISHER_WORKFLOW};
+use pentect_agent::{read_bounded_bytes, read_bounded_utf8, DEFAULT_PUBLISHER_WORKFLOW};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -499,11 +499,9 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
                 "asset": asset,
                 "runtime": manifest.as_ref().map(plugin_runtime),
                 "publisher_workflow": manifest.as_ref().filter(|manifest| manifest.binary.is_some()).and_then(|manifest| publisher_workflow(manifest).ok()),
-                "middleware": manifest.as_ref().and_then(|manifest| manifest.middleware.as_ref()).map(|middleware| json!({
-                    "stages": middleware.stages,
-                    "input": "stage_payload",
-                    "extra_permissions": middleware.permissions,
-                    "required": middleware.required,
+                "hooks": manifest.as_ref().and_then(|manifest| manifest.binary.as_ref()).map(|_| "wasm_exports"),
+                "execution": manifest.as_ref().and_then(|manifest| manifest.binary.as_ref()).map(|_| json!({
+                    "required": manifest.as_ref().is_some_and(|manifest| manifest.required),
                     "mode": manifest.as_ref().and_then(|manifest| manifest.execution.as_ref()).and_then(|execution| execution.mode.as_deref()).unwrap_or("oneshot"),
                 })),
                 "network": manifest.as_ref().and_then(|manifest| manifest.network.as_ref()),
@@ -548,21 +546,12 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
             println!("asset: {asset}");
         }
     }
-    if let Some(middleware) = manifest
+    if let Some(manifest) = manifest
         .as_ref()
-        .and_then(|manifest| manifest.middleware.as_ref())
+        .filter(|manifest| manifest.binary.is_some())
     {
-        println!("stages: {}", middleware.stages.join(", "));
-        println!("input: stage payload (implicit)");
-        println!(
-            "extra-permissions: {}",
-            if middleware.permissions.is_empty() {
-                "none".to_string()
-            } else {
-                middleware.permissions.join(", ")
-            }
-        );
-        println!("required: {}", middleware.required);
+        println!("hooks: detected from WebAssembly exports");
+        println!("required: {}", manifest.required);
     }
     if let Some(network) = manifest
         .as_ref()
@@ -642,7 +631,8 @@ struct PluginManifest {
     #[serde(default)]
     assets: BTreeMap<String, String>,
     execution: Option<ExecutionConfig>,
-    middleware: Option<MiddlewareConfig>,
+    #[serde(default)]
+    required: bool,
     network: Option<NetworkConfig>,
 }
 
@@ -698,17 +688,6 @@ fn runtime_name(runtime: PluginRuntime) -> &'static str {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MiddlewareConfig {
-    #[serde(default)]
-    stages: Vec<String>,
-    #[serde(default)]
-    permissions: Vec<String>,
-    #[serde(default)]
-    required: bool,
-}
-
 fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginManifest>, String> {
     let Some(path) = &source.manifest_path else {
         return Ok(None);
@@ -755,14 +734,6 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
         if execution.is_some_and(|execution| !execution.args.is_empty()) {
             return Err("WebAssembly plugins cannot declare execution.args".to_string());
         }
-        if manifest.middleware.as_ref().is_some_and(|middleware| {
-            middleware
-                .permissions
-                .iter()
-                .any(|permission| permission == "cache:write")
-        }) {
-            return Err("WebAssembly plugins cannot request cache:write".to_string());
-        }
         if let Some(repository) = manifest
             .repository
             .as_deref()
@@ -774,7 +745,6 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
     }
     validate_network(&manifest)?;
     validate_execution(&manifest)?;
-    validate_middleware(&manifest)?;
     Ok(Some(manifest))
 }
 
@@ -878,84 +848,6 @@ fn publisher_workflow(manifest: &PluginManifest) -> Result<&str, String> {
         .as_ref()
         .and_then(|publisher| publisher.workflow.as_deref())
         .unwrap_or(DEFAULT_PUBLISHER_WORKFLOW))
-}
-
-fn validate_middleware(manifest: &PluginManifest) -> Result<(), String> {
-    let Some(middleware) = &manifest.middleware else {
-        if manifest.binary.is_some() {
-            return Err("binary plugins require [middleware]".to_string());
-        }
-        return Ok(());
-    };
-    const STAGES: &[&str] = &[
-        "ingest",
-        "decode",
-        "detect",
-        "policy",
-        "mask",
-        "provider_request",
-        "provider_response",
-        "tool_call",
-        "output",
-        "file_discover",
-        "file_decode",
-        "file_detect",
-        "file_transform",
-        "finding",
-        "report",
-    ];
-    const PERMISSIONS: &[&str] = &[
-        "input:read",
-        "payload:write",
-        "pipeline:block",
-        "pipeline:respond",
-        "config:read",
-        "cache:write",
-    ];
-    if middleware.stages.is_empty() {
-        return Err("middleware must declare at least one stage".to_string());
-    }
-    for stage in &middleware.stages {
-        if !STAGES.contains(&stage.as_str()) {
-            return Err(format!("unknown middleware stage: {stage}"));
-        }
-    }
-    for permission in &middleware.permissions {
-        if !PERMISSIONS.contains(&permission.as_str()) {
-            return Err(format!("unknown middleware permission: {permission}"));
-        }
-    }
-    if middleware
-        .permissions
-        .iter()
-        .any(|permission| permission == "pipeline:respond")
-        && !middleware
-            .stages
-            .iter()
-            .any(|stage| stage == "provider_request")
-    {
-        return Err("pipeline:respond requires provider_request stage".to_string());
-    }
-    if let Some(mode) = manifest
-        .execution
-        .as_ref()
-        .and_then(|execution| execution.mode.as_deref())
-    {
-        if mode != "oneshot" {
-            return Err("plugins only support execution.mode = \"oneshot\"".to_string());
-        }
-    }
-    Ok(())
-}
-
-fn effective_permissions(middleware: &MiddlewareConfig) -> Vec<String> {
-    let mut permissions = middleware
-        .permissions
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    permissions.insert("input:read".to_string());
-    permissions.into_iter().collect()
 }
 
 fn plugin_name(source: &plugins::PluginSource, manifest: Option<&PluginManifest>) -> String {
@@ -1180,19 +1072,10 @@ fn setup_plugin_source(
             binary_destination(&name, binary, runtime, &source)?.display()
         );
     }
-    if let Some(middleware) = &manifest.middleware {
-        println!("middleware:");
-        println!("  stages: {}", middleware.stages.join(", "));
-        println!("  input: stage payload (implicit)");
-        println!(
-            "  extra-permissions: {}",
-            if middleware.permissions.is_empty() {
-                "none".to_string()
-            } else {
-                middleware.permissions.join(", ")
-            }
-        );
-        println!("  required: {}", middleware.required);
+    if manifest.binary.is_some() {
+        println!("plugin hooks:");
+        println!("  hooks: detected from WebAssembly exports");
+        println!("  required: {}", manifest.required);
         println!(
             "  execution: {}",
             manifest
@@ -1229,36 +1112,31 @@ fn setup_plugin_source(
             "  request-count-limit: {}",
             network.max_requests.unwrap_or(4)
         );
-        if manifest.middleware.is_some() {
-            println!("WARNING: this plugin can send its stage payload to approved network origins");
+        if manifest.binary.is_some() {
+            println!("WARNING: this plugin can send hook input to approved network origins");
         }
-        if manifest.middleware.as_ref().is_some_and(|middleware| {
-            middleware
-                .permissions
-                .iter()
-                .any(|permission| permission == "config:read")
-        }) {
-            println!(
-                "WARNING: this plugin can read approved configuration and send data to approved network origins"
-            );
-        }
-    }
-    if !approved && !confirm_setup()? {
-        return Err("plugin setup was not approved".to_string());
     }
     if let Some(binary) = manifest.binary.as_deref() {
         let repository = binary_repository(&source, &manifest)?;
+        let runtime = plugin_runtime(&manifest);
         install_release_binary(
             &name,
             &source,
             &repository,
             binary,
-            plugin_runtime(&manifest),
+            runtime,
             publisher_workflow(&manifest)?,
             &manifest.assets,
         )?;
+        let destination = binary_destination(&name, binary, runtime, &source)?;
+        let bytes = read_bounded_bytes(&destination, MAX_PLUGIN_WASM_BYTES, "WebAssembly plugin")?;
+        let hooks = pentect_agent::inspect_wasm_plugin_hooks(&bytes)?;
+        println!("hooks: {}", hooks.join(", "));
     }
-    if manifest.middleware.is_some() {
+    if !approved && !confirm_setup()? {
+        return Err("plugin setup was not approved".to_string());
+    }
+    if manifest.binary.is_some() {
         let current_hash = source
             .manifest_path
             .as_deref()
@@ -1274,31 +1152,23 @@ fn setup_plugin_source(
 }
 
 #[derive(Serialize)]
-struct PluginApproval<'a> {
+struct PluginApproval {
     schema: &'static str,
     manifest_sha256: String,
-    stages: &'a [String],
-    permissions: Vec<String>,
 }
 
 fn write_plugin_approval(
     name: &str,
     source: &plugins::PluginSource,
-    manifest: &PluginManifest,
+    _manifest: &PluginManifest,
 ) -> Result<(), String> {
     let path = source
         .manifest_path
         .as_deref()
-        .ok_or_else(|| "middleware approval requires plugin.toml".to_string())?;
-    let middleware = manifest
-        .middleware
-        .as_ref()
-        .ok_or_else(|| "middleware approval requires [middleware]".to_string())?;
+        .ok_or_else(|| "plugin approval requires plugin.toml".to_string())?;
     let approval = PluginApproval {
         schema: "pentect.plugin-approval.v1",
         manifest_sha256: sha256_path(path)?,
-        stages: &middleware.stages,
-        permissions: effective_permissions(middleware),
     };
     let encoded = toml::to_string(&approval)
         .map_err(|error| format!("could not encode plugin approval: {error}"))?;
@@ -1325,7 +1195,7 @@ fn update_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), St
     };
     let repository = binary_repository(&source, &manifest)?;
     if verify_plugin_update_approval(&name, &source, &manifest).is_err() {
-        println!("plugin manifest changed; reviewing updated permissions");
+        println!("plugin manifest changed; reviewing updated access");
         return setup_plugin_source(source, approved, false);
     }
     install_release_binary(
@@ -1369,8 +1239,6 @@ fn update_all_plugins(approved: bool, json_output: bool) -> Result<(), String> {
 struct StoredPluginApproval {
     schema: String,
     manifest_sha256: String,
-    stages: Vec<String>,
-    permissions: Vec<String>,
 }
 
 fn verify_plugin_update_approval(
@@ -1378,9 +1246,9 @@ fn verify_plugin_update_approval(
     plugin: &plugins::PluginSource,
     manifest: &PluginManifest,
 ) -> Result<(), String> {
-    let Some(middleware) = &manifest.middleware else {
+    if manifest.binary.is_none() {
         return Ok(());
-    };
+    }
     let manifest_path = plugin
         .manifest_path
         .as_deref()
@@ -1392,26 +1260,8 @@ fn verify_plugin_update_approval(
         .map_err(|_| "plugin update requires prior setup approval".to_string())?;
     let approval: StoredPluginApproval = toml::from_str(&source_text)
         .map_err(|_| "plugin approval is invalid; run `pentect plugins setup`".to_string())?;
-    let approved_stages = approval
-        .stages
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let approved_permissions = approval
-        .permissions
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let stages = middleware
-        .stages
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let permissions = effective_permissions(middleware)
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
     if approval.schema != "pentect.plugin-approval.v1"
         || approval.manifest_sha256 != sha256_path(manifest_path)?
-        || approved_stages != stages
-        || approved_permissions != permissions
     {
         return Err("plugin manifest changed; review it with `pentect plugins setup`".to_string());
     }
@@ -1773,8 +1623,8 @@ fn test_binary(path: &Path) -> Check {
         Ok(middleware) => middleware,
         Err(e) => return Check::fail("binary", e),
     };
-    match middleware.test_declared_stages() {
-        Ok(run) => Check::ok("binary", format!("stages-invoked={run}")),
+    match middleware.test_hooks() {
+        Ok(run) => Check::ok("binary", format!("hooks-invoked={run}")),
         Err(e) => Check::fail("binary", e),
     }
 }
@@ -2239,7 +2089,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
         let manifest_source = format!(
-            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper.wasm\"\nrepository = \"owner/repo\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n"
+            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\nbinary = \"helper.wasm\"\nrepository = \"owner/repo\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n"
         );
         std::fs::write(&manifest_path, &manifest_source).unwrap();
         let source = plugins::PluginSource {
@@ -2309,7 +2159,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join(plugins::PLUGIN_MANIFEST_FILE),
-            "schema = \"pentect.plugin.v1\"\nname = \"local\"\nbinary = \"tool.wasm\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
+            "schema = \"pentect.plugin.v1\"\nname = \"local\"\nbinary = \"tool.wasm\"\n[publisher]\nworkflow = \".github/workflows/release.yml\"\n",
         )
         .unwrap();
 
