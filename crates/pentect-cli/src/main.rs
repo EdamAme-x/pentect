@@ -424,12 +424,12 @@ fn cmd_mask(args: &[String]) {
     if let Err(e) = validate_mask_args(args) {
         die(&e);
     }
-    let kind = match arg_value(args, "--kind").as_deref() {
+    let explicit_kind = match arg_value(args, "--kind").as_deref() {
         Some(name) => match parse_kind(name) {
-            Ok(k) => k,
+            Ok(kind) => Some(kind),
             Err(e) => die(&e),
         },
-        None => Kind::Text,
+        None => None,
     };
     let profile: Profile = match arg_value(args, "--profile").as_deref() {
         Some(name) => match name.parse() {
@@ -473,6 +473,8 @@ fn cmd_mask(args: &[String]) {
         Ok(s) => s,
         Err(e) => die(&e),
     };
+    let kind =
+        explicit_kind.unwrap_or_else(|| infer_kind_with_content(Path::new("stdin"), data.as_str()));
 
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (resolve/restore is unavailable by design).

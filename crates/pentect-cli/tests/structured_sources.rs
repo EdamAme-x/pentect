@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -95,4 +96,32 @@ fn explicit_kinds_cover_arbitrary_dotenv_structured_and_one_secret_files() {
     assert_eq!(output.matches("<<").count(), 1, "{output}");
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mask_stdin_infers_dotenv_without_a_kind_flag() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pentect"))
+        .arg("mask")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"API_TOKEN=x\nMODE=dev\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let masked = String::from_utf8(output.stdout).unwrap();
+    assert!(masked.contains("API_TOKEN=<<API_TOKEN_"), "{masked}");
+    assert!(masked.contains("MODE=<<MODE_"), "{masked}");
+    assert!(!masked.contains("API_TOKEN=x"), "{masked}");
+    assert!(!masked.contains("MODE=dev"), "{masked}");
 }
