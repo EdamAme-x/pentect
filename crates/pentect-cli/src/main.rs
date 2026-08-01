@@ -149,7 +149,7 @@ fn usage() {
          pentect codex app\n\
          pentect claude app\n\
          pentect exec \"<command>\"\n\
-         pentect doctor [--fix [--yes]]\n\
+         pentect doctor [--json | --fix [--yes]]\n\
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
          pentect plugins add|remove|list|search|inspect|test|config|setup|update [NAME]\n\
@@ -473,6 +473,7 @@ fn cmd_mask(args: &[String]) {
         Ok(s) => s,
         Err(e) => die(&e),
     };
+    let inferred_kind = explicit_kind.is_none();
     let kind =
         explicit_kind.unwrap_or_else(|| infer_kind_with_content(Path::new("stdin"), data.as_str()));
 
@@ -501,7 +502,12 @@ fn cmd_mask(args: &[String]) {
         result.summary.residual.len()
     );
     if result.summary.parser_fallback {
-        eprintln!("[pentect] note: --kind {kind_label} failed to parse; masked as plaintext (key context lost, structure not guaranteed).");
+        let source = if inferred_kind {
+            "inferred kind"
+        } else {
+            "--kind"
+        };
+        eprintln!("[pentect] note: {source} {kind_label} failed to parse; masked as plaintext (key context lost, structure not guaranteed).");
     }
     if !result.summary.collisions.is_empty() {
         eprintln!(

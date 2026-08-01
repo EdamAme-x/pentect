@@ -232,8 +232,8 @@ fn looks_like_structured_document(raw: &str) -> bool {
                 continue;
             }
         }
-        if let Some((key, _)) = body.split_once(':') {
-            if structured_key(key.trim()) {
+        if let Some((key, value)) = body.split_once(':') {
+            if structured_yaml_key(key.trim()) && !value.trim().is_empty() {
                 yaml_entries += 1;
                 continue;
             }
@@ -249,6 +249,13 @@ fn structured_key(key: &str) -> bool {
         && key
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "_.-/".contains(character))
+}
+
+fn structured_yaml_key(key: &str) -> bool {
+    let key = key.trim_matches(['"', '\'']);
+    structured_key(key)
+        && key.starts_with(|character: char| character.is_ascii_lowercase())
+        && !matches!(key, "http" | "https")
 }
 
 fn is_dotenv_name(name: &str) -> bool {
@@ -451,6 +458,20 @@ mod tests {
         );
         assert_eq!(
             infer_kind_with_content(Path::new("stdin"), "This is ordinary prose.\nSecond line."),
+            Kind::Text
+        );
+        assert_eq!(
+            infer_kind_with_content(
+                Path::new("stdin"),
+                "Contact: support@example.com\nWebsite: https://example.com\n"
+            ),
+            Kind::Text
+        );
+        assert_eq!(
+            infer_kind_with_content(
+                Path::new("stdin"),
+                "http://example.com\nhttps://example.org\n"
+            ),
             Kind::Text
         );
     }

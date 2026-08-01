@@ -61,6 +61,8 @@ plugins, OCR support, and supported agent commands. Run `pentect doctor --fix`
 to receive an English confirmation prompt for each safe repair Pentect can
 perform. It currently adds the installed binary directory to the user PATH and
 migrates known removed configuration names after writing a backup.
+On fish, Pentect reports the required `fish_add_path` command instead of
+changing PATH automatically.
 
 Use `pentect doctor --fix --yes` only in automation where those repairs are
 already approved. `--json` is always read-only and cannot be combined with

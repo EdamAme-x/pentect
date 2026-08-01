@@ -46,7 +46,7 @@ struct Check {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Repair {
     AddToPath(PathBuf),
-    MigrateConfig { path: PathBuf, content: String },
+    MigrateConfig { path: PathBuf },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,9 +174,11 @@ fn check_configs() -> Vec<Check> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
+    #[cfg(windows)]
+    let variable = "USERPROFILE";
+    #[cfg(not(windows))]
+    let variable = "HOME";
+    std::env::var_os(variable).map(PathBuf::from)
 }
 
 fn check_config(name: &'static str, path: PathBuf) -> Check {
@@ -188,10 +190,10 @@ fn check_config(name: &'static str, path: PathBuf) -> Check {
         Err(error) => return Check::fail(name, format!("{}: {error}", path.display())),
     };
     match migrate_removed_config_keys(&source) {
-        Ok(Some(content)) => Check::repairable_warn(
+        Ok(Some(_)) => Check::repairable_warn(
             name,
             format!("{} uses removed settings", path.display()),
-            Repair::MigrateConfig { path, content },
+            Repair::MigrateConfig { path },
         ),
         Ok(None) => Check::ok(name, "ready"),
         Err(error) => Check::fail(name, format!("{}: {error}", path.display())),
@@ -263,7 +265,7 @@ fn migrate_removed_config_keys(source: &str) -> Result<Option<String>, String> {
 
     if document.contains_key("file_pointer_manager") {
         let legacy = document["file_pointer_manager"]
-            .as_table()
+            .as_table_like()
             .ok_or_else(|| "file_pointer_manager must be a table".to_string())?;
         if legacy.len() != 1 || !legacy.contains_key("save") {
             return Err("file_pointer_manager cannot be migrated automatically".to_string());
@@ -279,7 +281,7 @@ fn migrate_removed_config_keys(source: &str) -> Result<Option<String>, String> {
     }
     if document.contains_key("log") {
         let legacy = document["log"]
-            .as_table()
+            .as_table_like()
             .ok_or_else(|| "log must be a table".to_string())?;
         if legacy.len() != 1 || !legacy.contains_key("share") {
             return Err("log cannot be migrated automatically".to_string());
@@ -300,7 +302,7 @@ fn migrate_removed_config_keys(source: &str) -> Result<Option<String>, String> {
 fn table_string(document: &toml_edit::DocumentMut, table: &str, key: &str) -> Option<String> {
     document
         .get(table)?
-        .as_table()?
+        .as_table_like()?
         .get(key)?
         .as_str()
         .map(str::to_string)
@@ -309,23 +311,23 @@ fn table_string(document: &toml_edit::DocumentMut, table: &str, key: &str) -> Op
 fn table_has(document: &toml_edit::DocumentMut, table: &str, key: &str) -> bool {
     document
         .get(table)
-        .and_then(toml_edit::Item::as_table)
+        .and_then(toml_edit::Item::as_table_like)
         .is_some_and(|table| table.contains_key(key))
 }
 
 fn table_bool(document: &toml_edit::DocumentMut, table: &str, key: &str) -> Option<bool> {
-    document.get(table)?.as_table()?.get(key)?.as_bool()
+    document.get(table)?.as_table_like()?.get(key)?.as_bool()
 }
 
 fn ensure_table<'a>(
     document: &'a mut toml_edit::DocumentMut,
     name: &str,
-) -> Result<&'a mut toml_edit::Table, String> {
+) -> Result<&'a mut dyn toml_edit::TableLike, String> {
     if !document.contains_key(name) {
         document[name] = toml_edit::Item::Table(toml_edit::Table::new());
     }
     document[name]
-        .as_table_mut()
+        .as_table_like_mut()
         .ok_or_else(|| format!("{name} config must be a table"))
 }
 
@@ -468,7 +470,7 @@ impl Repair {
             Self::AddToPath(directory) => {
                 format!("add '{}' to your user PATH", directory.display())
             }
-            Self::MigrateConfig { path, .. } => format!(
+            Self::MigrateConfig { path } => format!(
                 "back up '{}' and migrate its removed setting names",
                 path.display()
             ),
@@ -478,12 +480,17 @@ impl Repair {
     fn apply(&self) -> Result<String, String> {
         match self {
             Self::AddToPath(directory) => add_to_user_path(directory),
-            Self::MigrateConfig { path, content } => migrate_config_file(path, content),
+            Self::MigrateConfig { path } => migrate_config_file(path),
         }
     }
 }
 
-fn migrate_config_file(path: &Path, content: &str) -> Result<String, String> {
+fn migrate_config_file(path: &Path) -> Result<String, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read '{}': {error}", path.display()))?;
+    let Some(content) = migrate_removed_config_keys(&source)? else {
+        return Ok("(already migrated)".to_string());
+    };
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -491,7 +498,7 @@ fn migrate_config_file(path: &Path, content: &str) -> Result<String, String> {
     let backup = path.with_extension(format!("toml.pentect-backup-{nonce}"));
     std::fs::copy(path, &backup)
         .map_err(|error| format!("could not back up '{}': {error}", path.display()))?;
-    if let Err(error) = std::fs::write(path, content) {
+    if let Err(error) = std::fs::write(path, &content) {
         let _ = std::fs::copy(&backup, path);
         return Err(format!("could not update '{}': {error}", path.display()));
     }
@@ -500,13 +507,21 @@ fn migrate_config_file(path: &Path, content: &str) -> Result<String, String> {
 
 #[cfg(windows)]
 fn add_to_user_path(directory: &Path) -> Result<String, String> {
-    const SCRIPT: &str = r#"$dir=$env:PENTECT_DOCTOR_PATH_DIR
-$user=[Environment]::GetEnvironmentVariable('Path','User')
-$parts=@($user -split ';' | Where-Object { $_ })
+    const SCRIPT: &str = r#"$ErrorActionPreference='Stop'
+$dir=$env:PENTECT_DOCTOR_PATH_DIR
+$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment',$true)
+if ($null -eq $key) { throw 'could not open HKCU\Environment' }
+try {
+  try { $kind=$key.GetValueKind('Path') } catch { $kind=[Microsoft.Win32.RegistryValueKind]::ExpandString }
+  $user=$key.GetValue('Path','',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+  $parts=if ($user -is [string[]]) { @($user) } else { @(([string]$user) -split ';' | Where-Object { $_ }) }
 if (-not ($parts | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') })) {
-  [Environment]::SetEnvironmentVariable('Path',((@($parts)+$dir)-join ';'),'User')
-}"#;
-    let status = Command::new("powershell.exe")
+    $parts=@($parts)+$dir
+    $value=if ($kind -eq [Microsoft.Win32.RegistryValueKind]::MultiString) { [string[]]$parts } else { $parts -join ';' }
+    $key.SetValue('Path',$value,$kind)
+  }
+} finally { $key.Dispose() }"#;
+    let output = Command::new("powershell.exe")
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -518,10 +533,15 @@ if (-not ($parts | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') })) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .status()
+        .output()
         .map_err(|error| format!("could not update the user PATH: {error}"))?;
-    if !status.success() {
-        return Err("PowerShell could not update the user PATH".to_string());
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "PowerShell could not update the user PATH".to_string()
+        } else {
+            format!("PowerShell could not update the user PATH: {detail}")
+        });
     }
     update_process_path(directory)?;
     Ok("restart open terminals to inherit the updated PATH".to_string())
@@ -537,37 +557,59 @@ fn add_to_user_path(directory: &Path) -> Result<String, String> {
     if shell == "fish" {
         return Err("fish PATH changes require a manual `fish_add_path`".to_string());
     }
-    let profile = if shell == "zsh" {
-        home.join(".zprofile")
-    } else {
-        home.join(".profile")
+    let profiles = match shell.as_str() {
+        "zsh" => vec![home.join(".zprofile"), home.join(".zshrc")],
+        "bash" => vec![
+            if home.join(".bash_profile").exists() {
+                home.join(".bash_profile")
+            } else {
+                home.join(".profile")
+            },
+            home.join(".bashrc"),
+        ],
+        _ => vec![home.join(".profile")],
     };
-    if std::fs::symlink_metadata(&profile).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+    let marker = "# Added by `pentect doctor --fix`";
+    for profile in &profiles {
+        append_path_profile(profile, directory, marker)?;
+    }
+    update_process_path(directory)?;
+    let names = profiles
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "restart login and interactive shells to load {names}"
+    ))
+}
+
+#[cfg(not(windows))]
+fn append_path_profile(profile: &Path, directory: &Path, marker: &str) -> Result<(), String> {
+    if std::fs::symlink_metadata(profile).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(format!(
             "refusing to modify symlink '{}'",
             profile.display()
         ));
     }
-    let marker = "# Added by `pentect doctor --fix`";
-    let existing = std::fs::read_to_string(&profile).unwrap_or_default();
-    if !existing.contains(marker) {
-        let line = format!(
-            "{marker}\nexport PATH={}:\"$PATH\"\n",
-            shell_single_quote(&directory.to_string_lossy())
-        );
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&profile)
-            .map_err(|error| format!("could not open '{}': {error}", profile.display()))?;
-        if !existing.is_empty() && !existing.ends_with('\n') {
-            writeln!(file).map_err(|error| error.to_string())?;
-        }
-        file.write_all(line.as_bytes())
-            .map_err(|error| format!("could not update '{}': {error}", profile.display()))?;
+    let existing = std::fs::read_to_string(profile).unwrap_or_default();
+    if existing.contains(marker) {
+        return Ok(());
     }
-    update_process_path(directory)?;
-    Ok(format!("restart the shell to load {}", profile.display()))
+    let line = format!(
+        "{marker}\nexport PATH={}:\"$PATH\"\n",
+        shell_single_quote(&directory.to_string_lossy())
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(profile)
+        .map_err(|error| format!("could not open '{}': {error}", profile.display()))?;
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        writeln!(file).map_err(|error| error.to_string())?;
+    }
+    file.write_all(line.as_bytes())
+        .map_err(|error| format!("could not update '{}': {error}", profile.display()))
 }
 
 #[cfg(not(windows))]
@@ -698,6 +740,30 @@ mod tests {
             "--fix".into(),
         ];
         assert!(parse_args(&invalid).is_err());
+        let yes_only = vec!["pentect".into(), "doctor".into(), "--yes".into()];
+        assert!(parse_args(&yes_only).is_err());
+    }
+
+    #[test]
+    fn ambiguous_removed_settings_are_reported() {
+        assert!(migrate_removed_config_keys("[handles]\nhash_scope = \"team\"\n").is_err());
+        assert!(migrate_removed_config_keys("[handles]\nhash_scope = 1\n").is_err());
+        assert!(migrate_removed_config_keys("not = = toml").is_err());
+    }
+
+    #[test]
+    fn inline_removed_config_tables_migrate() {
+        let source = concat!(
+            "file_pointer_manager = { save = false }\n",
+            "log = { share = true }\n",
+            "agent = { require_pentect = true }\n",
+            "handles = { hash_scope = \"machine\" }\n",
+        );
+        let migrated = migrate_removed_config_keys(source).unwrap().unwrap();
+        assert!(migrated.contains("remember = false"), "{migrated}");
+        assert!(migrated.contains("share = true"), "{migrated}");
+        assert!(migrated.contains("required = true"), "{migrated}");
+        assert!(migrated.contains("scope = \"device\""), "{migrated}");
     }
 
     #[test]
@@ -756,7 +822,7 @@ share = true
         let original = "[handles]\nhash_scope = \"machine\"\n";
         std::fs::write(&path, original).unwrap();
         let migrated = migrate_removed_config_keys(original).unwrap().unwrap();
-        let detail = migrate_config_file(&path, &migrated).unwrap();
+        let detail = migrate_config_file(&path).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), migrated);
         let backup = detail
             .strip_prefix("(backup: ")
