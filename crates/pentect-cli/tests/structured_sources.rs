@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -34,6 +35,29 @@ fn read_as(kind: &str, path: &std::path::Path) -> String {
         std::ffi::OsStr::new(kind),
         path.as_os_str(),
     ])
+}
+
+fn mask_stdin(input: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pentect"))
+        .arg("mask")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
 }
 
 #[test]
@@ -95,4 +119,44 @@ fn explicit_kinds_cover_arbitrary_dotenv_structured_and_one_secret_files() {
     assert_eq!(output.matches("<<").count(), 1, "{output}");
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mask_stdin_infers_dotenv_without_a_kind_flag() {
+    let masked = mask_stdin("API_TOKEN=x\nMODE=dev\n");
+    assert!(masked.contains("API_TOKEN=<<API_TOKEN_"), "{masked}");
+    assert!(masked.contains("MODE=<<MODE_"), "{masked}");
+    assert!(!masked.contains("API_TOKEN=x"), "{masked}");
+    assert!(!masked.contains("MODE=dev"), "{masked}");
+}
+
+#[test]
+fn mask_stdin_infers_terraform_without_a_kind_flag() {
+    let masked = mask_stdin("region = \"us-east-1\"\ndb_password = \"x\"\n");
+    assert!(masked.contains("region = \"us-east-1\""), "{masked}");
+    assert!(
+        masked.contains("db_password = \"<<DB_PASSWORD_"),
+        "{masked}"
+    );
+    assert!(!masked.contains("db_password = \"x\""), "{masked}");
+}
+
+#[test]
+fn mask_stdin_infers_kubernetes_yaml_without_a_kind_flag() {
+    let masked = mask_stdin(
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\nstringData:\n  password: x\n",
+    );
+    assert!(masked.contains("name: app"), "{masked}");
+    assert!(masked.contains("password: <<PASSWORD_"), "{masked}");
+    assert!(!masked.contains("password: x"), "{masked}");
+}
+
+#[test]
+fn mask_stdin_infers_kubernetes_json_without_a_kind_flag() {
+    let masked = mask_stdin(
+        r#"{"apiVersion":"v1","kind":"Secret","metadata":{"name":"app"},"stringData":{"password":"x"}}"#,
+    );
+    assert!(masked.contains(r#""name":"app""#), "{masked}");
+    assert!(masked.contains("<<PASSWORD_"), "{masked}");
+    assert!(!masked.contains(r#""password":"x""#), "{masked}");
 }

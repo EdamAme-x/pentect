@@ -149,7 +149,7 @@ fn usage() {
          pentect codex app\n\
          pentect claude app\n\
          pentect exec \"<command>\"\n\
-         pentect doctor\n\
+         pentect doctor [--json | --fix [--yes]]\n\
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
          pentect plugins add|remove|list|search|inspect|test|config|setup|update [NAME]\n\
@@ -185,7 +185,7 @@ fn help_text() -> &'static str {
         "  pentect claude app [--app PATH] [--upstream URL] [--plugins SOURCE] [--dry-run]\n",
         "  pentect claude-app [--app PATH] [--upstream URL] [--dry-run]  (alias)\n",
         "  pentect exec \"<command>\"\n\n",
-        "  pentect doctor [--json]\n",
+        "  pentect doctor [--json | --fix [--yes]]\n",
         "  pentect update [VERSION] [--check | --force]\n",
         "  pentect uninstall\n",
         "  pentect plugins add SOURCE [--yes]\n",
@@ -208,7 +208,7 @@ fn help_text() -> &'static str {
         "resolve: write handles\n",
         "scan: secrets; gitignore on; --no-gitignore broadens\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
-        "doctor: readiness\n",
+        "doctor: readiness; --fix offers safe repairs\n",
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
         "plugins: add, remove, list, search, inspect, test, config, setup, update\n",
@@ -424,12 +424,12 @@ fn cmd_mask(args: &[String]) {
     if let Err(e) = validate_mask_args(args) {
         die(&e);
     }
-    let kind = match arg_value(args, "--kind").as_deref() {
+    let explicit_kind = match arg_value(args, "--kind").as_deref() {
         Some(name) => match parse_kind(name) {
-            Ok(k) => k,
+            Ok(kind) => Some(kind),
             Err(e) => die(&e),
         },
-        None => Kind::Text,
+        None => None,
     };
     let profile: Profile = match arg_value(args, "--profile").as_deref() {
         Some(name) => match name.parse() {
@@ -473,6 +473,9 @@ fn cmd_mask(args: &[String]) {
         Ok(s) => s,
         Err(e) => die(&e),
     };
+    let inferred_kind = explicit_kind.is_none();
+    let kind =
+        explicit_kind.unwrap_or_else(|| infer_kind_with_content(Path::new("stdin"), data.as_str()));
 
     // Fresh per-run key: mask-only, so the recovery map is not retained and a
     // reproducible key isn't needed (resolve/restore is unavailable by design).
@@ -499,7 +502,12 @@ fn cmd_mask(args: &[String]) {
         result.summary.residual.len()
     );
     if result.summary.parser_fallback {
-        eprintln!("[pentect] note: --kind {kind_label} failed to parse; masked as plaintext (key context lost, structure not guaranteed).");
+        let source = if inferred_kind {
+            "inferred kind"
+        } else {
+            "--kind"
+        };
+        eprintln!("[pentect] note: {source} {kind_label} failed to parse; masked as plaintext (key context lost, structure not guaranteed).");
     }
     if !result.summary.collisions.is_empty() {
         eprintln!(
