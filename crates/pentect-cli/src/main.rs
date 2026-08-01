@@ -149,7 +149,7 @@ fn usage() {
          pentect codex app\n\
          pentect claude app\n\
          pentect exec \"<command>\"\n\
-         pentect doctor\n\
+         pentect doctor [--fix [--yes]]\n\
          pentect update [VERSION] [--check]\n\
          pentect uninstall\n\
          pentect plugins add|remove|list|search|inspect|test|config|setup|update [NAME]\n\
@@ -185,7 +185,7 @@ fn help_text() -> &'static str {
         "  pentect claude app [--app PATH] [--upstream URL] [--plugins SOURCE] [--dry-run]\n",
         "  pentect claude-app [--app PATH] [--upstream URL] [--dry-run]  (alias)\n",
         "  pentect exec \"<command>\"\n\n",
-        "  pentect doctor [--json]\n",
+        "  pentect doctor [--json | --fix [--yes]]\n",
         "  pentect update [VERSION] [--check | --force]\n",
         "  pentect uninstall\n",
         "  pentect plugins add SOURCE [--yes]\n",
@@ -208,7 +208,7 @@ fn help_text() -> &'static str {
         "resolve: write handles\n",
         "scan: secrets; gitignore on; --no-gitignore broadens\n",
         "groups: ~vcs ~deps ~build ~cache ~pentect ~heavy ~all; ! restores\n",
-        "doctor: readiness\n",
+        "doctor: readiness; --fix offers safe repairs\n",
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
         "plugins: add, remove, list, search, inspect, test, config, setup, update\n",

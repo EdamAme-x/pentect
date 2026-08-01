@@ -53,3 +53,15 @@ TOML booleans (`true` or `false`).
 
 Pentect v0.0.x intentionally does not preserve old configuration names.
 Errors name the replacement setting directly.
+
+## Repair
+
+`pentect doctor` checks the executable, PATH, configuration, memory store,
+plugins, OCR support, and supported agent commands. Run `pentect doctor --fix`
+to receive an English confirmation prompt for each safe repair Pentect can
+perform. It currently adds the installed binary directory to the user PATH and
+migrates known removed configuration names after writing a backup.
+
+Use `pentect doctor --fix --yes` only in automation where those repairs are
+already approved. `--json` is always read-only and cannot be combined with
+`--fix`.
