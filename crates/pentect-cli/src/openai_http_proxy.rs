@@ -18,6 +18,7 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use tokio::net::TcpListener;
@@ -27,6 +28,7 @@ use zeroize::Zeroize;
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_SSE_BYTES: usize = 8 * 1024 * 1024;
 const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local secret handles. Copy a handle byte-for-byte into a client function call when that function needs the represented value. Do not alter, expand, guess, or expose it. Pentect resolves handles only in completed client function-call arguments.";
+static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 
 type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
@@ -230,13 +232,24 @@ async fn proxy_request_inner(
         return Ok(text_response(StatusCode::FORBIDDEN, "Forbidden"));
     };
     let method = request.method().clone();
-    let responses_path = method == hyper::Method::POST && is_responses_path(path_and_query);
-    let files_upload = method == hyper::Method::POST && is_files_collection_path(path_and_query);
+    let endpoint = classify_openai_endpoint(path_and_query);
+    enforce_known_openai_endpoint(endpoint, state.block_unknown_formats)?;
+    let responses_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Responses;
+    let responses_response = matches!(
+        endpoint,
+        OpenAiEndpoint::Responses | OpenAiEndpoint::ResponsesResource
+    );
+    let protected_request = method == hyper::Method::POST
+        && matches!(
+            endpoint,
+            OpenAiEndpoint::Responses | OpenAiEndpoint::InputTokens
+        );
+    let files_upload = method == hyper::Method::POST && endpoint == OpenAiEndpoint::FilesCollection;
     let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
     let headers = request.headers().clone();
     let mut request_coverage = None;
     let mut request_streaming = false;
-    let body = if responses_path || files_upload {
+    let body = if protected_request || files_upload {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
             .await
@@ -320,7 +333,7 @@ async fn proxy_request_inner(
     let mut upstream_request = state.client.request(method, upstream_url);
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
-        if ((!(responses_path || files_upload) && name == hyper::header::CONTENT_LENGTH)
+        if ((!(protected_request || files_upload) && name == hyper::header::CONTENT_LENGTH)
             || should_forward_request_header(name.as_str()))
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
         {
@@ -355,7 +368,7 @@ async fn proxy_request_inner(
         response_media_type.is_some_and(|value| {
             value.eq_ignore_ascii_case("application/json")
                 || value.to_ascii_lowercase().ends_with("+json")
-        }) || (responses_path && !request_streaming && response_media_type.is_none());
+        }) || (responses_response && !request_streaming && response_media_type.is_none());
     let mut builder = Response::builder().status(status);
     let connection_headers = connection_named_headers(&response_headers);
     for (name, value) in &response_headers {
@@ -371,7 +384,7 @@ async fn proxy_request_inner(
             .unwrap_or(crate::http_files::Coverage::None)
             .as_header(),
     );
-    if is_event_stream || (!responses_path && !files_upload) {
+    if is_event_stream || (!responses_response && !files_upload) {
         return builder
             .body(streaming_response_body(
                 upstream,
@@ -401,7 +414,7 @@ async fn proxy_request_inner(
             }
         }
     }
-    let response_body = if responses_path && status.is_success() && is_json_response {
+    let response_body = if responses_response && status.is_success() && is_json_response {
         let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
         match rewrite_openai_json_response(&response_body) {
             Ok(rewritten) => Bytes::from(rewritten),
@@ -431,7 +444,7 @@ fn run_response_plugins(
         .lock()
         .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
     let run = plugins.run(
-        pentect_agent::MiddlewareStage::ProviderResponse,
+        pentect_agent::MiddlewareStage::Response,
         value,
         Some(serde_json::json!({"provider": provider, "transport": "http"})),
     )?;
@@ -536,7 +549,7 @@ fn protect_openai_request_body(
         .lock()
         .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?
         .run(
-            pentect_agent::MiddlewareStage::ProviderRequest,
+            pentect_agent::MiddlewareStage::Request,
             value,
             Some(serde_json::json!({"provider": "openai", "transport": "http"})),
         )?;
@@ -1320,18 +1333,53 @@ fn first_sse_block_end(bytes: &[u8]) -> Option<usize> {
     }
 }
 
-fn is_responses_path(path_and_query: &str) -> bool {
-    path_and_query
-        .split('?')
-        .next()
-        .is_some_and(|path| path.ends_with("/responses"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenAiEndpoint {
+    Responses,
+    ResponsesResource,
+    InputTokens,
+    FilesCollection,
+    Files,
+    Models,
+    Health,
+    Unknown,
 }
 
-fn is_files_collection_path(path_and_query: &str) -> bool {
-    path_and_query
-        .split('?')
-        .next()
-        .is_some_and(|path| path.ends_with("/files"))
+fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    if path.ends_with("/responses/input_tokens") {
+        OpenAiEndpoint::InputTokens
+    } else if path.ends_with("/responses") {
+        OpenAiEndpoint::Responses
+    } else if path.contains("/responses/") {
+        OpenAiEndpoint::ResponsesResource
+    } else if path.ends_with("/files") {
+        OpenAiEndpoint::FilesCollection
+    } else if path.contains("/files/") {
+        OpenAiEndpoint::Files
+    } else if path.ends_with("/models") || path.contains("/models/") {
+        OpenAiEndpoint::Models
+    } else if path == "/api/hello" {
+        OpenAiEndpoint::Health
+    } else {
+        OpenAiEndpoint::Unknown
+    }
+}
+
+fn enforce_known_openai_endpoint(
+    endpoint: OpenAiEndpoint,
+    block_unknown_formats: bool,
+) -> Result<(), String> {
+    if endpoint != OpenAiEndpoint::Unknown {
+        return Ok(());
+    }
+    if block_unknown_formats {
+        return Err("unknown format blocked: OpenAI endpoint is not supported; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through".to_string());
+    }
+    if !WARNED_UNKNOWN_ENDPOINT.swap(true, Ordering::Relaxed) {
+        eprintln!("[pentect] unknown OpenAI endpoint passed through without content inspection");
+    }
+    Ok(())
 }
 
 fn authenticated_request_path<'a>(path_and_query: &'a str, token: &str) -> Option<&'a str> {
@@ -1505,13 +1553,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_responses_endpoint_is_transformed() {
-        assert!(is_responses_path("/v1/responses"));
-        assert!(is_responses_path(
-            "/backend-api/codex/responses?stream=true"
-        ));
-        assert!(!is_responses_path("/v1/files"));
-        assert!(!is_responses_path("/v1/responses/input_tokens"));
+    fn known_openai_endpoints_are_classified_before_forwarding() {
+        assert_eq!(
+            classify_openai_endpoint("/v1/responses"),
+            OpenAiEndpoint::Responses
+        );
+        assert_eq!(
+            classify_openai_endpoint("/backend-api/codex/responses?stream=true"),
+            OpenAiEndpoint::Responses
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/responses/input_tokens"),
+            OpenAiEndpoint::InputTokens
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/responses/resp_123"),
+            OpenAiEndpoint::ResponsesResource
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/responses/resp_123/cancel"),
+            OpenAiEndpoint::ResponsesResource
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/responses/resp_123/input_items"),
+            OpenAiEndpoint::ResponsesResource
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/files"),
+            OpenAiEndpoint::FilesCollection
+        );
+        assert_eq!(
+            classify_openai_endpoint("/v1/unknown"),
+            OpenAiEndpoint::Unknown
+        );
+        assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, true).is_err());
+        assert!(enforce_known_openai_endpoint(OpenAiEndpoint::Unknown, false).is_ok());
     }
 
     #[test]

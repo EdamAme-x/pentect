@@ -272,7 +272,9 @@ impl Span {
     /// means `self` is the stronger span. Higher confidence first (a High
     /// anchored hit beats a Low guess), then larger span (cover the whole secret,
     /// never leak a prefix), then higher category; ties broken deterministically
-    /// by more-specific source then earliest position.
+    /// by more-specific source then earliest position. Labels deliberately do
+    /// not break a tie: two otherwise-identical findings with different labels
+    /// are genuinely ambiguous and merge to their canonical category label.
     pub fn cmp_strength(&self, other: &Self) -> core::cmp::Ordering {
         self.confidence
             .cmp(&other.confidence)

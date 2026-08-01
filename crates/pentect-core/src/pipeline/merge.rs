@@ -214,22 +214,25 @@ mod tests {
 
         let forward = merge(vec![beta.clone(), alpha.clone()], &[]);
         let reverse = merge(vec![alpha, beta], &[]);
+        assert_eq!(forward.len(), 1);
+        assert_eq!(reverse.len(), 1);
         assert_eq!(forward[0].label, "SECRET");
         assert_eq!(forward[0].label, reverse[0].label);
     }
 
     #[test]
-    fn unambiguous_stronger_finding_keeps_specific_label() {
+    fn unambiguous_stronger_finding_keeps_its_specific_label() {
         let mut weak = span(0, 10, Confidence::Medium);
         weak.label = "LIKELY_SECRET".into();
         let mut strong = span(0, 10, Confidence::High);
         strong.label = "API_KEY".into();
         let out = merge(vec![weak, strong], &[]);
+        assert_eq!(out.len(), 1);
         assert_eq!(out[0].label, "API_KEY");
     }
 
     #[test]
-    fn transitive_overlaps_union_but_adjacent_ranges_stay_separate() {
+    fn transitive_overlaps_form_one_union_but_adjacent_range_stays_separate() {
         let out = merge(
             vec![
                 span(0, 4, Confidence::Medium),

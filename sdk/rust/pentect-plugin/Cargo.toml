@@ -1,8 +1,16 @@
 [package]
 name = "pentect-plugin"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "SDK for sandboxed Pentect WebAssembly plugins"
+repository = "https://github.com/EdamAme-x/pentect"
+homepage = "https://github.com/EdamAme-x/pentect"
+documentation = "https://docs.rs/pentect-plugin"
+readme = "README.md"
+keywords = ["pentect", "wasm", "plugin", "security"]
+categories = ["wasm", "api-bindings"]
+include = ["src/**", "examples/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

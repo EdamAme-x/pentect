@@ -21,16 +21,16 @@ mod secure_io;
 #[doc(hidden)]
 pub use network_address::embedded_ipv4;
 pub use plugin_middleware::{
-    plugin_runtime_dirs, plugin_runtime_dirs_for_manifest, valid_plugin_publisher_workflow,
-    DetectSpansRun, MiddlewareCoverage, MiddlewareRun, MiddlewareStage, PluginMiddleware,
-    PluginRuntimeDirs, StopOutcome, DEFAULT_PUBLISHER_WORKFLOW,
+    inspect_wasm_plugin_hooks, plugin_runtime_dirs, plugin_runtime_dirs_for_manifest,
+    test_local_wasm_plugin, valid_plugin_publisher_workflow, DetectSpansRun, MiddlewareCoverage,
+    MiddlewareRun, MiddlewareStage, PluginMiddleware, PluginRuntimeDirs, StopOutcome,
+    DEFAULT_PUBLISHER_WORKFLOW,
 };
 #[doc(hidden)]
 pub use secure_io::{read_bounded_bytes, read_bounded_utf8, sha256_file};
 mod session;
 mod shell;
 
-pub use activity_log::record_scan as record_scan_activity;
 pub use delegated_process_host::{
     contains_host as delegated_process_host_contains, is_host as delegated_process_host_owned_by,
     is_running as delegated_process_host_running, matches_host as delegated_process_host_matches,

@@ -1,0 +1,51 @@
+name: Publish Rust plugin SDK
+
+on:
+  push:
+    tags:
+      - "sdk-rust-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    if: github.repository == 'EdamAme-x/pentect'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - name: Verify SDK
+        working-directory: sdk/rust/pentect-plugin
+        run: |
+          cargo test --locked
+          cargo build --locked --release --target wasm32-unknown-unknown --example wasm
+          cargo publish --locked --dry-run
+      - name: Verify tag
+        if: github.event_name == 'push'
+        working-directory: sdk/rust/pentect-plugin
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = $metadata.packages[0].version
+          if ($env:GITHUB_REF_NAME -ne "sdk-rust-v$version") {
+            throw "tag $env:GITHUB_REF_NAME must match SDK version sdk-rust-v$version"
+          }
+      - name: Authenticate to crates.io
+        id: crates-io
+        if: github.event_name == 'push'
+        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
+      - name: Publish crate
+        if: github.event_name == 'push'
+        working-directory: sdk/rust/pentect-plugin
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+        run: cargo publish --locked

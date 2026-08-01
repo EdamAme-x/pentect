@@ -9,11 +9,14 @@ Install and enable a plugin for the current project:
 pentect plugins add github:@owner/repository/path
 ```
 
-The same configured plugin set is used by `mask`, `read`, `scan`, Codex,
+The same configured plugin set is used by `mask`, `read`, Codex,
 Claude Code, and their desktop-app launchers. Use `--plugins SOURCE` only for a
 one-off addition.
 
 ```text
+pentect plugins new NAME
+pentect plugins dev PATH
+pentect plugins publish PATH
 pentect plugins list
 pentect plugins inspect NAME
 pentect plugins config NAME key=value

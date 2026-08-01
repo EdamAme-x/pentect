@@ -1077,7 +1077,7 @@ label = "INLINE_SECRET"
         std::fs::write(root.join("config.toml"), "").unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nbinary = \"tool.wasm\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool.wasm\"\n",
         )
         .unwrap();
 
@@ -1101,7 +1101,7 @@ label = "INLINE_SECRET"
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
         )
         .unwrap();
 
@@ -1119,7 +1119,7 @@ label = "INLINE_SECRET"
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("plugin.toml"),
-            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n[middleware]\nstages = [\"detect\"]\npermissions = [\"input:read\"]\n",
+            "schema = \"pentect.plugin.v1\"\nbinary = \"tool\"\n",
         )
         .unwrap();
 
