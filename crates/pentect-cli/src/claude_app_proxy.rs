@@ -39,6 +39,7 @@ type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 128;
+const MAX_CERTIFICATE_CACHE_ENTRIES: usize = 64;
 const MAX_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PENDING_UPLOADS: usize = 256;
 const MAX_IDS_PER_UPLOAD: usize = 16;
@@ -331,6 +332,11 @@ impl ProxyState {
             return Ok(Arc::clone(config));
         }
         let config = self.authority.server_config(host)?;
+        if configs.len() >= MAX_CERTIFICATE_CACHE_ENTRIES {
+            if let Some(expired) = configs.keys().next().cloned() {
+                configs.remove(&expired);
+            }
+        }
         configs.insert(host.to_string(), Arc::clone(&config));
         Ok(config)
     }
@@ -508,7 +514,8 @@ async fn forward_inspected(
     match forward_inspected_inner(request, &host, &state).await {
         Ok(response) => Ok(response),
         Err(error) => {
-            eprintln!("[pentect] Claude App request failed: {error}");
+            let category = error.split(':').next().unwrap_or("gateway request failed");
+            eprintln!("[pentect] Claude App request failed: {category}");
             Ok(
                 if error.starts_with("unknown format blocked:")
                     || error.starts_with("image blocked:")
@@ -518,6 +525,8 @@ async fn forward_inspected(
                     || error.starts_with("plugin blocked:")
                 {
                     text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
+                } else if error.starts_with("payload too large:") {
+                    text_response(StatusCode::PAYLOAD_TOO_LARGE, &error)
                 } else {
                     text_response(StatusCode::BAD_GATEWAY, "Pentect Claude App gateway failed")
                 },
@@ -563,11 +572,7 @@ async fn forward_inspected_inner(
     let mut upload_coverage = None;
     let mut upload_key = None;
     let body = if protect_chat {
-        let body = Limited::new(request.into_body(), MAX_CHAT_BODY_BYTES)
-            .collect()
-            .await
-            .map_err(|error| format!("could not read Claude App Chat request: {error}"))?
-            .to_bytes();
+        let body = read_request_capped(request.into_body(), "Chat").await?;
         let original = body.clone();
         let masker = Arc::clone(&state.masker);
         let plugins = Arc::clone(&state.plugins);
@@ -599,11 +604,7 @@ async fn forward_inspected_inner(
         request_kind,
         ClaudeAppRequest::JsonScan | ClaudeAppRequest::PrepareUploadJson
     ) {
-        let body = Limited::new(request.into_body(), MAX_CHAT_BODY_BYTES)
-            .collect()
-            .await
-            .map_err(|error| format!("could not read Claude App JSON request: {error}"))?
-            .to_bytes();
+        let body = read_request_capped(request.into_body(), "JSON").await?;
         let masker = Arc::clone(&state.masker);
         let block_unknown_formats = state.block_unknown_formats;
         let protected = tokio::task::spawn_blocking(move || {
@@ -614,11 +615,7 @@ async fn forward_inspected_inner(
         headers.remove(hyper::header::CONTENT_LENGTH);
         reqwest::Body::from(protected)
     } else if request_kind == ClaudeAppRequest::Upload {
-        let body = Limited::new(request.into_body(), MAX_CHAT_BODY_BYTES)
-            .collect()
-            .await
-            .map_err(|error| format!("could not read Claude App upload: {error}"))?
-            .to_bytes();
+        let body = read_request_capped(request.into_body(), "upload").await?;
         upload_key = claude_filestore_upload_key(&content_type, &body);
         let masker = Arc::clone(&state.masker);
         let plugins = Arc::clone(&state.plugins);
@@ -1021,6 +1018,16 @@ async fn read_response_capped(response: reqwest::Response) -> Result<Bytes, Stri
         body.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(body))
+}
+
+async fn read_request_capped(body: Incoming, label: &str) -> Result<Bytes, String> {
+    match Limited::new(body, MAX_CHAT_BODY_BYTES).collect().await {
+        Ok(body) => Ok(body.to_bytes()),
+        Err(error) if error.is::<http_body_util::LengthLimitError>() => Err(format!(
+            "payload too large: Claude App {label} request exceeds {MAX_CHAT_BODY_BYTES} bytes"
+        )),
+        Err(_) => Err(format!("could not read Claude App {label} request")),
+    }
 }
 
 fn reqwest_error_summary(error: &reqwest::Error) -> &'static str {
