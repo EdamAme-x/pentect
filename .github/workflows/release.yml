@@ -42,7 +42,9 @@ jobs:
             throw "release tag must point at origin/main ($main)"
           }
       - name: Validate POSIX installer
-        run: sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh
+        run: |
+          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh
+          sh tools/test_propose_automation_pr.sh
       - name: Validate PowerShell installer
         shell: pwsh
         run: |
@@ -370,7 +372,7 @@ jobs:
       - name: Promote validated release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --prerelease=false --repo "$GITHUB_REPOSITORY"
+        run: gh release edit "$GITHUB_REF_NAME" --prerelease=false --latest --repo "$GITHUB_REPOSITORY"
 
   package-metadata:
     name: Update package metadata

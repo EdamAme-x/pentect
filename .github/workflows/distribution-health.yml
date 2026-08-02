@@ -50,3 +50,19 @@ jobs:
               gzip -dc > "$RUNNER_TEMP/Packages-$architecture"
             grep -Fq "Version: $version" "$RUNNER_TEMP/Packages-$architecture"
           done
+      - name: Install and remove through APT
+        run: |
+          version=$(jq -r .version packaging/release.json)
+          sudo install -m 0644 "$RUNNER_TEMP/key.asc" /usr/share/keyrings/pentect-archive-keyring.asc
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/pentect-archive-keyring.asc] https://edamame-x.github.io/pentect/apt stable main" |
+            sudo tee /etc/apt/sources.list.d/pentect.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pentect
+          test "$(pentect version)" = "pentect $version"
+          if pentect uninstall 2>uninstall.err; then
+            echo "package-managed uninstall unexpectedly succeeded" >&2
+            exit 1
+          fi
+          dpkg-query -W -f='${Status}\n' pentect | grep -Fxq 'install ok installed'
+          sudo apt-get remove -y pentect
+          test ! -e /usr/bin/pentect
