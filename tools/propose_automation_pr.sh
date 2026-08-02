@@ -42,7 +42,7 @@ fi
 # Events created with GITHUB_TOKEN do not recursively start pull_request
 # workflows. Explicitly dispatch CI against the exact automation commit so the
 # protected branch still receives every required check.
-gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
 gh pr merge "$pull" --repo "$GITHUB_REPOSITORY" --auto --merge --delete-branch \
-  --match-head-commit "$(git rev-parse HEAD)"
+  --match-head-commit "$(git rev-parse HEAD)" >&2
 printf '%s\n' "$pull"
