@@ -337,9 +337,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p debs
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-            --json tagName,isDraft,isPrerelease \
-            --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
           while IFS= read -r tag; do
             gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
               --pattern 'pentect_*.deb' --dir debs --skip-existing || true

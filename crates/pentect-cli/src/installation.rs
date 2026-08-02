@@ -55,7 +55,9 @@ pub(crate) fn current_installation() -> Result<Option<ManagedInstallation>, Stri
     installation_for_executable(&executable)
 }
 
-fn installation_for_executable(path: &Path) -> Result<Option<ManagedInstallation>, String> {
+pub(crate) fn installation_for_executable(
+    path: &Path,
+) -> Result<Option<ManagedInstallation>, String> {
     let mut candidates = Vec::with_capacity(2);
     push_marker_candidate(&mut candidates, path);
     if let Ok(canonical) = std::fs::canonicalize(path) {
@@ -92,18 +94,7 @@ fn installation_for_executable(path: &Path) -> Result<Option<ManagedInstallation
                     marker.display()
                 )
             })?;
-        if installation.manager.is_empty()
-            || installation.manager.len() > 32
-            || !installation
-                .manager
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-            || installation
-                .update
-                .iter()
-                .chain(installation.uninstall.iter())
-                .any(|command| command.len() > 256 || command.chars().any(char::is_control))
-        {
+        if !valid_installation(&installation) {
             return Err(format!(
                 "installation marker '{}' contains invalid instructions",
                 marker.display()
@@ -112,6 +103,20 @@ fn installation_for_executable(path: &Path) -> Result<Option<ManagedInstallation
         return Ok(Some(installation));
     }
     Ok(None)
+}
+
+fn valid_installation(installation: &ManagedInstallation) -> bool {
+    !(installation.manager.is_empty()
+        || installation.manager.len() > 32
+        || !installation
+            .manager
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        || installation
+            .update
+            .iter()
+            .chain(installation.uninstall.iter())
+            .any(|command| command.len() > 256 || command.chars().any(char::is_control)))
 }
 
 fn push_marker_candidate(candidates: &mut Vec<PathBuf>, executable: &Path) {
@@ -146,5 +151,20 @@ mod tests {
         let marker: ManagedInstallation =
             serde_json::from_str(r#"{"version":1,"path_added":false}"#).unwrap();
         assert!(marker.is_self_managed());
+    }
+
+    #[test]
+    fn rejects_unsafe_marker_instructions() {
+        let mut marker = ManagedInstallation {
+            manager: "apt package".to_string(),
+            update: None,
+            uninstall: None,
+        };
+        assert!(!valid_installation(&marker));
+        marker.manager = "apt".to_string();
+        marker.update = Some("x".repeat(257));
+        assert!(!valid_installation(&marker));
+        marker.update = Some("apt\nupgrade pentect".to_string());
+        assert!(!valid_installation(&marker));
     }
 }

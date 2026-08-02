@@ -10,13 +10,13 @@ fn uninstall(args: &[String]) -> Result<(), String> {
     if args.len() != 2 {
         return Err("usage: pentect uninstall".to_string());
     }
-    if let Some(installation) = crate::installation::current_installation()? {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("could not locate the installed executable: {error}"))?;
+    if let Some(installation) = crate::installation::installation_for_executable(&executable)? {
         if !installation.is_self_managed() {
             return Err(installation.uninstall_message());
         }
     }
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("could not locate the installed executable: {error}"))?;
     validate_executable_name(&executable)?;
     let install_dir = executable
         .parent()

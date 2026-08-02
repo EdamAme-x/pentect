@@ -14,6 +14,12 @@ command -v dpkg-scanpackages >/dev/null 2>&1 || { echo "dpkg-scanpackages is req
 command -v apt-ftparchive >/dev/null 2>&1 || { echo "apt-ftparchive is required" >&2; exit 2; }
 command -v gpg >/dev/null 2>&1 || { echo "gpg is required" >&2; exit 2; }
 test -f "$public_key" || { echo "missing public key: $public_key" >&2; exit 2; }
+public_fingerprint=$(gpg --batch --with-colons --show-keys "$public_key" |
+  awk -F: '$1 == "fpr" { print $10; exit }')
+if [ "$public_fingerprint" != "$fingerprint" ]; then
+  echo "public key does not match signing fingerprint" >&2
+  exit 2
+fi
 
 rm -rf "$output_dir"
 pool="$output_dir/apt/pool/main/p/pentect"

@@ -1,6 +1,7 @@
 //! Shared transport and URL handling for provider-compatible upstreams.
 
 use std::path::Path;
+use zeroize::Zeroize;
 
 const CA_CERT_ENV: &str = "PENTECT_UPSTREAM_CA_CERT";
 const IDENTITY_ENV: &str = "PENTECT_UPSTREAM_IDENTITY";
@@ -132,10 +133,12 @@ pub(crate) fn client(protocol: &str) -> Result<reqwest::Client, String> {
     }
 
     if let Some(path) = nonempty_path_env(IDENTITY_ENV) {
-        let pem = read_transport_file(&path, IDENTITY_ENV)?;
+        let mut pem = read_transport_file(&path, IDENTITY_ENV)?;
         let identity = reqwest::Identity::from_pem(&pem).map_err(|_| {
             format!("{IDENTITY_ENV} must contain a PEM client certificate and private key")
-        })?;
+        });
+        pem.zeroize();
+        let identity = identity?;
         builder = builder.identity(identity);
     }
 

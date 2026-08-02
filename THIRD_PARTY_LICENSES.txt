@@ -365,7 +365,7 @@ Source: https://github.com/jrmuizel/adobe-cmap-parser
 Declared license expression: MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -1694,7 +1694,7 @@ Source: https://github.com/rusticata/asn1-rs.git
 Declared license expression: MIT/Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -2440,7 +2440,7 @@ Source: https://github.com/madsmtm/objc2
 Declared license expression: MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -4531,7 +4531,7 @@ Source: https://github.com/knurling-rs/defmt
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -4891,7 +4891,7 @@ Source: https://github.com/madsmtm/objc2
 Declared license expression: Zlib OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9311,7 +9311,7 @@ Source: https://github.com/jni-rs/jni-rs
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9343,7 +9343,7 @@ Source: https://github.com/jni-rs/jni-rs
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9401,7 +9401,7 @@ Source: https://github.com/jni-rs/jni-sys
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11167,7 +11167,7 @@ Source: https://github.com/rust-windowing/android-ndk-rs
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11256,7 +11256,7 @@ Source: https://github.com/rust-bakery/nom
 Declared license expression: MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11338,7 +11338,7 @@ Source: https://github.com/madsmtm/objc2
 Declared license expression: MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11370,7 +11370,7 @@ Source: https://github.com/madsmtm/objc2
 Declared license expression: Zlib OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11402,7 +11402,7 @@ Source: https://github.com/madsmtm/objc2
 Declared license expression: MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11434,7 +11434,7 @@ Source: https://github.com/madsmtm/objc2
 Declared license expression: MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11466,7 +11466,7 @@ Source: https://github.com/madsmtm/objc2
 Declared license expression: Zlib OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11498,7 +11498,7 @@ Source: https://github.com/madsmtm/objc2
 Declared license expression: Zlib OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11530,7 +11530,7 @@ Source: https://github.com/robertknight/ocrs
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11583,7 +11583,7 @@ Source: https://github.com/reem/rust-once-mutex.git
 Declared license expression: MIT/Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11615,7 +11615,7 @@ Source: https://github.com/jrmuizel/pdf-extract
 Declared license expression: MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -12357,7 +12357,7 @@ Source: https://github.com/r-efi/r-efi
 Declared license expression: MIT OR Apache-2.0 OR LGPL-2.1-or-later
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -13999,7 +13999,7 @@ Source: https://github.com/robertknight/rten
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -14031,7 +14031,7 @@ Source: https://github.com/robertknight/rten
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -14063,7 +14063,7 @@ Source: https://github.com/robertknight/rten
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -14095,7 +14095,7 @@ Source: https://github.com/robertknight/rten
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -14127,7 +14127,7 @@ Source: https://github.com/robertknight/rten
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -14159,7 +14159,7 @@ Source: https://github.com/robertknight/rten
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -14191,7 +14191,7 @@ Source: https://github.com/robertknight/rten
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -14223,7 +14223,7 @@ Source: https://github.com/robertknight/rten
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -14255,7 +14255,7 @@ Source: https://github.com/robertknight/rten
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -16679,7 +16679,7 @@ Source: https://github.com/snipsco/tract
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -16711,7 +16711,7 @@ Source: https://github.com/snipsco/tract
 Declared license expression: MIT OR Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17010,7 +17010,7 @@ Source: https://github.com/jrmuizel/type1-encoding-parser
 Declared license expression: MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17550,7 +17550,7 @@ Source: https://github.com/bytecodealliance/wasi-rs
 Declared license expression: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17582,7 +17582,7 @@ Source: https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasm-enc
 Declared license expression: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17614,7 +17614,7 @@ Source: https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasm-met
 Declared license expression: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17646,7 +17646,7 @@ Source: https://github.com/wasmi-labs/wasmi
 Declared license expression: MIT/Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17678,7 +17678,7 @@ Source: https://github.com/wasmi-labs/wasmi
 Declared license expression: MIT/Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17710,7 +17710,7 @@ Source: https://github.com/wasmi-labs/wasmi
 Declared license expression: MIT/Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17742,7 +17742,7 @@ Source: https://github.com/wasmi-labs/wasmi
 Declared license expression: MIT/Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17774,7 +17774,7 @@ Source: https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmpars
 Declared license expression: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17806,7 +17806,7 @@ Source: https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmpars
 Declared license expression: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -18128,7 +18128,7 @@ Source: https://github.com/retep998/winapi-rs
 Declared license expression: MIT/Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -18160,7 +18160,7 @@ Source: https://github.com/retep998/winapi-rs
 Declared license expression: MIT/Apache-2.0
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -18541,7 +18541,7 @@ Source: https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-comp
 Declared license expression: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -18573,7 +18573,7 @@ Source: https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-pars
 Declared license expression: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 MIT License
 
-Copyright (c) 2026 EdamAme-x
+The package did not include a separate copyright notice; see its author and source metadata above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -127,6 +127,19 @@ def read_text(path: Path) -> str:
     return path.read_bytes().decode("utf-8", errors="replace").replace("\r\n", "\n").strip()
 
 
+def mit_fallback_text() -> str:
+    project_license = read_text(ROOT / "LICENSE")
+    grant = "Permission is hereby granted"
+    if grant not in project_license:
+        raise RuntimeError("project MIT license template is malformed")
+    return (
+        "MIT License\n\n"
+        "The package did not include a separate copyright notice; see its "
+        "author and source metadata above.\n\n"
+        + project_license[project_license.index(grant) :]
+    )
+
+
 def fallback_license_document(package: dict) -> str:
     expression = package.get("license") or ""
     authors = ", ".join(package.get("authors") or []) or "Not declared in Cargo metadata"
@@ -140,9 +153,17 @@ def fallback_license_document(package: dict) -> str:
             "",
         ]
     )
-    if "MIT" in expression:
-        return prefix + read_text(ROOT / "LICENSE")
-    if "Apache-2.0" in expression:
+    if " AND " in expression:
+        raise RuntimeError(
+            f"{package['name']} {package['version']} has no packaged license file "
+            f"for compound expression {expression!r}"
+        )
+    # Cargo historically used `MIT/Apache-2.0` for the same disjunctive choice
+    # that modern SPDX writes as `MIT OR Apache-2.0`.
+    choices = [choice.strip(" ()") for choice in re.split(r"\s+OR\s+|/", expression)]
+    if "MIT" in choices:
+        return prefix + mit_fallback_text()
+    if "Apache-2.0" in choices:
         return prefix + read_text(ROOT / "research/pii-ner/LICENSE-APACHE-2.0.txt")
     if expression == "CC0-1.0":
         return prefix + (

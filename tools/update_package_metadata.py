@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 REPOSITORY = "EdamAme-x/pentect"
@@ -22,21 +23,33 @@ VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def request(url: str) -> bytes:
+def request(url: str, *, authenticated: bool = False) -> bytes:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise RuntimeError("package metadata requests require an HTTPS URL")
+    if authenticated and parsed.hostname != "api.github.com":
+        raise RuntimeError("authenticated package metadata requests require api.github.com")
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "pentect-package-metadata",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    if token := os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
-        headers["Authorization"] = f"Bearer {token}"
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+    request = urllib.request.Request(url, headers=headers)
+    if authenticated and (token := os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
+        # Unredirected headers are not copied to GitHub's release-asset CDN.
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(request, timeout=30) as response:
         return response.read()
 
 
 def release_metadata(tag: str | None) -> dict[str, object]:
     endpoint = "latest" if tag is None else f"tags/{tag}"
-    release = json.loads(request(f"https://api.github.com/repos/{REPOSITORY}/releases/{endpoint}"))
+    release = json.loads(
+        request(
+            f"https://api.github.com/repos/{REPOSITORY}/releases/{endpoint}",
+            authenticated=True,
+        )
+    )
     if release.get("draft") or release.get("prerelease"):
         raise SystemExit("refusing to package a draft or prerelease")
     match = VERSION_RE.fullmatch(str(release.get("tag_name", "")))
