@@ -34,6 +34,7 @@ jobs:
           filters: |
             detector:
               - '.github/workflows/ci.yml'
+              - '.github/actions/rust-toolchain/**'
               - '.gitmodules'
               - '.cargo/**'
               - 'Cargo.lock'
@@ -48,6 +49,7 @@ jobs:
               - 'tools/pentect-bench/**'
             ocr:
               - '.github/workflows/ci.yml'
+              - '.github/actions/rust-toolchain/**'
               - '.cargo/**'
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -57,6 +59,7 @@ jobs:
               - 'crates/pentect-runtime/src/image_ocr.rs'
             plugins:
               - '.github/workflows/ci.yml'
+              - '.github/actions/rust-toolchain/**'
               - '.cargo/**'
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -93,10 +96,8 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+      - uses: ./.github/actions/rust-toolchain
         if: needs.changes.outputs.ocr == 'true'
-        with:
-          toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: needs.changes.outputs.ocr == 'true'
       - name: Build native OCR
@@ -124,10 +125,9 @@ jobs:
         if: needs.changes.outputs.plugins == 'true'
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+      - uses: ./.github/actions/rust-toolchain
         if: needs.changes.outputs.plugins == 'true'
         with:
-          toolchain: 1.97.1
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: needs.changes.outputs.plugins == 'true'
@@ -160,9 +160,8 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+      - uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: 1.97.1
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

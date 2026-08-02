@@ -1,0 +1,25 @@
+name: Install pinned Rust toolchain
+description: Install the version declared in rust-toolchain.toml
+inputs:
+  components:
+    description: Comma-separated rustup components
+    required: false
+    default: ""
+  targets:
+    description: Comma-separated rustup targets
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - id: version
+      shell: bash
+      run: |
+        channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+        test -n "$channel"
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+    - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+      with:
+        toolchain: ${{ steps.version.outputs.channel }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
