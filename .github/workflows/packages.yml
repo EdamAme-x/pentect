@@ -54,7 +54,7 @@ jobs:
             if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
               --pattern "$asset" --dir binaries; then
               chmod +x "binaries/$asset"
-              tools/package_deb.sh "$version" "$architecture" "binaries/$asset" debs
+              bash tools/package_deb.sh "$version" "$architecture" "binaries/$asset" debs
             fi
           done <<'EOF'
           pentect-linux-x86_64 amd64
@@ -83,7 +83,7 @@ jobs:
           printf '%s' "$APT_SIGNING_KEY" | gpg --batch --import
           fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
           test "$fingerprint" = "$(cat packaging/apt/KEY_FINGERPRINT)"
-          tools/build_apt_repository.sh debs site \
+          bash tools/build_apt_repository.sh debs site \
             packaging/apt/pentect-archive-keyring.asc "$fingerprint"
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
