@@ -6,26 +6,92 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-formula
   cancel-in-progress: true
 
 jobs:
-  sync:
+  prepare:
     runs-on: ubuntu-slim
     timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Fetch the release-generated formula
         run: |
+          mkdir -p candidate
           curl -fsSL --proto '=https' --tlsv1.2 \
             https://raw.githubusercontent.com/EdamAme-x/pentect/main/packaging/homebrew/Formula/pentect.rb \
-            -o Formula/pentect.rb.next
-          mv Formula/pentect.rb.next Formula/pentect.rb
+            -o candidate/pentect.rb
+          version=$(sed -n 's/^  version "\([^"]*\)"/\1/p' candidate/pentect.rb)
+          test -n "$version"
+      - name: Detect an update
+        id: compare
+        run: |
+          if cmp -s candidate/pentect.rb Formula/pentect.rb; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-formula
+          path: candidate/pentect.rb
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidate-formula
+          path: candidate
+      - name: Test the exact candidate formula
+        run: |
+          brew tap EdamAme-x/pentect
+          tap=$(brew --repository EdamAme-x/pentect)
+          cp candidate/pentect.rb "$tap/Formula/pentect.rb"
+          brew style "$tap/Formula/pentect.rb"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install EdamAme-x/pentect/pentect
+          version=$(sed -n 's/^  version "\([^"]*\)"/\1/p' candidate/pentect.rb)
+          test "$(pentect version)" = "pentect $version"
+          if pentect uninstall 2>uninstall.err; then
+            echo "package-managed uninstall unexpectedly succeeded" >&2
+            exit 1
+          fi
+          test -x "$(command -v pentect)"
+          brew uninstall EdamAme-x/pentect/pentect
+          test ! -e "$(brew --prefix)/bin/pentect"
+
+  publish:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.changed == 'true' && needs.test.result == 'success'
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidate-formula
+          path: candidate
       - name: Publish an update when needed
         run: |
+          cp candidate/pentect.rb Formula/pentect.rb
           if git diff --quiet -- Formula/pentect.rb; then
             exit 0
           fi

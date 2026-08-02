@@ -29,8 +29,8 @@ curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/instal
 
 The installers detect the platform, download a GitHub Release asset, and verify
 its SHA-256 checksum. Run `pentect doctor` after installation. Version-specific
-installation is supported with `-Version 0.0.15` in PowerShell or
-`--version 0.0.15` for `install.sh`.
+installation is supported with `-Version X.Y.Z` in PowerShell or
+`--version X.Y.Z` for `install.sh`.
 
 Package managers are also supported:
 
@@ -40,6 +40,9 @@ brew install EdamAme-x/pentect/pentect
 
 # Nix
 nix profile install github:EdamAme-x/pentect
+
+# Nix, pinned to a Pentect release
+nix profile install github:EdamAme-x/pentect/nix-vX.Y.Z
 ```
 
 Debian and Ubuntu users can configure the signed Pentect repository and install
