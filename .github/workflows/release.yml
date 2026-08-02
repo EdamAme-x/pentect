@@ -158,7 +158,7 @@ jobs:
       - name: Build Debian package
         run: |
           chmod +x "binary/${{ matrix.artifact }}"
-          tools/package_deb.sh "${GITHUB_REF_NAME#v}" "${{ matrix.arch }}" \
+          bash tools/package_deb.sh "${GITHUB_REF_NAME#v}" "${{ matrix.arch }}" \
             "binary/${{ matrix.artifact }}" dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -365,7 +365,7 @@ jobs:
           test "$fingerprint" = "$expected"
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
       - name: Build signed repository
-        run: tools/build_apt_repository.sh debs site packaging/apt/pentect-archive-keyring.asc "${{ steps.signing.outputs.fingerprint }}"
+        run: bash tools/build_apt_repository.sh debs site packaging/apt/pentect-archive-keyring.asc "${{ steps.signing.outputs.fingerprint }}"
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
