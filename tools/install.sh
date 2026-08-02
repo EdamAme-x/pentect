@@ -35,6 +35,9 @@ case "$os:$arch" in
   Linux:x86_64|Linux:amd64)
     asset="pentect-linux-x86_64"
     ;;
+  Linux:arm64|Linux:aarch64)
+    asset="pentect-linux-aarch64"
+    ;;
   Darwin:x86_64|Darwin:amd64)
     asset="pentect-macos-x86_64"
     ;;
@@ -113,7 +116,7 @@ staged="$install_dir/.pentect.install.$$"
 cp "$temp_dir/$asset" "$staged"
 chmod 0755 "$staged"
 mv -f "$staged" "$destination"
-printf '%s\n' '{"version":1,"path_added":false}' > "$marker"
+printf '%s\n' '{"version":1,"manager":"pentect","path_added":false}' > "$marker"
 
 case ":${PATH:-}:" in
   *":$install_dir:"*) path_status="already on PATH" ;;

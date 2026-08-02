@@ -122,6 +122,7 @@ struct ProxyState {
     files: StdMutex<HashMap<String, crate::http_files::Coverage>>,
     requests: Arc<Semaphore>,
     block_unknown_formats: bool,
+    authorization: crate::upstream::AuthorizationOverride,
 }
 
 impl Drop for ProxyState {
@@ -156,6 +157,7 @@ async fn run_proxy(
         files: StdMutex::new(HashMap::new()),
         requests: Arc::new(Semaphore::new(32)),
         block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
+        authorization: crate::upstream::authorization_override()?,
     });
     // Keep authentication in the base URL path. Claude settings can replace
     // ANTHROPIC_CUSTOM_HEADERS after process start, so a header token is not
@@ -188,22 +190,7 @@ async fn run_proxy(
 }
 
 fn build_upstream_client() -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(60))
-        .pool_idle_timeout(std::time::Duration::from_secs(30))
-        .tcp_nodelay(true);
-    if let Some(path) = std::env::var_os("PENTECT_ANTHROPIC_CA_CERT") {
-        let pem = std::fs::read(&path)
-            .map_err(|_| "could not read PENTECT_ANTHROPIC_CA_CERT".to_string())?;
-        let certificate = reqwest::Certificate::from_pem(&pem)
-            .map_err(|_| "PENTECT_ANTHROPIC_CA_CERT is not a valid PEM certificate".to_string())?;
-        builder = builder.add_root_certificate(certificate);
-    }
-    builder
-        .build()
-        .map_err(|_| "could not build Claude HTTP proxy client".to_string())
+    crate::upstream::client("Anthropic Messages")
 }
 
 async fn proxy_request(
@@ -347,12 +334,16 @@ async fn proxy_request_inner(
     let mut upstream_request = state.client.request(method, upstream_url);
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
-        if ((!(protected_request || files_upload) && name == hyper::header::CONTENT_LENGTH)
-            || should_forward_request_header(name.as_str()))
+        if state.authorization.forward_incoming_header(name.as_str())
+            && ((!(protected_request || files_upload) && name == hyper::header::CONTENT_LENGTH)
+                || should_forward_request_header(name.as_str()))
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
         {
             upstream_request = upstream_request.header(name, value);
         }
+    }
+    if let Some(value) = state.authorization.replacement() {
+        upstream_request = upstream_request.header(hyper::header::AUTHORIZATION, value);
     }
     let upstream_response = upstream_request
         .body(body)
@@ -1858,32 +1849,7 @@ pub(crate) fn request_scoped_resolver() -> impl FnMut(&str) -> Result<String, St
 }
 
 fn parse_upstream_base(value: &str) -> Result<reqwest::Url, String> {
-    let url = reqwest::Url::parse(value.trim())
-        .map_err(|_| "ANTHROPIC_BASE_URL is not a valid URL".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err("ANTHROPIC_BASE_URL must use http or https and include a host".to_string());
-    }
-    if url.fragment().is_some() {
-        return Err("ANTHROPIC_BASE_URL must not contain a fragment".to_string());
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("ANTHROPIC_BASE_URL must not contain URL credentials".to_string());
-    }
-    if url.scheme() == "http"
-        && !url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        })
-        && std::env::var("PENTECT_ALLOW_INSECURE_UPSTREAM").as_deref() != Ok("1")
-    {
-        return Err(
-            "remote ANTHROPIC_BASE_URL must use https (set PENTECT_ALLOW_INSECURE_UPSTREAM=1 to override)"
-                .to_string(),
-        );
-    }
-    Ok(url)
+    crate::upstream::parse_base(value, "Anthropic Messages")
 }
 
 fn reqwest_error_message(context: &str, error: &reqwest::Error) -> String {
@@ -1904,29 +1870,7 @@ fn reqwest_stream_error(error: &reqwest::Error) -> io::Error {
 }
 
 fn join_upstream_url(base: &reqwest::Url, path_and_query: &str) -> Result<reqwest::Url, String> {
-    let (request_path, request_query) = path_and_query
-        .split_once('?')
-        .map_or((path_and_query, None), |(path, query)| (path, Some(query)));
-    let base_query = base.query().map(str::to_string);
-    let mut without_query = base.clone();
-    without_query.set_query(None);
-    let mut joined = without_query.as_str().trim_end_matches('/').to_string();
-    if !request_path.starts_with('/') {
-        joined.push('/');
-    }
-    joined.push_str(request_path);
-    let mut joined = reqwest::Url::parse(&joined)
-        .map_err(|_| "could not construct Claude upstream URL".to_string())?;
-    let query = match (base_query.as_deref(), request_query) {
-        (Some(base), Some(request)) if !base.is_empty() && !request.is_empty() => {
-            Some(format!("{base}&{request}"))
-        }
-        (Some(base), _) if !base.is_empty() => Some(base.to_string()),
-        (_, Some(request)) if !request.is_empty() => Some(request.to_string()),
-        _ => None,
-    };
-    joined.set_query(query.as_deref());
-    Ok(joined)
+    crate::upstream::join_url(base, path_and_query, "Anthropic Messages")
 }
 
 fn classify_anthropic_endpoint(path_and_query: &str) -> AnthropicEndpoint {

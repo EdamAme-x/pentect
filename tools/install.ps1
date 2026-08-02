@@ -101,7 +101,7 @@ try {
         }
     }
     Write-Output "[4/4] PATH: $pathStatus"
-    @{ version = 1; path_added = $pathAdded } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 -LiteralPath $marker
+    @{ version = 1; manager = 'pentect'; path_added = $pathAdded } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 -LiteralPath $marker
     Write-Output ''
     Write-Output "Installed Pentect $releaseTag"
     Write-Output 'Next: pentect doctor'

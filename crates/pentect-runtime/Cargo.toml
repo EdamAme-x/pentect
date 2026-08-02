@@ -5,6 +5,7 @@ description = "Pentect tool-boundary runtime"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 autobins = false
 
 [lib]

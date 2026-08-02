@@ -1,0 +1,38 @@
+name: Sync Pentect formula
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-formula
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Fetch the release-generated formula
+        run: |
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            https://raw.githubusercontent.com/EdamAme-x/pentect/main/packaging/homebrew/Formula/pentect.rb \
+            -o Formula/pentect.rb.next
+          mv Formula/pentect.rb.next Formula/pentect.rb
+      - name: Publish an update when needed
+        run: |
+          if git diff --quiet -- Formula/pentect.rb; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Formula/pentect.rb
+          version=$(sed -n 's/^  version "\([^"]*\)"/\1/p' Formula/pentect.rb)
+          test -n "$version"
+          git commit -m "pentect $version"
+          git push

@@ -27,3 +27,9 @@ selected with `--upstream URL`. Existing Codex provider configuration and
 Claude's managed/user endpoint configuration are preserved as the upstream
 when Pentect inserts its local gateway. Unsupported wire protocols are rejected
 before launch.
+
+Bifrost's `/openai/v1` and `/anthropic` integration base paths are covered by
+the URL-routing tests. This verifies Pentect's protocol boundary and path
+composition; it does not certify every Bifrost provider or release. LiteLLM and
+other gateways are supported through the same contracts rather than
+provider-specific code. See [custom upstreams](guides/upstreams.md).

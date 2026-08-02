@@ -1,0 +1,95 @@
+name: Publish packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable release tag; empty selects the latest release
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: packages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'EdamAme-x/pentect'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Resolve stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          tag=${REQUESTED_TAG:-$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)}
+          release=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease)
+          test "$(jq -r .isDraft <<<"$release")" = false
+          test "$(jq -r .isPrerelease <<<"$release")" = false
+          echo "tag=$(jq -r .tagName <<<"$release")" >> "$GITHUB_OUTPUT"
+      - name: Install package tools
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg
+      - name: Build available Debian packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          mkdir -p binaries debs
+          version=${TAG#v}
+          while read -r asset architecture; do
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset" --dir binaries; then
+              chmod +x "binaries/$asset"
+              tools/package_deb.sh "$version" "$architecture" "binaries/$asset" debs
+            fi
+          done <<'EOF'
+          pentect-linux-x86_64 amd64
+          pentect-linux-aarch64 arm64
+          EOF
+          test -n "$(find debs -name 'pentect_*.deb' -print -quit)"
+          gh release upload "$TAG" debs/* --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Download all stable Debian packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf debs
+          mkdir -p debs
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isDraft,isPrerelease \
+            --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' |
+          while IFS= read -r tag; do
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern 'pentect_*.deb' --dir debs --skip-existing || true
+          done
+      - name: Sign repository
+        id: signing
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          test -n "$APT_SIGNING_KEY"
+          printf '%s' "$APT_SIGNING_KEY" | gpg --batch --import
+          fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+          test "$fingerprint" = "$(cat packaging/apt/KEY_FINGERPRINT)"
+          tools/build_apt_repository.sh debs site \
+            packaging/apt/pentect-archive-keyring.asc "$fingerprint"
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: site
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

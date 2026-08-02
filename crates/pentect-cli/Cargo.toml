@@ -1,10 +1,11 @@
 [package]
 name = "pentect-cli"
-version = "0.0.14"
+version = "0.0.15"
 description = "Pentect CLI"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [[bin]]
 name = "pentect"
