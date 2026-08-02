@@ -159,6 +159,10 @@ const PENTECT_CONTROL_ENV_NAMES: &[&str] = &[
     "PENTECT_FILE_POINTER_MANAGER_DIR",
     "PENTECT_CODEX",
     "PENTECT_CLAUDE",
+    "PENTECT_UPSTREAM_AUTHORIZATION",
+    "PENTECT_UPSTREAM_CA_CERT",
+    "PENTECT_UPSTREAM_IDENTITY",
+    "PENTECT_ALLOW_INSECURE_UPSTREAM",
 ];
 
 pub fn pentect_control_env_names() -> &'static [&'static str] {

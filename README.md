@@ -29,8 +29,29 @@ curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/instal
 
 The installers detect the platform, download a GitHub Release asset, and verify
 its SHA-256 checksum. Run `pentect doctor` after installation. Version-specific
-installation is supported with `-Version 0.0.14` in PowerShell or
-`--version 0.0.14` for `install.sh`.
+installation is supported with `-Version 0.0.15` in PowerShell or
+`--version 0.0.15` for `install.sh`.
+
+Package managers are also supported:
+
+```sh
+# Homebrew (macOS or Linux)
+brew install EdamAme-x/pentect/pentect
+
+# Nix
+nix profile install github:EdamAme-x/pentect
+```
+
+Debian and Ubuntu users can configure the signed Pentect repository and install
+the package with one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install-apt.sh | sudo sh
+```
+
+When installed by Homebrew, Nix, or apt, use that package manager to update or
+remove Pentect. The CLI detects managed installations and will not overwrite
+package-owned files.
 
 ## Use
 
@@ -39,6 +60,14 @@ Launch a supported CLI through Pentect:
 ```text
 pentect codex
 pentect claude
+```
+
+Use a Responses- or Messages-compatible gateway without changing permanent
+client configuration:
+
+```text
+pentect codex --upstream http://127.0.0.1:8080/openai/v1
+pentect claude --upstream http://127.0.0.1:8080/anthropic
 ```
 
 Launch a desktop app only when explicitly requested:
@@ -89,6 +118,8 @@ global configuration, but project configuration cannot weaken this policy.
 
 See [configuration](guides/configuration.md) for policies and limits.
 See [compatibility](COMPATIBILITY.md) for the release-tested client matrix.
+See [custom upstreams](guides/upstreams.md) for Bifrost, LiteLLM, local models,
+enterprise CA, mTLS, and proxy configuration.
 
 ## Plugins
 
@@ -117,4 +148,7 @@ The Rust SDK is published as
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Pentect is licensed under the MIT License.
+Pentect is licensed under the [MIT License](LICENSE).
+Third-party notices, including the bundled OCR model attribution, are available
+in [`THIRD_PARTY_LICENSES.txt`](THIRD_PARTY_LICENSES.txt) and are attached to
+each GitHub Release.

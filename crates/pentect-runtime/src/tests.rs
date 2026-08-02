@@ -1252,6 +1252,14 @@ fn exec_auto_binds_generic_masked_handles_as_pentect_env_vars() {
 fn session_environment_name_is_reserved_for_internal_use() {
     assert!(is_pentect_control_env_name("PENTECT_SESSION"));
     assert!(is_pentect_control_env_name("pentect_session"));
+    assert!(is_pentect_control_env_name(
+        "PENTECT_UPSTREAM_AUTHORIZATION"
+    ));
+    assert!(is_pentect_control_env_name("PENTECT_UPSTREAM_CA_CERT"));
+    assert!(is_pentect_control_env_name("PENTECT_UPSTREAM_IDENTITY"));
+    assert!(is_pentect_control_env_name(
+        "PENTECT_ALLOW_INSECURE_UPSTREAM"
+    ));
     let mut names = pentect_control_env_names().to_vec();
     names.sort_unstable();
     names.dedup();

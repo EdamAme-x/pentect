@@ -1,7 +1,5 @@
 use std::path::Path;
 
-const INSTALL_MARKER: &str = ".pentect-managed-install.json";
-
 pub(crate) fn cmd_uninstall(args: &[String]) {
     if let Err(error) = uninstall(args) {
         crate::die(error);
@@ -14,11 +12,16 @@ fn uninstall(args: &[String]) -> Result<(), String> {
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not locate the installed executable: {error}"))?;
+    if let Some(installation) = crate::installation::installation_for_executable(&executable)? {
+        if !installation.is_self_managed() {
+            return Err(installation.uninstall_message());
+        }
+    }
     validate_executable_name(&executable)?;
     let install_dir = executable
         .parent()
         .ok_or_else(|| "installed executable has no parent directory".to_string())?;
-    let marker = install_dir.join(INSTALL_MARKER);
+    let marker = install_dir.join(crate::installation::INSTALL_MARKER);
 
     #[cfg(windows)]
     {

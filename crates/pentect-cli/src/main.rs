@@ -6,12 +6,14 @@ mod codex_app;
 mod doctor;
 mod http_files;
 mod input;
+mod installation;
 mod openai_http_proxy;
 mod plugins;
 mod plugins_cmd;
 mod remote_content;
 mod uninstall;
 mod update;
+mod upstream;
 
 use input::{decode_utf8_text, ImageOcrInput, InputAdapter, TextInput};
 use pentect_core::{

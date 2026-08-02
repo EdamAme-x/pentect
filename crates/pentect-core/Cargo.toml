@@ -5,6 +5,7 @@ description = "Pentect core masking engine"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [features]
 default = ["rand-key"]
