@@ -16,7 +16,6 @@ cat > "$tmp/gh" <<'EOF'
 case "$1 $2" in
   "pr list") exit 0 ;;
   "pr create") printf '%s\n' https://github.com/example/project/pull/1 ;;
-  "workflow run") printf '%s\n' https://github.com/example/project/actions/runs/1 ;;
   "pr merge") printf '%s\n' 'merge scheduled' ;;
   *) echo "unexpected gh invocation: $*" >&2; exit 1 ;;
 esac
