@@ -31,6 +31,28 @@ jobs:
       - name: Evaluate all supported systems
         run: nix flake check --no-build
 
+  install:
+    name: Install (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41
+      - name: Install, run, and remove Pentect
+        run: |
+          profile="$RUNNER_TEMP/pentect-profile"
+          version="$(jq -r .version packaging/release.json)"
+          nix profile install .#pentect --profile "$profile"
+          test "$("$profile/bin/pentect" version)" = "pentect $version"
+          nix profile remove pentect --profile "$profile"
+          test ! -e "$profile/bin/pentect"
+
   update-lock:
     if: github.event_name == 'workflow_dispatch'
     needs: check
