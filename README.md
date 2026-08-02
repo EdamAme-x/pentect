@@ -80,6 +80,11 @@ pentect codex app
 pentect claude app
 ```
 
+These commands protect Codex mode and supported Claude Desktop Chat, Code, and
+attachment traffic; they do not claim coverage for every Chat, Work, Cowork,
+Voice, or future opaque route.
+See the [desktop app guide](guides/apps.md) before using sensitive data.
+
 Mask text from stdin while preserving opaque handles:
 
 ```sh
@@ -121,6 +126,7 @@ global configuration, but project configuration cannot weaken this policy.
 
 See [configuration](guides/configuration.md) for policies and limits.
 See [compatibility](COMPATIBILITY.md) for the release-tested client matrix.
+See [desktop apps](guides/apps.md) for exact surface coverage and limitations.
 See [custom upstreams](guides/upstreams.md) for Bifrost, LiteLLM, local models,
 enterprise CA, mTLS, and proxy configuration.
 

@@ -24,6 +24,7 @@ jobs:
       detector: ${{ steps.filter.outputs.detector }}
       ocr: ${{ steps.filter.outputs.ocr }}
       plugins: ${{ steps.filter.outputs.plugins }}
+      apps: ${{ steps.filter.outputs.apps }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -76,6 +77,25 @@ jobs:
               - 'plugins/**'
               - 'protocol/**'
               - 'sdk/rust/pentect-plugin/**'
+            apps:
+              - '.github/workflows/ci.yml'
+              - '.github/actions/rust-toolchain/**'
+              - '.cargo/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/*/Cargo.toml'
+              - 'rust-toolchain*'
+              - 'crates/pentect-cli/src/claude_app_proxy.rs'
+              - 'crates/pentect-cli/src/claude_http_proxy.rs'
+              - 'crates/pentect-cli/src/codex_app.rs'
+              - 'crates/pentect-cli/src/http_files.rs'
+              - 'crates/pentect-cli/src/main.rs'
+              - 'crates/pentect-cli/src/openai_http_proxy.rs'
+              - 'crates/pentect-cli/src/remote_content.rs'
+              - 'crates/pentect-cli/src/upstream.rs'
+              - 'crates/pentect-runtime/**'
+              - 'guides/apps.md'
+              - 'COMPATIBILITY.md'
 
   native-ocr:
     name: Native OCR (${{ matrix.os }})
@@ -146,6 +166,39 @@ jobs:
       - name: No plugin changes
         if: needs.changes.outputs.plugins != 'true'
         run: echo "No plugin changes"
+
+  app-platform:
+    name: Desktop app boundaries (${{ matrix.os }})
+    needs: changes
+    if: always()
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - name: Require change detection
+        if: needs.changes.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: needs.changes.outputs.apps == 'true'
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        if: needs.changes.outputs.apps == 'true'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: needs.changes.outputs.apps == 'true'
+      - name: Test Codex App launcher and recovery
+        if: needs.changes.outputs.apps == 'true'
+        run: cargo test -p pentect-cli --no-default-features codex_app::tests --locked
+      - name: Test Claude Desktop gateway
+        if: needs.changes.outputs.apps == 'true'
+        run: cargo test -p pentect-cli --no-default-features claude_app_proxy::tests --locked
+      - name: No app changes
+        if: needs.changes.outputs.apps != 'true'
+        run: echo "No app changes"
 
   test:
     needs: changes

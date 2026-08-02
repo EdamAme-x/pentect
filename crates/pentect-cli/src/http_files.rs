@@ -232,6 +232,19 @@ fn multipart_field(
     None
 }
 
+pub(crate) fn multipart_text_field(
+    content_type: &str,
+    body: &[u8],
+    expected: &str,
+) -> Option<String> {
+    let boundary = multipart_boundary(content_type)?;
+    let delimiter = format!("--{boundary}").into_bytes();
+    let mut next_part_prefix = Vec::with_capacity(delimiter.len() + 2);
+    next_part_prefix.extend_from_slice(b"\r\n");
+    next_part_prefix.extend_from_slice(&delimiter);
+    multipart_field(body, &delimiter, &next_part_prefix, expected)
+}
+
 fn multipart_boundary(content_type: &str) -> Option<String> {
     if !content_type
         .split(';')
