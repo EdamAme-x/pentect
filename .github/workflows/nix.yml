@@ -55,7 +55,7 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add flake.lock
-          git commit -m "chore: update Nix lock [skip ci]"
+          git commit -m "chore: update Nix lock"
           branch="automation/nix-lock-${GITHUB_RUN_ID}"
           git config --local credential.helper '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
           git push "https://github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$branch"
