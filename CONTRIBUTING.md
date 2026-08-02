@@ -23,3 +23,15 @@ cargo check --locked -p pentect-cli
 ```
 
 Run focused tests for the crate or behavior you changed. Please do not add unrelated cleanup to the same pull request.
+
+## Releases
+
+Maintainers only need to merge a version bump and create the matching `vX.Y.Z`
+tag from `main`. GitHub Actions then builds immutable release assets, tests the
+install and uninstall lifecycle, signs and publishes the APT repository, updates
+package metadata through an auto-merge pull request, creates the matching
+`nix-vX.Y.Z` tag, and tests the Homebrew formula on Intel and Apple Silicon before
+publishing it.
+
+Never reuse a release tag. A workflow retry may fill in a missing prerelease
+asset only when every already-published asset has the same SHA-256 digest.

@@ -1,6 +1,7 @@
 name: Test formula
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -20,8 +21,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Audit and install
+      - name: Audit, install, and remove
         run: |
           brew style Formula/pentect.rb
           brew install EdamAme-x/pentect/pentect
           pentect version
+          if pentect uninstall 2>uninstall.err; then
+            echo "package-managed uninstall unexpectedly succeeded" >&2
+            exit 1
+          fi
+          test -x "$(command -v pentect)"
+          brew uninstall EdamAme-x/pentect/pentect
+          test ! -e "$(brew --prefix)/bin/pentect"

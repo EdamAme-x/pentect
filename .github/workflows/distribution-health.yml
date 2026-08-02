@@ -1,0 +1,52 @@
+name: Distribution health
+
+on:
+  schedule:
+    - cron: "13 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'EdamAme-x/pentect'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify release metadata and Homebrew
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease)
+          tag=$(jq -r .tagName <<<"$latest")
+          test "$(jq -r .isDraft <<<"$latest")" = false
+          test "$(jq -r .isPrerelease <<<"$latest")" = false
+          test "$(jq -r .tag packaging/release.json)" = "$tag"
+          version=${tag#v}
+          test "$(jq -r .version packaging/release.json)" = "$version"
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            https://raw.githubusercontent.com/EdamAme-x/homebrew-pentect/main/Formula/pentect.rb \
+            -o "$RUNNER_TEMP/pentect.rb"
+          grep -Fq "version \"$version\"" "$RUNNER_TEMP/pentect.rb"
+      - name: Verify signed APT repository and key lifetime
+        run: |
+          base=https://edamame-x.github.io/pentect/apt
+          curl -fsSL --proto '=https' --tlsv1.2 "$base/pentect-archive-keyring.asc" -o "$RUNNER_TEMP/key.asc"
+          cmp packaging/apt/pentect-archive-keyring.asc "$RUNNER_TEMP/key.asc"
+          gpg --batch --dearmor --output "$RUNNER_TEMP/key.gpg" "$RUNNER_TEMP/key.asc"
+          curl -fsSL --proto '=https' --tlsv1.2 "$base/dists/stable/InRelease" -o "$RUNNER_TEMP/InRelease"
+          gpgv --keyring "$RUNNER_TEMP/key.gpg" "$RUNNER_TEMP/InRelease"
+          expiry=$(gpg --batch --with-colons --show-keys "$RUNNER_TEMP/key.asc" | awk -F: '$1 == "pub" { print $7; exit }')
+          test -n "$expiry"
+          test $((expiry - $(date +%s))) -gt 15552000
+          version=$(jq -r .version packaging/release.json)
+          for architecture in amd64 arm64; do
+            curl -fsSL --proto '=https' --tlsv1.2 \
+              "$base/dists/stable/main/binary-$architecture/Packages.gz" |
+              gzip -dc > "$RUNNER_TEMP/Packages-$architecture"
+            grep -Fq "Version: $version" "$RUNNER_TEMP/Packages-$architecture"
+          done

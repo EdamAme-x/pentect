@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -95,7 +96,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         if: needs.changes.outputs.ocr == 'true'
         with:
-          toolchain: stable
+          toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: needs.changes.outputs.ocr == 'true'
       - name: Build native OCR
@@ -126,7 +127,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         if: needs.changes.outputs.plugins == 'true'
         with:
-          toolchain: stable
+          toolchain: 1.97.1
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: needs.changes.outputs.plugins == 'true'
@@ -161,7 +162,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
-          toolchain: stable
+          toolchain: 1.97.1
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -175,7 +176,7 @@ jobs:
       - name: Verify package metadata
         run: |
           python tools/update_package_metadata.py --metadata-file packaging/release.json --check
-          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh
+          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Check WebAssembly plugin SDK
