@@ -72,11 +72,14 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     }
     eprintln!("[pentect] Responses API prompts, files, and completed tool calls are protected");
 
-    let mut child = Command::new(&app)
+    let mut command = Command::new(&app);
+    command
         .env("OPENAI_BASE_URL", proxy.base_url())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    configure_child_process(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("could not start Codex App: {error}"))?;
     let config_cleanup = Arc::new(Mutex::new(config_override));
@@ -89,7 +92,7 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         }
         std::process::exit(130);
     }) {
-        let _ = child.kill();
+        terminate_child_process(child_id);
         let _ = child.wait();
         if let Ok(mut cleanup) = config_cleanup.lock() {
             cleanup.take();
@@ -123,8 +126,17 @@ fn terminate_child_process(pid: u32) {
 #[cfg(unix)]
 fn terminate_child_process(pid: u32) {
     unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
+        libc::kill(-(pid as i32), libc::SIGTERM);
     }
+}
+
+#[cfg(windows)]
+fn configure_child_process(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn configure_child_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
 }
 
 struct CodexConfigOverride {

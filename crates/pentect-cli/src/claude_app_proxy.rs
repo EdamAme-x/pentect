@@ -121,15 +121,53 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    configure_child_process(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start Claude Desktop: {error}"))?;
+    let child_id = child.id();
+    if let Err(error) = ctrlc::set_handler(move || {
+        terminate_child_process(child_id);
+        std::process::exit(130);
+    }) {
+        terminate_child_process(child_id);
+        let _ = child.wait();
+        return Err(format!(
+            "could not install Claude Desktop shutdown handler: {error}"
+        ));
+    }
     let status = child
         .wait()
         .map_err(|error| format!("could not wait for Claude Desktop: {error}"))?;
     drop(proxy);
     drop(anthropic);
     Ok(status)
+}
+
+#[cfg(windows)]
+fn configure_child_process(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn configure_child_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn terminate_child_process(pid: u32) {
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+fn terminate_child_process(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
 }
 
 #[derive(Debug)]
