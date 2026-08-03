@@ -28,9 +28,10 @@ jobs:
           test "$(jq -r .tag packaging/release.json)" = "$tag"
           version=${tag#v}
           test "$(jq -r .version packaging/release.json)" = "$version"
-          curl -fsSL --proto '=https' --tlsv1.2 \
-            https://raw.githubusercontent.com/EdamAme-x/homebrew-pentect/main/Formula/pentect.rb \
-            -o "$RUNNER_TEMP/pentect.rb"
+          gh api \
+            repos/EdamAme-x/homebrew-pentect/contents/Formula/pentect.rb \
+            -H 'Accept: application/vnd.github.raw' \
+            > "$RUNNER_TEMP/pentect.rb"
           grep -Fq "version \"$version\"" "$RUNNER_TEMP/pentect.rb"
       - name: Verify signed APT repository and key lifetime
         run: |

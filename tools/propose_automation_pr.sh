@@ -39,6 +39,11 @@ if [ -z "$pull" ]; then
     --body "$body")
 fi
 
+# Pushes authenticated with GITHUB_TOKEN do not trigger other workflows. Start
+# the required branch checks explicitly so automation PRs can actually merge.
+gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
+gh workflow run nix.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" >&2
+
 gh pr merge "$pull" --repo "$GITHUB_REPOSITORY" --auto --merge --delete-branch \
   --match-head-commit "$(git rev-parse HEAD)" >&2
 printf '%s\n' "$pull"
