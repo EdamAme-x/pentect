@@ -1068,9 +1068,10 @@ fn remember_pending_claude_files(body: &[u8], pending: &Mutex<PendingFiles>) -> 
             ids.push(file_id.to_string());
         }
         while pending.entries.len() > MAX_PENDING_UPLOADS {
-            if let Some(expired) = pending.insertion_order.pop_front() {
-                pending.entries.remove(&expired);
-            }
+            let Some(expired) = pending.insertion_order.pop_front() else {
+                break;
+            };
+            pending.entries.remove(&expired);
         }
     }
     Ok(())
@@ -1525,7 +1526,7 @@ struct ChatStreamState {
     passthrough: bool,
     finished: bool,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
-    resolve: ChatResolver,
+    resolve: Option<ChatResolver>,
 }
 
 fn chat_sse_body<S>(stream: S, plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>) -> ProxyBody
@@ -1539,7 +1540,7 @@ where
         passthrough: false,
         finished: false,
         plugins,
-        resolve: Box::new(crate::claude_http_proxy::request_scoped_resolver()),
+        resolve: Some(Box::new(crate::claude_http_proxy::request_scoped_resolver())),
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         loop {
@@ -1570,7 +1571,35 @@ where
                     state.pending.extend_from_slice(&chunk);
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
-                        match rewrite_chat_sse_block(&block, &state.plugins, &mut state.resolve) {
+                        if !chat_sse_block_contains_tool_call(&block) {
+                            state.ready.push_back(Ok(Frame::data(Bytes::from(block))));
+                            continue;
+                        }
+                        let Some(mut resolve) = state.resolve.take() else {
+                            state.finished = true;
+                            state.ready.push_back(Err(Box::new(io::Error::other(
+                                "Claude App Chat resolver is unavailable",
+                            ))));
+                            break;
+                        };
+                        let plugins = Arc::clone(&state.plugins);
+                        let rewritten = tokio::task::spawn_blocking(move || {
+                            let result = rewrite_chat_sse_block(&block, &plugins, &mut resolve);
+                            (result, resolve)
+                        })
+                        .await;
+                        let (result, resolve) = match rewritten {
+                            Ok(result) => result,
+                            Err(_) => {
+                                state.finished = true;
+                                state.ready.push_back(Err(Box::new(io::Error::other(
+                                    "Claude App Chat restoration task failed",
+                                ))));
+                                break;
+                            }
+                        };
+                        state.resolve = Some(resolve);
+                        match result {
                             Ok(block) => state.ready.push_back(Ok(Frame::data(block))),
                             Err(error) => {
                                 state.finished = true;
@@ -1602,6 +1631,14 @@ where
     StreamBody::new(stream).boxed_unsync()
 }
 
+fn chat_sse_block_contains_tool_call(block: &[u8]) -> bool {
+    std::str::from_utf8(block)
+        .ok()
+        .and_then(|text| text.lines().find_map(|line| line.strip_prefix("data:")))
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data.trim_start()).ok())
+        .is_some_and(|value| contains_chat_tool_call(&value))
+}
+
 fn rewrite_chat_sse_block<R>(
     block: &[u8],
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
@@ -1620,9 +1657,12 @@ where
         return Ok(Bytes::copy_from_slice(block));
     };
     if contains_chat_tool_call(&value) {
-        let plugins = plugins
-            .lock()
-            .map_err(|_| "Claude App plugin lock was poisoned".to_string())?;
+        let plugins = {
+            plugins
+                .lock()
+                .map_err(|_| "Claude App plugin lock was poisoned".to_string())?
+                .clone()
+        };
         run_chat_tool_plugins(&mut value, &plugins)?;
     }
     if let Err(error) = resolve_chat_tool_calls(&mut value, resolve) {
