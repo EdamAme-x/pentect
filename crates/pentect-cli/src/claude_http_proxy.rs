@@ -2102,17 +2102,22 @@ mod tests {
         None
     }
 
-    fn first_openai_file_handle(body: &str) -> Option<String> {
-        fn visit(value: &Value) -> Option<String> {
+    fn first_openai_file(body: &str) -> Option<(String, String, String)> {
+        fn visit(value: &Value) -> Option<(String, String, String)> {
             match value {
                 Value::Array(values) => values.iter().find_map(visit),
                 Value::Object(object) => {
                     if let Some(data) = object.get("file_data").and_then(Value::as_str) {
-                        let encoded = data.split_once(',').map_or(data, |(_, encoded)| encoded);
+                        let (metadata, encoded) = data.split_once(',')?;
+                        let media_type = metadata
+                            .strip_prefix("data:")?
+                            .strip_suffix(";base64")?
+                            .to_string();
                         let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
                         let decoded = std::str::from_utf8(&decoded).ok()?;
                         if let Some(handle) = first_valid_handle(decoded) {
-                            return Some(handle.to_string());
+                            let filename = object.get("filename")?.as_str()?.to_string();
+                            return Some((handle.to_string(), media_type, filename));
                         }
                     }
                     object.values().find_map(visit)
@@ -2250,6 +2255,9 @@ mod tests {
             let (mut file_stream, _) = listener.accept().unwrap();
             let (file_headers, file_request_body) = read_http_request(&mut file_stream);
             assert!(file_headers.starts_with("GET /files/file-test/content "));
+            assert!(file_headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: bearer synthetic-test")));
             assert!(file_request_body.is_empty());
             write!(
                 file_stream,
@@ -2263,8 +2271,9 @@ mod tests {
             let (mut response_stream, _) = listener.accept().unwrap();
             let (_, body) = read_http_request(&mut response_stream);
             let body = String::from_utf8(body).unwrap();
-            let handle = first_openai_file_handle(&body)
-                .expect("provider should receive a handle for fetched file content");
+            let handle = first_openai_file(&body)
+                .expect("provider should receive a handle for fetched file content")
+                .0;
             body_tx.send(body).unwrap();
             let event = serde_json::json!({
                 "type": "response.output_item.done",
@@ -2442,7 +2451,10 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
         assert!(!provider_body.contains(secret.as_str()));
-        assert!(first_openai_file_handle(&provider_body).is_some());
+        let (_, media_type, filename) = first_openai_file(&provider_body)
+            .expect("provider should receive the sanitized file and metadata");
+        assert_eq!(media_type, "text/plain");
+        assert_eq!(filename, "notes.txt");
         assert!(file_response.contains(&format!("python hash.py {secret}")));
         drop(file_proxy);
         file_thread.join().unwrap();

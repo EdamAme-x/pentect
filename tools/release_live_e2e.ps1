@@ -61,6 +61,9 @@ with only DONE.
     if ([IO.File]::ReadAllText($resultPath) -cne $synthetic) {
         throw "$Name did not restore the exact synthetic value at the local tool boundary"
     }
+    # Codex intentionally renders local tool stdout to its user. Provider-side
+    # redaction is asserted directly by the Rust boundary suite; only Claude's
+    # final response is expected to omit the locally restored value here.
     if ($Name -eq 'claude' -and $output.IndexOf($synthetic, [StringComparison]::Ordinal) -ge 0) {
         throw 'Claude final output exposed the synthetic value'
     }

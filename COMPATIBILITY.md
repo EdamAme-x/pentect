@@ -22,8 +22,9 @@ version as verified until that automation exists.
 
 ## Manual live smoke tests
 
-The v0.0.23 release binary was exercised on Windows on 2026-08-04 using
-synthetic secrets only. The reusable probe is `tools/release_live_e2e.ps1`:
+The v0.0.23 release binary was exercised on Windows on 2026-08-03 UTC
+(2026-08-04 JST) using synthetic secrets only. The reusable probe is
+`tools/release_live_e2e.ps1`:
 
 | Client | Version | Result |
 | --- | --- | --- |
