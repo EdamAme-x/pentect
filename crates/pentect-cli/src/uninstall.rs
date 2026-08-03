@@ -101,6 +101,7 @@ for ($attempt = 0; $attempt -lt 3000; $attempt++) {
     Start-Sleep -Milliseconds 100
 }
 $installDir = Split-Path -Parent $Target
+$updatesQuiesced = $false
 for ($attempt = 0; $attempt -lt 3000; $attempt++) {
     $updateRunning = Get-Process -Name 'pentect.update-*' -ErrorAction SilentlyContinue |
         Where-Object {
@@ -109,9 +110,13 @@ for ($attempt = 0; $attempt -lt 3000; $attempt++) {
         } |
         Select-Object -First 1
     $stagedUpdates = @(Get-ChildItem -LiteralPath $installDir -Filter 'pentect.update-*.exe' -File)
-    if (($null -eq $updateRunning) -and ($stagedUpdates.Count -eq 0)) { break }
+    if (($null -eq $updateRunning) -and ($stagedUpdates.Count -eq 0)) {
+        $updatesQuiesced = $true
+        break
+    }
     Start-Sleep -Milliseconds 100
 }
+if (-not $updatesQuiesced) { exit 1 }
 $pathAdded = $false
 if (Test-Path -LiteralPath $Marker) {
     try { $pathAdded = [bool]((Get-Content -Raw -LiteralPath $Marker | ConvertFrom-Json).path_added) } catch {}
