@@ -17,6 +17,7 @@ case "$1 $2" in
   "pr list") exit 0 ;;
   "pr create") printf '%s\n' https://github.com/example/project/pull/1 ;;
   "pr merge") printf '%s\n' 'merge scheduled' ;;
+  "workflow run") exit 0 ;;
   *) echo "unexpected gh invocation: $*" >&2; exit 1 ;;
 esac
 EOF
