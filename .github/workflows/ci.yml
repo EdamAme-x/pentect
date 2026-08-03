@@ -230,6 +230,21 @@ jobs:
           python tools/update_package_metadata.py --metadata-file packaging/release.json --check
           sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh
           sh tools/test_propose_automation_pr.sh
+      - name: Validate PowerShell tools
+        shell: pwsh
+        run: |
+          foreach ($path in @('tools/install.ps1', 'tools/release_live_e2e.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -ne 0) {
+              throw "$path`n$($errors | Out-String)"
+            }
+          }
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Check WebAssembly plugin SDK

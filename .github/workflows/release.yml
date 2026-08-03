@@ -48,15 +48,17 @@ jobs:
       - name: Validate PowerShell installer
         shell: pwsh
         run: |
-          $tokens = $null
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path 'tools/install.ps1'),
-            [ref]$tokens,
-            [ref]$errors
-          )
-          if ($errors.Count -ne 0) {
-            throw ($errors | Out-String)
+          foreach ($path in @('tools/install.ps1', 'tools/release_live_e2e.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -ne 0) {
+              throw "$path`n$($errors | Out-String)"
+            }
           }
       - name: Verify third-party licenses
         run: python tools/generate_licenses.py --check

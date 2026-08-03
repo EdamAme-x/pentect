@@ -2102,6 +2102,72 @@ mod tests {
         None
     }
 
+    fn first_openai_file(body: &str) -> Option<(String, String, String)> {
+        fn visit(value: &Value) -> Option<(String, String, String)> {
+            match value {
+                Value::Array(values) => values.iter().find_map(visit),
+                Value::Object(object) => {
+                    if let Some(data) = object.get("file_data").and_then(Value::as_str) {
+                        let (metadata, encoded) = data.split_once(',')?;
+                        let media_type = metadata
+                            .strip_prefix("data:")?
+                            .strip_suffix(";base64")?
+                            .to_string();
+                        let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
+                        let decoded = std::str::from_utf8(&decoded).ok()?;
+                        if let Some(handle) = first_valid_handle(decoded) {
+                            let filename = object.get("filename")?.as_str()?.to_string();
+                            return Some((handle.to_string(), media_type, filename));
+                        }
+                    }
+                    object.values().find_map(visit)
+                }
+                _ => None,
+            }
+        }
+
+        serde_json::from_str(body)
+            .ok()
+            .and_then(|value| visit(&value))
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        use std::io::Read;
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 8192];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(read > 0, "client closed before sending HTTP headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(at) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while request.len() - header_end < content_length {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(read > 0, "client closed before sending HTTP body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        (
+            headers,
+            request[header_end..header_end + content_length].to_vec(),
+        )
+    }
+
     fn mock_upstream(
         provider: MockProvider,
     ) -> (
@@ -2109,43 +2175,15 @@ mod tests {
         std::sync::mpsc::Receiver<String>,
         std::thread::JoinHandle<()>,
     ) {
-        use std::io::{Read, Write};
+        use std::io::Write;
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let (body_tx, body_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 8192];
-            let header_end = loop {
-                let read = stream.read(&mut buffer).unwrap();
-                assert!(read > 0, "client closed before sending HTTP headers");
-                request.extend_from_slice(&buffer[..read]);
-                if let Some(at) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                    break at + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .expect("proxy request must carry Content-Length");
-            while request.len() - header_end < content_length {
-                let read = stream.read(&mut buffer).unwrap();
-                assert!(read > 0, "client closed before sending HTTP body");
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let body = String::from_utf8(request[header_end..header_end + content_length].to_vec())
-                .unwrap();
+            let (_, body) = read_http_request(&mut stream);
+            let body = String::from_utf8(body).unwrap();
             let handle = first_valid_handle(&body)
                 .expect("provider should receive a valid Pentect handle")
                 .to_string();
@@ -2197,6 +2235,63 @@ mod tests {
             .unwrap();
             stream.write_all(&response).unwrap();
             stream.flush().unwrap();
+        });
+        (format!("http://{address}"), body_rx, thread)
+    }
+
+    fn mock_openai_file_upstream(
+        file_body: String,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut file_stream, _) = listener.accept().unwrap();
+            let (file_headers, file_request_body) = read_http_request(&mut file_stream);
+            assert!(file_headers.starts_with("GET /files/file-test/content "));
+            assert!(file_headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: bearer synthetic-test")));
+            assert!(file_request_body.is_empty());
+            write!(
+                file_stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=\"notes.txt\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                file_body.len()
+            )
+            .unwrap();
+            file_stream.write_all(file_body.as_bytes()).unwrap();
+            file_stream.flush().unwrap();
+
+            let (mut response_stream, _) = listener.accept().unwrap();
+            let (_, body) = read_http_request(&mut response_stream);
+            let body = String::from_utf8(body).unwrap();
+            let handle = first_openai_file(&body)
+                .expect("provider should receive a handle for fetched file content")
+                .0;
+            body_tx.send(body).unwrap();
+            let event = serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "custom_tool_call",
+                    "name": "exec_command",
+                    "input": format!("python hash.py {handle}")
+                }
+            });
+            let response = format!("event: response.output_item.done\ndata: {event}\n\n");
+            write!(
+                response_stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            response_stream.flush().unwrap();
         });
         (format!("http://{address}"), body_rx, thread)
     }
@@ -2288,6 +2383,81 @@ mod tests {
         assert!(!openai_response.contains("<<PENTECT_E2E_TOKEN_"));
         drop(openai_proxy);
         openai_thread.join().unwrap();
+
+        for provider in [MockProvider::OpenAi, MockProvider::Anthropic] {
+            let (upload_upstream, upload_request, upload_thread) = mock_upstream(provider);
+            let (upload_url, guard): (String, Box<dyn std::any::Any>) = match provider {
+                MockProvider::OpenAi => {
+                    let guard =
+                        crate::openai_http_proxy::OpenAiHttpProxyGuard::start(upload_upstream)
+                            .unwrap();
+                    (format!("{}/v1/files", guard.base_url()), Box::new(guard))
+                }
+                MockProvider::Anthropic => {
+                    let guard = ClaudeHttpProxyGuard::start(upload_upstream).unwrap();
+                    (format!("{}/v1/files", guard.base_url()), Box::new(guard))
+                }
+            };
+            let boundary = "pentect-provider-boundary";
+            let upload_body = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nuser_data\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"secrets.env\"\r\nContent-Type: text/plain\r\n\r\n{dotenv}\r\n--{boundary}--\r\n"
+            );
+            reqwest::blocking::Client::new()
+                .post(upload_url)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(upload_body)
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let provider_body = upload_request
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            assert!(!provider_body.contains(secret.as_str()));
+            assert!(first_valid_handle(&provider_body).is_some());
+            drop(guard);
+            upload_thread.join().unwrap();
+        }
+
+        let (file_upstream, file_request, file_thread) = mock_openai_file_upstream(dotenv.clone());
+        let file_proxy =
+            crate::openai_http_proxy::OpenAiHttpProxyGuard::start(file_upstream).unwrap();
+        let file_response = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/responses", file_proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::AUTHORIZATION, "Bearer synthetic-test")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "stream": true,
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_file", "file_id": "file-test"}]
+                    }]
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .unwrap();
+        let provider_body = file_request
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(!provider_body.contains(secret.as_str()));
+        let (_, media_type, filename) = first_openai_file(&provider_body)
+            .expect("provider should receive the sanitized file and metadata");
+        assert_eq!(media_type, "text/plain");
+        assert_eq!(filename, "notes.txt");
+        assert!(file_response.contains(&format!("python hash.py {secret}")));
+        drop(file_proxy);
+        file_thread.join().unwrap();
     }
 
     #[test]
