@@ -101,14 +101,29 @@ for ($attempt = 0; $attempt -lt 3000; $attempt++) {
     Start-Sleep -Milliseconds 100
 }
 $installDir = Split-Path -Parent $Target
+for ($attempt = 0; $attempt -lt 3000; $attempt++) {
+    $updateRunning = Get-Process -Name 'pentect.update-*' -ErrorAction SilentlyContinue |
+        Where-Object {
+            try { [string]::Equals((Split-Path -Parent $_.Path), $installDir, [StringComparison]::OrdinalIgnoreCase) }
+            catch { $false }
+        } |
+        Select-Object -First 1
+    if ($null -eq $updateRunning) { break }
+    Start-Sleep -Milliseconds 100
+}
 $pathAdded = $false
 if (Test-Path -LiteralPath $Marker) {
     try { $pathAdded = [bool]((Get-Content -Raw -LiteralPath $Marker | ConvertFrom-Json).path_added) } catch {}
 }
-Remove-Item -LiteralPath $Target -Force
+for ($attempt = 0; $attempt -lt 600; $attempt++) {
+    Remove-Item -LiteralPath $Target -Force
+    if (-not (Test-Path -LiteralPath $Target)) { break }
+    Start-Sleep -Milliseconds 100
+}
 if (Test-Path -LiteralPath $Target) { exit 1 }
 $name = Split-Path -Leaf $Target
 Get-ChildItem -LiteralPath $installDir -Filter "$name.previous-*" -File | Remove-Item -Force
+Get-ChildItem -LiteralPath $installDir -Filter 'pentect.update-*.exe' -File | Remove-Item -Force
 Remove-Item -LiteralPath $Marker -Force
 if ($pathAdded) {
     $pathKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
