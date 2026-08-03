@@ -494,6 +494,7 @@ fn apply_update(args: &[String]) -> Result<(), String> {
     for _ in 0..600 {
         match std::fs::copy(&source, destination) {
             Ok(_) if sha256_file(destination)? == expected.to_ascii_lowercase() => {
+                #[cfg(windows)]
                 let _ = spawn_windows_staged_cleanup(&source);
                 return Ok(());
             }
