@@ -37,6 +37,11 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Pentect owns maintenance decisions for direct dependencies. These
+          # informational advisories only affect transitive crates; actionable
+          # vulnerability and unsoundness advisories remain enforced at every
+          # dependency depth.
+          ignore: RUSTSEC-2023-0089,RUSTSEC-2026-0173,RUSTSEC-2026-0192
 
   rustsec-report:
     name: RustSec scheduled report
@@ -54,3 +59,5 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Keep the scheduled report aligned with the pull-request gate.
+          ignore: RUSTSEC-2023-0089,RUSTSEC-2026-0173,RUSTSEC-2026-0192
