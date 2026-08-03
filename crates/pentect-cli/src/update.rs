@@ -493,7 +493,10 @@ fn apply_update(args: &[String]) -> Result<(), String> {
     let backup = Path::new(backup);
     for _ in 0..600 {
         match std::fs::copy(&source, destination) {
-            Ok(_) if sha256_file(destination)? == expected.to_ascii_lowercase() => return Ok(()),
+            Ok(_) if sha256_file(destination)? == expected.to_ascii_lowercase() => {
+                let _ = spawn_windows_staged_cleanup(&source);
+                return Ok(());
+            }
             Ok(_) => {
                 let _ = std::fs::copy(backup, destination);
                 return Err("installed update checksum mismatch".to_string());
@@ -502,6 +505,56 @@ fn apply_update(args: &[String]) -> Result<(), String> {
         }
     }
     Err("timed out waiting to replace the executable".to_string())
+}
+
+#[cfg(windows)]
+fn spawn_windows_staged_cleanup(staged: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const SCRIPT: &str = r#"param(
+    [Parameter(Mandatory=$true)][int]$ParentPid,
+    [Parameter(Mandatory=$true)][string]$Target
+)
+$ErrorActionPreference = 'SilentlyContinue'
+for ($attempt = 0; $attempt -lt 600; $attempt++) {
+    if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 100
+}
+for ($attempt = 0; $attempt -lt 600; $attempt++) {
+    Remove-Item -LiteralPath $Target -Force
+    if (-not (Test-Path -LiteralPath $Target)) { break }
+    Start-Sleep -Milliseconds 100
+}
+Remove-Item -LiteralPath $PSCommandPath -Force
+"#;
+
+    let helper = std::env::temp_dir().join(format!(
+        "pentect-update-cleanup-{}-{}.ps1",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    std::fs::write(&helper, SCRIPT)
+        .map_err(|error| format!("could not create update cleanup helper: {error}"))?;
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+        ])
+        .arg(&helper)
+        .arg("-ParentPid")
+        .arg(std::process::id().to_string())
+        .arg("-Target")
+        .arg(staged)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not start update cleanup helper: {error}"))
 }
 
 #[cfg(test)]
