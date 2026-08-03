@@ -22,21 +22,21 @@ version as verified until that automation exists.
 
 ## Manual live smoke tests
 
-The protected client behavior carried into v0.0.23 was exercised on Windows on
-2026-08-03 against the v0.0.17 release binary, using synthetic secrets only.
-The gateway code did not change between those releases:
+The v0.0.23 release binary was exercised on Windows on 2026-08-04 using
+synthetic secrets only. The reusable probe is `tools/release_live_e2e.ps1`:
 
 | Client | Version | Result |
 | --- | --- | --- |
-| Codex CLI | `0.145.0` | The provider received a handle; a completed shell tool call was restored locally to the exact synthetic value. |
-| Claude Code | `2.1.220` | A tool result reached the model as a handle; a later PowerShell tool call using that handle was restored locally to the exact synthetic value. |
-| ChatGPT desktop app (Codex mode) | `26.721.4979.0` | Installation, running-process detection, and protected Responses routing preflight passed. No signed-GUI message was sent. |
-| Claude Desktop | `1.24012.9` | The signed app launched through Pentect with the local proxy, certificate pin, and memory store attached. No signed-GUI message was sent. |
+| Codex CLI | `0.145.0` | A completed shell tool call was restored locally to the exact synthetic value. |
+| Claude Code | `2.1.220` | A later PowerShell tool call using the opaque value was restored locally to the exact synthetic value; final output did not contain it. |
+| ChatGPT desktop app (Codex mode) | `26.721.4979.0` | v0.0.23 installation, running-process detection, and protected Responses routing preflight passed. No signed-GUI message was sent. |
+| Claude Desktop | `1.24012.9` | The signed app launched through v0.0.23 with the local proxy, certificate pin, and memory store attached. No signed-GUI message was sent. |
 
-The CLI checks compare the final local file with the original synthetic value
-without printing the value. They cover a real provider round trip in addition
-to the deterministic mock protocol suite. Desktop message submission remains a
-manual release task until a dedicated signed-GUI runner is available.
+The CLI probe compares the final local file with the original synthetic value
+without printing the value and deletes its temporary files. It covers a real
+provider round trip in addition to the deterministic mock protocol suite.
+Desktop message submission remains a manual release task until a dedicated
+signed-GUI runner is available.
 
 The App rows do not imply protection for ChatGPT Chat or Work, remote Claude
 Cowork execution, Voice, experimental binary transports, or unknown future
