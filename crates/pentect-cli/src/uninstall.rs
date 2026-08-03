@@ -108,7 +108,8 @@ for ($attempt = 0; $attempt -lt 3000; $attempt++) {
             catch { $false }
         } |
         Select-Object -First 1
-    if ($null -eq $updateRunning) { break }
+    $stagedUpdates = @(Get-ChildItem -LiteralPath $installDir -Filter 'pentect.update-*.exe' -File)
+    if (($null -eq $updateRunning) -and ($stagedUpdates.Count -eq 0)) { break }
     Start-Sleep -Milliseconds 100
 }
 $pathAdded = $false
@@ -117,7 +118,20 @@ if (Test-Path -LiteralPath $Marker) {
 }
 for ($attempt = 0; $attempt -lt 600; $attempt++) {
     Remove-Item -LiteralPath $Target -Force
-    if (-not (Test-Path -LiteralPath $Target)) { break }
+    if (-not (Test-Path -LiteralPath $Target)) {
+        # An update helper may have passed its process check but not completed
+        # the final copy yet. Require a short quiet period before declaring the
+        # target gone so a late replacement is removed as well.
+        $remainedAbsent = $true
+        for ($quiet = 0; $quiet -lt 20; $quiet++) {
+            Start-Sleep -Milliseconds 100
+            if (Test-Path -LiteralPath $Target) {
+                $remainedAbsent = $false
+                break
+            }
+        }
+        if ($remainedAbsent) { break }
+    }
     Start-Sleep -Milliseconds 100
 }
 if (Test-Path -LiteralPath $Target) { exit 1 }

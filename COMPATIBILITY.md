@@ -22,7 +22,7 @@ version as verified until that automation exists.
 
 ## Manual live smoke tests
 
-The protected client behavior carried into v0.0.21 was exercised on Windows on
+The protected client behavior carried into v0.0.22 was exercised on Windows on
 2026-08-03 against the v0.0.17 release binary, using synthetic secrets only.
 The gateway code did not change between those releases:
 
