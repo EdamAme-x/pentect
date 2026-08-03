@@ -20,6 +20,23 @@ Desktop vendor apps are not installed on ephemeral release runners, so their
 full signed-GUI flow is not yet a release gate. Pentect does not claim an App
 version as verified until that automation exists.
 
+## Manual live smoke tests
+
+The v0.0.18 release candidate was exercised on Windows on 2026-08-03 with
+synthetic secrets only:
+
+| Client | Version | Result |
+| --- | --- | --- |
+| Codex CLI | `0.145.0` | The provider received a handle; a completed shell tool call was restored locally to the exact synthetic value. |
+| Claude Code | `2.1.220` | A tool result reached the model as a handle; a later PowerShell tool call using that handle was restored locally to the exact synthetic value. |
+| ChatGPT desktop app (Codex mode) | `26.721.4979.0` | Installation, running-process detection, and protected Responses routing preflight passed. No signed-GUI message was sent. |
+| Claude Desktop | `1.24012.9` | The signed app launched through Pentect with the local proxy, certificate pin, and memory store attached. No signed-GUI message was sent. |
+
+The CLI checks compare the final local file with the original synthetic value
+without printing the value. They cover a real provider round trip in addition
+to the deterministic mock protocol suite. Desktop message submission remains a
+manual release task until a dedicated signed-GUI runner is available.
+
 The App rows do not imply protection for ChatGPT Chat or Work, remote Claude
 Cowork execution, Voice, experimental binary transports, or unknown future
 opaque routes. Current Claude multipart attachment flows are protected as
