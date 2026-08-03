@@ -55,6 +55,10 @@ pub(crate) fn cmd_claude_app(args: &[String]) -> i32 {
     }
 }
 
+pub(crate) fn check_mode(args: &[String]) -> Result<bool, String> {
+    ClaudeAppOptions::parse(args).map(|options| options.check)
+}
+
 fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let options = ClaudeAppOptions::parse(args)?;
     let app = options.app.unwrap_or_else(default_claude_app_path);
@@ -155,7 +159,7 @@ fn configure_child_process(command: &mut Command) {
 
 #[cfg(windows)]
 fn terminate_child_process(pid: u32) {
-    let _ = Command::new("taskkill.exe")
+    let _ = Command::new(crate::windows_system_executable("taskkill.exe"))
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -357,7 +361,13 @@ struct ProxyState {
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     block_unknown_formats: bool,
     files: Mutex<HashMap<String, crate::http_files::Coverage>>,
-    pending_files: Mutex<HashMap<String, Vec<String>>>,
+    pending_files: Mutex<PendingFiles>,
+}
+
+#[derive(Default)]
+struct PendingFiles {
+    entries: HashMap<String, Vec<String>>,
+    insertion_order: VecDeque<String>,
 }
 
 impl ProxyState {
@@ -411,7 +421,7 @@ async fn run_proxy(
         plugins: Arc::new(Mutex::new(plugins)),
         block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
         files: Mutex::new(HashMap::new()),
-        pending_files: Mutex::new(HashMap::new()),
+        pending_files: Mutex::new(PendingFiles::default()),
     });
     let _ = ready_tx.send(Ok(format!("http://{address}")));
 
@@ -427,9 +437,9 @@ async fn run_proxy(
                 };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let permit = Arc::new(Mutex::new(Some(permit)));
                     let service = service_fn(move |request| {
-                        connect_request(request, Arc::clone(&state))
+                        connect_request(request, Arc::clone(&state), Arc::clone(&permit))
                     });
                     let io = hyper_util::rt::TokioIo::new(stream);
                     if let Err(error) = http1::Builder::new()
@@ -451,6 +461,7 @@ async fn run_proxy(
 async fn connect_request(
     mut request: Request<Incoming>,
     state: Arc<ProxyState>,
+    connection_permit: Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<Response<ProxyBody>, Infallible> {
     if request.method() != Method::CONNECT {
         return Ok(empty_response(StatusCode::METHOD_NOT_ALLOWED));
@@ -463,9 +474,17 @@ async fn connect_request(
     if port != 443 {
         return Ok(empty_response(StatusCode::FORBIDDEN));
     }
+    let Some(permit) = connection_permit
+        .lock()
+        .ok()
+        .and_then(|mut permit| permit.take())
+    else {
+        return Ok(empty_response(StatusCode::SERVICE_UNAVAILABLE));
+    };
     let upgraded = hyper::upgrade::on(&mut request);
     if should_inspect(&host, port) {
         tokio::spawn(async move {
+            let _permit = permit;
             let result = async {
                 let upgraded = upgraded
                     .await
@@ -480,6 +499,7 @@ async fn connect_request(
         });
     } else {
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(error) = passthrough_tunnel(upgraded, &host, port).await {
                 eprintln!("[pentect] Claude App network tunnel failed: {error}");
             }
@@ -497,9 +517,13 @@ async fn passthrough_tunnel(
         .await
         .map_err(|error| format!("CONNECT upgrade failed: {error}"))?;
     let mut client = hyper_util::rt::TokioIo::new(upgraded);
-    let mut upstream = tokio::net::TcpStream::connect((host, port))
-        .await
-        .map_err(|error| format!("could not reach required app service: {error}"))?;
+    let mut upstream = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| "could not reach required app service: connection timed out".to_string())?
+    .map_err(|error| format!("could not reach required app service: {error}"))?;
     if let Err(error) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
         if !matches!(
             error.kind(),
@@ -609,6 +633,13 @@ async fn forward_inspected_inner(
     headers.remove(hyper::header::HOST);
     let mut upload_coverage = None;
     let mut upload_key = None;
+    let mut upload_filename = None;
+    if protect_chat || prepare_upload || request_kind == ClaudeAppRequest::Upload {
+        headers.insert(
+            hyper::header::ACCEPT_ENCODING,
+            hyper::header::HeaderValue::from_static("identity"),
+        );
+    }
     let body = if protect_chat {
         let body = read_request_capped(request.into_body(), "Chat").await?;
         let original = body.clone();
@@ -655,6 +686,7 @@ async fn forward_inspected_inner(
     } else if request_kind == ClaudeAppRequest::Upload {
         let body = read_request_capped(request.into_body(), "upload").await?;
         upload_key = claude_filestore_upload_key(&content_type, &body);
+        upload_filename = crate::http_files::multipart_file_name(&content_type, &body);
         let masker = Arc::clone(&state.masker);
         let plugins = Arc::clone(&state.plugins);
         let protected = tokio::task::spawn_blocking(move || {
@@ -706,17 +738,36 @@ async fn forward_inspected_inner(
         .unwrap_or("-");
     eprintln!("[pentect] claude-app < {status} {method} {host}{safe_path} {response_content_type}");
 
-    let mut builder = Response::builder().status(status);
-    for (name, value) in &response_headers {
-        builder = builder.header(name, value);
-    }
     let transform_chat = protect_chat
         && status.is_success()
         && response_content_type.eq_ignore_ascii_case("text/event-stream");
+    if (transform_chat || upload_coverage.is_some() || prepare_upload)
+        && response_headers
+            .get(hyper::header::CONTENT_ENCODING)
+            .is_some_and(|encoding| {
+                !encoding
+                    .to_str()
+                    .is_ok_and(|value| value.eq_ignore_ascii_case("identity"))
+            })
+    {
+        return Err(
+            "Claude App upstream returned compressed protected content despite requesting identity encoding"
+                .to_string(),
+        );
+    }
+
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &response_headers {
+        if !transform_chat || name != hyper::header::CONTENT_LENGTH {
+            builder = builder.header(name, value);
+        }
+    }
     if let Some(coverage) = upload_coverage {
         let body = read_response_capped(upstream).await?;
         if status.is_success() {
-            remember_claude_file_ids(&body, coverage, &state.files)?;
+            if let Some(filename) = upload_filename.as_deref() {
+                remember_claude_file_ids(&body, filename, coverage, &state.files)?;
+            }
             if let Some(key) = upload_key.as_deref() {
                 promote_pending_claude_files(key, coverage, &state.pending_files, &state.files)?;
             }
@@ -835,7 +886,7 @@ fn is_chat_completion(host: &str, path: &str, content_type: &str) -> bool {
 }
 
 fn is_chat_completion_path(path: &str) -> bool {
-    let Some(segment) = path.rsplit('/').next() else {
+    let Some(segment) = path.trim_end_matches('/').rsplit('/').next() else {
         return false;
     };
     let completion = segment.strip_prefix("retry_").unwrap_or(segment);
@@ -894,14 +945,14 @@ fn is_claude_prepare_upload_path(path: &str) -> bool {
 
 fn remember_claude_file_ids(
     body: &[u8],
+    uploaded_filename: &str,
     coverage: crate::http_files::Coverage,
     files: &Mutex<HashMap<String, crate::http_files::Coverage>>,
 ) -> Result<(), String> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return Ok(());
     };
-    let mut ids = Vec::new();
-    collect_claude_file_ids(&value, &mut ids);
+    let ids = uploaded_file_ids(&value, uploaded_filename);
     let mut files = files
         .lock()
         .map_err(|_| "Claude App file registry lock was poisoned".to_string())?;
@@ -911,47 +962,54 @@ fn remember_claude_file_ids(
     Ok(())
 }
 
-fn collect_claude_file_ids(value: &serde_json::Value, ids: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_claude_file_ids(value, ids);
-            }
-        }
-        serde_json::Value::Object(object) => {
-            for key in ["file_id", "file_uuid"] {
-                if let Some(id) = object.get(key).and_then(serde_json::Value::as_str) {
-                    if !id.is_empty() && id.len() <= 200 {
-                        ids.push(id.to_string());
-                    }
-                }
-            }
-            let file_shaped = object.contains_key("file_name")
-                || object.contains_key("filename")
-                || object.contains_key("mime_type")
-                || object.contains_key("content_type")
-                || object
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| {
-                        let kind = kind.to_ascii_lowercase();
-                        kind.contains("file") || kind.contains("document")
-                    });
-            if file_shaped {
-                for key in ["id", "uuid"] {
-                    if let Some(id) = object.get(key).and_then(serde_json::Value::as_str) {
-                        if !id.is_empty() && id.len() <= 200 {
-                            ids.push(id.to_string());
-                        }
-                    }
-                }
-            }
-            for value in object.values() {
-                collect_claude_file_ids(value, ids);
-            }
-        }
-        _ => {}
+fn uploaded_file_ids(value: &serde_json::Value, uploaded_filename: &str) -> Vec<String> {
+    let Some(root) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    if file_object_matches_name(root, uploaded_filename) {
+        candidates.push(root);
     }
+    for key in ["file", "data"] {
+        if let Some(object) = root.get(key).and_then(serde_json::Value::as_object) {
+            if file_object_matches_name(object, uploaded_filename) {
+                candidates.push(object);
+            }
+        }
+    }
+    for key in ["files", "uploads"] {
+        if let Some(values) = root.get(key).and_then(serde_json::Value::as_array) {
+            candidates.extend(
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_object)
+                    .filter(|object| file_object_matches_name(object, uploaded_filename)),
+            );
+        }
+    }
+    candidates
+        .into_iter()
+        .flat_map(|object| ["file_id", "file_uuid", "id", "uuid"].map(move |key| (object, key)))
+        .filter_map(|(object, key)| object.get(key).and_then(serde_json::Value::as_str))
+        .filter(|id| !id.is_empty() && id.len() <= 200)
+        .map(str::to_string)
+        .collect()
+}
+
+fn file_object_matches_name(
+    object: &serde_json::Map<String, serde_json::Value>,
+    uploaded_filename: &str,
+) -> bool {
+    ["file_name", "filename", "name", "path"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+        .any(|candidate| {
+            candidate == uploaded_filename
+                || Path::new(candidate)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(uploaded_filename)
+        })
 }
 
 fn claude_filestore_upload_key(content_type: &str, body: &[u8]) -> Option<String> {
@@ -965,10 +1023,7 @@ fn claude_filestore_upload_key(content_type: &str, body: &[u8]) -> Option<String
     Some(format!("{filesystem}\0{path}"))
 }
 
-fn remember_pending_claude_files(
-    body: &[u8],
-    pending: &Mutex<HashMap<String, Vec<String>>>,
-) -> Result<(), String> {
+fn remember_pending_claude_files(body: &[u8], pending: &Mutex<PendingFiles>) -> Result<(), String> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return Ok(());
     };
@@ -1004,13 +1059,17 @@ fn remember_pending_claude_files(
         {
             continue;
         }
-        let ids = pending.entry(format!("{filesystem}\0{path}")).or_default();
+        let key = format!("{filesystem}\0{path}");
+        if !pending.entries.contains_key(&key) {
+            pending.insertion_order.push_back(key.clone());
+        }
+        let ids = pending.entries.entry(key).or_default();
         if ids.len() < MAX_IDS_PER_UPLOAD && !ids.iter().any(|known| known == file_id) {
             ids.push(file_id.to_string());
         }
-        if pending.len() > MAX_PENDING_UPLOADS {
-            if let Some(expired) = pending.keys().next().cloned() {
-                pending.remove(&expired);
+        while pending.entries.len() > MAX_PENDING_UPLOADS {
+            if let Some(expired) = pending.insertion_order.pop_front() {
+                pending.entries.remove(&expired);
             }
         }
     }
@@ -1020,14 +1079,16 @@ fn remember_pending_claude_files(
 fn promote_pending_claude_files(
     key: &str,
     coverage: crate::http_files::Coverage,
-    pending: &Mutex<HashMap<String, Vec<String>>>,
+    pending: &Mutex<PendingFiles>,
     files: &Mutex<HashMap<String, crate::http_files::Coverage>>,
 ) -> Result<(), String> {
-    let ids = pending
-        .lock()
-        .map_err(|_| "Claude App pending file registry lock was poisoned".to_string())?
-        .remove(key)
-        .unwrap_or_default();
+    let ids = {
+        let mut pending = pending
+            .lock()
+            .map_err(|_| "Claude App pending file registry lock was poisoned".to_string())?;
+        pending.insertion_order.retain(|known| known != key);
+        pending.entries.remove(key).unwrap_or_default()
+    };
     if ids.is_empty() {
         return Ok(());
     }
@@ -1139,6 +1200,11 @@ fn protect_chat_request(
         if error.starts_with("image blocked:") || error.starts_with("document blocked:") {
             return Err(error);
         }
+        if block_unknown_formats {
+            return Err(format!(
+                "Claude App Chat request blocked: content inspection is unavailable ({error})"
+            ));
+        }
         eprintln!("[pentect] Claude App Chat protection skipped: {error}");
         return Ok(ProtectedChatRequest {
             body: body.clone(),
@@ -1185,6 +1251,11 @@ fn protect_generic_json_request(
         .lock()
         .map_err(|_| "Claude App JSON masker lock was poisoned".to_string())?;
     if let Err(error) = mask_generic_json_value(&mut value, &mut masker) {
+        if block_unknown_formats {
+            return Err(format!(
+                "Claude App JSON request blocked: content inspection is unavailable ({error})"
+            ));
+        }
         eprintln!("[pentect] Claude App JSON protection skipped: {error}");
         return Ok(body.clone());
     }
@@ -1275,14 +1346,11 @@ fn mask_chat_value(
                 if matches!(
                     key.as_str(),
                     "signature" | "thinking_signature" | "attestation"
-                ) {
+                ) || (!nested_tool_result && is_chat_protocol_metadata_field(key))
+                {
                     continue;
                 }
-                if is_chat_content_field(key)
-                    || (nested_tool_result && !is_chat_protocol_metadata_field(key))
-                {
-                    mask_chat_value(nested, nested_tool_result, masker, files)?;
-                }
+                mask_chat_value(nested, nested_tool_result, masker, files)?;
             }
             Ok(())
         }
@@ -1405,29 +1473,6 @@ fn inspect_chat_document(
     crate::claude_http_proxy::inspect_base64_document(&source, tool_result, masker)
 }
 
-fn is_chat_content_field(key: &str) -> bool {
-    matches!(
-        key,
-        "system"
-            | "prompt"
-            | "custom_system_prompt"
-            | "messages"
-            | "message"
-            | "content"
-            | "text"
-            | "parts"
-            | "attachments"
-            | "files"
-            | "input"
-            | "output"
-            | "result"
-            | "tool_result"
-            | "tool_output"
-            | "function_output"
-            | "extracted_content"
-    )
-}
-
 fn is_chat_protocol_metadata_field(key: &str) -> bool {
     matches!(
         key,
@@ -1442,6 +1487,8 @@ fn is_chat_protocol_metadata_field(key: &str) -> bool {
             | "signature"
             | "thinking_signature"
             | "attestation"
+            | "authorization"
+            | "token"
     )
 }
 
@@ -1469,6 +1516,7 @@ fn unscanned_chat_image() -> Result<(), String> {
 
 type ChatFrameStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Send>>;
+type ChatResolver = Box<dyn FnMut(&str) -> Result<String, String> + Send>;
 
 struct ChatStreamState {
     upstream: ChatFrameStream,
@@ -1477,6 +1525,7 @@ struct ChatStreamState {
     passthrough: bool,
     finished: bool,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
+    resolve: ChatResolver,
 }
 
 fn chat_sse_body<S>(stream: S, plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>) -> ProxyBody
@@ -1490,6 +1539,7 @@ where
         passthrough: false,
         finished: false,
         plugins,
+        resolve: Box::new(crate::claude_http_proxy::request_scoped_resolver()),
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         loop {
@@ -1520,7 +1570,7 @@ where
                     state.pending.extend_from_slice(&chunk);
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
-                        match rewrite_chat_sse_block(&block, &state.plugins) {
+                        match rewrite_chat_sse_block(&block, &state.plugins, &mut state.resolve) {
                             Ok(block) => state.ready.push_back(Ok(Frame::data(block))),
                             Err(error) => {
                                 state.finished = true;
@@ -1552,10 +1602,14 @@ where
     StreamBody::new(stream).boxed_unsync()
 }
 
-fn rewrite_chat_sse_block(
+fn rewrite_chat_sse_block<R>(
     block: &[u8],
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
-) -> Result<Bytes, String> {
+    resolve: &mut R,
+) -> Result<Bytes, String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
     let Ok(text) = std::str::from_utf8(block) else {
         return Ok(Bytes::copy_from_slice(block));
     };
@@ -1565,12 +1619,13 @@ fn rewrite_chat_sse_block(
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data.trim_start()) else {
         return Ok(Bytes::copy_from_slice(block));
     };
-    let plugins = plugins
-        .lock()
-        .map_err(|_| "Claude App plugin lock was poisoned".to_string())?;
-    run_chat_tool_plugins(&mut value, &plugins)?;
-    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
-    if let Err(error) = resolve_chat_tool_calls(&mut value, &mut resolve) {
+    if contains_chat_tool_call(&value) {
+        let plugins = plugins
+            .lock()
+            .map_err(|_| "Claude App plugin lock was poisoned".to_string())?;
+        run_chat_tool_plugins(&mut value, &plugins)?;
+    }
+    if let Err(error) = resolve_chat_tool_calls(&mut value, resolve) {
         eprintln!("[pentect] Claude App Chat tool restoration skipped: {error}");
         return Ok(Bytes::copy_from_slice(block));
     }
@@ -1594,6 +1649,27 @@ fn rewrite_chat_sse_block(
         }
     }
     Ok(Bytes::from(output))
+}
+
+fn contains_chat_tool_call(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(contains_chat_tool_call),
+        serde_json::Value::Object(object) => {
+            let kind = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            ((kind.contains("tool_use")
+                || kind.contains("tool_call")
+                || kind.contains("function_call"))
+                && ["arguments", "input"]
+                    .into_iter()
+                    .any(|key| object.contains_key(key)))
+                || object.values().any(contains_chat_tool_call)
+        }
+        _ => false,
+    }
 }
 
 fn run_chat_tool_plugins(
@@ -1884,7 +1960,8 @@ fn find_windows_claude_app() -> Option<PathBuf> {
     // WindowsApps intentionally denies ordinary directory enumeration. The
     // per-user AppModel repository is the supported local index for package
     // roots and does not require elevation.
-    let output = Command::new("reg.exe")
+    let reg = crate::windows_system_executable("reg.exe");
+    let output = Command::new(&reg)
         .args(["query", PACKAGES_KEY])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -1903,7 +1980,7 @@ fn find_windows_claude_app() -> Option<PathBuf> {
         })
         .filter_map(|key| {
             let package_name = key.rsplit('\\').next()?.to_string();
-            let output = Command::new("reg.exe")
+            let output = Command::new(&reg)
                 .args(["query", key, "/v", "PackageRootFolder"])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
@@ -2084,6 +2161,18 @@ mod tests {
     }
 
     #[test]
+    fn check_mode_does_not_treat_an_option_value_as_a_flag() {
+        let args = vec![
+            "pentect".to_string(),
+            "claude".to_string(),
+            "app".to_string(),
+            "--app".to_string(),
+            "--check".to_string(),
+        ];
+        assert!(!check_mode(&args).unwrap());
+    }
+
+    #[test]
     fn inspection_scope_is_exact_domain_suffix() {
         assert!(should_inspect("claude.ai", 443));
         assert!(should_inspect("assets.claude.ai", 443));
@@ -2112,6 +2201,11 @@ mod tests {
         assert!(is_chat_completion(
             "claude.ai",
             "/api/organizations/example/chat_conversations/example/retry_completion2",
+            "application/json"
+        ));
+        assert!(is_chat_completion(
+            "claude.ai",
+            "/api/organizations/example/chat_conversations/example/completion/",
             "application/json"
         ));
         assert!(!is_chat_completion(
@@ -2241,6 +2335,7 @@ mod tests {
                 "model": "claude-test-model",
                 "organization_uuid": "11111111-2222-3333-4444-555555555555",
                 "prompt": format!("Use this value:\nRUNPOD_API_KEY={secret}\n"),
+                "future_instructions": format!("A future field contains {secret}"),
                 "messages": [{"content": [{
                     "type": "tool_result",
                     "tool_use_id": "tool-stable-id",
@@ -2259,6 +2354,10 @@ mod tests {
         assert!(!prompt.contains(&secret));
         assert!(prompt.contains("<<"));
         assert!(prompt.contains(HANDLE_CONTRACT));
+        assert!(!value["future_instructions"]
+            .as_str()
+            .unwrap()
+            .contains(&secret));
         assert_eq!(value["model"], "claude-test-model");
         assert_eq!(
             value["organization_uuid"],
@@ -2289,17 +2388,15 @@ mod tests {
     fn uploaded_file_ids_are_registered_without_trusting_unrelated_ids() {
         let files = Mutex::new(HashMap::new());
         remember_claude_file_ids(
-            br#"{"id":"organization-id","nested":{"file_uuid":"file-123"},"file":{"id":"file-456","type":"file"}}"#,
+            br#"{"id":"organization-id","nested":{"file_uuid":"file-123","filename":"other.txt"},"file":{"id":"file-456","type":"file","filename":"a.txt"}}"#,
+            "a.txt",
             crate::http_files::Coverage::Full,
             &files,
         )
         .unwrap();
         let files = files.lock().unwrap();
         assert!(!files.contains_key("organization-id"));
-        assert_eq!(
-            files.get("file-123"),
-            Some(&crate::http_files::Coverage::Full)
-        );
+        assert!(!files.contains_key("file-123"));
         assert_eq!(
             files.get("file-456"),
             Some(&crate::http_files::Coverage::Full)
@@ -2321,7 +2418,7 @@ mod tests {
             "--pentect-test--\r\n"
         );
         let key = claude_filestore_upload_key(content_type, body.as_bytes()).unwrap();
-        let pending = Mutex::new(HashMap::new());
+        let pending = Mutex::new(PendingFiles::default());
         let files = Mutex::new(HashMap::new());
         remember_pending_claude_files(
             br#"{"uploads":[{"filesystem_id":"fs-1","path":"/uploads/a.txt","file_uuid":"file-1"}]}"#,
@@ -2335,6 +2432,28 @@ mod tests {
             files.lock().unwrap().get("file-1"),
             Some(&crate::http_files::Coverage::Full)
         );
+    }
+
+    #[test]
+    fn pending_upload_eviction_keeps_the_newest_correlations() {
+        let pending = Mutex::new(PendingFiles::default());
+        for index in 0..=MAX_PENDING_UPLOADS {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "uploads": [{
+                    "filesystem_id": "fs",
+                    "path": format!("/{index}.txt"),
+                    "file_uuid": format!("file-{index}")
+                }]
+            }))
+            .unwrap();
+            remember_pending_claude_files(&body, &pending).unwrap();
+        }
+        let pending = pending.lock().unwrap();
+        assert_eq!(pending.entries.len(), MAX_PENDING_UPLOADS);
+        assert!(!pending.entries.contains_key("fs\0/0.txt"));
+        assert!(pending
+            .entries
+            .contains_key(&format!("fs\0/{MAX_PENDING_UPLOADS}.txt")));
     }
 
     #[test]

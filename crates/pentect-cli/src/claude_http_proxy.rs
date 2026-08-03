@@ -1459,9 +1459,7 @@ pub(crate) fn mask_string(
     } else {
         masker.mask_prompt_text(text)?
     };
-    if let Some(masked) = masked {
-        *text = masked;
-    }
+    *text = masked.ok_or_else(|| "content inspection is unavailable".to_string())?;
     Ok(())
 }
 

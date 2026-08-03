@@ -32,6 +32,13 @@ use zeroize::Zeroize;
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
+#[cfg(windows)]
+pub(crate) fn windows_system_executable(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows")))
+        .join("System32")
+        .join(name)
+}
+
 #[cfg(test)]
 pub(crate) static TEST_PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -341,10 +348,7 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
 }
 
 fn cmd_claude_app(args: &[String]) -> i32 {
-    if args
-        .iter()
-        .any(|arg| arg == "--check" || arg == "--dry-run")
-    {
+    if claude_app_proxy::check_mode(args).unwrap_or_else(|error| die(error)) {
         return claude_app_proxy::cmd_claude_app(args);
     }
     let _plugin_env = app_plugin_env_guard(args).unwrap_or_else(|error| die(error));
@@ -361,10 +365,7 @@ fn cmd_claude_app(args: &[String]) -> i32 {
 }
 
 fn cmd_codex_app(args: &[String]) -> i32 {
-    if args
-        .iter()
-        .any(|arg| arg == "--check" || arg == "--dry-run")
-    {
+    if codex_app::check_mode(args).unwrap_or_else(|error| die(error)) {
         return codex_app::cmd_codex_app(args);
     }
     let _plugin_env = app_plugin_env_guard(args).unwrap_or_else(|error| die(error));

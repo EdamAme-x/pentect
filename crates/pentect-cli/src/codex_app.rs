@@ -58,7 +58,7 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
 
     let routing = crate::codex_app_routing(options.upstream)?;
     let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream)?;
-    let config_lock = CodexConfigLock::acquire()?;
+    let config_lock = Arc::new(Mutex::new(Some(CodexConfigLock::acquire()?)));
     let config_override = Some(CodexConfigOverride::install(
         &routing.provider,
         proxy.base_url(),
@@ -84,11 +84,15 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .map_err(|error| format!("could not start Codex App: {error}"))?;
     let config_cleanup = Arc::new(Mutex::new(config_override));
     let signal_cleanup = Arc::clone(&config_cleanup);
+    let signal_lock = Arc::clone(&config_lock);
     let child_id = child.id();
     if let Err(error) = ctrlc::set_handler(move || {
         terminate_child_process(child_id);
         if let Ok(mut cleanup) = signal_cleanup.lock() {
             cleanup.take();
+        }
+        if let Ok(mut lock) = signal_lock.lock() {
+            lock.take();
         }
         std::process::exit(130);
     }) {
@@ -96,6 +100,9 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         let _ = child.wait();
         if let Ok(mut cleanup) = config_cleanup.lock() {
             cleanup.take();
+        }
+        if let Ok(mut lock) = config_lock.lock() {
+            lock.take();
         }
         return Err(format!(
             "could not install Codex App config recovery handler: {error}"
@@ -108,14 +115,21 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .lock()
         .map_err(|_| "Codex App config recovery lock is unavailable".to_string())?
         .take();
-    drop(config_lock);
+    config_lock
+        .lock()
+        .map_err(|_| "Codex App session lock is unavailable".to_string())?
+        .take();
     drop(proxy);
     Ok(status)
 }
 
+pub(crate) fn check_mode(args: &[String]) -> Result<bool, String> {
+    CodexAppOptions::parse(args).map(|options| options.check)
+}
+
 #[cfg(windows)]
 fn terminate_child_process(pid: u32) {
-    let _ = Command::new("taskkill.exe")
+    let _ = Command::new(crate::windows_system_executable("taskkill.exe"))
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -145,8 +159,10 @@ struct CodexConfigOverride {
     no_original_marker: PathBuf,
 }
 
+#[derive(Debug)]
 struct CodexConfigLock {
     path: PathBuf,
+    file: std::fs::File,
 }
 
 impl CodexConfigLock {
@@ -159,75 +175,48 @@ impl CodexConfigLock {
             .map_err(|error| format!("could not create '{}': {error}", home.display()))?;
         let path = home.join("pentect-codex-app.lock");
         reject_symlink(&path, "Codex App lock")?;
-        for attempt in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id()).map_err(|error| {
-                        format!("could not initialize '{}': {error}", path.display())
-                    })?;
-                    file.sync_all().map_err(|error| {
-                        format!("could not persist '{}': {error}", path.display())
-                    })?;
-                    return Ok(Self { path });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                    if lock_owner_is_running(&path) {
-                        return Err(
-                            "another `pentect codex app` session is already active".to_string()
-                        );
-                    }
-                    std::fs::remove_file(&path).map_err(|remove_error| {
-                        format!(
-                            "could not clear stale Codex App lock '{}': {remove_error}",
-                            path.display()
-                        )
-                    })?;
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "could not lock Codex App configuration '{}': {error}",
-                        path.display()
-                    ));
-                }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|error| {
+            format!(
+                "could not open Codex App lock '{}': {error}",
+                path.display()
+            )
+        })?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err("another `pentect codex app` session is already active".to_string());
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!(
+                    "could not lock Codex App configuration '{}': {error}",
+                    path.display()
+                ));
             }
         }
-        Err("could not acquire Codex App configuration lock".to_string())
+        file.set_len(0)
+            .and_then(|_| writeln!(file, "{}", std::process::id()))
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("could not initialize '{}': {error}", path.display()))?;
+        Ok(Self { path, file })
     }
 }
 
 impl Drop for CodexConfigLock {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "[pentect] could not remove Codex App lock '{}': {error}",
-                    self.path.display()
-                );
-            }
+        if let Err(error) = self.file.unlock() {
+            eprintln!(
+                "[pentect] could not release Codex App lock '{}': {error}",
+                self.path.display()
+            );
         }
     }
-}
-
-fn lock_owner_is_running(path: &Path) -> bool {
-    let Ok(value) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(pid) = value.trim().parse::<sysinfo::Pid>() else {
-        return false;
-    };
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    system.process(pid).is_some_and(|process| {
-        process
-            .name()
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .starts_with("pentect")
-    })
 }
 
 impl CodexConfigOverride {
@@ -561,7 +550,8 @@ fn find_windows_store_chatgpt() -> Option<PathBuf> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const PACKAGES_KEY: &str = r"HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
 
-    let output = Command::new("reg.exe")
+    let reg = crate::windows_system_executable("reg.exe");
+    let output = Command::new(&reg)
         .args(["query", PACKAGES_KEY])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -582,7 +572,7 @@ fn find_windows_store_chatgpt() -> Option<PathBuf> {
         })
         .filter_map(|key| {
             let package_name = key.rsplit('\\').next()?.to_string();
-            let output = Command::new("reg.exe")
+            let output = Command::new(&reg)
                 .args(["query", key, "/v", "PackageRootFolder"])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
@@ -742,6 +732,18 @@ mod tests {
             "--dry-run".to_string(),
         ];
         assert!(CodexAppOptions::parse(&args).is_err());
+    }
+
+    #[test]
+    fn check_mode_does_not_treat_an_option_value_as_a_flag() {
+        let args = vec![
+            "pentect".to_string(),
+            "codex".to_string(),
+            "app".to_string(),
+            "--app".to_string(),
+            "--check".to_string(),
+        ];
+        assert!(!check_mode(&args).unwrap());
     }
 
     #[cfg(windows)]
@@ -976,7 +978,7 @@ base_url = "https://other.example/v1"
     }
 
     #[test]
-    fn config_lock_rejects_a_second_session_and_clears_on_drop() {
+    fn config_lock_rejects_a_second_session_and_releases_on_drop() {
         let home = std::env::temp_dir().join(format!(
             "pentect-codex-app-lock-{}-{}",
             std::process::id(),
@@ -986,7 +988,8 @@ base_url = "https://other.example/v1"
                 .as_nanos()
         ));
         let first = CodexConfigLock::acquire_in(&home).unwrap();
-        assert!(CodexConfigLock::acquire_in(&home).is_err());
+        let error = CodexConfigLock::acquire_in(&home).unwrap_err();
+        assert!(error.contains("another `pentect codex app` session is already active"));
         drop(first);
         let second = CodexConfigLock::acquire_in(&home).unwrap();
         drop(second);
@@ -994,7 +997,7 @@ base_url = "https://other.example/v1"
     }
 
     #[test]
-    fn config_lock_recovers_a_stale_owner() {
+    fn config_lock_ignores_stale_diagnostic_pid() {
         let home = std::env::temp_dir().join(format!(
             "pentect-codex-app-stale-lock-{}-{}",
             std::process::id(),

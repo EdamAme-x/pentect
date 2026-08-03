@@ -192,10 +192,10 @@ jobs:
         if: needs.changes.outputs.apps == 'true'
       - name: Test Codex App launcher and recovery
         if: needs.changes.outputs.apps == 'true'
-        run: cargo test -p pentect-cli --no-default-features codex_app::tests --locked
+        run: python tools/run_filtered_tests.py codex_app::tests
       - name: Test Claude Desktop gateway
         if: needs.changes.outputs.apps == 'true'
-        run: cargo test -p pentect-cli --no-default-features claude_app_proxy::tests --locked
+        run: python tools/run_filtered_tests.py claude_app_proxy::tests
       - name: No app changes
         if: needs.changes.outputs.apps != 'true'
         run: echo "No app changes"
