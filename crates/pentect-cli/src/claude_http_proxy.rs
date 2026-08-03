@@ -653,6 +653,11 @@ fn protect_anthropic_request_body(
         if is_media_policy_rejection(&error) {
             return Err(error);
         }
+        if block_unknown_formats {
+            return Err(format!(
+                "Anthropic request blocked: content inspection is unavailable ({error})"
+            ));
+        }
         eprintln!("[pentect] Claude request protection skipped: {error}");
         return Ok(ProtectedJsonBody {
             body: body.clone(),
@@ -1459,9 +1464,7 @@ pub(crate) fn mask_string(
     } else {
         masker.mask_prompt_text(text)?
     };
-    if let Some(masked) = masked {
-        *text = masked;
-    }
+    *text = masked.ok_or_else(|| "content inspection is unavailable".to_string())?;
     Ok(())
 }
 

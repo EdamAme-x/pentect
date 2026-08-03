@@ -232,6 +232,42 @@ fn multipart_field(
     None
 }
 
+pub(crate) fn multipart_text_field(
+    content_type: &str,
+    body: &[u8],
+    expected: &str,
+) -> Option<String> {
+    let boundary = multipart_boundary(content_type)?;
+    let delimiter = format!("--{boundary}").into_bytes();
+    let mut next_part_prefix = Vec::with_capacity(delimiter.len() + 2);
+    next_part_prefix.extend_from_slice(b"\r\n");
+    next_part_prefix.extend_from_slice(&delimiter);
+    multipart_field(body, &delimiter, &next_part_prefix, expected)
+}
+
+pub(crate) fn multipart_file_name(content_type: &str, body: &[u8]) -> Option<String> {
+    let boundary = multipart_boundary(content_type)?;
+    let delimiter = format!("--{boundary}").into_bytes();
+    let mut cursor = 0;
+    while let Some(relative_start) = memmem::find(&body[cursor..], &delimiter) {
+        let after_delimiter = cursor + relative_start + delimiter.len();
+        if body.get(after_delimiter..after_delimiter + 2) == Some(b"--") {
+            break;
+        }
+        let headers_start = after_delimiter.checked_add(2)?;
+        if body.get(after_delimiter..headers_start) != Some(b"\r\n") {
+            return None;
+        }
+        let headers_relative_end = memmem::find(&body[headers_start..], b"\r\n\r\n")?;
+        let headers_end = headers_start + headers_relative_end;
+        if let Some(file) = file_part(&body[headers_start..headers_end]) {
+            return Some(file.filename);
+        }
+        cursor = headers_end + 4;
+    }
+    None
+}
+
 fn multipart_boundary(content_type: &str) -> Option<String> {
     if !content_type
         .split(';')

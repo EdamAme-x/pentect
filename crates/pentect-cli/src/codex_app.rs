@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::{fs::OpenOptions, io::Write};
 
 pub(crate) fn cmd_codex_app(args: &[String]) -> i32 {
     match run_codex_app(args) {
@@ -22,8 +23,24 @@ pub(crate) fn cmd_codex_app(args: &[String]) -> i32 {
 fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let options = CodexAppOptions::parse(args)?;
     let app = options.app.unwrap_or_else(default_codex_app_path);
-    if options.dry_run {
-        println!("{}", app.display());
+    if options.check {
+        let installed = app.is_file();
+        println!("App: {}", app.display());
+        println!("Installed: {}", if installed { "yes" } else { "no" });
+        println!(
+            "Running: {}",
+            if codex_app_is_running(&app) {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+        let routing = crate::codex_app_routing(options.upstream)?;
+        println!("Provider: {}", routing.provider);
+        println!("Protection: OpenAI Responses API (HTTP)");
+        if !installed {
+            return Err("Codex mode was not found; pass --app PATH".to_string());
+        }
         return Ok(success_status());
     }
     if !app.is_file() {
@@ -41,6 +58,7 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
 
     let routing = crate::codex_app_routing(options.upstream)?;
     let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream)?;
+    let config_lock = Arc::new(Mutex::new(Some(CodexConfigLock::acquire()?)));
     let config_override = Some(CodexConfigOverride::install(
         &routing.provider,
         proxy.base_url(),
@@ -54,27 +72,37 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     }
     eprintln!("[pentect] Responses API prompts, files, and completed tool calls are protected");
 
-    let mut child = Command::new(&app)
+    let mut command = Command::new(&app);
+    command
         .env("OPENAI_BASE_URL", proxy.base_url())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    configure_child_process(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("could not start Codex App: {error}"))?;
     let config_cleanup = Arc::new(Mutex::new(config_override));
     let signal_cleanup = Arc::clone(&config_cleanup);
+    let signal_lock = Arc::clone(&config_lock);
     let child_id = child.id();
     if let Err(error) = ctrlc::set_handler(move || {
         terminate_child_process(child_id);
         if let Ok(mut cleanup) = signal_cleanup.lock() {
             cleanup.take();
         }
+        if let Ok(mut lock) = signal_lock.lock() {
+            lock.take();
+        }
         std::process::exit(130);
     }) {
-        let _ = child.kill();
+        terminate_child_process(child_id);
         let _ = child.wait();
         if let Ok(mut cleanup) = config_cleanup.lock() {
             cleanup.take();
+        }
+        if let Ok(mut lock) = config_lock.lock() {
+            lock.take();
         }
         return Err(format!(
             "could not install Codex App config recovery handler: {error}"
@@ -87,13 +115,21 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .lock()
         .map_err(|_| "Codex App config recovery lock is unavailable".to_string())?
         .take();
+    config_lock
+        .lock()
+        .map_err(|_| "Codex App session lock is unavailable".to_string())?
+        .take();
     drop(proxy);
     Ok(status)
 }
 
+pub(crate) fn check_mode(args: &[String]) -> Result<bool, String> {
+    CodexAppOptions::parse(args).map(|options| options.check)
+}
+
 #[cfg(windows)]
 fn terminate_child_process(pid: u32) {
-    let _ = Command::new("taskkill.exe")
+    let _ = Command::new(crate::windows_system_executable("taskkill.exe"))
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -104,14 +140,83 @@ fn terminate_child_process(pid: u32) {
 #[cfg(unix)]
 fn terminate_child_process(pid: u32) {
     unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
+        libc::kill(-(pid as i32), libc::SIGTERM);
     }
+}
+
+#[cfg(windows)]
+fn configure_child_process(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn configure_child_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
 }
 
 struct CodexConfigOverride {
     config: PathBuf,
     backup: PathBuf,
     no_original_marker: PathBuf,
+}
+
+#[derive(Debug)]
+struct CodexConfigLock {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl CodexConfigLock {
+    fn acquire() -> Result<Self, String> {
+        Self::acquire_in(&crate::codex_home_dir()?)
+    }
+
+    fn acquire_in(home: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(home)
+            .map_err(|error| format!("could not create '{}': {error}", home.display()))?;
+        let path = home.join("pentect-codex-app.lock");
+        reject_symlink(&path, "Codex App lock")?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|error| {
+            format!(
+                "could not open Codex App lock '{}': {error}",
+                path.display()
+            )
+        })?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err("another `pentect codex app` session is already active".to_string());
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!(
+                    "could not lock Codex App configuration '{}': {error}",
+                    path.display()
+                ));
+            }
+        }
+        file.set_len(0)
+            .and_then(|_| writeln!(file, "{}", std::process::id()))
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("could not initialize '{}': {error}", path.display()))?;
+        Ok(Self { path, file })
+    }
+}
+
+impl Drop for CodexConfigLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            eprintln!(
+                "[pentect] could not release Codex App lock '{}': {error}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 impl CodexConfigOverride {
@@ -126,6 +231,9 @@ impl CodexConfigOverride {
         let config = home.join("config.toml");
         let backup = home.join("config.toml.pentect-backup");
         let no_original_marker = home.join("config.toml.pentect-no-original");
+        reject_symlink(&config, "Codex config")?;
+        reject_symlink(&backup, "Codex recovery backup")?;
+        reject_symlink(&no_original_marker, "Codex recovery marker")?;
         if backup.is_file() {
             if config.is_file() {
                 std::fs::remove_file(&config).map_err(|error| {
@@ -167,14 +275,15 @@ impl CodexConfigOverride {
         };
         set_provider_gateway(&mut parsed, provider, gateway)?;
 
-        std::fs::write(&backup, original.as_bytes())
+        write_new_private_file(&backup, original.as_bytes())
             .map_err(|error| format!("could not back up '{}': {error}", config.display()))?;
         if !had_original {
-            std::fs::write(&no_original_marker, b"")
+            write_new_private_file(&no_original_marker, b"")
                 .map_err(|error| format!("could not create Codex recovery marker: {error}"))?;
         }
         let temporary = home.join(format!("config.toml.pentect-{}.tmp", std::process::id()));
-        std::fs::write(&temporary, parsed.to_string())
+        reject_symlink(&temporary, "Codex temporary config")?;
+        write_new_private_file(&temporary, parsed.to_string().as_bytes())
             .map_err(|error| format!("could not write '{}': {error}", temporary.display()))?;
         if config.is_file() {
             std::fs::remove_file(&config)
@@ -200,6 +309,9 @@ impl CodexConfigOverride {
     }
 
     fn restore(&self) -> Result<(), String> {
+        reject_symlink(&self.config, "Codex config")?;
+        reject_symlink(&self.backup, "Codex recovery backup")?;
+        reject_symlink(&self.no_original_marker, "Codex recovery marker")?;
         if !self.backup.is_file() {
             return Ok(());
         }
@@ -225,6 +337,29 @@ impl CodexConfigOverride {
             })
         }
     }
+}
+
+fn reject_symlink(path: &Path, label: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "{label} '{}' is a symbolic link; Pentect will not replace it",
+            path.display()
+        )),
+        Ok(_) | Err(_) => Ok(()),
+    }
+}
+
+fn write_new_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 impl Drop for CodexConfigOverride {
@@ -278,14 +413,14 @@ fn set_provider_gateway(
 struct CodexAppOptions {
     app: Option<PathBuf>,
     upstream: Option<String>,
-    dry_run: bool,
+    check: bool,
 }
 
 impl CodexAppOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut app = None;
         let mut upstream = None;
-        let mut dry_run = false;
+        let mut check = false;
         let mut index = if args.get(1).is_some_and(|arg| arg == "codex")
             && args.get(2).is_some_and(|arg| arg == "app")
         {
@@ -309,8 +444,8 @@ impl CodexAppOptions {
                     upstream = Some(value.clone());
                     index += 2;
                 }
-                "--dry-run" => {
-                    dry_run = true;
+                "--check" | "--dry-run" => {
+                    check = true;
                     index += 1;
                 }
                 "--plugins" => {
@@ -328,7 +463,7 @@ impl CodexAppOptions {
         Ok(Self {
             app,
             upstream,
-            dry_run,
+            check,
         })
     }
 }
@@ -342,7 +477,15 @@ fn default_codex_app_path() -> PathBuf {
     }
     #[cfg(target_os = "macos")]
     {
-        return PathBuf::from("/Applications/Codex.app/Contents/MacOS/Codex");
+        for candidate in [
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "/Applications/Codex.app/Contents/MacOS/Codex",
+        ] {
+            let candidate = PathBuf::from(candidate);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -366,11 +509,18 @@ fn default_codex_app_path() -> PathBuf {
 
 #[cfg(windows)]
 fn find_windows_codex_app() -> Option<PathBuf> {
-    let root = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)?
-        .join(Path::new("Programs").join("OpenAI Codex Standalone"));
-    let mut candidates = std::fs::read_dir(root)
-        .ok()?
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+    let roots = [
+        local_app_data
+            .join("Programs")
+            .join("OpenAI Codex Standalone"),
+        local_app_data.join("Programs").join("OpenAI ChatGPT"),
+        local_app_data.join("Programs").join("ChatGPT"),
+    ];
+    let mut candidates = roots
+        .into_iter()
+        .filter_map(|root| std::fs::read_dir(root).ok())
+        .flatten()
         .filter_map(Result::ok)
         .filter_map(|entry| {
             // Codex.exe is an updater/launcher stub in current standalone
@@ -388,7 +538,85 @@ fn find_windows_codex_app() -> Option<PathBuf> {
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some((_, executable)) = candidates.pop() {
+        return Some(executable);
+    }
+    find_windows_store_chatgpt()
+}
+
+#[cfg(windows)]
+fn find_windows_store_chatgpt() -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const PACKAGES_KEY: &str = r"HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+
+    let reg = crate::windows_system_executable("reg.exe");
+    let output = Command::new(&reg)
+        .args(["query", PACKAGES_KEY])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let keys = String::from_utf8_lossy(&output.stdout);
+    let mut candidates = keys
+        .lines()
+        .map(str::trim)
+        .filter(|key| {
+            key.rsplit('\\').next().is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
+                (name.starts_with("chatgpt_") || name.starts_with("openai.chatgpt"))
+                    && windows_package_matches_arch(&name)
+            })
+        })
+        .filter_map(|key| {
+            let package_name = key.rsplit('\\').next()?.to_string();
+            let output = Command::new(&reg)
+                .args(["query", key, "/v", "PackageRootFolder"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let root = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.split_once("REG_SZ").map(|(_, value)| value.trim()))?
+                .to_string();
+            ["ChatGPT.exe", "app\\ChatGPT.exe", "Codex.exe"]
+                .into_iter()
+                .map(|relative| PathBuf::from(&root).join(relative))
+                .find(|path| path.is_file())
+                .map(|path| (windows_package_version(&package_name), path))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
     candidates.pop().map(|(_, executable)| executable)
+}
+
+#[cfg(windows)]
+fn windows_package_matches_arch(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if cfg!(target_arch = "aarch64") {
+        name.contains("_arm64__")
+    } else {
+        name.contains("_x64__")
+    }
+}
+
+#[cfg(windows)]
+fn windows_package_version(name: &str) -> Vec<u64> {
+    name.split('_')
+        .find(|part| {
+            part.chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+        })
+        .unwrap_or_default()
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
 }
 
 #[cfg(windows)]
@@ -469,7 +697,7 @@ mod tests {
             CodexAppOptions {
                 app: Some(PathBuf::from("Codex.exe")),
                 upstream: Some("https://example.test/v1".to_string()),
-                dry_run: true,
+                check: true,
             }
         );
     }
@@ -489,7 +717,7 @@ mod tests {
             CodexAppOptions {
                 app: None,
                 upstream: None,
-                dry_run: true,
+                check: true,
             }
         );
     }
@@ -506,10 +734,33 @@ mod tests {
         assert!(CodexAppOptions::parse(&args).is_err());
     }
 
+    #[test]
+    fn check_mode_does_not_treat_an_option_value_as_a_flag() {
+        let args = vec![
+            "pentect".to_string(),
+            "codex".to_string(),
+            "app".to_string(),
+            "--app".to_string(),
+            "--check".to_string(),
+        ];
+        assert!(!check_mode(&args).unwrap());
+    }
+
     #[cfg(windows)]
     #[test]
     fn version_sort_is_numeric() {
         assert!(version_components("26.10.0") > version_components("26.9.99"));
+        assert!(
+            windows_package_version("ChatGPT_26.10.0.0_x64__id")
+                > windows_package_version("ChatGPT_26.9.99.0_x64__id")
+        );
+        assert!(windows_package_matches_arch(
+            if cfg!(target_arch = "aarch64") {
+                "ChatGPT_1.0.0.0_arm64__id"
+            } else {
+                "ChatGPT_1.0.0.0_x64__id"
+            }
+        ));
     }
 
     #[test]
@@ -595,5 +846,170 @@ base_url = "https://other.example/v1"
         );
         assert!(!root.join("config.toml.pentect-backup").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_config_override_is_recovered_before_reinstall() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let original = "model = \"original\"\n";
+        std::fs::write(root.join("config.toml"), "model = \"interrupted\"\n").unwrap();
+        std::fs::write(root.join("config.toml.pentect-backup"), original).unwrap();
+        let guard =
+            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(root.join("config.toml")).unwrap(),
+            original
+        );
+        assert!(!root.join("config.toml.pentect-backup").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_override_without_an_original_remains_absent_after_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-no-original-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.toml"), "model = \"interrupted\"\n").unwrap();
+        std::fs::write(root.join("config.toml.pentect-backup"), b"").unwrap();
+        std::fs::write(root.join("config.toml.pentect-no-original"), b"").unwrap();
+        let guard =
+            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
+        drop(guard);
+        assert!(!root.join("config.toml").exists());
+        assert!(!root.join("config.toml.pentect-backup").exists());
+        assert!(!root.join("config.toml.pentect-no-original").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_config_does_not_create_recovery_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-malformed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let malformed = "[not valid";
+        std::fs::write(root.join("config.toml"), malformed).unwrap();
+        assert!(
+            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("config.toml")).unwrap(),
+            malformed
+        );
+        assert!(!root.join("config.toml.pentect-backup").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlinks_are_rejected_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("outside.toml");
+        std::fs::write(&target, "model = \"untouched\"\n").unwrap();
+        symlink(&target, root.join("config.toml")).unwrap();
+        assert!(
+            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "model = \"untouched\"\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_config_and_recovery_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-permissions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.toml"), "model = \"original\"\n").unwrap();
+        let guard =
+            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
+        for path in [
+            root.join("config.toml"),
+            root.join("config.toml.pentect-backup"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_lock_rejects_a_second_session_and_releases_on_drop() {
+        let home = std::env::temp_dir().join(format!(
+            "pentect-codex-app-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = CodexConfigLock::acquire_in(&home).unwrap();
+        let error = CodexConfigLock::acquire_in(&home).unwrap_err();
+        assert!(error.contains("another `pentect codex app` session is already active"));
+        drop(first);
+        let second = CodexConfigLock::acquire_in(&home).unwrap();
+        drop(second);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn config_lock_ignores_stale_diagnostic_pid() {
+        let home = std::env::temp_dir().join(format!(
+            "pentect-codex-app-stale-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("pentect-codex-app.lock"), "4294967295\n").unwrap();
+        let lock = CodexConfigLock::acquire_in(&home).unwrap();
+        drop(lock);
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

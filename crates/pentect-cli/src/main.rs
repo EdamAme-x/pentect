@@ -32,6 +32,13 @@ use zeroize::Zeroize;
 
 pub(crate) type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
+#[cfg(windows)]
+pub(crate) fn windows_system_executable(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows")))
+        .join("System32")
+        .join(name)
+}
+
 #[cfg(test)]
 pub(crate) static TEST_PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -180,10 +187,8 @@ fn help_text() -> &'static str {
         "Use:\n",
         "  pentect\n",
         "  pentect codex|claude [--plugins NAME|PATH.toml]\n",
-        "  pentect codex app [--app PATH] [--upstream URL] [--plugins SOURCE] [--dry-run]\n",
-        "  pentect codex-app [--app PATH] [--upstream URL] [--dry-run]  (alias)\n",
-        "  pentect claude app [--app PATH] [--upstream URL] [--plugins SOURCE] [--dry-run]\n",
-        "  pentect claude-app [--app PATH] [--upstream URL] [--dry-run]  (alias)\n",
+        "  pentect codex app [--app PATH] [--upstream URL] [--plugins SOURCE] [--check]\n",
+        "  pentect claude app [--app PATH] [--upstream URL] [--plugins SOURCE] [--check]\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect doctor [--json | --fix [--yes]]\n",
         "  pentect update [VERSION] [--check | --force]\n",
@@ -211,7 +216,7 @@ fn help_text() -> &'static str {
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
         "plugins: add, remove, list, search, inspect, test, config, setup, update\n",
-        "codex-app: launch Codex App through the Responses API gateway\n",
+        "codex app: launch Codex App through the Responses API gateway\n",
         "claude app: launch Claude Desktop through the Chat and Anthropic gateways\n",
     )
 }
@@ -343,7 +348,7 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
 }
 
 fn cmd_claude_app(args: &[String]) -> i32 {
-    if args.iter().any(|arg| arg == "--dry-run") {
+    if claude_app_proxy::check_mode(args).unwrap_or_else(|error| die(error)) {
         return claude_app_proxy::cmd_claude_app(args);
     }
     let _plugin_env = app_plugin_env_guard(args).unwrap_or_else(|error| die(error));
@@ -360,7 +365,7 @@ fn cmd_claude_app(args: &[String]) -> i32 {
 }
 
 fn cmd_codex_app(args: &[String]) -> i32 {
-    if args.iter().any(|arg| arg == "--dry-run") {
+    if codex_app::check_mode(args).unwrap_or_else(|error| die(error)) {
         return codex_app::cmd_codex_app(args);
     }
     let _plugin_env = app_plugin_env_guard(args).unwrap_or_else(|error| die(error));
