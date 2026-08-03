@@ -242,8 +242,11 @@ fn get_response<T: for<'de> Deserialize<'de>>(
     url: &str,
     max_bytes: u64,
 ) -> Result<T, String> {
-    let response = client
-        .get(url)
+    let mut request = client.get(url);
+    if let Some(token) = github_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .map_err(|e| format!("could not fetch GitHub release: {e}"))?;
     if !response.status().is_success() {
@@ -267,6 +270,19 @@ fn get_response<T: for<'de> Deserialize<'de>>(
         return Err("GitHub release response is too large".to_string());
     }
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid GitHub release response: {e}"))
+}
+
+fn github_token() -> Option<String> {
+    github_token_from(|name| std::env::var(name).ok())
+}
+
+fn github_token_from(mut read: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    ["GH_TOKEN", "GITHUB_TOKEN"].into_iter().find_map(|name| {
+        read(name).and_then(|value| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+    })
 }
 
 fn release_version(tag: &str) -> Result<Version, String> {
@@ -534,5 +550,22 @@ mod tests {
         assert!(validate_repository("EdamAme-x/pentect").is_ok());
         assert!(validate_repository("owner/repo/extra").is_err());
         assert!(validate_repository("owner/../repo").is_err());
+    }
+
+    #[test]
+    fn selects_a_non_empty_github_token_without_exposing_it() {
+        let token = github_token_from(|name| match name {
+            "GH_TOKEN" => Some("  ".to_string()),
+            "GITHUB_TOKEN" => Some(" test-token ".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("test-token"));
+
+        let token = github_token_from(|name| match name {
+            "GH_TOKEN" => Some("preferred".to_string()),
+            "GITHUB_TOKEN" => Some("fallback".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("preferred"));
     }
 }

@@ -22,8 +22,9 @@ version as verified until that automation exists.
 
 ## Manual live smoke tests
 
-The v0.0.18 release candidate was exercised on Windows on 2026-08-03 with
-synthetic secrets only:
+The protected client behavior carried into v0.0.19 was exercised on Windows on
+2026-08-03 against the v0.0.17 release binary, using synthetic secrets only.
+The gateway code did not change between those releases:
 
 | Client | Version | Result |
 | --- | --- | --- |

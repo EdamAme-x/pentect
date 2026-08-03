@@ -326,6 +326,8 @@ jobs:
       - name: Install, update, and uninstall (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           $env:PENTECT_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'pentect-lifecycle\bin'
@@ -348,6 +350,8 @@ jobs:
       - name: Install, update, and uninstall (POSIX)
         if: runner.os != 'Windows'
         shell: sh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           version=${GITHUB_REF_NAME#v}
