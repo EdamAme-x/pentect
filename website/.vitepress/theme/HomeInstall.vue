@@ -1,4 +1,14 @@
 <script setup lang="ts">
+import {
+  siApple,
+  siDebian,
+  siGnubash,
+  siHomebrew,
+  siLinux,
+  siNixos,
+  siNpm,
+  siRust,
+} from 'simple-icons';
 import { computed, onMounted, ref } from 'vue';
 
 type OperatingSystem = 'windows' | 'macos' | 'linux';
@@ -11,9 +21,9 @@ const operatingSystems: Array<{
   icon: string;
   tone: string;
 }> = [
-  { id: 'windows', label: 'Windows', icon: '⊞', tone: 'windows' },
-  { id: 'macos', label: 'macOS', icon: '⌘', tone: 'macos' },
-  { id: 'linux', label: 'Linux', icon: '⌁', tone: 'linux' },
+  { id: 'windows', label: 'Windows', icon: 'windows', tone: 'windows' },
+  { id: 'macos', label: 'macOS', icon: 'apple', tone: 'macos' },
+  { id: 'linux', label: 'Linux', icon: 'linux', tone: 'linux' },
 ];
 
 const npmInstaller = {
@@ -27,7 +37,7 @@ const cargoInstaller = {
   id: 'cargo',
   label: 'Cargo',
   command: 'cargo install --git https://github.com/EdamAme-x/pentect --locked pentect-cli',
-  icon: '⚙',
+  icon: 'rust',
   tone: 'cargo',
 };
 
@@ -37,7 +47,7 @@ const installers: Record<OperatingSystem, Installer[]> = {
       id: 'powershell',
       label: 'PowerShell',
       command: 'irm https://pentect.dev/install | iex',
-      icon: '>_',
+      icon: 'powershell',
       tone: 'powershell',
     },
     npmInstaller,
@@ -48,14 +58,14 @@ const installers: Record<OperatingSystem, Installer[]> = {
       id: 'homebrew',
       label: 'Homebrew',
       command: 'brew install EdamAme-x/pentect/pentect',
-      icon: 'B',
+      icon: 'homebrew',
       tone: 'homebrew',
     },
     {
       id: 'shell',
       label: 'Shell',
       command: 'curl -fsSL https://pentect.dev/install.sh | sh',
-      icon: '$_',
+      icon: 'gnubash',
       tone: 'shell',
     },
     npmInstaller,
@@ -63,14 +73,14 @@ const installers: Record<OperatingSystem, Installer[]> = {
       id: 'nix',
       label: 'Nix profile',
       command: 'nix profile install github:EdamAme-x/pentect',
-      icon: '❄',
+      icon: 'nixos',
       tone: 'nix',
     },
     {
       id: 'nix-shell',
       label: 'Nix shell',
       command: 'nix shell github:EdamAme-x/pentect',
-      icon: '❄',
+      icon: 'nixos',
       tone: 'nix',
     },
     cargoInstaller,
@@ -80,14 +90,14 @@ const installers: Record<OperatingSystem, Installer[]> = {
       id: 'shell',
       label: 'Shell',
       command: 'curl -fsSL https://pentect.dev/install.sh | sh',
-      icon: '$_',
+      icon: 'gnubash',
       tone: 'shell',
     },
     {
       id: 'apt',
       label: 'APT',
       command: 'curl -fsSL https://pentect.dev/install-apt.sh | sudo sh',
-      icon: 'A',
+      icon: 'debian',
       tone: 'apt',
     },
     npmInstaller,
@@ -95,14 +105,14 @@ const installers: Record<OperatingSystem, Installer[]> = {
       id: 'nix',
       label: 'Nix profile',
       command: 'nix profile install github:EdamAme-x/pentect',
-      icon: '❄',
+      icon: 'nixos',
       tone: 'nix',
     },
     {
       id: 'nix-shell',
       label: 'Nix shell',
       command: 'nix shell github:EdamAme-x/pentect',
-      icon: '❄',
+      icon: 'nixos',
       tone: 'nix',
     },
     cargoInstaller,
@@ -112,12 +122,28 @@ const installers: Record<OperatingSystem, Installer[]> = {
 const selectedOs = ref<OperatingSystem>('windows');
 const selectedMethod = ref('powershell');
 const copyState = ref<'idle' | 'copied' | 'failed'>('idle');
+const iconSet: Record<string, string> = {
+  windows: 'M0 0h11.377v11.372H0Zm12.623 0H24v11.372H12.623ZM0 12.623h11.377V24H0Zm12.623 0H24V24H12.623',
+  apple: siApple.path,
+  linux: siLinux.path,
+  powershell: 'M23.181 2.974c.568 0 .923.463.792 1.035l-3.659 15.982c-.13.572-.697 1.035-1.265 1.035H.819c-.568 0-.923-.463-.792-1.035L3.686 4.009c.13-.572.697-1.035 1.265-1.035zm-8.375 9.346c.251-.394.227-.905-.09-1.243L9.122 5.125c-.38-.404-1.037-.407-1.466-.003c-.429.402-.468 1.056-.088 1.46l4.662 4.96v.11l-7.42 5.374c-.45.327-.533.977-.187 1.453s.991.597 1.44.27l8.229-5.91c.28-.196.438-.365.514-.52zm-2.796 4.399a.93.93 0 0 0-.934.923c0 .51.418.923.934.923h4.433a.93.93 0 0 0 .934-.923a.93.93 0 0 0-.934-.923z',
+  gnubash: siGnubash.path,
+  npm: siNpm.path,
+  rust: siRust.path,
+  homebrew: siHomebrew.path,
+  debian: siDebian.path,
+  nixos: siNixos.path,
+};
 
 const methods = computed(() => installers[selectedOs.value]);
 const selectedInstaller = computed(
   () => methods.value.find((item) => item.id === selectedMethod.value) ?? methods.value[0],
 );
 const commandTokens = computed(() => tokenizeCommand(selectedInstaller.value.command));
+
+function iconPath(name: string) {
+  return iconSet[name] ?? '';
+}
 
 function tokenizeCommand(command: string): CommandToken[] {
   const parts = command.match(/https?:\/\/[^\s|]+|github:[^\s|]+|--?[\w-]+|\||[^\s|]+|\s+/g) ?? [command];
@@ -183,7 +209,14 @@ onMounted(() => {
           :aria-pressed="selectedOs === os.id"
           @click="chooseOs(os.id)"
         >
-          <i class="install-select__icon" :data-tone="os.tone" aria-hidden="true">{{ os.icon }}</i>
+          <svg
+            class="install-select__icon"
+            :data-tone="os.tone"
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+          >
+            <path fill="currentColor" :d="iconPath(os.icon)" />
+          </svg>
           {{ os.label }}
         </button>
       </div>
@@ -198,7 +231,14 @@ onMounted(() => {
           :aria-pressed="selectedMethod === method.id"
           @click="chooseMethod(method.id)"
         >
-          <i class="install-select__icon" :data-tone="method.tone" aria-hidden="true">{{ method.icon }}</i>
+          <svg
+            class="install-select__icon"
+            :data-tone="method.tone"
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+          >
+            <path fill="currentColor" :d="iconPath(method.icon)" />
+          </svg>
           {{ method.label }}
         </button>
       </div>
