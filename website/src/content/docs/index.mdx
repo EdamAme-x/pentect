@@ -1,0 +1,81 @@
+---
+title: Pentect
+description: Let agents use secrets without seeing them.
+template: splash
+hero:
+  tagline: Let agents use secrets without seeing them. Pentect replaces sensitive values before they reach an AI provider, then restores them only for trusted local tool calls.
+  actions:
+    - text: Get started
+      link: /start/install/
+      icon: right-arrow
+      variant: primary
+    - text: How it works
+      link: /start/how-it-works/
+      icon: open-book
+      variant: minimal
+---
+
+import { Card, CardGrid, Steps, Aside } from '@astrojs/starlight/components';
+
+## The model gets context. Your secrets stay local.
+
+```text
+RUNPOD_API_KEY=rpa_live_value
+         ↓ Pentect
+RUNPOD_API_KEY=<<RUNPOD_API_KEY_a53912f7228c6f9d>>
+         ↓ model tool call
+restored only at the trusted local boundary
+```
+
+Pentect is not conventional redaction. The model retains a stable, meaningful
+handle, so it can compose commands and finish work without receiving the
+plaintext value.
+
+<CardGrid>
+  <Card title="Local by design" icon="seti:lock">
+    Plaintext recovery stays in the local Pentect session. Providers receive
+    handles, not the protected values behind them.
+  </Card>
+  <Card title="Works with your tools" icon="terminal">
+    Launch Codex CLI, Claude Code, Codex App, or Claude Desktop through Pentect.
+    No replacement chat UI is required.
+  </Card>
+  <Card title="More than prompts" icon="document">
+    Protect structured configuration, tool results, supported uploads, images,
+    and completed tool-call arguments.
+  </Card>
+  <Card title="Extensible, constrained" icon="puzzle">
+    Add regex detectors or sandboxed WebAssembly middleware with explicit
+    permissions.
+  </Card>
+</CardGrid>
+
+## Start in under a minute
+
+<Steps>
+1. Install Pentect.
+
+   ```powershell
+   irm https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.ps1 | iex
+   ```
+
+2. Check the installation.
+
+   ```text
+   pentect doctor
+   ```
+
+3. Launch an agent.
+
+   ```text
+   pentect codex
+   # or
+   pentect claude
+   ```
+</Steps>
+
+<Aside type="caution" title="Pre-1.0 security software">
+  Pentect blocks unknown provider formats by default, but no detector can
+  promise perfect detection. Keep provider and tool permissions narrow and
+  review the security model before production use.
+</Aside>

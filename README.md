@@ -83,7 +83,6 @@ pentect claude app
 These commands protect Codex mode and supported Claude Desktop Chat, Code, and
 attachment traffic; they do not claim coverage for every Chat, Work, Cowork,
 Voice, or future opaque route.
-See the [desktop app guide](guides/apps.md) before using sensitive data.
 
 Mask text from stdin while preserving opaque handles:
 
@@ -124,11 +123,7 @@ Unknown provider endpoints, content blocks, and malformed provider JSON are
 blocked by default. A user may explicitly select compatibility mode in the
 global configuration, but project configuration cannot weaken this policy.
 
-See [configuration](guides/configuration.md) for policies and limits.
 See [compatibility](COMPATIBILITY.md) for the release-tested client matrix.
-See [desktop apps](guides/apps.md) for exact surface coverage and limitations.
-See [custom upstreams](guides/upstreams.md) for Bifrost, LiteLLM, local models,
-enterprise CA, mTLS, and proxy configuration.
 
 ## Plugins
 
@@ -148,7 +143,7 @@ pentect plugins test NAME
 pentect plugins update NAME
 ```
 
-See [PLUGINS.md](PLUGINS.md) and the [plugin authoring guide](guides/plugins.md).
+See [PLUGINS.md](PLUGINS.md) for plugin authoring and security details.
 The Rust SDK is published as
 [`pentect-plugin`](https://crates.io/crates/pentect-plugin).
 
