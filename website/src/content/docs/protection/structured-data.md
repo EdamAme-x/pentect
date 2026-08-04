@@ -38,6 +38,3 @@ PowerShell:
 ```powershell
 Get-Content .env -Raw | pentect mask
 ```
-
-No `--kind` flag is required for ordinary input. Pentect infers the format from
-the source or content where available.
