@@ -33,6 +33,22 @@ export default defineConfig({
         { tag: 'meta', attrs: { name: 'theme-color', content: '#f3f0e8' } },
         { tag: 'meta', attrs: { property: 'og:type', content: 'website' } },
         { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary' } },
+        {
+          tag: 'link',
+          attrs: {
+            rel: 'alternate',
+            type: 'text/markdown',
+            href: './index.md',
+            title: 'Markdown version',
+          },
+        },
+        {
+          tag: 'meta',
+          attrs: {
+            name: 'agent-content',
+            content: 'A concise Markdown version of this page is available at ./index.md',
+          },
+        },
       ],
       sidebar: [
         {
