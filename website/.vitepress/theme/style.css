@@ -238,65 +238,104 @@ body {
   font-weight: 550;
 }
 
-.home-install__controls {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 24px;
-  padding: 0 32px 28px;
-}
-
-.home-install__control > span {
-  display: block;
-  margin-bottom: 8px;
-  color: var(--vp-c-text-3);
-  font-size: 12px;
-  font-weight: 650;
-  text-transform: uppercase;
-}
-
-.home-install__control > div {
+.home-install__sentence {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 10px;
+  margin: 0 !important;
+  padding: 2px 32px 30px;
+  color: var(--vp-c-text-1);
+  font-size: 17px;
+  line-height: 1.4;
 }
 
-.home-install__control button,
-.home-install__command button {
-  border: 0;
-  border-radius: 7px;
+.install-select {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 142px;
+}
+
+.install-select select {
+  width: 100%;
+  height: 44px;
+  appearance: none;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  padding: 0 36px 0 43px;
+  color: var(--vp-c-text-1);
+  background: var(--vp-c-bg);
   font: inherit;
+  font-size: 14px;
+  font-weight: 650;
   cursor: pointer;
+  outline: none;
 }
 
-.home-install__control button {
-  padding: 7px 11px;
-  color: var(--vp-c-text-2);
-  background: transparent;
-  font-size: 13px;
+.install-select select:hover {
+  border-color: color-mix(in srgb, var(--vp-c-brand-1) 38%, var(--vp-c-divider));
 }
 
-.home-install__control button:hover {
-  color: var(--vp-c-text-1);
-  background: var(--vp-c-bg-soft);
+.install-select select:focus-visible {
+  border-color: var(--vp-c-brand-1);
+  box-shadow: 0 0 0 3px var(--vp-c-brand-soft);
 }
 
-.home-install__control button[aria-pressed='true'] {
-  color: var(--vp-c-text-1);
-  background: var(--vp-c-bg-soft);
-  box-shadow: inset 0 0 0 1px var(--vp-c-divider);
+.install-select__icon {
+  position: absolute;
+  left: 10px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  color: #fff;
+  background: #4f554a;
+  font-family: var(--vp-font-family-mono);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.install-select__icon[data-tone='windows'] { background: #087cd5; font-size: 18px; }
+.install-select__icon[data-tone='macos'] { background: #343732; font-size: 17px; }
+.install-select__icon[data-tone='linux'] { background: #e6b422; color: #222; font-size: 18px; }
+.install-select__icon[data-tone='powershell'] { background: #2671be; }
+.install-select__icon[data-tone='shell'] { background: #3d443a; }
+.install-select__icon[data-tone='npm'] { background: #cb3837; font-size: 7px; }
+.install-select__icon[data-tone='cargo'] { background: #6d4c35; font-size: 15px; }
+.install-select__icon[data-tone='homebrew'] { background: #d89b20; color: #292016; }
+.install-select__icon[data-tone='apt'] { background: #a80030; }
+.install-select__icon[data-tone='nix'] { background: #5277c3; font-size: 14px; }
+
+.install-select__chevron {
+  position: absolute;
+  right: 12px;
+  color: var(--vp-c-text-3);
+  font-size: 16px;
+  line-height: 1;
+  pointer-events: none;
 }
 
 .home-install__command {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 24px;
+  display: block;
   min-width: 0;
-  padding: 20px 24px;
-  background: #20231e;
+  border-top: 1px solid var(--vp-c-divider);
+  background: #191c18;
+}
+
+.home-install__code {
+  min-width: 0;
+  padding: 24px;
 }
 
 .vp-doc .home-install__command code {
+  display: block;
   overflow-x: auto;
   padding: 0;
   color: #f4f2eb;
@@ -305,12 +344,48 @@ body {
   white-space: nowrap;
 }
 
+.home-install__command-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 48px;
+  padding: 8px 12px 8px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+  color: #b9bdb4;
+  font-size: 12px;
+}
+
+.home-install__command-footer > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.home-install__command-footer .install-select__icon {
+  position: static;
+  width: 20px;
+  height: 20px;
+}
+
 .home-install__command button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   flex: none;
+  border: 0;
+  border-radius: 7px;
   padding: 7px 12px;
   color: #d8dbd2;
   background: #353930;
+  font: inherit;
   font-size: 12px;
+  cursor: pointer;
+}
+
+.home-install__command button:hover {
+  color: #fff;
+  background: #42473d;
 }
 
 .home-install__status {
@@ -543,17 +618,22 @@ body {
     padding: 24px 20px 20px;
   }
 
-  .home-install__controls {
-    grid-template-columns: 1fr;
-    gap: 18px;
-    padding: 0 20px 22px;
+  .home-install__sentence {
+    align-items: stretch;
+    padding: 0 20px 24px;
+    font-size: 15px;
   }
 
-  .home-install__command {
-    align-items: stretch;
-    flex-direction: column;
-    gap: 14px;
-    padding: 18px 20px;
+  .home-install__sentence > span {
+    align-self: center;
+  }
+
+  .install-select {
+    flex: 1 1 145px;
+  }
+
+  .home-install__code {
+    padding: 20px;
   }
 
   .home-install__command code {
@@ -566,8 +646,8 @@ body {
     overflow-wrap: anywhere;
   }
 
-  .home-install__command button {
-    align-self: flex-end;
+  .home-install__command-footer {
+    padding-left: 14px;
   }
 
   .home-routes {
