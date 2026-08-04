@@ -3,25 +3,21 @@ title: Codex
 description: Run Codex CLI and Codex App through Pentect.
 ---
 
-import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+::: code-group
 
-<Tabs>
-  <TabItem label="CLI">
-    ```text
-    pentect codex
-    ```
+```text [CLI]
+pentect codex
+```
 
-    Arguments after `codex` are forwarded to the Codex CLI.
-  </TabItem>
-  <TabItem label="App">
-    ```text
-    pentect codex app
-    ```
+```text [App]
+pentect codex app
+```
 
-    This launches the installed desktop app with Pentect routing for that app
-    process. It does not permanently change the app's global configuration.
-  </TabItem>
-</Tabs>
+:::
+
+Arguments after `codex` are forwarded to the Codex CLI. The app command
+launches the installed desktop app with Pentect routing for that process; it
+does not permanently change the app's global configuration.
 
 ## Protected flow
 
@@ -38,7 +34,7 @@ protocol is supported. You can also select an upstream for one launch:
 pentect codex --upstream http://127.0.0.1:8080/openai/v1
 ```
 
-<Aside type="caution">
-  Codex App coverage applies to its supported Codex mode. Pentect does not claim
-  protection for ChatGPT Chat, Work, Voice, or unknown future opaque routes.
-</Aside>
+::: warning
+Codex App coverage applies to its supported Codex mode. Pentect does not claim
+protection for ChatGPT Chat, Work, Voice, or unknown future opaque routes.
+:::

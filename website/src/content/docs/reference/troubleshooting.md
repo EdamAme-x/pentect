@@ -3,8 +3,6 @@ title: Troubleshooting
 description: Diagnose launch, compatibility, handle, and installation problems.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 ## Start with doctor
 
 ```text
@@ -53,7 +51,7 @@ pentect log --json
 
 Logs report actions and counts, not plaintext protected values.
 
-<Aside type="caution">
-  Do not paste real credentials into a public issue. Reproduce with a synthetic
-  value that has the same format.
-</Aside>
+::: warning
+Do not paste real credentials into a public issue. Reproduce with a synthetic
+value that has the same format.
+:::

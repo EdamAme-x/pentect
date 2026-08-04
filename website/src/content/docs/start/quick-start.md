@@ -3,9 +3,6 @@ title: Quick start
 description: Protect a real Codex or Claude session in a few commands.
 ---
 
-import { Steps, Aside } from '@astrojs/starlight/components';
-
-<Steps>
 1. Check that Pentect can find your client.
 
    ```text
@@ -31,7 +28,6 @@ import { Steps, Aside } from '@astrojs/starlight/components';
    ```text
    pentect log
    ```
-</Steps>
 
 ## Try masking without an agent
 
@@ -49,7 +45,7 @@ Get-Content .env -Raw | pentect mask
 The output contains reusable handles. Plaintext is not printed back to the
 terminal.
 
-<Aside type="tip">
-  Pentect does not create a permanent global proxy. `pentect codex` and
-  `pentect claude` protect only the client process launched by that command.
-</Aside>
+::: tip
+Pentect does not create a permanent global proxy. `pentect codex` and
+`pentect claude` protect only the client process launched by that command.
+:::

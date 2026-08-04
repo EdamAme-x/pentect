@@ -40,7 +40,12 @@ for (const sourcePath of sourceFiles) {
   const route = slug ? `/${slug.replace(/^\/+|\/+$/g, '')}/` : '/';
   const outputDirectory = path.join(distRoot, route.slice(1));
   const tree = processor.parse(body);
-  tree.children = [heading(title), ...rewriteNodes(tree.children)];
+  const description = frontmatterValue(attributes, 'description');
+  tree.children = [
+    heading(title),
+    ...(description ? [paragraph(description)] : []),
+    ...rewriteNodes(tree.children),
+  ];
   const markdown = processor.stringify(tree).trim();
 
   if (!markdown.startsWith('# ')) {
@@ -113,6 +118,13 @@ function heading(value, depth = 1) {
   return {
     type: 'heading',
     depth,
+    children: [{ type: 'text', value }],
+  };
+}
+
+function paragraph(value) {
+  return {
+    type: 'paragraph',
     children: [{ type: 'text', value }],
   };
 }

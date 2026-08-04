@@ -3,8 +3,6 @@ title: Configuration
 description: Pentect user and project configuration with secure defaults.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 Pentect reads user configuration from `~/.pentect/config.toml` and project
 configuration from `.pentect/config.toml`. Project values take precedence where
 allowed, but a repository cannot weaken user-level unknown-format protection.
@@ -77,7 +75,7 @@ required = true
 Use this when the project must not silently continue without a Pentect-launched
 agent session.
 
-<Aside type="note">
-  Handle environment bindings always use the `PENTECT_` prefix. The prefix is
-  intentionally not configurable.
-</Aside>
+::: info
+Handle environment bindings always use the `PENTECT_` prefix. The prefix is
+intentionally not configurable.
+:::
