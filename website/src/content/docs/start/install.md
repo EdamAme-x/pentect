@@ -54,14 +54,14 @@ Pentect from source and therefore takes longer than the binary installers.
 
 ## Verify the installation
 
-```text
+```sh
 pentect doctor
 ```
 
 `doctor` checks whether Pentect and supported clients are ready. If it reports
 a repairable problem, review the proposed change before using:
 
-```text
+```sh
 pentect doctor --fix
 ```
 
@@ -86,7 +86,7 @@ it through the same package manager.
 
 ## Update or uninstall
 
-```text
+```sh
 pentect update
 pentect update X.Y.Z
 pentect uninstall

@@ -6,7 +6,7 @@ description: Route supported OpenAI Responses and Anthropic Messages traffic thr
 Pentect can protect a client while forwarding requests to an existing local or
 remote gateway.
 
-```text
+```sh
 pentect codex --upstream http://127.0.0.1:8080/openai/v1
 pentect claude --upstream http://127.0.0.1:8080/anthropic
 ```

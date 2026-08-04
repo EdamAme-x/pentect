@@ -5,13 +5,13 @@ description: Diagnose launch, compatibility, handle, and installation problems.
 
 ## Start with doctor
 
-```text
+```sh
 pentect doctor
 ```
 
 For automation or an issue report:
 
-```text
+```sh
 pentect doctor --json
 ```
 
@@ -97,7 +97,7 @@ values before attaching a request sample.
 
 ## Follow protection events
 
-```text
+```sh
 pentect log
 pentect log --json
 ```

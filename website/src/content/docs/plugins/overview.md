@@ -12,7 +12,7 @@ Native executable plugins and postscripts are not supported.
 
 ## Install a plugin
 
-```text
+```sh
 pentect plugins add github:@owner/repository/path
 ```
 
@@ -21,7 +21,7 @@ Codex, Claude, and supported desktop-app launchers.
 
 ## Manage plugins
 
-```text
+```sh
 pentect plugins list
 pentect plugins inspect NAME
 pentect plugins config NAME key=value
