@@ -5,26 +5,26 @@ description: Start a Pentect plugin and test it locally.
 
 1. Create a plugin project.
 
-   ```text
+   ```sh
    pentect plugins new my-plugin
    ```
 
 2. Run it from the local directory.
 
-   ```text
+   ```sh
    pentect plugins dev ./my-plugin
    ```
 
 3. Test its declared behavior and permissions.
 
-   ```text
+   ```sh
    pentect plugins test my-plugin
    pentect plugins inspect my-plugin
    ```
 
 4. Publish the prepared plugin.
 
-   ```text
+   ```sh
    pentect plugins publish ./my-plugin
    ```
 
