@@ -18,13 +18,13 @@ plugins.
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.ps1 | iex
+irm https://pentect.dev/install | iex
 ```
 
 Linux and macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.sh | sh
+curl -fsSL https://pentect.dev/install.sh | sh
 ```
 
 The installers detect the platform, download a GitHub Release asset, and verify
@@ -58,7 +58,7 @@ Debian and Ubuntu users can configure the signed Pentect repository and install
 the package with one command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install-apt.sh | sudo sh
+curl -fsSL https://pentect.dev/install-apt.sh | sudo sh
 ```
 
 When installed by Homebrew, Nix, or apt, use that package manager to update or

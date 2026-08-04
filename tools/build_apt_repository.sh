@@ -54,7 +54,7 @@ gpg --batch --yes --local-user "$fingerprint" --armor --detach-sign --output "$d
 install -m 0644 "$public_key" "$output_dir/apt/pentect-archive-keyring.asc"
 cat > "$output_dir/apt/pentect.sources" <<'EOF'
 Types: deb
-URIs: https://edamame-x.github.io/pentect/apt
+URIs: https://pentect.dev/apt
 Suites: stable
 Components: main
 Signed-By: /etc/apt/keyrings/pentect-archive-keyring.asc
