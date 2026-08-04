@@ -17,6 +17,25 @@ Protocol tests cover text, streaming responses, completed tool calls,
 structured content, file references, malformed content, and custom upstream
 path preservation.
 
+## API format adapters
+
+Pentect can connect through a protocol adapter when the target model provider
+does not expose OpenAI Responses or Anthropic Messages directly. The adapter
+converts the API format; Pentect continues to inspect the supported client-side
+contract.
+
+```text
+pentect codex --upstream http://127.0.0.1:8080/openai/v1
+pentect claude --upstream http://127.0.0.1:8080/anthropic
+```
+
+[Bifrost](https://docs.getbifrost.ai/cli-agents/overview) provides OpenAI and
+Anthropic protocol adapters, and Pentect tests its `/openai/v1` and `/anthropic`
+path composition. LiteLLM and other gateways can also be used when they expose
+the same contracts, but Pentect does not certify each gateway release.
+
+See [Custom upstreams](/clients/upstreams/) for setup and recovery steps.
+
 ## Desktop qualification
 
 Ephemeral release runners do not install and drive the signed vendor desktop
