@@ -5,11 +5,11 @@ description: Run Claude Code and supported Claude Desktop routes through Pentect
 
 ::: code-group
 
-```text [Claude Code]
+```sh [Claude Code]
 pentect claude
 ```
 
-```text [Claude Desktop]
+```sh [Claude Desktop]
 pentect claude app
 ```
 
@@ -25,7 +25,7 @@ Supported Chat, attachment, and Claude Code traffic is inspected before it
 reaches the Anthropic-compatible upstream. Completed local tool calls can use
 opaque handles without exposing their plaintext to the model.
 
-```text
+```sh
 pentect claude --upstream http://127.0.0.1:8080/anthropic
 ```
 

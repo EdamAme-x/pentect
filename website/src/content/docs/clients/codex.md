@@ -5,11 +5,11 @@ description: Run Codex CLI and Codex App through Pentect.
 
 ::: code-group
 
-```text [CLI]
+```sh [CLI]
 pentect codex
 ```
 
-```text [App]
+```sh [App]
 pentect codex app
 ```
 
@@ -30,7 +30,7 @@ tool-call arguments while preserving streaming responses.
 Existing Codex provider configuration is retained as the upstream when its wire
 protocol is supported. You can also select an upstream for one launch:
 
-```text
+```sh
 pentect codex --upstream http://127.0.0.1:8080/openai/v1
 ```
 

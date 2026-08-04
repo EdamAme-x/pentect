@@ -18,7 +18,7 @@ Client launchers accept `--upstream URL` for a compatible upstream and
 
 Codex and Claude arguments are forwarded directly:
 
-```text
+```sh
 pentect codex exec --full-auto
 pentect claude --model sonnet
 ```
@@ -51,7 +51,7 @@ Prefer `exec` when a command can consume a handle directly.
 
 ## Plugins
 
-```text
+```sh
 pentect plugins new NAME
 pentect plugins dev PATH
 pentect plugins publish PATH

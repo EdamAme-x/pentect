@@ -24,7 +24,7 @@ does not expose OpenAI Responses or Anthropic Messages directly. The adapter
 converts the API format; Pentect continues to inspect the supported client-side
 contract.
 
-```text
+```sh
 pentect codex --upstream http://127.0.0.1:8080/openai/v1
 pentect claude --upstream http://127.0.0.1:8080/anthropic
 ```

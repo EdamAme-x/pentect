@@ -11,14 +11,14 @@ then resolves those handles only at trusted local tool boundaries.
 
 Conventional redaction protects a value by removing its meaning:
 
-```text
+```dotenv
 DATABASE_URL=[REDACTED]
 ```
 
 The model can no longer use that value in a command. Pentect preserves a typed,
 stable reference instead:
 
-```text
+```dotenv
 DATABASE_URL=<<DATABASE_URL_4ce8a3b0a6f64e12>>
 ```
 

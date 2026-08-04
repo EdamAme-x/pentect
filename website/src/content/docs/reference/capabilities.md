@@ -72,7 +72,7 @@ cat terraform.tfvars | pentect mask
 Pentect can sit in front of an existing compatible gateway for a single
 launch:
 
-```text
+```sh
 pentect codex --upstream http://127.0.0.1:8080/openai/v1
 pentect claude --upstream http://127.0.0.1:8080/anthropic
 ```
