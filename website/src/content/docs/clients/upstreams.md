@@ -28,4 +28,7 @@ does not certify every gateway provider or release.
 
 Pentect rejects an unsupported wire protocol before launching the client. A
 provider being OpenAI-like is not sufficient if its request or streaming format
-does not match a supported contract.
+does not match a supported contract. First retry without `--upstream` to confirm
+the client works with its default provider. If the custom gateway must be used,
+follow the [unknown-format recovery steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
+or report its protocol for support.

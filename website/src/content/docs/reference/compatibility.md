@@ -34,4 +34,5 @@ without printing the value.
 - Every provider and release behind a third-party gateway
 
 Unknown or unsupported content blocks by default rather than silently claiming
-protection.
+protection. If you encounter that error, first retry the default upstream, then
+follow the [unknown-format recovery steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked).

@@ -32,5 +32,7 @@ pentect claude --upstream http://127.0.0.1:8080/anthropic
 ::: warning
 Pentect does not claim coverage for remote Cowork execution, Voice,
 experimental binary transports, or unknown future opaque routes. Unsupported
-formats follow the configured compatibility policy.
+formats follow the configured compatibility policy. See the
+[unknown-format recovery steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
+for protected alternatives and the explicit pass-through setting.
 :::

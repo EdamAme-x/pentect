@@ -36,5 +36,7 @@ pentect codex --upstream http://127.0.0.1:8080/openai/v1
 
 ::: warning
 Codex App coverage applies to its supported Codex mode. Pentect does not claim
-protection for ChatGPT Chat, Work, Voice, or unknown future opaque routes.
+protection for ChatGPT Chat, Work, Voice, or unknown future opaque routes. If a
+request is blocked, follow the [unknown-format recovery steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
+instead of disabling Pentect for the whole app.
 :::
