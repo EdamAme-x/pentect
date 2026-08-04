@@ -1949,7 +1949,7 @@ fn codex_effective_routing(opts: &AgentToolOpts) -> Result<CodexHttpRouting, Str
         })
         .ok_or_else(|| {
             format!(
-                "could not determine upstream for Codex provider '{provider}'; pass `pentect codex --upstream URL -- ...`"
+                "could not determine upstream for Codex provider '{provider}'; pass `pentect codex --upstream URL`"
             )
         })?;
     if provider != "openai" {
@@ -2491,6 +2491,33 @@ mod tests {
             claude.anthropic_upstream.as_deref(),
             Some("https://gateway.example/anthropic")
         );
+    }
+
+    #[test]
+    fn agent_options_forward_client_arguments_without_separator() {
+        let codex = AgentToolOpts::parse(
+            AgentTool::Codex,
+            &[
+                "pentect".to_string(),
+                "codex".to_string(),
+                "exec".to_string(),
+                "--full-auto".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(codex.tool_args, ["exec", "--full-auto"]);
+
+        let claude = AgentToolOpts::parse(
+            AgentTool::Claude,
+            &[
+                "pentect".to_string(),
+                "claude".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(claude.tool_args, ["--model", "sonnet"]);
     }
 
     #[test]
