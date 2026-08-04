@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-repository_url="https://edamame-x.github.io/pentect/apt"
-key_url="https://raw.githubusercontent.com/EdamAme-x/pentect/main/packaging/apt/pentect-archive-keyring.asc"
+repository_url="https://pentect.dev/apt"
+key_url="https://pentect.dev/apt/pentect-archive-keyring.asc"
 key_sha256="d6d59be8b1d87fa731577f52d98a604f2687bf97f6c5e1981dd805e78a7ff7ac"
 
 if [ "$(id -u)" -ne 0 ]; then

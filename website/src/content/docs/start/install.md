@@ -8,7 +8,7 @@ description: Install Pentect on Windows, macOS, or Linux.
 Run in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.ps1 | iex
+irm https://pentect.dev/install | iex
 ```
 
 ## macOS and Linux
@@ -16,7 +16,7 @@ irm https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.ps1 |
 ::: code-group
 
 ```sh [Shell]
-curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.sh | sh
+curl -fsSL https://pentect.dev/install.sh | sh
 ```
 
 ```sh [Homebrew]
@@ -40,7 +40,7 @@ cargo install --git https://github.com/EdamAme-x/pentect --locked pentect-cli
 ```
 
 ```sh [APT · Debian / Ubuntu]
-curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install-apt.sh | sudo sh
+curl -fsSL https://pentect.dev/install-apt.sh | sudo sh
 ```
 
 :::
@@ -70,11 +70,11 @@ pentect doctor --fix
 ::: code-group
 
 ```powershell [Windows]
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.ps1))) -Version X.Y.Z
+& ([scriptblock]::Create((irm https://pentect.dev/install))) -Version X.Y.Z
 ```
 
 ```sh [macOS / Linux]
-curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.sh | sh -s -- --version X.Y.Z
+curl -fsSL https://pentect.dev/install.sh | sh -s -- --version X.Y.Z
 ```
 
 :::

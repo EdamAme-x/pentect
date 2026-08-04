@@ -35,7 +35,7 @@ const installers: Record<OperatingSystem, Installer[]> = {
     {
       id: 'powershell',
       label: 'PowerShell',
-      command: 'irm https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.ps1 | iex',
+      command: 'irm https://pentect.dev/install | iex',
       icon: '>_',
       tone: 'powershell',
     },
@@ -53,7 +53,7 @@ const installers: Record<OperatingSystem, Installer[]> = {
     {
       id: 'shell',
       label: 'Shell',
-      command: 'curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.sh | sh',
+      command: 'curl -fsSL https://pentect.dev/install.sh | sh',
       icon: '$_',
       tone: 'shell',
     },
@@ -78,14 +78,14 @@ const installers: Record<OperatingSystem, Installer[]> = {
     {
       id: 'shell',
       label: 'Shell',
-      command: 'curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.sh | sh',
+      command: 'curl -fsSL https://pentect.dev/install.sh | sh',
       icon: '$_',
       tone: 'shell',
     },
     {
       id: 'apt',
       label: 'APT',
-      command: 'curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install-apt.sh | sudo sh',
+      command: 'curl -fsSL https://pentect.dev/install-apt.sh | sudo sh',
       icon: 'A',
       tone: 'apt',
     },
