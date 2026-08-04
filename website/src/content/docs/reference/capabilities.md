@@ -11,7 +11,7 @@ description: Every user-facing Pentect capability, grouped by the job it perform
 | Protect Claude Code | `pentect claude` |
 | Launch a protected Codex App session | `pentect codex app` |
 | Launch a protected Claude Desktop session | `pentect claude app` |
-| Forward normal client arguments | Place them after `--` |
+| Forward normal client arguments | Pass them normally, for example `pentect codex exec --full-auto` |
 | Select a compatible upstream for one launch | `--upstream URL` |
 | Load an additional plugin for one launch | `--plugins SOURCE` |
 | Check an app setup without launching it | `pentect codex app --check` or `pentect claude app --check` |

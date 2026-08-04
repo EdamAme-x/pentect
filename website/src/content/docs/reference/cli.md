@@ -16,6 +16,13 @@ Client launchers accept `--upstream URL` for a compatible upstream and
 `--plugins SOURCE` for a one-off plugin addition. App launchers also accept
 `--app PATH` and `--check`.
 
+Codex and Claude arguments are forwarded directly:
+
+```text
+pentect codex exec --full-auto
+pentect claude --model sonnet
+```
+
 ## Protect local input and execution
 
 | Command | Purpose |
