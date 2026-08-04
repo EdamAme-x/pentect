@@ -93,6 +93,9 @@ function rewriteNodes(nodes) {
     if (node.type === 'mdxTextExpression') return [];
 
     if (node.type === 'mdxJsxFlowElement' || node.type === 'mdxJsxTextElement') {
+      if (node.name === 'a') {
+        return [rewriteAnchor(node)];
+      }
       const children = rewriteNodes(node.children ?? []);
       const label = componentLabel(node);
       return label ? [heading(label, 3), ...children] : children;
@@ -103,6 +106,43 @@ function rewriteNodes(nodes) {
     }
     return [node];
   });
+}
+
+function rewriteAnchor(node) {
+  const href = node.attributes?.find(
+    (item) => item.type === 'mdxJsxAttribute' && item.name === 'href',
+  );
+  const url = typeof href?.value === 'string' ? href.value : '#';
+  const strong = findElement(node, 'strong');
+  const span = findElement(node, 'span');
+  const label = plainText(strong ?? node).trim() || url;
+  const description = plainText(span).trim();
+
+  return {
+    type: 'paragraph',
+    children: [
+      { type: 'link', url, children: [{ type: 'text', value: label }] },
+      ...(description ? [{ type: 'text', value: ` — ${description}` }] : []),
+    ],
+  };
+}
+
+function findElement(node, name) {
+  if (!node) return undefined;
+  if ((node.type === 'mdxJsxFlowElement' || node.type === 'mdxJsxTextElement') && node.name === name) {
+    return node;
+  }
+  for (const child of node.children ?? []) {
+    const found = findElement(child, name);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function plainText(node) {
+  if (!node) return '';
+  if (node.type === 'text' || node.type === 'inlineCode') return node.value ?? '';
+  return (node.children ?? []).map(plainText).join(' ');
 }
 
 function componentLabel(node) {

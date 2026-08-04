@@ -5,12 +5,13 @@ const site = process.env.PENTECT_DOCS_SITE ?? 'https://pentect.dev';
 const base = process.env.PENTECT_DOCS_BASE ?? '/';
 
 const sidebar = [
+  { text: 'Home', link: '/' },
+  { text: 'Quick start', link: '/start/quick-start/' },
   {
-    text: 'Start here',
+    text: 'Get started',
     items: [
       { text: 'What is Pentect?', link: '/start/what-is-pentect/' },
       { text: 'Install', link: '/start/install/' },
-      { text: 'Quick start', link: '/start/quick-start/' },
       { text: 'How it works', link: '/start/how-it-works/' },
     ],
   },
@@ -40,6 +41,7 @@ const sidebar = [
   {
     text: 'Reference',
     items: [
+      { text: 'Capabilities', link: '/reference/capabilities/' },
       { text: 'CLI', link: '/reference/cli/' },
       { text: 'Configuration', link: '/reference/configuration/' },
       { text: 'Compatibility', link: '/reference/compatibility/' },
@@ -100,11 +102,7 @@ export default defineConfig({
       dark: '/pentect-logo-dark.png',
       alt: 'Pentect',
     },
-    nav: [
-      { text: 'Guide', link: '/start/what-is-pentect/' },
-      { text: 'Reference', link: '/reference/cli/' },
-      { text: 'Plugins', link: '/plugins/overview/' },
-    ],
+    nav: [],
     sidebar,
     outline: { level: [2, 3], label: 'On this page' },
     search: { provider: 'local' },
@@ -117,7 +115,7 @@ export default defineConfig({
     ],
     footer: {
       message: 'Pentect is open source.',
-      copyright: 'Released under the Apache-2.0 license.',
+      copyright: 'Released under the MIT license.',
     },
     lastUpdated: { text: 'Updated' },
     docFooter: { prev: 'Previous', next: 'Next' },
