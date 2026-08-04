@@ -505,6 +505,10 @@ body {
   letter-spacing: -0.055em;
 }
 
+.doc-heading__accent {
+  color: var(--vp-c-brand-1);
+}
+
 .doc-heading p {
   max-width: 660px;
   margin: 14px 0 0;
