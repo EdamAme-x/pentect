@@ -27,6 +27,18 @@ brew install EdamAme-x/pentect/pentect
 nix profile install github:EdamAme-x/pentect
 ```
 
+```sh [Nix · temporary shell]
+nix shell github:EdamAme-x/pentect
+```
+
+```sh [npm]
+npm install --global github:EdamAme-x/pentect
+```
+
+```sh [Cargo · build from source]
+cargo install --git https://github.com/EdamAme-x/pentect --locked pentect-cli
+```
+
 ```sh [APT · Debian / Ubuntu]
 curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install-apt.sh | sudo sh
 ```
@@ -35,6 +47,10 @@ curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/instal
 
 The direct installers detect the current platform, download a GitHub Release
 asset, and verify its SHA-256 checksum.
+
+The npm package installs the same checksummed release binary. `nix shell` opens
+a temporary environment without adding Pentect to your profile. Cargo builds
+Pentect from source and therefore takes longer than the binary installers.
 
 ## Verify the installation
 

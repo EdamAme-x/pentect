@@ -4,6 +4,13 @@ import { computed, onMounted, ref } from 'vue';
 type OperatingSystem = 'windows' | 'macos' | 'linux';
 type Installer = { id: string; label: string; command: string };
 
+const npmInstaller = { id: 'npm', label: 'npm', command: 'npm install --global github:EdamAme-x/pentect' };
+const cargoInstaller = {
+  id: 'cargo',
+  label: 'Cargo',
+  command: 'cargo install --git https://github.com/EdamAme-x/pentect --locked pentect-cli',
+};
+
 const installers: Record<OperatingSystem, Installer[]> = {
   windows: [
     {
@@ -11,6 +18,8 @@ const installers: Record<OperatingSystem, Installer[]> = {
       label: 'PowerShell',
       command: 'irm https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.ps1 | iex',
     },
+    npmInstaller,
+    cargoInstaller,
   ],
   macos: [
     { id: 'homebrew', label: 'Homebrew', command: 'brew install EdamAme-x/pentect/pentect' },
@@ -19,7 +28,10 @@ const installers: Record<OperatingSystem, Installer[]> = {
       label: 'Shell',
       command: 'curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.sh | sh',
     },
-    { id: 'nix', label: 'Nix', command: 'nix profile install github:EdamAme-x/pentect' },
+    npmInstaller,
+    { id: 'nix', label: 'Nix profile', command: 'nix profile install github:EdamAme-x/pentect' },
+    { id: 'nix-shell', label: 'Nix shell', command: 'nix shell github:EdamAme-x/pentect' },
+    cargoInstaller,
   ],
   linux: [
     {
@@ -32,7 +44,10 @@ const installers: Record<OperatingSystem, Installer[]> = {
       label: 'APT',
       command: 'curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install-apt.sh | sudo sh',
     },
-    { id: 'nix', label: 'Nix', command: 'nix profile install github:EdamAme-x/pentect' },
+    npmInstaller,
+    { id: 'nix', label: 'Nix profile', command: 'nix profile install github:EdamAme-x/pentect' },
+    { id: 'nix-shell', label: 'Nix shell', command: 'nix shell github:EdamAme-x/pentect' },
+    cargoInstaller,
   ],
 };
 
