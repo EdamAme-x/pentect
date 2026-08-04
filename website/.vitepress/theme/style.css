@@ -317,31 +317,17 @@ body {
 }
 
 .install-select__icon {
-  position: static;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  border-radius: 0;
+  display: block;
+  width: 18px;
+  height: 18px;
   color: var(--vp-c-text-3);
-  background: transparent;
-  font-family: var(--vp-font-family-mono);
-  font-size: 10px;
-  font-style: normal;
-  font-weight: 800;
-  line-height: 1;
   flex: none;
+  transition: color 140ms ease;
 }
 
 .install-choice button:hover .install-select__icon,
 .install-choice button.is-active .install-select__icon { color: var(--vp-c-brand-1); }
-.install-select__icon[data-tone='windows'] { font-size: 18px; }
-.install-select__icon[data-tone='macos'] { font-size: 17px; }
-.install-select__icon[data-tone='linux'] { font-size: 18px; }
-.install-select__icon[data-tone='npm'] { font-size: 7px; }
-.install-select__icon[data-tone='cargo'] { font-size: 15px; }
-.install-select__icon[data-tone='nix'] { font-size: 14px; }
+.install-select__icon[data-tone='npm'] { width: 20px; }
 
 .home-install__command {
   position: relative;
@@ -660,24 +646,22 @@ body {
   }
 
   .install-choice {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    padding-bottom: 2px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    overflow: visible;
+    padding-bottom: 0;
   }
 
   .install-choice__label {
-    position: sticky;
-    left: 0;
-    z-index: 1;
-    width: 54px;
-    align-self: stretch;
-    display: inline-flex;
-    align-items: center;
-    background: var(--vp-c-bg);
+    position: static;
+    width: 100%;
+    padding: 0 8px 2px;
   }
 
   .install-choice button {
-    flex: none;
+    min-height: 38px;
+    padding-inline: 8px;
   }
 
   .home-install__command code {
