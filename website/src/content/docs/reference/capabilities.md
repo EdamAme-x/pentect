@@ -99,6 +99,9 @@ Pentect reads user configuration from `~/.pentect/config.toml` and project
 configuration from `.pentect/config.toml`. A project cannot weaken the user's
 unknown-format policy.
 
+For exact recovery and rollback steps, see
+[Unknown provider format troubleshooting](/reference/troubleshooting/#an-unknown-provider-format-was-blocked).
+
 ## Plugins
 
 | Capability | Command or format |

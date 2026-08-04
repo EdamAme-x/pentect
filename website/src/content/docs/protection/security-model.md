@@ -41,6 +41,10 @@ unknown_formats = "ignore"
 Project configuration cannot weaken this setting. This prevents a repository
 from silently choosing a less protective policy.
 
+See [Unknown provider format troubleshooting](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
+for protected alternatives, copyable setup commands, restart instructions, and
+how to restore the default.
+
 ::: danger
 Compatibility mode can allow content Pentect does not understand to reach an
 upstream. Do not enable it merely to suppress an unexplained error.

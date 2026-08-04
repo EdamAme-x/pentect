@@ -11,6 +11,8 @@ OCR and visual redaction because pixels cannot carry a textual handle in place.
 
 Supported UTF-8 uploads are inspected and rewritten before forwarding. Binary
 uploads that Pentect cannot inspect or safely rewrite are blocked by default.
+Convert an unsupported upload to UTF-8 text, a supported image, or PDF when
+possible. There is no blanket binary-upload bypass.
 
 ## File IDs and remote URLs
 
@@ -32,4 +34,5 @@ unscanned = "block" # or "allow"
 ```
 
 Allowing unscanned images trades protection for compatibility. Use it only
-when another trusted layer already inspects the content.
+when another trusted layer already inspects the content. Set `unscanned` back
+to `"block"` and relaunch the client to restore the default.

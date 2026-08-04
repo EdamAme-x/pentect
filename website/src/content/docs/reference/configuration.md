@@ -31,7 +31,13 @@ unknown_formats = "error" # default
 ```
 
 Set `ignore` only in the user configuration to continue past provider content
-Pentect does not understand.
+Pentect does not understand. Restart the Pentect-launched client after changing
+the value. `ignore` passes the affected unknown request upstream without
+inspection; change it back to `error` to restore the default.
+
+Project configuration may enforce `error`, but it cannot set `ignore`. See
+[Unknown provider format troubleshooting](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
+for copyable Windows, macOS, and Linux steps.
 
 ## Images
 
