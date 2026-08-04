@@ -3,8 +3,6 @@ title: Security model
 description: Trust boundaries, defaults, guarantees, and explicit limitations.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 Pentect protects supported content at the boundary between a local AI client
 and a model provider. It assumes the local user and explicitly authorized local
 tools are trusted to use the credentials they already possess.
@@ -43,10 +41,10 @@ unknown_formats = "ignore"
 Project configuration cannot weaken this setting. This prevents a repository
 from silently choosing a less protective policy.
 
-<Aside type="danger">
-  Compatibility mode can allow content Pentect does not understand to reach an
-  upstream. Do not enable it merely to suppress an unexplained error.
-</Aside>
+::: danger
+Compatibility mode can allow content Pentect does not understand to reach an
+upstream. Do not enable it merely to suppress an unexplained error.
+:::
 
 ## Reporting a vulnerability
 

@@ -3,9 +3,6 @@ title: Build a plugin
 description: Start a Pentect plugin and test it locally.
 ---
 
-import { Steps, Aside } from '@astrojs/starlight/components';
-
-<Steps>
 1. Create a plugin project.
 
    ```text
@@ -30,7 +27,6 @@ import { Steps, Aside } from '@astrojs/starlight/components';
    ```text
    pentect plugins publish ./my-plugin
    ```
-</Steps>
 
 ## Choose the smallest plugin form
 
@@ -41,8 +37,8 @@ control over whether the next middleware runs.
 The Rust SDK is published as
 [`pentect-plugin`](https://crates.io/crates/pentect-plugin).
 
-<Aside type="note">
-  Plugin permissions are part of the user-facing security contract. Declare
-  only the access the plugin needs; installation approval is not a substitute
-  for narrow permissions.
-</Aside>
+::: info
+Plugin permissions are part of the user-facing security contract. Declare
+only the access the plugin needs; installation approval is not a substitute
+for narrow permissions.
+:::

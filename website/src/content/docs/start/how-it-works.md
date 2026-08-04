@@ -3,12 +3,9 @@ title: How it works
 description: Follow a sensitive value from local input to a trusted tool call.
 ---
 
-import { Steps, Aside } from '@astrojs/starlight/components';
-
 Pentect sits between a supported AI client and its model provider. It transforms
 supported request and response structures without replacing the client UI.
 
-<Steps>
 1. **Detect locally**
 
    Pentect inspects prompts, supported tool results, configuration formats,
@@ -38,7 +35,6 @@ supported request and response structures without replacing the client UI.
 
    Tool output is inspected before it returns to the provider, preventing a
    locally restored value from simply leaking back in stdout or a file read.
-</Steps>
 
 ## Why handles instead of `[REDACTED]`?
 
@@ -46,8 +42,8 @@ Plain redaction removes both the value and its identity. A Pentect handle keeps
 enough context for an agent to finish work while preserving the security
 boundary.
 
-<Aside type="caution">
-  A handle is a reference, not an authorization decision. If a local tool is
-  allowed to use the credential, it can act with that credential's privileges.
-  Use scoped, revocable credentials and narrow tool permissions.
-</Aside>
+::: warning
+A handle is a reference, not an authorization decision. If a local tool is
+allowed to use the credential, it can act with that credential's privileges.
+Use scoped, revocable credentials and narrow tool permissions.
+:::

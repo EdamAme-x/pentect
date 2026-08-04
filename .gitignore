@@ -9,6 +9,7 @@ __pycache__/
 .mypy_cache/
 node_modules/
 /website/.astro/
+/website/.vitepress/cache/
 /website/dist/
 /website/public/pentect-logo-white.png
 /website/public/pentect-logo-color.png

@@ -1,0 +1,340 @@
+:root {
+  --vp-c-brand-1: #dd482d;
+  --vp-c-brand-2: #c83c24;
+  --vp-c-brand-3: #a92f1c;
+  --vp-c-brand-soft: rgba(221, 72, 45, 0.12);
+  --vp-c-bg: #f8f6f0;
+  --vp-c-bg-alt: #f1efe8;
+  --vp-c-bg-elv: #fdfcf8;
+  --vp-c-bg-soft: #f0eee7;
+  --vp-c-text-1: #242620;
+  --vp-c-text-2: #62645d;
+  --vp-c-text-3: #8a8c84;
+  --vp-c-divider: #dcddd5;
+  --vp-c-gutter: #e7e6df;
+  --vp-font-family-base: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --vp-font-family-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --vp-nav-height: 64px;
+}
+
+.dark {
+  --vp-c-bg: #181b17;
+  --vp-c-bg-alt: #20231e;
+  --vp-c-bg-elv: #242721;
+  --vp-c-bg-soft: #252821;
+  --vp-c-text-1: #f3f1ea;
+  --vp-c-text-2: #b7b9b0;
+  --vp-c-text-3: #85897f;
+  --vp-c-divider: #353931;
+  --vp-c-gutter: #282c25;
+}
+
+body {
+  letter-spacing: -0.01em;
+}
+
+.VPNavBar {
+  background: color-mix(in srgb, var(--vp-c-bg) 88%, transparent) !important;
+  backdrop-filter: blur(14px);
+}
+
+.VPNavBarTitle .logo {
+  width: 28px;
+  height: 28px;
+}
+
+.VPNavBarTitle .title {
+  font-weight: 720;
+  letter-spacing: -0.035em;
+}
+
+.VPHomeHero {
+  padding-top: clamp(72px, 10vw, 128px) !important;
+  padding-bottom: clamp(56px, 8vw, 96px) !important;
+}
+
+.VPHomeHero .container {
+  max-width: 1152px;
+}
+
+.VPHomeHero .main {
+  max-width: 820px;
+}
+
+.VPHomeHero .name {
+  color: var(--vp-c-brand-1);
+  font-size: 18px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  -webkit-text-fill-color: currentColor;
+}
+
+.VPHomeHero .text {
+  max-width: 900px;
+  padding-top: 14px;
+  font-size: clamp(48px, 8vw, 88px);
+  line-height: 0.98;
+  letter-spacing: -0.065em;
+}
+
+.VPHomeHero .tagline {
+  max-width: 680px;
+  padding-top: 24px;
+  font-size: clamp(18px, 2.1vw, 22px);
+  line-height: 1.55;
+}
+
+.VPHomeHero .actions {
+  padding-top: 32px;
+}
+
+.VPButton {
+  border-radius: 8px !important;
+  box-shadow: none !important;
+}
+
+.VPHome .vp-doc.container {
+  max-width: 1152px;
+  padding: 0 24px 96px;
+}
+
+.home-install {
+  overflow: hidden;
+  margin: 0 auto;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 18px;
+  background: var(--vp-c-bg-elv);
+}
+
+.home-install__heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 30px 32px 24px;
+}
+
+.home-install__heading p,
+.home-install__heading h2 {
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+.home-install__heading p {
+  color: var(--vp-c-brand-1);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.home-install__heading h2 {
+  margin-top: 5px;
+  font-size: clamp(24px, 3vw, 34px);
+  line-height: 1.2;
+  letter-spacing: -0.04em;
+}
+
+.home-install__heading a {
+  flex: none;
+  color: var(--vp-c-text-2);
+  font-size: 14px;
+  font-weight: 550;
+}
+
+.home-install__controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  padding: 0 32px 28px;
+}
+
+.home-install__control > span {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--vp-c-text-3);
+  font-size: 12px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.home-install__control > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.home-install__control button,
+.home-install__command button {
+  border: 0;
+  border-radius: 7px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.home-install__control button {
+  padding: 7px 11px;
+  color: var(--vp-c-text-2);
+  background: transparent;
+  font-size: 13px;
+}
+
+.home-install__control button:hover {
+  color: var(--vp-c-text-1);
+  background: var(--vp-c-bg-soft);
+}
+
+.home-install__control button[aria-pressed='true'] {
+  color: var(--vp-c-text-1);
+  background: var(--vp-c-bg-soft);
+  box-shadow: inset 0 0 0 1px var(--vp-c-divider);
+}
+
+.home-install__command {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  min-width: 0;
+  padding: 20px 24px;
+  background: #20231e;
+}
+
+.vp-doc .home-install__command code {
+  overflow-x: auto;
+  padding: 0;
+  color: #f4f2eb;
+  background: transparent;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.home-install__command button {
+  flex: none;
+  padding: 7px 12px;
+  color: #d8dbd2;
+  background: #353930;
+  font-size: 12px;
+}
+
+.home-install__status {
+  margin: 0;
+  padding: 8px 24px;
+  color: var(--vp-c-text-2);
+  font-size: 12px;
+  text-align: right;
+}
+
+.home-routes {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 64px;
+  border-block: 1px solid var(--vp-c-divider);
+}
+
+.home-routes a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 16px;
+  color: var(--vp-c-text-2);
+  font-size: 14px;
+  font-weight: 550;
+}
+
+.home-routes a + a {
+  border-left: 1px solid var(--vp-c-divider);
+}
+
+.home-routes a:hover {
+  color: var(--vp-c-brand-1);
+}
+
+.doc-heading {
+  margin-bottom: 40px;
+  padding-bottom: 28px;
+  border-bottom: 1px solid var(--vp-c-divider);
+}
+
+.doc-heading h1 {
+  margin: 0;
+  color: var(--vp-c-text-1);
+  font-weight: 700;
+  font-size: clamp(38px, 5vw, 52px);
+  line-height: 1.06;
+  letter-spacing: -0.055em;
+}
+
+.doc-heading p {
+  max-width: 660px;
+  margin: 14px 0 0;
+  color: var(--vp-c-text-2);
+  font-size: 18px;
+  line-height: 1.55;
+}
+
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3 {
+  letter-spacing: -0.035em;
+}
+
+.vp-doc table {
+  display: table;
+  width: 100%;
+}
+
+.vp-doc div[class*='language-'] {
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 10px;
+}
+
+@media (max-width: 640px) {
+  .VPHomeHero {
+    padding-top: 64px !important;
+    padding-bottom: 48px !important;
+  }
+
+  .VPHomeHero .text {
+    font-size: clamp(43px, 14vw, 62px);
+  }
+
+  .home-install__heading {
+    align-items: start;
+    flex-direction: column;
+    padding: 24px 20px 20px;
+  }
+
+  .home-install__controls {
+    grid-template-columns: 1fr;
+    gap: 18px;
+    padding: 0 20px 22px;
+  }
+
+  .home-install__command {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 14px;
+    padding: 18px 20px;
+  }
+
+  .home-install__command code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .home-install__command button {
+    align-self: flex-end;
+  }
+
+  .home-routes {
+    grid-template-columns: 1fr;
+    margin-top: 42px;
+  }
+
+  .home-routes a + a {
+    border-top: 1px solid var(--vp-c-divider);
+    border-left: 0;
+  }
+}
