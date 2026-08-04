@@ -5,13 +5,13 @@ description: Protect a real Codex or Claude session in a few commands.
 
 1. Check that Pentect can find your client.
 
-   ```text
+   ```sh
    pentect doctor
    ```
 
 2. Launch the client through Pentect.
 
-   ```text
+   ```sh
    pentect codex
    # or
    pentect claude
@@ -25,9 +25,45 @@ description: Protect a real Codex or Claude session in a few commands.
 
 4. Watch local protection events when needed.
 
-   ```text
+   ```sh
    pentect log
    ```
+
+## Launch through Pentect by default
+
+Add these functions to your shell profile, then restart the terminal. Existing
+Codex and Claude arguments continue to work normally.
+
+::: code-group
+
+```powershell [PowerShell · $PROFILE]
+function codex { & pentect codex @args }
+function claude { & pentect claude @args }
+```
+
+```sh [Bash · ~/.bashrc or Zsh · ~/.zshrc]
+codex() { command pentect codex "$@"; }
+claude() { command pentect claude "$@"; }
+```
+
+```fish [Fish · ~/.config/fish/config.fish]
+function codex
+    command pentect codex $argv
+end
+
+function claude
+    command pentect claude $argv
+end
+```
+
+:::
+
+After that, launch either client as usual:
+
+```sh
+codex exec --full-auto
+claude --model sonnet
+```
 
 ## Try masking without an agent
 
@@ -46,6 +82,6 @@ The output contains reusable handles. Plaintext is not printed back to the
 terminal.
 
 ::: tip
-Pentect does not create a permanent global proxy. `pentect codex` and
-`pentect claude` protect only the client process launched by that command.
+These functions affect only that shell. Pentect protects each client process
+launched through them; it does not create a system-wide proxy.
 :::

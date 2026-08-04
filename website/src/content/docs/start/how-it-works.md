@@ -13,7 +13,7 @@ supported request and response structures without replacing the client UI.
 
 2. **Replace with an opaque handle**
 
-   ```text
+   ```dotenv
    KAGGLE_API_TOKEN=KGAT_example
    KAGGLE_API_TOKEN=<<KAGGLE_API_TOKEN_85268c441f88c284>>
    ```
