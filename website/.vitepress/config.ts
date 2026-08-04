@@ -96,7 +96,8 @@ export default defineConfig({
   sitemap: { hostname: site },
   themeConfig: {
     logo: {
-      src: '/pentect-logo-transparent.png',
+      light: '/pentect-logo-transparent.png',
+      dark: '/pentect-logo-dark.png',
       alt: 'Pentect',
     },
     nav: [
