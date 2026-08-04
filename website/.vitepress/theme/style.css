@@ -133,6 +133,30 @@ body {
   text-transform: uppercase;
 }
 
+.sidebar-link-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.sidebar-link-label svg {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  color: var(--vp-c-text-3);
+  transition: color 140ms ease;
+}
+
+.VPSidebarItem.is-link > .item > .link:hover .sidebar-link-label svg,
+.VPSidebarItem.is-active > .item > .link .sidebar-link-label svg {
+  color: var(--vp-c-brand-1);
+}
+
+.VPSidebarItem.is-active > .item > .link .sidebar-link-label {
+  color: var(--vp-c-brand-1);
+}
+
 .VPNavBarTitle .logo {
   width: 28px;
   height: 28px;
