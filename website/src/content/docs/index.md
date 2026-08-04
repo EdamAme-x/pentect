@@ -1,11 +1,9 @@
 ---
 title: Docs_
-description: Keep sensitive values local while Codex and Claude use the context they need.
+description: Keep secrets out of AI requests.
 pageClass: docs-hub
 aside: false
 ---
-
-Pentect replaces sensitive values with usable handles before requests leave your machine. Known handles are restored only at trusted local boundaries.
 
 <HomeInstall />
 
