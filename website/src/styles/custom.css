@@ -38,14 +38,14 @@ body {
 }
 
 .hero {
-  padding-block: clamp(4rem, 10vw, 8rem);
+  padding-block: clamp(3rem, 8vw, 6rem);
 }
 
 .hero h1 {
-  max-width: 12ch;
-  font-size: clamp(3rem, 8vw, 6.4rem);
-  line-height: 0.95;
-  letter-spacing: -0.065em;
+  max-width: 13ch;
+  font-size: clamp(2.8rem, 7vw, 5.4rem);
+  line-height: 0.98;
+  letter-spacing: -0.055em;
 }
 
 .hero .tagline {
@@ -56,8 +56,32 @@ body {
 }
 
 .hero .actions a {
-  border-radius: 999px;
+  border-radius: 0.55rem;
   box-shadow: none;
+}
+
+.home-links {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-block: 0 3rem;
+  border-block: 1px solid var(--sl-color-gray-5);
+}
+
+.home-links a {
+  display: flex;
+  justify-content: space-between;
+  padding: 1rem 0.75rem;
+  color: var(--sl-color-gray-2);
+  font-size: 0.88rem;
+  text-decoration: none;
+}
+
+.home-links a + a {
+  border-left: 1px solid var(--sl-color-gray-5);
+}
+
+.home-links a:hover {
+  color: var(--sl-color-white);
 }
 
 .card {
@@ -87,5 +111,14 @@ body {
 @media (max-width: 50rem) {
   .hero {
     padding-block: 3rem;
+  }
+
+  .home-links {
+    grid-template-columns: 1fr;
+  }
+
+  .home-links a + a {
+    border-top: 1px solid var(--sl-color-gray-5);
+    border-left: 0;
   }
 }

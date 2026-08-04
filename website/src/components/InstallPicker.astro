@@ -1,0 +1,298 @@
+---
+const installers = {
+  windows: [
+    {
+      id: 'powershell',
+      label: 'PowerShell',
+      command: 'irm https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.ps1 | iex',
+    },
+  ],
+  macos: [
+    {
+      id: 'homebrew',
+      label: 'Homebrew',
+      command: 'brew install EdamAme-x/pentect/pentect',
+    },
+    {
+      id: 'shell',
+      label: 'Shell',
+      command: 'curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.sh | sh',
+    },
+    {
+      id: 'nix',
+      label: 'Nix',
+      command: 'nix profile install github:EdamAme-x/pentect',
+    },
+  ],
+  linux: [
+    {
+      id: 'shell',
+      label: 'Shell',
+      command: 'curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install.sh | sh',
+    },
+    {
+      id: 'apt',
+      label: 'APT',
+      command: 'curl -fsSL https://raw.githubusercontent.com/EdamAme-x/pentect/main/tools/install-apt.sh | sudo sh',
+    },
+    {
+      id: 'nix',
+      label: 'Nix',
+      command: 'nix profile install github:EdamAme-x/pentect',
+    },
+  ],
+};
+---
+
+<section class="install-picker" data-install-picker data-installers={JSON.stringify(installers)}>
+  <div class="install-heading">
+    <div>
+      <p class="install-kicker">Install Pentect</p>
+      <h2>Choose your setup</h2>
+    </div>
+    <a href="/start/install/">All install options →</a>
+  </div>
+
+  <div class="selector-row" aria-label="Operating system">
+    <span>OS</span>
+    <div class="selector-buttons">
+      <button type="button" data-os="windows" aria-pressed="true">Windows</button>
+      <button type="button" data-os="macos" aria-pressed="false">macOS</button>
+      <button type="button" data-os="linux" aria-pressed="false">Linux</button>
+    </div>
+  </div>
+
+  <div class="selector-row" aria-label="Installation method">
+    <span>Method</span>
+    <div class="selector-buttons">
+      {
+        Object.entries(installers).flatMap(([os, methods]) =>
+          methods.map((method, index) => (
+            <button
+              type="button"
+              data-method={method.id}
+              data-method-os={os}
+              aria-pressed={os === 'windows' && index === 0 ? 'true' : 'false'}
+              hidden={os !== 'windows'}
+            >
+              {method.label}
+            </button>
+          )),
+        )
+      }
+    </div>
+  </div>
+
+  <div class="install-command">
+    <code data-install-command>{installers.windows[0].command}</code>
+    <button type="button" data-copy-command aria-label="Copy install command">Copy</button>
+  </div>
+  <span class="copy-status" data-copy-status aria-live="polite"></span>
+</section>
+
+<script>
+  type Installer = { id: string; label: string; command: string };
+  type InstallerMap = Record<string, Installer[]>;
+
+  for (const picker of document.querySelectorAll<HTMLElement>('[data-install-picker]')) {
+    const installers = JSON.parse(
+      picker.getAttribute('data-installers') ?? '{}',
+    ) as InstallerMap;
+    const command = picker.querySelector<HTMLElement>('[data-install-command]');
+    const status = picker.querySelector<HTMLElement>('[data-copy-status]');
+    const osButtons = [...picker.querySelectorAll<HTMLButtonElement>('[data-os]')];
+    const methodButtons = [...picker.querySelectorAll<HTMLButtonElement>('[data-method]')];
+    let selectedOs = 'windows';
+
+    const chooseMethod = (methodButton: HTMLButtonElement) => {
+      const method = installers[selectedOs].find(
+        (item: Installer) => item.id === methodButton.dataset.method,
+      );
+      if (!method || !command) return;
+      for (const button of methodButtons) {
+        button.setAttribute('aria-pressed', String(button === methodButton));
+      }
+      command.textContent = method.command;
+      if (status) status.textContent = '';
+    };
+
+    const chooseOs = (os: string | undefined) => {
+      if (!os) return;
+      if (!installers[os]) return;
+      selectedOs = os;
+      for (const button of osButtons) {
+        button.setAttribute('aria-pressed', String(button.getAttribute('data-os') === os));
+      }
+      const availableMethods = methodButtons.filter((button) => {
+        const available = button.getAttribute('data-method-os') === os;
+        button.toggleAttribute('hidden', !available);
+        return available;
+      });
+      if (availableMethods[0]) chooseMethod(availableMethods[0]);
+    };
+
+    for (const button of osButtons) {
+      button.addEventListener('click', () => chooseOs(button.dataset.os));
+    }
+    for (const button of methodButtons) {
+      button.addEventListener('click', () => chooseMethod(button));
+    }
+
+    picker.querySelector('[data-copy-command]')?.addEventListener('click', async () => {
+      if (!command?.textContent) return;
+      try {
+        await navigator.clipboard.writeText(command.textContent);
+        if (status) status.textContent = 'Copied';
+      } catch {
+        if (status) status.textContent = 'Select the command and copy it manually';
+      }
+    });
+
+    const userAgent = navigator.userAgent.toLowerCase();
+    chooseOs(userAgent.includes('mac') ? 'macos' : userAgent.includes('win') ? 'windows' : 'linux');
+  }
+</script>
+
+<style>
+  .install-picker {
+    margin-block: 0 4rem;
+    padding: clamp(1rem, 3vw, 1.5rem);
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 1rem;
+  }
+
+  .install-heading {
+    display: flex;
+    gap: 1rem;
+    align-items: end;
+    justify-content: space-between;
+    margin-bottom: 1.5rem;
+  }
+
+  .install-heading h2,
+  .install-kicker {
+    margin: 0;
+  }
+
+  .install-heading h2 {
+    font-size: clamp(1.35rem, 3vw, 1.75rem);
+  }
+
+  .install-kicker {
+    color: var(--sl-color-gray-3);
+    font-size: 0.75rem;
+    font-weight: 650;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .install-heading a {
+    color: var(--sl-color-gray-2);
+    font-size: 0.85rem;
+    text-decoration: none;
+  }
+
+  .selector-row {
+    display: grid;
+    grid-template-columns: 4.5rem 1fr;
+    gap: 0.75rem;
+    align-items: center;
+    margin-block: 0.65rem;
+  }
+
+  .selector-row > span {
+    color: var(--sl-color-gray-3);
+    font-size: 0.8rem;
+  }
+
+  .selector-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  .selector-buttons button,
+  .install-command button {
+    border: 0;
+    border-radius: 0.45rem;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .selector-buttons button {
+    padding: 0.42rem 0.7rem;
+    color: var(--sl-color-gray-2);
+    background: transparent;
+    font-size: 0.82rem;
+  }
+
+  .selector-buttons button[aria-pressed='true'] {
+    color: var(--sl-color-white);
+    background: var(--sl-color-gray-6);
+    box-shadow: inset 0 0 0 1px var(--sl-color-gray-5);
+  }
+
+  .install-command {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 1.25rem;
+    padding: 0.9rem 1rem;
+    border-radius: 0.7rem;
+    background: var(--sl-color-black);
+  }
+
+  .install-command code {
+    overflow-x: auto;
+    color: var(--sl-color-white);
+    font-size: 0.8rem;
+    white-space: nowrap;
+  }
+
+  .install-command button {
+    flex: none;
+    padding: 0.4rem 0.65rem;
+    color: var(--sl-color-gray-2);
+    background: var(--sl-color-gray-6);
+    font-size: 0.75rem;
+  }
+
+  .copy-status {
+    display: block;
+    min-height: 1.2rem;
+    margin-top: 0.35rem;
+    color: var(--sl-color-gray-3);
+    font-size: 0.75rem;
+    text-align: right;
+  }
+
+  [hidden] {
+    display: none;
+  }
+
+  @media (max-width: 35rem) {
+    .install-heading {
+      align-items: start;
+      flex-direction: column;
+    }
+
+    .selector-row {
+      grid-template-columns: 1fr;
+    }
+
+    .install-command {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .install-command code {
+      white-space: normal;
+      word-break: break-word;
+    }
+
+    .install-command button {
+      align-self: end;
+    }
+  }
+</style>
