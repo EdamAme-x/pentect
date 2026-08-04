@@ -95,7 +95,7 @@ export default defineConfig({
   },
   head: [
     ['link', { rel: 'icon', href: '/pentect-logo-transparent.png' }],
-    ['meta', { name: 'theme-color', content: '#f7f5ef' }],
+    ['meta', { name: 'theme-color', content: '#ffffff' }],
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { name: 'twitter:card', content: 'summary' }],
   ],
