@@ -1,8 +1,8 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
-const site = process.env.PENTECT_DOCS_SITE ?? 'https://edamame-x.github.io';
-const base = process.env.PENTECT_DOCS_BASE ?? '/pentect';
+const site = process.env.PENTECT_DOCS_SITE ?? 'https://pentect.dev';
+const base = process.env.PENTECT_DOCS_BASE ?? '/';
 
 export default defineConfig({
   site,
