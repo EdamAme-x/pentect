@@ -26,15 +26,10 @@ The model can copy the handle into a completed tool call. Pentect resolves it
 immediately before the trusted local client executes that call. The provider
 never needs the plaintext.
 
-## What Pentect is not
+## Scope
 
-- It is not a replacement chat application.
-- It is not a password manager or secret vault.
-- It does not grant tools permission to use a secret.
-- It cannot guarantee detection of every future or unknown sensitive format.
-
-Pentect reduces exposure at the provider boundary. Existing client permissions,
-sandboxing, account controls, and least-privilege credentials still matter.
+Pentect protects supported AI client traffic; it is not a password manager or
+secret vault. It complements existing permissions, sandboxing, and access controls.
 
 ## Supported surfaces
 
