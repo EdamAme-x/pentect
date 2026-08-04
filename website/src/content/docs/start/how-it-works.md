@@ -36,6 +36,38 @@ supported request and response structures without replacing the client UI.
    Tool output is inspected before it returns to the provider, preventing a
    locally restored value from simply leaking back in stdout or a file read.
 
+## Request and response lifecycle
+
+| Stage | Input | Output |
+| --- | --- | --- |
+| Client request | Provider-shaped JSON, streaming metadata, or supported files | Same protocol with protected values replaced |
+| Provider response | Text, events, and completed tool calls | Protocol preserved; known handles remain references |
+| Local execution | Completed tool arguments | Known handles resolved just before execution |
+| Tool result | stdout, stderr, and supported structured output | Sensitive values replaced before the next provider request |
+
+Pentect transforms protocol fields rather than scraping the terminal UI. This
+keeps streaming and normal client interaction intact while putting protection
+at the network and local execution boundaries.
+
+## Handle identity
+
+A handle combines a useful label with a keyed digest. Structured sources can
+provide the label—`DATABASE_URL` in dotenv, for example—while detectors provide
+labels for unstructured text. The digest identifies the protected value without
+embedding it in the handle.
+
+Known handles can be resolved by the store that created them. Unknown
+handle-shaped text is never guessed or matched to a different value. Handle
+stability is configurable; see [Configuration](/reference/configuration/).
+
+## Content that needs a different treatment
+
+Text can carry a reusable handle. Images instead require local OCR and pixel
+redaction, while unsupported binary content follows the unscanned-content
+policy. [Files and images](/protection/files-and-images/) lists the exact
+behavior and controls. [Plugins](/plugins/overview/) can add detection or
+middleware without changing the client integration.
+
 ## Why handles instead of `[REDACTED]`?
 
 Plain redaction removes both the value and its identity. A Pentect handle keeps
