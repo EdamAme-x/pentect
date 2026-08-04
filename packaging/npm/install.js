@@ -27,25 +27,27 @@ export function expectedChecksum(text) {
   return match[1].toLowerCase();
 }
 
-async function download(url) {
+async function download(url, signal) {
   const response = await fetch(url, {
     redirect: 'follow',
     headers: { 'user-agent': 'pentect-npm-installer' },
+    signal,
   });
   if (!response.ok) throw new Error(`Download failed (${response.status} ${response.statusText})`);
   return Buffer.from(await response.arrayBuffer());
 }
 
-async function downloadBinary(base, asset) {
+async function downloadBinary(base, asset, signal) {
   const compressed = await fetch(`${base}/${asset}.gz`, {
     redirect: 'follow',
     headers: { 'user-agent': 'pentect-npm-installer' },
+    signal,
   });
   if (compressed.ok) return gunzipSync(Buffer.from(await compressed.arrayBuffer()));
   if (compressed.status !== 404) {
     throw new Error(`Download failed (${compressed.status} ${compressed.statusText})`);
   }
-  return download(`${base}/${asset}`);
+  return download(`${base}/${asset}`, signal);
 }
 
 export async function install() {
@@ -55,9 +57,10 @@ export async function install() {
   const base = tag === 'latest'
     ? `https://github.com/${repository}/releases/latest/download`
     : `https://github.com/${repository}/releases/download/${tag}`;
+  const signal = AbortSignal.timeout(90_000);
   const [binary, checksumFile] = await Promise.all([
-    downloadBinary(base, asset),
-    download(`${base}/${asset}.sha256`),
+    downloadBinary(base, asset, signal),
+    download(`${base}/${asset}.sha256`, signal),
   ]);
   const expected = expectedChecksum(checksumFile.toString('utf8'));
   const actual = createHash('sha256').update(binary).digest('hex');
