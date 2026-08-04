@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue';
 
 type OperatingSystem = 'windows' | 'macos' | 'linux';
 type Installer = { id: string; label: string; command: string; icon: string; tone: string };
+type CommandToken = { text: string; kind: 'space' | 'command' | 'option' | 'string' | 'operator' | 'argument' };
 
 const operatingSystems: Array<{
   id: OperatingSystem;
@@ -113,12 +114,30 @@ const selectedMethod = ref('powershell');
 const copyState = ref<'idle' | 'copied' | 'failed'>('idle');
 
 const methods = computed(() => installers[selectedOs.value]);
-const selectedOperatingSystem = computed(
-  () => operatingSystems.find((item) => item.id === selectedOs.value) ?? operatingSystems[0],
-);
 const selectedInstaller = computed(
   () => methods.value.find((item) => item.id === selectedMethod.value) ?? methods.value[0],
 );
+const commandTokens = computed(() => tokenizeCommand(selectedInstaller.value.command));
+
+function tokenizeCommand(command: string): CommandToken[] {
+  const parts = command.match(/https?:\/\/[^\s|]+|github:[^\s|]+|--?[\w-]+|\||[^\s|]+|\s+/g) ?? [command];
+  let expectsCommand = true;
+
+  return parts.map((text) => {
+    if (/^\s+$/.test(text)) return { text, kind: 'space' };
+    if (text === '|') {
+      expectsCommand = true;
+      return { text, kind: 'operator' };
+    }
+    if (expectsCommand) {
+      expectsCommand = false;
+      return { text, kind: 'command' };
+    }
+    if (text.startsWith('-')) return { text, kind: 'option' };
+    if (/^(?:https?:\/\/|github:)/.test(text)) return { text, kind: 'string' };
+    return { text, kind: 'argument' };
+  });
+}
 
 function chooseOs(os: OperatingSystem) {
   selectedOs.value = os;
@@ -149,70 +168,66 @@ onMounted(() => {
 <template>
   <section class="home-install" aria-labelledby="install-heading">
     <div class="home-install__heading">
-      <div>
-        <p>Install</p>
-        <h2 id="install-heading">Start with one command.</h2>
-      </div>
+      <p id="install-heading">Install</p>
       <a href="/start/install/">All options <span aria-hidden="true">→</span></a>
     </div>
 
-    <p class="home-install__sentence">
-      <span>Install Pentect for</span>
-      <label class="install-select">
-        <span
-          class="install-select__icon"
-          :data-tone="selectedOperatingSystem.tone"
-          aria-hidden="true"
-        >{{ selectedOperatingSystem.icon }}</span>
-        <select
-          v-model="selectedOs"
-          aria-label="Operating system"
-          @change="chooseOs(selectedOs)"
+    <div class="home-install__controls">
+      <div class="install-choice" role="group" aria-label="Operating system">
+        <span class="install-choice__label">OS</span>
+        <button
+          v-for="os in operatingSystems"
+          :key="os.id"
+          type="button"
+          :class="{ 'is-active': selectedOs === os.id }"
+          :aria-pressed="selectedOs === os.id"
+          @click="chooseOs(os.id)"
         >
-          <option v-for="os in operatingSystems" :key="os.id" :value="os.id">
-            {{ os.label }}
-          </option>
-        </select>
-        <span class="install-select__chevron" aria-hidden="true">⌄</span>
-      </label>
-      <span>using</span>
-      <label class="install-select">
-        <span
-          class="install-select__icon"
-          :data-tone="selectedInstaller.tone"
-          aria-hidden="true"
-        >{{ selectedInstaller.icon }}</span>
-        <select
-          v-model="selectedMethod"
-          aria-label="Installation method"
-          @change="chooseMethod(selectedMethod)"
-        >
-          <option v-for="method in methods" :key="method.id" :value="method.id">
-            {{ method.label }}
-          </option>
-        </select>
-        <span class="install-select__chevron" aria-hidden="true">⌄</span>
-      </label>
-    </p>
-
-    <div class="home-install__command">
-      <div class="home-install__code">
-        <code>{{ selectedInstaller.command }}</code>
-      </div>
-      <div class="home-install__command-footer">
-        <span>
-          <i
-            class="install-select__icon"
-            :data-tone="selectedInstaller.tone"
-            aria-hidden="true"
-          >{{ selectedInstaller.icon }}</i>
-          {{ selectedInstaller.label }}
-        </span>
-        <button type="button" @click="copyCommand">
-          <span aria-hidden="true">▣</span>
-          {{ copyState === 'copied' ? 'Copied' : 'Copy command' }}
+          <i class="install-select__icon" :data-tone="os.tone" aria-hidden="true">{{ os.icon }}</i>
+          {{ os.label }}
         </button>
       </div>
+
+      <div class="install-choice" role="group" aria-label="Installation method">
+        <span class="install-choice__label">Method</span>
+        <button
+          v-for="method in methods"
+          :key="method.id"
+          type="button"
+          :class="{ 'is-active': selectedMethod === method.id }"
+          :aria-pressed="selectedMethod === method.id"
+          @click="chooseMethod(method.id)"
+        >
+          <i class="install-select__icon" :data-tone="method.tone" aria-hidden="true">{{ method.icon }}</i>
+          {{ method.label }}
+        </button>
+      </div>
+    </div>
+
+    <div class="home-install__command">
+      <code aria-live="polite">
+        <span
+          v-for="(token, index) in commandTokens"
+          :key="`${index}-${token.text}`"
+          :class="`shell-token shell-token--${token.kind}`"
+        >{{ token.text }}</span>
+      </code>
+      <button
+        type="button"
+        class="home-install__copy"
+        :class="{ 'is-copied': copyState === 'copied' }"
+        :aria-label="copyState === 'copied' ? 'Copied' : 'Copy command'"
+        :title="copyState === 'copied' ? 'Copied' : 'Copy command'"
+        @click="copyCommand"
+      >
+        <svg v-if="copyState === 'copied'" aria-hidden="true" viewBox="0 0 24 24">
+          <path d="m5 12 4 4L19 6" />
+        </svg>
+        <svg v-else aria-hidden="true" viewBox="0 0 24 24">
+          <rect x="8" y="8" width="11" height="11" rx="2" />
+          <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+        </svg>
+      </button>
     </div>
     <p v-if="copyState === 'failed'" class="home-install__status" role="status">
       Select the command and copy it manually.

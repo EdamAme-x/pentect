@@ -1,15 +1,13 @@
 ---
 title: Docs_
-description: Keep secrets out of AI requests.
+description: Let agents use secrets without seeing them.
 pageClass: docs-hub
 aside: false
 ---
 
 <HomeInstall />
 
-## Start with a client
-
-Choose the surface you already use. Pentect only applies to sessions you launch through it.
+## Clients
 
 <DocsGrid class="is-compact">
   <a href="/clients/codex/" class="docs-grid__item">
@@ -30,9 +28,7 @@ Choose the surface you already use. Pentect only applies to sessions you launch 
   </a>
 </DocsGrid>
 
-## Explore Pentect
-
-Go directly to the part you need.
+## Explore
 
 <DocsGrid>
   <a href="/start/how-it-works/" class="docs-grid__item">
