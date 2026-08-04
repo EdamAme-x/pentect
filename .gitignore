@@ -8,6 +8,8 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 node_modules/
+*.tgz
+/packaging/npm/vendor/
 /website/.astro/
 /website/.vitepress/cache/
 /website/dist/

@@ -1,0 +1,29 @@
+{
+  "name": "pentect",
+  "version": "0.0.24",
+  "type": "module",
+  "description": "Local secret masking boundary for AI agents",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EdamAme-x/pentect.git"
+  },
+  "homepage": "https://pentect.dev",
+  "bugs": "https://github.com/EdamAme-x/pentect/issues",
+  "bin": {
+    "pentect": "packaging/npm/bin/pentect.js"
+  },
+  "files": [
+    "packaging/npm/bin/pentect.js",
+    "packaging/npm/install.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node packaging/npm/install.js",
+    "test": "node --test packaging/npm/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

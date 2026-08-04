@@ -64,6 +64,18 @@ jobs:
         run: python tools/generate_licenses.py --check
       - name: Verify package metadata generator
         run: python tools/update_package_metadata.py --metadata-file packaging/release.json --check
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Verify npm package
+        shell: pwsh
+        run: |
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
+          if ($env:GITHUB_REF_NAME -ne "v$($package.version)") {
+            throw "tag $env:GITHUB_REF_NAME must match npm package version v$($package.version)"
+          }
+          npm test
+          npm pack --dry-run
       - name: Stage release notices
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -122,11 +134,25 @@ jobs:
           Copy-Item '${{ matrix.binary }}' $destination
           $hash = (Get-FileHash -Algorithm SHA256 $destination).Hash.ToLowerInvariant()
           "$hash  $asset" | Set-Content -NoNewline -Encoding utf8 "$destination.sha256"
+          $source = [System.IO.File]::OpenRead($destination)
+          $archive = [System.IO.File]::Create("$destination.gz")
+          try {
+            $gzip = [System.IO.Compression.GZipStream]::new(
+              $archive,
+              [System.IO.Compression.CompressionLevel]::SmallestSize,
+              $true
+            )
+            try { $source.CopyTo($gzip) } finally { $gzip.Dispose() }
+          } finally {
+            $archive.Dispose()
+            $source.Dispose()
+          }
       - name: Attest release binaries
         uses: actions/attest-build-provenance@e3fe62ef559997059fe8380e7d2b4c909e2d65f4 # v3
         with:
           subject-path: |
             dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.gz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.asset }}
@@ -349,6 +375,15 @@ jobs:
             Start-Sleep -Milliseconds 100
           }
           if (Test-Path -LiteralPath $binary) { throw 'uninstall did not remove the binary' }
+      - name: Install through npm (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PENTECT_VERSION = $env:GITHUB_REF_NAME.TrimStart('v')
+          $prefix = Join-Path $env:RUNNER_TEMP 'pentect-npm'
+          npm install --global . --prefix $prefix
+          $version = & (Join-Path $prefix 'pentect.cmd') version
+          if ($version -ne "pentect $env:PENTECT_VERSION") { throw 'npm-installed version mismatch' }
       - name: Install, update, and uninstall (POSIX)
         if: runner.os != 'Windows'
         shell: sh
@@ -366,6 +401,15 @@ jobs:
           test "$("$binary" version)" = "pentect $version"
           "$binary" uninstall
           test ! -e "$binary"
+      - name: Install through npm (POSIX)
+        if: runner.os != 'Windows'
+        shell: sh
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          prefix="$RUNNER_TEMP/pentect-npm"
+          PENTECT_VERSION="$version" npm install --global . --prefix "$prefix"
+          test "$("$prefix/bin/pentect" version)" = "pentect $version"
 
   promote:
     name: Publish stable release

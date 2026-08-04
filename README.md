@@ -41,8 +41,17 @@ brew install EdamAme-x/pentect/pentect
 # Nix
 nix profile install github:EdamAme-x/pentect
 
+# Nix, temporary shell
+nix shell github:EdamAme-x/pentect
+
 # Nix, pinned to a Pentect release
 nix profile install github:EdamAme-x/pentect/nix-vX.Y.Z
+
+# npm (downloads a checksummed release binary)
+npm install --global github:EdamAme-x/pentect
+
+# Cargo (builds from source)
+cargo install --git https://github.com/EdamAme-x/pentect --locked pentect-cli
 ```
 
 Debian and Ubuntu users can configure the signed Pentect repository and install
