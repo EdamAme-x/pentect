@@ -62,8 +62,6 @@ kubeconfig, AWS, npm, PyPI, JSON, and other supported key/value formats.
 | `pentect update --check` | Check for an update without installing it |
 | `pentect uninstall` | Remove the binary while retaining project data |
 
-`mask` works in ordinary pipelines; no `--kind` flag is required:
-
 ```sh
 cat .env | pentect mask
 cat terraform.tfvars | pentect mask
