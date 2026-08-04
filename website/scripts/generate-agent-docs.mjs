@@ -52,15 +52,9 @@ for (const sourcePath of sourceFiles) {
     throw new Error(`Agent Markdown generation produced no page heading for ${sourcePath}`);
   }
 
-  const generatedNotice = [
-    '<!-- Generated from the canonical documentation source. Do not edit directly. -->',
-    `Canonical: ${new URL(route, 'https://pentect.dev').href}`,
-    '',
-  ].join('\n');
-
   await writeFile(
     path.join(outputDirectory, 'index.md'),
-    `${generatedNotice}${markdown}\n`,
+    `${markdown}\n`,
     'utf8',
   );
   generated += 1;
@@ -101,6 +95,10 @@ function rewriteNodes(nodes) {
       return label ? [heading(label, 3), ...children] : children;
     }
 
+    if (node.type === 'link') {
+      node.url = agentMarkdownUrl(node.url);
+    }
+
     if (Array.isArray(node.children)) {
       node.children = rewriteNodes(node.children);
     }
@@ -112,7 +110,7 @@ function rewriteAnchor(node) {
   const href = node.attributes?.find(
     (item) => item.type === 'mdxJsxAttribute' && item.name === 'href',
   );
-  const url = typeof href?.value === 'string' ? href.value : '#';
+  const url = agentMarkdownUrl(typeof href?.value === 'string' ? href.value : '#');
   const strong = findElement(node, 'strong');
   const span = findElement(node, 'span');
   const label = plainText(strong ?? node).trim() || url;
@@ -125,6 +123,18 @@ function rewriteAnchor(node) {
       ...(description ? [{ type: 'text', value: ` — ${description}` }] : []),
     ],
   };
+}
+
+function agentMarkdownUrl(url) {
+  if (!url.startsWith('/')) return url;
+
+  const match = url.match(/^([^?#]*)([?#].*)?$/);
+  const pathname = match?.[1] ?? url;
+  const suffix = match?.[2] ?? '';
+  if (/\.[a-z0-9]+$/i.test(pathname)) return url;
+
+  const normalized = pathname === '/' ? '/' : `${pathname.replace(/\/+$/, '')}/`;
+  return `${normalized}index.md${suffix}`;
 }
 
 function findElement(node, name) {
