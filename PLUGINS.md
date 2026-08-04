@@ -28,6 +28,3 @@ pentect plugins remove NAME
 Remote manifests are pinned locally. They change only through an explicit
 `add`, `setup`, or `update`, never merely because a cache timer expired.
 Run `pentect plugins update` without a name to update every enabled plugin.
-
-See [the plugin guide](guides/plugins.md) for the manifest, WebAssembly ABI,
-network approval, publishing, and SDK documentation.

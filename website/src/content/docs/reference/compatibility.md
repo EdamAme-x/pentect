@@ -1,0 +1,37 @@
+---
+title: Compatibility
+description: Release-tested clients, protocols, and explicit coverage limits.
+---
+
+Pentect validates its gateways against provider-shaped mock servers. Releases
+also launch pinned public CLI builds through the release binary.
+
+| Client | Release gate | Protected launch |
+| --- | --- | --- |
+| Codex CLI `0.146.0` | Automated on Linux | `pentect codex` |
+| Claude Code `2.1.220` | Automated on Linux | `pentect claude` |
+| ChatGPT desktop app, Codex mode | Launcher and Responses protocol tests | `pentect codex app` |
+| Claude Desktop, supported Chat, attachment, and Code routes | Launcher and protocol tests | `pentect claude app` |
+
+Protocol tests cover text, streaming responses, completed tool calls,
+structured content, file references, malformed content, and custom upstream
+path preservation.
+
+## Desktop qualification
+
+Ephemeral release runners do not install and drive the signed vendor desktop
+apps. Pentect therefore does not describe a desktop app version as fully
+release-verified until that automation exists. Windows smoke testing uses
+synthetic secrets and verifies launcher, routing, and local-resolution behavior
+without printing the value.
+
+## Not covered
+
+- ChatGPT Chat, Work, and Voice routes outside supported Codex mode
+- Remote Claude Cowork execution and Voice
+- Experimental binary transports
+- Unknown future opaque routes
+- Every provider and release behind a third-party gateway
+
+Unknown or unsupported content blocks by default rather than silently claiming
+protection.

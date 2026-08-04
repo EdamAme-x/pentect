@@ -8,6 +8,12 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 node_modules/
+/website/.astro/
+/website/dist/
+/website/public/pentect-logo-white.png
+/website/public/pentect-logo-color.png
+/website/public/pentect-logo-cyber.png
+/website/public/pentect-logo-muted.png
 .env
 .env.*
 .DS_Store
@@ -26,7 +32,7 @@ sandbox/
 /log/
 
 # Local planning / positioning notes
-docs/
+/docs/
 
 # Local agent recovery/session state
 .pentect-agent/

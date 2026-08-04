@@ -41,8 +41,8 @@ signed-GUI runner is available.
 
 The App rows do not imply protection for ChatGPT Chat or Work, remote Claude
 Cowork execution, Voice, experimental binary transports, or unknown future
-opaque routes. Current Claude multipart attachment flows are protected as
-described in [desktop apps](guides/apps.md).
+opaque routes. Current Claude multipart attachment flows are protected; unknown
+or unsupported attachment formats are blocked by default.
 
 ## Upstreams
 
@@ -56,4 +56,4 @@ Bifrost's `/openai/v1` and `/anthropic` integration base paths are covered by
 the URL-routing tests. This verifies Pentect's protocol boundary and path
 composition; it does not certify every Bifrost provider or release. LiteLLM and
 other gateways are supported through the same contracts rather than
-provider-specific code. See [custom upstreams](guides/upstreams.md).
+provider-specific code.

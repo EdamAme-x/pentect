@@ -1,0 +1,32 @@
+# Pentect
+
+Pentect is a local security boundary for AI coding tools. It replaces secrets
+and sensitive data with opaque handles before requests reach a model provider,
+then resolves known handles only at trusted local tool boundaries.
+
+Canonical documentation:
+- /start/what-is-pentect/
+- /start/install/
+- /start/quick-start/
+- /start/how-it-works/
+- /clients/codex/
+- /clients/claude/
+- /clients/upstreams/
+- /protection/structured-data/
+- /protection/files-and-images/
+- /protection/security-model/
+- /plugins/overview/
+- /plugins/build/
+- /reference/cli/
+- /reference/configuration/
+- /reference/compatibility/
+- /reference/troubleshooting/
+
+Important behavior:
+- `pentect codex` and `pentect claude` protect only the launched client process.
+- `pentect codex app` and `pentect claude app` explicitly launch protected apps.
+- Handles are references, not plaintext and not authorization grants.
+- Unknown provider formats block by default.
+- No detector can guarantee perfect secret or PII detection.
+
+Source: https://github.com/EdamAme-x/pentect
