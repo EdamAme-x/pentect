@@ -77,7 +77,7 @@ body {
   height: 38px;
   margin-left: 8px;
   padding: 0 16px;
-  border-radius: 8px;
+  border-radius: 3px;
   color: #fff !important;
   background: var(--vp-c-brand-1);
   font-size: 13px;
@@ -97,7 +97,7 @@ body {
 .VPNavBarSearch .DocSearch-Button {
   height: 40px;
   border: 1px solid var(--vp-c-divider);
-  border-radius: 8px;
+  border-radius: 3px;
   background: var(--vp-c-bg-soft);
 }
 
@@ -121,12 +121,13 @@ body {
 .VPSidebarItem.level-0.is-link > .item > .link {
   margin: 0 -10px;
   padding: 3px 10px;
-  border-radius: 7px;
+  border-left: 2px solid transparent;
 }
 
 .VPSidebarItem.level-0.is-link > .item > .link:hover,
 .VPSidebarItem.level-0.is-link.is-active > .item > .link {
-  background: var(--vp-c-bg-soft);
+  border-left-color: var(--vp-c-brand-1);
+  background: transparent;
 }
 
 .VPSidebarItem.level-0:not(.is-link) > .item > .text {
@@ -212,7 +213,7 @@ body {
 }
 
 .VPButton {
-  border-radius: 8px !important;
+  border-radius: 3px !important;
   box-shadow: none !important;
 }
 
@@ -224,9 +225,8 @@ body {
 .home-install {
   overflow: hidden;
   margin: 0 auto;
-  border: 1px solid var(--vp-c-divider);
-  border-radius: 18px;
-  background: var(--vp-c-bg-elv);
+  border-block: 1px solid var(--vp-c-divider);
+  background: transparent;
 }
 
 .home-install__heading {
@@ -234,7 +234,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 24px;
-  padding: 22px 24px;
+  padding: 20px 0;
 }
 
 .home-install__heading p {
@@ -262,7 +262,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 18px;
-  padding: 0 24px 24px;
+  padding: 0 0 24px;
 }
 
 .install-choice {
@@ -287,9 +287,10 @@ body {
   align-items: center;
   gap: 8px;
   min-height: 42px;
-  border: 1px solid var(--vp-c-divider);
-  border-radius: 8px;
-  padding: 7px 11px 7px 8px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 7px 8px 9px;
   color: var(--vp-c-text-2);
   background: transparent;
   font-size: 14px;
@@ -299,20 +300,20 @@ body {
 }
 
 .install-choice button:hover {
-  border-color: color-mix(in srgb, var(--vp-c-text-1) 28%, var(--vp-c-divider));
+  border-bottom-color: var(--vp-c-divider);
   color: var(--vp-c-text-1);
 }
 
 .install-choice button:focus-visible {
   outline: none;
-  border-color: var(--vp-c-brand-1);
-  box-shadow: 0 0 0 3px var(--vp-c-brand-soft);
+  border-bottom-color: var(--vp-c-brand-1);
+  box-shadow: none;
 }
 
 .install-choice button.is-active {
-  border-color: var(--vp-c-text-1);
+  border-bottom-color: var(--vp-c-brand-1);
   color: var(--vp-c-text-1);
-  background: var(--vp-c-bg-soft);
+  background: transparent;
 }
 
 .install-select__icon {
@@ -322,9 +323,9 @@ body {
   justify-content: center;
   width: 24px;
   height: 24px;
-  border-radius: 5px;
-  color: #fff;
-  background: #4f554a;
+  border-radius: 0;
+  color: var(--vp-c-text-3);
+  background: transparent;
   font-family: var(--vp-font-family-mono);
   font-size: 10px;
   font-style: normal;
@@ -333,21 +334,19 @@ body {
   flex: none;
 }
 
-.install-select__icon[data-tone='windows'] { background: #087cd5; font-size: 18px; }
-.install-select__icon[data-tone='macos'] { background: #343732; font-size: 17px; }
-.install-select__icon[data-tone='linux'] { background: #e6b422; color: #222; font-size: 18px; }
-.install-select__icon[data-tone='powershell'] { background: #2671be; }
-.install-select__icon[data-tone='shell'] { background: #3d443a; }
-.install-select__icon[data-tone='npm'] { background: #cb3837; font-size: 7px; }
-.install-select__icon[data-tone='cargo'] { background: #6d4c35; font-size: 15px; }
-.install-select__icon[data-tone='homebrew'] { background: #d89b20; color: #292016; }
-.install-select__icon[data-tone='apt'] { background: #a80030; }
-.install-select__icon[data-tone='nix'] { background: #5277c3; font-size: 14px; }
+.install-choice button:hover .install-select__icon,
+.install-choice button.is-active .install-select__icon { color: var(--vp-c-brand-1); }
+.install-select__icon[data-tone='windows'] { font-size: 18px; }
+.install-select__icon[data-tone='macos'] { font-size: 17px; }
+.install-select__icon[data-tone='linux'] { font-size: 18px; }
+.install-select__icon[data-tone='npm'] { font-size: 7px; }
+.install-select__icon[data-tone='cargo'] { font-size: 15px; }
+.install-select__icon[data-tone='nix'] { font-size: 14px; }
 
 .home-install__command {
   position: relative;
   min-width: 0;
-  border-top: 1px solid var(--vp-c-divider);
+  border-top: 0;
   background: #0d0d0d;
 }
 
@@ -379,7 +378,7 @@ body {
   opacity: 0;
   transform: translateY(-50%) translateX(4px);
   border: 0;
-  border-radius: 7px;
+  border-radius: 2px;
   padding: 0;
   color: #bcbcbc;
   background: #242424;
@@ -535,14 +534,15 @@ body {
 
 .vp-doc div[class*='language-'] {
   border: 1px solid var(--vp-c-divider);
-  border-radius: 10px;
+  border-radius: 3px;
 }
 
 .docs-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  gap: 0;
   margin: 20px 0 40px !important;
+  border-top: 1px solid var(--vp-c-divider);
   padding: 0 !important;
 }
 
@@ -557,22 +557,27 @@ body {
 .docs-grid__item {
   position: relative;
   display: flex;
-  min-height: 150px;
+  min-height: 132px;
   height: 100%;
   flex-direction: column;
   gap: 7px;
-  padding: 20px 44px 20px 20px;
-  border: 1px solid var(--vp-c-divider);
-  border-radius: 10px;
+  padding: 22px 46px 22px 0;
+  border-bottom: 1px solid var(--vp-c-divider);
+  border-radius: 0;
   color: var(--vp-c-text-2) !important;
-  background: var(--vp-c-bg-elv);
+  background: transparent;
   text-decoration: none !important;
   transition: border-color 140ms ease, background-color 140ms ease;
 }
 
 .docs-grid__item:hover {
-  border-color: color-mix(in srgb, var(--vp-c-brand-1) 45%, var(--vp-c-divider));
-  background: color-mix(in srgb, var(--vp-c-brand-soft) 35%, var(--vp-c-bg-elv));
+  border-color: var(--vp-c-brand-1);
+  background: transparent;
+}
+
+.docs-grid__item:nth-child(even) {
+  border-left: 1px solid var(--vp-c-divider);
+  padding-left: 22px;
 }
 
 .docs-grid__item strong {
@@ -646,12 +651,12 @@ body {
   }
 
   .home-install__heading {
-    padding: 20px;
+    padding: 18px 0;
   }
 
   .home-install__controls {
     gap: 16px;
-    padding: 0 20px 20px;
+    padding: 0 0 20px;
   }
 
   .install-choice {
@@ -668,7 +673,7 @@ body {
     align-self: stretch;
     display: inline-flex;
     align-items: center;
-    background: var(--vp-c-bg-elv);
+    background: var(--vp-c-bg);
   }
 
   .install-choice button {
@@ -713,6 +718,11 @@ body {
   .docs-grid__item,
   .docs-grid.is-compact .docs-grid__item {
     min-height: 0;
+  }
+
+  .docs-grid__item:nth-child(even) {
+    border-left: 0;
+    padding-left: 0;
   }
 }
 

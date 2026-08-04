@@ -29,6 +29,27 @@ description: Protect a real Codex or Claude session in a few commands.
    pentect log
    ```
 
+## What success looks like
+
+If a protected file contains `DATABASE_URL=postgres://...`, the provider sees a
+reference such as this instead of the credential:
+
+```dotenv
+DATABASE_URL=<<DATABASE_URL_4ce8a3b0a6f64e12>>
+```
+
+The agent can copy that handle into a completed local tool call. Pentect
+resolves a known handle immediately before execution, then masks sensitive
+stdout before it returns to the provider. `pentect log` records the protection
+event and label, not the plaintext value.
+
+Normal client arguments pass through unchanged:
+
+```sh
+pentect codex exec --full-auto
+pentect claude --model sonnet
+```
+
 ## Launch through Pentect by default
 
 Add these functions to your shell profile, then restart the terminal. Existing
@@ -85,3 +106,10 @@ terminal.
 These functions affect only that shell. Pentect protects each client process
 launched through them; it does not create a system-wide proxy.
 :::
+
+## Next steps
+
+- Use [Codex](/clients/codex/) or [Claude](/clients/claude/) for client-specific options.
+- See [Structured data](/protection/structured-data/) for dotenv, Terraform, Kubernetes, and JSON behavior.
+- Review [Files and images](/protection/files-and-images/) before sending uploads.
+- Run `pentect doctor` again after changing a client installation or provider.
