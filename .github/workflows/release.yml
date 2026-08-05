@@ -414,7 +414,7 @@ jobs:
           try {
             & $binary plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --yes
             $inspection = & $binary plugins inspect openai-privacy-filter
-            if ($inspection -notmatch 'hooks: inspect') { throw 'official plugin was not installed' }
+            if (-not ($inspection -match 'hooks: inspect')) { throw 'official plugin was not installed' }
           } finally {
             Pop-Location
           }
