@@ -35,7 +35,7 @@ pentect claude --model sonnet
 
 | Command | Purpose |
 | --- | --- |
-| `pentect mask [TEXT]` | Mask arguments or UTF-8 stdin |
+| `pentect mask` | Mask UTF-8 text from stdin |
 | `pentect read PATH` | Print a masked preview of a file |
 | `pentect exec "COMMAND"` | Restore known handles, run the command, and mask its output |
 | `pentect view HANDLE` | Show handle details without revealing its value |
@@ -45,7 +45,70 @@ pentect claude --model sonnet
 Use `resolve` with care. It writes real values to the selected file or output.
 Use `exec` instead when a command can take a handle directly.
 
-`mask` accepts text as arguments or reads UTF-8 standard input:
+### `mask`
+
+Mask UTF-8 standard input. It infers structured formats from content when no
+path is available.
+
+```sh
+printf '%s' 'TOKEN=fake-value' | pentect mask
+cat .env | pentect mask
+printf '%s' 'CASE-12345678' | pentect mask --plugins ./company-policy
+```
+
+### `read`
+
+Read a path with filename-aware format detection and print only the protected
+preview:
+
+```sh
+pentect read .env
+pentect read terraform.tfvars
+```
+
+When file remembering is enabled, `read` also records safe local recovery
+metadata for handles found in that file.
+
+### `exec`
+
+`exec` restores known handles before execution and masks stdout and stderr:
+
+| Form | Behavior |
+| --- | --- |
+| `pentect exec "COMMAND"` | Run through the native shell |
+| `pentect exec -- PROGRAM ARG...` | Run a program directly without shell parsing |
+| `pentect exec --stdin` | Read the shell script from UTF-8 stdin |
+| `pentect exec --live "COMMAND"` | Stream masked output instead of buffering it |
+| `--script-shell native\|bash\|powershell` | Choose the shell for script forms |
+| `--session NAME` | Use an explicit local session instead of the current-directory session |
+
+```sh
+pentect exec -- curl -H 'Authorization: Bearer <<API_TOKEN_...>>' https://api.example.test/me
+printf '%s' 'tool <<API_TOKEN_...>>' | pentect exec --stdin
+```
+
+Use the direct program form when possible. It avoids another layer of shell
+quoting. `--live` keeps interactive progress visible but still masks output in
+chunks before it is written.
+
+### `view` and `resolve`
+
+`view` parses a handle and prints its label, ID, and safe length hint. It does
+not require or reveal the real value.
+
+`resolve` reads stdin when no path is given. With paths, it replaces known
+handles in each file in place. Unknown handle-shaped text causes an error
+instead of being guessed.
+
+```sh
+pentect view '<<DATABASE_URL_4ce8a3b0a6f64e12>>'
+cat masked.txt | pentect resolve > plaintext.txt
+pentect resolve config.masked.toml
+```
+
+Treat redirected or in-place resolved output as plaintext secret material.
+
+`mask` reads UTF-8 standard input:
 
 ::: code-group
 
@@ -97,5 +160,12 @@ one launch.
 
 Approval flags skip an interactive confirmation; they do not skip checksum,
 build-record, manifest, or sandbox checks.
+
+## Output for scripts
+
+Commands with `--json` produce machine-readable JSON. Human output can change
+for clarity, so scripts should use JSON where offered. Pentect uses a non-zero
+exit code for invalid arguments, blocked content, launch failures, and failed
+updates. A launched program keeps its own exit code.
 
 See [Plugins](/plugins/overview/) for the full workflow.

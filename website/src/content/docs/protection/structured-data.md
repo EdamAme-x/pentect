@@ -15,11 +15,15 @@ KAGGLE_API_TOKEN=<<KAGGLE_API_TOKEN_039fe674477b5763>>
 
 Built-in checks support common formats, including:
 
-- dotenv files, including comments and small syntax errors
-- Terraform variables and values
-- Kubernetes Secrets and kubeconfig data
-- AWS, npm, and PyPI configuration
-- JSON and other recognized key/value structures
+- dotenv families such as `.env`, `.env.local`, `.dev.vars`, and
+  `*.secret.local`, including comments and small syntax errors;
+- Terraform `.tfvars`, TOML, INI, properties, YAML, and other structured
+  assignments;
+- Kubernetes Secrets, kubeconfig files, and mounted secret files such as
+  `/run/secrets/NAME`;
+- AWS credentials and config, `.npmrc`, and `.pypirc`;
+- JSON, JSON Lines, NDJSON, HAR, and recognized tool-result JSON;
+- GitHub Actions environment command files.
 
 When a file clearly names a field, Pentect uses that name for the handle. This
 works with dotenv keys, Terraform fields, Kubernetes Secret keys, and JSON keys:
@@ -48,6 +52,21 @@ stringData:
 Pentect handles comments, quotes, spaces, and small dotenv syntax errors. Empty
 values, comments, and values that are clearly safe stay visible.
 
+File extension is only one signal. Pentect can recognize high-confidence JSON,
+dotenv, Kubernetes, AWS, npm, PyPI, and general structured content even when a
+tool does not provide the original filename. It does not treat every line with
+an equals sign as dotenv because source code and prose can contain assignments.
+
+## Encoded and compressed values
+
+Pentect can decode common Base16, Base32, Base58, Base64, Base85, binary, octal,
+and compressed representations before it runs detection. When decoded content
+contains a secret, Pentect masks the complete encoded value because changing
+only the decoded range would corrupt it.
+
+Decode depth and size are limited. See the `[decode]` settings in
+[Configuration](/reference/configuration/#encoded-values).
+
 ## When detectors disagree
 
 Two checks can find the same text. Pentect chooses the label in this order:
@@ -60,6 +79,9 @@ Two checks can find the same text. Pentect chooses the label in this order:
 
 Overlapping results become one handle that covers the full area. Values that
 only touch at their edges stay separate. Plugin order does not change the result.
+
+The decision changes the label, not whether the matched bytes stay visible. A
+lower-priority finding is not allowed to uncover part of a stronger finding.
 
 ## Mask from a pipeline
 

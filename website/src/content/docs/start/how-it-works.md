@@ -25,7 +25,10 @@ requests and responses without changing the client UI.
 3. **Let the model use the reference**
 
    The model can understand the label and put the handle in a tool call. It
-   does not need the real value.
+   does not need the real value. Protected launches also provide a local
+   environment binding such as
+   `$env:PENTECT_KAGGLE_API_TOKEN_85268c441f88c284` in PowerShell or
+   `$PENTECT_KAGGLE_API_TOKEN_85268c441f88c284` in a POSIX shell.
 
 4. **Restore only before a local tool runs**
 
@@ -57,7 +60,9 @@ for plain text. The hash identifies the value without putting it in the handle.
 
 Only the local store that knows a handle can restore it. Pentect never guesses
 an unknown handle or connects it to another value. You can choose how long a
-handle stays stable in [Configuration](/reference/configuration/).
+handle ID stays stable in [Configuration](/reference/configuration/). A stable
+ID does not keep recovery data alive after the protected session ends. See
+[Handles](/start/handles/) for the full lifecycle.
 
 ## Content that needs a different treatment
 
@@ -70,6 +75,10 @@ new checks without changing the client setup.
 
 Plain masking removes both the value and its name. A Pentect handle keeps
 enough context for the agent to finish the task.
+
+The handle is not a permission token. It works only when the local Pentect
+session knows its value and the local tool already has permission to perform
+the action.
 
 ::: warning
 A handle is only a reference. It does not control permission. A local tool that

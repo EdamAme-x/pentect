@@ -27,6 +27,23 @@ Unknown fields cause an error. This helps catch spelling mistakes.
 `postscript` is not supported. A plugin cannot run an installer or native setup
 program.
 
+## What users approve
+
+Before activation, Pentect shows the plugin identity, hooks, required status,
+execution limits, network origins, HTTP methods, and private or insecure
+network access. The approval is tied to the manifest and verified Wasm binary.
+
+| Change | Result |
+| --- | --- |
+| Regex, hook, access, or manifest changes | Review and approval are required again |
+| New verified binary with the same approved access | Update can continue without wider permission |
+| Checksum or GitHub build record does not match | Installation stops |
+| Required plugin fails at runtime | The protected action stops |
+| Optional plugin fails at runtime | Pentect reports partial plugin coverage and continues |
+
+`--yes` accepts the displayed approval without another prompt. It never turns
+off validation, checksums, build-record verification, or sandbox limits.
+
 ## Regex detectors
 
 Add one or more detector tables:

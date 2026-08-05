@@ -13,6 +13,9 @@ crate-type = ["cdylib"]
 pentect-plugin = "0.1"
 ```
 
+The SDK is published on crates.io. Keep the dependency on the same supported
+API family as the host release. Commit `Cargo.lock` for release builds.
+
 Export only the hooks you use:
 
 ```rust
@@ -37,6 +40,9 @@ Pentect reads the exports from the Wasm file. You do not list hooks in
 Return `Ok(())` to continue. You do not call `next()`. If a hook blocks, later
 plugins and the normal action do not run. Only `request` can call `respond`.
 
+See [Middleware lifecycle](/plugins/lifecycle/) for the exact order around
+built-in detection and provider calls.
+
 ### Text input
 
 `prepare`, `inspect`, and `finalize` receive:
@@ -51,6 +57,10 @@ pub struct Text {
 Read it with `c.input()`. The `kind` tells you where the text came from, such
 as user input or a tool result. Do not use it as the only security check;
 future Pentect versions may add new kinds.
+
+`metadata()` provides safe context for the current surface when available. Its
+JSON fields can grow. Treat every field as optional and do not block only
+because a new field appears.
 
 ### Provider JSON
 
@@ -154,6 +164,8 @@ pentect plugins config NAME --unset policy.level
 ```
 
 Settings are JSON values inside the Wasm hook. A missing key returns `None`.
+The SDK call can fail, so use `?` or handle the error explicitly. Do not confuse
+a missing key with invalid JSON.
 
 ## Make an approved HTTP request
 
@@ -172,6 +184,10 @@ let response = c.fetch(
 The URL and method must match the manifest. Pentect checks request counts,
 sizes, DNS results, and private addresses. The Wasm module never receives a raw
 socket.
+
+`HttpResponse.status` can be absent when the host request fails. Check
+`response.error` before parsing the body. Set the response capacity no larger
+than your manifest limit.
 
 ## Errors and required plugins
 
@@ -194,6 +210,8 @@ The main public types are:
 
 The SDK source and examples live in
 [`sdk/rust/pentect-plugin`](https://github.com/EdamAme-x/pentect/tree/main/sdk/rust/pentect-plugin).
+
+Copy complete patterns from [Plugin recipes](/plugins/recipes/).
 
 ## Keep plugins compatible
 

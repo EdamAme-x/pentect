@@ -55,3 +55,29 @@ features. It also offers local masking commands, custom gateways, and safe
 plugins.
 
 See [Compatibility](/reference/compatibility/) for the release-tested matrix.
+
+## When it is useful
+
+Pentect fits work where an AI agent must read configuration, inspect logs, or
+call a local tool without sending every credential and private field to the
+model provider. Common examples are:
+
+- coding with `.env`, Terraform, Kubernetes, cloud, npm, or PyPI settings;
+- letting an agent call an API with a credential already on the computer;
+- checking documents and screenshots before they enter a supported request;
+- adding a company-specific detector through a reviewed plugin.
+
+It is less useful for a client that never exposes a supported local API route,
+or for a workflow that already sends the original value outside the protected
+client. Pentect cannot take back data that another process has already sent.
+
+## What changes on the computer
+
+Pentect starts the selected client with a temporary local API endpoint. It does
+not change the global provider configuration for every launch. The provider
+still receives the request and returns the model response; Pentect checks and
+rewrites supported content on the way through.
+
+For local commands, `pentect exec` restores known handles only for that command
+and masks its output before printing it. See [Handles](/start/handles/) for the
+mapping and lifetime rules.

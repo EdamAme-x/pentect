@@ -10,6 +10,22 @@ cannot lower the user's protection for unknown formats.
 You can leave both files absent. Pentect uses safe defaults. Restart a protected
 client after changing a setting.
 
+## Which file wins
+
+Pentect loads settings in this order:
+
+1. built-in defaults;
+2. `~/.pentect/config.toml` for the current user;
+3. `.pentect/config.toml` for the current project.
+
+Project values normally win. Two security rules are different: a project
+cannot change `compatibility.unknown_formats` to `ignore`, and
+`agent.required` becomes true when either file requires it. Plugin approval
+state is managed by the plugin commands, not by copying another user's config.
+
+Unknown keys and invalid values cause an error instead of being silently
+ignored.
+
 ## Settings at a glance
 
 | Setting | Default | Purpose |

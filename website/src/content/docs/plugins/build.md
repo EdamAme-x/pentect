@@ -51,6 +51,20 @@ pentect plugins new company-policy
 cd plugins/company-policy
 ```
 
+The generated project contains:
+
+```text
+company-policy/
+├── plugin.toml
+├── Cargo.toml
+├── Cargo.lock
+├── src/lib.rs
+└── .github/workflows/release.yml
+```
+
+`plugin.toml` is the user-visible contract. The Rust code implements only the
+hooks it exports. The lockfile and workflow make release builds reproducible.
+
 The generated hook looks like this:
 
 ```rust
@@ -87,6 +101,10 @@ you change the Wasm code.
 `plugins dev` currently builds Rust projects with Cargo. Other languages can
 produce a plugin if they export the same Wasm ABI, but Pentect does not provide
 an SDK for them yet.
+
+Run the generated native unit tests with `cargo test`. Run
+`pentect plugins test .` for manifest, Wasm, export, and host-contract checks.
+They cover different failure classes; use both.
 
 ## Use plugin settings
 
@@ -127,5 +145,7 @@ action. Leave it false when Pentect may continue after a plugin error.
 ## Continue learning
 
 - [Rust SDK](/plugins/sdk/) explains all seven hooks.
+- [Middleware lifecycle](/plugins/lifecycle/) explains order, replacement, block, and failure behavior.
+- [Plugin recipes](/plugins/recipes/) provides complete policy and HTTP examples.
 - [Plugin manifest](/plugins/manifest/) lists settings and hard limits.
 - [Test and publish](/plugins/publish/) covers unit tests, tags, and updates.
