@@ -19,9 +19,9 @@ description: Protect a real Codex or Claude session in a few commands.
 
 3. Work normally.
 
-   Ask the agent to read a local configuration file or perform a task that
-   requires a credential. Protected values appear to the model as handles such
-   as `<<DATABASE_URL_4ce8a3b0a6f64e12>>`.
+   Ask the agent to read a local config file or do a task that needs a
+   credential. The model sees a handle such as
+   `<<DATABASE_URL_4ce8a3b0a6f64e12>>` instead of the real value.
 
 4. Watch local protection events when needed.
 
@@ -31,17 +31,17 @@ description: Protect a real Codex or Claude session in a few commands.
 
 ## What success looks like
 
-If a protected file contains `DATABASE_URL=postgres://...`, the provider sees a
-reference such as this instead of the credential:
+If a file contains `DATABASE_URL=postgres://...`, the provider sees a handle
+instead of the credential:
 
 ```dotenv
 DATABASE_URL=<<DATABASE_URL_4ce8a3b0a6f64e12>>
 ```
 
-The agent can copy that handle into a completed local tool call. Pentect
-resolves a known handle immediately before execution, then masks sensitive
-stdout before it returns to the provider. `pentect log` records the protection
-event and label, not the plaintext value.
+The agent can copy the handle into a local tool call. Pentect restores it just
+before the tool runs. Pentect then masks sensitive command output before it
+returns to the provider. `pentect log` records the event and label, not the real
+value.
 
 Normal client arguments pass through unchanged:
 
@@ -99,12 +99,11 @@ PowerShell:
 Get-Content .env -Raw | pentect mask
 ```
 
-The output contains reusable handles. Plaintext is not printed back to the
-terminal.
+The output contains reusable handles. Pentect does not print the real values.
 
 ::: tip
-These functions affect only that shell. Pentect protects each client process
-launched through them; it does not create a system-wide proxy.
+These functions affect only that shell. Pentect protects clients started by the
+functions. It does not create a proxy for the whole system.
 :::
 
 ## Next steps

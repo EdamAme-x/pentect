@@ -50,17 +50,17 @@ sudo apt install --only-upgrade pentect
 
 :::
 
-The direct installers detect the current platform, download a GitHub Release
-asset, and verify its SHA-256 checksum.
+The direct installers find your platform, download the correct GitHub Release,
+and check its SHA-256 checksum.
 
-The npm package installs the same checksummed release binary. `nix shell` opens
-a temporary environment without adding Pentect to your profile. Cargo builds
-Pentect from source and therefore takes longer than the binary installers.
+The npm package installs the same release binary and checks its checksum.
+`nix shell` opens a temporary environment and does not change your profile.
+Cargo builds Pentect from source, so it takes longer.
 
 ## NixOS configuration
 
-With a flake-based NixOS configuration, add Pentect as an input and include its
-package in a module where `inputs` and `pkgs` are available:
+For a flake-based NixOS setup, add Pentect as an input. Then add its package to
+a module that has `inputs` and `pkgs`:
 
 ```nix
 # flake.nix
@@ -78,8 +78,8 @@ Then rebuild the same flake configuration you normally use:
 sudo nixos-rebuild switch --flake .#HOSTNAME
 ```
 
-This keeps Pentect declarative and pinned by `flake.lock`. Update the input with
-`nix flake update pentect`, review the lockfile change, and rebuild.
+`flake.lock` keeps the selected version. To update it, run
+`nix flake update pentect`, check the lockfile change, and rebuild.
 
 ## Verify the installation
 
@@ -87,8 +87,8 @@ This keeps Pentect declarative and pinned by `flake.lock`. Update the input with
 pentect doctor
 ```
 
-`doctor` checks whether Pentect and supported clients are ready. If it reports
-a repairable problem, review the proposed change before using:
+`doctor` checks Pentect and supported clients. If it finds a problem it can fix,
+review the change before you run:
 
 ```sh
 pentect doctor --fix

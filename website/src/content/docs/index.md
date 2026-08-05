@@ -16,11 +16,11 @@ aside: false
   </a>
   <a href="/clients/claude/" class="docs-grid__item">
     <small>CLI</small><strong>Claude Code</strong>
-    <span>Route Anthropic Messages traffic through Pentect.</span><b aria-hidden="true">→</b>
+    <span>Protect Claude Code requests with Pentect.</span><b aria-hidden="true">→</b>
   </a>
   <a href="/clients/codex/" class="docs-grid__item">
     <small>Desktop</small><strong>Codex App</strong>
-    <span>Start an isolated App session with Pentect enabled.</span><b aria-hidden="true">→</b>
+    <span>Start one Codex App session through Pentect.</span><b aria-hidden="true">→</b>
   </a>
   <a href="/clients/claude/" class="docs-grid__item">
     <small>Desktop</small><strong>Claude Desktop</strong>
@@ -33,7 +33,7 @@ aside: false
 <DocsGrid>
   <a href="/start/how-it-works/" class="docs-grid__item">
     <strong>How it works</strong>
-    <span>Follow a value from detection to a local tool call.</span><b aria-hidden="true">→</b>
+    <span>See how Pentect protects and restores a value.</span><b aria-hidden="true">→</b>
   </a>
   <a href="/protection/structured-data/" class="docs-grid__item">
     <strong>Structured data</strong>
@@ -41,15 +41,15 @@ aside: false
   </a>
   <a href="/protection/files-and-images/" class="docs-grid__item">
     <strong>Files and images</strong>
-    <span>Understand document, upload, image, and OCR handling.</span><b aria-hidden="true">→</b>
+    <span>Learn how Pentect checks uploads, images, and documents.</span><b aria-hidden="true">→</b>
   </a>
   <a href="/clients/upstreams/" class="docs-grid__item">
     <strong>Custom upstreams</strong>
-    <span>Put compatible gateways and local model servers behind Pentect.</span><b aria-hidden="true">→</b>
+    <span>Use Pentect with a compatible gateway or local model.</span><b aria-hidden="true">→</b>
   </a>
   <a href="/plugins/overview/" class="docs-grid__item">
     <strong>Plugins</strong>
-    <span>Extend detection and middleware in a Wasm sandbox.</span><b aria-hidden="true">→</b>
+    <span>Add custom checks safely with regex or Wasm.</span><b aria-hidden="true">→</b>
   </a>
   <a href="/reference/capabilities/" class="docs-grid__item">
     <strong>CLI and configuration</strong>

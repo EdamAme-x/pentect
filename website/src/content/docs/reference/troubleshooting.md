@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-description: Diagnose launch, compatibility, handle, and installation problems.
+description: Fix common launch, API, handle, and install problems.
 ---
 
 ## Start with doctor
@@ -9,53 +9,53 @@ description: Diagnose launch, compatibility, handle, and installation problems.
 pentect doctor
 ```
 
-For automation or an issue report:
+For scripts or an issue report:
 
 ```sh
 pentect doctor --json
 ```
 
-Use `pentect doctor --fix` only after reviewing the proposed repair.
+Read the suggested fix before you run `pentect doctor --fix`.
 
 ## A handle cannot be resolved
 
-Handles resolve through the running Pentect session that registered them. If a
-handle came from another session, re-read the source through the current
-Pentect-launched client instead of copying a stale handle.
+The Pentect session that created a handle also restores it. If a handle came
+from an old session, read the source again in the current Pentect client. Do
+not copy an old handle.
 
-Stable handle identity does not make recovery data global or persistent. It
-prevents confusing handle churn; the plaintext mapping remains constrained to
-the active local protection context or an explicitly remembered file pointer.
+A stable handle ID does not save the real value forever or share it everywhere.
+It only keeps the displayed handle from changing too often. The real value
+stays in the current local session or in a file location that Pentect remembers.
 
 ## The client does not launch
 
 1. Run `pentect doctor`.
-2. Confirm the unwrapped `codex` or `claude` command starts normally.
-3. If you use a custom upstream, confirm it implements the required Responses
-   or Messages contract.
-4. Retry with the default upstream to separate client discovery from gateway
-   compatibility.
+2. Check that normal `codex` or `claude` starts without Pentect.
+3. If you use a custom gateway, check that it supports the required Responses
+   or Messages API.
+4. Try the default provider. This shows whether the problem is the client or
+   the gateway.
 
 ## An unknown provider format was blocked
 
-This error means the client sent a provider request or content block that
-Pentect does not know how to inspect. The request was not sent upstream.
+This error means Pentect does not know how to check part of the request. Pentect
+did not send the request to the provider.
 
 ### Try the protected path first
 
-1. Run `pentect doctor`, then check for a fix with `pentect update --check`.
-   Install it with `pentect update` if one is available.
-2. Retry without `--upstream`. If that works, the custom gateway is using a
-   different wire format from OpenAI Responses or Anthropic Messages.
-3. If the error followed a client update, retry the last known working client
-   version or report the new format so Pentect can add support.
-4. Use `pentect log` to capture the route and error category. Logs do not
-   include plaintext protected values.
+1. Run `pentect doctor`, then run `pentect update --check`. If an update is
+   available, install it with `pentect update`.
+2. Try again without `--upstream`. If this works, the custom gateway uses a
+   different API format.
+3. If the error started after a client update, try the last working client
+   version. You can also report the new format.
+4. Run `pentect log` to record the route and error type. Logs do not include
+   real protected values.
 
 ### Temporarily pass the request through
 
-If you trust the destination and need compatibility immediately, add this to
-the **user** configuration at `~/.pentect/config.toml`:
+If you trust the provider and must continue now, add this to your **user**
+config at `~/.pentect/config.toml`:
 
 ```toml
 [compatibility]
@@ -78,22 +78,21 @@ ${EDITOR:-vi} ~/.pentect/config.toml
 
 :::
 
-If `[compatibility]` already exists, change its `unknown_formats` value instead
-of adding a second table. Then close and relaunch the Pentect-launched client.
-There is intentionally no per-project or one-launch bypass: a repository must
-not be able to weaken this user decision.
+If `[compatibility]` already exists, change its `unknown_formats` value. Do not
+add the table twice. Then close and restart the client through Pentect. A
+project cannot change this setting because only the user should make this
+choice.
 
-With `ignore`, an unknown request can reach the upstream without Pentect
-inspecting or masking that request. Supported requests remain protected. To
-restore the default, change the value back to `"error"` and relaunch the
-client.
+With `ignore`, Pentect sends an unknown request without checking or masking it.
+Known request types stay protected. To restore the default, change the value to
+`"error"` and restart the client.
 
 ### Report a format Pentect should support
 
-Open a [compatibility report](https://github.com/EdamAme-x/pentect/issues/new?template=bug_report.yml)
-with the Pentect version, client and version, command, upstream type, route, and
-the complete error text. Replace credentials and private content with synthetic
-values before attaching a request sample.
+Open a [compatibility report](https://github.com/EdamAme-x/pentect/issues/new?template=bug_report.yml).
+Include the Pentect version, client version, command, gateway type, route, and
+full error. Replace credentials and private data with fake values before you
+attach a request sample.
 
 ## Follow protection events
 
@@ -102,9 +101,9 @@ pentect log
 pentect log --json
 ```
 
-Logs report actions and counts, not plaintext protected values.
+Logs show actions and counts, not real protected values.
 
 ::: warning
-Do not paste real credentials into a public issue. Reproduce with a synthetic
-value that has the same format.
+Do not paste real credentials into a public issue. Use a fake value with the
+same format.
 :::

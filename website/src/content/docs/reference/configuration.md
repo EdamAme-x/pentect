@@ -1,11 +1,11 @@
 ---
 title: Configuration
-description: Pentect user and project configuration with secure defaults.
+description: Change Pentect settings for a user or project.
 ---
 
-Pentect reads user configuration from `~/.pentect/config.toml` and project
-configuration from `.pentect/config.toml`. Project values take precedence where
-allowed, but a repository cannot weaken user-level unknown-format protection.
+Pentect reads user settings from `~/.pentect/config.toml` and project settings
+from `.pentect/config.toml`. Project settings win when allowed. A repository
+cannot lower the user's protection for unknown formats.
 
 ## Handle identity
 
@@ -16,12 +16,12 @@ scope = "device"
 
 | Value | Behavior |
 | --- | --- |
-| `device` | Default. The same value produces the same handle identity on this device. |
-| `project` | Derives a distinct identity for each project on this device. |
-| `session` | Generates a new identity for each session. |
+| `device` | Default. The same value gets the same handle ID on this device. |
+| `project` | The same value gets a different handle ID in each project. |
+| `session` | The same value gets a new handle ID in each session. |
 
-Handle hashes are keyed. They are stable references, not unsalted fingerprints
-of the plaintext.
+Pentect creates handle hashes with a private key. They are stable references,
+not simple fingerprints of the real value.
 
 ## Unknown provider formats
 
@@ -30,12 +30,11 @@ of the plaintext.
 unknown_formats = "error" # default
 ```
 
-Set `ignore` only in the user configuration to continue past provider content
-Pentect does not understand. Restart the Pentect-launched client after changing
-the value. `ignore` passes the affected unknown request upstream without
-inspection; change it back to `error` to restore the default.
+Set `ignore` only in the user config. It sends an unknown request without
+checking it. Restart the client after changing this value. Change it back to
+`error` to restore the default.
 
-Project configuration may enforce `error`, but it cannot set `ignore`. See
+Project config can require `error`, but it cannot set `ignore`. See
 [Unknown provider format troubleshooting](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
 for copyable Windows, macOS, and Linux steps.
 
@@ -67,21 +66,19 @@ remember = true
 share = true
 ```
 
-`files.remember` keeps local recovery hints for file-backed handles.
-`activity.share` allows compatible local Pentect processes to share protection
-events.
+`files.remember` keeps local information that helps restore handles from files.
+`activity.share` lets compatible Pentect processes share protection events.
 
-## Require the Pentect agent boundary
+## Require the agent to start through Pentect
 
 ```toml
 [agent]
 required = true
 ```
 
-Use this when the project must not silently continue without a Pentect-launched
-agent session.
+Use this when the project must stop if the agent was not started by Pentect.
 
 ::: info
-Handle environment bindings always use the `PENTECT_` prefix. The prefix is
-intentionally not configurable.
+Environment variables for handles always start with `PENTECT_`. You cannot
+change this prefix.
 :::

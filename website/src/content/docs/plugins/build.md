@@ -1,6 +1,6 @@
 ---
 title: Build a plugin
-description: Start a Pentect plugin and test it locally.
+description: Create a Pentect plugin and test it on your computer.
 ---
 
 1. Create a plugin project.
@@ -15,14 +15,14 @@ description: Start a Pentect plugin and test it locally.
    pentect plugins dev ./my-plugin
    ```
 
-3. Test its declared behavior and permissions.
+3. Test its behavior and requested access.
 
    ```sh
    pentect plugins test my-plugin
    pentect plugins inspect my-plugin
    ```
 
-4. Publish the prepared plugin.
+4. Publish the plugin when it is ready.
 
    ```sh
    pentect plugins publish ./my-plugin
@@ -30,9 +30,9 @@ description: Start a Pentect plugin and test it locally.
 
 ## Choose the smallest plugin form
 
-Use a manifest-only regex detector when matching and labeling spans is enough.
-Choose Wasm middleware only when you need context, branching, configuration, or
-control over whether the next middleware runs.
+Use a manifest-only regex detector when you only need to find and label text.
+Use Wasm when you need context, choices, settings, or control over what runs
+next.
 
 The Rust SDK is published as
 [`pentect-plugin`](https://crates.io/crates/pentect-plugin).
@@ -53,7 +53,7 @@ category = "identifier"
 confidence = "high"
 ```
 
-This form needs no binary, build step, postscript, or native dependency.
+This form needs no binary, build step, setup script, or native library.
 
 ## Wasm middleware
 
@@ -80,11 +80,11 @@ fn inspect(context: &mut Inspect) -> PluginResult {
 pentect_plugin::export!(inspect);
 ```
 
-Finding offsets are UTF-8 byte offsets. The inspect hook adds findings; it does
-not replace its input. `prepare`, `finalize`, `request`, `response`, and
-`tool_call` may replace payloads. `request` may respond directly. Every hook may
-block. Returning `Ok(())` continues automatically, so simple middleware does
-not need boilerplate `next()` calls.
+Finding positions use UTF-8 byte offsets. The `inspect` hook adds results but
+does not change its input. `prepare`, `finalize`, `request`, `response`, and
+`tool_call` may change data. `request` may return a response directly. Every
+hook may block. `Ok(())` moves to the next step, so you do not need to call
+`next()`.
 
 Build the portable module:
 
@@ -93,16 +93,16 @@ rustup target add wasm32-unknown-unknown
 cargo build --release --target wasm32-unknown-unknown
 ```
 
-Set `binary = "my-plugin.wasm"` in `plugin.toml`. Pentect discovers hooks from
-the module exports and rejects native executables or path-traversing binary
-names.
+Set `binary = "my-plugin.wasm"` in `plugin.toml`. Pentect finds hooks from the
+module exports. It rejects native apps and binary paths that leave the plugin
+folder.
 
 ## Configuration and network access
 
-Plugins do not inherit the user's environment. Configuration is stored by
-Pentect and exposed through the SDK only when approved. HTTP access likewise
-uses a Pentect host function with an origin allowlist; the module receives no
-raw socket access.
+Plugins do not receive the user's environment variables. Pentect stores plugin
+settings and gives them to the SDK only after approval. HTTP access also goes
+through Pentect and can reach only approved hosts. Plugins do not get raw
+network sockets.
 
 Before publishing, run:
 
@@ -112,12 +112,11 @@ pentect plugins test my-plugin
 pentect plugins inspect my-plugin
 ```
 
-Test empty input, non-ASCII offsets, overlapping findings, maximum-size input,
-and every stop path. Keep the manifest, Wasm artifact, and release checksum in
-the same tagged release so users can approve an immutable build.
+Test empty input, non-ASCII text, overlapping results, the largest allowed
+input, and every block path. Put the manifest, Wasm file, and checksum in the
+same tagged release. This lets users approve one exact build.
 
 ::: info
-Plugin permissions are part of the user-facing security contract. Declare
-only the access the plugin needs; installation approval is not a substitute
-for narrow permissions.
+Plugin permissions protect the user. Ask only for the access your plugin needs.
+Approval during install does not make broad permissions safe.
 :::

@@ -1,62 +1,59 @@
 ---
 title: Custom upstreams
-description: Route supported OpenAI Responses and Anthropic Messages traffic through another gateway.
+description: Use Pentect with another gateway or local model server.
 ---
 
-Pentect can protect a client while forwarding requests to an existing local or
-remote gateway.
+Pentect can protect a client and send its requests to another local or remote
+gateway.
 
 ```sh
 pentect codex --upstream http://127.0.0.1:8080/openai/v1
 pentect claude --upstream http://127.0.0.1:8080/anthropic
 ```
 
-The upstream URL is selected for that launch only. Pentect preserves its base
-path when composing provider endpoints.
+The upstream URL applies to that launch only. Pentect keeps the base path when
+it builds provider URLs.
 
-Pentect sits in front of the gateway; it does not embed or replace it. The
-client connects to Pentect locally, and Pentect forwards the transformed
-provider request to the upstream you selected.
+Pentect runs in front of the gateway. It does not include or replace the
+gateway. The client connects to Pentect, and Pentect sends the protected
+request to the gateway you chose.
 
-## Supported contracts
+## Supported API formats
 
-- OpenAI Responses-compatible upstreams for Codex
-- Anthropic Messages-compatible upstreams for Claude
+- Gateways that support OpenAI Responses for Codex
+- Gateways that support Anthropic Messages for Claude
 - Existing compatible client provider configuration
 
-Bifrost's `/openai/v1` and `/anthropic` paths are included in Pentect's routing
-tests. LiteLLM and other gateways can use the same protocol contracts; Pentect
-does not certify every gateway provider or release.
+Pentect tests Bifrost's `/openai/v1` and `/anthropic` paths. LiteLLM and other
+gateways can also work when they support the same APIs. Pentect does not test
+every gateway version.
 
 ## Base paths and authentication
 
-Pass the provider-compatible base URL, not a single model endpoint. For example,
-`http://127.0.0.1:8080/openai/v1` remains the base when Pentect composes a
-Responses route. Authentication headers and provider credentials continue to
-come from the client or gateway configuration.
+Pass the base URL for the provider API, not a URL for one model. For example,
+Pentect keeps `http://127.0.0.1:8080/openai/v1` when it builds a Responses API
+URL. The client or gateway still sends the login data.
 
-| Client | Required upstream contract | Example base path |
+| Client | Required API format | Example base path |
 | --- | --- | --- |
 | Codex | OpenAI Responses, including streaming events | `/openai/v1` |
 | Claude | Anthropic Messages, including streaming events | `/anthropic` |
 
 ## Validate a gateway
 
-1. Confirm the client works with its default provider.
-2. Confirm the gateway works directly with the same client and model.
-3. Launch once with `--upstream` and a non-sensitive prompt.
-4. Run `pentect log` while testing a disposable value.
-5. Exercise streaming and one completed tool call—not only plain chat text.
+1. Check that the client works with its normal provider.
+2. Check that the gateway works with the same client and model.
+3. Start the client with `--upstream` and a safe test prompt.
+4. Run `pentect log` and test with a fake secret.
+5. Test streaming and one completed tool call, not only normal chat.
 
-An OpenAI-compatible chat-completions endpoint is not automatically a
-Responses endpoint. Likewise, a gateway can accept Messages JSON while emitting
-incompatible stream events.
+An OpenAI-compatible Chat Completions API is not always a Responses API. A
+gateway may also accept Messages JSON but return a different stream format.
 
 ## Unsupported protocols
 
-Pentect rejects an unsupported wire protocol before launching the client. A
-provider being OpenAI-like is not sufficient if its request or streaming format
-does not match a supported contract. First retry without `--upstream` to confirm
-the client works with its default provider. If the custom gateway must be used,
-follow the [unknown-format recovery steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
-or report its protocol for support.
+Pentect rejects an unsupported API format before it starts the client. An API
+that looks similar to OpenAI is not enough. Its requests and stream events must
+match a supported API. First try again without `--upstream`. If you still need
+the custom gateway, follow the [unknown-format steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
+or ask us to support its API format.
