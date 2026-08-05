@@ -16,6 +16,10 @@ specific public CLI versions with the release binary.
 API tests cover text, streaming, completed tool calls, structured data, file
 links, broken data, and custom gateway paths.
 
+The version numbers are release gates, not strict version locks. A newer client
+may work, but a new request or stream shape can be blocked until Pentect learns
+it. Run `pentect update --check` after a client update.
+
 ## API format adapters
 
 You can use an API adapter when a model provider does not offer OpenAI Responses
@@ -40,6 +44,12 @@ Short-lived CI machines do not install and control the official desktop apps.
 Because of this, Pentect does not list any desktop version as fully tested.
 Windows tests use fake secrets. They test app launch, routing, and local handle
 use without printing the value.
+
+| Desktop surface | Current scope |
+| --- | --- |
+| Codex App | Supported Codex mode using the Responses protocol |
+| Claude Desktop | Supported Chat, attachment, and Code routes |
+| Other app modes | Not claimed unless listed here |
 
 ## Not covered
 

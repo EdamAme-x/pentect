@@ -3,7 +3,22 @@ title: Install
 description: Install Pentect on Windows, macOS, or Linux.
 ---
 
-## Windows
+Choose the method that fits your system. Direct installers and npm download a
+prebuilt release and check its SHA-256 checksum. Cargo builds from source.
+
+| Method | Systems | Updates |
+| --- | --- | --- |
+| PowerShell | Windows | `pentect update` |
+| Shell | macOS and Linux | `pentect update` |
+| Homebrew | macOS and Linux | `brew upgrade pentect` |
+| APT | Debian and Ubuntu | normal APT updates |
+| Nix | macOS and Linux | Nix profile or flake updates |
+| npm | Windows, macOS, and Linux | reinstall the package |
+| Cargo | Any supported Rust host | reinstall from source |
+
+## Direct installer
+
+### Windows
 
 Run in PowerShell:
 
@@ -11,13 +26,18 @@ Run in PowerShell:
 irm https://pentect.dev/install | iex
 ```
 
-## macOS and Linux
+### macOS and Linux
 
-::: code-group
-
-```sh [Shell]
+```sh
 curl -fsSL https://pentect.dev/install.sh | sh
 ```
+
+The installer selects the correct GitHub Release for the current operating
+system and CPU architecture.
+
+## Package managers
+
+::: code-group
 
 ```sh [Homebrew]
 brew install EdamAme-x/pentect/pentect
@@ -50,10 +70,8 @@ sudo apt install --only-upgrade pentect
 
 :::
 
-The direct installers find your platform, download the correct GitHub Release,
-and check its SHA-256 checksum.
-
-The npm package installs the same release binary and checks its checksum.
+The npm package installs from the Pentect GitHub repository, then downloads the
+same release binary and checks its checksum.
 `nix shell` opens a temporary environment and does not change your profile.
 Cargo builds Pentect from source, so it takes longer.
 
@@ -88,7 +106,7 @@ pentect doctor
 ```
 
 `doctor` checks Pentect and supported clients. If it finds a problem it can fix,
-review the change before you run:
+it describes the change first. Apply approved fixes with:
 
 ```sh
 pentect doctor --fix
@@ -104,6 +122,14 @@ pentect doctor --fix
 
 ```sh [macOS / Linux]
 curl -fsSL https://pentect.dev/install.sh | sh -s -- --version X.Y.Z
+```
+
+```sh [npm]
+npm install --global github:EdamAme-x/pentect#vX.Y.Z
+```
+
+```sh [Cargo]
+cargo install --git https://github.com/EdamAme-x/pentect --tag vX.Y.Z --locked pentect-cli
 ```
 
 :::
@@ -145,3 +171,7 @@ pentect update
 pentect update X.Y.Z
 pentect uninstall
 ```
+
+`pentect uninstall` removes an installation managed by the direct installer. It
+keeps `.pentect` project settings and user data. Use the original package
+manager for a package-manager installation.

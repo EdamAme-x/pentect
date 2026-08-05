@@ -17,6 +17,14 @@ pentect doctor --json
 
 Read the suggested fix before you run `pentect doctor --fix`.
 
+Also record the versions involved:
+
+```sh
+pentect version
+codex --version
+claude --version
+```
+
 ## A handle cannot be resolved
 
 The Pentect session that created a handle also restores it. If a handle came
@@ -35,6 +43,38 @@ stays in the current local session or in a file location that Pentect remembers.
    or Messages API.
 4. Try the default provider. This shows whether the problem is the client or
    the gateway.
+
+For a desktop app, check discovery without keeping the app open:
+
+```sh
+pentect codex app --check
+pentect claude app --check
+```
+
+If auto-discovery fails, pass the executable with `--app PATH`.
+
+## A file or image was blocked
+
+1. Check whether the file is UTF-8 text, a supported image, or a supported PDF.
+2. For text, pipe it through `pentect mask` to isolate the problem.
+3. For an image, check its size against the `[image]` limits and keep OCR on.
+4. Convert an unknown binary format before sending it.
+
+`image.unscanned = "allow"` is available for content already checked by
+another trusted system. It sends unchecked content and should not be the first
+fix. See [Files and images](/protection/files-and-images/).
+
+## A plugin does not run
+
+```sh
+pentect plugins inspect NAME
+pentect plugins test NAME
+pentect plugins setup NAME
+```
+
+`inspect` shows requested hooks and access. `test` checks the manifest and
+Wasm exports. Run `setup` after a reviewed plugin update changes its approved
+access. For a required plugin, a plugin error stops the protected action.
 
 ## An unknown provider format was blocked
 

@@ -3,7 +3,10 @@ title: Quick start
 description: Protect a real Codex or Claude session in a few commands.
 ---
 
-1. Check that Pentect can find your client.
+Install Pentect first, then use one protected launch. You do not need to change
+the permanent settings of Codex or Claude.
+
+1. Check Pentect and the client.
 
    ```sh
    pentect doctor
@@ -17,13 +20,13 @@ description: Protect a real Codex or Claude session in a few commands.
    pentect claude
    ```
 
-3. Work normally.
+3. Work normally in the client that opens.
 
    Ask the agent to read a local config file or do a task that needs a
    credential. The model sees a handle such as
    `<<DATABASE_URL_4ce8a3b0a6f64e12>>` instead of the real value.
 
-4. Watch local protection events when needed.
+4. Watch local protection events when you need to verify a flow.
 
    ```sh
    pentect log
@@ -42,6 +45,10 @@ The agent can copy the handle into a local tool call. Pentect restores it just
 before the tool runs. Pentect then masks sensitive command output before it
 returns to the provider. `pentect log` records the event and label, not the real
 value.
+
+The client should still stream responses, run tools, and accept its normal
+flags. If a request format cannot be checked, Pentect returns an error instead
+of sending it by default.
 
 Normal client arguments pass through unchanged:
 
@@ -112,3 +119,4 @@ functions. It does not create a proxy for the whole system.
 - See [Structured data](/protection/structured-data/) for dotenv, Terraform, Kubernetes, and JSON behavior.
 - Review [Files and images](/protection/files-and-images/) before sending uploads.
 - Run `pentect doctor` again after changing a client installation or provider.
+- Copy a complete task from [Examples](/start/examples/).
