@@ -1,22 +1,22 @@
 ---
 title: Plugins
-description: Extend Pentect with declarative detectors or sandboxed Wasm middleware.
+description: Add custom checks with regex rules or safe Wasm code.
 ---
 
 Pentect plugins come in two forms:
 
-1. Manifest-only regex detectors for compact pattern matching.
-2. WebAssembly middleware for logic that cannot be expressed as an automaton.
+1. Regex rules in a manifest for simple pattern checks.
+2. WebAssembly (Wasm) code for checks that need more logic.
 
 Native executable plugins and postscripts are not supported.
 
 | Form | Best for | Runtime |
 | --- | --- | --- |
-| Manifest detector | Deterministic pattern and label rules | Built into Pentect's detection pass |
-| Wasm middleware | Context, branching, configuration, request or response control | Fuel- and memory-bounded WebAssembly sandbox |
+| Manifest detector | Clear pattern and label rules | Runs as part of Pentect's normal checks |
+| Wasm middleware | Context, choices, settings, or request and response control | Runs in a Wasm sandbox with time and memory limits |
 
-A manifest detector is the default choice. Use Wasm only when a regular
-expression cannot express the required behavior.
+Start with a manifest detector. Use Wasm only when a regular expression cannot
+do the job.
 
 ## Install a plugin
 
@@ -24,8 +24,8 @@ expression cannot express the required behavior.
 pentect plugins add github:@owner/repository/path
 ```
 
-The configured plugin set applies consistently to `mask`, local execution,
-Codex, Claude, and supported desktop-app launchers.
+Your plugin setup works with `mask`, local commands, Codex, Claude, and
+supported desktop apps.
 
 Plugins may also be selected for a single client launch:
 
@@ -45,29 +45,28 @@ pentect plugins update NAME
 pentect plugins remove NAME
 ```
 
-Remote manifests are pinned locally. They change only after an explicit add,
-setup, or update operation—not because a cache timer expired.
+Pentect saves the exact remote manifest locally. It changes only when you run
+an add, setup, or update command. A cache timer cannot change it.
 
 ## Installation lifecycle
 
-1. `add` resolves the source and stores the manifest.
+1. `add` finds the source and saves the manifest.
 2. `setup` downloads and verifies a Wasm binary when the plugin has one.
-3. Pentect shows the discovered hooks and requested access for approval.
-4. A binary digest, manifest state, and approval are locked together locally.
-5. `update` fetches a newer version explicitly. Changed binary or hook access requires approval again.
+3. Pentect shows the plugin hooks and requested access for your approval.
+4. Pentect links the binary hash, manifest, and approval together.
+5. `update` gets a newer version. You must approve a changed binary or new access again.
 
-Use `inspect` before approval and `test` after setup. A modified installed
-binary is rejected until it is verified again.
+Use `inspect` before approval and `test` after setup. If an installed binary
+changes, Pentect blocks it until you check it again.
 
 ## Sandbox and permissions
 
-Wasm middleware runs without WASI. It has no ambient filesystem, environment,
-process, or socket access. Network destinations and permissions that can change
-payloads require explicit user approval.
+Wasm code runs without WASI. It cannot directly use files, environment
+variables, processes, or network sockets. You must approve network targets and
+any access that can change data.
 
-Available hooks are `prepare`, `inspect`, `finalize`, `request`, `response`,
-`tool_call`, and `file`. A successful hook continues to the next plugin
-automatically. A plugin can block at any hook; only the request hook can return
-a response directly. Outbound HTTP is limited to approved origins, methods,
-sizes, request counts, and timeouts. Private or insecure origins require
-additional explicit approval.
+Plugins can use these hooks: `prepare`, `inspect`, `finalize`, `request`,
+`response`, `tool_call`, and `file`. After a hook succeeds, Pentect runs the
+next plugin. Any hook can block an action. Only `request` can return a response
+directly. HTTP calls have limits for approved hosts, methods, size, number of
+requests, and time. Private or insecure hosts need extra approval.

@@ -1,6 +1,6 @@
 ---
 title: CLI reference
-description: User-facing Pentect commands and their purpose.
+description: Pentect commands and what they do.
 ---
 
 ## Launch clients
@@ -12,8 +12,8 @@ description: User-facing Pentect commands and their purpose.
 | `pentect codex app` | Launch Codex App for this protected session |
 | `pentect claude app` | Launch Claude Desktop for this protected session |
 
-Client launchers accept `--upstream URL` for a compatible upstream and
-`--plugins SOURCE` for a one-off plugin addition. App launchers also accept
+Use `--upstream URL` to choose a compatible gateway for one launch. Use
+`--plugins SOURCE` to add a plugin for one launch. App commands also support
 `--app PATH` and `--check`.
 
 Codex and Claude arguments are forwarded directly:
@@ -29,24 +29,24 @@ pentect claude --model sonnet
 | --- | --- |
 | `pentect mask [TEXT]` | Mask arguments or UTF-8 stdin |
 | `pentect read PATH` | Print a masked preview of a file |
-| `pentect exec "COMMAND"` | Resolve known handles locally, run the command, and mask stdout/stderr |
-| `pentect view HANDLE` | Show handle metadata without revealing its value |
-| `pentect resolve [PATH...]` | Resolve known handles from stdin or in selected files |
+| `pentect exec "COMMAND"` | Restore known handles, run the command, and mask its output |
+| `pentect view HANDLE` | Show handle details without revealing its value |
+| `pentect resolve [PATH...]` | Restore known handles from stdin or selected files |
 | `pentect log [--json]` | Follow local protection events |
 
-Use `resolve` carefully: resolving a file writes plaintext to its destination.
-Prefer `exec` when a command can consume a handle directly.
+Use `resolve` with care. It writes real values to the selected file or output.
+Use `exec` instead when a command can take a handle directly.
 
 ## Installation health
 
 | Command | Purpose |
 | --- | --- |
 | `pentect doctor` | Check readiness |
-| `pentect doctor --json` | Emit machine-readable diagnostics |
-| `pentect doctor --fix` | Offer safe repairs |
+| `pentect doctor --json` | Print results as JSON |
+| `pentect doctor --fix` | Show and apply approved fixes |
 | `pentect update [VERSION]` | Install a verified GitHub Release binary |
 | `pentect update --check` | Check without installing |
-| `pentect uninstall` | Remove the binary while retaining project data |
+| `pentect uninstall` | Remove Pentect but keep project data |
 | `pentect version` | Print the installed version |
 
 ## Plugins

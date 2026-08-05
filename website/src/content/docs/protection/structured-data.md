@@ -1,10 +1,10 @@
 ---
 title: Structured data
-description: Preserve useful labels while masking secrets in common configuration formats.
+description: Keep useful field names while masking secrets in common config files.
 ---
 
-Pentect uses syntax and surrounding structure when it can. This produces more
-useful handles than treating every detected value as a generic secret.
+Pentect uses file syntax and field names when possible. This creates clearer
+handles than using `SECRET` for every value.
 
 ```dotenv
 RUNPOD_API_KEY=<<RUNPOD_API_KEY_6b1275e3e3fadb9f>>
@@ -13,17 +13,16 @@ KAGGLE_API_TOKEN=<<KAGGLE_API_TOKEN_039fe674477b5763>>
 
 ## Recognized sources
 
-Built-in structured detection covers common forms including:
+Built-in checks support common formats, including:
 
-- dotenv files, including comments and mildly malformed assignments
+- dotenv files, including comments and small syntax errors
 - Terraform variables and values
 - Kubernetes Secrets and kubeconfig data
 - AWS, npm, and PyPI configuration
 - JSON and other recognized key/value structures
 
-The label comes from the structure when the structure identifies the field. A
-dotenv assignment, Terraform attribute, Kubernetes Secret key, and JSON object
-key can therefore keep a useful name:
+When a file clearly names a field, Pentect uses that name for the handle. This
+works with dotenv keys, Terraform fields, Kubernetes Secret keys, and JSON keys:
 
 ::: code-group
 
@@ -46,23 +45,21 @@ stringData:
 
 :::
 
-Comments, quoting, whitespace, and mildly malformed dotenv assignments are
-handled without requiring a perfect parser round trip. Values that are empty,
-comments, or clearly non-sensitive remain readable.
+Pentect handles comments, quotes, spaces, and small dotenv syntax errors. Empty
+values, comments, and values that are clearly safe stay visible.
 
 ## When detectors disagree
 
-Detection results can overlap. Pentect resolves overlap using structural label
-evidence in this order:
+Two checks can find the same text. Pentect chooses the label in this order:
 
-1. A label established by the containing format, such as a dotenv or Kubernetes key.
-2. Higher detector confidence.
-3. A detection that covers the complete sensitive value.
-4. A more specific built-in detector.
-5. A canonical `SECRET` or `PII` label when equally credible labels still conflict.
+1. A field name from the file format, such as a dotenv or Kubernetes key.
+2. The result with higher confidence.
+3. The result that covers the full sensitive value.
+4. The more specific built-in check.
+5. `SECRET` or `PII` when two equally strong labels still disagree.
 
-Overlapping spans become one masked union and one handle. Edge-adjacent values
-remain separate. The result does not depend on plugin execution order.
+Overlapping results become one handle that covers the full area. Values that
+only touch at their edges stay separate. Plugin order does not change the result.
 
 ## Mask from a pipeline
 
@@ -77,6 +74,6 @@ PowerShell:
 Get-Content .env -Raw | pentect mask
 ```
 
-`pentect mask` reads standard input and writes transformed text to standard
-output, so it composes with existing tools. It does not need a format flag;
-Pentect recognizes supported structure from the input itself.
+`pentect mask` reads standard input and writes protected text to standard
+output. You can use it in a normal pipe. Pentect finds the format on its own,
+so you do not need a format option.

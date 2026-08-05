@@ -15,15 +15,15 @@ pentect codex app
 
 :::
 
-Arguments after `codex` are forwarded to the Codex CLI. The app command
-launches the installed desktop app with Pentect routing for that process; it
-does not permanently change the app's global configuration.
+Pentect passes arguments after `codex` to the Codex CLI. The app command starts
+the installed desktop app through Pentect. It does not make a permanent change
+to the app.
 
 | Launch | Scope |
 | --- | --- |
 | `pentect codex` | One Codex CLI process and its children |
 | `pentect codex app` | One Codex App launch |
-| `pentect codex --upstream URL` | One CLI launch using a compatible upstream |
+| `pentect codex --upstream URL` | One CLI launch using a compatible gateway |
 | `pentect codex --plugins NAME` | One launch with the selected plugin set |
 
 Client flags do not need a separator:
@@ -35,45 +35,44 @@ pentect codex --model o3
 
 ## Protected flow
 
-Pentect inserts a local Responses-compatible gateway for the launched client.
-It protects supported prompt content, tool results, file inputs, and completed
-tool-call arguments while preserving streaming responses.
+Pentect starts a local gateway that supports the Responses API. It protects
+prompts, tool results, files, and completed tool-call arguments. Streaming
+responses still work.
 
 ## Existing providers
 
-Existing Codex provider configuration is retained as the upstream when its wire
-protocol is supported. You can also select an upstream for one launch:
+Pentect keeps your current Codex provider when it uses a supported API format.
+You can also choose a provider or gateway for one launch:
 
 ```sh
 pentect codex --upstream http://127.0.0.1:8080/openai/v1
 ```
 
-Pentect preserves the configured base path when it composes Responses API
-routes. Authentication remains owned by Codex and the upstream; Pentect does
-not replace provider credentials.
+Pentect keeps the base path when it builds Responses API URLs. Codex and the
+selected provider still manage login details and credentials.
 
 ## Codex App
 
-Use `--check` to validate discovery and routing without keeping an app session
-open. If automatic discovery does not find the executable, pass it explicitly:
+Use `--check` to test app discovery and routing without leaving the app open.
+If Pentect cannot find the app, pass its path:
 
 ```sh
 pentect codex app --check
 pentect codex app --app /path/to/codex
 ```
 
-This is opt-in per launch. Opening Codex App normally does not silently install
-a global proxy or change unrelated ChatGPT traffic.
+This affects only the launch started by Pentect. Opening Codex App normally
+does not use Pentect or change other ChatGPT traffic.
 
 ## Verify protection
 
-Run `pentect log` in another terminal, then ask Codex to read a test dotenv file.
-The model-visible text should contain a handle and the log should show a masked
-event. Do not use a production credential for the first check.
+Run `pentect log` in another terminal. Then ask Codex to read a test dotenv
+file. The model should see a handle, and the log should show a mask event. Use
+a test value, not a real production credential.
 
 ::: warning
-Codex App coverage applies to its supported Codex mode. Pentect does not claim
-protection for ChatGPT Chat, Work, Voice, or unknown future opaque routes. If a
-request is blocked, follow the [unknown-format recovery steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
-instead of disabling Pentect for the whole app.
+Pentect protects the supported Codex mode in the app. It does not protect
+ChatGPT Chat, Work, Voice, or unknown future routes. If Pentect blocks a
+request, follow the [unknown-format steps](/reference/troubleshooting/#an-unknown-provider-format-was-blocked).
+Do not turn off Pentect for the whole app.
 :::
