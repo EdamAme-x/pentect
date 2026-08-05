@@ -1,16 +1,22 @@
 use pentect_plugin::{Finding, Inspect, PluginResult};
 
 fn inspect(context: &mut Inspect) -> PluginResult {
-    for (start, value) in context.input().text.match_indices("ACME-") {
-        let end = start + value.len() + 8;
-        if context
-            .input()
-            .text
-            .get(start + value.len()..end)
-            .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
-        {
-            context.add_finding(Finding::new(start, end, "ACME_ID"))?;
-        }
+    let findings = context
+        .input()
+        .text
+        .match_indices("ACME-")
+        .filter_map(|(start, value)| {
+            let end = start + value.len() + 8;
+            context
+                .input()
+                .text
+                .get(start + value.len()..end)
+                .filter(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+                .map(|_| (start, end))
+        })
+        .collect::<Vec<_>>();
+    for (start, end) in findings {
+        context.add_finding(Finding::new(start, end, "ACME_ID"))?;
     }
     Ok(())
 }
