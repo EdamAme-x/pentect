@@ -32,6 +32,7 @@
 
 body {
   letter-spacing: -0.01em;
+  text-rendering: optimizeLegibility;
 }
 
 /* Keep wheel, touch, and keyboard scrolling without native scrollbar chrome. */
@@ -232,6 +233,22 @@ body {
 .VPHome .vp-doc.container {
   max-width: 1152px;
   padding: 0 24px 96px;
+}
+
+.vp-doc {
+  font-size: 15px;
+  line-height: 1.75;
+}
+
+.vp-doc > p,
+.vp-doc > ul,
+.vp-doc > ol {
+  max-width: 760px;
+}
+
+.vp-doc a {
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
 }
 
 .home-install {
@@ -497,6 +514,50 @@ body {
   line-height: 1.7;
 }
 
+.home-flow {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 4px 0 64px;
+  border-block: 1px solid var(--vp-c-divider);
+}
+
+.home-flow__step {
+  display: flex;
+  min-height: 170px;
+  flex-direction: column;
+  gap: 9px;
+  padding: 24px 28px 24px 0;
+}
+
+.home-flow__step + .home-flow__step {
+  border-left: 1px solid var(--vp-c-divider);
+  padding-left: 28px;
+}
+
+.home-flow__step small {
+  color: var(--vp-c-brand-1);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+
+.home-flow__step strong {
+  color: var(--vp-c-text-1);
+  font-size: 17px;
+}
+
+.home-flow__step span {
+  color: var(--vp-c-text-2);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.home-flow__step code {
+  padding: 1px 4px;
+  color: var(--vp-c-text-1);
+  font-size: 12px;
+}
+
 .docs-hub .vp-doc > h2 {
   margin-top: 64px;
   border-top: 0;
@@ -534,6 +595,25 @@ body {
 .vp-doc table {
   display: table;
   width: 100%;
+  border-collapse: collapse;
+}
+
+.vp-doc th {
+  color: var(--vp-c-text-3);
+  font-size: 11px;
+  letter-spacing: .055em;
+  text-transform: uppercase;
+}
+
+.vp-doc td,
+.vp-doc th {
+  padding: 11px 14px;
+}
+
+.vp-doc .custom-block {
+  border: 0;
+  border-left: 3px solid var(--vp-c-brand-1);
+  border-radius: 0;
 }
 
 .vp-doc div[class*='language-'] {
@@ -706,6 +786,28 @@ body {
   .home-routes {
     grid-template-columns: 1fr;
     margin-top: 42px;
+  }
+
+  .home-flow {
+    grid-template-columns: 1fr;
+    margin-bottom: 44px;
+  }
+
+  .home-flow__step {
+    min-height: 0;
+    padding: 20px 0;
+  }
+
+  .home-flow__step + .home-flow__step {
+    border-top: 1px solid var(--vp-c-divider);
+    border-left: 0;
+    padding-left: 0;
+  }
+
+  .vp-doc table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
   }
 
   .home-routes a + a {

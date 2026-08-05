@@ -7,6 +7,22 @@ Pentect reads user settings from `~/.pentect/config.toml` and project settings
 from `.pentect/config.toml`. Project settings win when allowed. A repository
 cannot lower the user's protection for unknown formats.
 
+You can leave both files absent. Pentect uses safe defaults. Restart a protected
+client after changing a setting.
+
+## Settings at a glance
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `handles.scope` | `device` | Choose how stable handle IDs are |
+| `compatibility.unknown_formats` | `error` | Block request formats Pentect cannot inspect |
+| `image.ocr` | `on` | Check supported images locally |
+| `image.redaction` | `black` | Cover detected image regions |
+| `image.unscanned` | `block` | Stop when image or document content cannot be checked |
+| `files.remember` | `true` | Remember safe local file-to-handle information |
+| `activity.share` | `true` | Share events with compatible local Pentect processes |
+| `agent.required` | `false` | Require supported agents to start through Pentect |
+
 ## Handle identity
 
 ```toml
@@ -55,6 +71,28 @@ fetch_seconds = 8
 ```
 
 `redaction` accepts `black` or `blur`. `unscanned` accepts `block` or `allow`.
+Size values are bytes except `max_edge` and `max_pixels`. Keep the defaults
+unless a trusted file is larger than a limit.
+
+## Encoded values
+
+Pentect can inspect common encoded text and compressed data before detection:
+
+```toml
+[decode]
+enabled = true
+max_depth = 3
+min_bytes = 16
+max_bytes = 262144
+max_inflate_bytes = 8388608
+mask_unknown = false
+unknown_min_bytes = 24
+```
+
+Use `"unlimited"` for `max_depth`, `max_bytes`, or `max_inflate_bytes` only
+when another limit controls the input. `mask_unknown = true` also masks long
+opaque encoded values that Pentect cannot identify. It can create false
+positives, so it is off by default.
 
 ## Files and activity
 
@@ -69,6 +107,9 @@ share = true
 `files.remember` keeps local information that helps restore handles from files.
 `activity.share` lets compatible Pentect processes share protection events.
 
+Project values normally override user values. `agent.required` is stricter: if
+either file sets it to `true`, the effective value is true.
+
 ## Require the agent to start through Pentect
 
 ```toml
@@ -82,3 +123,16 @@ Use this when the project must stop if the agent was not started by Pentect.
 Environment variables for handles always start with `PENTECT_`. You cannot
 change this prefix.
 :::
+
+## Plugin settings
+
+Do not edit plugin state by hand. Use the CLI so values stay valid:
+
+```sh
+pentect plugins config PLUGIN policy.level=strict
+pentect plugins config PLUGIN --unset policy.level
+pentect plugins setup PLUGIN
+```
+
+`plugins add` records an enabled source in the project config. Wasm access is
+approved separately and tied to the manifest and binary hashes.

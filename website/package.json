@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "vitepress dev",
-    "build": "vitepress build && node scripts/copy-installers.mjs && node scripts/generate-agent-docs.mjs",
+    "build": "vitepress build && node scripts/copy-installers.mjs && node scripts/generate-agent-docs.mjs && node scripts/check-docs.mjs",
+    "check": "node scripts/check-docs.mjs",
     "preview": "vitepress preview"
   },
   "dependencies": {

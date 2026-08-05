@@ -3,6 +3,10 @@ title: CLI reference
 description: Pentect commands and what they do.
 ---
 
+Run `pentect help` for the short list installed with your version. Pentect
+returns a non-zero exit code when it blocks input, cannot start a client, or
+cannot complete a requested change.
+
 ## Launch clients
 
 | Command | Purpose |
@@ -23,6 +27,10 @@ pentect codex exec --full-auto
 pentect claude --model sonnet
 ```
 
+`--check` validates app discovery and routing without leaving the app open.
+`--plugins` accepts a local plugin directory or a
+`github:@OWNER/REPOSITORY/path` source. Separate multiple sources with commas.
+
 ## Protect local input and execution
 
 | Command | Purpose |
@@ -37,6 +45,20 @@ pentect claude --model sonnet
 Use `resolve` with care. It writes real values to the selected file or output.
 Use `exec` instead when a command can take a handle directly.
 
+`mask` accepts text as arguments or reads UTF-8 standard input:
+
+::: code-group
+
+```sh [macOS / Linux]
+printf '%s' 'TOKEN=example' | pentect mask
+```
+
+```powershell [Windows]
+'TOKEN=example' | pentect mask
+```
+
+:::
+
 ## Installation health
 
 | Command | Purpose |
@@ -44,8 +66,10 @@ Use `exec` instead when a command can take a handle directly.
 | `pentect doctor` | Check readiness |
 | `pentect doctor --json` | Print results as JSON |
 | `pentect doctor --fix` | Show and apply approved fixes |
+| `pentect doctor --fix --yes` | Apply all offered fixes without another prompt |
 | `pentect update [VERSION]` | Install a verified GitHub Release binary |
 | `pentect update --check` | Check without installing |
+| `pentect update --force` | Reinstall even when the selected version is already present |
 | `pentect uninstall` | Remove Pentect but keep project data |
 | `pentect version` | Print the installed version |
 
@@ -70,5 +94,8 @@ Use `exec` instead when a command can take a handle directly.
 `SOURCE` can be a local directory or `github:@OWNER/REPOSITORY/path`. Use
 `--plugins SOURCE` on a client or mask command when you need a plugin for only
 one launch.
+
+Approval flags skip an interactive confirmation; they do not skip checksum,
+build-record, manifest, or sandbox checks.
 
 See [Plugins](/plugins/overview/) for the full workflow.

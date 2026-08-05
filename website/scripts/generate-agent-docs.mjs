@@ -39,10 +39,12 @@ for (const sourcePath of sourceFiles) {
   const slug = frontmatterValue(attributes, 'slug') ?? defaultSlug;
   const route = slug ? `/${slug.replace(/^\/+|\/+$/g, '')}/` : '/';
   const outputDirectory = path.join(distRoot, route.slice(1));
-  const tree = processor.parse(body);
+  const agentTitle = title.endsWith('_') ? title.slice(0, -1) : title;
+  const agentBody = body.replace(/^:::\s*(?:code-group|tip|info|warning|danger)?\s*$/gm, '');
+  const tree = processor.parse(agentBody);
   const description = frontmatterValue(attributes, 'description');
   tree.children = [
-    heading(title),
+    heading(agentTitle),
     ...(description ? [paragraph(description)] : []),
     ...rewriteNodes(tree.children),
   ];
@@ -89,6 +91,19 @@ function rewriteNodes(nodes) {
     if (node.type === 'mdxJsxFlowElement' || node.type === 'mdxJsxTextElement') {
       if (node.name === 'a') {
         return [rewriteAnchor(node)];
+      }
+      if (node.name === 'div' && componentClass(node).includes('home-flow')) {
+        return (node.children ?? [])
+          .filter((child) => componentClass(child).includes('home-flow__step'))
+          .flatMap((step) => {
+            const number = componentAttribute(step, 'data-number');
+            const title = componentAttribute(step, 'data-title');
+            const description = componentAttribute(step, 'data-description');
+            return [
+              heading([number, title].filter(Boolean).join(' — '), 3),
+              ...(description ? [paragraph(description)] : []),
+            ];
+          });
       }
       const children = rewriteNodes(node.children ?? []);
       const label = componentLabel(node);
@@ -162,6 +177,17 @@ function componentLabel(node) {
     (item) => item.type === 'mdxJsxAttribute' && item.name === attributeName,
   );
   return typeof attribute?.value === 'string' ? attribute.value : undefined;
+}
+
+function componentClass(node) {
+  return componentAttribute(node, 'class');
+}
+
+function componentAttribute(node, name) {
+  const attribute = node?.attributes?.find(
+    (item) => item.type === 'mdxJsxAttribute' && item.name === name,
+  );
+  return typeof attribute?.value === 'string' ? attribute.value : '';
 }
 
 function heading(value, depth = 1) {

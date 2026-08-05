@@ -10,6 +10,7 @@ const sidebarIcons = {
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/>',
   download: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/>',
   flow: '<circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 6h8M7 8l4 8m6-8-4 8"/>',
+  examples: '<path d="M5 4h14v16H5Z"/><path d="M8 8h8M8 12h5M8 16h7"/>',
   terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/>',
   message: '<path d="M5 18 3 21l4-1.5A9 9 0 1 0 5 18Z"/><path d="M8 11h8M8 14h5"/>',
   network: '<circle cx="5" cy="12" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="m7 11 10-4m-10 6 10 4"/>',
@@ -44,6 +45,7 @@ const sidebar = [
       { text: sidebarLabel('What is Pentect?', 'info'), link: '/start/what-is-pentect/' },
       { text: sidebarLabel('Install', 'download'), link: '/start/install/' },
       { text: sidebarLabel('How it works', 'flow'), link: '/start/how-it-works/' },
+      { text: sidebarLabel('Examples', 'examples'), link: '/start/examples/' },
     ],
   },
   {
@@ -97,7 +99,7 @@ export default defineConfig({
   lang: 'en-US',
   title: 'Pentect',
   titleTemplate: ':title — Pentect',
-  description: 'Let agents use secrets without seeing them.',
+  description: 'Protect sensitive data before it reaches an AI model, while local tools keep working.',
   cleanUrls: true,
   lastUpdated: true,
   rewrites(id) {
