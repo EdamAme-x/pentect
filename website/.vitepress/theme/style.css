@@ -161,7 +161,7 @@ body {
   object-fit: contain;
 }
 
-.dark .sidebar-link-label .sidebar-brand-icon[src$='openai-blossom.svg'] {
+.dark .sidebar-link-label .sidebar-brand-icon {
   filter: invert(1);
 }
 
