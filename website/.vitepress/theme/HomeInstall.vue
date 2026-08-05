@@ -12,8 +12,19 @@ import {
 import { computed, onMounted, ref } from 'vue';
 
 type OperatingSystem = 'windows' | 'macos' | 'linux';
-type Installer = { id: string; label: string; command: string; icon: string; tone: string };
-type CommandToken = { text: string; kind: 'space' | 'command' | 'option' | 'string' | 'operator' | 'argument' };
+type InstallerVariant = { id: string; label: string; command: string };
+type Installer = {
+  id: string;
+  label: string;
+  command: string;
+  icon: string;
+  tone: string;
+  variants?: InstallerVariant[];
+};
+type CommandToken = {
+  text: string;
+  kind: 'space' | 'comment' | 'command' | 'option' | 'string' | 'operator' | 'argument';
+};
 
 const operatingSystems: Array<{
   id: OperatingSystem;
@@ -39,6 +50,30 @@ const cargoInstaller = {
   command: 'cargo install --git https://github.com/EdamAme-x/pentect --locked pentect-cli',
   icon: 'rust',
   tone: 'cargo',
+};
+const nixInstaller: Installer = {
+  id: 'nix',
+  label: 'Nix',
+  command: '# Temporary environment; nothing is installed permanently\nnix shell github:EdamAme-x/pentect',
+  icon: 'nixos',
+  tone: 'nix',
+  variants: [
+    {
+      id: 'shell',
+      label: 'Shell',
+      command: '# Temporary environment; nothing is installed permanently\nnix shell github:EdamAme-x/pentect',
+    },
+    {
+      id: 'profile',
+      label: 'Profile',
+      command: '# Install once\nnix profile install github:EdamAme-x/pentect\n\n# Update later\nnix profile upgrade pentect',
+    },
+    {
+      id: 'nixos',
+      label: 'NixOS',
+      command: '# flake.nix\ninputs.pentect.url = "github:EdamAme-x/pentect";\n\n# In a module where `inputs` and `pkgs` are available\nenvironment.systemPackages = [\n  inputs.pentect.packages.${pkgs.system}.default\n];',
+    },
+  ],
 };
 
 const installers: Record<OperatingSystem, Installer[]> = {
@@ -69,20 +104,7 @@ const installers: Record<OperatingSystem, Installer[]> = {
       tone: 'shell',
     },
     npmInstaller,
-    {
-      id: 'nix',
-      label: 'Nix profile',
-      command: 'nix profile install github:EdamAme-x/pentect',
-      icon: 'nixos',
-      tone: 'nix',
-    },
-    {
-      id: 'nix-shell',
-      label: 'Nix shell',
-      command: 'nix shell github:EdamAme-x/pentect',
-      icon: 'nixos',
-      tone: 'nix',
-    },
+    nixInstaller,
     cargoInstaller,
   ],
   linux: [
@@ -95,32 +117,20 @@ const installers: Record<OperatingSystem, Installer[]> = {
     },
     {
       id: 'apt',
-      label: 'APT',
-      command: 'curl -fsSL https://pentect.dev/install-apt.sh | sudo sh',
+      label: 'APT repository',
+      command: '# First install: add the Pentect APT repository and install\ncurl -fsSL https://pentect.dev/install-apt.sh | sudo sh\n\n# Update later through APT\nsudo apt update && sudo apt install --only-upgrade pentect',
       icon: 'debian',
       tone: 'apt',
     },
     npmInstaller,
-    {
-      id: 'nix',
-      label: 'Nix profile',
-      command: 'nix profile install github:EdamAme-x/pentect',
-      icon: 'nixos',
-      tone: 'nix',
-    },
-    {
-      id: 'nix-shell',
-      label: 'Nix shell',
-      command: 'nix shell github:EdamAme-x/pentect',
-      icon: 'nixos',
-      tone: 'nix',
-    },
+    nixInstaller,
     cargoInstaller,
   ],
 };
 
 const selectedOs = ref<OperatingSystem>('windows');
 const selectedMethod = ref('powershell');
+const selectedVariant = ref<string | null>(null);
 const copyState = ref<'idle' | 'copied' | 'failed'>('idle');
 const iconSet: Record<string, string> = {
   windows: 'M0 0h11.377v11.372H0Zm12.623 0H24v11.372H12.623ZM0 12.623h11.377V24H0Zm12.623 0H24V24H12.623',
@@ -139,19 +149,29 @@ const methods = computed(() => installers[selectedOs.value]);
 const selectedInstaller = computed(
   () => methods.value.find((item) => item.id === selectedMethod.value) ?? methods.value[0],
 );
-const commandTokens = computed(() => tokenizeCommand(selectedInstaller.value.command));
+const variants = computed(() => selectedInstaller.value.variants ?? []);
+const activeVariant = computed(
+  () => variants.value.find((item) => item.id === selectedVariant.value) ?? variants.value[0],
+);
+const selectedCommand = computed(() => activeVariant.value?.command ?? selectedInstaller.value.command);
+const commandTokens = computed(() => tokenizeCommand(selectedCommand.value));
 
 function iconPath(name: string) {
   return iconSet[name] ?? '';
 }
 
 function tokenizeCommand(command: string): CommandToken[] {
-  const parts = command.match(/https?:\/\/[^\s|]+|github:[^\s|]+|--?[\w-]+|\||[^\s|]+|\s+/g) ?? [command];
+  const parts = command.match(/#[^\r\n]*|https?:\/\/[^\s|]+|github:[^\s|;"']+|--?[\w-]+|&&|\||\r?\n|[^\s|]+|[\t ]+/g) ?? [command];
   let expectsCommand = true;
 
   return parts.map((text) => {
-    if (/^\s+$/.test(text)) return { text, kind: 'space' };
-    if (text === '|') {
+    if (/^\r?\n$/.test(text)) {
+      expectsCommand = true;
+      return { text, kind: 'space' };
+    }
+    if (/^[\t ]+$/.test(text)) return { text, kind: 'space' };
+    if (text.startsWith('#')) return { text, kind: 'comment' };
+    if (text === '|' || text === '&&') {
       expectsCommand = true;
       return { text, kind: 'operator' };
     }
@@ -168,17 +188,25 @@ function tokenizeCommand(command: string): CommandToken[] {
 function chooseOs(os: OperatingSystem) {
   selectedOs.value = os;
   selectedMethod.value = installers[os][0].id;
+  selectedVariant.value = installers[os][0].variants?.[0]?.id ?? null;
   copyState.value = 'idle';
 }
 
 function chooseMethod(method: string) {
   selectedMethod.value = method;
+  const installer = methods.value.find((item) => item.id === method);
+  selectedVariant.value = installer?.variants?.[0]?.id ?? null;
+  copyState.value = 'idle';
+}
+
+function chooseVariant(variant: string) {
+  selectedVariant.value = variant;
   copyState.value = 'idle';
 }
 
 async function copyCommand() {
   try {
-    await navigator.clipboard.writeText(selectedInstaller.value.command);
+    await navigator.clipboard.writeText(selectedCommand.value);
     copyState.value = 'copied';
   } catch {
     copyState.value = 'failed';
@@ -240,6 +268,25 @@ onMounted(() => {
             <path fill="currentColor" :d="iconPath(method.icon)" />
           </svg>
           {{ method.label }}
+        </button>
+      </div>
+
+      <div
+        v-if="variants.length"
+        class="install-choice install-choice--variant"
+        role="group"
+        aria-label="Nix installation mode"
+      >
+        <span class="install-choice__label">Mode</span>
+        <button
+          v-for="variant in variants"
+          :key="variant.id"
+          type="button"
+          :class="{ 'is-active': activeVariant?.id === variant.id }"
+          :aria-pressed="activeVariant?.id === variant.id"
+          @click="chooseVariant(variant.id)"
+        >
+          {{ variant.label }}
         </button>
       </div>
     </div>

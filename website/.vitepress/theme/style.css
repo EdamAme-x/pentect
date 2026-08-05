@@ -343,9 +343,11 @@ body {
   color: #eeeeee;
   background: transparent;
   font-size: 13px;
-  white-space: nowrap;
+  line-height: 1.75;
+  white-space: pre;
 }
 
+.shell-token--comment { color: #7f849c; }
 .shell-token--command { color: #ff7b63; }
 .shell-token--option { color: #c6a0ff; }
 .shell-token--string { color: #8bd5ca; }
@@ -410,6 +412,10 @@ body {
   color: var(--vp-c-text-2);
   font-size: 12px;
   text-align: right;
+}
+
+.install-choice--variant {
+  padding-left: 70px;
 }
 
 .home-routes {
@@ -662,6 +668,10 @@ body {
   .install-choice button {
     min-height: 38px;
     padding-inline: 8px;
+  }
+
+  .install-choice--variant {
+    padding-left: 0;
   }
 
   .home-install__command code {
