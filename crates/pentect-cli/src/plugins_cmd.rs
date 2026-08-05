@@ -27,7 +27,7 @@ pub(crate) fn cmd_plugins(args: &[String]) {
         Action::Inspect { spec } => inspect_plugin(&spec, opts.json),
         Action::Test { spec } => test_plugin(&spec, opts.json),
         Action::New { name } => new_plugin(&name, opts.json),
-        Action::Dev { spec } => dev_plugin(&spec, opts.json),
+        Action::Dev { spec, approved } => dev_plugin(&spec, approved, opts.json),
         Action::Publish { spec } => publish_plugin(&spec, opts.json),
         Action::Config { spec, change } => config_plugin(&spec, change, opts.json),
         Action::Setup { spec, approved } => setup_plugin(&spec, approved, opts.json),
@@ -71,6 +71,7 @@ enum Action {
     },
     Dev {
         spec: String,
+        approved: bool,
     },
     Publish {
         spec: String,
@@ -176,9 +177,12 @@ impl PluginCmd {
                 }
             }
             "dev" => {
-                reject_action_flags(approved, unset.as_deref())?;
+                if unset.is_some() {
+                    return Err("--unset is only valid for plugins config".to_string());
+                }
                 Action::Dev {
                     spec: one_value("plugins dev", values)?,
+                    approved,
                 }
             }
             "publish" => {
@@ -307,7 +311,7 @@ fn search_plugins(query: Option<&str>, json_output: bool) -> Result<(), String> 
 
 fn reject_action_flags(approved: bool, unset: Option<&str>) -> Result<(), String> {
     if approved {
-        return Err("--yes is only valid for plugins add, setup, or update".to_string());
+        return Err("--yes is only valid for plugins add, dev, setup, or update".to_string());
     }
     if unset.is_some() {
         return Err("--unset is only valid for plugins config".to_string());
@@ -672,7 +676,7 @@ fn new_plugin(name: &str, json_output: bool) -> Result<(), String> {
     .map_err(|error| format!("could not write plugin source: {error}"))?;
     std::fs::write(
         root.join("README.md"),
-        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\npentect plugins dev .\npentect plugins publish .\n```\n\nCommit `Cargo.lock`. The release workflow builds with `--locked`.\n"),
+        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\npentect plugins dev .\npentect plugins test .\npentect plugins publish .\n```\n\n`plugins dev` activates the local build after approval. Commit `Cargo.lock`; the release workflow builds with `--locked`.\n\nRead the plugin guide at https://pentect.dev/plugins/build/.\n"),
     )
     .map_err(|error| format!("could not write plugin README: {error}"))?;
     std::fs::write(root.join(".gitignore"), "/target\n/dist\n")
@@ -706,20 +710,97 @@ fn validate_new_plugin_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn dev_plugin(spec: &str, json_output: bool) -> Result<(), String> {
+fn dev_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), String> {
     if json_output {
         return Err("plugins dev does not support --json".to_string());
     }
     let source = plugins::plugin_source(spec).map_err(|error| error.to_string())?;
     let manifest = load_plugin_manifest(&source)?
         .ok_or_else(|| "plugin development requires plugin.toml".to_string())?;
+    let manifest_path = source
+        .manifest_path
+        .as_deref()
+        .ok_or_else(|| "plugin development requires a local plugin.toml".to_string())?;
+    let manifest_hash = sha256_path(manifest_path)?;
     let built = build_local_plugin(&source, &manifest)?;
-    let check = test_binary(&built);
+    let built_bytes = read_bounded_bytes(&built, MAX_PLUGIN_WASM_BYTES, "WebAssembly plugin")?;
+    let hooks = pentect_agent::inspect_wasm_plugin_hooks(&built_bytes)?;
+    let check = if manifest.network.is_some() {
+        Check::ok(
+            "binary",
+            "valid Wasm; network access is checked during activation",
+        )
+    } else {
+        test_binary(&built)
+    };
     println!("binary: {}", check.status.as_str());
     if check.status == Status::Fail {
         return Err(format!("plugin test failed: {}", check.detail));
     }
+    let name = plugin_name(&source, Some(&manifest));
     println!("built: {}", display_path(&built));
+    println!("hooks: {}", hooks.join(", "));
+    println!("required: {}", manifest.required);
+    if let Some(network) = manifest.network.as_ref() {
+        println!("requested network access:");
+        println!("  allow: {}", network.allow.join(", "));
+        println!("  methods: {}", network.methods.join(", "));
+        println!("WARNING: this development build can send hook input to these origins");
+    }
+    if !approved && !confirm_setup()? {
+        return Err("plugin development activation was not approved".to_string());
+    }
+
+    let binary = manifest
+        .binary
+        .as_deref()
+        .ok_or_else(|| "plugin development requires a Wasm binary".to_string())?;
+    let destination = binary_destination(&name, binary, plugin_runtime(&manifest), &source)?;
+    let dirs = plugin_runtime_dirs_for_source(&name, &source)?;
+    let lock_path = dirs.data_dir.join(PLUGIN_BINARY_LOCK_FILE);
+    let approval_path = dirs.data_dir.join(PLUGIN_APPROVAL_FILE);
+    let previous_binary = read_optional_bounded(
+        &destination,
+        MAX_PLUGIN_WASM_BYTES,
+        "installed development plugin",
+    )?;
+    let previous_lock =
+        read_optional_bounded(&lock_path, MAX_PLUGIN_METADATA_BYTES, "plugin binary lock")?;
+    let previous_approval =
+        read_optional_bounded(&approval_path, MAX_PLUGIN_METADATA_BYTES, "plugin approval")?;
+
+    let activation = (|| {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| "plugin binary destination has no parent".to_string())?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create plugin binary directory: {error}"))?;
+        let staged = destination.with_extension(format!("wasm.tmp-{}", std::process::id()));
+        std::fs::copy(&built, &staged)
+            .map_err(|error| format!("could not stage development plugin: {error}"))?;
+        replace_binary(&staged, &destination)?;
+        let sha256 = sha256_path(&destination)?;
+        write_development_binary_lock(&name, &source, binary, &sha256)?;
+        if sha256_path(manifest_path)? != manifest_hash {
+            return Err("plugin.toml changed during the development build".to_string());
+        }
+        write_plugin_approval(&name, &source, &manifest, &hooks)?;
+        let active_check = test_binary(manifest_path);
+        if active_check.status == Status::Fail {
+            return Err(format!(
+                "activated development plugin test failed: {}",
+                active_check.detail
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = activation {
+        let _ = restore_optional_file(&destination, previous_binary.as_deref());
+        let _ = restore_optional_file(&lock_path, previous_lock.as_deref());
+        let _ = restore_optional_file(&approval_path, previous_approval.as_deref());
+        return Err(error);
+    }
+    println!("active: local development build");
     Ok(())
 }
 
@@ -1898,6 +1979,33 @@ fn write_binary_lock(
     Ok(())
 }
 
+fn write_development_binary_lock(
+    name: &str,
+    plugin: &plugins::PluginSource,
+    asset: &str,
+    sha256: &str,
+) -> Result<(), String> {
+    let dirs = plugin_runtime_dirs_for_source(name, plugin)?;
+    let lock = BinaryLock {
+        schema: "pentect.plugin-lock.v1",
+        repository: "local/development",
+        publisher_workflow: "local/development.yml",
+        version: "0.0.0".to_string(),
+        asset,
+        sha256,
+    };
+    let source =
+        toml::to_string(&lock).map_err(|error| format!("could not encode binary lock: {error}"))?;
+    let destination = dirs.data_dir.join(PLUGIN_BINARY_LOCK_FILE);
+    let temporary = dirs.data_dir.join(format!(
+        "{PLUGIN_BINARY_LOCK_FILE}.tmp-{}",
+        std::process::id()
+    ));
+    std::fs::write(&temporary, source)
+        .map_err(|error| format!("could not write plugin binary lock: {error}"))?;
+    replace_binary(&temporary, &destination)
+}
+
 fn sha256_path(path: &Path) -> Result<String, String> {
     pentect_agent::sha256_file(path, "plugin file")
 }
@@ -2199,6 +2307,18 @@ mod tests {
         assert!(validate_new_plugin_name("safe-plugin-2").is_ok());
         assert!(validate_new_plugin_name("../escape").is_err());
         assert!(validate_new_plugin_name("double--hyphen").is_err());
+
+        let dev = vec![
+            "pentect".into(),
+            "plugins".into(),
+            "dev".into(),
+            "example-plugin".into(),
+            "--yes".into(),
+        ];
+        assert!(matches!(
+            PluginCmd::parse(&dev).unwrap().action,
+            Action::Dev { approved: true, .. }
+        ));
     }
 
     #[test]
@@ -2532,7 +2652,7 @@ mod tests {
     }
 
     #[test]
-    fn list_plugins_includes_official_rule_plugins_only() {
+    fn list_plugins_includes_official_plugins() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
@@ -2545,7 +2665,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         assert!(names.contains("example-regex"), "{names:?}");
-        assert!(!names.contains("openai-privacy-filter"), "{names:?}");
+        assert!(names.contains("openai-privacy-filter"), "{names:?}");
         assert!(!names.contains("pii-ner"), "{names:?}");
     }
 

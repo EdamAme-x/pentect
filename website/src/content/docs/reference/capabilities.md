@@ -110,10 +110,14 @@ For exact recovery and rollback steps, see
 | Configure and approve access | `plugins config`, `plugins setup` |
 | Discover and maintain | `plugins search`, `plugins list`, `plugins update`, `plugins remove` |
 | Publish | `plugins publish` |
+| Local model example | First-party OpenAI Privacy Filter adapter |
 
 Wasm plugins cannot directly use WASI, files, environment variables, processes,
 or network sockets. Optional HTTP access needs approval and has limits for
 hosts, methods, request count, and data size.
+
+See [Plugins](/plugins/overview/) for the full workflow and
+[Official plugins](/plugins/official/) for ready examples.
 
 ## Installation and distribution
 

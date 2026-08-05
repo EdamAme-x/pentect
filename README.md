@@ -155,6 +155,8 @@ pentect plugins update NAME
 See [PLUGINS.md](PLUGINS.md) for plugin authoring and security details.
 The Rust SDK is published as
 [`pentect-plugin`](https://crates.io/crates/pentect-plugin).
+The first-party catalog includes a one-file regex example and an optional
+[OpenAI Privacy Filter adapter](https://pentect.dev/plugins/official/).
 
 ## Security and development
 
