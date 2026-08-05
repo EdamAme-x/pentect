@@ -24,8 +24,11 @@ const sidebarIcons = {
   wrench: '<path d="M14 6a4 4 0 0 0-5 5L3 17l4 4 6-6a4 4 0 0 0 5-5l-3 2-3-3Z"/>',
 };
 
-function sidebarLabel(label: string, icon: keyof typeof sidebarIcons) {
-  return `<span class="sidebar-link-label"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${sidebarIcons[icon]}</svg><span>${label}</span></span>`;
+function sidebarLabel(label: string, icon: keyof typeof sidebarIcons, brandIcon?: string) {
+  const iconMarkup = brandIcon
+    ? `<img class="sidebar-brand-icon" aria-hidden="true" src="${brandIcon}" alt="">`
+    : `<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${sidebarIcons[icon]}</svg>`;
+  return `<span class="sidebar-link-label">${iconMarkup}<span>${label}</span></span>`;
 }
 
 const sidebar = [
@@ -42,8 +45,8 @@ const sidebar = [
   {
     text: 'Clients',
     items: [
-      { text: sidebarLabel('Codex', 'terminal'), link: '/clients/codex/' },
-      { text: sidebarLabel('Claude', 'message'), link: '/clients/claude/' },
+      { text: sidebarLabel('Codex', 'terminal', '/brands/openai-blossom.svg'), link: '/clients/codex/' },
+      { text: sidebarLabel('Claude', 'message', '/brands/claude.svg'), link: '/clients/claude/' },
       { text: sidebarLabel('Custom upstreams', 'network'), link: '/clients/upstreams/' },
     ],
   },
