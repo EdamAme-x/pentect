@@ -182,9 +182,18 @@ pub(crate) fn download_latest_release_asset(
         .user_agent(USER_AGENT)
         .build()
         .map_err(|e| format!("could not create release client: {e}"))?;
-    let api = format!("https://api.github.com/repos/{repository}/releases/latest");
+    let allow_prerelease =
+        std::env::var("PENTECT_UPDATE_ALLOW_PRERELEASE").is_ok_and(|value| value == "1");
+    let api = if allow_prerelease {
+        format!(
+            "https://api.github.com/repos/{repository}/releases/tags/v{}",
+            env!("CARGO_PKG_VERSION")
+        )
+    } else {
+        format!("https://api.github.com/repos/{repository}/releases/latest")
+    };
     let release: Release = get_response(&client, &api, MAX_CHECKSUM_BYTES * 16)?;
-    if release.draft || release.prerelease {
+    if release.draft || (release.prerelease && !allow_prerelease) {
         return Err("latest GitHub release is not a stable release".to_string());
     }
     let version = release_version(&release.tag_name)?;

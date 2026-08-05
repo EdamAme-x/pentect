@@ -1,72 +1,131 @@
 ---
 title: Plugins
-description: Add custom checks with regex rules or safe Wasm code.
+description: Add your own detection rules and request checks to Pentect.
 ---
 
-Pentect plugins come in two forms:
+A plugin can find sensitive text or change how Pentect handles a request. You
+can write a small regex plugin with only `plugin.toml`. For more control, write
+a WebAssembly (Wasm) plugin with the Rust SDK.
 
-1. Regex rules in a manifest for simple pattern checks.
-2. WebAssembly (Wasm) code for checks that need more logic.
+Plugins are not enabled by default. You choose each plugin and review its
+access before you use it.
 
-Native executable plugins and postscripts are not supported.
+Pentect's normal secret and structured-data checks do not depend on plugins.
+See [Official plugins](/plugins/official/#built-in-protection) for what is
+already included.
 
-| Form | Best for | Runtime |
+## Choose a plugin type
+
+| Type | Use it for | Files you write |
 | --- | --- | --- |
-| Manifest detector | Clear pattern and label rules | Runs as part of Pentect's normal checks |
-| Wasm middleware | Context, choices, settings, or request and response control | Runs in a Wasm sandbox with time and memory limits |
+| Regex | Company IDs, internal names, or tokens with a clear pattern | `plugin.toml` |
+| Wasm | Context-aware checks, request changes, local model adapters, or custom policy | `plugin.toml`, Wasm source, and tests |
 
-Start with a manifest detector. Use Wasm only when a regular expression cannot
-do the job.
+Start with regex. Move to Wasm only when a pattern is not enough.
 
-## Install a plugin
+## Find and install plugins
 
-```sh
-pentect plugins add github:@owner/repository/path
-```
-
-Your plugin setup works with `mask`, local commands, Codex, Claude, and
-supported desktop apps.
-
-Plugins may also be selected for a single client launch:
+Search the small first-party catalog:
 
 ```sh
-pentect codex --plugins jp-pii
-pentect claude --plugins jp-pii,company-policy
+pentect plugins search
+pentect plugins search privacy
 ```
 
-## Manage plugins
+Inspect a plugin before you add it:
+
+```sh
+pentect plugins inspect github:@EdamAme-x/pentect/plugins/example-regex
+```
+
+Add it to the current project:
+
+```sh
+pentect plugins add github:@EdamAme-x/pentect/plugins/example-regex
+```
+
+This writes the source to `.pentect/config.toml`. A Wasm plugin also downloads
+its release file, checks its SHA-256 checksum and GitHub build record, and asks
+you to approve its hooks and network access.
+
+Released Wasm plugins need
+[GitHub CLI](https://cli.github.com/) v2.51.0 or newer for build-record checks.
+Regex plugins do not need it.
+
+Use a plugin for only one launch without changing the project:
+
+```sh
+pentect codex --plugins github:@owner/repository/path
+pentect claude --plugins ./my-plugin
+```
+
+Separate more than one plugin with commas.
+
+## How plugins run
+
+Pentect runs plugins in the order shown in the project config. A hook returns
+normally to continue to the next plugin. It can also block the action. The
+`request` hook can return a response without calling the provider.
+
+```text
+client input
+  → prepare
+  → inspect
+  → Pentect detection and handles
+  → finalize
+  → request
+  → provider
+  → response
+  → completed tool_call
+```
+
+The `file` hook runs when Pentect handles supported file information. Built-in
+checks still run. A regex plugin cannot turn them off.
+
+## What a plugin can see
+
+A hook receives only the data for its point in the flow. Text hooks receive a
+text value and its kind. Provider hooks receive the supported request or
+response JSON. The file hook receives the filename, media type, and size; it
+does not receive arbitrary file bytes.
+
+A Wasm plugin does not inherit the user's environment or filesystem. Settings
+added with `pentect plugins config` are available only when the plugin asks for
+that key. Approved HTTP requests are made by Pentect, not by a raw socket in
+the plugin.
+
+## Sandbox and approval
+
+Wasm plugins run without WASI. They cannot directly read files, read environment
+variables, start programs, or open network sockets.
+
+A plugin can ask Pentect to make an HTTP request for it. The manifest must list
+the exact origins and methods. Pentect shows this access during setup. Private
+addresses and plain HTTP need extra settings and extra approval.
+
+Pentect links approval to the manifest hash, Wasm hash, release, and exported
+hooks. If any of these change, you must review the plugin again.
+
+Native executable plugins and setup scripts are not supported.
+
+## Manage installed plugins
 
 ```sh
 pentect plugins list
 pentect plugins inspect NAME
-pentect plugins config NAME key=value
 pentect plugins test NAME
+pentect plugins config NAME key=value
 pentect plugins update NAME
 pentect plugins remove NAME
 ```
 
-Pentect saves the exact remote manifest locally. It changes only when you run
-an add, setup, or update command. A cache timer cannot change it.
+`remove` disables the plugin in the current project. It does not run cleanup
+code from the plugin.
 
-## Installation lifecycle
+## Next steps
 
-1. `add` finds the source and saves the manifest.
-2. `setup` downloads and verifies a Wasm binary when the plugin has one.
-3. Pentect shows the plugin hooks and requested access for your approval.
-4. Pentect links the binary hash, manifest, and approval together.
-5. `update` gets a newer version. You must approve a changed binary or new access again.
-
-Use `inspect` before approval and `test` after setup. If an installed binary
-changes, Pentect blocks it until you check it again.
-
-## Sandbox and permissions
-
-Wasm code runs without WASI. It cannot directly use files, environment
-variables, processes, or network sockets. You must approve network targets and
-any access that can change data.
-
-Plugins can use these hooks: `prepare`, `inspect`, `finalize`, `request`,
-`response`, `tool_call`, and `file`. After a hook succeeds, Pentect runs the
-next plugin. Any hook can block an action. Only `request` can return a response
-directly. HTTP calls have limits for approved hosts, methods, size, number of
-requests, and time. Private or insecure hosts need extra approval.
+- Follow [Build a plugin](/plugins/build/) for a working regex and Wasm example.
+- See [Plugin manifest](/plugins/manifest/) for every `plugin.toml` field.
+- See [Rust SDK](/plugins/sdk/) for hooks and context methods.
+- See [Test and publish](/plugins/publish/) for releases and updates.
+- Browse [Official plugins](/plugins/official/), including OpenAI Privacy Filter.

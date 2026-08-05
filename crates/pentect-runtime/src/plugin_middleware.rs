@@ -767,8 +767,12 @@ const HTTP_MAX_ORIGINS: usize = 64;
 const HTTP_MAX_HEADERS: usize = 64;
 const HTTP_MAX_HEADER_BYTES: usize = 64 * 1024;
 const HTTP_MAX_DNS_THREADS: usize = 32;
-// Fuel is a short scheduling quantum. The wall clock below is authoritative.
-const WASM_FUEL_SLICE: u64 = 100_000;
+// Each invocation gets a fixed fuel budget derived from its configured time
+// limit. This keeps untrusted Wasm bounded without resumable execution around
+// compound instructions. HTTP calls also use the wall-clock deadline stored
+// in WasmHostState.
+const WASM_FUEL_PER_MS: u64 = 1_000;
+const WASM_MIN_FUEL: u64 = 100_000;
 
 #[derive(Clone, Debug)]
 struct WasmProgram {
@@ -831,6 +835,10 @@ impl WasmProgram {
             .tables(1)
             .build();
         let started = Instant::now();
+        let fuel = u64::try_from(timeout.as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(WASM_FUEL_PER_MS)
+            .max(WASM_MIN_FUEL);
         let mut store = wasmi::Store::new(
             &self.engine,
             WasmHostState {
@@ -843,7 +851,7 @@ impl WasmProgram {
         );
         store.limiter(|state| &mut state.limits);
         store
-            .set_fuel(WASM_FUEL_SLICE)
+            .set_fuel(fuel)
             .map_err(|error| format!("plugin '{name}' fuel setup failed: {error}"))?;
         let mut linker = wasmi::Linker::new(&self.engine);
         if self.network.is_some() {
@@ -879,34 +887,15 @@ impl WasmProgram {
         memory
             .write(&mut store, request_offset, request)
             .map_err(|error| format!("plugin '{name}' request write failed: {error}"))?;
-        store
-            .set_fuel(WASM_FUEL_SLICE)
-            .map_err(|error| format!("plugin '{name}' fuel setup failed: {error}"))?;
-        let mut call = handle
-            .call_resumable(&mut store, (request_ptr, request_len))
-            .map_err(|error| format!("plugin '{name}' execution failed: {error}"))?;
-        let packed = loop {
-            match call {
-                wasmi::TypedResumableCall::Finished(value) => break value as u64,
-                wasmi::TypedResumableCall::HostTrap(trap) => {
-                    return Err(format!(
-                        "plugin '{name}' host call failed: {}",
-                        trap.host_error()
-                    ));
+        let packed = handle
+            .call(&mut store, (request_ptr, request_len))
+            .map_err(|error| {
+                if error.as_trap_code() == Some(wasmi::TrapCode::OutOfFuel) {
+                    format!("plugin '{name}' timed out")
+                } else {
+                    format!("plugin '{name}' execution failed: {error}")
                 }
-                wasmi::TypedResumableCall::OutOfFuel(pending) => {
-                    if started.elapsed() >= timeout {
-                        return Err(format!("plugin '{name}' timed out"));
-                    }
-                    store
-                        .set_fuel(WASM_FUEL_SLICE.max(pending.required_fuel()))
-                        .map_err(|error| format!("plugin '{name}' fuel resume failed: {error}"))?;
-                    call = pending
-                        .resume(&mut store)
-                        .map_err(|error| format!("plugin '{name}' execution failed: {error}"))?;
-                }
-            }
-        };
+            })? as u64;
         let output_ptr = usize::try_from(packed >> 32)
             .map_err(|_| format!("plugin '{name}' returned an invalid output pointer"))?;
         let output_len = usize::try_from(packed & u64::from(u32::MAX))
@@ -1933,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn wasm_plugin_enforces_wall_clock_timeout() {
+    fn wasm_plugin_enforces_execution_budget() {
         let bytes = wat::parse_str(
             r#"(module
                 (memory (export "memory") 1)

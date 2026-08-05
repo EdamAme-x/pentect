@@ -1,78 +1,70 @@
 ---
 title: Build a plugin
-description: Create a Pentect plugin and test it on your computer.
+description: Create your first regex or Wasm plugin.
 ---
 
-1. Create a plugin project.
+## A regex plugin in one file
 
-   ```sh
-   pentect plugins new my-plugin
-   ```
-
-2. Run it from the local directory.
-
-   ```sh
-   pentect plugins dev ./my-plugin
-   ```
-
-3. Test its behavior and requested access.
-
-   ```sh
-   pentect plugins test my-plugin
-   pentect plugins inspect my-plugin
-   ```
-
-4. Publish the plugin when it is ready.
-
-   ```sh
-   pentect plugins publish ./my-plugin
-   ```
-
-## Choose the smallest plugin form
-
-Use a manifest-only regex detector when you only need to find and label text.
-Use Wasm when you need context, choices, settings, or control over what runs
-next.
-
-The Rust SDK is published as
-[`pentect-plugin`](https://crates.io/crates/pentect-plugin).
-
-## Manifest-only detector
-
-The smallest plugin is one `plugin.toml` file:
+Create `my-plugin/plugin.toml`:
 
 ```toml
 schema = "pentect.plugin.v1"
-name = "example-regex"
-description = "Detect ACME case identifiers."
+name = "acme-case-id"
+description = "Protect ACME support case IDs."
 
 [[detector]]
-label = "ACME_CASE"
+label = "ACME_CASE_ID"
 pattern = '''\bACME-[0-9]{8}\b'''
 category = "identifier"
 confidence = "high"
 ```
 
-This form needs no binary, build step, setup script, or native library.
+Try it without installing anything:
 
-## Wasm middleware
-
-Add the SDK to a `cdylib` crate and export only the hooks you implement:
-
-```toml
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-pentect-plugin = "0.1"
+```sh
+echo "case ACME-12345678" | pentect mask --plugins ./my-plugin
 ```
 
-```rust
-use pentect_plugin::{Finding, Inspect, PluginResult};
+The result contains a handle:
 
-fn inspect(context: &mut Inspect) -> PluginResult {
-    if let Some(start) = context.input().text.find("ACME-") {
-        context.add_finding(Finding::new(start, start + 5, "ACME_ID"))?;
+```text
+case <<ACME_CASE_ID_...>>
+```
+
+Check and enable the plugin:
+
+```sh
+pentect plugins test ./my-plugin
+pentect plugins add ./my-plugin
+```
+
+Regex plugins have no binary and need no setup step. See
+[Plugin manifest](/plugins/manifest/#regex-detectors) for capture groups,
+prefilters, checksums, categories, and confidence values.
+
+## Create a Wasm plugin
+
+The CLI can create a Rust project, a manifest, and a release workflow:
+
+```sh
+pentect plugins new company-policy
+cd plugins/company-policy
+```
+
+The generated hook looks like this:
+
+```rust
+use pentect_plugin::{Category, Confidence, Finding, Inspect, PluginResult};
+
+fn inspect(c: &mut Inspect) -> PluginResult {
+    for (start, _) in c.input().text.match_indices("INTERNAL-") {
+        c.add_finding(Finding {
+            start,
+            end: start + "INTERNAL-".len(),
+            label: "INTERNAL_ID".into(),
+            category: Some(Category::Identifier),
+            confidence: Some(Confidence::High),
+        })?;
     }
     Ok(())
 }
@@ -80,43 +72,60 @@ fn inspect(context: &mut Inspect) -> PluginResult {
 pentect_plugin::export!(inspect);
 ```
 
-Finding positions use UTF-8 byte offsets. The `inspect` hook adds results but
-does not change its input. `prepare`, `finalize`, `request`, `response`, and
-`tool_call` may change data. `request` may return a response directly. Every
-hook may block. `Ok(())` moves to the next step, so you do not need to call
-`next()`.
-
-Build the portable module:
+Build and check it:
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo build --release --target wasm32-unknown-unknown
+pentect plugins dev .
+pentect plugins test .
 ```
 
-Set `binary = "my-plugin.wasm"` in `plugin.toml`. Pentect finds hooks from the
-module exports. It rejects native apps and binary paths that leave the plugin
-folder.
+`plugins dev` builds, tests, and activates that local build after you approve
+its hooks and access. It does not require a GitHub release. Run it again after
+you change the Wasm code.
 
-## Configuration and network access
+`plugins dev` currently builds Rust projects with Cargo. Other languages can
+produce a plugin if they export the same Wasm ABI, but Pentect does not provide
+an SDK for them yet.
 
-Plugins do not receive the user's environment variables. Pentect stores plugin
-settings and gives them to the SDK only after approval. HTTP access also goes
-through Pentect and can reach only approved hosts. Plugins do not get raw
-network sockets.
+## Use plugin settings
 
-Before publishing, run:
+Set a value outside the plugin:
 
 ```sh
-pentect plugins dev ./my-plugin
-pentect plugins test my-plugin
-pentect plugins inspect my-plugin
+pentect plugins config company-policy prefix=INTERNAL-
 ```
 
-Test empty input, non-ASCII text, overlapping results, the largest allowed
-input, and every block path. Put the manifest, Wasm file, and checksum in the
-same tagged release. This lets users approve one exact build.
+Read it from any hook:
 
-::: info
-Plugin permissions protect the user. Ask only for the access your plugin needs.
-Approval during install does not make broad permissions safe.
-:::
+```rust
+let prefix = c
+    .config("prefix")?
+    .and_then(|value| value.as_str().map(str::to_owned))
+    .unwrap_or_else(|| "INTERNAL-".to_string());
+```
+
+The plugin receives only the key it asks for. It does not receive the user's
+environment variables.
+
+## Block an action
+
+Every hook can stop the current action:
+
+```rust
+fn inspect(c: &mut Inspect) -> PluginResult {
+    if c.input().text.contains("DO_NOT_SEND") {
+        c.block("company policy blocked this text");
+    }
+    Ok(())
+}
+```
+
+Set `required = true` in `plugin.toml` when a plugin error must also stop the
+action. Leave it false when Pentect may continue after a plugin error.
+
+## Continue learning
+
+- [Rust SDK](/plugins/sdk/) explains all seven hooks.
+- [Plugin manifest](/plugins/manifest/) lists settings and hard limits.
+- [Test and publish](/plugins/publish/) covers unit tests, tags, and updates.

@@ -160,6 +160,44 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  plugin-assets:
+    name: Official plugin assets
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Build OpenAI Privacy Filter plugin
+        run: cargo build --manifest-path plugins/openai-privacy-filter/Cargo.toml --locked --release --target wasm32-unknown-unknown
+      - name: Package plugin and checksum
+        run: |
+          mkdir -p dist
+          cp plugins/openai-privacy-filter/target/wasm32-unknown-unknown/release/openai_privacy_filter.wasm dist/openai-privacy-filter.wasm
+          cp plugins/openai-privacy-filter/server.py dist/openai-privacy-filter-server.py
+          (cd dist && sha256sum openai-privacy-filter.wasm > openai-privacy-filter.wasm.sha256)
+          (cd dist && sha256sum openai-privacy-filter-server.py > openai-privacy-filter-server.py.sha256)
+      - name: Attest plugin binary
+        uses: actions/attest-build-provenance@e3fe62ef559997059fe8380e7d2b4c909e2d65f4 # v3
+        with:
+          subject-path: |
+            dist/openai-privacy-filter.wasm
+            dist/openai-privacy-filter-server.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: official-plugin-assets
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   package-deb:
     name: Debian package (${{ matrix.arch }})
     needs: build
@@ -249,7 +287,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [build, compatibility-cli, package-deb]
+    needs: [build, compatibility-cli, package-deb, plugin-assets]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -370,6 +408,16 @@ jobs:
             if ((Test-Path -LiteralPath $binary) -and ((& $binary version) -eq "pentect $version")) { break }
           }
           if (-not (Test-Path -LiteralPath $binary)) { throw 'updated binary is missing' }
+          $pluginProject = Join-Path $env:RUNNER_TEMP 'pentect-plugin-project'
+          New-Item -ItemType Directory -Force $pluginProject | Out-Null
+          Push-Location $pluginProject
+          try {
+            & $binary plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --yes
+            $inspection = & $binary plugins inspect openai-privacy-filter
+            if ($inspection -notmatch 'hooks: inspect') { throw 'official plugin was not installed' }
+          } finally {
+            Pop-Location
+          }
           & $binary uninstall
           for ($attempt = 0; $attempt -lt 100 -and (Test-Path -LiteralPath $binary); $attempt++) {
             Start-Sleep -Milliseconds 100
@@ -399,6 +447,13 @@ jobs:
           test "$("$binary" version)" = "pentect $version"
           "$binary" update "$version" --force
           test "$("$binary" version)" = "pentect $version"
+          plugin_project="$RUNNER_TEMP/pentect-plugin-project"
+          mkdir -p "$plugin_project"
+          (
+            cd "$plugin_project"
+            "$binary" plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --yes
+            "$binary" plugins inspect openai-privacy-filter | grep -F 'hooks: inspect'
+          )
           "$binary" uninstall
           test ! -e "$binary"
       - name: Install through npm (POSIX)

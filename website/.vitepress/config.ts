@@ -18,6 +18,10 @@ const sidebarIcons = {
   shield: '<path d="M12 3 5 6v5c0 4.7 2.9 8 7 10 4.1-2 7-5.3 7-10V6Z"/><path d="m9 12 2 2 4-4"/>',
   plugin: '<path d="M8 3h3v4a2 2 0 1 0 4 0V3h3v6h3v6h-4v2a4 4 0 0 1-4 4h-2a4 4 0 0 1-4-4v-2H3V9h5Z"/>',
   build: '<path d="m14 6 4-3 3 3-3 4"/><path d="m16 8-9 9"/><path d="m5 15 4 4-2 2-4-4Z"/>',
+  star: '<path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6-5.4-2.9-5.4 2.9 1-6-4.4-4.3 6.1-.9Z"/>',
+  file: '<path d="M6 3h8l4 4v14H6Z"/><path d="M14 3v5h5M9 12h6m-6 4h6"/>',
+  code: '<path d="m8 9-3 3 3 3m8-6 3 3-3 3m-2-9-4 12"/>',
+  package: '<path d="m12 3 8 4-8 4-8-4Z"/><path d="m4 7 8 4 8-4v10l-8 4-8-4Z"/><path d="M12 11v10"/>',
   grid: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>',
   settings: '<path d="M4 7h10M18 7h2M4 17h2m4 0h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>',
   check: '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
@@ -62,7 +66,11 @@ const sidebar = [
     text: 'Plugins',
     items: [
       { text: sidebarLabel('Overview', 'plugin'), link: '/plugins/overview/' },
+      { text: sidebarLabel('Official plugins', 'star'), link: '/plugins/official/' },
       { text: sidebarLabel('Build a plugin', 'build'), link: '/plugins/build/' },
+      { text: sidebarLabel('Plugin manifest', 'file'), link: '/plugins/manifest/' },
+      { text: sidebarLabel('Rust SDK', 'code'), link: '/plugins/sdk/' },
+      { text: sidebarLabel('Test and publish', 'package'), link: '/plugins/publish/' },
     ],
   },
   {

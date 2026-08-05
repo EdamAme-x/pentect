@@ -177,6 +177,12 @@ jobs:
       - name: Check plugin SDK
         if: needs.changes.outputs.plugins == 'true'
         run: cargo check --manifest-path sdk/rust/pentect-plugin/Cargo.toml --target wasm32-unknown-unknown
+      - name: Check official OpenAI Privacy Filter plugin
+        if: needs.changes.outputs.plugins == 'true'
+        run: cargo check --manifest-path plugins/openai-privacy-filter/Cargo.toml --locked --target wasm32-unknown-unknown
+      - name: Test OpenAI Privacy Filter bridge
+        if: needs.changes.outputs.plugins == 'true'
+        run: python -m unittest discover plugins/openai-privacy-filter/tests
       - name: No plugin changes
         if: needs.changes.outputs.plugins != 'true'
         run: echo "No plugin changes"

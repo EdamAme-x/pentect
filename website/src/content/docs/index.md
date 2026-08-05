@@ -49,7 +49,7 @@ aside: false
   </a>
   <a href="/plugins/overview/" class="docs-grid__item">
     <strong>Plugins</strong>
-    <span>Add custom checks safely with regex or Wasm.</span><b aria-hidden="true">→</b>
+    <span>Build, test, and publish custom checks with regex or Wasm.</span><b aria-hidden="true">→</b>
   </a>
   <a href="/reference/capabilities/" class="docs-grid__item">
     <strong>CLI and configuration</strong>
