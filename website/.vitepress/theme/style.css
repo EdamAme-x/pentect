@@ -153,6 +153,18 @@ body {
   transition: color 140ms ease;
 }
 
+.sidebar-link-label .sidebar-brand-icon {
+  display: block;
+  flex: none;
+  width: 17px;
+  height: 17px;
+  object-fit: contain;
+}
+
+.dark .sidebar-link-label .sidebar-brand-icon[src$='openai-blossom.svg'] {
+  filter: invert(1);
+}
+
 .VPSidebarItem.is-link > .item > .link:hover .sidebar-link-label svg,
 .VPSidebarItem.is-active > .item > .link .sidebar-link-label svg {
   color: var(--vp-c-brand-1);
