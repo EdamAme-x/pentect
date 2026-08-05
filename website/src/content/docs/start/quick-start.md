@@ -26,6 +26,11 @@ the permanent settings of Codex or Claude.
    credential. The model sees a handle such as
    `<<DATABASE_URL_4ce8a3b0a6f64e12>>` instead of the real value.
 
+   When the agent needs the value in a shell command, it can use the matching
+   `PENTECT_DATABASE_URL_4ce8a3b0a6f64e12` environment binding. Pentect adds
+   the binding to the protected tool process; it is not a permanent user
+   environment variable.
+
 4. Watch local protection events when you need to verify a flow.
 
    ```sh
@@ -45,6 +50,10 @@ The agent can copy the handle into a local tool call. Pentect restores it just
 before the tool runs. Pentect then masks sensitive command output before it
 returns to the provider. `pentect log` records the event and label, not the real
 value.
+
+If `echo $env:PENTECT_DATABASE_URL_...` or `echo
+$PENTECT_DATABASE_URL_...` appears masked in tool output, that is expected. The
+command received the value, and Pentect protected the output on its way back.
 
 The client should still stream responses, run tools, and accept its normal
 flags. If a request format cannot be checked, Pentect returns an error instead
@@ -117,6 +126,7 @@ functions. It does not create a proxy for the whole system.
 
 - Use [Codex](/clients/codex/) or [Claude](/clients/claude/) for client-specific options.
 - See [Structured data](/protection/structured-data/) for dotenv, Terraform, Kubernetes, and JSON behavior.
+- Read [Handles](/start/handles/) before copying handles between sessions or scripts.
 - Review [Files and images](/protection/files-and-images/) before sending uploads.
 - Run `pentect doctor` again after changing a client installation or provider.
 - Copy a complete task from [Examples](/start/examples/).

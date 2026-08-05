@@ -45,14 +45,21 @@ other key/value formats.
 - Are restored only when the current local session knows them.
 - Do not restore unknown or invented handle-like text.
 - Show handle details through `pentect view` without printing the value.
+- Provide a `PENTECT_<LABEL>_<ID>` environment binding inside protected tool
+  processes.
+
+See [Handles](/start/handles/) for lifetime, recovery, environment syntax, and
+unknown-handle behavior.
 
 ## Local CLI
 
 | Command | What it does |
 | --- | --- |
-| `pentect mask [TEXT]` | Mask arguments or UTF-8 stdin |
+| `pentect mask` | Mask UTF-8 text from stdin |
 | `pentect read PATH` | Print a masked file preview |
-| `pentect exec "COMMAND"` | Restore known handles and mask command output |
+| `pentect exec "COMMAND"` | Restore known handles, run through a shell, and mask output |
+| `pentect exec -- PROGRAM...` | Run a program directly without shell parsing |
+| `pentect exec --live "COMMAND"` | Stream masked output while the command runs |
 | `pentect view HANDLE` | Show handle details without revealing the real value |
 | `pentect resolve [PATH...]` | Restore known handles from stdin or selected files |
 | `pentect log [--json]` | Follow local protection events without secret values |

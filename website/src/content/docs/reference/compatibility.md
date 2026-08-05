@@ -16,6 +16,20 @@ specific public CLI versions with the release binary.
 API tests cover text, streaming, completed tool calls, structured data, file
 links, broken data, and custom gateway paths.
 
+## Provider contracts
+
+| Launch | Contract Pentect checks | Notes |
+| --- | --- | --- |
+| `pentect codex` | OpenAI Responses | Includes streaming events and completed tool calls |
+| `pentect claude` | Anthropic Messages | Includes streaming content blocks and tool use |
+| `pentect codex app` | Responses routes used by supported Codex mode | Other ChatGPT modes are outside this claim |
+| `pentect claude app` | Supported Claude Chat, attachment, and Code routes | Cowork and Voice are outside this claim |
+
+“Supported” means Pentect recognizes and checks the route and content shapes
+documented here. “Tested” means the release suite exercised them with fake
+secrets. It does not mean every provider model, account feature, or future
+client build has been tested.
+
 The version numbers are release gates, not strict version locks. A newer client
 may work, but a new request or stream shape can be blocked until Pentect learns
 it. Run `pentect update --check` after a client update.
@@ -58,6 +72,11 @@ use without printing the value.
 - Test binary formats
 - Unknown future routes
 - Every provider and release behind a third-party gateway
+
+Files referenced only by an unknown remote ID are not treated as inspected
+just because the surrounding JSON is valid. See
+[Files and images](/protection/files-and-images/) for the exact upload, URL,
+image, and PDF boundaries.
 
 Pentect blocks unknown or unsupported content by default. It does not claim to
 protect content that it cannot check. If you see this error, first try the

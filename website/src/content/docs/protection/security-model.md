@@ -7,6 +7,10 @@ Pentect protects supported content between a local AI client and a model
 provider. It trusts the local user and approved local tools to use credentials
 they already have.
 
+The main boundary is the provider request. Pentect reduces which sensitive
+values leave the computer without trying to remove the local tool's existing
+permissions.
+
 ## Security properties
 
 - Pentect replaces sensitive values before supported requests leave the local
@@ -19,6 +23,31 @@ they already have.
 - Wasm plugins cannot directly use WASI, files, environment variables,
   processes, or network sockets.
 
+## Local state
+
+Recovery data lives in the active local Pentect flow. The handle identity key
+is stored with restricted local permissions and is used only to create stable,
+keyed handle IDs. A handle ID is not enough to recover a value.
+
+Optional file-pointer metadata is encrypted locally and is useful only while
+the source still matches. Activity logs store actions, labels, counts, and safe
+context—not real protected values.
+
+Pentect control environment variables carry local process-host addresses and
+tokens. They are filtered from normal tool environment exposure. Wasm plugins
+do not receive them.
+
+## Trust boundaries
+
+| Component | Boundary |
+| --- | --- |
+| Local user | Chooses providers, plugins, and compatibility settings |
+| Supported client launcher | Starts the protected process with the local gateway |
+| Pentect gateway and memory store | Holds recovery data and applies protection at supported boundaries |
+| Model provider | Receives the protected request; it is not trusted with original values |
+| Approved local tool | Receives restored values and runs with the user's existing permissions |
+| Wasm plugin | Receives only hook input and the host access shown during approval |
+
 ## What Pentect does not guarantee
 
 - Finding every possible secret or type of personal data
@@ -26,6 +55,9 @@ they already have.
 - Protection for unsupported clients, hidden binary traffic, or future routes
 - A replacement for limited permissions, key changes, network rules, or client
   sandboxes
+- Protection from a malicious local process running as the same user with
+  access to the same files or debugging rights
+- Proof that every OCR engine or detector will find every sensitive value
 
 ## Compatibility mode
 

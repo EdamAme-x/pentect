@@ -125,6 +125,8 @@ code from the plugin.
 ## Next steps
 
 - Follow [Build a plugin](/plugins/build/) for a working regex and Wasm example.
+- Understand ordering and failure behavior in [Middleware lifecycle](/plugins/lifecycle/).
+- Copy complete patterns from [Plugin recipes](/plugins/recipes/).
 - See [Plugin manifest](/plugins/manifest/) for every `plugin.toml` field.
 - See [Rust SDK](/plugins/sdk/) for hooks and context methods.
 - See [Test and publish](/plugins/publish/) for releases and updates.

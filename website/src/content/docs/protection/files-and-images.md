@@ -15,12 +15,22 @@ because text handles cannot replace pixels.
 | Unknown binary | Block | Nothing |
 | File ID or remote file that Pentect cannot check | Use the unscanned setting | Nothing when set to `block` |
 
+Support depends on both the file format and the client API route. A format is
+not protected merely because the desktop app can open it.
+
 ## Files API
 
 Pentect checks and rewrites supported UTF-8 uploads before sending them. It
 blocks binary files that it cannot check or safely rewrite. If possible,
 convert an unsupported file to UTF-8 text, a supported image, or PDF. There is
 no setting that allows every binary upload.
+
+Files API text detection accepts `text/*`, JSON, JSON Lines, NDJSON, XML, YAML,
+and common text extensions such as `.md`, `.csv`, `.env`, and `.log`. Pentect
+validates UTF-8 before rewriting the body.
+
+Supported upload images are PNG, JPEG, WebP, GIF, and BMP. When masking is
+needed, Pentect safely regenerates the image and updates its media type.
 
 Pentect checks an upload before sending it. A later request can use its file ID
 only when Pentect knows the content behind that ID. A provider file ID alone
@@ -35,11 +45,28 @@ a secret just because it is a URL.
 Pentect treats the URL and the downloaded file as two different things. The URL
 can stay visible while Pentect blocks a file it could not check.
 
+Remote attachments must use HTTPS, contain no URL credentials or fragment, and
+resolve only to public addresses. Fetches have redirect, time, and 8 MiB size
+limits. These checks prevent a model-supplied file URL from becoming access to
+a local or cloud-metadata address.
+
+A provider file ID is accepted only when the same protected flow recorded full
+coverage for that upload. An unrelated or old ID is not trusted by name.
+
 ## Images
 
 OCR runs on your computer. Pentect covers sensitive areas before it sends the
 image. Limits control the number of images, file size, image size, download
 time, and total check time.
+
+OCR also checks text found in QR codes and common barcodes. Pentect removes
+supported image metadata when it rewrites an image. A scan can still miss text,
+especially with low contrast, unusual writing, or unsupported image content.
+
+Inline PDF text extraction is supported on the documented Claude routes. The
+PDF is blocked when extraction fails, returns no useful text, exceeds the
+limits, or contains sensitive text that cannot be rewritten safely. Files API
+PDF upload is not treated as UTF-8 text.
 
 ```toml
 [image]

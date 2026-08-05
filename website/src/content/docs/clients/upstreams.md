@@ -18,6 +18,10 @@ Pentect runs in front of the gateway. It does not include or replace the
 gateway. The client connects to Pentect, and Pentect sends the protected
 request to the gateway you chose.
 
+The URL may be local or remote. Treat it as a provider endpoint: Pentect sends
+the protected request to it, and the client or gateway supplies authentication.
+Pentect does not copy credentials from one provider configuration into another.
+
 ## Supported API formats
 
 - Gateways that support OpenAI Responses for Codex
@@ -27,6 +31,10 @@ request to the gateway you chose.
 Pentect tests Bifrost's `/openai/v1` and `/anthropic` paths. LiteLLM and other
 gateways can also work when they support the same APIs. Pentect does not test
 every gateway version.
+
+If your model server offers only Chat Completions, use an adapter that produces
+the full Responses or Messages contract. Pentect does not translate arbitrary
+provider APIs itself.
 
 ## Base paths and authentication
 
@@ -46,9 +54,14 @@ URL. The client or gateway still sends the login data.
 3. Start the client with `--upstream` and a safe test prompt.
 4. Run `pentect log` and test with a fake secret.
 5. Test streaming and one completed tool call, not only normal chat.
+6. Test one attachment if your workflow sends files or images.
 
 An OpenAI-compatible Chat Completions API is not always a Responses API. A
 gateway may also accept Messages JSON but return a different stream format.
+
+Do not treat a successful plain-text prompt as full compatibility. Tool calls,
+stream events, file references, and errors use additional structures that
+Pentect must understand.
 
 ## Unsupported protocols
 

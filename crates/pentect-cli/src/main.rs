@@ -162,7 +162,7 @@ fn usage() {
          pentect plugins new NAME | dev PATH | publish PATH\n\
          pentect plugins add SOURCE | remove NAME | list | search [QUERY]\n\
          pentect plugins inspect NAME | test NAME | config NAME [KEY=VALUE] | setup NAME | update [NAME]\n\
-         pentect mask [TEXT]\n\
+         < input pentect mask\n\
          pentect read PATH\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
@@ -201,12 +201,12 @@ fn help_text() -> &'static str {
         "  pentect plugins config NAME|PATH [KEY=VALUE | --unset KEY]\n",
         "  pentect plugins setup NAME|PATH [--yes]\n",
         "  pentect plugins update [NAME|PATH] [--yes]\n",
-        "  pentect mask [TEXT]\n",
+        "  < input pentect mask\n",
         "  pentect read PATH\n",
         "  pentect view '<HANDLE>'\n\n",
         "  pentect resolve [PATH...]\n",
         "  pentect log [--json]\n\n",
-        "mask: mask text from arguments or stdin\n",
+        "mask: mask UTF-8 text from stdin\n",
         "exec: masked stdout/stderr\n",
         "read: masked file preview\n",
         "view: handle\n",
@@ -2446,7 +2446,7 @@ mod tests {
         assert!(help.contains("pentect codex|claude"));
         assert!(help.contains("pentect codex app"));
         assert!(help.contains("pentect claude app"));
-        assert!(help.contains("pentect mask [TEXT]"));
+        assert!(help.contains("< input pentect mask"));
         assert!(help.contains("pentect read PATH"));
         assert!(help.contains("pentect resolve [PATH...]"));
         assert!(!help.contains("pentect scan"));

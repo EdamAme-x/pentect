@@ -74,11 +74,20 @@ checksum, adds a GitHub build record, and uploads both files to a release.
 Users can then install it with:
 
 ```sh
-pentect plugins add github:@OWNER/REPOSITORY
+pentect plugins add \
+  https://raw.githubusercontent.com/OWNER/REPOSITORY/main/plugin.toml
 ```
+
+The short `github:@OWNER/REPOSITORY/path` form needs a path because it points
+to a plugin directory. Use the raw `plugin.toml` URL above when the plugin is
+at the repository root.
 
 Binary installation needs [GitHub CLI](https://cli.github.com/) v2.51.0 or
 newer. Pentect uses it to check the release build record.
+
+Use normal semantic versions such as `v0.2.0`. Before 1.0, document every hook,
+access, setting, and behavior change because users may need to approve the
+plugin again.
 
 For a plugin inside a larger repository, add the path:
 
@@ -99,7 +108,13 @@ again when the manifest or exported hooks change. A binary with the same
 approved access can update without changing the saved manifest approval.
 
 Do not replace files in an old release. Publish a new tag so users can review
-and roll back versions clearly.
+changes clearly.
+
+Pentect currently follows the latest release and does not offer a plugin
+version pin or rollback command. If an update is bad, remove or disable the
+plugin and publish a corrected release. Do not copy an older Wasm into the
+cache: its checksum and GitHub build record must agree with the release that
+Pentect verifies.
 
 ## Add a plugin to the Pentect catalog
 

@@ -45,6 +45,10 @@ when a trusted local tool needs the value.
     <strong>How it works</strong>
     <span>See how Pentect protects and restores a value.</span><b aria-hidden="true">→</b>
   </a>
+  <a href="/start/handles/" class="docs-grid__item">
+    <strong>Handles</strong>
+    <span>Learn how references, environment bindings, lifetime, and recovery work.</span><b aria-hidden="true">→</b>
+  </a>
   <a href="/protection/structured-data/" class="docs-grid__item">
     <strong>Structured data</strong>
     <span>Protect dotenv, Terraform, Kubernetes, and other supported formats.</span><b aria-hidden="true">→</b>

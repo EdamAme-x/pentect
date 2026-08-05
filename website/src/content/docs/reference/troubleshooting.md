@@ -35,6 +35,49 @@ A stable handle ID does not save the real value forever or share it everywhere.
 It only keeps the displayed handle from changing too often. The real value
 stays in the current local session or in a file location that Pentect remembers.
 
+Check these points:
+
+1. Use the exact handle produced in the current protected launch.
+2. If the handle came from a file, read that file again in the same launch.
+3. Do not remove or edit the handle ID.
+4. Do not expect a handle copied from another device to resolve.
+5. Run the command through the protected client or `pentect exec`, not a normal
+   terminal with no active Pentect recovery store.
+
+See [Handles](/start/handles/) for the difference between stable identity and
+live recovery data.
+
+## A `PENTECT_...` environment binding is empty
+
+These bindings exist in protected tool processes. They are not permanent user
+environment variables and normally do not exist in a separate terminal.
+
+Use the complete name from the current handle. For example:
+
+```text
+<<KAGGLE_API_TOKEN_b818890b85f7482a>>
+PENTECT_KAGGLE_API_TOKEN_b818890b85f7482a
+```
+
+In PowerShell, reference it as
+`$env:PENTECT_KAGGLE_API_TOKEN_b818890b85f7482a`. In Bash or Zsh, use
+`$PENTECT_KAGGLE_API_TOKEN_b818890b85f7482a`.
+
+If the command output shows another handle instead of the value, masking worked.
+Do not use `echo` as a test. Test the intended API call with a fake credential
+and check its ordinary status result.
+
+## A handle ID changed
+
+- `handles.scope = "session"` changes IDs every protected launch.
+- `handles.scope = "project"` changes IDs between project roots.
+- `device` IDs change after the local identity key is removed or on another
+  device.
+- Different normalized values always produce different IDs.
+
+Changing the ID does not change the source value. Copy the newly produced
+handle instead of trying to keep an old one alive.
+
 ## The client does not launch
 
 1. Run `pentect doctor`.
