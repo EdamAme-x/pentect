@@ -2445,7 +2445,10 @@ mod tests {
         assert!(!provider_body.contains(secret.as_str()));
         assert!(first_valid_handle(&provider_body).is_some());
         assert!(chat_response.contains(secret.as_str()), "{chat_response}");
-        assert!(!chat_response.contains("<<RUNPOD_API_KEY_"));
+        assert!(
+            first_valid_handle(&chat_response).is_none(),
+            "{chat_response}"
+        );
         drop(chat_proxy);
         chat_thread.join().unwrap();
 

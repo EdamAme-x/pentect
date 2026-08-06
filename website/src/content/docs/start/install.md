@@ -87,10 +87,20 @@ Add Pentect to your flake input and system packages:
 # flake.nix
 inputs.pentect.url = "github:EdamAme-x/pentect";
 
-# configuration.nix or another NixOS module
-environment.systemPackages = [
-  inputs.pentect.packages.${pkgs.system}.default
-];
+outputs = inputs@{ nixpkgs, ... }: {
+  nixosConfigurations.HOSTNAME = nixpkgs.lib.nixosSystem {
+    specialArgs = { inherit inputs; };
+    modules = [ ./configuration.nix ];
+  };
+};
+
+# configuration.nix
+{ pkgs, inputs, ... }:
+{
+  environment.systemPackages = [
+    inputs.pentect.packages.${pkgs.system}.default
+  ];
+}
 ```
 
 Then rebuild with the host name from your flake:

@@ -478,7 +478,7 @@ jobs:
 
   promote:
     name: Publish stable release
-    needs: [lifecycle, apt-repository]
+    needs: [lifecycle, apt-repository, npm-publish]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -491,9 +491,9 @@ jobs:
 
   npm-publish:
     name: Publish npm packages
-    needs: promote
+    needs: [lifecycle, apt-repository]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       actions: write
       contents: read
@@ -530,10 +530,29 @@ jobs:
         run: |
           set -euo pipefail
           version=${GITHUB_REF_NAME#v}
+          request_id="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           gh workflow run publish-pi.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref "$GITHUB_REF_NAME" \
-            -f version="$version"
+            -f version="$version" \
+            -f request_id="$request_id"
+          title="Publish Pi $version $request_id"
+          run_id=""
+          for attempt in $(seq 1 30); do
+            run_id=$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow publish-pi.yml \
+              --event workflow_dispatch \
+              --limit 30 \
+              --json databaseId,displayTitle \
+              | jq -r --arg title "$title" \
+                '.[] | select(.displayTitle == $title) | .databaseId' \
+              | head -n 1)
+            test -n "$run_id" && break
+            sleep 2
+          done
+          test -n "$run_id"
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
 
   package-metadata:
     name: Update package metadata

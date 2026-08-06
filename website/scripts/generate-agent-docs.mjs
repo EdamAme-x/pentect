@@ -99,7 +99,7 @@ function rewriteNodes(nodes) {
           codeBlock('irm https://pentect.dev/install | iex', 'powershell'),
           heading('Shell — macOS and Linux', 3),
           codeBlock('curl -fsSL https://pentect.dev/install.sh | sh', 'sh'),
-          heading('Homebrew — macOS and Linux', 3),
+          heading('Homebrew — macOS', 3),
           codeBlock('brew install EdamAme-x/pentect/pentect', 'sh'),
           heading('Nix — temporary environment', 3),
           codeBlock('nix shell github:EdamAme-x/pentect', 'sh'),

@@ -1048,12 +1048,25 @@ fn inject_chat_handle_contract(value: &mut Value) {
             .and_then(Value::as_str)
             .is_some_and(|role| matches!(role, "system" | "developer"))
     }) {
-        if let Some(Value::String(content)) = message.get_mut("content") {
-            if !content.contains(HANDLE_CONTRACT) {
-                content.push_str("\n\n");
-                content.push_str(HANDLE_CONTRACT);
+        match message.get_mut("content") {
+            Some(Value::String(content)) => {
+                if !content.contains(HANDLE_CONTRACT) {
+                    content.push_str("\n\n");
+                    content.push_str(HANDLE_CONTRACT);
+                }
+                return;
             }
-            return;
+            Some(Value::Array(parts)) => {
+                if !parts.iter().any(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains(HANDLE_CONTRACT))
+                }) {
+                    parts.push(serde_json::json!({"type": "text", "text": HANDLE_CONTRACT}));
+                }
+                return;
+            }
+            _ => {}
         }
     }
     messages.insert(
@@ -1519,6 +1532,16 @@ fn streaming_response_body(
                 }
                 Some(Ok(chunk)) => {
                     if state.pending.len().saturating_add(chunk.len()) > MAX_PENDING_SSE_BYTES {
+                        if state.transform == StreamTransform::ChatCompletions
+                            && !state.chat.calls.is_empty()
+                        {
+                            state.finished = true;
+                            state.ready.push_back(Err(Box::new(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "OpenAI Chat Completions tool input exceeded limit",
+                            ))));
+                            continue;
+                        }
                         eprintln!(
                             "[pentect] OpenAI SSE restoration disabled: event exceeded limit"
                         );
@@ -1597,6 +1620,12 @@ struct ChatStreamCall {
     arguments: String,
 }
 
+impl ChatStreamCall {
+    fn buffered_len(&self) -> usize {
+        self.id.len() + self.kind.len() + self.name.len() + self.arguments.len()
+    }
+}
+
 impl ChatStreamState {
     fn rewrite_block(
         &mut self,
@@ -1651,17 +1680,24 @@ impl ChatStreamState {
                     }
                     let entry = self.calls.entry(key).or_default();
                     if let Some(id) = call.get("id").and_then(Value::as_str) {
-                        entry.id.push_str(id);
-                        self.buffered_bytes = self.buffered_bytes.saturating_add(id.len());
+                        if entry.id.is_empty() {
+                            entry.id.push_str(id);
+                            self.buffered_bytes = self.buffered_bytes.saturating_add(id.len());
+                        }
                     }
                     if let Some(kind) = call.get("type").and_then(Value::as_str) {
-                        entry.kind.push_str(kind);
-                        self.buffered_bytes = self.buffered_bytes.saturating_add(kind.len());
+                        if entry.kind.is_empty() {
+                            entry.kind.push_str(kind);
+                            self.buffered_bytes = self.buffered_bytes.saturating_add(kind.len());
+                        }
                     }
                     if let Some(function) = call.get("function") {
                         if let Some(name) = function.get("name").and_then(Value::as_str) {
-                            entry.name.push_str(name);
-                            self.buffered_bytes = self.buffered_bytes.saturating_add(name.len());
+                            if entry.name.is_empty() {
+                                entry.name.push_str(name);
+                                self.buffered_bytes =
+                                    self.buffered_bytes.saturating_add(name.len());
+                            }
                         }
                         if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                             entry.arguments.push_str(arguments);
@@ -1712,6 +1748,7 @@ impl ChatStreamState {
                 .calls
                 .remove(&(choice_index, index))
                 .unwrap_or_default();
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(call.buffered_len());
             let mut plugin_call = serde_json::json!({
                 "type": "function_call",
                 "name": call.name,
@@ -2171,7 +2208,8 @@ mod tests {
             "data: {}\n\n",
             serde_json::json!({
                 "id": "chat_1", "choices": [{"index": 0, "delta": {
-                    "tool_calls": [{"index": 0, "function": {"arguments": "ok\"}"}}]
+                    "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "shell", "arguments": "ok\"}"}}]
                 }, "finish_reason": null}]
             })
         );
@@ -2192,11 +2230,14 @@ mod tests {
         assert_eq!(finished.len(), 2);
         let completed = String::from_utf8_lossy(&finished[0]);
         assert!(completed.contains("call_1"), "{completed}");
+        assert!(!completed.contains("call_1call_1"), "{completed}");
+        assert!(!completed.contains("shellshell"), "{completed}");
         assert!(
             completed.contains(r#"{\"command\":\"echo ok\"}"#),
             "{completed}"
         );
         assert!(state.calls.is_empty());
+        assert_eq!(state.buffered_bytes, 0);
     }
 
     #[test]
@@ -2212,6 +2253,24 @@ mod tests {
             "use <<SECRET_0123456789abcdef>>"
         );
         assert!(value["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("opaque local secret handles"));
+    }
+
+    #[test]
+    fn chat_array_system_content_receives_the_contract_once() {
+        let mut value = serde_json::json!({
+            "messages": [{
+                "role": "developer",
+                "content": [{"type": "text", "text": "Existing instructions"}]
+            }]
+        });
+        inject_chat_handle_contract(&mut value);
+        inject_chat_handle_contract(&mut value);
+        let parts = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[1]["text"]
             .as_str()
             .unwrap()
             .contains("opaque local secret handles"));
