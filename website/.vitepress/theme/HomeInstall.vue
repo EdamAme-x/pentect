@@ -7,9 +7,9 @@ import {
   siLinux,
   siNixos,
   siNpm,
-  siRust,
 } from 'simple-icons';
 import { computed, onMounted, ref } from 'vue';
+import { useRoute } from 'vitepress';
 
 type OperatingSystem = 'windows' | 'macos' | 'linux';
 type InstallerVariant = { id: string; label: string; command: string };
@@ -40,16 +40,9 @@ const operatingSystems: Array<{
 const npmInstaller = {
   id: 'npm',
   label: 'npm',
-  command: 'npm install --global github:EdamAme-x/pentect',
+  command: 'npm i -g pentect',
   icon: 'npm',
   tone: 'npm',
-};
-const cargoInstaller = {
-  id: 'cargo',
-  label: 'Cargo',
-  command: 'cargo install --git https://github.com/EdamAme-x/pentect --locked pentect-cli',
-  icon: 'rust',
-  tone: 'cargo',
 };
 const nixInstaller: Installer = {
   id: 'nix',
@@ -86,7 +79,6 @@ const installers: Record<OperatingSystem, Installer[]> = {
       tone: 'powershell',
     },
     npmInstaller,
-    cargoInstaller,
   ],
   macos: [
     {
@@ -105,7 +97,6 @@ const installers: Record<OperatingSystem, Installer[]> = {
     },
     npmInstaller,
     nixInstaller,
-    cargoInstaller,
   ],
   linux: [
     {
@@ -124,11 +115,12 @@ const installers: Record<OperatingSystem, Installer[]> = {
     },
     npmInstaller,
     nixInstaller,
-    cargoInstaller,
   ],
 };
 
 const selectedOs = ref<OperatingSystem>('windows');
+const route = useRoute();
+const showAllOptions = computed(() => !route.path.startsWith('/start/install'));
 const selectedMethod = ref('powershell');
 const selectedVariant = ref<string | null>(null);
 const copyState = ref<'idle' | 'copied' | 'failed'>('idle');
@@ -139,7 +131,6 @@ const iconSet: Record<string, string> = {
   powershell: 'M23.181 2.974c.568 0 .923.463.792 1.035l-3.659 15.982c-.13.572-.697 1.035-1.265 1.035H.819c-.568 0-.923-.463-.792-1.035L3.686 4.009c.13-.572.697-1.035 1.265-1.035zm-8.375 9.346c.251-.394.227-.905-.09-1.243L9.122 5.125c-.38-.404-1.037-.407-1.466-.003c-.429.402-.468 1.056-.088 1.46l4.662 4.96v.11l-7.42 5.374c-.45.327-.533.977-.187 1.453s.991.597 1.44.27l8.229-5.91c.28-.196.438-.365.514-.52zm-2.796 4.399a.93.93 0 0 0-.934.923c0 .51.418.923.934.923h4.433a.93.93 0 0 0 .934-.923a.93.93 0 0 0-.934-.923z',
   gnubash: siGnubash.path,
   npm: siNpm.path,
-  rust: siRust.path,
   homebrew: siHomebrew.path,
   debian: siDebian.path,
   nixos: siNixos.path,
@@ -223,7 +214,7 @@ onMounted(() => {
   <section class="home-install" aria-labelledby="install-heading">
     <div class="home-install__heading">
       <p id="install-heading">Install</p>
-      <a href="/start/install/">All options <span aria-hidden="true">→</span></a>
+      <a v-if="showAllOptions" href="/start/install/">All options <span aria-hidden="true">→</span></a>
     </div>
 
     <div class="home-install__controls">

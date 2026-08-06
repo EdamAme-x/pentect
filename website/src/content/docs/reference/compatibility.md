@@ -10,6 +10,8 @@ specific public CLI versions with the release binary.
 | --- | --- | --- |
 | Codex CLI `0.146.0` | Automatic test on Linux | `pentect codex` |
 | Claude Code `2.1.220` | Automatic test on Linux | `pentect claude` |
+| OpenCode `1.18.14` | Provider registration and model discovery on Windows | `pentect opencode` |
+| Pi `0.73.1` and `0.83.0` | Provider registration and model discovery on Windows | `pentect pi` |
 | ChatGPT desktop app, Codex mode | Launcher and Responses protocol tests | `pentect codex app` |
 | Claude Desktop, supported Chat, attachment, and Code routes | Launcher and protocol tests | `pentect claude app` |
 

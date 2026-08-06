@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
@@ -52,7 +52,8 @@ async function downloadBinary(base, asset, signal) {
 
 export async function install() {
   const asset = releaseAsset();
-  const version = process.env.PENTECT_VERSION?.replace(/^v/, '');
+  const metadata = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'));
+  const version = (process.env.PENTECT_VERSION || metadata.version)?.replace(/^v/, '');
   const tag = version ? `v${version}` : 'latest';
   const base = tag === 'latest'
     ? `https://github.com/${repository}/releases/latest/download`

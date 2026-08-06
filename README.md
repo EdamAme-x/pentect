@@ -4,9 +4,9 @@ Pentect is a local security boundary for AI coding tools. It replaces secrets
 and sensitive data with opaque handles before requests reach a model provider,
 then resolves those handles only at trusted client tool boundaries.
 
-Pentect currently supports Codex CLI, Claude Code, Codex App, and Claude
-Desktop. It also provides standalone masking commands and sandboxed WebAssembly
-plugins.
+Pentect currently supports Codex CLI, Claude Code, OpenCode, Pi, Codex App, and
+Claude Desktop. It also provides standalone masking commands and sandboxed
+WebAssembly plugins.
 
 > Pentect is pre-1.0 security software. Unknown provider formats are blocked by
 > default, but no filter can promise perfect detection. Keep provider and tool
@@ -48,7 +48,7 @@ nix shell github:EdamAme-x/pentect
 nix profile install github:EdamAme-x/pentect/nix-vX.Y.Z
 
 # npm (downloads a checksummed release binary)
-npm install --global github:EdamAme-x/pentect
+npm install --global pentect
 
 # Cargo (builds from source)
 cargo install --git https://github.com/EdamAme-x/pentect --locked pentect-cli
@@ -72,6 +72,8 @@ Launch a supported CLI through Pentect:
 ```text
 pentect codex
 pentect claude
+pentect opencode --model openai/gpt-5
+pentect pi --model openai/gpt-5
 ```
 
 Use a Responses- or Messages-compatible gateway without changing permanent
@@ -80,6 +82,8 @@ client configuration:
 ```text
 pentect codex --upstream http://127.0.0.1:8080/openai/v1
 pentect claude --upstream http://127.0.0.1:8080/anthropic
+pentect opencode --model anthropic/claude-sonnet --upstream http://127.0.0.1:8080/openai/v1
+pentect pi --model anthropic/claude-sonnet --upstream http://127.0.0.1:8080/openai/v1
 ```
 
 Launch a desktop app only when explicitly requested:

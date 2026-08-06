@@ -2086,6 +2086,7 @@ mod tests {
     enum MockProvider {
         Anthropic,
         OpenAi,
+        OpenAiChat,
     }
 
     fn first_valid_handle(text: &str) -> Option<&str> {
@@ -2220,6 +2221,37 @@ mod tests {
                     (
                         format!("event: response.output_item.done\ndata: {event}\n\n").into_bytes(),
                         None,
+                    )
+                }
+                MockProvider::OpenAiChat => {
+                    let arguments = format!(r#"{{"command":"echo {handle}"}}"#);
+                    let split = arguments.len() / 2;
+                    let first = serde_json::json!({
+                        "id": "chat_test",
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{
+                            "index": 0, "id": "call_test", "type": "function",
+                            "function": {"name": "shell", "arguments": &arguments[..split]}
+                        }]}, "finish_reason": null}]
+                    });
+                    let second = serde_json::json!({
+                        "id": "chat_test",
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"tool_calls": [{
+                            "index": 0, "function": {"arguments": &arguments[split..]}
+                        }]}, "finish_reason": null}]
+                    });
+                    let finish = serde_json::json!({
+                        "id": "chat_test",
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+                    });
+                    (
+                        format!(
+                            "data: {first}\n\ndata: {second}\n\ndata: {finish}\n\ndata: [DONE]\n\n"
+                        )
+                        .into_bytes(),
+                        Some("text/event-stream"),
                     )
                 }
             };
@@ -2384,6 +2416,42 @@ mod tests {
         drop(openai_proxy);
         openai_thread.join().unwrap();
 
+        let (chat_upstream, chat_request, chat_thread) = mock_upstream(MockProvider::OpenAiChat);
+        let chat_proxy =
+            crate::openai_http_proxy::OpenAiHttpProxyGuard::start(chat_upstream).unwrap();
+        let chat_response = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/chat/completions", chat_proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "stream": true,
+                    "messages": [{
+                        "role": "user",
+                        "content": format!("Use this dotenv value:\nRUNPOD_API_KEY={secret}\n")
+                    }]
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .unwrap();
+        let provider_body = chat_request
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(!provider_body.contains(secret.as_str()));
+        assert!(first_valid_handle(&provider_body).is_some());
+        assert!(chat_response.contains(secret.as_str()), "{chat_response}");
+        assert!(
+            first_valid_handle(&chat_response).is_none(),
+            "{chat_response}"
+        );
+        drop(chat_proxy);
+        chat_thread.join().unwrap();
+
         for provider in [MockProvider::OpenAi, MockProvider::Anthropic] {
             let (upload_upstream, upload_request, upload_thread) = mock_upstream(provider);
             let (upload_url, guard): (String, Box<dyn std::any::Any>) = match provider {
@@ -2397,6 +2465,7 @@ mod tests {
                     let guard = ClaudeHttpProxyGuard::start(upload_upstream).unwrap();
                     (format!("{}/v1/files", guard.base_url()), Box::new(guard))
                 }
+                MockProvider::OpenAiChat => unreachable!("chat mock is not used for uploads"),
             };
             let boundary = "pentect-provider-boundary";
             let upload_body = format!(

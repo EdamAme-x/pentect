@@ -56,6 +56,8 @@ const sidebar = [
     items: [
       { text: sidebarLabel('Codex', 'terminal', '/brands/openai-blossom.svg'), link: '/clients/codex/' },
       { text: sidebarLabel('Claude', 'message', '/brands/claude.svg'), link: '/clients/claude/' },
+      { text: sidebarLabel('OpenCode', 'terminal'), link: '/clients/opencode/' },
+      { text: sidebarLabel('Pi', 'terminal'), link: '/clients/pi/' },
       { text: sidebarLabel('Custom upstreams', 'network'), link: '/clients/upstreams/' },
     ],
   },

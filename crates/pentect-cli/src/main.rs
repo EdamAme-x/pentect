@@ -7,6 +7,7 @@ mod doctor;
 mod http_files;
 mod input;
 mod installation;
+mod openai_clients;
 mod openai_http_proxy;
 mod plugins;
 mod plugins_cmd;
@@ -116,6 +117,8 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
             return Some(cmd_claude_app(&args));
         }
         Some("claude") => return Some(cmd_agent_tool(AgentTool::Claude, &args)),
+        Some("opencode") => return Some(cmd_agent_tool(AgentTool::OpenCode, &args)),
+        Some("pi") => return Some(cmd_agent_tool(AgentTool::Pi, &args)),
         Some("claude-app") => return Some(cmd_claude_app(&args)),
         Some("codex-app") => return Some(cmd_codex_app(&args)),
         _ => {
@@ -152,7 +155,7 @@ fn supports_process_host(args: &[String]) -> bool {
 fn usage() {
     eprintln!(
         "pentect\n\
-         pentect codex|claude\n\
+         pentect codex|claude|opencode|pi\n\
          pentect codex app\n\
          pentect claude app\n\
          pentect exec \"<command>\"\n\
@@ -187,6 +190,7 @@ fn help_text() -> &'static str {
         "Use:\n",
         "  pentect\n",
         "  pentect codex|claude [--plugins NAME|PATH.toml]\n",
+        "  pentect opencode|pi [--model ID] [--upstream URL] [--api chat|responses]\n",
         "  pentect codex app [--app PATH] [--upstream URL] [--plugins SOURCE] [--check]\n",
         "  pentect claude app [--app PATH] [--upstream URL] [--plugins SOURCE] [--check]\n",
         "  pentect exec \"<command>\"\n\n",
@@ -218,6 +222,8 @@ fn help_text() -> &'static str {
         "plugins: add, remove, list, search, inspect, test, config, setup, update\n",
         "codex app: launch Codex App through the Responses API gateway\n",
         "claude app: launch Claude Desktop through the Chat and Anthropic gateways\n",
+        "opencode: launch OpenCode through an ephemeral OpenAI-compatible provider\n",
+        "pi: launch Pi through an ephemeral OpenAI-compatible provider\n",
     )
 }
 
@@ -342,6 +348,7 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
     let status = match tool {
         AgentTool::Codex => run_codex(&opts, &pentect),
         AgentTool::Claude => run_claude(&opts, &pentect),
+        AgentTool::OpenCode | AgentTool::Pi => openai_clients::run(tool, &opts, &pentect),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     status.code().unwrap_or(1)
@@ -649,6 +656,8 @@ fn cmd_view(args: &[String]) {
 enum AgentTool {
     Codex,
     Claude,
+    OpenCode,
+    Pi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -727,6 +736,8 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "codex",
             AgentTool::Claude => "claude",
+            AgentTool::OpenCode => "opencode",
+            AgentTool::Pi => "pi",
         }
     }
 
@@ -738,6 +749,8 @@ impl AgentTool {
         match self {
             AgentTool::Codex => "--codex",
             AgentTool::Claude => "--claude",
+            AgentTool::OpenCode => "--opencode",
+            AgentTool::Pi => "--pi",
         }
     }
 }
@@ -750,6 +763,8 @@ struct AgentToolOpts {
     dry_run: bool,
     anthropic_upstream: Option<String>,
     openai_upstream: Option<String>,
+    model: Option<String>,
+    api: Option<String>,
     tool_args: Vec<String>,
 }
 
@@ -761,6 +776,8 @@ impl AgentToolOpts {
         let mut dry_run = false;
         let mut anthropic_upstream = None;
         let mut openai_upstream = None;
+        let mut model = None;
+        let mut api = None;
         let mut tool_args = Vec::new();
         let mut i = 2;
         while i < args.len() {
@@ -801,8 +818,16 @@ impl AgentToolOpts {
                 "--upstream" if tool == AgentTool::Claude => {
                     anthropic_upstream = Some(required_value(args, &mut i, "--upstream")?);
                 }
-                "--upstream" if tool == AgentTool::Codex => {
+                "--upstream"
+                    if matches!(tool, AgentTool::Codex | AgentTool::OpenCode | AgentTool::Pi) =>
+                {
                     openai_upstream = Some(required_value(args, &mut i, "--upstream")?);
+                }
+                "--model" | "-m" if matches!(tool, AgentTool::OpenCode | AgentTool::Pi) => {
+                    model = Some(required_value(args, &mut i, "--model")?);
+                }
+                "--api" if matches!(tool, AgentTool::OpenCode | AgentTool::Pi) => {
+                    api = Some(required_value(args, &mut i, "--api")?);
                 }
                 "--prompt-proxy" | "--no-prompt-proxy" => {
                     return Err("prompt protection is automatic".to_string());
@@ -820,6 +845,8 @@ impl AgentToolOpts {
             dry_run,
             anthropic_upstream,
             openai_upstream,
+            model,
+            api,
             tool_args,
         })
     }
@@ -2444,13 +2471,14 @@ mod tests {
     fn help_lists_public_commands_and_only_active_agent_integrations() {
         let help = help_text();
         assert!(help.contains("pentect codex|claude"));
+        assert!(help.contains("pentect opencode|pi"));
         assert!(help.contains("pentect codex app"));
         assert!(help.contains("pentect claude app"));
         assert!(help.contains("< input pentect mask"));
         assert!(help.contains("pentect read PATH"));
         assert!(help.contains("pentect resolve [PATH...]"));
         assert!(!help.contains("pentect scan"));
-        assert!(!help.contains("opencode"));
+        assert!(help.contains("opencode"));
         assert!(!help.contains("pentect shell"));
         assert!(!help.contains("\n  pentect up\n"));
         assert!(!help.contains("\n  pentect eval"));
@@ -2491,6 +2519,24 @@ mod tests {
             claude.anthropic_upstream.as_deref(),
             Some("https://gateway.example/anthropic")
         );
+
+        let opencode = AgentToolOpts::parse(
+            AgentTool::OpenCode,
+            &[
+                "pentect".to_string(),
+                "opencode".to_string(),
+                "--upstream".to_string(),
+                "http://127.0.0.1:8080/openai/v1".to_string(),
+                "--model".to_string(),
+                "anthropic/claude-sonnet".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            opencode.openai_upstream.as_deref(),
+            Some("http://127.0.0.1:8080/openai/v1")
+        );
+        assert_eq!(opencode.model.as_deref(), Some("anthropic/claude-sonnet"));
     }
 
     #[test]
