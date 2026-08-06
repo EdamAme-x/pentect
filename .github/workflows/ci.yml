@@ -30,6 +30,12 @@ jobs:
           node-version: "22"
       - run: npm test
       - run: npm pack --dry-run
+      - name: Verify Pi launcher package
+        working-directory: integrations/pi
+        run: |
+          npm run check
+          npm test
+          npm pack --dry-run
 
   changes:
     name: Changes

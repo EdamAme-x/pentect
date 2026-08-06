@@ -28,6 +28,14 @@ when a trusted local tool needs the value.
     <small>CLI</small><strong>Claude Code</strong>
     <span>Protect Claude Code requests with Pentect.</span><b aria-hidden="true">→</b>
   </a>
+  <a href="/clients/opencode/" class="docs-grid__item">
+    <small>CLI</small><strong>OpenCode</strong>
+    <span>Run OpenCode through a temporary protected provider.</span><b aria-hidden="true">→</b>
+  </a>
+  <a href="/clients/pi/" class="docs-grid__item">
+    <small>CLI</small><strong>Pi</strong>
+    <span>Run Pi through a temporary protected provider.</span><b aria-hidden="true">→</b>
+  </a>
   <a href="/clients/codex/" class="docs-grid__item">
     <small>Desktop</small><strong>Codex App</strong>
     <span>Start one Codex App session through Pentect.</span><b aria-hidden="true">→</b>

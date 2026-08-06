@@ -1,4 +1,4 @@
-//! OpenAI Responses API gateway used by unmodified Codex hosts.
+//! OpenAI Responses and Chat Completions gateway used by unmodified clients.
 //!
 //! Model-bound prompts and local function outputs are masked on requests.
 //! Completed client function-call arguments are resolved on responses. Local
@@ -27,6 +27,7 @@ use zeroize::Zeroize;
 
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_SSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CHAT_TOOL_CALLS: usize = 1024;
 const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local secret handles. Copy a handle byte-for-byte into a client function call when that function needs the represented value. Do not alter, expand, guess, or expose it. Pentect resolves handles only in completed client function-call arguments.";
 static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 
@@ -222,14 +223,18 @@ async fn proxy_request_inner(
     let endpoint = classify_openai_endpoint(path_and_query);
     enforce_known_openai_endpoint(endpoint, state.block_unknown_formats)?;
     let responses_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Responses;
+    let chat_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::ChatCompletions;
     let responses_response = matches!(
         endpoint,
         OpenAiEndpoint::Responses | OpenAiEndpoint::ResponsesResource
     );
+    let chat_response = endpoint == OpenAiEndpoint::ChatCompletions;
     let protected_request = method == hyper::Method::POST
         && matches!(
             endpoint,
-            OpenAiEndpoint::Responses | OpenAiEndpoint::InputTokens
+            OpenAiEndpoint::Responses
+                | OpenAiEndpoint::InputTokens
+                | OpenAiEndpoint::ChatCompletions
         );
     let files_upload = method == hyper::Method::POST && endpoint == OpenAiEndpoint::FilesCollection;
     let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
@@ -299,6 +304,11 @@ async fn proxy_request_inner(
                     &masker,
                     &plugins,
                     &files,
+                    if chat_path {
+                        OpenAiRequestDialect::ChatCompletions
+                    } else {
+                        OpenAiRequestDialect::Responses
+                    },
                     block_unknown_formats,
                 )
             })
@@ -354,12 +364,13 @@ async fn proxy_request_inner(
     // explicit stream flag is authoritative in that case.
     let is_event_stream = response_media_type
         .is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream"))
-        || (responses_path && request_streaming && response_media_type.is_none());
-    let is_json_response =
-        response_media_type.is_some_and(|value| {
-            value.eq_ignore_ascii_case("application/json")
-                || value.to_ascii_lowercase().ends_with("+json")
-        }) || (responses_response && !request_streaming && response_media_type.is_none());
+        || ((responses_path || chat_path) && request_streaming && response_media_type.is_none());
+    let is_json_response = response_media_type.is_some_and(|value| {
+        value.eq_ignore_ascii_case("application/json")
+            || value.to_ascii_lowercase().ends_with("+json")
+    }) || ((responses_response || chat_response)
+        && !request_streaming
+        && response_media_type.is_none());
     let mut builder = Response::builder().status(status);
     let connection_headers = connection_named_headers(&response_headers);
     for (name, value) in &response_headers {
@@ -375,11 +386,17 @@ async fn proxy_request_inner(
             .unwrap_or(crate::http_files::Coverage::None)
             .as_header(),
     );
-    if is_event_stream || (!responses_response && !files_upload) {
+    if is_event_stream || (!(responses_response || chat_response) && !files_upload) {
         return builder
             .body(streaming_response_body(
                 upstream,
-                status.is_success() && responses_path && is_event_stream,
+                if status.is_success() && responses_path && is_event_stream {
+                    StreamTransform::Responses
+                } else if status.is_success() && chat_path && is_event_stream {
+                    StreamTransform::ChatCompletions
+                } else {
+                    StreamTransform::None
+                },
                 Arc::clone(&state.plugins),
             ))
             .map_err(|error| format!("could not build OpenAI streaming response: {error}"));
@@ -405,18 +422,24 @@ async fn proxy_request_inner(
             }
         }
     }
-    let response_body = if responses_response && status.is_success() && is_json_response {
-        let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
-        match rewrite_openai_json_response(&response_body) {
-            Ok(rewritten) => Bytes::from(rewritten),
-            Err(error) => {
-                eprintln!("[pentect] OpenAI response restoration skipped: {error}");
-                response_body
+    let response_body =
+        if (responses_response || chat_response) && status.is_success() && is_json_response {
+            let response_body = run_response_plugins(response_body, &state.plugins, "openai")?;
+            let rewritten = if chat_response {
+                rewrite_chat_completions_json_response(&response_body)
+            } else {
+                rewrite_openai_json_response(&response_body)
+            };
+            match rewritten {
+                Ok(rewritten) => Bytes::from(rewritten),
+                Err(error) => {
+                    eprintln!("[pentect] OpenAI response restoration skipped: {error}");
+                    response_body
+                }
             }
-        }
-    } else {
-        response_body
-    };
+        } else {
+            response_body
+        };
     builder
         .body(full_body(response_body))
         .map_err(|error| format!("could not build OpenAI response: {error}"))
@@ -464,9 +487,9 @@ fn run_openai_tool_plugins(
             }
         }
         Value::Object(object) => {
-            let is_call = object
+            let responses_call = object
                 .get("type")
-                .and_then(Value::as_str)
+                .and_then(|value| value.as_str())
                 .is_some_and(|kind| {
                     matches!(
                         kind,
@@ -479,6 +502,12 @@ fn run_openai_tool_plugins(
                 && ["arguments", "input"]
                     .iter()
                     .any(|key| object.get(*key).is_some());
+            let chat_call = object.get("type").and_then(Value::as_str) == Some("function")
+                && object
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .is_some_and(|function| function.get("arguments").is_some());
+            let is_call = responses_call || chat_call;
             if is_call {
                 let run = plugins.run(
                     pentect_agent::MiddlewareStage::ToolCall,
@@ -513,11 +542,18 @@ struct ProtectedJsonBody {
     local_response: Option<Bytes>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenAiRequestDialect {
+    Responses,
+    ChatCompletions,
+}
+
 fn protect_openai_request_body(
     body: &Bytes,
     masker: &Mutex<pentect_agent::ActiveToolOutputMasker>,
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     files: &HashMap<String, crate::http_files::Coverage>,
+    dialect: OpenAiRequestDialect,
     block_unknown_formats: bool,
 ) -> Result<ProtectedJsonBody, String> {
     let mut value: Value = match serde_json::from_slice(body) {
@@ -561,7 +597,7 @@ fn protect_openai_request_body(
             })
             .map_err(|error| format!("could not encode plugin response: {error}"));
     }
-    let unknown_content_kind = openai_request_unknown_content_kind(&value);
+    let unknown_content_kind = openai_request_unknown_content_kind(&value, dialect);
     let partial_schema = unknown_content_kind.is_some();
     if block_unknown_formats && (partial_schema || plugin_partial) {
         let detail = unknown_content_kind
@@ -577,6 +613,11 @@ fn protect_openai_request_body(
     if let Err(error) = mask_openai_request(&mut value, &mut masker, files) {
         if error.starts_with("image blocked:") || error.starts_with("document blocked:") {
             return Err(error);
+        }
+        if block_unknown_formats {
+            return Err(format!(
+                "unknown format blocked: OpenAI request could not be fully inspected ({error}); set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
+            ));
         }
         eprintln!("[pentect] OpenAI request protection skipped: {error}");
         return Ok(ProtectedJsonBody {
@@ -629,6 +670,43 @@ fn resolve_openai_file_reference_values<'a>(
                 }
             }
             Value::Object(object) => {
+                if object.get("type").and_then(Value::as_str) == Some("file") {
+                    let file_id = object
+                        .get("file")
+                        .and_then(Value::as_object)
+                        .and_then(|file| file.get("file_id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if let Some(file_id) = file_id {
+                        let known = state
+                            .files
+                            .lock()
+                            .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
+                            .get(&file_id)
+                            .copied();
+                        if known != Some(crate::http_files::Coverage::Full) {
+                            let mut remote =
+                                fetch_openai_file_content(&file_id, state, request_headers).await?;
+                            let encoded = data_encoding::BASE64.encode(&remote.bytes);
+                            remote.bytes.zeroize();
+                            if let Some(file) =
+                                object.get_mut("file").and_then(Value::as_object_mut)
+                            {
+                                file.remove("file_id");
+                                file.insert(
+                                    "file_data".to_string(),
+                                    Value::String(format!(
+                                        "data:{};base64,{encoded}",
+                                        remote.media_type
+                                    )),
+                                );
+                                file.entry("filename".to_string())
+                                    .or_insert(Value::String(remote.filename));
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
                 if object.get("type").and_then(Value::as_str) == Some("input_file") {
                     if let Some(file_id) = object
                         .get("file_id")
@@ -769,6 +847,36 @@ fn resolve_openai_remote_file_values(
             }
             Value::Object(object) => {
                 let input_type = object.get("type").and_then(Value::as_str);
+                if input_type == Some("image_url") {
+                    let url = object
+                        .get("image_url")
+                        .and_then(Value::as_object)
+                        .and_then(|image| image.get("url"))
+                        .and_then(Value::as_str)
+                        .filter(|url| !url.starts_with("data:"))
+                        .map(str::to_string);
+                    if let Some(url) = url {
+                        let mut remote = crate::remote_content::fetch(&url).await?;
+                        if !remote.media_type.starts_with("image/") {
+                            remote.bytes.zeroize();
+                            return Err("remote image URL did not return an image".to_string());
+                        }
+                        let encoded = data_encoding::BASE64.encode(&remote.bytes);
+                        remote.bytes.zeroize();
+                        if let Some(image) =
+                            object.get_mut("image_url").and_then(Value::as_object_mut)
+                        {
+                            image.insert(
+                                "url".to_string(),
+                                Value::String(format!(
+                                    "data:{};base64,{encoded}",
+                                    remote.media_type
+                                )),
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
                 if input_type == Some("input_file") {
                     if let Some(url) = object
                         .get("file_url")
@@ -819,7 +927,10 @@ fn resolve_openai_remote_file_values(
     })
 }
 
-fn openai_request_unknown_content_kind(value: &Value) -> Option<&str> {
+fn openai_request_unknown_content_kind(
+    value: &Value,
+    dialect: OpenAiRequestDialect,
+) -> Option<&str> {
     fn visit(value: &Value) -> Option<&str> {
         match value {
             Value::Array(items) => items.iter().find_map(visit),
@@ -866,10 +977,55 @@ fn openai_request_unknown_content_kind(value: &Value) -> Option<&str> {
             _ => None,
         }
     }
-    value.get("input").and_then(visit)
+    match dialect {
+        OpenAiRequestDialect::Responses => value
+            .get("input")
+            .map(visit)
+            .unwrap_or(Some("missing input")),
+        OpenAiRequestDialect::ChatCompletions => value
+            .get("messages")
+            .map(visit_chat_messages)
+            .unwrap_or(Some("missing messages")),
+    }
+}
+
+fn visit_chat_messages(value: &Value) -> Option<&str> {
+    let Some(messages) = value.as_array() else {
+        return Some("messages must be an array");
+    };
+    for message in messages {
+        let Some(object) = message.as_object() else {
+            return Some("non-object message");
+        };
+        let Some(content) = object.get("content") else {
+            continue;
+        };
+        let Value::Array(parts) = content else {
+            if !content.is_string() && !content.is_null() {
+                return Some("non-text message content");
+            }
+            continue;
+        };
+        for part in parts {
+            let Some(kind) = part.get("type").and_then(Value::as_str) else {
+                return Some("untyped message content");
+            };
+            if !matches!(
+                kind,
+                "text" | "image_url" | "input_text" | "input_image" | "file" | "refusal"
+            ) {
+                return Some(kind);
+            }
+        }
+    }
+    None
 }
 
 fn inject_handle_contract(value: &mut Value) {
+    if value.get("messages").is_some() {
+        inject_chat_handle_contract(value);
+        return;
+    }
     match value.get_mut("instructions") {
         Some(Value::String(instructions)) if !instructions.contains(HANDLE_CONTRACT) => {
             let existing = std::mem::take(instructions);
@@ -882,6 +1038,30 @@ fn inject_handle_contract(value: &mut Value) {
     }
 }
 
+fn inject_chat_handle_contract(value: &mut Value) {
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if let Some(message) = messages.iter_mut().find(|message| {
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| matches!(role, "system" | "developer"))
+    }) {
+        if let Some(Value::String(content)) = message.get_mut("content") {
+            if !content.contains(HANDLE_CONTRACT) {
+                content.push_str("\n\n");
+                content.push_str(HANDLE_CONTRACT);
+            }
+            return;
+        }
+    }
+    messages.insert(
+        0,
+        serde_json::json!({"role": "system", "content": HANDLE_CONTRACT}),
+    );
+}
+
 fn mask_openai_request(
     value: &mut Value,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
@@ -889,6 +1069,112 @@ fn mask_openai_request(
 ) -> Result<(), String> {
     if let Some(input) = value.get_mut("input") {
         mask_openai_input(input, false, masker, files)?;
+    }
+    if let Some(messages) = value.get_mut("messages") {
+        mask_chat_messages(messages, masker, files)?;
+    }
+    Ok(())
+}
+
+fn mask_chat_messages(
+    value: &mut Value,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    let Some(messages) = value.as_array_mut() else {
+        return Err("OpenAI Chat Completions messages must be an array".to_string());
+    };
+    for message in messages {
+        let Some(object) = message.as_object_mut() else {
+            return Err("OpenAI Chat Completions message must be an object".to_string());
+        };
+        let tool_result = object.get("role").and_then(Value::as_str) == Some("tool");
+        if let Some(content) = object.get_mut("content") {
+            mask_chat_content(content, tool_result, masker, files)?;
+        }
+        if let Some(tool_calls) = object.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for call in tool_calls {
+                if let Some(arguments) = call
+                    .get_mut("function")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|function| function.get_mut("arguments"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+                {
+                    let mut protected = arguments;
+                    mask_text(&mut protected, true, masker)?;
+                    call["function"]["arguments"] = Value::String(protected);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mask_chat_content(
+    value: &mut Value,
+    tool_result: bool,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+    files: &HashMap<String, crate::http_files::Coverage>,
+) -> Result<(), String> {
+    match value {
+        Value::String(text) => mask_text(text, tool_result, masker),
+        Value::Null => Ok(()),
+        Value::Array(parts) => {
+            for part in parts {
+                let Some(object) = part.as_object_mut() else {
+                    return Err(
+                        "OpenAI Chat Completions content part must be an object".to_string()
+                    );
+                };
+                match object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                {
+                    "text" | "input_text" => {
+                        if let Some(Value::String(text)) = object.get_mut("text") {
+                            mask_text(text, tool_result, masker)?;
+                        }
+                    }
+                    "image_url" => inspect_chat_image(object)?,
+                    "input_image" => inspect_openai_image(object)?,
+                    "file" => {
+                        let Some(file) = object.get_mut("file").and_then(Value::as_object_mut)
+                        else {
+                            return Err("OpenAI Chat Completions file part is invalid".to_string());
+                        };
+                        inspect_openai_file(file, tool_result, masker, files)?;
+                    }
+                    "refusal" => {
+                        if let Some(Value::String(text)) = object.get_mut("refusal") {
+                            mask_text(text, tool_result, masker)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        _ => Err("OpenAI Chat Completions content has an unsupported shape".to_string()),
+    }
+}
+
+fn inspect_chat_image(object: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    let Some(image) = object.get_mut("image_url").and_then(Value::as_object_mut) else {
+        return unscanned_image_policy();
+    };
+    let Some(Value::String(url)) = image.get_mut("url") else {
+        return unscanned_image_policy();
+    };
+    let Some((metadata, encoded)) = url.split_once(',') else {
+        return unscanned_image_policy();
+    };
+    if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") {
+        return unscanned_image_policy();
+    }
+    if let Some(protected) = crate::claude_http_proxy::redact_inline_image_data(encoded)? {
+        *url = format!("data:image/png;base64,{protected}");
     }
     Ok(())
 }
@@ -910,7 +1196,7 @@ fn mask_openai_input(
         Value::Object(object) => {
             let item_type = object
                 .get("type")
-                .and_then(Value::as_str)
+                .and_then(|value| value.as_str())
                 .unwrap_or_default()
                 .to_string();
             match item_type.as_str() {
@@ -1048,6 +1334,55 @@ fn rewrite_openai_json_response(body: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("could not encode restored OpenAI response: {error}"))
 }
 
+fn rewrite_chat_completions_json_response(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("OpenAI Chat Completions response was not valid JSON: {error}"))?;
+    let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+    rewrite_chat_tool_calls(&mut value, &mut resolve)?;
+    serde_json::to_vec(&value)
+        .map_err(|error| format!("could not encode restored Chat Completions response: {error}"))
+}
+
+fn rewrite_chat_tool_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+where
+    R: FnMut(&str) -> Result<String, String>,
+{
+    let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for choice in choices {
+        let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in calls {
+            let tool_name = call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let Some(arguments) = call
+                .get_mut("function")
+                .and_then(Value::as_object_mut)
+                .and_then(|function| function.get_mut("arguments"))
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let restored = crate::claude_http_proxy::resolve_tool_input_json(
+                &arguments,
+                tool_name.as_deref(),
+                resolve,
+            )?;
+            call["function"]["arguments"] = Value::String(restored);
+        }
+    }
+    Ok(())
+}
+
 fn rewrite_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
 where
     R: FnMut(&str) -> Result<String, String>,
@@ -1143,14 +1478,22 @@ struct StreamState {
     upstream: UpstreamByteStream,
     pending: Vec<u8>,
     ready: VecDeque<Result<Frame<Bytes>, ProxyBodyError>>,
-    transform: bool,
+    transform: StreamTransform,
+    chat: ChatStreamState,
     finished: bool,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamTransform {
+    None,
+    Responses,
+    ChatCompletions,
+}
+
 fn streaming_response_body(
     response: reqwest::Response,
-    transform: bool,
+    transform: StreamTransform,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
 ) -> ProxyBody {
     let state = StreamState {
@@ -1158,6 +1501,7 @@ fn streaming_response_body(
         pending: Vec::new(),
         ready: VecDeque::new(),
         transform,
+        chat: ChatStreamState::default(),
         finished: false,
         plugins,
     };
@@ -1170,7 +1514,7 @@ fn streaming_response_body(
                 return None;
             }
             match state.upstream.next().await {
-                Some(Ok(chunk)) if !state.transform => {
+                Some(Ok(chunk)) if state.transform == StreamTransform::None => {
                     return Some((Ok(Frame::data(chunk)), state));
                 }
                 Some(Ok(chunk)) => {
@@ -1178,7 +1522,7 @@ fn streaming_response_body(
                         eprintln!(
                             "[pentect] OpenAI SSE restoration disabled: event exceeded limit"
                         );
-                        state.transform = false;
+                        state.transform = StreamTransform::None;
                         let mut pending = std::mem::take(&mut state.pending);
                         pending.extend_from_slice(&chunk);
                         state.ready.push_back(Ok(Frame::data(Bytes::from(pending))));
@@ -1187,8 +1531,24 @@ fn streaming_response_body(
                     state.pending.extend_from_slice(&chunk);
                     while let Some(end) = first_sse_block_end(&state.pending) {
                         let block = state.pending.drain(..end).collect::<Vec<_>>();
-                        match rewrite_openai_sse_block(&block, &state.plugins) {
-                            Ok(block) => state.ready.push_back(Ok(Frame::data(block))),
+                        let rewritten = match state.transform {
+                            StreamTransform::Responses => {
+                                rewrite_openai_sse_block(&block, &state.plugins)
+                                    .map(|block| vec![block])
+                            }
+                            StreamTransform::ChatCompletions => {
+                                state.chat.rewrite_block(&block, &state.plugins)
+                            }
+                            StreamTransform::None => Ok(vec![Bytes::from(block)]),
+                        };
+                        match rewritten {
+                            Ok(blocks) => {
+                                for block in blocks {
+                                    if !block.is_empty() {
+                                        state.ready.push_back(Ok(Frame::data(block)));
+                                    }
+                                }
+                            }
                             Err(error) => {
                                 state.finished = true;
                                 state.ready.push_back(Err(Box::new(io::Error::new(
@@ -1221,6 +1581,215 @@ fn streaming_response_body(
         }
     });
     StreamBody::new(stream).boxed_unsync()
+}
+
+#[derive(Default)]
+struct ChatStreamState {
+    calls: HashMap<(u64, u64), ChatStreamCall>,
+    buffered_bytes: usize,
+}
+
+#[derive(Default)]
+struct ChatStreamCall {
+    id: String,
+    kind: String,
+    name: String,
+    arguments: String,
+}
+
+impl ChatStreamState {
+    fn rewrite_block(
+        &mut self,
+        block: &[u8],
+        plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    ) -> Result<Vec<Bytes>, String> {
+        let Ok(text) = std::str::from_utf8(block) else {
+            return Ok(vec![Bytes::copy_from_slice(block)]);
+        };
+        let Some(data) = sse_data(text) else {
+            return Ok(vec![Bytes::copy_from_slice(block)]);
+        };
+        if data == "[DONE]" {
+            if self.calls.is_empty() {
+                return Ok(vec![Bytes::copy_from_slice(block)]);
+            }
+            return Err(
+                "OpenAI Chat Completions stream ended before its tool call completed".to_string(),
+            );
+        }
+        let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+            return Ok(vec![Bytes::copy_from_slice(block)]);
+        };
+        let mut has_tool_delta = false;
+        let mut completed_choices = Vec::new();
+        if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
+            for choice in choices {
+                let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if choice
+                    .get("finish_reason")
+                    .is_some_and(|reason| !reason.is_null())
+                {
+                    completed_choices.push(choice_index);
+                }
+                let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                let Some(tool_calls) = delta
+                    .remove("tool_calls")
+                    .and_then(|calls| calls.as_array().cloned())
+                else {
+                    continue;
+                };
+                has_tool_delta = true;
+                for call in tool_calls {
+                    let call_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let key = (choice_index, call_index);
+                    if !self.calls.contains_key(&key) && self.calls.len() >= MAX_CHAT_TOOL_CALLS {
+                        return Err(
+                            "OpenAI Chat Completions produced too many tool calls".to_string()
+                        );
+                    }
+                    let entry = self.calls.entry(key).or_default();
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        entry.id.push_str(id);
+                        self.buffered_bytes = self.buffered_bytes.saturating_add(id.len());
+                    }
+                    if let Some(kind) = call.get("type").and_then(Value::as_str) {
+                        entry.kind.push_str(kind);
+                        self.buffered_bytes = self.buffered_bytes.saturating_add(kind.len());
+                    }
+                    if let Some(function) = call.get("function") {
+                        if let Some(name) = function.get("name").and_then(Value::as_str) {
+                            entry.name.push_str(name);
+                            self.buffered_bytes = self.buffered_bytes.saturating_add(name.len());
+                        }
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                            entry.arguments.push_str(arguments);
+                            self.buffered_bytes =
+                                self.buffered_bytes.saturating_add(arguments.len());
+                        }
+                    }
+                    if self.buffered_bytes > MAX_PENDING_SSE_BYTES {
+                        return Err("OpenAI Chat Completions tool input exceeded limit".to_string());
+                    }
+                }
+            }
+        }
+
+        let mut output = Vec::new();
+        for choice_index in completed_choices {
+            if self.calls.keys().any(|(choice, _)| *choice == choice_index) {
+                output.push(self.completed_tool_block(text, &value, choice_index, plugins)?);
+            }
+        }
+        let keep_original = !has_tool_delta || chat_chunk_has_visible_delta(&value);
+        if keep_original {
+            output.push(encode_sse_value(text, &value)?);
+        }
+        Ok(output)
+    }
+
+    fn completed_tool_block(
+        &mut self,
+        template: &str,
+        envelope: &Value,
+        choice_index: u64,
+        plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    ) -> Result<Bytes, String> {
+        let mut indexes = self
+            .calls
+            .keys()
+            .filter_map(|(choice, index)| (*choice == choice_index).then_some(*index))
+            .collect::<Vec<_>>();
+        indexes.sort_unstable();
+        let mut calls = Vec::with_capacity(indexes.len());
+        let plugins = plugins
+            .lock()
+            .map_err(|_| "OpenAI plugin lock was poisoned".to_string())?;
+        let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
+        for index in indexes {
+            let call = self
+                .calls
+                .remove(&(choice_index, index))
+                .unwrap_or_default();
+            let mut plugin_call = serde_json::json!({
+                "type": "function_call",
+                "name": call.name,
+                "arguments": call.arguments,
+            });
+            run_openai_tool_plugins(&mut plugin_call, &plugins)?;
+            let name = plugin_call
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let arguments = plugin_call
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let arguments = crate::claude_http_proxy::resolve_tool_input_json(
+                arguments,
+                Some(name),
+                &mut resolve,
+            )?;
+            calls.push(serde_json::json!({
+                "index": index,
+                "id": call.id,
+                "type": if call.kind.is_empty() { "function" } else { call.kind.as_str() },
+                "function": {"name": name, "arguments": arguments}
+            }));
+        }
+        let mut completed = envelope.clone();
+        completed["choices"] = serde_json::json!([{
+            "index": choice_index,
+            "delta": {"tool_calls": calls},
+            "finish_reason": null
+        }]);
+        encode_sse_value(template, &completed)
+    }
+}
+
+fn chat_chunk_has_visible_delta(value: &Value) -> bool {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .get("finish_reason")
+                    .is_some_and(|reason| !reason.is_null())
+                    || choice
+                        .get("delta")
+                        .and_then(Value::as_object)
+                        .is_some_and(|delta| !delta.is_empty())
+            })
+        })
+}
+
+fn sse_data(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
+}
+
+fn encode_sse_value(template: &str, value: &Value) -> Result<Bytes, String> {
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| format!("could not encode OpenAI SSE event: {error}"))?;
+    let mut replaced = false;
+    let mut output = String::with_capacity(template.len() + encoded.len());
+    for line in template.split_inclusive('\n') {
+        if !replaced && line.trim_end_matches(['\r', '\n']).starts_with("data:") {
+            output.push_str("data: ");
+            output.push_str(&encoded);
+            if line.ends_with("\r\n") {
+                output.push_str("\r\n");
+            } else if line.ends_with('\n') {
+                output.push('\n');
+            }
+            replaced = true;
+        } else {
+            output.push_str(line);
+        }
+    }
+    Ok(Bytes::from(output))
 }
 
 fn rewrite_openai_sse_block(
@@ -1329,6 +1898,7 @@ enum OpenAiEndpoint {
     Responses,
     ResponsesResource,
     InputTokens,
+    ChatCompletions,
     FilesCollection,
     Files,
     Models,
@@ -1344,6 +1914,8 @@ fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {
         OpenAiEndpoint::Responses
     } else if path.contains("/responses/") {
         OpenAiEndpoint::ResponsesResource
+    } else if path.ends_with("/chat/completions") {
+        OpenAiEndpoint::ChatCompletions
     } else if path.ends_with("/files") {
         OpenAiEndpoint::FilesCollection
     } else if path.contains("/files/") {
@@ -1514,6 +2086,10 @@ mod tests {
             OpenAiEndpoint::InputTokens
         );
         assert_eq!(
+            classify_openai_endpoint("/v1/chat/completions"),
+            OpenAiEndpoint::ChatCompletions
+        );
+        assert_eq!(
             classify_openai_endpoint("/v1/responses/resp_123"),
             OpenAiEndpoint::ResponsesResource
         );
@@ -1551,6 +2127,97 @@ mod tests {
     }
 
     #[test]
+    fn chat_response_tool_arguments_are_restored_without_touching_text() {
+        let mut value = serde_json::json!({
+            "choices": [{"message": {
+                "content": "keep <<SECRET_0123456789abcdef>>",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": "{\"command\":\"echo <<SECRET_0123456789abcdef>>\"}"
+                    }
+                }]
+            }}]
+        });
+        let mut resolve =
+            |text: &str| Ok(text.replace("<<SECRET_0123456789abcdef>>", "safe-secret-token"));
+        rewrite_chat_tool_calls(&mut value, &mut resolve).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            r#"{"command":"echo safe-secret-token"}"#
+        );
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            "keep <<SECRET_0123456789abcdef>>"
+        );
+    }
+
+    #[test]
+    fn chat_stream_buffers_fragmented_tool_json_until_completion() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::default());
+        let mut state = ChatStreamState::default();
+        let first = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "chat_1", "choices": [{"index": 0, "delta": {
+                    "role": "assistant", "tool_calls": [{"index": 0, "id": "call_1",
+                    "type": "function", "function": {"name": "shell", "arguments": "{\"command\":\"echo "}}]
+                }, "finish_reason": null}]
+            })
+        );
+        let second = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "chat_1", "choices": [{"index": 0, "delta": {
+                    "tool_calls": [{"index": 0, "function": {"arguments": "ok\"}"}}]
+                }, "finish_reason": null}]
+            })
+        );
+        let finish = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "chat_1", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            })
+        );
+        let first_out = state.rewrite_block(first.as_bytes(), &plugins).unwrap();
+        assert_eq!(first_out.len(), 1);
+        assert!(!String::from_utf8_lossy(&first_out[0]).contains("tool_calls"));
+        assert!(state
+            .rewrite_block(second.as_bytes(), &plugins)
+            .unwrap()
+            .is_empty());
+        let finished = state.rewrite_block(finish.as_bytes(), &plugins).unwrap();
+        assert_eq!(finished.len(), 2);
+        let completed = String::from_utf8_lossy(&finished[0]);
+        assert!(completed.contains("call_1"), "{completed}");
+        assert!(
+            completed.contains(r#"{\"command\":\"echo ok\"}"#),
+            "{completed}"
+        );
+        assert!(state.calls.is_empty());
+    }
+
+    #[test]
+    fn chat_messages_receive_the_handle_contract_without_replacing_user_text() {
+        let mut value = serde_json::json!({
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "use <<SECRET_0123456789abcdef>>"}]
+        });
+        inject_handle_contract(&mut value);
+        assert_eq!(value["messages"][1]["role"], "user");
+        assert_eq!(
+            value["messages"][1]["content"],
+            "use <<SECRET_0123456789abcdef>>"
+        );
+        assert!(value["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("opaque local secret handles"));
+    }
+
+    #[test]
     fn completed_custom_tool_input_is_restored_but_text_is_not() {
         let mut value = serde_json::json!({
             "type": "response.output_item.done",
@@ -1576,18 +2243,51 @@ mod tests {
         let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
         let files = HashMap::new();
-        let error = match protect_openai_request_body(&body, &masker, &plugins, &files, true) {
+        let error = match protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            OpenAiRequestDialect::Responses,
+            true,
+        ) {
             Ok(_) => panic!("unknown OpenAI block should be rejected"),
             Err(error) => error,
         };
         assert!(error.starts_with("unknown format blocked:"), "{error}");
         assert!(error.contains("future_block"), "{error}");
 
-        let allowed = protect_openai_request_body(&body, &masker, &plugins, &files, false).unwrap();
+        let allowed = protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            OpenAiRequestDialect::Responses,
+            false,
+        )
+        .unwrap();
         assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
         assert_eq!(
             serde_json::from_slice::<Value>(&allowed.body).unwrap(),
             serde_json::from_slice::<Value>(&body).unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_chat_content_and_missing_messages_are_classified() {
+        let future = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "future_media"}]}]
+        });
+        assert_eq!(
+            openai_request_unknown_content_kind(&future, OpenAiRequestDialect::ChatCompletions),
+            Some("future_media")
+        );
+        assert_eq!(
+            openai_request_unknown_content_kind(
+                &serde_json::json!({"model": "test"}),
+                OpenAiRequestDialect::ChatCompletions
+            ),
+            Some("missing messages")
         );
     }
 
@@ -1628,11 +2328,14 @@ mod tests {
                 {"type": "context_compaction", "encrypted_content": "opaque"}
             ]
         });
-        assert_eq!(openai_request_unknown_content_kind(&value), None);
+        assert_eq!(
+            openai_request_unknown_content_kind(&value, OpenAiRequestDialect::Responses),
+            None
+        );
 
         let future = serde_json::json!({"input": [{"type": "future_block"}]});
         assert_eq!(
-            openai_request_unknown_content_kind(&future),
+            openai_request_unknown_content_kind(&future, OpenAiRequestDialect::Responses),
             Some("future_block")
         );
     }
@@ -1644,8 +2347,24 @@ mod tests {
         let masker = Mutex::new(pentect_agent::ActiveToolOutputMasker::new().unwrap());
         let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
         let files = HashMap::new();
-        assert!(protect_openai_request_body(&body, &masker, &plugins, &files, true).is_err());
-        let allowed = protect_openai_request_body(&body, &masker, &plugins, &files, false).unwrap();
+        assert!(protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            OpenAiRequestDialect::Responses,
+            true,
+        )
+        .is_err());
+        let allowed = protect_openai_request_body(
+            &body,
+            &masker,
+            &plugins,
+            &files,
+            OpenAiRequestDialect::Responses,
+            false,
+        )
+        .unwrap();
         assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
         assert_eq!(allowed.body, body);
     }

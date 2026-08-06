@@ -1,0 +1,41 @@
+{
+  "name": "@pentect/pi",
+  "version": "0.0.0",
+  "description": "Run Pi through Pentect's local HTTP protection",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EdamAme-x/pentect.git",
+    "directory": "integrations/pi"
+  },
+  "homepage": "https://pentect.dev/clients/pi/",
+  "bugs": "https://github.com/EdamAme-x/pentect/issues",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "ai-security",
+    "pi-coding-agent",
+    "secret-detection"
+  ],
+  "bin": {
+    "pentect-pi": "bin/pentect-pi.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check bin/pentect-pi.js && node --check lib/command.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "pentect": "0.0.0"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  }
+}

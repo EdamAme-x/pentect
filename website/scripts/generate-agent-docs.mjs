@@ -89,6 +89,24 @@ function rewriteNodes(nodes) {
     if (node.type === 'mdxTextExpression') return [];
 
     if (node.type === 'mdxJsxFlowElement' || node.type === 'mdxJsxTextElement') {
+      if (node.name === 'HomeInstall') {
+        return [
+          heading('Install', 2),
+          paragraph('Choose one install method for your operating system.'),
+          heading('npm — Windows, macOS, and Linux', 3),
+          codeBlock('npm i -g pentect', 'sh'),
+          heading('PowerShell — Windows', 3),
+          codeBlock('irm https://pentect.dev/install | iex', 'powershell'),
+          heading('Shell — macOS and Linux', 3),
+          codeBlock('curl -fsSL https://pentect.dev/install.sh | sh', 'sh'),
+          heading('Homebrew — macOS and Linux', 3),
+          codeBlock('brew install EdamAme-x/pentect/pentect', 'sh'),
+          heading('Nix — temporary environment', 3),
+          codeBlock('nix shell github:EdamAme-x/pentect', 'sh'),
+          heading('APT — Debian and Ubuntu', 3),
+          codeBlock('curl -fsSL https://pentect.dev/install-apt.sh | sudo sh', 'sh'),
+        ];
+      }
       if (node.name === 'a') {
         return [rewriteAnchor(node)];
       }
@@ -203,6 +221,10 @@ function paragraph(value) {
     type: 'paragraph',
     children: [{ type: 'text', value }],
   };
+}
+
+function codeBlock(value, lang) {
+  return { type: 'code', lang, value };
 }
 
 async function findSourceFiles(directory) {

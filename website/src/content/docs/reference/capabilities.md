@@ -9,6 +9,8 @@ description: A full list of what you can do with Pentect.
 | --- | --- |
 | Protect Codex CLI | `pentect codex` |
 | Protect Claude Code | `pentect claude` |
+| Protect OpenCode | `pentect opencode --model MODEL` |
+| Protect Pi | `pentect pi --model MODEL` |
 | Launch a protected Codex App session | `pentect codex app` |
 | Launch a protected Claude Desktop session | `pentect claude app` |
 | Pass normal client arguments | Add them normally, for example `pentect codex exec --full-auto` |
@@ -129,7 +131,7 @@ See [Plugins](/plugins/overview/) for the full workflow and
 ## Installation and distribution
 
 You can install Pentect with PowerShell, a shell script, Homebrew, apt, Nix,
-npm, or Cargo. The binary installers check SHA-256 checksums. They support
+or npm. The binary installers check SHA-256 checksums. They support
 version choice, updates, and uninstall. They also find installs managed by
 another package manager.
 

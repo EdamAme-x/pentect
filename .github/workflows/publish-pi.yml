@@ -1,0 +1,76 @@
+name: Publish Pi
+
+on:
+  push:
+    tags:
+      - "pi-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Pentect release version without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-pi-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'EdamAme-x/pentect'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: integrations/pi
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Resolve and verify release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if test "$GITHUB_EVENT_NAME" = workflow_dispatch; then
+            version=$INPUT_VERSION
+          else
+            version=${GITHUB_REF_NAME#pi-v}
+            test "$GITHUB_REF_NAME" = "pi-v$version"
+          fi
+          test -n "$version"
+          release=$(gh release view "v$version" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,targetCommitish)
+          test "$(jq -r .isDraft <<<"$release")" = false
+          test "$(jq -r .isPrerelease <<<"$release")" = false
+          test "$(npm view "pentect@$version" version)" = "$version"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Prepare package
+        run: |
+          set -euo pipefail
+          npm pkg set "version=$VERSION" "dependencies.pentect=$VERSION"
+          test "$(node --print "require('./package.json').version")" = "$VERSION"
+          test "$(node --print "require('./package.json').dependencies.pentect")" = "$VERSION"
+          npm run check
+          npm test
+          npm pack --dry-run
+      - name: Publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npm view "@pentect/pi@$VERSION" version >/dev/null 2>&1; then
+            echo "@pentect/pi@$VERSION is already published"
+          else
+            npm publish --access public
+          fi

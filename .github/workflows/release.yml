@@ -76,6 +76,14 @@ jobs:
           }
           npm test
           npm pack --dry-run
+          Push-Location integrations/pi
+          try {
+            npm run check
+            npm test
+            npm pack --dry-run
+          } finally {
+            Pop-Location
+          }
       - name: Stage release notices
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -367,12 +375,14 @@ jobs:
         with:
           node-version: "22"
       - name: Install supported agent CLIs
-        run: npm install --global @openai/codex@0.146.0 @anthropic-ai/claude-code@2.1.220
+        run: npm install --global @openai/codex@0.146.0 @anthropic-ai/claude-code@2.1.220 opencode-ai@1.18.14 @mariozechner/pi-coding-agent@0.73.1
       - name: Verify launchers
         run: |
           chmod +x dist/pentect-linux-x86_64
           dist/pentect-linux-x86_64 codex -- --version
           dist/pentect-linux-x86_64 claude -- --version
+          dist/pentect-linux-x86_64 opencode -- --version
+          dist/pentect-linux-x86_64 pi -- --version
 
   lifecycle:
     name: Lifecycle (${{ matrix.os }})
@@ -478,6 +488,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$GITHUB_REF_NAME" --prerelease=false --latest --repo "$GITHUB_REPOSITORY"
+
+  npm-publish:
+    name: Publish npm packages
+    needs: promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          test "$(node --print "require('./package.json').version")" = "$version"
+      - name: Publish Pentect
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          if npm view "pentect@$version" version >/dev/null 2>&1; then
+            echo "pentect@$version is already published"
+          else
+            npm publish --access public
+          fi
+      - name: Trigger matching Pi launcher release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          gh workflow run publish-pi.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME" \
+            -f version="$version"
 
   package-metadata:
     name: Update package metadata
