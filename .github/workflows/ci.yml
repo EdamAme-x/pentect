@@ -36,6 +36,8 @@ jobs:
           npm run check
           npm test
           npm pack --dry-run
+          npm pkg set "dependencies.pentect=$(npm view pentect version)"
+          node ../../tools/smoke_pi_package.mjs 0.73.1
 
   changes:
     name: Changes

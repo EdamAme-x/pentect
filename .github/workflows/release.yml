@@ -44,6 +44,7 @@ jobs:
       - name: Validate POSIX installer
         run: |
           sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh
+          node --check tools/smoke_pi_package.mjs
           sh tools/test_propose_automation_pr.sh
       - name: Validate PowerShell installer
         shell: pwsh

@@ -73,6 +73,7 @@ jobs:
           npm run check
           npm test
           npm pack --dry-run
+          node ../../tools/smoke_pi_package.mjs 0.73.1
       - name: Publish
         shell: bash
         run: |

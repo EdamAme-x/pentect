@@ -4,7 +4,11 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createRequire } from "node:module";
-import { invocation, piBinaryFromEntry } from "../lib/command.js";
+import {
+  invocation,
+  packageEntryPath,
+  piBinaryFromEntry,
+} from "../lib/command.js";
 
 const require = createRequire(import.meta.url);
 
@@ -24,7 +28,7 @@ try {
   // Pi exports dist/index.js but intentionally does not export package.json.
   // Its pinned package exposes the adjacent dist/cli.js as the `pi` binary.
   const piCli = piBinaryFromEntry(
-    require.resolve("@mariozechner/pi-coding-agent"),
+    packageEntryPath("@mariozechner/pi-coding-agent"),
   );
   const next = invocation(pentectCli, piCli, process.argv.slice(2));
   const result = spawnSync(next.command, next.args, { stdio: "inherit" });
