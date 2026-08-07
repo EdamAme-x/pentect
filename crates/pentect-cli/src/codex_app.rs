@@ -36,6 +36,7 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
             }
         );
         let routing = crate::codex_app_routing(options.upstream)?;
+        crate::upstream::header_overrides(&options.upstream_header_env)?;
         println!("Provider: {}", routing.provider);
         println!("Protection: OpenAI Responses API (HTTP)");
         if !installed {

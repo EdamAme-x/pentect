@@ -155,13 +155,72 @@ fn update_profile(
     } else {
         None
     };
-    if let Err(error) = fs::write(profile, updated) {
+    if let Err(error) = write_profile_atomically(profile, updated.as_bytes()) {
         if let Some(backup) = &backup {
             let _ = fs::copy(backup, profile);
         }
         return Err(format!("could not update '{}': {error}", profile.display()));
     }
     Ok(ProfileUpdate::Changed { backup })
+}
+
+fn write_profile_atomically(profile: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = profile.parent().unwrap_or_else(|| Path::new("."));
+    let name = profile
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("profile");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging = parent.join(format!(
+        ".{name}.pentect-staging-{}-{nonce}",
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        if let Ok(metadata) = fs::metadata(profile) {
+            fs::set_permissions(&staging, metadata.permissions())?;
+        }
+        atomic_replace(&staging, profile)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let moved = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn install_block(
@@ -215,7 +274,12 @@ fn marker_range(existing: &str, start: &str, end: &str) -> Result<Option<(usize,
         (None, None) => Ok(None),
         (Some(start_at), Some(end_at)) if end_at >= start_at => {
             let to = end_at + end.len();
-            if existing[to..].contains(start) || existing[to..].contains(end) {
+            let inside = &existing[start_at + start.len()..end_at];
+            if inside.contains(start)
+                || inside.contains(end)
+                || existing[to..].contains(start)
+                || existing[to..].contains(end)
+            {
                 return Err(
                     "multiple Pentect default blocks found; edit the profile manually".into(),
                 );
@@ -295,11 +359,8 @@ fn detect_shell() -> Result<ShellKind, String> {
 
 #[cfg(windows)]
 fn profile_path(shell: ShellKind) -> Result<PathBuf, String> {
-    let executable = match shell {
-        ShellKind::PowerShell => "powershell.exe",
-        ShellKind::Pwsh => "pwsh.exe",
-    };
-    let output = Command::new(executable)
+    let executable = powershell_executable(shell)?;
+    let output = Command::new(&executable)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -318,7 +379,54 @@ fn profile_path(shell: ShellKind) -> Result<PathBuf, String> {
     if path.is_empty() {
         return Err("PowerShell returned an empty profile path".into());
     }
-    Ok(PathBuf::from(path))
+    let path = PathBuf::from(path);
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(format!(
+            "{} returned an invalid profile path",
+            executable.display()
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn powershell_executable(shell: ShellKind) -> Result<PathBuf, String> {
+    if shell == ShellKind::PowerShell {
+        let path = crate::windows_system_executable(r"WindowsPowerShell\v1.0\powershell.exe");
+        return path
+            .is_file()
+            .then_some(path)
+            .ok_or_else(|| "Windows PowerShell was not found".to_string());
+    }
+
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut pid = sysinfo::get_current_pid().map_err(|error| error.to_string())?;
+    for _ in 0..8 {
+        let Some(process) = system.process(pid) else {
+            break;
+        };
+        if matches!(
+            process
+                .name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .as_str(),
+            "pwsh" | "pwsh.exe"
+        ) {
+            if let Some(path) = process
+                .exe()
+                .filter(|path| path.is_absolute() && path.is_file())
+            {
+                return Ok(path.to_path_buf());
+            }
+        }
+        let Some(parent) = process.parent() else {
+            break;
+        };
+        pid = parent;
+    }
+    Err("could not locate the PowerShell executable that launched Pentect".to_string())
 }
 
 #[cfg(not(windows))]

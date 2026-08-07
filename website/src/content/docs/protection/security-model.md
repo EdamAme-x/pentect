@@ -19,8 +19,9 @@ permissions.
   added to the model request.
 - Pentect restores known handles only before supported local tools run.
 - Tool output is masked before it returns to the provider.
-- Supported MCP and connector results are checked as text, structured data, or
-  media before they enter the next provider request.
+- Supported MCP and connector text and structured data are checked before they
+  enter the next provider request. Media follows the configured OCR and
+  `unscanned` policy; allowing unchecked media can bypass inspection.
 - Unknown provider formats and unsupported content are blocked by default.
 - Wasm plugins cannot directly use WASI, files, environment variables,
   processes, or network sockets.

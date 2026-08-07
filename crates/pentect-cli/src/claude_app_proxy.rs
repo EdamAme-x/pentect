@@ -80,6 +80,7 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
             .as_deref()
             .unwrap_or("https://api.anthropic.com");
         crate::upstream::parse_base(upstream, "Anthropic Messages")?;
+        crate::upstream::header_overrides(&options.upstream_header_env)?;
         if !installed {
             return Err("Claude Desktop was not found; pass --app PATH".to_string());
         }

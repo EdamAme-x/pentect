@@ -115,7 +115,7 @@ function rewriteNodes(nodes) {
           codeBlock('irm https://pentect.dev/install | iex', 'powershell'),
           heading('Shell — macOS and Linux', 3),
           codeBlock('curl -fsSL https://pentect.dev/install.sh | sh', 'sh'),
-          linkParagraph('All install options', '/start/install/index.md'),
+          linkParagraph('All install options', agentMarkdownUrl('/start/install/index.md')),
         ];
       }
       if (node.name === 'a') {

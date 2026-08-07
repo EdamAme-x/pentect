@@ -194,12 +194,12 @@ fn help_text() -> &'static str {
         "Use:\n",
         "  pentect\n",
         "  pentect codex|claude [--upstream URL] [--upstream-header-env HEADER=ENV_NAME] [--plugins NAME|PATH.toml]\n",
-        "  pentect codex|claude --set-default | --unset-default\n",
+        "  pentect codex|claude (--set-default | --unset-default) [--yes]\n",
         "  pentect opencode|pi [--model ID] [--upstream URL] [--api chat|responses]\n",
         "  --upstream-header-env HEADER=ENV_NAME  read an upstream credential without putting it in command arguments\n",
-        "  pentect codex app [--app PATH] [--upstream URL] [--plugins SOURCE] [--check]\n",
-        "  pentect claude app [--app PATH] [--upstream URL] [--plugins SOURCE] [--check]\n",
-        "  pentect codex|claude app --install-launcher | --remove-launcher\n",
+        "  pentect codex app [--app PATH] [--upstream URL] [--upstream-header-env HEADER=ENV_NAME] [--plugins SOURCE] [--check]\n",
+        "  pentect claude app [--app PATH] [--upstream URL] [--upstream-header-env HEADER=ENV_NAME] [--plugins SOURCE] [--check]\n",
+        "  pentect codex|claude app (--install-launcher | --remove-launcher) [--yes]\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect doctor [--json | --fix [--yes]]\n",
         "  pentect update [VERSION] [--check | --force]\n",
@@ -2519,7 +2519,14 @@ mod tests {
         let help = help_text();
         assert!(help.contains("pentect codex|claude"));
         assert!(help.contains("--set-default | --unset-default"));
-        assert!(help.contains("--install-launcher | --remove-launcher"));
+        assert!(help.contains("(--set-default | --unset-default) [--yes]"));
+        assert!(help.contains("(--install-launcher | --remove-launcher) [--yes]"));
+        assert!(help.contains(
+            "codex app [--app PATH] [--upstream URL] [--upstream-header-env HEADER=ENV_NAME]"
+        ));
+        assert!(help.contains(
+            "claude app [--app PATH] [--upstream URL] [--upstream-header-env HEADER=ENV_NAME]"
+        ));
         assert!(help.contains("pentect opencode|pi"));
         assert!(help.contains("pentect codex app"));
         assert!(help.contains("pentect claude app"));

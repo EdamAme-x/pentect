@@ -171,31 +171,6 @@ fn is_owned(target: &Path, tool: &str) -> bool {
 
 #[cfg(any(windows, target_os = "macos"))]
 fn launcher_executable() -> Result<PathBuf, String> {
-    let arg0 = std::env::args_os().next().map(PathBuf::from);
-    if let Some(path) = arg0
-        .as_ref()
-        .filter(|path| path.is_absolute() && path.is_file())
-    {
-        return Ok(path.clone());
-    }
-    if let Some(path) = arg0.as_ref().filter(|path| path.components().count() > 1) {
-        let absolute = std::env::current_dir()
-            .map_err(|error| format!("could not read the current directory: {error}"))?
-            .join(path);
-        if absolute.is_file() {
-            return Ok(absolute);
-        }
-    }
-    if let Some(name) = arg0.as_ref().and_then(|path| path.file_name()) {
-        if let Some(paths) = std::env::var_os("PATH") {
-            for directory in std::env::split_paths(&paths) {
-                let candidate = directory.join(name);
-                if candidate.is_file() {
-                    return Ok(candidate);
-                }
-            }
-        }
-    }
     std::env::current_exe()
         .map_err(|error| format!("could not locate the Pentect executable: {error}"))
 }
@@ -204,7 +179,7 @@ fn launcher_executable() -> Result<PathBuf, String> {
 fn install(tool: &str, target: &Path) -> Result<bool, String> {
     if target.exists() && !is_owned(target, tool) {
         return Err(format!(
-            "refusing to replace launcher not owned by Pentect: '{}'",
+            "refusing to replace launcher not owned by Pentect: '{}'; if this is an interrupted Pentect install, remove that bundle manually and try again",
             target.display()
         ));
     }
@@ -359,7 +334,7 @@ fn remove(tool: &str, target: &Path) -> Result<bool, String> {
     }
     if !is_owned(target, tool) {
         return Err(format!(
-            "refusing to remove launcher not owned by Pentect: '{}'",
+            "refusing to remove launcher not owned by Pentect: '{}'; if this is an interrupted Pentect install, remove it manually",
             target.display()
         ));
     }

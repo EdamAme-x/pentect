@@ -86,16 +86,16 @@ side effect happens outside Pentect's provider boundary.
 ## Screenshots and OCR
 
 A screenshot may contain a token even when the tool result has no useful text.
-For supported image payloads, Pentect runs OCR locally and covers detected
-sensitive regions before the image is sent to the provider.
+With OCR enabled, Pentect scans supported image payloads locally and covers
+detected sensitive regions before the image is sent to the provider.
 
 Pentect also checks text found in supported QR codes and barcodes. When an
 image must be rewritten, it removes supported metadata and sends protected
 pixels instead of the original image.
 
-If an image cannot be checked, the default setting blocks it. You can choose to
-allow unchecked media, but then the provider may receive content Pentect did
-not inspect:
+If OCR is disabled or an image cannot be checked, the default setting blocks
+it. You can choose to allow unchecked media, but then the provider may receive
+content Pentect did not inspect:
 
 ```toml
 [image]

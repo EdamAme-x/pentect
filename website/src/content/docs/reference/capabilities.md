@@ -26,15 +26,15 @@ proxy for the whole system or replace the client UI.
 | Capability | Behavior |
 | --- | --- |
 | Prompts and tool results | Replaces sensitive text before supported requests are sent |
-| MCP and connector results | Checks supported text, structured values, clipboard text, and media |
+| MCP and connector results | Checks supported text, structured values, and clipboard text; media follows the image policy |
 | Completed tool calls | Restores known handles just before a trusted local tool runs |
 | Command output | Masks stdout and stderr before they return to the model |
 | Structured config | Uses field names and syntax to create useful labels |
 | UTF-8 uploads | Checks and rewrites supported Files API content |
 | Documents | Checks supported document formats sent in a request |
-| Images | Runs local OCR and covers sensitive areas |
+| Images | With OCR enabled, scans locally and covers detected areas; unchecked media follows `image.unscanned` |
 | QR codes and barcodes | Checks the text found in codes inside images |
-| Browser screenshots | Runs local OCR before supported screenshot results reach the provider |
+| Browser screenshots | Applies the configured OCR and unchecked-media policy before supported results reach the provider |
 | Unknown provider structures | Returns an error by default |
 
 Pentect checks for secrets and personal data. Supported config formats include
