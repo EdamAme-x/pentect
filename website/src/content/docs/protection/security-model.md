@@ -19,6 +19,8 @@ permissions.
   added to the model request.
 - Pentect restores known handles only before supported local tools run.
 - Tool output is masked before it returns to the provider.
+- Supported MCP and connector results are checked as text, structured data, or
+  media before they enter the next provider request.
 - Unknown provider formats and unsupported content are blocked by default.
 - Wasm plugins cannot directly use WASI, files, environment variables,
   processes, or network sockets.
@@ -52,6 +54,7 @@ do not receive them.
 
 - Finding every possible secret or type of personal data
 - Safety after a trusted local tool sends a credential to another service
+- Protection for a browser or MCP server's direct network side effects
 - Protection for unsupported clients, hidden binary traffic, or future routes
 - A replacement for limited permissions, key changes, network rules, or client
   sandboxes
@@ -75,6 +78,9 @@ silently turning off the default check.
 See [Unknown provider format troubleshooting](/reference/troubleshooting/#an-unknown-provider-format-was-blocked)
 for protected alternatives, copyable setup commands, restart instructions, and
 how to restore the default.
+
+For concrete prompt, MCP, browser, and screenshot flows, read
+[Prompts and tool results](/protection/prompts-and-tools/).
 
 ::: danger
 Compatibility mode can send content that Pentect does not understand. Do not

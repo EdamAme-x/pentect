@@ -8,8 +8,8 @@ requests and responses without changing the client UI.
 
 1. **Detect locally**
 
-   Pentect checks prompts, tool results, config files, uploads, and images
-   before they are sent to the provider.
+   Pentect checks text typed into a prompt, tool and MCP results, config files,
+   uploads, and images before they are sent to the provider.
 
 2. **Replace the value with a handle**
 
@@ -49,6 +49,10 @@ requests and responses without changing the client UI.
 | Local execution | Completed tool arguments | Known handles restored just before the tool runs |
 | Tool result | stdout, stderr, and supported data | Sensitive values replaced before the next request |
 
+A tool result can come from a shell, file reader, browser, connector, or MCP
+server. Supported text and structured fields are checked as they enter the
+next provider request. Supported screenshots use the image path instead.
+
 Pentect works with API fields instead of reading the terminal screen. Streaming
 and normal client controls continue to work.
 
@@ -70,6 +74,9 @@ Text can contain a reusable handle. Images need local OCR and visual masking.
 Unknown binary files follow the unscanned-content setting. See
 [Files and images](/protection/files-and-images/) for details. Plugins can add
 new checks without changing the client setup.
+
+See [Prompts and tool results](/protection/prompts-and-tools/) for examples of
+manual input, unexpected output, browser-created keys, and screenshots.
 
 ## Why handles instead of `[REDACTED]`?
 

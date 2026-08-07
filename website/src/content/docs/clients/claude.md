@@ -32,6 +32,30 @@ Prerequisites:
 | `pentect claude --upstream URL` | One CLI launch using a gateway that supports Messages |
 | `pentect claude --plugins NAME` | One launch with the selected plugin set |
 
+## Use a clickable App launcher
+
+For regular use, create a separate protected launcher:
+
+```sh
+pentect claude app --install-launcher
+```
+
+Windows adds `Claude via Pentect` under Start menu → Pentect. macOS adds it to
+`~/Applications`. Pin that launcher and use it for protected Desktop sessions.
+It starts the same `pentect claude app` gateways in the background and does not
+modify the official App.
+
+Quit Claude Desktop first. If it is already running, Pentect stops and asks you
+to close it so the new process can receive the proxy settings.
+
+```sh
+pentect claude app --remove-launcher
+```
+
+The launcher uses normal App discovery and the default upstream. Use the
+terminal command when you need a one-time `--app`, `--upstream`, or `--plugins`
+option.
+
 Normal Claude Code arguments pass through directly:
 
 ```sh

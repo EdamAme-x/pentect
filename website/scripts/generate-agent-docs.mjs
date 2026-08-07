@@ -107,6 +107,17 @@ function rewriteNodes(nodes) {
           codeBlock('curl -fsSL https://pentect.dev/install-apt.sh | sudo sh', 'sh'),
         ];
       }
+      if (node.name === 'QuickInstall') {
+        return [
+          heading('Install', 2),
+          paragraph('Use the recommended installer for your operating system, or open the install page for every package manager.'),
+          heading('PowerShell — Windows', 3),
+          codeBlock('irm https://pentect.dev/install | iex', 'powershell'),
+          heading('Shell — macOS and Linux', 3),
+          codeBlock('curl -fsSL https://pentect.dev/install.sh | sh', 'sh'),
+          linkParagraph('All install options', '/start/install/index.md'),
+        ];
+      }
       if (node.name === 'a') {
         return [rewriteAnchor(node)];
       }
@@ -220,6 +231,17 @@ function paragraph(value) {
   return {
     type: 'paragraph',
     children: [{ type: 'text', value }],
+  };
+}
+
+function linkParagraph(label, url) {
+  return {
+    type: 'paragraph',
+    children: [{
+      type: 'link',
+      url,
+      children: [{ type: 'text', value: label }],
+    }],
   };
 }
 

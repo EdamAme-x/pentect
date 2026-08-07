@@ -33,6 +33,30 @@ Prerequisites:
 | `pentect codex --upstream URL` | One CLI launch using a compatible gateway |
 | `pentect codex --plugins NAME` | One launch with the selected plugin set |
 
+## Use a clickable App launcher
+
+For regular use, create a separate protected launcher:
+
+```sh
+pentect codex app --install-launcher
+```
+
+Windows adds `Codex via Pentect` under Start menu → Pentect. macOS adds it to
+`~/Applications`. Pin that launcher and use it for protected App sessions. It
+starts the same `pentect codex app` gateway in the background and does not
+modify the official App.
+
+Quit ChatGPT/Codex first. If it is already running, Pentect stops and asks you
+to close it so the new process can receive the protected routing.
+
+```sh
+pentect codex app --remove-launcher
+```
+
+The launcher uses normal App discovery and your current Codex provider. Use the
+terminal command when you need a one-time `--app`, `--upstream`, or `--plugins`
+option.
+
 Client flags do not need a separator:
 
 ```sh

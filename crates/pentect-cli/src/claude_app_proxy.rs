@@ -98,10 +98,12 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         );
     }
 
-    let anthropic = crate::claude_http_proxy::ClaudeHttpProxyGuard::start(
+    let anthropic = crate::claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
         options
             .upstream
+            .clone()
             .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+        &options.upstream_header_env,
     )?;
     let proxy = ClaudeAppProxyGuard::start()?;
     let user_data_dir = claude_user_data_dir()?;
@@ -114,6 +116,7 @@ fn run_claude_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     );
 
     let mut command = Command::new(&app);
+    crate::upstream::hide_header_source_env(&mut command, &options.upstream_header_env);
     command
         .arg(format!("--proxy-server={}", proxy.proxy_url()))
         .arg(format!(
@@ -178,6 +181,7 @@ fn terminate_child_process(pid: u32) {
 struct ClaudeAppOptions {
     app: Option<PathBuf>,
     upstream: Option<String>,
+    upstream_header_env: Vec<String>,
     check: bool,
 }
 
@@ -185,6 +189,7 @@ impl ClaudeAppOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut app = None;
         let mut upstream = None;
+        let mut upstream_header_env = Vec::new();
         let mut check = false;
         let mut index = if args.get(1).is_some_and(|arg| arg == "claude")
             && args.get(2).is_some_and(|arg| arg == "app")
@@ -213,6 +218,13 @@ impl ClaudeAppOptions {
                     upstream = Some(value.clone());
                     index += 2;
                 }
+                "--upstream-header-env" => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| "--upstream-header-env requires a value".to_string())?;
+                    upstream_header_env.push(value.clone());
+                    index += 2;
+                }
                 "--plugins" => {
                     if args
                         .get(index + 1)
@@ -228,6 +240,7 @@ impl ClaudeAppOptions {
         Ok(Self {
             app,
             upstream,
+            upstream_header_env,
             check,
         })
     }
@@ -1935,7 +1948,7 @@ fn text_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
         .expect("static text response")
 }
 
-fn default_claude_app_path() -> PathBuf {
+pub(crate) fn default_claude_app_path() -> PathBuf {
     #[cfg(windows)]
     {
         if let Some(path) = find_windows_claude_app() {

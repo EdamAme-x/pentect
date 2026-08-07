@@ -1,8 +1,10 @@
 //! Pentect CLI: local secret masking boundary for AI agents.
 
+mod app_launcher;
 mod claude_app_proxy;
 mod claude_http_proxy;
 mod codex_app;
+mod default_launch;
 mod doctor;
 mod http_files;
 mod input;
@@ -156,8 +158,10 @@ fn usage() {
     eprintln!(
         "pentect\n\
          pentect codex|claude|opencode|pi\n\
+         pentect codex|claude --set-default | --unset-default\n\
          pentect codex app\n\
          pentect claude app\n\
+         pentect codex|claude app --install-launcher | --remove-launcher\n\
          pentect exec \"<command>\"\n\
          pentect doctor [--json | --fix [--yes]]\n\
          pentect update [VERSION] [--check]\n\
@@ -189,10 +193,13 @@ fn help_text() -> &'static str {
         "pentect protects AI tool boundaries.\n\n",
         "Use:\n",
         "  pentect\n",
-        "  pentect codex|claude [--plugins NAME|PATH.toml]\n",
+        "  pentect codex|claude [--upstream URL] [--upstream-header-env HEADER=ENV_NAME] [--plugins NAME|PATH.toml]\n",
+        "  pentect codex|claude --set-default | --unset-default\n",
         "  pentect opencode|pi [--model ID] [--upstream URL] [--api chat|responses]\n",
+        "  --upstream-header-env HEADER=ENV_NAME  read an upstream credential without putting it in command arguments\n",
         "  pentect codex app [--app PATH] [--upstream URL] [--plugins SOURCE] [--check]\n",
         "  pentect claude app [--app PATH] [--upstream URL] [--plugins SOURCE] [--check]\n",
+        "  pentect codex|claude app --install-launcher | --remove-launcher\n",
         "  pentect exec \"<command>\"\n\n",
         "  pentect doctor [--json | --fix [--yes]]\n",
         "  pentect update [VERSION] [--check | --force]\n",
@@ -220,6 +227,10 @@ fn help_text() -> &'static str {
         "update: verified GitHub Release binary\n",
         "uninstall: remove the binary; keep project data\n",
         "plugins: add, remove, list, search, inspect, test, config, setup, update\n",
+        "--set-default: make the normal client command launch through Pentect\n",
+        "--unset-default: remove the shell-profile change made by Pentect\n",
+        "--install-launcher: add a protected App launcher for this user\n",
+        "--remove-launcher: remove the App launcher created by Pentect\n",
         "codex app: launch Codex App through the Responses API gateway\n",
         "claude app: launch Claude Desktop through the Chat and Anthropic gateways\n",
         "opencode: launch OpenCode through an ephemeral OpenAI-compatible provider\n",
@@ -334,6 +345,12 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
 }
 
 fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
+    if default_launch::run_if_requested(tool.name(), &args[2..])
+        .unwrap_or_else(|error| die(error))
+        .is_some()
+    {
+        return 0;
+    }
     let opts = match AgentToolOpts::parse(tool, args) {
         Ok(o) => o,
         Err(e) => die(&e),
@@ -355,6 +372,12 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
 }
 
 fn cmd_claude_app(args: &[String]) -> i32 {
+    if app_launcher::run_if_requested("claude", args)
+        .unwrap_or_else(|error| die(error))
+        .is_some()
+    {
+        return 0;
+    }
     if claude_app_proxy::check_mode(args).unwrap_or_else(|error| die(error)) {
         return claude_app_proxy::cmd_claude_app(args);
     }
@@ -372,6 +395,12 @@ fn cmd_claude_app(args: &[String]) -> i32 {
 }
 
 fn cmd_codex_app(args: &[String]) -> i32 {
+    if app_launcher::run_if_requested("codex", args)
+        .unwrap_or_else(|error| die(error))
+        .is_some()
+    {
+        return 0;
+    }
     if codex_app::check_mode(args).unwrap_or_else(|error| die(error)) {
         return codex_app::cmd_codex_app(args);
     }
@@ -765,6 +794,7 @@ struct AgentToolOpts {
     openai_upstream: Option<String>,
     model: Option<String>,
     api: Option<String>,
+    upstream_header_env: Vec<String>,
     tool_args: Vec<String>,
 }
 
@@ -778,6 +808,7 @@ impl AgentToolOpts {
         let mut openai_upstream = None;
         let mut model = None;
         let mut api = None;
+        let mut upstream_header_env = Vec::new();
         let mut tool_args = Vec::new();
         let mut i = 2;
         while i < args.len() {
@@ -829,6 +860,13 @@ impl AgentToolOpts {
                 "--api" if matches!(tool, AgentTool::OpenCode | AgentTool::Pi) => {
                     api = Some(required_value(args, &mut i, "--api")?);
                 }
+                "--upstream-header-env" => {
+                    upstream_header_env.push(required_value(
+                        args,
+                        &mut i,
+                        "--upstream-header-env",
+                    )?);
+                }
                 "--prompt-proxy" | "--no-prompt-proxy" => {
                     return Err("prompt protection is automatic".to_string());
                 }
@@ -847,6 +885,7 @@ impl AgentToolOpts {
             openai_upstream,
             model,
             api,
+            upstream_header_env,
             tool_args,
         })
     }
@@ -864,7 +903,10 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
     let _parent_env = agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
-    let http_proxy = openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream.clone())?;
+    let http_proxy = openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(
+        routing.upstream.clone(),
+        &opts.upstream_header_env,
+    )?;
     // These overrides are appended so a caller-supplied routing override
     // cannot bypass the local gateway. Codex accepts global config flags after
     // its subcommand and uses the last value for duplicate keys.
@@ -872,6 +914,7 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
 
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
+    upstream::hide_header_source_env(&mut cmd, &opts.upstream_header_env);
     apply_plugin_env(&mut cmd, &active_plugins)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
@@ -898,10 +941,14 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     let _parent_env = agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
     let mut cmd = Command::new(&opts.command);
     clear_pentect_control_env(&mut cmd);
+    upstream::hide_header_source_env(&mut cmd, &opts.upstream_header_env);
     apply_plugin_env(&mut cmd, &active_plugins)?;
     apply_pentect_env(&mut cmd, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut cmd, Some(&memory_store));
-    let http_proxy = claude_http_proxy::ClaudeHttpProxyGuard::start(upstream)?;
+    let http_proxy = claude_http_proxy::ClaudeHttpProxyGuard::start_with_header_env(
+        upstream,
+        &opts.upstream_header_env,
+    )?;
     cmd.env("ANTHROPIC_BASE_URL", http_proxy.base_url());
     // Claude Code reapplies settings.env after process start. Put the local
     // route in the CLI settings layer as well, while preserving a caller's
@@ -2471,6 +2518,8 @@ mod tests {
     fn help_lists_public_commands_and_only_active_agent_integrations() {
         let help = help_text();
         assert!(help.contains("pentect codex|claude"));
+        assert!(help.contains("--set-default | --unset-default"));
+        assert!(help.contains("--install-launcher | --remove-launcher"));
         assert!(help.contains("pentect opencode|pi"));
         assert!(help.contains("pentect codex app"));
         assert!(help.contains("pentect claude app"));
@@ -2493,6 +2542,8 @@ mod tests {
                 "codex".to_string(),
                 "--upstream".to_string(),
                 "https://gateway.example/v1".to_string(),
+                "--upstream-header-env".to_string(),
+                "x-bf-vk=BIFROST_API_KEY".to_string(),
                 "--".to_string(),
                 "exec".to_string(),
                 "hello".to_string(),
@@ -2503,6 +2554,7 @@ mod tests {
             codex.openai_upstream.as_deref(),
             Some("https://gateway.example/v1")
         );
+        assert_eq!(codex.upstream_header_env, ["x-bf-vk=BIFROST_API_KEY"]);
         assert_eq!(codex.tool_args, ["exec", "hello"]);
 
         let claude = AgentToolOpts::parse(

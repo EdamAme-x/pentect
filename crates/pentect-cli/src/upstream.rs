@@ -8,21 +8,106 @@ const IDENTITY_ENV: &str = "PENTECT_UPSTREAM_IDENTITY";
 const AUTHORIZATION_ENV: &str = "PENTECT_UPSTREAM_AUTHORIZATION";
 
 #[derive(Clone)]
-pub(crate) enum AuthorizationOverride {
-    Forward,
-    Remove,
-    Replace(reqwest::header::HeaderValue),
+struct HeaderOverride {
+    name: reqwest::header::HeaderName,
+    value: Option<reqwest::header::HeaderValue>,
 }
 
-impl AuthorizationOverride {
+#[derive(Clone, Default)]
+pub(crate) struct HeaderOverrides {
+    values: Vec<HeaderOverride>,
+    suppress_origin_auth: bool,
+}
+
+impl HeaderOverrides {
     pub(crate) fn forward_incoming_header(&self, name: &str) -> bool {
-        matches!(self, Self::Forward) || !is_origin_auth_header(name)
+        !(self.suppress_origin_auth && is_origin_auth_header(name))
+            && !self
+                .values
+                .iter()
+                .any(|header| header.name.as_str().eq_ignore_ascii_case(name))
     }
 
-    pub(crate) fn replacement(&self) -> Option<&reqwest::header::HeaderValue> {
-        match self {
-            Self::Replace(value) => Some(value),
-            Self::Forward | Self::Remove => None,
+    pub(crate) fn apply(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for header in &self.values {
+            if let Some(value) = &header.value {
+                request = request.header(&header.name, value);
+            }
+        }
+        request
+    }
+}
+
+pub(crate) fn header_overrides(specs: &[String]) -> Result<HeaderOverrides, String> {
+    if specs.len() > 32 {
+        return Err("too many --upstream-header-env options (maximum 32)".to_string());
+    }
+    let mut overrides = HeaderOverrides::default();
+    if let Some(value) = std::env::var_os(AUTHORIZATION_ENV) {
+        let value = if value.is_empty() {
+            None
+        } else {
+            let mut value = value
+                .into_string()
+                .map_err(|_| format!("{AUTHORIZATION_ENV} is not valid Unicode"))?;
+            let header = sensitive_header_value(&value, AUTHORIZATION_ENV);
+            value.zeroize();
+            Some(header?)
+        };
+        overrides.suppress_origin_auth = true;
+        overrides.values.push(HeaderOverride {
+            name: reqwest::header::AUTHORIZATION,
+            value,
+        });
+    }
+
+    for spec in specs {
+        let (name, env_name) = spec.split_once('=').ok_or_else(|| {
+            "--upstream-header-env must use HEADER=ENV_NAME (for example x-bf-vk=BIFROST_API_KEY)"
+                .to_string()
+        })?;
+        let name = reqwest::header::HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|_| format!("invalid upstream header name '{name}'"))?;
+        reject_unsafe_override_header(&name)?;
+        if overrides
+            .values
+            .iter()
+            .any(|existing| existing.name == name)
+        {
+            return Err(format!(
+                "upstream header '{}' is configured more than once",
+                name
+            ));
+        }
+        let env_name = env_name.trim();
+        if env_name.is_empty() || env_name.contains('=') || env_name.contains('\0') {
+            return Err("upstream header environment variable name is invalid".to_string());
+        }
+        let mut value = std::env::var(env_name).map_err(|_| {
+            format!("environment variable {env_name} is not set or is not valid Unicode")
+        })?;
+        if value.is_empty() {
+            return Err(format!("environment variable {env_name} is empty"));
+        }
+        if value.len() > 16 * 1024 {
+            value.zeroize();
+            return Err(format!("environment variable {env_name} is too large"));
+        }
+        let header = sensitive_header_value(&value, env_name);
+        value.zeroize();
+        overrides.suppress_origin_auth = true;
+        overrides.values.push(HeaderOverride {
+            name,
+            value: Some(header?),
+        });
+    }
+    Ok(overrides)
+}
+
+pub(crate) fn hide_header_source_env(command: &mut std::process::Command, specs: &[String]) {
+    for spec in specs {
+        if let Some((_, env_name)) = spec.split_once('=') {
+            command.env_remove(env_name.trim());
         }
     }
 }
@@ -31,22 +116,35 @@ fn is_origin_auth_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("x-api-key")
         || name.eq_ignore_ascii_case("api-key")
+        || name.eq_ignore_ascii_case("x-goog-api-key")
 }
 
-pub(crate) fn authorization_override() -> Result<AuthorizationOverride, String> {
-    let Some(value) = std::env::var_os(AUTHORIZATION_ENV) else {
-        return Ok(AuthorizationOverride::Forward);
-    };
-    if value.is_empty() {
-        return Ok(AuthorizationOverride::Remove);
-    }
-    let value = value
-        .into_string()
-        .map_err(|_| format!("{AUTHORIZATION_ENV} is not valid Unicode"))?;
-    let mut header = reqwest::header::HeaderValue::from_str(&value)
-        .map_err(|_| format!("{AUTHORIZATION_ENV} is not a valid HTTP header value"))?;
+fn sensitive_header_value(
+    value: &str,
+    source: &str,
+) -> Result<reqwest::header::HeaderValue, String> {
+    let mut header = reqwest::header::HeaderValue::from_str(value)
+        .map_err(|_| format!("{source} is not a valid HTTP header value"))?;
     header.set_sensitive(true);
-    Ok(AuthorizationOverride::Replace(header))
+    Ok(header)
+}
+
+fn reject_unsafe_override_header(name: &reqwest::header::HeaderName) -> Result<(), String> {
+    if matches!(
+        name.as_str(),
+        "connection"
+            | "content-length"
+            | "host"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) {
+        return Err(format!("upstream header '{name}' cannot be overridden"));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_base(value: &str, protocol: &str) -> Result<reqwest::Url, String> {
@@ -219,20 +317,50 @@ mod tests {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         {
             let _env = EnvRestore::set(AUTHORIZATION_ENV, "");
-            assert!(matches!(
-                authorization_override().unwrap(),
-                AuthorizationOverride::Remove
-            ));
+            let overrides = header_overrides(&[]).unwrap();
+            assert!(!overrides.forward_incoming_header("authorization"));
         }
         {
             let _env = EnvRestore::set(AUTHORIZATION_ENV, "Bearer gateway-token");
-            let override_value = authorization_override().unwrap();
-            assert!(!override_value.forward_incoming_header("authorization"));
-            assert!(!override_value.forward_incoming_header("x-api-key"));
-            assert!(!override_value.forward_incoming_header("api-key"));
-            assert!(override_value.forward_incoming_header("anthropic-version"));
-            assert!(override_value.replacement().is_some());
-            assert!(override_value.replacement().unwrap().is_sensitive());
+            let overrides = header_overrides(&[]).unwrap();
+            assert!(!overrides.forward_incoming_header("authorization"));
+            assert!(!overrides.forward_incoming_header("x-api-key"));
+            assert!(overrides.forward_incoming_header("anthropic-version"));
+            assert!(overrides.values[0].value.as_ref().unwrap().is_sensitive());
         }
+    }
+
+    #[test]
+    fn named_header_reads_secret_from_environment() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let _secret = EnvRestore::set("PENTECT_TEST_BIFROST_KEY", "bf-test-key");
+        let overrides =
+            header_overrides(&["x-bf-vk=PENTECT_TEST_BIFROST_KEY".to_string()]).unwrap();
+        assert!(!overrides.forward_incoming_header("X-BF-VK"));
+        assert!(!overrides.forward_incoming_header("authorization"));
+        assert!(overrides.values[0].value.as_ref().unwrap().is_sensitive());
+        let request = overrides
+            .apply(reqwest::Client::new().get("https://example.test"))
+            .build()
+            .unwrap();
+        assert_eq!(request.headers().get("x-bf-vk").unwrap(), "bf-test-key");
+
+        let mut command = std::process::Command::new("example");
+        command.env("PENTECT_TEST_BIFROST_KEY", "bf-test-key");
+        hide_header_source_env(
+            &mut command,
+            &["x-bf-vk=PENTECT_TEST_BIFROST_KEY".to_string()],
+        );
+        assert!(command
+            .get_envs()
+            .any(|(name, value)| name == "PENTECT_TEST_BIFROST_KEY" && value.is_none()));
+    }
+
+    #[test]
+    fn named_header_rejects_missing_values_and_transport_headers() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PENTECT_TEST_MISSING_KEY");
+        assert!(header_overrides(&["x-bf-vk=PENTECT_TEST_MISSING_KEY".to_string()]).is_err());
+        assert!(header_overrides(&["host=PENTECT_TEST_MISSING_KEY".to_string()]).is_err());
     }
 }

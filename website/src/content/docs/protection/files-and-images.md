@@ -59,6 +59,16 @@ OCR runs on your computer. Pentect covers sensitive areas before it sends the
 image. Limits control the number of images, file size, image size, download
 time, and total check time.
 
+This also applies when a supported browser or MCP tool returns a screenshot as
+part of a tool result. Pentect checks the image before that result enters the
+next provider request. If the tool also returns page text, HTML, clipboard
+text, or structured JSON, Pentect checks those values as text.
+
+For example, when an agent creates an API key in a browser, the key may appear
+in a page snapshot, structured tool result, or screenshot. Supported text
+results become handles. Supported screenshots are scanned locally and any
+detected sensitive pixels are covered.
+
 OCR also checks text found in QR codes and common barcodes. Pentect removes
 supported image metadata when it rewrites an image. A scan can still miss text,
 especially with low contrast, unusual writing, or unsupported image content.
@@ -94,3 +104,5 @@ If a file is blocked:
 
 See [Configuration](/reference/configuration/) for limits and
 [Troubleshooting](/reference/troubleshooting/) for unknown-format recovery.
+See [Prompts and tool results](/protection/prompts-and-tools/) for browser, MCP,
+clipboard, and accidental-output examples.

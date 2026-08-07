@@ -57,7 +57,10 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     }
 
     let routing = crate::codex_app_routing(options.upstream)?;
-    let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start(routing.upstream)?;
+    let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(
+        routing.upstream,
+        &options.upstream_header_env,
+    )?;
     let config_lock = Arc::new(Mutex::new(Some(CodexConfigLock::acquire()?)));
     let config_override = Some(CodexConfigOverride::install(
         &routing.provider,
@@ -73,6 +76,7 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     eprintln!("[pentect] Responses API prompts, files, and completed tool calls are protected");
 
     let mut command = Command::new(&app);
+    crate::upstream::hide_header_source_env(&mut command, &options.upstream_header_env);
     command
         .env("OPENAI_BASE_URL", proxy.base_url())
         .stdin(Stdio::null())
@@ -413,6 +417,7 @@ fn set_provider_gateway(
 struct CodexAppOptions {
     app: Option<PathBuf>,
     upstream: Option<String>,
+    upstream_header_env: Vec<String>,
     check: bool,
 }
 
@@ -420,6 +425,7 @@ impl CodexAppOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut app = None;
         let mut upstream = None;
+        let mut upstream_header_env = Vec::new();
         let mut check = false;
         let mut index = if args.get(1).is_some_and(|arg| arg == "codex")
             && args.get(2).is_some_and(|arg| arg == "app")
@@ -444,6 +450,13 @@ impl CodexAppOptions {
                     upstream = Some(value.clone());
                     index += 2;
                 }
+                "--upstream-header-env" => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| "--upstream-header-env requires a value".to_string())?;
+                    upstream_header_env.push(value.clone());
+                    index += 2;
+                }
                 "--check" | "--dry-run" => {
                     check = true;
                     index += 1;
@@ -463,12 +476,13 @@ impl CodexAppOptions {
         Ok(Self {
             app,
             upstream,
+            upstream_header_env,
             check,
         })
     }
 }
 
-fn default_codex_app_path() -> PathBuf {
+pub(crate) fn default_codex_app_path() -> PathBuf {
     #[cfg(windows)]
     {
         if let Some(path) = find_windows_codex_app() {
@@ -690,6 +704,8 @@ mod tests {
             "Codex.exe".to_string(),
             "--upstream".to_string(),
             "https://example.test/v1".to_string(),
+            "--upstream-header-env".to_string(),
+            "x-bf-vk=BIFROST_API_KEY".to_string(),
             "--dry-run".to_string(),
         ];
         assert_eq!(
@@ -697,6 +713,7 @@ mod tests {
             CodexAppOptions {
                 app: Some(PathBuf::from("Codex.exe")),
                 upstream: Some("https://example.test/v1".to_string()),
+                upstream_header_env: vec!["x-bf-vk=BIFROST_API_KEY".to_string()],
                 check: true,
             }
         );
@@ -717,6 +734,7 @@ mod tests {
             CodexAppOptions {
                 app: None,
                 upstream: None,
+                upstream_header_env: Vec::new(),
                 check: true,
             }
         );
