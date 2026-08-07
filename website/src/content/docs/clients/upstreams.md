@@ -3,8 +3,9 @@ title: Custom upstreams
 description: Use Pentect with another gateway or local model server.
 ---
 
-Pentect can protect a client and send its requests to another local or remote
-gateway.
+Put Pentect in front of a local model server or an existing gateway. The
+gateway stays in charge of models, provider credentials, routing, and usage
+limits.
 
 ```sh
 pentect codex --upstream http://127.0.0.1:8080/openai/v1
@@ -13,16 +14,8 @@ pentect opencode --model anthropic/claude-sonnet --upstream http://127.0.0.1:808
 pentect pi --model anthropic/claude-sonnet --upstream http://127.0.0.1:8080/openai/v1
 ```
 
-The upstream URL applies to that launch only. Pentect keeps the base path when
-it builds provider URLs.
-
-Pentect runs in front of the gateway. It does not include or replace the
-gateway. The client connects to Pentect, and Pentect sends the protected
-request to the gateway you chose.
-
-The URL may be local or remote. Treat it as a provider endpoint: Pentect sends
-the protected request to it, and the client or gateway supplies authentication.
-Pentect does not copy credentials from one provider configuration into another.
+The URL applies to one launch. Pentect keeps its base path, masks the request,
+and then sends it to that gateway.
 
 ## Use Bifrost
 
@@ -30,7 +23,7 @@ Bifrost lets one OpenAI- or Anthropic-compatible gateway route requests to
 different model providers. Pentect stays in front of it and protects the
 request before Bifrost receives it.
 
-Start a local Bifrost gateway and configure at least one provider:
+Start Bifrost and configure at least one provider:
 
 ```sh
 npx -y @maximhq/bifrost
@@ -63,23 +56,38 @@ pentect pi --upstream http://127.0.0.1:8080/openai/v1 \
 
 :::
 
-If Bifrost virtual-key authentication is enabled, give Pentect the complete
-authorization value before launching the client:
+### Virtual keys
+
+Keep the key in an environment variable and tell Pentect which request header
+should receive it. Only the environment-variable name appears in the command.
+Pentect removes that variable from the launched AI client.
 
 ::: code-group
 
 ```powershell [PowerShell]
-$env:PENTECT_UPSTREAM_AUTHORIZATION = "Bearer bf-your-virtual-key"
+$secret = Read-Host "Bifrost virtual key" -AsSecureString
+$env:BIFROST_API_KEY = [Net.NetworkCredential]::new('', $secret).Password
+pentect codex --upstream http://127.0.0.1:8080/openai/v1 `
+  --upstream-header-env x-bf-vk=BIFROST_API_KEY
 ```
 
 ```sh [Shell]
-export PENTECT_UPSTREAM_AUTHORIZATION="Bearer bf-your-virtual-key"
+read -rsp "Bifrost virtual key: " BIFROST_API_KEY && echo
+export BIFROST_API_KEY
+pentect codex --upstream http://127.0.0.1:8080/openai/v1 \
+  --upstream-header-env x-bf-vk=BIFROST_API_KEY
 ```
 
 :::
 
-Do not put a real virtual key in a project file or command history. Bifrost's
-dashboard and request logs remain available at `http://127.0.0.1:8080` and
+`x-bf-vk` is Bifrost's dedicated virtual-key header. You can repeat
+`--upstream-header-env HEADER=ENV_NAME` when another gateway needs more than
+one header. Pentect replaces matching client headers and does not forward the
+client's original provider credential when a custom upstream credential is
+configured.
+
+Do not put a real key in a project file or command argument. Bifrost's dashboard
+and request logs remain available at `http://127.0.0.1:8080` and
 `http://127.0.0.1:8080/logs`. See the
 [Bifrost agent guide](https://docs.getbifrost.ai/cli-agents/overview) for
 provider setup, virtual keys, and model IDs.
@@ -100,11 +108,11 @@ Responses, and Claude still needs Messages. Use a gateway when the server does
 not provide the format required by the selected client. Pentect does not
 translate arbitrary provider APIs itself.
 
-## Base paths and authentication
+## Base paths
 
 Pass the base URL for the provider API, not a URL for one model. For example,
 Pentect keeps `http://127.0.0.1:8080/openai/v1` when it builds a Responses API
-URL. The client or gateway still sends the login data.
+URL.
 
 | Client | Required API format | Example base path |
 | --- | --- | --- |

@@ -62,10 +62,18 @@ Pentect fits work where an AI agent must read configuration, inspect logs, or
 call a local tool without sending every credential and private field to the
 model provider. Common examples are:
 
+- pasting a credential into a prompt by mistake;
+- masking a secret that appears in terminal output, logs, or clipboard text;
+- letting an MCP browser create a new API key without returning the real value
+  to the model provider;
+- covering sensitive text in a browser screenshot with local OCR;
 - coding with `.env`, Terraform, Kubernetes, cloud, npm, or PyPI settings;
 - letting an agent call an API with a credential already on the computer;
 - checking documents and screenshots before they enter a supported request;
 - adding a company-specific detector through a reviewed plugin.
+
+See [Prompts and tool results](/protection/prompts-and-tools/) for the complete
+flow from local input to provider request.
 
 It is less useful for a client that never exposes a supported local API route,
 or for a workflow that already sends the original value outside the protected

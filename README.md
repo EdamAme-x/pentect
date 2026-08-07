@@ -76,6 +76,18 @@ pentect opencode --model openai/gpt-5
 pentect pi --model openai/gpt-5
 ```
 
+To keep using the normal `codex` or `claude` command, let Pentect add a small
+function to your shell profile:
+
+```text
+pentect codex --set-default
+pentect claude --set-default
+```
+
+Pentect shows the profile and change before asking for approval. Undo it with
+`pentect codex --unset-default` or `pentect claude --unset-default`.
+Shell defaults support Bash, Zsh, Fish, and PowerShell.
+
 Use a Responses- or Messages-compatible gateway without changing permanent
 client configuration:
 
@@ -92,6 +104,17 @@ Launch a desktop app only when explicitly requested:
 pentect codex app
 pentect claude app
 ```
+
+Install an optional clickable launcher when you use a protected App regularly:
+
+```text
+pentect codex app --install-launcher
+pentect claude app --install-launcher
+```
+
+This adds `Codex via Pentect` or `Claude via Pentect` for the current user. It
+does not modify the official App. Launchers support Windows and macOS. Remove
+one later with `--remove-launcher`.
 
 These commands protect Codex mode and supported Claude Desktop Chat, Code, and
 attachment traffic; they do not claim coverage for every Chat, Work, Cowork,

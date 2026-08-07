@@ -43,8 +43,17 @@ pub(crate) struct OpenAiHttpProxyGuard {
 }
 
 impl OpenAiHttpProxyGuard {
+    #[cfg(test)]
     pub(crate) fn start(upstream: String) -> Result<Self, String> {
+        Self::start_with_header_env(upstream, &[])
+    }
+
+    pub(crate) fn start_with_header_env(
+        upstream: String,
+        header_env: &[String],
+    ) -> Result<Self, String> {
         let upstream = parse_upstream_base(&upstream)?;
+        let headers = crate::upstream::header_overrides(header_env)?;
         let auth = random_auth_token()?;
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -64,7 +73,9 @@ impl OpenAiHttpProxyGuard {
                 }
             };
             runtime.block_on(async move {
-                if let Err(error) = run_proxy(upstream, thread_auth, ready_tx, shutdown_rx).await {
+                if let Err(error) =
+                    run_proxy(upstream, headers, thread_auth, ready_tx, shutdown_rx).await
+                {
                     eprintln!("[pentect] OpenAI HTTP gateway stopped: {error}");
                 }
             });
@@ -105,7 +116,7 @@ struct ProxyState {
     files: Mutex<HashMap<String, crate::http_files::Coverage>>,
     requests: Arc<Semaphore>,
     block_unknown_formats: bool,
-    authorization: crate::upstream::AuthorizationOverride,
+    headers: crate::upstream::HeaderOverrides,
 }
 
 impl Drop for ProxyState {
@@ -116,6 +127,7 @@ impl Drop for ProxyState {
 
 async fn run_proxy(
     upstream: reqwest::Url,
+    headers: crate::upstream::HeaderOverrides,
     auth: String,
     ready_tx: mpsc::Sender<Result<String, String>>,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -139,7 +151,7 @@ async fn run_proxy(
         files: Mutex::new(HashMap::new()),
         requests: Arc::new(Semaphore::new(32)),
         block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
-        authorization: crate::upstream::authorization_override()?,
+        headers,
     });
     let _ = ready_tx.send(Ok(local_base_url));
 
@@ -330,7 +342,7 @@ async fn proxy_request_inner(
     let mut upstream_request = state.client.request(method, upstream_url);
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
-        if state.authorization.forward_incoming_header(name.as_str())
+        if state.headers.forward_incoming_header(name.as_str())
             && ((!(protected_request || files_upload) && name == hyper::header::CONTENT_LENGTH)
                 || should_forward_request_header(name.as_str()))
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
@@ -338,9 +350,7 @@ async fn proxy_request_inner(
             upstream_request = upstream_request.header(name, value);
         }
     }
-    if let Some(value) = state.authorization.replacement() {
-        upstream_request = upstream_request.header(hyper::header::AUTHORIZATION, value);
-    }
+    upstream_request = state.headers.apply(upstream_request);
     let upstream = upstream_request
         .body(body)
         .send()
@@ -765,12 +775,14 @@ async fn fetch_openai_file_content(
     let mut request = state.client.get(url);
     let connection_headers = connection_named_headers(request_headers);
     for (name, value) in request_headers {
-        if should_forward_request_header(name.as_str())
+        if state.headers.forward_incoming_header(name.as_str())
+            && should_forward_request_header(name.as_str())
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
         {
             request = request.header(name, value);
         }
     }
+    request = state.headers.apply(request);
     let response = request
         .send()
         .await

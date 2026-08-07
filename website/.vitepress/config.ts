@@ -16,6 +16,7 @@ const sidebarIcons = {
   terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/>',
   message: '<path d="M5 18 3 21l4-1.5A9 9 0 1 0 5 18Z"/><path d="M8 11h8M8 14h5"/>',
   network: '<circle cx="5" cy="12" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="m7 11 10-4m-10 6 10 4"/>',
+  gateway: '<path d="M4 7h11"/><path d="m12 4 3 3-3 3"/><path d="M20 17H9"/><path d="m12 14-3 3 3 3"/><path d="M4 4v16M20 4v16"/>',
   data: '<path d="M8 4 4 8l4 4"/><path d="m16 12 4 4-4 4"/><path d="m14 3-4 18"/>',
   image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m3 16 5-4 4 3 3-2 6 5"/>',
   shield: '<path d="M12 3 5 6v5c0 4.7 2.9 8 7 10 4.1-2 7-5.3 7-10V6Z"/><path d="m9 12 2 2 4-4"/>',
@@ -56,14 +57,15 @@ const sidebar = [
     items: [
       { text: sidebarLabel('Codex', 'terminal', '/brands/openai-blossom.svg'), link: '/clients/codex/' },
       { text: sidebarLabel('Claude', 'message', '/brands/claude.svg'), link: '/clients/claude/' },
-      { text: sidebarLabel('OpenCode', 'terminal'), link: '/clients/opencode/' },
-      { text: sidebarLabel('Pi', 'terminal'), link: '/clients/pi/' },
-      { text: sidebarLabel('Custom upstreams', 'network'), link: '/clients/upstreams/' },
+      { text: sidebarLabel('OpenCode', 'terminal', '/brands/opencode.svg'), link: '/clients/opencode/' },
+      { text: sidebarLabel('Pi', 'terminal', '/brands/pi.svg'), link: '/clients/pi/' },
+      { text: sidebarLabel('Custom upstreams', 'gateway'), link: '/clients/upstreams/' },
     ],
   },
   {
     text: 'Protection',
     items: [
+      { text: sidebarLabel('Prompts and tool results', 'message'), link: '/protection/prompts-and-tools/' },
       { text: sidebarLabel('Structured data', 'data'), link: '/protection/structured-data/' },
       { text: sidebarLabel('Files and images', 'image'), link: '/protection/files-and-images/' },
       { text: sidebarLabel('Security model', 'shield'), link: '/protection/security-model/' },

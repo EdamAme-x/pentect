@@ -1,32 +1,22 @@
 ---
 title: Docs_
-description: Protect sensitive data before it reaches an AI model, while local tools keep working.
+description: AI can use your secrets without ever seeing them.
 pageClass: docs-hub
 aside: false
 ---
 
-Pentect runs locally between supported AI clients and their providers. It
-replaces sensitive values with useful handles, then restores those handles only
-when a trusted local tool needs the value.
-
-<div class="home-flow" aria-label="How Pentect protects a request">
-  <div class="home-flow__step" data-number="01" data-title="Detect locally" data-description="Check text, config files, uploads, images, and tool output."><small>01</small><strong>Detect locally</strong><span>Check text, config files, uploads, images, and tool output.</span></div>
-  <div class="home-flow__step" data-number="02" data-title="Send a handle" data-description="The provider sees a DATABASE_URL handle, not the value."><small>02</small><strong>Send a handle</strong><span>The provider sees <code>&lt;&lt;DATABASE_URL_...&gt;&gt;</code>, not the value.</span></div>
-  <div class="home-flow__step" data-number="03" data-title="Use it locally" data-description="Restore known handles only at a trusted tool boundary."><small>03</small><strong>Use it locally</strong><span>Restore known handles only at a trusted tool boundary.</span></div>
-</div>
-
-<HomeInstall />
+<QuickInstall />
 
 ## Clients
 
 <DocsGrid class="is-compact">
   <a href="/clients/codex/" class="docs-grid__item">
-    <small>CLI</small><strong>Codex CLI</strong>
-    <span>Run Codex through Pentect for the current session.</span><b aria-hidden="true">→</b>
+    <small>CLI + Desktop</small><strong>Codex</strong>
+    <span>Protect Codex CLI or launch Codex App through Pentect.</span><b aria-hidden="true">→</b>
   </a>
   <a href="/clients/claude/" class="docs-grid__item">
-    <small>CLI</small><strong>Claude Code</strong>
-    <span>Protect Claude Code requests with Pentect.</span><b aria-hidden="true">→</b>
+    <small>Code + Desktop</small><strong>Claude</strong>
+    <span>Protect Claude Code or supported Claude Desktop traffic.</span><b aria-hidden="true">→</b>
   </a>
   <a href="/clients/opencode/" class="docs-grid__item">
     <small>CLI</small><strong>OpenCode</strong>
@@ -36,19 +26,15 @@ when a trusted local tool needs the value.
     <small>CLI</small><strong>Pi</strong>
     <span>Run Pi through a temporary protected provider.</span><b aria-hidden="true">→</b>
   </a>
-  <a href="/clients/codex/" class="docs-grid__item">
-    <small>Desktop</small><strong>Codex App</strong>
-    <span>Start one Codex App session through Pentect.</span><b aria-hidden="true">→</b>
-  </a>
-  <a href="/clients/claude/" class="docs-grid__item">
-    <small>Desktop</small><strong>Claude Desktop</strong>
-    <span>Protect supported Claude Desktop traffic.</span><b aria-hidden="true">→</b>
-  </a>
 </DocsGrid>
 
 ## Explore
 
 <DocsGrid>
+  <a href="/protection/prompts-and-tools/" class="docs-grid__item">
+    <strong>Prompts and tool results</strong>
+    <span>Protect pasted secrets, accidental output, MCP results, and browser screenshots.</span><b aria-hidden="true">→</b>
+  </a>
   <a href="/start/how-it-works/" class="docs-grid__item">
     <strong>How it works</strong>
     <span>See how Pentect protects and restores a value.</span><b aria-hidden="true">→</b>

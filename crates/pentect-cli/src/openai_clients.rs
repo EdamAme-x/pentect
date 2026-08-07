@@ -51,9 +51,13 @@ pub(crate) fn run(
     let active_plugins = crate::agent_tool_plugins(opts)?;
     let memory_store = crate::start_memory_store(pentect)?;
     let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
-    let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start(upstream)?;
+    let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(
+        upstream,
+        &opts.upstream_header_env,
+    )?;
     let mut command = Command::new(&opts.command);
     crate::clear_pentect_control_env(&mut command);
+    crate::upstream::hide_header_source_env(&mut command, &opts.upstream_header_env);
     crate::apply_plugin_env(&mut command, &active_plugins)?;
     crate::apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
     crate::apply_memory_store_env(&mut command, Some(&memory_store));

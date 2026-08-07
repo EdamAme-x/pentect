@@ -18,8 +18,42 @@ cannot complete a requested change.
 | `pentect codex app` | Launch Codex App for this protected session |
 | `pentect claude app` | Launch Claude Desktop for this protected session |
 
+For Codex and Claude, `--set-default` adds a reviewed function to the current
+shell's user profile. The normal `codex` or `claude` command then launches
+through Pentect. `--unset-default` removes only the block Pentect added.
+
+```sh
+pentect codex --set-default
+pentect codex --unset-default
+```
+
+PowerShell, Bash, Zsh, and Fish are supported. Add `--yes` only in automation
+where you have already reviewed the profile change.
+
+### App launchers
+
+Add an optional clickable launcher for a desktop App:
+
+```sh
+pentect codex app --install-launcher
+pentect claude app --install-launcher
+```
+
+| Option | Result |
+| --- | --- |
+| `--install-launcher` | Add or refresh the current user's Pentect launcher |
+| `--remove-launcher` | Remove only the launcher owned by Pentect |
+| `--yes` | Skip the confirmation in reviewed automation |
+
+Windows and macOS are supported. Both commands show the exact target and ask
+before changing it. The launcher does not store a custom `--app`, `--upstream`,
+or `--plugins` value; use the normal terminal launch for those one-time options.
+
 Use `--upstream URL` to choose a compatible gateway for one launch. Use
-`--plugins SOURCE` to add a plugin for one launch. App commands also support
+`--upstream-header-env HEADER=ENV_NAME` to add a gateway credential without
+putting its value in command arguments. The source variable is removed from the
+launched client process. Use `--plugins SOURCE` to add a plugin for one launch.
+App commands also support
 `--app PATH` and `--check`.
 
 Codex and Claude arguments are forwarded directly:

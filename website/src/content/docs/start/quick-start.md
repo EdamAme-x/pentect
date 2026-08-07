@@ -3,8 +3,15 @@ title: Quick start
 description: Protect a real Codex or Claude session in a few commands.
 ---
 
-Install Pentect first, then use one protected launch. You do not need to change
-the permanent settings of Codex or Claude.
+## Install
+
+New to Pentect? [Choose your OS and install method](/start/install/). The
+installation page covers Windows, macOS, Linux, npm, Homebrew, APT, and Nix.
+
+Already installed? Continue below. You do not need to change the permanent
+settings of Codex or Claude.
+
+## Start a protected session
 
 1. Check Pentect and the client.
 
@@ -39,6 +46,17 @@ the permanent settings of Codex or Claude.
 
 ## What success looks like
 
+You can test the request boundary with fake data. Paste this into the protected
+client:
+
+```text
+Remember OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX for this task.
+```
+
+The provider-bound prompt contains an `<<OPENAI_API_KEY_...>>` handle instead
+of the fake value. The same protection applies to supported text returned by a
+terminal, file tool, browser, or MCP server.
+
 If a file contains `DATABASE_URL=postgres://...`, the provider sees a handle
 instead of the credential:
 
@@ -66,34 +84,19 @@ pentect codex exec --full-auto
 pentect claude --model sonnet
 ```
 
-## Launch through Pentect by default
+## Use Pentect from your normal CLI command
 
-Add these functions to your shell profile, then restart the terminal. Existing
-Codex and Claude arguments continue to work normally.
+This step is optional. If you want `codex` or `claude` to use Pentect without
+typing the `pentect` prefix, run:
 
-::: code-group
-
-```powershell [PowerShell · $PROFILE]
-function codex { & pentect codex @args }
-function claude { & pentect claude @args }
+```sh
+pentect codex --set-default
+pentect claude --set-default
 ```
 
-```sh [Bash · ~/.bashrc or Zsh · ~/.zshrc]
-codex() { command pentect codex "$@"; }
-claude() { command pentect claude "$@"; }
-```
-
-```fish [Fish · ~/.config/fish/config.fish]
-function codex
-    command pentect codex $argv
-end
-
-function claude
-    command pentect claude $argv
-end
-```
-
-:::
+Pentect detects PowerShell, Bash, Zsh, or Fish. Before changing anything, it
+shows the profile path and the function it will add. It also backs up an
+existing profile. Restart the terminal after you approve the change.
 
 After that, launch either client as usual:
 
@@ -101,6 +104,45 @@ After that, launch either client as usual:
 codex exec --full-auto
 claude --model sonnet
 ```
+
+Remove only the profile block created by Pentect with:
+
+```sh
+pentect codex --unset-default
+pentect claude --unset-default
+```
+
+## Add a clickable App launcher
+
+This is also optional. Add a separate protected launcher for the desktop App:
+
+```sh
+pentect codex app --install-launcher
+pentect claude app --install-launcher
+```
+
+| System | Launcher location |
+| --- | --- |
+| Windows | Start menu → Pentect |
+| macOS | `~/Applications` |
+
+Pin `Codex via Pentect` or `Claude via Pentect` to the taskbar or Dock. The
+launcher starts the same local Pentect gateway as the terminal command, without
+leaving a terminal window open. The official App and its shortcut are not
+changed.
+
+Quit the official App before using the protected launcher. An App that is
+already running cannot inherit the temporary Pentect routing.
+
+Remove the launcher with:
+
+```sh
+pentect codex app --remove-launcher
+pentect claude app --remove-launcher
+```
+
+The remove command checks that Pentect created the launcher. It will not delete
+an unrelated shortcut or App with the same name.
 
 ## Try masking without an agent
 
@@ -118,8 +160,8 @@ Get-Content .env -Raw | pentect mask
 The output contains reusable handles. Pentect does not print the real values.
 
 ::: tip
-These functions affect only that shell. Pentect protects clients started by the
-functions. It does not create a proxy for the whole system.
+The default is optional. It affects only supported clients started from that
+shell; it does not create a proxy for the whole system.
 :::
 
 ## Next steps
@@ -128,5 +170,7 @@ functions. It does not create a proxy for the whole system.
 - See [Structured data](/protection/structured-data/) for dotenv, Terraform, Kubernetes, and JSON behavior.
 - Read [Handles](/start/handles/) before copying handles between sessions or scripts.
 - Review [Files and images](/protection/files-and-images/) before sending uploads.
+- See [Prompts and tool results](/protection/prompts-and-tools/) for pasted
+  secrets, accidental output, MCP browsers, and screenshots.
 - Run `pentect doctor` again after changing a client installation or provider.
 - Copy a complete task from [Examples](/start/examples/).

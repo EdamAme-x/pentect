@@ -18,6 +18,37 @@ pentect doctor
 `doctor` checks Pentect and the AI clients installed on your machine. To apply
 a fix after reviewing it, run `pentect doctor --fix`.
 
+## Start a client
+
+Use Pentect for one session:
+
+```sh
+pentect codex
+# or
+pentect claude
+```
+
+To keep the shorter client command, ask Pentect to update your shell profile:
+
+```sh
+pentect codex --set-default
+pentect claude --set-default
+```
+
+The change is shown before approval and can be removed later with
+`--unset-default`. See [Quick start](/start/quick-start/) for the full flow.
+
+If you use a desktop App often, install a separate protected launcher:
+
+```sh
+pentect codex app --install-launcher
+pentect claude app --install-launcher
+```
+
+The launcher is optional. It appears as `Codex via Pentect` or `Claude via
+Pentect` and does not replace the official App. Quit the official App before
+opening the protected launcher.
+
 ## Install a specific version
 
 Use the same installer with a version number:
@@ -110,6 +141,15 @@ sudo nixos-rebuild switch --flake .#HOSTNAME
 ```
 
 ## Uninstall
+
+Remove any shell defaults or App launchers first:
+
+```sh
+pentect codex --unset-default
+pentect claude --unset-default
+pentect codex app --remove-launcher
+pentect claude app --remove-launcher
+```
 
 For a direct PowerShell or shell install:
 

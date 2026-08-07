@@ -6,6 +6,52 @@ description: Copyable ways to use Pentect in everyday work.
 Each example uses fake data. Start a client through Pentect before you use a
 handle in that client.
 
+## Paste a secret into a prompt
+
+If you paste a credential into a protected client, Pentect checks it before the
+request leaves your computer:
+
+```text
+Use OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX to test the account.
+```
+
+The provider receives a handle instead of the detected value:
+
+```text
+Use OPENAI_API_KEY=<<OPENAI_API_KEY_...>> to test the account.
+```
+
+The original text can remain visible in the local client UI. This protection
+applies to requests sent through a supported Pentect launch.
+
+## Keep an accidental tool result local
+
+An agent may run a command that prints a token, read a sensitive log line, or
+receive a secret in clipboard text. Pentect checks supported tool output before
+the next provider request and replaces the value with a handle.
+
+The same rule applies to supported MCP results. Text, JSON fields, page
+snapshots, and clipboard data can be protected even when the agent did not know
+that the tool would return a secret.
+
+## Create an API key with a browser tool
+
+Suppose an MCP browser opens an admin page and creates a new key. The tool may
+return it as structured data:
+
+```json
+{"apiKey":"sk-ABCDEFGHIJKLMNOPQRSTUVWX"}
+```
+
+Before the result is sent back to the provider, Pentect changes the value to a
+handle such as `<<APIKEY_...>>`. A later local tool can use the known handle
+without the provider receiving the key.
+
+If the browser returns only a screenshot, Pentect uses local OCR and covers
+detected sensitive regions. Read
+[Prompts and tool results](/protection/prompts-and-tools/) for the full flow and
+[Files and images](/protection/files-and-images/) for OCR limits.
+
 ## Read a config file safely
 
 Ask a protected Codex or Claude session to read `.env`. The provider receives
@@ -43,34 +89,18 @@ Prefer this to `pentect resolve` when a command can accept the handle directly.
 
 ## Keep your normal client command
 
-Add a small function to your shell profile. Client arguments still pass
-through:
+Let Pentect add the shell function after showing it to you:
 
-::: code-group
-
-```powershell [PowerShell]
-function codex { & pentect codex @args }
-function claude { & pentect claude @args }
+```sh
+pentect codex --set-default
+pentect claude --set-default
 ```
-
-```sh [Bash / Zsh]
-codex() { command pentect codex "$@"; }
-claude() { command pentect claude "$@"; }
-```
-
-```fish [Fish]
-function codex
-    command pentect codex $argv
-end
-function claude
-    command pentect claude $argv
-end
-```
-
-:::
 
 Now commands such as `codex exec --full-auto` and `claude --model sonnet` use
 Pentect without changing their normal arguments.
+
+Undo the change with `pentect codex --unset-default` or `pentect claude
+--unset-default`.
 
 ## Use a local model or gateway
 
