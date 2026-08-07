@@ -73,6 +73,8 @@ jobs:
           npm run check
           npm test
           npm pack --dry-run
+          npm install --no-audit --no-fund --no-package-lock
+          node bin/pentect-pi.js --version
       - name: Publish
         shell: bash
         run: |

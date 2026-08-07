@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import test from "node:test";
-import { invocation, piBinaryFromEntry } from "../lib/command.js";
+import { pathToFileURL } from "node:url";
+import {
+  invocation,
+  packageEntryPath,
+  piBinaryFromEntry,
+} from "../lib/command.js";
 
 test("launches the bundled Pi CLI through Pentect without a shell", () => {
   const result = invocation(
@@ -32,4 +37,14 @@ test("finds Pi's CLI beside its public package entry", () => {
     piBinaryFromEntry("/packages/pi/dist/index.js"),
     resolve("/packages/pi/dist/cli.js"),
   );
+});
+
+test("resolves ESM-only package entries with import conditions", () => {
+  const expected = resolve("/packages/pi/dist/index.js");
+  const entry = packageEntryPath("pi-package", (specifier) => {
+    assert.equal(specifier, "pi-package");
+    return pathToFileURL(expected).href;
+  });
+
+  assert.equal(entry, expected);
 });
