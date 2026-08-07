@@ -5,7 +5,7 @@ pageClass: docs-hub
 aside: false
 ---
 
-<QuickInstall />
+<HomeInstall />
 
 ## Clients
 
