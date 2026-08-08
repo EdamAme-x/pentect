@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import DefaultTheme from 'vitepress/theme';
 import { useData, useRoute } from 'vitepress';
-import { computed, nextTick, onMounted, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, watch } from 'vue';
 
 const { frontmatter } = useData();
 const route = useRoute();
@@ -42,10 +42,40 @@ function selectPlatformCodeTabs() {
   }
 }
 
-onMounted(() => selectPlatformCodeTabs());
+let removeDemoEndedListener: (() => void) | undefined;
+
+function bindDemoEndScroll() {
+  removeDemoEndedListener?.();
+
+  const video = document.querySelector<HTMLVideoElement>('.home-demo video');
+  if (!video) {
+    removeDemoEndedListener = undefined;
+    return;
+  }
+
+  const onEnded = () => {
+    const rect = video.getBoundingClientRect();
+    if (rect.bottom <= 0 || rect.top >= window.innerHeight) return;
+
+    window.scrollBy({
+      top: rect.height,
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+    });
+  };
+
+  video.addEventListener('ended', onEnded);
+  removeDemoEndedListener = () => video.removeEventListener('ended', onEnded);
+}
+
+onMounted(() => {
+  selectPlatformCodeTabs();
+  bindDemoEndScroll();
+});
+onBeforeUnmount(() => removeDemoEndedListener?.());
 watch(() => route.path, async () => {
   await nextTick();
   selectPlatformCodeTabs();
+  bindDemoEndScroll();
 });
 </script>
 

@@ -9,6 +9,7 @@
     "@fontsource-variable/geist": "^5.3.0",
     "@fontsource-variable/jetbrains-mono": "^5.3.0",
     "@remotion/cli": "4.0.507",
+    "@remotion/media": "4.0.507",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "remotion": "4.0.507"
@@ -24,8 +25,9 @@
   "scripts": {
     "dev": "remotion studio",
     "build": "remotion bundle",
-    "render": "remotion render PentectDemo ../public/pentect-demo.mp4 --codec=h264 --crf=10 --scale=2 --muted",
-    "poster": "remotion still PentectDemo ../public/pentect-demo-poster.png --frame=415 --scale=2",
+    "audio": "node scripts/prepare-audio.mjs",
+    "render": "npm run audio && remotion render PentectDemo ../public/pentect-demo.mp4 --codec=h264 --crf=10 --scale=2",
+    "poster": "npm run audio && remotion still PentectDemo ../public/pentect-demo-poster.png --frame=415 --scale=2",
     "upgrade": "remotion upgrade",
     "lint": "eslint src && tsc"
   },

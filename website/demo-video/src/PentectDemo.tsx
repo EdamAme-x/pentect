@@ -1,4 +1,5 @@
 import type {CSSProperties, ReactNode} from "react";
+import {Audio} from "@remotion/media";
 import {
   AbsoluteFill,
   Easing,
@@ -762,6 +763,16 @@ export const PentectDemo: React.FC = () => {
 
   return (
     <AbsoluteFill style={{background: COLORS.bg, color: COLORS.text, fontFamily: SANS}}>
+      <Audio
+        src={staticFile("audio/close-up-bed.mp3")}
+        trimBefore={120}
+        volume={(audioFrame) =>
+          interpolate(audioFrame, [0, 45, 600, 679], [0, 0.2, 0.2, 0], {
+            extrapolateLeft: "clamp",
+            extrapolateRight: "clamp",
+          })
+        }
+      />
       <div
         style={{
           position: "absolute",
