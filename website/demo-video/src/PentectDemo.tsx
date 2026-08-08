@@ -17,6 +17,8 @@ const COLORS = {
   muted: "#a1a1a1",
   dim: "#6d6d6d",
   orange: "#f26a45",
+  running: "#d7a84b",
+  success: "#75c58b",
 };
 
 const SANS = '"Geist Variable", sans-serif';
@@ -220,10 +222,57 @@ const BorderGlow = ({opacity}: {opacity: number}) => (
   />
 );
 
-const ClaudeToolUse = ({frame, successOpacity}: {frame: number; successOpacity: number}) => (
+const ClaudeToolUse = ({frame, successOpacity}: {frame: number; successOpacity: number}) => {
+  const successPulse = Math.sin(successOpacity * Math.PI);
+
+  return (
   <div style={{fontSize: TYPE.code, lineHeight: 1.72, fontWeight: 480, ...mono}}>
     <div style={{display: "flex", alignItems: "baseline", gap: 11}}>
-      <span style={{color: COLORS.muted}}>●</span>
+      <span
+        style={{
+          position: "relative",
+          display: "inline-flex",
+          width: 10,
+          height: 10,
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <span
+          style={{
+            position: "absolute",
+            width: 9,
+            height: 9,
+            borderRadius: "50%",
+            background: COLORS.success,
+            opacity: successPulse * 0.48,
+            scale: 0.7 + successOpacity * 2.5,
+            filter: "blur(5px)",
+          }}
+        />
+        <span
+          style={{
+            position: "absolute",
+            width: 7,
+            height: 7,
+            borderRadius: "50%",
+            background: COLORS.running,
+            opacity: 1 - successOpacity,
+            boxShadow: "0 0 5px rgba(215,168,75,0.22)",
+          }}
+        />
+        <span
+          style={{
+            position: "absolute",
+            width: 7,
+            height: 7,
+            borderRadius: "50%",
+            background: COLORS.success,
+            opacity: successOpacity,
+            boxShadow: `0 0 ${successPulse * 12}px rgba(117,197,139,${successPulse * 0.56})`,
+          }}
+        />
+      </span>
       <span style={{color: COLORS.text}}>Bash</span>
     </div>
     <div style={{paddingLeft: 34, marginTop: 5, whiteSpace: "nowrap"}}>
@@ -247,7 +296,8 @@ const ClaudeToolUse = ({frame, successOpacity}: {frame: number; successOpacity: 
       ⎿ 1 checkout session returned
     </div>
   </div>
-);
+  );
+};
 
 const Panel = ({
   children,
