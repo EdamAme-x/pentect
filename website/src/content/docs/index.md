@@ -9,16 +9,13 @@ aside: false
 
 <div class="home-demo">
   <video
-    autoplay
-    muted
-    loop
     playsinline
     controls
     preload="metadata"
     poster="/pentect-demo-poster.png?v=6"
     aria-label="Pentect replaces a Stripe secret with a handle before the request reaches the AI provider, then restores it for a local tool."
   >
-    <source src="/pentect-demo.mp4?v=6" type="video/mp4" />
+    <source src="/pentect-demo.mp4?v=7" type="video/mp4" />
   </video>
 </div>
 
