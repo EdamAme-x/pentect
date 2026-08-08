@@ -507,7 +507,6 @@ const ProviderPanel = ({frame}: {frame: number}) => {
           <UpstreamMark />
           <span style={{fontSize: 18, fontWeight: 650, letterSpacing: "-0.01em"}}>Upstream</span>
         </div>
-        <span style={{fontSize: 14, color: COLORS.dim, ...mono}}>what the model sees</span>
       </div>
 
       <div style={{position: "relative", height: "calc(100% - 72px)", padding: "15px 46px", ...mono}}>
