@@ -269,7 +269,7 @@ const ClaudeToolUse = ({frame, successOpacity}: {frame: number; successOpacity: 
             borderRadius: "50%",
             background: COLORS.success,
             opacity: successOpacity,
-            boxShadow: `0 0 ${4 + successPulse * 8}px rgba(117,197,139,${0.18 + successPulse * 0.38})`,
+            boxShadow: `0 0 ${successPulse * 12}px rgba(117,197,139,${successPulse * 0.56})`,
           }}
         />
       </span>
