@@ -1,9 +1,25 @@
 ---
-title: Docs_
+title: Docs - Pentect
+titleTemplate: false
 description: AI can use your secrets without ever seeing them.
 pageClass: docs-hub
 aside: false
 ---
+
+<div class="home-demo">
+  <video
+    autoplay
+    muted
+    loop
+    playsinline
+    controls
+    preload="metadata"
+    poster="/pentect-demo-poster.png"
+    aria-label="Pentect replaces a Stripe secret with a handle before the request reaches the AI provider, then restores it for a local tool."
+  >
+    <source src="/pentect-demo.mp4" type="video/mp4" />
+  </video>
+</div>
 
 <HomeInstall />
 

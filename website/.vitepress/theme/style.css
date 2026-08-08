@@ -647,6 +647,23 @@ body {
   letter-spacing: -0.025em;
 }
 
+.home-demo {
+  overflow: hidden;
+  margin: 34px 0 48px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 5px;
+  background: #050505;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.home-demo video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #050505;
+  object-fit: contain;
+}
+
 .docs-hub .vp-doc > h2 {
   margin-top: 64px;
   border-top: 0;
@@ -812,6 +829,11 @@ body {
 
   .docs-hub .doc-heading p {
     font-size: 17px;
+  }
+
+  .home-demo {
+    margin: 24px -8px 36px;
+    border-radius: 3px;
   }
 
   .VPHomeHero {

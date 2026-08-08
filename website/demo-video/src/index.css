@@ -1,0 +1,21 @@
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/jetbrains-mono";
+
+:root {
+  font-family: "Geist Variable", sans-serif;
+  color: #f4f1ec;
+  background: #0b0a09;
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: #0b0a09;
+}

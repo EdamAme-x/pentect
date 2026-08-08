@@ -119,13 +119,23 @@ export default defineConfig({
     ['link', { rel: 'icon', href: '/pentect-logo-transparent.png' }],
     ['meta', { name: 'theme-color', content: '#ffffff' }],
     ['meta', { property: 'og:type', content: 'website' }],
-    ['meta', { name: 'twitter:card', content: 'summary' }],
+    ['meta', { property: 'og:site_name', content: 'Pentect' }],
+    ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
   ],
   transformPageData(pageData) {
     const routePath = pageData.relativePath
       .replace(/(^|\/)index\.md$/, '$1')
       .replace(/\.md$/, '/');
     const route = `/${routePath}`;
+    const pageTitle = pageData.relativePath === 'index.md'
+      ? 'Docs - Pentect'
+      : `${pageData.title} — Pentect`;
+    const pageDescription = String(
+      pageData.frontmatter.description
+      ?? 'Protect sensitive data before it reaches an AI model, while local tools keep working.',
+    );
+    const canonical = new URL(route, site).href;
+    const socialImage = new URL('/og-docs.png', site).href;
     pageData.frontmatter.head ??= [];
     pageData.frontmatter.head.push(
       ['link', {
@@ -138,7 +148,17 @@ export default defineConfig({
         name: 'agent-content',
         content: `A concise Markdown version of this page is available at ${route}index.md`,
       }],
-      ['link', { rel: 'canonical', href: new URL(route, site).href }],
+      ['link', { rel: 'canonical', href: canonical }],
+      ['meta', { property: 'og:title', content: pageTitle }],
+      ['meta', { property: 'og:description', content: pageDescription }],
+      ['meta', { property: 'og:url', content: canonical }],
+      ['meta', { property: 'og:image', content: socialImage }],
+      ['meta', { property: 'og:image:width', content: '1200' }],
+      ['meta', { property: 'og:image:height', content: '630' }],
+      ['meta', { property: 'og:image:alt', content: 'Docs - Pentect' }],
+      ['meta', { name: 'twitter:title', content: pageTitle }],
+      ['meta', { name: 'twitter:description', content: pageDescription }],
+      ['meta', { name: 'twitter:image', content: socialImage }],
     );
   },
   sitemap: { hostname: site },
