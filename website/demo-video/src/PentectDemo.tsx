@@ -26,9 +26,9 @@ const SECRET = ["sk", "live", "51Qx7K9mN2vR4aBcD8eFgH6jØ"].join("_");
 const HANDLE = "<<STRIPE_SECRET_KEY_a81f42c7d93>>";
 
 const TYPE = {
-  body: 18,
-  secret: 18,
-  code: 16,
+  body: 22,
+  secret: 22,
+  code: 18,
 } as const;
 
 const LAYOUT = {

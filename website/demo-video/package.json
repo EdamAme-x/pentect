@@ -24,8 +24,8 @@
   "scripts": {
     "dev": "remotion studio",
     "build": "remotion bundle",
-    "render": "remotion render PentectDemo ../public/pentect-demo.mp4 --codec=h264 --crf=18",
-    "poster": "remotion still PentectDemo ../public/pentect-demo-poster.png --frame=415",
+    "render": "remotion render PentectDemo ../public/pentect-demo.mp4 --codec=h264 --crf=10 --scale=2 --muted",
+    "poster": "remotion still PentectDemo ../public/pentect-demo-poster.png --frame=415 --scale=2",
     "upgrade": "remotion upgrade",
     "lint": "eslint src && tsc"
   },
