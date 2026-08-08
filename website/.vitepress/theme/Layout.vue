@@ -5,7 +5,7 @@ import { computed, nextTick, onMounted, watch } from 'vue';
 
 const { frontmatter } = useData();
 const route = useRoute();
-const title = computed(() => String(frontmatter.value.title ?? ''));
+const title = computed(() => String(frontmatter.value.displayTitle ?? frontmatter.value.title ?? ''));
 const hasAccentSuffix = computed(() => title.value.endsWith('_'));
 const titleBase = computed(() => hasAccentSuffix.value ? title.value.slice(0, -1) : title.value);
 

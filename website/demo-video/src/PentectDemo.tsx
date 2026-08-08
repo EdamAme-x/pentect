@@ -21,7 +21,7 @@ const COLORS = {
 
 const SANS = '"Geist Variable", sans-serif';
 const MONO = '"JetBrains Mono Variable", monospace';
-const PROMPT = "Check the latest order using this production Stripe key:";
+const PROMPT = "Check the latest order with this live Stripe key:";
 const SECRET = ["sk", "live", "51Qx7K9mN2vR4aBcD8eFgH6jØ"].join("_");
 const HANDLE = "<<STRIPE_SECRET_KEY_a81f42c7d93>>";
 
@@ -221,7 +221,7 @@ const BorderGlow = ({opacity}: {opacity: number}) => (
 );
 
 const ClaudeToolUse = ({frame, successOpacity}: {frame: number; successOpacity: number}) => (
-  <div style={{marginTop: 26, fontSize: TYPE.code, lineHeight: 1.72, fontWeight: 480, ...mono}}>
+  <div style={{fontSize: TYPE.code, lineHeight: 1.72, fontWeight: 480, ...mono}}>
     <div style={{display: "flex", alignItems: "baseline", gap: 11}}>
       <span style={{color: COLORS.muted}}>●</span>
       <span style={{color: COLORS.text}}>Bash</span>
@@ -318,10 +318,16 @@ const ClaudePanel = ({frame}: {frame: number}) => {
         <div style={{fontFamily: MONO, color: COLORS.dim, fontSize: 17}}>~/ec</div>
       </div>
 
-      <div style={{position: "absolute", left: 46, top: 68, right: 46}}>
+      <div
+        style={{
+          position: "relative",
+          height: "calc(100% - 72px)",
+          padding: "15px 46px",
+          ...mono,
+        }}
+      >
         <div
           style={{
-            marginTop: 20,
             display: "flex",
             alignItems: "flex-start",
             gap: 18,
@@ -334,27 +340,39 @@ const ClaudePanel = ({frame}: {frame: number}) => {
             style={{
               flex: 1,
               fontSize: TYPE.body,
-              lineHeight: 1.62,
+              lineHeight: 1.65,
               fontWeight: 470,
-              ...mono,
             }}
           >
             {PROMPT}
-            <div style={{color: COLORS.orange, marginTop: 6, fontSize: TYPE.secret, fontWeight: 520}}>{SECRET}</div>
+            <div style={{color: COLORS.orange, marginTop: 4, fontSize: TYPE.secret, fontWeight: 520}}>{SECRET}</div>
           </div>
         </div>
 
         <div
           style={{
-            marginTop: 92,
+            position: "absolute",
+            top: 173,
+            left: 46,
+            right: 46,
             opacity: commandIn,
             translate: `0px ${interpolate(commandIn, [0, 1], [22, 0])}px`,
           }}
         >
-          <div>
-            <div style={{fontSize: TYPE.body, lineHeight: 1.6, fontWeight: 470, ...mono}}>I’ll check the latest order.</div>
-            <ClaudeToolUse frame={frame} successOpacity={successIn} />
-          </div>
+          <div style={{fontSize: TYPE.body, lineHeight: 1.65, fontWeight: 470}}>I’ll check the latest order.</div>
+        </div>
+
+        <div
+          style={{
+            position: "absolute",
+            top: 240,
+            left: 46,
+            right: 46,
+            opacity: commandIn,
+            translate: `0px ${interpolate(commandIn, [0, 1], [9, 0])}px`,
+          }}
+        >
+          <ClaudeToolUse frame={frame} successOpacity={successIn} />
         </div>
       </div>
 
