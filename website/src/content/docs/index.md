@@ -14,10 +14,10 @@ aside: false
     playsinline
     controls
     preload="metadata"
-    poster="/pentect-demo-poster.png"
+    poster="/pentect-demo-poster.png?v=2"
     aria-label="Pentect replaces a Stripe secret with a handle before the request reaches the AI provider, then restores it for a local tool."
   >
-    <source src="/pentect-demo.mp4" type="video/mp4" />
+    <source src="/pentect-demo.mp4?v=2" type="video/mp4" />
   </video>
 </div>
 
