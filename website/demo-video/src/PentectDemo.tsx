@@ -89,11 +89,12 @@ const Brand = ({frame}: {frame: number}) => {
   );
 };
 
-const ClaudeMark = () => (
-  <Img
-    src={staticFile("claude.svg")}
-    style={{width: 30, height: 30, filter: "invert(1)", opacity: 0.88}}
-  />
+const AgentMark = () => (
+  <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+    <rect x="2.75" y="4.25" width="22.5" height="19.5" rx="5" stroke={COLORS.text} strokeWidth="1.5" />
+    <path d="M8.25 10.25 11.75 14l-3.5 3.75" stroke={COLORS.text} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M14.5 17.75h5.25" stroke={COLORS.text} strokeWidth="1.5" strokeLinecap="round" />
+  </svg>
 );
 
 const UpstreamMark = () => (
@@ -223,7 +224,15 @@ const BorderGlow = ({opacity}: {opacity: number}) => (
 );
 
 const ClaudeToolUse = ({frame, successOpacity}: {frame: number; successOpacity: number}) => {
-  const successPulse = Math.sin(successOpacity * Math.PI);
+  const statusComplete = interpolate(frame, [655, 683], [0, 1], {
+    extrapolateLeft: "clamp",
+    extrapolateRight: "clamp",
+  });
+  const pulseProgress = interpolate(frame, [655, 705], [0, 1], {
+    extrapolateLeft: "clamp",
+    extrapolateRight: "clamp",
+  });
+  const completionGlow = Math.sin(pulseProgress * Math.PI);
 
   return (
   <div style={{fontSize: TYPE.code, lineHeight: 1.72, fontWeight: 480, ...mono}}>
@@ -245,9 +254,9 @@ const ClaudeToolUse = ({frame, successOpacity}: {frame: number; successOpacity: 
             height: 9,
             borderRadius: "50%",
             background: COLORS.success,
-            opacity: successPulse * 0.48,
-            scale: 0.7 + successOpacity * 2.5,
-            filter: "blur(5px)",
+            opacity: completionGlow * 0.2,
+            scale: 0.85 + pulseProgress * 1.55,
+            filter: "blur(6px)",
           }}
         />
         <span
@@ -257,8 +266,7 @@ const ClaudeToolUse = ({frame, successOpacity}: {frame: number; successOpacity: 
             height: 7,
             borderRadius: "50%",
             background: COLORS.running,
-            opacity: 1 - successOpacity,
-            boxShadow: "0 0 5px rgba(215,168,75,0.22)",
+            opacity: 1 - statusComplete,
           }}
         />
         <span
@@ -268,8 +276,7 @@ const ClaudeToolUse = ({frame, successOpacity}: {frame: number; successOpacity: 
             height: 7,
             borderRadius: "50%",
             background: COLORS.success,
-            opacity: successOpacity,
-            boxShadow: `0 0 ${successPulse * 12}px rgba(117,197,139,${successPulse * 0.56})`,
+            opacity: statusComplete,
           }}
         />
       </span>
@@ -362,8 +369,8 @@ const ClaudePanel = ({frame}: {frame: number}) => {
         }}
       >
         <div style={{display: "flex", alignItems: "center", gap: 15}}>
-          <ClaudeMark />
-          <span style={{fontSize: 18, fontWeight: 650, letterSpacing: "-0.01em"}}>Claude Code</span>
+          <AgentMark />
+          <span style={{fontSize: 18, fontWeight: 650, letterSpacing: "-0.01em"}}>AI agent</span>
         </div>
         <div style={{fontFamily: MONO, color: COLORS.dim, fontSize: 17}}>~/ec</div>
       </div>
