@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="orange" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ed342d"/>
+      <stop offset="1" stop-color="#ff7a18"/>
+    </linearGradient>
+    <radialGradient id="soft-light" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(150 72) rotate(31) scale(720 480)">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="0.48" stop-color="#ffffff" stop-opacity="0.035"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="#0b0b0c"/>
+  <rect width="1200" height="630" fill="url(#soft-light)"/>
+  <rect x="0" y="0" width="10" height="630" fill="url(#orange)"/>
+  <image href="pentect-logo-dark.png" x="76" y="78" width="116" height="116"/>
+  <text x="76" y="352" fill="#f4f2ed" font-family="Segoe UI, Arial, sans-serif" font-size="82" font-weight="700" letter-spacing="-3">Docs - Pentect</text>
+  <rect x="76" y="397" width="92" height="8" rx="4" fill="url(#orange)"/>
+  <text x="76" y="473" fill="#aaa8a5" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="400">AI can use your secrets without ever seeing them.</text>
+  <text x="1124" y="556" fill="#777679" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="600" text-anchor="end">pentect.dev</text>
+</svg>
