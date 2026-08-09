@@ -817,7 +817,7 @@ pub(crate) fn remote_plugin_sources(source: &PluginSource) -> Result<BTreeMap<St
         return Ok(BTreeMap::new());
     };
     let mut sources = BTreeMap::new();
-    for url in remote_plugin_urls(&resolved) {
+    for url in remote_plugin_urls(resolved) {
         let path = remote_cache_file(&url)?;
         if path.is_file() {
             let bytes = pentect_agent::read_bounded_bytes(

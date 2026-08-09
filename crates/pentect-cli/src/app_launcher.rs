@@ -146,14 +146,14 @@ fn launcher_target(_tool: &str) -> Result<PathBuf, String> {
 fn owner_marker(target: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        return target.with_extension("pentect-launcher");
+        target.with_extension("pentect-launcher")
     }
     #[cfg(target_os = "macos")]
     {
-        return target
+        target
             .join("Contents")
             .join("Resources")
-            .join("pentect-launcher");
+            .join("pentect-launcher")
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
