@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const expectedVersion = process.argv[2];
@@ -81,6 +82,31 @@ try {
   if (extension.providerDefinition(ready).models[0]?.id !== "gpt-5") {
     throw new Error("@pentect/pi extension could not register its model");
   }
+
+  // The pull request's Rust backend is exercised by provider_backend.rs. The
+  // package dependency still resolves to the last published Pentect release,
+  // so use a protocol-faithful temporary backend to test Pi's package loader.
+  const packageRequire = createRequire(join(packageRoot, "package.json"));
+  const pentectRoot = dirname(packageRequire.resolve("pentect/package.json"));
+  writeFileSync(
+    join(pentectRoot, "packaging", "npm", "bin", "pentect.js"),
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const modelIndex = args.indexOf("--model");
+const apiIndex = args.indexOf("--api");
+const api = ["responses", "openai-responses"].includes(args[apiIndex + 1])
+  ? "openai-responses"
+  : "openai-completions";
+console.log(JSON.stringify({
+  protocol: 1,
+  integration: "pi",
+  baseUrl: "http://127.0.0.1:43123/${"a".repeat(64)}",
+  model: args[modelIndex + 1] || "gpt-5",
+  api,
+}));
+process.stdin.resume();
+`,
+  );
 
   run(
     npm,
