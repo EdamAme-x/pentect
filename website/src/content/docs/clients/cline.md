@@ -1,6 +1,6 @@
 ---
 title: Cline CLI
-description: Run a local Cline CLI session through Pentect.
+description: Use Cline CLI with Pentect.
 ---
 
 ## Start
@@ -15,8 +15,7 @@ Choose a model or pass normal task arguments:
 pentect cline --model gpt-5 "Review this project"
 ```
 
-Pentect starts Cline with a temporary provider registry and data directory.
-The registry is removed when Cline exits. Your normal Cline settings are not
+Pentect protects this Cline CLI session only. Your saved Cline settings are not
 changed.
 
 ## Protected

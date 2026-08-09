@@ -1,6 +1,6 @@
 ---
 title: Antigravity CLI
-description: Run the official Antigravity CLI through Pentect.
+description: Use Antigravity CLI with Pentect.
 ---
 
 Start a protected Antigravity CLI session:

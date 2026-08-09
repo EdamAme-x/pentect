@@ -1,6 +1,6 @@
 ---
 title: OpenCode
-description: Run OpenCode through a temporary Pentect provider.
+description: Use OpenCode with Pentect.
 ---
 
 ```sh

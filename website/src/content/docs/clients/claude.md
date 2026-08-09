@@ -1,6 +1,6 @@
 ---
 title: Claude
-description: Run Claude Code and supported Claude Desktop features through Pentect.
+description: Use Claude with Pentect.
 ---
 
 ::: code-group
@@ -15,9 +15,8 @@ pentect claude app
 
 :::
 
-Pentect passes arguments after `claude` to Claude Code. The app command starts
-Claude Desktop with a local gateway that supports the Messages API. It uses a
-separate certificate setup for that process.
+Pentect protects the Claude session it starts. Normal Claude Code arguments
+pass through, and `app` opens Claude Desktop without changing the official app.
 
 Prerequisites:
 

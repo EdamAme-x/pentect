@@ -1,6 +1,6 @@
 ---
 title: Pi
-description: Run Pi through a temporary Pentect provider.
+description: Use Pi with Pentect.
 ---
 
 ```sh
@@ -38,5 +38,5 @@ pentect pi --model anthropic/claude-sonnet \
   --upstream http://127.0.0.1:8080/openai/v1
 ```
 
-The temporary provider contains no API key or gateway token. See
+Pentect does not save the upstream key in Pi settings. See
 [Custom upstreams](/clients/upstreams/) for credentials and endpoint details.

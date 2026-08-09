@@ -1,6 +1,6 @@
 ---
 title: Zed
-description: Run Zed agent and inline-assistant traffic through Pentect.
+description: Use Zed with Pentect.
 ---
 
 ## Start
@@ -9,8 +9,8 @@ description: Run Zed agent and inline-assistant traffic through Pentect.
 pentect zed
 ```
 
-Pentect opens Zed with a temporary user-data directory and model setting. Your
-normal Zed settings are not changed.
+Pentect protects this Zed session only. Your saved Zed settings are not
+changed.
 
 ```sh
 pentect zed --model gpt-5 ~/project
@@ -18,7 +18,7 @@ pentect zed --model gpt-5 ~/project
 
 ## Protected
 
-- Zed Agent Panel requests using the temporary Pentect model
+- Zed Agent Panel requests using the Pentect model
 - Inline Assistant requests using that model
 - Agent conversation compaction
 - Text, supported images, tool results, and completed tool calls on those paths

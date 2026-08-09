@@ -1,6 +1,6 @@
 ---
 title: VS Code
-description: Use Pentect as a selectable VS Code language model provider.
+description: Use a Pentect model in VS Code.
 ---
 
 ## Install the provider
@@ -15,14 +15,8 @@ code --install-extension pentect-vscode.vsix
 
 Reload VS Code, then select a model whose provider is **Pentect** in Chat.
 
-The extension starts this local backend when the selected model is used:
-
-```sh
-pentect provider vscode
-```
-
-You normally do not run that command yourself. The extension keeps the
-authenticated loopback gateway alive for the VS Code session.
+The extension starts Pentect when the selected model is used. You do not need
+to start another command.
 
 ## Protected
 

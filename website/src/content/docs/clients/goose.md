@@ -1,6 +1,6 @@
 ---
 title: Goose CLI
-description: Run Goose CLI through Pentect without changing saved Goose settings.
+description: Use Goose CLI with Pentect.
 ---
 
 ## Start
@@ -15,9 +15,8 @@ Choose a model or pass normal Goose CLI arguments:
 pentect goose --model gpt-5 session
 ```
 
-Pentect sets process-only provider values. The main, fast, and planner model
-routes use the same local OpenAI-compatible gateway. Saved Goose settings and
-keychain entries are not changed.
+Pentect protects this Goose CLI session only. Saved Goose settings and keychain
+entries are not changed.
 
 ## Protected
 
