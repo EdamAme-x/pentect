@@ -167,6 +167,16 @@ pub fn record_read_activity(result: &MaskResult, path: &Path) {
     activity_log::record_mask_result("read", result, Some(path));
 }
 
+pub fn record_diagnostic_activity(surface: &str, reason: &str) {
+    activity_log::record_summary(
+        "warning",
+        surface,
+        1,
+        BTreeMap::from([(reason.to_string(), 1)]),
+        None,
+    );
+}
+
 fn mask_input_into_memory_store_client(
     client: &MemoryStoreClient,
     input: Input,

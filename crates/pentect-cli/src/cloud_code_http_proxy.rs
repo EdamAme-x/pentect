@@ -336,7 +336,8 @@ async fn proxy_request_inner(
             "Upstream response body too large",
         ));
     };
-    let rewritten = match rewrite_response_body(&body, &state.plugins) {
+    let rewritten = match rewrite_response_body(&body, &state.plugins, state.block_unknown_formats)
+    {
         Ok(rewritten) => rewritten,
         Err(error)
             if !state.block_unknown_formats && error.starts_with("unknown format blocked:") =>
@@ -529,6 +530,11 @@ fn mask_cloud_code_request(
             "unknown format blocked: Google Cloud Code request.request must be an object"
                 .to_string()
         })?;
+    for (key, value) in request.iter_mut() {
+        if !matches!(key.as_str(), "contents" | "systemInstruction") {
+            mask_value_strings(value, false, masker)?;
+        }
+    }
     let contents = request
         .get_mut("contents")
         .and_then(Value::as_array_mut)
@@ -575,7 +581,7 @@ fn mask_part(
     let object = part.as_object_mut().ok_or_else(|| {
         "unknown format blocked: Google Cloud Code part must be an object".to_string()
     })?;
-    let recognized = [
+    const DATA_FIELDS: &[&str] = &[
         "text",
         "functionCall",
         "functionResponse",
@@ -583,26 +589,37 @@ fn mask_part(
         "fileData",
         "executableCode",
         "codeExecutionResult",
-    ]
-    .iter()
-    .any(|key| object.contains_key(*key));
+    ];
+    const METADATA_FIELDS: &[&str] = &[
+        "thought",
+        "thoughtSignature",
+        "videoMetadata",
+        "partMetadata",
+        "mediaResolution",
+    ];
+    let recognized = DATA_FIELDS.iter().any(|key| object.contains_key(*key));
     if !recognized && block_unknown_formats {
         return Err(
             "unknown format blocked: Google Cloud Code content part is unsupported".to_string(),
         );
     }
+    if block_unknown_formats {
+        if let Some(key) = object.keys().find(|key| {
+            !DATA_FIELDS.contains(&key.as_str()) && !METADATA_FIELDS.contains(&key.as_str())
+        }) {
+            return Err(format!(
+                "unknown format blocked: Google Cloud Code content part field '{key}' is unsupported"
+            ));
+        }
+    }
     if let Some(Value::String(text)) = object.get_mut("text") {
         crate::claude_http_proxy::mask_string(text, tool_result, masker)?;
     }
     if let Some(call) = object.get_mut("functionCall") {
-        if let Some(args) = call.get_mut("args") {
-            mask_value_strings(args, true, masker)?;
-        }
+        mask_value_strings(call, true, masker)?;
     }
     if let Some(response) = object.get_mut("functionResponse") {
-        if let Some(result) = response.get_mut("response") {
-            mask_value_strings(result, true, masker)?;
-        }
+        mask_value_strings(response, true, masker)?;
     }
     if let Some(inline) = object.get_mut("inlineData") {
         inspect_inline_data(inline, tool_result, masker)?;
@@ -611,6 +628,12 @@ fn mask_part(
         return Err(
             "document blocked: Google Cloud Code fileData could not be scanned".to_string(),
         );
+    }
+    if let Some(code) = object.get_mut("executableCode") {
+        mask_value_strings(code, false, masker)?;
+    }
+    if let Some(result) = object.get_mut("codeExecutionResult") {
+        mask_value_strings(result, true, masker)?;
     }
     Ok(())
 }
@@ -717,11 +740,12 @@ fn inject_handle_contract(value: &mut Value) -> Result<(), String> {
 fn rewrite_response_body(
     body: &[u8],
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    block_unknown_formats: bool,
 ) -> Result<Vec<u8>, String> {
     let mut value: Value = serde_json::from_slice(body).map_err(|error| {
         format!("unknown format blocked: Google Cloud Code response is not valid JSON ({error})")
     })?;
-    rewrite_response_value(&mut value, plugins)?;
+    rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
     serde_json::to_vec(&value)
         .map_err(|error| format!("could not encode restored Google Cloud Code response: {error}"))
 }
@@ -729,7 +753,9 @@ fn rewrite_response_body(
 fn rewrite_response_value(
     value: &mut Value,
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
+    block_unknown_formats: bool,
 ) -> Result<(), String> {
+    validate_response_value(value, block_unknown_formats)?;
     let mut run = plugins
         .lock()
         .map_err(|_| "Google Cloud Code plugin lock was poisoned".to_string())?
@@ -738,6 +764,12 @@ fn rewrite_response_value(
             value.clone(),
             Some(serde_json::json!({"provider": "google-cloud-code", "transport": "http"})),
         )?;
+    if block_unknown_formats && run.coverage == pentect_agent::MiddlewareCoverage::Partial {
+        return Err(
+            "unknown format blocked: a plugin reported partial Google Cloud Code response coverage"
+                .to_string(),
+        );
+    }
     if run.stopped == Some(pentect_agent::StopOutcome::Block) {
         return Err(format!(
             "plugin blocked: {}",
@@ -746,6 +778,7 @@ fn rewrite_response_value(
         ));
     }
     let mut payload = std::mem::take(&mut run.payload);
+    validate_response_value(&payload, block_unknown_formats)?;
     let plugins = plugins
         .lock()
         .map_err(|_| "Google Cloud Code plugin lock was poisoned".to_string())?;
@@ -754,6 +787,83 @@ fn rewrite_response_value(
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
     resolve_function_calls(&mut payload, &mut resolve)?;
     *value = payload;
+    Ok(())
+}
+
+fn validate_response_value(value: &Value, block_unknown_formats: bool) -> Result<(), String> {
+    if !block_unknown_formats {
+        return Ok(());
+    }
+    let response = value
+        .get("response")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "unknown format blocked: Google Cloud Code response.response must be an object"
+                .to_string()
+        })?;
+    let Some(candidates) = response.get("candidates") else {
+        return Ok(());
+    };
+    let candidates = candidates.as_array().ok_or_else(|| {
+        "unknown format blocked: Google Cloud Code response candidates must be an array".to_string()
+    })?;
+    for candidate in candidates {
+        let candidate = candidate.as_object().ok_or_else(|| {
+            "unknown format blocked: Google Cloud Code candidate must be an object".to_string()
+        })?;
+        let Some(content) = candidate.get("content") else {
+            continue;
+        };
+        validate_response_content(content)?;
+    }
+    Ok(())
+}
+
+fn validate_response_content(content: &Value) -> Result<(), String> {
+    let content = content.as_object().ok_or_else(|| {
+        "unknown format blocked: Google Cloud Code response content must be an object".to_string()
+    })?;
+    let parts = content
+        .get("parts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "unknown format blocked: Google Cloud Code response content.parts must be an array"
+                .to_string()
+        })?;
+    for part in parts {
+        let part = part.as_object().ok_or_else(|| {
+            "unknown format blocked: Google Cloud Code response part must be an object".to_string()
+        })?;
+        const DATA_FIELDS: &[&str] = &[
+            "text",
+            "functionCall",
+            "functionResponse",
+            "inlineData",
+            "fileData",
+            "executableCode",
+            "codeExecutionResult",
+        ];
+        const METADATA_FIELDS: &[&str] = &[
+            "thought",
+            "thoughtSignature",
+            "videoMetadata",
+            "partMetadata",
+            "mediaResolution",
+        ];
+        if !DATA_FIELDS.iter().any(|key| part.contains_key(*key)) {
+            return Err(
+                "unknown format blocked: Google Cloud Code response part is unsupported"
+                    .to_string(),
+            );
+        }
+        if let Some(key) = part.keys().find(|key| {
+            !DATA_FIELDS.contains(&key.as_str()) && !METADATA_FIELDS.contains(&key.as_str())
+        }) {
+            return Err(format!(
+                "unknown format blocked: Google Cloud Code response part field '{key}' is unsupported"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -895,11 +1005,18 @@ fn streaming_response_body(
                 None => {
                     state.finished = true;
                     if !state.pending.is_empty() {
-                        state
-                            .ready
-                            .push_back(Ok(Frame::data(Bytes::from(std::mem::take(
-                                &mut state.pending,
-                            )))));
+                        let pending = std::mem::take(&mut state.pending);
+                        match rewrite_sse_block(
+                            &pending,
+                            &state.plugins,
+                            state.block_unknown_formats,
+                        ) {
+                            Ok(block) => state.ready.push_back(Ok(Frame::data(block))),
+                            Err(error) => state.ready.push_back(Err(Box::new(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                error,
+                            )))),
+                        }
                     }
                 }
             }
@@ -913,8 +1030,17 @@ fn rewrite_sse_block(
     plugins: &Mutex<pentect_agent::PluginMiddleware>,
     block_unknown_formats: bool,
 ) -> Result<Bytes, String> {
-    let Ok(text) = std::str::from_utf8(block) else {
-        return Ok(Bytes::copy_from_slice(block));
+    let text = match std::str::from_utf8(block) {
+        Ok(text) => text,
+        Err(error) if block_unknown_formats => {
+            return Err(format!(
+                "unknown format blocked: Google Cloud Code stream event is not UTF-8 ({error})"
+            ));
+        }
+        Err(_) => {
+            proxy_diagnostic("stream-event-protection-skipped");
+            return Ok(Bytes::copy_from_slice(block));
+        }
     };
     let data = text
         .lines()
@@ -935,7 +1061,7 @@ fn rewrite_sse_block(
             return Ok(Bytes::copy_from_slice(block));
         }
     };
-    rewrite_response_value(&mut value, plugins)?;
+    rewrite_response_value(&mut value, plugins, block_unknown_formats)?;
     let encoded = serde_json::to_string(&value)
         .map_err(|error| format!("could not encode Google Cloud Code SSE event: {error}"))?;
     let ending = if text.ends_with("\r\n\r\n") {
@@ -1709,8 +1835,92 @@ mod tests {
             rewrite_sse_block(block, &plugins, false).unwrap(),
             block.as_slice()
         );
-        assert!(rewrite_response_body(b"{broken", &plugins)
+        assert!(rewrite_response_body(b"{broken", &plugins, true)
             .unwrap_err()
             .starts_with("unknown format blocked:"));
+        assert!(rewrite_sse_block(&[0xff], &plugins, true)
+            .unwrap_err()
+            .starts_with("unknown format blocked:"));
+    }
+
+    #[test]
+    fn unterminated_sse_event_is_still_inspected() {
+        let plugins = Mutex::new(pentect_agent::PluginMiddleware::from_env().unwrap());
+        let block = br#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}}"#;
+        let rewritten = rewrite_sse_block(block, &plugins, true).unwrap();
+        assert!(rewritten.ends_with(b"\n\n"));
+    }
+
+    #[test]
+    fn unknown_part_fields_are_blocked_on_both_boundaries() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let plugins = pentect_agent::PluginMiddleware::from_env().unwrap();
+        let masker = Mutex::new(
+            pentect_agent::ActiveToolOutputMasker::new_with_plugins(plugins.clone()).unwrap(),
+        );
+        let plugins = Mutex::new(plugins);
+        let request = Bytes::from_static(
+            br#"{"request":{"contents":[{"role":"user","parts":[{"text":"ok","futureContent":"secret"}]}]}}"#,
+        );
+        assert!(protect_request_body(
+            &request,
+            CloudCodeEndpoint::GenerateContent,
+            &masker,
+            &plugins,
+            true,
+        )
+        .unwrap_err()
+        .starts_with("unknown format blocked:"));
+
+        let response = serde_json::json!({
+            "response": {"candidates": [{"content": {"parts": [{
+                "text": "ok",
+                "futureToolCall": {"name": "run", "args": {}}
+            }]}}]}
+        });
+        assert!(validate_response_value(&response, true)
+            .unwrap_err()
+            .starts_with("unknown format blocked:"));
+        assert!(validate_response_value(&response, false).is_ok());
+    }
+
+    #[test]
+    fn request_metadata_and_executable_code_are_masked() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = TestEnv::install(&store);
+        let secret = ["rpa_", "ABCDEFGHIJKLMNOP", "QRSTUVWXYZ012345", "6789abcdef"].concat();
+        let plugins = pentect_agent::PluginMiddleware::from_env().unwrap();
+        let masker = Mutex::new(
+            pentect_agent::ActiveToolOutputMasker::new_with_plugins(plugins.clone()).unwrap(),
+        );
+        let plugins = Mutex::new(plugins);
+        let request = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "request": {
+                    "contents": [{"role": "user", "parts": [{
+                        "executableCode": {"language": "shell", "code": format!("echo {secret}")}
+                    }]}],
+                    "tools": [{"functionDeclarations": [{
+                        "name": "lookup",
+                        "description": format!("Use {secret}")
+                    }]}]
+                }
+            }))
+            .unwrap(),
+        );
+        let protected = protect_request_body(
+            &request,
+            CloudCodeEndpoint::GenerateContent,
+            &masker,
+            &plugins,
+            true,
+        )
+        .unwrap();
+        let protected = std::str::from_utf8(&protected.body).unwrap();
+        assert!(!protected.contains(&secret));
+        assert!(protected.matches("<<").count() >= 2);
     }
 }
