@@ -1,6 +1,6 @@
 ---
 title: Roo Code
-description: Open legacy Roo Code in an isolated VS Code profile through Pentect.
+description: Legacy support for existing Roo Code installations.
 ---
 
 ::: warning Archived upstream

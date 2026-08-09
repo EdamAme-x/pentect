@@ -1,17 +1,16 @@
 ---
 title: Aider
-description: Launch Aider through Pentect's local OpenAI-compatible gateway.
+description: Use Aider with Pentect.
 ---
 
-## Launch
+## Start
 
 ```sh
 pentect aider
 ```
 
-Pentect starts a local gateway, points Aider's main, weak, and editor models at
-it, then removes the gateway when Aider exits. Your Aider config and `.env`
-files are not rewritten.
+Pentect protects this Aider session only. Your saved Aider settings are not
+changed.
 
 Choose a model or forward normal Aider arguments directly:
 

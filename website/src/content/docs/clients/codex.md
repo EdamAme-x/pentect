@@ -1,6 +1,6 @@
 ---
 title: Codex
-description: Run Codex CLI and Codex App through Pentect.
+description: Use Codex with Pentect.
 ---
 
 ::: code-group
@@ -15,9 +15,8 @@ pentect codex app
 
 :::
 
-Pentect passes arguments after `codex` to the Codex CLI. The app command starts
-the installed desktop app through Pentect. It does not make a permanent change
-to the app.
+Pentect protects the Codex session it starts. Normal CLI arguments pass
+through, and `app` opens Codex App without changing the official app.
 
 Prerequisites:
 
@@ -104,9 +103,7 @@ pentect codex app --app /path/to/codex
 This affects only the launch started by Pentect. Opening Codex App normally
 does not use Pentect or change other ChatGPT traffic.
 
-Pentect makes a temporary provider override for the protected app process and
-restores the previous configuration when that launch ends. `--check` exercises
-discovery and routing without sending a model prompt.
+`--check` exercises discovery and routing without sending a model prompt.
 
 ## Verify protection
 
