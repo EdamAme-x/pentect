@@ -14,4 +14,4 @@ tool calls, images, MCP results, and resumed conversations must pass integration
 tests before support is released.
 
 See the [Pentect roadmap](https://github.com/EdamAme-x/pentect/issues/114) and
-[Cline CLI reference](https://docs.cline.bot/cli/cli-reference).
+[Cline OpenAI-compatible provider documentation](https://docs.cline.bot/provider-config/openai-compatible).

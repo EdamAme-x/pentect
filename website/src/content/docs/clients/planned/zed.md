@@ -9,9 +9,9 @@ Pentect does not protect Zed today. This page describes planned support only.
 
 ## Planned coverage
 
-Pentect will use Zed's documented gateway setting for supported Chat and
+Pentect will use Zed's documented `api_url` setting for supported Chat and
 Responses traffic. Agent, Inline Assistant, utility requests, and external
 agents will be verified independently.
 
 See the [Pentect roadmap](https://github.com/EdamAme-x/pentect/issues/114) and
-[Zed gateway documentation](https://zed.dev/docs/ai/use-api-access).
+[Zed gateway documentation](https://zed.dev/docs/ai/use-a-gateway).
