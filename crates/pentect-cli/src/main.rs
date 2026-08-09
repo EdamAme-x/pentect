@@ -3,6 +3,7 @@
 mod app_launcher;
 mod claude_app_proxy;
 mod claude_http_proxy;
+mod cloud_code_http_proxy;
 mod codex_app;
 mod default_launch;
 mod doctor;
@@ -121,6 +122,9 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("claude") => return Some(cmd_agent_tool(AgentTool::Claude, &args)),
         Some("opencode") => return Some(cmd_agent_tool(AgentTool::OpenCode, &args)),
         Some("pi") => return Some(cmd_agent_tool(AgentTool::Pi, &args)),
+        Some("antigravity" | "agy") => {
+            return Some(cmd_agent_tool(AgentTool::Antigravity, &args));
+        }
         Some("claude-app") => return Some(cmd_claude_app(&args)),
         Some("codex-app") => return Some(cmd_codex_app(&args)),
         _ => {
@@ -157,7 +161,7 @@ fn supports_process_host(args: &[String]) -> bool {
 fn usage() {
     eprintln!(
         "pentect\n\
-         pentect codex|claude|opencode|pi\n\
+         pentect codex|claude|opencode|pi|antigravity\n\
          pentect codex|claude --set-default | --unset-default\n\
          pentect codex app\n\
          pentect claude app\n\
@@ -193,7 +197,7 @@ fn help_text() -> &'static str {
         "pentect protects AI tool boundaries.\n\n",
         "Use:\n",
         "  pentect\n",
-        "  pentect codex|claude [--upstream URL] [--upstream-header-env HEADER=ENV_NAME] [--plugins NAME|PATH.toml]\n",
+        "  pentect codex|claude|antigravity [--upstream URL] [--upstream-header-env HEADER=ENV_NAME] [--plugins NAME|PATH.toml]\n",
         "  pentect codex|claude (--set-default | --unset-default) [--yes]\n",
         "  pentect opencode|pi [--model ID] [--upstream URL] [--api chat|responses]\n",
         "  --upstream-header-env HEADER=ENV_NAME  read an upstream credential without putting it in command arguments\n",
@@ -235,6 +239,7 @@ fn help_text() -> &'static str {
         "claude app: launch Claude Desktop through the Chat and Anthropic gateways\n",
         "opencode: launch OpenCode through an ephemeral OpenAI-compatible provider\n",
         "pi: launch Pi through an ephemeral OpenAI-compatible provider\n",
+        "antigravity: launch the official agy CLI through the Cloud Code gateway\n",
     )
 }
 
@@ -366,6 +371,7 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
         AgentTool::Codex => run_codex(&opts, &pentect),
         AgentTool::Claude => run_claude(&opts, &pentect),
         AgentTool::OpenCode | AgentTool::Pi => openai_clients::run(tool, &opts, &pentect),
+        AgentTool::Antigravity => run_antigravity(&opts, &pentect),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     status.code().unwrap_or(1)
@@ -687,6 +693,7 @@ enum AgentTool {
     Claude,
     OpenCode,
     Pi,
+    Antigravity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -767,11 +774,15 @@ impl AgentTool {
             AgentTool::Claude => "claude",
             AgentTool::OpenCode => "opencode",
             AgentTool::Pi => "pi",
+            AgentTool::Antigravity => "antigravity",
         }
     }
 
     fn default_command(self) -> &'static str {
-        self.name()
+        match self {
+            AgentTool::Antigravity => "agy",
+            _ => self.name(),
+        }
     }
 
     fn path_flag(self) -> &'static str {
@@ -780,6 +791,7 @@ impl AgentTool {
             AgentTool::Claude => "--claude",
             AgentTool::OpenCode => "--opencode",
             AgentTool::Pi => "--pi",
+            AgentTool::Antigravity => "--agy",
         }
     }
 }
@@ -792,6 +804,7 @@ struct AgentToolOpts {
     dry_run: bool,
     anthropic_upstream: Option<String>,
     openai_upstream: Option<String>,
+    cloud_code_upstream: Option<String>,
     model: Option<String>,
     api: Option<String>,
     upstream_header_env: Vec<String>,
@@ -806,6 +819,7 @@ impl AgentToolOpts {
         let mut dry_run = false;
         let mut anthropic_upstream = None;
         let mut openai_upstream = None;
+        let mut cloud_code_upstream = None;
         let mut model = None;
         let mut api = None;
         let mut upstream_header_env = Vec::new();
@@ -854,6 +868,9 @@ impl AgentToolOpts {
                 {
                     openai_upstream = Some(required_value(args, &mut i, "--upstream")?);
                 }
+                "--upstream" if tool == AgentTool::Antigravity => {
+                    cloud_code_upstream = Some(required_value(args, &mut i, "--upstream")?);
+                }
                 "--model" | "-m" if matches!(tool, AgentTool::OpenCode | AgentTool::Pi) => {
                     model = Some(required_value(args, &mut i, "--model")?);
                 }
@@ -883,6 +900,7 @@ impl AgentToolOpts {
             dry_run,
             anthropic_upstream,
             openai_upstream,
+            cloud_code_upstream,
             model,
             api,
             upstream_header_env,
@@ -958,6 +976,43 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
         caller_settings.with_gateway(&args, http_proxy.base_url(), enable_tool_search)?;
     cmd.args(gateway_settings.args());
     run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
+}
+
+fn run_antigravity(
+    opts: &AgentToolOpts,
+    pentect: &Path,
+) -> Result<std::process::ExitStatus, String> {
+    const DEFAULT_UPSTREAM: &str = "https://daily-cloudcode-pa.googleapis.com";
+    let upstream = opts
+        .cloud_code_upstream
+        .clone()
+        .or_else(|| {
+            std::env::var("CLOUD_CODE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string());
+    if opts.dry_run {
+        print_dry_run(&opts.command, &opts.tool_args);
+        return Ok(success_status());
+    }
+
+    let active_plugins = agent_tool_plugins(opts)?;
+    let memory_store = start_memory_store(pentect)?;
+    let _parent_env = agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
+    let proxy = cloud_code_http_proxy::CloudCodeHttpProxyGuard::start_with_header_env(
+        upstream,
+        &opts.upstream_header_env,
+    )?;
+    let mut command = Command::new(&opts.command);
+    clear_pentect_control_env(&mut command);
+    upstream::hide_header_source_env(&mut command, &opts.upstream_header_env);
+    apply_plugin_env(&mut command, &active_plugins)?;
+    apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
+    apply_memory_store_env(&mut command, Some(&memory_store));
+    command.env("CLOUD_CODE_URL", proxy.base_url());
+    command.args(&opts.tool_args);
+    run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
 }
 
 const CLAUDE_CLOUD_PROVIDER_FLAGS: &[&str] = &[
@@ -2528,6 +2583,7 @@ mod tests {
             "claude app [--app PATH] [--upstream URL] [--upstream-header-env HEADER=ENV_NAME]"
         ));
         assert!(help.contains("pentect opencode|pi"));
+        assert!(help.contains("antigravity"));
         assert!(help.contains("pentect codex app"));
         assert!(help.contains("pentect claude app"));
         assert!(help.contains("< input pentect mask"));
@@ -2596,6 +2652,25 @@ mod tests {
             Some("http://127.0.0.1:8080/openai/v1")
         );
         assert_eq!(opencode.model.as_deref(), Some("anthropic/claude-sonnet"));
+
+        let antigravity = AgentToolOpts::parse(
+            AgentTool::Antigravity,
+            &[
+                "pentect".to_string(),
+                "antigravity".to_string(),
+                "--upstream".to_string(),
+                "https://cloud-code.example/base".to_string(),
+                "--".to_string(),
+                "--agent".to_string(),
+                "reviewer".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            antigravity.cloud_code_upstream.as_deref(),
+            Some("https://cloud-code.example/base")
+        );
+        assert_eq!(antigravity.tool_args, ["--agent", "reviewer"]);
     }
 
     #[test]
