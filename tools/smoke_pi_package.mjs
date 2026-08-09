@@ -103,7 +103,7 @@ try {
       OPENAI_BASE_URL: "http://127.0.0.1:9/v1",
     },
   });
-  if (!`${models.stdout}${models.stderr}`.includes("pentect/gpt-5")) {
+  if (!/\bpentect\s+gpt-5\b/.test(`${models.stdout}${models.stderr}`)) {
     throw new Error("Pi did not discover the Pentect provider extension");
   }
 } finally {
