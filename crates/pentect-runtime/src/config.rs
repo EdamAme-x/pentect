@@ -489,7 +489,7 @@ fn team_policy_config() -> Result<Option<toml::Value>, String> {
     #[cfg(not(test))]
     {
         static POLICY: OnceLock<Result<Option<toml::Value>, String>> = OnceLock::new();
-        return POLICY.get_or_init(load_team_policy_config).clone();
+        POLICY.get_or_init(load_team_policy_config).clone()
     }
     #[cfg(test)]
     load_team_policy_config()
