@@ -90,11 +90,9 @@ The same launch pattern works for other supported clients:
 | --- | --- |
 | Continue CLI | `pentect continue` |
 | Cline CLI | `pentect cline` |
-| Roo Code | `pentect roo` |
 | Zed | `pentect zed` |
 | Goose CLI | `pentect goose` |
 | Junie CLI | `pentect junie` |
-| Gemini CLI | `pentect gemini` |
 
 Each command protects a specific surface. Check the client page before you
 use desktop, autocomplete, or external-agent features.
