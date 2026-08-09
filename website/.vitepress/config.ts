@@ -59,7 +59,7 @@ const sidebar = [
       { text: sidebarLabel('Claude', 'message', '/brands/claude.svg'), link: '/clients/claude/' },
       { text: sidebarLabel('OpenCode', 'terminal', '/brands/opencode.svg'), link: '/clients/opencode/' },
       { text: sidebarLabel('Pi', 'terminal', '/brands/pi.svg'), link: '/clients/pi/' },
-      { text: sidebarLabel('Antigravity CLI', 'terminal'), link: '/clients/antigravity/' },
+      { text: sidebarLabel('Antigravity CLI', 'terminal', '/brands/antigravity.svg'), link: '/clients/antigravity/' },
       { text: sidebarLabel('Custom upstreams', 'gateway'), link: '/clients/upstreams/' },
     ],
   },
