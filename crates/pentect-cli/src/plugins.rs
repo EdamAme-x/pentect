@@ -1413,17 +1413,34 @@ fn prune_remote_plugin_cache_with_limits(
                 .map(|component| cache_root.join(component.as_os_str()))
         });
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(cache_root)
-        .with_context(|| format!("could not inspect plugin cache '{}'", cache_root.display()))?
-    {
-        let entry = entry.with_context(|| {
-            format!("could not inspect plugin cache '{}'", cache_root.display())
-        })?;
-        if !entry
-            .file_type()
-            .with_context(|| format!("could not inspect '{}'", entry.path().display()))?
-            .is_dir()
-        {
+    let cache_entries = match std::fs::read_dir(cache_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("could not inspect plugin cache '{}'", cache_root.display())
+            });
+        }
+    };
+    for entry in cache_entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("could not inspect plugin cache '{}'", cache_root.display())
+                });
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not inspect '{}'", entry.path().display()));
+            }
+        };
+        if !file_type.is_dir() {
             continue;
         }
         let (bytes, modified) = remote_cache_entry_usage(&entry.path())?;
@@ -1448,12 +1465,16 @@ fn prune_remote_plugin_cache_with_limits(
         if protected_entry.as_ref() == Some(&entry.path) {
             continue;
         }
-        std::fs::remove_dir_all(&entry.path).with_context(|| {
-            format!(
-                "could not remove old plugin cache entry '{}'",
-                entry.path.display()
-            )
-        })?;
+        if let Err(error) = std::fs::remove_dir_all(&entry.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not remove old plugin cache entry '{}'",
+                        entry.path.display()
+                    )
+                });
+            }
+        }
         total_bytes = total_bytes.saturating_sub(entry.bytes);
         total_entries = total_entries.saturating_sub(1);
     }
@@ -1465,15 +1486,34 @@ fn remote_cache_entry_usage(path: &Path) -> Result<(u64, SystemTime)> {
     let mut modified = SystemTime::UNIX_EPOCH;
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(&directory)
-            .with_context(|| format!("could not inspect plugin cache '{}'", directory.display()))?
-        {
-            let entry = entry.with_context(|| {
-                format!("could not inspect plugin cache '{}'", directory.display())
-            })?;
-            let metadata = entry
-                .metadata()
-                .with_context(|| format!("could not inspect '{}'", entry.path().display()))?;
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("could not inspect plugin cache '{}'", directory.display())
+                });
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("could not inspect plugin cache '{}'", directory.display())
+                    });
+                }
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("could not inspect '{}'", entry.path().display())
+                    });
+                }
+            };
             modified = modified.max(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));
             if metadata.is_dir() {
                 pending.push(entry.path());
