@@ -448,28 +448,42 @@ body {
   align-items: center;
   gap: 8px;
   padding: 18px 0;
-  color: var(--vp-c-text-1);
   font-size: 14px;
-  text-decoration: none;
 }
 
-.home-install__next span:first-child {
+.home-install__next-label {
+  color: var(--vp-c-text-3);
+}
+
+.vp-doc .home-install__next-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   color: var(--vp-c-text-2);
-}
-
-.home-install__next strong {
   font-weight: 600;
+  text-decoration: none;
+  transition: color 140ms ease;
 }
 
-.home-install__next span:last-child {
+.home-install__next-link span:first-child {
+  border-bottom: 1px solid color-mix(in srgb, currentcolor 45%, transparent);
+  line-height: 1.35;
+}
+
+.home-install__next-link span:last-child {
+  color: var(--vp-c-text-3);
   transition: transform 140ms ease;
 }
 
-.home-install__next:hover {
-  color: var(--vp-c-brand-1);
+.vp-doc .home-install__next-link:hover {
+  color: var(--vp-c-text-1);
 }
 
-.home-install__next:hover span:last-child {
+.home-install__next-link:hover span:first-child {
+  border-bottom-color: var(--vp-c-brand-1);
+}
+
+.home-install__next-link:hover span:last-child {
   transform: translateX(3px);
 }
 
