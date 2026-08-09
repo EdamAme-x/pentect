@@ -612,7 +612,7 @@ fn mask_cloud_code_request(
     Ok(())
 }
 
-fn mask_content(
+pub(crate) fn mask_content(
     content: &mut Value,
     tool_result: bool,
     masker: &mut pentect_agent::ActiveToolOutputMasker,
@@ -963,7 +963,7 @@ fn run_tool_plugins(
     Ok(())
 }
 
-fn resolve_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
+pub(crate) fn resolve_function_calls<R>(value: &mut Value, resolve: &mut R) -> Result<(), String>
 where
     R: FnMut(&str) -> Result<String, String>,
 {

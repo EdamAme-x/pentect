@@ -17,6 +17,13 @@ cannot complete a requested change.
 | `pentect pi` | Launch Pi with a temporary Pentect provider |
 | `pentect antigravity` | Launch the official `agy` CLI through Pentect |
 | `pentect aider` | Launch Aider with a temporary Pentect provider |
+| `pentect continue` | Launch Continue CLI with a temporary Chat/Edit/Apply config |
+| `pentect cline` | Launch Cline CLI with isolated provider data |
+| `pentect roo` | Open archived Roo Code in an isolated VS Code profile |
+| `pentect zed` | Open Zed with isolated Pentect settings |
+| `pentect goose` | Launch Goose CLI with process-only provider settings |
+| `pentect junie` | Launch Junie CLI with a temporary model profile |
+| `pentect gemini` | Launch Gemini CLI through the native Gemini gateway |
 | `pentect codex app` | Launch Codex App for this protected session |
 | `pentect claude app` | Launch Claude Desktop for this protected session |
 
@@ -65,7 +72,16 @@ pentect codex exec --full-auto
 pentect claude --model sonnet
 pentect agy --print "Review this project"
 pentect aider --model gpt-5 README.md
+pentect continue --model gpt-5
+pentect cline "Review this project"
+pentect zed ~/project
+pentect goose session
+pentect junie --api responses
+pentect gemini --model gemini-2.5-pro
 ```
+
+The VS Code extension starts `pentect provider vscode` itself. This backend
+command is not an interactive client and is not meant for normal terminal use.
 
 `--check` validates app discovery and routing without leaving the app open.
 `--plugins` accepts a local plugin directory or a

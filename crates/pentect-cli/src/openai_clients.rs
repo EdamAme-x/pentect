@@ -5,32 +5,33 @@
 
 use serde_json::{json, Map, Value};
 use std::ffi::OsString;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use zeroize::Zeroize;
 
-const DEFAULT_UPSTREAM: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-5";
 
 pub(crate) fn run(
-    tool: crate::AgentTool,
+    tool: &'static crate::client_descriptor::ClientDescriptor,
     opts: &crate::AgentToolOpts,
     pentect: &Path,
 ) -> Result<std::process::ExitStatus, String> {
     let upstream = opts
-        .openai_upstream
+        .upstream
         .clone()
         .or_else(|| configured_upstream(tool))
-        .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string());
-    let (args, model) = client_args_and_model(&opts.tool_args, opts.model.as_deref())?;
+        .or_else(|| tool.default_upstream.map(str::to_string))
+        .ok_or_else(|| format!("{} has no configured upstream", tool.name))?;
+    let crate::client_descriptor::Launcher::OpenAi(injection) = tool.launcher else {
+        return Err("internal OpenAI client launcher mismatch".to_string());
+    };
+    let args = opts.tool_args.clone();
+    let model = selected_model(opts.model.as_deref())?;
     let api = ClientApi::parse(opts.api.as_deref())?;
     if opts.dry_run {
         let mut shown = args;
-        match tool {
-            crate::AgentTool::OpenCode => {}
-            crate::AgentTool::Pi => {
+        match injection {
+            crate::client_descriptor::OpenAiInjection::InlineConfig => {}
+            crate::client_descriptor::OpenAiInjection::TempExtension => {
                 shown.extend([
                     "--extension".to_string(),
                     "<pentect-provider>".to_string(),
@@ -38,10 +39,18 @@ pub(crate) fn run(
                     format!("pentect/{model}"),
                 ]);
             }
-            crate::AgentTool::Aider => {
+            crate::client_descriptor::OpenAiInjection::ForcedArgs => {
                 shown.extend(aider_gateway_args("<pentect-gateway>", &model)?)
             }
-            _ => return Err("internal client launcher mismatch".to_string()),
+            crate::client_descriptor::OpenAiInjection::GooseEnv => {}
+            crate::client_descriptor::OpenAiInjection::JunieProfile => {
+                shown.extend([
+                    "--model-location".to_string(),
+                    "<pentect-models>".to_string(),
+                    "--model".to_string(),
+                    "custom:<pentect-model>".to_string(),
+                ]);
+            }
         }
         crate::print_dry_run(&opts.command, &shown);
         return Ok(crate::success_status());
@@ -50,6 +59,21 @@ pub(crate) fn run(
     let active_plugins = crate::agent_tool_plugins(opts)?;
     let memory_store = crate::start_memory_store(pentect)?;
     let _parent_env = crate::agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
+    let standard_key_names: &[&str] = match injection {
+        crate::client_descriptor::OpenAiInjection::GooseEnv => {
+            &["GOOSE_PROVIDER__API_KEY", "OPENAI_API_KEY"]
+        }
+        crate::client_descriptor::OpenAiInjection::JunieProfile => {
+            &["JUNIE_OPENAI_API_KEY", "OPENAI_API_KEY"]
+        }
+        _ => &["OPENAI_API_KEY"],
+    };
+    let standard_key_names = if has_authorization_override(&opts.upstream_header_env) {
+        &[][..]
+    } else {
+        standard_key_names
+    };
+    let _authorization = crate::upstream_bearer_guard(standard_key_names);
     let proxy = crate::openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(
         upstream,
         &opts.upstream_header_env,
@@ -57,18 +81,24 @@ pub(crate) fn run(
     let mut command = Command::new(&opts.command);
     crate::clear_pentect_control_env(&mut command);
     crate::upstream::hide_header_source_env(&mut command, &opts.upstream_header_env);
+    // Provider credentials belong to the gateway, not to the agent process or
+    // its local tools. The client only needs a syntactically valid loopback
+    // credential; the gateway replaces it for the upstream request.
+    command.env("OPENAI_API_KEY", "pentect-local");
+    command.env_remove("GOOSE_PROVIDER__API_KEY");
+    command.env_remove("JUNIE_OPENAI_API_KEY");
     crate::apply_plugin_env(&mut command, &active_plugins)?;
     crate::apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
     crate::apply_memory_store_env(&mut command, Some(&memory_store));
 
-    match tool {
-        crate::AgentTool::OpenCode => {
+    match injection {
+        crate::client_descriptor::OpenAiInjection::InlineConfig => {
             let config = opencode_config(proxy.base_url(), &model, api)?;
             command.env("OPENCODE_CONFIG_CONTENT", config);
             command.args(args);
             crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
         }
-        crate::AgentTool::Pi => {
+        crate::client_descriptor::OpenAiInjection::TempExtension => {
             let extension = PiProviderFile::create()?;
             command.env("PENTECT_PROXY_URL", proxy.base_url());
             command.env("PENTECT_PROVIDER_MODEL", &model);
@@ -78,7 +108,7 @@ pub(crate) fn run(
             // provider after Pentect has started its gateway.
             command.args([
                 OsString::from("--extension"),
-                extension.path.as_os_str().to_owned(),
+                extension.file.path().as_os_str().to_owned(),
                 OsString::from("--model"),
                 OsString::from(format!("pentect/{model}")),
             ]);
@@ -88,19 +118,49 @@ pub(crate) fn run(
                 (proxy, memory_store, extension),
             )
         }
-        crate::AgentTool::Aider => {
+        crate::client_descriptor::OpenAiInjection::ForcedArgs => {
             command.args(args);
             // Appended last so config files, environment variables and caller
             // options cannot select an unprotected provider or helper model.
             command.args(aider_gateway_args(proxy.base_url(), &model)?);
             crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
         }
-        _ => Err("internal client launcher mismatch".to_string()),
+        crate::client_descriptor::OpenAiInjection::GooseEnv => {
+            crate::openai_client_injection::configure_goose(
+                &mut command,
+                proxy.base_url(),
+                &model,
+                std::ffi::OsStr::new("pentect-local"),
+            );
+            command.args(args);
+            crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+        }
+        crate::client_descriptor::OpenAiInjection::JunieProfile => {
+            let profile = crate::openai_client_injection::JunieModelProfile::create(
+                proxy.base_url(),
+                &model,
+                api.injection_api(),
+            )?;
+            command.args(args);
+            profile.apply(&mut command, std::ffi::OsStr::new("pentect-local"));
+            crate::run_native_command_with_guards(
+                command,
+                &opts.command,
+                (proxy, memory_store, profile),
+            )
+        }
     }
 }
 
-fn configured_upstream(tool: crate::AgentTool) -> Option<String> {
-    tool.descriptor().upstream_env.iter().find_map(|name| {
+fn has_authorization_override(specs: &[String]) -> bool {
+    specs.iter().any(|spec| {
+        spec.split_once('=')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+    })
+}
+
+fn configured_upstream(tool: &crate::client_descriptor::ClientDescriptor) -> Option<String> {
+    tool.upstream_env.iter().find_map(|name| {
         std::env::var(name)
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -163,39 +223,19 @@ impl ClientApi {
             Self::Responses => "openai-responses",
         }
     }
+
+    fn injection_api(self) -> crate::openai_client_injection::OpenAiWireApi {
+        match self {
+            Self::ChatCompletions => crate::openai_client_injection::OpenAiWireApi::ChatCompletions,
+            Self::Responses => crate::openai_client_injection::OpenAiWireApi::Responses,
+        }
+    }
 }
 
-fn client_args_and_model(
-    args: &[String],
-    explicit: Option<&str>,
-) -> Result<(Vec<String>, String), String> {
-    let mut output = Vec::with_capacity(args.len());
-    let mut model = explicit.map(str::to_string);
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if matches!(arg.as_str(), "--model" | "-m") {
-            let Some(value) = args.get(index + 1) else {
-                return Err(format!("{arg} requires a value"));
-            };
-            model = Some(value.clone());
-            index += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--model=") {
-            if value.is_empty() {
-                return Err("--model requires a value".to_string());
-            }
-            model = Some(value.to_string());
-            index += 1;
-            continue;
-        }
-        output.push(arg.clone());
-        index += 1;
-    }
-    let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+fn selected_model(explicit: Option<&str>) -> Result<String, String> {
+    let model = explicit.unwrap_or(DEFAULT_MODEL).to_string();
     validate_model(&model)?;
-    Ok((output, model))
+    Ok(model)
 }
 
 fn validate_model(model: &str) -> Result<(), String> {
@@ -223,11 +263,10 @@ fn opencode_config(proxy: &str, model: &str, api: ClientApi) -> Result<String, S
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| "OPENCODE_CONFIG_CONTENT.provider must be an object".to_string())?;
-    let api_key = if std::env::var_os("OPENAI_API_KEY").is_some() {
-        "{env:OPENAI_API_KEY}"
-    } else {
-        "pentect-local"
-    };
+    // Do not copy credentials for unrelated providers into the child process.
+    // This launch intentionally exposes only the ephemeral Pentect provider.
+    providers.clear();
+    let api_key = "{env:OPENAI_API_KEY}";
     providers.insert(
         "pentect".to_string(),
         json!({
@@ -255,42 +294,19 @@ fn opencode_config(proxy: &str, model: &str, api: ClientApi) -> Result<String, S
 }
 
 struct PiProviderFile {
-    path: PathBuf,
+    file: crate::secure_temp::SecureTempFile,
 }
 
 impl PiProviderFile {
     fn create() -> Result<Self, String> {
-        let mut random = [0u8; 16];
-        getrandom::getrandom(&mut random)
-            .map_err(|error| format!("could not create Pi provider file name: {error}"))?;
-        let name = format!("pentect-pi-{}.mjs", data_encoding::HEXLOWER.encode(&random));
-        random.zeroize();
-        let path = std::env::temp_dir().join(name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| format!("could not create temporary Pi provider: {error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| format!("could not protect temporary Pi provider: {error}"))?;
-        }
-        file.write_all(PI_PROVIDER.as_bytes())
-            .and_then(|_| file.flush())
-            .map_err(|error| format!("could not write temporary Pi provider: {error}"))?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for PiProviderFile {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("[pentect] could not remove temporary Pi provider: {error}");
-            }
-        }
+        let file = crate::secure_temp::SecureTempFile::create(
+            &std::env::temp_dir(),
+            ".pentect-pi-provider-",
+            ".mjs",
+            PI_PROVIDER.as_bytes(),
+            "Pi provider",
+        )?;
+        Ok(Self { file })
     }
 }
 
@@ -323,23 +339,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_flags_are_consumed_wherever_the_client_puts_them() {
-        let args = vec![
-            "prompt".to_string(),
-            "--model".to_string(),
-            "anthropic/claude-sonnet".to_string(),
-            "--verbose".to_string(),
-        ];
-        let (forwarded, model) = client_args_and_model(&args, None).unwrap();
-        assert_eq!(model, "anthropic/claude-sonnet");
-        assert_eq!(forwarded, ["prompt", "--verbose"]);
+    fn selected_model_only_uses_the_parsed_pentect_option() {
+        assert_eq!(selected_model(None).unwrap(), DEFAULT_MODEL);
+        assert_eq!(
+            selected_model(Some("anthropic/claude-sonnet")).unwrap(),
+            "anthropic/claude-sonnet"
+        );
     }
 
     #[test]
-    fn opencode_config_preserves_unrelated_inline_settings() {
+    fn opencode_config_preserves_settings_but_drops_other_providers() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let old = std::env::var_os("OPENCODE_CONFIG_CONTENT");
-        std::env::set_var("OPENCODE_CONFIG_CONTENT", r#"{"theme":"dark"}"#);
+        std::env::set_var(
+            "OPENCODE_CONFIG_CONTENT",
+            r#"{"theme":"dark","provider":{"other":{"options":{"apiKey":"must-not-survive"}}}}"#,
+        );
         let value: Value = serde_json::from_str(
             &opencode_config(
                 "http://127.0.0.1/token",
@@ -361,6 +376,21 @@ mod tests {
             value["provider"]["pentect"]["options"]["baseURL"],
             "http://127.0.0.1/token"
         );
+        assert_eq!(value["provider"].as_object().unwrap().len(), 1);
+        assert!(!value.to_string().contains("must-not-survive"));
+    }
+
+    #[test]
+    fn explicit_authorization_header_disables_implicit_key_selection() {
+        assert!(has_authorization_override(&[
+            "authorization=MY_HEADER".to_string()
+        ]));
+        assert!(has_authorization_override(&[
+            " Authorization =MY_HEADER".to_string()
+        ]));
+        assert!(!has_authorization_override(&[
+            "X-Api-Key=MY_HEADER".to_string()
+        ]));
     }
 
     #[test]

@@ -8,14 +8,18 @@ mod cloud_code_http_proxy;
 mod codex_app;
 mod default_launch;
 mod doctor;
+mod gemini_http_proxy;
 mod http_files;
+mod ide_clients;
 mod input;
 mod installation;
+mod openai_client_injection;
 mod openai_clients;
 mod openai_http_proxy;
 mod plugins;
 mod plugins_cmd;
 mod remote_content;
+mod secure_temp;
 mod uninstall;
 mod update;
 mod upstream;
@@ -164,6 +168,12 @@ const COMMANDS: &[CommandSpec] = &[
         audience: CommandAudience::Internal,
     },
     CommandSpec {
+        name: "provider",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
         name: "memory-store",
         usage: "",
         summary: "",
@@ -258,6 +268,7 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("view") => cmd_view(&args),
         Some("doctor") => doctor::cmd_doctor(&args),
         Some("plugins") => plugins_cmd::cmd_plugins(&args),
+        Some("provider") => return Some(cmd_provider(&args)),
         Some(
             "exec" | "resolve" | "log" | "hook" | "bridge" | "memory-store" | "purge"
             | "__agent-script" | "__agent-stream",
@@ -271,7 +282,7 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         }
         Some("claude-app") => return Some(cmd_claude_app(&args)),
         Some("codex-app") => return Some(cmd_codex_app(&args)),
-        Some(command) => match AgentTool::from_command(command) {
+        Some(command) => match client_descriptor::find(command) {
             Some(tool) => return Some(cmd_agent_tool(tool, &args)),
             None => {
                 usage();
@@ -301,7 +312,8 @@ fn supports_process_host(args: &[String]) -> bool {
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
         ),
-        (Some("exec" | "log" | "bridge"), _) | (Some("agent"), Some("exec" | "log" | "bridge"))
+        (Some("exec" | "log" | "bridge" | "provider"), _)
+            | (Some("agent"), Some("exec" | "log" | "bridge"))
     )
 }
 
@@ -315,8 +327,7 @@ fn cmd_help() {
 
 fn help_text() -> String {
     let mut help = String::from("pentect protects sensitive data in AI workflows.\n\nClients:\n");
-    for tool in AgentTool::ALL {
-        let descriptor = tool.descriptor();
+    for descriptor in client_descriptor::CLIENTS {
         help.push_str(&format!(
             "  pentect {:<13} Launch {} and pass normal client arguments through\n",
             descriptor.name, descriptor.default_command
@@ -354,7 +365,7 @@ fn command_names(audience: CommandAudience) -> Vec<&'static str> {
         .map(|command| command.name)
         .collect::<Vec<_>>();
     if audience == CommandAudience::Public {
-        names.extend(AgentTool::ALL.map(AgentTool::name));
+        names.extend(client_descriptor::CLIENTS.iter().map(|client| client.name));
     }
     names.sort_unstable();
     names
@@ -466,8 +477,8 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
     code
 }
 
-fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
-    if default_launch::run_if_requested(tool.name(), &args[2..])
+fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[String]) -> i32 {
+    if default_launch::run_if_requested(tool.name, &args[2..])
         .unwrap_or_else(|error| die(error))
         .is_some()
     {
@@ -484,13 +495,12 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
             pentect.display()
         ));
     }
-    let status = match tool {
-        AgentTool::Codex => run_codex(&opts, &pentect),
-        AgentTool::Claude => run_claude(&opts, &pentect),
-        AgentTool::OpenCode | AgentTool::Pi | AgentTool::Aider => {
-            openai_clients::run(tool, &opts, &pentect)
-        }
-        AgentTool::Antigravity => run_antigravity(&opts, &pentect),
+    let status = match tool.launcher {
+        client_descriptor::Launcher::CodexConfig => run_codex(&opts, &pentect),
+        client_descriptor::Launcher::ClaudeSettings => run_claude(&opts, &pentect),
+        client_descriptor::Launcher::OpenAi(_) => openai_clients::run(tool, &opts, &pentect),
+        client_descriptor::Launcher::EndpointEnv => run_endpoint_env(tool, &opts, &pentect),
+        client_descriptor::Launcher::Ide(client) => ide_clients::run(client, &opts, &pentect),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     status.code().unwrap_or(1)
@@ -806,14 +816,83 @@ fn cmd_view(args: &[String]) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentTool {
-    Codex,
-    Claude,
-    OpenCode,
-    Pi,
-    Antigravity,
-    Aider,
+/// Long-lived provider backend for first-party integrations such as the
+/// VS Code LanguageModelChatProvider. Readiness is the only stdout record;
+/// the process and its loopback gateway live until the parent closes stdin.
+fn cmd_provider(args: &[String]) -> i32 {
+    if args.get(2).map(String::as_str) != Some("vscode") {
+        die("provider requires the supported integration name `vscode`");
+    }
+    let mut upstream =
+        nonempty_env("OPENAI_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let mut model = "gpt-5".to_string();
+    let mut header_env = Vec::new();
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--upstream" => {
+                upstream = args
+                    .get(index + 1)
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| die("--upstream requires a value"));
+                index += 2;
+            }
+            "--model" => {
+                model = args
+                    .get(index + 1)
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| die("--model requires a value"));
+                index += 2;
+            }
+            "--upstream-header-env" => {
+                header_env.push(
+                    args.get(index + 1)
+                        .cloned()
+                        .unwrap_or_else(|| die("--upstream-header-env requires HEADER=ENV_NAME")),
+                );
+                index += 2;
+            }
+            flag => die(format!("unknown provider option '{flag}'")),
+        }
+    }
+    if model.len() > 200 || model.chars().any(char::is_control) {
+        die("model ID is invalid");
+    }
+
+    // The integration process inherits the environment without reading the
+    // credential. Rust converts the standard OpenAI key into an upstream-only
+    // Authorization override, so a local caller's dummy header cannot replace
+    // it and the key never appears in readiness output or arguments.
+    let _authorization = upstream_bearer_guard(&["OPENAI_API_KEY"]);
+    let proxy =
+        openai_http_proxy::OpenAiHttpProxyGuard::start_with_header_env(upstream, &header_env)
+            .unwrap_or_else(|error| die_with_issue(error));
+    let ready = serde_json::json!({
+        "protocol": 1,
+        "baseUrl": proxy.base_url(),
+        "model": model,
+    });
+    println!("{ready}");
+    std::io::stdout()
+        .flush()
+        .unwrap_or_else(|error| die(format!("could not report provider readiness: {error}")));
+
+    let mut discard = [0_u8; 1024];
+    loop {
+        match std::io::stdin().read(&mut discard) {
+            Ok(0) => break,
+            Ok(_) => discard.zeroize(),
+            Err(error) => {
+                discard.zeroize();
+                die(format!("provider control stream failed: {error}"));
+            }
+        }
+    }
+    discard.zeroize();
+    drop(proxy);
+    0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -887,56 +966,13 @@ impl ReadOpts {
     }
 }
 
-impl AgentTool {
-    const ALL: [Self; 6] = [
-        Self::Codex,
-        Self::Claude,
-        Self::OpenCode,
-        Self::Pi,
-        Self::Antigravity,
-        Self::Aider,
-    ];
-
-    fn from_command(command: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|tool| {
-            let descriptor = tool.descriptor();
-            command == descriptor.name || descriptor.aliases.contains(&command)
-        })
-    }
-
-    fn descriptor(self) -> &'static client_descriptor::ClientDescriptor {
-        match self {
-            AgentTool::Codex => &client_descriptor::CODEX,
-            AgentTool::Claude => &client_descriptor::CLAUDE,
-            AgentTool::OpenCode => &client_descriptor::OPENCODE,
-            AgentTool::Pi => &client_descriptor::PI,
-            AgentTool::Antigravity => &client_descriptor::ANTIGRAVITY,
-            AgentTool::Aider => &client_descriptor::AIDER,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        self.descriptor().name
-    }
-
-    fn default_command(self) -> &'static str {
-        self.descriptor().default_command
-    }
-
-    fn path_flag(self) -> &'static str {
-        self.descriptor().path_flag
-    }
-}
-
 #[derive(Debug)]
 struct AgentToolOpts {
     pentect: Option<PathBuf>,
     command: PathBuf,
     plugins: Vec<String>,
     dry_run: bool,
-    anthropic_upstream: Option<String>,
-    openai_upstream: Option<String>,
-    cloud_code_upstream: Option<String>,
+    upstream: Option<String>,
     model: Option<String>,
     api: Option<String>,
     upstream_header_env: Vec<String>,
@@ -944,14 +980,15 @@ struct AgentToolOpts {
 }
 
 impl AgentToolOpts {
-    fn parse(tool: AgentTool, args: &[String]) -> Result<Self, String> {
+    fn parse(
+        tool: &'static client_descriptor::ClientDescriptor,
+        args: &[String],
+    ) -> Result<Self, String> {
         let mut pentect = None;
-        let mut command = PathBuf::from(tool.default_command());
+        let mut command = PathBuf::from(tool.default_command);
         let mut plugins = Vec::new();
         let mut dry_run = false;
-        let mut anthropic_upstream = None;
-        let mut openai_upstream = None;
-        let mut cloud_code_upstream = None;
+        let mut upstream = None;
         let mut model = None;
         let mut api = None;
         let mut upstream_header_env = Vec::new();
@@ -969,7 +1006,7 @@ impl AgentToolOpts {
                 "--tool" => {
                     command = PathBuf::from(required_value(args, &mut i, "--tool")?);
                 }
-                flag if flag == tool.path_flag() => {
+                flag if flag == tool.path_flag => {
                     command = PathBuf::from(required_value(args, &mut i, flag)?);
                 }
                 "--plugins" => {
@@ -986,27 +1023,21 @@ impl AgentToolOpts {
                     dry_run = true;
                     i += 1;
                 }
-                "--no-app-server-proxy" if tool == AgentTool::Codex => {
+                "--no-app-server-proxy"
+                    if tool.launcher == client_descriptor::Launcher::CodexConfig =>
+                {
                     return Err(
                         "Codex app-server interception was removed; HTTP protection is automatic"
                             .to_string(),
                     );
                 }
-                "--upstream" if tool == AgentTool::Claude => {
-                    anthropic_upstream = Some(required_value(args, &mut i, "--upstream")?);
+                "--upstream" => {
+                    upstream = Some(required_value(args, &mut i, "--upstream")?);
                 }
-                "--upstream"
-                    if tool.descriptor().protocol == client_descriptor::Protocol::OpenAi =>
-                {
-                    openai_upstream = Some(required_value(args, &mut i, "--upstream")?);
-                }
-                "--upstream" if tool == AgentTool::Antigravity => {
-                    cloud_code_upstream = Some(required_value(args, &mut i, "--upstream")?);
-                }
-                "--model" | "-m" if tool.descriptor().accepts_model => {
+                "--model" | "-m" if tool.accepts_model => {
                     model = Some(required_value(args, &mut i, "--model")?);
                 }
-                "--api" if tool.descriptor().accepts_api => {
+                "--api" if tool.accepts_api => {
                     api = Some(required_value(args, &mut i, "--api")?);
                 }
                 "--upstream-header-env" => {
@@ -1030,9 +1061,7 @@ impl AgentToolOpts {
             command,
             plugins,
             dry_run,
-            anthropic_upstream,
-            openai_upstream,
-            cloud_code_upstream,
+            upstream,
             model,
             api,
             upstream_header_env,
@@ -1110,20 +1139,28 @@ fn run_claude(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::Exit
     run_native_command_with_guards(cmd, &opts.command, (http_proxy, gateway_settings))
 }
 
-fn run_antigravity(
+fn run_endpoint_env(
+    tool: &'static client_descriptor::ClientDescriptor,
     opts: &AgentToolOpts,
     pentect: &Path,
 ) -> Result<std::process::ExitStatus, String> {
-    const DEFAULT_UPSTREAM: &str = "https://daily-cloudcode-pa.googleapis.com";
+    if !matches!(
+        tool.protocol,
+        client_descriptor::Protocol::CloudCode | client_descriptor::Protocol::Gemini
+    ) || tool.upstream_env.len() != 1
+    {
+        return Err("internal endpoint-environment launcher mismatch".to_string());
+    }
     let upstream = opts
-        .cloud_code_upstream
+        .upstream
         .clone()
         .or_else(|| {
-            std::env::var("CLOUD_CODE_URL")
+            std::env::var(tool.upstream_env[0])
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
-        .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string());
+        .or_else(|| tool.default_upstream.map(str::to_string))
+        .ok_or_else(|| format!("{} has no configured upstream", tool.name))?;
     if opts.dry_run {
         print_dry_run(&opts.command, &opts.tool_args);
         return Ok(success_status());
@@ -1132,19 +1169,32 @@ fn run_antigravity(
     let active_plugins = agent_tool_plugins(opts)?;
     let memory_store = start_memory_store(pentect)?;
     let _parent_env = agent_parent_env_guard(pentect, &memory_store, &active_plugins)?;
-    let proxy = cloud_code_http_proxy::CloudCodeHttpProxyGuard::start_with_header_env(
-        upstream,
-        &opts.upstream_header_env,
-    )?;
     let mut command = Command::new(&opts.command);
     clear_pentect_control_env(&mut command);
     upstream::hide_header_source_env(&mut command, &opts.upstream_header_env);
     apply_plugin_env(&mut command, &active_plugins)?;
     apply_pentect_env(&mut command, pentect, Some(memory_store.token.as_str()))?;
     apply_memory_store_env(&mut command, Some(&memory_store));
-    command.env("CLOUD_CODE_URL", proxy.base_url());
     command.args(&opts.tool_args);
-    run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+    match tool.protocol {
+        client_descriptor::Protocol::CloudCode => {
+            let proxy = cloud_code_http_proxy::CloudCodeHttpProxyGuard::start_with_header_env(
+                upstream,
+                &opts.upstream_header_env,
+            )?;
+            command.env(tool.upstream_env[0], proxy.base_url());
+            run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+        }
+        client_descriptor::Protocol::Gemini => {
+            let proxy = gemini_http_proxy::GeminiHttpProxyGuard::start_with_header_env(
+                upstream,
+                &opts.upstream_header_env,
+            )?;
+            command.env(tool.upstream_env[0], proxy.base_url());
+            run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+        }
+        _ => Err("internal endpoint-environment protocol mismatch".to_string()),
+    }
 }
 
 const CLAUDE_CLOUD_PROVIDER_FLAGS: &[&str] = &[
@@ -1270,7 +1320,15 @@ impl ClaudeCallerSettings {
                     format!("could not locate the working directory for Claude settings: {error}")
                 })
             })?;
-        let file = ClaudeSettingsFile::create(&directory, &settings)?;
+        let encoded = serde_json::to_vec(&settings)
+            .map_err(|error| format!("could not encode protected Claude settings: {error}"))?;
+        let file = secure_temp::SecureTempFile::create(
+            &directory,
+            ".pentect-claude-settings-",
+            ".json",
+            &encoded,
+            "Claude settings",
+        )?;
         let path = file.path().to_string_lossy().into_owned();
         let mut out = args.to_vec();
         if let Some(index) = self.settings_at {
@@ -1293,158 +1351,12 @@ impl ClaudeCallerSettings {
 #[derive(Debug)]
 struct ClaudeGatewaySettings {
     args: Vec<String>,
-    _file: ClaudeSettingsFile,
+    _file: secure_temp::SecureTempFile,
 }
 
 impl ClaudeGatewaySettings {
     fn args(&self) -> &[String] {
         &self.args
-    }
-}
-
-#[derive(Debug)]
-struct ClaudeSettingsFile {
-    path: PathBuf,
-}
-
-impl ClaudeSettingsFile {
-    fn create(directory: &Path, settings: &serde_json::Value) -> Result<Self, String> {
-        cleanup_stale_claude_settings_files(directory);
-        let mut nonce = [0_u8; 16];
-        getrandom::getrandom(&mut nonce)
-            .map_err(|error| format!("OS CSPRNG unavailable for Claude settings: {error}"))?;
-        let name = format!(
-            ".pentect-claude-settings-{}-{}.json",
-            std::process::id(),
-            data_encoding::HEXLOWER.encode(&nonce)
-        );
-        let path = directory.join(name);
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path).map_err(|error| {
-            format!(
-                "could not create protected Claude settings beside the caller settings ({}): {error}",
-                path.display()
-            )
-        })?;
-        if let Err(error) = restrict_sensitive_file(&path) {
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
-        }
-        if let Err(error) = serde_json::to_writer(&mut file, settings) {
-            let _ = std::fs::remove_file(&path);
-            return Err(format!(
-                "could not encode protected Claude settings: {error}"
-            ));
-        }
-        if let Err(error) = file.flush() {
-            let _ = std::fs::remove_file(&path);
-            return Err(format!(
-                "could not flush protected Claude settings: {error}"
-            ));
-        }
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-#[cfg(windows)]
-fn restrict_sensitive_file(path: &Path) -> Result<(), String> {
-    let identity = Command::new("whoami.exe")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|error| format!("could not resolve the Windows account for ACL setup: {error}"))?;
-    if !identity.status.success() {
-        return Err("could not resolve the Windows account for ACL setup".to_string());
-    }
-    let identity = String::from_utf8(identity.stdout)
-        .map_err(|_| "Windows account name is not UTF-8".to_string())?;
-    let identity = identity.trim();
-    if identity.is_empty() {
-        return Err("Windows account name is empty".to_string());
-    }
-    let grant = format!("{identity}:(F)");
-    let status = Command::new("icacls.exe")
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r", &grant])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| format!("could not restrict Claude settings ACL: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("could not restrict Claude settings ACL".to_string())
-    }
-}
-
-#[cfg(not(windows))]
-fn restrict_sensitive_file(_: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-fn cleanup_stale_claude_settings_files(directory: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    let mut candidates = Vec::new();
-    for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(stem) = name
-            .strip_prefix(".pentect-claude-settings-")
-            .and_then(|rest| rest.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        // Builds before PID ownership used a single 128-bit hex nonce. No
-        // current process creates that shape, so it is always crash residue.
-        if stem.len() == 32 && stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            let _ = std::fs::remove_file(path);
-            continue;
-        }
-        let Some(owner) = stem
-            .split_once('-')
-            .map(|(owner, _)| owner)
-            .and_then(|owner| owner.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if owner != std::process::id() {
-            candidates.push((path, sysinfo::Pid::from_u32(owner)));
-        }
-    }
-    if candidates.is_empty() {
-        return;
-    }
-    let pids = candidates.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
-    let mut system = sysinfo::System::new();
-    system.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::Some(&pids),
-        true,
-        sysinfo::ProcessRefreshKind::nothing(),
-    );
-    for (path, pid) in candidates {
-        if system.process(pid).is_none() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-impl Drop for ClaudeSettingsFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1468,7 +1380,7 @@ fn claude_effective_upstream(
     settings: &ClaudeCallerSettings,
 ) -> Result<String, String> {
     if let Some(explicit) = opts
-        .anthropic_upstream
+        .upstream
         .clone()
         .or_else(|| nonempty_env("PENTECT_ANTHROPIC_UPSTREAM"))
     {
@@ -1759,6 +1671,20 @@ fn nonempty_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn upstream_bearer_guard(key_env_names: &[&str]) -> EnvVarGuard {
+    let existing = std::env::var_os("PENTECT_UPSTREAM_AUTHORIZATION");
+    let mut generated = None;
+    if existing.is_none() {
+        if let Some(mut key) = key_env_names.iter().find_map(|name| nonempty_env(name)) {
+            let mut authorization = format!("Bearer {key}");
+            generated = Some(OsString::from(&authorization));
+            authorization.zeroize();
+            key.zeroize();
+        }
+    }
+    EnvVarGuard::set_optional([("PENTECT_UPSTREAM_AUTHORIZATION", existing.or(generated))])
 }
 
 fn run_native_command_with_guards<G>(
@@ -2191,7 +2117,7 @@ fn codex_effective_routing(opts: &AgentToolOpts) -> Result<CodexHttpRouting, Str
         }
     });
     let upstream = opts
-        .openai_upstream
+        .upstream
         .clone()
         .or(configured_upstream)
         .or_else(|| {
@@ -2709,20 +2635,27 @@ mod tests {
                 "aider",
                 "antigravity",
                 "claude",
+                "cline",
                 "codex",
+                "continue",
                 "doctor",
                 "exec",
+                "gemini",
+                "goose",
                 "help",
+                "junie",
                 "log",
                 "mask",
                 "opencode",
                 "pi",
                 "plugins",
                 "read",
+                "roo",
                 "uninstall",
                 "update",
                 "version",
                 "view",
+                "zed",
             ]
         );
         assert_eq!(command_names(CommandAudience::Advanced), ["resolve"]);
@@ -2776,7 +2709,7 @@ mod tests {
     #[test]
     fn agent_options_keep_provider_upstreams_out_of_tool_args() {
         let codex = AgentToolOpts::parse(
-            AgentTool::Codex,
+            &client_descriptor::CODEX,
             &[
                 "pentect".to_string(),
                 "codex".to_string(),
@@ -2791,14 +2724,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            codex.openai_upstream.as_deref(),
+            codex.upstream.as_deref(),
             Some("https://gateway.example/v1")
         );
         assert_eq!(codex.upstream_header_env, ["x-bf-vk=BIFROST_API_KEY"]);
         assert_eq!(codex.tool_args, ["exec", "hello"]);
 
         let claude = AgentToolOpts::parse(
-            AgentTool::Claude,
+            &client_descriptor::CLAUDE,
             &[
                 "pentect".to_string(),
                 "claude".to_string(),
@@ -2808,12 +2741,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            claude.anthropic_upstream.as_deref(),
+            claude.upstream.as_deref(),
             Some("https://gateway.example/anthropic")
         );
 
         let opencode = AgentToolOpts::parse(
-            AgentTool::OpenCode,
+            &client_descriptor::OPENCODE,
             &[
                 "pentect".to_string(),
                 "opencode".to_string(),
@@ -2825,13 +2758,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            opencode.openai_upstream.as_deref(),
+            opencode.upstream.as_deref(),
             Some("http://127.0.0.1:8080/openai/v1")
         );
         assert_eq!(opencode.model.as_deref(), Some("anthropic/claude-sonnet"));
 
         let aider = AgentToolOpts::parse(
-            AgentTool::Aider,
+            &client_descriptor::AIDER,
             &[
                 "pentect".to_string(),
                 "aider".to_string(),
@@ -2845,14 +2778,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            aider.openai_upstream.as_deref(),
+            aider.upstream.as_deref(),
             Some("http://127.0.0.1:8080/openai/v1")
         );
         assert_eq!(aider.model.as_deref(), Some("gpt-5.1"));
         assert_eq!(aider.tool_args, ["src/main.rs"]);
 
         let antigravity = AgentToolOpts::parse(
-            AgentTool::Antigravity,
+            &client_descriptor::ANTIGRAVITY,
             &[
                 "pentect".to_string(),
                 "antigravity".to_string(),
@@ -2865,7 +2798,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            antigravity.cloud_code_upstream.as_deref(),
+            antigravity.upstream.as_deref(),
             Some("https://cloud-code.example/base")
         );
         assert_eq!(antigravity.tool_args, ["--agent", "reviewer"]);
@@ -2873,16 +2806,25 @@ mod tests {
 
     #[test]
     fn client_commands_and_aliases_come_from_descriptors() {
-        assert_eq!(AgentTool::from_command("codex"), Some(AgentTool::Codex));
-        assert_eq!(AgentTool::from_command("agy"), Some(AgentTool::Antigravity));
-        assert_eq!(AgentTool::from_command("aider"), Some(AgentTool::Aider));
-        assert_eq!(AgentTool::from_command("unknown"), None);
+        assert_eq!(
+            client_descriptor::find("codex"),
+            Some(&client_descriptor::CODEX)
+        );
+        assert_eq!(
+            client_descriptor::find("agy"),
+            Some(&client_descriptor::ANTIGRAVITY)
+        );
+        assert_eq!(
+            client_descriptor::find("aider"),
+            Some(&client_descriptor::AIDER)
+        );
+        assert_eq!(client_descriptor::find("unknown"), None);
     }
 
     #[test]
     fn agent_options_forward_client_arguments_without_separator() {
         let codex = AgentToolOpts::parse(
-            AgentTool::Codex,
+            &client_descriptor::CODEX,
             &[
                 "pentect".to_string(),
                 "codex".to_string(),
@@ -2894,7 +2836,7 @@ mod tests {
         assert_eq!(codex.tool_args, ["exec", "--full-auto"]);
 
         let claude = AgentToolOpts::parse(
-            AgentTool::Claude,
+            &client_descriptor::CLAUDE,
             &[
                 "pentect".to_string(),
                 "claude".to_string(),
@@ -2904,6 +2846,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(claude.tool_args, ["--model", "sonnet"]);
+
+        let opencode_args = [
+            "pentect",
+            "opencode",
+            "run",
+            "--model",
+            "client-owned-model",
+            "--model=second-client-value",
+        ]
+        .map(str::to_string);
+        let opencode = AgentToolOpts::parse(&client_descriptor::OPENCODE, &opencode_args).unwrap();
+        assert_eq!(opencode.model, None);
+        assert_eq!(opencode.tool_args, opencode_args[2..]);
     }
 
     #[test]
@@ -2939,7 +2894,7 @@ mod tests {
 
     #[test]
     fn only_long_lived_agent_commands_support_process_host_handoff() {
-        for command in ["exec", "log", "bridge"] {
+        for command in ["exec", "log", "bridge", "provider"] {
             let args = vec!["pentect".to_string(), command.to_string()];
             assert!(supports_process_host(&args));
         }
