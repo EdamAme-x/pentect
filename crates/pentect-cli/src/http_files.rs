@@ -534,13 +534,9 @@ impl FileAttestationStore {
 
     pub(crate) fn open(root: impl AsRef<Path>) -> Result<Self, String> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)
-            .map_err(|error| format!("could not create file attestation store: {error}"))?;
-        restrict_directory(&root)?;
+        create_private_directory(&root)?;
         let key = load_or_create_attestation_key(&root.join("attestation.key"))?;
-        fs::create_dir_all(root.join("records"))
-            .map_err(|error| format!("could not create file attestation records: {error}"))?;
-        restrict_directory(&root.join("records"))?;
+        create_private_directory(&root.join("records"))?;
         Ok(Self { root, key })
     }
 
@@ -1028,14 +1024,38 @@ fn restrict_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("could not restrict file attestation directory: {error}"))
 }
 
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder
+        .create(path)
+        .map_err(|error| format!("could not create file attestation directory: {error}"))?;
+    restrict_directory(path)
+}
+
 #[cfg(windows)]
 fn restrict_directory(path: &Path) -> Result<(), String> {
     restrict_windows_path(path, true)
 }
 
+#[cfg(windows)]
+fn create_private_directory(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("could not create file attestation directory: {error}"))?;
+    restrict_directory(path)
+}
+
 #[cfg(not(any(unix, windows)))]
 fn restrict_directory(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_private_directory(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("could not create file attestation directory: {error}"))
 }
 
 #[cfg(unix)]
@@ -1057,50 +1077,128 @@ fn restrict_private_file(_path: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn restrict_windows_path(path: &Path, directory: bool) -> Result<(), String> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
-
-    let mut buffer = [0u16; 32_768];
-    // SAFETY: the writable buffer remains valid for the Win32 call.
-    let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-    if length == 0 || length as usize >= buffer.len() {
-        return Err("could not resolve Windows system directory for attestation ACL".to_string());
-    }
-    let system32 = PathBuf::from(OsString::from_wide(&buffer[..length as usize])).join("System32");
-    let identity = std::process::Command::new(system32.join("whoami.exe"))
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map_err(|error| {
-            format!("could not resolve Windows account for attestation ACL: {error}")
-        })?;
-    if !identity.status.success() {
-        return Err("could not resolve Windows account for attestation ACL".to_string());
-    }
-    let identity = String::from_utf8(identity.stdout)
-        .map_err(|_| "Windows account for attestation ACL is not UTF-8".to_string())?;
-    let identity = identity.trim();
-    if identity.is_empty() {
-        return Err("Windows account for attestation ACL is empty".to_string());
-    }
-    let grant = if directory {
-        format!("{identity}:(OI)(CI)(F)")
-    } else {
-        format!("{identity}:(F)")
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
+        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
-    let status = std::process::Command::new(system32.join("icacls.exe"))
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r", &grant])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|error| format!("could not restrict file attestation ACL: {error}"))?;
-    if !status.success() {
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION,
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    let sid = current_process_sid()?;
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_USER,
+        ptstrName: sid.as_ptr().cast_mut().cast(),
+    };
+    let access = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: if directory {
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        } else {
+            NO_INHERITANCE
+        },
+        Trustee: trustee,
+    };
+    let mut acl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `access` and `acl` are valid for the duration of the call; the
+    // returned ACL is owned by LocalAlloc and released below with LocalFree.
+    let acl_status = unsafe { SetEntriesInAclW(1, &access, std::ptr::null(), &mut acl) };
+    if acl_status != ERROR_SUCCESS || acl.is_null() {
         return Err("could not restrict file attestation ACL".to_string());
     }
-    Ok(())
+    let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide_path.push(0);
+    // SAFETY: the path is NUL-terminated, `acl` is a valid ACL allocated by
+    // SetEntriesInAclW, and all other optional security components are null.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        )
+    };
+    // SAFETY: `acl` came from SetEntriesInAclW and is released exactly once.
+    unsafe { LocalFree(acl.cast()) };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err("could not restrict file attestation ACL".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn current_process_sid() -> Result<&'static [u8], String> {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        CopySid, GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    static SID: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
+    SID.get_or_init(|| {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `token` is a valid output pointer and the pseudo process
+        // handle returned by GetCurrentProcess is valid in this process.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err("could not open Windows process token for attestation ACL".to_string());
+        }
+        let result = (|| {
+            let mut required = 0_u32;
+            // SAFETY: a null buffer with length zero is the documented size
+            // query for GetTokenInformation.
+            unsafe {
+                GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required)
+            };
+            if required < std::mem::size_of::<TOKEN_USER>() as u32 {
+                return Err("could not size Windows process SID".to_string());
+            }
+            let mut token_user = vec![0_u8; required as usize];
+            // SAFETY: `token_user` has the exact capacity requested above.
+            if unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    token_user.as_mut_ptr().cast(),
+                    required,
+                    &mut required,
+                )
+            } == 0
+            {
+                return Err("could not read Windows process SID".to_string());
+            }
+            // SAFETY: a successful TokenUser query starts with TOKEN_USER.
+            let source = unsafe { (*(token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+            if source.is_null() || unsafe { IsValidSid(source) } == 0 {
+                return Err("Windows process SID is invalid".to_string());
+            }
+            // SAFETY: IsValidSid succeeded for `source`.
+            let length = unsafe { GetLengthSid(source) };
+            let mut sid = vec![0_u8; length as usize];
+            // SAFETY: `sid` has `length` bytes and `source` is a valid SID.
+            if unsafe { CopySid(length, sid.as_mut_ptr().cast(), source) } == 0 {
+                return Err("could not copy Windows process SID".to_string());
+            }
+            Ok(sid)
+        })();
+        // SAFETY: OpenProcessToken returned this owned handle.
+        unsafe { CloseHandle(token) };
+        result
+    })
+    .as_deref()
+    .map_err(Clone::clone)
 }
 
 pub(crate) fn remember_file_coverage(
@@ -1395,6 +1493,7 @@ mod tests {
         let mut expired: FileAttestation =
             serde_json::from_slice(&fs::read(&expired_path).unwrap()).unwrap();
         expired.expires_at = 0;
+        expired.mac = mac_hex(&store.key, &attestation_payload(&expired));
         fs::write(&expired_path, serde_json::to_vec(&expired).unwrap()).unwrap();
         assert_eq!(
             store

@@ -67,9 +67,10 @@ impl HeaderOverrides {
         }
         fields.sort();
         let mut material = zeroize::Zeroizing::new(Vec::new());
-        for (name, value) in fields {
+        for (name, mut value) in fields {
             append_scope_field(&mut material, &name);
             append_scope_field(&mut material, &value);
+            value.zeroize();
         }
         material
     }

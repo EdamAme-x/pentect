@@ -28,14 +28,9 @@ pub(crate) enum HandleScope {
 
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn handle_identity_key() -> Result<[u8; 32], String> {
-    let team = team_policy_config()?
-        .as_ref()
-        .map(handle_scope_value)
-        .transpose()?
-        .flatten();
     let project = read_handle_scope(project_config_path())?;
     let global = read_handle_scope(global_config_path()?)?;
-    match team.or(project).or(global).unwrap_or_default() {
+    match project.or(global).unwrap_or_default() {
         HandleScope::Device => machine_identity_key(),
         HandleScope::Project => {
             let root = project_identity_root()?;
@@ -373,25 +368,15 @@ struct DecodeConfigPartial {
 }
 
 pub(crate) fn require_pentect_agent_by_config() -> Result<bool, String> {
-    let team = team_policy_config()?
-        .as_ref()
-        .map(agent_require_pentect_value)
-        .transpose()?
-        .flatten();
     let project = read_agent_require_pentect(project_config_path())?;
     let global = read_agent_require_pentect(global_config_path()?)?;
-    Ok(team.unwrap_or(false) || require_pentect_agent_effective(project, global))
+    Ok(require_pentect_agent_effective(project, global))
 }
 
 pub(crate) fn image_ocr_config() -> Result<ImageOcrConfig, String> {
-    let team = team_policy_config()?
-        .as_ref()
-        .map(image_ocr_config_value)
-        .transpose()?
-        .unwrap_or_default();
     let project = read_image_ocr_config(project_config_path())?;
     let global = read_image_ocr_config(global_config_path()?)?;
-    Ok(merge_image_ocr_config(team, project, global))
+    Ok(merge_image_ocr_config(project, global))
 }
 
 #[cfg(not(test))]
@@ -408,14 +393,9 @@ pub(crate) fn environment_variable_prefix() -> Result<String, String> {
 
 #[cfg(not(test))]
 pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
-    let team = team_policy_config()?
-        .as_ref()
-        .map(decode_config_value)
-        .transpose()?
-        .unwrap_or_default();
     let project = read_decode_config(project_config_path())?;
     let global = read_decode_config(global_config_path()?)?;
-    merge_decode_config(profile, team, project, global).validate()
+    merge_decode_config(profile, project, global).validate()
 }
 
 #[cfg(test)]
@@ -424,46 +404,29 @@ pub(crate) fn decode_config(profile: Profile) -> Result<DecodeConfig, String> {
         profile,
         DecodeConfigPartial::default(),
         DecodeConfigPartial::default(),
-        DecodeConfigPartial::default(),
     )
     .validate()
 }
 
 pub(crate) fn remember_files_enabled() -> Result<bool, String> {
-    let team = team_policy_config()?
-        .as_ref()
-        .map(files_remember_value)
-        .transpose()?
-        .flatten();
     let project = read_files_remember(project_config_path())?;
     let global = read_files_remember(global_config_path()?)?;
-    Ok(team.or(project).or(global).unwrap_or(true))
+    Ok(project.or(global).unwrap_or(true))
 }
 
 pub(crate) fn activity_share_enabled() -> Result<bool, String> {
-    let team = team_policy_config()?
-        .as_ref()
-        .map(activity_share_value)
-        .transpose()?
-        .flatten();
     let project = read_activity_share(project_config_path())?;
     let global = read_activity_share(global_config_path()?)?;
-    Ok(team.or(project).or(global).unwrap_or(true))
+    Ok(project.or(global).unwrap_or(true))
 }
 
 pub(crate) fn unknown_formats_should_block() -> Result<bool, String> {
-    let team = team_policy_config()?
-        .as_ref()
-        .map(unknown_format_policy_value)
-        .transpose()?
-        .flatten();
     let project = read_unknown_format_policy(project_config_path())?;
     let global = read_unknown_format_policy(global_config_path()?)?;
-    unknown_formats_should_block_effective(team, project, global)
+    unknown_formats_should_block_effective(project, global)
 }
 
 fn unknown_formats_should_block_effective(
-    team: Option<UnknownFormatPolicy>,
     project: Option<UnknownFormatPolicy>,
     global: Option<UnknownFormatPolicy>,
 ) -> Result<bool, String> {
@@ -473,52 +436,8 @@ fn unknown_formats_should_block_effective(
                 .to_string(),
         );
     }
-    if team == Some(UnknownFormatPolicy::Error)
-        || project == Some(UnknownFormatPolicy::Error)
-        || global == Some(UnknownFormatPolicy::Error)
-    {
-        return Ok(true);
-    }
-    if team == Some(UnknownFormatPolicy::Ignore) {
-        return Ok(false);
-    }
-    Ok(global.unwrap_or(UnknownFormatPolicy::Error) == UnknownFormatPolicy::Error)
-}
-
-fn team_policy_config() -> Result<Option<toml::Value>, String> {
-    #[cfg(not(test))]
-    {
-        static POLICY: OnceLock<Result<Option<toml::Value>, String>> = OnceLock::new();
-        POLICY.get_or_init(load_team_policy_config).clone()
-    }
-    #[cfg(test)]
-    load_team_policy_config()
-}
-
-fn load_team_policy_config() -> Result<Option<toml::Value>, String> {
-    let project_path = project_config_path();
-    let user_path = global_config_path()?;
-    let project = parse_config_file(&project_path)?;
-    let user = parse_config_file(&user_path)?;
-    crate::team_policy::load(project.as_ref(), user.as_ref(), &user_path)
-}
-
-pub(super) fn validate_team_policy_payload(value: &toml::Value) -> Result<(), String> {
-    handle_scope_value(value)?;
-    agent_require_pentect_value(value)?;
-    image_ocr_config_value(value)?;
-    files_remember_value(value)?;
-    activity_share_value(value)?;
-    unknown_format_policy_value(value)?;
-    let decode = decode_config_value(value)?;
-    merge_decode_config(
-        Profile::Strict,
-        decode,
-        DecodeConfigPartial::default(),
-        DecodeConfigPartial::default(),
-    )
-    .validate()?;
-    Ok(())
+    Ok(project == Some(UnknownFormatPolicy::Error)
+        || global.unwrap_or(UnknownFormatPolicy::Error) == UnknownFormatPolicy::Error)
 }
 
 fn require_pentect_agent_effective(project: Option<bool>, global: Option<bool>) -> bool {
@@ -844,59 +763,45 @@ fn config_positive_integer(value: &toml::Value, field: &str) -> Result<i64, Stri
 }
 
 fn merge_image_ocr_config(
-    team: ImageOcrConfigPartial,
     project: ImageOcrConfigPartial,
     global: ImageOcrConfigPartial,
 ) -> ImageOcrConfig {
     ImageOcrConfig {
-        mode: team
-            .mode
-            .or(project.mode)
-            .or(global.mode)
-            .unwrap_or(ImageOcrMode::On),
-        redaction: team
+        mode: project.mode.or(global.mode).unwrap_or(ImageOcrMode::On),
+        redaction: project
             .redaction
-            .or(project.redaction)
             .or(global.redaction)
             .unwrap_or(ImageRedactionStyle::Black),
-        max_pixels: team
+        max_pixels: project
             .max_pixels
-            .or(project.max_pixels)
             .or(global.max_pixels)
             .unwrap_or(DEFAULT_IMAGE_OCR_MAX_PIXELS),
-        max_edge: team
+        max_edge: project
             .max_edge
-            .or(project.max_edge)
             .or(global.max_edge)
             .unwrap_or(DEFAULT_IMAGE_OCR_MAX_EDGE),
-        max_images: team
+        max_images: project
             .max_images
-            .or(project.max_images)
             .or(global.max_images)
             .unwrap_or(DEFAULT_IMAGE_MAX_IMAGES),
-        max_total_bytes: team
+        max_total_bytes: project
             .max_total_bytes
-            .or(project.max_total_bytes)
             .or(global.max_total_bytes)
             .unwrap_or(DEFAULT_IMAGE_MAX_TOTAL_BYTES),
-        max_seconds: team
+        max_seconds: project
             .max_seconds
-            .or(project.max_seconds)
             .or(global.max_seconds)
             .unwrap_or(DEFAULT_IMAGE_MAX_SECONDS),
-        max_image_bytes: team
+        max_image_bytes: project
             .max_image_bytes
-            .or(project.max_image_bytes)
             .or(global.max_image_bytes)
             .unwrap_or(DEFAULT_IMAGE_MAX_IMAGE_BYTES),
-        fetch_seconds: team
+        fetch_seconds: project
             .fetch_seconds
-            .or(project.fetch_seconds)
             .or(global.fetch_seconds)
             .unwrap_or(DEFAULT_IMAGE_FETCH_SECONDS),
-        unscanned_images: team
+        unscanned_images: project
             .unscanned_images
-            .or(project.unscanned_images)
             .or(global.unscanned_images)
             .unwrap_or(UnscannedImagePolicy::Block),
     }
@@ -904,7 +809,6 @@ fn merge_image_ocr_config(
 
 fn merge_decode_config(
     profile: Profile,
-    team: DecodeConfigPartial,
     project: DecodeConfigPartial,
     global: DecodeConfigPartial,
 ) -> DecodeConfig {
@@ -914,41 +818,34 @@ fn merge_decode_config(
         unknown_min_bytes: knobs.min_opaque_run,
         ..DecodeConfig::default()
     };
-    let min_bytes = team
+    let min_bytes = project
         .min_bytes
-        .or(project.min_bytes)
         .or(global.min_bytes)
         .unwrap_or(defaults.min_bytes);
-    let mask_unknown = team
+    let mask_unknown = project
         .mask_unknown
-        .or(project.mask_unknown)
         .or(global.mask_unknown)
         .unwrap_or(defaults.mask_unknown);
-    let unknown_min_bytes = team
+    let unknown_min_bytes = project
         .unknown_min_bytes
-        .or(project.unknown_min_bytes)
         .or(global.unknown_min_bytes)
         .unwrap_or_else(|| defaults.unknown_min_bytes.max(min_bytes));
     DecodeConfig {
-        enabled: team
+        enabled: project
             .enabled
-            .or(project.enabled)
             .or(global.enabled)
             .unwrap_or(defaults.enabled),
-        max_depth: team
+        max_depth: project
             .max_depth
-            .or(project.max_depth)
             .or(global.max_depth)
             .unwrap_or(defaults.max_depth),
         min_bytes,
-        max_bytes: team
+        max_bytes: project
             .max_bytes
-            .or(project.max_bytes)
             .or(global.max_bytes)
             .unwrap_or(defaults.max_bytes),
-        max_inflate_bytes: team
+        max_inflate_bytes: project
             .max_inflate_bytes
-            .or(project.max_inflate_bytes)
             .or(global.max_inflate_bytes)
             .unwrap_or(defaults.max_inflate_bytes),
         mask_unknown,
@@ -1123,31 +1020,20 @@ mod tests {
 
     #[test]
     fn unknown_formats_block_by_default_and_only_global_config_can_relax() {
-        assert!(unknown_formats_should_block_effective(None, None, None).unwrap());
-        assert!(!unknown_formats_should_block_effective(
-            None,
-            None,
-            Some(UnknownFormatPolicy::Ignore)
-        )
-        .unwrap());
+        assert!(unknown_formats_should_block_effective(None, None).unwrap());
+        assert!(
+            !unknown_formats_should_block_effective(None, Some(UnknownFormatPolicy::Ignore))
+                .unwrap()
+        );
         assert!(unknown_formats_should_block_effective(
-            None,
             Some(UnknownFormatPolicy::Error),
             Some(UnknownFormatPolicy::Ignore)
         )
         .unwrap());
-        assert!(unknown_formats_should_block_effective(
-            None,
-            Some(UnknownFormatPolicy::Ignore),
-            None
-        )
-        .is_err());
-        assert!(!unknown_formats_should_block_effective(
-            Some(UnknownFormatPolicy::Ignore),
-            None,
-            None
-        )
-        .unwrap());
+        assert!(
+            unknown_formats_should_block_effective(Some(UnknownFormatPolicy::Ignore), None)
+                .is_err()
+        );
 
         let ignore = "[compatibility]\nunknown_formats = \"ignore\""
             .parse::<toml::Value>()
@@ -1266,43 +1152,10 @@ unknown_min_bytes = 32
             max_bytes: Some(None),
             ..DecodeConfigPartial::default()
         };
-        let merged = merge_decode_config(
-            Profile::Strict,
-            DecodeConfigPartial::default(),
-            project,
-            global,
-        );
+        let merged = merge_decode_config(Profile::Strict, project, global);
         assert_eq!(merged.max_depth, None);
         assert_eq!(merged.min_bytes, 24);
         assert_eq!(merged.max_bytes, Some(2_000_000));
-    }
-
-    #[test]
-    fn team_policy_precedes_project_and_user_config() {
-        let team = DecodeConfigPartial {
-            max_depth: Some(Some(7)),
-            mask_unknown: Some(true),
-            ..DecodeConfigPartial::default()
-        };
-        let project = DecodeConfigPartial {
-            max_depth: Some(Some(99)),
-            mask_unknown: Some(false),
-            ..DecodeConfigPartial::default()
-        };
-        let global = DecodeConfigPartial {
-            max_depth: Some(Some(50)),
-            ..DecodeConfigPartial::default()
-        };
-        let merged = merge_decode_config(Profile::Strict, team, project, global);
-        assert_eq!(merged.max_depth, Some(7));
-        assert!(merged.mask_unknown);
-
-        assert!(unknown_formats_should_block_effective(
-            Some(UnknownFormatPolicy::Error),
-            None,
-            Some(UnknownFormatPolicy::Ignore)
-        )
-        .unwrap());
     }
 
     #[test]
@@ -1314,14 +1167,9 @@ unknown_min_bytes = 32
             max_depth: Some(Some(100_000)),
             ..DecodeConfigPartial::default()
         };
-        let merged = merge_decode_config(
-            Profile::Strict,
-            DecodeConfigPartial::default(),
-            project,
-            DecodeConfigPartial::default(),
-        )
-        .validate()
-        .unwrap();
+        let merged = merge_decode_config(Profile::Strict, project, DecodeConfigPartial::default())
+            .validate()
+            .unwrap();
         assert_eq!(merged.max_depth, Some(100_000));
     }
 
@@ -1342,7 +1190,6 @@ unknown_min_bytes = 32
     #[test]
     fn image_ocr_config_defaults_to_2k_ocr_edge() {
         let cfg = merge_image_ocr_config(
-            ImageOcrConfigPartial::default(),
             ImageOcrConfigPartial::default(),
             ImageOcrConfigPartial::default(),
         );

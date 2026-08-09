@@ -4,7 +4,7 @@
   "title": "Pentect project plugin lock",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "plugin"],
+  "required": ["schema"],
   "properties": {
     "schema": { "const": "pentect.plugin-project-lock.v1" },
     "plugin": {

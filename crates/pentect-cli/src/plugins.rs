@@ -1132,12 +1132,20 @@ impl ProjectPluginMutationGuard {
                     guard_path.display()
                 )
             })?;
-        lock_project_file(&file).with_context(|| {
+        if !try_lock_project_file(&file).with_context(|| {
             format!(
-                "could not acquire project plugin lock guard '{}'",
+                "could not inspect project plugin lock guard '{}'",
                 guard_path.display()
             )
-        })?;
+        })? {
+            eprintln!("[pentect] waiting for another plugin operation to finish");
+            lock_project_file(&file).with_context(|| {
+                format!(
+                    "could not acquire project plugin lock guard '{}'",
+                    guard_path.display()
+                )
+            })?;
+        }
         Ok(Self {
             file,
             project_lock: project_lock.to_path_buf(),
@@ -1148,6 +1156,22 @@ impl ProjectPluginMutationGuard {
 impl Drop for ProjectPluginMutationGuard {
     fn drop(&mut self) {
         let _ = unlock_project_file(&self.file);
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_project_file(file: &File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    let raw = error.raw_os_error();
+    if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) {
+        Ok(false)
+    } else {
+        Err(error)
     }
 }
 
@@ -1168,6 +1192,36 @@ fn unlock_project_file(file: &File) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_project_file(file: &File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(false)
+    } else {
+        Err(error)
     }
 }
 

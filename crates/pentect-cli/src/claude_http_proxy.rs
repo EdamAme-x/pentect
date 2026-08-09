@@ -649,19 +649,17 @@ async fn hydrate_anthropic_attested_files_from_sources(
     .await
     .map_err(|_| "Claude file attestation task failed".to_string())??;
     for (id, coverage) in coverages {
-        let registry = files
+        let mut registry = files
             .lock()
             .map_err(|_| "Claude file registry lock was poisoned".to_string())?;
-        let already_known =
-            crate::http_files::scoped_file_coverage(&registry, account_scope, &id).is_some();
-        drop(registry);
-        if already_known {
-            continue;
+        if crate::http_files::scoped_file_coverage(&registry, account_scope, &id).is_none() {
+            crate::http_files::remember_scoped_file_coverage(
+                &mut registry,
+                account_scope,
+                id,
+                coverage,
+            );
         }
-        let mut files = files
-            .lock()
-            .map_err(|_| "Claude file registry lock was poisoned".to_string())?;
-        crate::http_files::remember_scoped_file_coverage(&mut files, account_scope, id, coverage);
     }
     Ok(())
 }

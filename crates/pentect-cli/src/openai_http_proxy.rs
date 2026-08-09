@@ -818,9 +818,25 @@ async fn known_openai_file_coverage(
     account_scope: &str,
     file_id: &str,
 ) -> Result<Option<crate::http_files::Coverage>, String> {
+    known_openai_file_coverage_from_sources(
+        &state.files,
+        &state.file_attestations,
+        state.upstream.as_str(),
+        account_scope,
+        file_id,
+    )
+    .await
+}
+
+async fn known_openai_file_coverage_from_sources(
+    files: &Mutex<HashMap<String, crate::http_files::Coverage>>,
+    attestations: &crate::http_files::FileAttestationStore,
+    upstream: &str,
+    account_scope: &str,
+    file_id: &str,
+) -> Result<Option<crate::http_files::Coverage>, String> {
     let in_memory = {
-        let registry = state
-            .files
+        let registry = files
             .lock()
             .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?;
         crate::http_files::scoped_file_coverage(&registry, account_scope, file_id)
@@ -828,8 +844,8 @@ async fn known_openai_file_coverage(
     if let Some(coverage) = in_memory {
         return Ok(Some(coverage));
     }
-    let attestations = state.file_attestations.clone();
-    let upstream = state.upstream.as_str().to_string();
+    let attestations = attestations.clone();
+    let upstream = upstream.to_string();
     let account_scope = account_scope.to_string();
     let file_id = file_id.to_string();
     let task_scope = account_scope.clone();
@@ -840,46 +856,13 @@ async fn known_openai_file_coverage(
     .await
     .map_err(|_| "OpenAI file attestation task failed".to_string())??;
     if let Some(coverage) = coverage {
-        let mut files = state
-            .files
-            .lock()
-            .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?;
-        crate::http_files::remember_scoped_file_coverage(
-            &mut files,
-            account_scope.as_str(),
-            file_id,
-            coverage,
-        );
-    }
-    Ok(coverage)
-}
-
-#[cfg(test)]
-fn known_openai_file_coverage_from_sources(
-    files: &Mutex<HashMap<String, crate::http_files::Coverage>>,
-    attestations: &crate::http_files::FileAttestationStore,
-    upstream: &str,
-    account_scope: &str,
-    file_id: &str,
-) -> Result<Option<crate::http_files::Coverage>, String> {
-    let registry = files
-        .lock()
-        .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?;
-    if let Some(coverage) =
-        crate::http_files::scoped_file_coverage(&registry, account_scope, file_id)
-    {
-        return Ok(Some(coverage));
-    }
-    drop(registry);
-    let coverage = attestations.coverage("openai", upstream, account_scope, file_id)?;
-    if let Some(coverage) = coverage {
         let mut files = files
             .lock()
             .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?;
         crate::http_files::remember_scoped_file_coverage(
             &mut files,
-            account_scope,
-            file_id.to_string(),
+            &account_scope,
+            file_id,
             coverage,
         );
     }
@@ -2264,8 +2247,8 @@ fn random_auth_token() -> Result<String, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn uploaded_file_coverage_is_reused_after_openai_registry_restart() {
+    #[tokio::test]
+    async fn uploaded_file_coverage_is_reused_after_openai_registry_restart() {
         const SCOPE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2297,6 +2280,7 @@ mod tests {
                 SCOPE,
                 "file-restart",
             )
+            .await
             .unwrap(),
             Some(crate::http_files::Coverage::Full)
         );
@@ -2312,6 +2296,7 @@ mod tests {
                 SCOPE,
                 "file-restart",
             )
+            .await
             .unwrap(),
             None
         );

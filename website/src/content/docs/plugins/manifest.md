@@ -115,7 +115,8 @@ settings. A plugin's own limits can only make its invocation stricter.
 Wasm modules are checked before compilation with `wasmi`'s strict untrusted
 module limits. At runtime Pentect permits one memory, one table, and one
 instance, caps memory at 64 MiB and table size at 4,096 elements, and uses a
-fuel budget for Wasm instructions. The chain deadline is also used by brokered
+fuel budget for Wasm instructions. Memory or table growth beyond those host
+caps traps the plugin. The chain deadline is also used by brokered
 HTTP calls. Fuel bounds compute work; it is not a general thread preemption
 mechanism for host code.
 

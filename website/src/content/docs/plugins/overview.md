@@ -44,8 +44,10 @@ Add it to the current project:
 pentect plugins add github:@EdamAme-x/pentect/plugins/example-regex@v0.1.0
 ```
 
-This writes the source to `.pentect/config.toml` and its exact content hashes
-to `pentect.plugins.lock`. Commit the lockfile with your project. A Wasm plugin
+This writes the source to `.pentect/config.toml`. The lockfile records that
+source, the normalized raw GitHub URL Pentect resolved, and the full SHA-256 of
+every fetched manifest and detector file. Commit `pentect.plugins.lock` with
+your project. A Wasm plugin
 also downloads its release file, checks its SHA-256 checksum and GitHub build
 record, and asks you to approve its hooks and network access.
 
