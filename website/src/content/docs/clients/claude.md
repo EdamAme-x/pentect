@@ -29,7 +29,6 @@ Prerequisites:
 | --- | --- |
 | `pentect claude` | One Claude Code process and its children |
 | `pentect claude app` | One supported Claude Desktop launch |
-| `pentect claude --upstream URL` | One CLI launch using a gateway that supports Messages |
 | `pentect claude --plugins NAME` | One launch with the selected plugin set |
 
 ## Use a clickable App launcher
@@ -52,9 +51,8 @@ to close it so the new process can receive the proxy settings.
 pentect claude app --remove-launcher
 ```
 
-The launcher uses normal App discovery and the default upstream. Use the
-terminal command when you need a one-time `--app`, `--upstream`, or `--plugins`
-option.
+The launcher uses normal App discovery and the default provider. Use the
+terminal command when you need a one-time `--app` or `--plugins` option.
 
 Normal Claude Code arguments pass through directly:
 
@@ -74,6 +72,8 @@ environment bindings. The instructions contain labels and syntax, not real
 secret values. Claude can use a binding directly in a tool call instead of
 rereading the source file.
 
+## Custom gateways
+
 ```sh
 pentect claude --upstream http://127.0.0.1:8080/anthropic
 ```
@@ -85,6 +85,9 @@ and completed tool calls.
 An endpoint that accepts similar JSON but does not implement Anthropic Messages
 and its streaming events is not supported. Put a compatible adapter in front of
 that endpoint and pass the adapter base URL with `--upstream`.
+
+See [Custom upstreams](/clients/upstreams/) for compatible gateway setup,
+credentials, and troubleshooting.
 
 ## Claude Desktop
 

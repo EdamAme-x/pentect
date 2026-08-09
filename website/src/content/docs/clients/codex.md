@@ -30,7 +30,6 @@ Prerequisites:
 | --- | --- |
 | `pentect codex` | One Codex CLI process and its children |
 | `pentect codex app` | One Codex App launch |
-| `pentect codex --upstream URL` | One CLI launch using a compatible gateway |
 | `pentect codex --plugins NAME` | One launch with the selected plugin set |
 
 ## Use a clickable App launcher
@@ -54,8 +53,7 @@ pentect codex app --remove-launcher
 ```
 
 The launcher uses normal App discovery and your current Codex provider. Use the
-terminal command when you need a one-time `--app`, `--upstream`, or `--plugins`
-option.
+terminal command when you need a one-time `--app` or `--plugins` option.
 
 Client flags do not need a separator:
 
@@ -75,7 +73,7 @@ Codex how to use handles and their local environment bindings. These
 instructions contain no real secret values. They prevent the agent from
 rereading a file only because it sees a handle.
 
-## Existing providers
+## Custom gateways
 
 Pentect keeps your current Codex provider when it uses a supported API format.
 You can also choose a provider or gateway for one launch:
@@ -89,7 +87,9 @@ selected provider still manage login details and credentials.
 
 An OpenAI Chat Completions endpoint is not enough. Codex needs the Responses
 request and streaming event format. Use an API adapter such as Bifrost when the
-model server exposes a different contract.
+model server exposes a different contract. See
+[Custom upstreams](/clients/upstreams/) for setup, credentials, and
+troubleshooting.
 
 ## Codex App
 
