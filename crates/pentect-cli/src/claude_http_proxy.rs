@@ -31,11 +31,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Semaphore};
 use zeroize::Zeroize;
 
+use crate::handle_contract::HANDLE_CONTRACT;
+
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PENDING_SSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INLINE_PDF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EXTRACTED_PDF_TEXT_BYTES: usize = 16 * 1024 * 1024;
-const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local secret handles. When a client tool needs the represented value, copy the handle byte-for-byte into the tool input. Do not alter, expand, guess, or expose the represented value. Handles are resolved only for client tool calls.";
 static WARNED_UNKNOWN_CONTENT_BLOCK: AtomicBool = AtomicBool::new(false);
 static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 static WARNED_PROVIDER_MCP_CREDENTIALS: AtomicBool = AtomicBool::new(false);

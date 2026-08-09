@@ -34,6 +34,8 @@ use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroize;
 
+use crate::handle_contract::HANDLE_CONTRACT;
+
 type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 
@@ -43,7 +45,6 @@ const MAX_CERTIFICATE_CACHE_ENTRIES: usize = 64;
 const MAX_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PENDING_UPLOADS: usize = 256;
 const MAX_IDS_PER_UPLOAD: usize = 16;
-const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local secret handles. Copy a handle byte-for-byte into a client tool call when the tool needs the represented value. Do not alter, expand, guess, or expose it.";
 
 pub(crate) fn cmd_claude_app(args: &[String]) -> i32 {
     match run_claude_app(args) {
@@ -1284,7 +1285,6 @@ fn protect_chat_request(
             local_response: Some(body),
         });
     }
-    inject_chat_contract(&mut value);
     let mut masker = masker
         .lock()
         .map_err(|_| "Claude App Chat masker lock was poisoned".to_string())?;
@@ -1302,6 +1302,9 @@ fn protect_chat_request(
             body: body.clone(),
             local_response: None,
         });
+    }
+    if crate::claude_http_proxy::value_contains_handle(&value) {
+        inject_chat_contract(&mut value);
     }
     let protected = serde_json::to_vec(&value)
         .map(Bytes::from)
