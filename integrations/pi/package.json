@@ -1,7 +1,7 @@
 {
   "name": "@pentect/pi",
   "version": "0.0.0",
-  "description": "Run Pi through Pentect's local HTTP protection",
+  "description": "Pentect provider extension for Pi",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -17,22 +17,23 @@
   "keywords": [
     "ai-security",
     "pi-coding-agent",
+    "pi-package",
     "secret-detection"
   ],
-  "bin": {
-    "pentect-pi": "bin/pentect-pi.js"
+  "pi": {
+    "extensions": [
+      "extensions/pentect.js"
+    ]
   },
   "files": [
-    "bin",
-    "lib",
+    "extensions",
     "README.md"
   ],
   "scripts": {
-    "check": "node --check bin/pentect-pi.js && node --check lib/command.js",
+    "check": "node --check extensions/pentect.js",
     "test": "node --test"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "0.73.1",
     "pentect": "0.0.0"
   },
   "engines": {

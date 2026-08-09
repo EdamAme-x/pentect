@@ -51,6 +51,16 @@ do not receive them.
 | Approved local tool | Receives restored values and runs with the user's existing permissions |
 | Wasm plugin | Receives only hook input and the host access shown during approval |
 
+## Where Pentect must run
+
+Pentect must run on the same machine as the client process that sends the model
+request. A loopback gateway on your laptop cannot protect an extension host,
+background agent, container, SSH session, or cloud task running elsewhere.
+
+For remote development, install Pentect on the remote host and start the agent
+through Pentect there. Do not expose Pentect's loopback URL or session token as
+a remote service.
+
 ## What Pentect does not guarantee
 
 - Finding every possible secret or type of personal data

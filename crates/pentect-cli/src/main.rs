@@ -817,15 +817,18 @@ fn cmd_view(args: &[String]) {
 }
 
 /// Long-lived provider backend for first-party integrations such as the
-/// VS Code LanguageModelChatProvider. Readiness is the only stdout record;
+/// VS Code provider and Pi extension. Readiness is the only stdout record;
 /// the process and its loopback gateway live until the parent closes stdin.
 fn cmd_provider(args: &[String]) -> i32 {
-    if args.get(2).map(String::as_str) != Some("vscode") {
-        die("provider requires the supported integration name `vscode`");
-    }
+    let integration = match args.get(2).map(String::as_str) {
+        Some("vscode") => "vscode",
+        Some("pi") => "pi",
+        _ => die("provider requires the supported integration name `vscode` or `pi`"),
+    };
     let mut upstream =
         nonempty_env("OPENAI_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".to_string());
     let mut model = "gpt-5".to_string();
+    let mut api = "openai-completions";
     let mut header_env = Vec::new();
     let mut index = 3;
     while index < args.len() {
@@ -844,6 +847,19 @@ fn cmd_provider(args: &[String]) -> i32 {
                     .filter(|value| !value.trim().is_empty())
                     .cloned()
                     .unwrap_or_else(|| die("--model requires a value"));
+                index += 2;
+            }
+            "--api" if integration == "pi" => {
+                api = match args.get(index + 1).map(String::as_str) {
+                    Some("chat" | "chat-completions" | "openai-completions") => {
+                        "openai-completions"
+                    }
+                    Some("responses" | "openai-responses") => "openai-responses",
+                    Some(value) => die(format!(
+                        "unsupported API format '{value}'; use --api chat or --api responses"
+                    )),
+                    None => die("--api requires a value"),
+                };
                 index += 2;
             }
             "--upstream-header-env" => {
@@ -871,8 +887,10 @@ fn cmd_provider(args: &[String]) -> i32 {
             .unwrap_or_else(|error| die_with_issue(error));
     let ready = serde_json::json!({
         "protocol": 1,
+        "integration": integration,
         "baseUrl": proxy.base_url(),
         "model": model,
+        "api": api,
     });
     println!("{ready}");
     std::io::stdout()

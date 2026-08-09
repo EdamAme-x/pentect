@@ -11,7 +11,7 @@ specific public CLI versions with the release binary.
 | Codex CLI `0.146.0` | Automatic test on Linux | `pentect codex` |
 | Claude Code `2.1.220` | Automatic test on Linux | `pentect claude` |
 | OpenCode `1.18.14` | Provider registration and model discovery on Windows | `pentect opencode` |
-| Pi `0.73.1` and `0.83.0` | Provider registration and model discovery on Windows | `pentect pi` |
+| Pi `0.84.1` | Launcher and npm extension provider discovery | `pentect pi` or `@pentect/pi` |
 | Antigravity CLI `1.1.11` | Cloud Code JSON, SSE, function calls, and endpoint override | `pentect antigravity` |
 | Aider | OpenAI-compatible launch and route override | `pentect aider` |
 | Continue CLI | Temporary config, Chat/Edit/Apply roles, and tool calls | `pentect continue` |

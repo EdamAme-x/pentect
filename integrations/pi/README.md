@@ -1,19 +1,23 @@
 # @pentect/pi
 
-Run [Pi](https://github.com/badlogic/pi-mono) through Pentect's local HTTP
-protection without changing Pi's saved configuration.
+Use [Pi](https://github.com/badlogic/pi-mono) with Pentect as a normal Pi
+extension. The extension starts Pentect's local gateway and registers one
+protected provider for the session.
 
 ```sh
-npx @pentect/pi --model openai/gpt-5
+pi install npm:@pentect/pi
+pi --model pentect/gpt-5
 ```
 
-For a permanent command:
+To try it without installing:
 
 ```sh
-npm install --global @pentect/pi
-pentect-pi --model openai/gpt-5
+pi -e npm:@pentect/pi --model pentect/gpt-5
 ```
 
-The package installs matching Pentect and Pi versions. It is a small launcher,
-not a prompt hook: requests go through the same loopback gateway as
-`pentect pi`.
+Set `PENTECT_PI_MODEL` before Pi starts to expose a different model. Set
+`PENTECT_PI_API=responses` for the OpenAI Responses API. `OPENAI_BASE_URL` and
+`OPENAI_API_KEY` configure the upstream.
+
+The JavaScript extension only manages Pi's provider lifecycle. Detection,
+handles, plugins, and network forwarding remain inside the Pentect binary.
