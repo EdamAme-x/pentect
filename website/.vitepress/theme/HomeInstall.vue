@@ -310,10 +310,12 @@ onMounted(() => {
     <p v-if="copyState === 'failed'" class="home-install__status" role="status">
       Select the command and copy it manually.
     </p>
-    <a class="home-install__next" href="/start/quick-start/">
-      <span>Installed?</span>
-      <strong>Continue to Quick start</strong>
-      <span aria-hidden="true">→</span>
-    </a>
+    <div class="home-install__next">
+      <span class="home-install__next-label">Installed?</span>
+      <a class="home-install__next-link" href="/start/quick-start/">
+        <span>Continue to Quick start</span>
+        <span aria-hidden="true">→</span>
+      </a>
+    </div>
   </section>
 </template>
