@@ -13,8 +13,8 @@ Or install Pi and the matching Pentect release together:
 npx @pentect/pi --model openai/gpt-5
 ```
 
-Pentect creates a small provider-only extension for this process and removes
-it when Pi exits. It does not install prompt hooks or edit Pi settings.
+Pentect protects this Pi launch only. It does not install prompt hooks or edit
+Pi settings.
 
 Normal Pi arguments pass through:
 
@@ -28,6 +28,8 @@ Chat Completions is the default. Responses can be selected explicitly:
 pentect pi --api responses --model gpt-5
 ```
 
+## Custom gateways
+
 Custom and local providers can be reached through an OpenAI-compatible
 gateway such as Bifrost:
 
@@ -36,5 +38,5 @@ pentect pi --model anthropic/claude-sonnet \
   --upstream http://127.0.0.1:8080/openai/v1
 ```
 
-The adapter contains no API key or gateway token. Those values remain in the
-child environment and the authenticated loopback URL.
+The temporary provider contains no API key or gateway token. See
+[Custom upstreams](/clients/upstreams/) for credentials and endpoint details.

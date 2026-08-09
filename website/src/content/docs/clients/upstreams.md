@@ -12,10 +12,14 @@ pentect codex --upstream http://127.0.0.1:8080/openai/v1
 pentect claude --upstream http://127.0.0.1:8080/anthropic
 pentect opencode --model anthropic/claude-sonnet --upstream http://127.0.0.1:8080/openai/v1
 pentect pi --model anthropic/claude-sonnet --upstream http://127.0.0.1:8080/openai/v1
+pentect antigravity --upstream https://cloud-code.example
 ```
 
 The URL applies to one launch. Pentect keeps its base path, masks the request,
 and then sends it to that gateway.
+
+You do not need a custom upstream for normal use. Each client keeps its usual
+provider and sign-in when `--upstream` is not supplied.
 
 ## Use Bifrost
 
@@ -91,6 +95,48 @@ and request logs remain available at `http://127.0.0.1:8080` and
 `http://127.0.0.1:8080/logs`. See the
 [Bifrost agent guide](https://docs.getbifrost.ai/cli-agents/overview) for
 provider setup, virtual keys, and model IDs.
+
+## Antigravity and Cloud Code
+
+Normal Antigravity use needs no endpoint setting:
+
+```sh
+pentect antigravity
+```
+
+If Antigravity already uses a compatible `CLOUD_CODE_URL`, Pentect keeps that
+endpoint behind its local gateway. You can override it for one launch with
+`--upstream`. This is for existing Cloud Code gateways, not normal Google
+sign-in.
+
+Add a custom gateway credential without placing its value in command history:
+
+::: code-group
+
+```powershell [PowerShell]
+$secret = Read-Host "Gateway token" -AsSecureString
+$env:PENTECT_GATEWAY_AUTH = [Net.NetworkCredential]::new('', $secret).Password
+pentect antigravity --upstream https://cloud-code.example `
+  --upstream-header-env Authorization=PENTECT_GATEWAY_AUTH
+```
+
+```sh [Shell]
+read -rsp "Gateway token: " PENTECT_GATEWAY_AUTH && echo
+export PENTECT_GATEWAY_AUTH
+pentect antigravity --upstream https://cloud-code.example \
+  --upstream-header-env Authorization=PENTECT_GATEWAY_AUTH
+```
+
+:::
+
+Pentect reads the credential, removes the source variable from `agy`, and adds
+the header only when contacting that upstream.
+
+## Existing endpoint settings
+
+Pentect also respects `OPENAI_BASE_URL` for OpenCode and `CLOUD_CODE_URL` for
+Antigravity when those variables already exist. You normally do not set them
+for Pentect. Use `--upstream` when you want an explicit one-launch override.
 
 ## Supported API formats
 
