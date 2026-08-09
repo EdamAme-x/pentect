@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
@@ -31,6 +32,13 @@ const MAX_TIMEOUT_MS: u64 = 60_000;
 const MAX_PLUGIN_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_SPANS: usize = 4096;
+// These are request-wide ceilings. Individual plugin limits still apply and
+// can only make an invocation stricter.
+const MAX_PLUGIN_CHAIN_DURATION: Duration = Duration::from_secs(60);
+const MAX_PLUGIN_CHAIN_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PLUGIN_CHAIN_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PLUGIN_CHAIN_SPANS: usize = 8192;
+const MAX_PLUGIN_CHAIN_NETWORK_REQUESTS: usize = 32;
 const PROTOCOL_SCHEMA: &str = "pentect.plugin.v1";
 pub const DEFAULT_PUBLISHER_WORKFLOW: &str = ".github/workflows/release.yml";
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -92,7 +100,9 @@ impl MiddlewareStage {
 }
 
 pub fn inspect_wasm_plugin_hooks(bytes: &[u8]) -> Result<Vec<String>, String> {
-    let engine = wasmi::Engine::default();
+    let mut config = wasmi::Config::default();
+    config.enforced_limits(wasmi::EnforcedLimits::strict());
+    let engine = wasmi::Engine::new(&config);
     let module = wasmi::Module::new(&engine, bytes)
         .map_err(|error| format!("WebAssembly plugin is invalid: {error}"))?;
     Ok(validated_module_hooks(&module, "WebAssembly plugin")?
@@ -204,6 +214,82 @@ pub struct DetectSpansRun {
     pub coverage: MiddlewareCoverage,
 }
 
+#[derive(Debug)]
+struct PluginChainBudget {
+    deadline: Instant,
+    input_bytes: usize,
+    output_bytes: usize,
+    spans: usize,
+    network_requests: Arc<AtomicUsize>,
+}
+
+impl PluginChainBudget {
+    fn new() -> Self {
+        Self {
+            deadline: Instant::now() + MAX_PLUGIN_CHAIN_DURATION,
+            input_bytes: 0,
+            output_bytes: 0,
+            spans: 0,
+            network_requests: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, String> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err("plugin chain deadline exceeded".to_string())
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    fn charge_input(&mut self, bytes: usize) -> Result<(), String> {
+        charge_chain_total(
+            &mut self.input_bytes,
+            bytes,
+            MAX_PLUGIN_CHAIN_INPUT_BYTES,
+            "input bytes",
+        )
+    }
+
+    fn charge_output(&mut self, bytes: usize) -> Result<(), String> {
+        charge_chain_total(
+            &mut self.output_bytes,
+            bytes,
+            MAX_PLUGIN_CHAIN_OUTPUT_BYTES,
+            "output bytes",
+        )
+    }
+
+    fn charge_spans(&mut self, spans: usize) -> Result<(), String> {
+        charge_chain_total(&mut self.spans, spans, MAX_PLUGIN_CHAIN_SPANS, "findings")
+    }
+}
+
+fn charge_chain_total(
+    current: &mut usize,
+    amount: usize,
+    limit: usize,
+    resource: &str,
+) -> Result<(), String> {
+    let next = current
+        .checked_add(amount)
+        .ok_or_else(|| format!("plugin chain {resource} limit exceeded"))?;
+    if next > limit {
+        return Err(format!("plugin chain {resource} limit exceeded"));
+    }
+    *current = next;
+    Ok(())
+}
+
+fn charge_chain_network_request(requests: &AtomicUsize) -> bool {
+    requests
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |requests| {
+            (requests < MAX_PLUGIN_CHAIN_NETWORK_REQUESTS).then_some(requests + 1)
+        })
+        .is_ok()
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PluginMiddleware {
     plugins: Vec<PluginBinary>,
@@ -239,10 +325,11 @@ impl PluginMiddleware {
     /// the actual ABI and handler, not only module loading.
     pub fn test_hooks(&self) -> Result<usize, String> {
         let mut invoked = 0;
+        let mut budget = PluginChainBudget::new();
         for plugin in &self.plugins {
             for hook in plugin.hooks.iter().copied() {
                 let payload = hook_test_input(hook);
-                let response = plugin.invoke(hook, &payload, None)?;
+                let response = plugin.invoke_bounded(hook, &payload, None, &mut budget)?;
                 if response.action == Action::Stop {
                     let outcome = response.outcome.unwrap_or(StopOutcomeFile::Block);
                     if matches!(outcome, StopOutcomeFile::Respond)
@@ -276,23 +363,25 @@ impl PluginMiddleware {
         context: Option<Value>,
     ) -> Result<MiddlewareRun, String> {
         let mut coverage = MiddlewareCoverage::Full;
+        let mut budget = PluginChainBudget::new();
         for plugin in self
             .plugins
             .iter()
             .filter(|plugin| plugin.hooks.contains(&hook))
         {
-            let response = match plugin.invoke(hook, &payload, context.as_ref()) {
-                Ok(response) => response,
-                Err(error) if !plugin.required => {
-                    coverage = MiddlewareCoverage::Partial;
-                    eprintln!(
-                        "[pentect] optional plugin '{}' skipped: {error}",
-                        plugin.name
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let response =
+                match plugin.invoke_bounded(hook, &payload, context.as_ref(), &mut budget) {
+                    Ok(response) => response,
+                    Err(error) if !plugin.required => {
+                        coverage = MiddlewareCoverage::Partial;
+                        eprintln!(
+                            "[pentect] optional plugin '{}' skipped: {error}",
+                            plugin.name
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
             let stop = if response.action == Action::Stop {
                 let outcome = response.outcome.unwrap_or(StopOutcomeFile::Block);
                 if matches!(outcome, StopOutcomeFile::Respond) && hook != MiddlewareStage::Request {
@@ -354,6 +443,7 @@ impl PluginMiddleware {
     ) -> Result<DetectSpansRun, String> {
         let mut spans = Vec::new();
         let mut coverage = MiddlewareCoverage::Full;
+        let mut budget = PluginChainBudget::new();
         let plugins = self
             .plugins
             .iter()
@@ -378,19 +468,23 @@ impl PluginMiddleware {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|error| format!("plugin context encode failed: {error}"))?;
-            let response =
-                match plugin.invoke(MiddlewareStage::Inspect, &payload, metadata.as_ref()) {
-                    Ok(response) => response,
-                    Err(error) if !plugin.required => {
-                        coverage = MiddlewareCoverage::Partial;
-                        eprintln!(
-                            "[pentect] optional plugin '{}' skipped: {error}",
-                            plugin.name
-                        );
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
+            let response = match plugin.invoke_bounded(
+                MiddlewareStage::Inspect,
+                &payload,
+                metadata.as_ref(),
+                &mut budget,
+            ) {
+                Ok(response) => response,
+                Err(error) if !plugin.required => {
+                    coverage = MiddlewareCoverage::Partial;
+                    eprintln!(
+                        "[pentect] optional plugin '{}' skipped: {error}",
+                        plugin.name
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if response.action == Action::Stop {
                 let outcome = response.outcome.unwrap_or(StopOutcomeFile::Block);
                 if matches!(outcome, StopOutcomeFile::Respond) {
@@ -437,6 +531,17 @@ impl PluginMiddleware {
                 }
                 coverage = MiddlewareCoverage::Partial;
                 eprintln!("[pentect] optional {error}");
+                continue;
+            }
+            if let Err(error) = budget.charge_spans(response.spans.len()) {
+                if plugin.required {
+                    return Err(format!("plugin '{}': {error}", plugin.name));
+                }
+                coverage = MiddlewareCoverage::Partial;
+                eprintln!(
+                    "[pentect] optional plugin '{}' skipped: {error}",
+                    plugin.name
+                );
                 continue;
             }
             let plugin_spans = response
@@ -598,11 +703,12 @@ impl PluginBinary {
         })
     }
 
-    fn invoke(
+    fn invoke_bounded(
         &self,
         hook: MiddlewareStage,
         payload: &Value,
         context: Option<&Value>,
+        budget: &mut PluginChainBudget,
     ) -> Result<PluginResponse, String> {
         let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let request = json!({
@@ -616,13 +722,26 @@ impl PluginBinary {
         if encoded.len() > self.max_input_bytes {
             return Err(format!("plugin '{}' input exceeds its limit", self.name));
         }
-        let output = self.wasm.invoke(
+        budget
+            .charge_input(encoded.len())
+            .map_err(|error| format!("plugin '{}': {error}", self.name))?;
+        let timeout = self.timeout.min(
+            budget
+                .remaining()
+                .map_err(|error| format!("plugin '{}': {error}", self.name))?,
+        );
+        let output = self.wasm.invoke_bounded(
             hook,
             &encoded,
-            self.timeout,
+            timeout,
             self.max_output_bytes,
             &self.name,
+            budget.deadline,
+            Arc::clone(&budget.network_requests),
         )?;
+        budget
+            .charge_output(output.len())
+            .map_err(|error| format!("plugin '{}': {error}", self.name))?;
         let response: PluginResponse = serde_json::from_slice(&output)
             .map_err(|error| format!("plugin '{}' returned invalid JSON: {error}", self.name))?;
         if response.schema.as_deref() != Some(PROTOCOL_SCHEMA)
@@ -792,6 +911,7 @@ impl WasmProgram {
     ) -> Result<Self, String> {
         let mut engine_config = wasmi::Config::default();
         engine_config.consume_fuel(true);
+        engine_config.enforced_limits(wasmi::EnforcedLimits::strict());
         let engine = wasmi::Engine::new(&engine_config);
         let module = wasmi::Module::new(&engine, bytes)
             .map_err(|error| format!("plugin '{name}' WebAssembly is invalid: {error}"))?;
@@ -820,6 +940,7 @@ impl WasmProgram {
         })
     }
 
+    #[cfg(test)]
     fn invoke(
         &self,
         hook: MiddlewareStage,
@@ -828,11 +949,35 @@ impl WasmProgram {
         max_output_bytes: usize,
         name: &str,
     ) -> Result<Vec<u8>, String> {
+        self.invoke_bounded(
+            hook,
+            request,
+            timeout,
+            max_output_bytes,
+            name,
+            Instant::now() + timeout,
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_bounded(
+        &self,
+        hook: MiddlewareStage,
+        request: &[u8],
+        timeout: Duration,
+        max_output_bytes: usize,
+        name: &str,
+        chain_deadline: Instant,
+        chain_network_requests: Arc<AtomicUsize>,
+    ) -> Result<Vec<u8>, String> {
         let limits = wasmi::StoreLimitsBuilder::new()
             .memory_size(WASM_MAX_MEMORY_BYTES)
+            .table_elements(4096)
             .memories(1)
             .instances(1)
             .tables(1)
+            .trap_on_grow_failure(true)
             .build();
         let started = Instant::now();
         let fuel = u64::try_from(timeout.as_millis())
@@ -845,8 +990,9 @@ impl WasmProgram {
                 limits,
                 network: self.network.clone(),
                 network_requests: 0,
+                chain_network_requests,
                 config: self.config.clone(),
-                deadline: started + timeout,
+                deadline: (started + timeout).min(chain_deadline),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -915,6 +1061,7 @@ struct WasmHostState {
     limits: wasmi::StoreLimits,
     network: Option<NetworkPolicy>,
     network_requests: usize,
+    chain_network_requests: Arc<AtomicUsize>,
     config: Option<toml::Value>,
     deadline: Instant,
 }
@@ -1066,6 +1213,9 @@ fn wasm_http_request(
     let policy = caller.data().network.clone();
     let request_allowed = policy.as_ref().is_some_and(|policy| {
         if caller.data().network_requests >= policy.max_requests {
+            return false;
+        }
+        if !charge_chain_network_request(&caller.data().chain_network_requests) {
             return false;
         }
         caller.data_mut().network_requests += 1;
@@ -1945,6 +2095,43 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn wasm_plugin_enforces_compile_limits() {
+        let parameters = (0..33).map(|_| "i32").collect::<Vec<_>>().join(" ");
+        let bytes = wat::parse_str(format!(
+            "(module (func (param {parameters})) (memory (export \"memory\") 1) \
+             (func (export \"pentect_alloc\") (param i32) (result i32) i32.const 0) \
+             (func (export \"pentect_inspect\") (param i32 i32) (result i64) i64.const 0))"
+        ))
+        .unwrap();
+        let error = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap_err();
+        assert!(error.contains("exceeds the limit"), "{error}");
+        assert!(inspect_wasm_plugin_hooks(&bytes).is_err());
+    }
+
+    #[test]
+    fn plugin_chain_budget_is_aggregate_and_fail_before_mutation() {
+        let mut budget = PluginChainBudget::new();
+        budget
+            .charge_input(MAX_PLUGIN_CHAIN_INPUT_BYTES - 1)
+            .unwrap();
+        assert!(budget.charge_input(2).is_err());
+        assert_eq!(budget.input_bytes, MAX_PLUGIN_CHAIN_INPUT_BYTES - 1);
+
+        budget.charge_output(MAX_PLUGIN_CHAIN_OUTPUT_BYTES).unwrap();
+        assert!(budget.charge_output(1).is_err());
+        budget.charge_spans(MAX_PLUGIN_CHAIN_SPANS).unwrap();
+        assert!(budget.charge_spans(1).is_err());
+
+        budget.deadline = Instant::now();
+        assert!(budget.remaining().is_err());
+
+        for _ in 0..MAX_PLUGIN_CHAIN_NETWORK_REQUESTS {
+            assert!(charge_chain_network_request(&budget.network_requests));
+        }
+        assert!(!charge_chain_network_request(&budget.network_requests));
     }
 
     #[test]

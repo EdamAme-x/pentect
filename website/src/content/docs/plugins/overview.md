@@ -32,21 +32,28 @@ pentect plugins search
 pentect plugins search privacy
 ```
 
-Inspect a plugin before you add it:
+Inspect a released version before you add it:
 
 ```sh
-pentect plugins inspect github:@EdamAme-x/pentect/plugins/example-regex
+pentect plugins inspect github:@EdamAme-x/pentect/plugins/example-regex@v0.1.0
 ```
 
 Add it to the current project:
 
 ```sh
-pentect plugins add github:@EdamAme-x/pentect/plugins/example-regex
+pentect plugins add github:@EdamAme-x/pentect/plugins/example-regex@v0.1.0
 ```
 
-This writes the source to `.pentect/config.toml`. A Wasm plugin also downloads
-its release file, checks its SHA-256 checksum and GitHub build record, and asks
-you to approve its hooks and network access.
+This writes the source to `.pentect/config.toml`. The lockfile records that
+source, the normalized raw GitHub URL Pentect resolved, and the full SHA-256 of
+every fetched manifest and detector file. Commit `pentect.plugins.lock` with
+your project. A Wasm plugin
+also downloads its release file, checks its SHA-256 checksum and GitHub build
+record, and asks you to approve its hooks and network access.
+
+The `@VERSION` suffix selects a tag or full commit. When an older unversioned
+source uses `main`, Pentect treats the lockfile's content hashes—not `main`—as
+its runtime identity. Only `plugins update` can replace those locked bytes.
 
 Released Wasm plugins need
 [GitHub CLI](https://cli.github.com/) v2.51.0 or newer for build-record checks.
@@ -55,11 +62,13 @@ Regex plugins do not need it.
 Use a plugin for only one launch without changing the project:
 
 ```sh
-pentect codex --plugins github:@owner/repository/path
+pentect codex --plugins github:@owner/repository/path@0123456789abcdef0123456789abcdef01234567
 pentect claude --plugins ./my-plugin
 ```
 
-Separate more than one plugin with commas.
+Separate more than one plugin with commas. A one-off remote plugin must use a
+full 40-character commit. Tags can move, so tag-based sources must first be
+added to the project and pinned by `pentect.plugins.lock`.
 
 ## How plugins run
 

@@ -13,6 +13,7 @@ specific public CLI versions with the release binary.
 | OpenCode `1.18.14` | Provider registration and model discovery on Windows | `pentect opencode` |
 | Pi `0.73.1` and `0.83.0` | Provider registration and model discovery on Windows | `pentect pi` |
 | Antigravity CLI `1.1.11` | Cloud Code JSON, SSE, function calls, and endpoint override | `pentect antigravity` |
+| Aider | OpenAI-compatible launch and route override | `pentect aider` |
 | ChatGPT desktop app, Codex mode | Launcher and Responses protocol tests | `pentect codex app` |
 | Claude Desktop, supported Chat, attachment, and Code routes | Launcher and protocol tests | `pentect claude app` |
 
@@ -26,6 +27,7 @@ links, broken data, and custom gateway paths.
 | `pentect codex` | OpenAI Responses | Includes streaming events and completed tool calls |
 | `pentect claude` | Anthropic Messages | Includes streaming content blocks and tool use |
 | `pentect antigravity` | Google Cloud Code | Includes streaming content, function calls, inline data, and telemetry JSON |
+| `pentect aider` | OpenAI Chat Completions | Main, weak, and editor model routes use the same local gateway |
 | `pentect codex app` | Responses routes used by supported Codex mode | Other ChatGPT modes are outside this claim |
 | `pentect claude app` | Supported Claude Chat, attachment, and Code routes | Cowork and Voice are outside this claim |
 

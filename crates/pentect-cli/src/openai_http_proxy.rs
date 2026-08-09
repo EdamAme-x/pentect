@@ -31,6 +31,10 @@ const MAX_CHAT_TOOL_CALLS: usize = 1024;
 const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local secret handles. Copy a handle byte-for-byte into a client function call when that function needs the represented value. Do not alter, expand, guess, or expose it. Pentect resolves handles only in completed client function-call arguments.";
 static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 
+fn proxy_diagnostic(reason: &str) {
+    pentect_agent::record_diagnostic_activity("openai", reason);
+}
+
 type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 type UpstreamByteStream =
@@ -76,7 +80,8 @@ impl OpenAiHttpProxyGuard {
                 if let Err(error) =
                     run_proxy(upstream, headers, thread_auth, ready_tx, shutdown_rx).await
                 {
-                    eprintln!("[pentect] OpenAI HTTP gateway stopped: {error}");
+                    let _ = error;
+                    proxy_diagnostic("gateway-stopped");
                 }
             });
         });
@@ -114,6 +119,7 @@ struct ProxyState {
     masker: Arc<Mutex<pentect_agent::ActiveToolOutputMasker>>,
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     files: Mutex<HashMap<String, crate::http_files::Coverage>>,
+    file_attestations: crate::http_files::FileAttestationStore,
     requests: Arc<Semaphore>,
     block_unknown_formats: bool,
     headers: crate::upstream::HeaderOverrides,
@@ -149,6 +155,7 @@ async fn run_proxy(
         )),
         plugins: Arc::new(Mutex::new(plugins)),
         files: Mutex::new(HashMap::new()),
+        file_attestations: crate::http_files::FileAttestationStore::open_default()?,
         requests: Arc::new(Semaphore::new(32)),
         block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
         headers,
@@ -174,7 +181,8 @@ async fn run_proxy(
                         .await
                     {
                         if !error.is_incomplete_message() {
-                            eprintln!("[pentect] OpenAI HTTP gateway connection failed: {error}");
+                            let _ = error;
+                            proxy_diagnostic("connection-failed");
                         }
                     }
                 });
@@ -201,7 +209,7 @@ async fn proxy_request(
     match proxy_request_inner(request, &state).await {
         Ok(response) => Ok(response),
         Err(error) => {
-            eprintln!("[pentect] OpenAI HTTP gateway request failed: {error}");
+            proxy_diagnostic("request-failed");
             let local_rejection = error.starts_with("image blocked:")
                 || error.starts_with("document blocked:")
                 || error.starts_with("remote ")
@@ -251,6 +259,8 @@ async fn proxy_request_inner(
     let files_upload = method == hyper::Method::POST && endpoint == OpenAiEndpoint::FilesCollection;
     let upstream_url = join_upstream_url(&state.upstream, path_and_query)?;
     let headers = request.headers().clone();
+    let credential_material = state.headers.credential_scope_material(&headers);
+    let account_scope = state.file_attestations.account_scope(&credential_material);
     let mut request_coverage = None;
     let mut request_streaming = false;
     let body = if protected_request || files_upload {
@@ -300,15 +310,25 @@ async fn proxy_request_inner(
                 .ok()
                 .and_then(|value| value.get("stream").and_then(Value::as_bool))
                 .unwrap_or(false);
-            let original = resolve_openai_file_references(body, state, &headers).await?;
-            let original = resolve_openai_remote_files(original).await?;
+            let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
+            let original = resolve_openai_file_references(
+                body,
+                state,
+                &headers,
+                &account_scope,
+                &mut remote_budget,
+            )
+            .await?;
+            let original = resolve_openai_remote_files(original, &mut remote_budget).await?;
             let masker = Arc::clone(&state.masker);
             let plugins = Arc::clone(&state.plugins);
-            let files = state
-                .files
-                .lock()
-                .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
-                .clone();
+            let files = {
+                let registry = state
+                    .files
+                    .lock()
+                    .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?;
+                crate::http_files::scoped_file_coverages(&registry, &account_scope)
+            };
             let block_unknown_formats = state.block_unknown_formats;
             let protected = tokio::task::spawn_blocking(move || {
                 protect_openai_request_body(
@@ -424,11 +444,31 @@ async fn proxy_request_inner(
             serde_json::from_slice::<Value>(&response_body),
         ) {
             if let Some(id) = value.get("id").and_then(Value::as_str) {
-                let mut files = state
-                    .files
-                    .lock()
-                    .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?;
-                crate::http_files::remember_file_coverage(&mut files, id.to_string(), coverage);
+                if state
+                    .file_attestations
+                    .remember_async(
+                        "openai",
+                        state.upstream.as_str(),
+                        &account_scope,
+                        id,
+                        coverage,
+                    )
+                    .await
+                    .is_err()
+                {
+                    eprintln!(
+                        "[pentect] file attestation unavailable; uploaded file remains untrusted"
+                    );
+                } else if let Ok(mut files) = state.files.lock() {
+                    crate::http_files::remember_scoped_file_coverage(
+                        &mut files,
+                        &account_scope,
+                        id.to_string(),
+                        coverage,
+                    );
+                } else {
+                    eprintln!("[pentect] uploaded file registry unavailable; persistent attestation retained");
+                }
             }
         }
     }
@@ -443,7 +483,8 @@ async fn proxy_request_inner(
             match rewritten {
                 Ok(rewritten) => Bytes::from(rewritten),
                 Err(error) => {
-                    eprintln!("[pentect] OpenAI response restoration skipped: {error}");
+                    let _ = error;
+                    proxy_diagnostic("response-restore-skipped");
                     response_body
                 }
             }
@@ -574,7 +615,8 @@ fn protect_openai_request_body(
                     "unknown format blocked: OpenAI request is not valid JSON ({error}); set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
                 ));
             }
-            eprintln!("[pentect] OpenAI request protection skipped: invalid JSON: {error}");
+            let _ = error;
+            proxy_diagnostic("request-invalid-json");
             return Ok(ProtectedJsonBody {
                 body: body.clone(),
                 coverage: crate::http_files::Coverage::Partial,
@@ -629,7 +671,8 @@ fn protect_openai_request_body(
                 "unknown format blocked: OpenAI request could not be fully inspected ({error}); set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through"
             ));
         }
-        eprintln!("[pentect] OpenAI request protection skipped: {error}");
+        let _ = error;
+        proxy_diagnostic("request-protection-skipped");
         return Ok(ProtectedJsonBody {
             body: body.clone(),
             coverage: crate::http_files::Coverage::Partial,
@@ -656,12 +699,15 @@ async fn resolve_openai_file_references(
     body: Bytes,
     state: &ProxyState,
     request_headers: &hyper::HeaderMap,
+    account_scope: &str,
+    budget: &mut crate::remote_content::RemoteRequestBudget,
 ) -> Result<Bytes, String> {
     let mut value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return Ok(body),
     };
-    resolve_openai_file_reference_values(&mut value, state, request_headers).await?;
+    resolve_openai_file_reference_values(&mut value, state, request_headers, account_scope, budget)
+        .await?;
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| "could not encode resolved file reference".to_string())
@@ -671,12 +717,21 @@ fn resolve_openai_file_reference_values<'a>(
     value: &'a mut Value,
     state: &'a ProxyState,
     request_headers: &'a hyper::HeaderMap,
+    account_scope: &'a str,
+    budget: &'a mut crate::remote_content::RemoteRequestBudget,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    resolve_openai_file_reference_values(value, state, request_headers).await?;
+                    resolve_openai_file_reference_values(
+                        value,
+                        state,
+                        request_headers,
+                        account_scope,
+                        budget,
+                    )
+                    .await?;
                 }
             }
             Value::Object(object) => {
@@ -688,15 +743,12 @@ fn resolve_openai_file_reference_values<'a>(
                         .and_then(Value::as_str)
                         .map(str::to_string);
                     if let Some(file_id) = file_id {
-                        let known = state
-                            .files
-                            .lock()
-                            .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
-                            .get(&file_id)
-                            .copied();
+                        let known =
+                            known_openai_file_coverage(state, account_scope, &file_id).await?;
                         if known != Some(crate::http_files::Coverage::Full) {
                             let mut remote =
-                                fetch_openai_file_content(&file_id, state, request_headers).await?;
+                                fetch_openai_file_content(&file_id, state, request_headers, budget)
+                                    .await?;
                             let encoded = data_encoding::BASE64.encode(&remote.bytes);
                             remote.bytes.zeroize();
                             if let Some(file) =
@@ -723,17 +775,14 @@ fn resolve_openai_file_reference_values<'a>(
                         .and_then(Value::as_str)
                         .map(str::to_string)
                     {
-                        let known = state
-                            .files
-                            .lock()
-                            .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?
-                            .get(&file_id)
-                            .copied();
+                        let known =
+                            known_openai_file_coverage(state, account_scope, &file_id).await?;
                         if known == Some(crate::http_files::Coverage::Full) {
                             return Ok(());
                         }
                         let mut remote =
-                            fetch_openai_file_content(&file_id, state, request_headers).await?;
+                            fetch_openai_file_content(&file_id, state, request_headers, budget)
+                                .await?;
                         let encoded = data_encoding::BASE64.encode(&remote.bytes);
                         remote.bytes.zeroize();
                         object.remove("file_id");
@@ -748,7 +797,14 @@ fn resolve_openai_file_reference_values<'a>(
                     }
                 }
                 for value in object.values_mut() {
-                    resolve_openai_file_reference_values(value, state, request_headers).await?;
+                    resolve_openai_file_reference_values(
+                        value,
+                        state,
+                        request_headers,
+                        account_scope,
+                        budget,
+                    )
+                    .await?;
                 }
             }
             _ => {}
@@ -757,10 +813,67 @@ fn resolve_openai_file_reference_values<'a>(
     })
 }
 
+async fn known_openai_file_coverage(
+    state: &ProxyState,
+    account_scope: &str,
+    file_id: &str,
+) -> Result<Option<crate::http_files::Coverage>, String> {
+    known_openai_file_coverage_from_sources(
+        &state.files,
+        &state.file_attestations,
+        state.upstream.as_str(),
+        account_scope,
+        file_id,
+    )
+    .await
+}
+
+async fn known_openai_file_coverage_from_sources(
+    files: &Mutex<HashMap<String, crate::http_files::Coverage>>,
+    attestations: &crate::http_files::FileAttestationStore,
+    upstream: &str,
+    account_scope: &str,
+    file_id: &str,
+) -> Result<Option<crate::http_files::Coverage>, String> {
+    let in_memory = {
+        let registry = files
+            .lock()
+            .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?;
+        crate::http_files::scoped_file_coverage(&registry, account_scope, file_id)
+    };
+    if let Some(coverage) = in_memory {
+        return Ok(Some(coverage));
+    }
+    let attestations = attestations.clone();
+    let upstream = upstream.to_string();
+    let account_scope = account_scope.to_string();
+    let file_id = file_id.to_string();
+    let task_scope = account_scope.clone();
+    let task_file_id = file_id.clone();
+    let coverage = tokio::task::spawn_blocking(move || {
+        attestations.coverage("openai", &upstream, &task_scope, &task_file_id)
+    })
+    .await
+    .map_err(|_| "OpenAI file attestation task failed".to_string())??;
+    if let Some(coverage) = coverage {
+        let mut files = files
+            .lock()
+            .map_err(|_| "OpenAI file registry lock was poisoned".to_string())?;
+        crate::http_files::remember_scoped_file_coverage(
+            &mut files,
+            &account_scope,
+            file_id,
+            coverage,
+        );
+    }
+    Ok(coverage)
+}
+
 async fn fetch_openai_file_content(
     file_id: &str,
     state: &ProxyState,
     request_headers: &hyper::HeaderMap,
+    budget: &mut crate::remote_content::RemoteRequestBudget,
 ) -> Result<crate::remote_content::RemoteContent, String> {
     if file_id.is_empty()
         || file_id.len() > 200
@@ -770,6 +883,7 @@ async fn fetch_openai_file_content(
     {
         return Err("OpenAI file ID is invalid".to_string());
     }
+    budget.begin()?;
     let path = format!("/files/{file_id}/content");
     let url = join_upstream_url(&state.upstream, &path)?;
     let mut request = state.client.get(url);
@@ -799,6 +913,9 @@ async fn fetch_openai_file_content(
     {
         return Err("OpenAI file is too large to inspect".to_string());
     }
+    if let Some(length) = response.content_length() {
+        budget.check_declared_size(length)?;
+    }
     let media_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -827,6 +944,10 @@ async fn fetch_openai_file_content(
             bytes.zeroize();
             return Err("OpenAI file is too large to inspect".to_string());
         }
+        if let Err(error) = budget.consume(chunk.len()) {
+            bytes.zeroize();
+            return Err(error);
+        }
         bytes.extend_from_slice(&chunk);
     }
     Ok(crate::remote_content::RemoteContent {
@@ -836,25 +957,29 @@ async fn fetch_openai_file_content(
     })
 }
 
-async fn resolve_openai_remote_files(body: Bytes) -> Result<Bytes, String> {
+async fn resolve_openai_remote_files(
+    body: Bytes,
+    budget: &mut crate::remote_content::RemoteRequestBudget,
+) -> Result<Bytes, String> {
     let mut value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return Ok(body),
     };
-    resolve_openai_remote_file_values(&mut value).await?;
+    resolve_openai_remote_file_values(&mut value, budget).await?;
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| "could not encode resolved remote attachment".to_string())
 }
 
-fn resolve_openai_remote_file_values(
-    value: &mut Value,
-) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+fn resolve_openai_remote_file_values<'a>(
+    value: &'a mut Value,
+    budget: &'a mut crate::remote_content::RemoteRequestBudget,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    resolve_openai_remote_file_values(value).await?;
+                    resolve_openai_remote_file_values(value, budget).await?;
                 }
             }
             Value::Object(object) => {
@@ -868,7 +993,8 @@ fn resolve_openai_remote_file_values(
                         .filter(|url| !url.starts_with("data:"))
                         .map(str::to_string);
                     if let Some(url) = url {
-                        let mut remote = crate::remote_content::fetch(&url).await?;
+                        let mut remote =
+                            crate::remote_content::fetch_with_budget(&url, budget).await?;
                         if !remote.media_type.starts_with("image/") {
                             remote.bytes.zeroize();
                             return Err("remote image URL did not return an image".to_string());
@@ -895,7 +1021,8 @@ fn resolve_openai_remote_file_values(
                         .and_then(Value::as_str)
                         .map(str::to_string)
                     {
-                        let mut remote = crate::remote_content::fetch(&url).await?;
+                        let mut remote =
+                            crate::remote_content::fetch_with_budget(&url, budget).await?;
                         let encoded = data_encoding::BASE64.encode(&remote.bytes);
                         remote.bytes.zeroize();
                         object.remove("file_url");
@@ -915,7 +1042,8 @@ fn resolve_openai_remote_file_values(
                         .filter(|url| !url.starts_with("data:"))
                         .map(str::to_string)
                     {
-                        let mut remote = crate::remote_content::fetch(&url).await?;
+                        let mut remote =
+                            crate::remote_content::fetch_with_budget(&url, budget).await?;
                         if !remote.media_type.starts_with("image/") {
                             remote.bytes.zeroize();
                             return Err("remote image URL did not return an image".to_string());
@@ -930,7 +1058,7 @@ fn resolve_openai_remote_file_values(
                     }
                 }
                 for value in object.values_mut() {
-                    resolve_openai_remote_file_values(value).await?;
+                    resolve_openai_remote_file_values(value, budget).await?;
                 }
             }
             _ => {}
@@ -1554,9 +1682,7 @@ fn streaming_response_body(
                             ))));
                             continue;
                         }
-                        eprintln!(
-                            "[pentect] OpenAI SSE restoration disabled: event exceeded limit"
-                        );
+                        proxy_diagnostic("sse-event-limit");
                         state.transform = StreamTransform::None;
                         let mut pending = std::mem::take(&mut state.pending);
                         pending.extend_from_slice(&chunk);
@@ -1870,7 +1996,8 @@ fn rewrite_openai_sse_block(
     run_openai_tool_plugins(&mut value, &plugins)?;
     let mut resolve = crate::claude_http_proxy::request_scoped_resolver();
     if let Err(error) = rewrite_function_calls(&mut value, &mut resolve) {
-        eprintln!("[pentect] OpenAI SSE restoration skipped: {error}");
+        let _ = error;
+        proxy_diagnostic("sse-restore-skipped");
         return Ok(Bytes::copy_from_slice(block));
     }
     let Ok(encoded) = serde_json::to_string(&value) else {
@@ -1989,7 +2116,7 @@ fn enforce_known_openai_endpoint(
         return Err("unknown format blocked: OpenAI endpoint is not supported; set compatibility.unknown_formats = \"ignore\" in ~/.pentect/config.toml to pass it through".to_string());
     }
     if !WARNED_UNKNOWN_ENDPOINT.swap(true, Ordering::Relaxed) {
-        eprintln!("[pentect] unknown OpenAI endpoint passed through without content inspection");
+        proxy_diagnostic("unknown-endpoint");
     }
     Ok(())
 }
@@ -2119,6 +2246,62 @@ fn random_auth_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn uploaded_file_coverage_is_reused_after_openai_registry_restart() {
+        const SCOPE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-openai-attestation-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = crate::http_files::FileAttestationStore::open(&root).unwrap();
+        store
+            .remember(
+                "openai",
+                "https://gateway.example/v1",
+                SCOPE,
+                "file-restart",
+                crate::http_files::Coverage::Full,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = crate::http_files::FileAttestationStore::open(&root).unwrap();
+        let files = Mutex::new(HashMap::new());
+        assert_eq!(
+            known_openai_file_coverage_from_sources(
+                &files,
+                &reopened,
+                "https://gateway.example/v1",
+                SCOPE,
+                "file-restart",
+            )
+            .await
+            .unwrap(),
+            Some(crate::http_files::Coverage::Full)
+        );
+        assert_eq!(
+            crate::http_files::scoped_file_coverage(&files.lock().unwrap(), SCOPE, "file-restart"),
+            Some(crate::http_files::Coverage::Full)
+        );
+        assert_eq!(
+            known_openai_file_coverage_from_sources(
+                &Mutex::new(HashMap::new()),
+                &reopened,
+                "https://other.example/v1",
+                SCOPE,
+                "file-restart",
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn known_openai_endpoints_are_classified_before_forwarding() {

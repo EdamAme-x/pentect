@@ -21,7 +21,7 @@ pub(crate) struct HeaderOverrides {
 
 impl HeaderOverrides {
     pub(crate) fn forward_incoming_header(&self, name: &str) -> bool {
-        !(self.suppress_origin_auth && is_origin_auth_header(name))
+        !(self.suppress_origin_auth && is_replaceable_origin_auth_header(name))
             && !self
                 .values
                 .iter()
@@ -36,6 +36,49 @@ impl HeaderOverrides {
         }
         request
     }
+
+    /// Canonical, short-lived input used to bind local file attestations to
+    /// the effective upstream identity. The caller must hash this with a
+    /// local keyed digest and discard it; it must never be persisted or logged.
+    pub(crate) fn credential_scope_material(
+        &self,
+        incoming: &hyper::HeaderMap,
+    ) -> zeroize::Zeroizing<Vec<u8>> {
+        let mut fields = Vec::<(Vec<u8>, Vec<u8>)>::new();
+        for (name, value) in incoming {
+            if is_origin_auth_header(name.as_str()) && self.forward_incoming_header(name.as_str()) {
+                fields.push((
+                    name.as_str().to_ascii_lowercase().into_bytes(),
+                    value.as_bytes().to_vec(),
+                ));
+            }
+        }
+        for override_header in &self.values {
+            if let Some(value) = &override_header.value {
+                fields.push((
+                    override_header
+                        .name
+                        .as_str()
+                        .to_ascii_lowercase()
+                        .into_bytes(),
+                    value.as_bytes().to_vec(),
+                ));
+            }
+        }
+        fields.sort();
+        let mut material = zeroize::Zeroizing::new(Vec::new());
+        for (name, mut value) in fields {
+            append_scope_field(&mut material, &name);
+            append_scope_field(&mut material, &value);
+            value.zeroize();
+        }
+        material
+    }
+}
+
+fn append_scope_field(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
 }
 
 pub(crate) fn header_overrides(specs: &[String]) -> Result<HeaderOverrides, String> {
@@ -117,6 +160,11 @@ fn is_origin_auth_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("x-api-key")
         || name.eq_ignore_ascii_case("api-key")
         || name.eq_ignore_ascii_case("x-goog-api-key")
+        || name.eq_ignore_ascii_case("cookie")
+}
+
+fn is_replaceable_origin_auth_header(name: &str) -> bool {
+    is_origin_auth_header(name) && !name.eq_ignore_ascii_case("cookie")
 }
 
 fn sensitive_header_value(

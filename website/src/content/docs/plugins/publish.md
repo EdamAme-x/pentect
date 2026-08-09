@@ -75,7 +75,7 @@ Users can then install it with:
 
 ```sh
 pentect plugins add \
-  https://raw.githubusercontent.com/OWNER/REPOSITORY/main/plugin.toml
+  https://raw.githubusercontent.com/OWNER/REPOSITORY/v0.1.0/plugin.toml
 ```
 
 The short `github:@OWNER/REPOSITORY/path` form needs a path because it points
@@ -92,10 +92,18 @@ plugin again.
 For a plugin inside a larger repository, add the path:
 
 ```sh
-pentect plugins add github:@OWNER/REPOSITORY/plugins/my-plugin
+pentect plugins add github:@OWNER/REPOSITORY/plugins/my-plugin@v0.1.0
 ```
 
 The release asset still comes from `repository` in the manifest.
+
+Pentect records the configured source, its normalized raw GitHub URL, and every
+fetched manifest and detector file with its full SHA-256 digest in
+`pentect.plugins.lock`. Commit this file. Normal runs
+verify the cached bytes and never treat a moving `main` branch as the plugin's
+identity. `plugins update` fetches new bytes, shows detector label, category,
+confidence, and rule-digest changes, and rolls the source and project lock back
+when review or installation fails.
 
 ## Updates and approval
 
@@ -110,11 +118,12 @@ approved access can update without changing the saved manifest approval.
 Do not replace files in an old release. Publish a new tag so users can review
 changes clearly.
 
-Pentect currently follows the latest release and does not offer a plugin
-version pin or rollback command. If an update is bad, remove or disable the
-plugin and publish a corrected release. Do not copy an older Wasm into the
-cache: its checksum and GitHub build record must agree with the release that
-Pentect verifies.
+Manifest and detector sources can be pinned to a tag or commit. The Wasm asset
+currently follows the repository's latest release; Pentect does not yet offer
+a binary-release pin or rollback command. If an update is bad, remove or
+disable the plugin and publish a corrected release. Do not copy an older Wasm
+into the cache: its checksum and GitHub build record must agree with the
+release that Pentect verifies.
 
 ## Add a plugin to the Pentect catalog
 

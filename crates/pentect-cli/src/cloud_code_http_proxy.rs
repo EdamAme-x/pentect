@@ -251,6 +251,8 @@ async fn proxy_request_inner(
             }
             Err(error) => return Err(format!("could not read Google Cloud Code request: {error}")),
         };
+        let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
+        let body = resolve_cloud_code_remote_files(body, &mut remote_budget).await?;
         let protected = protect_request_body(
             &body,
             endpoint,
@@ -350,6 +352,65 @@ async fn proxy_request_inner(
     builder
         .body(full_body(Bytes::from(rewritten)))
         .map_err(|error| format!("could not build Google Cloud Code response: {error}"))
+}
+
+async fn resolve_cloud_code_remote_files(
+    body: Bytes,
+    budget: &mut crate::remote_content::RemoteRequestBudget,
+) -> Result<Bytes, String> {
+    let mut value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return Ok(body),
+    };
+    resolve_cloud_code_remote_values(&mut value, budget).await?;
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| "could not encode resolved Google Cloud Code attachment".to_string())
+}
+
+fn resolve_cloud_code_remote_values<'a>(
+    value: &'a mut Value,
+    budget: &'a mut crate::remote_content::RemoteRequestBudget,
+) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    resolve_cloud_code_remote_values(value, budget).await?;
+                }
+            }
+            Value::Object(object) => {
+                if let Some(file_data) = object.get("fileData").and_then(Value::as_object) {
+                    let uri = file_data
+                        .get("fileUri")
+                        .or_else(|| file_data.get("file_uri"))
+                        .and_then(Value::as_str)
+                        .filter(|uri| uri.starts_with("https://"))
+                        .map(str::to_string);
+                    if let Some(uri) = uri {
+                        let mut remote =
+                            crate::remote_content::fetch_with_budget(&uri, budget).await?;
+                        let encoded = data_encoding::BASE64.encode(&remote.bytes);
+                        remote.bytes.zeroize();
+                        object.remove("fileData");
+                        object.insert(
+                            "inlineData".to_string(),
+                            serde_json::json!({
+                                "mimeType": remote.media_type,
+                                "data": encoded,
+                            }),
+                        );
+                        return Ok(());
+                    }
+                }
+                for value in object.values_mut() {
+                    resolve_cloud_code_remote_values(value, budget).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

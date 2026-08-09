@@ -6,7 +6,75 @@ use std::time::Duration;
 use zeroize::Zeroize;
 
 const MAX_REMOTE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REMOTE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REMOTE_REQUEST_ITEMS: usize = 16;
 const MAX_REDIRECTS: usize = 3;
+
+/// Request-local limits shared by every remote attachment resolution in one
+/// model request. Callers should create one budget and pass it to every fetch.
+pub(crate) struct RemoteRequestBudget {
+    bytes: usize,
+    items: usize,
+    current_item_bytes: usize,
+    max_bytes: usize,
+    max_items: usize,
+}
+
+impl Default for RemoteRequestBudget {
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            items: 0,
+            current_item_bytes: 0,
+            max_bytes: MAX_REMOTE_REQUEST_BYTES,
+            max_items: MAX_REMOTE_REQUEST_ITEMS,
+        }
+    }
+}
+
+impl RemoteRequestBudget {
+    #[cfg(test)]
+    fn with_limits(max_bytes: usize, max_items: usize) -> Self {
+        Self {
+            bytes: 0,
+            items: 0,
+            current_item_bytes: 0,
+            max_bytes,
+            max_items,
+        }
+    }
+
+    pub(crate) fn begin(&mut self) -> Result<(), String> {
+        if self.items >= self.max_items {
+            return Err("remote attachments exceed the request item limit".to_string());
+        }
+        self.items += 1;
+        self.current_item_bytes = 0;
+        Ok(())
+    }
+
+    pub(crate) fn check_declared_size(&self, bytes: u64) -> Result<(), String> {
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| "remote attachments exceed the request byte limit".to_string())?;
+        if bytes > MAX_REMOTE_BYTES.saturating_sub(self.current_item_bytes)
+            || bytes > self.max_bytes.saturating_sub(self.bytes)
+        {
+            return Err("remote attachments exceed the request byte limit".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn consume(&mut self, bytes: usize) -> Result<(), String> {
+        if bytes > MAX_REMOTE_BYTES.saturating_sub(self.current_item_bytes)
+            || bytes > self.max_bytes.saturating_sub(self.bytes)
+        {
+            return Err("remote attachments exceed the request byte limit".to_string());
+        }
+        self.bytes += bytes;
+        self.current_item_bytes += bytes;
+        Ok(())
+    }
+}
 
 pub(crate) struct RemoteContent {
     pub(crate) bytes: Vec<u8>,
@@ -14,7 +82,11 @@ pub(crate) struct RemoteContent {
     pub(crate) filename: String,
 }
 
-pub(crate) async fn fetch(url: &str) -> Result<RemoteContent, String> {
+pub(crate) async fn fetch_with_budget(
+    url: &str,
+    budget: &mut RemoteRequestBudget,
+) -> Result<RemoteContent, String> {
+    budget.begin()?;
     let mut current = validate_url(url)?;
     for redirects in 0..=MAX_REDIRECTS {
         let host = current
@@ -68,11 +140,8 @@ pub(crate) async fn fetch(url: &str) -> Result<RemoteContent, String> {
                 response.status().as_u16()
             ));
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_REMOTE_BYTES as u64)
-        {
-            return Err("remote attachment is too large".to_string());
+        if let Some(length) = response.content_length() {
+            budget.check_declared_size(length)?;
         }
         let media_type = response
             .headers()
@@ -95,6 +164,10 @@ pub(crate) async fn fetch(url: &str) -> Result<RemoteContent, String> {
             if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_BYTES {
                 bytes.zeroize();
                 return Err("remote attachment is too large".to_string());
+            }
+            if let Err(error) = budget.consume(chunk.len()) {
+                bytes.zeroize();
+                return Err(error);
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -170,5 +243,35 @@ mod tests {
         assert!(!public_ip("64:ff9b::127.0.0.1".parse().unwrap()));
         assert!(!public_ip("2002:7f00:0001::".parse().unwrap()));
         assert!(public_ip("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn request_budget_limits_items_and_aggregate_bytes() {
+        let mut budget = RemoteRequestBudget::with_limits(10, 2);
+        budget.begin().unwrap();
+        budget.consume(6).unwrap();
+        budget.begin().unwrap();
+        assert!(budget.check_declared_size(5).is_err());
+        budget.consume(4).unwrap();
+        assert!(budget.consume(1).is_err());
+        assert!(budget.begin().is_err());
+    }
+
+    #[test]
+    fn request_budget_rejects_single_oversized_item() {
+        let mut budget = RemoteRequestBudget::with_limits(MAX_REMOTE_BYTES * 2, 1);
+        budget.begin().unwrap();
+        assert!(budget
+            .check_declared_size(MAX_REMOTE_BYTES as u64 + 1)
+            .is_err());
+    }
+
+    #[test]
+    fn request_budget_rejects_chunked_item_over_the_single_item_limit() {
+        let mut budget = RemoteRequestBudget::default();
+        budget.begin().unwrap();
+        budget.consume(4 * 1024 * 1024).unwrap();
+        budget.consume(4 * 1024 * 1024).unwrap();
+        assert!(budget.consume(1).is_err());
     }
 }
