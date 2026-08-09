@@ -65,6 +65,19 @@ const sidebar = [
     ],
   },
   {
+    text: 'Planned · not supported yet',
+    items: [
+      { text: sidebarLabel('Continue', 'code', '/brands/continue.svg'), link: '/clients/planned/continue/' },
+      { text: sidebarLabel('Cline', 'code', '/brands/cline.svg'), link: '/clients/planned/cline/' },
+      { text: sidebarLabel('Roo Code', 'code', '/brands/roo-code.svg'), link: '/clients/planned/roo-code/' },
+      { text: sidebarLabel('Zed', 'code', '/brands/zed.svg'), link: '/clients/planned/zed/' },
+      { text: sidebarLabel('VS Code', 'code'), link: '/clients/planned/vscode/' },
+      { text: sidebarLabel('Goose', 'terminal'), link: '/clients/planned/goose/' },
+      { text: sidebarLabel('Junie CLI', 'terminal', '/brands/jetbrains.svg'), link: '/clients/planned/junie/' },
+      { text: sidebarLabel('Gemini CLI', 'terminal', '/brands/gemini.svg'), link: '/clients/planned/gemini/' },
+    ],
+  },
+  {
     text: 'Protection',
     items: [
       { text: sidebarLabel('Prompts and tool results', 'message'), link: '/protection/prompts-and-tools/' },
