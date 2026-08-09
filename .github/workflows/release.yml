@@ -207,6 +207,38 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  vscode-extension:
+    name: VS Code extension
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: integrations/vscode/package-lock.json
+      - working-directory: integrations/vscode
+        run: npm ci
+      - working-directory: integrations/vscode
+        run: npm run check
+      - working-directory: integrations/vscode
+        run: npm run package
+      - name: Stage version-independent VSIX
+        run: |
+          mkdir -p dist
+          cp integrations/vscode/pentect-vscode-*.vsix dist/pentect-vscode.vsix
+          (cd dist && sha256sum pentect-vscode.vsix > pentect-vscode.vsix.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pentect-vscode
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   package-deb:
     name: Debian package (${{ matrix.arch }})
     needs: build
@@ -296,7 +328,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [build, compatibility-cli, package-deb, plugin-assets]
+    needs: [build, compatibility-cli, package-deb, plugin-assets, vscode-extension]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -376,7 +408,15 @@ jobs:
         with:
           node-version: "22"
       - name: Install supported agent CLIs
-        run: npm install --global @openai/codex@0.146.0 @anthropic-ai/claude-code@2.1.220 opencode-ai@1.18.14 @mariozechner/pi-coding-agent@0.73.1
+        run: >-
+          npm install --global
+          @openai/codex@0.146.0
+          @anthropic-ai/claude-code@2.1.220
+          opencode-ai@1.18.14
+          @mariozechner/pi-coding-agent@0.73.1
+          @continuedev/cli@1.5.47
+          cline@3.0.52
+          @google/gemini-cli@0.54.4
       - name: Verify launchers
         run: |
           chmod +x dist/pentect-linux-x86_64
@@ -384,6 +424,9 @@ jobs:
           dist/pentect-linux-x86_64 claude -- --version
           dist/pentect-linux-x86_64 opencode -- --version
           dist/pentect-linux-x86_64 pi -- --version
+          dist/pentect-linux-x86_64 continue -- --version
+          dist/pentect-linux-x86_64 cline -- --version
+          dist/pentect-linux-x86_64 gemini -- --version
 
   lifecycle:
     name: Lifecycle (${{ matrix.os }})

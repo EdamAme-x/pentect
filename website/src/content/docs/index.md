@@ -44,6 +44,10 @@ aside: false
     <small>CLI</small><strong>Antigravity</strong>
     <span>Run the official Antigravity CLI through the Cloud Code gateway.</span><b aria-hidden="true">→</b>
   </a>
+  <a href="/reference/capabilities/#clients" class="docs-grid__item">
+    <small>CLI + Editors</small><strong>More clients</strong>
+    <span>Continue, Cline, Roo Code, Zed, Goose, Junie, Gemini, and VS Code.</span><b aria-hidden="true">→</b>
+  </a>
 </DocsGrid>
 
 ## Explore

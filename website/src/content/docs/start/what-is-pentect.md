@@ -50,9 +50,10 @@ that process only.
 
 ## Supported surfaces
 
-Pentect supports Codex CLI, Claude Code, Codex App, and selected Claude Desktop
-features. It also offers local masking commands, custom gateways, and safe
-plugins.
+Pentect supports named CLI, editor, and desktop surfaces. These include Codex,
+Claude, OpenCode, Pi, Antigravity, Aider, Continue, Cline, Roo Code, Zed,
+Goose, Junie, Gemini, and a selectable VS Code provider. It also offers local
+masking commands, custom gateways, and safe plugins.
 
 See [Compatibility](/reference/compatibility/) for the release-tested matrix.
 

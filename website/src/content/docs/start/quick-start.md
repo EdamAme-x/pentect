@@ -84,6 +84,21 @@ pentect codex exec --full-auto
 pentect claude --model sonnet
 ```
 
+The same launch pattern works for other supported clients:
+
+| Client | Command |
+| --- | --- |
+| Continue CLI | `pentect continue` |
+| Cline CLI | `pentect cline` |
+| Roo Code | `pentect roo` |
+| Zed | `pentect zed` |
+| Goose CLI | `pentect goose` |
+| Junie CLI | `pentect junie` |
+| Gemini CLI | `pentect gemini` |
+
+Each command protects a specific surface. Check the client page before you
+use desktop, autocomplete, or external-agent features.
+
 ## Use Pentect from your normal CLI command
 
 This step is optional. If you want `codex` or `claude` to use Pentect without
@@ -166,7 +181,7 @@ shell; it does not create a proxy for the whole system.
 
 ## Next steps
 
-- Use [Codex](/clients/codex/) or [Claude](/clients/claude/) for client-specific options.
+- Open the client page from the sidebar for exact protected and unsupported surfaces.
 - See [Structured data](/protection/structured-data/) for dotenv, Terraform, Kubernetes, and JSON behavior.
 - Read [Handles](/start/handles/) before copying handles between sessions or scripts.
 - Review [Files and images](/protection/files-and-images/) before sending uploads.

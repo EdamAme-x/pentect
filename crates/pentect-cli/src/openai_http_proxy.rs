@@ -1220,13 +1220,61 @@ fn mask_openai_request(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     files: &HashMap<String, crate::http_files::Coverage>,
 ) -> Result<(), String> {
+    if let Some(Value::String(instructions)) = value.get_mut("instructions") {
+        mask_text(instructions, false, masker)?;
+    }
     if let Some(input) = value.get_mut("input") {
         mask_openai_input(input, false, masker, files)?;
     }
     if let Some(messages) = value.get_mut("messages") {
         mask_chat_messages(messages, masker, files)?;
     }
+    // Tool descriptions and JSON Schemas are sent to the model too. MCP and
+    // editor integrations commonly generate them from local state, so they
+    // must cross the same masking boundary as messages. Keys are structural;
+    // every string value is potentially model-visible text.
+    for field in ["tools", "functions", "response_format"] {
+        if let Some(definition) = value.get_mut(field) {
+            let mut nodes = 0_usize;
+            mask_model_definition(definition, 0, &mut nodes, masker)?;
+        }
+    }
     Ok(())
+}
+
+fn mask_model_definition(
+    value: &mut Value,
+    depth: usize,
+    nodes: &mut usize,
+    masker: &mut pentect_agent::ActiveToolOutputMasker,
+) -> Result<(), String> {
+    const MAX_DEFINITION_DEPTH: usize = 64;
+    const MAX_DEFINITION_NODES: usize = 65_536;
+    if depth > MAX_DEFINITION_DEPTH {
+        return Err("OpenAI model definition exceeds nesting limit".to_string());
+    }
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or_else(|| "OpenAI model definition is too large".to_string())?;
+    if *nodes > MAX_DEFINITION_NODES {
+        return Err("OpenAI model definition exceeds item limit".to_string());
+    }
+    match value {
+        Value::String(text) => mask_text(text, false, masker),
+        Value::Array(items) => {
+            for item in items {
+                mask_model_definition(item, depth + 1, nodes, masker)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            for item in object.values_mut() {
+                mask_model_definition(item, depth + 1, nodes, masker)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn mask_chat_messages(
@@ -2246,6 +2294,242 @@ fn random_auth_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ProviderBoundaryTestEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        home: std::path::PathBuf,
+        process_host_candidate: Option<std::path::PathBuf>,
+    }
+
+    impl ProviderBoundaryTestEnv {
+        fn install(store: &pentect_agent::InProcessMemoryStore) -> Self {
+            let names = [
+                "PENTECT_MEMORY_STORE_ADDR",
+                "PENTECT_MEMORY_STORE_TOKEN",
+                "PENTECT_AGENT_LAUNCHED",
+                "PENTECT_HOME",
+                "LOCALAPPDATA",
+            ];
+            let saved = names
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let home = std::env::temp_dir().join(format!(
+                "pentect-openai-provider-boundary-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            std::env::set_var("PENTECT_MEMORY_STORE_ADDR", store.addr());
+            std::env::set_var("PENTECT_MEMORY_STORE_TOKEN", store.token());
+            std::env::set_var("PENTECT_AGENT_LAUNCHED", store.token());
+            std::env::set_var("PENTECT_HOME", &home);
+            std::env::set_var("LOCALAPPDATA", &home);
+            let process_host_candidate = Some(
+                pentect_agent::register_process_host_candidate(
+                    &pentect_agent::process_host_root().unwrap(),
+                    store.addr(),
+                    store.token(),
+                    store.process_host_read_token(),
+                    store.process_host_write_token(),
+                    std::process::id(),
+                )
+                .unwrap(),
+            );
+            Self {
+                saved,
+                home,
+                process_host_candidate,
+            }
+        }
+    }
+
+    impl Drop for ProviderBoundaryTestEnv {
+        fn drop(&mut self) {
+            if let Some(path) = self.process_host_candidate.take() {
+                pentect_agent::unregister_process_host_candidate(&path);
+            }
+            for (name, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn first_handle(text: &str) -> Option<String> {
+        let mut offset = 0;
+        while let Some(relative_start) = text[offset..].find("<<") {
+            let start = offset + relative_start;
+            let end = start + text[start..].find(">>")? + 2;
+            let candidate = &text[start..end];
+            if candidate != "<<LABEL_HASH>>" {
+                return Some(candidate.to_string());
+            }
+            offset = end;
+        }
+        None
+    }
+
+    fn mock_chat_upstream() -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end;
+            loop {
+                let read = socket.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(at) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    header_end = at + 4;
+                    break;
+                }
+            }
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = socket.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = String::from_utf8(request[header_end..header_end + content_length].to_vec())
+                .unwrap();
+            let handle = first_handle(&body).expect("masked request contains a handle");
+            body_tx.send(body).unwrap();
+            let response = serde_json::json!({
+                "id": "chatcmpl_pentect_test",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": handle,
+                        "tool_calls": [{
+                            "id": "call_pentect_test",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": serde_json::json!({
+                                    "command": format!("echo {handle}")
+                                }).to_string()
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })
+            .to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            socket.flush().unwrap();
+        });
+        (format!("http://{address}"), body_rx, thread)
+    }
+
+    #[test]
+    fn provider_boundary_masks_chat_requests_and_restores_only_tool_arguments() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = [
+            "rpa_",
+            "ZYXWVUTS",
+            "RQPONMLK",
+            "JIHGFEDC",
+            "BA098765",
+            "4321fedcba",
+        ]
+        .concat();
+        let (upstream, captured, thread) = mock_chat_upstream();
+        let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/chat/completions", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "messages": [{
+                        "role": "user",
+                        "content": format!("Use RUNPOD_API_KEY={secret}")
+                    }],
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "description": format!("Local helper configured with {secret}"),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "command": {
+                                        "type": "string",
+                                        "examples": [format!("echo {secret}")]
+                                    }
+                                }
+                            }
+                        }
+                    }]
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        let request = captured
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(!request.contains(&secret));
+        let handle = first_handle(&request).unwrap();
+        assert!(request.matches(&handle).count() >= 3);
+        assert!(request.contains(HANDLE_CONTRACT));
+        assert_eq!(response["choices"][0]["message"]["content"], handle);
+        let arguments = response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let arguments: Value = serde_json::from_str(arguments).unwrap();
+        assert!(
+            arguments["command"].as_str().is_some_and(|command| {
+                command
+                    .strip_prefix("echo ")
+                    .is_some_and(|value| value == secret)
+            }),
+            "trusted shell argument was not restored"
+        );
+    }
 
     #[tokio::test]
     async fn uploaded_file_coverage_is_reused_after_openai_registry_restart() {
