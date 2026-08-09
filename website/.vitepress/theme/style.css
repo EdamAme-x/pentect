@@ -160,10 +160,11 @@ body {
   width: 17px;
   height: 17px;
   object-fit: contain;
+  filter: grayscale(1) brightness(0);
 }
 
 .dark .sidebar-link-label .sidebar-brand-icon {
-  filter: invert(1);
+  filter: grayscale(1) brightness(0) invert(1);
 }
 
 .VPSidebarItem.is-link > .item > .link:hover .sidebar-link-label svg,
