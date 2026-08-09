@@ -7,14 +7,27 @@ description: Use Pi with Pentect.
 pentect pi --model openai/gpt-5
 ```
 
-Or install Pi and the matching Pentect release together:
+For a permanent Pi integration, install the JavaScript extension once:
 
 ```sh
-npx @pentect/pi --model openai/gpt-5
+pi install npm:@pentect/pi
 ```
 
-Pentect protects this Pi launch only. It does not install prompt hooks or edit
-Pi settings.
+Then select its protected provider:
+
+```sh
+pi --model pentect/gpt-5
+```
+
+For one session without installing it:
+
+```sh
+pi -e npm:@pentect/pi --model pentect/gpt-5
+```
+
+`pentect pi` protects that launch only. The npm package registers a normal Pi
+provider and starts the same local Pentect gateway for each Pi session. Neither
+method installs prompt hooks.
 
 Normal Pi arguments pass through:
 
@@ -27,6 +40,9 @@ Chat Completions is the default. Responses can be selected explicitly:
 ```sh
 pentect pi --api responses --model gpt-5
 ```
+
+With the extension, set `PENTECT_PI_API=responses` and `PENTECT_PI_MODEL=gpt-5`
+before Pi starts, then select `pentect/gpt-5`.
 
 ## Custom gateways
 

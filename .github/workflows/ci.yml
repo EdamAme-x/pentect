@@ -30,14 +30,14 @@ jobs:
           node-version: "22"
       - run: npm test
       - run: npm pack --dry-run
-      - name: Verify Pi launcher package
+      - name: Verify Pi extension package
         working-directory: integrations/pi
         run: |
           npm run check
           npm test
           npm pack --dry-run
           npm pkg set "dependencies.pentect=$(npm view pentect version)"
-          node ../../tools/smoke_pi_package.mjs 0.73.1
+          node ../../tools/smoke_pi_package.mjs 0.0.0 0.84.1
 
   changes:
     name: Changes

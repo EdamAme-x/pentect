@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub(crate) const CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
 pub(crate) const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
@@ -28,6 +28,8 @@ const DEFAULT_REMOTE_PLUGINS_BASE: &str =
 const DEFAULT_PLUGIN_REPOSITORY: &str = "EdamAme-x/pentect";
 const REMOTE_PLUGIN_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_REMOTE_PLUGIN_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_REMOTE_PLUGIN_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_REMOTE_PLUGIN_CACHE_ENTRIES: usize = 256;
 const MAX_PROJECT_PLUGIN_LOCK_BYTES: u64 = 1024 * 1024;
 static PROJECT_LOCK_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1315,6 +1317,9 @@ fn atomic_replace(staged: &Path, destination: &Path) -> Result<()> {
 
 fn fetch_remote_plugin_file_with_refresh(url: &str, refresh: bool) -> Result<Option<PathBuf>> {
     let path = remote_cache_file(url)?;
+    if let Some(cache_root) = path.parent().and_then(Path::parent) {
+        prune_remote_plugin_cache(cache_root, Some(&path))?;
+    }
     let missing = remote_missing_file(&path);
     if !refresh && path.is_file() {
         return Ok(Some(path));
@@ -1338,6 +1343,9 @@ fn fetch_remote_plugin_file_with_refresh(url: &str, refresh: bool) -> Result<Opt
         }
         std::fs::write(&missing, [])
             .with_context(|| format!("could not write plugin cache '{}'", missing.display()))?;
+        if let Some(cache_root) = path.parent().and_then(Path::parent) {
+            prune_remote_plugin_cache(cache_root, Some(&missing))?;
+        }
         return Ok(None);
     }
     if !status.is_success() {
@@ -1364,7 +1372,117 @@ fn fetch_remote_plugin_file_with_refresh(url: &str, refresh: bool) -> Result<Opt
     std::fs::write(&path, &bytes)
         .with_context(|| format!("could not write plugin cache '{}'", path.display()))?;
     let _ = std::fs::remove_file(missing);
+    if let Some(cache_root) = path.parent().and_then(Path::parent) {
+        prune_remote_plugin_cache(cache_root, Some(&path))?;
+    }
     Ok(Some(path))
+}
+
+#[derive(Debug)]
+struct RemoteCacheEntry {
+    path: PathBuf,
+    bytes: u64,
+    modified: SystemTime,
+}
+
+fn prune_remote_plugin_cache(cache_root: &Path, protected: Option<&Path>) -> Result<()> {
+    prune_remote_plugin_cache_with_limits(
+        cache_root,
+        protected,
+        MAX_REMOTE_PLUGIN_CACHE_BYTES,
+        MAX_REMOTE_PLUGIN_CACHE_ENTRIES,
+    )
+}
+
+fn prune_remote_plugin_cache_with_limits(
+    cache_root: &Path,
+    protected: Option<&Path>,
+    max_bytes: u64,
+    max_entries: usize,
+) -> Result<()> {
+    if !cache_root.is_dir() {
+        return Ok(());
+    }
+
+    let protected_entry = protected
+        .and_then(|path| path.strip_prefix(cache_root).ok())
+        .and_then(|relative| {
+            relative
+                .components()
+                .next()
+                .map(|component| cache_root.join(component.as_os_str()))
+        });
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(cache_root)
+        .with_context(|| format!("could not inspect plugin cache '{}'", cache_root.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!("could not inspect plugin cache '{}'", cache_root.display())
+        })?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("could not inspect '{}'", entry.path().display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let (bytes, modified) = remote_cache_entry_usage(&entry.path())?;
+        entries.push(RemoteCacheEntry {
+            path: entry.path(),
+            bytes,
+            modified,
+        });
+    }
+
+    let mut total_bytes = entries.iter().map(|entry| entry.bytes).sum::<u64>();
+    let mut total_entries = entries.len();
+    if total_bytes <= max_bytes && total_entries <= max_entries {
+        return Ok(());
+    }
+
+    entries.sort_by_key(|entry| entry.modified);
+    for entry in entries {
+        if total_bytes <= max_bytes && total_entries <= max_entries {
+            break;
+        }
+        if protected_entry.as_ref() == Some(&entry.path) {
+            continue;
+        }
+        std::fs::remove_dir_all(&entry.path).with_context(|| {
+            format!(
+                "could not remove old plugin cache entry '{}'",
+                entry.path.display()
+            )
+        })?;
+        total_bytes = total_bytes.saturating_sub(entry.bytes);
+        total_entries = total_entries.saturating_sub(1);
+    }
+    Ok(())
+}
+
+fn remote_cache_entry_usage(path: &Path) -> Result<(u64, SystemTime)> {
+    let mut bytes = 0_u64;
+    let mut modified = SystemTime::UNIX_EPOCH;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("could not inspect plugin cache '{}'", directory.display()))?
+        {
+            let entry = entry.with_context(|| {
+                format!("could not inspect plugin cache '{}'", directory.display())
+            })?;
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("could not inspect '{}'", entry.path().display()))?;
+            modified = modified.max(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok((bytes, modified))
 }
 
 fn remote_missing_file(path: &Path) -> PathBuf {
@@ -1557,6 +1675,34 @@ label = "INLINE_SECRET"
             "remote cache must be outside the project: {}",
             cache.display()
         );
+    }
+
+    #[test]
+    fn remote_plugin_cache_prunes_entries_without_removing_the_active_download() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pentect-plugin-cache-prune-{nonce}"));
+        let first = root.join("first").join("plugin.toml");
+        let second = root.join("second").join("plugin.toml");
+        let protected = root.join("protected").join("plugin.toml");
+        for path in [&first, &second, &protected] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"1234").unwrap();
+        }
+
+        prune_remote_plugin_cache_with_limits(&root, Some(&protected), 8, 2).unwrap();
+
+        assert!(protected.is_file());
+        let remaining = std::fs::read_dir(&root).unwrap().count();
+        assert_eq!(remaining, 2);
+        let remaining_bytes = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| remote_cache_entry_usage(&entry.unwrap().path()).unwrap().0)
+            .sum::<u64>();
+        assert_eq!(remaining_bytes, 8);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
