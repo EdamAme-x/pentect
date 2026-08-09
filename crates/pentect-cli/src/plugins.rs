@@ -1,10 +1,14 @@
 use crate::Result;
 use anyhow::{anyhow, bail, Context};
 use pentect_core::{load_pack, load_plugin_pack, Pack};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub(crate) const CONFIGS_ENV: &str = "PENTECT_PLUGIN_CONFIGS";
@@ -15,6 +19,7 @@ const PENTECT_DIR: &str = ".pentect";
 const PLUGINS_DIR: &str = "plugins";
 const PLUGINS_CACHE_DIR: &str = "plugin-cache";
 const PENTECT_CONFIG_FILE: &str = "config.toml";
+const PROJECT_PLUGIN_LOCK_FILE: &str = "pentect.plugins.lock";
 const PLUGIN_CONFIG_FILE: &str = "config.toml";
 const PLUGIN_CONFIGS_DIR: &str = "configs";
 const OFFICIAL_PLUGINS_DIR: &str = "plugins";
@@ -23,6 +28,8 @@ const DEFAULT_REMOTE_PLUGINS_BASE: &str =
 const DEFAULT_PLUGIN_REPOSITORY: &str = "EdamAme-x/pentect";
 const REMOTE_PLUGIN_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_REMOTE_PLUGIN_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PROJECT_PLUGIN_LOCK_BYTES: u64 = 1024 * 1024;
+static PROJECT_LOCK_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default)]
 pub(crate) struct ActivePlugins {
@@ -30,11 +37,40 @@ pub(crate) struct ActivePlugins {
     binary_paths: Vec<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PluginSource {
     pub(crate) name: String,
     pub(crate) manifest_path: Option<PathBuf>,
     pub(crate) repository: Option<String>,
+    pub(crate) remote_base: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct RemotePluginLockEntry {
+    pub(crate) source: String,
+    pub(crate) resolved: String,
+    #[serde(default)]
+    pub(crate) files: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RemotePluginCacheSnapshot {
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    previous_sources: BTreeMap<String, Vec<u8>>,
+}
+
+impl RemotePluginCacheSnapshot {
+    pub(crate) fn previous_sources(&self) -> &BTreeMap<String, Vec<u8>> {
+        &self.previous_sources
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectPluginLock {
+    schema: String,
+    #[serde(default)]
+    plugin: Vec<RemotePluginLockEntry>,
 }
 
 impl ActivePlugins {
@@ -284,6 +320,7 @@ fn plugin_paths_for_specs(
         let spec = resolved.as_str();
         if is_remote_spec(spec) {
             let found = plugin_paths_for_url(spec)?;
+            verify_project_remote_plugin(spec, &normalize_github_plugin_url(spec)?)?;
             configs.extend(found.config_paths);
             binaries.extend(found.binary_paths);
         } else if is_path_spec(spec) {
@@ -333,7 +370,13 @@ fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
 
     let remote_error = if remote_plugins_enabled() {
         match remote_plugin_paths_for_name(name) {
-            Ok(paths) if !paths.is_empty() => return Ok(paths),
+            Ok(paths) if !paths.is_empty() => {
+                verify_project_remote_plugin(
+                    name,
+                    &format!("{DEFAULT_REMOTE_PLUGINS_BASE}/{name}"),
+                )?;
+                return Ok(paths);
+            }
             Ok(_) => None,
             Err(e) => Some(e),
         }
@@ -533,7 +576,8 @@ fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource>
     if is_remote_spec(spec) {
         let normalized = normalize_github_plugin_url(spec)?;
         let repository = github_repository(&normalized);
-        let (base, manifest_url) = if normalized.ends_with("/plugin.toml") {
+        let points_to_manifest = normalized.ends_with("/plugin.toml");
+        let (base, manifest_url) = if points_to_manifest {
             let base = normalized
                 .strip_suffix("/plugin.toml")
                 .unwrap_or(&normalized)
@@ -554,10 +598,16 @@ fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource>
         }
         let manifest_path = fetch_remote_plugin_file_with_refresh(&manifest_url, refresh)?;
         let name = remote_plugin_name(&base)?;
+        let remote_base = if points_to_manifest {
+            manifest_url.clone()
+        } else {
+            base.clone()
+        };
         return Ok(PluginSource {
             name,
             manifest_path,
             repository,
+            remote_base: Some(remote_base),
         });
     }
     if is_path_spec(spec) {
@@ -589,6 +639,7 @@ fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource>
             name,
             manifest_path: manifest.is_file().then_some(manifest),
             repository: None,
+            remote_base: None,
         });
     }
 
@@ -609,6 +660,7 @@ fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource>
                 name: spec.to_string(),
                 manifest_path: manifest.is_file().then_some(manifest),
                 repository,
+                remote_base: None,
             });
         }
     }
@@ -623,6 +675,7 @@ fn plugin_source_with_refresh(spec: &str, refresh: bool) -> Result<PluginSource>
         name: spec.to_string(),
         manifest_path,
         repository: Some(DEFAULT_PLUGIN_REPOSITORY.to_string()),
+        remote_base: Some(base),
     })
 }
 
@@ -724,15 +777,491 @@ fn fetch_remote_plugin_file(url: &str) -> Result<Option<PathBuf>> {
     fetch_remote_plugin_file_with_refresh(url, false)
 }
 
+pub(crate) fn project_plugin_lock_path() -> PathBuf {
+    PathBuf::from(PROJECT_PLUGIN_LOCK_FILE)
+}
+
+pub(crate) fn remote_plugin_lock_entry(
+    spec: &str,
+    source: &PluginSource,
+) -> Result<Option<RemotePluginLockEntry>> {
+    let Some(resolved) = source.remote_base.clone() else {
+        return Ok(None);
+    };
+    let mut files = BTreeMap::new();
+    for url in remote_plugin_urls(&resolved) {
+        let path = remote_cache_file(&url)?;
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = pentect_agent::read_bounded_bytes(
+            &path,
+            MAX_REMOTE_PLUGIN_FILE_BYTES,
+            "remote plugin file",
+        )
+        .map_err(anyhow::Error::msg)?;
+        files.insert(url, data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)));
+    }
+    if files.is_empty() {
+        bail!("remote plugin has no cached files to lock: {spec}");
+    }
+    Ok(Some(RemotePluginLockEntry {
+        source: spec.to_string(),
+        resolved,
+        files,
+    }))
+}
+
+pub(crate) fn remote_plugin_sources(source: &PluginSource) -> Result<BTreeMap<String, Vec<u8>>> {
+    let Some(resolved) = source.remote_base.as_deref() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut sources = BTreeMap::new();
+    for url in remote_plugin_urls(&resolved) {
+        let path = remote_cache_file(&url)?;
+        if path.is_file() {
+            let bytes = pentect_agent::read_bounded_bytes(
+                &path,
+                MAX_REMOTE_PLUGIN_FILE_BYTES,
+                "remote plugin file",
+            )
+            .map_err(anyhow::Error::msg)?;
+            sources.insert(url, bytes);
+        }
+    }
+    Ok(sources)
+}
+
+pub(crate) fn snapshot_remote_plugin_cache(
+    spec: &str,
+) -> Result<Option<RemotePluginCacheSnapshot>> {
+    let source = plugin_source_with_refresh(spec, false)?;
+    let Some(resolved) = source.remote_base else {
+        return Ok(None);
+    };
+    let mut files = Vec::new();
+    let mut previous_sources = BTreeMap::new();
+    for url in remote_plugin_urls(&resolved) {
+        let path = remote_cache_file(&url)?;
+        let contents = if path.is_file() {
+            let bytes = pentect_agent::read_bounded_bytes(
+                &path,
+                MAX_REMOTE_PLUGIN_FILE_BYTES,
+                "remote plugin cache",
+            )
+            .map_err(anyhow::Error::msg)?;
+            previous_sources.insert(url, bytes.clone());
+            Some(bytes)
+        } else {
+            None
+        };
+        files.push((path.clone(), contents));
+        let missing = remote_missing_file(&path);
+        let missing_contents = if missing.is_file() {
+            Some(std::fs::read(&missing).with_context(|| {
+                format!("could not snapshot plugin cache '{}'", missing.display())
+            })?)
+        } else {
+            None
+        };
+        files.push((missing, missing_contents));
+    }
+    Ok(Some(RemotePluginCacheSnapshot {
+        files,
+        previous_sources,
+    }))
+}
+
+pub(crate) fn restore_remote_plugin_cache(snapshot: &RemotePluginCacheSnapshot) -> Result<()> {
+    for (path, contents) in &snapshot.files {
+        match contents {
+            Some(contents) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("could not restore plugin cache '{}'", parent.display())
+                    })?;
+                }
+                let staged = path.with_extension(format!("restore-{}", std::process::id()));
+                std::fs::write(&staged, contents).with_context(|| {
+                    format!("could not stage plugin cache restore '{}'", path.display())
+                })?;
+                atomic_replace(&staged, path)?;
+            }
+            None if path.exists() => {
+                std::fs::remove_file(path).with_context(|| {
+                    format!(
+                        "could not remove refreshed plugin cache '{}'",
+                        path.display()
+                    )
+                })?;
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn lock_project_plugin_mutation() -> Result<ProjectPluginMutationGuard> {
+    ProjectPluginMutationGuard::acquire(&project_plugin_lock_path())
+}
+
+pub(crate) fn set_project_remote_plugin_lock_with_guard(
+    guard: &ProjectPluginMutationGuard,
+    spec: &str,
+    entry: Option<RemotePluginLockEntry>,
+) -> Result<()> {
+    let path = project_plugin_lock_path();
+    if guard.project_lock != path {
+        bail!("project plugin mutation guard does not match the project lock");
+    }
+    set_project_remote_plugin_lock_at_locked(&path, spec, entry)
+}
+
+#[cfg(test)]
+fn set_project_remote_plugin_lock_at(
+    path: &Path,
+    spec: &str,
+    entry: Option<RemotePluginLockEntry>,
+) -> Result<()> {
+    let _guard = ProjectPluginMutationGuard::acquire(path)?;
+    set_project_remote_plugin_lock_at_locked(path, spec, entry)
+}
+
+fn set_project_remote_plugin_lock_at_locked(
+    path: &Path,
+    spec: &str,
+    entry: Option<RemotePluginLockEntry>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("could not create '{}'", parent.display()))?;
+    // The caller acquired the project guard before any transaction snapshot.
+    // Always reread here so this update is based on the latest committed state.
+    let mut lock = if path.is_file() {
+        let source = pentect_agent::read_bounded_utf8(
+            path,
+            MAX_PROJECT_PLUGIN_LOCK_BYTES,
+            "project plugin lock",
+        )
+        .map_err(anyhow::Error::msg)?;
+        toml::from_str::<ProjectPluginLock>(&source)
+            .with_context(|| format!("project plugin lock '{}' is invalid", path.display()))?
+    } else {
+        ProjectPluginLock {
+            schema: "pentect.plugin-project-lock.v1".to_string(),
+            plugin: Vec::new(),
+        }
+    };
+    if lock.schema != "pentect.plugin-project-lock.v1" {
+        bail!("project plugin lock has an unsupported schema");
+    }
+    lock.plugin.retain(|item| item.source != spec);
+    if let Some(entry) = entry {
+        lock.plugin.push(entry);
+    }
+    lock.plugin
+        .sort_by(|left, right| left.source.cmp(&right.source));
+    let staged = unique_project_lock_sibling(path, "tmp");
+    let encoded = toml::to_string(&lock).context("could not encode project plugin lock")?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, encoded.as_bytes()))
+        .with_context(|| format!("could not stage project plugin lock '{}'", path.display()))?;
+    if let Err(error) = atomic_replace(&staged, path) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn verify_project_remote_plugin(spec: &str, resolved: &str) -> Result<()> {
+    let configured = config_specs()?.iter().any(|configured| configured == spec);
+    let path = project_plugin_lock_path();
+    if !path.is_file() {
+        if remote_reference_may_run_without_lock(configured, resolved) {
+            return Ok(());
+        }
+        bail!("remote plugin is not locked for this project; run `pentect plugins add {spec}`");
+    }
+    let source = pentect_agent::read_bounded_utf8(
+        &path,
+        MAX_PROJECT_PLUGIN_LOCK_BYTES,
+        "project plugin lock",
+    )
+    .map_err(anyhow::Error::msg)?;
+    let lock: ProjectPluginLock = toml::from_str(&source)
+        .with_context(|| format!("project plugin lock '{}' is invalid", path.display()))?;
+    if lock.schema != "pentect.plugin-project-lock.v1" {
+        bail!("project plugin lock has an unsupported schema");
+    }
+    let entries = lock
+        .plugin
+        .iter()
+        .filter(|entry| entry.source == spec)
+        .collect::<Vec<_>>();
+    let [entry] = entries.as_slice() else {
+        if entries.is_empty() {
+            if remote_reference_may_run_without_lock(configured, resolved) {
+                return Ok(());
+            }
+            bail!("remote plugin is not locked; run `pentect plugins add {spec}`");
+        }
+        bail!("remote plugin lock contains duplicate entries for {spec}");
+    };
+    verify_remote_plugin_lock_entry(spec, resolved, entry)
+}
+
+fn verify_remote_plugin_lock_entry(
+    spec: &str,
+    resolved: &str,
+    entry: &RemotePluginLockEntry,
+) -> Result<()> {
+    if entry.resolved != resolved || entry.files.is_empty() {
+        bail!("remote plugin lock does not match {spec}; run `pentect plugins update {spec}`");
+    }
+    let expected_urls = remote_plugin_urls(resolved);
+    let present_urls = expected_urls
+        .iter()
+        .filter_map(|url| {
+            remote_cache_file(url)
+                .ok()
+                .filter(|path| path.is_file())
+                .map(|_| url.as_str())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let locked_urls = entry
+        .files
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if present_urls != locked_urls {
+        bail!("remote plugin file set changed after it was locked; run `pentect plugins update {spec}`");
+    }
+    for (url, expected) in &entry.files {
+        if !expected_urls.contains(url) || !valid_sha256(expected) {
+            bail!("remote plugin lock for {spec} is invalid");
+        }
+        let path = remote_cache_file(url)?;
+        let bytes = pentect_agent::read_bounded_bytes(
+            &path,
+            MAX_REMOTE_PLUGIN_FILE_BYTES,
+            "locked remote plugin file",
+        )
+        .map_err(anyhow::Error::msg)?;
+        let actual = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+        if actual != *expected {
+            bail!(
+                "remote plugin content changed after it was locked; run `pentect plugins update {spec}`"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn remote_plugin_urls(resolved: &str) -> Vec<String> {
+    if resolved.ends_with(".toml") {
+        vec![resolved.to_string()]
+    } else {
+        let base = resolved.trim_end_matches('/');
+        vec![
+            format!("{base}/{PLUGIN_MANIFEST_FILE}"),
+            format!("{base}/{PLUGIN_CONFIG_FILE}"),
+        ]
+    }
+}
+
+fn remote_reference_is_full_commit(resolved: &str) -> bool {
+    resolved
+        .strip_prefix("https://raw.githubusercontent.com/")
+        .and_then(|rest| rest.split('/').nth(2))
+        .is_some_and(|reference| {
+            reference.len() == 40 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn remote_reference_may_run_without_lock(configured: bool, resolved: &str) -> bool {
+    !configured && remote_reference_is_full_commit(resolved)
+}
+
+fn unique_project_lock_sibling(path: &Path, purpose: &str) -> PathBuf {
+    let sequence = PROJECT_LOCK_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!(
+        "lock.{purpose}-{}-{nanos}-{sequence}",
+        std::process::id()
+    ))
+}
+
+pub(crate) struct ProjectPluginMutationGuard {
+    file: File,
+    project_lock: PathBuf,
+}
+
+impl ProjectPluginMutationGuard {
+    fn acquire(project_lock: &Path) -> Result<Self> {
+        let project_root = project_lock
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let guard_path = project_root.join(PENTECT_DIR).join("plugin-lock.guard");
+        if let Some(parent) = guard_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "could not create project plugin lock guard directory '{}'",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&guard_path)
+            .with_context(|| {
+                format!(
+                    "could not open project plugin lock guard '{}'",
+                    guard_path.display()
+                )
+            })?;
+        lock_project_file(&file).with_context(|| {
+            format!(
+                "could not acquire project plugin lock guard '{}'",
+                guard_path.display()
+            )
+        })?;
+        Ok(Self {
+            file,
+            project_lock: project_lock.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for ProjectPluginMutationGuard {
+    fn drop(&mut self) {
+        let _ = unlock_project_file(&self.file);
+    }
+}
+
+#[cfg(unix)]
+fn lock_project_file(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unlock_project_file(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn lock_project_file(file: &File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn unlock_project_file(file: &File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
+    let result = unsafe {
+        UnlockFileEx(
+            file.as_raw_handle() as _,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(unix)]
+fn atomic_replace(staged: &Path, destination: &Path) -> Result<()> {
+    // POSIX rename replaces an existing same-filesystem destination atomically.
+    std::fs::rename(staged, destination)
+        .with_context(|| format!("could not atomically install '{}'", destination.display()))
+}
+
+#[cfg(windows)]
+fn atomic_replace(staged: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let staged = staged
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            staged.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+            .with_context(|| format!("could not atomically install '{}'", destination.display()))
+    }
+}
+
 fn fetch_remote_plugin_file_with_refresh(url: &str, refresh: bool) -> Result<Option<PathBuf>> {
     let path = remote_cache_file(url)?;
-    let missing = path.with_extension(format!(
-        "{}missing",
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| format!("{extension}."))
-            .unwrap_or_default()
-    ));
+    let missing = remote_missing_file(&path);
     if !refresh && path.is_file() {
         return Ok(Some(path));
     }
@@ -784,6 +1313,16 @@ fn fetch_remote_plugin_file_with_refresh(url: &str, refresh: bool) -> Result<Opt
     Ok(Some(path))
 }
 
+fn remote_missing_file(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}missing",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("{extension}."))
+            .unwrap_or_default()
+    ))
+}
+
 fn remote_cache_file(url: &str) -> Result<PathBuf> {
     let mut hash = Sha256::new();
     hash.update(url.as_bytes());
@@ -810,11 +1349,18 @@ fn normalize_github_plugin_url(url: &str) -> Result<String> {
         let owner = parts[0];
         let repo = parts[1];
         let path = parts[2..].join("/");
+        let (path, reference) = match path.rsplit_once('@') {
+            Some((path, reference)) if !path.is_empty() && valid_github_reference(reference) => {
+                (path, reference)
+            }
+            Some(_) => bail!("invalid GitHub plugin version in shorthand: {url}"),
+            None => (path.as_str(), "main"),
+        };
         if !valid_github_segment(owner) || !valid_github_segment(repo) {
             bail!("invalid GitHub owner or repository in plugin shorthand: {url}");
         }
         return Ok(format!(
-            "https://raw.githubusercontent.com/{owner}/{repo}/main/{path}"
+            "https://raw.githubusercontent.com/{owner}/{repo}/{reference}/{path}"
         ));
     }
     if let Some(rest) = url.strip_prefix("https://raw.githubusercontent.com/") {
@@ -850,6 +1396,18 @@ fn valid_github_segment(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn valid_github_reference(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && !value.ends_with('.')
+        && !value.contains("..")
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
 }
 
 #[cfg(not(test))]
@@ -945,6 +1503,242 @@ label = "INLINE_SECRET"
             "remote cache must be outside the project: {}",
             cache.display()
         );
+    }
+
+    #[test]
+    fn github_shorthand_supports_an_explicit_version() {
+        assert_eq!(
+            normalize_github_plugin_url("github:@owner/repo/plugins/pii@v1.2.3").unwrap(),
+            "https://raw.githubusercontent.com/owner/repo/v1.2.3/plugins/pii"
+        );
+        assert!(normalize_github_plugin_url("github:@owner/repo/plugins/pii@../main").is_err());
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        assert!(remote_reference_is_full_commit(&format!(
+            "https://raw.githubusercontent.com/owner/repo/{commit}/plugins/pii"
+        )));
+        assert!(!remote_reference_is_full_commit(
+            "https://raw.githubusercontent.com/owner/repo/main/plugins/pii"
+        ));
+        assert!(!remote_reference_is_full_commit(
+            "https://raw.githubusercontent.com/owner/repo/v1.2.3/plugins/pii"
+        ));
+        assert!(!remote_reference_may_run_without_lock(
+            false,
+            "https://raw.githubusercontent.com/owner/repo/v1.2.3/plugins/pii"
+        ));
+        assert!(remote_reference_may_run_without_lock(
+            false,
+            &format!("https://raw.githubusercontent.com/owner/repo/{commit}/plugins/pii")
+        ));
+        assert!(!remote_reference_may_run_without_lock(
+            true,
+            &format!("https://raw.githubusercontent.com/owner/repo/{commit}/plugins/pii")
+        ));
+    }
+
+    #[test]
+    fn remote_lock_detects_cached_content_changes() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let resolved =
+            format!("https://raw.githubusercontent.com/owner/repo/main/plugins/lock-test-{nonce}");
+        let manifest_url = format!("{resolved}/plugin.toml");
+        let path = remote_cache_file(&manifest_url).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = b"schema = \"pentect.plugin.v1\"\n";
+        std::fs::write(&path, original).unwrap();
+        let entry = RemotePluginLockEntry {
+            source: resolved.clone(),
+            resolved: resolved.clone(),
+            files: BTreeMap::from([(
+                manifest_url,
+                data_encoding::HEXLOWER.encode(&Sha256::digest(original)),
+            )]),
+        };
+        verify_remote_plugin_lock_entry(&resolved, &resolved, &entry).unwrap();
+        std::fs::write(&path, b"changed").unwrap();
+        assert!(verify_remote_plugin_lock_entry(&resolved, &resolved, &entry).is_err());
+        std::fs::write(&path, original).unwrap();
+        let config = remote_cache_file(&format!("{resolved}/config.toml")).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, b"[[detector]]\npattern = \"new\"\n").unwrap();
+        assert!(verify_remote_plugin_lock_entry(&resolved, &resolved, &entry).is_err());
+        let parent = path.parent().unwrap().to_path_buf();
+        let config_parent = config.parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(parent);
+        let _ = std::fs::remove_dir_all(config_parent);
+    }
+
+    #[test]
+    fn project_remote_lock_update_is_atomic_and_sorted() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-project-plugin-lock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("plugins.lock");
+        let entry = |source: &str| RemotePluginLockEntry {
+            source: source.to_string(),
+            resolved: format!("https://raw.githubusercontent.com/{source}"),
+            files: BTreeMap::from([("file".to_string(), "0".repeat(64))]),
+        };
+        set_project_remote_plugin_lock_at(&path, "z/repo", Some(entry("z/repo"))).unwrap();
+        set_project_remote_plugin_lock_at(&path, "a/repo", Some(entry("a/repo"))).unwrap();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let lock: ProjectPluginLock = toml::from_str(&source).unwrap();
+        assert_eq!(
+            lock.plugin
+                .iter()
+                .map(|entry| entry.source.as_str())
+                .collect::<Vec<_>>(),
+            ["a/repo", "z/repo"]
+        );
+        set_project_remote_plugin_lock_at(&path, "a/repo", None).unwrap();
+        let lock: ProjectPluginLock =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(lock.plugin.len(), 1);
+        assert_eq!(lock.plugin[0].source, "z/repo");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_project_lock_updates_do_not_lose_entries() {
+        use std::sync::{Arc, Barrier};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-project-plugin-lock-concurrent-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("plugins.lock");
+        let count = 12;
+        let barrier = Arc::new(Barrier::new(count));
+        let mut threads = Vec::new();
+        for index in 0..count {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let source = format!("owner/repo-{index}");
+                let entry = RemotePluginLockEntry {
+                    source: source.clone(),
+                    resolved: format!("https://raw.githubusercontent.com/{source}"),
+                    files: BTreeMap::from([("file".to_string(), "0".repeat(64))]),
+                };
+                barrier.wait();
+                set_project_remote_plugin_lock_at(&path, &source, Some(entry)).unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let lock: ProjectPluginLock =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(lock.plugin.len(), count);
+        for index in 0..count {
+            assert!(
+                lock.plugin
+                    .iter()
+                    .any(|entry| entry.source == format!("owner/repo-{index}")),
+                "concurrent update {index} was lost"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_transaction_rollback_cannot_erase_a_concurrent_success() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-plugin-transaction-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let lock_path = root.join("pentect.plugins.lock");
+        let config_path = root.join("config.toml");
+        let (a_ready_tx, a_ready_rx) = std::sync::mpsc::channel();
+        let (b_attempt_tx, b_attempt_rx) = std::sync::mpsc::channel();
+
+        let a_lock = lock_path.clone();
+        let a_config = config_path.clone();
+        let failed = std::thread::spawn(move || {
+            let guard = ProjectPluginMutationGuard::acquire(&a_lock).unwrap();
+            std::fs::write(&a_config, b"plugins = ['failed']\n").unwrap();
+            let entry = RemotePluginLockEntry {
+                source: "failed".to_string(),
+                resolved: "https://raw.githubusercontent.com/owner/failed/main".to_string(),
+                files: BTreeMap::from([("failed".to_string(), "0".repeat(64))]),
+            };
+            set_project_remote_plugin_lock_at_locked(&a_lock, "failed", Some(entry)).unwrap();
+            a_ready_tx.send(()).unwrap();
+            b_attempt_rx.recv().unwrap();
+            // This models restoring the transaction's original empty snapshot.
+            std::fs::remove_file(&a_config).unwrap();
+            std::fs::remove_file(&a_lock).unwrap();
+            drop(guard);
+        });
+
+        let b_lock = lock_path.clone();
+        let b_config = config_path.clone();
+        let succeeded = std::thread::spawn(move || {
+            a_ready_rx.recv().unwrap();
+            b_attempt_tx.send(()).unwrap();
+            let _guard = ProjectPluginMutationGuard::acquire(&b_lock).unwrap();
+            std::fs::write(&b_config, b"plugins = ['success']\n").unwrap();
+            let entry = RemotePluginLockEntry {
+                source: "success".to_string(),
+                resolved: "https://raw.githubusercontent.com/owner/success/main".to_string(),
+                files: BTreeMap::from([("success".to_string(), "0".repeat(64))]),
+            };
+            set_project_remote_plugin_lock_at_locked(&b_lock, "success", Some(entry)).unwrap();
+        });
+
+        failed.join().unwrap();
+        succeeded.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "plugins = ['success']\n"
+        );
+        let lock: ProjectPluginLock =
+            toml::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+        assert_eq!(lock.plugin.len(), 1);
+        assert_eq!(lock.plugin[0].source, "success");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refreshed_remote_cache_can_be_rolled_back_as_one_set() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-remote-cache-rollback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let existing = root.join("plugin.toml");
+        let newly_created = root.join("config.toml");
+        std::fs::write(&existing, b"old").unwrap();
+        let snapshot = RemotePluginCacheSnapshot {
+            files: vec![
+                (existing.clone(), Some(b"old".to_vec())),
+                (newly_created.clone(), None),
+            ],
+            previous_sources: BTreeMap::new(),
+        };
+        std::fs::write(&existing, b"new").unwrap();
+        std::fs::write(&newly_created, b"new config").unwrap();
+        restore_remote_plugin_cache(&snapshot).unwrap();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"old");
+        assert!(!newly_created.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

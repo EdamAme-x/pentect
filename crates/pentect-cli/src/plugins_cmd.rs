@@ -2,7 +2,8 @@ use crate::{plugins, update};
 use pentect_agent::{read_bounded_bytes, read_bounded_utf8, DEFAULT_PUBLISHER_WORKFLOW};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -379,19 +380,43 @@ fn add_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Strin
     if json_output {
         return Err("plugins add does not support --json".to_string());
     }
-    let source = plugins::refresh_plugin_source(spec).map_err(|error| error.to_string())?;
-    if source.manifest_path.is_some() {
-        setup_plugin_source(source, approved, false)?;
-    } else {
-        let active = active_for_one(spec)?;
-        if active.config_paths().is_empty() {
-            return Err(format!(
-                "plugin '{}' has no plugin.toml or detector config",
-                source.name
-            ));
+    let project_guard =
+        plugins::lock_project_plugin_mutation().map_err(|error| error.to_string())?;
+    let cache = plugins::snapshot_remote_plugin_cache(spec).map_err(|error| error.to_string())?;
+    let project = snapshot_project_plugin_files()?;
+    let result = (|| {
+        let source = plugins::refresh_plugin_source(spec).map_err(|error| error.to_string())?;
+        let lock_entry =
+            plugins::remote_plugin_lock_entry(spec, &source).map_err(|error| error.to_string())?;
+        if let Some(entry) = lock_entry {
+            plugins::set_project_remote_plugin_lock_with_guard(&project_guard, spec, Some(entry))
+                .map_err(|error| error.to_string())?;
         }
+        if source.manifest_path.is_some() {
+            setup_plugin_source(source.clone(), approved, false)?;
+        }
+        if source.manifest_path.is_none() {
+            let active = active_for_one(spec)?;
+            if active.config_paths().is_empty() {
+                return Err(format!(
+                    "plugin '{}' has no plugin.toml or detector config",
+                    source.name
+                ));
+            }
+        }
+        update_project_plugins(spec, true)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if let Some(cache) = cache.as_ref() {
+            plugins::restore_remote_plugin_cache(cache).map_err(|restore| {
+                format!("{error}; could not roll back plugin source: {restore}")
+            })?;
+        }
+        restore_project_plugin_files(&project)
+            .map_err(|restore| format!("{error}; could not roll back project lock: {restore}"))?;
+        return Err(error);
     }
-    update_project_plugins(spec, true)?;
     println!("enabled: {spec}");
     Ok(())
 }
@@ -400,9 +425,66 @@ fn remove_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     if json_output {
         return Err("plugins remove does not support --json".to_string());
     }
-    update_project_plugins(spec, false)?;
+    let project_guard =
+        plugins::lock_project_plugin_mutation().map_err(|error| error.to_string())?;
+    let project = snapshot_project_plugin_files()?;
+    let result = (|| {
+        let removed = update_project_plugins(spec, false)?;
+        for source in removed {
+            plugins::set_project_remote_plugin_lock_with_guard(&project_guard, &source, None)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        restore_project_plugin_files(&project)?;
+        return Err(error);
+    }
     println!("removed: {spec}");
     Ok(())
+}
+
+struct ProjectPluginFiles {
+    config: Option<Vec<u8>>,
+    lock: Option<Vec<u8>>,
+}
+
+fn snapshot_project_plugin_files() -> Result<ProjectPluginFiles, String> {
+    snapshot_project_plugin_files_at(
+        &Path::new(".pentect").join("config.toml"),
+        &plugins::project_plugin_lock_path(),
+    )
+}
+
+fn snapshot_project_plugin_files_at(
+    config_path: &Path,
+    lock_path: &Path,
+) -> Result<ProjectPluginFiles, String> {
+    Ok(ProjectPluginFiles {
+        config: read_optional_bounded(
+            config_path,
+            MAX_PLUGIN_CONFIG_BYTES,
+            "Pentect project config",
+        )?,
+        lock: read_optional_bounded(lock_path, MAX_PLUGIN_CONFIG_BYTES, "project plugin lock")?,
+    })
+}
+
+fn restore_project_plugin_files(snapshot: &ProjectPluginFiles) -> Result<(), String> {
+    restore_project_plugin_files_at(
+        snapshot,
+        &Path::new(".pentect").join("config.toml"),
+        &plugins::project_plugin_lock_path(),
+    )
+}
+
+fn restore_project_plugin_files_at(
+    snapshot: &ProjectPluginFiles,
+    config_path: &Path,
+    lock_path: &Path,
+) -> Result<(), String> {
+    restore_optional_file(config_path, snapshot.config.as_deref())?;
+    restore_optional_file(lock_path, snapshot.lock.as_deref())
 }
 
 fn update_project_plugins(spec: &str, enable: bool) -> Result<Vec<String>, String> {
@@ -1379,8 +1461,31 @@ fn toml_leaf_keys(table: &toml::Table) -> Vec<String> {
 }
 
 fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), String> {
-    let source = plugins::refresh_plugin_source(spec).map_err(|e| e.to_string())?;
-    setup_plugin_source(source, approved, json_output)
+    let project_guard =
+        plugins::lock_project_plugin_mutation().map_err(|error| error.to_string())?;
+    let cache = plugins::snapshot_remote_plugin_cache(spec).map_err(|error| error.to_string())?;
+    let project = snapshot_project_plugin_files()?;
+    let result = (|| {
+        let source = plugins::refresh_plugin_source(spec).map_err(|error| error.to_string())?;
+        if let Some(entry) =
+            plugins::remote_plugin_lock_entry(spec, &source).map_err(|error| error.to_string())?
+        {
+            plugins::set_project_remote_plugin_lock_with_guard(&project_guard, spec, Some(entry))
+                .map_err(|error| error.to_string())?;
+        }
+        setup_plugin_source(source, approved, json_output)
+    })();
+    if let Err(error) = result {
+        if let Some(cache) = cache.as_ref() {
+            plugins::restore_remote_plugin_cache(cache).map_err(|restore| {
+                format!("{error}; could not roll back plugin source: {restore}")
+            })?;
+        }
+        restore_project_plugin_files(&project)
+            .map_err(|restore| format!("{error}; could not roll back project lock: {restore}"))?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn setup_plugin_source(
@@ -1558,18 +1663,59 @@ fn update_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), St
     if json_output {
         return Err("plugins update does not support --json".to_string());
     }
+    let project_guard =
+        plugins::lock_project_plugin_mutation().map_err(|error| error.to_string())?;
+    let cache = plugins::snapshot_remote_plugin_cache(spec).map_err(|error| error.to_string())?;
+    let project = snapshot_project_plugin_files()?;
+    let result = update_plugin_inner(spec, approved, cache.as_ref(), &project_guard);
+    if let Err(error) = result {
+        if let Some(cache) = cache.as_ref() {
+            plugins::restore_remote_plugin_cache(cache).map_err(|restore| {
+                format!("{error}; could not roll back plugin source: {restore}")
+            })?;
+        }
+        restore_project_plugin_files(&project)
+            .map_err(|restore| format!("{error}; could not roll back project lock: {restore}"))?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn update_plugin_inner(
+    spec: &str,
+    approved: bool,
+    previous: Option<&plugins::RemotePluginCacheSnapshot>,
+    project_guard: &plugins::ProjectPluginMutationGuard,
+) -> Result<(), String> {
     let source = plugins::refresh_plugin_source(spec).map_err(|e| e.to_string())?;
+    let lock_entry =
+        plugins::remote_plugin_lock_entry(spec, &source).map_err(|error| error.to_string())?;
     let manifest = load_plugin_manifest(&source)?
         .ok_or_else(|| format!("plugin '{}' has no plugin.toml", source.name))?;
     let name = plugin_name(&source, Some(&manifest));
+    let current_sources =
+        plugins::remote_plugin_sources(&source).map_err(|error| error.to_string())?;
+    let detector_changed = show_detector_diff(previous, &current_sources)?;
     let Some(binary) = manifest.binary.as_deref() else {
+        if detector_changed && !approved && !confirm_setup()? {
+            return Err("plugin update was not approved".to_string());
+        }
+        if let Some(entry) = lock_entry {
+            plugins::set_project_remote_plugin_lock_with_guard(project_guard, spec, Some(entry))
+                .map_err(|error| error.to_string())?;
+        }
         println!("update: refreshed manifest for {name}");
         return Ok(());
     };
     let repository = binary_repository(&source, &manifest)?;
     if verify_plugin_update_approval(&name, &source, &manifest).is_err() {
         println!("plugin manifest changed; reviewing updated access");
-        return setup_plugin_source(source, approved, false);
+        if let Some(entry) = lock_entry {
+            plugins::set_project_remote_plugin_lock_with_guard(project_guard, spec, Some(entry))
+                .map_err(|error| error.to_string())?;
+        }
+        setup_plugin_source(source, approved, false)?;
+        return Ok(());
     }
     let runtime = plugin_runtime(&manifest);
     let destination = binary_destination(&name, binary, runtime, &source)?;
@@ -1596,12 +1742,108 @@ fn update_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), St
         restore_optional_file(&destination, previous_binary.as_deref())?;
         restore_optional_file(&lock_path, previous_lock.as_deref())?;
         println!("plugin hook access changed; reviewing updated access");
-        return setup_plugin_source(source, approved, false);
+        if let Some(entry) = lock_entry {
+            plugins::set_project_remote_plugin_lock_with_guard(project_guard, spec, Some(entry))
+                .map_err(|error| error.to_string())?;
+        }
+        setup_plugin_source(source, approved, false)?;
+        return Ok(());
     }
     // Updating a release binary must not rewrite the user's manifest approval.
     // Keeping the original digest makes any concurrent or later edit require setup again.
+    if let Some(entry) = lock_entry {
+        if let Err(error) =
+            plugins::set_project_remote_plugin_lock_with_guard(project_guard, spec, Some(entry))
+        {
+            restore_optional_file(&destination, previous_binary.as_deref())?;
+            restore_optional_file(&lock_path, previous_lock.as_deref())?;
+            return Err(error.to_string());
+        }
+    }
     println!("update: complete");
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DetectorDescriptor {
+    label: String,
+    category: String,
+    confidence: String,
+    rule_sha256: String,
+}
+
+fn show_detector_diff(
+    previous: Option<&plugins::RemotePluginCacheSnapshot>,
+    current: &BTreeMap<String, Vec<u8>>,
+) -> Result<bool, String> {
+    let Some(previous) = previous else {
+        return Ok(false);
+    };
+    let mut before = BTreeSet::new();
+    for source in previous.previous_sources().values() {
+        before.extend(detector_descriptors(source)?);
+    }
+    let mut after = BTreeSet::new();
+    for source in current.values() {
+        after.extend(detector_descriptors(source)?);
+    }
+    if before == after {
+        return Ok(false);
+    }
+    println!("detector changes:");
+    for detector in before.difference(&after) {
+        println!("  - {}", detector_summary(detector));
+    }
+    for detector in after.difference(&before) {
+        println!("  + {}", detector_summary(detector));
+    }
+    Ok(true)
+}
+
+fn detector_descriptors(source: &[u8]) -> Result<BTreeSet<DetectorDescriptor>, String> {
+    let source = std::str::from_utf8(source)
+        .map_err(|_| "remote plugin detector source is not UTF-8".to_string())?;
+    let value: toml::Value = toml::from_str(source)
+        .map_err(|error| format!("remote plugin detector source is invalid: {error}"))?;
+    let Some(detectors) = value.get("detector").and_then(toml::Value::as_array) else {
+        return Ok(BTreeSet::new());
+    };
+    detectors
+        .iter()
+        .map(|detector| {
+            let table = detector
+                .as_table()
+                .ok_or_else(|| "remote plugin detector entry must be a table".to_string())?;
+            let canonical = toml::to_string(table)
+                .map_err(|error| format!("could not encode detector for comparison: {error}"))?;
+            Ok(DetectorDescriptor {
+                label: table
+                    .get("label")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("SECRET")
+                    .to_string(),
+                category: table
+                    .get("category")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("secret")
+                    .to_string(),
+                confidence: table
+                    .get("confidence")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("medium")
+                    .to_string(),
+                rule_sha256: data_encoding::HEXLOWER
+                    .encode(&Sha256::digest(canonical.as_bytes())[..8]),
+            })
+        })
+        .collect()
+}
+
+fn detector_summary(detector: &DetectorDescriptor) -> String {
+    format!(
+        "{} category={} confidence={} rule={}",
+        detector.label, detector.category, detector.confidence, detector.rule_sha256
+    )
 }
 
 fn update_all_plugins(approved: bool, json_output: bool) -> Result<(), String> {
@@ -1688,6 +1930,8 @@ fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> Result<(), Str
     };
     let parent = path
         .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .or(Some(Path::new(".")))
         .ok_or_else(|| "plugin restore destination has no parent".to_string())?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("could not create plugin restore directory: {error}"))?;
@@ -2361,6 +2605,35 @@ mod tests {
     }
 
     #[test]
+    fn project_plugin_config_and_lock_restore_together() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-project-plugin-rollback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        let lock = root.join("pentect.plugins.lock");
+        std::fs::write(&config, "plugins = [\"old\"]\n").unwrap();
+        std::fs::write(&lock, "schema = \"old\"\n").unwrap();
+        let snapshot = snapshot_project_plugin_files_at(&config, &lock).unwrap();
+
+        std::fs::write(&config, "plugins = [\"new\"]\n").unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        restore_project_plugin_files_at(&snapshot, &config, &lock).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "plugins = [\"old\"]\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            "schema = \"old\"\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn parses_add_and_remove() {
         let add = vec![
             "pentect".into(),
@@ -2518,6 +2791,7 @@ mod tests {
             name: "test".to_string(),
             manifest_path: Some(manifest),
             repository: None,
+            remote_base: None,
         };
         assert_eq!(
             binary_asset("helper.wasm", PluginRuntime::Wasm, &BTreeMap::new()),
@@ -2583,6 +2857,34 @@ mod tests {
     }
 
     #[test]
+    fn detector_diff_tracks_label_category_confidence_and_rule() {
+        let before = detector_descriptors(
+            br#"[[detector]]
+pattern = "old-[0-9]+"
+label = "ACCOUNT_ID"
+category = "pii"
+confidence = "high"
+"#,
+        )
+        .unwrap();
+        let after = detector_descriptors(
+            br#"[[detector]]
+pattern = "new-[0-9]+"
+label = "ACCOUNT_ID"
+category = "pii"
+confidence = "high"
+"#,
+        )
+        .unwrap();
+        assert_ne!(before, after);
+        let item = after.iter().next().unwrap();
+        assert_eq!(item.label, "ACCOUNT_ID");
+        assert_eq!(item.category, "pii");
+        assert_eq!(item.confidence, "high");
+        assert_eq!(item.rule_sha256.len(), 16);
+    }
+
+    #[test]
     fn plugin_update_requires_the_exact_approved_manifest() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2600,6 +2902,7 @@ mod tests {
             name: name.clone(),
             manifest_path: Some(manifest_path.clone()),
             repository: None,
+            remote_base: None,
         };
         let manifest = load_plugin_manifest(&source).unwrap().unwrap();
         let hooks = vec!["inspect".to_string()];
@@ -2685,6 +2988,7 @@ mod tests {
             name: "local".to_string(),
             manifest_path: Some(root.join(plugins::PLUGIN_MANIFEST_FILE)),
             repository: None,
+            remote_base: None,
         };
         let manifest = load_plugin_manifest(&source).unwrap().unwrap();
         let err = binary_repository(&source, &manifest).unwrap_err();
@@ -2699,6 +3003,7 @@ mod tests {
             name: "remote".to_string(),
             manifest_path: None,
             repository: Some("trusted/owner".to_string()),
+            remote_base: None,
         };
         let manifest: PluginManifest = toml::from_str(
             "schema = \"pentect.plugin.v1\"\nname = \"remote\"\nrepository = \"attacker/repo\"\n",
@@ -2724,6 +3029,7 @@ mod tests {
             name: name.clone(),
             manifest_path: Some(manifest),
             repository: None,
+            remote_base: None,
         };
         let data_dir = plugin_runtime_dirs_for_source(&name, &source)
             .unwrap()

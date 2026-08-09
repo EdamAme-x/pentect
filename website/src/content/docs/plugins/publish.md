@@ -75,7 +75,7 @@ Users can then install it with:
 
 ```sh
 pentect plugins add \
-  https://raw.githubusercontent.com/OWNER/REPOSITORY/main/plugin.toml
+  https://raw.githubusercontent.com/OWNER/REPOSITORY/v0.1.0/plugin.toml
 ```
 
 The short `github:@OWNER/REPOSITORY/path` form needs a path because it points
@@ -92,10 +92,17 @@ plugin again.
 For a plugin inside a larger repository, add the path:
 
 ```sh
-pentect plugins add github:@OWNER/REPOSITORY/plugins/my-plugin
+pentect plugins add github:@OWNER/REPOSITORY/plugins/my-plugin@v0.1.0
 ```
 
 The release asset still comes from `repository` in the manifest.
+
+Pentect records every fetched manifest and detector file in
+`pentect.plugins.lock` with its SHA-256 digest. Commit this file. Normal runs
+verify the cached bytes and never treat a moving `main` branch as the plugin's
+identity. `plugins update` fetches new bytes, shows detector label, category,
+confidence, and rule-digest changes, and rolls the source and project lock back
+when review or installation fails.
 
 ## Updates and approval
 

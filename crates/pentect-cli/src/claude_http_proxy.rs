@@ -131,6 +131,7 @@ struct ProxyState {
     masker: Arc<StdMutex<pentect_agent::ActiveToolOutputMasker>>,
     plugins: Arc<StdMutex<pentect_agent::PluginMiddleware>>,
     files: StdMutex<HashMap<String, crate::http_files::Coverage>>,
+    file_attestations: crate::http_files::FileAttestationStore,
     requests: Arc<Semaphore>,
     block_unknown_formats: bool,
     headers: crate::upstream::HeaderOverrides,
@@ -167,6 +168,7 @@ async fn run_proxy(
         )),
         plugins: Arc::new(StdMutex::new(plugins)),
         files: StdMutex::new(HashMap::new()),
+        file_attestations: crate::http_files::FileAttestationStore::open_default()?,
         requests: Arc::new(Semaphore::new(32)),
         block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
         headers,
@@ -255,6 +257,8 @@ async fn proxy_request_inner(
     let path_and_query = path_and_query.to_string();
     let upstream_url = join_upstream_url(&state.upstream, &path_and_query)?;
     let headers = request.headers().clone();
+    let credential_material = state.headers.credential_scope_material(&headers);
+    let account_scope = state.file_attestations.account_scope(&credential_material);
     let messages_path = endpoint == AnthropicEndpoint::Messages;
     let protected_request = matches!(
         endpoint,
@@ -310,14 +314,18 @@ async fn proxy_request_inner(
             request_coverage = Some(protected.coverage);
             reqwest::Body::from(protected.body)
         } else {
-            let body = resolve_anthropic_remote_content(body).await?;
+            let mut remote_budget = crate::remote_content::RemoteRequestBudget::default();
+            let body = resolve_anthropic_remote_content(body, &mut remote_budget).await?;
+            hydrate_anthropic_attested_files(&body, &account_scope, state).await?;
             let masker = Arc::clone(&state.masker);
             let plugins = Arc::clone(&state.plugins);
-            let files = state
-                .files
-                .lock()
-                .map_err(|_| "Claude file registry lock was poisoned".to_string())?
-                .clone();
+            let files = {
+                let registry = state
+                    .files
+                    .lock()
+                    .map_err(|_| "Claude file registry lock was poisoned".to_string())?;
+                crate::http_files::scoped_file_coverages(&registry, &account_scope)
+            };
             let block_unknown_formats = state.block_unknown_formats;
             let protected = tokio::task::spawn_blocking(move || {
                 protect_anthropic_request_body(
@@ -412,11 +420,31 @@ async fn proxy_request_inner(
             serde_json::from_slice::<Value>(&response_body),
         ) {
             if let Some(id) = value.get("id").and_then(Value::as_str) {
-                let mut files = state
-                    .files
-                    .lock()
-                    .map_err(|_| "Claude file registry lock was poisoned".to_string())?;
-                crate::http_files::remember_file_coverage(&mut files, id.to_string(), coverage);
+                if state
+                    .file_attestations
+                    .remember_async(
+                        "anthropic",
+                        state.upstream.as_str(),
+                        &account_scope,
+                        id,
+                        coverage,
+                    )
+                    .await
+                    .is_err()
+                {
+                    eprintln!(
+                        "[pentect] file attestation unavailable; uploaded file remains untrusted"
+                    );
+                } else if let Ok(mut files) = state.files.lock() {
+                    crate::http_files::remember_scoped_file_coverage(
+                        &mut files,
+                        &account_scope,
+                        id.to_string(),
+                        coverage,
+                    );
+                } else {
+                    eprintln!("[pentect] uploaded file registry unavailable; persistent attestation retained");
+                }
             }
         }
     }
@@ -508,25 +536,29 @@ fn run_anthropic_tool_plugins(
     Ok(())
 }
 
-async fn resolve_anthropic_remote_content(body: Bytes) -> Result<Bytes, String> {
+async fn resolve_anthropic_remote_content(
+    body: Bytes,
+    budget: &mut crate::remote_content::RemoteRequestBudget,
+) -> Result<Bytes, String> {
     let mut value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return Ok(body),
     };
-    resolve_anthropic_remote_values(&mut value).await?;
+    resolve_anthropic_remote_values(&mut value, budget).await?;
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| "could not encode resolved remote attachment".to_string())
 }
 
-fn resolve_anthropic_remote_values(
-    value: &mut Value,
-) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+fn resolve_anthropic_remote_values<'a>(
+    value: &'a mut Value,
+    budget: &'a mut crate::remote_content::RemoteRequestBudget,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    resolve_anthropic_remote_values(value).await?;
+                    resolve_anthropic_remote_values(value, budget).await?;
                 }
             }
             Value::Object(object) => {
@@ -542,7 +574,8 @@ fn resolve_anthropic_remote_values(
                                 .and_then(Value::as_str)
                                 .map(str::to_string)
                             {
-                                let mut remote = crate::remote_content::fetch(&url).await?;
+                                let mut remote =
+                                    crate::remote_content::fetch_with_budget(&url, budget).await?;
                                 if block_type.as_deref() == Some("document")
                                     && crate::http_files::supported_text_file(
                                         &remote.filename,
@@ -575,13 +608,62 @@ fn resolve_anthropic_remote_values(
                     }
                 }
                 for value in object.values_mut() {
-                    resolve_anthropic_remote_values(value).await?;
+                    resolve_anthropic_remote_values(value, budget).await?;
                 }
             }
             _ => {}
         }
         Ok(())
     })
+}
+
+async fn hydrate_anthropic_attested_files(
+    body: &[u8],
+    account_scope: &str,
+    state: &ProxyState,
+) -> Result<(), String> {
+    hydrate_anthropic_attested_files_from_sources(
+        body,
+        &state.files,
+        &state.file_attestations,
+        state.upstream.as_str(),
+        account_scope,
+    )
+    .await
+}
+
+async fn hydrate_anthropic_attested_files_from_sources(
+    body: &[u8],
+    files: &StdMutex<HashMap<String, crate::http_files::Coverage>>,
+    attestations: &crate::http_files::FileAttestationStore,
+    upstream: &str,
+    account_scope: &str,
+) -> Result<(), String> {
+    let attestations = attestations.clone();
+    let body = body.to_vec();
+    let upstream = upstream.to_string();
+    let scope_for_task = account_scope.to_string();
+    let coverages = tokio::task::spawn_blocking(move || {
+        attestations.coverages_in_json(&body, "anthropic", &upstream, &scope_for_task)
+    })
+    .await
+    .map_err(|_| "Claude file attestation task failed".to_string())??;
+    for (id, coverage) in coverages {
+        let registry = files
+            .lock()
+            .map_err(|_| "Claude file registry lock was poisoned".to_string())?;
+        let already_known =
+            crate::http_files::scoped_file_coverage(&registry, account_scope, &id).is_some();
+        drop(registry);
+        if already_known {
+            continue;
+        }
+        let mut files = files
+            .lock()
+            .map_err(|_| "Claude file registry lock was poisoned".to_string())?;
+        crate::http_files::remember_scoped_file_coverage(&mut files, account_scope, id, coverage);
+    }
+    Ok(())
 }
 
 struct ProtectedJsonBody {
@@ -2024,6 +2106,58 @@ fn random_auth_token() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn uploaded_file_coverage_is_reused_after_anthropic_registry_restart() {
+        const SCOPE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pentect-anthropic-attestation-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = crate::http_files::FileAttestationStore::open(&root).unwrap();
+        store
+            .remember(
+                "anthropic",
+                "https://gateway.example",
+                SCOPE,
+                "file-restart",
+                crate::http_files::Coverage::Full,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = crate::http_files::FileAttestationStore::open(&root).unwrap();
+        let files = StdMutex::new(HashMap::new());
+        hydrate_anthropic_attested_files_from_sources(
+            br#"{"messages":[{"content":[{"type":"document","source":{"type":"file","file_id":"file-restart"}}]}]}"#,
+            &files,
+            &reopened,
+            "https://gateway.example",
+            SCOPE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::http_files::scoped_file_coverage(&files.lock().unwrap(), SCOPE, "file-restart"),
+            Some(crate::http_files::Coverage::Full)
+        );
+        let other_files = StdMutex::new(HashMap::new());
+        hydrate_anthropic_attested_files_from_sources(
+            br#"{"file_id":"file-restart"}"#,
+            &other_files,
+            &reopened,
+            "https://other.example",
+            SCOPE,
+        )
+        .await
+        .unwrap();
+        assert!(other_files.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     struct TestEnv {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,

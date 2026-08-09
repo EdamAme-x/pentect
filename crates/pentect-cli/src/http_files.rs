@@ -6,10 +6,24 @@
 
 use hyper::body::Bytes;
 use memchr::memmem;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+const MAX_MULTIPART_BYTES: usize = 32 * 1024 * 1024;
+const MAX_MULTIPART_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MULTIPART_PARTS: usize = 64;
+const MAX_MULTIPART_FILES: usize = 16;
+const MAX_MULTIPART_HEADER_BYTES: usize = 64 * 1024;
+const MAX_MULTIPART_FIELD_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Coverage {
     Full,
     Partial,
@@ -51,6 +65,9 @@ pub(crate) fn protect_multipart_upload_with_plugins(
     masker: &mut pentect_agent::ActiveToolOutputMasker,
     plugins: &pentect_agent::PluginMiddleware,
 ) -> Result<ProtectedUpload, String> {
+    if body.len() > MAX_MULTIPART_BYTES {
+        return Err("file upload blocked: multipart request is too large".to_string());
+    }
     let boundary = multipart_boundary(content_type)
         .ok_or_else(|| "Files API upload is missing a multipart boundary".to_string())?;
     let delimiter = format!("--{boundary}").into_bytes();
@@ -67,6 +84,9 @@ pub(crate) fn protect_multipart_upload_with_plugins(
     let mut saw_file = false;
     let mut coverage = Coverage::Full;
     let mut plugin_partial = false;
+    let mut part_count = 0usize;
+    let mut file_count = 0usize;
+    let mut field_bytes = 0usize;
 
     while let Some(relative_start) = memmem::find(&body[cursor..], &delimiter) {
         let part_start = cursor + relative_start;
@@ -90,6 +110,13 @@ pub(crate) fn protect_multipart_upload_with_plugins(
             return Err("file upload blocked: malformed multipart headers".to_string());
         };
         let headers_end = headers_start + headers_relative_end;
+        if headers_end - headers_start > MAX_MULTIPART_HEADER_BYTES {
+            return Err("file upload blocked: multipart headers are too large".to_string());
+        }
+        part_count = part_count.saturating_add(1);
+        if part_count > MAX_MULTIPART_PARTS {
+            return Err("file upload blocked: multipart request has too many parts".to_string());
+        }
         let content_start = headers_end + body_separator.len();
         let Some(content_relative_end) = memmem::find(&body[content_start..], &next_part_prefix)
         else {
@@ -101,6 +128,10 @@ pub(crate) fn protect_multipart_upload_with_plugins(
 
         output.extend_from_slice(&body[cursor..headers_start]);
         if let Some(file) = file_part(headers) {
+            file_count = file_count.saturating_add(1);
+            if file_count > MAX_MULTIPART_FILES {
+                return Err("file upload blocked: multipart request has too many files".to_string());
+            }
             saw_file = true;
             let metadata = serde_json::json!({
                 "filename": file.filename,
@@ -130,7 +161,7 @@ pub(crate) fn protect_multipart_upload_with_plugins(
                                         .to_string(),
                                 );
                             }
-                            output.extend_from_slice(final_masked.as_bytes());
+                            extend_protected_output(&mut output, final_masked.as_bytes())?;
                         }
                         Ok(None) => {
                             return Err(
@@ -160,7 +191,7 @@ pub(crate) fn protect_multipart_upload_with_plugins(
                         })?,
                     );
                     output.extend_from_slice(body_separator);
-                    output.extend_from_slice(&protected);
+                    extend_protected_output(&mut output, &protected)?;
                 } else {
                     output.extend_from_slice(headers);
                     output.extend_from_slice(body_separator);
@@ -173,6 +204,10 @@ pub(crate) fn protect_multipart_upload_with_plugins(
                 );
             }
         } else {
+            field_bytes = field_bytes.saturating_add(content.len());
+            if field_bytes > MAX_MULTIPART_FIELD_BYTES {
+                return Err("file upload blocked: multipart fields are too large".to_string());
+            }
             output.extend_from_slice(headers);
             output.extend_from_slice(body_separator);
             output.extend_from_slice(content);
@@ -187,6 +222,10 @@ pub(crate) fn protect_multipart_upload_with_plugins(
         coverage = Coverage::None;
     } else if plugin_partial {
         coverage = Coverage::Partial;
+    }
+    if output.len() > MAX_MULTIPART_OUTPUT_BYTES {
+        output.zeroize();
+        return Err("file upload blocked: protected multipart request is too large".to_string());
     }
     Ok(ProtectedUpload {
         body: Bytes::from(output),
@@ -399,6 +438,15 @@ fn run_file_stage(
     Ok(run.payload)
 }
 
+fn extend_protected_output(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_MULTIPART_OUTPUT_BYTES.saturating_sub(output.len()) {
+        output.zeroize();
+        return Err("file upload blocked: protected multipart request is too large".to_string());
+    }
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
 fn disposition_parameter(header: &str, expected: &str) -> Option<String> {
     header.split(';').skip(1).find_map(|parameter| {
         let (name, value) = parameter.trim().split_once('=')?;
@@ -409,6 +457,651 @@ fn disposition_parameter(header: &str, expected: &str) -> Option<String> {
 }
 
 const MAX_TRACKED_FILE_IDS: usize = 1024;
+
+const ATTESTATION_VERSION: u8 = 2;
+const ATTESTATION_KEY_BYTES: usize = 32;
+const DEFAULT_ATTESTATION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MAX_ATTESTATION_RECORDS: usize = 4096;
+const MAX_ATTESTATION_RECORD_BYTES: usize = 16 * 1024;
+
+/// Persistent, locally authenticated proof that a remote file ID refers to an
+/// upload Pentect inspected. Provider, upstream, and a keyed credential scope
+/// are part of the proof so a colliding ID cannot inherit coverage.
+#[derive(Clone)]
+pub(crate) struct FileAttestationStore {
+    root: PathBuf,
+    key: [u8; ATTESTATION_KEY_BYTES],
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FileAttestation {
+    version: u8,
+    provider: String,
+    upstream_hash: String,
+    account_scope: String,
+    file_id: String,
+    coverage: Coverage,
+    expires_at: u64,
+    mac: String,
+}
+
+impl FileAttestationStore {
+    /// Returns a keyed digest of ephemeral credential material. The material
+    /// itself is neither retained nor serialized.
+    pub(crate) fn account_scope(&self, material: &[u8]) -> String {
+        mac_hex(&self.key, material)
+    }
+
+    pub(crate) fn account_scope_for_app_headers(&self, headers: &hyper::HeaderMap) -> String {
+        let mut fields = headers
+            .iter()
+            .filter(|(name, _)| {
+                matches!(
+                    name.as_str().to_ascii_lowercase().as_str(),
+                    "authorization" | "cookie" | "x-api-key" | "api-key" | "x-goog-api-key"
+                )
+            })
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase().into_bytes(),
+                    value.as_bytes().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        fields.sort();
+        let mut material = zeroize::Zeroizing::new(Vec::new());
+        for (name, value) in fields {
+            append_field(&mut material, &name);
+            append_field(&mut material, &value);
+        }
+        self.account_scope(&material)
+    }
+
+    pub(crate) fn open_default() -> Result<Self, String> {
+        #[cfg(target_os = "windows")]
+        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        #[cfg(target_os = "macos")]
+        let base = home_directory().map(|home| home.join("Library").join("Application Support"));
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home_directory().map(|home| home.join(".local").join("state")));
+        let root = base
+            .map(|base| base.join("pentect").join("file-attestations"))
+            .ok_or_else(|| "could not find a local state directory for Pentect".to_string())?;
+        Self::open(root)
+    }
+
+    pub(crate) fn open(root: impl AsRef<Path>) -> Result<Self, String> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(&root)
+            .map_err(|error| format!("could not create file attestation store: {error}"))?;
+        restrict_directory(&root)?;
+        let key = load_or_create_attestation_key(&root.join("attestation.key"))?;
+        fs::create_dir_all(root.join("records"))
+            .map_err(|error| format!("could not create file attestation records: {error}"))?;
+        restrict_directory(&root.join("records"))?;
+        Ok(Self { root, key })
+    }
+
+    pub(crate) fn remember(
+        &self,
+        provider: &str,
+        upstream: &str,
+        account_scope: &str,
+        file_id: &str,
+        coverage: Coverage,
+    ) -> Result<(), String> {
+        self.remember_for(
+            provider,
+            upstream,
+            account_scope,
+            file_id,
+            coverage,
+            DEFAULT_ATTESTATION_TTL,
+        )
+    }
+
+    pub(crate) async fn remember_async(
+        &self,
+        provider: &str,
+        upstream: &str,
+        account_scope: &str,
+        file_id: &str,
+        coverage: Coverage,
+    ) -> Result<(), String> {
+        let store = self.clone();
+        let provider = provider.to_string();
+        let upstream = upstream.to_string();
+        let account_scope = account_scope.to_string();
+        let file_id = file_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            store.remember(&provider, &upstream, &account_scope, &file_id, coverage)
+        })
+        .await
+        .map_err(|_| "file attestation task failed".to_string())?
+    }
+
+    fn remember_for(
+        &self,
+        provider: &str,
+        upstream: &str,
+        account_scope: &str,
+        file_id: &str,
+        coverage: Coverage,
+        ttl: Duration,
+    ) -> Result<(), String> {
+        validate_attestation_component("provider", provider, 128)?;
+        validate_attestation_component("file ID", file_id, 1024)?;
+        validate_attestation_component("upstream", upstream, 4096)?;
+        validate_attestation_scope(account_scope)?;
+        let upstream_hash = digest_hex(upstream.as_bytes());
+        let expires_at = unix_time()
+            .checked_add(ttl.as_secs())
+            .ok_or_else(|| "file attestation expiry overflowed".to_string())?;
+        let mut record = FileAttestation {
+            version: ATTESTATION_VERSION,
+            provider: provider.to_string(),
+            upstream_hash,
+            account_scope: account_scope.to_string(),
+            file_id: file_id.to_string(),
+            coverage,
+            expires_at,
+            mac: String::new(),
+        };
+        record.mac = mac_hex(&self.key, &attestation_payload(&record));
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|error| format!("could not encode file attestation: {error}"))?;
+        let path = self.record_path(provider, upstream, account_scope, file_id);
+        atomic_private_write(&path, &bytes)?;
+        self.prune()?;
+        Ok(())
+    }
+
+    pub(crate) fn coverage(
+        &self,
+        provider: &str,
+        upstream: &str,
+        account_scope: &str,
+        file_id: &str,
+    ) -> Result<Option<Coverage>, String> {
+        validate_attestation_component("provider", provider, 128)?;
+        validate_attestation_component("file ID", file_id, 1024)?;
+        validate_attestation_component("upstream", upstream, 4096)?;
+        validate_attestation_scope(account_scope)?;
+        let path = self.record_path(provider, upstream, account_scope, file_id);
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("could not open file attestation: {error}")),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_ATTESTATION_RECORD_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("could not read file attestation: {error}"))?;
+        if bytes.len() > MAX_ATTESTATION_RECORD_BYTES {
+            let _ = fs::remove_file(path);
+            return Ok(None);
+        }
+        let record: FileAttestation = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(_) => {
+                let _ = fs::remove_file(path);
+                return Ok(None);
+            }
+        };
+        let expected_upstream = digest_hex(upstream.as_bytes());
+        let expected_mac = mac_bytes(&self.key, &attestation_payload(&record));
+        let supplied_mac = match data_encoding::HEXLOWER.decode(record.mac.as_bytes()) {
+            Ok(mac) => mac,
+            Err(_) => {
+                let _ = fs::remove_file(path);
+                return Ok(None);
+            }
+        };
+        let valid = record.version == ATTESTATION_VERSION
+            && record.provider == provider
+            && record.upstream_hash == expected_upstream
+            && record.account_scope == account_scope
+            && record.file_id == file_id
+            && record.expires_at >= unix_time()
+            && constant_time_eq(&expected_mac, &supplied_mac);
+        if !valid {
+            let _ = fs::remove_file(path);
+            return Ok(None);
+        }
+        Ok(Some(record.coverage))
+    }
+
+    pub(crate) fn coverages_in_json(
+        &self,
+        body: &[u8],
+        provider: &str,
+        upstream: &str,
+        account_scope: &str,
+    ) -> Result<Vec<(String, Coverage)>, String> {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Ok(Vec::new());
+        };
+        let mut ids = Vec::new();
+        collect_json_file_ids(&value, &mut ids);
+        let mut coverages = Vec::new();
+        for id in ids {
+            if let Some(coverage) = self.coverage(provider, upstream, account_scope, &id)? {
+                coverages.push((id, coverage));
+            }
+        }
+        Ok(coverages)
+    }
+
+    fn record_path(
+        &self,
+        provider: &str,
+        upstream: &str,
+        account_scope: &str,
+        file_id: &str,
+    ) -> PathBuf {
+        let mut identity = Vec::with_capacity(
+            provider.len() + upstream.len() + account_scope.len() + file_id.len() + 4,
+        );
+        append_field(&mut identity, provider.as_bytes());
+        append_field(&mut identity, upstream.as_bytes());
+        append_field(&mut identity, account_scope.as_bytes());
+        append_field(&mut identity, file_id.as_bytes());
+        self.root
+            .join("records")
+            .join(format!("{}.json", digest_hex(&identity)))
+    }
+
+    fn prune(&self) -> Result<(), String> {
+        let mut entries = fs::read_dir(self.root.join("records"))
+            .map_err(|error| format!("could not inspect file attestations: {error}"))?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let metadata = entry.metadata().ok()?;
+                metadata
+                    .is_file()
+                    .then(|| (metadata.modified().unwrap_or(UNIX_EPOCH), entry.path()))
+            })
+            .collect::<Vec<_>>();
+        if entries.len() <= MAX_ATTESTATION_RECORDS {
+            return Ok(());
+        }
+        entries.sort_by_key(|(modified, _)| *modified);
+        let remove = entries.len() - MAX_ATTESTATION_RECORDS;
+        for (_, path) in entries.into_iter().take(remove) {
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
+    }
+}
+
+fn validate_attestation_scope(scope: &str) -> Result<(), String> {
+    if scope.len() != 64 || !scope.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("file attestation account scope is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn collect_json_file_ids(value: &serde_json::Value, ids: &mut Vec<String>) {
+    if ids.len() >= MAX_TRACKED_FILE_IDS {
+        return;
+    }
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_file_ids(value, ids);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for key in ["file_id", "file_uuid"] {
+                if let Some(id) = object.get(key).and_then(serde_json::Value::as_str) {
+                    if !id.is_empty() && id.len() <= 1024 && !ids.iter().any(|known| known == id) {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+            for value in object.values() {
+                collect_json_file_ids(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+impl Drop for FileAttestationStore {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+fn validate_attestation_component(name: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+        return Err(format!("file attestation {name} is invalid"));
+    }
+    Ok(())
+}
+
+fn attestation_payload(record: &FileAttestation) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(record.version);
+    append_field(&mut payload, record.provider.as_bytes());
+    append_field(&mut payload, record.upstream_hash.as_bytes());
+    append_field(&mut payload, record.account_scope.as_bytes());
+    append_field(&mut payload, record.file_id.as_bytes());
+    payload.push(match record.coverage {
+        Coverage::Full => 2,
+        Coverage::Partial => 1,
+        Coverage::None => 0,
+    });
+    payload.extend_from_slice(&record.expires_at.to_be_bytes());
+    payload
+}
+
+fn append_field(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
+fn mac_hex(key: &[u8; 32], payload: &[u8]) -> String {
+    data_encoding::HEXLOWER.encode(&mac_bytes(key, payload))
+}
+
+fn mac_bytes(key: &[u8; 32], payload: &[u8]) -> [u8; 32] {
+    const BLOCK_BYTES: usize = 64;
+    let mut inner_key = [0x36u8; BLOCK_BYTES];
+    let mut outer_key = [0x5cu8; BLOCK_BYTES];
+    for index in 0..key.len() {
+        inner_key[index] ^= key[index];
+        outer_key[index] ^= key[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_key);
+    inner.update(payload);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_key);
+    outer.update(inner_digest);
+    let result: [u8; 32] = outer.finalize().into();
+    inner_key.zeroize();
+    outer_key.zeroize();
+    result
+}
+
+fn constant_time_eq(expected: &[u8], supplied: &[u8]) -> bool {
+    if expected.len() != supplied.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(supplied)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn digest_hex(value: &[u8]) -> String {
+    data_encoding::HEXLOWER.encode(&Sha256::digest(value))
+}
+
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn load_or_create_attestation_key(path: &Path) -> Result<[u8; 32], String> {
+    if !path.exists() {
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key)
+            .map_err(|error| format!("could not generate file attestation key: {error}"))?;
+        let temporary = private_temporary_path(path, "key");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(&key).and_then(|_| file.sync_all()) {
+                    drop(file);
+                    let _ = fs::remove_file(&temporary);
+                    key.zeroize();
+                    return Err(format!("could not write file attestation key: {error}"));
+                }
+                drop(file);
+                if let Err(error) = restrict_private_file(&temporary) {
+                    let _ = fs::remove_file(&temporary);
+                    key.zeroize();
+                    return Err(error);
+                }
+                match fs::hard_link(&temporary, path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&temporary);
+                        if let Err(error) =
+                            sync_parent_directory(path).and_then(|_| restrict_private_file(path))
+                        {
+                            let _ = fs::remove_file(path);
+                            key.zeroize();
+                            return Err(error);
+                        }
+                        return Ok(key);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let _ = fs::remove_file(&temporary);
+                        key.zeroize();
+                    }
+                    Err(error) => {
+                        let _ = fs::remove_file(&temporary);
+                        key.zeroize();
+                        return Err(format!("could not publish file attestation key: {error}"));
+                    }
+                }
+            }
+            Err(error) => {
+                key.zeroize();
+                return Err(format!(
+                    "could not create temporary attestation key: {error}"
+                ));
+            }
+        }
+    }
+    restrict_private_file(path)?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("could not read file attestation key: {error}"))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        format!(
+            "file attestation key must contain exactly 32 bytes (found {})",
+            bytes.len()
+        )
+    })
+}
+
+fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temporary = private_temporary_path(path, "record");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("could not create file attestation: {error}"))?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_data()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("could not write file attestation: {error}"));
+    }
+    drop(file);
+    if let Err(error) = restrict_private_file(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = replace_private_file(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    sync_parent_directory(path)
+}
+
+fn private_temporary_path(path: &Path, label: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!(
+        "{label}.tmp-{}-{}-{sequence}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+}
+
+#[cfg(windows)]
+fn replace_private_file(temporary: &Path, path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers that remain valid
+    // for the duration of the call.
+    let moved = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(format!(
+            "could not atomically publish file attestation: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_private_file(temporary: &Path, path: &Path) -> Result<(), String> {
+    fs::rename(temporary, path)
+        .map_err(|error| format!("could not atomically publish file attestation: {error}"))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "file attestation path has no parent".to_string())?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("could not sync file attestation directory: {error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("could not restrict file attestation directory: {error}"))
+}
+
+#[cfg(windows)]
+fn restrict_directory(path: &Path) -> Result<(), String> {
+    restrict_windows_path(path, true)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restrict_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_private_file(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("could not restrict file attestation: {error}"))
+}
+
+#[cfg(windows)]
+fn restrict_private_file(path: &Path) -> Result<(), String> {
+    restrict_windows_path(path, false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restrict_private_file(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restrict_windows_path(path: &Path, directory: bool) -> Result<(), String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+
+    let mut buffer = [0u16; 32_768];
+    // SAFETY: the writable buffer remains valid for the Win32 call.
+    let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length == 0 || length as usize >= buffer.len() {
+        return Err("could not resolve Windows system directory for attestation ACL".to_string());
+    }
+    let system32 = PathBuf::from(OsString::from_wide(&buffer[..length as usize])).join("System32");
+    let identity = std::process::Command::new(system32.join("whoami.exe"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|error| {
+            format!("could not resolve Windows account for attestation ACL: {error}")
+        })?;
+    if !identity.status.success() {
+        return Err("could not resolve Windows account for attestation ACL".to_string());
+    }
+    let identity = String::from_utf8(identity.stdout)
+        .map_err(|_| "Windows account for attestation ACL is not UTF-8".to_string())?;
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return Err("Windows account for attestation ACL is empty".to_string());
+    }
+    let grant = if directory {
+        format!("{identity}:(OI)(CI)(F)")
+    } else {
+        format!("{identity}:(F)")
+    };
+    let status = std::process::Command::new(system32.join("icacls.exe"))
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", &grant])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("could not restrict file attestation ACL: {error}"))?;
+    if !status.success() {
+        return Err("could not restrict file attestation ACL".to_string());
+    }
+    Ok(())
+}
 
 pub(crate) fn remember_file_coverage(
     files: &mut HashMap<String, Coverage>,
@@ -421,6 +1114,41 @@ pub(crate) fn remember_file_coverage(
         }
     }
     files.insert(id, coverage);
+}
+
+fn scoped_registry_key(account_scope: &str, id: &str) -> String {
+    format!("{account_scope}:{id}")
+}
+
+pub(crate) fn remember_scoped_file_coverage(
+    files: &mut HashMap<String, Coverage>,
+    account_scope: &str,
+    id: String,
+    coverage: Coverage,
+) {
+    remember_file_coverage(files, scoped_registry_key(account_scope, &id), coverage);
+}
+
+pub(crate) fn scoped_file_coverage(
+    files: &HashMap<String, Coverage>,
+    account_scope: &str,
+    id: &str,
+) -> Option<Coverage> {
+    files.get(&scoped_registry_key(account_scope, id)).copied()
+}
+
+pub(crate) fn scoped_file_coverages(
+    files: &HashMap<String, Coverage>,
+    account_scope: &str,
+) -> HashMap<String, Coverage> {
+    let prefix = format!("{account_scope}:");
+    files
+        .iter()
+        .filter_map(|(key, coverage)| {
+            key.strip_prefix(&prefix)
+                .map(|id| (id.to_string(), *coverage))
+        })
+        .collect()
 }
 
 pub(crate) fn supported_text_file(filename: &str, media_type: Option<&str>) -> bool {
@@ -466,6 +1194,19 @@ pub(crate) fn supported_text_file(filename: &str, media_type: Option<&str>) -> b
 mod tests {
     use super::*;
 
+    const TEST_SCOPE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn temporary_attestation_directory(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pentect-attestation-test-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn parses_quoted_boundary() {
         assert_eq!(
@@ -509,5 +1250,240 @@ mod tests {
             multipart_field(&body, b"--boundary", b"\r\n--boundary", "purpose").as_deref(),
             Some("user_data")
         );
+    }
+
+    #[test]
+    fn persistent_attestation_is_bound_to_provider_upstream_and_file() {
+        let root = temporary_attestation_directory("binding");
+        let store = FileAttestationStore::open(&root).unwrap();
+        store
+            .remember(
+                "openai",
+                "https://api.example.test/v1",
+                TEST_SCOPE,
+                "file-123",
+                Coverage::Full,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = FileAttestationStore::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .coverage(
+                    "openai",
+                    "https://api.example.test/v1",
+                    TEST_SCOPE,
+                    "file-123"
+                )
+                .unwrap(),
+            Some(Coverage::Full)
+        );
+        assert_eq!(
+            reopened
+                .coverage(
+                    "anthropic",
+                    "https://api.example.test/v1",
+                    TEST_SCOPE,
+                    "file-123"
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened
+                .coverage(
+                    "openai",
+                    "https://other.example.test/v1",
+                    TEST_SCOPE,
+                    "file-123"
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened
+                .coverage(
+                    "openai",
+                    "https://api.example.test/v1",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "file-123",
+                )
+                .unwrap(),
+            None
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn uploaded_file_attestations_rehydrate_openai_and_anthropic_references() {
+        let root = temporary_attestation_directory("providers");
+        let store = FileAttestationStore::open(&root).unwrap();
+        store
+            .remember(
+                "openai",
+                "https://api.openai.test/v1",
+                TEST_SCOPE,
+                "file-openai",
+                Coverage::Full,
+            )
+            .unwrap();
+        store
+            .remember(
+                "anthropic",
+                "https://api.anthropic.test",
+                TEST_SCOPE,
+                "file-anthropic",
+                Coverage::Partial,
+            )
+            .unwrap();
+
+        let openai = store
+            .coverages_in_json(
+                br#"{"input":[{"type":"input_file","file_id":"file-openai"}]}"#,
+                "openai",
+                "https://api.openai.test/v1",
+                TEST_SCOPE,
+            )
+            .unwrap();
+        assert_eq!(openai, vec![("file-openai".to_string(), Coverage::Full)]);
+
+        let anthropic = store
+            .coverages_in_json(
+                br#"{"messages":[{"content":[{"type":"document","source":{"type":"file","file_id":"file-anthropic"}}]}]}"#,
+                "anthropic",
+                "https://api.anthropic.test",
+                TEST_SCOPE,
+            )
+            .unwrap();
+        assert_eq!(
+            anthropic,
+            vec![("file-anthropic".to_string(), Coverage::Partial)]
+        );
+        assert!(store
+            .coverages_in_json(
+                br#"{"file_id":"file-openai"}"#,
+                "anthropic",
+                "https://api.openai.test/v1",
+                TEST_SCOPE,
+            )
+            .unwrap()
+            .is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn tampered_or_expired_attestation_is_not_trusted() {
+        let root = temporary_attestation_directory("tamper");
+        let store = FileAttestationStore::open(&root).unwrap();
+        store
+            .remember_for(
+                "openai",
+                "https://api.example.test/v1",
+                TEST_SCOPE,
+                "file-expired",
+                Coverage::Full,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let expired_path = store.record_path(
+            "openai",
+            "https://api.example.test/v1",
+            TEST_SCOPE,
+            "file-expired",
+        );
+        let mut expired: FileAttestation =
+            serde_json::from_slice(&fs::read(&expired_path).unwrap()).unwrap();
+        expired.expires_at = 0;
+        fs::write(&expired_path, serde_json::to_vec(&expired).unwrap()).unwrap();
+        assert_eq!(
+            store
+                .coverage(
+                    "openai",
+                    "https://api.example.test/v1",
+                    TEST_SCOPE,
+                    "file-expired"
+                )
+                .unwrap(),
+            None
+        );
+
+        store
+            .remember(
+                "openai",
+                "https://api.example.test/v1",
+                TEST_SCOPE,
+                "file-tampered",
+                Coverage::Full,
+            )
+            .unwrap();
+        let tampered_path = store.record_path(
+            "openai",
+            "https://api.example.test/v1",
+            TEST_SCOPE,
+            "file-tampered",
+        );
+        let mut tampered: FileAttestation =
+            serde_json::from_slice(&fs::read(&tampered_path).unwrap()).unwrap();
+        tampered.account_scope =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        fs::write(&tampered_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert_eq!(
+            store
+                .coverage(
+                    "openai",
+                    "https://api.example.test/v1",
+                    TEST_SCOPE,
+                    "file-tampered"
+                )
+                .unwrap(),
+            None
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn oversized_attestation_record_is_rejected_without_unbounded_read() {
+        let root = temporary_attestation_directory("oversized");
+        let store = FileAttestationStore::open(&root).unwrap();
+        store
+            .remember(
+                "openai",
+                "https://api.example.test/v1",
+                TEST_SCOPE,
+                "file-large",
+                Coverage::Full,
+            )
+            .unwrap();
+        let path = store.record_path(
+            "openai",
+            "https://api.example.test/v1",
+            TEST_SCOPE,
+            "file-large",
+        );
+        fs::write(&path, vec![b'x'; MAX_ATTESTATION_RECORD_BYTES + 1]).unwrap();
+        assert_eq!(
+            store
+                .coverage(
+                    "openai",
+                    "https://api.example.test/v1",
+                    TEST_SCOPE,
+                    "file-large",
+                )
+                .unwrap(),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multipart_request_size_is_bounded_before_parsing() {
+        let body = Bytes::from(vec![0u8; MAX_MULTIPART_BYTES + 1]);
+        let mut masker = pentect_agent::ActiveToolOutputMasker::new().unwrap();
+        let error =
+            protect_multipart_upload("multipart/form-data; boundary=boundary", &body, &mut masker)
+                .err()
+                .unwrap();
+        assert!(error.contains("too large"));
     }
 }

@@ -18,6 +18,7 @@ mod network_address;
 mod output_remask;
 mod plugin_middleware;
 mod secure_io;
+mod team_policy;
 #[doc(hidden)]
 pub use network_address::embedded_ipv4;
 pub use plugin_middleware::{

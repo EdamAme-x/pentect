@@ -3,6 +3,7 @@
 mod app_launcher;
 mod claude_app_proxy;
 mod claude_http_proxy;
+mod client_descriptor;
 mod cloud_code_http_proxy;
 mod codex_app;
 mod default_launch;
@@ -55,6 +56,156 @@ const PENTECT_MEMORY_STORE_ADDR_ENV: &str = "PENTECT_MEMORY_STORE_ADDR";
 const PENTECT_MEMORY_STORE_TOKEN_ENV: &str = "PENTECT_MEMORY_STORE_TOKEN";
 const MEMORY_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ISSUE_NEW_URL: &str = "https://github.com/EdamAme-x/pentect/issues/new";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandAudience {
+    Public,
+    Advanced,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommandSpec {
+    name: &'static str,
+    usage: &'static str,
+    summary: &'static str,
+    audience: CommandAudience,
+}
+
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "help",
+        usage: "pentect help",
+        summary: "Show this help",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "version",
+        usage: "pentect version",
+        summary: "Print the installed version",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "update",
+        usage: "pentect update [VERSION] [--check | --force]",
+        summary: "Install a verified release",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "uninstall",
+        usage: "pentect uninstall",
+        summary: "Remove Pentect and keep project data",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "doctor",
+        usage: "pentect doctor [--json | --fix [--yes]]",
+        summary: "Check readiness and offer safe repairs",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "plugins",
+        usage: "pentect plugins <COMMAND>",
+        summary: "Build, install, configure, and update plugins",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "mask",
+        usage: "< input pentect mask",
+        summary: "Mask UTF-8 text from standard input",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "read",
+        usage: "pentect read PATH",
+        summary: "Mask a file with filename-aware metadata",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "exec",
+        usage: "pentect exec [--] COMMAND [ARG...]",
+        summary: "Restore handles locally and mask command output",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "view",
+        usage: "pentect view '<HANDLE>'",
+        summary: "Show safe handle metadata",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "log",
+        usage: "pentect log [--json]",
+        summary: "Follow local protection events",
+        audience: CommandAudience::Public,
+    },
+    CommandSpec {
+        name: "resolve",
+        usage: "pentect resolve [PATH...]",
+        summary: "Write real values for known handles",
+        audience: CommandAudience::Advanced,
+    },
+    CommandSpec {
+        name: "__apply-update",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
+        name: "hook",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
+        name: "bridge",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
+        name: "memory-store",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
+        name: "purge",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
+        name: "__agent-script",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
+        name: "__agent-stream",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
+        name: "agent",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
+        name: "claude-app",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+    CommandSpec {
+        name: "codex-app",
+        usage: "",
+        summary: "",
+        audience: CommandAudience::Internal,
+    },
+];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -115,22 +266,18 @@ fn dispatch(args: Vec<String>, inherited_env_is_trusted: bool) -> Option<i32> {
         Some("codex") if args.get(2).is_some_and(|arg| arg == "app") => {
             return Some(cmd_codex_app(&args));
         }
-        Some("codex") => return Some(cmd_agent_tool(AgentTool::Codex, &args)),
         Some("claude") if args.get(2).is_some_and(|arg| arg == "app") => {
             return Some(cmd_claude_app(&args));
         }
-        Some("claude") => return Some(cmd_agent_tool(AgentTool::Claude, &args)),
-        Some("opencode") => return Some(cmd_agent_tool(AgentTool::OpenCode, &args)),
-        Some("pi") => return Some(cmd_agent_tool(AgentTool::Pi, &args)),
-        Some("antigravity" | "agy") => {
-            return Some(cmd_agent_tool(AgentTool::Antigravity, &args));
-        }
         Some("claude-app") => return Some(cmd_claude_app(&args)),
         Some("codex-app") => return Some(cmd_codex_app(&args)),
-        _ => {
-            usage();
-            return Some(2);
-        }
+        Some(command) => match AgentTool::from_command(command) {
+            Some(tool) => return Some(cmd_agent_tool(tool, &args)),
+            None => {
+                usage();
+                return Some(2);
+            }
+        },
     }
     None
 }
@@ -159,88 +306,58 @@ fn supports_process_host(args: &[String]) -> bool {
 }
 
 fn usage() {
-    eprintln!(
-        "pentect\n\
-         pentect codex|claude|opencode|pi|antigravity\n\
-         pentect codex|claude --set-default | --unset-default\n\
-         pentect codex app\n\
-         pentect claude app\n\
-         pentect codex|claude app --install-launcher | --remove-launcher\n\
-         pentect exec \"<command>\"\n\
-         pentect doctor [--json | --fix [--yes]]\n\
-         pentect update [VERSION] [--check]\n\
-         pentect uninstall\n\
-         pentect plugins new NAME | dev PATH | publish PATH\n\
-         pentect plugins add SOURCE | remove NAME | list | search [QUERY]\n\
-         pentect plugins inspect NAME | test NAME | config NAME [KEY=VALUE] | setup NAME | update [NAME]\n\
-         < input pentect mask\n\
-         pentect read PATH\n\
-         pentect view <HANDLE>\n\
-         pentect resolve [PATH...]\n\
-         pentect log [--json]\n\
-         pentect help\n\
-         \n\
-         exec: masked output\n\
-         doctor: readiness\n\
-         view: handle\n\
-         resolve: write handles\n\
-         log: live events"
-    );
+    eprint!("{}", help_text());
 }
 
 fn cmd_help() {
     print!("{}", help_text());
 }
 
-fn help_text() -> &'static str {
-    concat!(
-        "pentect protects AI tool boundaries.\n\n",
-        "Use:\n",
-        "  pentect\n",
-        "  pentect codex|claude|antigravity [--upstream URL] [--upstream-header-env HEADER=ENV_NAME] [--plugins NAME|PATH.toml]\n",
-        "  pentect codex|claude (--set-default | --unset-default) [--yes]\n",
-        "  pentect opencode|pi [--model ID] [--upstream URL] [--api chat|responses]\n",
-        "  --upstream-header-env HEADER=ENV_NAME  read an upstream credential without putting it in command arguments\n",
-        "  pentect codex app [--app PATH] [--upstream URL] [--upstream-header-env HEADER=ENV_NAME] [--plugins SOURCE] [--check]\n",
-        "  pentect claude app [--app PATH] [--upstream URL] [--upstream-header-env HEADER=ENV_NAME] [--plugins SOURCE] [--check]\n",
-        "  pentect codex|claude app (--install-launcher | --remove-launcher) [--yes]\n",
-        "  pentect exec \"<command>\"\n\n",
-        "  pentect doctor [--json | --fix [--yes]]\n",
-        "  pentect update [VERSION] [--check | --force]\n",
-        "  pentect uninstall\n",
-        "  pentect plugins new NAME\n",
-        "  pentect plugins dev|publish PATH\n",
-        "  pentect plugins add SOURCE [--yes]\n",
-        "  pentect plugins remove SOURCE\n",
-        "  pentect plugins list|search|inspect|test [NAME|PATH] [--json]\n",
-        "  pentect plugins config NAME|PATH [KEY=VALUE | --unset KEY]\n",
-        "  pentect plugins setup NAME|PATH [--yes]\n",
-        "  pentect plugins update [NAME|PATH] [--yes]\n",
-        "  < input pentect mask\n",
-        "  pentect read PATH\n",
-        "  pentect view '<HANDLE>'\n\n",
-        "  pentect resolve [PATH...]\n",
-        "  pentect log [--json]\n\n",
-        "mask: mask UTF-8 text from stdin\n",
-        "exec: masked stdout/stderr\n",
-        "read: masked file preview\n",
-        "view: handle\n",
-        "log: live events\n",
-        "resolve: write handles\n",
-        "doctor: readiness; --fix offers safe repairs\n",
-        "update: verified GitHub Release binary\n",
-        "uninstall: remove the binary; keep project data\n",
-        "plugins: add, remove, list, search, inspect, test, config, setup, update\n",
-        "--set-default: make the normal client command launch through Pentect\n",
-        "--unset-default: remove the shell-profile change made by Pentect\n",
-        "--install-launcher: add a protected App launcher for this user\n",
-        "--remove-launcher: remove the App launcher created by Pentect\n",
-        "codex app: launch Codex App through the Responses API gateway\n",
-        "claude app: launch Claude Desktop through the Chat and Anthropic gateways\n",
-        "opencode: launch OpenCode through an ephemeral OpenAI-compatible provider\n",
-        "pi: launch Pi through an ephemeral OpenAI-compatible provider\n",
-        "antigravity: launch the official agy CLI through the Cloud Code gateway\n",
-    )
+fn help_text() -> String {
+    let mut help = String::from("pentect protects sensitive data in AI workflows.\n\nClients:\n");
+    for tool in AgentTool::ALL {
+        let descriptor = tool.descriptor();
+        help.push_str(&format!(
+            "  pentect {:<13} Launch {} and pass normal client arguments through\n",
+            descriptor.name, descriptor.default_command
+        ));
+    }
+    help.push_str(
+        "  pentect codex app     Launch Codex App for this protected session\n  pentect claude app    Launch Claude Desktop for this protected session\n\nCommands:\n",
+    );
+    append_help_commands(&mut help, CommandAudience::Public);
+    help.push_str("\nAdvanced:\n");
+    append_help_commands(&mut help, CommandAudience::Advanced);
+    help.push_str(
+        "\nClient arguments are forwarded as written; `--` is optional.\n\
+         Use --upstream URL, --upstream-header-env HEADER=ENV_NAME, or --plugins SOURCE before client arguments.\n\
+         Codex and Claude support --set-default and --unset-default.\n\
+         App commands support --install-launcher, --remove-launcher, --app PATH, and --check.\n",
+    );
+    help
+}
+
+fn append_help_commands(help: &mut String, audience: CommandAudience) {
+    for command in COMMANDS
+        .iter()
+        .filter(|command| command.audience == audience)
+    {
+        help.push_str(&format!("  {:<54} {}\n", command.usage, command.summary));
+    }
+}
+
+#[cfg(test)]
+fn command_names(audience: CommandAudience) -> Vec<&'static str> {
+    let mut names = COMMANDS
+        .iter()
+        .filter(|command| command.audience == audience)
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    if audience == CommandAudience::Public {
+        names.extend(AgentTool::ALL.map(AgentTool::name));
+    }
+    names.sort_unstable();
+    names
 }
 
 #[derive(Debug)]
@@ -370,7 +487,9 @@ fn cmd_agent_tool(tool: AgentTool, args: &[String]) -> i32 {
     let status = match tool {
         AgentTool::Codex => run_codex(&opts, &pentect),
         AgentTool::Claude => run_claude(&opts, &pentect),
-        AgentTool::OpenCode | AgentTool::Pi => openai_clients::run(tool, &opts, &pentect),
+        AgentTool::OpenCode | AgentTool::Pi | AgentTool::Aider => {
+            openai_clients::run(tool, &opts, &pentect)
+        }
         AgentTool::Antigravity => run_antigravity(&opts, &pentect),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
@@ -694,6 +813,7 @@ enum AgentTool {
     OpenCode,
     Pi,
     Antigravity,
+    Aider,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -768,31 +888,43 @@ impl ReadOpts {
 }
 
 impl AgentTool {
-    fn name(self) -> &'static str {
+    const ALL: [Self; 6] = [
+        Self::Codex,
+        Self::Claude,
+        Self::OpenCode,
+        Self::Pi,
+        Self::Antigravity,
+        Self::Aider,
+    ];
+
+    fn from_command(command: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| {
+            let descriptor = tool.descriptor();
+            command == descriptor.name || descriptor.aliases.contains(&command)
+        })
+    }
+
+    fn descriptor(self) -> &'static client_descriptor::ClientDescriptor {
         match self {
-            AgentTool::Codex => "codex",
-            AgentTool::Claude => "claude",
-            AgentTool::OpenCode => "opencode",
-            AgentTool::Pi => "pi",
-            AgentTool::Antigravity => "antigravity",
+            AgentTool::Codex => &client_descriptor::CODEX,
+            AgentTool::Claude => &client_descriptor::CLAUDE,
+            AgentTool::OpenCode => &client_descriptor::OPENCODE,
+            AgentTool::Pi => &client_descriptor::PI,
+            AgentTool::Antigravity => &client_descriptor::ANTIGRAVITY,
+            AgentTool::Aider => &client_descriptor::AIDER,
         }
+    }
+
+    fn name(self) -> &'static str {
+        self.descriptor().name
     }
 
     fn default_command(self) -> &'static str {
-        match self {
-            AgentTool::Antigravity => "agy",
-            _ => self.name(),
-        }
+        self.descriptor().default_command
     }
 
     fn path_flag(self) -> &'static str {
-        match self {
-            AgentTool::Codex => "--codex",
-            AgentTool::Claude => "--claude",
-            AgentTool::OpenCode => "--opencode",
-            AgentTool::Pi => "--pi",
-            AgentTool::Antigravity => "--agy",
-        }
+        self.descriptor().path_flag
     }
 }
 
@@ -864,17 +996,17 @@ impl AgentToolOpts {
                     anthropic_upstream = Some(required_value(args, &mut i, "--upstream")?);
                 }
                 "--upstream"
-                    if matches!(tool, AgentTool::Codex | AgentTool::OpenCode | AgentTool::Pi) =>
+                    if tool.descriptor().protocol == client_descriptor::Protocol::OpenAi =>
                 {
                     openai_upstream = Some(required_value(args, &mut i, "--upstream")?);
                 }
                 "--upstream" if tool == AgentTool::Antigravity => {
                     cloud_code_upstream = Some(required_value(args, &mut i, "--upstream")?);
                 }
-                "--model" | "-m" if matches!(tool, AgentTool::OpenCode | AgentTool::Pi) => {
+                "--model" | "-m" if tool.descriptor().accepts_model => {
                     model = Some(required_value(args, &mut i, "--model")?);
                 }
-                "--api" if matches!(tool, AgentTool::OpenCode | AgentTool::Pi) => {
+                "--api" if tool.descriptor().accepts_api => {
                     api = Some(required_value(args, &mut i, "--api")?);
                 }
                 "--upstream-header-env" => {
@@ -2570,30 +2702,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn help_lists_public_commands_and_only_active_agent_integrations() {
+    fn public_command_snapshot_is_intentional() {
+        assert_eq!(
+            command_names(CommandAudience::Public),
+            [
+                "aider",
+                "antigravity",
+                "claude",
+                "codex",
+                "doctor",
+                "exec",
+                "help",
+                "log",
+                "mask",
+                "opencode",
+                "pi",
+                "plugins",
+                "read",
+                "uninstall",
+                "update",
+                "version",
+                "view",
+            ]
+        );
+        assert_eq!(command_names(CommandAudience::Advanced), ["resolve"]);
+    }
+
+    #[test]
+    fn command_catalog_has_unique_names_and_hidden_internal_usage() {
+        let mut names = std::collections::HashSet::new();
+        for command in COMMANDS {
+            assert!(
+                names.insert(command.name),
+                "duplicate command {}",
+                command.name
+            );
+            match command.audience {
+                CommandAudience::Public | CommandAudience::Advanced => {
+                    assert!(!command.usage.is_empty());
+                    assert!(!command.summary.is_empty());
+                }
+                CommandAudience::Internal => {
+                    assert!(command.usage.is_empty());
+                    assert!(command.summary.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn help_lists_public_and_advanced_commands_but_no_internal_commands() {
         let help = help_text();
-        assert!(help.contains("pentect codex|claude"));
-        assert!(help.contains("--set-default | --unset-default"));
-        assert!(help.contains("(--set-default | --unset-default) [--yes]"));
-        assert!(help.contains("(--install-launcher | --remove-launcher) [--yes]"));
-        assert!(help.contains(
-            "codex app [--app PATH] [--upstream URL] [--upstream-header-env HEADER=ENV_NAME]"
-        ));
-        assert!(help.contains(
-            "claude app [--app PATH] [--upstream URL] [--upstream-header-env HEADER=ENV_NAME]"
-        ));
-        assert!(help.contains("pentect opencode|pi"));
-        assert!(help.contains("antigravity"));
-        assert!(help.contains("pentect codex app"));
-        assert!(help.contains("pentect claude app"));
-        assert!(help.contains("< input pentect mask"));
-        assert!(help.contains("pentect read PATH"));
+        for command in command_names(CommandAudience::Public)
+            .into_iter()
+            .chain(command_names(CommandAudience::Advanced))
+        {
+            assert!(help.contains(command), "help omitted {command}");
+        }
+        assert!(help.contains("Advanced:\n"));
         assert!(help.contains("pentect resolve [PATH...]"));
-        assert!(!help.contains("pentect scan"));
-        assert!(help.contains("opencode"));
-        assert!(!help.contains("pentect shell"));
-        assert!(!help.contains("\n  pentect up\n"));
-        assert!(!help.contains("\n  pentect eval"));
+        for command in COMMANDS
+            .iter()
+            .filter(|command| command.audience == CommandAudience::Internal)
+        {
+            assert!(
+                !help.contains(&format!("pentect {}", command.name)),
+                "help exposed internal command {}",
+                command.name
+            );
+        }
     }
 
     #[test]
@@ -2653,6 +2830,27 @@ mod tests {
         );
         assert_eq!(opencode.model.as_deref(), Some("anthropic/claude-sonnet"));
 
+        let aider = AgentToolOpts::parse(
+            AgentTool::Aider,
+            &[
+                "pentect".to_string(),
+                "aider".to_string(),
+                "--upstream".to_string(),
+                "http://127.0.0.1:8080/openai/v1".to_string(),
+                "--model".to_string(),
+                "gpt-5.1".to_string(),
+                "--".to_string(),
+                "src/main.rs".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            aider.openai_upstream.as_deref(),
+            Some("http://127.0.0.1:8080/openai/v1")
+        );
+        assert_eq!(aider.model.as_deref(), Some("gpt-5.1"));
+        assert_eq!(aider.tool_args, ["src/main.rs"]);
+
         let antigravity = AgentToolOpts::parse(
             AgentTool::Antigravity,
             &[
@@ -2671,6 +2869,14 @@ mod tests {
             Some("https://cloud-code.example/base")
         );
         assert_eq!(antigravity.tool_args, ["--agent", "reviewer"]);
+    }
+
+    #[test]
+    fn client_commands_and_aliases_come_from_descriptors() {
+        assert_eq!(AgentTool::from_command("codex"), Some(AgentTool::Codex));
+        assert_eq!(AgentTool::from_command("agy"), Some(AgentTool::Antigravity));
+        assert_eq!(AgentTool::from_command("aider"), Some(AgentTool::Aider));
+        assert_eq!(AgentTool::from_command("unknown"), None);
     }
 
     #[test]

@@ -16,6 +16,7 @@ cannot complete a requested change.
 | `pentect opencode` | Launch OpenCode with a temporary Pentect provider |
 | `pentect pi` | Launch Pi with a temporary Pentect provider |
 | `pentect antigravity` | Launch the official `agy` CLI through Pentect |
+| `pentect aider` | Launch Aider with a temporary Pentect provider |
 | `pentect codex app` | Launch Codex App for this protected session |
 | `pentect claude app` | Launch Claude Desktop for this protected session |
 
@@ -63,6 +64,7 @@ Codex and Claude arguments are forwarded directly:
 pentect codex exec --full-auto
 pentect claude --model sonnet
 pentect agy --print "Review this project"
+pentect aider --model gpt-5 README.md
 ```
 
 `--check` validates app discovery and routing without leaving the app open.
@@ -77,11 +79,7 @@ pentect agy --print "Review this project"
 | `pentect read PATH` | Print a masked preview of a file |
 | `pentect exec "COMMAND"` | Restore known handles, run the command, and mask its output |
 | `pentect view HANDLE` | Show handle details without revealing its value |
-| `pentect resolve [PATH...]` | Restore known handles from stdin or selected files |
 | `pentect log [--json]` | Follow local protection events |
-
-Use `resolve` with care. It writes real values to the selected file or output.
-Use `exec` instead when a command can take a handle directly.
 
 ### `mask`
 
@@ -107,6 +105,12 @@ pentect read terraform.tfvars
 When file remembering is enabled, `read` also records safe local recovery
 metadata for handles found in that file.
 
+`mask` and `read` stay separate because they have different recovery
+contracts. `mask` is a stateless stdin filter with a fresh one-run key. `read`
+uses the path and can retain handle metadata in the active local store. Merging
+them would either discard that metadata or make a simple pipe unexpectedly
+stateful.
+
 ### `exec`
 
 `exec` restores known handles before execution and masks stdout and stderr:
@@ -129,10 +133,17 @@ Use the direct program form when possible. It avoids another layer of shell
 quoting. `--live` keeps interactive progress visible but still masks output in
 chunks before it is written.
 
-### `view` and `resolve`
+### `view`
 
 `view` parses a handle and prints its label, ID, and safe length hint. It does
 not require or reveal the real value.
+
+## Advanced commands
+
+Advanced commands are available, but are kept separate in `pentect help`
+because they can write plaintext or are mainly useful for debugging workflows.
+
+### `resolve`
 
 `resolve` reads stdin when no path is given. With paths, it replaces known
 handles in each file in place. Unknown handle-shaped text causes an error
@@ -145,20 +156,6 @@ pentect resolve config.masked.toml
 ```
 
 Treat redirected or in-place resolved output as plaintext secret material.
-
-`mask` reads UTF-8 standard input:
-
-::: code-group
-
-```sh [macOS / Linux]
-printf '%s' 'TOKEN=example' | pentect mask
-```
-
-```powershell [Windows]
-'TOKEN=example' | pentect mask
-```
-
-:::
 
 ## Installation health
 

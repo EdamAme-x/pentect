@@ -16,3 +16,10 @@ unscanned = "block"
 
 [files]
 remember = true
+
+# User config only. The bundle is loaded from disk, verified with the pinned
+# Ed25519 public key, then applied above project and user settings.
+# [team_policy]
+# bundle = "/absolute/path/to/pentect-policy.json"
+# issuer = "example-security"
+# public_key = "64-lowercase-hex-characters"

@@ -375,6 +375,7 @@ struct ProxyState {
     plugins: Arc<Mutex<pentect_agent::PluginMiddleware>>,
     block_unknown_formats: bool,
     files: Mutex<HashMap<String, crate::http_files::Coverage>>,
+    file_attestations: crate::http_files::FileAttestationStore,
     pending_files: Mutex<PendingFiles>,
 }
 
@@ -435,6 +436,7 @@ async fn run_proxy(
         plugins: Arc::new(Mutex::new(plugins)),
         block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
         files: Mutex::new(HashMap::new()),
+        file_attestations: crate::http_files::FileAttestationStore::open_default()?,
         pending_files: Mutex::new(PendingFiles::default()),
     });
     let _ = ready_tx.send(Ok(format!("http://{address}")));
@@ -643,6 +645,9 @@ async fn forward_inspected_inner(
 
     let url = format!("https://{host}{path_and_query}");
     let mut headers = request.headers().clone();
+    let account_scope = state
+        .file_attestations
+        .account_scope_for_app_headers(&headers);
     remove_hop_by_hop_headers(&mut headers);
     headers.remove(hyper::header::HOST);
     let mut upload_coverage = None;
@@ -656,14 +661,17 @@ async fn forward_inspected_inner(
     }
     let body = if protect_chat {
         let body = read_request_capped(request.into_body(), "Chat").await?;
+        hydrate_claude_app_attested_files(&body, &account_scope, state).await?;
         let original = body.clone();
         let masker = Arc::clone(&state.masker);
         let plugins = Arc::clone(&state.plugins);
-        let files = state
-            .files
-            .lock()
-            .map_err(|_| "Claude App file registry lock was poisoned".to_string())?
-            .clone();
+        let files = {
+            let registry = state
+                .files
+                .lock()
+                .map_err(|_| "Claude App file registry lock was poisoned".to_string())?;
+            crate::http_files::scoped_file_coverages(&registry, &account_scope)
+        };
         let block_unknown_formats = state.block_unknown_formats;
         let protected = tokio::task::spawn_blocking(move || {
             protect_chat_request(&original, &masker, &plugins, &files, block_unknown_formats)
@@ -779,11 +787,60 @@ async fn forward_inspected_inner(
     if let Some(coverage) = upload_coverage {
         let body = read_response_capped(upstream).await?;
         if status.is_success() {
+            let attestation_upstream = "claude-app-service";
             if let Some(filename) = upload_filename.as_deref() {
-                remember_claude_file_ids(&body, filename, coverage, &state.files)?;
+                for id in uploaded_claude_file_ids(&body, filename) {
+                    if state
+                        .file_attestations
+                        .remember_async(
+                            "claude-app",
+                            attestation_upstream,
+                            &account_scope,
+                            &id,
+                            coverage,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        eprintln!("[pentect] file attestation unavailable; uploaded file remains untrusted");
+                    } else if let Ok(mut files) = state.files.lock() {
+                        crate::http_files::remember_scoped_file_coverage(
+                            &mut files,
+                            &account_scope,
+                            id,
+                            coverage,
+                        );
+                    } else {
+                        eprintln!("[pentect] uploaded file registry unavailable; persistent attestation retained");
+                    }
+                }
             }
             if let Some(key) = upload_key.as_deref() {
-                promote_pending_claude_files(key, coverage, &state.pending_files, &state.files)?;
+                for id in promote_pending_claude_files(key, &account_scope, &state.pending_files)? {
+                    if state
+                        .file_attestations
+                        .remember_async(
+                            "claude-app",
+                            attestation_upstream,
+                            &account_scope,
+                            &id,
+                            coverage,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        eprintln!("[pentect] file attestation unavailable; uploaded file remains untrusted");
+                    } else if let Ok(mut files) = state.files.lock() {
+                        crate::http_files::remember_scoped_file_coverage(
+                            &mut files,
+                            &account_scope,
+                            id,
+                            coverage,
+                        );
+                    } else {
+                        eprintln!("[pentect] uploaded file registry unavailable; persistent attestation retained");
+                    }
+                }
             }
         }
         let mut response = Response::builder().status(status);
@@ -804,7 +861,7 @@ async fn forward_inspected_inner(
     if prepare_upload {
         let body = read_response_capped(upstream).await?;
         if status.is_success() {
-            remember_pending_claude_files(&body, &state.pending_files)?;
+            remember_pending_claude_files(&body, &account_scope, &state.pending_files)?;
         }
         let mut response = Response::builder().status(status);
         for (name, value) in &response_headers {
@@ -957,21 +1014,42 @@ fn is_claude_prepare_upload_path(path: &str) -> bool {
     )
 }
 
-fn remember_claude_file_ids(
-    body: &[u8],
-    uploaded_filename: &str,
-    coverage: crate::http_files::Coverage,
-    files: &Mutex<HashMap<String, crate::http_files::Coverage>>,
-) -> Result<(), String> {
+fn uploaded_claude_file_ids(body: &[u8], uploaded_filename: &str) -> Vec<String> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return Ok(());
+        return Vec::new();
     };
-    let ids = uploaded_file_ids(&value, uploaded_filename);
-    let mut files = files
-        .lock()
-        .map_err(|_| "Claude App file registry lock was poisoned".to_string())?;
-    for id in ids {
-        crate::http_files::remember_file_coverage(&mut files, id, coverage);
+    uploaded_file_ids(&value, uploaded_filename)
+}
+
+async fn hydrate_claude_app_attested_files(
+    body: &[u8],
+    account_scope: &str,
+    state: &ProxyState,
+) -> Result<(), String> {
+    let attestations = state.file_attestations.clone();
+    let body = body.to_vec();
+    let scope_for_task = account_scope.to_string();
+    let coverages = tokio::task::spawn_blocking(move || {
+        attestations.coverages_in_json(&body, "claude-app", "claude-app-service", &scope_for_task)
+    })
+    .await
+    .map_err(|_| "Claude App file attestation task failed".to_string())??;
+    for (id, coverage) in coverages {
+        let registry = state
+            .files
+            .lock()
+            .map_err(|_| "Claude App file registry lock was poisoned".to_string())?;
+        let already_known =
+            crate::http_files::scoped_file_coverage(&registry, account_scope, &id).is_some();
+        drop(registry);
+        if already_known {
+            continue;
+        }
+        let mut files = state
+            .files
+            .lock()
+            .map_err(|_| "Claude App file registry lock was poisoned".to_string())?;
+        crate::http_files::remember_scoped_file_coverage(&mut files, account_scope, id, coverage);
     }
     Ok(())
 }
@@ -1037,7 +1115,11 @@ fn claude_filestore_upload_key(content_type: &str, body: &[u8]) -> Option<String
     Some(format!("{filesystem}\0{path}"))
 }
 
-fn remember_pending_claude_files(body: &[u8], pending: &Mutex<PendingFiles>) -> Result<(), String> {
+fn remember_pending_claude_files(
+    body: &[u8],
+    account_scope: &str,
+    pending: &Mutex<PendingFiles>,
+) -> Result<(), String> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return Ok(());
     };
@@ -1073,7 +1155,7 @@ fn remember_pending_claude_files(body: &[u8], pending: &Mutex<PendingFiles>) -> 
         {
             continue;
         }
-        let key = format!("{filesystem}\0{path}");
+        let key = scoped_pending_key(account_scope, &format!("{filesystem}\0{path}"));
         if !pending.entries.contains_key(&key) {
             pending.insertion_order.push_back(key.clone());
         }
@@ -1093,27 +1175,22 @@ fn remember_pending_claude_files(body: &[u8], pending: &Mutex<PendingFiles>) -> 
 
 fn promote_pending_claude_files(
     key: &str,
-    coverage: crate::http_files::Coverage,
+    account_scope: &str,
     pending: &Mutex<PendingFiles>,
-    files: &Mutex<HashMap<String, crate::http_files::Coverage>>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    let key = scoped_pending_key(account_scope, key);
     let ids = {
         let mut pending = pending
             .lock()
             .map_err(|_| "Claude App pending file registry lock was poisoned".to_string())?;
-        pending.insertion_order.retain(|known| known != key);
-        pending.entries.remove(key).unwrap_or_default()
+        pending.insertion_order.retain(|known| known != &key);
+        pending.entries.remove(&key).unwrap_or_default()
     };
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let mut files = files
-        .lock()
-        .map_err(|_| "Claude App file registry lock was poisoned".to_string())?;
-    for id in ids {
-        crate::http_files::remember_file_coverage(&mut files, id, coverage);
-    }
-    Ok(())
+    Ok(ids)
+}
+
+fn scoped_pending_key(account_scope: &str, key: &str) -> String {
+    format!("{account_scope}:{key}")
 }
 
 async fn read_response_capped(response: reqwest::Response) -> Result<Bytes, String> {
@@ -2440,21 +2517,11 @@ mod tests {
 
     #[test]
     fn uploaded_file_ids_are_registered_without_trusting_unrelated_ids() {
-        let files = Mutex::new(HashMap::new());
-        remember_claude_file_ids(
+        let ids = uploaded_claude_file_ids(
             br#"{"id":"organization-id","nested":{"file_uuid":"file-123","filename":"other.txt"},"file":{"id":"file-456","type":"file","filename":"a.txt"}}"#,
             "a.txt",
-            crate::http_files::Coverage::Full,
-            &files,
-        )
-        .unwrap();
-        let files = files.lock().unwrap();
-        assert!(!files.contains_key("organization-id"));
-        assert!(!files.contains_key("file-123"));
-        assert_eq!(
-            files.get("file-456"),
-            Some(&crate::http_files::Coverage::Full)
         );
+        assert_eq!(ids, ["file-456"]);
     }
 
     #[test]
@@ -2473,19 +2540,19 @@ mod tests {
         );
         let key = claude_filestore_upload_key(content_type, body.as_bytes()).unwrap();
         let pending = Mutex::new(PendingFiles::default());
-        let files = Mutex::new(HashMap::new());
         remember_pending_claude_files(
             br#"{"uploads":[{"filesystem_id":"fs-1","path":"/uploads/a.txt","file_uuid":"file-1"}]}"#,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &pending,
         )
         .unwrap();
-        assert!(!files.lock().unwrap().contains_key("file-1"));
-        promote_pending_claude_files(&key, crate::http_files::Coverage::Full, &pending, &files)
-            .unwrap();
-        assert_eq!(
-            files.lock().unwrap().get("file-1"),
-            Some(&crate::http_files::Coverage::Full)
-        );
+        let promoted = promote_pending_claude_files(
+            &key,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &pending,
+        )
+        .unwrap();
+        assert_eq!(promoted, ["file-1"]);
     }
 
     #[test]
@@ -2500,14 +2567,23 @@ mod tests {
                 }]
             }))
             .unwrap();
-            remember_pending_claude_files(&body, &pending).unwrap();
+            remember_pending_claude_files(
+                &body,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &pending,
+            )
+            .unwrap();
         }
         let pending = pending.lock().unwrap();
         assert_eq!(pending.entries.len(), MAX_PENDING_UPLOADS);
-        assert!(!pending.entries.contains_key("fs\0/0.txt"));
-        assert!(pending
-            .entries
-            .contains_key(&format!("fs\0/{MAX_PENDING_UPLOADS}.txt")));
+        assert!(!pending.entries.contains_key(&scoped_pending_key(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "fs\0/0.txt",
+        )));
+        assert!(pending.entries.contains_key(&scoped_pending_key(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &format!("fs\0/{MAX_PENDING_UPLOADS}.txt"),
+        )));
     }
 
     #[test]

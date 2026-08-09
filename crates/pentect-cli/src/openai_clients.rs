@@ -22,11 +22,7 @@ pub(crate) fn run(
     let upstream = opts
         .openai_upstream
         .clone()
-        .or_else(|| {
-            std::env::var("OPENAI_BASE_URL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
+        .or_else(|| configured_upstream(tool))
         .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string());
     let (args, model) = client_args_and_model(&opts.tool_args, opts.model.as_deref())?;
     let api = ClientApi::parse(opts.api.as_deref())?;
@@ -41,6 +37,9 @@ pub(crate) fn run(
                     "--model".to_string(),
                     format!("pentect/{model}"),
                 ]);
+            }
+            crate::AgentTool::Aider => {
+                shown.extend(aider_gateway_args("<pentect-gateway>", &model)?)
             }
             _ => return Err("internal client launcher mismatch".to_string()),
         }
@@ -89,8 +88,49 @@ pub(crate) fn run(
                 (proxy, memory_store, extension),
             )
         }
+        crate::AgentTool::Aider => {
+            command.args(args);
+            // Appended last so config files, environment variables and caller
+            // options cannot select an unprotected provider or helper model.
+            command.args(aider_gateway_args(proxy.base_url(), &model)?);
+            crate::run_native_command_with_guards(command, &opts.command, (proxy, memory_store))
+        }
         _ => Err("internal client launcher mismatch".to_string()),
     }
+}
+
+fn configured_upstream(tool: crate::AgentTool) -> Option<String> {
+    tool.descriptor().upstream_env.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn aider_model(model: &str) -> Result<String, String> {
+    if model.starts_with("openai/") {
+        Ok(model.to_string())
+    } else if model.contains('/') {
+        Err(format!(
+            "Aider model '{model}' uses a provider that cannot be routed through the Pentect OpenAI gateway; use an openai/ model and pass --upstream for a compatible custom endpoint"
+        ))
+    } else {
+        Ok(format!("openai/{model}"))
+    }
+}
+
+fn aider_gateway_args(proxy: &str, model: &str) -> Result<Vec<String>, String> {
+    let model = aider_model(model)?;
+    Ok(vec![
+        "--openai-api-base".to_string(),
+        proxy.to_string(),
+        "--model".to_string(),
+        model.clone(),
+        "--weak-model".to_string(),
+        model.clone(),
+        "--editor-model".to_string(),
+        model,
+    ])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -336,5 +376,24 @@ mod tests {
             "openai-responses"
         );
         assert!(ClientApi::parse(Some("anthropic")).is_err());
+    }
+
+    #[test]
+    fn aider_gateway_options_override_all_openai_model_routes() {
+        assert_eq!(
+            aider_gateway_args("http://127.0.0.1:4321/v1", "gpt-5").unwrap(),
+            [
+                "--openai-api-base",
+                "http://127.0.0.1:4321/v1",
+                "--model",
+                "openai/gpt-5",
+                "--weak-model",
+                "openai/gpt-5",
+                "--editor-model",
+                "openai/gpt-5",
+            ]
+        );
+        assert_eq!(aider_model("openai/custom").unwrap(), "openai/custom");
+        assert!(aider_model("anthropic/claude-sonnet").is_err());
     }
 }
