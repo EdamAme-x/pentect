@@ -11,6 +11,7 @@ description: A full list of what you can do with Pentect.
 | Protect Claude Code | `pentect claude` |
 | Protect OpenCode | `pentect opencode --model MODEL` |
 | Protect Pi | `pentect pi --model MODEL` |
+| Protect Antigravity CLI | `pentect antigravity` or `pentect agy` |
 | Launch a protected Codex App session | `pentect codex app` |
 | Launch a protected Claude Desktop session | `pentect claude app` |
 | Pass normal client arguments | Add them normally, for example `pentect codex exec --full-auto` |

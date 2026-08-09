@@ -15,6 +15,7 @@ cannot complete a requested change.
 | `pentect claude` | Launch Claude Code through Pentect |
 | `pentect opencode` | Launch OpenCode with a temporary Pentect provider |
 | `pentect pi` | Launch Pi with a temporary Pentect provider |
+| `pentect antigravity` | Launch the official `agy` CLI through Pentect |
 | `pentect codex app` | Launch Codex App for this protected session |
 | `pentect claude app` | Launch Claude Desktop for this protected session |
 
@@ -61,6 +62,7 @@ Codex and Claude arguments are forwarded directly:
 ```sh
 pentect codex exec --full-auto
 pentect claude --model sonnet
+pentect agy --print "Review this project"
 ```
 
 `--check` validates app discovery and routing without leaving the app open.

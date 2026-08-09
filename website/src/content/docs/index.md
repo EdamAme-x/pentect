@@ -40,6 +40,10 @@ aside: false
     <small>CLI</small><strong>Pi</strong>
     <span>Run Pi through a temporary protected provider.</span><b aria-hidden="true">→</b>
   </a>
+  <a href="/clients/antigravity/" class="docs-grid__item">
+    <small>CLI</small><strong>Antigravity</strong>
+    <span>Run the official Antigravity CLI through the Cloud Code gateway.</span><b aria-hidden="true">→</b>
+  </a>
 </DocsGrid>
 
 ## Explore
