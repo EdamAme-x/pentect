@@ -25,10 +25,11 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Semaphore};
 use zeroize::Zeroize;
 
+use crate::handle_contract::HANDLE_CONTRACT;
+
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_SSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHAT_TOOL_CALLS: usize = 1024;
-const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local secret handles. Copy a handle byte-for-byte into a client function call when that function needs the represented value. Do not alter, expand, guess, or expose it. Pentect resolves handles only in completed client function-call arguments.";
 static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 
 fn proxy_diagnostic(reason: &str) {
@@ -2731,10 +2732,7 @@ mod tests {
             value["messages"][1]["content"],
             "use <<SECRET_0123456789abcdef>>"
         );
-        assert!(value["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("opaque local secret handles"));
+        assert_eq!(value["messages"][0]["content"], HANDLE_CONTRACT);
     }
 
     #[test]
@@ -2749,10 +2747,7 @@ mod tests {
         inject_chat_handle_contract(&mut value);
         let parts = value["messages"][0]["content"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
-        assert!(parts[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("opaque local secret handles"));
+        assert_eq!(parts[1]["text"], HANDLE_CONTRACT);
     }
 
     #[test]

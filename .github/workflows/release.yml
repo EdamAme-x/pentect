@@ -567,7 +567,7 @@ jobs:
           else
             npm publish --access public
           fi
-      - name: Trigger matching Pi launcher release
+      - name: Trigger matching Pi extension release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

@@ -9,6 +9,7 @@ mod codex_app;
 mod default_launch;
 mod doctor;
 mod gemini_http_proxy;
+mod handle_contract;
 mod http_files;
 mod ide_clients;
 mod input;

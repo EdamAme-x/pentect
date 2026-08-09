@@ -22,10 +22,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Semaphore};
 use zeroize::Zeroize;
 
+use crate::handle_contract::HANDLE_CONTRACT;
+
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_SSE_BYTES: usize = 8 * 1024 * 1024;
-const HANDLE_CONTRACT: &str = "Values formatted as <<LABEL_HASH>> are opaque local secret handles. Copy a handle byte-for-byte into a function call when that function needs the represented value. Do not alter, expand, guess, or expose it. Pentect resolves handles only in completed function-call arguments.";
-
 type ProxyBodyError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, ProxyBodyError>;
 type UpstreamByteStream =

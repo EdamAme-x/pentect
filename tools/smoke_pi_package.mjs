@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 
 const expectedVersion = process.argv[2];
 const piVersion = process.argv[3];
+const usePublishedBackend = process.argv.includes("--published-backend");
 if (!expectedVersion) throw new Error("expected @pentect/pi version is required");
 if (!piVersion) throw new Error("expected Pi version is required");
 
@@ -83,14 +84,14 @@ try {
     throw new Error("@pentect/pi extension could not register its model");
   }
 
-  // The pull request's Rust backend is exercised by provider_backend.rs. The
-  // package dependency still resolves to the last published Pentect release,
-  // so use a protocol-faithful temporary backend to test Pi's package loader.
-  const packageRequire = createRequire(join(packageRoot, "package.json"));
-  const pentectRoot = dirname(packageRequire.resolve("pentect/package.json"));
-  writeFileSync(
-    join(pentectRoot, "packaging", "npm", "bin", "pentect.js"),
-    `#!/usr/bin/env node
+  if (!usePublishedBackend) {
+    // Pull-request CI cannot install an unpublished Rust backend. Use the
+    // backend protocol fixture there; release CI uses the published binary.
+    const packageRequire = createRequire(join(packageRoot, "package.json"));
+    const pentectRoot = dirname(packageRequire.resolve("pentect/package.json"));
+    writeFileSync(
+      join(pentectRoot, "packaging", "npm", "bin", "pentect.js"),
+      `#!/usr/bin/env node
 const args = process.argv.slice(2);
 const modelIndex = args.indexOf("--model");
 const apiIndex = args.indexOf("--api");
@@ -106,7 +107,8 @@ console.log(JSON.stringify({
 }));
 process.stdin.resume();
 `,
-  );
+    );
+  }
 
   run(
     npm,
