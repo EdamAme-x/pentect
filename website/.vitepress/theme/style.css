@@ -167,6 +167,14 @@ body {
   filter: grayscale(1) brightness(0) invert(1);
 }
 
+.sidebar-link-label .sidebar-brand-icon[src$="/aider.svg"] {
+  filter: grayscale(1) contrast(1.35);
+}
+
+.dark .sidebar-link-label .sidebar-brand-icon[src$="/aider.svg"] {
+  filter: grayscale(1) invert(1) contrast(1.35);
+}
+
 .VPSidebarItem.is-link > .item > .link:hover .sidebar-link-label svg,
 .VPSidebarItem.is-active > .item > .link .sidebar-link-label svg {
   color: var(--vp-c-brand-1);

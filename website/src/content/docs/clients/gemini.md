@@ -1,11 +1,14 @@
 ---
-title: Gemini CLI
-description: Run Gemini CLI through Pentect's native Gemini API gateway.
+title: Gemini CLI (legacy)
+description: Legacy native Gemini API support for existing Gemini CLI installations.
 ---
 
 ## Start
 
-Use Gemini CLI's **Gemini API key** authentication. The CLI reads the key from
+Gemini CLI has been replaced by Antigravity. This adapter remains available for
+existing installations, but new users should use [Antigravity CLI](/clients/antigravity/).
+
+For an existing installation, use Gemini CLI's **Gemini API key** authentication. The CLI reads the key from
 `GEMINI_API_KEY`. Then launch it through Pentect:
 
 ```sh

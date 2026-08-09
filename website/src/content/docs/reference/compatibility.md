@@ -20,7 +20,7 @@ specific public CLI versions with the release binary.
 | Zed | Isolated settings for Agent, Inline Assistant, and compaction | `pentect zed` |
 | Goose CLI | Process-only main, fast, and planner model routing | `pentect goose` |
 | Junie CLI | Temporary custom model profile | `pentect junie` |
-| Gemini CLI | Native Gemini JSON, SSE, functions, and endpoint override | `pentect gemini` |
+| Gemini CLI (legacy) | Native Gemini JSON, SSE, functions, and endpoint override | `pentect gemini` |
 | VS Code language model provider | Text chat, text tool results, and tool calls | Select the Pentect provider |
 | ChatGPT desktop app, Codex mode | Launcher and Responses protocol tests | `pentect codex app` |
 | Claude Desktop, supported Chat, attachment, and Code routes | Launcher and protocol tests | `pentect claude app` |

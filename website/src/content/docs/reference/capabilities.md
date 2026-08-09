@@ -14,11 +14,9 @@ description: A full list of what you can do with Pentect.
 | Protect Antigravity CLI | `pentect antigravity` or `pentect agy` |
 | Protect Continue CLI Chat, Edit, and Apply | `pentect continue` or `pentect cn` |
 | Protect a local Cline CLI session | `pentect cline` |
-| Protect archived Roo Code in an isolated VS Code profile | `pentect roo` |
 | Protect Zed Agent and Inline Assistant | `pentect zed` |
 | Protect Goose CLI | `pentect goose` |
 | Protect Junie CLI | `pentect junie` |
-| Protect native Gemini API traffic from Gemini CLI | `pentect gemini` |
 | Add a selectable VS Code model provider | Install the Pentect VS Code extension |
 | Launch a protected Codex App session | `pentect codex app` |
 | Launch a protected Claude Desktop session | `pentect claude app` |
