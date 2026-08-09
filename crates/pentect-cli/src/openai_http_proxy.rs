@@ -2732,10 +2732,7 @@ mod tests {
             value["messages"][1]["content"],
             "use <<SECRET_0123456789abcdef>>"
         );
-        assert!(value["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("opaque local secret handles"));
+        assert_eq!(value["messages"][0]["content"], HANDLE_CONTRACT);
     }
 
     #[test]
@@ -2750,10 +2747,7 @@ mod tests {
         inject_chat_handle_contract(&mut value);
         let parts = value["messages"][0]["content"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
-        assert!(parts[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("opaque local secret handles"));
+        assert_eq!(parts[1]["text"], HANDLE_CONTRACT);
     }
 
     #[test]
