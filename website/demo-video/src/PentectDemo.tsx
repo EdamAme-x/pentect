@@ -627,9 +627,9 @@ const SignalBeam = ({
           right: 0,
           top: -2,
           height: 5,
-          opacity: bloomActive * 0.34,
+          opacity: bloomActive * 0.16,
           background: COLORS.orange,
-          filter: "blur(4px)",
+          filter: "blur(3px)",
           scale: `${draw} 1`,
           transformOrigin: origin,
         }}
@@ -641,9 +641,9 @@ const SignalBeam = ({
           right: 0,
           top: -1,
           height: 2,
-          opacity: coreActive * 0.88,
+          opacity: coreActive * 0.68,
           background: beamGradient,
-          boxShadow: "0 0 5px rgba(242,106,69,0.42)",
+          boxShadow: "0 0 3px rgba(242,106,69,0.22)",
           scale: `${draw} 1`,
           transformOrigin: origin,
         }}
@@ -655,11 +655,11 @@ const SignalBeam = ({
           top: -6,
           width: 13,
           height: 13,
-          opacity: targetPulse * 0.45,
+          opacity: targetPulse * 0.24,
           borderRadius: "50%",
           background:
-            "radial-gradient(circle, rgba(255,236,226,0.72) 0%, rgba(242,106,69,0.28) 34%, rgba(242,106,69,0) 74%)",
-          filter: "blur(2px)",
+            "radial-gradient(circle, rgba(255,236,226,0.5) 0%, rgba(242,106,69,0.18) 34%, rgba(242,106,69,0) 72%)",
+          filter: "blur(1.5px)",
         }}
       />
     </div>
