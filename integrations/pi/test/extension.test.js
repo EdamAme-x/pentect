@@ -4,6 +4,7 @@ import {
   parseReady,
   providerArguments,
   providerDefinition,
+  restoreProviderCredentials,
 } from "../extensions/pentect.js";
 
 const baseUrl = `http://127.0.0.1:43123/${"a".repeat(64)}`;
@@ -61,4 +62,49 @@ test("registers one Pentect provider and one selected model", () => {
   assert.equal(provider.apiKey, "pentect-local");
   assert.equal(provider.models.length, 1);
   assert.equal(provider.models[0].id, "gpt-5");
+});
+
+test("allows truthful model limits and capabilities for custom upstreams", () => {
+  const provider = providerDefinition(
+    { baseUrl, model: "local-model", api: "openai-completions" },
+    {
+      PENTECT_PI_CONTEXT_WINDOW: "65536",
+      PENTECT_PI_MAX_TOKENS: "8192",
+      PENTECT_PI_INPUTS: "text",
+      PENTECT_PI_REASONING: "true",
+    },
+  );
+  assert.equal(provider.models[0].contextWindow, 65536);
+  assert.equal(provider.models[0].maxTokens, 8192);
+  assert.deepEqual(provider.models[0].input, ["text"]);
+  assert.equal(provider.models[0].reasoning, true);
+
+  assert.throws(() =>
+    providerDefinition(
+      { baseUrl, model: "bad", api: "openai-completions" },
+      { PENTECT_PI_CONTEXT_WINDOW: "unknown" },
+    ),
+  );
+});
+
+test("restores credentials when provider startup fails", () => {
+  const env = {
+    OPENAI_API_KEY: "pentect-local",
+  };
+  restoreProviderCredentials(
+    {
+      openaiApiKey: "original-key",
+      upstreamAuthorization: "Bearer original",
+    },
+    env,
+  );
+  assert.equal(env.OPENAI_API_KEY, "original-key");
+  assert.equal(env.PENTECT_UPSTREAM_AUTHORIZATION, "Bearer original");
+
+  restoreProviderCredentials(
+    { openaiApiKey: undefined, upstreamAuthorization: undefined },
+    env,
+  );
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.equal(env.PENTECT_UPSTREAM_AUTHORIZATION, undefined);
 });

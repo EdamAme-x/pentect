@@ -410,10 +410,10 @@ jobs:
       - name: Install supported agent CLIs
         run: >-
           npm install --global
-          @openai/codex@0.146.0
-          @anthropic-ai/claude-code@2.1.220
-          opencode-ai@1.18.14
-          @mariozechner/pi-coding-agent@0.73.1
+          @openai/codex@0.147.0
+          @anthropic-ai/claude-code@2.1.227
+          opencode-ai@1.18.16
+          @earendil-works/pi-coding-agent@0.84.1
           @continuedev/cli@1.5.47
           cline@3.0.52
           @google/gemini-cli@0.54.4

@@ -6,10 +6,10 @@ through the release binary:
 
 | Client | Release gate | Protected mode |
 | --- | --- | --- |
-| Codex CLI `0.146.0` | automated on Linux | `pentect codex` |
-| Claude Code `2.1.220` | automated on Linux | `pentect claude` |
-| OpenCode `1.18.14` | provider registration and model discovery on Windows | `pentect opencode` |
-| Pi `0.73.1` and `0.83.0` | provider registration and model discovery on Windows | `pentect pi` |
+| Codex CLI `0.147.0` | automated on Linux | `pentect codex` |
+| Claude Code `2.1.227` | automated on Linux | `pentect claude` |
+| OpenCode `1.18.16` | automated on Linux | `pentect opencode` |
+| Pi `0.84.1` | launcher and published extension discovery | `pentect pi` or `@pentect/pi` |
 | ChatGPT desktop app (Codex mode) | launcher and Responses protocol tests | `pentect codex app` |
 | Claude Desktop (supported Chat, attachment, and Claude Code routes) | launcher and protocol tests | `pentect claude app` |
 

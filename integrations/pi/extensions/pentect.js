@@ -6,6 +6,8 @@ const require = createRequire(import.meta.url);
 const STATE = Symbol.for("@pentect/pi/provider-state");
 const MAX_READY_BYTES = 16 * 1024;
 const START_TIMEOUT_MS = 10_000;
+const DEFAULT_CONTEXT_WINDOW = 128_000;
+const DEFAULT_MAX_TOKENS = 32_768;
 
 function sharedState() {
   if (!globalThis[STATE]) {
@@ -43,7 +45,34 @@ export function parseReady(line) {
   return ready;
 }
 
-export function providerDefinition(ready) {
+function positiveInteger(env, name, fallback) {
+  const raw = env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function reasoningSupport(env, api) {
+  const value = env.PENTECT_PI_REASONING?.trim().toLowerCase();
+  if (!value || value === "auto") return api === "openai-responses";
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error("PENTECT_PI_REASONING must be auto, true, or false");
+}
+
+function inputSupport(env) {
+  const value = env.PENTECT_PI_INPUTS?.trim().toLowerCase();
+  if (!value || value === "text,image" || value === "image,text") {
+    return ["text", "image"];
+  }
+  if (value === "text") return ["text"];
+  throw new Error("PENTECT_PI_INPUTS must be text or text,image");
+}
+
+export function providerDefinition(ready, env = process.env) {
   return {
     name: "Pentect",
     baseUrl: ready.baseUrl,
@@ -54,11 +83,19 @@ export function providerDefinition(ready) {
       {
         id: ready.model,
         name: ready.model,
-        reasoning: ready.api === "openai-responses",
-        input: ["text", "image"],
+        reasoning: reasoningSupport(env, ready.api),
+        input: inputSupport(env),
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128000,
-        maxTokens: 32768,
+        contextWindow: positiveInteger(
+          env,
+          "PENTECT_PI_CONTEXT_WINDOW",
+          DEFAULT_CONTEXT_WINDOW,
+        ),
+        maxTokens: positiveInteger(
+          env,
+          "PENTECT_PI_MAX_TOKENS",
+          DEFAULT_MAX_TOKENS,
+        ),
       },
     ],
   };
@@ -101,8 +138,19 @@ async function startProvider() {
     return { child, ready: parseReady(line) };
   } catch (error) {
     child.kill();
+    restoreProviderCredentials(state, process.env);
     const detail = errors.trim();
     throw new Error(detail || error.message, { cause: error });
+  }
+}
+
+export function restoreProviderCredentials(state, env) {
+  if (state.openaiApiKey === undefined) delete env.OPENAI_API_KEY;
+  else env.OPENAI_API_KEY = state.openaiApiKey;
+  if (state.upstreamAuthorization === undefined) {
+    delete env.PENTECT_UPSTREAM_AUTHORIZATION;
+  } else {
+    env.PENTECT_UPSTREAM_AUTHORIZATION = state.upstreamAuthorization;
   }
 }
 
@@ -149,7 +197,14 @@ function stopProvider(child) {
 }
 
 export default async function pentect(pi) {
+  const state = sharedState();
   const { child, ready } = await startProvider();
-  pi.registerProvider("pentect", providerDefinition(ready));
+  try {
+    pi.registerProvider("pentect", providerDefinition(ready));
+  } catch (error) {
+    stopProvider(child);
+    restoreProviderCredentials(state, process.env);
+    throw error;
+  }
   pi.on("session_shutdown", () => stopProvider(child));
 }
