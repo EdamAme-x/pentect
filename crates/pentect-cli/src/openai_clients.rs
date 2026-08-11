@@ -202,8 +202,8 @@ enum ClientApi {
 impl ClientApi {
     fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.unwrap_or("chat") {
-            "chat" | "chat-completions" => Ok(Self::ChatCompletions),
-            "responses" => Ok(Self::Responses),
+            "chat" | "chat-completions" | "openai-completions" => Ok(Self::ChatCompletions),
+            "responses" | "openai-responses" => Ok(Self::Responses),
             value => Err(format!(
                 "unsupported API format '{value}'; use --api chat or --api responses"
             )),
@@ -324,13 +324,36 @@ const PI_PROVIDER: &str = r#"export default function (pi) {
     models: [{
       id: model,
       name: model,
-      reasoning: api === "openai-responses",
-      input: ["text", "image"],
+      reasoning: piBoolean("PENTECT_PI_REASONING", api === "openai-responses"),
+      input: piInputs(),
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128000,
-      maxTokens: 32768
+      contextWindow: piPositiveInteger("PENTECT_PI_CONTEXT_WINDOW", 128000),
+      maxTokens: piPositiveInteger("PENTECT_PI_MAX_TOKENS", 32768)
     }]
   });
+}
+
+function piPositiveInteger(name, fallback) {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
+
+function piBoolean(name, fallback) {
+  const value = process.env[name]?.trim().toLowerCase();
+  if (!value || value === "auto") return fallback;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`${name} must be auto, true, or false`);
+}
+
+function piInputs() {
+  const value = process.env.PENTECT_PI_INPUTS?.trim().toLowerCase();
+  if (!value || value === "text,image" || value === "image,text") return ["text", "image"];
+  if (value === "text") return ["text"];
+  throw new Error("PENTECT_PI_INPUTS must be text or text,image");
 }
 "#;
 
@@ -406,6 +429,14 @@ mod tests {
             "openai-responses"
         );
         assert!(ClientApi::parse(Some("anthropic")).is_err());
+        assert_eq!(
+            ClientApi::parse(Some("openai-completions")).unwrap(),
+            ClientApi::ChatCompletions
+        );
+        assert_eq!(
+            ClientApi::parse(Some("openai-responses")).unwrap(),
+            ClientApi::Responses
+        );
     }
 
     #[test]

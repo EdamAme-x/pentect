@@ -44,6 +44,11 @@ pentect pi --api responses --model gpt-5
 With the extension, set `PENTECT_PI_API=responses` and `PENTECT_PI_MODEL=gpt-5`
 before Pi starts, then select `pentect/gpt-5`.
 
+If a custom model has different limits, set `PENTECT_PI_CONTEXT_WINDOW` and
+`PENTECT_PI_MAX_TOKENS`. Use `PENTECT_PI_INPUTS=text` for a text-only model and
+`PENTECT_PI_REASONING=true` or `false` when API type alone cannot describe it.
+Pentect rejects invalid values instead of telling Pi the wrong capabilities.
+
 ## Custom gateways
 
 Custom and local providers can be reached through an OpenAI-compatible
