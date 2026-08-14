@@ -199,9 +199,17 @@ def generate() -> str:
             documents[digest] = content
             document_packages[digest].add(label)
 
+    credsweeper_source = json.loads(
+        (ROOT / "crates/pentect-core/vendors/credsweeper-assets/SOURCE.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    credsweeper_version = credsweeper_source["version"]
+    credsweeper_commit = credsweeper_source["commit"]
+
     bundled_documents = [
         (
-            "CredSweeper v1.17.1 detection assets (MIT)",
+            f"CredSweeper {credsweeper_version} detection assets (MIT)",
             ROOT / "crates/pentect-core/vendors/credsweeper-assets/LICENSE",
         ),
         (
@@ -227,7 +235,7 @@ def generate() -> str:
         "",
         "CredSweeper detection assets",
         "Source: https://github.com/Samsung/CredSweeper",
-        "Version: v1.17.1 (commit 1064da2a54b4e3e4671e229eb2f7ba2ceb0bf629)",
+        f"Version: {credsweeper_version} (commit {credsweeper_commit})",
         "Copyright (c) 2021 SAMSUNG",
         "License: MIT. The full MIT text appears below in the Cargo license documents.",
         "",

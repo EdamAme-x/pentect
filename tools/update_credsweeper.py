@@ -25,6 +25,7 @@ ASSETS = {
     "credsweeper/rules/config.yaml": "rules/config.yaml",
     "credsweeper/secret/config.json": "secret/config.json",
 }
+SIDECAR_PATCH = Path("tools/credsweeper-sidecar/patches/lazy-imports.patch")
 
 
 def run(*args: str, cwd: Path, capture: bool = False) -> str:
@@ -118,6 +119,27 @@ def sync_runtime_requirements(submodule: Path, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
+def sync_sidecar_patch(repo: Path, tag: str) -> None:
+    patch = repo / SIDECAR_PATCH
+    text = patch.read_text(encoding="utf-8")
+    replacement = f' __version__ = "{tag.removeprefix("v")}"'
+    updated, count = re.subn(
+        r'^ __version__ = "[0-9]+\.[0-9]+\.[0-9]+"$',
+        replacement,
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise RuntimeError("CredSweeper sidecar patch has no unique version context")
+    patch.write_text(updated, encoding="utf-8", newline="\n")
+    run("git", "apply", "--check", str(patch.resolve()), cwd=repo / "crates/pentect-core/vendors/CredSweeper")
+
+
+def sync_license_bundle(repo: Path) -> None:
+    run(sys.executable, "tools/generate_licenses.py", cwd=repo)
+
+
 def validate(repo: Path) -> None:
     run("cargo", "check", "-p", "pentect-core", cwd=repo)
     run("cargo", "test", "-p", "pentect-core", "migration_coverage_is_explicit", cwd=repo)
@@ -192,6 +214,8 @@ def main() -> int:
     commit = run("git", "rev-parse", "HEAD", cwd=submodule, capture=True)
     sync_assets(submodule, assets, requested, commit)
     sync_runtime_requirements(submodule, runtime_requirements)
+    sync_sidecar_patch(repo, requested)
+    sync_license_bundle(repo)
     if not args.skip_validation:
         validate(repo)
     print(f"CredSweeper {requested} synced at {commit}")

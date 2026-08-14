@@ -9,7 +9,7 @@ BUNDLED DATA AND MODELS
 
 CredSweeper detection assets
 Source: https://github.com/Samsung/CredSweeper
-Version: v1.17.1 (commit 1064da2a54b4e3e4671e229eb2f7ba2ceb0bf629)
+Version: v1.17.4 (commit c7ad63b95ce0941954465a3b759046b14b88807b)
 Copyright (c) 2021 SAMSUNG
 License: MIT. The full MIT text appears below in the Cargo license documents.
 
@@ -3394,7 +3394,7 @@ SOFTWARE.
 DOCUMENT 56
 ~~~~~~~~~~~
 Applies to:
-- CredSweeper v1.17.1 detection assets (MIT)
+- CredSweeper v1.17.4 detection assets (MIT)
 
 Copyright (c) 2021 SAMSUNG
 

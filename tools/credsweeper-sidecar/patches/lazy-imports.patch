@@ -20,7 +20,7 @@ index 1cedfcf..e339c82 100644
 @@ -25,3 +14,35 @@ __all__ = [
  ]
  
- __version__ = "1.17.0"
+ __version__ = "1.17.4"
 +
 +
 +def __getattr__(name):
@@ -116,10 +116,14 @@ index 77b72b2..b110d99 100644
  import ast
  import base64
  import contextlib
-@@ -14,20 +16,6 @@ from typing import Any, Dict, List, Tuple, Optional, Union
+@@ -14,23 +16,9 @@ from typing import Any, Dict, List, Tuple, Optional, Union
  
  import numpy as np
  import yaml
+ from cryptography.utils import CryptographyDeprecationWarning
+-
++
+ warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)  # TODO: remove with DH
 -from cryptography.hazmat.primitives import hashes
 -from cryptography.hazmat.primitives.asymmetric import padding
 -from cryptography.hazmat.primitives.asymmetric.dh import DHPrivateKey, DHPublicKey
