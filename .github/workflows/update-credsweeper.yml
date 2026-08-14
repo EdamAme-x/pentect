@@ -45,11 +45,13 @@ jobs:
           git add -- \
             crates/pentect-core/vendors/CredSweeper \
             crates/pentect-core/vendors/credsweeper-assets \
-            tools/credsweeper-sidecar/runtime-requirements.txt
+            tools/credsweeper-sidecar/runtime-requirements.txt \
+            tools/credsweeper-sidecar/patches/lazy-imports.patch \
+            THIRD_PARTY_LICENSES.txt
           git commit -m "chore: update CredSweeper to $version"
           git push --force-with-lease origin "HEAD:$branch"
 
-          if ! gh pr view "$branch" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [ "$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$branch" --json number --jq 'length')" -eq 0 ]; then
             gh pr create \
               --repo "$GITHUB_REPOSITORY" \
               --base "$BASE_BRANCH" \
