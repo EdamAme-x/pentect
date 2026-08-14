@@ -133,6 +133,7 @@ enum CompiledRegex {
 #[derive(Clone)]
 enum SpecialMatcher {
     AwsMulti,
+    AlibabaMulti,
     GoogleMulti,
     Jwk,
     PemPrivateKey,
@@ -649,7 +650,7 @@ struct CandidateLineData<'a> {
 impl SpecialMatcher {
     fn find<'a>(&self, line: &'a str) -> Vec<Candidate<'a>> {
         match self {
-            Self::AwsMulti | Self::GoogleMulti | Self::Jwk => Vec::new(),
+            Self::AwsMulti | Self::AlibabaMulti | Self::GoogleMulti | Self::Jwk => Vec::new(),
             Self::PemPrivateKey => pem_private_key_candidates(line),
             Self::Base64PrivateKey => base64_private_key_candidates(line),
         }
@@ -658,13 +659,18 @@ impl SpecialMatcher {
     fn is_whole_text(&self) -> bool {
         matches!(
             self,
-            Self::AwsMulti | Self::GoogleMulti | Self::Jwk | Self::PemPrivateKey
+            Self::AwsMulti
+                | Self::AlibabaMulti
+                | Self::GoogleMulti
+                | Self::Jwk
+                | Self::PemPrivateKey
         )
     }
 
     fn find_whole_text<'a>(&self, text: &'a str) -> Vec<Candidate<'a>> {
         match self {
             Self::AwsMulti => aws_multi_candidates(text),
+            Self::AlibabaMulti => alibaba_multi_candidates(text),
             Self::GoogleMulti => google_multi_candidates(text),
             Self::Jwk => jwk_multi_candidates(text),
             Self::PemPrivateKey => pem_private_key_block_candidates(text),
@@ -702,6 +708,7 @@ fn translated_rule(raw: &RawRule) -> Option<SpecialMatcher> {
     match raw.kind.as_deref()? {
         "multi" => match raw.name.as_str() {
             "AWS Multi" => Some(SpecialMatcher::AwsMulti),
+            "Alibaba Multi" => Some(SpecialMatcher::AlibabaMulti),
             "Google Multi" => Some(SpecialMatcher::GoogleMulti),
             "JWK" => Some(SpecialMatcher::Jwk),
             _ => None,
@@ -783,6 +790,49 @@ fn aws_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
         },
         |line_start, line, anchor| {
             regex_line_data(line_start, line, &AWS_SECRET)
+                .into_iter()
+                .filter(|part| {
+                    let local_start = part.start - line_start;
+                    let local_end = part.end - line_start;
+                    has_upper_lower_digit_or_aws_symbol(part.value)
+                        && !line
+                            .as_bytes()
+                            .get(local_end)
+                            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'/' | b'+'))
+                        && !multi_value_filtered(line, part, anchor.value, local_start, local_end)
+                        && !base64_part_filtered(line, part.value, local_start, local_end)
+                })
+                .collect()
+        },
+    )
+}
+
+fn alibaba_multi_candidates(text: &str) -> Vec<Candidate<'_>> {
+    static ALIBABA_ID: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r"(?:^|/|[^\\0-9A-Za-z+_-]|\\[0abfnrtv]|(?:%|\\x)[0-9A-Fa-f]{2}|\\[0-7]{3}|\\[Uu][0-9A-Fa-f]{4}|\x1B\[[0-9;]{0,80}m)(?P<value>LTAI[0-9A-Za-z]{12,20})",
+        )
+        .expect("alibaba multi id regex")
+    });
+    static ALIBABA_SECRET: LazyLock<RustRegex> = LazyLock::new(|| {
+        RustRegex::new(
+            r"(?:^|/|[^\\0-9A-Za-z+_-]|\\[0abfnrtv]|(?:%|\\x)[0-9A-Fa-f]{2}|\\[0-7]{3}|\\[Uu][0-9A-Fa-f]{4}|\x1B\[[0-9;]{0,80}m)(?P<value>[0-9A-Za-z/+]{30})",
+        )
+        .expect("alibaba multi secret regex")
+    });
+
+    multi_pattern_candidates(
+        text,
+        &ALIBABA_ID,
+        |line_start, line, anchor| {
+            let local_end = anchor.end - line_start;
+            !line
+                .as_bytes()
+                .get(local_end)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'+' | b'-'))
+        },
+        |line_start, line, anchor| {
+            regex_line_data(line_start, line, &ALIBABA_SECRET)
                 .into_iter()
                 .filter(|part| {
                     let local_start = part.start - line_start;
@@ -2582,6 +2632,23 @@ mod tests {
             stats.total_patterns,
             stats.compiled_patterns + stats.translated_patterns + stats.unsupported_patterns
         );
+    }
+
+    #[test]
+    fn alibaba_multi_reports_the_secret_paired_with_an_access_key_id() {
+        let raw = concat!(
+            "access_key_id = LTAI1234567890ABCDEF\n",
+            "access_key_secret = AbCdEfGhIjKlMnOpQrStUvWxYz1234\n",
+        );
+        let candidates = alibaba_multi_candidates(raw);
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.value == "AbCdEfGhIjKlMnOpQrStUvWxYz1234"
+                && candidate
+                    .line_data
+                    .iter()
+                    .any(|part| part.value == "LTAI1234567890ABCDEF")
+        }));
     }
 
     #[test]
