@@ -3131,15 +3131,10 @@ mod tests {
         let env_name = "PENTECT_STRIPE_SECRET_KEY_a81f42c7d933";
         let mut env = |text: &str| {
             Ok(match text {
-                value
-                    if matches!(
-                        value,
-                        "$env:PENTECT_STRIPE_SECRET_KEY_a81f42c7d933"
-                            | "${PENTECT_STRIPE_SECRET_KEY_a81f42c7d933}"
-                            | "$PENTECT_STRIPE_SECRET_KEY_a81f42c7d933"
-                            | "%PENTECT_STRIPE_SECRET_KEY_a81f42c7d933%"
-                    ) =>
-                {
+                "$env:PENTECT_STRIPE_SECRET_KEY_a81f42c7d933"
+                | "${PENTECT_STRIPE_SECRET_KEY_a81f42c7d933}"
+                | "$PENTECT_STRIPE_SECRET_KEY_a81f42c7d933"
+                | "%PENTECT_STRIPE_SECRET_KEY_a81f42c7d933%" => {
                     "sk_live_51Qx7K9mN2vR4aBcD8eF".to_string()
                 }
                 _ => text.to_string(),
