@@ -1036,7 +1036,7 @@ impl CommandProgram {
 struct CommandSession {
     child: Child,
     tree: CommandTree,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     responses: mpsc::Receiver<Result<Vec<u8>, String>>,
 }
 
@@ -1072,7 +1072,9 @@ impl CommandSession {
             .stdout
             .take()
             .ok_or_else(|| format!("plugin '{name}' command stdout is unavailable"))?;
-        let (sender, responses) = mpsc::sync_channel(1);
+        // Keep draining stdout even while the caller is busy writing or processing a
+        // previous response. The byte limit is enforced before anything is queued.
+        let (sender, responses) = mpsc::channel();
         std::thread::Builder::new()
             .name(format!("pentect-plugin-{name}"))
             .spawn(move || {
@@ -1109,7 +1111,7 @@ impl CommandSession {
         Ok(Self {
             child,
             tree,
-            stdin,
+            stdin: Some(stdin),
             responses,
         })
     }
@@ -1120,13 +1122,39 @@ impl CommandSession {
         timeout: Duration,
         name: &str,
     ) -> Result<Vec<u8>, String> {
-        self.stdin
-            .write_all(request)
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
-            .map_err(|_| format!("plugin '{name}' command input failed"))?;
+        let deadline = Instant::now() + timeout;
+        let mut stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| format!("plugin '{name}' command input is unavailable"))?;
+        let payload = request.to_vec();
+        let (write_tx, write_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(format!("pentect-plugin-{name}-stdin"))
+            .spawn(move || {
+                let result = stdin
+                    .write_all(&payload)
+                    .and_then(|_| stdin.write_all(b"\n"))
+                    .and_then(|_| stdin.flush());
+                let _ = write_tx.send((stdin, result));
+            })
+            .map_err(|error| format!("plugin '{name}' input writer could not start: {error}"))?;
+        match write_rx.recv_timeout(timeout) {
+            Ok((stdin, Ok(()))) => self.stdin = Some(stdin),
+            Ok((_stdin, Err(_))) => return Err(format!("plugin '{name}' command input failed")),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!("plugin '{name}' timed out"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("plugin '{name}' command input failed"));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("plugin '{name}' timed out"));
+        }
         self.responses
-            .recv_timeout(timeout)
+            .recv_timeout(remaining)
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => format!("plugin '{name}' timed out"),
                 mpsc::RecvTimeoutError::Disconnected => {
@@ -1315,6 +1343,8 @@ struct PluginCommandLock {
     schema: String,
     executable: String,
     #[serde(default)]
+    managed: bool,
+    #[serde(default)]
     file: Vec<PluginCommandLockFile>,
 }
 
@@ -1358,13 +1388,17 @@ fn verify_command_files(
     let expected = argv
         .iter()
         .filter_map(|argument| argument.strip_prefix("{plugin}/"))
+        .map(str::to_string)
         .collect::<BTreeSet<_>>();
     let locked = lock
         .file
         .iter()
-        .map(|file| file.path.as_str())
+        .map(|file| file.path.clone())
         .collect::<BTreeSet<_>>();
-    if expected != locked || locked.len() != lock.file.len() {
+    if !expected.is_subset(&locked)
+        || (!lock.managed && expected != locked)
+        || locked.len() != lock.file.len()
+    {
         return Err(format!(
             "plugin '{name}' command file set changed after setup"
         ));
@@ -1372,6 +1406,14 @@ fn verify_command_files(
     let canonical_root = root
         .canonicalize()
         .map_err(|_| format!("plugin '{name}' command root is unavailable"))?;
+    if lock.managed {
+        let actual = walk_regular_files(root)?;
+        if actual != locked {
+            return Err(format!(
+                "plugin '{name}' command file set changed after setup"
+            ));
+        }
+    }
     for file in lock.file {
         if file.sha256.len() != 64 || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(format!("plugin '{name}' command lock is invalid"));
@@ -1405,6 +1447,36 @@ fn verify_command_files(
         }
     }
     Ok(executable)
+}
+
+fn walk_regular_files(root: &Path) -> Result<BTreeSet<String>, String> {
+    let mut result = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|_| "plugin command directory is unavailable".to_string())?
+        {
+            let entry = entry.map_err(|_| "plugin command directory is unavailable".to_string())?;
+            let kind = entry
+                .file_type()
+                .map_err(|_| "plugin command directory is unavailable".to_string())?;
+            if kind.is_symlink() {
+                return Err("plugin command directory contains a symbolic link".to_string());
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|_| "plugin command path is invalid".to_string())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                result.insert(relative);
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn resolve_plugin_command_executable(
@@ -1719,6 +1791,7 @@ impl WasmProgram {
                 config: self.config.clone(),
                 permissions: self.permissions.clone(),
                 host_requests: 0,
+                pending_host_response: None,
                 deadline: (started + timeout).min(chain_deadline),
             },
         );
@@ -1797,6 +1870,7 @@ struct WasmHostState {
     config: Option<toml::Value>,
     permissions: Option<PermissionPolicy>,
     host_requests: usize,
+    pending_host_response: Option<(Vec<u8>, Vec<u8>)>,
     deadline: Instant,
 }
 
@@ -2024,27 +2098,39 @@ fn wasm_host_request(
     if request_len > DEFAULT_MAX_INPUT_BYTES || response_capacity > DEFAULT_MAX_OUTPUT_BYTES {
         return -2;
     }
-    if caller.data().host_requests >= HOST_MAX_REQUESTS {
-        return -2;
-    }
-    caller.data_mut().host_requests += 1;
     let mut request = vec![0; request_len];
     if memory.read(&caller, request_offset, &mut request).is_err() {
         return -1;
     }
-    let response = match (
-        caller.data().permissions.as_ref(),
-        serde_json::from_slice::<HostRequest>(&request),
-    ) {
-        (Some(policy), Ok(request)) => {
-            perform_host_request(policy, request, caller.data().deadline)
+    let encoded = if caller
+        .data()
+        .pending_host_response
+        .as_ref()
+        .is_some_and(|(pending, _)| pending == &request)
+    {
+        caller.data_mut().pending_host_response.take().unwrap().1
+    } else {
+        caller.data_mut().pending_host_response = None;
+        if caller.data().host_requests >= HOST_MAX_REQUESTS {
+            return -2;
         }
-        _ => HostResponse::denied(),
-    };
-    let Ok(encoded) = serde_json::to_vec(&response) else {
-        return -3;
+        caller.data_mut().host_requests += 1;
+        let response = match (
+            caller.data().permissions.as_ref(),
+            serde_json::from_slice::<HostRequest>(&request),
+        ) {
+            (Some(policy), Ok(request)) => {
+                perform_host_request(policy, request, caller.data().deadline)
+            }
+            _ => HostResponse::denied(),
+        };
+        let Ok(encoded) = serde_json::to_vec(&response) else {
+            return -3;
+        };
+        encoded
     };
     if encoded.len() > response_capacity {
+        caller.data_mut().pending_host_response = Some((request, encoded.clone()));
         return i32::try_from(encoded.len()).unwrap_or(-2);
     }
     if memory
@@ -2314,11 +2400,27 @@ fn run_brokered_command(
             .map(|_| value)
     });
     if let Some(mut input) = child.stdin.take() {
-        if input.write_all(stdin.as_bytes()).is_err() {
-            tree.terminate();
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("approved command input failed".to_string());
+        let bytes = stdin.as_bytes().to_vec();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = input.write_all(&bytes);
+            let _ = sender.send(result);
+        });
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tree.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("approved command input failed".to_string());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                tree.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("approved command timed out".to_string());
+            }
         }
     }
     let status = loop {
@@ -3424,13 +3526,21 @@ mod tests {
         }
     }
 
-    fn python_protocol_fixture(code: &str) -> Vec<String> {
-        vec![
-            "python".to_string(),
+    fn python_protocol_fixture(code: &str) -> Option<Vec<String>> {
+        let executable = ["python3", "python"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })?;
+        Some(vec![
+            executable.to_string(),
             "-u".to_string(),
             "-c".to_string(),
             code.to_string(),
-        ]
+        ])
     }
 
     #[cfg(windows)]
@@ -3519,9 +3629,11 @@ mod tests {
 
     #[test]
     fn command_protocol_rejects_a_wrong_response_id() {
-        let command = python_protocol_fixture(
+        let Some(command) = python_protocol_fixture(
             "import json,sys; r=json.loads(sys.stdin.readline()); print(json.dumps({'schema':'pentect.plugin.v1','id':r['id']+1,'type':'result','action':'next'}), flush=True)",
-        );
+        ) else {
+            return;
+        };
         let plugin = PluginBinary {
             name: "wrong-id".to_string(),
             program: PluginProgram::Command(

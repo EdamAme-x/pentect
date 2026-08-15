@@ -1,9 +1,13 @@
 import {createInterface} from 'node:readline';
 
 export const schema = 'pentect.plugin.v1';
+const hooks = new Set(['prepare', 'inspect', 'finalize', 'request', 'response', 'tool_call', 'file']);
+const actions = new Set(['next', 'stop']);
 
 export function result(request, values = {}) {
-  return {...values, schema, id: request.id, type: 'result', action: values.action ?? 'next'};
+  const action = values.action ?? 'next';
+  if (!actions.has(action)) throw new Error('invalid Pentect action');
+  return {...values, schema, id: request.id, type: 'result', action};
 }
 
 export async function serve(handler, {input = process.stdin, output = process.stdout} = {}) {
@@ -15,13 +19,19 @@ export async function serve(handler, {input = process.stdin, output = process.st
       const request = JSON.parse(line);
       id = request?.id;
       if (request?.schema !== schema || !Number.isSafeInteger(id) || id < 1 ||
-          typeof request?.hook !== 'string' || !('payload' in request)) {
+          !hooks.has(request?.hook) || !('payload' in request)) {
         throw new Error('invalid Pentect request');
       }
       response = result(request, await handler(request) ?? {});
     } catch {
       response = {schema, id, type: 'result', action: 'next', error: {code: 'handler_error'}};
     }
-    output.write(`${JSON.stringify(response)}\n`);
+    let encoded;
+    try {
+      encoded = JSON.stringify(response);
+    } catch {
+      encoded = JSON.stringify({schema, id, type: 'result', action: 'next', error: {code: 'handler_error'}});
+    }
+    output.write(`${encoded}\n`);
   }
 }

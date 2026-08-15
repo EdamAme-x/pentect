@@ -6,8 +6,9 @@ the plugin process run on your computer. Pentect communicates with it over
 stdin/stdout and does not expose a local HTTP port.
 
 The model is not bundled with Pentect. Install its Python dependency in the
-documented managed environment before enabling the plugin. Pentect starts the
-process only when it is needed.
+documented managed environment at `~/.pentect/openai-privacy-filter/venv`
+before enabling the plugin. Pentect starts the process only when it is needed.
+See the [setup guide](https://pentect.dev/plugins/official/#openai-privacy-filter).
 
 ```sh
 pentect plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter

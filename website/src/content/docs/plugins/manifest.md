@@ -28,8 +28,8 @@ Unknown fields cause an error. This helps catch spelling mistakes.
 | `required` | No | Stop when the plugin cannot run; default is `false` |
 
 `postscript` is not supported. A plugin cannot run an installer or native setup
-program. A plugin must choose exactly one form: `[[detector]]`, `wasm`, or
-`command`.
+program. A plugin must choose exactly one form: `[[detector]]`, `wasm`,
+`command`, or `[commands]`.
 
 ## What users approve
 

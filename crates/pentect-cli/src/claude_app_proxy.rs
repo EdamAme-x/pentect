@@ -1400,6 +1400,10 @@ fn inject_chat_contract(value: &mut serde_json::Value) {
             return;
         }
     }
+    object.insert(
+        "system".to_string(),
+        serde_json::Value::String(HANDLE_CONTRACT.to_string()),
+    );
 }
 
 fn mask_chat_value(
@@ -2607,6 +2611,13 @@ mod tests {
             "local-value"
         );
         assert_eq!(value["content"][1]["input"]["body"][0], "local-value");
+    }
+
+    #[test]
+    fn chat_contract_is_added_when_request_has_no_prompt_field() {
+        let mut value = serde_json::json!({"messages": []});
+        inject_chat_contract(&mut value);
+        assert_eq!(value["system"], HANDLE_CONTRACT);
     }
 
     #[test]

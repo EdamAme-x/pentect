@@ -2272,6 +2272,7 @@ struct PluginApproval {
 struct CommandLock {
     schema: &'static str,
     executable: String,
+    managed: bool,
     file: Vec<CommandLockFile>,
 }
 
@@ -2291,6 +2292,7 @@ fn write_command_lock(
         .map_err(|error| format!("could not create plugin data directory: {error}"))?;
 
     let remote = plugins::remote_command_files(source).map_err(|error| error.to_string())?;
+    let managed = !remote.is_empty();
     let root = if remote.is_empty() {
         source
             .manifest_path
@@ -2306,17 +2308,27 @@ fn write_command_lock(
     let command = manifest
         .selected_command()?
         .ok_or_else(|| "command plugin has no command for this platform".to_string())?;
-    for argument in command {
-        let Some(relative) = argument.strip_prefix("{plugin}/") else {
-            continue;
-        };
+    let command_files = command
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("{plugin}/").map(PathBuf::from))
+        .collect::<Vec<_>>();
+    let locked_files = if managed {
+        remote
+            .iter()
+            .map(|(relative, _)| relative.clone())
+            .collect()
+    } else {
+        command_files
+    };
+    for relative in locked_files {
+        let relative = relative.to_string_lossy().replace('\\', "/");
         if files
             .iter()
             .any(|file: &CommandLockFile| file.path == relative)
         {
             continue;
         }
-        let path = root.join(relative);
+        let path = root.join(&relative);
         if !path.is_file() {
             return Err(format!(
                 "command plugin file is unavailable: {}",
@@ -2333,6 +2345,7 @@ fn write_command_lock(
     let encoded = toml::to_string(&CommandLock {
         schema: "pentect.plugin-command-lock.v1",
         executable: executable.to_string_lossy().into_owned(),
+        managed,
         file: files,
     })
     .map_err(|error| format!("could not encode plugin command lock: {error}"))?;
@@ -3484,6 +3497,17 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn python_test_executable() -> Option<&'static str> {
+        ["python3", "python"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
     #[test]
     fn parses_list() {
         let args = vec!["pentect".into(), "plugins".into(), "list".into()];
@@ -3807,6 +3831,9 @@ mod tests {
 
     #[test]
     fn local_command_files_are_hashed_into_the_runtime_lock() {
+        let Some(python) = python_test_executable() else {
+            return;
+        };
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3818,7 +3845,7 @@ mod tests {
         std::fs::write(
             &manifest_path,
             format!(
-                "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ncommand = [\"python\", \"{{plugin}}/server.py\"]\nhooks = [\"inspect\"]\n"
+                "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ncommand = [\"{python}\", \"{{plugin}}/server.py\"]\nhooks = [\"inspect\"]\n"
             ),
         )
         .unwrap();
@@ -3846,6 +3873,9 @@ mod tests {
 
     #[test]
     fn command_runtime_snapshot_restores_only_managed_state() {
+        let Some(python) = python_test_executable() else {
+            return;
+        };
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3857,7 +3887,7 @@ mod tests {
         std::fs::write(
             &manifest_path,
             format!(
-                "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ncommand = [\"python\", \"{{plugin}}/server.py\"]\nhooks = [\"inspect\"]\n"
+                "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ncommand = [\"{python}\", \"{{plugin}}/server.py\"]\nhooks = [\"inspect\"]\n"
             ),
         )
         .unwrap();

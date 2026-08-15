@@ -58,7 +58,7 @@ into the protected client's terminal; use value-free Pentect activity logs for
 runtime diagnostics.
 
 ```json
-{"schema":"pentect.plugin.v1","id":1,"hook":"inspect","payload":{"kind":"text","text":"hello"},"metadata":null}
+{"schema":"pentect.plugin.v1","id":1,"hook":"inspect","payload":{"kind":"text","text":"hello"},"metadata":null,"config":{}}
 ```
 
 The response must repeat the schema and id:

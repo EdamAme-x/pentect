@@ -16,7 +16,7 @@ Protected values
 Using a value
 - Pass the unchanged handle directly in the local tool or function input that needs the value; Pentect restores it at the completed local tool boundary.
 - You may instead use its environment binding. With the default prefix, <<LABEL_HASH>> maps to $env:PENTECT_LABEL_HASH in PowerShell and ${PENTECT_LABEL_HASH} in a POSIX shell.
-- When using an environment binding, write that complete reference literally in the tool input. Do not construct the variable name dynamically, look it up through an environment API, copy the handle into a variable, or assign the binding yourself; Pentect injects it for that local tool call.
+- When using an environment binding, write that complete reference literally in the tool input. Do not construct the variable name dynamically, look it up through an environment API, copy the handle into a variable, or assign the binding yourself; at the local tool boundary Pentect rewrites the command with a shell-local assignment while the model sees only the reference.
 - Use the handle or binding in the actual command, request header, SDK call, or destination file. Do not print or echo it first.
 
 Avoid retries

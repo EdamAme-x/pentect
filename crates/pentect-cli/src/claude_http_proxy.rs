@@ -1937,8 +1937,14 @@ fn inject_shell_environment(
         ShellEnvironmentSyntax::Cmd => {
             let assignments = unique
                 .into_values()
-                .filter(|(_, value)| shell_safe_secret_token(value))
-                .map(|(name, value)| format!("set \"{name}={value}\" && "))
+                .filter_map(|(name, value)| {
+                    if shell_safe_secret_token(&value) {
+                        Some(format!("set \"{name}={value}\" && "))
+                    } else {
+                        eprintln!("[pentect] cmd binding '{name}' was not injected because its value is not cmd-safe");
+                        None
+                    }
+                })
                 .collect::<String>();
             format!("{assignments}{command}")
         }
@@ -3129,33 +3135,32 @@ mod tests {
         assert!(!restored.contains(dangerous_value));
 
         let env_name = "PENTECT_STRIPE_SECRET_KEY_a81f42c7d933";
+        let secret = ["sk", "live", "51Qx7K9mN2vR4aBcD8eF"].join("_");
         let mut env = |text: &str| {
             Ok(match text {
                 "$env:PENTECT_STRIPE_SECRET_KEY_a81f42c7d933"
                 | "${PENTECT_STRIPE_SECRET_KEY_a81f42c7d933}"
                 | "$PENTECT_STRIPE_SECRET_KEY_a81f42c7d933"
-                | "%PENTECT_STRIPE_SECRET_KEY_a81f42c7d933%" => {
-                    "sk_live_51Qx7K9mN2vR4aBcD8eF".to_string()
-                }
+                | "%PENTECT_STRIPE_SECRET_KEY_a81f42c7d933%" => secret.clone(),
                 _ => text.to_string(),
             })
         };
         for (reference, expected_prefix) in [
             (
                 format!("$env:{env_name}"),
-                format!("$env:{env_name} = 'sk_live_51Qx7K9mN2vR4aBcD8eF'; "),
+                format!("$env:{env_name} = '{secret}'; "),
             ),
             (
                 format!("${{{env_name}}}"),
-                format!("export {env_name}='sk_live_51Qx7K9mN2vR4aBcD8eF'; "),
+                format!("export {env_name}='{secret}'; "),
             ),
             (
                 format!("${env_name}"),
-                format!("export {env_name}='sk_live_51Qx7K9mN2vR4aBcD8eF'; "),
+                format!("export {env_name}='{secret}'; "),
             ),
             (
                 format!("%{env_name}%"),
-                format!("set \"{env_name}=sk_live_51Qx7K9mN2vR4aBcD8eF\" && "),
+                format!("set \"{env_name}={secret}\" && "),
             ),
         ] {
             let restored = resolve_shell_text_safely(
@@ -3163,10 +3168,7 @@ mod tests {
                 &mut env,
             )
             .unwrap();
-            assert!(
-                restored.contains("sk_live_51Qx7K9mN2vR4aBcD8eF"),
-                "{restored}"
-            );
+            assert!(restored.contains(&secret), "{restored}");
             assert!(restored.starts_with(&expected_prefix), "{restored}");
             assert!(restored.contains(&reference), "{restored}");
         }

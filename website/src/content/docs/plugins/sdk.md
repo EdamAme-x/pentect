@@ -198,8 +198,8 @@ method. Every method is available on every hook context.
 ```rust
 let policy = c.read("project:config/policy.json")?;
 let endpoint = c.env("POLICY_URL")?;
-c.storage_set("last-policy", &policy)?;
 let previous: Option<String> = c.storage_get("last-policy")?;
+c.storage_set("last-policy", &policy)?;
 let result = c.run(&["git", "status", "--porcelain"], "")?;
 ```
 

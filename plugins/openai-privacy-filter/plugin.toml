@@ -2,7 +2,7 @@ schema = "pentect.plugin.v1"
 name = "openai-privacy-filter"
 description = "Detect private text with OpenAI Privacy Filter running on your computer."
 hooks = ["inspect"]
-required = true
+required = false
 
 [commands]
 windows = ["py", "{plugin}/server.py", "--device", "cpu"]
