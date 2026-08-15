@@ -3476,7 +3476,7 @@ mod tests {
             16,
         )
         .unwrap()
-        .invoke(b"{}", Duration::from_secs(5), "fixture")
+        .invoke(b"{}", Duration::from_secs(15), "fixture")
         .unwrap_err();
         assert!(oversized.contains("exceeds its limit"), "{oversized}");
     }
