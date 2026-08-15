@@ -58,7 +58,6 @@ const sidebar = [
       { text: sidebarLabel('Codex', 'terminal', '/brands/openai-blossom.svg'), link: '/clients/codex/' },
       { text: sidebarLabel('Claude', 'message', '/brands/claude.svg'), link: '/clients/claude/' },
       { text: sidebarLabel('OpenCode', 'terminal', '/brands/opencode.svg'), link: '/clients/opencode/' },
-      { text: sidebarLabel('VS Code', 'code', '/brands/vscode.svg'), link: '/clients/vscode/' },
       { text: sidebarLabel('Antigravity CLI', 'terminal', '/brands/antigravity.svg'), link: '/clients/antigravity/' },
       {
         text: 'Others',

@@ -813,12 +813,27 @@ pub(crate) fn remote_plugin_lock_entry(
     let Some(resolved) = source.remote_base.clone() else {
         return Ok(None);
     };
+    let manifest_url = if resolved.ends_with(".toml") {
+        resolved.clone()
+    } else {
+        format!(
+            "{}/{}",
+            resolved.trim_end_matches('/'),
+            PLUGIN_MANIFEST_FILE
+        )
+    };
+    fetch_remote_plugin_file(&manifest_url)?
+        .ok_or_else(|| anyhow!("remote plugin manifest could not be fetched for lock: {spec}"))?;
+    let optional_config_url = (!resolved.ends_with(".toml"))
+        .then(|| format!("{}/{}", resolved.trim_end_matches('/'), PLUGIN_CONFIG_FILE));
     let mut files = BTreeMap::new();
     for url in remote_plugin_urls(&resolved) {
-        let path = remote_cache_file(&url)?;
-        if !path.is_file() {
-            continue;
-        }
+        let Some(path) = fetch_remote_plugin_file(&url)? else {
+            if optional_config_url.as_deref() == Some(url.as_str()) {
+                continue;
+            }
+            bail!("remote plugin file could not be fetched for lock: {url}");
+        };
         let bytes = pentect_agent::read_bounded_bytes(
             &path,
             MAX_REMOTE_PLUGIN_FILE_BYTES,
