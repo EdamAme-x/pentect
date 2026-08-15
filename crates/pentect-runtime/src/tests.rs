@@ -814,6 +814,7 @@ fn active_memory_store_resolver_reuses_one_snapshot_for_many_scalars() {
         .unwrap()
         .unwrap();
     let handle = masked_handle_from_assignment(&masked, "OPENAI_API_KEY");
+    let env_name = pentect_env_name_for_handle(&handle);
     let resolver = ActiveMemoryStoreResolver::new().unwrap();
 
     assert_eq!(
@@ -826,6 +827,25 @@ fn active_memory_store_resolver_reuses_one_snapshot_for_many_scalars() {
             .unwrap()
             .as_deref(),
         Some("before <<UNKNOWN_0123456789abcdef>> after")
+    );
+    for reference in [
+        format!("$env:{env_name}"),
+        format!("${{{env_name}}}"),
+        format!("${env_name}"),
+        format!("%{env_name}%"),
+    ] {
+        assert_eq!(
+            resolver.resolve_known_text(&reference).unwrap().as_deref(),
+            Some(raw),
+            "{reference}"
+        );
+    }
+    assert_eq!(
+        resolver
+            .resolve_known_text("$env:PENTECT_UNKNOWN_deadbeef")
+            .unwrap()
+            .as_deref(),
+        Some("$env:PENTECT_UNKNOWN_deadbeef")
     );
 }
 

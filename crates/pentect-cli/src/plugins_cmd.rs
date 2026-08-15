@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
+const PLUGIN_COMMAND_LOCK_FILE: &str = "command.lock";
 const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
 const MAX_PLUGIN_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_PLUGIN_METADATA_BYTES: u64 = 64 * 1024;
@@ -27,7 +28,7 @@ pub(crate) fn cmd_plugins(args: &[String]) {
         Action::Search { query } => search_plugins(query.as_deref(), opts.json),
         Action::Inspect { spec } => inspect_plugin(&spec, opts.json),
         Action::Test { spec } => test_plugin(&spec, opts.json),
-        Action::New { name } => new_plugin(&name, opts.json),
+        Action::New { name, form } => new_plugin(&name, form, opts.json),
         Action::Dev { spec, approved } => dev_plugin(&spec, approved, opts.json),
         Action::Publish { spec } => publish_plugin(&spec, opts.json),
         Action::Config { spec, change } => config_plugin(&spec, change, opts.json),
@@ -69,6 +70,7 @@ enum Action {
     },
     New {
         name: String,
+        form: Option<NewPluginForm>,
     },
     Dev {
         spec: String,
@@ -173,9 +175,12 @@ impl PluginCmd {
             }
             "new" => {
                 reject_action_flags(approved, unset.as_deref())?;
-                Action::New {
-                    name: one_value("plugins new", values)?,
-                }
+                let (name, form) = match values.as_slice() {
+                    [name] => (name.clone(), None),
+                    [name, form] => (name.clone(), Some(NewPluginForm::parse(form)?)),
+                    _ => return Err("plugins new NAME [manifest|wasm|command]".to_string()),
+                };
+                Action::New { name, form }
             }
             "dev" => {
                 if unset.is_some() {
@@ -253,8 +258,7 @@ struct RegistryPlugin {
     description: String,
     source: String,
     publisher: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    runtime: Option<PluginRuntime>,
+    form: PluginRuntime,
 }
 
 fn search_plugins(query: Option<&str>, json_output: bool) -> Result<(), String> {
@@ -302,7 +306,7 @@ fn search_plugins(query: Option<&str>, json_output: bool) -> Result<(), String> 
             "{}: {} [{}; {}]\n  {}",
             plugin.name,
             plugin.description,
-            plugin.runtime.map(runtime_name).unwrap_or("declarative"),
+            runtime_name(plugin.form),
             plugin.publisher,
             plugin.source
         );
@@ -615,14 +619,16 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let manifest = load_plugin_manifest(&source)?;
     let name = plugin_name(&source, manifest.as_ref());
     let hooks = installed_wasm_hooks(&name, manifest.as_ref(), &source)?;
-    let binary = manifest
+    let binary = manifest.as_ref().and_then(PluginManifest::wasm_name);
+    let form = manifest.as_ref().map(plugin_runtime);
+    let command = match manifest
         .as_ref()
-        .and_then(|manifest| manifest.binary.as_deref());
-    let platform = if binary.is_some() {
-        "portable-wasm".to_string()
-    } else {
-        binary_platform()
+        .filter(|manifest| manifest.form().ok() == Some(PluginRuntime::Command))
+    {
+        Some(manifest) => manifest.selected_command()?,
+        None => None,
     };
+    let platform = binary.is_some().then_some("portable-wasm");
     let repository = manifest.as_ref().and_then(|manifest| {
         manifest
             .repository
@@ -648,15 +654,13 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
                 "binary": binary,
                 "repository": repository,
                 "asset": asset,
-                "runtime": manifest.as_ref().map(plugin_runtime),
-                "publisher_workflow": manifest.as_ref().filter(|manifest| manifest.binary.is_some()).and_then(|manifest| publisher_workflow(manifest).ok()),
+                "form": form,
+                "command": command,
+                "publisher_workflow": manifest.as_ref().filter(|manifest| manifest.wasm_name().is_some()).and_then(|manifest| publisher_workflow(manifest).ok()),
                 "hooks": hooks,
-                "execution": manifest.as_ref().and_then(|manifest| manifest.binary.as_ref()).map(|_| json!({
-                    "required": manifest.as_ref().is_some_and(|manifest| manifest.required),
-                    "mode": manifest.as_ref().and_then(|manifest| manifest.execution.as_ref()).and_then(|execution| execution.mode.as_deref()).unwrap_or("oneshot"),
-                })),
-                "network": manifest.as_ref().and_then(|manifest| manifest.network.as_ref()),
-                "postscripts": manifest.as_ref().map(|manifest| manifest.postscript.len()).unwrap_or(0),
+                "required": manifest.as_ref().filter(|manifest| manifest.form().ok() != Some(PluginRuntime::Manifest)).map(|manifest| manifest.required),
+                "network": manifest.as_ref().and_then(|manifest| manifest.network_config()),
+                "permissions": manifest.as_ref().and_then(|manifest| manifest.permissions.as_ref()),
             })
         );
         return Ok(());
@@ -671,24 +675,22 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     if let Some(path) = source.manifest_path.as_deref() {
         println!("manifest: {}", display_path(path));
     }
+    if let Some(form) = form {
+        println!("form: {}", runtime_name(form));
+    }
     println!("configs: {}", active.config_paths().len());
     for path in active.config_paths() {
         println!("config: {}", display_path(path));
     }
     if let Some(binary) = binary {
-        println!(
-            "runtime: {}",
-            runtime_name(plugin_runtime(manifest.as_ref().unwrap()))
-        );
-        println!("platform: {platform}");
+        println!("platform: {}", platform.expect("Wasm has a platform"));
         println!("binary: {binary}");
         if let Some(repository) = repository {
             println!("repository: {repository}");
         }
         if let Some(workflow) = manifest.as_ref().and_then(|manifest| {
             manifest
-                .binary
-                .as_ref()
+                .wasm_name()
                 .and_then(|_| publisher_workflow(manifest).ok())
         }) {
             println!("publisher-workflow: {workflow}");
@@ -696,19 +698,21 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         if let Some(asset) = asset {
             println!("asset: {asset}");
         }
+    } else if let Some(command) = command {
+        println!("command: {}", display_command(command));
     }
     if let Some(hooks) = hooks {
         println!("hooks: {}", hooks.join(", "));
     }
     if let Some(manifest) = manifest
         .as_ref()
-        .filter(|manifest| manifest.binary.is_some())
+        .filter(|manifest| manifest.form().ok() != Some(PluginRuntime::Manifest))
     {
         println!("required: {}", manifest.required);
     }
     if let Some(network) = manifest
         .as_ref()
-        .and_then(|manifest| manifest.network.as_ref())
+        .and_then(|manifest| manifest.network_config())
     {
         println!("network-allow: {}", network.allow.join(", "));
         println!(
@@ -723,13 +727,12 @@ fn inspect_plugin(spec: &str, json_output: bool) -> Result<(), String> {
         println!("network-private: {}", network.private_network);
         println!("network-insecure: {}", network.allow_insecure);
     }
-    println!(
-        "postscripts: {}",
-        manifest
-            .as_ref()
-            .map(|manifest| manifest.postscript.len())
-            .unwrap_or(0)
-    );
+    if let Some(permissions) = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.permissions.as_ref())
+    {
+        print_permissions(permissions);
+    }
     Ok(())
 }
 
@@ -741,7 +744,10 @@ fn installed_wasm_hooks(
     let Some(manifest) = manifest else {
         return Ok(None);
     };
-    let Some(binary) = manifest.binary.as_deref() else {
+    if manifest.form()? == PluginRuntime::Command {
+        return Ok(Some(manifest.hooks.clone()));
+    }
+    let Some(binary) = manifest.wasm_name() else {
         return Ok(None);
     };
     let destination = binary_destination(name, binary, plugin_runtime(manifest), source)?;
@@ -752,7 +758,49 @@ fn installed_wasm_hooks(
     pentect_agent::inspect_wasm_plugin_hooks(&bytes).map(Some)
 }
 
-fn new_plugin(name: &str, json_output: bool) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NewPluginForm {
+    Manifest,
+    Wasm,
+    Command,
+}
+
+impl NewPluginForm {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "manifest" => Ok(Self::Manifest),
+            "wasm" => Ok(Self::Wasm),
+            "command" => Ok(Self::Command),
+            _ => Err("plugin form must be manifest, wasm, or command".to_string()),
+        }
+    }
+}
+
+fn choose_new_plugin_form() -> Result<NewPluginForm, String> {
+    if !std::io::stdin().is_terminal() {
+        return Err("choose a form: pentect plugins new NAME manifest|wasm|command".to_string());
+    }
+    println!("Choose one plugin form:");
+    println!("  1  Manifest  regex declarations, no code");
+    println!("  2  Wasm      sandboxed code with approved access");
+    println!("  3  Command   Python, Node.js, native, or Docker over JSONL");
+    print!("Form [1-3]: ");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("could not show plugin form prompt: {error}"))?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("could not read plugin form: {error}"))?;
+    match answer.trim() {
+        "1" | "manifest" => Ok(NewPluginForm::Manifest),
+        "2" | "wasm" => Ok(NewPluginForm::Wasm),
+        "3" | "command" => Ok(NewPluginForm::Command),
+        _ => Err("plugin form must be 1, 2, or 3".to_string()),
+    }
+}
+
+fn new_plugin(name: &str, form: Option<NewPluginForm>, json_output: bool) -> Result<(), String> {
     if json_output {
         return Err("plugins new does not support --json".to_string());
     }
@@ -764,15 +812,47 @@ fn new_plugin(name: &str, json_output: bool) -> Result<(), String> {
             display_path(&root)
         ));
     }
+    let form = form.map(Ok).unwrap_or_else(choose_new_plugin_form)?;
     let crate_name = name.replace('-', "_");
-    std::fs::create_dir_all(root.join("src"))
+    std::fs::create_dir_all(&root)
         .map_err(|error| format!("could not create plugin directory: {error}"))?;
+    match form {
+        NewPluginForm::Manifest => write_manifest_plugin_template(&root, name)?,
+        NewPluginForm::Wasm => write_wasm_plugin_template(&root, name, &crate_name)?,
+        NewPluginForm::Command => write_command_plugin_template(&root, name)?,
+    }
+    std::fs::write(
+        root.join("README.md"),
+        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\npentect plugins setup .\npentect plugins test .\n```\n\nRead the plugin guide at https://pentect.dev/plugins/build/.\n"),
+    )
+    .map_err(|error| format!("could not write plugin README: {error}"))?;
+    println!("created: {}", display_path(&root));
+    println!(
+        "next: cd {} && pentect plugins setup .",
+        display_path(&root)
+    );
+    Ok(())
+}
+
+fn write_manifest_plugin_template(root: &Path, name: &str) -> Result<(), String> {
+    std::fs::write(
+        root.join("plugin.toml"),
+        format!(
+            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ndescription = \"A Pentect plugin.\"\n\n[[detector]]\nlabel = \"CUSTOM_SECRET\"\npattern = '''CHANGE_ME_[A-Za-z0-9]+'''\n"
+        ),
+    )
+    .map_err(|error| format!("could not write plugin.toml: {error}"))
+}
+
+fn write_wasm_plugin_template(root: &Path, name: &str, crate_name: &str) -> Result<(), String> {
+    std::fs::create_dir_all(root.join("src"))
+        .map_err(|error| format!("could not create plugin source directory: {error}"))?;
     std::fs::create_dir_all(root.join(".github/workflows"))
         .map_err(|error| format!("could not create plugin workflow directory: {error}"))?;
     std::fs::write(
         root.join("plugin.toml"),
         format!(
-            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ndescription = \"A Pentect plugin.\"\nbinary = \"{name}.wasm\"\n# Set this before publishing:\n# repository = \"OWNER/REPOSITORY\"\n"
+            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ndescription = \"A Pentect plugin.\"\nwasm = \"{name}.wasm\"\n# Set this before publishing:\n# repository = \"OWNER/REPOSITORY\"\n"
         ),
     )
     .map_err(|error| format!("could not write plugin.toml: {error}"))?;
@@ -788,21 +868,41 @@ fn new_plugin(name: &str, json_output: bool) -> Result<(), String> {
         "use pentect_plugin::{Finding, Inspect, PluginResult};\n\nfn inspect(context: &mut Inspect) -> PluginResult {\n    if let Some(start) = context.input().text.find(\"CHANGE_ME\") {\n        context.add_finding(Finding::new(start, start + 9, \"CUSTOM_SECRET\"))?;\n    }\n    Ok(())\n}\n\npentect_plugin::export!(inspect);\n",
     )
     .map_err(|error| format!("could not write plugin source: {error}"))?;
-    std::fs::write(
-        root.join("README.md"),
-        format!("# {name}\n\nCreated with `pentect plugins new {name}`.\n\n```sh\npentect plugins dev .\npentect plugins test .\npentect plugins publish .\n```\n\n`plugins dev` activates the local build after approval. Commit `Cargo.lock`; the release workflow builds with `--locked`.\n\nRead the plugin guide at https://pentect.dev/plugins/build/.\n"),
-    )
-    .map_err(|error| format!("could not write plugin README: {error}"))?;
     std::fs::write(root.join(".gitignore"), "/target\n/dist\n")
         .map_err(|error| format!("could not write plugin .gitignore: {error}"))?;
     std::fs::write(
         root.join(".github/workflows/release.yml"),
-        plugin_release_workflow(name, &crate_name),
+        plugin_release_workflow(name, crate_name),
     )
-    .map_err(|error| format!("could not write plugin release workflow: {error}"))?;
-    println!("created: {}", display_path(&root));
-    println!("next: cd {} && pentect plugins dev .", display_path(&root));
-    Ok(())
+    .map_err(|error| format!("could not write plugin release workflow: {error}"))
+}
+
+fn write_command_plugin_template(root: &Path, name: &str) -> Result<(), String> {
+    std::fs::write(
+        root.join("plugin.toml"),
+        format!(
+            "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ndescription = \"A Pentect plugin.\"\nhooks = [\"inspect\"]\n\n[commands]\nwindows = [\"py\", \"{{plugin}}/server.py\"]\nmacos = [\"python3\", \"{{plugin}}/server.py\"]\nlinux = [\"python3\", \"{{plugin}}/server.py\"]\n"
+        ),
+    )
+    .map_err(|error| format!("could not write plugin.toml: {error}"))?;
+    std::fs::write(
+        root.join("server.py"),
+        r#"import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    text = request.get("payload", {}).get("text", "")
+    spans = []
+    marker = "CHANGE_ME"
+    start = text.find(marker)
+    if start >= 0:
+        spans.append({"start": start, "end": start + len(marker), "label": "CUSTOM_SECRET", "category": "secret", "confidence": "high"})
+    response = {"schema": "pentect.plugin.v1", "id": request["id"], "type": "result", "action": "next", "spans": spans}
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+"#,
+    )
+    .map_err(|error| format!("could not write command plugin source: {error}"))
 }
 
 fn validate_new_plugin_name(name: &str) -> Result<(), String> {
@@ -831,6 +931,9 @@ fn dev_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Strin
     let source = plugins::plugin_source(spec).map_err(|error| error.to_string())?;
     let manifest = load_plugin_manifest(&source)?
         .ok_or_else(|| "plugin development requires plugin.toml".to_string())?;
+    if manifest.form()? != PluginRuntime::Wasm {
+        return Err("plugins dev currently builds Wasm plugins only".to_string());
+    }
     let manifest_path = source
         .manifest_path
         .as_deref()
@@ -839,7 +942,7 @@ fn dev_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Strin
     let built = build_local_plugin(&source, &manifest)?;
     let built_bytes = read_bounded_bytes(&built, MAX_PLUGIN_WASM_BYTES, "WebAssembly plugin")?;
     let hooks = pentect_agent::inspect_wasm_plugin_hooks(&built_bytes)?;
-    let check = if manifest.network.is_some() {
+    let check = if manifest.network_config().is_some() {
         Check::ok(
             "binary",
             "valid Wasm; network access is checked during activation",
@@ -855,7 +958,7 @@ fn dev_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Strin
     println!("built: {}", display_path(&built));
     println!("hooks: {}", hooks.join(", "));
     println!("required: {}", manifest.required);
-    if let Some(network) = manifest.network.as_ref() {
+    if let Some(network) = manifest.network_config() {
         println!("requested network access:");
         println!("  allow: {}", network.allow.join(", "));
         println!("  methods: {}", network.methods.join(", "));
@@ -866,8 +969,7 @@ fn dev_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Strin
     }
 
     let binary = manifest
-        .binary
-        .as_deref()
+        .wasm_name()
         .ok_or_else(|| "plugin development requires a Wasm binary".to_string())?;
     let destination = binary_destination(&name, binary, plugin_runtime(&manifest), &source)?;
     let dirs = plugin_runtime_dirs_for_source(&name, &source)?;
@@ -932,10 +1034,12 @@ fn publish_plugin(spec: &str, json_output: bool) -> Result<(), String> {
     let source = plugins::plugin_source(spec).map_err(|error| error.to_string())?;
     let manifest = load_plugin_manifest(&source)?
         .ok_or_else(|| "plugins publish requires plugin.toml".to_string())?;
+    if manifest.form()? != PluginRuntime::Wasm {
+        return Err("plugins publish currently packages Wasm plugins only".to_string());
+    }
     let repository = binary_repository(&source, &manifest)?;
     let binary = manifest
-        .binary
-        .as_deref()
+        .wasm_name()
         .ok_or_else(|| "declarative plugins do not need a release binary".to_string())?;
     let built = build_local_plugin(&source, &manifest)?;
     let check = test_binary(&built);
@@ -972,8 +1076,7 @@ fn build_local_plugin(
     manifest: &PluginManifest,
 ) -> Result<PathBuf, String> {
     let binary = manifest
-        .binary
-        .as_deref()
+        .wasm_name()
         .ok_or_else(|| "declarative plugins do not need a WebAssembly build".to_string())?;
     let root = source
         .manifest_path
@@ -1101,8 +1204,15 @@ struct PluginManifest {
     postscript: Vec<toml::Value>,
     #[serde(default)]
     #[serde(rename = "detector")]
-    _detector: Vec<toml::Value>,
+    detector: Vec<toml::Value>,
+    wasm: Option<String>,
+    /// Legacy alias for `wasm`, retained while installed v0.0.x plugins migrate.
     binary: Option<String>,
+    #[serde(default)]
+    command: Vec<String>,
+    commands: Option<PlatformCommands>,
+    #[serde(default)]
+    hooks: Vec<String>,
     repository: Option<String>,
     publisher: Option<PublisherConfig>,
     #[serde(default)]
@@ -1111,6 +1221,7 @@ struct PluginManifest {
     #[serde(default)]
     required: bool,
     network: Option<NetworkConfig>,
+    permissions: Option<PermissionsConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1148,21 +1259,141 @@ struct NetworkConfig {
     max_requests: Option<usize>,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionsConfig {
+    #[serde(default)]
+    read: Vec<String>,
+    #[serde(default)]
+    write: Vec<String>,
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default)]
+    run: Vec<Vec<String>>,
+    #[serde(default)]
+    storage: bool,
+    network: Option<NetworkConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlatformCommands {
+    windows: Option<Vec<String>>,
+    macos: Option<Vec<String>>,
+    linux: Option<Vec<String>>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PluginRuntime {
+    Manifest,
     #[default]
     Wasm,
+    Command,
 }
 
-fn plugin_runtime(_manifest: &PluginManifest) -> PluginRuntime {
-    PluginRuntime::Wasm
+impl PluginManifest {
+    fn wasm_name(&self) -> Option<&str> {
+        self.wasm.as_deref().or(self.binary.as_deref())
+    }
+
+    fn network_config(&self) -> Option<&NetworkConfig> {
+        self.permissions
+            .as_ref()
+            .and_then(|permissions| permissions.network.as_ref())
+            .or(self.network.as_ref())
+    }
+
+    fn form(&self) -> Result<PluginRuntime, String> {
+        let manifest = !self.detector.is_empty();
+        let wasm = self.wasm_name().is_some();
+        if !self.command.is_empty() && self.commands.is_some() {
+            return Err("plugin.toml cannot set both command and [commands]".to_string());
+        }
+        let command = !self.command.is_empty() || self.commands.is_some();
+        let count = usize::from(manifest) + usize::from(wasm) + usize::from(command);
+        if count != 1 {
+            return Err(
+                "plugin.toml must contain exactly one of [[detector]], wasm, or command"
+                    .to_string(),
+            );
+        }
+        Ok(if manifest {
+            PluginRuntime::Manifest
+        } else if wasm {
+            PluginRuntime::Wasm
+        } else {
+            PluginRuntime::Command
+        })
+    }
+
+    fn selected_command(&self) -> Result<Option<&[String]>, String> {
+        if !self.command.is_empty() {
+            return Ok(Some(&self.command));
+        }
+        let Some(commands) = self.commands.as_ref() else {
+            return Ok(None);
+        };
+        #[cfg(windows)]
+        let selected = commands.windows.as_deref();
+        #[cfg(target_os = "macos")]
+        let selected = commands.macos.as_deref();
+        #[cfg(target_os = "linux")]
+        let selected = commands.linux.as_deref();
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        let selected: Option<&[String]> = None;
+        selected
+            .map(Some)
+            .ok_or_else(|| format!("command plugin is unsupported on {}", std::env::consts::OS))
+    }
+
+    fn command_variants(&self) -> Vec<&[String]> {
+        if !self.command.is_empty() {
+            return vec![&self.command];
+        }
+        self.commands
+            .iter()
+            .flat_map(|commands| {
+                [
+                    commands.windows.as_deref(),
+                    commands.macos.as_deref(),
+                    commands.linux.as_deref(),
+                ]
+            })
+            .flatten()
+            .collect()
+    }
+}
+
+fn plugin_runtime(manifest: &PluginManifest) -> PluginRuntime {
+    manifest
+        .form()
+        .expect("validated plugin manifest has one runtime")
 }
 
 fn runtime_name(runtime: PluginRuntime) -> &'static str {
     match runtime {
+        PluginRuntime::Manifest => "manifest",
         PluginRuntime::Wasm => "wasm",
+        PluginRuntime::Command => "command",
     }
+}
+
+fn display_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| {
+            if argument.is_empty()
+                || argument
+                    .chars()
+                    .any(|character| character.is_whitespace() || matches!(character, '"' | '\''))
+            {
+                serde_json::to_string(argument).unwrap_or_else(|_| "\"<invalid>\"".to_string())
+            } else {
+                argument.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginManifest>, String> {
@@ -1185,7 +1416,20 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
                 .to_string(),
         );
     }
-    if let Some(binary) = manifest.binary.as_deref() {
+    let form = manifest.form()?;
+    if manifest.wasm.is_some() && manifest.binary.is_some() {
+        return Err("plugin.toml cannot set both wasm and legacy binary".to_string());
+    }
+    if manifest.network.is_some()
+        && manifest
+            .permissions
+            .as_ref()
+            .and_then(|permissions| permissions.network.as_ref())
+            .is_some()
+    {
+        return Err("use [permissions.network], not both it and legacy [network]".to_string());
+    }
+    if let Some(binary) = manifest.wasm_name() {
         let name = manifest
             .name
             .as_deref()
@@ -1193,7 +1437,7 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
             .unwrap_or(&source.name);
         validate_binary_name(binary, name)?;
         if !binary.to_ascii_lowercase().ends_with(".wasm") {
-            return Err("executable plugins must publish a portable .wasm module".to_string());
+            return Err("wasm plugins must publish a portable .wasm module".to_string());
         }
         let execution = manifest.execution.as_ref();
         if execution
@@ -1220,9 +1464,139 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
         }
         validate_publisher(&manifest)?;
     }
+    if form == PluginRuntime::Command {
+        validate_command(&manifest)?;
+        if manifest.network.is_some() || manifest.permissions.is_some() {
+            return Err(
+                "command plugins run natively; [network] and [permissions] apply only to Wasm"
+                    .to_string(),
+            );
+        }
+    } else if !manifest.hooks.is_empty() {
+        return Err("hooks are declared only by command plugins".to_string());
+    }
+    if form == PluginRuntime::Wasm {
+        validate_permissions(manifest.permissions.as_ref())?;
+    } else if manifest.permissions.is_some() {
+        return Err("[permissions] is only valid for Wasm plugins".to_string());
+    }
+    if form != PluginRuntime::Wasm && manifest.network.is_some() {
+        return Err("[network] is only valid for Wasm plugins".to_string());
+    }
     validate_network(&manifest)?;
     validate_execution(&manifest)?;
     Ok(Some(manifest))
+}
+
+fn validate_permissions(permissions: Option<&PermissionsConfig>) -> Result<(), String> {
+    let Some(permissions) = permissions else {
+        return Ok(());
+    };
+    if permissions.read.len() > 64
+        || permissions.write.len() > 64
+        || permissions.env.len() > 64
+        || permissions.run.len() > 64
+    {
+        return Err("Wasm permissions allow at most 64 entries per access type".to_string());
+    }
+    for (kind, paths) in [
+        ("read", permissions.read.as_slice()),
+        ("write", permissions.write.as_slice()),
+    ] {
+        let mut seen = BTreeSet::new();
+        for path in paths {
+            let valid_root = path.starts_with("project:") || path.starts_with("plugin:");
+            let relative = path.split_once(':').map(|(_, value)| value).unwrap_or("");
+            if !valid_root
+                || relative.is_empty()
+                || relative.starts_with(['/', '\\'])
+                || relative
+                    .split(['/', '\\'])
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+                || (!relative.ends_with("/**") && relative.contains('*'))
+                || relative.contains('?')
+            {
+                return Err(format!(
+                    "Wasm permission {kind} path must be project:PATH or plugin:PATH and may only end in /**"
+                ));
+            }
+            if !seen.insert(path) {
+                return Err(format!("duplicate Wasm {kind} permission: {path}"));
+            }
+        }
+    }
+    let mut env = BTreeSet::new();
+    for name in &permissions.env {
+        if name.is_empty()
+            || name.len() > 128
+            || name.as_bytes()[0].is_ascii_digit()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(format!("invalid environment permission: {name}"));
+        }
+        if !env.insert(name) {
+            return Err(format!("duplicate environment permission: {name}"));
+        }
+    }
+    let mut run = BTreeSet::new();
+    for argv in &permissions.run {
+        if argv.is_empty()
+            || argv.len() > 64
+            || argv
+                .iter()
+                .any(|argument| argument.len() > 8192 || argument.contains('\0'))
+        {
+            return Err("Wasm run permissions must contain a bounded argv array".to_string());
+        }
+        if !run.insert(argv) {
+            return Err("duplicate Wasm run permission".to_string());
+        }
+    }
+    if let Some(network) = permissions.network.as_ref() {
+        validate_network_config(network)?;
+    }
+    Ok(())
+}
+
+fn validate_command(manifest: &PluginManifest) -> Result<(), String> {
+    let variants = manifest.command_variants();
+    if variants.is_empty() {
+        return Err("command plugins require at least one command argv".to_string());
+    }
+    for command in variants {
+        if command.is_empty() || command[0].trim().is_empty() {
+            return Err("command plugins require a non-empty command argv".to_string());
+        }
+        if command.len() > 256 || command.iter().any(|argument| argument.len() > 32 * 1024) {
+            return Err("command argv exceeds its limit".to_string());
+        }
+    }
+    if manifest.hooks.is_empty() {
+        return Err("command plugins require at least one hook".to_string());
+    }
+    let allowed = [
+        "prepare",
+        "inspect",
+        "finalize",
+        "request",
+        "response",
+        "tool_call",
+        "file",
+    ];
+    let mut seen = BTreeSet::new();
+    for hook in &manifest.hooks {
+        if !allowed.contains(&hook.as_str()) {
+            return Err(format!("command plugin declares unknown hook '{hook}'"));
+        }
+        if !seen.insert(hook) {
+            return Err(format!(
+                "command plugin declares hook '{hook}' more than once"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_publisher(manifest: &PluginManifest) -> Result<(), String> {
@@ -1234,9 +1608,13 @@ fn validate_publisher(manifest: &PluginManifest) -> Result<(), String> {
 }
 
 fn validate_network(manifest: &PluginManifest) -> Result<(), String> {
-    let Some(network) = manifest.network.as_ref() else {
+    let Some(network) = manifest.network_config() else {
         return Ok(());
     };
+    validate_network_config(network)
+}
+
+fn validate_network_config(network: &NetworkConfig) -> Result<(), String> {
     if network.allow.is_empty() || network.allow.len() > 64 {
         return Err("network access requires 1 to 64 allowed origins".to_string());
     }
@@ -1314,7 +1692,7 @@ fn validate_execution(manifest: &PluginManifest) -> Result<(), String> {
             .max_spans
             .is_some_and(|value| value == 0 || value > 4096)
     {
-        return Err("execution limits exceed Pentect's sandbox limits".to_string());
+        return Err("execution limits exceed Pentect's runtime limits".to_string());
     }
     Ok(())
 }
@@ -1525,6 +1903,30 @@ fn setup_plugin_source(
     approved: bool,
     json_output: bool,
 ) -> Result<(), String> {
+    let command_snapshot = load_plugin_manifest(&source)?
+        .filter(|manifest| manifest.form().ok() == Some(PluginRuntime::Command))
+        .map(|manifest| {
+            let name = plugin_name(&source, Some(&manifest));
+            snapshot_command_runtime(&name, &source)
+        })
+        .transpose()?;
+    let result = setup_plugin_source_inner(source, approved, json_output);
+    match (result, command_snapshot) {
+        (Ok(()), Some(snapshot)) => {
+            snapshot.discard();
+            Ok(())
+        }
+        (Ok(()), None) => Ok(()),
+        (Err(error), Some(snapshot)) => Err(attach_rollback_error(error, snapshot.restore())),
+        (Err(error), None) => Err(error),
+    }
+}
+
+fn setup_plugin_source_inner(
+    source: plugins::PluginSource,
+    approved: bool,
+    json_output: bool,
+) -> Result<(), String> {
     if json_output {
         return Err("plugins setup does not support --json".to_string());
     }
@@ -1536,7 +1938,8 @@ fn setup_plugin_source(
         .map(sha256_path)
         .transpose()?;
     let name = plugin_name(&source, Some(&manifest));
-    if manifest.binary.is_none() {
+    let form = manifest.form()?;
+    if form == PluginRuntime::Manifest {
         println!("verified: manifest-only plugin");
         return Ok(());
     }
@@ -1552,7 +1955,7 @@ fn setup_plugin_source(
             .map(display_path)
             .unwrap_or_else(|| "plugin.toml".to_string())
     );
-    if let Some(binary) = manifest.binary.as_deref() {
+    if let Some(binary) = manifest.wasm_name() {
         let repository = binary_repository(&source, &manifest)?;
         let runtime = plugin_runtime(&manifest);
         let asset = binary_asset(binary, runtime, &manifest.assets);
@@ -1565,21 +1968,26 @@ fn setup_plugin_source(
             binary_destination(&name, binary, runtime, &source)?.display()
         );
     }
-    if manifest.binary.is_some() {
+    if form == PluginRuntime::Wasm {
         println!("plugin hooks:");
         println!("  hooks: detected from WebAssembly exports");
         println!("  required: {}", manifest.required);
-        println!(
-            "  execution: {}",
-            manifest
-                .execution
-                .as_ref()
-                .and_then(|execution| execution.mode.as_deref())
-                .unwrap_or("oneshot")
-        );
         println!("  isolation: WebAssembly sandbox (explicit access only)");
+    } else {
+        let command = manifest
+            .selected_command()?
+            .ok_or_else(|| "command plugin has no command for this platform".to_string())?;
+        println!("plugin hooks: {}", manifest.hooks.join(", "));
+        print_hook_access(&manifest.hooks);
+        println!("required: {}", manifest.required);
+        println!("command: {}", display_command(command));
+        println!(
+            "executable: {}",
+            command_executable_preview(&name, &source, &command[0])?.display()
+        );
+        println!("isolation: native process (runs with your user permissions)");
     }
-    if let Some(network) = manifest.network.as_ref() {
+    if let Some(network) = manifest.network_config() {
         println!("requested network access:");
         println!("  allow: {}", network.allow.join(", "));
         println!(
@@ -1605,12 +2013,22 @@ fn setup_plugin_source(
             "  request-count-limit: {}",
             network.max_requests.unwrap_or(4)
         );
-        if manifest.binary.is_some() {
+        if form == PluginRuntime::Wasm {
             println!("WARNING: this plugin can send hook input to approved network origins");
         }
     }
-    let mut approved_hooks = Vec::new();
-    if let Some(binary) = manifest.binary.as_deref() {
+    if let Some(permissions) = manifest.permissions.as_ref() {
+        println!("requested host access:");
+        print_permissions(permissions);
+        for argv in &permissions.run {
+            println!(
+                "permission-run-executable: {}",
+                resolve_command_executable(&argv[0])?.display()
+            );
+        }
+        println!("WARNING: approved access is brokered by the WebAssembly sandbox");
+    }
+    let approved_hooks = if let Some(binary) = manifest.wasm_name() {
         let repository = binary_repository(&source, &manifest)?;
         let runtime = plugin_runtime(&manifest);
         let destination = binary_destination(&name, binary, runtime, &source)?;
@@ -1636,6 +2054,7 @@ fn setup_plugin_source(
         let bytes = read_bounded_bytes(&destination, MAX_PLUGIN_WASM_BYTES, "WebAssembly plugin")?;
         let hooks = pentect_agent::inspect_wasm_plugin_hooks(&bytes)?;
         println!("hooks: {}", hooks.join(", "));
+        print_hook_access(&hooks);
         if !approved && !confirm_setup()? {
             return Err(attach_rollback_error(
                 "plugin setup was not approved".to_string(),
@@ -1647,9 +2066,15 @@ fn setup_plugin_source(
                 ),
             ));
         }
-        approved_hooks = hooks;
-    }
-    if manifest.binary.is_some() {
+        hooks
+    } else {
+        if !approved && !confirm_setup()? {
+            return Err("plugin setup was not approved".to_string());
+        }
+        write_command_lock(&name, &source, &manifest)?;
+        manifest.hooks.clone()
+    };
+    if form != PluginRuntime::Manifest {
         let current_hash = source
             .manifest_path
             .as_deref()
@@ -1664,17 +2089,414 @@ fn setup_plugin_source(
     Ok(())
 }
 
+struct CommandRuntimeSnapshot {
+    data_dir: PathBuf,
+    approval: Option<Vec<u8>>,
+    lock: Option<Vec<u8>>,
+    backup: Option<PathBuf>,
+}
+
+impl CommandRuntimeSnapshot {
+    fn restore(self) -> Result<(), String> {
+        let command = self.data_dir.join("command");
+        let command_restore = (|| {
+            if command.exists() {
+                std::fs::remove_dir_all(&command)
+                    .map_err(|error| format!("could not clear updated command files: {error}"))?;
+            }
+            if let Some(backup) = self.backup {
+                std::fs::rename(&backup, &command)
+                    .map_err(|error| format!("could not restore command files: {error}"))?;
+            }
+            Ok(())
+        })();
+        combine_rollback_results([
+            ("plugin command files", command_restore),
+            (
+                "plugin approval",
+                restore_optional_file(
+                    &self.data_dir.join(PLUGIN_APPROVAL_FILE),
+                    self.approval.as_deref(),
+                ),
+            ),
+            (
+                "plugin command lock",
+                restore_optional_file(
+                    &self.data_dir.join(PLUGIN_COMMAND_LOCK_FILE),
+                    self.lock.as_deref(),
+                ),
+            ),
+        ])
+    }
+
+    fn discard(self) {
+        if let Some(backup) = self.backup {
+            let _ = std::fs::remove_dir_all(backup);
+        }
+    }
+}
+
+fn snapshot_command_runtime(
+    name: &str,
+    source: &plugins::PluginSource,
+) -> Result<CommandRuntimeSnapshot, String> {
+    let data_dir = plugin_runtime_dirs_for_source(name, source)?.data_dir;
+    let approval = read_optional_bounded(
+        &data_dir.join(PLUGIN_APPROVAL_FILE),
+        MAX_PLUGIN_METADATA_BYTES,
+        "plugin approval",
+    )?;
+    let lock = read_optional_bounded(
+        &data_dir.join(PLUGIN_COMMAND_LOCK_FILE),
+        MAX_PLUGIN_METADATA_BYTES,
+        "plugin command lock",
+    )?;
+    let command = data_dir.join("command");
+    let backup = if command.is_dir() {
+        let backup = data_dir.join(format!("command.rollback-{}", std::process::id()));
+        if backup.exists() {
+            std::fs::remove_dir_all(&backup)
+                .map_err(|error| format!("could not clear command rollback directory: {error}"))?;
+        }
+        copy_command_tree(&command, &backup)?;
+        Some(backup)
+    } else {
+        None
+    };
+    Ok(CommandRuntimeSnapshot {
+        data_dir,
+        approval,
+        lock,
+        backup,
+    })
+}
+
+fn copy_command_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(destination)
+        .map_err(|error| format!("could not create command rollback directory: {error}"))?;
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+    let mut files = 0usize;
+    while let Some((from, to)) = pending.pop() {
+        for entry in std::fs::read_dir(&from)
+            .map_err(|error| format!("could not read command files for rollback: {error}"))?
+        {
+            let entry = entry
+                .map_err(|error| format!("could not read command file for rollback: {error}"))?;
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("could not inspect command file for rollback: {error}"))?;
+            let target = to.join(entry.file_name());
+            if kind.is_dir() {
+                std::fs::create_dir_all(&target).map_err(|error| {
+                    format!("could not create command rollback directory: {error}")
+                })?;
+                pending.push((entry.path(), target));
+            } else if kind.is_file() {
+                files += 1;
+                if files > 64 {
+                    return Err("command plugin rollback exceeds 64 files".to_string());
+                }
+                std::fs::copy(entry.path(), target).map_err(|error| {
+                    format!("could not copy command file for rollback: {error}")
+                })?;
+            } else {
+                return Err("command plugin rollback refuses links and special files".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn command_executable_preview(
+    name: &str,
+    source: &plugins::PluginSource,
+    value: &str,
+) -> Result<PathBuf, String> {
+    let Some(relative) = value.strip_prefix("{plugin}/") else {
+        return resolve_command_executable(value);
+    };
+    let relative = PathBuf::from(relative);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("command executable path must stay inside the plugin directory".to_string());
+    }
+    let remote = plugins::remote_command_files(source).map_err(|error| error.to_string())?;
+    if remote.is_empty() {
+        let root = source
+            .manifest_path
+            .as_deref()
+            .and_then(Path::parent)
+            .ok_or_else(|| "command plugin manifest has no parent directory".to_string())?;
+        return resolve_plugin_command_executable(value, root);
+    }
+    if !remote.iter().any(|(path, _)| path == &relative) {
+        return Err(format!(
+            "command executable is not distributed by plugin '{name}'"
+        ));
+    }
+    Ok(plugin_runtime_dirs_for_source(name, source)?
+        .data_dir
+        .join("command")
+        .join(relative))
+}
+
+fn print_hook_access(hooks: &[String]) {
+    for hook in hooks {
+        let access = match hook.as_str() {
+            "prepare" => "reads and may change text before masking",
+            "inspect" => "reads text before masking and may add findings",
+            "finalize" => "reads and may change masked text",
+            "request" => "reads and may change provider request JSON",
+            "response" => "reads and may change provider response JSON",
+            "tool_call" => "reads and may change a completed local tool call",
+            "file" => "reads file metadata and may block the file action",
+            _ => "unknown access",
+        };
+        println!("  {hook}: {access}");
+    }
+}
+
 #[derive(Serialize)]
 struct PluginApproval {
     schema: &'static str,
     manifest_sha256: String,
     hooks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_lock_sha256: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CommandLock {
+    schema: &'static str,
+    executable: String,
+    managed: bool,
+    file: Vec<CommandLockFile>,
+}
+
+#[derive(Serialize)]
+struct CommandLockFile {
+    path: String,
+    sha256: String,
+}
+
+fn write_command_lock(
+    name: &str,
+    source: &plugins::PluginSource,
+    manifest: &PluginManifest,
+) -> Result<(), String> {
+    let dirs = plugin_runtime_dirs_for_source(name, source)?;
+    std::fs::create_dir_all(&dirs.data_dir)
+        .map_err(|error| format!("could not create plugin data directory: {error}"))?;
+
+    let remote = plugins::remote_command_files(source).map_err(|error| error.to_string())?;
+    let managed = !remote.is_empty();
+    let root = if remote.is_empty() {
+        source
+            .manifest_path
+            .as_deref()
+            .and_then(Path::parent)
+            .ok_or_else(|| "command plugin manifest has no parent directory".to_string())?
+            .to_path_buf()
+    } else {
+        stage_remote_command_files(&dirs.data_dir, &remote)?
+    };
+
+    let mut files = Vec::new();
+    let command = manifest
+        .selected_command()?
+        .ok_or_else(|| "command plugin has no command for this platform".to_string())?;
+    let command_files = command
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("{plugin}/").map(PathBuf::from))
+        .collect::<Vec<_>>();
+    let locked_files = if managed {
+        remote
+            .iter()
+            .map(|(relative, _)| relative.clone())
+            .collect()
+    } else {
+        command_files
+    };
+    for relative in locked_files {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if files
+            .iter()
+            .any(|file: &CommandLockFile| file.path == relative)
+        {
+            continue;
+        }
+        let path = root.join(&relative);
+        if !path.is_file() {
+            return Err(format!(
+                "command plugin file is unavailable: {}",
+                display_path(&path)
+            ));
+        }
+        files.push(CommandLockFile {
+            path: relative.replace('\\', "/"),
+            sha256: sha256_path(&path)?,
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let executable = resolve_plugin_command_executable(&command[0], &root)?;
+    let encoded = toml::to_string(&CommandLock {
+        schema: "pentect.plugin-command-lock.v1",
+        executable: executable.to_string_lossy().into_owned(),
+        managed,
+        file: files,
+    })
+    .map_err(|error| format!("could not encode plugin command lock: {error}"))?;
+    let destination = dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE);
+    let temporary = dirs.data_dir.join(format!(
+        "{PLUGIN_COMMAND_LOCK_FILE}.tmp-{}",
+        std::process::id()
+    ));
+    std::fs::write(&temporary, encoded)
+        .map_err(|error| format!("could not write plugin command lock: {error}"))?;
+    replace_binary(&temporary, &destination)
+}
+
+fn resolve_plugin_command_executable(value: &str, root: &Path) -> Result<PathBuf, String> {
+    let Some(relative) = value.strip_prefix("{plugin}/") else {
+        return resolve_command_executable(value);
+    };
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("command executable path must stay inside the plugin directory".to_string());
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| "command plugin directory is unavailable".to_string())?;
+    let executable = canonical_root
+        .join(relative)
+        .canonicalize()
+        .map_err(|_| format!("command executable is unavailable: {value}"))?;
+    if !executable.starts_with(&canonical_root) || !supported_command_executable(&executable) {
+        return Err(format!("command executable is unavailable: {value}"));
+    }
+    Ok(executable)
+}
+
+fn resolve_command_executable(value: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(value);
+    if candidate.components().count() > 1 || candidate.is_absolute() {
+        let resolved = candidate
+            .canonicalize()
+            .map_err(|_| format!("command executable is unavailable: {value}"));
+        return resolved.and_then(|path| {
+            supported_command_executable(&path)
+                .then_some(path)
+                .ok_or_else(|| format!("command executable is unavailable: {value}"))
+        });
+    }
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    #[cfg(windows)]
+    let extensions = std::env::var_os("PATHEXT")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .filter(|extension| {
+                    matches!(extension.to_ascii_uppercase().as_str(), ".EXE" | ".COM")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![".EXE".to_string(), ".COM".to_string()]);
+    #[cfg(not(windows))]
+    let extensions = vec![String::new()];
+    for directory in std::env::split_paths(&paths) {
+        for extension in &extensions {
+            let path = if extension.is_empty()
+                || value
+                    .to_ascii_lowercase()
+                    .ends_with(&extension.to_ascii_lowercase())
+            {
+                directory.join(value)
+            } else {
+                directory.join(format!("{value}{extension}"))
+            };
+            if let Ok(path) = path.canonicalize() {
+                if supported_command_executable(&path) {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+    Err(format!("command executable is unavailable: {value}"))
+}
+
+#[cfg(unix)]
+fn supported_command_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn supported_command_executable(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "exe" | "com")
+            })
+}
+
+fn stage_remote_command_files(
+    data_dir: &Path,
+    files: &[(PathBuf, PathBuf)],
+) -> Result<PathBuf, String> {
+    let destination = data_dir.join("command");
+    let staged = data_dir.join(format!("command.tmp-{}", std::process::id()));
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged)
+            .map_err(|error| format!("could not clear staged command plugin: {error}"))?;
+    }
+    std::fs::create_dir_all(&staged)
+        .map_err(|error| format!("could not stage command plugin: {error}"))?;
+    for (relative, cached) in files {
+        let target = staged.join(relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("could not stage command plugin: {error}"))?;
+        }
+        std::fs::copy(cached, &target)
+            .map_err(|error| format!("could not stage command plugin file: {error}"))?;
+    }
+    if destination.exists() {
+        let backup = data_dir.join(format!("command.previous-{}", std::process::id()));
+        if backup.exists() {
+            std::fs::remove_dir_all(&backup)
+                .map_err(|error| format!("could not clear command plugin backup: {error}"))?;
+        }
+        std::fs::rename(&destination, &backup)
+            .map_err(|error| format!("could not replace command plugin: {error}"))?;
+        if let Err(error) = std::fs::rename(&staged, &destination) {
+            let _ = std::fs::rename(&backup, &destination);
+            return Err(format!("could not activate command plugin: {error}"));
+        }
+        std::fs::remove_dir_all(&backup)
+            .map_err(|error| format!("could not remove command plugin backup: {error}"))?;
+    } else {
+        std::fs::rename(&staged, &destination)
+            .map_err(|error| format!("could not activate command plugin: {error}"))?;
+    }
+    Ok(destination)
 }
 
 fn write_plugin_approval(
     name: &str,
     source: &plugins::PluginSource,
-    _manifest: &PluginManifest,
+    manifest: &PluginManifest,
     hooks: &[String],
 ) -> Result<(), String> {
     let path = source
@@ -1685,6 +2507,12 @@ fn write_plugin_approval(
         schema: "pentect.plugin-approval.v1",
         manifest_sha256: sha256_path(path)?,
         hooks: hooks.to_vec(),
+        command_lock_sha256: (manifest.form()? == PluginRuntime::Command)
+            .then(|| {
+                plugin_runtime_dirs_for_source(name, source)
+                    .and_then(|dirs| sha256_path(&dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)))
+            })
+            .transpose()?,
     };
     let encoded = toml::to_string(&approval)
         .map_err(|error| format!("could not encode plugin approval: {error}"))?;
@@ -1730,7 +2558,26 @@ fn update_plugin_inner(
     if detector_update_requires_confirmation(detector_changed, approved) && !confirm_setup()? {
         return Err("plugin update was not approved".to_string());
     }
-    let Some(binary) = manifest.binary.as_deref() else {
+    let Some(binary) = manifest.wasm_name() else {
+        if manifest.form()? == PluginRuntime::Command {
+            let command_sources_changed =
+                previous.is_some_and(|snapshot| snapshot.previous_sources() != &current_sources);
+            if command_sources_changed
+                || verify_plugin_update_approval(&name, &source, &manifest).is_err()
+            {
+                println!("plugin command, files, or hook access changed; reviewing updated access");
+                if let Some(entry) = lock_entry {
+                    plugins::set_project_remote_plugin_lock_with_guard(
+                        project_guard,
+                        spec,
+                        Some(entry),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                setup_plugin_source(source, approved, false)?;
+                return Ok(());
+            }
+        }
         if let Some(entry) = lock_entry {
             plugins::set_project_remote_plugin_lock_with_guard(project_guard, spec, Some(entry))
                 .map_err(|error| error.to_string())?;
@@ -1803,6 +2650,24 @@ fn update_plugin_inner(
     }
     println!("update: complete");
     Ok(())
+}
+
+fn print_permissions(permissions: &PermissionsConfig) {
+    if !permissions.read.is_empty() {
+        println!("permission-read: {}", permissions.read.join(", "));
+    }
+    if !permissions.write.is_empty() {
+        println!("permission-write: {}", permissions.write.join(", "));
+    }
+    if !permissions.env.is_empty() {
+        println!("permission-env: {}", permissions.env.join(", "));
+    }
+    for argv in &permissions.run {
+        println!("permission-run: {}", display_command(argv));
+    }
+    if permissions.storage {
+        println!("permission-storage: enabled");
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1960,6 +2825,7 @@ struct StoredPluginApproval {
     schema: String,
     manifest_sha256: String,
     hooks: Vec<String>,
+    command_lock_sha256: Option<String>,
 }
 
 fn verify_plugin_update_approval(
@@ -1967,7 +2833,7 @@ fn verify_plugin_update_approval(
     plugin: &plugins::PluginSource,
     manifest: &PluginManifest,
 ) -> Result<(), String> {
-    if manifest.binary.is_none() {
+    if manifest.form()? == PluginRuntime::Manifest {
         return Ok(());
     }
     let manifest_path = plugin
@@ -1985,6 +2851,17 @@ fn verify_plugin_update_approval(
         || approval.manifest_sha256 != sha256_path(manifest_path)?
     {
         return Err("plugin manifest changed; review it with `pentect plugins setup`".to_string());
+    }
+    if manifest.form()? == PluginRuntime::Command {
+        let lock = plugin_runtime_dirs_for_source(name, plugin)?
+            .data_dir
+            .join(PLUGIN_COMMAND_LOCK_FILE);
+        let lock_sha256 = sha256_path(&lock)?;
+        if approval.command_lock_sha256.as_deref() != Some(lock_sha256.as_str()) {
+            return Err("plugin command files changed; run setup again".to_string());
+        }
+        pentect_agent::PluginMiddleware::from_paths([manifest_path.to_path_buf()])
+            .map_err(|_| "plugin command files changed; run setup again".to_string())?;
     }
     let hooks = installed_wasm_hooks(name, Some(manifest), plugin)?
         .ok_or_else(|| "installed plugin binary is missing; run setup again".to_string())?;
@@ -2620,6 +3497,17 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn python_test_executable() -> Option<&'static str> {
+        ["python3", "python"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
     #[test]
     fn parses_list() {
         let args = vec!["pentect".into(), "plugins".into(), "list".into()];
@@ -2661,6 +3549,41 @@ mod tests {
             PluginCmd::parse(&dev).unwrap().action,
             Action::Dev { approved: true, .. }
         ));
+
+        for form in ["manifest", "wasm", "command"] {
+            let args = vec![
+                "pentect".into(),
+                "plugins".into(),
+                "new".into(),
+                "example-plugin".into(),
+                form.into(),
+            ];
+            assert!(matches!(
+                PluginCmd::parse(&args).unwrap().action,
+                Action::New { form: Some(_), .. }
+            ));
+        }
+        assert!(NewPluginForm::parse("native").is_err());
+    }
+
+    #[test]
+    fn command_template_uses_the_common_jsonl_envelope() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pentect-command-template-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        write_command_plugin_template(&root, "example-plugin").unwrap();
+        let manifest = std::fs::read_to_string(root.join("plugin.toml")).unwrap();
+        let server = std::fs::read_to_string(root.join("server.py")).unwrap();
+        assert!(manifest.contains("[commands]"));
+        assert!(manifest.contains("windows = [\"py\", \"{plugin}/server.py\"]"));
+        assert!(manifest.contains("linux = [\"python3\", \"{plugin}/server.py\"]"));
+        assert!(manifest.contains("hooks = [\"inspect\"]"));
+        assert!(server.contains("request.get(\"payload\", {})"));
+        assert!(server.contains("\"schema\": \"pentect.plugin.v1\""));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2839,6 +3762,167 @@ mod tests {
         let error = load_plugin_manifest(&source).unwrap_err();
         let _ = std::fs::remove_dir_all(root);
         assert!(error.contains("postscripts are not supported"), "{error}");
+    }
+
+    #[test]
+    fn plugin_forms_are_inferred_and_ambiguous_manifests_are_rejected() {
+        let manifest: PluginManifest =
+            toml::from_str("schema = \"pentect.plugin.v1\"\n[[detector]]\npattern = \"x\"\n")
+                .unwrap();
+        assert_eq!(manifest.form().unwrap(), PluginRuntime::Manifest);
+
+        let wasm: PluginManifest =
+            toml::from_str("schema = \"pentect.plugin.v1\"\nwasm = \"plugin.wasm\"\n").unwrap();
+        assert_eq!(wasm.form().unwrap(), PluginRuntime::Wasm);
+
+        let legacy: PluginManifest =
+            toml::from_str("schema = \"pentect.plugin.v1\"\nbinary = \"plugin.wasm\"\n").unwrap();
+        assert_eq!(legacy.form().unwrap(), PluginRuntime::Wasm);
+
+        let command: PluginManifest = toml::from_str(
+            "schema = \"pentect.plugin.v1\"\ncommand = [\"python\", \"plugin.py\"]\nhooks = [\"inspect\"]\n",
+        )
+        .unwrap();
+        assert_eq!(command.form().unwrap(), PluginRuntime::Command);
+        validate_command(&command).unwrap();
+
+        let platform_command: PluginManifest = toml::from_str(
+            "schema = \"pentect.plugin.v1\"\nhooks = [\"inspect\"]\n[commands]\nwindows = [\"py\", \"plugin.py\"]\nmacos = [\"python3\", \"plugin.py\"]\nlinux = [\"python3\", \"plugin.py\"]\n",
+        )
+        .unwrap();
+        assert_eq!(platform_command.form().unwrap(), PluginRuntime::Command);
+        validate_command(&platform_command).unwrap();
+        assert!(platform_command.selected_command().unwrap().is_some());
+
+        let duplicate_command: PluginManifest = toml::from_str(
+            "schema = \"pentect.plugin.v1\"\ncommand = [\"python\"]\n[commands]\nlinux = [\"python3\"]\n",
+        )
+        .unwrap();
+        assert!(duplicate_command.form().is_err());
+
+        let ambiguous: PluginManifest = toml::from_str(
+            "schema = \"pentect.plugin.v1\"\nwasm = \"plugin.wasm\"\ncommand = [\"tool\"]\nhooks = [\"inspect\"]\n",
+        )
+        .unwrap();
+        assert!(ambiguous.form().is_err());
+    }
+
+    #[test]
+    fn wasm_permissions_use_compact_explicit_scopes() {
+        let permissions: PermissionsConfig = toml::from_str(
+            r#"
+                read = ["project:config/**", "plugin:model.json"]
+                write = ["project:generated/result.json"]
+                env = ["POLICY_URL"]
+                run = [["git", "status", "--porcelain"]]
+                storage = true
+            "#,
+        )
+        .unwrap();
+        validate_permissions(Some(&permissions)).unwrap();
+
+        let traversal: PermissionsConfig =
+            toml::from_str(r#"read = ["project:../secret"]"#).unwrap();
+        assert!(validate_permissions(Some(&traversal)).is_err());
+        let broad_glob: PermissionsConfig =
+            toml::from_str(r#"read = ["project:**/*.env"]"#).unwrap();
+        assert!(validate_permissions(Some(&broad_glob)).is_err());
+    }
+
+    #[test]
+    fn local_command_files_are_hashed_into_the_runtime_lock() {
+        let Some(python) = python_test_executable() else {
+            return;
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("command-lock-{nonce}");
+        let root = std::env::temp_dir().join(&name);
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ncommand = [\"{python}\", \"{{plugin}}/server.py\"]\nhooks = [\"inspect\"]\n"
+            ),
+        )
+        .unwrap();
+        let script = root.join("server.py");
+        std::fs::write(&script, "print('first')\n").unwrap();
+        let source = plugins::PluginSource {
+            name: name.clone(),
+            manifest_path: Some(manifest_path),
+            repository: None,
+            remote_base: None,
+        };
+        let manifest = load_plugin_manifest(&source).unwrap().unwrap();
+        write_command_lock(&name, &source, &manifest).unwrap();
+        let dirs = plugin_runtime_dirs_for_source(&name, &source).unwrap();
+        let first = std::fs::read_to_string(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap();
+        assert!(first.contains("path = \"server.py\""));
+
+        std::fs::write(&script, "print('second')\n").unwrap();
+        write_command_lock(&name, &source, &manifest).unwrap();
+        let second = std::fs::read_to_string(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap();
+        assert_ne!(first, second);
+        let _ = std::fs::remove_dir_all(dirs.data_dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_runtime_snapshot_restores_only_managed_state() {
+        let Some(python) = python_test_executable() else {
+            return;
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("command-rollback-{nonce}");
+        let root = std::env::temp_dir().join(&name);
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join(plugins::PLUGIN_MANIFEST_FILE);
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ncommand = [\"{python}\", \"{{plugin}}/server.py\"]\nhooks = [\"inspect\"]\n"
+            ),
+        )
+        .unwrap();
+        let source = plugins::PluginSource {
+            name: name.clone(),
+            manifest_path: Some(manifest_path),
+            repository: None,
+            remote_base: None,
+        };
+        let dirs = plugin_runtime_dirs_for_source(&name, &source).unwrap();
+        std::fs::create_dir_all(dirs.data_dir.join("command")).unwrap();
+        std::fs::write(dirs.data_dir.join("command/server.py"), "old").unwrap();
+        std::fs::write(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE), "old-lock").unwrap();
+        std::fs::write(dirs.data_dir.join(PLUGIN_APPROVAL_FILE), "old-approval").unwrap();
+
+        let snapshot = snapshot_command_runtime(&name, &source).unwrap();
+        std::fs::write(dirs.data_dir.join("command/server.py"), "new").unwrap();
+        std::fs::write(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE), "new-lock").unwrap();
+        std::fs::write(dirs.data_dir.join(PLUGIN_APPROVAL_FILE), "new-approval").unwrap();
+        snapshot.restore().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dirs.data_dir.join("command/server.py")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap(),
+            "old-lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dirs.data_dir.join(PLUGIN_APPROVAL_FILE)).unwrap(),
+            "old-approval"
+        );
+        let _ = std::fs::remove_dir_all(dirs.data_dir);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

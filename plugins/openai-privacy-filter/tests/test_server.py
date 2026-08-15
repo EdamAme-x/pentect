@@ -22,15 +22,34 @@ class ServerTests(unittest.TestCase):
         result = SERVER.inspect_text(Redactor(), "AéZ")
         self.assertEqual(
             result,
-            {
-                "schema": SERVER.SCHEMA,
-                "spans": [{"start": 1, "end": 3, "label": "private_person"}],
-            },
+            [{
+                "start": 1,
+                "end": 3,
+                "label": "PRIVATE_PERSON",
+                "category": "pii",
+                "confidence": "medium",
+            }],
         )
 
     def test_out_of_range_offset_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             SERVER._byte_offset("short", 6)
+
+    def test_command_protocol_response_matches_request(self) -> None:
+        result = SERVER.handle_request(
+            Redactor(),
+            {
+                "schema": SERVER.PROTOCOL_SCHEMA,
+                "id": 7,
+                "hook": "inspect",
+                "payload": {"kind": "text", "text": "AéZ"},
+                "metadata": None,
+            },
+        )
+        self.assertEqual(result["id"], 7)
+        self.assertEqual(result["type"], "result")
+        self.assertEqual(result["action"], "next")
+        self.assertEqual(len(result["spans"]), 1)
 
 
 if __name__ == "__main__":

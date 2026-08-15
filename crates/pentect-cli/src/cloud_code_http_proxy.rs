@@ -565,8 +565,7 @@ fn protect_request_body(
     if matches!(
         endpoint,
         CloudCodeEndpoint::GenerateContent | CloudCodeEndpoint::StreamGenerateContent
-    ) && crate::claude_http_proxy::value_contains_handle(&value)
-    {
+    ) {
         inject_handle_contract(&mut value)?;
     }
     let body = serde_json::to_vec(&value)
@@ -1628,7 +1627,11 @@ mod tests {
         thread.join().unwrap();
         assert!(!request.contains(&secret));
         let handle = first_handle(&request).unwrap();
-        assert!(request.contains(HANDLE_CONTRACT));
+        let protected_request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(
+            protected_request["request"]["systemInstruction"]["parts"][0]["text"],
+            HANDLE_CONTRACT
+        );
         assert_eq!(
             response["response"]["candidates"][0]["content"]["parts"][0]["text"],
             handle

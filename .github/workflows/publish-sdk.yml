@@ -1,50 +1,119 @@
-name: Publish Rust plugin SDK
+name: Publish plugin SDKs
 
 on:
   push:
-    tags:
-      - "sdk-rust-v*"
+    tags: ["sdk-rust-v*", "sdk-js-v*", "sdk-python-v*"]
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  publish:
-    if: github.repository == 'EdamAme-x/pentect'
+  rust-verify:
+    if: github.repository == 'EdamAme-x/pentect' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'sdk-rust-v'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
+        with: {persist-credentials: false}
       - uses: ./.github/actions/rust-toolchain
-        with:
-          targets: wasm32-unknown-unknown
-      - name: Verify SDK
-        working-directory: sdk/rust/pentect-plugin
+        with: {targets: wasm32-unknown-unknown}
+      - working-directory: sdk/rust/pentect-plugin
         run: |
           cargo test --locked
           cargo build --locked --release --target wasm32-unknown-unknown --example wasm
           cargo publish --locked --dry-run
-      - name: Verify tag
-        if: github.event_name == 'push'
+      - if: github.event_name == 'push'
         working-directory: sdk/rust/pentect-plugin
         shell: pwsh
         run: |
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = $metadata.packages[0].version
-          if ($env:GITHUB_REF_NAME -ne "sdk-rust-v$version") {
-            throw "tag $env:GITHUB_REF_NAME must match SDK version sdk-rust-v$version"
-          }
-      - name: Authenticate to crates.io
-        id: crates-io
-        if: github.event_name == 'push'
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_NAME -ne "sdk-rust-v$version") { throw "tag does not match SDK version" }
+
+  rust-publish:
+    needs: rust-verify
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'sdk-rust-v')
+    permissions: {contents: read, id-token: write}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/rust-toolchain
+      - id: crates-io
         uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
-      - name: Publish crate
-        if: github.event_name == 'push'
-        working-directory: sdk/rust/pentect-plugin
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+      - working-directory: sdk/rust/pentect-plugin
+        env: {CARGO_REGISTRY_TOKEN: "${{ steps.crates-io.outputs.token }}"}
         run: cargo publish --locked
+
+  javascript-verify:
+    if: github.repository == 'EdamAme-x/pentect' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'sdk-js-v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with: {node-version: "24", package-manager-cache: false}
+      - working-directory: sdk/javascript
+        run: |
+          npm test
+          npm pack --dry-run
+      - if: github.event_name == 'push'
+        working-directory: sdk/javascript
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -ne "sdk-js-v$version") { throw "tag does not match SDK version" }
+
+  javascript-publish:
+    needs: javascript-verify
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'sdk-js-v')
+    permissions: {contents: read, id-token: write}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with: {node-version: "24", registry-url: https://registry.npmjs.org, package-manager-cache: false}
+      - working-directory: sdk/javascript
+        run: npm publish --access public
+
+  python-verify:
+    if: github.repository == 'EdamAme-x/pentect' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'sdk-python-v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: "3.12"}
+      - env: {PYTHONPATH: sdk/python}
+        run: |
+          python -m pip install --disable-pip-version-check build==1.5.0 twine==7.0.0
+          python -m unittest discover sdk/python/tests
+          python -m build sdk/python
+          python -m twine check sdk/python/dist/*
+      - if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('sdk/python/pyproject.toml','rb'))['project']['version'])"
+          if ($env:GITHUB_REF_NAME -ne "sdk-python-v$version") { throw "tag does not match SDK version" }
+
+  python-publish:
+    needs: python-verify
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'sdk-python-v')
+    permissions: {contents: read, id-token: write}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with: {python-version: "3.12"}
+      - run: |
+          python -m pip install --disable-pip-version-check build==1.5.0
+          python -m build sdk/python
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with: {packages-dir: sdk/python/dist}

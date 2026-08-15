@@ -90,6 +90,13 @@ echo 'sample' | pentect mask --plugins first,second
 Use one plugin for one job. Small plugins are easier to approve, test, update,
 and remove than one plugin with unrelated access.
 
+`pentect plugins remove NAME` removes the project reference. A protected client
+that is already running keeps its loaded middleware until that client exits;
+its supervised Command process is then stopped and reaped. Start a new client
+to use the updated project list. Pentect may retain verified shared cache and
+private plugin storage so removing one project reference cannot break another
+project that uses the same plugin.
+
 ## Sandbox boundary
 
 Wasm plugins have no WASI. They cannot directly read files, environment

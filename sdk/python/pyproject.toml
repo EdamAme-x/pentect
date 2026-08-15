@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pentect-plugin"
+version = "0.1.0"
+description = "Small helpers for Pentect Command plugins"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Pentect contributors" }]
+dependencies = []
+
+[project.urls]
+Documentation = "https://pentect.dev/plugins/command/"
+Repository = "https://github.com/EdamAme-x/pentect"

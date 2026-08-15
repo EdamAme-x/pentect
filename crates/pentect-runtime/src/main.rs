@@ -332,16 +332,22 @@ pub fn resolve_known_text_from_active_memory_store(text: &str) -> Result<Option<
 /// one IPC round trip and recovery rebuild per JSON string.
 pub struct ActiveMemoryStoreResolver {
     recovery: Option<pentect_core::Recovery>,
+    env_bindings: BTreeMap<String, String>,
 }
 
 impl ActiveMemoryStoreResolver {
     pub fn new() -> Result<Self, String> {
         let Some(client) = MemoryStoreClient::from_env() else {
-            return Ok(Self { recovery: None });
+            return Ok(Self {
+                recovery: None,
+                env_bindings: BTreeMap::new(),
+            });
         };
         let snapshot = client.snapshot().map_err(|e| e.to_string())?;
+        let env_bindings = environment_bindings_from_recovery(&snapshot.recovery);
         Ok(Self {
             recovery: Some(snapshot.recovery),
+            env_bindings,
         })
     }
 
@@ -349,8 +355,120 @@ impl ActiveMemoryStoreResolver {
         Ok(self
             .recovery
             .as_ref()
-            .map(|recovery| recovery.resolve(text)))
+            .map(|recovery| resolve_known_references(text, recovery, &self.env_bindings)))
     }
+}
+
+fn environment_bindings_from_recovery(
+    recovery: &pentect_core::Recovery,
+) -> BTreeMap<String, String> {
+    let mut bindings = BTreeMap::new();
+    for placeholder in recovery.placeholders() {
+        if !masking::is_env_alias_placeholder(&placeholder) {
+            continue;
+        }
+        let record = recovery.resolve(&placeholder);
+        let Some((name, handle)) = masking::decode_env_alias_record(&record) else {
+            continue;
+        };
+        if memory_store::is_reserved_child_env_name(name) {
+            continue;
+        }
+        let value = recovery.resolve(handle);
+        if value != handle {
+            bindings.insert(name.to_ascii_lowercase(), value);
+        }
+    }
+    bindings
+}
+
+fn resolve_known_references(
+    text: &str,
+    recovery: &pentect_core::Recovery,
+    bindings: &BTreeMap<String, String>,
+) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"<<") {
+            let Some(close) = text[index + 2..].find(">>") else {
+                break;
+            };
+            let end = index + 2 + close + 2;
+            let reference = &text[index..end];
+            let value = recovery.resolve(reference);
+            if value != reference {
+                out.push_str(&text[cursor..index]);
+                out.push_str(&value);
+                cursor = end;
+            }
+            index = end;
+            continue;
+        }
+        let reference = environment_reference_at(text, index);
+        let Some((end, name)) = reference else {
+            index += 1;
+            continue;
+        };
+        let Some(value) = bindings.get(&name.to_ascii_lowercase()) else {
+            index = end;
+            continue;
+        };
+        out.push_str(&text[cursor..index]);
+        out.push_str(value);
+        cursor = end;
+        index = end;
+    }
+    if cursor == 0 {
+        return text.to_string();
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn environment_reference_at(text: &str, start: usize) -> Option<(usize, &str)> {
+    let bytes = text.as_bytes();
+    if start >= bytes.len() {
+        return None;
+    }
+    if bytes[start] == b'$' {
+        if bytes
+            .get(start..start.saturating_add(5))
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"$env:"))
+        {
+            let name_start = start + 5;
+            let end = env_name_end(bytes, name_start);
+            return (end > name_start).then(|| (end, &text[name_start..end]));
+        }
+        if bytes.get(start + 1) == Some(&b'{') {
+            let name_start = start + 2;
+            let end = env_name_end(bytes, name_start);
+            if end > name_start && bytes.get(end) == Some(&b'}') {
+                return Some((end + 1, &text[name_start..end]));
+            }
+            return None;
+        }
+        let name_start = start + 1;
+        let end = env_name_end(bytes, name_start);
+        return (end > name_start).then(|| (end, &text[name_start..end]));
+    }
+    if bytes[start] == b'%' {
+        let name_start = start + 1;
+        let end = env_name_end(bytes, name_start);
+        if end > name_start && bytes.get(end) == Some(&b'%') {
+            return Some((end + 1, &text[name_start..end]));
+        }
+    }
+    None
+}
+
+fn env_name_end(bytes: &[u8], mut end: usize) -> usize {
+    while end < bytes.len() && is_env_name_byte(bytes[end]) {
+        end += 1;
+    }
+    end
 }
 
 pub fn preflight_exec_server_process_start_from_active_memory_store(

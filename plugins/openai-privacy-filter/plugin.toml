@@ -1,26 +1,16 @@
 schema = "pentect.plugin.v1"
 name = "openai-privacy-filter"
 description = "Detect private text with OpenAI Privacy Filter running on your computer."
-binary = "openai-privacy-filter.wasm"
-repository = "EdamAme-x/pentect"
-required = true
+hooks = ["inspect"]
+required = false
 
-[publisher]
-workflow = ".github/workflows/release.yml"
+[commands]
+windows = ["py", "{plugin}/server.py", "--device", "cpu"]
+macos = ["python3", "{plugin}/server.py", "--device", "cpu"]
+linux = ["python3", "{plugin}/server.py", "--device", "cpu"]
 
 [execution]
-runtime = "wasm"
-mode = "oneshot"
 timeout_ms = 60000
 max_input_bytes = 1048576
 max_output_bytes = 1048576
 max_spans = 4096
-
-[network]
-allow = ["http://127.0.0.1:8787"]
-methods = ["POST"]
-private_network = true
-allow_insecure = true
-max_request_bytes = 1048576
-max_response_bytes = 1048576
-max_requests = 1

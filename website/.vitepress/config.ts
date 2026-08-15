@@ -91,6 +91,7 @@ const sidebar = [
       { text: sidebarLabel('Overview', 'plugin'), link: '/plugins/overview/' },
       { text: sidebarLabel('Official plugins', 'star'), link: '/plugins/official/' },
       { text: sidebarLabel('Build a plugin', 'build'), link: '/plugins/build/' },
+      { text: sidebarLabel('Command plugins', 'terminal'), link: '/plugins/command/' },
       { text: sidebarLabel('Middleware lifecycle', 'layers'), link: '/plugins/lifecycle/' },
       { text: sidebarLabel('Plugin recipes', 'examples'), link: '/plugins/recipes/' },
       { text: sidebarLabel('Plugin manifest', 'file'), link: '/plugins/manifest/' },

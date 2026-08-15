@@ -392,7 +392,7 @@ fn plugin_paths_for_named(name: &str, _create: bool) -> Result<PluginPaths> {
             &official_dir
         };
         let mut message = format!(
-            "plugin '{name}' has no detectors or binary; add '{}' or '{}'",
+            "plugin '{name}' has no detectors, Wasm, or command; add '{}' or '{}'",
             suggestion_dir.join(PLUGIN_CONFIG_FILE).display(),
             suggestion_dir.join(PLUGIN_MANIFEST_FILE).display()
         );
@@ -480,18 +480,37 @@ fn add_manifest_paths(path: &Path, paths: &mut PluginPaths) -> Result<()> {
     let value = source
         .parse::<toml::Value>()
         .with_context(|| format!("could not parse plugin manifest '{}'", path.display()))?;
-    if value
+    let has_detectors = value
         .get("detector")
         .and_then(toml::Value::as_array)
-        .is_some_and(|detectors| !detectors.is_empty())
-    {
-        paths.config_paths.push(path.to_path_buf());
-    }
-    if value
+        .is_some_and(|detectors| !detectors.is_empty());
+    let canonical_wasm = value
+        .get("wasm")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|wasm| !wasm.is_empty());
+    let legacy_wasm = value
         .get("binary")
         .and_then(toml::Value::as_str)
-        .is_some_and(|binary| !binary.is_empty())
-    {
+        .is_some_and(|wasm| !wasm.is_empty());
+    if canonical_wasm && legacy_wasm {
+        bail!("plugin manifest cannot set both wasm and legacy binary");
+    }
+    let has_wasm = canonical_wasm || legacy_wasm;
+    let has_command = value
+        .get("command")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|command| !command.is_empty())
+        || value
+            .get("commands")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|commands| !commands.is_empty());
+    if usize::from(has_detectors) + usize::from(has_wasm) + usize::from(has_command) != 1 {
+        bail!("plugin manifest must contain exactly one of detector, wasm, or command");
+    }
+    if has_detectors {
+        paths.config_paths.push(path.to_path_buf());
+    }
+    if has_wasm || has_command {
         paths.binary_paths.push(path.to_path_buf());
     }
     Ok(())
@@ -764,13 +783,17 @@ fn remote_plugin_paths_for_base_url(base_url: &str) -> Result<PluginPaths> {
         result.map_err(|_| anyhow!("remote plugin fetch worker panicked"))?
     };
     if let Some(manifest) = join(manifest)? {
+        for (_, url) in command_files_from_manifest(base, &manifest)? {
+            fetch_remote_plugin_file(&url)?
+                .ok_or_else(|| anyhow!("remote command plugin file was not found: {url}"))?;
+        }
         add_manifest_paths(&manifest, &mut paths)?;
     }
     if let Some(config) = join(config)? {
         paths.config_paths.push(config);
     }
     if paths.is_empty() {
-        bail!("remote plugin has no inline detectors, config.toml, or binary: {base_url}");
+        bail!("remote plugin has no inline detectors, config.toml, Wasm, or command: {base_url}");
     }
     Ok(paths)
 }
@@ -1066,7 +1089,7 @@ fn verify_remote_plugin_lock_entry(
 }
 
 fn remote_plugin_urls(resolved: &str) -> Vec<String> {
-    if resolved.ends_with(".toml") {
+    let mut urls = if resolved.ends_with(".toml") {
         vec![resolved.to_string()]
     } else {
         let base = resolved.trim_end_matches('/');
@@ -1074,7 +1097,100 @@ fn remote_plugin_urls(resolved: &str) -> Vec<String> {
             format!("{base}/{PLUGIN_MANIFEST_FILE}"),
             format!("{base}/{PLUGIN_CONFIG_FILE}"),
         ]
+    };
+    let manifest_url = if resolved.ends_with("/plugin.toml") {
+        resolved.to_string()
+    } else if resolved.ends_with(".toml") {
+        return urls;
+    } else {
+        format!(
+            "{}/{}",
+            resolved.trim_end_matches('/'),
+            PLUGIN_MANIFEST_FILE
+        )
+    };
+    if let Ok(path) = remote_cache_file(&manifest_url) {
+        let base = manifest_url.trim_end_matches("/plugin.toml");
+        if let Ok(files) = command_files_from_manifest(base, &path) {
+            urls.extend(files.into_iter().map(|(_, url)| url));
+        }
     }
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+fn command_files_from_manifest(base: &str, manifest: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let source =
+        pentect_agent::read_bounded_utf8(manifest, MAX_REMOTE_PLUGIN_FILE_BYTES, "plugin manifest")
+            .map_err(anyhow::Error::msg)?;
+    let value = source
+        .parse::<toml::Value>()
+        .with_context(|| format!("could not parse plugin manifest '{}'", manifest.display()))?;
+    let mut files = Vec::new();
+    let direct = value.get("command").and_then(toml::Value::as_array);
+    let platforms = value.get("commands").and_then(toml::Value::as_table);
+    if direct.is_some() && platforms.is_some() {
+        bail!("plugin.toml cannot set both command and [commands]");
+    }
+    let commands = direct
+        .into_iter()
+        .chain(
+            platforms
+                .into_iter()
+                .flat_map(|table| table.values().filter_map(toml::Value::as_array)),
+        )
+        .collect::<Vec<_>>();
+    for argument in commands
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+    {
+        let Some(relative) = argument.strip_prefix("{plugin}/") else {
+            continue;
+        };
+        let relative = PathBuf::from(relative);
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!("command plugin file paths must stay inside the plugin directory");
+        }
+        let url_path = relative
+            .iter()
+            .map(|part| part.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        files.push((
+            relative,
+            format!("{}/{url_path}", base.trim_end_matches('/')),
+        ));
+        if files.len() > 64 {
+            bail!("command plugins may distribute at most 64 files");
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files.dedup_by(|left, right| left.0 == right.0);
+    Ok(files)
+}
+
+pub(crate) fn remote_command_files(source: &PluginSource) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let (Some(base), Some(manifest)) = (
+        source.remote_base.as_deref(),
+        source.manifest_path.as_deref(),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let base = base.trim_end_matches("/plugin.toml");
+    command_files_from_manifest(base, manifest)?
+        .into_iter()
+        .map(|(relative, url)| {
+            let cached = fetch_remote_plugin_file(&url)?
+                .ok_or_else(|| anyhow!("remote command plugin file was not found: {url}"))?;
+            Ok((relative, cached))
+        })
+        .collect()
 }
 
 fn remote_reference_is_full_commit(resolved: &str) -> bool {
@@ -1774,6 +1890,31 @@ label = "INLINE_SECRET"
             true,
             &format!("https://raw.githubusercontent.com/owner/repo/{commit}/plugins/pii")
         ));
+    }
+
+    #[test]
+    fn platform_commands_lock_files_for_every_supported_os() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-platform-command-files-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("plugin.toml");
+        std::fs::write(
+            &manifest,
+            "schema = \"pentect.plugin.v1\"\n[commands]\nwindows = [\"{plugin}/windows.exe\"]\nmacos = [\"{plugin}/macos\"]\nlinux = [\"{plugin}/linux\"]\n",
+        )
+        .unwrap();
+        let files = command_files_from_manifest("https://example.test/plugin", &manifest).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .map(|(path, _)| path.to_string_lossy().replace('\\', "/"))
+                .collect::<Vec<_>>(),
+            ["linux", "macos", "windows.exe"]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

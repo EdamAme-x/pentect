@@ -1,4 +1,4 @@
-use crate::{embedded_ipv4, read_bounded_bytes, read_bounded_utf8};
+use crate::{activity_log, embedded_ipv4, read_bounded_bytes, read_bounded_utf8};
 use pentect_core::{
     ByteRange, Category, Confidence, Config, Context, DetectorId, Engine, Input, Kind, MaskResult,
     Span,
@@ -6,18 +6,20 @@ use pentect_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
 
 const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
 const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
+const PLUGIN_COMMAND_LOCK_FILE: &str = "command.lock";
 const PLUGIN_CACHE_DIR: &str = "cache";
 const PLUGIN_CONFIG_FILE: &str = "config.toml";
 const MAX_PLUGIN_MANIFEST_BYTES: u64 = 256 * 1024;
@@ -88,6 +90,13 @@ impl MiddlewareStage {
             .find(|hook| hook.export_name() == value)
     }
 
+    fn from_name(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|hook| hook.as_str() == value)
+    }
+
     const ALL: [Self; 7] = [
         Self::Prepare,
         Self::Inspect,
@@ -121,14 +130,16 @@ pub fn test_local_wasm_plugin(bytes: &[u8], name: &str) -> Result<usize, String>
         name,
         None,
         Some(toml::Value::Table(toml::map::Map::new())),
+        None,
     )?;
     let hooks = wasm.hooks.clone();
     PluginMiddleware {
         plugins: vec![PluginBinary {
             name: name.to_string(),
-            wasm,
+            program: PluginProgram::Wasm(Box::new(wasm)),
             hooks,
             required: true,
+            command_config: None,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -585,9 +596,10 @@ fn hook_test_input(hook: MiddlewareStage) -> Value {
 #[derive(Clone, Debug)]
 struct PluginBinary {
     name: String,
-    wasm: WasmProgram,
+    program: PluginProgram,
     hooks: BTreeSet<MiddlewareStage>,
     required: bool,
+    command_config: Option<Value>,
     timeout: Duration,
     max_input_bytes: usize,
     max_output_bytes: usize,
@@ -621,23 +633,64 @@ impl PluginBinary {
             .name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| plugin_default_name(path));
-        let binary = file
-            .binary
-            .filter(|binary| !binary.trim().is_empty())
-            .ok_or_else(|| format!("plugin '{name}' requires binary"))?;
-        let publisher_workflow = file
-            .publisher
-            .as_ref()
-            .and_then(|publisher| publisher.workflow.as_deref())
-            .unwrap_or(DEFAULT_PUBLISHER_WORKFLOW);
-        if !valid_plugin_publisher_workflow(publisher_workflow) {
+        let legacy_wasm = file.binary.filter(|value| !value.trim().is_empty());
+        let wasm = file.wasm.filter(|value| !value.trim().is_empty());
+        if legacy_wasm.is_some() && wasm.is_some() {
             return Err(format!(
-                "plugin '{name}' publisher workflow must be a repository-relative YAML path"
+                "plugin '{name}' cannot set both wasm and legacy binary"
             ));
         }
-        if !binary.to_ascii_lowercase().ends_with(".wasm") {
+        let wasm = wasm.or(legacy_wasm);
+        if !file.command.is_empty() && file.commands.is_some() {
             return Err(format!(
-                "plugin '{name}' binary must be a portable .wasm module"
+                "plugin '{name}' cannot set both command and [commands]"
+            ));
+        }
+        let command_form = !file.command.is_empty() || file.commands.is_some();
+        let command_variants = if !file.command.is_empty() {
+            vec![file.command.as_slice()]
+        } else {
+            file.commands
+                .iter()
+                .flat_map(PlatformCommandsFile::variants)
+                .collect::<Vec<_>>()
+        };
+        if command_form
+            && (command_variants.is_empty()
+                || command_variants.iter().any(|argv| {
+                    argv.is_empty()
+                        || argv[0].trim().is_empty()
+                        || argv.len() > 256
+                        || argv.iter().any(|argument| argument.len() > 32 * 1024)
+                }))
+        {
+            return Err(format!("plugin '{name}' has an invalid command argv"));
+        }
+        let command = if !file.command.is_empty() {
+            Some(file.command)
+        } else {
+            file.commands
+                .as_ref()
+                .and_then(PlatformCommandsFile::current)
+                .cloned()
+        };
+        let has_detectors = !file.detector.is_empty();
+        let forms =
+            usize::from(has_detectors) + usize::from(wasm.is_some()) + usize::from(command_form);
+        if forms != 1 {
+            return Err(format!(
+                "plugin '{name}' must contain exactly one of detector, wasm, or command"
+            ));
+        }
+        if has_detectors {
+            return Err(format!(
+                "plugin '{name}' is manifest-only and has no middleware runtime"
+            ));
+        }
+        if command_form && command.is_none() {
+            return Err(format!(
+                "plugin '{name}' is unsupported on {}",
+                std::env::consts::OS
             ));
         }
         let execution = file.execution.unwrap_or_default();
@@ -647,7 +700,7 @@ impl PluginBinary {
             .is_some_and(|value| value != "wasm")
         {
             return Err(format!(
-                "plugin '{name}' only supports execution.runtime = \"wasm\""
+                "plugin '{name}' legacy execution.runtime only supports \"wasm\""
             ));
         }
         if execution
@@ -656,12 +709,12 @@ impl PluginBinary {
             .is_some_and(|value| value != "oneshot")
         {
             return Err(format!(
-                "plugin '{name}' only supports execution.mode = \"oneshot\""
+                "plugin '{name}' legacy execution.mode only supports \"oneshot\""
             ));
         }
         if !execution.args.is_empty() {
             return Err(format!(
-                "plugin '{name}' WebAssembly execution cannot use args"
+                "plugin '{name}' execution.args is obsolete; put the complete argv in command"
             ));
         }
         let timeout_ms = execution.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
@@ -680,22 +733,85 @@ impl PluginBinary {
             || max_spans > MAX_PLUGIN_SPANS
         {
             return Err(format!(
-                "plugin '{name}' execution limits exceed Pentect's sandbox limits"
+                "plugin '{name}' execution limits exceed Pentect's runtime limits"
             ));
         }
-        let network = validate_network(&name, file.network)?;
         let runtime_dirs = plugin_runtime_dirs_for_manifest(&name, path)?;
-        let wasm_path = wasm_binary_path(&name, &binary, &runtime_dirs)?;
-        let wasm_bytes = load_approved_plugin_binary(&wasm_path, &runtime_dirs, &name)?;
-        let config = Some(load_plugin_config(&runtime_dirs)?);
-        let wasm = WasmProgram::load_bytes(&wasm_bytes, &name, network, config)?;
-        let hooks = wasm.hooks.clone();
-        verify_plugin_approval(path, &runtime_dirs, &hooks)?;
+        let mut permissions_file = file.permissions;
+        let permission_network = permissions_file
+            .as_mut()
+            .and_then(|permissions| permissions.network.take());
+        if file.network.is_some() && permission_network.is_some() {
+            return Err(format!(
+                "plugin '{name}' cannot set both [permissions.network] and legacy [network]"
+            ));
+        }
+        let network_file = permission_network.or(file.network);
+        let (program, hooks, command_config) = if let Some(wasm) = wasm {
+            let publisher_workflow = file
+                .publisher
+                .as_ref()
+                .and_then(|publisher| publisher.workflow.as_deref())
+                .unwrap_or(DEFAULT_PUBLISHER_WORKFLOW);
+            if !valid_plugin_publisher_workflow(publisher_workflow) {
+                return Err(format!(
+                    "plugin '{name}' publisher workflow must be a repository-relative YAML path"
+                ));
+            }
+            if !wasm.to_ascii_lowercase().ends_with(".wasm") {
+                return Err(format!(
+                    "plugin '{name}' wasm must name a portable .wasm module"
+                ));
+            }
+            let network = validate_network(&name, network_file)?;
+            let permissions = validate_permissions(&name, permissions_file, path, &runtime_dirs)?;
+            let wasm_path = wasm_binary_path(&name, &wasm, &runtime_dirs)?;
+            let wasm_bytes = load_approved_plugin_binary(&wasm_path, &runtime_dirs, &name)?;
+            let config = Some(load_plugin_config(&runtime_dirs)?);
+            let wasm = WasmProgram::load_bytes(&wasm_bytes, &name, network, config, permissions)?;
+            let hooks = wasm.hooks.clone();
+            (PluginProgram::Wasm(Box::new(wasm)), hooks, None)
+        } else {
+            if network_file.is_some() || permissions_file.is_some() {
+                return Err(format!(
+                    "plugin '{name}' command runs natively; Wasm permissions do not apply"
+                ));
+            }
+            let command = command.expect("validated command form");
+            let hooks = parse_declared_hooks(&name, &file.hooks)?;
+            let manifest_root = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            let installed_root = runtime_dirs.data_dir.join("command");
+            let command_root = if installed_root.is_dir() {
+                installed_root
+            } else {
+                manifest_root
+            };
+            let executable = verify_command_files(&name, &command, &command_root, &runtime_dirs)?;
+            let mut command = expand_plugin_command(&name, command, &command_root)?;
+            command[0] = executable.to_string_lossy().into_owned();
+            let config = serde_json::to_value(load_plugin_config(&runtime_dirs)?)
+                .map_err(|error| format!("plugin '{name}' config encode failed: {error}"))?;
+            (
+                PluginProgram::Command(CommandProgram::new(
+                    command,
+                    command_root,
+                    max_output_bytes,
+                )?),
+                hooks,
+                Some(config),
+            )
+        };
+        verify_plugin_approval(path, &runtime_dirs, &hooks, command_form)?;
         Ok(Self {
             name,
-            wasm,
+            program,
             hooks,
             required: file.required,
+            command_config,
             timeout: Duration::from_millis(timeout_ms),
             max_input_bytes,
             max_output_bytes,
@@ -714,8 +830,10 @@ impl PluginBinary {
         let request = json!({
             "schema": PROTOCOL_SCHEMA,
             "id": request_id,
+            "hook": hook.as_str(),
             "payload": payload,
             "metadata": context,
+            "config": self.command_config,
         });
         let encoded = serde_json::to_vec(&request)
             .map_err(|error| format!("plugin '{}' request encode failed: {error}", self.name))?;
@@ -730,15 +848,18 @@ impl PluginBinary {
                 .remaining()
                 .map_err(|error| format!("plugin '{}': {error}", self.name))?,
         );
-        let output = self.wasm.invoke_bounded(
-            hook,
-            &encoded,
-            timeout,
-            self.max_output_bytes,
-            &self.name,
-            budget.deadline,
-            Arc::clone(&budget.network_requests),
-        )?;
+        let output = match &self.program {
+            PluginProgram::Wasm(wasm) => wasm.invoke_bounded(
+                hook,
+                &encoded,
+                timeout,
+                self.max_output_bytes,
+                &self.name,
+                budget.deadline,
+                Arc::clone(&budget.network_requests),
+            )?,
+            PluginProgram::Command(command) => command.invoke(&encoded, timeout, &self.name)?,
+        };
         budget
             .charge_output(output.len())
             .map_err(|error| format!("plugin '{}': {error}", self.name))?;
@@ -774,6 +895,418 @@ impl PluginBinary {
     }
 }
 
+fn parse_declared_hooks(
+    name: &str,
+    values: &[String],
+) -> Result<BTreeSet<MiddlewareStage>, String> {
+    if values.is_empty() {
+        return Err(format!(
+            "plugin '{name}' command requires at least one hook"
+        ));
+    }
+    let mut hooks = BTreeSet::new();
+    for value in values {
+        let hook = MiddlewareStage::from_name(value)
+            .ok_or_else(|| format!("plugin '{name}' declares unknown hook '{value}'"))?;
+        if !hooks.insert(hook) {
+            return Err(format!(
+                "plugin '{name}' declares hook '{value}' more than once"
+            ));
+        }
+    }
+    Ok(hooks)
+}
+
+fn expand_plugin_command(
+    name: &str,
+    argv: Vec<String>,
+    root: &Path,
+) -> Result<Vec<String>, String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("plugin '{name}' command root is unavailable: {error}"))?;
+    argv.into_iter()
+        .map(|argument| {
+            let relative = if argument == "{plugin}" {
+                Some("")
+            } else {
+                argument.strip_prefix("{plugin}/")
+            };
+            let Some(relative) = relative else {
+                return Ok(argument);
+            };
+            let relative = Path::new(relative);
+            if relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                && !relative.as_os_str().is_empty()
+            {
+                return Err(format!(
+                    "plugin '{name}' command path must stay inside the plugin directory"
+                ));
+            }
+            let path = if relative.as_os_str().is_empty() {
+                canonical_root.clone()
+            } else {
+                canonical_root
+                    .join(relative)
+                    .canonicalize()
+                    .map_err(|error| {
+                        format!("plugin '{name}' command file '{argument}' is unavailable: {error}")
+                    })?
+            };
+            if !path.starts_with(&canonical_root) {
+                return Err(format!(
+                    "plugin '{name}' command path escapes the plugin directory"
+                ));
+            }
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+enum PluginProgram {
+    Wasm(Box<WasmProgram>),
+    Command(CommandProgram),
+}
+
+#[derive(Clone)]
+struct CommandProgram {
+    argv: Arc<Vec<String>>,
+    cwd: Arc<PathBuf>,
+    state: Arc<Mutex<Option<CommandSession>>>,
+    max_output_bytes: usize,
+}
+
+impl std::fmt::Debug for CommandProgram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandProgram")
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("max_output_bytes", &self.max_output_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CommandProgram {
+    fn new(argv: Vec<String>, cwd: PathBuf, max_output_bytes: usize) -> Result<Self, String> {
+        if argv.is_empty() || argv[0].trim().is_empty() {
+            return Err("plugin command requires a non-empty executable".to_string());
+        }
+        if argv.len() > 256 || argv.iter().any(|argument| argument.len() > 32 * 1024) {
+            return Err("plugin command argv exceeds its limit".to_string());
+        }
+        Ok(Self {
+            argv: Arc::new(argv),
+            cwd: Arc::new(cwd),
+            state: Arc::new(Mutex::new(None)),
+            max_output_bytes,
+        })
+    }
+
+    fn invoke(&self, request: &[u8], timeout: Duration, name: &str) -> Result<Vec<u8>, String> {
+        record_plugin_access(name, "command");
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| format!("plugin '{name}' command state is unavailable"))?;
+        if state.is_none() {
+            *state = Some(CommandSession::start(
+                &self.argv,
+                &self.cwd,
+                self.max_output_bytes,
+                name,
+            )?);
+        }
+        let result = state
+            .as_mut()
+            .expect("command session initialized")
+            .exchange(request, timeout, name);
+        if result.is_err() {
+            if let Some(mut session) = state.take() {
+                session.stop();
+            }
+        }
+        result
+    }
+}
+
+struct CommandSession {
+    child: Child,
+    tree: CommandTree,
+    stdin: Option<ChildStdin>,
+    responses: mpsc::Receiver<Result<Vec<u8>, String>>,
+}
+
+impl CommandSession {
+    fn start(
+        argv: &[String],
+        cwd: &Path,
+        max_output_bytes: usize,
+        name: &str,
+    ) -> Result<Self, String> {
+        let mut command = Command::new(&argv[0]);
+        command
+            .args(&argv[1..])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        sanitize_command_environment(&mut command);
+        configure_command_tree(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("plugin '{name}' command could not start: {error}"))?;
+        let tree = CommandTree::attach(&child).map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            format!("plugin '{name}' command isolation failed: {error}")
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("plugin '{name}' command stdin is unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("plugin '{name}' command stdout is unavailable"))?;
+        // Keep draining stdout even while the caller is busy writing or processing a
+        // previous response. The byte limit is enforced before anything is queued.
+        let (sender, responses) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(format!("pentect-plugin-{name}"))
+            .spawn(move || {
+                let mut stdout = BufReader::new(stdout);
+                loop {
+                    let mut line = Vec::new();
+                    let read = stdout
+                        .by_ref()
+                        .take(max_output_bytes.saturating_add(2) as u64)
+                        .read_until(b'\n', &mut line);
+                    let result = match read {
+                        Ok(0) => Err("command closed stdout".to_string()),
+                        Ok(_) if line.len() > max_output_bytes => {
+                            Err("command response exceeds its limit".to_string())
+                        }
+                        Ok(_) if line.last() != Some(&b'\n') => {
+                            Err("command returned an incomplete protocol line".to_string())
+                        }
+                        Ok(_) => {
+                            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                                line.pop();
+                            }
+                            Ok(line)
+                        }
+                        Err(_) => Err("command response could not be read".to_string()),
+                    };
+                    let stop = result.is_err();
+                    if sender.send(result).is_err() || stop {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| format!("plugin '{name}' response reader could not start: {error}"))?;
+        Ok(Self {
+            child,
+            tree,
+            stdin: Some(stdin),
+            responses,
+        })
+    }
+
+    fn exchange(
+        &mut self,
+        request: &[u8],
+        timeout: Duration,
+        name: &str,
+    ) -> Result<Vec<u8>, String> {
+        let deadline = Instant::now() + timeout;
+        let mut stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| format!("plugin '{name}' command input is unavailable"))?;
+        let payload = request.to_vec();
+        let (write_tx, write_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(format!("pentect-plugin-{name}-stdin"))
+            .spawn(move || {
+                let result = stdin
+                    .write_all(&payload)
+                    .and_then(|_| stdin.write_all(b"\n"))
+                    .and_then(|_| stdin.flush());
+                let _ = write_tx.send((stdin, result));
+            })
+            .map_err(|error| format!("plugin '{name}' input writer could not start: {error}"))?;
+        match write_rx.recv_timeout(timeout) {
+            Ok((stdin, Ok(()))) => self.stdin = Some(stdin),
+            Ok((_stdin, Err(_))) => return Err(format!("plugin '{name}' command input failed")),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!("plugin '{name}' timed out"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("plugin '{name}' command input failed"));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("plugin '{name}' timed out"));
+        }
+        self.responses
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => format!("plugin '{name}' timed out"),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    format!("plugin '{name}' command stopped without a response")
+                }
+            })?
+            .map_err(|error| format!("plugin '{name}' {error}"))
+    }
+
+    fn stop(&mut self) {
+        self.tree.terminate();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for CommandSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn sanitize_command_environment(command: &mut Command) {
+    const KEEP: &[&str] = &[
+        "HOME",
+        "USERPROFILE",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+    ];
+    let kept = KEEP
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
+        .collect::<Vec<_>>();
+    command.env_clear();
+    command.envs(kept);
+}
+
+#[cfg(unix)]
+fn configure_command_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_command_tree(_command: &mut Command) {}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_command_tree(_command: &mut Command) {}
+
+#[cfg(unix)]
+struct CommandTree {
+    process_group: i32,
+}
+
+#[cfg(unix)]
+impl CommandTree {
+    fn attach(child: &Child) -> Result<Self, String> {
+        Ok(Self {
+            process_group: i32::try_from(child.id())
+                .map_err(|_| "child process id is invalid".to_string())?,
+        })
+    }
+
+    fn terminate(&self) {
+        unsafe {
+            libc::kill(-self.process_group, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CommandTree {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(windows)]
+struct CommandTree {
+    job: usize,
+}
+
+#[cfg(windows)]
+impl CommandTree {
+    fn attach(child: &Child) -> Result<Self, String> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err("could not create a Windows Job Object".to_string());
+        }
+        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(information).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        let assigned = configured
+            && unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) } != 0;
+        if !assigned {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(job);
+            }
+            return Err("could not assign the process to a Windows Job Object".to_string());
+        }
+        Ok(Self { job: job as usize })
+    }
+
+    fn terminate(&self) {
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CommandTree {
+    fn drop(&mut self) {
+        self.terminate();
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.job as _);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct CommandTree;
+
+#[cfg(not(any(unix, windows)))]
+impl CommandTree {
+    fn attach(_child: &Child) -> Result<Self, String> {
+        Ok(Self)
+    }
+
+    fn terminate(&self) {}
+}
+
 pub fn valid_plugin_publisher_workflow(workflow: &str) -> bool {
     !workflow.is_empty()
         && workflow.len() <= 256
@@ -795,6 +1328,7 @@ struct PluginApproval {
     schema: String,
     manifest_sha256: String,
     hooks: Vec<String>,
+    command_lock_sha256: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -803,10 +1337,251 @@ struct PluginBinaryLock {
     sha256: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginCommandLock {
+    schema: String,
+    executable: String,
+    #[serde(default)]
+    managed: bool,
+    #[serde(default)]
+    file: Vec<PluginCommandLockFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginCommandLockFile {
+    path: String,
+    sha256: String,
+}
+
+fn verify_command_files(
+    name: &str,
+    argv: &[String],
+    root: &Path,
+    runtime_dirs: &PluginRuntimeDirs,
+) -> Result<PathBuf, String> {
+    use sha2::{Digest, Sha256};
+
+    let lock_path = runtime_dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE);
+    let source = read_bounded_utf8(&lock_path, MAX_PLUGIN_METADATA_BYTES, "plugin command lock")
+        .map_err(|_| {
+            format!("plugin '{name}' command is not locked; run `pentect plugins setup` again")
+        })?;
+    let lock: PluginCommandLock =
+        toml::from_str(&source).map_err(|_| format!("plugin '{name}' command lock is invalid"))?;
+    if lock.schema != "pentect.plugin-command-lock.v1" {
+        return Err(format!("plugin '{name}' command lock is invalid"));
+    }
+    if lock.file.len() > 64 {
+        return Err(format!("plugin '{name}' command lock is invalid"));
+    }
+    let executable = resolve_plugin_command_executable(&argv[0], root, name)?;
+    let locked_executable = Path::new(&lock.executable)
+        .canonicalize()
+        .map_err(|_| format!("plugin '{name}' command executable is unavailable"))?;
+    if executable != locked_executable {
+        return Err(format!(
+            "plugin '{name}' command executable changed after setup"
+        ));
+    }
+    let expected = argv
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("{plugin}/"))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let locked = lock
+        .file
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+    if !expected.is_subset(&locked)
+        || (!lock.managed && expected != locked)
+        || locked.len() != lock.file.len()
+    {
+        return Err(format!(
+            "plugin '{name}' command file set changed after setup"
+        ));
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| format!("plugin '{name}' command root is unavailable"))?;
+    if lock.managed {
+        let actual = walk_regular_files(root)?;
+        if actual != locked {
+            return Err(format!(
+                "plugin '{name}' command file set changed after setup"
+            ));
+        }
+    }
+    for file in lock.file {
+        if file.sha256.len() != 64 || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("plugin '{name}' command lock is invalid"));
+        }
+        let relative = Path::new(&file.path);
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(format!("plugin '{name}' command lock path is invalid"));
+        }
+        let path = canonical_root.join(relative).canonicalize().map_err(|_| {
+            format!(
+                "plugin '{name}' command file '{}' is unavailable",
+                file.path
+            )
+        })?;
+        if !path.starts_with(&canonical_root) || !path.is_file() {
+            return Err(format!(
+                "plugin '{name}' command file '{}' is invalid",
+                file.path
+            ));
+        }
+        let bytes = read_bounded_bytes(&path, MAX_PLUGIN_WASM_BYTES, "plugin command file")?;
+        let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+        if !digest.eq_ignore_ascii_case(&file.sha256) {
+            return Err(format!(
+                "plugin '{name}' command file '{}' changed after setup",
+                file.path
+            ));
+        }
+    }
+    Ok(executable)
+}
+
+fn walk_regular_files(root: &Path) -> Result<BTreeSet<String>, String> {
+    let mut result = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|_| "plugin command directory is unavailable".to_string())?
+        {
+            let entry = entry.map_err(|_| "plugin command directory is unavailable".to_string())?;
+            let kind = entry
+                .file_type()
+                .map_err(|_| "plugin command directory is unavailable".to_string())?;
+            if kind.is_symlink() {
+                return Err("plugin command directory contains a symbolic link".to_string());
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|_| "plugin command path is invalid".to_string())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                result.insert(relative);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn resolve_plugin_command_executable(
+    value: &str,
+    root: &Path,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let Some(relative) = value.strip_prefix("{plugin}/") else {
+        return resolve_command_executable(value);
+    };
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "plugin '{name}' command executable path is invalid"
+        ));
+    }
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|_| format!("plugin '{name}' command root is unavailable"))?;
+    let executable = canonical_root
+        .join(relative)
+        .canonicalize()
+        .map_err(|_| format!("plugin '{name}' command executable is unavailable"))?;
+    if !executable.starts_with(&canonical_root) || !supported_command_executable(&executable) {
+        return Err(format!("plugin '{name}' command executable is invalid"));
+    }
+    Ok(executable)
+}
+
+fn resolve_command_executable(value: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(value);
+    if candidate.components().count() > 1 || candidate.is_absolute() {
+        let resolved = candidate
+            .canonicalize()
+            .map_err(|_| format!("command executable is unavailable: {value}"));
+        return resolved.and_then(|path| {
+            supported_command_executable(&path)
+                .then_some(path)
+                .ok_or_else(|| format!("command executable is unavailable: {value}"))
+        });
+    }
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    #[cfg(windows)]
+    let extensions = std::env::var_os("PATHEXT")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .filter(|extension| {
+                    matches!(extension.to_ascii_uppercase().as_str(), ".EXE" | ".COM")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![".EXE".to_string(), ".COM".to_string()]);
+    #[cfg(not(windows))]
+    let extensions = vec![String::new()];
+    for directory in std::env::split_paths(&paths) {
+        for extension in &extensions {
+            let path = if extension.is_empty()
+                || value
+                    .to_ascii_lowercase()
+                    .ends_with(&extension.to_ascii_lowercase())
+            {
+                directory.join(value)
+            } else {
+                directory.join(format!("{value}{extension}"))
+            };
+            if let Ok(path) = path.canonicalize() {
+                if supported_command_executable(&path) {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+    Err(format!("command executable is unavailable: {value}"))
+}
+
+#[cfg(unix)]
+fn supported_command_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn supported_command_executable(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "exe" | "com")
+            })
+}
+
 fn verify_plugin_approval(
     manifest: &Path,
     runtime_dirs: &PluginRuntimeDirs,
     hooks: &BTreeSet<MiddlewareStage>,
+    command: bool,
 ) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let path = runtime_dirs.data_dir.join(PLUGIN_APPROVAL_FILE);
@@ -827,9 +1602,20 @@ fn verify_plugin_approval(
         .iter()
         .map(|hook| hook.as_str().to_string())
         .collect::<Vec<_>>();
+    let command_lock_sha256 = command
+        .then(|| {
+            read_bounded_bytes(
+                &runtime_dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE),
+                MAX_PLUGIN_METADATA_BYTES,
+                "plugin command lock",
+            )
+            .map(|bytes| data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)))
+        })
+        .transpose()?;
     if approval.schema != "pentect.plugin-approval.v1"
         || approval.manifest_sha256 != digest
         || approval.hooks != installed_hooks
+        || approval.command_lock_sha256 != command_lock_sha256
     {
         return Err(format!(
             "plugin '{}' manifest or hook access changed after approval; run `pentect plugins setup {} --yes` again",
@@ -877,6 +1663,8 @@ const WASM_HTTP_MODULE: &str = "pentect:http";
 const WASM_HTTP_REQUEST: &str = "request";
 const WASM_CONFIG_MODULE: &str = "pentect:config";
 const WASM_CONFIG_READ: &str = "read";
+const WASM_HOST_MODULE: &str = "pentect:host";
+const WASM_HOST_REQUEST: &str = "request";
 const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const HTTP_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const HTTP_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -886,6 +1674,9 @@ const HTTP_MAX_ORIGINS: usize = 64;
 const HTTP_MAX_HEADERS: usize = 64;
 const HTTP_MAX_HEADER_BYTES: usize = 64 * 1024;
 const HTTP_MAX_DNS_THREADS: usize = 32;
+const HOST_MAX_REQUESTS: usize = 64;
+const HOST_MAX_VALUE_BYTES: usize = 128 * 1024;
+const HOST_MAX_COMMAND_STREAM_BYTES: usize = 64 * 1024;
 // Each invocation gets a fixed fuel budget derived from its configured time
 // limit. This keeps untrusted Wasm bounded without resumable execution around
 // compound instructions. HTTP calls also use the wall-clock deadline stored
@@ -900,6 +1691,7 @@ struct WasmProgram {
     hooks: BTreeSet<MiddlewareStage>,
     network: Option<NetworkPolicy>,
     config: Option<toml::Value>,
+    permissions: Option<PermissionPolicy>,
 }
 
 impl WasmProgram {
@@ -908,6 +1700,7 @@ impl WasmProgram {
         name: &str,
         network: Option<NetworkPolicy>,
         config: Option<toml::Value>,
+        permissions: Option<PermissionPolicy>,
     ) -> Result<Self, String> {
         let mut engine_config = wasmi::Config::default();
         engine_config.consume_fuel(true);
@@ -922,7 +1715,10 @@ impl WasmProgram {
                 && network.is_some())
                 || (import.module() == WASM_CONFIG_MODULE
                     && import.name() == WASM_CONFIG_READ
-                    && config.is_some());
+                    && config.is_some())
+                || (import.module() == WASM_HOST_MODULE
+                    && import.name() == WASM_HOST_REQUEST
+                    && permissions.is_some());
             if !permitted {
                 return Err(format!(
                     "plugin '{name}' imports unapproved host function '{}:{}'",
@@ -937,6 +1733,7 @@ impl WasmProgram {
             hooks,
             network,
             config,
+            permissions,
         })
     }
 
@@ -992,6 +1789,9 @@ impl WasmProgram {
                 network_requests: 0,
                 chain_network_requests,
                 config: self.config.clone(),
+                permissions: self.permissions.clone(),
+                host_requests: 0,
+                pending_host_response: None,
                 deadline: (started + timeout).min(chain_deadline),
             },
         );
@@ -1009,6 +1809,11 @@ impl WasmProgram {
             linker
                 .func_wrap(WASM_CONFIG_MODULE, WASM_CONFIG_READ, wasm_config_read)
                 .map_err(|error| format!("plugin '{name}' config setup failed: {error}"))?;
+        }
+        if self.permissions.is_some() {
+            linker
+                .func_wrap(WASM_HOST_MODULE, WASM_HOST_REQUEST, wasm_host_request)
+                .map_err(|error| format!("plugin '{name}' host setup failed: {error}"))?;
         }
         let instance = linker
             .instantiate_and_start(&mut store, &self.module)
@@ -1063,6 +1868,9 @@ struct WasmHostState {
     network_requests: usize,
     chain_network_requests: Arc<AtomicUsize>,
     config: Option<toml::Value>,
+    permissions: Option<PermissionPolicy>,
+    host_requests: usize,
+    pending_host_response: Option<(Vec<u8>, Vec<u8>)>,
     deadline: Instant,
 }
 
@@ -1075,6 +1883,94 @@ struct NetworkPolicy {
     max_request_bytes: usize,
     max_response_bytes: usize,
     max_requests: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PermissionPolicy {
+    name: String,
+    read: Vec<PathPermission>,
+    write: Vec<PathPermission>,
+    env: BTreeSet<String>,
+    run: BTreeMap<Vec<String>, Vec<String>>,
+    storage: bool,
+    project_root: PathBuf,
+    plugin_root: PathBuf,
+    storage_root: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct PathPermission {
+    scope: PathScope,
+    relative: PathBuf,
+    recursive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PathScope {
+    Project,
+    Plugin,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum HostRequest {
+    EnvRead {
+        name: String,
+    },
+    FileRead {
+        path: String,
+    },
+    FileWrite {
+        path: String,
+        data: String,
+    },
+    StorageGet {
+        key: String,
+    },
+    StorageSet {
+        key: String,
+        value: Value,
+    },
+    CommandRun {
+        argv: Vec<String>,
+        #[serde(default)]
+        stdin: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct HostResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+}
+
+impl HostResponse {
+    fn ok(value: impl Into<Value>) -> Self {
+        Self {
+            ok: true,
+            value: Some(value.into()),
+            error: None,
+        }
+    }
+
+    fn denied() -> Self {
+        Self {
+            ok: false,
+            value: None,
+            error: Some("permission_denied"),
+        }
+    }
+
+    fn failed() -> Self {
+        Self {
+            ok: false,
+            value: None,
+            error: Some("operation_failed"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1176,6 +2072,393 @@ fn wasm_config_read(
 fn config_value<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
     key.split('.')
         .try_fold(root, |value, part| value.as_table()?.get(part))
+}
+
+fn wasm_host_request(
+    mut caller: wasmi::Caller<'_, WasmHostState>,
+    request_ptr: i32,
+    request_len: i32,
+    response_ptr: i32,
+    response_capacity: i32,
+) -> i32 {
+    let Some(memory) = caller
+        .get_export(WASM_ABI_MEMORY)
+        .and_then(wasmi::Extern::into_memory)
+    else {
+        return -1;
+    };
+    let (Ok(request_offset), Ok(request_len), Ok(response_offset), Ok(response_capacity)) = (
+        usize::try_from(request_ptr),
+        usize::try_from(request_len),
+        usize::try_from(response_ptr),
+        usize::try_from(response_capacity),
+    ) else {
+        return -1;
+    };
+    if request_len > DEFAULT_MAX_INPUT_BYTES || response_capacity > DEFAULT_MAX_OUTPUT_BYTES {
+        return -2;
+    }
+    let mut request = vec![0; request_len];
+    if memory.read(&caller, request_offset, &mut request).is_err() {
+        return -1;
+    }
+    let encoded = if caller
+        .data()
+        .pending_host_response
+        .as_ref()
+        .is_some_and(|(pending, _)| pending == &request)
+    {
+        caller.data_mut().pending_host_response.take().unwrap().1
+    } else {
+        caller.data_mut().pending_host_response = None;
+        if caller.data().host_requests >= HOST_MAX_REQUESTS {
+            return -2;
+        }
+        caller.data_mut().host_requests += 1;
+        let response = match (
+            caller.data().permissions.as_ref(),
+            serde_json::from_slice::<HostRequest>(&request),
+        ) {
+            (Some(policy), Ok(request)) => {
+                perform_host_request(policy, request, caller.data().deadline)
+            }
+            _ => HostResponse::denied(),
+        };
+        let Ok(encoded) = serde_json::to_vec(&response) else {
+            return -3;
+        };
+        encoded
+    };
+    if encoded.len() > response_capacity {
+        caller.data_mut().pending_host_response = Some((request, encoded.clone()));
+        return i32::try_from(encoded.len()).unwrap_or(-2);
+    }
+    if memory
+        .write(&mut caller, response_offset, &encoded)
+        .is_err()
+    {
+        return -1;
+    }
+    i32::try_from(encoded.len()).unwrap_or(-2)
+}
+
+fn perform_host_request(
+    policy: &PermissionPolicy,
+    request: HostRequest,
+    deadline: Instant,
+) -> HostResponse {
+    if Instant::now() >= deadline {
+        return HostResponse::failed();
+    }
+    record_plugin_access(
+        &policy.name,
+        match &request {
+            HostRequest::EnvRead { .. } => "env-read",
+            HostRequest::FileRead { .. } => "file-read",
+            HostRequest::FileWrite { .. } => "file-write",
+            HostRequest::StorageGet { .. } => "storage-read",
+            HostRequest::StorageSet { .. } => "storage-write",
+            HostRequest::CommandRun { .. } => "command-run",
+        },
+    );
+    match request {
+        HostRequest::EnvRead { name } => {
+            if !policy.env.contains(&name) {
+                return HostResponse::denied();
+            }
+            HostResponse::ok(
+                std::env::var_os(name)
+                    .map(|value| Value::String(value.to_string_lossy().into_owned()))
+                    .unwrap_or(Value::Null),
+            )
+        }
+        HostRequest::FileRead { path } => {
+            let Some(path) = approved_file_path(policy, &path, false) else {
+                return HostResponse::denied();
+            };
+            match read_bounded_utf8(&path, HOST_MAX_VALUE_BYTES as u64, "plugin file") {
+                Ok(value) => HostResponse::ok(value),
+                Err(_) => HostResponse::failed(),
+            }
+        }
+        HostRequest::FileWrite { path, data } => {
+            if data.len() > HOST_MAX_VALUE_BYTES {
+                return HostResponse::failed();
+            }
+            let Some(path) = approved_file_path(policy, &path, true) else {
+                return HostResponse::denied();
+            };
+            let temporary = path.with_extension(format!(
+                "pentect-tmp-{}-{}",
+                std::process::id(),
+                REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::write(&temporary, data)
+                .map_err(|error| error.to_string())
+                .and_then(|_| replace_host_file(&temporary, &path))
+            {
+                Ok(()) => HostResponse::ok(true),
+                Err(_) => {
+                    let _ = std::fs::remove_file(temporary);
+                    HostResponse::failed()
+                }
+            }
+        }
+        HostRequest::StorageGet { key } => {
+            if !policy.storage || !valid_storage_key(&key) {
+                return HostResponse::denied();
+            }
+            let path = storage_path(&policy.storage_root, &key);
+            if !path.is_file() {
+                return HostResponse::ok(Value::Null);
+            }
+            match read_bounded_utf8(&path, HOST_MAX_VALUE_BYTES as u64, "plugin storage").and_then(
+                |source| {
+                    serde_json::from_str::<Value>(&source)
+                        .map_err(|_| "plugin storage value is invalid".to_string())
+                },
+            ) {
+                Ok(value) => HostResponse::ok(value),
+                Err(_) => HostResponse::failed(),
+            }
+        }
+        HostRequest::StorageSet { key, value } => {
+            if !policy.storage || !valid_storage_key(&key) {
+                return HostResponse::denied();
+            }
+            let Ok(encoded) = serde_json::to_vec(&value) else {
+                return HostResponse::failed();
+            };
+            if encoded.len() > HOST_MAX_VALUE_BYTES {
+                return HostResponse::failed();
+            }
+            let path = storage_path(&policy.storage_root, &key);
+            let temporary = path.with_extension(format!(
+                "tmp-{}-{}",
+                std::process::id(),
+                REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::write(&temporary, encoded)
+                .map_err(|error| error.to_string())
+                .and_then(|_| replace_host_file(&temporary, &path))
+            {
+                Ok(()) => HostResponse::ok(true),
+                Err(_) => {
+                    let _ = std::fs::remove_file(temporary);
+                    HostResponse::failed()
+                }
+            }
+        }
+        HostRequest::CommandRun { argv, stdin } => {
+            let Some(resolved) = policy.run.get(&argv) else {
+                return HostResponse::denied();
+            };
+            if stdin.len() > DEFAULT_MAX_INPUT_BYTES {
+                return HostResponse::denied();
+            }
+            match run_brokered_command(&policy.project_root, resolved, &stdin, deadline) {
+                Ok(value) => HostResponse::ok(value),
+                Err(_) => HostResponse::failed(),
+            }
+        }
+    }
+}
+
+fn approved_file_path(policy: &PermissionPolicy, value: &str, write: bool) -> Option<PathBuf> {
+    let (scope, relative) = value.split_once(':')?;
+    let (scope, root) = match scope {
+        "project" => (PathScope::Project, &policy.project_root),
+        "plugin" => (PathScope::Plugin, &policy.plugin_root),
+        _ => return None,
+    };
+    let relative = PathBuf::from(relative);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let allowed = if write { &policy.write } else { &policy.read };
+    if !allowed.iter().any(|permission| {
+        permission.scope == scope
+            && if permission.recursive {
+                relative.starts_with(&permission.relative)
+            } else {
+                relative == permission.relative
+            }
+    }) {
+        return None;
+    }
+    let candidate = root.join(&relative);
+    if write {
+        let parent = candidate.parent()?.canonicalize().ok()?;
+        if !parent.starts_with(root) {
+            return None;
+        }
+        if candidate.exists() {
+            let canonical = candidate.canonicalize().ok()?;
+            canonical.starts_with(root).then_some(canonical)
+        } else {
+            Some(candidate)
+        }
+    } else {
+        let canonical = candidate.canonicalize().ok()?;
+        (canonical.starts_with(root) && canonical.is_file()).then_some(canonical)
+    }
+}
+
+fn valid_storage_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 256
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+fn record_plugin_access(name: &str, operation: &str) {
+    activity_log::record_summary(
+        "plugin",
+        name,
+        1,
+        BTreeMap::from([(operation.to_string(), 1)]),
+        None,
+    );
+}
+
+fn replace_host_file(staged: &Path, destination: &Path) -> Result<(), String> {
+    if !destination.exists() {
+        return std::fs::rename(staged, destination).map_err(|error| error.to_string());
+    }
+    let backup = destination.with_extension(format!(
+        "pentect-backup-{}-{}",
+        std::process::id(),
+        REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::rename(destination, &backup).map_err(|error| error.to_string())?;
+    if let Err(error) = std::fs::rename(staged, destination) {
+        let _ = std::fs::rename(&backup, destination);
+        return Err(error.to_string());
+    }
+    std::fs::remove_file(backup).map_err(|error| error.to_string())
+}
+
+fn storage_path(root: &Path, key: &str) -> PathBuf {
+    let mut digest = sha2::Sha256::new();
+    use sha2::Digest as _;
+    digest.update(b"pentect-plugin-storage-v1");
+    digest.update(key.as_bytes());
+    root.join(format!(
+        "{}.json",
+        data_encoding::HEXLOWER.encode(&digest.finalize())
+    ))
+}
+
+fn run_brokered_command(
+    cwd: &Path,
+    argv: &[String],
+    stdin: &str,
+    deadline: Instant,
+) -> Result<Value, String> {
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    sanitize_command_environment(&mut command);
+    configure_command_tree(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|_| "approved command could not start".to_string())?;
+    let tree = CommandTree::attach(&child).map_err(|error| {
+        let _ = child.kill();
+        let _ = child.wait();
+        format!("approved command isolation failed: {error}")
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr unavailable".to_string())?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut value = Vec::new();
+        stdout
+            .take((HOST_MAX_COMMAND_STREAM_BYTES + 1) as u64)
+            .read_to_end(&mut value)
+            .map(|_| value)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut value = Vec::new();
+        stderr
+            .take((HOST_MAX_COMMAND_STREAM_BYTES + 1) as u64)
+            .read_to_end(&mut value)
+            .map(|_| value)
+    });
+    if let Some(mut input) = child.stdin.take() {
+        let bytes = stdin.as_bytes().to_vec();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = input.write_all(&bytes);
+            let _ = sender.send(result);
+        });
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tree.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("approved command input failed".to_string());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                tree.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("approved command timed out".to_string());
+            }
+        }
+    }
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|_| "approved command wait failed".to_string())?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            tree.terminate();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("approved command timed out".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    // A command may leave descendants alive with inherited stdout/stderr handles.
+    // Stop the whole approved tree before joining the readers so those handles close.
+    tree.terminate();
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "approved command output failed".to_string())?
+        .map_err(|_| "approved command output failed".to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "approved command error output failed".to_string())?
+        .map_err(|_| "approved command error output failed".to_string())?;
+    if stdout.len() > HOST_MAX_COMMAND_STREAM_BYTES || stderr.len() > HOST_MAX_COMMAND_STREAM_BYTES
+    {
+        return Err("approved command output exceeds its limit".to_string());
+    }
+    Ok(json!({
+        "status": status.code(),
+        "success": status.success(),
+        "stdout": String::from_utf8_lossy(&stdout),
+        "stderr": String::from_utf8_lossy(&stderr),
+    }))
 }
 
 fn wasm_http_request(
@@ -1536,15 +2819,22 @@ struct PluginFile {
     _assets: BTreeMap<String, String>,
     #[serde(default)]
     #[serde(rename = "detector")]
-    _detector: Vec<toml::Value>,
+    detector: Vec<toml::Value>,
     #[serde(default)]
     postscript: Vec<toml::Value>,
+    wasm: Option<String>,
     binary: Option<String>,
+    #[serde(default)]
+    command: Vec<String>,
+    commands: Option<PlatformCommandsFile>,
+    #[serde(default)]
+    hooks: Vec<String>,
     publisher: Option<PublisherFile>,
     execution: Option<ExecutionFile>,
     #[serde(default)]
     required: bool,
     network: Option<NetworkFile>,
+    permissions: Option<PermissionsFile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1566,7 +2856,7 @@ struct ExecutionFile {
     max_spans: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NetworkFile {
     #[serde(default)]
@@ -1580,6 +2870,180 @@ struct NetworkFile {
     max_request_bytes: Option<usize>,
     max_response_bytes: Option<usize>,
     max_requests: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionsFile {
+    #[serde(default)]
+    read: Vec<String>,
+    #[serde(default)]
+    write: Vec<String>,
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default)]
+    run: Vec<Vec<String>>,
+    #[serde(default)]
+    storage: bool,
+    network: Option<NetworkFile>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlatformCommandsFile {
+    windows: Option<Vec<String>>,
+    macos: Option<Vec<String>>,
+    linux: Option<Vec<String>>,
+}
+
+impl PlatformCommandsFile {
+    fn current(&self) -> Option<&Vec<String>> {
+        #[cfg(windows)]
+        let selected = self.windows.as_ref();
+        #[cfg(target_os = "macos")]
+        let selected = self.macos.as_ref();
+        #[cfg(target_os = "linux")]
+        let selected = self.linux.as_ref();
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        let selected = None;
+        selected
+    }
+
+    fn variants(&self) -> impl Iterator<Item = &[String]> {
+        [
+            self.windows.as_deref(),
+            self.macos.as_deref(),
+            self.linux.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+fn validate_permissions(
+    name: &str,
+    permissions: Option<PermissionsFile>,
+    manifest: &Path,
+    runtime_dirs: &PluginRuntimeDirs,
+) -> Result<Option<PermissionPolicy>, String> {
+    let Some(permissions) = permissions else {
+        return Ok(None);
+    };
+    if permissions.read.len() > 64
+        || permissions.write.len() > 64
+        || permissions.env.len() > 64
+        || permissions.run.len() > 64
+    {
+        return Err(format!("plugin '{name}' declares too many permissions"));
+    }
+    if permissions.read.is_empty()
+        && permissions.write.is_empty()
+        && permissions.env.is_empty()
+        && permissions.run.is_empty()
+        && !permissions.storage
+    {
+        return Ok(None);
+    }
+    let project_root = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| format!("plugin '{name}' project directory is unavailable"))?;
+    let plugin_root = manifest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .map_err(|_| format!("plugin '{name}' source directory is unavailable"))?;
+    let read = permissions
+        .read
+        .iter()
+        .map(|value| parse_path_permission(name, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let write = permissions
+        .write
+        .iter()
+        .map(|value| parse_path_permission(name, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut env = BTreeSet::new();
+    for variable in permissions.env {
+        if variable.is_empty()
+            || variable.len() > 128
+            || variable.as_bytes()[0].is_ascii_digit()
+            || !variable
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || !env.insert(variable.clone())
+        {
+            return Err(format!(
+                "plugin '{name}' has an invalid environment permission"
+            ));
+        }
+    }
+    let mut run = BTreeMap::new();
+    for argv in permissions.run {
+        if argv.is_empty()
+            || argv.len() > 64
+            || argv
+                .iter()
+                .any(|argument| argument.len() > 8192 || argument.contains('\0'))
+            || run.contains_key(&argv)
+        {
+            return Err(format!("plugin '{name}' has an invalid run permission"));
+        }
+        let mut resolved = argv.clone();
+        resolved[0] = resolve_command_executable(&argv[0])?
+            .to_string_lossy()
+            .into_owned();
+        run.insert(argv, resolved);
+    }
+    let storage_root = runtime_dirs.data_dir.join("storage");
+    if permissions.storage {
+        std::fs::create_dir_all(&storage_root)
+            .map_err(|_| format!("plugin '{name}' storage is unavailable"))?;
+        restrict_plugin_directory(&storage_root)?;
+    }
+    Ok(Some(PermissionPolicy {
+        name: name.to_string(),
+        read,
+        write,
+        env,
+        run,
+        storage: permissions.storage,
+        project_root,
+        plugin_root,
+        storage_root,
+    }))
+}
+
+fn parse_path_permission(name: &str, value: &str) -> Result<PathPermission, String> {
+    let (scope, relative) = value
+        .split_once(':')
+        .ok_or_else(|| format!("plugin '{name}' has an invalid file permission"))?;
+    let scope = match scope {
+        "project" => PathScope::Project,
+        "plugin" => PathScope::Plugin,
+        _ => {
+            return Err(format!(
+                "plugin '{name}' has an invalid file permission root"
+            ))
+        }
+    };
+    let recursive = relative.ends_with("/**");
+    let relative = relative.strip_suffix("/**").unwrap_or(relative);
+    let relative = PathBuf::from(relative);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "plugin '{name}' has an invalid file permission path"
+        ));
+    }
+    Ok(PathPermission {
+        scope,
+        relative,
+        recursive,
+    })
 }
 
 fn validate_network(
@@ -1972,6 +3436,342 @@ fn plugin_id(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn command_fixture(response: &str) -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![
+                "powershell".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                format!(
+                    "$null = [Console]::In.ReadLine(); [Console]::Out.WriteLine({})",
+                    powershell_single_quoted(response)
+                ),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "IFS= read -r line; printf '%s\\n' {}",
+                    shell_single_quoted(response)
+                ),
+            ]
+        }
+    }
+
+    fn sleeping_command_fixture() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![
+                "powershell".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "$null = [Console]::In.ReadLine(); Start-Sleep -Seconds 2".to_string(),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "IFS= read -r line; sleep 2".to_string(),
+            ]
+        }
+    }
+
+    fn incomplete_command_fixture() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![
+                "powershell".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "$null = [Console]::In.ReadLine(); [Console]::Out.Write('partial')".to_string(),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "IFS= read -r line; printf partial".to_string(),
+            ]
+        }
+    }
+
+    fn crashing_command_fixture() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![
+                "powershell".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "$null = [Console]::In.ReadLine(); exit 7".to_string(),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "IFS= read -r line; exit 7".to_string(),
+            ]
+        }
+    }
+
+    fn python_protocol_fixture(code: &str) -> Option<Vec<String>> {
+        let executable = ["python3", "python"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })?;
+        Some(vec![
+            executable.to_string(),
+            "-u".to_string(),
+            "-c".to_string(),
+            code.to_string(),
+        ])
+    }
+
+    #[cfg(windows)]
+    fn powershell_single_quoted(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    #[cfg(not(windows))]
+    fn shell_single_quoted(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    #[test]
+    fn command_program_exchanges_one_json_line() {
+        let response = r#"{"schema":"pentect.plugin.v1","id":42,"type":"result","action":"next"}"#;
+        let program = CommandProgram::new(
+            command_fixture(response),
+            std::env::current_dir().unwrap(),
+            4096,
+        )
+        .unwrap();
+        let output = program
+            .invoke(br#"{"id":42}"#, Duration::from_secs(5), "fixture")
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&output).unwrap()["id"], 42);
+    }
+
+    #[test]
+    fn command_program_enforces_deadline_and_output_limit() {
+        let timeout = CommandProgram::new(
+            sleeping_command_fixture(),
+            std::env::current_dir().unwrap(),
+            4096,
+        )
+        .unwrap()
+        .invoke(b"{}", Duration::from_millis(20), "fixture")
+        .unwrap_err();
+        assert!(timeout.contains("timed out"), "{timeout}");
+
+        let oversized = CommandProgram::new(
+            command_fixture(&"x".repeat(64)),
+            std::env::current_dir().unwrap(),
+            16,
+        )
+        .unwrap()
+        .invoke(b"{}", Duration::from_secs(15), "fixture")
+        .unwrap_err();
+        assert!(oversized.contains("exceeds its limit"), "{oversized}");
+    }
+
+    #[test]
+    fn command_program_rejects_partial_lines_and_crashes() {
+        let partial = CommandProgram::new(
+            incomplete_command_fixture(),
+            std::env::current_dir().unwrap(),
+            4096,
+        )
+        .unwrap()
+        .invoke(b"{}", Duration::from_secs(5), "fixture")
+        .unwrap_err();
+        assert!(partial.contains("incomplete protocol line"), "{partial}");
+
+        let crash = CommandProgram::new(
+            crashing_command_fixture(),
+            std::env::current_dir().unwrap(),
+            4096,
+        )
+        .unwrap()
+        .invoke(b"{}", Duration::from_secs(5), "fixture")
+        .unwrap_err();
+        assert!(crash.contains("closed stdout"), "{crash}");
+    }
+
+    #[test]
+    fn command_session_stop_reaps_the_child() {
+        let mut session = CommandSession::start(
+            &sleeping_command_fixture(),
+            &std::env::current_dir().unwrap(),
+            4096,
+            "fixture",
+        )
+        .unwrap();
+        session.stop();
+        assert!(session.child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn command_protocol_rejects_a_wrong_response_id() {
+        let Some(command) = python_protocol_fixture(
+            "import json,sys; r=json.loads(sys.stdin.readline()); print(json.dumps({'schema':'pentect.plugin.v1','id':r['id']+1,'type':'result','action':'next'}), flush=True)",
+        ) else {
+            return;
+        };
+        let plugin = PluginBinary {
+            name: "wrong-id".to_string(),
+            program: PluginProgram::Command(
+                CommandProgram::new(command, std::env::current_dir().unwrap(), 4096).unwrap(),
+            ),
+            hooks: BTreeSet::from([MiddlewareStage::Inspect]),
+            required: true,
+            command_config: Some(json!({})),
+            timeout: Duration::from_secs(5),
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_output_bytes: 4096,
+            max_spans: DEFAULT_MAX_SPANS,
+        };
+        let error = plugin
+            .invoke_bounded(
+                MiddlewareStage::Inspect,
+                &json!({"kind": "text", "text": "safe"}),
+                None,
+                &mut PluginChainBudget::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("mismatched protocol response"), "{error}");
+    }
+
+    fn invalid_command_plugin(required: bool) -> PluginBinary {
+        PluginBinary {
+            name: "invalid-command".to_string(),
+            program: PluginProgram::Command(
+                CommandProgram::new(
+                    command_fixture("not-json"),
+                    std::env::current_dir().unwrap(),
+                    4096,
+                )
+                .unwrap(),
+            ),
+            hooks: BTreeSet::from([MiddlewareStage::Inspect]),
+            required,
+            command_config: Some(json!({})),
+            timeout: Duration::from_secs(5),
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_output_bytes: 4096,
+            max_spans: DEFAULT_MAX_SPANS,
+        }
+    }
+
+    #[test]
+    fn required_command_failure_blocks_and_optional_failure_marks_partial_coverage() {
+        let required = PluginMiddleware {
+            plugins: vec![invalid_command_plugin(true)],
+        };
+        let error = match required.detect_spans(&Input::text("safe"), None) {
+            Ok(_) => panic!("required invalid command unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.contains("invalid JSON"), "{error}");
+
+        let optional = PluginMiddleware {
+            plugins: vec![invalid_command_plugin(false)],
+        };
+        let result = optional.detect_spans(&Input::text("safe"), None).unwrap();
+        assert_eq!(result.coverage, MiddlewareCoverage::Partial);
+        assert!(result.spans.is_empty());
+    }
+
+    #[test]
+    fn command_plugin_runs_end_to_end_with_approval_and_file_lock() {
+        use sha2::Digest as _;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pentect-command-e2e-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = format!("command-e2e-{nonce}");
+        let manifest = root.join("plugin.toml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ncommand = [\"python\", \"{{plugin}}/server.py\"]\nhooks = [\"inspect\"]\nrequired = true\n"
+            ),
+        )
+        .unwrap();
+        let script = root.join("server.py");
+        std::fs::write(
+            &script,
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    label = request.get("config", {}).get("label", "TOKEN")
+    response = {"schema":"pentect.plugin.v1","id":request["id"],"type":"result","action":"next","spans":[{"start":0,"end":6,"label":label,"category":"secret","confidence":"high"}]}
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+"#,
+        )
+        .unwrap();
+        let dirs = plugin_runtime_dirs_for_manifest(&name, &manifest).unwrap();
+        std::fs::write(&dirs.config_file, "label = \"CONFIGURED\"\n").unwrap();
+        let manifest_hash = data_encoding::HEXLOWER
+            .encode(&sha2::Sha256::digest(std::fs::read(&manifest).unwrap()));
+        let script_hash =
+            data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(std::fs::read(&script).unwrap()));
+        let executable = toml::Value::String(
+            resolve_command_executable("python")
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let command_lock = format!(
+            "schema = \"pentect.plugin-command-lock.v1\"\nexecutable = {executable}\n\n[[file]]\npath = \"server.py\"\nsha256 = \"{script_hash}\"\n"
+        );
+        std::fs::write(dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE), &command_lock).unwrap();
+        let command_lock_sha256 =
+            data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(command_lock.as_bytes()));
+        std::fs::write(
+            dirs.data_dir.join(PLUGIN_APPROVAL_FILE),
+            format!(
+                "schema = \"pentect.plugin-approval.v1\"\nmanifest_sha256 = \"{manifest_hash}\"\nhooks = [\"inspect\"]\ncommand_lock_sha256 = \"{command_lock_sha256}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let middleware = PluginMiddleware::from_paths([manifest.clone()]).unwrap();
+        let result = middleware
+            .detect_spans(&Input::text("SECRET"), None)
+            .unwrap();
+        assert_eq!(result.spans.len(), 1);
+        assert_eq!(result.spans[0].range, ByteRange::new(0, 6));
+        assert_eq!(result.spans[0].label, "CONFIGURED");
+
+        drop(middleware);
+        std::fs::write(&script, "print('changed')\n").unwrap();
+        let error = PluginMiddleware::from_paths([manifest.clone()]).unwrap_err();
+        assert!(error.contains("changed after setup"), "{error}");
+
+        let _ = std::fs::remove_dir_all(dirs.data_dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn parses_all_public_hooks() {
         for hook in MiddlewareStage::ALL {
@@ -2058,7 +3858,7 @@ mod tests {
             String::from_utf8_lossy(output).replace('"', "\\22")
         );
         let bytes = wat::parse_str(wat).unwrap();
-        let program = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap();
+        let program = WasmProgram::load_bytes(&bytes, "fixture", None, None, None).unwrap();
         let result = program
             .invoke(
                 MiddlewareStage::Inspect,
@@ -2084,7 +3884,7 @@ mod tests {
             )"#,
         )
         .unwrap();
-        let program = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap();
+        let program = WasmProgram::load_bytes(&bytes, "fixture", None, None, None).unwrap();
         let error = program
             .invoke(
                 MiddlewareStage::Inspect,
@@ -2106,7 +3906,7 @@ mod tests {
              (func (export \"pentect_inspect\") (param i32 i32) (result i64) i64.const 0))"
         ))
         .unwrap();
-        let error = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap_err();
+        let error = WasmProgram::load_bytes(&bytes, "fixture", None, None, None).unwrap_err();
         assert!(error.contains("exceeds the limit"), "{error}");
         assert!(inspect_wasm_plugin_hooks(&bytes).is_err());
     }
@@ -2148,7 +3948,7 @@ mod tests {
             )"#,
         )
         .unwrap();
-        let denied = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap_err();
+        let denied = WasmProgram::load_bytes(&bytes, "fixture", None, None, None).unwrap_err();
         assert!(denied.contains("unapproved host function"), "{denied}");
 
         let policy = NetworkPolicy {
@@ -2164,7 +3964,7 @@ mod tests {
             max_response_bytes: 1024,
             max_requests: 1,
         };
-        WasmProgram::load_bytes(&bytes, "fixture", Some(policy), None).unwrap();
+        WasmProgram::load_bytes(&bytes, "fixture", Some(policy), None, None).unwrap();
     }
 
     #[test]
@@ -2181,7 +3981,7 @@ mod tests {
             )"#,
         )
         .unwrap();
-        let denied = WasmProgram::load_bytes(&bytes, "fixture", None, None).unwrap_err();
+        let denied = WasmProgram::load_bytes(&bytes, "fixture", None, None, None).unwrap_err();
         assert!(denied.contains("unapproved host function"), "{denied}");
         let config = toml::Value::Table(toml::Table::from_iter([(
             "model".to_string(),
@@ -2194,7 +3994,146 @@ mod tests {
             config_value(&config, "model.threshold").and_then(toml::Value::as_float),
             Some(0.8)
         );
-        WasmProgram::load_bytes(&bytes, "fixture", None, Some(config)).unwrap();
+        WasmProgram::load_bytes(&bytes, "fixture", None, Some(config), None).unwrap();
+    }
+
+    #[test]
+    fn wasm_host_import_requires_permissions_and_file_access_is_exact() {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "pentect:host" "request"
+                    (func $request (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "pentect_alloc") (param i32) (result i32) (i32.const 1024))
+                (func (export "pentect_inspect") (param i32 i32) (result i64) (i64.const 0)))"#,
+        )
+        .unwrap();
+        let denied = WasmProgram::load_bytes(&bytes, "fixture", None, None, None).unwrap_err();
+        assert!(denied.contains("unapproved host function"), "{denied}");
+
+        let root = std::env::temp_dir().join(format!(
+            "pentect-plugin-host-permissions-{}",
+            std::process::id()
+        ));
+        let project = root.join("project");
+        let plugin = root.join("plugin");
+        let storage = root.join("storage");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(project.join("allowed.txt"), "visible").unwrap();
+        std::fs::write(project.join("denied.txt"), "hidden").unwrap();
+        let requested_command = vec!["rustc".to_string(), "--version".to_string()];
+        let mut resolved_command = requested_command.clone();
+        resolved_command[0] = resolve_command_executable("rustc")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let policy = PermissionPolicy {
+            name: "fixture".to_string(),
+            read: vec![PathPermission {
+                scope: PathScope::Project,
+                relative: PathBuf::from("allowed.txt"),
+                recursive: false,
+            }],
+            write: vec![PathPermission {
+                scope: PathScope::Project,
+                relative: PathBuf::from("written.txt"),
+                recursive: false,
+            }],
+            env: BTreeSet::from(["PATH".to_string()]),
+            run: BTreeMap::from([(requested_command.clone(), resolved_command)]),
+            storage: true,
+            project_root: project.canonicalize().unwrap(),
+            plugin_root: plugin.canonicalize().unwrap(),
+            storage_root: storage.canonicalize().unwrap(),
+        };
+        WasmProgram::load_bytes(&bytes, "fixture", None, None, Some(policy.clone())).unwrap();
+        let allowed = perform_host_request(
+            &policy,
+            HostRequest::FileRead {
+                path: "project:allowed.txt".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(allowed.ok);
+        assert_eq!(allowed.value, Some(Value::String("visible".to_string())));
+        let denied = perform_host_request(
+            &policy,
+            HostRequest::FileRead {
+                path: "project:denied.txt".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(!denied.ok);
+
+        let environment = perform_host_request(
+            &policy,
+            HostRequest::EnvRead {
+                name: "PATH".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(environment.ok);
+        let denied_environment = perform_host_request(
+            &policy,
+            HostRequest::EnvRead {
+                name: "PENTECT_UNAPPROVED".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(!denied_environment.ok);
+
+        let written = perform_host_request(
+            &policy,
+            HostRequest::FileWrite {
+                path: "project:written.txt".to_string(),
+                data: "generated".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(written.ok);
+        assert_eq!(
+            std::fs::read_to_string(project.join("written.txt")).unwrap(),
+            "generated"
+        );
+
+        let stored = perform_host_request(
+            &policy,
+            HostRequest::StorageSet {
+                key: "state".to_string(),
+                value: json!({"count": 1}),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(stored.ok);
+        let loaded = perform_host_request(
+            &policy,
+            HostRequest::StorageGet {
+                key: "state".to_string(),
+            },
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(loaded.value, Some(json!({"count": 1})));
+        let command = perform_host_request(
+            &policy,
+            HostRequest::CommandRun {
+                argv: requested_command,
+                stdin: String::new(),
+            },
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(command.ok);
+        let denied_command = perform_host_request(
+            &policy,
+            HostRequest::CommandRun {
+                argv: vec!["rustc".to_string(), "-Vv".to_string()],
+                stdin: String::new(),
+            },
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(!denied_command.ok);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
