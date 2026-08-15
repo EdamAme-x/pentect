@@ -114,7 +114,7 @@ fn resolve_with_recoveries(recoveries: &[Recovery], text: &str) -> String {
     out
 }
 
-fn is_reserved_child_env_name(name: &str) -> bool {
+pub(crate) fn is_reserved_child_env_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     is_pentect_control_env_name(&lower)
         || matches!(

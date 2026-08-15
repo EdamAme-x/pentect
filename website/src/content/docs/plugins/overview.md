@@ -5,7 +5,8 @@ description: Add your own detection rules and request checks to Pentect.
 
 A plugin can find sensitive text or change how Pentect handles a request. You
 can write a small regex plugin with only `plugin.toml`. For more control, write
-a WebAssembly (Wasm) plugin with the Rust SDK.
+a WebAssembly (Wasm) plugin with the Rust SDK. A local model or existing tool
+can use the language-neutral Command protocol.
 
 Plugins are not enabled by default. You choose each plugin and review its
 access before you use it.
@@ -18,10 +19,13 @@ already included.
 
 | Type | Use it for | Files you write |
 | --- | --- | --- |
-| Regex | Company IDs, internal names, or tokens with a clear pattern | `plugin.toml` |
-| Wasm | Context-aware checks, request changes, local model adapters, or custom policy | `plugin.toml`, Wasm source, and tests |
+| Manifest | Company IDs, internal names, or tokens with a clear regex | `plugin.toml` |
+| Wasm | Context-aware checks, request changes, local model integrations, or custom policy | `plugin.toml`, Wasm source, and tests |
+| Command | Python, native tools, local models, or Docker | `plugin.toml` and an executable speaking JSONL |
 
-Start with regex. Move to Wasm only when a pattern is not enough.
+Start with Manifest. Use Wasm when the plugin needs sandboxed logic or approved
+host access. Use Command when the workload already needs Python, native code,
+or Docker.
 
 ## Find and install plugins
 
@@ -53,7 +57,7 @@ record, and asks you to approve its hooks and network access.
 
 The `@VERSION` suffix selects a tag or full commit. When an older unversioned
 source uses `main`, Pentect treats the lockfile's content hashes—not `main`—as
-its runtime identity. Only `plugins update` can replace those locked bytes.
+its approved identity. Only `plugins update` can replace those locked bytes.
 
 Released Wasm plugins need
 [GitHub CLI](https://cli.github.com/) v2.51.0 or newer for build-record checks.
@@ -100,13 +104,18 @@ does not receive arbitrary file bytes.
 
 A Wasm plugin does not inherit the user's environment or filesystem. Settings
 added with `pentect plugins config` are available only when the plugin asks for
-that key. Approved HTTP requests are made by Pentect, not by a raw socket in
-the plugin.
+that key. File, environment, storage, command, and HTTP access must be declared
+and is performed by Pentect.
+
+A Command plugin is a native process. It receives one request and returns one
+response per JSONL line. It runs with the user's OS permissions, so Pentect
+shows its exact argv, files, and hooks before activation.
 
 ## Sandbox and approval
 
 Wasm plugins run without WASI. They cannot directly read files, read environment
-variables, start programs, or open network sockets.
+variables, start programs, or open network sockets. Optional `[permissions]`
+entries expose only the listed operations through the Pentect host.
 
 A plugin can ask Pentect to make an HTTP request for it. The manifest must list
 the exact origins and methods. Pentect shows this access during setup. Private
@@ -115,7 +124,9 @@ addresses and plain HTTP need extra settings and extra approval.
 Pentect links approval to the manifest hash, Wasm hash, release, and exported
 hooks. If any of these change, you must review the plugin again.
 
-Native executable plugins and setup scripts are not supported.
+Command plugins do not receive the Wasm sandbox. Their downloaded files are
+hash-locked, their argv is never passed through a shell, and access changes
+require approval. Setup scripts are not supported.
 
 ## Manage installed plugins
 
@@ -138,5 +149,6 @@ code from the plugin.
 - Copy complete patterns from [Plugin recipes](/plugins/recipes/).
 - See [Plugin manifest](/plugins/manifest/) for every `plugin.toml` field.
 - See [Rust SDK](/plugins/sdk/) for hooks and context methods.
+- See [Command plugins](/plugins/command/) for Python, JavaScript, native, and Docker integrations.
 - See [Test and publish](/plugins/publish/) for releases and updates.
 - Browse [Official plugins](/plugins/official/), including OpenAI Privacy Filter.

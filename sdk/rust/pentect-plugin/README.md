@@ -59,5 +59,5 @@ The module has no WASI, file, environment, process, or raw socket access.
 Pentect provides settings and HTTP only after the user approves them.
 
 See the first-party
-[OpenAI Privacy Filter adapter](https://github.com/EdamAme-x/pentect/tree/main/plugins/openai-privacy-filter)
+[OpenAI Privacy Filter plugin](https://github.com/EdamAme-x/pentect/tree/main/plugins/openai-privacy-filter)
 for a complete local-service example.

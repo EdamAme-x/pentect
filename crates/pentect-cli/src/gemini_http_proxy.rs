@@ -434,7 +434,7 @@ fn protect_request_body(
         }
         return Err(error);
     }
-    if endpoint.is_model_response() && crate::claude_http_proxy::value_contains_handle(&value) {
+    if endpoint.is_model_response() {
         inject_handle_contract(&mut value)?;
     }
     serde_json::to_vec(&value)

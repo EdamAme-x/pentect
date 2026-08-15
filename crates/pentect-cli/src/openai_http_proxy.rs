@@ -680,9 +680,7 @@ fn protect_openai_request_body(
             local_response: None,
         });
     }
-    if crate::claude_http_proxy::value_contains_handle(&value) {
-        inject_handle_contract(&mut value);
-    }
+    inject_handle_contract(&mut value);
     serde_json::to_vec(&value)
         .map(|body| ProtectedJsonBody {
             body: Bytes::from(body),

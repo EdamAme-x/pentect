@@ -5,10 +5,11 @@ name = "example-regex"
 description = "One-file example for regex detection."
 source = "github:@EdamAme-x/pentect/plugins/example-regex"
 publisher = "EdamAme-x/pentect"
+form = "manifest"
 
 [[plugin]]
 name = "openai-privacy-filter"
 description = "Local PII detection with OpenAI Privacy Filter."
 source = "github:@EdamAme-x/pentect/plugins/openai-privacy-filter"
 publisher = "EdamAme-x/pentect"
-runtime = "wasm"
+form = "command"

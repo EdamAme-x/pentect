@@ -169,7 +169,8 @@ a missing key with invalid JSON.
 
 ## Make an approved HTTP request
 
-First list the origin and method in `plugin.toml`. Then ask the Pentect host to
+First list the origin and method under `[permissions.network]` in `plugin.toml`.
+Then ask the Pentect host to
 make the request:
 
 ```rust
@@ -189,6 +190,23 @@ socket.
 `response.error` before parsing the body. Set the response capacity no larger
 than your manifest limit.
 
+## Use approved host access
+
+Declare Wasm access under `[permissions]`, then use the matching context
+method. Every method is available on every hook context.
+
+```rust
+let policy = c.read("project:config/policy.json")?;
+let endpoint = c.env("POLICY_URL")?;
+c.storage_set("last-policy", &policy)?;
+let previous: Option<String> = c.storage_get("last-policy")?;
+let result = c.run(&["git", "status", "--porcelain"], "")?;
+```
+
+`read` and `write` use UTF-8 text. Storage accepts any Serde JSON value.
+`run` returns `status`, `success`, `stdout`, and `stderr`. A path or argv that
+does not exactly match the approved manifest is rejected by the host.
+
 ## Errors and required plugins
 
 Returning `Err` marks the hook as failed. With `required = true`, the action
@@ -206,6 +224,7 @@ The main public types are:
 - `Text` and `FileInfo`
 - `Finding`, `Category`, and `Confidence`
 - `HttpRequest` and `HttpResponse`
+- `CommandOutput`
 - `PluginResult`
 
 The SDK source and examples live in

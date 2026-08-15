@@ -109,6 +109,57 @@ macro_rules! context {
             ) -> Result<HttpResponse, Box<dyn std::error::Error>> {
                 http_request(request, response_capacity)
             }
+
+            pub fn env(&self, name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+                host_value(serde_json::json!({"operation": "env_read", "name": name}))
+            }
+
+            pub fn read(&self, path: &str) -> Result<String, Box<dyn std::error::Error>> {
+                host_value(serde_json::json!({"operation": "file_read", "path": path}))
+            }
+
+            pub fn write(
+                &self,
+                path: &str,
+                data: &str,
+            ) -> Result<bool, Box<dyn std::error::Error>> {
+                host_value(serde_json::json!({
+                    "operation": "file_write",
+                    "path": path,
+                    "data": data,
+                }))
+            }
+
+            pub fn storage_get<T: DeserializeOwned>(
+                &self,
+                key: &str,
+            ) -> Result<Option<T>, Box<dyn std::error::Error>> {
+                host_value(serde_json::json!({"operation": "storage_get", "key": key}))
+            }
+
+            pub fn storage_set<T: Serialize>(
+                &self,
+                key: &str,
+                value: &T,
+            ) -> Result<bool, Box<dyn std::error::Error>> {
+                host_value(serde_json::json!({
+                    "operation": "storage_set",
+                    "key": key,
+                    "value": value,
+                }))
+            }
+
+            pub fn run(
+                &self,
+                argv: &[&str],
+                stdin: &str,
+            ) -> Result<CommandOutput, Box<dyn std::error::Error>> {
+                host_value(serde_json::json!({
+                    "operation": "command_run",
+                    "argv": argv,
+                    "stdin": stdin,
+                }))
+            }
         }
 
         impl __private::HookContext for $name {
@@ -305,6 +356,22 @@ pub struct HttpResponse {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CommandOutput {
+    pub status: Option<i32>,
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+struct HostResponse {
+    ok: bool,
+    value: Option<Value>,
+    error: Option<String>,
+}
+
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "pentect:http")]
 extern "C" {
@@ -315,6 +382,61 @@ extern "C" {
         response_ptr: i32,
         response_capacity: i32,
     ) -> i32;
+}
+
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "pentect:host")]
+extern "C" {
+    #[link_name = "request"]
+    fn pentect_host_request(
+        request_ptr: i32,
+        request_len: i32,
+        response_ptr: i32,
+        response_capacity: i32,
+    ) -> i32;
+}
+
+#[cfg(target_arch = "wasm32")]
+fn host_value<T: DeserializeOwned>(request: Value) -> Result<T, Box<dyn std::error::Error>> {
+    const INITIAL_CAPACITY: usize = 4096;
+    const MAX_CAPACITY: usize = 4 * 1024 * 1024;
+    let encoded = serde_json::to_vec(&request)?;
+    let mut output = vec![0_u8; INITIAL_CAPACITY];
+    loop {
+        let len = unsafe {
+            pentect_host_request(
+                encoded.as_ptr() as i32,
+                i32::try_from(encoded.len())?,
+                output.as_mut_ptr() as i32,
+                i32::try_from(output.len())?,
+            )
+        };
+        if len < 0 {
+            return Err(format!("Pentect host request failed with code {len}").into());
+        }
+        let len = usize::try_from(len)?;
+        if len > output.len() {
+            if len > MAX_CAPACITY {
+                return Err("Pentect host response exceeds its limit".into());
+            }
+            output.resize(len, 0);
+            continue;
+        }
+        output.truncate(len);
+        let response: HostResponse = serde_json::from_slice(&output)?;
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "operation_failed".to_string())
+                .into());
+        }
+        return Ok(serde_json::from_value(response.value.unwrap_or(Value::Null))?);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_value<T: DeserializeOwned>(_request: Value) -> Result<T, Box<dyn std::error::Error>> {
+    Err("Pentect host access is only available inside WebAssembly plugins".into())
 }
 
 #[cfg(target_arch = "wasm32")]

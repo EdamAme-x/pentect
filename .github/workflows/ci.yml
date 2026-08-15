@@ -98,7 +98,7 @@ jobs:
               - 'crates/pentect-runtime/src/plugin_middleware.rs'
               - 'plugins/**'
               - 'protocol/**'
-              - 'sdk/rust/pentect-plugin/**'
+              - 'sdk/**'
             apps:
               - '.github/workflows/ci.yml'
               - '.github/actions/rust-toolchain/**'
@@ -185,9 +185,13 @@ jobs:
       - name: Check plugin SDK
         if: needs.changes.outputs.plugins == 'true'
         run: cargo check --manifest-path sdk/rust/pentect-plugin/Cargo.toml --target wasm32-unknown-unknown
-      - name: Check official OpenAI Privacy Filter plugin
+      - name: Test Command plugin SDKs
         if: needs.changes.outputs.plugins == 'true'
-        run: cargo check --manifest-path plugins/openai-privacy-filter/Cargo.toml --locked --target wasm32-unknown-unknown
+        env:
+          PYTHONPATH: sdk/python
+        run: |
+          python -m unittest discover sdk/python/tests
+          node --test sdk/javascript/test.mjs
       - name: Test OpenAI Privacy Filter bridge
         if: needs.changes.outputs.plugins == 'true'
         run: python -m unittest discover plugins/openai-privacy-filter/tests

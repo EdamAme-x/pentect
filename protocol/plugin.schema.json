@@ -5,12 +5,16 @@
   "oneOf": [
     {
       "type": "object",
-      "required": ["schema", "id", "payload"],
+      "required": ["schema", "id", "hook", "payload"],
       "properties": {
         "schema": { "const": "pentect.plugin.v1" },
         "id": { "type": "integer", "minimum": 1 },
+        "hook": {
+          "enum": ["prepare", "inspect", "finalize", "request", "response", "tool_call", "file"]
+        },
         "payload": {},
-        "metadata": {}
+        "metadata": {},
+        "config": { "type": ["object", "null"] }
       },
       "additionalProperties": false
     },

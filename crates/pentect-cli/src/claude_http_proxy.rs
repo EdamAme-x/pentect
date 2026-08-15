@@ -756,7 +756,7 @@ fn protect_anthropic_request_body(
             local_response: None,
         });
     }
-    inject_handle_contract_if_needed(&mut value);
+    inject_handle_contract(&mut value);
     match serde_json::to_vec(&value) {
         Ok(protected) => Ok(ProtectedJsonBody {
             body: Bytes::from(protected),
@@ -884,37 +884,6 @@ fn inject_handle_contract(value: &mut Value) {
         // an otherwise valid request unusable.
         Some(_) => {}
     }
-}
-
-fn inject_handle_contract_if_needed(value: &mut Value) {
-    if value_contains_handle(value) {
-        inject_handle_contract(value);
-    }
-}
-
-pub(crate) fn value_contains_handle(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text_contains_handle(text),
-        Value::Array(values) => values.iter().any(value_contains_handle),
-        Value::Object(object) => object.values().any(value_contains_handle),
-        _ => false,
-    }
-}
-
-fn text_contains_handle(text: &str) -> bool {
-    let mut offset = 0usize;
-    while let Some(start_rel) = text[offset..].find("<<") {
-        let start = offset + start_rel;
-        let Some(end_rel) = text[start + 2..].find(">>") else {
-            return false;
-        };
-        let end = start + 2 + end_rel + 2;
-        if pentect_core::parse_placeholder(&text[start..end]).is_ok() {
-            return true;
-        }
-        offset = end;
-    }
-    false
 }
 
 type UpstreamByteStream =
@@ -1870,7 +1839,7 @@ fn is_free_form_shell_tool(name: Option<&str>) -> bool {
     name.is_some_and(|name| {
         matches!(
             name.to_ascii_lowercase().as_str(),
-            "bash" | "shell" | "powershell" | "pwsh" | "cmd"
+            "bash" | "shell" | "powershell" | "pwsh" | "cmd" | "exec_command" | "shell_command"
         )
     })
 }
@@ -1881,28 +1850,148 @@ where
 {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find("<<") {
+    let mut environment = Vec::new();
+    while let Some((start, end)) = next_shell_secret_reference(rest) {
         out.push_str(&rest[..start]);
-        let candidate = &rest[start..];
-        let Some(relative_end) = candidate.find(">>") else {
-            out.push_str(candidate);
-            return Ok(out);
-        };
-        let end = relative_end + 2;
-        let handle = &candidate[..end];
-        let resolved = resolve(handle)?;
-        if resolved == handle || shell_safe_secret_token(&resolved) {
+        let reference = &rest[start..end];
+        let resolved = resolve(reference)?;
+        if resolved == reference {
+            out.push_str(&resolved);
+        } else if let Some((syntax, name)) = shell_environment_reference(reference) {
+            environment.push((syntax, name.to_string(), resolved));
+            out.push_str(reference);
+        } else if shell_safe_secret_token(&resolved) {
             out.push_str(&resolved);
         } else {
             eprintln!(
-                "[pentect] shell tool handle left unresolved: represented value is not shell-safe"
+                "[pentect] shell tool secret reference left unresolved: represented value is not shell-safe"
             );
-            out.push_str(handle);
+            out.push_str(reference);
         }
-        rest = &candidate[end..];
+        rest = &rest[end..];
     }
     out.push_str(rest);
-    Ok(out)
+    Ok(inject_shell_environment(out, environment))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellEnvironmentSyntax {
+    PowerShell,
+    Posix,
+    Cmd,
+}
+
+fn shell_environment_reference(reference: &str) -> Option<(ShellEnvironmentSyntax, &str)> {
+    if reference
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"$env:"))
+        && reference.len() > 5
+    {
+        return Some((ShellEnvironmentSyntax::PowerShell, &reference[5..]));
+    }
+    if let Some(name) = reference
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        return Some((ShellEnvironmentSyntax::Posix, name));
+    }
+    if let Some(name) = reference.strip_prefix('$') {
+        return Some((ShellEnvironmentSyntax::Posix, name));
+    }
+    reference
+        .strip_prefix('%')
+        .and_then(|value| value.strip_suffix('%'))
+        .map(|name| (ShellEnvironmentSyntax::Cmd, name))
+}
+
+fn inject_shell_environment(
+    command: String,
+    bindings: Vec<(ShellEnvironmentSyntax, String, String)>,
+) -> String {
+    let Some(syntax) = bindings.first().map(|binding| binding.0) else {
+        return command;
+    };
+    let mut unique = std::collections::BTreeMap::new();
+    for (binding_syntax, name, value) in bindings {
+        if binding_syntax == syntax {
+            unique.insert(name.to_ascii_lowercase(), (name, value));
+        }
+    }
+    match syntax {
+        ShellEnvironmentSyntax::PowerShell => {
+            let prefix = unique
+                .into_values()
+                .map(|(name, value)| format!("$env:{name} = '{}'; ", value.replace('\'', "''")))
+                .collect::<String>();
+            format!("{prefix}{command}")
+        }
+        ShellEnvironmentSyntax::Posix => {
+            let assignments = unique
+                .into_values()
+                .map(|(name, value)| format!("{name}='{}'", value.replace('\'', "'\\''")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("export {assignments}; {command}")
+        }
+        ShellEnvironmentSyntax::Cmd => {
+            let assignments = unique
+                .into_values()
+                .filter(|(_, value)| shell_safe_secret_token(value))
+                .map(|(name, value)| format!("set \"{name}={value}\" && "))
+                .collect::<String>();
+            format!("{assignments}{command}")
+        }
+    }
+}
+
+fn next_shell_secret_reference(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start..].starts_with(b"<<") {
+            let close = text[start + 2..].find(">>")?;
+            return Some((start, start + 2 + close + 2));
+        }
+        if bytes[start] == b'$' {
+            if bytes
+                .get(start..start.saturating_add(5))
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"$env:"))
+            {
+                let name_start = start + 5;
+                let end = shell_env_name_end(bytes, name_start);
+                if end > name_start {
+                    return Some((start, end));
+                }
+            } else if bytes.get(start + 1) == Some(&b'{') {
+                let name_start = start + 2;
+                let end = shell_env_name_end(bytes, name_start);
+                if end > name_start && bytes.get(end) == Some(&b'}') {
+                    return Some((start, end + 1));
+                }
+            } else {
+                let name_start = start + 1;
+                let end = shell_env_name_end(bytes, name_start);
+                if end > name_start {
+                    return Some((start, end));
+                }
+            }
+        }
+        if bytes[start] == b'%' {
+            let name_start = start + 1;
+            let end = shell_env_name_end(bytes, name_start);
+            if end > name_start && bytes.get(end) == Some(&b'%') {
+                return Some((start, end + 1));
+            }
+        }
+    }
+    None
+}
+
+fn shell_env_name_end(bytes: &[u8], mut end: usize) -> usize {
+    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+        end += 1;
+    }
+    end
 }
 
 fn shell_safe_secret_token(value: &str) -> bool {
@@ -2752,13 +2841,14 @@ mod tests {
     }
 
     #[test]
-    fn handle_contract_is_added_only_when_a_handle_exists() {
+    fn handle_contract_is_added_to_every_protected_request() {
         let mut clean = serde_json::json!({
             "system": "existing",
             "messages": [{"role": "user", "content": "hello"}]
         });
-        inject_handle_contract_if_needed(&mut clean);
-        assert_eq!(clean["system"], "existing");
+        inject_handle_contract(&mut clean);
+        assert_eq!(clean["system"][0]["text"], "existing");
+        assert_eq!(clean["system"][1]["text"], HANDLE_CONTRACT);
 
         let mut protected = serde_json::json!({
             "system": "existing",
@@ -2767,7 +2857,7 @@ mod tests {
                 "content": "use <<SECRET_0123456789abcdef>>"
             }]
         });
-        inject_handle_contract_if_needed(&mut protected);
+        inject_handle_contract(&mut protected);
         assert_eq!(protected["system"][0]["text"], "existing");
         assert_eq!(protected["system"][1]["text"], HANDLE_CONTRACT);
     }
@@ -3037,6 +3127,79 @@ mod tests {
         .unwrap();
         assert!(restored.contains("<<SECRET_danger>>"));
         assert!(!restored.contains(dangerous_value));
+
+        let env_name = "PENTECT_STRIPE_SECRET_KEY_a81f42c7d933";
+        let mut env = |text: &str| {
+            Ok(match text {
+                value
+                    if matches!(
+                        value,
+                        "$env:PENTECT_STRIPE_SECRET_KEY_a81f42c7d933"
+                            | "${PENTECT_STRIPE_SECRET_KEY_a81f42c7d933}"
+                            | "$PENTECT_STRIPE_SECRET_KEY_a81f42c7d933"
+                            | "%PENTECT_STRIPE_SECRET_KEY_a81f42c7d933%"
+                    ) =>
+                {
+                    "sk_live_51Qx7K9mN2vR4aBcD8eF".to_string()
+                }
+                _ => text.to_string(),
+            })
+        };
+        for (reference, expected_prefix) in [
+            (
+                format!("$env:{env_name}"),
+                format!("$env:{env_name} = 'sk_live_51Qx7K9mN2vR4aBcD8eF'; "),
+            ),
+            (
+                format!("${{{env_name}}}"),
+                format!("export {env_name}='sk_live_51Qx7K9mN2vR4aBcD8eF'; "),
+            ),
+            (
+                format!("${env_name}"),
+                format!("export {env_name}='sk_live_51Qx7K9mN2vR4aBcD8eF'; "),
+            ),
+            (
+                format!("%{env_name}%"),
+                format!("set \"{env_name}=sk_live_51Qx7K9mN2vR4aBcD8eF\" && "),
+            ),
+        ] {
+            let restored = resolve_shell_text_safely(
+                &format!("curl -u {reference}: https://api.stripe.com"),
+                &mut env,
+            )
+            .unwrap();
+            assert!(
+                restored.contains("sk_live_51Qx7K9mN2vR4aBcD8eF"),
+                "{restored}"
+            );
+            assert!(restored.starts_with(&expected_prefix), "{restored}");
+            assert!(restored.contains(&reference), "{restored}");
+        }
+
+        let powershell = resolve_shell_text_safely(
+            &format!("[Text.Encoding]::UTF8.GetBytes($env:{env_name})"),
+            &mut env,
+        )
+        .unwrap();
+        assert!(
+            powershell.ends_with(&format!("[Text.Encoding]::UTF8.GetBytes($env:{env_name})")),
+            "{powershell}"
+        );
+
+        let codex = resolve_tool_input_json(
+            &format!(r#"{{"command":"[Text.Encoding]::UTF8.GetBytes($env:{env_name})"}}"#),
+            Some("exec_command"),
+            &mut env,
+        )
+        .unwrap();
+        let codex: Value = serde_json::from_str(&codex).unwrap();
+        let codex = codex["command"].as_str().unwrap();
+        assert!(
+            codex.starts_with(&format!(
+                "$env:{env_name} = 'sk_live_51Qx7K9mN2vR4aBcD8eF'; "
+            )),
+            "{codex}"
+        );
     }
 
     #[test]

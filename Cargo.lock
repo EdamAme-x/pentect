@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "pentect-cli"
-version = "0.0.31"
+version = "0.0.32"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -2393,6 +2393,7 @@ dependencies = [
  "hmac",
  "image",
  "jiff",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",

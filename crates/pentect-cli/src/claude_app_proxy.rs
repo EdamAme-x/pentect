@@ -1303,9 +1303,7 @@ fn protect_chat_request(
             local_response: None,
         });
     }
-    if crate::claude_http_proxy::value_contains_handle(&value) {
-        inject_chat_contract(&mut value);
-    }
+    inject_chat_contract(&mut value);
     let protected = serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|error| format!("could not encode protected Claude App Chat request: {error}"))?;

@@ -565,8 +565,7 @@ fn protect_request_body(
     if matches!(
         endpoint,
         CloudCodeEndpoint::GenerateContent | CloudCodeEndpoint::StreamGenerateContent
-    ) && crate::claude_http_proxy::value_contains_handle(&value)
-    {
+    ) {
         inject_handle_contract(&mut value)?;
     }
     let body = serde_json::to_vec(&value)

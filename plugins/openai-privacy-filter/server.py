@@ -1,18 +1,35 @@
 #!/usr/bin/env python3
-"""Local HTTP bridge between Pentect and OpenAI Privacy Filter."""
+"""OpenAI Privacy Filter as a Pentect Command plugin."""
 
 from __future__ import annotations
 
 import argparse
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import os
 from pathlib import Path
-import threading
+import sys
 from typing import Any
 
 MAX_REQUEST_BYTES = 1024 * 1024
-SCHEMA = "pentect.openai-privacy-filter.v1"
+PROTOCOL_SCHEMA = "pentect.plugin.v1"
+
+
+def _use_managed_python() -> None:
+    root = Path.home() / ".pentect" / "openai-privacy-filter" / "venv"
+    candidate = (
+        root / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else root / "bin" / "python"
+    )
+    if not candidate.is_file():
+        return
+    try:
+        current = Path(sys.executable).resolve()
+        managed = candidate.resolve()
+    except OSError:
+        return
+    if current != managed:
+        os.execv(str(managed), [str(managed), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def _byte_offset(text: str, character_offset: int) -> int:
@@ -21,7 +38,16 @@ def _byte_offset(text: str, character_offset: int) -> int:
     return len(text[:character_offset].encode("utf-8"))
 
 
-def inspect_text(redactor: Any, text: str) -> dict[str, object]:
+def _label(value: object) -> tuple[str, str]:
+    raw = str(value)
+    label = "".join(
+        character.upper() if character.isascii() and character.isalnum() else "_"
+        for character in raw
+    ).strip("_")
+    return (label or "PII", "secret" if raw.lower() == "secret" else "pii")
+
+
+def inspect_text(redactor: Any, text: str) -> list[dict[str, object]]:
     result = redactor.redact(text)
     if isinstance(result, str):
         raise TypeError("Privacy Filter must return structured output")
@@ -29,76 +55,68 @@ def inspect_text(redactor: Any, text: str) -> dict[str, object]:
         raise ValueError(result.warning)
     spans = []
     for span in result.detected_spans:
+        label, category = _label(span.label)
         spans.append(
             {
                 "start": _byte_offset(text, int(span.start)),
                 "end": _byte_offset(text, int(span.end)),
-                "label": str(span.label),
+                "label": label,
+                "category": category,
+                "confidence": "medium",
             }
         )
-    return {"schema": SCHEMA, "spans": spans}
+    return spans
 
 
-class FilterHandler(BaseHTTPRequestHandler):
-    server_version = "PentectOpenAIPrivacyFilter/1"
-    redactor: Any = None
-    inference_lock = threading.Lock()
+def handle_request(redactor: Any, request: object) -> dict[str, object]:
+    if not isinstance(request, dict):
+        raise ValueError("request must be an object")
+    request_id = request.get("id")
+    payload = request.get("payload")
+    if (
+        request.get("schema") != PROTOCOL_SCHEMA
+        or request.get("hook") != "inspect"
+        or not isinstance(request_id, int)
+        or not isinstance(payload, dict)
+        or not isinstance(payload.get("text"), str)
+    ):
+        raise ValueError("invalid Pentect plugin request")
+    return {
+        "schema": PROTOCOL_SCHEMA,
+        "id": request_id,
+        "type": "result",
+        "action": "next",
+        "spans": inspect_text(redactor, payload["text"]),
+    }
 
-    def do_GET(self) -> None:
-        if self.path != "/health":
-            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-            return
-        self._json(HTTPStatus.OK, {"schema": SCHEMA, "status": "ready"})
 
-    def do_POST(self) -> None:
-        if self.path != "/v1/inspect":
-            self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-            return
-        content_type = self.headers.get_content_type().lower()
-        if content_type != "application/json":
-            self._json(
-                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                {"error": "content_type_must_be_application_json"},
-            )
-            return
+def serve(redactor: Any) -> None:
+    for line in sys.stdin.buffer:
+        request_id: int | None = None
         try:
-            length = int(self.headers.get("content-length", "0"))
-        except ValueError:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_length"})
-            return
-        if length <= 0 or length > MAX_REQUEST_BYTES:
-            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "invalid_size"})
-            return
-        try:
-            payload = json.loads(self.rfile.read(length))
-            text = payload.get("text") if isinstance(payload, dict) else None
-            if not isinstance(text, str):
-                raise ValueError("text must be a string")
-            with self.inference_lock:
-                response = inspect_text(self.redactor, text)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
-            return
+            if len(line) > MAX_REQUEST_BYTES:
+                raise ValueError("request exceeds the plugin limit")
+            request = json.loads(line)
+            if isinstance(request, dict) and isinstance(request.get("id"), int):
+                request_id = request["id"]
+            response = handle_request(redactor, request)
         except Exception:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "inference_failed"})
-            return
-        self._json(HTTPStatus.OK, response)
-
-    def _json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.send_header("cache-control", "no-store")
-        self.send_header("x-content-type-options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: object) -> None:
-        print(f"[openai-privacy-filter] {format % args}")
+            response = {
+                "schema": PROTOCOL_SCHEMA,
+                "id": request_id,
+                "type": "result",
+                "action": "next",
+                "error": {"code": "inference_failed"},
+            }
+        encoded = json.dumps(
+            response, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        sys.stdout.buffer.write(encoded + b"\n")
+        sys.stdout.buffer.flush()
 
 
 def main() -> None:
+    _use_managed_python()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--checkpoint", type=Path)
@@ -106,23 +124,14 @@ def main() -> None:
 
     from opf import OPF
 
-    FilterHandler.redactor = OPF(
+    redactor = OPF(
         model=args.checkpoint,
         device=args.device,
         output_mode="typed",
         output_text_only=False,
     )
-    FilterHandler.redactor.get_runtime()
-    # Inference is serial. A single-threaded server also avoids building an
-    # unbounded queue of request threads on a developer machine.
-    server = HTTPServer(("127.0.0.1", 8787), FilterHandler)
-    print("OpenAI Privacy Filter ready at http://127.0.0.1:8787")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+    redactor.get_runtime()
+    serve(redactor)
 
 
 if __name__ == "__main__":

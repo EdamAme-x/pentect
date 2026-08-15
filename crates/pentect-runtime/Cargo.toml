@@ -58,7 +58,13 @@ hickory-resolver = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 windows = { workspace = true, optional = true, features = [
     "Foundation",
     "Graphics_Imaging",
@@ -93,6 +99,9 @@ objc2-vision = { workspace = true, optional = true, default-features = false, fe
 [target.'cfg(target_os = "linux")'.dependencies]
 ocrs = { workspace = true, optional = true }
 rten = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 rxing = { workspace = true, features = ["encoders"] }

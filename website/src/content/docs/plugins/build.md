@@ -1,6 +1,6 @@
 ---
 title: Build a plugin
-description: Create your first regex or Wasm plugin.
+description: Create a Manifest, Wasm, or Command plugin.
 ---
 
 ## A regex plugin in one file
@@ -44,10 +44,11 @@ prefilters, checksums, categories, and confidence values.
 
 ## Create a Wasm plugin
 
-The CLI can create a Rust project, a manifest, and a release workflow:
+The CLI asks for one of the three plugin forms. You can also include the choice
+in the command:
 
 ```sh
-pentect plugins new company-policy
+pentect plugins new company-policy wasm
 cd plugins/company-policy
 ```
 
@@ -105,6 +106,25 @@ an SDK for them yet.
 Run the generated native unit tests with `cargo test`. Run
 `pentect plugins test .` for manifest, Wasm, export, and host-contract checks.
 They cover different failure classes; use both.
+
+## Create a Command plugin
+
+Create a small Python JSONL service:
+
+```sh
+pentect plugins new local-policy command
+cd plugins/local-policy
+pentect plugins setup .
+pentect plugins test .
+```
+
+The generated `server.py` reads the common `pentect.plugin.v1` envelope from
+stdin and writes one result to stdout. Replace it with Node.js, a native binary,
+or Docker by changing only the `command` argv in `plugin.toml`.
+
+Command runs as native code with your user permissions. Setup shows the exact
+executable, argv, hooks, and file hashes before it records approval. See
+[Command plugins](/plugins/command/) for the protocol and security boundary.
 
 ## Use plugin settings
 
