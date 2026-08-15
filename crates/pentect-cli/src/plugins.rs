@@ -499,7 +499,11 @@ fn add_manifest_paths(path: &Path, paths: &mut PluginPaths) -> Result<()> {
     let has_command = value
         .get("command")
         .and_then(toml::Value::as_array)
-        .is_some_and(|command| !command.is_empty());
+        .is_some_and(|command| !command.is_empty())
+        || value
+            .get("commands")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|commands| !commands.is_empty());
     if usize::from(has_detectors) + usize::from(has_wasm) + usize::from(has_command) != 1 {
         bail!("plugin manifest must contain exactly one of detector, wasm, or command");
     }

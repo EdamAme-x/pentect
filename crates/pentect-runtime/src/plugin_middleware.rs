@@ -136,7 +136,7 @@ pub fn test_local_wasm_plugin(bytes: &[u8], name: &str) -> Result<usize, String>
     PluginMiddleware {
         plugins: vec![PluginBinary {
             name: name.to_string(),
-            program: PluginProgram::Wasm(wasm),
+            program: PluginProgram::Wasm(Box::new(wasm)),
             hooks,
             required: true,
             command_config: None,
@@ -770,7 +770,7 @@ impl PluginBinary {
             let config = Some(load_plugin_config(&runtime_dirs)?);
             let wasm = WasmProgram::load_bytes(&wasm_bytes, &name, network, config, permissions)?;
             let hooks = wasm.hooks.clone();
-            (PluginProgram::Wasm(wasm), hooks, None)
+            (PluginProgram::Wasm(Box::new(wasm)), hooks, None)
         } else {
             if network_file.is_some() || permissions_file.is_some() {
                 return Err(format!(
@@ -967,7 +967,7 @@ fn expand_plugin_command(
 
 #[derive(Clone, Debug)]
 enum PluginProgram {
-    Wasm(WasmProgram),
+    Wasm(Box<WasmProgram>),
     Command(CommandProgram),
 }
 
