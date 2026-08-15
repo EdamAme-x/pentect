@@ -2514,7 +2514,8 @@ mod tests {
         assert!(!request.contains(&secret));
         let handle = first_handle(&request).unwrap();
         assert!(request.matches(&handle).count() >= 3);
-        assert!(request.contains(HANDLE_CONTRACT));
+        let protected_request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(protected_request["messages"][0]["content"], HANDLE_CONTRACT);
         assert_eq!(response["choices"][0]["message"]["content"], handle);
         let arguments = response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
             .as_str()
@@ -2798,10 +2799,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&allowed.body).unwrap(),
-            serde_json::from_slice::<Value>(&body).unwrap()
-        );
+        let allowed: Value = serde_json::from_slice(&allowed.body).unwrap();
+        let original: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(allowed["input"], original["input"]);
+        assert_eq!(allowed["instructions"], HANDLE_CONTRACT);
     }
 
     #[test]

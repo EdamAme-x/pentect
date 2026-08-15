@@ -2881,10 +2881,10 @@ mod tests {
         let allowed =
             protect_anthropic_request_body(&body, &masker, &plugins, &files, false).unwrap();
         assert_eq!(allowed.coverage, crate::http_files::Coverage::Partial);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&allowed.body).unwrap(),
-            serde_json::from_slice::<Value>(&body).unwrap()
-        );
+        let allowed: Value = serde_json::from_slice(&allowed.body).unwrap();
+        let original: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(allowed["messages"], original["messages"]);
+        assert_eq!(allowed["system"][0]["text"], HANDLE_CONTRACT);
     }
 
     #[test]
