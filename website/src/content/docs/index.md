@@ -46,7 +46,7 @@ aside: false
   </a>
   <a href="/reference/capabilities/#clients" class="docs-grid__item">
     <small>CLI + Editors</small><strong>More clients</strong>
-    <span>Aider, Continue, Cline, Zed, Goose, Junie, and VS Code.</span><b aria-hidden="true">→</b>
+    <span>Aider, Continue, Cline, Zed, Goose, and Junie.</span><b aria-hidden="true">→</b>
   </a>
 </DocsGrid>
 

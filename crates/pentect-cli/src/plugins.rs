@@ -815,10 +815,9 @@ pub(crate) fn remote_plugin_lock_entry(
     };
     let mut files = BTreeMap::new();
     for url in remote_plugin_urls(&resolved) {
-        let path = remote_cache_file(&url)?;
-        if !path.is_file() {
+        let Some(path) = fetch_remote_plugin_file(&url)? else {
             continue;
-        }
+        };
         let bytes = pentect_agent::read_bounded_bytes(
             &path,
             MAX_REMOTE_PLUGIN_FILE_BYTES,

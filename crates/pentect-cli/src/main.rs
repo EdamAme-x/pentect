@@ -817,14 +817,13 @@ fn cmd_view(args: &[String]) {
     }
 }
 
-/// Long-lived provider backend for first-party integrations such as the
-/// VS Code provider and Pi extension. Readiness is the only stdout record;
+/// Long-lived provider backend for first-party integrations such as the Pi
+/// extension. Readiness is the only stdout record;
 /// the process and its loopback gateway live until the parent closes stdin.
 fn cmd_provider(args: &[String]) -> i32 {
     let integration = match args.get(2).map(String::as_str) {
-        Some("vscode") => "vscode",
         Some("pi") => "pi",
-        _ => die("provider requires the supported integration name `vscode` or `pi`"),
+        _ => die("provider requires the supported integration name `pi`"),
     };
     let mut upstream =
         nonempty_env("OPENAI_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".to_string());

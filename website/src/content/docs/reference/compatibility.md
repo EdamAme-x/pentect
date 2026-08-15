@@ -21,7 +21,6 @@ specific public CLI versions with the release binary.
 | Goose CLI | Process-only main, fast, and planner model routing | `pentect goose` |
 | Junie CLI | Temporary custom model profile | `pentect junie` |
 | Gemini CLI (legacy) | Native Gemini JSON, SSE, functions, and endpoint override | `pentect gemini` |
-| VS Code language model provider | Text chat, text tool results, and tool calls | Select the Pentect provider |
 | ChatGPT desktop app, Codex mode | Launcher and Responses protocol tests | `pentect codex app` |
 | Claude Desktop, supported Chat, attachment, and Code routes | Launcher and protocol tests | `pentect claude app` |
 
@@ -43,7 +42,6 @@ links, broken data, and custom gateway paths.
 | `pentect goose` | OpenAI Chat Completions | Covers Goose CLI main, fast, and planner routes; not Goose Desktop |
 | `pentect junie` | OpenAI Chat Completions or Responses | Selected with `--api chat` or `--api responses`; not Junie IDE |
 | `pentect gemini` | Native Gemini API | Covers Gemini API-key mode; not Google sign-in, Vertex, or Code Assist |
-| VS Code Pentect provider | OpenAI Chat Completions | Covers requests that select Pentect; not Copilot, inline suggestions, other extensions, or images |
 | `pentect codex app` | Responses routes used by supported Codex mode | Other ChatGPT modes are outside this claim |
 | `pentect claude app` | Supported Claude Chat, attachment, and Code routes | Cowork and Voice are outside this claim |
 

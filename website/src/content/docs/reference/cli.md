@@ -80,9 +80,6 @@ pentect junie --api responses
 pentect gemini --model gemini-2.5-pro
 ```
 
-The VS Code extension starts `pentect provider vscode` itself. This backend
-command is not an interactive client and is not meant for normal terminal use.
-
 `--check` validates app discovery and routing without leaving the app open.
 `--plugins` accepts a local plugin directory or a
 `github:@OWNER/REPOSITORY/path` source. Separate multiple sources with commas.

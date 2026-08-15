@@ -150,7 +150,7 @@ client. Examples include `OPENAI_BASE_URL`, `CLOUD_CODE_URL`, and
 - Gateways that support Anthropic Messages for Claude
 - Gateways that support OpenAI Chat Completions or Responses for OpenCode and Pi
 - OpenAI-compatible routes used by Continue, Cline, Roo Code, Zed, Goose CLI,
-  Junie CLI, and the Pentect VS Code provider
+  and Junie CLI
 - Native Gemini API routes used by Gemini CLI
 - Existing compatible client provider configuration
 
@@ -177,7 +177,6 @@ URL.
 | Pi | OpenAI Chat Completions by default; Responses with `--api responses` | `/openai/v1` |
 | Continue, Cline, Roo Code, Zed, Goose | OpenAI Chat Completions | `/openai/v1` |
 | Junie | OpenAI Chat Completions by default; Responses with `--api responses` | `/openai/v1` |
-| VS Code Pentect provider | OpenAI Chat Completions | `/openai/v1` |
 | Gemini CLI | Native Gemini `generateContent` API | `/` before `/v1beta/models/...` |
 
 ## Validate a gateway

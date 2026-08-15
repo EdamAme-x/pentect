@@ -17,7 +17,6 @@ description: A full list of what you can do with Pentect.
 | Protect Zed Agent and Inline Assistant | `pentect zed` |
 | Protect Goose CLI | `pentect goose` |
 | Protect Junie CLI | `pentect junie` |
-| Add a selectable VS Code model provider | Install the Pentect VS Code extension |
 | Launch a protected Codex App session | `pentect codex app` |
 | Launch a protected Claude Desktop session | `pentect claude app` |
 | Pass normal client arguments | Add them normally, for example `pentect codex exec --full-auto` |
