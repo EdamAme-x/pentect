@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://pentect.dev/">
-    <img src="website/public/pentect-logo-transparent.png" width="96" alt="Pentect">
+    <img src="https://pentect.dev/pentect-logo-transparent.png" width="96" alt="Pentect">
   </a>
 </p>
 
