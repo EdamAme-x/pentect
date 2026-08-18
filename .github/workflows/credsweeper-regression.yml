@@ -121,17 +121,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          target="$GITHUB_WORKSPACE/target/credsweeper-regression"
+          cp -a baseline "$RUNNER_TEMP/credsweeper-baseline"
           cargo build --release --manifest-path tools/pentect-bench/Cargo.toml \
-            --target-dir "$RUNNER_TEMP/target-candidate"
-          cargo build --release --manifest-path baseline/tools/pentect-bench/Cargo.toml \
-            --target-dir "$RUNNER_TEMP/target-baseline"
+            --target-dir "$target"
+          cp "$target/release/pentect-bench" "$RUNNER_TEMP/pentect-bench-candidate"
+          cargo build --release \
+            --manifest-path "$RUNNER_TEMP/credsweeper-baseline/tools/pentect-bench/Cargo.toml" \
+            --target-dir "$target"
+          cp "$target/release/pentect-bench" "$RUNNER_TEMP/pentect-bench-baseline"
 
       - name: Check detection quality and speed against baseline
         shell: bash
         run: |
           python tools/check_credsweeper_regression.py \
-            --candidate "$RUNNER_TEMP/target-candidate/release/pentect-bench" \
-            --baseline "$RUNNER_TEMP/target-baseline/release/pentect-bench" \
+            --candidate "$RUNNER_TEMP/pentect-bench-candidate" \
+            --baseline "$RUNNER_TEMP/pentect-bench-baseline" \
             --dataset benchmarks/CredData \
             --repo 02dfa7ec \
             --rounds 7 \
@@ -144,7 +149,7 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/credsweeper-parity"
           mkdir -p "$out"
-          "$RUNNER_TEMP/target-candidate/release/pentect-bench" creddata benchmarks/CredData \
+          "$RUNNER_TEMP/pentect-bench-candidate" creddata benchmarks/CredData \
             --repo 02dfa7ec \
             --ignore-x \
             --save-credsweeper-json "$out/rust.json" \
@@ -153,7 +158,7 @@ jobs:
           mapfile -t paths < "$out/paths.txt"
           PYTHONPATH="$PWD/crates/pentect-core/vendors/CredSweeper" \
             python tools/credsweeper-sidecar/sidecar.py "${paths[@]}" --output "$out/oracle.json"
-          "$RUNNER_TEMP/target-candidate/release/pentect-bench" credsweeper-parity \
+          "$RUNNER_TEMP/pentect-bench-candidate" credsweeper-parity \
             "$out/rust.json" \
             "$out/oracle.json" \
             --min-precision 1 \
