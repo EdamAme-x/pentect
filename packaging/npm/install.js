@@ -1,12 +1,30 @@
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
 const repository = 'EdamAme-x/pentect';
 const packageRoot = fileURLToPath(new URL('../..', import.meta.url));
-const destination = join(packageRoot, 'packaging', 'npm', 'vendor', process.platform === 'win32' ? 'pentect.exe' : 'pentect');
+
+function cacheBase(environment = process.env, platform = process.platform, home = homedir()) {
+  if (environment.PENTECT_NPM_CACHE) return resolve(environment.PENTECT_NPM_CACHE);
+  if (platform === 'win32') {
+    return resolve(environment.LOCALAPPDATA || join(home, 'AppData', 'Local'), 'Pentect', 'npm');
+  }
+  if (platform === 'darwin') return resolve(home, 'Library', 'Caches', 'Pentect', 'npm');
+  return resolve(environment.XDG_CACHE_HOME || join(home, '.cache'), 'pentect', 'npm');
+}
+
+export function installationPath(version, options = {}) {
+  if (!/^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/.test(version) || version === '..') {
+    throw new Error('The Pentect package version is invalid');
+  }
+  const platform = options.platform || process.platform;
+  const base = cacheBase(options.environment, platform, options.home);
+  return join(base, version, platform === 'win32' ? 'pentect.exe' : 'pentect');
+}
 
 export function releaseAsset(platform = process.platform, architecture = process.arch) {
   const assets = {
@@ -54,6 +72,7 @@ export async function install() {
   const asset = releaseAsset();
   const metadata = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'));
   const version = (process.env.PENTECT_VERSION || metadata.version)?.replace(/^v/, '');
+  const destination = installationPath(version);
   const tag = version ? `v${version}` : 'latest';
   const base = tag === 'latest'
     ? `https://github.com/${repository}/releases/latest/download`
@@ -74,9 +93,29 @@ export async function install() {
     await rm(destination, { force: true });
     await rename(temporary, destination);
     if (process.platform !== 'win32') await chmod(destination, 0o755);
+    await writeFile(join(dirname(destination), '.pentect-managed-install.json'), JSON.stringify({
+      version: 1,
+      manager: 'npm',
+      update: 'npm update -g pentect',
+      uninstall: 'npm uninstall -g pentect',
+    }), { mode: 0o600 });
   } finally {
     await rm(temporary, { force: true });
   }
+  return destination;
+}
+
+export async function ensureInstalled() {
+  const metadata = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'));
+  const version = (process.env.PENTECT_VERSION || metadata.version)?.replace(/^v/, '');
+  const destination = installationPath(version);
+  try {
+    await access(destination);
+    return destination;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  return install();
 }
 
 const invokedDirectly = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);

@@ -20,7 +20,6 @@
     "README.md"
   ],
   "scripts": {
-    "postinstall": "node packaging/npm/install.js",
     "test": "node --test packaging/npm/*.test.js"
   },
   "engines": {

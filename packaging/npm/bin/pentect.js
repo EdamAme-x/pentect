@@ -1,8 +1,15 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { ensureInstalled } from '../install.js';
 
-const executable = fileURLToPath(new URL(`../vendor/${process.platform === 'win32' ? 'pentect.exe' : 'pentect'}`, import.meta.url));
+let executable;
+try {
+  executable = await ensureInstalled();
+} catch (error) {
+  console.error(`pentect: ${error.message}`);
+  process.exit(1);
+}
+
 const result = spawnSync(executable, process.argv.slice(2), { stdio: 'inherit' });
 if (result.error) {
   console.error(`pentect: ${result.error.message}`);
