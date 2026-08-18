@@ -73,7 +73,8 @@ async function downloadBinary(base, asset, signal) {
   return download(`${base}/${asset}`, signal);
 }
 
-export async function install(version = await packageVersion()) {
+export async function install(version) {
+  version ||= await packageVersion();
   const asset = releaseAsset();
   const destination = installationPath(version);
   const tag = version ? `v${version}` : 'latest';
