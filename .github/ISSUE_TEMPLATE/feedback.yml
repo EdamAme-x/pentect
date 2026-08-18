@@ -1,0 +1,11 @@
+name: Feedback ⭐
+description: Share anything about Pentect.
+title: ""
+body:
+  - type: textarea
+    id: feedback
+    attributes:
+      label: Feedback
+      placeholder: Write anything you would like to share. Never include secrets.
+    validations:
+      required: true
