@@ -31,6 +31,11 @@ providers. Start with the [documentation](https://pentect.dev/).
 - [Contributing](CONTRIBUTING.md)
 - [Third-party notices](THIRD_PARTY_LICENSES.txt)
 
+> **Security scope:** Pentect does not protect a compromised operating system
+> from malware with administrator privileges or an attacker that can read local
+> process memory. It reduces unintended disclosure of sensitive data to AI
+> providers.
+
 ## License
 
 [MIT](LICENSE)
