@@ -45,6 +45,11 @@ export function expectedChecksum(text) {
   return match[1].toLowerCase();
 }
 
+async function packageVersion() {
+  const metadata = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'));
+  return metadata.version?.replace(/^v/, '');
+}
+
 async function download(url, signal) {
   const response = await fetch(url, {
     redirect: 'follow',
@@ -68,10 +73,8 @@ async function downloadBinary(base, asset, signal) {
   return download(`${base}/${asset}`, signal);
 }
 
-export async function install() {
+export async function install(version = await packageVersion()) {
   const asset = releaseAsset();
-  const metadata = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'));
-  const version = (process.env.PENTECT_VERSION || metadata.version)?.replace(/^v/, '');
   const destination = installationPath(version);
   const tag = version ? `v${version}` : 'latest';
   const base = tag === 'latest'
@@ -106,8 +109,7 @@ export async function install() {
 }
 
 export async function ensureInstalled() {
-  const metadata = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'));
-  const version = (process.env.PENTECT_VERSION || metadata.version)?.replace(/^v/, '');
+  const version = await packageVersion();
   const destination = installationPath(version);
   try {
     await access(destination);
@@ -115,7 +117,7 @@ export async function ensureInstalled() {
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
-  return install();
+  return install(version);
 }
 
 const invokedDirectly = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
