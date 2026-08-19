@@ -31,6 +31,8 @@ use pentect_core::{
     Profile,
 };
 use serde_json::Value;
+#[cfg(any(windows, test))]
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -485,10 +487,13 @@ fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[St
     {
         return 0;
     }
-    let opts = match AgentToolOpts::parse(tool, args) {
+    let mut opts = match AgentToolOpts::parse(tool, args) {
         Ok(o) => o,
         Err(e) => die(&e),
     };
+    if !opts.dry_run {
+        opts.command = resolve_agent_command(&opts.command).unwrap_or_else(|error| die(error));
+    }
     let pentect = opts.pentect.clone().unwrap_or_else(default_pentect_path);
     if !pentect.exists() && pentect.components().count() > 1 {
         die(format!(
@@ -505,6 +510,54 @@ fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[St
     }
     .unwrap_or_else(|e| die_with_issue(&e));
     status.code().unwrap_or(1)
+}
+
+fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let pathext =
+            std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+        return resolve_windows_command_from(program, &path, &pathext)
+            .ok_or_else(|| format!("could not run '{}': program not found", program.display()));
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(program.to_path_buf())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -> Option<PathBuf> {
+    let mut names = vec![program.to_path_buf()];
+    if program.extension().is_none() {
+        names.extend(
+            pathext
+                .to_string_lossy()
+                .split(';')
+                .map(str::trim)
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| {
+                    let mut name = program.as_os_str().to_os_string();
+                    name.push(extension);
+                    PathBuf::from(name)
+                }),
+        );
+    }
+
+    let explicit_path = program.is_absolute() || program.components().count() > 1;
+    if explicit_path {
+        return names.into_iter().find(|candidate| candidate.is_file());
+    }
+    for directory in std::env::split_paths(path) {
+        for name in &names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn cmd_claude_app(args: &[String]) -> i32 {
@@ -2644,6 +2697,56 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command_test_directory(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("pentect-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn windows_npm_cmd_shim_is_found_via_pathext() {
+        let directory = command_test_directory("npm-shim-resolution");
+        std::fs::create_dir_all(&directory).unwrap();
+        let shim = if cfg!(windows) {
+            directory.join("codex.cmd")
+        } else {
+            directory.join("codex.CMD")
+        };
+        std::fs::write(&shim, b"npm shim fixture").unwrap();
+
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
+                .unwrap();
+        assert_eq!(resolved.file_name().unwrap().to_string_lossy(), "codex.CMD");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_npm_cmd_shim_executes_after_resolution() {
+        let directory = command_test_directory("npm-shim-execution");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("codex.cmd"),
+            b"@echo off\r\necho codex-cli npm-shim-test\r\n",
+        )
+        .unwrap();
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
+                .unwrap();
+        let output = Command::new(resolved).arg("--version").output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "codex-cli npm-shim-test"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn public_command_snapshot_is_intentional() {
