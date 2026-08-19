@@ -22,6 +22,7 @@ pub(crate) fn cmd_codex_app(args: &[String]) -> i32 {
 
 fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let options = CodexAppOptions::parse(args)?;
+    let app_was_explicit = options.app.is_some();
     let app = options.app.unwrap_or_else(default_codex_app_path);
     if options.check {
         let installed = app.is_file();
@@ -40,15 +41,12 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         println!("Provider: {}", routing.provider);
         println!("Protection: OpenAI Responses API (HTTP)");
         if !installed {
-            return Err("Codex mode was not found; pass --app PATH".to_string());
+            return Err(codex_app_not_found(&app, app_was_explicit));
         }
         return Ok(success_status());
     }
     if !app.is_file() {
-        return Err(format!(
-            "Codex App was not found at '{}'; pass --app PATH",
-            app.display()
-        ));
+        return Err(codex_app_not_found(&app, app_was_explicit));
     }
     if codex_app_is_running(&app) {
         return Err(
@@ -126,6 +124,18 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .take();
     drop(proxy);
     Ok(status)
+}
+
+fn codex_app_not_found(app: &Path, app_was_explicit: bool) -> String {
+    if app_was_explicit {
+        format!(
+            "Codex App was not found at '{}'; pass an existing executable to --app",
+            app.display()
+        )
+    } else {
+        "Codex App was not found automatically; install Codex App or pass its executable with --app PATH"
+            .to_string()
+    }
 }
 
 pub(crate) fn check_mode(args: &[String]) -> Result<bool, String> {
@@ -556,11 +566,11 @@ fn find_windows_codex_app() -> Option<PathBuf> {
     if let Some((_, executable)) = candidates.pop() {
         return Some(executable);
     }
-    find_windows_store_chatgpt()
+    find_windows_store_codex_app()
 }
 
 #[cfg(windows)]
-fn find_windows_store_chatgpt() -> Option<PathBuf> {
+fn find_windows_store_codex_app() -> Option<PathBuf> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const PACKAGES_KEY: &str = r"HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
@@ -579,11 +589,9 @@ fn find_windows_store_chatgpt() -> Option<PathBuf> {
         .lines()
         .map(str::trim)
         .filter(|key| {
-            key.rsplit('\\').next().is_some_and(|name| {
-                let name = name.to_ascii_lowercase();
-                (name.starts_with("chatgpt_") || name.starts_with("openai.chatgpt"))
-                    && windows_package_matches_arch(&name)
-            })
+            key.rsplit('\\')
+                .next()
+                .is_some_and(windows_package_is_codex_app)
         })
         .filter_map(|key| {
             let package_name = key.rsplit('\\').next()?.to_string();
@@ -608,6 +616,15 @@ fn find_windows_store_chatgpt() -> Option<PathBuf> {
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
     candidates.pop().map(|(_, executable)| executable)
+}
+
+#[cfg(windows)]
+fn windows_package_is_codex_app(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["openai.codex_", "openai.chatgpt_", "chatgpt_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        && windows_package_matches_arch(&name)
 }
 
 #[cfg(windows)]
@@ -742,6 +759,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_app_message_distinguishes_auto_detection_from_an_explicit_path() {
+        assert_eq!(
+            codex_app_not_found(Path::new("Codex.exe"), false),
+            "Codex App was not found automatically; install Codex App or pass its executable with --app PATH"
+        );
+        assert!(codex_app_not_found(Path::new("missing.exe"), true)
+            .contains("was not found at 'missing.exe'"));
+    }
+
+    #[test]
     fn options_reject_missing_plugin_value() {
         let args = vec![
             "pentect".to_string(),
@@ -780,6 +807,37 @@ mod tests {
                 "ChatGPT_1.0.0.0_x64__id"
             }
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recognizes_current_and_legacy_windows_store_packages() {
+        let architecture = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        let other_architecture = if cfg!(target_arch = "aarch64") {
+            "x64"
+        } else {
+            "arm64"
+        };
+
+        assert!(windows_package_is_codex_app(&format!(
+            "OpenAI.Codex_26.814.5167.0_{architecture}__2p2nqsd0c76g0"
+        )));
+        assert!(windows_package_is_codex_app(&format!(
+            "OpenAI.ChatGPT_1.2026.210.0_{architecture}__2p2nqsd0c76g0"
+        )));
+        assert!(windows_package_is_codex_app(&format!(
+            "ChatGPT_1.2026.210.0_{architecture}__2p2nqsd0c76g0"
+        )));
+        assert!(!windows_package_is_codex_app(&format!(
+            "OpenAI.Codex_26.814.5167.0_{other_architecture}__2p2nqsd0c76g0"
+        )));
+        assert!(!windows_package_is_codex_app(&format!(
+            "OpenAI.CodexHelper_26.814.5167.0_{architecture}__2p2nqsd0c76g0"
+        )));
     }
 
     #[test]

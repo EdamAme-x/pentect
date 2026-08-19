@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Pentect. Remove secrets, tokens, personal data, and private URLs from every field and attachment.
+        Thanks for reporting a bug. Remove secrets, personal data, and private system details before posting. Report security vulnerabilities privately through the Security tab.
 
   - type: textarea
     id: problem
@@ -48,9 +48,9 @@ body:
   - type: textarea
     id: diagnostics
     attributes:
-      label: Sanitized diagnostics
-      description: Add minimal logs or screenshots after confirming they contain no sensitive data.
-      render: shell
+      label: Logs or screenshots
+      description: Optional. Paste text, drag in files, or paste screenshots here after removing sensitive or private details.
+      placeholder: Paste logs or screenshots here.
 
   - type: checkboxes
     id: checks
@@ -59,7 +59,5 @@ body:
       options:
         - label: I searched for an existing issue.
           required: true
-        - label: I removed secrets, personal data, and private infrastructure details.
-          required: true
-        - label: This is not a security vulnerability.
+        - label: I removed secrets, personal data, and private system details.
           required: true
