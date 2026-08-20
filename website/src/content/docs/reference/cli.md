@@ -92,7 +92,7 @@ pentect gemini --model gemini-2.5-pro
 | `pentect read PATH` | Print a masked preview of a file |
 | `pentect exec "COMMAND"` | Restore known handles, run the command, and mask its output |
 | `pentect view HANDLE` | Show handle details without revealing its value |
-| `pentect log [--json]` | Show gateway history and follow protection events |
+| `pentect log [--json \| --path]` | Show persistent diagnostics and follow protection events |
 
 ### `mask`
 

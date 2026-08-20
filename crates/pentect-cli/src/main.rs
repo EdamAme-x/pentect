@@ -142,8 +142,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "log",
-        usage: "pentect log [--json]",
-        summary: "Show gateway history and follow protection events",
+        usage: "pentect log [--json | --path]",
+        summary: "Show persistent diagnostics and live protection events",
         audience: CommandAudience::Public,
     },
     CommandSpec {
@@ -222,12 +222,87 @@ const COMMANDS: &[CommandSpec] = &[
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let Some(code) = catch_cli_exit(|| run(args)) {
+    let surface = diagnostic_surface(&args);
+    install_panic_logger(surface.clone());
+    pentect_agent::record_process_activity(
+        "started",
+        &surface,
+        env!("CARGO_PKG_VERSION"),
+        None,
+        None,
+        None,
+    );
+    let code = catch_cli_exit(|| run(args));
+    let exit_code = code.unwrap_or(0);
+    pentect_agent::record_process_activity(
+        "finished",
+        &surface,
+        env!("CARGO_PKG_VERSION"),
+        Some(exit_code),
+        None,
+        None,
+    );
+    pentect_agent::flush_activity_log();
+    if let Some(code) = code {
         std::process::exit(code);
     }
 }
 
+fn diagnostic_surface(args: &[String]) -> String {
+    let candidate = match (
+        args.get(1).map(String::as_str),
+        args.get(2).map(String::as_str),
+    ) {
+        (Some("agent"), Some(command)) => command,
+        (Some("codex"), Some("app")) => return "codex-app".to_string(),
+        (Some("claude"), Some("app")) => return "claude-app".to_string(),
+        #[cfg(debug_assertions)]
+        (Some("__test-panic"), _) => return "test-panic".to_string(),
+        (Some("--version" | "-V"), _) => "version",
+        (Some("--help" | "-h"), _) | (None, _) => "help",
+        (Some(command), _) => command,
+    };
+    if COMMANDS.iter().any(|command| command.name == candidate)
+        || client_descriptor::find(candidate).is_some()
+    {
+        candidate.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn install_panic_logger(surface: String) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info.location().map(|location| {
+            format!(
+                "{}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            )
+        });
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        pentect_agent::record_process_activity(
+            "panic",
+            &surface,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            location.as_deref(),
+            Some(&backtrace),
+        );
+        pentect_agent::flush_activity_log();
+        previous(info);
+    }));
+}
+
 fn run(args: Vec<String>) -> Option<i32> {
+    #[cfg(debug_assertions)]
+    if args.get(1).map(String::as_str) == Some("__test-panic")
+        && std::env::var_os("PENTECT_INTERNAL_TEST_PANIC").is_some()
+    {
+        panic!("forced test panic with payload that must not be persisted");
+    }
     let inherited_env_is_trusted = pentect_agent::active_memory_store_ready();
     if is_memory_store_server(&args) || !supports_process_host(&args) {
         return dispatch(args, inherited_env_is_trusted);
@@ -310,6 +385,15 @@ fn is_memory_store_server(args: &[String]) -> bool {
 /// One-shot inspection commands would only add startup cost and disappear
 /// before a useful handoff can occur.
 fn supports_process_host(args: &[String]) -> bool {
+    if matches!(
+        (
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        (Some("log"), Some("--path"))
+    ) {
+        return false;
+    }
     matches!(
         (
             args.get(1).map(String::as_str),
@@ -509,7 +593,29 @@ fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[St
         client_descriptor::Launcher::Ide(client) => ide_clients::run(client, &opts, &pentect),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
+    record_child_exit(tool.name, &status);
     status.code().unwrap_or(1)
+}
+
+fn record_child_exit(surface: &str, status: &std::process::ExitStatus) {
+    #[cfg(unix)]
+    let event = {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .signal()
+            .map(|signal| format!("child-signal-{signal}"))
+            .unwrap_or_else(|| "child-exited".to_string())
+    };
+    #[cfg(not(unix))]
+    let event = "child-exited".to_string();
+    pentect_agent::record_process_activity(
+        &event,
+        surface,
+        env!("CARGO_PKG_VERSION"),
+        status.code(),
+        None,
+        None,
+    );
 }
 
 fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
@@ -3092,6 +3198,23 @@ mod tests {
             let args = vec!["pentect".to_string(), command.to_string()];
             assert!(!supports_process_host(&args));
         }
+        assert!(!supports_process_host(&[
+            "pentect".to_string(),
+            "log".to_string(),
+            "--path".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn diagnostic_surface_never_persists_unknown_argument_text() {
+        assert_eq!(
+            diagnostic_surface(&["pentect".to_string(), "sk-secret-command".to_string(),]),
+            "unknown"
+        );
+        assert_eq!(
+            diagnostic_surface(&["pentect".to_string(), "codex".to_string()]),
+            "codex"
+        );
     }
 
     #[test]
