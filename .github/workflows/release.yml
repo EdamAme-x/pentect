@@ -361,16 +361,7 @@ jobs:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       - name: Install supported agent CLIs
-        run: >-
-          npm install --global
-          --allow-scripts=@anthropic-ai/claude-code,cline,opencode-ai,@github/keytar,node-pty,@google/genai,protobufjs
-          @openai/codex@0.148.0
-          @anthropic-ai/claude-code@2.1.237
-          opencode-ai@1.18.19
-          @earendil-works/pi-coding-agent@0.84.2
-          @continuedev/cli@1.5.47
-          cline@3.0.55
-          @google/gemini-cli@0.56.0
+        run: python tools/install_portable_client_smoke.py --mode release
       - name: Install native and editor clients
         run: sh tools/install_client_smoke.sh "$RUNNER_TEMP/release-clients"
       - name: Verify every public client launcher
@@ -525,7 +516,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          npm install --global --allow-scripts=@anthropic-ai/claude-code,cline,opencode-ai,@github/keytar,node-pty,@google/genai,protobufjs @openai/codex@0.148.0 @anthropic-ai/claude-code@2.1.237 opencode-ai@1.18.19 @earendil-works/pi-coding-agent@0.84.2 @continuedev/cli@1.5.47 cline@3.0.55 @google/gemini-cli@0.56.0
+          python tools/install_portable_client_smoke.py --mode release
           python tools/client_smoke.py --group portable
           $node = (Get-Command node -ErrorAction Stop).Source
           $fixture = Join-Path $env:RUNNER_TEMP 'codex-app-fixture.exe'
@@ -550,7 +541,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install --global --allow-scripts=@anthropic-ai/claude-code,cline,opencode-ai,@github/keytar,node-pty,@google/genai,protobufjs @openai/codex@0.148.0 @anthropic-ai/claude-code@2.1.237 opencode-ai@1.18.19 @earendil-works/pi-coding-agent@0.84.2 @continuedev/cli@1.5.47 cline@3.0.55 @google/gemini-cli@0.56.0
+          python tools/install_portable_client_smoke.py --mode release
           python tools/client_smoke.py --group portable
           fixture="$RUNNER_TEMP/codex-app-fixture"
           cp "$(command -v node)" "$fixture"

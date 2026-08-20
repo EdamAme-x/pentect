@@ -67,16 +67,7 @@ jobs:
           test -x "$install_dir/pentect"
           printf 'PENTECT_SMOKE_BINARY=%s\n' "$install_dir/pentect" >> "$GITHUB_ENV"
       - name: Install current portable clients
-        run: >-
-          npm install --global
-          --allow-scripts=@anthropic-ai/claude-code,cline,opencode-ai,@github/keytar,node-pty,@google/genai,protobufjs
-          @openai/codex@latest
-          @anthropic-ai/claude-code@latest
-          opencode-ai@latest
-          @earendil-works/pi-coding-agent@latest
-          @continuedev/cli@latest
-          cline@latest
-          @google/gemini-cli@latest
+        run: python tools/install_portable_client_smoke.py --mode latest
       - name: Start all current portable clients
         run: python tools/client_smoke.py --group portable
       - name: Start both protected desktop app contracts (Windows)
