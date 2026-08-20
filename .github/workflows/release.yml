@@ -280,8 +280,15 @@ jobs:
               --json isDraft,isPrerelease,assets)
             test "$(jq -r .isDraft <<<"$release")" = false
             if test "$(jq -r .isPrerelease <<<"$release")" != true; then
-              echo "refusing to replace assets on an existing stable release" >&2
-              exit 1
+              asset_count=$(jq '.assets | length' <<<"$release")
+              if test "$asset_count" != 0; then
+                echo "refusing to replace assets on an existing stable release" >&2
+                exit 1
+              fi
+              echo "existing stable release has no uploaded assets; returning it to prerelease validation"
+              gh release edit "$GITHUB_REF_NAME" --prerelease --repo "$GITHUB_REPOSITORY"
+              release=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                --json isDraft,isPrerelease,assets)
             fi
 
             find dist -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/local-assets"
