@@ -14,7 +14,7 @@ drift is visible before the next release.
 | Claude Code `2.1.237` | Real launch on Linux and all installer platforms | `pentect claude` |
 | OpenCode `1.18.19` | Real launch on Linux and all installer platforms | `pentect opencode` |
 | Pi `0.84.2` | Real launch, npm extension, and provider discovery | `pentect pi` or `@pentect/pi` |
-| Antigravity CLI `1.1.16` | Real launch plus Cloud Code protocol tests | `pentect antigravity` |
+| Antigravity CLI `1.1.17` | Real launch plus Cloud Code protocol tests | `pentect antigravity` |
 | Aider `0.86.2` | Real launch and OpenAI-compatible route tests | `pentect aider` |
 | Continue CLI `1.5.47` | Real launch and Chat/Edit/Apply route tests | `pentect continue` |
 | Cline CLI `3.0.55` | Real launch, isolated provider registry, streaming, and tools | `pentect cline` |

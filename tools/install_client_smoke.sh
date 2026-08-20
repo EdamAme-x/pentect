@@ -71,6 +71,13 @@ else
 fi
 
 echo "Installing Roo Code extension..."
+if ! command -v code >/dev/null 2>&1; then
+  echo "Installing VS Code CLI..."
+  download \
+    'https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-x64' \
+    "$downloads/code.deb"
+  sudo apt-get install -y "$downloads/code.deb"
+fi
 code --install-extension "$roo_extension" --force
 
 echo "Installing Zed..."
