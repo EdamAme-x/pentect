@@ -403,6 +403,8 @@ jobs:
             installer: npm
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    env:
+      PENTECT_LOG_DIR: ${{ github.workspace }}/.pentect-test-logs
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -542,6 +544,63 @@ jobs:
           cp "$CODEX_HOME/config.toml" "$RUNNER_TEMP/config.before"
           "$PENTECT_SMOKE_BINARY" codex app --app "$fixture" --upstream https://api.openai.com/v1
           cmp "$RUNNER_TEMP/config.before" "$CODEX_HOME/config.toml"
+      - name: Verify persistent diagnostics (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $secret = 'sk-pentect-log-smoke-secret'
+          & $env:PENTECT_SMOKE_BINARY __unknown_command $secret *> $null
+          if ($LASTEXITCODE -ne 2) { throw 'diagnostic failure fixture returned the wrong status' }
+          $logPath = (& $env:PENTECT_SMOKE_BINARY log --path | Select-Object -Last 1)
+          $expected = Join-Path $env:PENTECT_LOG_DIR 'pentect.log'
+          if ([IO.Path]::GetFullPath($logPath) -ne [IO.Path]::GetFullPath($expected)) {
+            throw "unexpected persistent log path: $logPath"
+          }
+          $raw = Get-Content -LiteralPath $logPath -Raw
+          if ($raw.Contains($secret)) { throw 'persistent log captured a command argument' }
+          $events = $raw -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json }
+          if (-not ($events | Where-Object { $_.event -eq 'finished' -and $_.surface -eq 'codex' -and $_.exit_code -eq 0 })) {
+            throw 'successful Codex lifecycle was not persisted'
+          }
+          if (-not ($events | Where-Object { $_.event -eq 'finished' -and $_.surface -eq 'unknown' -and $_.exit_code -eq 2 })) {
+            throw 'failed command lifecycle was not persisted'
+          }
+      - name: Verify persistent diagnostics (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          secret='sk-pentect-log-smoke-secret'
+          set +e
+          "$PENTECT_SMOKE_BINARY" __unknown_command "$secret" >/dev/null 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 2
+          log_path=$("$PENTECT_SMOKE_BINARY" log --path)
+          test "$log_path" = "$PENTECT_LOG_DIR/pentect.log"
+          python3 - "$log_path" "$secret" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          secret = sys.argv[2]
+          raw = path.read_text(encoding="utf-8")
+          assert secret not in raw, "persistent log captured a command argument"
+          events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+          assert any(
+              event.get("event") == "finished"
+              and event.get("surface") == "codex"
+              and event.get("exit_code") == 0
+              for event in events
+          ), "successful Codex lifecycle was not persisted"
+          assert any(
+              event.get("event") == "finished"
+              and event.get("surface") == "unknown"
+              and event.get("exit_code") == 2
+              for event in events
+          ), "failed command lifecycle was not persisted"
+          PY
       - name: Uninstall direct installation (Windows)
         if: runner.os == 'Windows' && matrix.installer == 'direct'
         shell: pwsh

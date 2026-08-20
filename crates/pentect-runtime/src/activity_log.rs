@@ -6,13 +6,22 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 const MAX_LABELS_PER_EVENT: usize = 64;
 const MAX_SEEN_EVENTS: usize = 4_096;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LOG_BATCH_EVENTS: usize = 64;
+const LOG_BATCH_BYTES: usize = 64 * 1024;
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const LOG_CHANNEL_CAPACITY: usize = 1_024;
+const LOG_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const LOG_ROTATIONS: usize = 8;
 static LOG_SHARE: OnceLock<bool> = OnceLock::new();
+static PERSISTENT_LOG: OnceLock<Option<PersistentLogWriter>> = OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ActivityEvent {
@@ -24,6 +33,22 @@ pub(crate) struct ActivityEvent {
     labels: Vec<LabelCount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    panic_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backtrace: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -43,6 +68,16 @@ struct LifecycleSource {
     file: Option<std::fs::File>,
     offset: u64,
     pending: Vec<u8>,
+}
+
+struct PersistentLogWriter {
+    sender: SyncSender<LogMessage>,
+    dropped: Arc<AtomicU64>,
+}
+
+enum LogMessage {
+    Entry(String),
+    Flush(mpsc::Sender<()>),
 }
 
 #[derive(Default)]
@@ -86,8 +121,77 @@ impl ActivityEvent {
                 .map(|(name, count)| LabelCount { name, count })
                 .collect(),
             target,
+            event: None,
+            pid: None,
+            version: None,
+            os: None,
+            arch: None,
+            exit_code: None,
+            panic_location: None,
+            backtrace: None,
         }
     }
+
+    fn process(
+        event: &str,
+        surface: &str,
+        version: &str,
+        exit_code: Option<i32>,
+        panic_location: Option<&str>,
+        backtrace: Option<&str>,
+    ) -> Self {
+        Self {
+            time: jiff::Timestamp::now().to_string(),
+            action: "process".to_string(),
+            surface: safe_identifier(surface),
+            count: 1,
+            labels: Vec::new(),
+            target: None,
+            event: Some(safe_identifier(event)),
+            pid: Some(std::process::id()),
+            version: Some(version.chars().take(64).collect()),
+            os: Some(std::env::consts::OS.to_string()),
+            arch: Some(std::env::consts::ARCH.to_string()),
+            exit_code,
+            panic_location: panic_location.map(safe_panic_location),
+            backtrace: backtrace.map(safe_backtrace),
+        }
+    }
+}
+
+pub(crate) fn record_process(
+    event: &str,
+    surface: &str,
+    version: &str,
+    exit_code: Option<i32>,
+    panic_location: Option<&str>,
+    backtrace: Option<&str>,
+) {
+    record(ActivityEvent::process(
+        event,
+        surface,
+        version,
+        exit_code,
+        panic_location,
+        backtrace,
+    ));
+}
+
+pub(crate) fn flush_persistent() {
+    if let Some(writer) = persistent_log() {
+        writer.flush();
+    }
+}
+
+pub(crate) fn persistent_log_path() -> PathBuf {
+    if let Some(directory) = std::env::var_os("PENTECT_LOG_DIR") {
+        return PathBuf::from(directory).join("pentect.log");
+    }
+    user_home()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".pentect")
+        .join("logs")
+        .join("pentect.log")
 }
 
 pub(crate) fn record_mask_result(surface: &str, result: &MaskResult, target: Option<&Path>) {
@@ -165,12 +269,28 @@ pub(crate) fn record_image(secret_images: usize, notes: &[String]) {
 pub(crate) fn follow(json: bool) -> Result<(), String> {
     let mut source = activity_source()?;
     let mut lifecycle = LifecycleSource::open();
+    let mut persistent = LifecycleSource::open_at(persistent_log_path());
     let mut seen = SeenActivity::default();
 
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     loop {
         let mut wrote = false;
+        for payload in persistent.read_new()? {
+            if !seen.insert(&payload) {
+                continue;
+            }
+            let event: ActivityEvent = serde_json::from_str(&payload)
+                .map_err(|error| format!("invalid persistent log event: {error}"))?;
+            if json {
+                writeln!(output, "{payload}")
+                    .map_err(|error| format!("could not write persistent log: {error}"))?;
+            } else {
+                writeln!(output, "{}", format_event(&event))
+                    .map_err(|error| format!("could not write persistent log: {error}"))?;
+            }
+            wrote = true;
+        }
         for payload in lifecycle.read_new()? {
             if json {
                 writeln!(output, "{payload}")
@@ -320,8 +440,187 @@ fn record(event: ActivityEvent) {
     let Ok(json) = serde_json::to_string(&event) else {
         return;
     };
+    if let Some(writer) = persistent_log() {
+        writer.enqueue(json.clone());
+    }
     let share = *LOG_SHARE.get_or_init(|| crate::config::activity_share_enabled().unwrap_or(true));
     let _ = delegated_process_host::send_activity(&json, share);
+}
+
+fn persistent_log() -> Option<&'static PersistentLogWriter> {
+    PERSISTENT_LOG
+        .get_or_init(|| PersistentLogWriter::spawn(persistent_log_path()).ok())
+        .as_ref()
+}
+
+impl PersistentLogWriter {
+    fn spawn(path: PathBuf) -> Result<Self, String> {
+        prepare_log_path(&path)?;
+        let (sender, receiver) = mpsc::sync_channel(LOG_CHANNEL_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker_dropped = Arc::clone(&dropped);
+        std::thread::Builder::new()
+            .name("pentect-log-writer".to_string())
+            .spawn(move || log_writer_loop(path, receiver, worker_dropped))
+            .map_err(|error| format!("could not start persistent log writer: {error}"))?;
+        Ok(Self { sender, dropped })
+    }
+
+    fn enqueue(&self, entry: String) {
+        match self.sender.try_send(LogMessage::Entry(entry)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    fn flush(&self) {
+        let (sender, receiver) = mpsc::channel();
+        if self.sender.send(LogMessage::Flush(sender)).is_ok() {
+            let _ = receiver.recv_timeout(Duration::from_secs(5));
+        }
+    }
+}
+
+fn log_writer_loop(path: PathBuf, receiver: Receiver<LogMessage>, dropped: Arc<AtomicU64>) {
+    let mut batch = Vec::with_capacity(LOG_BATCH_EVENTS);
+    let mut bytes = 0usize;
+    loop {
+        let message = if batch.is_empty() {
+            match receiver.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            }
+        } else {
+            match receiver.recv_timeout(LOG_FLUSH_INTERVAL) {
+                Ok(message) => message,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    flush_batch(&path, &mut batch, &dropped);
+                    bytes = 0;
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+        match message {
+            LogMessage::Entry(entry) => {
+                bytes = bytes.saturating_add(entry.len() + 1);
+                batch.push(entry);
+                if batch.len() >= LOG_BATCH_EVENTS || bytes >= LOG_BATCH_BYTES {
+                    flush_batch(&path, &mut batch, &dropped);
+                    bytes = 0;
+                }
+            }
+            LogMessage::Flush(acknowledge) => {
+                flush_batch(&path, &mut batch, &dropped);
+                bytes = 0;
+                let _ = acknowledge.send(());
+            }
+        }
+    }
+    flush_batch(&path, &mut batch, &dropped);
+}
+
+fn flush_batch(path: &Path, batch: &mut Vec<String>, dropped: &AtomicU64) {
+    let lost = dropped.swap(0, Ordering::Relaxed);
+    if lost > 0 {
+        batch.push(
+            serde_json::json!({
+                "time": jiff::Timestamp::now().to_string(),
+                "action": "process",
+                "surface": "logger",
+                "count": lost,
+                "event": "queue-overflow",
+                "pid": std::process::id(),
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+            })
+            .to_string(),
+        );
+    }
+    if batch.is_empty() {
+        return;
+    }
+    if write_batch(path, batch).is_err() {
+        dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
+    }
+    batch.clear();
+}
+
+fn write_batch(path: &Path, batch: &[String]) -> Result<(), String> {
+    prepare_log_path(path)?;
+    let payload = batch.join("\n") + "\n";
+    rotate_log_if_needed(path, payload.len() as u64);
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("could not open persistent log: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    file.write_all(payload.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|error| format!("could not write persistent log: {error}"))
+}
+
+fn prepare_log_path(path: &Path) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "persistent log path has no parent directory".to_string())?;
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("could not create persistent log directory: {error}"))?;
+    if std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err("persistent log directory must not be a symbolic link".to_string());
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err("persistent log must not be a symbolic link".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+fn rotate_log_if_needed(path: &Path, incoming: u64) {
+    let current = std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if current.saturating_add(incoming) <= LOG_MAX_BYTES {
+        return;
+    }
+    for generation in (1..=LOG_ROTATIONS).rev() {
+        let source = if generation == 1 {
+            path.to_path_buf()
+        } else {
+            rotated_log_path(path, generation - 1)
+        };
+        let destination = rotated_log_path(path, generation);
+        if generation == LOG_ROTATIONS {
+            let _ = std::fs::remove_file(&destination);
+        }
+        if source.exists() {
+            let _ = std::fs::rename(source, destination);
+        }
+    }
+}
+
+fn rotated_log_path(path: &Path, generation: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{generation}"));
+    PathBuf::from(name)
 }
 
 fn activity_source() -> Result<ActivitySource, String> {
@@ -334,6 +633,30 @@ fn activity_source() -> Result<ActivitySource, String> {
 }
 
 fn format_event(event: &ActivityEvent) -> String {
+    if event.action == "process" {
+        let event_name = event.event.as_deref().unwrap_or("event");
+        let exit = event
+            .exit_code
+            .map(|code| format!("  exit={code}"))
+            .unwrap_or_default();
+        let location = event
+            .panic_location
+            .as_deref()
+            .map(|location| format!("  at={location}"))
+            .unwrap_or_default();
+        return format!(
+            "{}  process/{}  {}  pid={}  version={}  {}/{}{}{}",
+            event.time,
+            event.surface,
+            event_name,
+            event.pid.unwrap_or_default(),
+            event.version.as_deref().unwrap_or("unknown"),
+            event.os.as_deref().unwrap_or("unknown"),
+            event.arch.as_deref().unwrap_or("unknown"),
+            exit,
+            location,
+        );
+    }
     let labels = event
         .labels
         .iter()
@@ -360,6 +683,41 @@ fn format_event(event: &ActivityEvent) -> String {
         "{}  {}/{}  {}{}{}",
         event.time, event.action, event.surface, event.count, labels, target
     )
+}
+
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+fn safe_identifier(value: &str) -> String {
+    let value = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(64)
+        .collect::<String>();
+    if value.is_empty() {
+        "unknown".to_string()
+    } else {
+        value
+    }
+}
+
+fn safe_panic_location(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n' | '\0'))
+        .take(512)
+        .collect()
+}
+
+fn safe_backtrace(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| *character != '\0')
+        .take(16 * 1024)
+        .collect()
 }
 
 fn safe_target(path: &Path) -> String {
@@ -508,6 +866,50 @@ mod tests {
             source.read_new().unwrap(),
             ["{\"event\":\"after-rotation\"}"]
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_writer_flushes_a_batch_on_the_interval() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-persistent-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("pentect.log");
+        let writer = PersistentLogWriter::spawn(path.clone()).unwrap();
+        writer.enqueue("{\"event\":\"one\"}".to_string());
+        writer.enqueue("{\"event\":\"two\"}".to_string());
+        std::thread::sleep(LOG_FLUSH_INTERVAL + Duration::from_millis(100));
+        let payload = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(payload.lines().count(), 2);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_log_rotates_and_keeps_the_current_file_bounded() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-persistent-rotation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("pentect.log");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(LOG_MAX_BYTES + 1).unwrap();
+        write_batch(&path, &["{\"event\":\"after-rotation\"}".to_string()]).unwrap();
+        assert!(rotated_log_path(&path, 1).exists());
+        assert!(std::fs::metadata(&path).unwrap().len() < LOG_MAX_BYTES);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("after-rotation"));
         let _ = std::fs::remove_dir_all(root);
     }
 }
