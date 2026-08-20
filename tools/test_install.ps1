@@ -3,9 +3,11 @@ Set-StrictMode -Version Latest
 
 $savedDryRun = $env:PENTECT_INSTALL_DRY_RUN
 $savedSkipPath = $env:PENTECT_INSTALL_SKIP_PATH
+$savedInstallDir = $env:PENTECT_INSTALL_DIR
 try {
     $env:PENTECT_INSTALL_DRY_RUN = '1'
     $env:PENTECT_INSTALL_SKIP_PATH = '1'
+    $env:PENTECT_INSTALL_DIR = Join-Path ([System.IO.Path]::GetTempPath()) 'pentect-installer-test'
     . (Join-Path $PSScriptRoot 'install.ps1') | Out-Null
 
     $missingRuntimeProperty = { throw 'OSArchitecture property is unavailable' }
@@ -26,4 +28,5 @@ try {
 } finally {
     $env:PENTECT_INSTALL_DRY_RUN = $savedDryRun
     $env:PENTECT_INSTALL_SKIP_PATH = $savedSkipPath
+    $env:PENTECT_INSTALL_DIR = $savedInstallDir
 }
