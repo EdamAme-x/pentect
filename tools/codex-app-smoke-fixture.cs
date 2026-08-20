@@ -1,4 +1,5 @@
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Threading;
 
@@ -21,7 +22,19 @@ public static class CodexAppSmokeFixture
             UseShellExecute = false,
         };
         start.EnvironmentVariables[ChildMarker] = "1";
-        Process child = Process.Start(start);
+        Process child;
+        try
+        {
+            child = Process.Start(start);
+        }
+        catch (Win32Exception)
+        {
+            return 70;
+        }
+        catch (InvalidOperationException)
+        {
+            return 70;
+        }
         if (child == null)
         {
             return 70;
