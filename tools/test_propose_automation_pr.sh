@@ -47,4 +47,12 @@ output=$(
 )
 test "$output" = https://github.com/example/project/pull/1
 test "$(wc -l < "$tmp/state/watch")" -eq 2
+grep -Fx 'run watch 101 --repo example/project --exit-status' "$tmp/state/watch"
+grep -Fx 'run watch 102 --repo example/project --exit-status' "$tmp/state/watch"
 test "$(wc -l < "$tmp/state/api")" -eq 3
+status_endpoint='api --method POST repos/example/project/statuses/0123456789abcdef'
+test "$(grep -Fc "$status_endpoint" "$tmp/state/api")" -eq 3
+grep -F 'context=test' "$tmp/state/api"
+grep -F 'context=Native OCR (windows-latest)' "$tmp/state/api"
+grep -F 'context=Native OCR (macos-latest)' "$tmp/state/api"
+test "$(grep -Fc 'target_url=https://github.com/example/project/actions/runs/101' "$tmp/state/api")" -eq 3
