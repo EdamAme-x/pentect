@@ -1130,27 +1130,29 @@ impl CodexAppProcessProbe {
         self.system
             .processes()
             .iter()
-            .filter_map(|(pid, process)| {
-                process
-                    .exe()
-                    .and_then(|path| path.canonicalize().ok())
-                    .map(|path| path.to_string_lossy().to_ascii_lowercase())
-                    .is_some_and(|path| {
-                        path == self.expected
-                            || (!self.install_root.is_empty()
-                                && path.starts_with(&self.install_root)
-                                && matches!(
-                                    process
-                                        .name()
-                                        .to_string_lossy()
-                                        .to_ascii_lowercase()
-                                        .as_str(),
-                                    "codex.exe" | "chatgpt.exe"
-                                ))
-                    })
-                    .then(|| pid.as_u32())
-            })
+            .filter(|(_, process)| self.matches(process))
+            .map(|(pid, _)| pid.as_u32())
             .collect()
+    }
+
+    fn matches(&self, process: &sysinfo::Process) -> bool {
+        process
+            .exe()
+            .and_then(|path| path.canonicalize().ok())
+            .map(|path| path.to_string_lossy().to_ascii_lowercase())
+            .is_some_and(|path| {
+                path == self.expected
+                    || (!self.install_root.is_empty()
+                        && path.starts_with(&self.install_root)
+                        && matches!(
+                            process
+                                .name()
+                                .to_string_lossy()
+                                .to_ascii_lowercase()
+                                .as_str(),
+                            "codex.exe" | "chatgpt.exe"
+                        ))
+            })
     }
 }
 
