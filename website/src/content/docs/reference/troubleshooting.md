@@ -193,9 +193,9 @@ version, OS, architecture, PID, source location, and a backtrace so a crash can
 be investigated after the process exits.
 
 Writes are handled by a bounded background queue and flushed in batches of up
-to 64 events, 64 KiB, or 250 ms. The file rotates at 64 MiB and keeps 15
-older generations (`pentect.log.1` through `pentect.log.15`), for a maximum of
-about 1 GiB. A saturated queue never blocks protection work; the log records
+to 64 events, 64 KiB, or 250 ms. The file rotates at 128 MiB and keeps 31
+older generations (`pentect.log.1` through `pentect.log.31`), for a maximum of
+about 4 GiB. A saturated queue never blocks protection work; the log records
 the number of dropped diagnostic events when writing catches up.
 
 The entries contain command categories and status metadata only. Pentect does
