@@ -1,0 +1,63 @@
+name: Guard published releases
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  quarantine-incomplete-release:
+    if: github.repository == 'EdamAme-x/pentect' && github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Quarantine a stable release with missing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          version=${RELEASE_TAG#v}
+          required=(
+            LICENSE
+            THIRD_PARTY_LICENSES.txt
+            pentect-windows-x86_64.exe
+            pentect-windows-x86_64.exe.gz
+            pentect-windows-x86_64.exe.sha256
+            pentect-linux-x86_64
+            pentect-linux-x86_64.gz
+            pentect-linux-x86_64.sha256
+            pentect-linux-aarch64
+            pentect-linux-aarch64.gz
+            pentect-linux-aarch64.sha256
+            pentect-macos-x86_64
+            pentect-macos-x86_64.gz
+            pentect-macos-x86_64.sha256
+            pentect-macos-aarch64
+            pentect-macos-aarch64.gz
+            pentect-macos-aarch64.sha256
+            "pentect_${version}_amd64.deb"
+            "pentect_${version}_amd64.deb.sha256"
+            "pentect_${version}_arm64.deb"
+            "pentect_${version}_arm64.deb.sha256"
+          )
+          missing=()
+          for asset in "${required[@]}"; do
+            if ! jq -e --arg name "$asset" '.assets[] | select(.name == $name)' <<<"$release" >/dev/null; then
+              missing+=("$asset")
+            fi
+          done
+          if test "${#missing[@]}" -eq 0; then
+            exit 0
+          fi
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F prerelease=true \
+            -f make_latest=false >/dev/null
+          printf 'Incomplete release was changed back to prerelease. Missing assets:\n' >&2
+          printf '  %s\n' "${missing[@]}" >&2
+          exit 1

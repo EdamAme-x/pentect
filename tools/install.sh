@@ -65,6 +65,12 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
+download() {
+  curl -fsSL --proto '=https' --tlsv1.2 \
+    --retry 3 --retry-delay 1 \
+    "$1" -o "$2"
+}
+
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/pentect-install.XXXXXX")
 cleanup() {
   rm -rf "$temp_dir"
@@ -77,12 +83,13 @@ printf '  Version  : %s\n' "$release_tag"
 printf '  Install  : %s\n\n' "$destination"
 
 printf '[1/4] Downloading %s...\n' "$release_tag"
-curl -fsSL --proto '=https' --tlsv1.2 \
-  "$base_url/$asset" \
-  -o "$temp_dir/$asset"
-curl -fsSL --proto '=https' --tlsv1.2 \
-  "$base_url/$asset.sha256" \
-  -o "$temp_dir/$asset.sha256"
+if command -v gzip >/dev/null 2>&1 && \
+  download "$base_url/$asset.gz" "$temp_dir/$asset.gz" 2>/dev/null; then
+  gzip -dc "$temp_dir/$asset.gz" > "$temp_dir/$asset"
+else
+  download "$base_url/$asset" "$temp_dir/$asset"
+fi
+download "$base_url/$asset.sha256" "$temp_dir/$asset.sha256"
 
 printf '[2/4] Verifying SHA-256...\n'
 expected=$(awk 'NR == 1 { print tolower($1) }' "$temp_dir/$asset.sha256")

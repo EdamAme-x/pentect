@@ -50,27 +50,49 @@ async function packageVersion() {
   return metadata.version?.replace(/^v/, '');
 }
 
-async function download(url, signal) {
-  const response = await fetch(url, {
-    redirect: 'follow',
-    headers: { 'user-agent': 'pentect-npm-installer' },
-    signal,
-  });
+export function retryableStatus(status) {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+export async function fetchWithRetry(url, options = {}) {
+  const request = options.request || globalThis.fetch;
+  const wait = options.wait || ((milliseconds) => new Promise(
+    (resolveDelay) => setTimeout(resolveDelay, milliseconds),
+  ));
+  const timeout = options.timeout || (() => AbortSignal.timeout(90_000));
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await request(url, {
+        redirect: 'follow',
+        headers: { 'user-agent': 'pentect-npm-installer' },
+        signal: timeout(),
+      });
+      if (!retryableStatus(response.status) || attempt === 3) return response;
+      await response.body?.cancel();
+      lastError = new Error(`Download failed (${response.status} ${response.statusText})`);
+    } catch (error) {
+      lastError = error;
+      if (attempt === 3) throw error;
+    }
+    await wait(attempt * 250);
+  }
+  throw lastError;
+}
+
+async function download(url) {
+  const response = await fetchWithRetry(url);
   if (!response.ok) throw new Error(`Download failed (${response.status} ${response.statusText})`);
   return Buffer.from(await response.arrayBuffer());
 }
 
-async function downloadBinary(base, asset, signal) {
-  const compressed = await fetch(`${base}/${asset}.gz`, {
-    redirect: 'follow',
-    headers: { 'user-agent': 'pentect-npm-installer' },
-    signal,
-  });
+async function downloadBinary(base, asset) {
+  const compressed = await fetchWithRetry(`${base}/${asset}.gz`);
   if (compressed.ok) return gunzipSync(Buffer.from(await compressed.arrayBuffer()));
   if (compressed.status !== 404) {
     throw new Error(`Download failed (${compressed.status} ${compressed.statusText})`);
   }
-  return download(`${base}/${asset}`, signal);
+  return download(`${base}/${asset}`);
 }
 
 export async function install(version) {
@@ -81,10 +103,9 @@ export async function install(version) {
   const base = tag === 'latest'
     ? `https://github.com/${repository}/releases/latest/download`
     : `https://github.com/${repository}/releases/download/${tag}`;
-  const signal = AbortSignal.timeout(90_000);
   const [binary, checksumFile] = await Promise.all([
-    downloadBinary(base, asset, signal),
-    download(`${base}/${asset}.sha256`, signal),
+    downloadBinary(base, asset),
+    download(`${base}/${asset}.sha256`),
   ]);
   const expected = expectedChecksum(checksumFile.toString('utf8'));
   const actual = createHash('sha256').update(binary).digest('hex');

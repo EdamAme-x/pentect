@@ -43,6 +43,57 @@ function Get-PentectOsArchitecture {
     return ConvertTo-PentectArchitecture $environmentValue
 }
 
+function Invoke-PentectDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [switch]$AllowNotFound
+    )
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile
+            return $true
+        } catch {
+            $response = $_.Exception.Response
+            if ($AllowNotFound -and $null -ne $response -and [int]$response.StatusCode -eq 404) {
+                return $false
+            }
+            if ($attempt -eq 3) {
+                throw "pentect: could not download '$Uri' after 3 attempts: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds $attempt
+        }
+    }
+}
+
+function Expand-PentectGzip {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $inputStream = [System.IO.File]::OpenRead($Source)
+    try {
+        $outputStream = [System.IO.File]::Create($Destination)
+        try {
+            $gzipStream = [System.IO.Compression.GzipStream]::new(
+                $inputStream,
+                [System.IO.Compression.CompressionMode]::Decompress
+            )
+            try {
+                $gzipStream.CopyTo($outputStream)
+            } finally {
+                $gzipStream.Dispose()
+            }
+        } finally {
+            $outputStream.Dispose()
+        }
+    } finally {
+        $inputStream.Dispose()
+    }
+}
+
 $repository = 'EdamAme-x/pentect'
 $requestedVersion = $Version
 if ($requestedVersion) {
@@ -80,16 +131,25 @@ if ($env:PENTECT_INSTALL_DRY_RUN -eq '1') {
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pentect-install-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tempDir | Out-Null
 try {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch {}
     Write-Output 'Pentect installer'
     Write-Output "  Platform : Windows x64"
     Write-Output "  Version  : $releaseTag"
     Write-Output "  Install  : $destination"
     Write-Output ''
     $binaryPath = Join-Path $tempDir $asset
+    $compressedPath = "$binaryPath.gz"
     $checksumPath = "$binaryPath.sha256"
     Write-Output "[1/4] Downloading $releaseTag..."
-    Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/$asset" -OutFile $binaryPath
-    Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/$asset.sha256" -OutFile $checksumPath
+    if (Invoke-PentectDownload -Uri "$baseUrl/$asset.gz" -OutFile $compressedPath -AllowNotFound) {
+        Expand-PentectGzip -Source $compressedPath -Destination $binaryPath
+    } else {
+        Invoke-PentectDownload -Uri "$baseUrl/$asset" -OutFile $binaryPath | Out-Null
+    }
+    Invoke-PentectDownload -Uri "$baseUrl/$asset.sha256" -OutFile $checksumPath | Out-Null
 
     Write-Output '[2/4] Verifying SHA-256...'
     $expected = ((Get-Content -Raw -LiteralPath $checksumPath) -split '\s+')[0].ToLowerInvariant()
