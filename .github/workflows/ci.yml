@@ -183,7 +183,7 @@ jobs:
   native-ocr:
     name: Native OCR (${{ matrix.os }})
     needs: changes
-    if: needs.changes.result == 'success' && needs.changes.outputs.ocr == 'true'
+    if: always()
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -213,7 +213,7 @@ jobs:
   plugin-platform:
     name: Plugins (${{ matrix.os }})
     needs: changes
-    if: needs.changes.result == 'success' && needs.changes.outputs.plugins == 'true'
+    if: always()
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -263,7 +263,7 @@ jobs:
   app-platform:
     name: Desktop app boundaries (${{ matrix.os }})
     needs: changes
-    if: needs.changes.result == 'success' && (needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true')
+    if: always()
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -315,7 +315,7 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.result == 'success' && (github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.manifests == 'true' || needs.changes.outputs.packaging == 'true' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.runtime_log == 'true' || needs.changes.outputs.cli_general == 'true' || needs.changes.outputs.runtime_general == 'true' || needs.changes.outputs.runtime_main == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.detector == 'true')
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
