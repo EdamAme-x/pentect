@@ -495,13 +495,17 @@ jobs:
           sudo dpkg -i dist/pentect_*.deb
           test "$(pentect version)" = "pentect ${GITHUB_REF_NAME#v}"
           echo 'PENTECT_SMOKE_BINARY=/usr/bin/pentect' >> "$GITHUB_ENV"
-      - name: Verify Codex CLI and Codex App launch (Windows)
+      - name: Verify agent CLI and Codex App launch (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          npm install --global @openai/codex@0.147.0
+          npm install --global @openai/codex@0.147.0 @anthropic-ai/claude-code@2.1.227 opencode-ai@1.18.16
           & $env:PENTECT_SMOKE_BINARY codex -- --version
           if ($LASTEXITCODE -ne 0) { throw 'pentect codex failed to launch' }
+          & $env:PENTECT_SMOKE_BINARY claude -- --version
+          if ($LASTEXITCODE -ne 0) { throw 'pentect claude failed to launch' }
+          & $env:PENTECT_SMOKE_BINARY opencode -- --version
+          if ($LASTEXITCODE -ne 0) { throw 'pentect opencode failed to launch' }
           $node = (Get-Command node -ErrorAction Stop).Source
           $fixture = Join-Path $env:RUNNER_TEMP 'codex-app-fixture.exe'
           Copy-Item -LiteralPath $node -Destination $fixture
@@ -513,13 +517,15 @@ jobs:
           & $env:PENTECT_SMOKE_BINARY codex app --app $fixture --upstream https://api.openai.com/v1
           if ($LASTEXITCODE -ne 0) { throw 'pentect codex app failed to launch' }
           if ((Get-FileHash -Algorithm SHA256 $config).Hash -ne $before) { throw 'Codex config was modified' }
-      - name: Verify Codex CLI and Codex App launch (POSIX)
+      - name: Verify agent CLI and Codex App launch (POSIX)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          npm install --global @openai/codex@0.147.0
+          npm install --global @openai/codex@0.147.0 @anthropic-ai/claude-code@2.1.227 opencode-ai@1.18.16
           "$PENTECT_SMOKE_BINARY" codex -- --version
+          "$PENTECT_SMOKE_BINARY" claude -- --version
+          "$PENTECT_SMOKE_BINARY" opencode -- --version
           fixture="$RUNNER_TEMP/codex-app-fixture"
           cp "$(command -v node)" "$fixture"
           chmod +x "$fixture"
