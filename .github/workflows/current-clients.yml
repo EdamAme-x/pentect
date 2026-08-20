@@ -61,7 +61,7 @@ jobs:
         run: |
           set -eu
           install_dir="$RUNNER_TEMP/pentect-client-smoke"
-          curl -fsSL --proto '=https' --tlsv1.2 https://pentect.dev/install |
+          curl -fsSL --proto '=https' --tlsv1.2 https://pentect.dev/install.sh |
             PENTECT_INSTALL_DIR="$install_dir" sh
           test -x "$install_dir/pentect"
           printf 'PENTECT_SMOKE_BINARY=%s\n' "$install_dir/pentect" >> "$GITHUB_ENV"
@@ -162,7 +162,7 @@ jobs:
         run: |
           set -eu
           install_dir="$RUNNER_TEMP/pentect-native-smoke"
-          curl -fsSL --proto '=https' --tlsv1.2 https://pentect.dev/install |
+          curl -fsSL --proto '=https' --tlsv1.2 https://pentect.dev/install.sh |
             PENTECT_INSTALL_DIR="$install_dir" sh
           test -x "$install_dir/pentect"
           printf 'PENTECT_SMOKE_BINARY=%s\n' "$install_dir/pentect" >> "$GITHUB_ENV"
