@@ -325,7 +325,11 @@ jobs:
               gh release upload "$GITHUB_REF_NAME" "${missing[@]}" --repo "$GITHUB_REPOSITORY"
             fi
           else
-            gh release create "$GITHUB_REF_NAME" dist/* \
+            mapfile -d '' -t release_assets < <(
+              find dist -maxdepth 1 -type f -print0 | sort -z
+            )
+            test "${#release_assets[@]}" -gt 0
+            gh release create "$GITHUB_REF_NAME" "${release_assets[@]}" \
               --verify-tag \
               --generate-notes \
               --prerelease \
