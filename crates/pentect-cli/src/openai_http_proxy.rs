@@ -158,28 +158,14 @@ async fn run_proxy(
     ready_tx: mpsc::Sender<Result<String, String>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|error| format!("could not bind OpenAI HTTP gateway: {error}"))?;
-    let address = listener
-        .local_addr()
-        .map_err(|error| format!("could not read OpenAI HTTP gateway address: {error}"))?;
-    let local_base_url = format!("http://{address}/{auth}");
-    let plugins = pentect_agent::PluginMiddleware::from_env()?;
-    let state = Arc::new(ProxyState {
-        upstream,
-        auth,
-        client: build_upstream_client()?,
-        masker: Arc::new(Mutex::new(
-            pentect_agent::ActiveToolOutputMasker::new_with_plugins(plugins.clone())?,
-        )),
-        plugins: Arc::new(Mutex::new(plugins)),
-        files: Mutex::new(HashMap::new()),
-        file_attestations: crate::http_files::FileAttestationStore::open_default()?,
-        requests: Arc::new(Semaphore::new(32)),
-        block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
-        headers,
-    });
+    let initialized = initialize_proxy(upstream, headers, auth).await;
+    let (listener, state, local_base_url) = match initialized {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            return Err("gateway initialization failed".to_string());
+        }
+    };
     let _ = ready_tx.send(Ok(local_base_url));
 
     loop {
@@ -187,7 +173,7 @@ async fn run_proxy(
             _ = &mut shutdown_rx => break,
             accepted = listener.accept() => {
                 let (socket, _) = accepted
-                    .map_err(|error| format!("OpenAI HTTP gateway accept failed: {error}"))?;
+                    .map_err(|_| "gateway listener failed".to_string())?;
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let io = hyper_util::rt::TokioIo::new(socket);
@@ -210,6 +196,36 @@ async fn run_proxy(
         }
     }
     Ok(())
+}
+
+async fn initialize_proxy(
+    upstream: reqwest::Url,
+    headers: crate::upstream::HeaderOverrides,
+    auth: String,
+) -> Result<(TcpListener, Arc<ProxyState>, String), String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("could not bind OpenAI HTTP gateway: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("could not read OpenAI HTTP gateway address: {error}"))?;
+    let local_base_url = format!("http://{address}/{auth}");
+    let plugins = pentect_agent::PluginMiddleware::from_env()?;
+    let state = Arc::new(ProxyState {
+        upstream,
+        auth,
+        client: build_upstream_client()?,
+        masker: Arc::new(Mutex::new(
+            pentect_agent::ActiveToolOutputMasker::new_with_plugins(plugins.clone())?,
+        )),
+        plugins: Arc::new(Mutex::new(plugins)),
+        files: Mutex::new(HashMap::new()),
+        file_attestations: crate::http_files::FileAttestationStore::open_default()?,
+        requests: Arc::new(Semaphore::new(32)),
+        block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
+        headers,
+    });
+    Ok((listener, state, local_base_url))
 }
 
 fn build_upstream_client() -> Result<reqwest::Client, String> {
@@ -2407,6 +2423,38 @@ mod tests {
             offset = end;
         }
         None
+    }
+
+    #[test]
+    fn startup_reports_pre_ready_plugin_failure_without_timeout() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let name = "PENTECT_PLUGIN_BINARIES";
+        let previous = std::env::var_os(name);
+        let missing = std::env::temp_dir().join(format!(
+            "pentect-missing-plugin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::env::set_var(name, &missing);
+        let started = std::time::Instant::now();
+        let result = OpenAiHttpProxyGuard::start("https://example.test/v1".to_string());
+        match previous {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+
+        let error = match result {
+            Ok(_) => panic!("missing plugin must fail gateway startup"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        assert!(
+            error.contains("plugin") || error.contains("WebAssembly"),
+            "{error}"
+        );
     }
 
     fn mock_chat_upstream() -> (

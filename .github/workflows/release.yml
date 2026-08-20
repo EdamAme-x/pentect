@@ -61,6 +61,7 @@ jobs:
               throw "$path`n$($errors | Out-String)"
             }
           }
+          & ./tools/test_install.ps1
       - name: Verify third-party licenses
         run: python tools/generate_licenses.py --check
       - name: Verify package metadata generator

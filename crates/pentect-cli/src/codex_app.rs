@@ -200,7 +200,10 @@ fn monitor_handed_off_app(
     let mut warned_unobservable = false;
     let mut absent_since = None;
     loop {
-        ensure_gateway_running(proxy, lifecycle_log)?;
+        if let Err(error) = ensure_gateway_running(proxy, lifecycle_log) {
+            terminate_codex_app_processes(app);
+            return Err(error);
+        }
         if process_probe.is_running() {
             if !observed {
                 record_lifecycle(lifecycle_log, "app-process-observed", "running");
@@ -217,7 +220,11 @@ fn monitor_handed_off_app(
             // Packaged Windows apps can hide their executable path from normal
             // process enumeration. Never drop the gateway merely because the
             // process cannot be observed: remain in the foreground until Ctrl+C.
-            record_lifecycle(lifecycle_log, "app-process-unobservable", "gateway-kept-alive");
+            record_lifecycle(
+                lifecycle_log,
+                "app-process-unobservable",
+                "gateway-kept-alive",
+            );
             eprintln!(
                 "[pentect] Codex App process could not be observed; the gateway will stay active until Ctrl+C"
             );
@@ -265,16 +272,16 @@ impl CodexAppLifecycleLog {
                 .open(&path)
                 .map_err(|error| format!("could not rotate '{}': {error}", path.display()))?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| format!("could not open '{}': {error}", path.display()))?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let file = options
+            .open(&path)
+            .map_err(|error| format!("could not open '{}': {error}", path.display()))?;
         Ok(Self {
             file: Mutex::new(file),
         })
@@ -1091,28 +1098,16 @@ fn codex_app_is_running(app: &Path) -> bool {
 }
 
 struct CodexAppProcessProbe {
-    expected: String,
-    install_root: String,
+    expected: PathBuf,
+    install_root: Option<PathBuf>,
     system: sysinfo::System,
 }
 
 impl CodexAppProcessProbe {
     fn new(app: &Path) -> Self {
         Self {
-            expected: app
-                .canonicalize()
-                .unwrap_or_else(|_| app.to_path_buf())
-                .to_string_lossy()
-                .to_ascii_lowercase(),
-            install_root: app
-                .parent()
-                .map(|path| {
-                    path.canonicalize()
-                        .unwrap_or_else(|_| path.to_path_buf())
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                })
-                .unwrap_or_default(),
+            expected: comparable_process_path(app),
+            install_root: app.parent().map(comparable_process_path),
             system: sysinfo::System::new(),
         }
     }
@@ -1133,7 +1128,7 @@ impl CodexAppProcessProbe {
     }
 
     fn matches(&self, process: &sysinfo::Process) -> bool {
-        let process_name = process.name().to_string_lossy().to_ascii_lowercase();
+        let process_name = comparable_process_name(&process.name().to_string_lossy());
         // Windows packaged ChatGPT/Codex processes may not expose their image
         // path to a non-elevated caller. Treat ChatGPT.exe as the App in that
         // case so an already-running process is never mistaken for a protected
@@ -1145,30 +1140,49 @@ impl CodexAppProcessProbe {
 
         let executable_matches = process
             .exe()
-            .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
-            .map(|path| path.to_string_lossy().to_ascii_lowercase())
-            .is_some_and(|path| {
-                path == self.expected
-                    || (!self.install_root.is_empty()
-                        && path.starts_with(&self.install_root)
-                        && matches!(
-                            process_name.as_str(),
-                            "codex.exe" | "chatgpt.exe"
-                        ))
-            });
+            .map(comparable_process_path)
+            .is_some_and(|path| self.path_matches(&path, &process_name));
         if executable_matches {
             return true;
         }
 
         process.cmd().first().is_some_and(|command| {
             let path = PathBuf::from(command.as_os_str());
-            let path = path.canonicalize().unwrap_or(path);
-            let path = path.to_string_lossy().to_ascii_lowercase();
-            path == self.expected
-                || (!self.install_root.is_empty()
-                    && path.starts_with(&self.install_root)
-                    && matches!(process_name.as_str(), "codex.exe" | "chatgpt.exe"))
+            let path = comparable_process_path(&path);
+            self.path_matches(&path, &process_name)
         })
+    }
+
+    fn path_matches(&self, path: &Path, process_name: &str) -> bool {
+        path == self.expected
+            || (self
+                .install_root
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
+                && matches!(process_name, "codex.exe" | "chatgpt.exe"))
+    }
+}
+
+fn comparable_process_path(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        PathBuf::from(path.to_string_lossy().to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+fn comparable_process_name(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        name.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_string()
     }
 }
 
@@ -1187,6 +1201,23 @@ fn success_status() -> std::process::ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_matching_requires_install_root_component_boundary() {
+        let probe = CodexAppProcessProbe {
+            expected: PathBuf::from("/opt/Codex/app/ChatGPT.exe"),
+            install_root: Some(PathBuf::from("/opt/Codex/app")),
+            system: sysinfo::System::new(),
+        };
+        assert!(probe.path_matches(
+            Path::new("/opt/Codex/app/helper/ChatGPT.exe"),
+            "chatgpt.exe",
+        ));
+        assert!(!probe.path_matches(
+            Path::new("/opt/Codex/app-nightly/ChatGPT.exe"),
+            "chatgpt.exe",
+        ));
+    }
 
     #[test]
     fn parses_launcher_options() {

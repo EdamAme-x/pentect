@@ -530,11 +530,32 @@ fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
 #[cfg(any(windows, test))]
 fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -> Option<PathBuf> {
     let names = if program.extension().is_none() {
-        let mut names = pathext
+        let mut extensions = pathext
             .to_string_lossy()
             .split(';')
             .map(str::trim)
             .filter(|extension| !extension.is_empty())
+            // Command::new can launch PE binaries and cmd/bat shims. A
+            // PowerShell .ps1 entry may appear in PATHEXT but cannot be
+            // executed directly through CreateProcess.
+            .filter(|extension| {
+                matches!(
+                    extension.to_ascii_uppercase().as_str(),
+                    ".COM" | ".EXE" | ".BAT" | ".CMD"
+                )
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for fallback in [".COM", ".EXE", ".BAT", ".CMD"] {
+            if !extensions
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case(fallback))
+            {
+                extensions.push(fallback.to_string());
+            }
+        }
+        let mut names = extensions
+            .into_iter()
             .map(|extension| {
                 let mut name = program.as_os_str().to_os_string();
                 name.push(extension);
@@ -2741,6 +2762,30 @@ mod tests {
             resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
                 .unwrap();
         assert_eq!(resolved.parent(), Some(directory.as_path()));
+        assert!(resolved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("codex.cmd"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_command_resolution_skips_powershell_only_pathext_entries() {
+        let directory = command_test_directory("npm-shim-powershell-pathext");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("codex.ps1"), b"Write-Output codex\n").unwrap();
+        let cmd = if cfg!(windows) {
+            directory.join("codex.cmd")
+        } else {
+            directory.join("codex.CMD")
+        };
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".PS1;.CMD"))
+                .unwrap();
         assert!(resolved
             .file_name()
             .unwrap()

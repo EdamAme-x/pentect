@@ -64,6 +64,7 @@ jobs:
       runtime_log: ${{ steps.filter.outputs.runtime_log }}
       cli_general: ${{ steps.filter.outputs.cli_general }}
       runtime_general: ${{ steps.filter.outputs.runtime_general }}
+      runtime_main: ${{ steps.filter.outputs.runtime_main }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -106,6 +107,8 @@ jobs:
             packaging:
               - 'packaging/**'
               - 'tools/install.ps1'
+              - 'tools/test_install.ps1'
+              - 'tools/release_live_e2e.ps1'
               - 'tools/install.sh'
               - 'tools/install-apt.sh'
               - 'tools/package_deb.sh'
@@ -174,6 +177,8 @@ jobs:
               - '!crates/pentect-runtime/src/image.rs'
               - '!crates/pentect-runtime/src/masking.rs'
               - '!crates/pentect-runtime/src/plugin_middleware.rs'
+            runtime_main:
+              - 'crates/pentect-runtime/src/main.rs'
 
   native-ocr:
     name: Native OCR (${{ matrix.os }})
@@ -258,7 +263,7 @@ jobs:
   app-platform:
     name: Desktop app boundaries (${{ matrix.os }})
     needs: changes
-    if: needs.changes.result == 'success' && (needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.command_shims == 'true')
+    if: needs.changes.result == 'success' && (needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -270,14 +275,14 @@ jobs:
         if: needs.changes.result != 'success'
         run: exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.command_shims == 'true'
+        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true'
         with:
           submodules: recursive
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.command_shims == 'true'
+        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true'
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.command_shims == 'true'
+        if: needs.changes.outputs.codex_app == 'true' || needs.changes.outputs.claude_app == 'true' || needs.changes.outputs.openai_proxy == 'true' || needs.changes.outputs.command_shims == 'true'
       - name: Test Codex App launcher and recovery
         if: needs.changes.outputs.codex_app == 'true'
         run: python tools/run_filtered_tests.py codex_app::tests
@@ -291,12 +296,26 @@ jobs:
         if: needs.changes.outputs.command_shims == 'true' && runner.os == 'Windows'
         run: cargo test -p pentect-cli --no-default-features windows_npm_cmd_shim --locked
       - name: No app changes
-        if: needs.changes.outputs.codex_app != 'true' && needs.changes.outputs.claude_app != 'true' && needs.changes.outputs.command_shims != 'true'
+        if: needs.changes.outputs.codex_app != 'true' && needs.changes.outputs.claude_app != 'true' && needs.changes.outputs.openai_proxy != 'true' && needs.changes.outputs.command_shims != 'true'
         run: echo "No app changes"
+
+  windows-powershell-installer:
+    name: Windows PowerShell installer
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.packaging == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test Windows PowerShell 5.1 fallback
+        shell: powershell
+        run: ./tools/test_install.ps1
 
   test:
     needs: changes
-    if: needs.changes.result == 'success' && (github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.manifests == 'true' || needs.changes.outputs.packaging == 'true' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.runtime_log == 'true' || needs.changes.outputs.cli_general == 'true' || needs.changes.outputs.runtime_general == 'true' || needs.changes.outputs.detector == 'true')
+    if: needs.changes.result == 'success' && (github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.manifests == 'true' || needs.changes.outputs.packaging == 'true' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.runtime_log == 'true' || needs.changes.outputs.cli_general == 'true' || needs.changes.outputs.runtime_general == 'true' || needs.changes.outputs.runtime_main == 'true' || needs.changes.outputs.command_shims == 'true' || needs.changes.outputs.detector == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -342,6 +361,7 @@ jobs:
               throw "$path`n$($errors | Out-String)"
             }
           }
+          & ./tools/test_install.ps1
       - name: Clippy core
         if: needs.changes.outputs.core_rust == 'true'
         run: cargo clippy -p pentect-core --all-targets --no-default-features -- -D warnings
@@ -367,6 +387,9 @@ jobs:
         run: cargo test -p pentect-cli --no-default-features --locked
       - name: Test general runtime changes
         if: needs.changes.outputs.runtime_general == 'true'
+        run: cargo test -p pentect-runtime --no-default-features --locked
+      - name: Test runtime entrypoint changes
+        if: needs.changes.outputs.runtime_main == 'true'
         run: cargo test -p pentect-runtime --no-default-features --locked
       - name: Test detector changes
         if: needs.changes.outputs.detector == 'true'
