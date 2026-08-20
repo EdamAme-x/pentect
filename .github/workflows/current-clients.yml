@@ -8,6 +8,7 @@ on:
       - "crates/pentect-cli/src/client_descriptor.rs"
       - "tools/client_smoke.py"
       - "tools/install_client_smoke.sh"
+      - "tools/install_portable_client_smoke.py"
       - "tools/test_client_smoke_coverage.py"
       - "tools/verify_client_smoke_log.py"
       - "tools/codex-app-smoke-fixture.cjs"
@@ -88,8 +89,10 @@ jobs:
           if ((Get-FileHash -Algorithm SHA256 $config).Hash -ne $before) { throw 'Codex config was modified' }
 
           $claudeFixture = Join-Path $env:RUNNER_TEMP 'claude-app-fixture.exe'
-          Add-Type -Path tools/claude-app-smoke-fixture.cs `
-            -OutputAssembly $claudeFixture -OutputType ConsoleApplication
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path -LiteralPath $csc)) { throw 'Framework C# compiler is unavailable' }
+          & $csc /nologo /target:exe "/out:$claudeFixture" tools/claude-app-smoke-fixture.cs
+          if ($LASTEXITCODE -ne 0) { throw 'Claude fixture compilation failed' }
           Remove-Item Env:NODE_OPTIONS
           & $env:PENTECT_SMOKE_BINARY claude app --app $claudeFixture --upstream https://api.anthropic.com
           if ($LASTEXITCODE -ne 0) { throw 'Claude Desktop contract failed' }

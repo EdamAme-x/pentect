@@ -121,6 +121,7 @@ jobs:
               - 'tools/update_package_metadata.py'
               - 'tools/client_smoke.py'
               - 'tools/install_client_smoke.sh'
+              - 'tools/install_portable_client_smoke.py'
               - 'tools/test_client_smoke_coverage.py'
               - 'tools/verify_client_smoke_log.py'
               - 'tools/codex-app-smoke-fixture.cjs'
@@ -323,9 +324,11 @@ jobs:
         shell: powershell
         run: |
           ./tools/test_install.ps1
-          Add-Type -Path tools/claude-app-smoke-fixture.cs `
-            -OutputAssembly "$env:RUNNER_TEMP/claude-app-smoke-fixture.exe" `
-            -OutputType ConsoleApplication
+          $fixture = "$env:RUNNER_TEMP/claude-app-smoke-fixture.exe"
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path -LiteralPath $csc)) { throw 'Framework C# compiler is unavailable' }
+          & $csc /nologo /target:exe "/out:$fixture" tools/claude-app-smoke-fixture.cs
+          if ($LASTEXITCODE -ne 0) { throw 'Claude fixture compilation failed' }
 
   test:
     needs: changes
@@ -358,7 +361,7 @@ jobs:
         run: |
           python tools/update_package_metadata.py --metadata-file packaging/release.json --check
           python tools/test_client_smoke_coverage.py
-          python -m py_compile tools/client_smoke.py tools/test_client_smoke_coverage.py tools/verify_client_smoke_log.py
+          python -m py_compile tools/client_smoke.py tools/install_portable_client_smoke.py tools/test_client_smoke_coverage.py tools/verify_client_smoke_log.py
           sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$RUNNER_TEMP/claude-app-smoke-fixture"
           sh tools/test_propose_automation_pr.sh
