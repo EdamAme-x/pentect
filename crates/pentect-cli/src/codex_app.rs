@@ -1133,7 +1133,17 @@ impl CodexAppProcessProbe {
     }
 
     fn matches(&self, process: &sysinfo::Process) -> bool {
-        process
+        let process_name = process.name().to_string_lossy().to_ascii_lowercase();
+        // Windows packaged ChatGPT/Codex processes may not expose their image
+        // path to a non-elevated caller. Treat ChatGPT.exe as the App in that
+        // case so an already-running process is never mistaken for a protected
+        // launch. Do not do this for a bare codex.exe name because that can be
+        // the unrelated CLI.
+        if cfg!(windows) && process_name == "chatgpt.exe" {
+            return true;
+        }
+
+        let executable_matches = process
             .exe()
             .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
             .map(|path| path.to_string_lossy().to_ascii_lowercase())
@@ -1142,14 +1152,23 @@ impl CodexAppProcessProbe {
                     || (!self.install_root.is_empty()
                         && path.starts_with(&self.install_root)
                         && matches!(
-                            process
-                                .name()
-                                .to_string_lossy()
-                                .to_ascii_lowercase()
-                                .as_str(),
+                            process_name.as_str(),
                             "codex.exe" | "chatgpt.exe"
                         ))
-            })
+            });
+        if executable_matches {
+            return true;
+        }
+
+        process.cmd().first().is_some_and(|command| {
+            let path = PathBuf::from(command.as_os_str());
+            let path = path.canonicalize().unwrap_or(path);
+            let path = path.to_string_lossy().to_ascii_lowercase();
+            path == self.expected
+                || (!self.install_root.is_empty()
+                    && path.starts_with(&self.install_root)
+                    && matches!(process_name.as_str(), "codex.exe" | "chatgpt.exe"))
+        })
     }
 }
 
