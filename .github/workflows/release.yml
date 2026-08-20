@@ -67,7 +67,8 @@ jobs:
           $fixture = "$env:RUNNER_TEMP/claude-app-smoke-fixture.exe"
           $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
           if (-not (Test-Path -LiteralPath $csc)) { throw 'Framework C# compiler is unavailable' }
-          & $csc /nologo /target:exe "/out:$fixture" tools/claude-app-smoke-fixture.cs
+          $source = (Resolve-Path 'tools/claude-app-smoke-fixture.cs').Path
+          & $csc /nologo /target:exe "/out:$fixture" $source
           if ($LASTEXITCODE -ne 0) { throw 'Claude fixture compilation failed' }
           & ./tools/test_install.ps1
       - name: Verify third-party licenses
@@ -535,7 +536,8 @@ jobs:
           $claudeFixture = Join-Path $env:RUNNER_TEMP 'claude-app-fixture.exe'
           $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
           if (-not (Test-Path -LiteralPath $csc)) { throw 'Framework C# compiler is unavailable' }
-          & $csc /nologo /target:exe "/out:$claudeFixture" tools/claude-app-smoke-fixture.cs
+          $claudeSource = (Resolve-Path 'tools/claude-app-smoke-fixture.cs').Path
+          & $csc /nologo /target:exe "/out:$claudeFixture" $claudeSource
           if ($LASTEXITCODE -ne 0) { throw 'Claude fixture compilation failed' }
           Remove-Item Env:NODE_OPTIONS
           & $env:PENTECT_SMOKE_BINARY claude app --app $claudeFixture --upstream https://api.anthropic.com
