@@ -184,6 +184,10 @@ pentect log
 pentect log --json
 ```
 
+Codex App gateway lifecycle and crash entries are persisted locally, so this
+also shows why a previous protected App session ended. The entries contain
+event types and process status only, never request bodies or secret values.
+
 Logs show actions and counts, not real protected values.
 
 ::: warning

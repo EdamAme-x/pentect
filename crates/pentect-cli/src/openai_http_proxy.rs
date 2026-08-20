@@ -45,6 +45,7 @@ pub(crate) struct OpenAiHttpProxyGuard {
     base_url: String,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl OpenAiHttpProxyGuard {
@@ -63,6 +64,8 @@ impl OpenAiHttpProxyGuard {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let thread_auth = auth.clone();
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
         let thread = thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -71,6 +74,9 @@ impl OpenAiHttpProxyGuard {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(format!("runtime initialization failed: {error}"));
+                    }
                     let _ = ready_tx.send(Err(format!(
                         "could not start OpenAI HTTP gateway runtime: {error}"
                     )));
@@ -81,7 +87,9 @@ impl OpenAiHttpProxyGuard {
                 if let Err(error) =
                     run_proxy(upstream, headers, thread_auth, ready_tx, shutdown_rx).await
                 {
-                    let _ = error;
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(error);
+                    }
                     proxy_diagnostic("gateway-stopped");
                 }
             });
@@ -93,11 +101,22 @@ impl OpenAiHttpProxyGuard {
             base_url,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
+            failure,
         })
     }
 
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub(crate) fn failure_reason(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
     }
 }
 
@@ -139,28 +158,14 @@ async fn run_proxy(
     ready_tx: mpsc::Sender<Result<String, String>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|error| format!("could not bind OpenAI HTTP gateway: {error}"))?;
-    let address = listener
-        .local_addr()
-        .map_err(|error| format!("could not read OpenAI HTTP gateway address: {error}"))?;
-    let local_base_url = format!("http://{address}/{auth}");
-    let plugins = pentect_agent::PluginMiddleware::from_env()?;
-    let state = Arc::new(ProxyState {
-        upstream,
-        auth,
-        client: build_upstream_client()?,
-        masker: Arc::new(Mutex::new(
-            pentect_agent::ActiveToolOutputMasker::new_with_plugins(plugins.clone())?,
-        )),
-        plugins: Arc::new(Mutex::new(plugins)),
-        files: Mutex::new(HashMap::new()),
-        file_attestations: crate::http_files::FileAttestationStore::open_default()?,
-        requests: Arc::new(Semaphore::new(32)),
-        block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
-        headers,
-    });
+    let initialized = initialize_proxy(upstream, headers, auth).await;
+    let (listener, state, local_base_url) = match initialized {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            return Err("gateway initialization failed".to_string());
+        }
+    };
     let _ = ready_tx.send(Ok(local_base_url));
 
     loop {
@@ -168,7 +173,7 @@ async fn run_proxy(
             _ = &mut shutdown_rx => break,
             accepted = listener.accept() => {
                 let (socket, _) = accepted
-                    .map_err(|error| format!("OpenAI HTTP gateway accept failed: {error}"))?;
+                    .map_err(|_| "gateway listener failed".to_string())?;
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let io = hyper_util::rt::TokioIo::new(socket);
@@ -191,6 +196,36 @@ async fn run_proxy(
         }
     }
     Ok(())
+}
+
+async fn initialize_proxy(
+    upstream: reqwest::Url,
+    headers: crate::upstream::HeaderOverrides,
+    auth: String,
+) -> Result<(TcpListener, Arc<ProxyState>, String), String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("could not bind OpenAI HTTP gateway: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("could not read OpenAI HTTP gateway address: {error}"))?;
+    let local_base_url = format!("http://{address}/{auth}");
+    let plugins = pentect_agent::PluginMiddleware::from_env()?;
+    let state = Arc::new(ProxyState {
+        upstream,
+        auth,
+        client: build_upstream_client()?,
+        masker: Arc::new(Mutex::new(
+            pentect_agent::ActiveToolOutputMasker::new_with_plugins(plugins.clone())?,
+        )),
+        plugins: Arc::new(Mutex::new(plugins)),
+        files: Mutex::new(HashMap::new()),
+        file_attestations: crate::http_files::FileAttestationStore::open_default()?,
+        requests: Arc::new(Semaphore::new(32)),
+        block_unknown_formats: pentect_agent::unknown_formats_should_block()?,
+        headers,
+    });
+    Ok((listener, state, local_base_url))
 }
 
 fn build_upstream_client() -> Result<reqwest::Client, String> {
@@ -243,6 +278,21 @@ async fn proxy_request_inner(
     let method = request.method().clone();
     let endpoint = classify_openai_endpoint(path_and_query);
     enforce_known_openai_endpoint(endpoint, state.block_unknown_formats)?;
+    if method == hyper::Method::GET
+        && endpoint == OpenAiEndpoint::Responses
+        && request
+            .headers()
+            .get(hyper::header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        // Codex treats 426 as the supported signal to disable Responses
+        // WebSockets for this session and retry through HTTP/SSE. Pentect then
+        // protects the ordinary POST /responses request below.
+        return Ok(text_response(
+            StatusCode::UPGRADE_REQUIRED,
+            "Pentect uses protected HTTP Responses",
+        ));
+    }
     let responses_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Responses;
     let chat_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::ChatCompletions;
     let responses_response = matches!(
@@ -2375,6 +2425,38 @@ mod tests {
         None
     }
 
+    #[test]
+    fn startup_reports_pre_ready_plugin_failure_without_timeout() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let name = "PENTECT_PLUGIN_BINARIES";
+        let previous = std::env::var_os(name);
+        let missing = std::env::temp_dir().join(format!(
+            "pentect-missing-plugin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::env::set_var(name, &missing);
+        let started = std::time::Instant::now();
+        let result = OpenAiHttpProxyGuard::start("https://example.test/v1".to_string());
+        match previous {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+
+        let error = match result {
+            Ok(_) => panic!("missing plugin must fail gateway startup"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        assert!(
+            error.contains("plugin") || error.contains("WebAssembly"),
+            "{error}"
+        );
+    }
+
     fn mock_chat_upstream() -> (
         String,
         std::sync::mpsc::Receiver<String>,
@@ -2453,6 +2535,23 @@ mod tests {
             socket.flush().unwrap();
         });
         (format!("http://{address}"), body_rx, thread)
+    }
+
+    #[test]
+    fn codex_websocket_upgrade_falls_back_to_protected_http() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let proxy = OpenAiHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
+
+        let response = reqwest::blocking::Client::new()
+            .get(format!("{}/responses", proxy.base_url()))
+            .header(reqwest::header::CONNECTION, "Upgrade")
+            .header(reqwest::header::UPGRADE, "websocket")
+            .send()
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::UPGRADE_REQUIRED);
     }
 
     #[test]

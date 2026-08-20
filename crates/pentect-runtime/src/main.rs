@@ -697,7 +697,7 @@ fn usage() {
          exec: masked output\n\
          view: handle\n\
          resolve: write handles\n\
-         log: live events"
+         log: gateway history and live events"
     );
 }
 

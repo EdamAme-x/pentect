@@ -61,6 +61,7 @@ jobs:
               throw "$path`n$($errors | Out-String)"
             }
           }
+          & ./tools/test_install.ps1
       - name: Verify third-party licenses
         run: python tools/generate_licenses.py --check
       - name: Verify package metadata generator
@@ -359,22 +360,57 @@ jobs:
           dist/pentect-linux-x86_64 gemini -- --version
 
   lifecycle:
-    name: Lifecycle (${{ matrix.os }})
-    needs: publish
+    name: Installer smoke (${{ matrix.os }}, ${{ matrix.installer }})
+    needs: [publish, package-deb]
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-15]
+        include:
+          - os: windows-latest
+            installer: direct
+          - os: windows-latest
+            installer: npm
+          - os: ubuntu-22.04
+            installer: direct
+          - os: ubuntu-22.04
+            installer: npm
+          - os: ubuntu-22.04
+            installer: deb
+            artifact: pentect-deb-amd64
+          - os: ubuntu-22.04-arm
+            installer: direct
+          - os: ubuntu-22.04-arm
+            installer: npm
+          - os: ubuntu-22.04-arm
+            installer: deb
+            artifact: pentect-deb-arm64
+          - os: macos-15-intel
+            installer: direct
+          - os: macos-15-intel
+            installer: npm
+          - os: macos-15
+            installer: direct
+          - os: macos-15
+            installer: npm
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Download Debian package
+        if: matrix.installer == 'deb'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
       - name: Install, update, and uninstall (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.installer == 'direct'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -405,13 +441,9 @@ jobs:
           } finally {
             Pop-Location
           }
-          & $binary uninstall
-          for ($attempt = 0; $attempt -lt 100 -and (Test-Path -LiteralPath $binary); $attempt++) {
-            Start-Sleep -Milliseconds 100
-          }
-          if (Test-Path -LiteralPath $binary) { throw 'uninstall did not remove the binary' }
+          "PENTECT_SMOKE_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Install through npm (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.installer == 'npm'
         shell: pwsh
         run: |
           $env:PENTECT_VERSION = $env:GITHUB_REF_NAME.TrimStart('v')
@@ -419,8 +451,9 @@ jobs:
           npm install --global . --prefix $prefix
           $version = & (Join-Path $prefix 'pentect.cmd') version
           if ($version -ne "pentect $env:PENTECT_VERSION") { throw 'npm-installed version mismatch' }
+          "PENTECT_SMOKE_BINARY=$(Join-Path $prefix 'pentect.cmd')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Install, update, and uninstall (POSIX)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.installer == 'direct'
         shell: sh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -443,10 +476,9 @@ jobs:
             "$binary" plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --yes
             "$binary" plugins inspect openai-privacy-filter | grep -F 'hooks: inspect'
           )
-          "$binary" uninstall
-          test ! -e "$binary"
+          printf 'PENTECT_SMOKE_BINARY=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Install through npm (POSIX)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.installer == 'npm'
         shell: sh
         run: |
           set -eu
@@ -454,6 +486,67 @@ jobs:
           prefix="$RUNNER_TEMP/pentect-npm"
           PENTECT_VERSION="$version" npm install --global . --prefix "$prefix"
           test "$("$prefix/bin/pentect" version)" = "pentect $version"
+          printf 'PENTECT_SMOKE_BINARY=%s\n' "$prefix/bin/pentect" >> "$GITHUB_ENV"
+      - name: Install Debian package
+        if: matrix.installer == 'deb'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo dpkg -i dist/pentect_*.deb
+          test "$(pentect version)" = "pentect ${GITHUB_REF_NAME#v}"
+          echo 'PENTECT_SMOKE_BINARY=/usr/bin/pentect' >> "$GITHUB_ENV"
+      - name: Verify Codex CLI and Codex App launch (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          npm install --global @openai/codex@0.147.0
+          & $env:PENTECT_SMOKE_BINARY codex -- --version
+          if ($LASTEXITCODE -ne 0) { throw 'pentect codex failed to launch' }
+          $node = (Get-Command node -ErrorAction Stop).Source
+          $fixture = Join-Path $env:RUNNER_TEMP 'codex-app-fixture.exe'
+          Copy-Item -LiteralPath $node -Destination $fixture
+          $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'codex-home'
+          New-Item -ItemType Directory -Force $env:CODEX_HOME | Out-Null
+          $config = Join-Path $env:CODEX_HOME 'config.toml'
+          '# installer smoke sentinel' | Set-Content -Encoding utf8 $config
+          $before = (Get-FileHash -Algorithm SHA256 $config).Hash
+          & $env:PENTECT_SMOKE_BINARY codex app --app $fixture --upstream https://api.openai.com/v1
+          if ($LASTEXITCODE -ne 0) { throw 'pentect codex app failed to launch' }
+          if ((Get-FileHash -Algorithm SHA256 $config).Hash -ne $before) { throw 'Codex config was modified' }
+      - name: Verify Codex CLI and Codex App launch (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @openai/codex@0.147.0
+          "$PENTECT_SMOKE_BINARY" codex -- --version
+          fixture="$RUNNER_TEMP/codex-app-fixture"
+          cp "$(command -v node)" "$fixture"
+          chmod +x "$fixture"
+          export CODEX_HOME="$RUNNER_TEMP/codex-home"
+          mkdir -p "$CODEX_HOME"
+          printf '%s\n' '# installer smoke sentinel' > "$CODEX_HOME/config.toml"
+          cp "$CODEX_HOME/config.toml" "$RUNNER_TEMP/config.before"
+          "$PENTECT_SMOKE_BINARY" codex app --app "$fixture" --upstream https://api.openai.com/v1
+          cmp "$RUNNER_TEMP/config.before" "$CODEX_HOME/config.toml"
+      - name: Uninstall direct installation (Windows)
+        if: runner.os == 'Windows' && matrix.installer == 'direct'
+        shell: pwsh
+        run: |
+          & $env:PENTECT_SMOKE_BINARY uninstall
+          for ($attempt = 0; $attempt -lt 100 -and (Test-Path -LiteralPath $env:PENTECT_SMOKE_BINARY); $attempt++) {
+            Start-Sleep -Milliseconds 100
+          }
+          if (Test-Path -LiteralPath $env:PENTECT_SMOKE_BINARY) { throw 'uninstall did not remove the binary' }
+      - name: Uninstall direct installation (POSIX)
+        if: runner.os != 'Windows' && matrix.installer == 'direct'
+        shell: sh
+        run: |
+          "$PENTECT_SMOKE_BINARY" uninstall
+          test ! -e "$PENTECT_SMOKE_BINARY"
+      - name: Remove Debian package
+        if: matrix.installer == 'deb'
+        run: sudo apt-get remove -y pentect
 
   promote:
     name: Publish stable release

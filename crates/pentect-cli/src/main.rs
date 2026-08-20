@@ -143,7 +143,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "log",
         usage: "pentect log [--json]",
-        summary: "Follow local protection events",
+        summary: "Show gateway history and follow protection events",
         audience: CommandAudience::Public,
     },
     CommandSpec {
@@ -518,8 +518,8 @@ fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let pathext =
             std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
-        return resolve_windows_command_from(program, &path, &pathext)
-            .ok_or_else(|| format!("could not run '{}': program not found", program.display()));
+        resolve_windows_command_from(program, &path, &pathext)
+            .ok_or_else(|| format!("could not run '{}': program not found", program.display()))
     }
     #[cfg(not(windows))]
     {
@@ -529,21 +529,47 @@ fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
 
 #[cfg(any(windows, test))]
 fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -> Option<PathBuf> {
-    let mut names = vec![program.to_path_buf()];
-    if program.extension().is_none() {
-        names.extend(
-            pathext
-                .to_string_lossy()
-                .split(';')
-                .map(str::trim)
-                .filter(|extension| !extension.is_empty())
-                .map(|extension| {
-                    let mut name = program.as_os_str().to_os_string();
-                    name.push(extension);
-                    PathBuf::from(name)
-                }),
-        );
-    }
+    let names = if program.extension().is_none() {
+        let mut extensions = pathext
+            .to_string_lossy()
+            .split(';')
+            .map(str::trim)
+            .filter(|extension| !extension.is_empty())
+            // Command::new can launch PE binaries and cmd/bat shims. A
+            // PowerShell .ps1 entry may appear in PATHEXT but cannot be
+            // executed directly through CreateProcess.
+            .filter(|extension| {
+                matches!(
+                    extension.to_ascii_uppercase().as_str(),
+                    ".COM" | ".EXE" | ".BAT" | ".CMD"
+                )
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for fallback in [".COM", ".EXE", ".BAT", ".CMD"] {
+            if !extensions
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case(fallback))
+            {
+                extensions.push(fallback.to_string());
+            }
+        }
+        let mut names = extensions
+            .into_iter()
+            .map(|extension| {
+                let mut name = program.as_os_str().to_os_string();
+                name.push(extension);
+                PathBuf::from(name)
+            })
+            .collect::<Vec<_>>();
+        // npm installs a POSIX shim without an extension beside the Windows
+        // .cmd/.ps1 shims. It is a file, but Windows cannot execute it. Keep
+        // the raw name only as a final fallback after PATHEXT candidates.
+        names.push(program.to_path_buf());
+        names
+    } else {
+        vec![program.to_path_buf()]
+    };
 
     let explicit_path = program.is_absolute() || program.components().count() > 1;
     if explicit_path {
@@ -1142,6 +1168,12 @@ impl AgentToolOpts {
 }
 
 fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
+    // Releases before 0.0.36 could leave an App-only loopback provider in the
+    // shared config after an interrupted launch. Repair that exact generated
+    // shape before resolving the real upstream.
+    if let Err(error) = codex_app::recover_legacy_config() {
+        eprintln!("[pentect] warning: could not recover legacy Codex App config: {error}");
+    }
     let routing = codex_effective_routing(opts)?;
     let mut args = opts.tool_args.clone();
     if opts.dry_run {
@@ -2118,23 +2150,10 @@ const CODEX_GATEWAY_PROVIDER: &str = "pentect-openai-gateway";
 impl CodexHttpRouting {
     fn gateway_args(&self, gateway: &str) -> Vec<String> {
         let entries = if self.provider == "openai" {
-            vec![
-                format!("model_provider={}", toml_string(CODEX_GATEWAY_PROVIDER)),
-                format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}.name={}",
-                    toml_string("OpenAI through Pentect")
-                ),
-                format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}.base_url={}",
-                    toml_string(gateway)
-                ),
-                format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}.wire_api={}",
-                    toml_string("responses")
-                ),
-                format!("model_providers.{CODEX_GATEWAY_PROVIDER}.requires_openai_auth=true"),
-                format!("model_providers.{CODEX_GATEWAY_PROVIDER}.supports_websockets=false"),
-            ]
+            // Keep the built-in provider ID so Codex can resume this thread without
+            // Pentect. The gateway rejects the WebSocket upgrade with 426, which is
+            // Codex's supported signal to fall back to protected HTTP Responses.
+            vec![format!("openai_base_url={}", toml_string(gateway))]
         } else {
             let provider = codex_toml_key_segment(&self.provider);
             vec![
@@ -2722,6 +2741,56 @@ mod tests {
             resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
                 .unwrap();
         assert_eq!(resolved.file_name().unwrap().to_string_lossy(), "codex.CMD");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_npm_cmd_shim_wins_over_posix_and_powershell_shims() {
+        let directory = command_test_directory("npm-shim-precedence");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("codex"), b"#!/bin/sh\n").unwrap();
+        let cmd = if cfg!(windows) {
+            directory.join("codex.cmd")
+        } else {
+            directory.join("codex.CMD")
+        };
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+        std::fs::write(directory.join("codex.ps1"), b"Write-Output codex\n").unwrap();
+
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
+                .unwrap();
+        assert_eq!(resolved.parent(), Some(directory.as_path()));
+        assert!(resolved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("codex.cmd"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_command_resolution_skips_powershell_only_pathext_entries() {
+        let directory = command_test_directory("npm-shim-powershell-pathext");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("codex.ps1"), b"Write-Output codex\n").unwrap();
+        let cmd = if cfg!(windows) {
+            directory.join("codex.cmd")
+        } else {
+            directory.join("codex.CMD")
+        };
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".PS1;.CMD"))
+                .unwrap();
+        assert!(resolved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("codex.cmd"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

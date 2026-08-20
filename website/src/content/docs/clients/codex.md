@@ -101,9 +101,17 @@ pentect codex app --app /path/to/codex
 ```
 
 This affects only the launch started by Pentect. Opening Codex App normally
-does not use Pentect or change other ChatGPT traffic.
+does not use Pentect or change other ChatGPT traffic. Pentect gives the child
+App a session-only Codex configuration; it never points your shared
+`~/.codex/config.toml` at the temporary gateway. Running `codex` directly still
+uses your normal provider, even while the protected App is open.
 
 `--check` exercises discovery and routing without sending a model prompt.
+
+`pentect codex app` stays attached for the full App session. If the launcher
+hands off to another App process, Pentect keeps the gateway alive until that
+process exits. `pentect log` includes value-free Codex App lifecycle and crash
+events from previous sessions as well as live protection events.
 
 ## Verify protection
 

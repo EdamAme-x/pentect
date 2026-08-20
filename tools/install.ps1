@@ -4,6 +4,45 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
 
+function ConvertTo-PentectArchitecture {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    switch ($Value.Trim().ToUpperInvariant()) {
+        { $_ -in @('X64', 'AMD64', 'X86_64') } { return 'X64' }
+        { $_ -in @('ARM64', 'AARCH64') } { return 'Arm64' }
+        { $_ -in @('X86', 'I386', 'I486', 'I586', 'I686') } { return 'X86' }
+        default { return $Value.Trim() }
+    }
+}
+
+function Get-PentectOsArchitecture {
+    param(
+        [scriptblock]$RuntimeArchitecture = { [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() },
+        [AllowEmptyString()][string]$ProcessorArchitecture = $env:PROCESSOR_ARCHITECTURE,
+        [AllowEmptyString()][string]$ProcessorArchitectureW6432 = $env:PROCESSOR_ARCHITEW6432
+    )
+
+    try {
+        $runtimeValue = & $RuntimeArchitecture
+        if (-not [string]::IsNullOrWhiteSpace([string]$runtimeValue)) {
+            return ConvertTo-PentectArchitecture ([string]$runtimeValue)
+        }
+    } catch {
+        # Windows PowerShell 5.1 can expose RuntimeInformation without the
+        # OSArchitecture property. Fall back to the native process variables.
+    }
+
+    $environmentValue = if (-not [string]::IsNullOrWhiteSpace($ProcessorArchitectureW6432)) {
+        $ProcessorArchitectureW6432
+    } else {
+        $ProcessorArchitecture
+    }
+    if ([string]::IsNullOrWhiteSpace($environmentValue)) {
+        throw 'pentect: could not determine Windows architecture'
+    }
+    return ConvertTo-PentectArchitecture $environmentValue
+}
+
 $repository = 'EdamAme-x/pentect'
 $requestedVersion = $Version
 if ($requestedVersion) {
@@ -17,7 +56,7 @@ if ($requestedVersion) {
     $releaseTag = 'latest'
     $baseUrl = "https://github.com/$repository/releases/latest/download"
 }
-$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$architecture = Get-PentectOsArchitecture
 if ($architecture -ne 'X64') {
     throw "pentect: unsupported Windows architecture: $architecture"
 }
