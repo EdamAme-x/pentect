@@ -10,7 +10,9 @@ fn uninstall(args: &[String]) -> Result<(), String> {
     if args.len() != 2 {
         return Err("usage: pentect uninstall".to_string());
     }
-    crate::codex_app::recover_legacy_config()?;
+    if let Err(error) = crate::codex_app::recover_legacy_config() {
+        eprintln!("pentect: warning: could not recover legacy Codex App config: {error}");
+    }
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not locate the installed executable: {error}"))?;
     if let Some(installation) = crate::installation::installation_for_executable(&executable)? {

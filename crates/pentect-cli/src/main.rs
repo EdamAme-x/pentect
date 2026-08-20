@@ -1150,7 +1150,9 @@ fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitS
     // Releases before 0.0.36 could leave an App-only loopback provider in the
     // shared config after an interrupted launch. Repair that exact generated
     // shape before resolving the real upstream.
-    codex_app::recover_legacy_config()?;
+    if let Err(error) = codex_app::recover_legacy_config() {
+        eprintln!("[pentect] warning: could not recover legacy Codex App config: {error}");
+    }
     let routing = codex_effective_routing(opts)?;
     let mut args = opts.tool_args.clone();
     if opts.dry_run {

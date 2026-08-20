@@ -67,16 +67,8 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         &options.upstream_header_env,
     )?;
     let config_lock = Arc::new(Mutex::new(Some(CodexConfigLock::acquire()?)));
-    let session_home = Some(CodexSessionHome::create(
-        &routing.provider,
-        proxy.base_url(),
-    )?);
-    let lifecycle_log = match CodexAppLifecycleLog::open(
-        session_home
-            .as_ref()
-            .expect("Codex session home exists")
-            .source_home(),
-    ) {
+    let session_home = CodexSessionHome::create(&routing.provider, proxy.base_url())?;
+    let lifecycle_log = match CodexAppLifecycleLog::open(session_home.source_home()) {
         Ok(log) => Some(log),
         Err(error) => {
             eprintln!("[pentect] warning: Codex App lifecycle log is unavailable: {error}");
@@ -97,25 +89,13 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let mut command = Command::new(&app);
     crate::upstream::hide_header_source_env(&mut command, &options.upstream_header_env);
     command
-        .env(
-            "CODEX_HOME",
-            session_home
-                .as_ref()
-                .expect("Codex session home exists")
-                .path(),
-        )
+        .env("CODEX_HOME", session_home.path())
         .env("OPENAI_BASE_URL", proxy.base_url())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if std::env::var_os("CODEX_SQLITE_HOME").is_none() {
-        command.env(
-            "CODEX_SQLITE_HOME",
-            session_home
-                .as_ref()
-                .expect("Codex session home exists")
-                .source_home(),
-        );
+        command.env("CODEX_SQLITE_HOME", session_home.source_home());
     }
     configure_child_process(&mut command);
     let mut child = match command.spawn() {
@@ -130,7 +110,7 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         "launcher-started",
         &format!("pid={}", child.id()),
     );
-    let session_cleanup = Arc::new(Mutex::new(session_home));
+    let session_cleanup = Arc::new(Mutex::new(Some(session_home)));
     let signal_cleanup = Arc::clone(&session_cleanup);
     let signal_lock = Arc::clone(&config_lock);
     let child_id = child.id();
@@ -600,13 +580,13 @@ fn link_session_entry(source: &Path, destination: &Path) -> Result<(), String> {
             }
         }
     } else if metadata.is_file() {
-        std::fs::hard_link(source, destination)
-            .or_else(|hard_link_error| {
-                std::os::windows::fs::symlink_file(source, destination).map_err(|symlink_error| {
+        std::os::windows::fs::symlink_file(source, destination)
+            .or_else(|symlink_error| {
+                std::fs::hard_link(source, destination).map_err(|hard_link_error| {
                     std::io::Error::new(
-                        symlink_error.kind(),
+                        hard_link_error.kind(),
                         format!(
-                            "hard link failed ({hard_link_error}); file symlink failed ({symlink_error})"
+                            "file symlink failed ({symlink_error}); hard link failed ({hard_link_error})"
                         ),
                     )
                 })
@@ -629,22 +609,36 @@ fn cleanup_stale_session_homes(sessions: &Path) {
     let Ok(entries) = std::fs::read_dir(sessions) else {
         return;
     };
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     for entry in entries.flatten() {
-        if generated_session_name(&entry.file_name()) {
+        let Some(pid) = generated_session_pid(&entry.file_name()) else {
+            continue;
+        };
+        if system.process(sysinfo::Pid::from_u32(pid)).is_none() {
             cleanup_session_home(&entry.path());
         }
     }
 }
 
+#[cfg(test)]
 fn generated_session_name(name: &std::ffi::OsStr) -> bool {
+    generated_session_pid(name).is_some()
+}
+
+fn generated_session_pid(name: &std::ffi::OsStr) -> Option<u32> {
     let name = name.to_string_lossy();
     let Some((pid, suffix)) = name.split_once('-') else {
-        return false;
+        return None;
     };
-    !pid.is_empty()
-        && !suffix.is_empty()
-        && pid.bytes().all(|byte| byte.is_ascii_digit())
-        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    if pid.is_empty()
+        || suffix.is_empty()
+        || !pid.bytes().all(|byte| byte.is_ascii_digit())
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    pid.parse().ok()
 }
 
 fn cleanup_session_home(path: &Path) {
@@ -679,7 +673,10 @@ fn cleanup_session_home(path: &Path) {
             continue;
         };
         if metadata.file_type().is_symlink() || metadata.is_file() {
-            let _ = std::fs::remove_file(&entry_path);
+            if std::fs::remove_file(&entry_path).is_err() {
+                // Windows directory symlinks require directory removal.
+                let _ = std::fs::remove_dir(&entry_path);
+            }
         } else if metadata.is_dir() {
             let _ = std::fs::remove_dir_all(&entry_path);
         }
@@ -699,15 +696,15 @@ fn recover_legacy_config_in(home: &Path) -> Result<bool, String> {
     reject_symlink(&backup, "Codex recovery backup")?;
     reject_symlink(&no_original_marker, "Codex recovery marker")?;
     if backup.is_file() {
-        if config.is_file() {
-            std::fs::remove_file(&config).map_err(|error| {
-                format!(
-                    "could not recover Codex config '{}': {error}",
-                    config.display()
-                )
-            })?;
-        }
         if no_original_marker.is_file() {
+            if config.is_file() {
+                std::fs::remove_file(&config).map_err(|error| {
+                    format!(
+                        "could not recover Codex config '{}': {error}",
+                        config.display()
+                    )
+                })?;
+            }
             std::fs::remove_file(&backup)
                 .map_err(|error| format!("could not clear interrupted Codex backup: {error}"))?;
         } else {
@@ -725,11 +722,12 @@ fn recover_legacy_config_in(home: &Path) -> Result<bool, String> {
     if !config.is_file() {
         return Ok(false);
     }
-    let original = std::fs::read_to_string(&config)
-        .map_err(|error| format!("could not read '{}': {error}", config.display()))?;
-    let mut parsed = original
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| format!("could not parse '{}': {error}", config.display()))?;
+    let Ok(original) = std::fs::read_to_string(&config) else {
+        return Ok(false);
+    };
+    let Ok(mut parsed) = original.parse::<toml_edit::DocumentMut>() else {
+        return Ok(false);
+    };
     if !is_orphaned_legacy_gateway(&parsed) {
         return Ok(false);
     }
@@ -1413,6 +1411,26 @@ base_url = "https://other.example/v1"
         assert!(!generated_session_name(std::ffi::OsStr::new("123-current")));
     }
 
+    #[test]
+    fn stale_cleanup_keeps_live_sessions_and_removes_dead_ones() {
+        let root = test_home("codex-stale-session-cleanup");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let live = sessions.join(format!("{}-1", std::process::id()));
+        let stale = sessions.join(format!("{}-2", u32::MAX));
+        let unrelated = sessions.join("keep-me");
+        std::fs::create_dir(&live).unwrap();
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+
+        cleanup_stale_session_homes(&sessions);
+
+        assert!(live.exists());
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn test_home(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "pentect-{label}-{}-{}",
@@ -1524,6 +1542,7 @@ theme = "dark"
         let malformed = "[not valid";
         std::fs::write(root.join("config.toml"), malformed).unwrap();
         assert!(CodexSessionHome::create_in(&root, "openai", "http://127.0.0.1:47781").is_err());
+        assert!(!recover_legacy_config_in(&root).unwrap());
         assert_eq!(
             std::fs::read_to_string(root.join("config.toml")).unwrap(),
             malformed
