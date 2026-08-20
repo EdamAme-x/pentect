@@ -143,7 +143,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "log",
         usage: "pentect log [--json]",
-        summary: "Follow local protection events",
+        summary: "Show gateway history and follow protection events",
         audience: CommandAudience::Public,
     },
     CommandSpec {

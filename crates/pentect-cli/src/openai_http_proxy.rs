@@ -45,6 +45,7 @@ pub(crate) struct OpenAiHttpProxyGuard {
     base_url: String,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl OpenAiHttpProxyGuard {
@@ -63,6 +64,8 @@ impl OpenAiHttpProxyGuard {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let thread_auth = auth.clone();
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
         let thread = thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -71,6 +74,9 @@ impl OpenAiHttpProxyGuard {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(format!("runtime initialization failed: {error}"));
+                    }
                     let _ = ready_tx.send(Err(format!(
                         "could not start OpenAI HTTP gateway runtime: {error}"
                     )));
@@ -81,7 +87,9 @@ impl OpenAiHttpProxyGuard {
                 if let Err(error) =
                     run_proxy(upstream, headers, thread_auth, ready_tx, shutdown_rx).await
                 {
-                    let _ = error;
+                    if let Ok(mut failure) = thread_failure.lock() {
+                        *failure = Some(error);
+                    }
                     proxy_diagnostic("gateway-stopped");
                 }
             });
@@ -93,11 +101,22 @@ impl OpenAiHttpProxyGuard {
             base_url,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
+            failure,
         })
     }
 
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub(crate) fn failure_reason(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
     }
 }
 

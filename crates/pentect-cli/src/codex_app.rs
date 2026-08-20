@@ -8,7 +8,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::{fs::OpenOptions, io::Write};
+use std::{fs::OpenOptions, io::Write, thread, time::Duration};
+
+const APP_START_GRACE: Duration = Duration::from_secs(15);
+const APP_EXIT_GRACE: Duration = Duration::from_secs(3);
+const APP_MONITOR_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) fn cmd_codex_app(args: &[String]) -> i32 {
     match run_codex_app(args) {
@@ -66,6 +70,19 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         &routing.provider,
         proxy.base_url(),
     )?);
+    let lifecycle_log = match CodexAppLifecycleLog::open(
+        session_home
+            .as_ref()
+            .expect("Codex session home exists")
+            .source_home(),
+    ) {
+        Ok(log) => Some(log),
+        Err(error) => {
+            eprintln!("[pentect] warning: Codex App lifecycle log is unavailable: {error}");
+            None
+        }
+    };
+    record_lifecycle(&lifecycle_log, "gateway-started", "loopback");
     eprintln!("[pentect] Codex App gateway ready at {}", proxy.base_url());
     eprintln!(
         "[pentect] Codex provider '{}' is routed through the gateway for this App session",
@@ -100,6 +117,11 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start Codex App: {error}"))?;
+    record_lifecycle(
+        &lifecycle_log,
+        "launcher-started",
+        &format!("pid={}", child.id()),
+    );
     let session_cleanup = Arc::new(Mutex::new(session_home));
     let signal_cleanup = Arc::clone(&session_cleanup);
     let signal_lock = Arc::clone(&config_lock);
@@ -126,9 +148,7 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
             "could not install Codex App session cleanup handler: {error}"
         ));
     }
-    let status = child
-        .wait()
-        .map_err(|error| format!("could not wait for Codex App: {error}"))?;
+    let status = monitor_codex_app(&mut child, &app, &proxy, &lifecycle_log)?;
     session_cleanup
         .lock()
         .map_err(|_| "Codex App session cleanup lock is unavailable".to_string())?
@@ -138,7 +158,141 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         .map_err(|_| "Codex App session lock is unavailable".to_string())?
         .take();
     drop(proxy);
+    record_lifecycle(&lifecycle_log, "session-finished", "app-exited");
     Ok(status)
+}
+
+fn monitor_codex_app(
+    child: &mut std::process::Child,
+    app: &Path,
+    proxy: &crate::openai_http_proxy::OpenAiHttpProxyGuard,
+    lifecycle_log: &Option<CodexAppLifecycleLog>,
+) -> Result<std::process::ExitStatus, String> {
+    loop {
+        if !proxy.is_running() {
+            let reason = proxy
+                .failure_reason()
+                .unwrap_or_else(|| "gateway thread exited unexpectedly".to_string());
+            record_lifecycle(lifecycle_log, "gateway-stopped", &reason);
+            terminate_child_process(child.id());
+            let _ = child.wait();
+            return Err(format!(
+                "Codex App gateway stopped: {reason}; inspect the lifecycle entries with `pentect log`"
+            ));
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("could not monitor Codex App launcher: {error}"))?
+        {
+            record_lifecycle(
+                lifecycle_log,
+                "launcher-exited",
+                &format!("status={}", status.code().unwrap_or(-1)),
+            );
+            return monitor_handed_off_app(app, proxy, lifecycle_log, status);
+        }
+        thread::sleep(APP_MONITOR_INTERVAL);
+    }
+}
+
+fn monitor_handed_off_app(
+    app: &Path,
+    proxy: &crate::openai_http_proxy::OpenAiHttpProxyGuard,
+    lifecycle_log: &Option<CodexAppLifecycleLog>,
+    launcher_status: std::process::ExitStatus,
+) -> Result<std::process::ExitStatus, String> {
+    let mut process_probe = CodexAppProcessProbe::new(app);
+    let started = std::time::Instant::now();
+    while started.elapsed() < APP_START_GRACE {
+        ensure_gateway_running(proxy, lifecycle_log)?;
+        if process_probe.is_running() {
+            record_lifecycle(lifecycle_log, "app-process-observed", "running");
+            let mut absent_since = None;
+            loop {
+                ensure_gateway_running(proxy, lifecycle_log)?;
+                if process_probe.is_running() {
+                    absent_since = None;
+                } else {
+                    let since = absent_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= APP_EXIT_GRACE {
+                        return Ok(launcher_status);
+                    }
+                }
+                thread::sleep(APP_MONITOR_INTERVAL);
+            }
+        }
+        thread::sleep(APP_MONITOR_INTERVAL);
+    }
+    Ok(launcher_status)
+}
+
+fn ensure_gateway_running(
+    proxy: &crate::openai_http_proxy::OpenAiHttpProxyGuard,
+    lifecycle_log: &Option<CodexAppLifecycleLog>,
+) -> Result<(), String> {
+    if proxy.is_running() {
+        return Ok(());
+    }
+    let reason = proxy
+        .failure_reason()
+        .unwrap_or_else(|| "gateway thread exited unexpectedly".to_string());
+    record_lifecycle(lifecycle_log, "gateway-stopped", &reason);
+    Err(format!(
+        "Codex App gateway stopped: {reason}; inspect the lifecycle entries with `pentect log`"
+    ))
+}
+
+struct CodexAppLifecycleLog {
+    file: Mutex<std::fs::File>,
+}
+
+impl CodexAppLifecycleLog {
+    fn open(codex_home: &Path) -> Result<Self, String> {
+        let directory = codex_home.join(".pentect").join("logs");
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("could not create '{}': {error}", directory.display()))?;
+        reject_directory_link(&directory, "Codex App log directory")?;
+        let path = directory.join("codex-app.log");
+        reject_symlink(&path, "Codex App lifecycle log")?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("could not open '{}': {error}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(Self {
+            file: Mutex::new(file),
+        })
+    }
+
+    fn record(&self, event: &str, detail: &str) {
+        let detail = detail
+            .chars()
+            .filter(|character| !matches!(character, '\r' | '\n'))
+            .take(512)
+            .collect::<String>();
+        if let Ok(mut file) = self.file.lock() {
+            let entry = serde_json::json!({
+                "time": jiff::Timestamp::now().to_string(),
+                "action": "lifecycle",
+                "surface": "codex-app",
+                "event": event,
+                "detail": detail,
+            });
+            let _ = writeln!(file, "{entry}");
+            let _ = file.flush();
+        }
+    }
+}
+
+fn record_lifecycle(log: &Option<CodexAppLifecycleLog>, event: &str, detail: &str) {
+    if let Some(log) = log {
+        log.record(event, detail);
+    }
 }
 
 fn codex_app_not_found(app: &Path, app_was_explicit: bool) -> String {
@@ -895,41 +1049,59 @@ fn version_components(value: &str) -> Vec<u64> {
 }
 
 fn codex_app_is_running(app: &Path) -> bool {
-    let expected = app
-        .canonicalize()
-        .unwrap_or_else(|_| app.to_path_buf())
-        .to_string_lossy()
-        .to_ascii_lowercase();
-    let install_root = app
-        .parent()
-        .map(|path| {
-            path.canonicalize()
-                .unwrap_or_else(|_| path.to_path_buf())
+    CodexAppProcessProbe::new(app).is_running()
+}
+
+struct CodexAppProcessProbe {
+    expected: String,
+    install_root: String,
+    system: sysinfo::System,
+}
+
+impl CodexAppProcessProbe {
+    fn new(app: &Path) -> Self {
+        Self {
+            expected: app
+                .canonicalize()
+                .unwrap_or_else(|_| app.to_path_buf())
                 .to_string_lossy()
-                .to_ascii_lowercase()
+                .to_ascii_lowercase(),
+            install_root: app
+                .parent()
+                .map(|path| {
+                    path.canonicalize()
+                        .unwrap_or_else(|_| path.to_path_buf())
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                })
+                .unwrap_or_default(),
+            system: sysinfo::System::new(),
+        }
+    }
+
+    fn is_running(&mut self) -> bool {
+        self.system
+            .refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        self.system.processes().values().any(|process| {
+            process
+                .exe()
+                .and_then(|path| path.canonicalize().ok())
+                .map(|path| path.to_string_lossy().to_ascii_lowercase())
+                .is_some_and(|path| {
+                    path == self.expected
+                        || (!self.install_root.is_empty()
+                            && path.starts_with(&self.install_root)
+                            && matches!(
+                                process
+                                    .name()
+                                    .to_string_lossy()
+                                    .to_ascii_lowercase()
+                                    .as_str(),
+                                "codex.exe" | "chatgpt.exe"
+                            ))
+                })
         })
-        .unwrap_or_default();
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    system.processes().values().any(|process| {
-        process
-            .exe()
-            .and_then(|path| path.canonicalize().ok())
-            .map(|path| path.to_string_lossy().to_ascii_lowercase())
-            .is_some_and(|path| {
-                path == expected
-                    || (!install_root.is_empty()
-                        && path.starts_with(&install_root)
-                        && matches!(
-                            process
-                                .name()
-                                .to_string_lossy()
-                                .to_ascii_lowercase()
-                                .as_str(),
-                            "codex.exe" | "chatgpt.exe"
-                        ))
-            })
-    })
+    }
 }
 
 #[cfg(windows)]
@@ -1042,6 +1214,35 @@ mod tests {
                 "ChatGPT_1.0.0.0_x64__id"
             }
         ));
+    }
+
+    #[test]
+    fn lifecycle_log_is_value_free_jsonl() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-lifecycle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = CodexAppLifecycleLog::open(&root).unwrap();
+        log.record("gateway-stopped", "gateway thread exited unexpectedly");
+        let payload =
+            std::fs::read_to_string(root.join(".pentect").join("logs").join("codex-app.log"))
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(payload.trim()).unwrap();
+        assert_eq!(value["action"], "lifecycle");
+        assert_eq!(value["surface"], "codex-app");
+        assert_eq!(value["event"], "gateway-stopped");
+        assert_eq!(value["detail"], "gateway thread exited unexpectedly");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn process_probe_observes_the_current_executable() {
+        let executable = std::env::current_exe().unwrap();
+        assert!(CodexAppProcessProbe::new(&executable).is_running());
     }
 
     #[cfg(windows)]

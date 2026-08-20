@@ -108,6 +108,11 @@ uses your normal provider, even while the protected App is open.
 
 `--check` exercises discovery and routing without sending a model prompt.
 
+`pentect codex app` stays attached for the full App session. If the launcher
+hands off to another App process, Pentect keeps the gateway alive until that
+process exits. `pentect log` includes value-free Codex App lifecycle and crash
+events from previous sessions as well as live protection events.
+
 ## Verify protection
 
 Run `pentect log` in another terminal. Then ask Codex to read a test dotenv

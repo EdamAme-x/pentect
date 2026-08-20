@@ -4,7 +4,7 @@ use pentect_core::MaskResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -36,6 +36,11 @@ struct ActivitySource {
     client: MemoryStoreClient,
     cursor: u64,
     endpoint: ProcessHostEndpoint,
+}
+
+struct LifecycleSource {
+    file: Option<std::fs::File>,
+    offset: u64,
 }
 
 #[derive(Default)]
@@ -157,12 +162,29 @@ pub(crate) fn record_image(secret_images: usize, notes: &[String]) {
 
 pub(crate) fn follow(json: bool) -> Result<(), String> {
     let mut source = activity_source()?;
+    let mut lifecycle = LifecycleSource::open();
     let mut seen = SeenActivity::default();
 
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     loop {
         let mut wrote = false;
+        for payload in lifecycle.read_new()? {
+            if json {
+                writeln!(output, "{payload}")
+                    .map_err(|error| format!("could not write lifecycle log: {error}"))?;
+            } else if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&payload) {
+                writeln!(
+                    output,
+                    "{}  lifecycle/codex-app  {}  {}",
+                    entry["time"].as_str().unwrap_or("unknown"),
+                    entry["event"].as_str().unwrap_or("event"),
+                    entry["detail"].as_str().unwrap_or_default(),
+                )
+                .map_err(|error| format!("could not write lifecycle log: {error}"))?;
+            }
+            wrote = true;
+        }
         match source.client.poll_activity(source.cursor) {
             Ok(records) => {
                 for (id, payload) in records {
@@ -195,6 +217,53 @@ pub(crate) fn follow(json: bool) -> Result<(), String> {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+impl LifecycleSource {
+    fn open() -> Self {
+        Self::open_at(codex_lifecycle_log_path())
+    }
+
+    fn open_at(path: PathBuf) -> Self {
+        let file = std::fs::OpenOptions::new().read(true).open(path).ok();
+        Self { file, offset: 0 }
+    }
+
+    fn read_new(&mut self) -> Result<Vec<String>, String> {
+        if self.file.is_none() {
+            self.file = std::fs::OpenOptions::new()
+                .read(true)
+                .open(codex_lifecycle_log_path())
+                .ok();
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Ok(Vec::new());
+        };
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(|error| format!("could not seek Codex App lifecycle log: {error}"))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| format!("could not read Codex App lifecycle log: {error}"))?;
+        self.offset += bytes.len() as u64;
+        Ok(String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+}
+
+fn codex_lifecycle_log_path() -> PathBuf {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+                .map(|home| home.join(".codex"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".codex"));
+    home.join(".pentect").join("logs").join("codex-app.log")
 }
 
 fn record(event: ActivityEvent) {
@@ -304,5 +373,30 @@ mod tests {
         assert!(seen.insert(event));
         assert!(!seen.insert(event));
         assert!(seen.insert(r#"{"action":"resolve","count":1}"#));
+    }
+
+    #[test]
+    fn lifecycle_source_reads_only_appended_records_after_the_first_poll() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-lifecycle-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("codex-app.log");
+        std::fs::write(&path, "{\"event\":\"gateway-started\"}\n").unwrap();
+        let mut source = LifecycleSource::open_at(path.clone());
+        assert_eq!(source.read_new().unwrap().len(), 1);
+        assert!(source.read_new().unwrap().is_empty());
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{{\"event\":\"session-finished\"}}").unwrap();
+        assert_eq!(source.read_new().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
