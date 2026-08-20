@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
-use std::io;
+use std::io::{self, Read};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -314,6 +314,7 @@ async fn proxy_request_inner(
     let account_scope = state.file_attestations.account_scope(&credential_material);
     let mut request_coverage = None;
     let mut request_streaming = false;
+    let mut inspect_protected_request = protected_request;
     let body = if protected_request || files_upload {
         let body = match Limited::new(request.into_body(), MAX_HTTP_BODY_BYTES)
             .collect()
@@ -327,6 +328,28 @@ async fn proxy_request_inner(
                 ));
             }
             Err(error) => return Err(format!("could not read OpenAI request body: {error}")),
+        };
+        let body = if protected_request {
+            let original = body.clone();
+            match decode_openai_request_body(body, &headers) {
+                Ok(body) => body,
+                Err(RequestBodyDecodeError::TooLarge) => {
+                    return Ok(text_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Request body too large after decompression",
+                    ));
+                }
+                Err(RequestBodyDecodeError::Invalid(error)) if state.block_unknown_formats => {
+                    return Err(error);
+                }
+                Err(RequestBodyDecodeError::Invalid(_)) => {
+                    proxy_diagnostic("request-content-encoding-skipped");
+                    inspect_protected_request = false;
+                    original
+                }
+            }
+        } else {
+            body
         };
         if body.is_empty() {
             reqwest::Body::from(body)
@@ -356,6 +379,9 @@ async fn proxy_request_inner(
             .map_err(|_| "OpenAI file protection task failed".to_string())??;
             request_coverage = Some(protected.coverage);
             reqwest::Body::from(protected.body)
+        } else if !inspect_protected_request {
+            request_coverage = Some(crate::http_files::Coverage::Partial);
+            reqwest::Body::from(body)
         } else {
             request_streaming = serde_json::from_slice::<Value>(&body)
                 .ok()
@@ -416,6 +442,7 @@ async fn proxy_request_inner(
         if state.headers.forward_incoming_header(name.as_str())
             && ((!(protected_request || files_upload) && name == hyper::header::CONTENT_LENGTH)
                 || should_forward_request_header(name.as_str()))
+            && (!inspect_protected_request || name != hyper::header::CONTENT_ENCODING)
             && !connection_headers.contains(&name.as_str().to_ascii_lowercase())
         {
             upstream_request = upstream_request.header(name, value);
@@ -642,6 +669,52 @@ struct ProtectedJsonBody {
     body: Bytes,
     coverage: crate::http_files::Coverage,
     local_response: Option<Bytes>,
+}
+
+enum RequestBodyDecodeError {
+    Invalid(String),
+    TooLarge,
+}
+
+fn decode_openai_request_body(
+    body: Bytes,
+    headers: &hyper::HeaderMap,
+) -> Result<Bytes, RequestBodyDecodeError> {
+    let Some(encoding) = headers.get(hyper::header::CONTENT_ENCODING) else {
+        return Ok(body);
+    };
+    let encoding = encoding.to_str().map_err(|_| {
+        RequestBodyDecodeError::Invalid(
+            "unknown format blocked: OpenAI request Content-Encoding is not valid text".to_string(),
+        )
+    })?;
+    if encoding.eq_ignore_ascii_case("identity") {
+        return Ok(body);
+    }
+    if !encoding.eq_ignore_ascii_case("zstd") {
+        return Err(RequestBodyDecodeError::Invalid(format!(
+            "unknown format blocked: OpenAI request uses unsupported Content-Encoding '{encoding}'"
+        )));
+    }
+
+    let decoder = zstd::stream::read::Decoder::new(body.as_ref()).map_err(|error| {
+        RequestBodyDecodeError::Invalid(format!(
+            "unknown format blocked: OpenAI zstd request could not be decoded ({error})"
+        ))
+    })?;
+    let mut decoded = Vec::new();
+    decoder
+        .take(MAX_HTTP_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut decoded)
+        .map_err(|error| {
+            RequestBodyDecodeError::Invalid(format!(
+                "unknown format blocked: OpenAI zstd request could not be decoded ({error})"
+            ))
+        })?;
+    if decoded.len() > MAX_HTTP_BODY_BYTES {
+        return Err(RequestBodyDecodeError::TooLarge);
+    }
+    Ok(Bytes::from(decoded))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2459,7 +2532,7 @@ mod tests {
 
     fn mock_chat_upstream() -> (
         String,
-        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Receiver<(String, String)>,
         std::thread::JoinHandle<()>,
     ) {
         use std::io::{Read, Write};
@@ -2484,7 +2557,7 @@ mod tests {
                     break;
                 }
             }
-            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
             let content_length = headers
                 .lines()
                 .find_map(|line| {
@@ -2501,7 +2574,7 @@ mod tests {
             let body = String::from_utf8(request[header_end..header_end + content_length].to_vec())
                 .unwrap();
             let handle = first_handle(&body).expect("masked request contains a handle");
-            body_tx.send(body).unwrap();
+            body_tx.send((headers.to_string(), body)).unwrap();
             let response = serde_json::json!({
                 "id": "chatcmpl_pentect_test",
                 "object": "chat.completion",
@@ -2606,7 +2679,7 @@ mod tests {
             .text()
             .unwrap();
         let response: Value = serde_json::from_str(&response).unwrap();
-        let request = captured
+        let (_, request) = captured
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         thread.join().unwrap();
@@ -2628,6 +2701,48 @@ mod tests {
             }),
             "trusted shell argument was not restored"
         );
+    }
+
+    #[test]
+    fn provider_boundary_decodes_codex_zstd_requests_before_protection() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let secret = [
+            "rpa_",
+            "ABCDEFGHIJKLMNOP",
+            "QRSTUVWXYZ012345",
+            "6789abcdefghijkl",
+        ]
+        .concat();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "model": "test",
+            "input": format!("Use RUNPOD_API_KEY={secret}"),
+            "stream": false
+        }))
+        .unwrap();
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(payload), 3).unwrap();
+        let (upstream, captured, thread) = mock_chat_upstream();
+        let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+
+        reqwest::blocking::Client::new()
+            .post(format!("{}/responses", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::CONTENT_ENCODING, "zstd")
+            .body(compressed)
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let (headers, request) = captured
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(!headers.to_ascii_lowercase().contains("content-encoding:"));
+        assert!(!request.contains(&secret));
+        assert!(first_handle(&request).is_some());
+        serde_json::from_str::<Value>(&request).unwrap();
     }
 
     #[tokio::test]

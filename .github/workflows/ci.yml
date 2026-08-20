@@ -105,6 +105,8 @@ jobs:
               - 'Cargo.toml'
               - 'rust-toolchain*'
             packaging:
+              - '.github/workflows/current-clients.yml'
+              - '.github/workflows/release.yml'
               - 'packaging/**'
               - 'tools/install.ps1'
               - 'tools/test_install.ps1'
@@ -116,6 +118,13 @@ jobs:
               - 'tools/propose_automation_pr.sh'
               - 'tools/test_propose_automation_pr.sh'
               - 'tools/update_package_metadata.py'
+              - 'tools/client_smoke.py'
+              - 'tools/install_client_smoke.sh'
+              - 'tools/test_client_smoke_coverage.py'
+              - 'tools/verify_client_smoke_log.py'
+              - 'tools/codex-app-smoke-fixture.cjs'
+              - 'tools/claude-app-smoke-fixture.c'
+              - 'tools/claude-app-smoke-fixture.cs'
             sdk:
               - 'sdk/**'
             detector:
@@ -311,7 +320,11 @@ jobs:
           persist-credentials: false
       - name: Test Windows PowerShell 5.1 fallback
         shell: powershell
-        run: ./tools/test_install.ps1
+        run: |
+          ./tools/test_install.ps1
+          Add-Type -Path tools/claude-app-smoke-fixture.cs `
+            -OutputAssembly "$env:RUNNER_TEMP/claude-app-smoke-fixture.exe" `
+            -OutputType ConsoleApplication
 
   test:
     needs: changes
@@ -343,7 +356,10 @@ jobs:
         if: needs.changes.outputs.packaging == 'true'
         run: |
           python tools/update_package_metadata.py --metadata-file packaging/release.json --check
-          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh
+          python tools/test_client_smoke_coverage.py
+          python -m py_compile tools/client_smoke.py tools/test_client_smoke_coverage.py tools/verify_client_smoke_log.py
+          sh -n tools/install.sh tools/install-apt.sh tools/package_deb.sh tools/build_apt_repository.sh tools/propose_automation_pr.sh tools/install_client_smoke.sh
+          cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$RUNNER_TEMP/claude-app-smoke-fixture"
           sh tools/test_propose_automation_pr.sh
       - name: Validate PowerShell tools
         if: needs.changes.outputs.packaging == 'true'
