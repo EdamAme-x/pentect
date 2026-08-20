@@ -18,8 +18,8 @@ const LOG_BATCH_EVENTS: usize = 64;
 const LOG_BATCH_BYTES: usize = 64 * 1024;
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const LOG_CHANNEL_CAPACITY: usize = 1_024;
-const LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const LOG_ROTATIONS: usize = 15;
+const LOG_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const LOG_ROTATIONS: usize = 31;
 static LOG_SHARE: OnceLock<bool> = OnceLock::new();
 static PERSISTENT_LOG: OnceLock<Option<PersistentLogWriter>> = OnceLock::new();
 
