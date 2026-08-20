@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::{fs::OpenOptions, io::Write, thread, time::Duration};
 
 const APP_START_GRACE: Duration = Duration::from_secs(15);
-const APP_EXIT_GRACE: Duration = Duration::from_secs(3);
+const APP_EXIT_GRACE: Duration = Duration::from_secs(30);
 const APP_MONITOR_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_LIFECYCLE_LOG_BYTES: u64 = 1024 * 1024;
 
@@ -179,6 +179,9 @@ fn monitor_codex_app(
                 "launcher-exited",
                 &format!("status={}", status.code().unwrap_or(-1)),
             );
+            if !status.success() {
+                return Ok(status);
+            }
             return monitor_handed_off_app(app, proxy, lifecycle_log, status);
         }
         thread::sleep(APP_MONITOR_INTERVAL);
@@ -193,27 +196,35 @@ fn monitor_handed_off_app(
 ) -> Result<std::process::ExitStatus, String> {
     let mut process_probe = CodexAppProcessProbe::new(app);
     let started = std::time::Instant::now();
-    while started.elapsed() < APP_START_GRACE {
+    let mut observed = false;
+    let mut warned_unobservable = false;
+    let mut absent_since = None;
+    loop {
         ensure_gateway_running(proxy, lifecycle_log)?;
         if process_probe.is_running() {
-            record_lifecycle(lifecycle_log, "app-process-observed", "running");
-            let mut absent_since = None;
-            loop {
-                ensure_gateway_running(proxy, lifecycle_log)?;
-                if process_probe.is_running() {
-                    absent_since = None;
-                } else {
-                    let since = absent_since.get_or_insert_with(std::time::Instant::now);
-                    if since.elapsed() >= APP_EXIT_GRACE {
-                        return Ok(launcher_status);
-                    }
-                }
-                thread::sleep(APP_MONITOR_INTERVAL);
+            if !observed {
+                record_lifecycle(lifecycle_log, "app-process-observed", "running");
+                observed = true;
             }
+            absent_since = None;
+        } else if observed {
+            let since = absent_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= APP_EXIT_GRACE {
+                record_lifecycle(lifecycle_log, "app-process-exited", "confirmed");
+                return Ok(launcher_status);
+            }
+        } else if started.elapsed() >= APP_START_GRACE && !warned_unobservable {
+            // Packaged Windows apps can hide their executable path from normal
+            // process enumeration. Never drop the gateway merely because the
+            // process cannot be observed: remain in the foreground until Ctrl+C.
+            record_lifecycle(lifecycle_log, "app-process-unobservable", "gateway-kept-alive");
+            eprintln!(
+                "[pentect] Codex App process could not be observed; the gateway will stay active until Ctrl+C"
+            );
+            warned_unobservable = true;
         }
         thread::sleep(APP_MONITOR_INTERVAL);
     }
-    Ok(launcher_status)
 }
 
 fn ensure_gateway_running(
@@ -1124,7 +1135,7 @@ impl CodexAppProcessProbe {
     fn matches(&self, process: &sysinfo::Process) -> bool {
         process
             .exe()
-            .and_then(|path| path.canonicalize().ok())
+            .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
             .map(|path| path.to_string_lossy().to_ascii_lowercase())
             .is_some_and(|path| {
                 path == self.expected
