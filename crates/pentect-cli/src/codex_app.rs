@@ -628,9 +628,7 @@ fn generated_session_name(name: &std::ffi::OsStr) -> bool {
 
 fn generated_session_pid(name: &std::ffi::OsStr) -> Option<u32> {
     let name = name.to_string_lossy();
-    let Some((pid, suffix)) = name.split_once('-') else {
-        return None;
-    };
+    let (pid, suffix) = name.split_once('-')?;
     if pid.is_empty()
         || suffix.is_empty()
         || !pid.bytes().all(|byte| byte.is_ascii_digit())
