@@ -518,8 +518,8 @@ fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let pathext =
             std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
-        return resolve_windows_command_from(program, &path, &pathext)
-            .ok_or_else(|| format!("could not run '{}': program not found", program.display()));
+        resolve_windows_command_from(program, &path, &pathext)
+            .ok_or_else(|| format!("could not run '{}': program not found", program.display()))
     }
     #[cfg(not(windows))]
     {
@@ -1142,6 +1142,10 @@ impl AgentToolOpts {
 }
 
 fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
+    // Releases before 0.0.36 could leave an App-only loopback provider in the
+    // shared config after an interrupted launch. Repair that exact generated
+    // shape before resolving the real upstream.
+    codex_app::recover_legacy_config()?;
     let routing = codex_effective_routing(opts)?;
     let mut args = opts.tool_args.clone();
     if opts.dry_run {

@@ -1,9 +1,9 @@
 //! Launcher for the unmodified Codex desktop application.
 //!
 //! The app and its bundled Codex process use a loopback-only Responses API
-//! gateway. Pentect temporarily overrides the selected provider in the user's
-//! Codex configuration, restores the exact original when the App exits, and
-//! refuses to launch while another Codex App process is running.
+//! gateway. The App gets a session-only `CODEX_HOME`; Pentect never changes the
+//! user's shared Codex configuration and refuses to launch while another Codex
+//! App process is running.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -22,6 +22,7 @@ pub(crate) fn cmd_codex_app(args: &[String]) -> i32 {
 
 fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let options = CodexAppOptions::parse(args)?;
+    recover_legacy_config()?;
     let app_was_explicit = options.app.is_some();
     let app = options.app.unwrap_or_else(default_codex_app_path);
     if options.check {
@@ -61,32 +62,46 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         &options.upstream_header_env,
     )?;
     let config_lock = Arc::new(Mutex::new(Some(CodexConfigLock::acquire()?)));
-    let config_override = Some(CodexConfigOverride::install(
+    let session_home = Some(CodexSessionHome::create(
         &routing.provider,
         proxy.base_url(),
     )?);
     eprintln!("[pentect] Codex App gateway ready at {}", proxy.base_url());
-    if config_override.is_some() {
-        eprintln!(
-            "[pentect] Codex provider '{}' is routed through the gateway for this App session",
-            routing.provider
-        );
-    }
+    eprintln!(
+        "[pentect] Codex provider '{}' is routed through the gateway for this App session",
+        routing.provider
+    );
     eprintln!("[pentect] Responses API prompts, files, and completed tool calls are protected");
 
     let mut command = Command::new(&app);
     crate::upstream::hide_header_source_env(&mut command, &options.upstream_header_env);
     command
+        .env(
+            "CODEX_HOME",
+            session_home
+                .as_ref()
+                .expect("Codex session home exists")
+                .path(),
+        )
         .env("OPENAI_BASE_URL", proxy.base_url())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if std::env::var_os("CODEX_SQLITE_HOME").is_none() {
+        command.env(
+            "CODEX_SQLITE_HOME",
+            session_home
+                .as_ref()
+                .expect("Codex session home exists")
+                .source_home(),
+        );
+    }
     configure_child_process(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start Codex App: {error}"))?;
-    let config_cleanup = Arc::new(Mutex::new(config_override));
-    let signal_cleanup = Arc::clone(&config_cleanup);
+    let session_cleanup = Arc::new(Mutex::new(session_home));
+    let signal_cleanup = Arc::clone(&session_cleanup);
     let signal_lock = Arc::clone(&config_lock);
     let child_id = child.id();
     if let Err(error) = ctrlc::set_handler(move || {
@@ -101,22 +116,22 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     }) {
         terminate_child_process(child_id);
         let _ = child.wait();
-        if let Ok(mut cleanup) = config_cleanup.lock() {
+        if let Ok(mut cleanup) = session_cleanup.lock() {
             cleanup.take();
         }
         if let Ok(mut lock) = config_lock.lock() {
             lock.take();
         }
         return Err(format!(
-            "could not install Codex App config recovery handler: {error}"
+            "could not install Codex App session cleanup handler: {error}"
         ));
     }
     let status = child
         .wait()
         .map_err(|error| format!("could not wait for Codex App: {error}"))?;
-    config_cleanup
+    session_cleanup
         .lock()
-        .map_err(|_| "Codex App config recovery lock is unavailable".to_string())?
+        .map_err(|_| "Codex App session cleanup lock is unavailable".to_string())?
         .take();
     config_lock
         .lock()
@@ -168,10 +183,9 @@ fn configure_child_process(command: &mut Command) {
     command.process_group(0);
 }
 
-struct CodexConfigOverride {
-    config: PathBuf,
-    backup: PathBuf,
-    no_original_marker: PathBuf,
+struct CodexSessionHome {
+    path: PathBuf,
+    source_home: PathBuf,
 }
 
 #[derive(Debug)]
@@ -210,7 +224,7 @@ impl CodexConfigLock {
             }
             Err(std::fs::TryLockError::Error(error)) => {
                 return Err(format!(
-                    "could not lock Codex App configuration '{}': {error}",
+                    "could not lock Codex App session '{}': {error}",
                     path.display()
                 ));
             }
@@ -234,124 +248,342 @@ impl Drop for CodexConfigLock {
     }
 }
 
-impl CodexConfigOverride {
-    fn install(provider: &str, gateway: &str) -> Result<Self, String> {
-        let home = crate::codex_home_dir()?;
-        Self::install_in(&home, provider, gateway)
+impl CodexSessionHome {
+    fn create(provider: &str, gateway: &str) -> Result<Self, String> {
+        Self::create_in(&crate::codex_home_dir()?, provider, gateway)
     }
 
-    fn install_in(home: &Path, provider: &str, gateway: &str) -> Result<Self, String> {
-        std::fs::create_dir_all(home)
-            .map_err(|error| format!("could not create '{}': {error}", home.display()))?;
-        let config = home.join("config.toml");
-        let backup = home.join("config.toml.pentect-backup");
-        let no_original_marker = home.join("config.toml.pentect-no-original");
-        reject_symlink(&config, "Codex config")?;
-        reject_symlink(&backup, "Codex recovery backup")?;
-        reject_symlink(&no_original_marker, "Codex recovery marker")?;
-        if backup.is_file() {
-            if config.is_file() {
-                std::fs::remove_file(&config).map_err(|error| {
-                    format!(
-                        "could not recover Codex config '{}': {error}",
-                        config.display()
-                    )
-                })?;
-            }
-            if no_original_marker.is_file() {
-                std::fs::remove_file(&backup).map_err(|error| {
-                    format!("could not clear interrupted Codex backup: {error}")
-                })?;
-                let _ = std::fs::remove_file(&no_original_marker);
-            } else {
-                std::fs::rename(&backup, &config).map_err(|error| {
-                    format!(
-                        "could not restore interrupted Codex config override '{}': {error}",
-                        backup.display()
-                    )
-                })?;
-            }
-            eprintln!("[pentect] restored Codex config left by an interrupted App session");
-        }
+    fn create_in(source_home: &Path, provider: &str, gateway: &str) -> Result<Self, String> {
+        std::fs::create_dir_all(source_home)
+            .map_err(|error| format!("could not create '{}': {error}", source_home.display()))?;
+        let pentect_state = source_home.join(".pentect");
+        reject_directory_link(&pentect_state, "Pentect Codex state directory")?;
+        std::fs::create_dir_all(&pentect_state).map_err(|error| {
+            format!(
+                "could not create Pentect Codex state directory '{}': {error}",
+                pentect_state.display()
+            )
+        })?;
+        let sessions = pentect_state.join("codex-app-sessions");
+        reject_directory_link(&sessions, "Codex App sessions directory")?;
+        std::fs::create_dir_all(&sessions).map_err(|error| {
+            format!(
+                "could not create Codex App session directory '{}': {error}",
+                sessions.display()
+            )
+        })?;
+        cleanup_stale_session_homes(&sessions);
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = sessions.join(format!("{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&path).map_err(|error| {
+            format!(
+                "could not create Codex App session home '{}': {error}",
+                path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .map_err(|error| {
+                format!(
+                    "could not protect Codex App session home '{}': {error}",
+                    path.display()
+                )
+            })?;
 
-        let had_original = config.is_file();
-        let original = if had_original {
-            std::fs::read_to_string(&config)
-                .map_err(|error| format!("could not read '{}': {error}", config.display()))?
-        } else {
-            String::new()
-        };
-        let mut parsed = if original.trim().is_empty() {
-            toml_edit::DocumentMut::new()
-        } else {
-            original
-                .parse::<toml_edit::DocumentMut>()
-                .map_err(|error| format!("could not parse '{}': {error}", config.display()))?
-        };
-        set_provider_gateway(&mut parsed, provider, gateway)?;
-
-        write_new_private_file(&backup, original.as_bytes())
-            .map_err(|error| format!("could not back up '{}': {error}", config.display()))?;
-        if !had_original {
-            write_new_private_file(&no_original_marker, b"")
-                .map_err(|error| format!("could not create Codex recovery marker: {error}"))?;
-        }
-        let temporary = home.join(format!("config.toml.pentect-{}.tmp", std::process::id()));
-        reject_symlink(&temporary, "Codex temporary config")?;
-        write_new_private_file(&temporary, parsed.to_string().as_bytes())
-            .map_err(|error| format!("could not write '{}': {error}", temporary.display()))?;
-        if config.is_file() {
-            std::fs::remove_file(&config)
-                .map_err(|error| format!("could not replace '{}': {error}", config.display()))?;
-        }
-        if let Err(error) = std::fs::rename(&temporary, &config) {
-            if had_original {
-                let _ = std::fs::rename(&backup, &config);
-            } else {
-                let _ = std::fs::remove_file(&backup);
-                let _ = std::fs::remove_file(&no_original_marker);
+        let result = (|| {
+            for entry in std::fs::read_dir(source_home).map_err(|error| {
+                format!(
+                    "could not inspect Codex home '{}': {error}",
+                    source_home.display()
+                )
+            })? {
+                let entry = entry
+                    .map_err(|error| format!("could not inspect Codex home entry: {error}"))?;
+                let name = entry.file_name();
+                if session_home_excludes(&name) {
+                    continue;
+                }
+                link_session_entry(&entry.path(), &path.join(&name))?;
             }
-            return Err(format!(
-                "could not activate Codex config override '{}': {error}",
-                config.display()
-            ));
+
+            let source_config = source_home.join("config.toml");
+            reject_symlink(&source_config, "Codex config")?;
+            let original = match std::fs::read_to_string(&source_config) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => {
+                    return Err(format!(
+                        "could not read '{}': {error}",
+                        source_config.display()
+                    ));
+                }
+            };
+            let mut config = if original.trim().is_empty() {
+                toml_edit::DocumentMut::new()
+            } else {
+                original
+                    .parse::<toml_edit::DocumentMut>()
+                    .map_err(|error| {
+                        format!("could not parse '{}': {error}", source_config.display())
+                    })?
+            };
+            set_provider_gateway(&mut config, provider, gateway)?;
+            write_new_private_file(&path.join("config.toml"), config.to_string().as_bytes())
+                .map_err(|error| format!("could not write Codex App session config: {error}"))?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            cleanup_session_home(&path);
+            return Err(error);
         }
         Ok(Self {
-            config,
-            backup,
-            no_original_marker,
+            path,
+            source_home: source_home.to_path_buf(),
         })
     }
 
-    fn restore(&self) -> Result<(), String> {
-        reject_symlink(&self.config, "Codex config")?;
-        reject_symlink(&self.backup, "Codex recovery backup")?;
-        reject_symlink(&self.no_original_marker, "Codex recovery marker")?;
-        if !self.backup.is_file() {
-            return Ok(());
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn source_home(&self) -> &Path {
+        &self.source_home
+    }
+}
+
+impl Drop for CodexSessionHome {
+    fn drop(&mut self) {
+        cleanup_session_home(&self.path);
+    }
+}
+
+fn session_home_excludes(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name == ".pentect"
+        || name == "config.toml"
+        || name == "config.toml.pentect-backup"
+        || name == "config.toml.pentect-no-original"
+        || name == "pentect-codex-app.lock"
+        || (name.starts_with("config.toml.pentect-") && name.ends_with(".tmp"))
+}
+
+#[cfg(unix)]
+fn link_session_entry(source: &Path, destination: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(source, destination).map_err(|error| {
+        format!(
+            "could not link Codex state '{}' into the App session: {error}",
+            source.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn link_session_entry(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(source).map_err(|error| {
+        format!(
+            "could not inspect Codex state '{}': {error}",
+            source.display()
+        )
+    })?;
+    if metadata.is_dir() {
+        match junction::create(source, destination) {
+            Ok(()) => Ok(()),
+            Err(junction_error) => {
+                // `junction::create` may leave an empty directory behind when
+                // the volume does not support junctions.
+                let _ = std::fs::remove_dir(destination);
+                std::os::windows::fs::symlink_dir(source, destination).map_err(|symlink_error| {
+                    format!(
+                        "could not link Codex state directory '{}' into the App session: junction failed ({junction_error}); directory symlink failed ({symlink_error})",
+                        source.display()
+                    )
+                })
+            }
         }
-        if self.config.is_file() {
-            std::fs::remove_file(&self.config).map_err(|error| {
+    } else if metadata.is_file() {
+        std::fs::hard_link(source, destination)
+            .or_else(|hard_link_error| {
+                std::os::windows::fs::symlink_file(source, destination).map_err(|symlink_error| {
+                    std::io::Error::new(
+                        symlink_error.kind(),
+                        format!(
+                            "hard link failed ({hard_link_error}); file symlink failed ({symlink_error})"
+                        ),
+                    )
+                })
+            })
+            .map_err(|error| {
                 format!(
-                    "could not remove temporary Codex config '{}': {error}",
-                    self.config.display()
+                    "could not link Codex state file '{}' into the App session: {error}",
+                    source.display()
+                )
+            })
+    } else {
+        Err(format!(
+            "Codex state entry '{}' has an unsupported file type",
+            source.display()
+        ))
+    }
+}
+
+fn cleanup_stale_session_homes(sessions: &Path) {
+    let Ok(entries) = std::fs::read_dir(sessions) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if generated_session_name(&entry.file_name()) {
+            cleanup_session_home(&entry.path());
+        }
+    }
+}
+
+fn generated_session_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    let Some((pid, suffix)) = name.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !suffix.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn cleanup_session_home(path: &Path) {
+    #[cfg(windows)]
+    if junction::exists(path).unwrap_or(false) {
+        let _ = junction::delete(path);
+        let _ = std::fs::remove_dir(path);
+        return;
+    }
+    let Ok(root_metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if root_metadata.file_type().is_symlink() || root_metadata.is_file() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if !root_metadata.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        #[cfg(windows)]
+        if junction::exists(&entry_path).unwrap_or(false) {
+            let _ = junction::delete(&entry_path);
+            let _ = std::fs::remove_dir(&entry_path);
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || metadata.is_file() {
+            let _ = std::fs::remove_file(&entry_path);
+        } else if metadata.is_dir() {
+            let _ = std::fs::remove_dir_all(&entry_path);
+        }
+    }
+    let _ = std::fs::remove_dir(path);
+}
+
+pub(crate) fn recover_legacy_config() -> Result<(), String> {
+    recover_legacy_config_in(&crate::codex_home_dir()?)
+}
+
+fn recover_legacy_config_in(home: &Path) -> Result<(), String> {
+    let config = home.join("config.toml");
+    let backup = home.join("config.toml.pentect-backup");
+    let no_original_marker = home.join("config.toml.pentect-no-original");
+    reject_symlink(&config, "Codex config")?;
+    reject_symlink(&backup, "Codex recovery backup")?;
+    reject_symlink(&no_original_marker, "Codex recovery marker")?;
+    if backup.is_file() {
+        if config.is_file() {
+            std::fs::remove_file(&config).map_err(|error| {
+                format!(
+                    "could not recover Codex config '{}': {error}",
+                    config.display()
                 )
             })?;
         }
-        if self.no_original_marker.is_file() {
-            std::fs::remove_file(&self.backup)
-                .map_err(|error| format!("could not remove Codex backup: {error}"))?;
-            std::fs::remove_file(&self.no_original_marker)
-                .map_err(|error| format!("could not remove Codex recovery marker: {error}"))
+        if no_original_marker.is_file() {
+            std::fs::remove_file(&backup)
+                .map_err(|error| format!("could not clear interrupted Codex backup: {error}"))?;
         } else {
-            std::fs::rename(&self.backup, &self.config).map_err(|error| {
+            std::fs::rename(&backup, &config).map_err(|error| {
                 format!(
-                    "could not restore Codex config '{}': {error}",
-                    self.config.display()
+                    "could not restore interrupted Codex config '{}': {error}",
+                    backup.display()
                 )
-            })
+            })?;
+        }
+        let _ = std::fs::remove_file(&no_original_marker);
+        eprintln!("[pentect] restored Codex config left by an older interrupted App session");
+        return Ok(());
+    }
+    if !config.is_file() {
+        return Ok(());
+    }
+    let original = std::fs::read_to_string(&config)
+        .map_err(|error| format!("could not read '{}': {error}", config.display()))?;
+    let mut parsed = original
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("could not parse '{}': {error}", config.display()))?;
+    if !is_orphaned_legacy_gateway(&parsed) {
+        return Ok(());
+    }
+    parsed.remove("model_provider");
+    if let Some(providers) = parsed
+        .get_mut("model_providers")
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        providers.remove(crate::CODEX_GATEWAY_PROVIDER);
+        if providers.is_empty() {
+            parsed.remove("model_providers");
         }
     }
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temporary = home.join(format!(
+        "config.toml.pentect-recovery-{}-{suffix}.tmp",
+        std::process::id()
+    ));
+    write_new_private_file(&temporary, parsed.to_string().as_bytes())
+        .map_err(|error| format!("could not write Codex recovery config: {error}"))?;
+    std::fs::rename(&temporary, &config)
+        .map_err(|error| format!("could not recover '{}': {error}", config.display()))?;
+    eprintln!("[pentect] removed a stale Codex gateway left by an older release");
+    Ok(())
+}
+
+fn is_orphaned_legacy_gateway(config: &toml_edit::DocumentMut) -> bool {
+    if config
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        != Some(crate::CODEX_GATEWAY_PROVIDER)
+    {
+        return false;
+    }
+    let Some(provider) = config
+        .get("model_providers")
+        .and_then(toml_edit::Item::as_table)
+        .and_then(|providers| providers.get(crate::CODEX_GATEWAY_PROVIDER))
+        .and_then(toml_edit::Item::as_table)
+    else {
+        return false;
+    };
+    let base_url = provider
+        .get("base_url")
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or_default();
+    provider.get("name").and_then(toml_edit::Item::as_str) == Some("OpenAI through Pentect")
+        && provider.get("wire_api").and_then(toml_edit::Item::as_str) == Some("responses")
+        && (base_url.starts_with("http://127.0.0.1:") || base_url.starts_with("http://localhost:"))
 }
 
 fn reject_symlink(path: &Path, label: &str) -> Result<(), String> {
@@ -362,6 +594,17 @@ fn reject_symlink(path: &Path, label: &str) -> Result<(), String> {
         )),
         Ok(_) | Err(_) => Ok(()),
     }
+}
+
+fn reject_directory_link(path: &Path, label: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    if junction::exists(path).unwrap_or(false) {
+        return Err(format!(
+            "{label} '{}' is a junction; Pentect will not use it",
+            path.display()
+        ));
+    }
+    reject_symlink(path, label)
 }
 
 fn write_new_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -375,14 +618,6 @@ fn write_new_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
-}
-
-impl Drop for CodexConfigOverride {
-    fn drop(&mut self) {
-        if let Err(error) = self.restore() {
-            eprintln!("[pentect] {error}");
-        }
-    }
 }
 
 fn set_provider_gateway(
@@ -896,52 +1131,69 @@ base_url = "https://other.example/v1"
     }
 
     #[test]
-    fn temporary_config_override_restores_the_exact_original() {
+    fn stale_cleanup_only_accepts_generated_session_names() {
+        assert!(generated_session_name(std::ffi::OsStr::new("123-456")));
+        assert!(!generated_session_name(std::ffi::OsStr::new("123")));
+        assert!(!generated_session_name(std::ffi::OsStr::new("../outside")));
+        assert!(!generated_session_name(std::ffi::OsStr::new("123-current")));
+    }
+
+    fn test_home(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "pentect-codex-config-{}-{}",
+            "pentect-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn session_home_routes_only_the_app_and_keeps_shared_state_linked() {
+        let root = test_home("codex-session-home");
         let original = "# keep this comment\nopenai_base_url = \"https://example.test/v1\"\n";
         std::fs::write(root.join("config.toml"), original).unwrap();
-        {
-            let guard =
-                CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
-            let active = std::fs::read_to_string(root.join("config.toml")).unwrap();
-            assert!(active.contains("http://127.0.0.1:47781"));
-            assert!(root.join("config.toml.pentect-backup").is_file());
-            drop(guard);
-        }
+        std::fs::write(root.join("auth.json"), "{\"token\":\"local\"}").unwrap();
+        std::fs::create_dir(root.join("sessions")).unwrap();
+        std::fs::write(root.join("sessions").join("thread.jsonl"), "thread").unwrap();
+
+        let session =
+            CodexSessionHome::create_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
+        let session_path = session.path().to_path_buf();
         assert_eq!(
             std::fs::read_to_string(root.join("config.toml")).unwrap(),
             original
         );
         assert!(!root.join("config.toml.pentect-backup").exists());
+        let session_config = std::fs::read_to_string(session.path().join("config.toml")).unwrap();
+        assert!(session_config.contains("http://127.0.0.1:47781"));
+        assert_eq!(
+            std::fs::read_to_string(session.path().join("auth.json")).unwrap(),
+            "{\"token\":\"local\"}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(session.path().join("sessions").join("thread.jsonl")).unwrap(),
+            "thread"
+        );
+        drop(session);
+        assert!(!session_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("config.toml")).unwrap(),
+            original
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn interrupted_config_override_is_recovered_before_reinstall() {
-        let root = std::env::temp_dir().join(format!(
-            "pentect-codex-recovery-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+    fn legacy_backup_is_restored_before_a_new_session() {
+        let root = test_home("codex-legacy-backup");
         let original = "model = \"original\"\n";
         std::fs::write(root.join("config.toml"), "model = \"interrupted\"\n").unwrap();
         std::fs::write(root.join("config.toml.pentect-backup"), original).unwrap();
-        let guard =
-            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
-        drop(guard);
+        recover_legacy_config_in(&root).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("config.toml")).unwrap(),
             original
@@ -951,22 +1203,12 @@ base_url = "https://other.example/v1"
     }
 
     #[test]
-    fn interrupted_override_without_an_original_remains_absent_after_recovery() {
-        let root = std::env::temp_dir().join(format!(
-            "pentect-codex-no-original-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+    fn legacy_override_without_an_original_is_removed() {
+        let root = test_home("codex-legacy-no-original");
         std::fs::write(root.join("config.toml"), "model = \"interrupted\"\n").unwrap();
         std::fs::write(root.join("config.toml.pentect-backup"), b"").unwrap();
         std::fs::write(root.join("config.toml.pentect-no-original"), b"").unwrap();
-        let guard =
-            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
-        drop(guard);
+        recover_legacy_config_in(&root).unwrap();
         assert!(!root.join("config.toml").exists());
         assert!(!root.join("config.toml.pentect-backup").exists());
         assert!(!root.join("config.toml.pentect-no-original").exists());
@@ -974,21 +1216,39 @@ base_url = "https://other.example/v1"
     }
 
     #[test]
-    fn malformed_config_does_not_create_recovery_artifacts() {
-        let root = std::env::temp_dir().join(format!(
-            "pentect-codex-malformed-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+    fn orphaned_generated_gateway_is_removed_without_touching_other_settings() {
+        let root = test_home("codex-orphaned-gateway");
+        std::fs::write(
+            root.join("config.toml"),
+            r#"model = "gpt-5"
+model_provider = "pentect-openai-gateway"
+
+[model_providers.pentect-openai-gateway]
+name = "OpenAI through Pentect"
+base_url = "http://127.0.0.1:40495/v1"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+
+[desktop]
+theme = "dark"
+"#,
+        )
+        .unwrap();
+        recover_legacy_config_in(&root).unwrap();
+        let recovered = std::fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(!recovered.contains("pentect-openai-gateway"));
+        assert!(recovered.contains("model = \"gpt-5\""));
+        assert!(recovered.contains("theme = \"dark\""));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_config_is_never_replaced() {
+        let root = test_home("codex-malformed-config");
         let malformed = "[not valid";
         std::fs::write(root.join("config.toml"), malformed).unwrap();
-        assert!(
-            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").is_err()
-        );
+        assert!(CodexSessionHome::create_in(&root, "openai", "http://127.0.0.1:47781").is_err());
         assert_eq!(
             std::fs::read_to_string(root.join("config.toml")).unwrap(),
             malformed
@@ -1014,9 +1274,7 @@ base_url = "https://other.example/v1"
         let target = root.join("outside.toml");
         std::fs::write(&target, "model = \"untouched\"\n").unwrap();
         symlink(&target, root.join("config.toml")).unwrap();
-        assert!(
-            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").is_err()
-        );
+        assert!(CodexSessionHome::create_in(&root, "openai", "http://127.0.0.1:47781").is_err());
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "model = \"untouched\"\n"
@@ -1026,7 +1284,7 @@ base_url = "https://other.example/v1"
 
     #[cfg(unix)]
     #[test]
-    fn active_config_and_recovery_files_are_private() {
+    fn session_config_is_private() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
@@ -1039,17 +1297,15 @@ base_url = "https://other.example/v1"
         ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("config.toml"), "model = \"original\"\n").unwrap();
-        let guard =
-            CodexConfigOverride::install_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
-        for path in [
-            root.join("config.toml"),
-            root.join("config.toml.pentect-backup"),
-        ] {
-            assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
-                0
-            );
-        }
+        let guard = CodexSessionHome::create_in(&root, "openai", "http://127.0.0.1:47781").unwrap();
+        assert_eq!(
+            std::fs::metadata(guard.path().join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
         drop(guard);
         std::fs::remove_dir_all(root).unwrap();
     }

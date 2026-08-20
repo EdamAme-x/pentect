@@ -1,6 +1,6 @@
 [package]
 name = "pentect-cli"
-version = "0.0.35"
+version = "0.0.36"
 description = "Pentect CLI"
 edition.workspace = true
 license.workspace = true
@@ -43,6 +43,7 @@ rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [target.'cfg(windows)'.dependencies]
+junction = "2.0.0"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
