@@ -518,6 +518,7 @@ jobs:
           $node = (Get-Command node -ErrorAction Stop).Source
           $fixture = Join-Path $env:RUNNER_TEMP 'codex-app-fixture.exe'
           Copy-Item -LiteralPath $node -Destination $fixture
+          $env:NODE_OPTIONS = "--require=$((Resolve-Path 'tools/codex-app-smoke-fixture.cjs').Path)"
           $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'codex-home'
           New-Item -ItemType Directory -Force $env:CODEX_HOME | Out-Null
           $config = Join-Path $env:CODEX_HOME 'config.toml'
@@ -538,6 +539,7 @@ jobs:
           fixture="$RUNNER_TEMP/codex-app-fixture"
           cp "$(command -v node)" "$fixture"
           chmod +x "$fixture"
+          export NODE_OPTIONS="--require=$PWD/tools/codex-app-smoke-fixture.cjs"
           export CODEX_HOME="$RUNNER_TEMP/codex-home"
           mkdir -p "$CODEX_HOME"
           printf '%s\n' '# installer smoke sentinel' > "$CODEX_HOME/config.toml"
