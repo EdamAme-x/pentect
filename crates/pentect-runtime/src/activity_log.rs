@@ -39,8 +39,10 @@ struct ActivitySource {
 }
 
 struct LifecycleSource {
+    path: PathBuf,
     file: Option<std::fs::File>,
     offset: u64,
+    pending: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -225,27 +227,45 @@ impl LifecycleSource {
     }
 
     fn open_at(path: PathBuf) -> Self {
-        let file = std::fs::OpenOptions::new().read(true).open(path).ok();
-        Self { file, offset: 0 }
+        let file = std::fs::OpenOptions::new().read(true).open(&path).ok();
+        Self {
+            path,
+            file,
+            offset: 0,
+            pending: Vec::new(),
+        }
     }
 
     fn read_new(&mut self) -> Result<Vec<String>, String> {
         if self.file.is_none() {
-            self.file = std::fs::OpenOptions::new()
-                .read(true)
-                .open(codex_lifecycle_log_path())
-                .ok();
+            self.file = std::fs::OpenOptions::new().read(true).open(&self.path).ok();
         }
         let Some(file) = self.file.as_mut() else {
             return Ok(Vec::new());
         };
+        let length = file
+            .metadata()
+            .map_err(|error| format!("could not inspect Codex App lifecycle log: {error}"))?
+            .len();
+        if length < self.offset {
+            self.offset = 0;
+            self.pending.clear();
+        }
         file.seek(SeekFrom::Start(self.offset))
             .map_err(|error| format!("could not seek Codex App lifecycle log: {error}"))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|error| format!("could not read Codex App lifecycle log: {error}"))?;
         self.offset += bytes.len() as u64;
-        Ok(String::from_utf8_lossy(&bytes)
+        self.pending.extend_from_slice(&bytes);
+
+        let complete = self
+            .pending
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| self.pending.drain(..=index).collect::<Vec<_>>())
+            .unwrap_or_default();
+        Ok(String::from_utf8_lossy(&complete)
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(str::to_string)
@@ -397,6 +417,38 @@ mod tests {
             .unwrap();
         writeln!(file, "{{\"event\":\"session-finished\"}}").unwrap();
         assert_eq!(source.read_new().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lifecycle_source_waits_for_complete_lines_and_recovers_after_truncation() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-lifecycle-partial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("codex-app.log");
+        std::fs::write(&path, "{\"event\":\"gateway").unwrap();
+        let mut source = LifecycleSource::open_at(path.clone());
+        assert!(source.read_new().unwrap().is_empty());
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "-started\"}}").unwrap();
+        assert_eq!(
+            source.read_new().unwrap(),
+            ["{\"event\":\"gateway-started\"}"]
+        );
+
+        drop(file);
+        std::fs::write(&path, "{\"event\":\"rotated\"}\n").unwrap();
+        assert_eq!(source.read_new().unwrap(), ["{\"event\":\"rotated\"}"]);
         let _ = std::fs::remove_dir_all(root);
     }
 }

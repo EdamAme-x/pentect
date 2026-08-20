@@ -529,21 +529,26 @@ fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
 
 #[cfg(any(windows, test))]
 fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -> Option<PathBuf> {
-    let mut names = vec![program.to_path_buf()];
-    if program.extension().is_none() {
-        names.extend(
-            pathext
-                .to_string_lossy()
-                .split(';')
-                .map(str::trim)
-                .filter(|extension| !extension.is_empty())
-                .map(|extension| {
-                    let mut name = program.as_os_str().to_os_string();
-                    name.push(extension);
-                    PathBuf::from(name)
-                }),
-        );
-    }
+    let names = if program.extension().is_none() {
+        let mut names = pathext
+            .to_string_lossy()
+            .split(';')
+            .map(str::trim)
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| {
+                let mut name = program.as_os_str().to_os_string();
+                name.push(extension);
+                PathBuf::from(name)
+            })
+            .collect::<Vec<_>>();
+        // npm installs a POSIX shim without an extension beside the Windows
+        // .cmd/.ps1 shims. It is a file, but Windows cannot execute it. Keep
+        // the raw name only as a final fallback after PATHEXT candidates.
+        names.push(program.to_path_buf());
+        names
+    } else {
+        vec![program.to_path_buf()]
+    };
 
     let explicit_path = program.is_absolute() || program.components().count() > 1;
     if explicit_path {
@@ -2726,6 +2731,32 @@ mod tests {
             resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
                 .unwrap();
         assert_eq!(resolved.file_name().unwrap().to_string_lossy(), "codex.CMD");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_npm_cmd_shim_wins_over_posix_and_powershell_shims() {
+        let directory = command_test_directory("npm-shim-precedence");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("codex"), b"#!/bin/sh\n").unwrap();
+        let cmd = if cfg!(windows) {
+            directory.join("codex.cmd")
+        } else {
+            directory.join("codex.CMD")
+        };
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+        std::fs::write(directory.join("codex.ps1"), b"Write-Output codex\n").unwrap();
+
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
+                .unwrap();
+        assert_eq!(resolved.parent(), Some(directory.as_path()));
+        assert!(resolved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("codex.cmd"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

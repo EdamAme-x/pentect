@@ -13,6 +13,7 @@ use std::{fs::OpenOptions, io::Write, thread, time::Duration};
 const APP_START_GRACE: Duration = Duration::from_secs(15);
 const APP_EXIT_GRACE: Duration = Duration::from_secs(3);
 const APP_MONITOR_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_LIFECYCLE_LOG_BYTES: u64 = 1024 * 1024;
 
 pub(crate) fn cmd_codex_app(args: &[String]) -> i32 {
     match run_codex_app(args) {
@@ -26,7 +27,7 @@ pub(crate) fn cmd_codex_app(args: &[String]) -> i32 {
 
 fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let options = CodexAppOptions::parse(args)?;
-    recover_legacy_config()?;
+    let recovered_legacy_config = recover_legacy_config()?;
     let app_was_explicit = options.app.is_some();
     let app = options.app.unwrap_or_else(default_codex_app_path);
     if options.check {
@@ -82,6 +83,9 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
             None
         }
     };
+    if recovered_legacy_config {
+        record_lifecycle(&lifecycle_log, "legacy-config-restored", "completed");
+    }
     record_lifecycle(&lifecycle_log, "gateway-started", "loopback");
     eprintln!("[pentect] Codex App gateway ready at {}", proxy.base_url());
     eprintln!(
@@ -114,9 +118,13 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
         );
     }
     configure_child_process(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("could not start Codex App: {error}"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            record_lifecycle(&lifecycle_log, "launcher-failed", &error.to_string());
+            return Err(format!("could not start Codex App: {error}"));
+        }
+    };
     record_lifecycle(
         &lifecycle_log,
         "launcher-started",
@@ -126,8 +134,10 @@ fn run_codex_app(args: &[String]) -> Result<std::process::ExitStatus, String> {
     let signal_cleanup = Arc::clone(&session_cleanup);
     let signal_lock = Arc::clone(&config_lock);
     let child_id = child.id();
+    let signal_app = app.clone();
     if let Err(error) = ctrlc::set_handler(move || {
         terminate_child_process(child_id);
+        terminate_codex_app_processes(&signal_app);
         if let Ok(mut cleanup) = signal_cleanup.lock() {
             cleanup.take();
         }
@@ -254,6 +264,16 @@ impl CodexAppLifecycleLog {
         reject_directory_link(&directory, "Codex App log directory")?;
         let path = directory.join("codex-app.log");
         reject_symlink(&path, "Codex App lifecycle log")?;
+        if path
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > MAX_LIFECYCLE_LOG_BYTES)
+        {
+            OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .map_err(|error| format!("could not rotate '{}': {error}", path.display()))?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -319,6 +339,29 @@ fn terminate_child_process(pid: u32) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+fn terminate_codex_app_processes(app: &Path) {
+    for pid in CodexAppProcessProbe::new(app).matching_pids() {
+        terminate_process(pid);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process(pid: u32) {
+    let _ = Command::new(crate::windows_system_executable("taskkill.exe"))
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
 }
 
 #[cfg(unix)]
@@ -644,11 +687,11 @@ fn cleanup_session_home(path: &Path) {
     let _ = std::fs::remove_dir(path);
 }
 
-pub(crate) fn recover_legacy_config() -> Result<(), String> {
+pub(crate) fn recover_legacy_config() -> Result<bool, String> {
     recover_legacy_config_in(&crate::codex_home_dir()?)
 }
 
-fn recover_legacy_config_in(home: &Path) -> Result<(), String> {
+fn recover_legacy_config_in(home: &Path) -> Result<bool, String> {
     let config = home.join("config.toml");
     let backup = home.join("config.toml.pentect-backup");
     let no_original_marker = home.join("config.toml.pentect-no-original");
@@ -677,10 +720,10 @@ fn recover_legacy_config_in(home: &Path) -> Result<(), String> {
         }
         let _ = std::fs::remove_file(&no_original_marker);
         eprintln!("[pentect] restored Codex config left by an older interrupted App session");
-        return Ok(());
+        return Ok(true);
     }
     if !config.is_file() {
-        return Ok(());
+        return Ok(false);
     }
     let original = std::fs::read_to_string(&config)
         .map_err(|error| format!("could not read '{}': {error}", config.display()))?;
@@ -688,7 +731,7 @@ fn recover_legacy_config_in(home: &Path) -> Result<(), String> {
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| format!("could not parse '{}': {error}", config.display()))?;
     if !is_orphaned_legacy_gateway(&parsed) {
-        return Ok(());
+        return Ok(false);
     }
     parsed.remove("model_provider");
     if let Some(providers) = parsed
@@ -712,7 +755,7 @@ fn recover_legacy_config_in(home: &Path) -> Result<(), String> {
     std::fs::rename(&temporary, &config)
         .map_err(|error| format!("could not recover '{}': {error}", config.display()))?;
     eprintln!("[pentect] removed a stale Codex gateway left by an older release");
-    Ok(())
+    Ok(true)
 }
 
 fn is_orphaned_legacy_gateway(config: &toml_edit::DocumentMut) -> bool {
@@ -1080,27 +1123,36 @@ impl CodexAppProcessProbe {
     }
 
     fn is_running(&mut self) -> bool {
+        !self.matching_pids().is_empty()
+    }
+
+    fn matching_pids(&mut self) -> Vec<u32> {
         self.system
             .refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        self.system.processes().values().any(|process| {
-            process
-                .exe()
-                .and_then(|path| path.canonicalize().ok())
-                .map(|path| path.to_string_lossy().to_ascii_lowercase())
-                .is_some_and(|path| {
-                    path == self.expected
-                        || (!self.install_root.is_empty()
-                            && path.starts_with(&self.install_root)
-                            && matches!(
-                                process
-                                    .name()
-                                    .to_string_lossy()
-                                    .to_ascii_lowercase()
-                                    .as_str(),
-                                "codex.exe" | "chatgpt.exe"
-                            ))
-                })
-        })
+        self.system
+            .processes()
+            .iter()
+            .filter_map(|(pid, process)| {
+                process
+                    .exe()
+                    .and_then(|path| path.canonicalize().ok())
+                    .map(|path| path.to_string_lossy().to_ascii_lowercase())
+                    .is_some_and(|path| {
+                        path == self.expected
+                            || (!self.install_root.is_empty()
+                                && path.starts_with(&self.install_root)
+                                && matches!(
+                                    process
+                                        .name()
+                                        .to_string_lossy()
+                                        .to_ascii_lowercase()
+                                        .as_str(),
+                                    "codex.exe" | "chatgpt.exe"
+                                ))
+                    })
+                    .then(|| pid.as_u32())
+            })
+            .collect()
     }
 }
 
@@ -1236,6 +1288,28 @@ mod tests {
         assert_eq!(value["surface"], "codex-app");
         assert_eq!(value["event"], "gateway-stopped");
         assert_eq!(value["detail"], "gateway thread exited unexpectedly");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lifecycle_log_is_truncated_before_it_grows_without_bound() {
+        let root = std::env::temp_dir().join(format!(
+            "pentect-codex-lifecycle-rotation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join(".pentect").join("logs").join("codex-app.log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; MAX_LIFECYCLE_LOG_BYTES as usize + 1]).unwrap();
+
+        let log = CodexAppLifecycleLog::open(&root).unwrap();
+        log.record("gateway-started", "loopback");
+        let payload = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(payload.lines().count(), 1);
+        assert!(payload.contains("gateway-started"));
         let _ = std::fs::remove_dir_all(root);
     }
 
