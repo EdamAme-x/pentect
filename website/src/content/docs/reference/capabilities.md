@@ -12,11 +12,14 @@ description: A full list of what you can do with Pentect.
 | Protect OpenCode | `pentect opencode --model MODEL` |
 | Protect Pi | `pentect pi --model MODEL` |
 | Protect Antigravity CLI | `pentect antigravity` or `pentect agy` |
+| Protect Aider | `pentect aider` |
 | Protect Continue CLI Chat, Edit, and Apply | `pentect continue` or `pentect cn` |
 | Protect a local Cline CLI session | `pentect cline` |
+| Protect Roo Code | `pentect roo` |
 | Protect Zed Agent and Inline Assistant | `pentect zed` |
 | Protect Goose CLI | `pentect goose` |
 | Protect Junie CLI | `pentect junie` |
+| Protect Gemini CLI | `pentect gemini` |
 | Launch a protected Codex App session | `pentect codex app` |
 | Launch a protected Claude Desktop session | `pentect claude app` |
 | Pass normal client arguments | Add them normally, for example `pentect codex exec --full-auto` |

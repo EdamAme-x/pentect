@@ -18,8 +18,8 @@ const LOG_BATCH_EVENTS: usize = 64;
 const LOG_BATCH_BYTES: usize = 64 * 1024;
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const LOG_CHANNEL_CAPACITY: usize = 1_024;
-const LOG_MAX_BYTES: u64 = 32 * 1024 * 1024;
-const LOG_ROTATIONS: usize = 8;
+const LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const LOG_ROTATIONS: usize = 15;
 static LOG_SHARE: OnceLock<bool> = OnceLock::new();
 static PERSISTENT_LOG: OnceLock<Option<PersistentLogWriter>> = OnceLock::new();
 
@@ -902,10 +902,28 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("pentect.log");
-        let file = std::fs::File::create(&path).unwrap();
+        for generation in 1..=LOG_ROTATIONS {
+            std::fs::write(
+                rotated_log_path(&path, generation),
+                format!("generation-{generation}"),
+            )
+            .unwrap();
+        }
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"current-generation").unwrap();
         file.set_len(LOG_MAX_BYTES + 1).unwrap();
         write_batch(&path, &["{\"event\":\"after-rotation\"}".to_string()]).unwrap();
         assert!(rotated_log_path(&path, 1).exists());
+        let mut previous = std::fs::File::open(rotated_log_path(&path, 1)).unwrap();
+        let mut prefix = [0_u8; 18];
+        previous.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"current-generation");
+        for generation in 2..=LOG_ROTATIONS {
+            assert_eq!(
+                std::fs::read_to_string(rotated_log_path(&path, generation)).unwrap(),
+                format!("generation-{}", generation - 1)
+            );
+        }
         assert!(std::fs::metadata(&path).unwrap().len() < LOG_MAX_BYTES);
         assert!(std::fs::read_to_string(&path)
             .unwrap()

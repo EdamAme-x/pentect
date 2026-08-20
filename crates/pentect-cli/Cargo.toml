@@ -1,6 +1,6 @@
 [package]
 name = "pentect-cli"
-version = "0.0.38"
+version = "0.0.39"
 description = "Pentect CLI"
 edition.workspace = true
 license.workspace = true
@@ -38,6 +38,7 @@ reqwest.workspace = true
 toml_edit.workspace = true
 futures-util = { workspace = true }
 jiff = { workspace = true }
+zstd = { workspace = true }
 pdf-extract = "0.12"
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
