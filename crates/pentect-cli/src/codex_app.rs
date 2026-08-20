@@ -819,22 +819,10 @@ fn set_provider_gateway(
     gateway: &str,
 ) -> Result<(), String> {
     if provider == "openai" {
-        config["model_provider"] = toml_edit::value(crate::CODEX_GATEWAY_PROVIDER);
-        let providers = config
-            .entry("model_providers")
-            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-            .as_table_mut()
-            .ok_or_else(|| "model_providers is not a TOML table".to_string())?;
-        let mut gateway_provider = toml_edit::Table::new();
-        gateway_provider.insert("name", toml_edit::value("OpenAI through Pentect"));
-        gateway_provider.insert("base_url", toml_edit::value(gateway));
-        gateway_provider.insert("wire_api", toml_edit::value("responses"));
-        gateway_provider.insert("requires_openai_auth", toml_edit::value(true));
-        gateway_provider.insert("supports_websockets", toml_edit::value(false));
-        providers.insert(
-            crate::CODEX_GATEWAY_PROVIDER,
-            toml_edit::Item::Table(gateway_provider),
-        );
+        // Preserve the built-in provider ID in Codex's thread metadata. The
+        // gateway answers WebSocket upgrades with 426 so Codex falls back to
+        // the protected HTTP Responses path for this session.
+        config["openai_base_url"] = toml_edit::value(gateway);
         return Ok(());
     }
     let providers = config
@@ -1380,7 +1368,7 @@ base_url = "https://other.example/v1"
     #[test]
     fn provider_override_preserves_comments_and_valid_toml() {
         let mut config =
-            "# keep this comment\n[model_providers.proxy]\nbase_url = \"https://old.example/v1\"\n"
+            "# keep this comment\nmodel_provider = \"openai\"\n[model_providers.proxy]\nbase_url = \"https://old.example/v1\"\n"
                 .parse::<toml_edit::DocumentMut>()
                 .unwrap();
         set_provider_gateway(&mut config, "openai", "http://127.0.0.1:47781").unwrap();
@@ -1389,18 +1377,13 @@ base_url = "https://other.example/v1"
         assert!(encoded.contains("# keep this comment"), "{encoded}");
         let parsed = encoded.parse::<toml::Value>().unwrap();
         assert_eq!(
-            parsed["model_provider"].as_str(),
-            Some(crate::CODEX_GATEWAY_PROVIDER)
-        );
-        assert_eq!(
-            parsed["model_providers"][crate::CODEX_GATEWAY_PROVIDER]["base_url"].as_str(),
+            parsed["openai_base_url"].as_str(),
             Some("http://127.0.0.1:47781")
         );
-        assert_eq!(
-            parsed["model_providers"][crate::CODEX_GATEWAY_PROVIDER]["supports_websockets"]
-                .as_bool(),
-            Some(false)
-        );
+        assert_eq!(parsed["model_provider"].as_str(), Some("openai"));
+        assert!(parsed["model_providers"]
+            .get(crate::CODEX_GATEWAY_PROVIDER)
+            .is_none());
     }
 
     #[test]

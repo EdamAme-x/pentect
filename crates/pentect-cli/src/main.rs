@@ -2129,23 +2129,10 @@ const CODEX_GATEWAY_PROVIDER: &str = "pentect-openai-gateway";
 impl CodexHttpRouting {
     fn gateway_args(&self, gateway: &str) -> Vec<String> {
         let entries = if self.provider == "openai" {
-            vec![
-                format!("model_provider={}", toml_string(CODEX_GATEWAY_PROVIDER)),
-                format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}.name={}",
-                    toml_string("OpenAI through Pentect")
-                ),
-                format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}.base_url={}",
-                    toml_string(gateway)
-                ),
-                format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}.wire_api={}",
-                    toml_string("responses")
-                ),
-                format!("model_providers.{CODEX_GATEWAY_PROVIDER}.requires_openai_auth=true"),
-                format!("model_providers.{CODEX_GATEWAY_PROVIDER}.supports_websockets=false"),
-            ]
+            // Keep the built-in provider ID so Codex can resume this thread without
+            // Pentect. The gateway rejects the WebSocket upgrade with 426, which is
+            // Codex's supported signal to fall back to protected HTTP Responses.
+            vec![format!("openai_base_url={}", toml_string(gateway))]
         } else {
             let provider = codex_toml_key_segment(&self.provider);
             vec![

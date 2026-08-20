@@ -262,6 +262,21 @@ async fn proxy_request_inner(
     let method = request.method().clone();
     let endpoint = classify_openai_endpoint(path_and_query);
     enforce_known_openai_endpoint(endpoint, state.block_unknown_formats)?;
+    if method == hyper::Method::GET
+        && endpoint == OpenAiEndpoint::Responses
+        && request
+            .headers()
+            .get(hyper::header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        // Codex treats 426 as the supported signal to disable Responses
+        // WebSockets for this session and retry through HTTP/SSE. Pentect then
+        // protects the ordinary POST /responses request below.
+        return Ok(text_response(
+            StatusCode::UPGRADE_REQUIRED,
+            "Pentect uses protected HTTP Responses",
+        ));
+    }
     let responses_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::Responses;
     let chat_path = method == hyper::Method::POST && endpoint == OpenAiEndpoint::ChatCompletions;
     let responses_response = matches!(
@@ -2472,6 +2487,23 @@ mod tests {
             socket.flush().unwrap();
         });
         (format!("http://{address}"), body_rx, thread)
+    }
+
+    #[test]
+    fn codex_websocket_upgrade_falls_back_to_protected_http() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let proxy = OpenAiHttpProxyGuard::start("http://127.0.0.1:9".to_string()).unwrap();
+
+        let response = reqwest::blocking::Client::new()
+            .get(format!("{}/responses", proxy.base_url()))
+            .header(reqwest::header::CONNECTION, "Upgrade")
+            .header(reqwest::header::UPGRADE, "websocket")
+            .send()
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::UPGRADE_REQUIRED);
     }
 
     #[test]
