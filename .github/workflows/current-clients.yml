@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/current-clients.yml"
       - ".github/workflows/release.yml"
+      - "crates/pentect-cli/src/client_descriptor.rs"
       - "tools/client_smoke.py"
       - "tools/install_client_smoke.sh"
       - "tools/test_client_smoke_coverage.py"

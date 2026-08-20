@@ -918,10 +918,12 @@ mod tests {
         let mut prefix = [0_u8; 18];
         previous.read_exact(&mut prefix).unwrap();
         assert_eq!(&prefix, b"current-generation");
-        assert_eq!(
-            std::fs::read_to_string(rotated_log_path(&path, LOG_ROTATIONS)).unwrap(),
-            format!("generation-{}", LOG_ROTATIONS - 1)
-        );
+        for generation in 2..=LOG_ROTATIONS {
+            assert_eq!(
+                std::fs::read_to_string(rotated_log_path(&path, generation)).unwrap(),
+                format!("generation-{}", generation - 1)
+            );
+        }
         assert!(std::fs::metadata(&path).unwrap().len() < LOG_MAX_BYTES);
         assert!(std::fs::read_to_string(&path)
             .unwrap()

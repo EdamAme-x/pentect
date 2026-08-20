@@ -105,6 +105,7 @@ jobs:
               - 'Cargo.toml'
               - 'rust-toolchain*'
             packaging:
+              - 'crates/pentect-cli/src/client_descriptor.rs'
               - '.github/workflows/current-clients.yml'
               - '.github/workflows/release.yml'
               - 'packaging/**'
