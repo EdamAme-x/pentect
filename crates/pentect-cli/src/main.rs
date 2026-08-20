@@ -529,7 +529,7 @@ fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
 
 #[cfg(any(windows, test))]
 fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -> Option<PathBuf> {
-    let mut names = vec![program.to_path_buf()];
+    let mut names = Vec::new();
     if program.extension().is_none() {
         names.extend(
             pathext
@@ -544,6 +544,10 @@ fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -
                 }),
         );
     }
+    // npm installs a POSIX shim without an extension next to the Windows
+    // `.cmd` shim. Windows must try PATHEXT candidates first or CreateProcess
+    // receives the shell script and fails with ERROR_BAD_EXE_FORMAT (193).
+    names.push(program.to_path_buf());
 
     let explicit_path = program.is_absolute() || program.components().count() > 1;
     if explicit_path {
@@ -2707,21 +2711,25 @@ mod tests {
     }
 
     #[test]
-    fn windows_npm_cmd_shim_is_found_via_pathext() {
+    fn windows_npm_cmd_shim_wins_over_the_posix_shim() {
         let directory = command_test_directory("npm-shim-resolution");
         std::fs::create_dir_all(&directory).unwrap();
-        let shim = if cfg!(windows) {
-            directory.join("codex.cmd")
-        } else {
-            directory.join("codex.CMD")
-        };
-        std::fs::write(&shim, b"npm shim fixture").unwrap();
+        std::fs::write(directory.join("codex"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(directory.join("codex.ps1"), b"npm PowerShell shim fixture").unwrap();
+        std::fs::write(directory.join("codex.cmd"), b"npm cmd shim fixture").unwrap();
 
         let path = std::env::join_paths([&directory]).unwrap();
         let resolved =
             resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
                 .unwrap();
-        assert_eq!(resolved.file_name().unwrap().to_string_lossy(), "codex.CMD");
+        assert_eq!(
+            resolved
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+            "codex.cmd"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2730,6 +2738,12 @@ mod tests {
     fn windows_npm_cmd_shim_executes_after_resolution() {
         let directory = command_test_directory("npm-shim-execution");
         std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("codex"), b"#!/bin/sh\necho wrong shim\n").unwrap();
+        std::fs::write(
+            directory.join("codex.ps1"),
+            b"Write-Output 'wrong shim'\r\n",
+        )
+        .unwrap();
         std::fs::write(
             directory.join("codex.cmd"),
             b"@echo off\r\necho codex-cli npm-shim-test\r\n",
