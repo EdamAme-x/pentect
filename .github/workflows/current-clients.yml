@@ -11,7 +11,8 @@ on:
       - "tools/install_portable_client_smoke.py"
       - "tools/test_client_smoke_coverage.py"
       - "tools/verify_client_smoke_log.py"
-      - "tools/codex-app-smoke-fixture.cjs"
+      - "tools/codex-app-smoke-fixture.c"
+      - "tools/codex-app-smoke-fixture.cs"
       - "tools/claude-app-smoke-fixture.c"
       - "tools/claude-app-smoke-fixture.cs"
   schedule:
@@ -75,10 +76,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $node = (Get-Command node -ErrorAction Stop).Source
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path -LiteralPath $csc)) { throw 'Framework C# compiler is unavailable' }
           $codexFixture = Join-Path $env:RUNNER_TEMP 'codex-app-fixture.exe'
-          Copy-Item -LiteralPath $node -Destination $codexFixture
-          $env:NODE_OPTIONS = "--require=$((Resolve-Path 'tools/codex-app-smoke-fixture.cjs').Path)"
+          $codexSource = (Resolve-Path 'tools/codex-app-smoke-fixture.cs').Path
+          & $csc /nologo /target:exe "/out:$codexFixture" $codexSource
+          if ($LASTEXITCODE -ne 0) { throw 'Codex fixture compilation failed' }
           $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP 'codex-home'
           New-Item -ItemType Directory -Force $env:CODEX_HOME | Out-Null
           $config = Join-Path $env:CODEX_HOME 'config.toml'
@@ -89,12 +92,9 @@ jobs:
           if ((Get-FileHash -Algorithm SHA256 $config).Hash -ne $before) { throw 'Codex config was modified' }
 
           $claudeFixture = Join-Path $env:RUNNER_TEMP 'claude-app-fixture.exe'
-          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-          if (-not (Test-Path -LiteralPath $csc)) { throw 'Framework C# compiler is unavailable' }
           $claudeSource = (Resolve-Path 'tools/claude-app-smoke-fixture.cs').Path
           & $csc /nologo /target:exe "/out:$claudeFixture" $claudeSource
           if ($LASTEXITCODE -ne 0) { throw 'Claude fixture compilation failed' }
-          Remove-Item Env:NODE_OPTIONS
           & $env:PENTECT_SMOKE_BINARY claude app --app $claudeFixture --upstream https://api.anthropic.com
           if ($LASTEXITCODE -ne 0) { throw 'Claude Desktop contract failed' }
       - name: Start both protected desktop app contracts (POSIX)
@@ -103,9 +103,7 @@ jobs:
         run: |
           set -euo pipefail
           codex_fixture="$RUNNER_TEMP/codex-app-fixture"
-          cp "$(command -v node)" "$codex_fixture"
-          chmod +x "$codex_fixture"
-          export NODE_OPTIONS="--require=$PWD/tools/codex-app-smoke-fixture.cjs"
+          cc -std=c11 -Wall -Wextra -Werror tools/codex-app-smoke-fixture.c -o "$codex_fixture"
           export CODEX_HOME="$RUNNER_TEMP/codex-home"
           mkdir -p "$CODEX_HOME"
           printf '%s\n' '# current client smoke sentinel' > "$CODEX_HOME/config.toml"
@@ -115,7 +113,6 @@ jobs:
 
           claude_fixture="$RUNNER_TEMP/claude-app-fixture"
           cc -std=c11 -Wall -Wextra -Werror tools/claude-app-smoke-fixture.c -o "$claude_fixture"
-          unset NODE_OPTIONS
           "$PENTECT_SMOKE_BINARY" claude app --app "$claude_fixture" --upstream https://api.anthropic.com
       - name: Verify client diagnostics
         run: >-
