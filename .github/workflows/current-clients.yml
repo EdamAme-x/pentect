@@ -120,7 +120,7 @@ jobs:
       - name: Verify client diagnostics
         run: >-
           python tools/verify_client_smoke_log.py
-          "$PENTECT_LOG_DIR/pentect.log"
+          "${{ env.PENTECT_LOG_DIR }}/pentect.log"
           codex claude opencode pi continue cline gemini codex-app claude-app
       - name: Uninstall direct installation (Windows)
         if: runner.os == 'Windows'
@@ -174,7 +174,7 @@ jobs:
       - name: Verify client diagnostics
         run: >-
           python tools/verify_client_smoke_log.py
-          "$PENTECT_LOG_DIR/pentect.log"
+          "${{ env.PENTECT_LOG_DIR }}/pentect.log"
           antigravity aider goose junie roo zed
       - name: Uninstall Pentect
         shell: sh
