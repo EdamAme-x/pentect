@@ -283,17 +283,19 @@ pub(crate) fn active_from_specs(
     active_from_scoped_specs(specs, create_named)
 }
 
-pub(crate) fn active_from_explicit_specs(
+pub(crate) fn active_from_selected_specs(
     specs: Vec<String>,
     create_named: bool,
 ) -> Result<ActivePlugins> {
-    active_from_scoped_specs(
-        specs
-            .into_iter()
-            .map(|spec| (PluginScope::Project, spec))
-            .collect(),
-        create_named,
-    )
+    let specs = specs
+        .into_iter()
+        .map(|spec| {
+            let resolved = resolve_configured_plugin_spec(&spec)?;
+            let scope = configured_scope(&resolved).unwrap_or(PluginScope::Project);
+            Ok((scope, resolved))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    active_from_scoped_specs(specs, create_named)
 }
 
 pub(crate) fn active_from_scoped_specs(
@@ -2084,7 +2086,7 @@ label = "INLINE_SECRET"
         )
         .unwrap();
 
-        let active = active_from_explicit_specs(vec![root.display().to_string()], true).unwrap();
+        let active = active_from_selected_specs(vec![root.display().to_string()], true).unwrap();
         assert_eq!(active.config_paths().len(), 1);
         assert!(active.config_paths()[0].ends_with("plugin.toml"));
         assert_eq!(load_config_packs_from_active(&active).unwrap().len(), 1);
@@ -2596,7 +2598,7 @@ label = "INLINE_SECRET"
         )
         .unwrap();
 
-        let active = active_from_explicit_specs(vec![root.display().to_string()], true).unwrap();
+        let active = active_from_selected_specs(vec![root.display().to_string()], true).unwrap();
         let packs = load_config_packs_from_active(&active).unwrap();
         assert!(packs.is_empty());
 
