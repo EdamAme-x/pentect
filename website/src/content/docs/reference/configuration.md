@@ -150,5 +150,7 @@ pentect plugins config PLUGIN --unset policy.level
 pentect plugins setup PLUGIN
 ```
 
-`plugins add` records an enabled source in the project config. Wasm access is
-approved separately and tied to the manifest and binary hashes.
+`plugins add` records an enabled source in the user config by default. Add
+`--project` to use the project config instead. Wasm and Command access is
+approved separately and tied to the selected scope, manifest, and binary or
+command-file hashes.

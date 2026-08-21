@@ -182,21 +182,23 @@ Treat redirected or in-place resolved output as plaintext secret material.
 | --- | --- |
 | `plugins search [QUERY]` | Search the first-party catalog |
 | `plugins inspect SOURCE` | Show the manifest, hooks, binary, and requested access |
-| `plugins add SOURCE [--yes]` | Verify, approve, and enable a plugin in this project |
-| `plugins remove NAME` | Disable a plugin in this project |
+| `plugins add SOURCE [--yes] [--project]` | Verify, approve, and enable a plugin for the user (or this project) |
+| `plugins remove NAME [--project]` | Disable a user plugin (or a project plugin) |
 | `plugins list [--json]` | Show enabled and installed plugins |
-| `plugins config NAME KEY=VALUE` | Save one JSON setting for a plugin |
-| `plugins config NAME --unset KEY` | Remove one plugin setting |
-| `plugins setup NAME [--yes]` | Review changed hooks or access again |
+| `plugins config NAME KEY=VALUE [--project]` | Save one setting in the selected scope |
+| `plugins config NAME --unset KEY [--project]` | Remove one setting in the selected scope |
+| `plugins setup NAME [--yes] [--project]` | Review changed hooks or access again |
 | `plugins test SOURCE [--json]` | Validate a manifest or installed binary |
-| `plugins update [NAME] [--yes]` | Fetch and verify a newer release |
+| `plugins update [NAME] [--yes] [--project]` | Update user plugins (or project plugins) |
 | `plugins new NAME` | Create a Rust Wasm plugin project |
 | `plugins dev PATH [--yes]` | Build, approve, and activate a local development build |
 | `plugins publish PATH` | Build a release bundle in `dist` |
 
 `SOURCE` can be a local directory or `github:@OWNER/REPOSITORY/path`. Use
 `--plugins SOURCE` on a client or mask command when you need a plugin for only
-one launch.
+one launch. Plugin-management commands use user scope by default; pass
+`--project` for `.pentect/config.toml`, the project lock, approval, settings,
+and runtime data.
 
 Approval flags skip an interactive confirmation; they do not skip checksum,
 build-record, manifest, or sandbox checks.

@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const BINARIES_ENV: &str = "PENTECT_PLUGIN_BINARIES";
+pub const GLOBAL_BINARIES_ENV: &str = "PENTECT_GLOBAL_PLUGIN_BINARIES";
+pub const GLOBAL_BINARY_IDS_ENV: &str = "PENTECT_GLOBAL_PLUGIN_IDS";
 
 const PLUGIN_APPROVAL_FILE: &str = "approval.toml";
 const PLUGIN_BINARY_LOCK_FILE: &str = "binary.lock";
@@ -308,10 +310,34 @@ pub struct PluginMiddleware {
 
 impl PluginMiddleware {
     pub fn from_env() -> Result<Self, String> {
-        let Some(value) = std::env::var_os(BINARIES_ENV) else {
-            return Ok(Self::default());
-        };
-        Self::from_paths(std::env::split_paths(&value).filter(|path| !path.as_os_str().is_empty()))
+        let mut plugins = Vec::new();
+        if let Some(value) = std::env::var_os(GLOBAL_BINARIES_ENV) {
+            let paths = std::env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect::<Vec<_>>();
+            let ids = std::env::var_os(GLOBAL_BINARY_IDS_ENV)
+                .map(|value| {
+                    std::env::split_paths(&value)
+                        .filter(|path| !path.as_os_str().is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if paths.len() != ids.len() {
+                return Err("global plugin path and identity counts do not match".to_string());
+            }
+            for (path, id) in paths.into_iter().zip(ids) {
+                let id = id
+                    .to_str()
+                    .ok_or_else(|| "global plugin identity is not UTF-8".to_string())?;
+                plugins.push(PluginBinary::load_global(&path, id)?);
+            }
+        }
+        if let Some(value) = std::env::var_os(BINARIES_ENV) {
+            for path in std::env::split_paths(&value).filter(|path| !path.as_os_str().is_empty()) {
+                plugins.push(PluginBinary::load(&path)?);
+            }
+        }
+        Ok(Self { plugins })
     }
 
     pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
@@ -608,6 +634,14 @@ struct PluginBinary {
 
 impl PluginBinary {
     fn load(path: &Path) -> Result<Self, String> {
+        Self::load_scoped(path, None)
+    }
+
+    fn load_global(path: &Path, id: &str) -> Result<Self, String> {
+        Self::load_scoped(path, Some(id))
+    }
+
+    fn load_scoped(path: &Path, global_id: Option<&str>) -> Result<Self, String> {
         if !path.is_file() {
             return Err(format!(
                 "plugin manifest does not exist: {}",
@@ -736,7 +770,10 @@ impl PluginBinary {
                 "plugin '{name}' execution limits exceed Pentect's runtime limits"
             ));
         }
-        let runtime_dirs = plugin_runtime_dirs_for_manifest(&name, path)?;
+        let runtime_dirs = match global_id {
+            Some(id) => global_plugin_runtime_dirs(id)?,
+            None => plugin_runtime_dirs_for_manifest(&name, path)?,
+        };
         let mut permissions_file = file.permissions;
         let permission_network = permissions_file
             .as_mut()
@@ -3315,6 +3352,35 @@ pub fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String
     })
 }
 
+/// Resolve device-wide storage for a plugin explicitly enabled in the user's
+/// global Pentect configuration. The caller supplies a stable source identity
+/// so the same approval and managed command are reused from every project.
+pub fn global_plugin_runtime_dirs(source_id: &str) -> Result<PluginRuntimeDirs, String> {
+    let id = plugin_id(source_id);
+    if id.is_empty() {
+        return Err("global plugin identity is empty".to_string());
+    }
+    let user_root = plugin_user_data_root()?;
+    if !user_root.is_absolute() {
+        return Err("Pentect plugin data directory must be absolute".to_string());
+    }
+    std::fs::create_dir_all(&user_root)
+        .map_err(|error| format!("could not create '{}': {error}", user_root.display()))?;
+    let user_root = std::fs::canonicalize(&user_root)
+        .map_err(|error| format!("could not resolve '{}': {error}", user_root.display()))?;
+    restrict_plugin_directory(&user_root)?;
+    let data_dir = user_root.join("global").join(id);
+    let cache_dir = data_dir.join(PLUGIN_CACHE_DIR);
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|error| format!("could not create '{}': {error}", cache_dir.display()))?;
+    restrict_plugin_directory(&data_dir)?;
+    Ok(PluginRuntimeDirs {
+        config_file: data_dir.join(PLUGIN_CONFIG_FILE),
+        data_dir,
+        cache_dir,
+    })
+}
+
 /// Resolve storage for one concrete plugin source. The source path is part of
 /// the identity so two publishers may safely use the same display name.
 pub fn plugin_runtime_dirs_for_manifest(
@@ -3764,11 +3830,35 @@ for line in sys.stdin:
         assert_eq!(result.spans[0].label, "CONFIGURED");
 
         drop(middleware);
+        let global_id = format!("global-command-e2e-{nonce}");
+        let global_dirs = global_plugin_runtime_dirs(&global_id).unwrap();
+        std::fs::write(&global_dirs.config_file, "label = \"GLOBAL_CONFIGURED\"\n").unwrap();
+        std::fs::write(
+            global_dirs.data_dir.join(PLUGIN_COMMAND_LOCK_FILE),
+            &command_lock,
+        )
+        .unwrap();
+        std::fs::write(
+            global_dirs.data_dir.join(PLUGIN_APPROVAL_FILE),
+            format!(
+                "schema = \"pentect.plugin-approval.v1\"\nmanifest_sha256 = \"{manifest_hash}\"\nhooks = [\"inspect\"]\ncommand_lock_sha256 = \"{command_lock_sha256}\"\n"
+            ),
+        )
+        .unwrap();
+        let global = PluginMiddleware {
+            plugins: vec![PluginBinary::load_global(&manifest, &global_id).unwrap()],
+        };
+        let result = global.detect_spans(&Input::text("SECRET"), None).unwrap();
+        assert_eq!(result.spans.len(), 1);
+        assert_eq!(result.spans[0].label, "GLOBAL_CONFIGURED");
+        drop(global);
+
         std::fs::write(&script, "print('changed')\n").unwrap();
         let error = PluginMiddleware::from_paths([manifest.clone()]).unwrap_err();
         assert!(error.contains("changed after setup"), "{error}");
 
         let _ = std::fs::remove_dir_all(dirs.data_dir);
+        let _ = std::fs::remove_dir_all(global_dirs.data_dir);
         let _ = std::fs::remove_dir_all(root);
     }
 

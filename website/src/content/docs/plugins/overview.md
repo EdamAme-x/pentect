@@ -42,16 +42,15 @@ Inspect a released version before you add it:
 pentect plugins inspect github:@EdamAme-x/pentect/plugins/example-regex@v0.1.0
 ```
 
-Add it to the current project:
+Add it for your user account on this computer:
 
 ```sh
 pentect plugins add github:@EdamAme-x/pentect/plugins/example-regex@v0.1.0
 ```
 
-This writes the source to `.pentect/config.toml`. The lockfile records that
-source, the normalized raw GitHub URL Pentect resolved, and the full SHA-256 of
-every fetched manifest and detector file. Commit `pentect.plugins.lock` with
-your project. A Wasm plugin
+This writes the source to `~/.pentect/config.toml` and pins downloaded source
+bytes in `~/.pentect/pentect.plugins.lock`. The plugin is then available from
+every project on this computer. A Wasm plugin
 also downloads its release file, checks its SHA-256 checksum and GitHub build
 record, and asks you to approve its hooks and network access.
 
@@ -63,7 +62,7 @@ Released Wasm plugins need
 [GitHub CLI](https://cli.github.com/) v2.51.0 or newer for build-record checks.
 Regex plugins do not need it.
 
-Use a plugin for only one launch without changing the project:
+Use a plugin for only one launch without changing saved configuration:
 
 ```sh
 pentect codex --plugins github:@owner/repository/path@0123456789abcdef0123456789abcdef01234567
@@ -72,11 +71,23 @@ pentect claude --plugins ./my-plugin
 
 Separate more than one plugin with commas. A one-off remote plugin must use a
 full 40-character commit. Tags can move, so tag-based sources must first be
-added to the project and pinned by `pentect.plugins.lock`.
+added and pinned by a lockfile.
+
+For a repository-owned plugin set, add `--project`. This writes
+`.pentect/config.toml` and `pentect.plugins.lock`; commit both project files.
+
+```sh
+pentect plugins add github:@owner/repository/path@v1.2.3 --project
+```
+
+The same `--project` switch selects project scope for `remove`, `config`,
+`setup`, and `update`. Existing project plugin settings stay project-scoped
+after upgrading; Pentect does not silently promote their permissions.
 
 ## How plugins run
 
-Pentect runs plugins in the order shown in the project config. A hook returns
+Pentect runs user plugins first, followed by project plugins and one-off
+plugins, preserving the order within each config. A hook returns
 normally to continue to the next plugin. It can also block the action. The
 `request` hook can return a response without calling the provider.
 
@@ -139,8 +150,8 @@ pentect plugins update NAME
 pentect plugins remove NAME
 ```
 
-`remove` disables the plugin in the current project. It does not run cleanup
-code from the plugin.
+`remove` disables the user plugin. Use `remove NAME --project` for a project
+plugin. Neither form runs cleanup code from the plugin.
 
 ## Next steps
 

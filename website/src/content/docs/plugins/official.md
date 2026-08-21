@@ -3,8 +3,8 @@ title: Official plugins
 description: First-party plugins and examples maintained with Pentect.
 ---
 
-Pentect's built-in engine works without plugins. Plugins add project-specific
-rules or optional local models.
+Pentect's built-in engine works without plugins. Plugins add user-wide or
+project-specific rules and optional local models.
 
 ## Built-in protection
 
@@ -108,7 +108,7 @@ OS access as the user; enable only plugins you trust.
 | CPU use is high | Remove the plugin when the local model is not needed |
 | Plugin file or command changed | Inspect it, then run `pentect plugins setup` |
 
-Remove it from the current project:
+Remove the user-wide installation:
 
 ```sh
 pentect plugins remove openai-privacy-filter

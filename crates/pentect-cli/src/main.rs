@@ -525,9 +525,29 @@ fn cmd_agent_from(start: usize, args: &[String], inherited_env_is_trusted: bool)
             .then(|| std::env::var_os(plugins::BINARIES_ENV))
             .flatten()
     });
+    let global_binary_env = match active_plugins.global_binary_env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    }
+    .or_else(|| {
+        inherited_env_is_trusted
+            .then(|| std::env::var_os(plugins::GLOBAL_BINARIES_ENV))
+            .flatten()
+    });
+    let global_binary_ids_env = match active_plugins.global_binary_ids_env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    }
+    .or_else(|| {
+        inherited_env_is_trusted
+            .then(|| std::env::var_os(plugins::GLOBAL_BINARY_IDS_ENV))
+            .flatten()
+    });
     let plugin_env = EnvVarGuard::set_optional([
         (plugins::CONFIGS_ENV, config_env),
         (plugins::BINARIES_ENV, binary_env),
+        (plugins::GLOBAL_BINARIES_ENV, global_binary_env),
+        (plugins::GLOBAL_BINARY_IDS_ENV, global_binary_ids_env),
     ]);
     let mut agent_args = Vec::with_capacity(forward_args.len() + 1);
     agent_args.push(
@@ -755,6 +775,18 @@ fn app_plugin_env_guard(args: &[String]) -> Result<EnvVarGuard, String> {
                 .binary_env_value()
                 .map_err(|error| error.to_string())?,
         ),
+        (
+            plugins::GLOBAL_BINARIES_ENV,
+            active
+                .global_binary_env_value()
+                .map_err(|error| error.to_string())?,
+        ),
+        (
+            plugins::GLOBAL_BINARY_IDS_ENV,
+            active
+                .global_binary_ids_env_value()
+                .map_err(|error| error.to_string())?,
+        ),
     ]))
 }
 
@@ -820,6 +852,18 @@ fn cmd_mask(args: &[String]) {
             plugins::BINARIES_ENV,
             active_plugins
                 .binary_env_value()
+                .unwrap_or_else(|error| die(error)),
+        ),
+        (
+            plugins::GLOBAL_BINARIES_ENV,
+            active_plugins
+                .global_binary_env_value()
+                .unwrap_or_else(|error| die(error)),
+        ),
+        (
+            plugins::GLOBAL_BINARY_IDS_ENV,
+            active_plugins
+                .global_binary_ids_env_value()
                 .unwrap_or_else(|error| die(error)),
         ),
     ]);
@@ -943,9 +987,19 @@ fn cmd_read(args: &[String]) {
         Ok(value) => value,
         Err(e) => die(&e),
     };
+    let global_binary_env = match active_plugins.global_binary_env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    };
+    let global_binary_ids_env = match active_plugins.global_binary_ids_env_value() {
+        Ok(value) => value,
+        Err(e) => die(&e),
+    };
     let _plugin_env = EnvVarGuard::set_optional([
         (plugins::CONFIGS_ENV, config_env),
         (plugins::BINARIES_ENV, binary_env),
+        (plugins::GLOBAL_BINARIES_ENV, global_binary_env),
+        (plugins::GLOBAL_BINARY_IDS_ENV, global_binary_ids_env),
     ]);
     let input = Input { kind, data };
     match pentect_agent::mask_input_into_active_memory_store(
@@ -2138,6 +2192,12 @@ fn agent_parent_env_guard(
     let binary_env = active_plugins
         .binary_env_value()
         .map_err(|e| e.to_string())?;
+    let global_binary_env = active_plugins
+        .global_binary_env_value()
+        .map_err(|e| e.to_string())?;
+    let global_binary_ids_env = active_plugins
+        .global_binary_ids_env_value()
+        .map_err(|e| e.to_string())?;
     Ok(EnvVarGuard::set_optional([
         (
             PENTECT_MEMORY_STORE_ADDR_ENV,
@@ -2154,6 +2214,8 @@ fn agent_parent_env_guard(
         ),
         (plugins::CONFIGS_ENV, config_env),
         (plugins::BINARIES_ENV, binary_env),
+        (plugins::GLOBAL_BINARIES_ENV, global_binary_env),
+        (plugins::GLOBAL_BINARY_IDS_ENV, global_binary_ids_env),
     ]))
 }
 
@@ -2566,6 +2628,18 @@ fn apply_plugin_env(cmd: &mut Command, active: &plugins::ActivePlugins) -> Resul
     }
     if let Some(value) = active.binary_env_value().map_err(|e| e.to_string())? {
         cmd.env(plugins::BINARIES_ENV, value);
+    }
+    if let Some(value) = active
+        .global_binary_env_value()
+        .map_err(|e| e.to_string())?
+    {
+        cmd.env(plugins::GLOBAL_BINARIES_ENV, value);
+    }
+    if let Some(value) = active
+        .global_binary_ids_env_value()
+        .map_err(|e| e.to_string())?
+    {
+        cmd.env(plugins::GLOBAL_BINARY_IDS_ENV, value);
     }
     Ok(())
 }

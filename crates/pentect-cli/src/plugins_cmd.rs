@@ -23,19 +23,35 @@ pub(crate) fn cmd_plugins(args: &[String]) {
     };
     let result = match opts.action {
         Action::List => list_plugins(opts.json),
-        Action::Add { spec, approved } => add_plugin(&spec, approved, opts.json),
-        Action::Remove { spec } => remove_plugin(&spec, opts.json),
+        Action::Add {
+            spec,
+            approved,
+            scope,
+        } => add_plugin(&spec, approved, scope, opts.json),
+        Action::Remove { spec, scope } => remove_plugin(&spec, scope, opts.json),
         Action::Search { query } => search_plugins(query.as_deref(), opts.json),
         Action::Inspect { spec } => inspect_plugin(&spec, opts.json),
         Action::Test { spec } => test_plugin(&spec, opts.json),
         Action::New { name, form } => new_plugin(&name, form, opts.json),
         Action::Dev { spec, approved } => dev_plugin(&spec, approved, opts.json),
         Action::Publish { spec } => publish_plugin(&spec, opts.json),
-        Action::Config { spec, change } => config_plugin(&spec, change, opts.json),
-        Action::Setup { spec, approved } => setup_plugin(&spec, approved, opts.json),
-        Action::Update { spec, approved } => match spec {
-            Some(spec) => update_plugin(&spec, approved, opts.json),
-            None => update_all_plugins(approved, opts.json),
+        Action::Config {
+            spec,
+            change,
+            scope,
+        } => config_plugin(&spec, change, scope, opts.json),
+        Action::Setup {
+            spec,
+            approved,
+            scope,
+        } => setup_plugin(&spec, approved, scope, opts.json),
+        Action::Update {
+            spec,
+            approved,
+            scope,
+        } => match spec {
+            Some(spec) => update_plugin(&spec, approved, scope, opts.json),
+            None => update_all_plugins(approved, scope, opts.json),
         },
     };
     if let Err(e) = result {
@@ -55,9 +71,11 @@ enum Action {
     Add {
         spec: String,
         approved: bool,
+        scope: plugins::PluginScope,
     },
     Remove {
         spec: String,
+        scope: plugins::PluginScope,
     },
     Search {
         query: Option<String>,
@@ -82,14 +100,17 @@ enum Action {
     Config {
         spec: String,
         change: ConfigChange,
+        scope: plugins::PluginScope,
     },
     Setup {
         spec: String,
         approved: bool,
+        scope: plugins::PluginScope,
     },
     Update {
         spec: Option<String>,
         approved: bool,
+        scope: plugins::PluginScope,
     },
 }
 
@@ -110,6 +131,8 @@ impl PluginCmd {
         };
         let mut json = false;
         let mut approved = false;
+        let mut scope = plugins::PluginScope::User;
+        let mut scope_explicit = false;
         let mut unset = None;
         let mut values = Vec::new();
         let mut i = 3usize;
@@ -117,6 +140,10 @@ impl PluginCmd {
             match args[i].as_str() {
                 "--json" => json = true,
                 "--yes" => approved = true,
+                "--project" => {
+                    scope = plugins::PluginScope::Project;
+                    scope_explicit = true;
+                }
                 "--unset" => {
                     let Some(key) = args.get(i + 1) else {
                         return Err("--unset requires a key".to_string());
@@ -128,6 +155,12 @@ impl PluginCmd {
                 value => values.push(value.to_string()),
             }
             i += 1;
+        }
+        if scope_explicit && !matches!(action, "add" | "remove" | "config" | "setup" | "update") {
+            return Err(
+                "--project is only valid for plugins add, remove, config, setup, or update"
+                    .to_string(),
+            );
         }
         let action = match action {
             "list" => {
@@ -144,12 +177,14 @@ impl PluginCmd {
                 Action::Add {
                     spec: one_value("plugins add", values)?,
                     approved,
+                    scope,
                 }
             }
             "remove" => {
                 reject_action_flags(approved, unset.as_deref())?;
                 Action::Remove {
                     spec: one_value("plugins remove", values)?,
+                    scope,
                 }
             }
             "search" => {
@@ -213,7 +248,11 @@ impl PluginCmd {
                         return Err("plugins config NAME|PATH [KEY=VALUE | --unset KEY]".to_string())
                     }
                 };
-                Action::Config { spec, change }
+                Action::Config {
+                    spec,
+                    change,
+                    scope,
+                }
             }
             "setup" => {
                 if unset.is_some() {
@@ -222,6 +261,7 @@ impl PluginCmd {
                 Action::Setup {
                     spec: one_value("plugins setup", values)?,
                     approved,
+                    scope,
                 }
             }
             "update" => {
@@ -235,6 +275,7 @@ impl PluginCmd {
                         _ => return Err("plugins update [NAME|PATH]".to_string()),
                     },
                     approved,
+                    scope,
                 }
             }
             other => return Err(format!("unknown plugins command: {other}")),
@@ -333,15 +374,21 @@ fn one_value(command: &str, values: Vec<String>) -> Result<String, String> {
 
 fn list_plugins(json_output: bool) -> Result<(), String> {
     let mut rows = plugin_rows()?;
-    for spec in plugins::config_specs().map_err(|error| error.to_string())? {
-        let active = active_for_one(&spec)?;
-        let source = plugins::plugin_source(&spec).map_err(|error| error.to_string())?;
+    for (scope, spec) in plugins::config_specs_scoped().map_err(|error| error.to_string())? {
+        let active = plugins::active_from_scoped_specs(vec![(scope, spec.clone())], true)
+            .map_err(|error| error.to_string())?;
+        let source =
+            plugins::plugin_source_in_scope(&spec, scope).map_err(|error| error.to_string())?;
         let manifest = load_plugin_manifest(&source)?;
         rows.push(PluginRow {
             name: plugin_name(&source, manifest.as_ref()),
-            source: "enabled".to_string(),
+            source: match scope {
+                plugins::PluginScope::User => "user",
+                plugins::PluginScope::Project => "project",
+            }
+            .to_string(),
             configs: active.config_paths().len(),
-            binary: !active.binary_paths().is_empty(),
+            binary: active.has_binary(),
         });
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.source.cmp(&b.source)));
@@ -380,27 +427,35 @@ fn list_plugins(json_output: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn add_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), String> {
+fn add_plugin(
+    spec: &str,
+    approved: bool,
+    scope: plugins::PluginScope,
+    json_output: bool,
+) -> Result<(), String> {
     if json_output {
         return Err("plugins add does not support --json".to_string());
     }
-    let project_guard =
-        plugins::lock_project_plugin_mutation().map_err(|error| error.to_string())?;
+    let spec = plugins::plugin_spec_for_scope(spec, scope).map_err(|error| error.to_string())?;
+    let spec = spec.as_str();
+    let project_guard = plugins::lock_plugin_mutation(scope).map_err(|error| error.to_string())?;
     let cache = plugins::snapshot_remote_plugin_cache(spec).map_err(|error| error.to_string())?;
-    let project = snapshot_project_plugin_files()?;
+    let project = snapshot_plugin_files(scope)?;
     let result = (|| {
-        let source = plugins::refresh_plugin_source(spec).map_err(|error| error.to_string())?;
+        let source = plugins::refresh_plugin_source_in_scope(spec, scope)
+            .map_err(|error| error.to_string())?;
         let lock_entry =
             plugins::remote_plugin_lock_entry(spec, &source).map_err(|error| error.to_string())?;
         if let Some(entry) = lock_entry {
-            plugins::set_project_remote_plugin_lock_with_guard(&project_guard, spec, Some(entry))
+            plugins::set_remote_plugin_lock_with_guard(scope, &project_guard, spec, Some(entry))
                 .map_err(|error| error.to_string())?;
         }
         if source.manifest_path.is_some() {
             setup_plugin_source(source.clone(), approved, false)?;
         }
         if source.manifest_path.is_none() {
-            let active = active_for_one(spec)?;
+            let active = plugins::active_from_scoped_specs(vec![(scope, spec.to_string())], true)
+                .map_err(|error| error.to_string())?;
             if active.config_paths().is_empty() {
                 return Err(format!(
                     "plugin '{}' has no plugin.toml or detector config",
@@ -408,33 +463,39 @@ fn add_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), Strin
                 ));
             }
         }
-        update_project_plugins(spec, true)?;
+        update_scoped_plugins(scope, spec, true)?;
         Ok(())
     })();
     if let Err(error) = result {
-        return Err(rollback_plugin_transaction(error, cache.as_ref(), &project));
+        return Err(rollback_plugin_transaction(
+            error,
+            cache.as_ref(),
+            &project,
+            scope,
+        ));
     }
     println!("enabled: {spec}");
     Ok(())
 }
 
-fn remove_plugin(spec: &str, json_output: bool) -> Result<(), String> {
+fn remove_plugin(spec: &str, scope: plugins::PluginScope, json_output: bool) -> Result<(), String> {
     if json_output {
         return Err("plugins remove does not support --json".to_string());
     }
-    let project_guard =
-        plugins::lock_project_plugin_mutation().map_err(|error| error.to_string())?;
-    let project = snapshot_project_plugin_files()?;
+    let spec = plugins::plugin_spec_for_scope(spec, scope).map_err(|error| error.to_string())?;
+    let spec = spec.as_str();
+    let project_guard = plugins::lock_plugin_mutation(scope).map_err(|error| error.to_string())?;
+    let project = snapshot_plugin_files(scope)?;
     let result = (|| {
-        let removed = update_project_plugins(spec, false)?;
+        let removed = update_scoped_plugins(scope, spec, false)?;
         for source in removed {
-            plugins::set_project_remote_plugin_lock_with_guard(&project_guard, &source, None)
+            plugins::set_remote_plugin_lock_with_guard(scope, &project_guard, &source, None)
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
     })();
     if let Err(error) = result {
-        restore_project_plugin_files(&project)?;
+        restore_plugin_files(scope, &project)?;
         return Err(error);
     }
     println!("removed: {spec}");
@@ -446,10 +507,10 @@ struct ProjectPluginFiles {
     lock: Option<Vec<u8>>,
 }
 
-fn snapshot_project_plugin_files() -> Result<ProjectPluginFiles, String> {
+fn snapshot_plugin_files(scope: plugins::PluginScope) -> Result<ProjectPluginFiles, String> {
     snapshot_project_plugin_files_at(
-        &Path::new(".pentect").join("config.toml"),
-        &plugins::project_plugin_lock_path(),
+        &plugin_config_path(scope)?,
+        &plugins::plugin_lock_path(scope).map_err(|error| error.to_string())?,
     )
 }
 
@@ -467,11 +528,14 @@ fn snapshot_project_plugin_files_at(
     })
 }
 
-fn restore_project_plugin_files(snapshot: &ProjectPluginFiles) -> Result<(), String> {
+fn restore_plugin_files(
+    scope: plugins::PluginScope,
+    snapshot: &ProjectPluginFiles,
+) -> Result<(), String> {
     restore_project_plugin_files_at(
         snapshot,
-        &Path::new(".pentect").join("config.toml"),
-        &plugins::project_plugin_lock_path(),
+        &plugin_config_path(scope)?,
+        &plugins::plugin_lock_path(scope).map_err(|error| error.to_string())?,
     )
 }
 
@@ -489,6 +553,7 @@ fn rollback_plugin_transaction(
     error: String,
     cache: Option<&plugins::RemotePluginCacheSnapshot>,
     project: &ProjectPluginFiles,
+    scope: plugins::PluginScope,
 ) -> String {
     // Evaluate both before aggregating so a cache rollback error never skips
     // restoration of the project config and lock (or vice versa).
@@ -496,7 +561,7 @@ fn rollback_plugin_transaction(
         .map(plugins::restore_remote_plugin_cache)
         .unwrap_or(Ok(()))
         .map_err(|error| error.to_string());
-    let project = restore_project_plugin_files(project);
+    let project = restore_plugin_files(scope, project);
     let rollback =
         combine_rollback_results([("plugin source", cache), ("project plugin files", project)]);
     attach_rollback_error(error, rollback)
@@ -523,12 +588,30 @@ fn combine_rollback_results<const N: usize>(
     }
 }
 
-fn update_project_plugins(spec: &str, enable: bool) -> Result<Vec<String>, String> {
-    let path = Path::new(".pentect").join("config.toml");
-    update_project_plugins_at(&path, spec, enable)
+fn update_scoped_plugins(
+    scope: plugins::PluginScope,
+    spec: &str,
+    enable: bool,
+) -> Result<Vec<String>, String> {
+    let path = plugin_config_path(scope)?;
+    update_project_plugins_at(&path, spec, enable, scope)
 }
 
-fn update_project_plugins_at(path: &Path, spec: &str, enable: bool) -> Result<Vec<String>, String> {
+fn plugin_config_path(scope: plugins::PluginScope) -> Result<PathBuf, String> {
+    match scope {
+        plugins::PluginScope::User => {
+            plugins::user_plugin_config_path().map_err(|error| error.to_string())
+        }
+        plugins::PluginScope::Project => Ok(plugins::project_plugin_config_path()),
+    }
+}
+
+fn update_project_plugins_at(
+    path: &Path,
+    spec: &str,
+    enable: bool,
+    scope: plugins::PluginScope,
+) -> Result<Vec<String>, String> {
     let mut document = if path.is_file() {
         read_bounded_utf8(path, MAX_PLUGIN_CONFIG_BYTES, "Pentect project config")?
             .parse::<toml_edit::DocumentMut>()
@@ -568,7 +651,7 @@ fn update_project_plugins_at(path: &Path, spec: &str, enable: bool) -> Result<Ve
             .collect::<Vec<_>>();
         if matches.is_empty() {
             for value in &active {
-                let Ok(source) = plugins::plugin_source(value) else {
+                let Ok(source) = plugins::plugin_source_in_scope(value, scope) else {
                     continue;
                 };
                 let Ok(manifest) = load_plugin_manifest(&source) else {
@@ -580,7 +663,9 @@ fn update_project_plugins_at(path: &Path, spec: &str, enable: bool) -> Result<Ve
             }
         }
         if matches.is_empty() {
-            return Err(format!("plugin is not enabled in this project: {spec}"));
+            return Err(format!(
+                "plugin is not enabled in the selected scope: {spec}"
+            ));
         }
         if matches.len() > 1 {
             return Err(format!(
@@ -1713,8 +1798,14 @@ fn plugin_name(source: &plugins::PluginSource, manifest: Option<&PluginManifest>
         .to_string()
 }
 
-fn config_plugin(spec: &str, change: ConfigChange, json_output: bool) -> Result<(), String> {
-    let source = plugins::plugin_source(spec).map_err(|e| e.to_string())?;
+fn config_plugin(
+    spec: &str,
+    change: ConfigChange,
+    scope: plugins::PluginScope,
+    json_output: bool,
+) -> Result<(), String> {
+    let spec = plugins::plugin_spec_for_scope(spec, scope).map_err(|error| error.to_string())?;
+    let source = plugins::plugin_source_in_scope(&spec, scope).map_err(|e| e.to_string())?;
     let manifest = load_plugin_manifest(&source)?;
     let name = plugin_name(&source, manifest.as_ref());
     let dirs = plugin_runtime_dirs_for_source(&name, &source)?;
@@ -1877,23 +1968,35 @@ fn toml_leaf_keys(table: &toml::Table) -> Vec<String> {
     keys
 }
 
-fn setup_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), String> {
-    let project_guard =
-        plugins::lock_project_plugin_mutation().map_err(|error| error.to_string())?;
+fn setup_plugin(
+    spec: &str,
+    approved: bool,
+    scope: plugins::PluginScope,
+    json_output: bool,
+) -> Result<(), String> {
+    let spec = plugins::plugin_spec_for_scope(spec, scope).map_err(|error| error.to_string())?;
+    let spec = spec.as_str();
+    let project_guard = plugins::lock_plugin_mutation(scope).map_err(|error| error.to_string())?;
     let cache = plugins::snapshot_remote_plugin_cache(spec).map_err(|error| error.to_string())?;
-    let project = snapshot_project_plugin_files()?;
+    let project = snapshot_plugin_files(scope)?;
     let result = (|| {
-        let source = plugins::refresh_plugin_source(spec).map_err(|error| error.to_string())?;
+        let source = plugins::refresh_plugin_source_in_scope(spec, scope)
+            .map_err(|error| error.to_string())?;
         if let Some(entry) =
             plugins::remote_plugin_lock_entry(spec, &source).map_err(|error| error.to_string())?
         {
-            plugins::set_project_remote_plugin_lock_with_guard(&project_guard, spec, Some(entry))
+            plugins::set_remote_plugin_lock_with_guard(scope, &project_guard, spec, Some(entry))
                 .map_err(|error| error.to_string())?;
         }
         setup_plugin_source(source, approved, json_output)
     })();
     if let Err(error) = result {
-        return Err(rollback_plugin_transaction(error, cache.as_ref(), &project));
+        return Err(rollback_plugin_transaction(
+            error,
+            cache.as_ref(),
+            &project,
+            scope,
+        ));
     }
     Ok(())
 }
@@ -2525,17 +2628,28 @@ fn write_plugin_approval(
         .map_err(|error| format!("could not activate plugin approval: {error}"))
 }
 
-fn update_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), String> {
+fn update_plugin(
+    spec: &str,
+    approved: bool,
+    scope: plugins::PluginScope,
+    json_output: bool,
+) -> Result<(), String> {
     if json_output {
         return Err("plugins update does not support --json".to_string());
     }
-    let project_guard =
-        plugins::lock_project_plugin_mutation().map_err(|error| error.to_string())?;
+    let spec = plugins::plugin_spec_for_scope(spec, scope).map_err(|error| error.to_string())?;
+    let spec = spec.as_str();
+    let project_guard = plugins::lock_plugin_mutation(scope).map_err(|error| error.to_string())?;
     let cache = plugins::snapshot_remote_plugin_cache(spec).map_err(|error| error.to_string())?;
-    let project = snapshot_project_plugin_files()?;
-    let result = update_plugin_inner(spec, approved, cache.as_ref(), &project_guard);
+    let project = snapshot_plugin_files(scope)?;
+    let result = update_plugin_inner(spec, approved, scope, cache.as_ref(), &project_guard);
     if let Err(error) = result {
-        return Err(rollback_plugin_transaction(error, cache.as_ref(), &project));
+        return Err(rollback_plugin_transaction(
+            error,
+            cache.as_ref(),
+            &project,
+            scope,
+        ));
     }
     Ok(())
 }
@@ -2543,10 +2657,11 @@ fn update_plugin(spec: &str, approved: bool, json_output: bool) -> Result<(), St
 fn update_plugin_inner(
     spec: &str,
     approved: bool,
+    scope: plugins::PluginScope,
     previous: Option<&plugins::RemotePluginCacheSnapshot>,
     project_guard: &plugins::ProjectPluginMutationGuard,
 ) -> Result<(), String> {
-    let source = plugins::refresh_plugin_source(spec).map_err(|e| e.to_string())?;
+    let source = plugins::refresh_plugin_source_in_scope(spec, scope).map_err(|e| e.to_string())?;
     let lock_entry =
         plugins::remote_plugin_lock_entry(spec, &source).map_err(|error| error.to_string())?;
     let manifest = load_plugin_manifest(&source)?
@@ -2567,7 +2682,8 @@ fn update_plugin_inner(
             {
                 println!("plugin command, files, or hook access changed; reviewing updated access");
                 if let Some(entry) = lock_entry {
-                    plugins::set_project_remote_plugin_lock_with_guard(
+                    plugins::set_remote_plugin_lock_with_guard(
+                        scope,
                         project_guard,
                         spec,
                         Some(entry),
@@ -2579,7 +2695,7 @@ fn update_plugin_inner(
             }
         }
         if let Some(entry) = lock_entry {
-            plugins::set_project_remote_plugin_lock_with_guard(project_guard, spec, Some(entry))
+            plugins::set_remote_plugin_lock_with_guard(scope, project_guard, spec, Some(entry))
                 .map_err(|error| error.to_string())?;
         }
         println!("update: refreshed manifest for {name}");
@@ -2589,7 +2705,7 @@ fn update_plugin_inner(
     if verify_plugin_update_approval(&name, &source, &manifest).is_err() {
         println!("plugin manifest changed; reviewing updated access");
         if let Some(entry) = lock_entry {
-            plugins::set_project_remote_plugin_lock_with_guard(project_guard, spec, Some(entry))
+            plugins::set_remote_plugin_lock_with_guard(scope, project_guard, spec, Some(entry))
                 .map_err(|error| error.to_string())?;
         }
         setup_plugin_source(source, approved, false)?;
@@ -2625,7 +2741,7 @@ fn update_plugin_inner(
         )?;
         println!("plugin hook access changed; reviewing updated access");
         if let Some(entry) = lock_entry {
-            plugins::set_project_remote_plugin_lock_with_guard(project_guard, spec, Some(entry))
+            plugins::set_remote_plugin_lock_with_guard(scope, project_guard, spec, Some(entry))
                 .map_err(|error| error.to_string())?;
         }
         setup_plugin_source(source, approved, false)?;
@@ -2635,7 +2751,7 @@ fn update_plugin_inner(
     // Keeping the original digest makes any concurrent or later edit require setup again.
     if let Some(entry) = lock_entry {
         if let Err(error) =
-            plugins::set_project_remote_plugin_lock_with_guard(project_guard, spec, Some(entry))
+            plugins::set_remote_plugin_lock_with_guard(scope, project_guard, spec, Some(entry))
         {
             return Err(attach_rollback_error(
                 error.to_string(),
@@ -2798,15 +2914,23 @@ fn detector_summary(detector: &DetectorDescriptor) -> String {
     )
 }
 
-fn update_all_plugins(approved: bool, json_output: bool) -> Result<(), String> {
-    let specs = plugins::config_specs().map_err(|error| error.to_string())?;
+fn update_all_plugins(
+    approved: bool,
+    scope: plugins::PluginScope,
+    json_output: bool,
+) -> Result<(), String> {
+    let specs = plugins::config_specs_scoped()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|(configured_scope, spec)| (configured_scope == scope).then_some(spec))
+        .collect::<Vec<_>>();
     if specs.is_empty() {
         println!("none");
         return Ok(());
     }
     let mut failures = Vec::new();
     for spec in specs {
-        if let Err(error) = update_plugin(&spec, approved, json_output) {
+        if let Err(error) = update_plugin(&spec, approved, scope, json_output) {
             failures.push(format!("{spec}: {error}"));
         }
     }
@@ -3326,6 +3450,9 @@ fn plugin_runtime_dirs_for_source(
     name: &str,
     source: &plugins::PluginSource,
 ) -> Result<pentect_agent::PluginRuntimeDirs, String> {
+    if source.scope == plugins::PluginScope::User {
+        return pentect_agent::global_plugin_runtime_dirs(&source.runtime_id);
+    }
     match source.manifest_path.as_deref() {
         Some(manifest) => pentect_agent::plugin_runtime_dirs_for_manifest(name, manifest),
         None => plugin_runtime_dirs(name),
@@ -3605,7 +3732,7 @@ mod tests {
         )
         .unwrap();
 
-        update_project_plugins_at(&path, "second", true).unwrap();
+        update_project_plugins_at(&path, "second", true, plugins::PluginScope::Project).unwrap();
         let after_add = std::fs::read_to_string(&path).unwrap();
         assert!(after_add.contains("# keep this comment"), "{after_add}");
         assert!(after_add.contains("# and this one"), "{after_add}");
@@ -3613,7 +3740,7 @@ mod tests {
         assert!(after_add.contains("\"first\""), "{after_add}");
         assert!(after_add.contains("\"second\""), "{after_add}");
 
-        update_project_plugins_at(&path, "first", false).unwrap();
+        update_project_plugins_at(&path, "first", false, plugins::PluginScope::Project).unwrap();
         let after_remove = std::fs::read_to_string(&path).unwrap();
         assert!(!after_remove.contains("\"first\""), "{after_remove}");
         assert!(after_remove.contains("\"second\""), "{after_remove}");
@@ -3665,7 +3792,20 @@ mod tests {
         ];
         assert!(matches!(
             PluginCmd::parse(&add).unwrap().action,
-            Action::Add { approved: true, .. }
+            Action::Add {
+                approved: true,
+                scope: plugins::PluginScope::User,
+                ..
+            }
+        ));
+        let mut project_add = add.clone();
+        project_add.push("--project".into());
+        assert!(matches!(
+            PluginCmd::parse(&project_add).unwrap().action,
+            Action::Add {
+                scope: plugins::PluginScope::Project,
+                ..
+            }
         ));
         let remove = vec![
             "pentect".into(),
@@ -3675,8 +3815,18 @@ mod tests {
         ];
         assert!(matches!(
             PluginCmd::parse(&remove).unwrap().action,
-            Action::Remove { .. }
+            Action::Remove {
+                scope: plugins::PluginScope::User,
+                ..
+            }
         ));
+        let invalid = vec![
+            "pentect".into(),
+            "plugins".into(),
+            "list".into(),
+            "--project".into(),
+        ];
+        assert!(PluginCmd::parse(&invalid).is_err());
     }
 
     #[test]
@@ -3856,6 +4006,8 @@ mod tests {
             manifest_path: Some(manifest_path),
             repository: None,
             remote_base: None,
+            scope: plugins::PluginScope::Project,
+            runtime_id: name.clone(),
         };
         let manifest = load_plugin_manifest(&source).unwrap().unwrap();
         write_command_lock(&name, &source, &manifest).unwrap();
@@ -3896,6 +4048,8 @@ mod tests {
             manifest_path: Some(manifest_path),
             repository: None,
             remote_base: None,
+            scope: plugins::PluginScope::Project,
+            runtime_id: name.clone(),
         };
         let dirs = plugin_runtime_dirs_for_source(&name, &source).unwrap();
         std::fs::create_dir_all(dirs.data_dir.join("command")).unwrap();
@@ -3974,6 +4128,8 @@ mod tests {
             manifest_path: Some(manifest),
             repository: None,
             remote_base: None,
+            scope: plugins::PluginScope::Project,
+            runtime_id: "test".to_string(),
         };
         assert_eq!(
             binary_asset("helper.wasm", PluginRuntime::Wasm, &BTreeMap::new()),
@@ -4165,6 +4321,8 @@ pattern = "token-[0-9]+"
             manifest_path: Some(manifest_path.clone()),
             repository: None,
             remote_base: None,
+            scope: plugins::PluginScope::Project,
+            runtime_id: name.clone(),
         };
         let manifest = load_plugin_manifest(&source).unwrap().unwrap();
         let hooks = vec!["inspect".to_string()];
@@ -4251,6 +4409,8 @@ pattern = "token-[0-9]+"
             manifest_path: Some(root.join(plugins::PLUGIN_MANIFEST_FILE)),
             repository: None,
             remote_base: None,
+            scope: plugins::PluginScope::Project,
+            runtime_id: "local".to_string(),
         };
         let manifest = load_plugin_manifest(&source).unwrap().unwrap();
         let err = binary_repository(&source, &manifest).unwrap_err();
@@ -4266,6 +4426,8 @@ pattern = "token-[0-9]+"
             manifest_path: None,
             repository: Some("trusted/owner".to_string()),
             remote_base: None,
+            scope: plugins::PluginScope::Project,
+            runtime_id: "remote".to_string(),
         };
         let manifest: PluginManifest = toml::from_str(
             "schema = \"pentect.plugin.v1\"\nname = \"remote\"\nrepository = \"attacker/repo\"\n",
@@ -4292,6 +4454,8 @@ pattern = "token-[0-9]+"
             manifest_path: Some(manifest),
             repository: None,
             remote_base: None,
+            scope: plugins::PluginScope::Project,
+            runtime_id: name.clone(),
         };
         let data_dir = plugin_runtime_dirs_for_source(&name, &source)
             .unwrap()
