@@ -92,15 +92,6 @@ release-tested matrix is on the [Compatibility](/reference/compatibility/) page:
 | --- | --- |
 | OpenCode | `pentect opencode` |
 | Pi | `pentect pi` |
-| Antigravity CLI | `pentect antigravity` |
-| Aider | `pentect aider` |
-| Continue CLI | `pentect continue` |
-| Cline CLI | `pentect cline` |
-| Roo Code | `pentect roo` |
-| Zed | `pentect zed` |
-| Goose CLI | `pentect goose` |
-| Junie CLI | `pentect junie` |
-| Gemini CLI | `pentect gemini` |
 
 Each command protects a specific surface. Check the client page before you
 use desktop, autocomplete, or external-agent features.

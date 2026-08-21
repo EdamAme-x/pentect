@@ -14,15 +14,6 @@ drift is visible before the next release.
 | Claude Code `2.1.238` | Real launch on Linux and all installer platforms | `pentect claude` |
 | OpenCode `1.18.20` | Real launch on Linux and all installer platforms | `pentect opencode` |
 | Pi `0.84.2` | Real launch, npm extension, and provider discovery | `pentect pi` or `@pentect/pi` |
-| Antigravity CLI `1.1.17` | Real launch plus Cloud Code protocol tests | `pentect antigravity` |
-| Aider `0.86.2` | Real launch and OpenAI-compatible route tests | `pentect aider` |
-| Continue CLI `1.5.47` | Real launch and Chat/Edit/Apply route tests | `pentect continue` |
-| Cline CLI `3.0.56` | Real launch, isolated provider registry, streaming, and tools | `pentect cline` |
-| Roo Code `3.54.0` | Real VS Code extension launch and built-in Roo modes | `pentect roo` |
-| Zed `1.16.1` | Real launch and isolated Agent/Inline Assistant settings | `pentect zed` |
-| Goose CLI `1.46.0` | Real launch and main/fast/planner model routing | `pentect goose` |
-| Junie CLI `26.8.17` (`2777.8`) | Real launch and temporary custom model profile | `pentect junie` |
-| Gemini CLI `0.56.0` | Real launch plus native Gemini protocol tests | `pentect gemini` |
 | ChatGPT desktop app, Codex mode | Executable launch contract and Responses protocol tests | `pentect codex app` |
 | Claude Desktop, supported Chat, attachment, and Code routes | Executable launch contract and protocol tests | `pentect claude app` |
 
@@ -35,15 +26,6 @@ links, broken data, custom gateway paths, and Codex zstd-compressed requests.
 | --- | --- | --- |
 | `pentect codex` | OpenAI Responses | Includes streaming events and completed tool calls |
 | `pentect claude` | Anthropic Messages | Includes streaming content blocks and tool use |
-| `pentect antigravity` | Google Cloud Code | Includes streaming content, function calls, inline data, and telemetry JSON |
-| `pentect aider` | OpenAI Chat Completions | Main, weak, and editor model routes use the same local gateway |
-| `pentect continue` | OpenAI Chat Completions | Covers only the generated Chat, Edit, and Apply model roles |
-| `pentect cline` | OpenAI Chat Completions | Covers the local CLI process; detached Zen sessions are rejected |
-| `pentect roo` | OpenAI Chat Completions | Covers Roo built-in modes in the isolated VS Code profile |
-| `pentect zed` | OpenAI Chat Completions | Covers Agent, Inline Assistant, and compaction; not edit predictions or external agents |
-| `pentect goose` | OpenAI Chat Completions | Covers Goose CLI main, fast, and planner routes; not Goose Desktop |
-| `pentect junie` | OpenAI Chat Completions or Responses | Selected with `--api chat` or `--api responses`; not Junie IDE |
-| `pentect gemini` | Native Gemini API | Covers Gemini API-key mode; not Google sign-in, Vertex, or Code Assist |
 | `pentect codex app` | Responses routes used by supported Codex mode | Other ChatGPT modes are outside this claim |
 | `pentect claude app` | Supported Claude Chat, attachment, and Code routes | Cowork and Voice are outside this claim |
 
@@ -93,11 +75,6 @@ that local handles are not printed.
 
 - ChatGPT Chat, Work, and Voice routes outside supported Codex mode
 - Remote Claude Cowork execution and Voice
-- Continue autocomplete, embeddings, and reranking
-- Cline's VS Code extension and detached `--zen` sessions
-- Goose Desktop and Junie IDE
-- Zed edit predictions and external agents
-- Gemini CLI Google sign-in, Vertex AI, and Code Assist OAuth paths
 - Copilot, VS Code inline suggestions, and private traffic from other extensions
 - Test binary formats
 - Unknown future routes

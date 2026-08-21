@@ -2929,30 +2929,21 @@ mod tests {
         assert_eq!(
             command_names(CommandAudience::Public),
             [
-                "aider",
-                "antigravity",
                 "claude",
-                "cline",
                 "codex",
-                "continue",
                 "doctor",
                 "exec",
-                "gemini",
-                "goose",
                 "help",
-                "junie",
                 "log",
                 "mask",
                 "opencode",
                 "pi",
                 "plugins",
                 "read",
-                "roo",
                 "uninstall",
                 "update",
                 "version",
                 "view",
-                "zed",
             ]
         );
         assert_eq!(command_names(CommandAudience::Advanced), ["resolve"]);
@@ -3108,13 +3099,24 @@ mod tests {
             Some(&client_descriptor::CODEX)
         );
         assert_eq!(
-            client_descriptor::find("agy"),
-            Some(&client_descriptor::ANTIGRAVITY)
+            client_descriptor::find("opencode"),
+            Some(&client_descriptor::OPENCODE)
         );
-        assert_eq!(
-            client_descriptor::find("aider"),
-            Some(&client_descriptor::AIDER)
-        );
+        for unpublished in [
+            "antigravity",
+            "agy",
+            "aider",
+            "goose",
+            "junie",
+            "continue",
+            "cn",
+            "cline",
+            "roo",
+            "zed",
+            "gemini",
+        ] {
+            assert_eq!(client_descriptor::find(unpublished), None);
+        }
         assert_eq!(client_descriptor::find("unknown"), None);
     }
 

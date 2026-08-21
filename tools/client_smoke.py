@@ -16,19 +16,9 @@ PORTABLE_CLIENTS = (
     ("claude", None),
     ("opencode", None),
     ("pi", None),
-    ("continue", None),
-    ("cline", None),
-    ("gemini", None),
 )
 
-NATIVE_CLIENTS = (
-    ("antigravity", "agy"),
-    ("aider", "aider"),
-    ("goose", "goose"),
-    ("junie", "junie"),
-    ("roo", "code"),
-    ("zed", "zed"),
-)
+NATIVE_CLIENTS = ()
 
 APP_SURFACES = ("codex-app", "claude-app")
 

@@ -12,10 +12,6 @@ pentect codex --upstream http://127.0.0.1:8080/openai/v1
 pentect claude --upstream http://127.0.0.1:8080/anthropic
 pentect opencode --model anthropic/claude-sonnet --upstream http://127.0.0.1:8080/openai/v1
 pentect pi --model anthropic/claude-sonnet --upstream http://127.0.0.1:8080/openai/v1
-pentect goose --model anthropic/claude-sonnet --upstream http://127.0.0.1:8080/openai/v1
-pentect junie --model anthropic/claude-sonnet --upstream http://127.0.0.1:8080/openai/v1
-pentect antigravity --upstream https://cloud-code.example
-pentect gemini --upstream https://generativelanguage.googleapis.com
 ```
 
 The URL applies to one launch. Pentect keeps its base path, masks the request,
@@ -23,8 +19,6 @@ and then sends it to that gateway.
 
 You do not need a custom upstream for normal use. Each protected client route
 keeps its usual provider authentication when `--upstream` is not supplied.
-Gemini CLI must use its Gemini API-key mode; Google sign-in, Vertex AI, and
-Code Assist use different routes and are not covered.
 
 ## Use Bifrost
 
@@ -101,47 +95,10 @@ and request logs remain available at `http://127.0.0.1:8080` and
 [Bifrost agent guide](https://docs.getbifrost.ai/cli-agents/overview) for
 provider setup, virtual keys, and model IDs.
 
-## Antigravity and Cloud Code
-
-Normal Antigravity use needs no endpoint setting:
-
-```sh
-pentect antigravity
-```
-
-If Antigravity already uses a compatible `CLOUD_CODE_URL`, Pentect keeps that
-endpoint behind its local gateway. You can override it for one launch with
-`--upstream`. This is for existing Cloud Code gateways, not normal Google
-sign-in.
-
-Add a custom gateway credential without placing its value in command history:
-
-::: code-group
-
-```powershell [PowerShell]
-$secret = Read-Host "Gateway token" -AsSecureString
-$env:PENTECT_GATEWAY_AUTH = [Net.NetworkCredential]::new('', $secret).Password
-pentect antigravity --upstream https://cloud-code.example `
-  --upstream-header-env Authorization=PENTECT_GATEWAY_AUTH
-```
-
-```sh [Shell]
-read -rsp "Gateway token: " PENTECT_GATEWAY_AUTH && echo
-export PENTECT_GATEWAY_AUTH
-pentect antigravity --upstream https://cloud-code.example \
-  --upstream-header-env Authorization=PENTECT_GATEWAY_AUTH
-```
-
-:::
-
-Pentect reads the credential, removes the source variable from `agy`, and adds
-the header only when contacting that upstream.
-
 ## Existing endpoint settings
 
 Pentect also respects the documented endpoint variable for each supported
-client. Examples include `OPENAI_BASE_URL`, `CLOUD_CODE_URL`, and
-`GOOGLE_GEMINI_BASE_URL`. You normally do not set them for Pentect. Use
+client, such as `OPENAI_BASE_URL`. You normally do not set it for Pentect. Use
 `--upstream` when you want an explicit one-launch override.
 
 ## Supported API formats
@@ -149,9 +106,6 @@ client. Examples include `OPENAI_BASE_URL`, `CLOUD_CODE_URL`, and
 - Gateways that support OpenAI Responses for Codex
 - Gateways that support Anthropic Messages for Claude
 - Gateways that support OpenAI Chat Completions or Responses for OpenCode and Pi
-- OpenAI-compatible routes used by Continue, Cline, Roo Code, Zed, Goose CLI,
-  and Junie CLI
-- Native Gemini API routes used by Gemini CLI
 - Existing compatible client provider configuration
 
 Pentect tests Bifrost's `/openai/v1` and `/anthropic` paths. LiteLLM and other
@@ -175,9 +129,6 @@ URL.
 | Claude | Anthropic Messages, including streaming events | `/anthropic` |
 | OpenCode | OpenAI Chat Completions by default; Responses with `--api responses` | `/openai/v1` |
 | Pi | OpenAI Chat Completions by default; Responses with `--api responses` | `/openai/v1` |
-| Continue, Cline, Roo Code, Zed, Goose | OpenAI Chat Completions | `/openai/v1` |
-| Junie | OpenAI Chat Completions by default; Responses with `--api responses` | `/openai/v1` |
-| Gemini CLI | Native Gemini `generateContent` API | `/` before `/v1beta/models/...` |
 
 ## Validate a gateway
 
