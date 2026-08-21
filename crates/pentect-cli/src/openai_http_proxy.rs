@@ -2704,6 +2704,59 @@ mod tests {
     }
 
     #[test]
+    fn provider_boundary_masks_current_codex_prompt_shape_with_keyed_and_vendor_detectors() {
+        let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
+        let store = pentect_agent::start_in_process_memory_store().unwrap();
+        let _env = ProviderBoundaryTestEnv::install(&store);
+        let password = ["test-pentect", "-password-284-provider"].concat();
+        let openrouter = [
+            "sk-or-v1-",
+            "fedcba9876543210fedcba9876543210",
+            "fedcba9876543210fedcba9876543210",
+        ]
+        .concat();
+        let (upstream, captured, thread) = mock_chat_upstream();
+        let proxy = OpenAiHttpProxyGuard::start(upstream).unwrap();
+
+        reqwest::blocking::Client::new()
+            .post(format!("{}/responses", proxy.base_url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": format!(
+                                "Audit fixture: sudo password is {password} and OPENROUTER_API_KEY={openrouter}."
+                            )
+                        }]
+                    }],
+                    "stream": false
+                }))
+                .unwrap(),
+            )
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let (_, request) = captured
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        assert!(!request.contains(&password), "password reached upstream");
+        assert!(
+            !request.contains(&openrouter),
+            "OpenRouter key reached upstream"
+        );
+        assert!(request.contains("<<KEYED_SECRET_"), "{request}");
+        assert!(request.matches("<<").count() >= 2, "{request}");
+    }
+
+    #[test]
     fn provider_boundary_decodes_codex_zstd_requests_before_protection() {
         let _lock = crate::TEST_PROCESS_ENV_LOCK.lock().unwrap();
         let store = pentect_agent::start_in_process_memory_store().unwrap();
