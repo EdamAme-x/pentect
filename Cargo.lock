@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "pentect-cli"
-version = "0.0.47"
+version = "0.0.48"
 dependencies = [
  "anyhow",
  "ctrlc",

@@ -157,7 +157,7 @@ pub(crate) fn parse_plugin_value(value: &str) -> Result<Vec<String>> {
 
 pub(crate) fn plugin_spec_for_scope(spec: &str, scope: PluginScope) -> Result<String> {
     validate_plugin_spec(spec)?;
-    if scope == PluginScope::User && is_path_spec(spec) {
+    if scope == PluginScope::User && !is_remote_spec(spec) && is_path_spec(spec) {
         if config_specs_scoped()?
             .into_iter()
             .any(|(configured_scope, configured)| configured_scope == scope && configured == spec)
@@ -2104,6 +2104,15 @@ label = "INLINE_SECRET"
         assert_eq!(
             parse_plugin_value("github:@EdamAme-x/pentect/plugins/pii-ner").unwrap(),
             ["github:@EdamAme-x/pentect/plugins/pii-ner"]
+        );
+    }
+
+    #[test]
+    fn user_scoped_github_plugin_is_not_resolved_as_a_local_path() {
+        let spec = "github:@EdamAme-x/pentect/plugins/example-regex";
+        assert_eq!(
+            plugin_spec_for_scope(spec, PluginScope::User).unwrap(),
+            spec
         );
     }
 
