@@ -1,6 +1,6 @@
 name: Bug report
-description: Report reproducible incorrect behavior in Pentect.
-title: "[Bug]: "
+description: Tell us about something that is not working.
+title: ""
 body:
   - type: markdown
     attributes:
@@ -11,53 +11,6 @@ body:
     id: problem
     attributes:
       label: What happened?
-      description: Describe the actual behavior and what you expected instead.
-      placeholder: Pentect did ...; I expected ...
+      placeholder: Tell us what happened. Add steps, commands, or screenshots only if useful. Never include secrets.
     validations:
       required: true
-
-  - type: textarea
-    id: reproduce
-    attributes:
-      label: How can we reproduce it?
-      description: Provide the smallest safe sequence of commands or actions that reproduces the problem.
-      placeholder: |
-        1. Run `pentect ...`
-        2. ...
-        3. Observe ...
-    validations:
-      required: true
-
-  - type: input
-    id: version
-    attributes:
-      label: Pentect version
-      placeholder: Output of `pentect --version`
-    validations:
-      required: true
-
-  - type: input
-    id: environment
-    attributes:
-      label: Environment
-      description: Operating system, architecture, terminal, and affected integration when relevant.
-      placeholder: Windows 11 x86_64, PowerShell 7, Claude Code
-    validations:
-      required: true
-
-  - type: textarea
-    id: diagnostics
-    attributes:
-      label: Logs or screenshots
-      description: Optional. Paste text, drag in files, or paste screenshots here after removing sensitive or private details.
-      placeholder: Paste logs or screenshots here.
-
-  - type: checkboxes
-    id: checks
-    attributes:
-      label: Before submitting
-      options:
-        - label: I searched for an existing issue.
-          required: true
-        - label: I removed secrets, personal data, and private system details.
-          required: true
