@@ -5,9 +5,20 @@ hooks = ["inspect"]
 required = false
 
 [commands]
-windows = ["py", "{plugin}/server.py", "--device", "cpu"]
-macos = ["python3", "{plugin}/server.py", "--device", "cpu"]
-linux = ["python3", "{plugin}/server.py", "--device", "cpu"]
+windows = ["py", "{plugin}/server.py"]
+macos = ["python3", "{plugin}/server.py"]
+linux = ["python3", "{plugin}/server.py"]
+
+[setup]
+profiles = ["auto", "cpu", "cuda"]
+profile_arg = "--profile"
+download = "CPU: about 2.7 GB; CUDA: about 5-6 GB (checkpoint included)"
+disk = "CPU: about 5 GB; CUDA: about 8 GB"
+
+[setup.commands]
+windows = ["py", "{plugin}/setup.py"]
+macos = ["python3", "{plugin}/setup.py"]
+linux = ["python3", "{plugin}/setup.py"]
 
 [execution]
 timeout_ms = 60000

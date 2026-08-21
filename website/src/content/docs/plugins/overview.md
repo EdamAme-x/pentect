@@ -137,7 +137,10 @@ hooks. If any of these change, you must review the plugin again.
 
 Command plugins do not receive the Wasm sandbox. Their downloaded files are
 hash-locked, their argv is never passed through a shell, and access changes
-require approval. Setup scripts are not supported.
+require approval. A Command plugin may declare one explicit native environment
+setup command and bounded profiles. Pentect displays its argv and expected
+cost, locks its distributed files, and runs it only as part of approval; it
+does not support hidden package lifecycle scripts.
 
 ## Manage installed plugins
 

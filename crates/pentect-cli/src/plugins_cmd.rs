@@ -27,7 +27,8 @@ pub(crate) fn cmd_plugins(args: &[String]) {
             spec,
             approved,
             scope,
-        } => add_plugin(&spec, approved, scope, opts.json),
+            profile,
+        } => add_plugin(&spec, approved, scope, profile.as_deref(), opts.json),
         Action::Remove { spec, scope } => remove_plugin(&spec, scope, opts.json),
         Action::Search { query } => search_plugins(query.as_deref(), opts.json),
         Action::Inspect { spec } => inspect_plugin(&spec, opts.json),
@@ -44,7 +45,8 @@ pub(crate) fn cmd_plugins(args: &[String]) {
             spec,
             approved,
             scope,
-        } => setup_plugin(&spec, approved, scope, opts.json),
+            profile,
+        } => setup_plugin(&spec, approved, scope, profile.as_deref(), opts.json),
         Action::Update {
             spec,
             approved,
@@ -72,6 +74,7 @@ enum Action {
         spec: String,
         approved: bool,
         scope: plugins::PluginScope,
+        profile: Option<String>,
     },
     Remove {
         spec: String,
@@ -106,6 +109,7 @@ enum Action {
         spec: String,
         approved: bool,
         scope: plugins::PluginScope,
+        profile: Option<String>,
     },
     Update {
         spec: Option<String>,
@@ -134,6 +138,7 @@ impl PluginCmd {
         let mut scope = plugins::PluginScope::User;
         let mut scope_explicit = false;
         let mut unset = None;
+        let mut profile = None;
         let mut values = Vec::new();
         let mut i = 3usize;
         while i < args.len() {
@@ -149,6 +154,18 @@ impl PluginCmd {
                         return Err("--unset requires a key".to_string());
                     };
                     unset = Some(key.clone());
+                    i += 1;
+                }
+                "--profile" => {
+                    let Some(value) = args.get(i + 1) else {
+                        return Err("--profile requires a profile name".to_string());
+                    };
+                    if value.starts_with("--") {
+                        return Err("--profile requires a profile name".to_string());
+                    }
+                    if profile.replace(value.clone()).is_some() {
+                        return Err("--profile may only be set once".to_string());
+                    }
                     i += 1;
                 }
                 flag if flag.starts_with("--") => return Err(format!("unknown option: {flag}")),
@@ -178,6 +195,7 @@ impl PluginCmd {
                     spec: one_value("plugins add", values)?,
                     approved,
                     scope,
+                    profile: profile.clone(),
                 }
             }
             "remove" => {
@@ -262,6 +280,7 @@ impl PluginCmd {
                     spec: one_value("plugins setup", values)?,
                     approved,
                     scope,
+                    profile: profile.clone(),
                 }
             }
             "update" => {
@@ -280,6 +299,9 @@ impl PluginCmd {
             }
             other => return Err(format!("unknown plugins command: {other}")),
         };
+        if profile.is_some() && !matches!(action, Action::Add { .. } | Action::Setup { .. }) {
+            return Err("--profile is only valid for plugins add or setup".to_string());
+        }
         Ok(Self { action, json })
     }
 }
@@ -431,6 +453,7 @@ fn add_plugin(
     spec: &str,
     approved: bool,
     scope: plugins::PluginScope,
+    profile: Option<&str>,
     json_output: bool,
 ) -> Result<(), String> {
     if json_output {
@@ -451,9 +474,12 @@ fn add_plugin(
                 .map_err(|error| error.to_string())?;
         }
         if source.manifest_path.is_some() {
-            setup_plugin_source(source.clone(), approved, false)?;
+            setup_plugin_source(source.clone(), approved, profile, false)?;
         }
         if source.manifest_path.is_none() {
+            if profile.is_some() {
+                return Err("this plugin does not declare setup profiles".to_string());
+            }
             let active = plugins::active_from_scoped_specs(vec![(scope, spec.to_string())], true)
                 .map_err(|error| error.to_string())?;
             if active.config_paths().is_empty() {
@@ -1296,6 +1322,7 @@ struct PluginManifest {
     #[serde(default)]
     command: Vec<String>,
     commands: Option<PlatformCommands>,
+    setup: Option<CommandSetupConfig>,
     #[serde(default)]
     hooks: Vec<String>,
     repository: Option<String>,
@@ -1366,6 +1393,64 @@ struct PlatformCommands {
     windows: Option<Vec<String>>,
     macos: Option<Vec<String>>,
     linux: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandSetupConfig {
+    #[serde(default)]
+    command: Vec<String>,
+    commands: Option<PlatformCommands>,
+    #[serde(default)]
+    profiles: Vec<String>,
+    profile_arg: Option<String>,
+    download: Option<String>,
+    disk: Option<String>,
+}
+
+impl CommandSetupConfig {
+    fn selected_command(&self) -> Result<&[String], String> {
+        if !self.command.is_empty() && self.commands.is_some() {
+            return Err("[setup] cannot set both command and [setup.commands]".to_string());
+        }
+        if !self.command.is_empty() {
+            return Ok(&self.command);
+        }
+        let Some(commands) = self.commands.as_ref() else {
+            return Err("[setup] requires command or [setup.commands]".to_string());
+        };
+        #[cfg(windows)]
+        let selected = commands.windows.as_deref();
+        #[cfg(target_os = "macos")]
+        let selected = commands.macos.as_deref();
+        #[cfg(target_os = "linux")]
+        let selected = commands.linux.as_deref();
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        let selected: Option<&[String]> = None;
+        selected.ok_or_else(|| {
+            format!(
+                "plugin environment setup is unsupported on {}",
+                std::env::consts::OS
+            )
+        })
+    }
+
+    fn command_variants(&self) -> Vec<&[String]> {
+        if !self.command.is_empty() {
+            return vec![&self.command];
+        }
+        self.commands
+            .iter()
+            .flat_map(|commands| {
+                [
+                    commands.windows.as_deref(),
+                    commands.macos.as_deref(),
+                    commands.linux.as_deref(),
+                ]
+            })
+            .flatten()
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1551,14 +1636,15 @@ fn load_plugin_manifest(source: &plugins::PluginSource) -> Result<Option<PluginM
     }
     if form == PluginRuntime::Command {
         validate_command(&manifest)?;
+        validate_command_setup(manifest.setup.as_ref())?;
         if manifest.network.is_some() || manifest.permissions.is_some() {
             return Err(
                 "command plugins run natively; [network] and [permissions] apply only to Wasm"
                     .to_string(),
             );
         }
-    } else if !manifest.hooks.is_empty() {
-        return Err("hooks are declared only by command plugins".to_string());
+    } else if !manifest.hooks.is_empty() || manifest.setup.is_some() {
+        return Err("hooks and [setup] are declared only by command plugins".to_string());
     }
     if form == PluginRuntime::Wasm {
         validate_permissions(manifest.permissions.as_ref())?;
@@ -1679,6 +1765,60 @@ fn validate_command(manifest: &PluginManifest) -> Result<(), String> {
             return Err(format!(
                 "command plugin declares hook '{hook}' more than once"
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_command_setup(setup: Option<&CommandSetupConfig>) -> Result<(), String> {
+    let Some(setup) = setup else {
+        return Ok(());
+    };
+    let variants = setup.command_variants();
+    if variants.is_empty() {
+        return Err("[setup] requires at least one command argv".to_string());
+    }
+    for command in variants {
+        if command.is_empty() || command[0].trim().is_empty() {
+            return Err("[setup] requires a non-empty command argv".to_string());
+        }
+        if command.len() > 256 || command.iter().any(|argument| argument.len() > 32 * 1024) {
+            return Err("setup command argv exceeds its limit".to_string());
+        }
+    }
+    if setup.profiles.len() > 16 {
+        return Err("[setup] allows at most 16 profiles".to_string());
+    }
+    let mut profiles = BTreeSet::new();
+    for profile in &setup.profiles {
+        if profile.is_empty()
+            || profile.len() > 32
+            || !profile
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(format!("invalid setup profile: {profile}"));
+        }
+        if !profiles.insert(profile) {
+            return Err(format!("duplicate setup profile: {profile}"));
+        }
+    }
+    match (setup.profiles.is_empty(), setup.profile_arg.as_deref()) {
+        (true, Some(_)) => return Err("setup profile_arg requires profiles".to_string()),
+        (false, None) => return Err("setup profiles require profile_arg".to_string()),
+        (_, Some(argument))
+            if argument.is_empty()
+                || argument.len() > 128
+                || !argument.starts_with('-')
+                || argument.chars().any(char::is_whitespace) =>
+        {
+            return Err("setup profile_arg must be one bounded option".to_string())
+        }
+        _ => {}
+    }
+    for (name, value) in [("download", &setup.download), ("disk", &setup.disk)] {
+        if value.as_ref().is_some_and(|value| value.len() > 512) {
+            return Err(format!("setup {name} description exceeds its limit"));
         }
     }
     Ok(())
@@ -1972,6 +2112,7 @@ fn setup_plugin(
     spec: &str,
     approved: bool,
     scope: plugins::PluginScope,
+    profile: Option<&str>,
     json_output: bool,
 ) -> Result<(), String> {
     let spec = plugins::plugin_spec_for_scope(spec, scope).map_err(|error| error.to_string())?;
@@ -1988,7 +2129,7 @@ fn setup_plugin(
             plugins::set_remote_plugin_lock_with_guard(scope, &project_guard, spec, Some(entry))
                 .map_err(|error| error.to_string())?;
         }
-        setup_plugin_source(source, approved, json_output)
+        setup_plugin_source(source, approved, profile, json_output)
     })();
     if let Err(error) = result {
         return Err(rollback_plugin_transaction(
@@ -2004,6 +2145,7 @@ fn setup_plugin(
 fn setup_plugin_source(
     source: plugins::PluginSource,
     approved: bool,
+    profile: Option<&str>,
     json_output: bool,
 ) -> Result<(), String> {
     let command_snapshot = load_plugin_manifest(&source)?
@@ -2013,7 +2155,7 @@ fn setup_plugin_source(
             snapshot_command_runtime(&name, &source)
         })
         .transpose()?;
-    let result = setup_plugin_source_inner(source, approved, json_output);
+    let result = setup_plugin_source_inner(source, approved, profile, json_output);
     match (result, command_snapshot) {
         (Ok(()), Some(snapshot)) => {
             snapshot.discard();
@@ -2028,6 +2170,7 @@ fn setup_plugin_source(
 fn setup_plugin_source_inner(
     source: plugins::PluginSource,
     approved: bool,
+    profile: Option<&str>,
     json_output: bool,
 ) -> Result<(), String> {
     if json_output {
@@ -2042,6 +2185,9 @@ fn setup_plugin_source_inner(
         .transpose()?;
     let name = plugin_name(&source, Some(&manifest));
     let form = manifest.form()?;
+    if profile.is_some() && manifest.setup.is_none() {
+        return Err("this plugin does not declare setup profiles".to_string());
+    }
     if form == PluginRuntime::Manifest {
         println!("verified: manifest-only plugin");
         return Ok(());
@@ -2089,6 +2235,36 @@ fn setup_plugin_source_inner(
             command_executable_preview(&name, &source, &command[0])?.display()
         );
         println!("isolation: native process (runs with your user permissions)");
+        if let Some(setup) = manifest.setup.as_ref() {
+            if let Some(profile) = profile {
+                if !setup.profiles.iter().any(|candidate| candidate == profile) {
+                    return Err(format!(
+                        "unknown setup profile '{profile}'; choose one of: {}",
+                        setup.profiles.join(", ")
+                    ));
+                }
+            }
+            let setup_command = setup.selected_command()?;
+            println!("environment setup: {}", display_command(setup_command));
+            println!(
+                "setup executable: {}",
+                command_executable_preview(&name, &source, &setup_command[0])?.display()
+            );
+            if !setup.profiles.is_empty() {
+                println!("setup profiles: {}", setup.profiles.join(", "));
+                println!(
+                    "selected profile: {}",
+                    profile.unwrap_or("automatic or previously selected")
+                );
+            }
+            if let Some(download) = setup.download.as_deref() {
+                println!("expected download: {download}");
+            }
+            if let Some(disk) = setup.disk.as_deref() {
+                println!("expected disk: {disk}");
+            }
+            println!("WARNING: environment setup runs natively with your user permissions");
+        }
     }
     if let Some(network) = manifest.network_config() {
         println!("requested network access:");
@@ -2175,6 +2351,9 @@ fn setup_plugin_source_inner(
             return Err("plugin setup was not approved".to_string());
         }
         write_command_lock(&name, &source, &manifest)?;
+        if let Some(setup) = manifest.setup.as_ref() {
+            run_command_environment_setup(&name, &source, setup, profile)?;
+        }
         manifest.hooks.clone()
     };
     if form != PluginRuntime::Manifest {
@@ -2189,6 +2368,72 @@ fn setup_plugin_source_inner(
         write_plugin_approval(&name, &source, &manifest, &approved_hooks)?;
     }
     println!("setup: complete");
+    Ok(())
+}
+
+fn run_command_environment_setup(
+    name: &str,
+    source: &plugins::PluginSource,
+    setup: &CommandSetupConfig,
+    profile: Option<&str>,
+) -> Result<(), String> {
+    let remote = plugins::remote_command_files(source).map_err(|error| error.to_string())?;
+    let root = if remote.is_empty() {
+        source
+            .manifest_path
+            .as_deref()
+            .and_then(Path::parent)
+            .ok_or_else(|| "command plugin manifest has no parent directory".to_string())?
+            .to_path_buf()
+    } else {
+        plugin_runtime_dirs_for_source(name, source)?
+            .data_dir
+            .join("command")
+    };
+    let mut argv = setup.selected_command()?.to_vec();
+    for argument in &mut argv {
+        if argument == "{plugin}" {
+            *argument = root.to_string_lossy().into_owned();
+        } else if let Some(relative) = argument.strip_prefix("{plugin}/") {
+            let relative = Path::new(relative);
+            if relative.as_os_str().is_empty()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err("setup command path must stay inside the plugin directory".to_string());
+            }
+            *argument = root.join(relative).to_string_lossy().into_owned();
+        }
+    }
+    if let Some(profile) = profile {
+        let argument = setup
+            .profile_arg
+            .as_deref()
+            .ok_or_else(|| "this plugin does not accept a setup profile".to_string())?;
+        argv.push(argument.to_string());
+        argv.push(profile.to_string());
+    }
+    let executable = resolve_command_executable(&argv[0])?;
+    println!("environment setup: starting");
+    let status = Command::new(executable)
+        .args(&argv[1..])
+        .current_dir(&root)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| format!("could not start plugin environment setup: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "plugin environment setup failed with {}",
+            status
+                .code()
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| "a signal".to_string())
+        ));
+    }
+    println!("environment setup: complete");
     Ok(())
 }
 
@@ -2415,6 +2660,16 @@ fn write_command_lock(
         .iter()
         .filter_map(|argument| argument.strip_prefix("{plugin}/").map(PathBuf::from))
         .collect::<Vec<_>>();
+    let mut command_files = command_files;
+    if let Some(setup) = manifest.setup.as_ref() {
+        command_files.extend(
+            setup
+                .selected_command()?
+                .iter()
+                .filter_map(|argument| argument.strip_prefix("{plugin}/"))
+                .map(PathBuf::from),
+        );
+    }
     let locked_files = if managed {
         remote
             .iter()
@@ -2690,7 +2945,7 @@ fn update_plugin_inner(
                     )
                     .map_err(|error| error.to_string())?;
                 }
-                setup_plugin_source(source, approved, false)?;
+                setup_plugin_source(source, approved, None, false)?;
                 return Ok(());
             }
         }
@@ -2708,7 +2963,7 @@ fn update_plugin_inner(
             plugins::set_remote_plugin_lock_with_guard(scope, project_guard, spec, Some(entry))
                 .map_err(|error| error.to_string())?;
         }
-        setup_plugin_source(source, approved, false)?;
+        setup_plugin_source(source, approved, None, false)?;
         return Ok(());
     }
     let runtime = plugin_runtime(&manifest);
@@ -2744,7 +2999,7 @@ fn update_plugin_inner(
             plugins::set_remote_plugin_lock_with_guard(scope, project_guard, spec, Some(entry))
                 .map_err(|error| error.to_string())?;
         }
-        setup_plugin_source(source, approved, false)?;
+        setup_plugin_source(source, approved, None, false)?;
         return Ok(());
     }
     // Updating a release binary must not rewrite the user's manifest approval.
@@ -3867,6 +4122,24 @@ mod tests {
         let args = vec![
             "pentect".into(),
             "plugins".into(),
+            "setup".into(),
+            "example-plugin".into(),
+            "--profile".into(),
+            "cuda".into(),
+            "--yes".into(),
+        ];
+        assert!(matches!(
+            PluginCmd::parse(&args).unwrap().action,
+            Action::Setup {
+                approved: true,
+                profile: Some(profile),
+                ..
+            } if profile == "cuda"
+        ));
+
+        let args = vec![
+            "pentect".into(),
+            "plugins".into(),
             "update".into(),
             "example-plugin".into(),
         ];
@@ -3955,6 +4228,47 @@ mod tests {
         )
         .unwrap();
         assert!(ambiguous.form().is_err());
+    }
+
+    #[test]
+    fn approved_command_setup_runs_selected_profile_and_is_locked() {
+        let Some(python) = python_test_executable() else {
+            return;
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("command-setup-{nonce}");
+        let root = std::env::temp_dir().join(&name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("server.py"), "print('unused')\n").unwrap();
+        std::fs::write(
+            root.join("setup.py"),
+            "import argparse\nfrom pathlib import Path\np=argparse.ArgumentParser();p.add_argument('--profile');a=p.parse_args();Path(__file__).with_name('selected.txt').write_text(a.profile)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(plugins::PLUGIN_MANIFEST_FILE),
+            format!(
+                "schema = \"pentect.plugin.v1\"\nname = \"{name}\"\ncommand = [\"{python}\", \"{{plugin}}/server.py\"]\nhooks = [\"inspect\"]\n[setup]\ncommand = [\"{python}\", \"{{plugin}}/setup.py\"]\nprofiles = [\"cpu\", \"cuda\"]\nprofile_arg = \"--profile\"\ndownload = \"fixture\"\ndisk = \"fixture\"\n"
+            ),
+        )
+        .unwrap();
+        let source = plugins::plugin_source(&root.to_string_lossy()).unwrap();
+        let runtime = plugin_runtime_dirs_for_source(&name, &source).unwrap();
+
+        setup_plugin_source(source, true, Some("cpu"), false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("selected.txt")).unwrap(),
+            "cpu"
+        );
+        let lock =
+            std::fs::read_to_string(runtime.data_dir.join(PLUGIN_COMMAND_LOCK_FILE)).unwrap();
+        assert!(lock.contains("path = \"setup.py\""), "{lock}");
+        let _ = std::fs::remove_dir_all(runtime.data_dir);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

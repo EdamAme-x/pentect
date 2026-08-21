@@ -113,6 +113,32 @@ The handler reads it from `request["config"]` in Python or `request.config` in
 JavaScript. Command is native, so it receives the complete plugin-specific
 configuration object. Wasm keeps the narrower key-by-key `c.config(...)` API.
 
+## Managed environment setup
+
+Command plugins that need a model, virtual environment, or device-specific
+runtime can declare `[setup]` in `plugin.toml`. The command is displayed as part
+of the native approval and runs during `plugins add` and `plugins setup`.
+Platform-specific commands use `[setup.commands]`.
+
+```toml
+[setup]
+command = ["python", "{plugin}/setup.py"]
+profiles = ["auto", "cpu", "cuda"]
+profile_arg = "--profile"
+download = "CPU: about 3 GB; CUDA: about 6 GB"
+disk = "CPU: about 5 GB; CUDA: about 8 GB"
+```
+
+```sh
+pentect plugins add ./my-model --profile auto
+pentect plugins setup my-model --profile cpu
+```
+
+Setup is still native code, not a sandboxed package hook. Pentect never invokes
+a shell, locks every distributed `{plugin}/...` setup file, and rolls managed
+command state back when setup fails. The setup program should stage and replace
+its own external environment atomically.
+
 ## Security boundary
 
 Command is native. It runs with the current user's OS permissions. Pentect
