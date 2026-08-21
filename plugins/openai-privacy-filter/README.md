@@ -8,8 +8,8 @@ stdin/stdout and does not expose a local HTTP port.
 The model is not bundled with Pentect. During plugin approval, Pentect displays
 the expected cost and creates the managed environment at
 `~/.pentect/openai-privacy-filter/venv`. Automatic setup selects a compatible
-NVIDIA CUDA wheel when available and the official CPU-only PyTorch wheel
-otherwise. See the
+NVIDIA CUDA wheel when available, the official CPU-only PyTorch index on Linux
+and Windows otherwise, and PyTorch's official default package on macOS. See the
 [setup guide](https://pentect.dev/plugins/official/#openai-privacy-filter).
 
 ```sh

@@ -68,7 +68,11 @@ def nvidia_driver_major() -> int | None:
 
 
 def cuda_wheel(driver_major: int | None) -> str | None:
-    if platform.system() == "Darwin" or driver_major is None:
+    if (
+        platform.system() == "Darwin"
+        or platform.machine().lower() not in {"x86_64", "amd64"}
+        or driver_major is None
+    ):
         return None
     if platform.system() == "Windows" and driver_major < 528:
         return None
@@ -93,13 +97,14 @@ def build_plan(requested: str, state: dict[str, Any]) -> dict[str, Any]:
         detail = "no NVIDIA driver was detected" if driver is None else f"NVIDIA driver {driver} is too old"
         raise RuntimeError(f"CUDA profile is unavailable: {detail}; use --profile cpu")
     device = "cuda" if requested == "cuda" or (requested == "auto" and wheel) else "cpu"
-    wheel = wheel if device == "cuda" else "cpu"
+    wheel = wheel if device == "cuda" else ("macos" if platform.system() == "Darwin" else "cpu")
+    torch_index = None if wheel == "macos" else f"https://download.pytorch.org/whl/{wheel}"
     return {
         "schema": "pentect.opf-setup.v1",
         "requested_profile": requested,
         "device": device,
         "nvidia_driver_major": driver,
-        "torch_index": f"https://download.pytorch.org/whl/{wheel}",
+        "torch_index": torch_index,
         "torch_wheel": wheel,
         "opf_revision": OPF_REVISION,
     }
@@ -168,7 +173,10 @@ def install(root: Path, plan: dict[str, Any]) -> None:
         run([sys.executable, "-m", "venv", str(staged)])
         python = staged / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         run([str(python), "-m", "pip", "install", "--upgrade", "pip"])
-        run([str(python), "-m", "pip", "install", "torch", "--index-url", plan["torch_index"]])
+        torch_command = [str(python), "-m", "pip", "install", "torch"]
+        if plan["torch_index"]:
+            torch_command.extend(["--index-url", plan["torch_index"]])
+        run(torch_command)
         run([str(python), "-m", "pip", "install", *DEPENDENCIES])
         run([str(python), "-m", "pip", "install", "--no-deps", OPF_SOURCE])
         checkpoint = shared_checkpoint(root)

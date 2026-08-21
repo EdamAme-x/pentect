@@ -51,9 +51,11 @@ pentect plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter
 Pentect shows the expected transfer and disk cost, asks once, detects a
 compatible NVIDIA driver, and installs the complete managed environment. The
 automatic profile chooses CUDA when a supported NVIDIA driver is visible and
-CPU otherwise. CPU installation uses PyTorch's official CPU-only wheel index,
-so it does not pull CUDA runtimes. macOS uses CPU because OPF currently exposes
-`cpu` and `cuda`, not an MPS profile.
+CPU otherwise. Linux and Windows CPU installation use PyTorch's official
+CPU-only wheel index, so they do not pull CUDA runtimes. macOS uses PyTorch's
+official default package and the CPU device because OPF currently exposes
+`cpu` and `cuda`, not an MPS profile. Unsupported architectures do not select
+an x86-only CUDA wheel.
 
 Force a profile when automatic selection is not what you want:
 

@@ -14,17 +14,46 @@ SPEC.loader.exec_module(SETUP)
 
 class SetupTests(unittest.TestCase):
     def test_cpu_profile_uses_official_cpu_index(self) -> None:
-        with mock.patch.object(SETUP, "nvidia_driver_major", return_value=600):
+        with (
+            mock.patch.object(SETUP, "nvidia_driver_major", return_value=600),
+            mock.patch.object(SETUP.platform, "system", return_value="Linux"),
+            mock.patch.object(SETUP.platform, "machine", return_value="x86_64"),
+        ):
             plan = SETUP.build_plan("cpu", {})
         self.assertEqual(plan["device"], "cpu")
         self.assertEqual(plan["torch_index"], "https://download.pytorch.org/whl/cpu")
 
     @unittest.skipIf(platform.system() == "Darwin", "CUDA is intentionally unavailable on macOS")
     def test_auto_profile_selects_cuda_wheel_from_driver(self) -> None:
-        with mock.patch.object(SETUP, "nvidia_driver_major", return_value=579):
+        with (
+            mock.patch.object(SETUP, "nvidia_driver_major", return_value=579),
+            mock.patch.object(SETUP.platform, "machine", return_value="x86_64"),
+        ):
             self.assertEqual(SETUP.build_plan("auto", {})["torch_wheel"], "cu126")
-        with mock.patch.object(SETUP, "nvidia_driver_major", return_value=580):
+        with (
+            mock.patch.object(SETUP, "nvidia_driver_major", return_value=580),
+            mock.patch.object(SETUP.platform, "machine", return_value="x86_64"),
+        ):
             self.assertEqual(SETUP.build_plan("auto", {})["torch_wheel"], "cu130")
+
+    def test_macos_uses_the_official_default_pytorch_package(self) -> None:
+        with (
+            mock.patch.object(SETUP, "nvidia_driver_major", return_value=None),
+            mock.patch.object(SETUP.platform, "system", return_value="Darwin"),
+        ):
+            plan = SETUP.build_plan("auto", {})
+        self.assertEqual(plan["device"], "cpu")
+        self.assertEqual(plan["torch_wheel"], "macos")
+        self.assertIsNone(plan["torch_index"])
+
+    def test_arm_does_not_select_an_unsupported_cuda_index(self) -> None:
+        with (
+            mock.patch.object(SETUP, "nvidia_driver_major", return_value=600),
+            mock.patch.object(SETUP.platform, "system", return_value="Linux"),
+            mock.patch.object(SETUP.platform, "machine", return_value="aarch64"),
+        ):
+            plan = SETUP.build_plan("auto", {})
+        self.assertEqual(plan["device"], "cpu")
 
     def test_auto_profile_falls_back_to_cpu_without_nvidia(self) -> None:
         with mock.patch.object(SETUP, "nvidia_driver_major", return_value=None):
