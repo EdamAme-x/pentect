@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { expectedChecksum, installationPath, releaseAsset } from './install.js';
+import {
+  expectedChecksum,
+  fetchWithRetry,
+  installationPath,
+  releaseAsset,
+  retryableStatus,
+} from './install.js';
 
 test('maps supported npm platforms to release assets', () => {
   assert.equal(releaseAsset('win32', 'x64'), 'pentect-windows-x86_64.exe');
@@ -19,6 +25,26 @@ test('accepts only a complete SHA-256 checksum record', () => {
   const hash = 'a'.repeat(64);
   assert.equal(expectedChecksum(`${hash}  pentect-linux-x86_64\n`), hash);
   assert.throws(() => expectedChecksum('not-a-checksum'), /invalid/);
+});
+
+test('retries only transient download failures', () => {
+  assert.equal(retryableStatus(408), true);
+  assert.equal(retryableStatus(429), true);
+  assert.equal(retryableStatus(503), true);
+  assert.equal(retryableStatus(404), false);
+  assert.equal(retryableStatus(401), false);
+});
+
+test('retries transient responses before returning success', async () => {
+  const statuses = [503, 429, 200];
+  const waits = [];
+  const response = await fetchWithRetry('https://example.invalid/pentect', {
+    request: async () => new Response(null, { status: statuses.shift() }),
+    timeout: () => undefined,
+    wait: async (milliseconds) => waits.push(milliseconds),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(waits, [250, 500]);
 });
 
 test('uses a user-writable versioned cache for the installed binary', () => {

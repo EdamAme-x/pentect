@@ -182,7 +182,27 @@ attach a request sample.
 ```sh
 pentect log
 pentect log --json
+pentect log --path
 ```
+
+Pentect persists process starts, exit codes, gateway activity, and panic
+diagnostics to `~/.pentect/logs/pentect.log`. `pentect log` reads that history
+before following live events, `--json` keeps the JSONL representation, and
+`--path` prints the exact file location. Panic entries include the Pentect
+version, OS, architecture, PID, source location, and a backtrace so a crash can
+be investigated after the process exits.
+
+Writes are handled by a bounded background queue and flushed in batches of up
+to 64 events, 64 KiB, or 250 ms. The file rotates at 128 MiB and keeps 31
+older generations (`pentect.log.1` through `pentect.log.31`), for a maximum of
+about 4 GiB. A saturated queue never blocks protection work; the log records
+the number of dropped diagnostic events when writing catches up.
+
+The entries contain command categories and status metadata only. Pentect does
+not persist command arguments, environment variables, request or response
+bodies, prompts, protected values, or panic payload text. Codex App also keeps
+its value-free lifecycle history, so the combined view shows why a previous
+protected App session ended.
 
 Logs show actions and counts, not real protected values.
 

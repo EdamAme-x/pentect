@@ -3,29 +3,31 @@ title: Compatibility
 description: Clients and API formats tested for this release.
 ---
 
-Pentect tests its gateways with mock provider servers. Each release also starts
-specific public CLI versions with the release binary.
+Pentect tests its gateways with mock provider servers. Each release also
+installs and starts every public client launcher with the release binary. A
+daily workflow installs current upstream client versions so compatibility
+drift is visible before the next release.
 
 | Client | Test | Protected launch |
 | --- | --- | --- |
-| Codex CLI `0.147.0` | Automatic test on Linux | `pentect codex` |
-| Claude Code `2.1.227` | Automatic test on Linux | `pentect claude` |
-| OpenCode `1.18.16` | Automatic test on Linux | `pentect opencode` |
-| Pi `0.84.1` | Launcher and npm extension provider discovery | `pentect pi` or `@pentect/pi` |
-| Antigravity CLI `1.1.11` | Cloud Code JSON, SSE, function calls, and endpoint override | `pentect antigravity` |
-| Aider | OpenAI-compatible launch and route override | `pentect aider` |
-| Continue CLI | Temporary config, Chat/Edit/Apply roles, and tool calls | `pentect continue` |
-| Cline CLI | Isolated provider registry, streaming, and tool calls | `pentect cline` |
-| Roo Code, archived VS Code extension | Isolated VS Code profile and built-in Roo modes | `pentect roo` |
-| Zed | Isolated settings for Agent, Inline Assistant, and compaction | `pentect zed` |
-| Goose CLI | Process-only main, fast, and planner model routing | `pentect goose` |
-| Junie CLI | Temporary custom model profile | `pentect junie` |
-| Gemini CLI (legacy) | Native Gemini JSON, SSE, functions, and endpoint override | `pentect gemini` |
-| ChatGPT desktop app, Codex mode | Launcher and Responses protocol tests | `pentect codex app` |
-| Claude Desktop, supported Chat, attachment, and Code routes | Launcher and protocol tests | `pentect claude app` |
+| Codex CLI `0.148.0` | Real launch on Linux and all installer platforms | `pentect codex` |
+| Claude Code `2.1.237` | Real launch on Linux and all installer platforms | `pentect claude` |
+| OpenCode `1.18.19` | Real launch on Linux and all installer platforms | `pentect opencode` |
+| Pi `0.84.2` | Real launch, npm extension, and provider discovery | `pentect pi` or `@pentect/pi` |
+| Antigravity CLI `1.1.17` | Real launch plus Cloud Code protocol tests | `pentect antigravity` |
+| Aider `0.86.2` | Real launch and OpenAI-compatible route tests | `pentect aider` |
+| Continue CLI `1.5.47` | Real launch and Chat/Edit/Apply route tests | `pentect continue` |
+| Cline CLI `3.0.55` | Real launch, isolated provider registry, streaming, and tools | `pentect cline` |
+| Roo Code `3.54.0` | Real VS Code extension launch and built-in Roo modes | `pentect roo` |
+| Zed `1.16.1` | Real launch and isolated Agent/Inline Assistant settings | `pentect zed` |
+| Goose CLI `1.46.0` | Real launch and main/fast/planner model routing | `pentect goose` |
+| Junie CLI `26.8.17` (`2777.8`) | Real launch and temporary custom model profile | `pentect junie` |
+| Gemini CLI `0.56.0` | Real launch plus native Gemini protocol tests | `pentect gemini` |
+| ChatGPT desktop app, Codex mode | Executable launch contract and Responses protocol tests | `pentect codex app` |
+| Claude Desktop, supported Chat, attachment, and Code routes | Executable launch contract and protocol tests | `pentect claude app` |
 
 API tests cover text, streaming, completed tool calls, structured data, file
-links, broken data, and custom gateway paths.
+links, broken data, custom gateway paths, and Codex zstd-compressed requests.
 
 ## Provider contracts
 
@@ -74,10 +76,12 @@ See [Custom upstreams](/clients/upstreams/) for setup and recovery steps.
 
 ## Desktop testing
 
-Short-lived CI machines do not install and control the official desktop apps.
-Because of this, Pentect does not list any desktop version as fully tested.
-Windows tests use fake secrets. They test app launch, routing, and local handle
-use without printing the value.
+Short-lived CI machines do not sign in to or drive the official desktop user
+interfaces. Instead, Windows, Linux, and macOS execute process-contract
+fixtures that validate the proxy, certificate, and isolated profile arguments,
+while protocol tests exercise the supported routes. Pentect therefore does not
+list a desktop app version as fully UI-tested. Tests use fake secrets and check
+that local handles are not printed.
 
 | Desktop surface | Current scope |
 | --- | --- |

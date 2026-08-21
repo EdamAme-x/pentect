@@ -33,5 +33,10 @@ package metadata through an auto-merge pull request, creates the matching
 `nix-vX.Y.Z` tag, and tests the Homebrew formula on Intel and Apple Silicon before
 publishing it.
 
+Do not create or publish the GitHub Release manually. Push only the matching tag;
+the release workflow creates a prerelease and promotes it after every installer
+and launcher check passes. A guard changes incomplete manually published releases
+back to prereleases so they cannot replace the last healthy `latest` release.
+
 Never reuse a release tag. A workflow retry may fill in a missing prerelease
 asset only when every already-published asset has the same SHA-256 digest.

@@ -177,6 +177,30 @@ pub fn record_diagnostic_activity(surface: &str, reason: &str) {
     );
 }
 
+/// Persist value-free process lifecycle diagnostics without recording command
+/// arguments, environment variables, request bodies, or protected values.
+pub fn record_process_activity(
+    event: &str,
+    surface: &str,
+    version: &str,
+    exit_code: Option<i32>,
+    panic_location: Option<&str>,
+    backtrace: Option<&str>,
+) {
+    activity_log::record_process(
+        event,
+        surface,
+        version,
+        exit_code,
+        panic_location,
+        backtrace,
+    );
+}
+
+pub fn flush_activity_log() {
+    activity_log::flush_persistent();
+}
+
 fn mask_input_into_memory_store_client(
     client: &MemoryStoreClient,
     input: Input,
@@ -692,20 +716,24 @@ fn usage() {
          pentect exec \"<command>\"\n\
          pentect view <HANDLE>\n\
          pentect resolve [PATH...]\n\
-         pentect log [--json]\n\
+         pentect log [--json | --path]\n\
          \n\
          exec: masked output\n\
          view: handle\n\
          resolve: write handles\n\
-         log: live events"
+         log: gateway history and live events"
     );
 }
 
 fn cmd_log(args: &[String]) -> i32 {
+    if args.get(2).map(String::as_str) == Some("--path") && args.len() == 3 {
+        println!("{}", activity_log::persistent_log_path().display());
+        return 0;
+    }
     let json = match args.get(2).map(String::as_str) {
         None => false,
         Some("--json") if args.len() == 3 => true,
-        _ => return die("log [--json]"),
+        _ => return die("log [--json | --path]"),
     };
     match activity_log::follow(json) {
         Ok(()) => 0,

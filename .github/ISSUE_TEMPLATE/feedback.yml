@@ -1,11 +1,11 @@
 name: Feedback ⭐
-description: Share anything about Pentect.
+description: Share non-sensitive feedback about Pentect. Report vulnerabilities privately through the Security tab.
 title: ""
 body:
   - type: textarea
     id: feedback
     attributes:
       label: Feedback
-      placeholder: Write anything you would like to share. Never include secrets.
+      placeholder: Write anything you would like to share. Never include secrets or vulnerability details.
     validations:
       required: true

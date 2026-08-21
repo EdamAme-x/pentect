@@ -2,6 +2,11 @@ name: Bug report
 description: Tell us about something that is not working.
 title: ""
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Remove secrets, personal data, and private system details before posting. Report security vulnerabilities privately through the Security tab.
+
   - type: textarea
     id: problem
     attributes:

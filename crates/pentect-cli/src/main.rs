@@ -31,6 +31,8 @@ use pentect_core::{
     Profile,
 };
 use serde_json::Value;
+#[cfg(any(windows, test))]
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -140,8 +142,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "log",
-        usage: "pentect log [--json]",
-        summary: "Follow local protection events",
+        usage: "pentect log [--json | --path]",
+        summary: "Show persistent diagnostics and live protection events",
         audience: CommandAudience::Public,
     },
     CommandSpec {
@@ -220,12 +222,87 @@ const COMMANDS: &[CommandSpec] = &[
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if let Some(code) = catch_cli_exit(|| run(args)) {
+    let surface = diagnostic_surface(&args);
+    install_panic_logger(surface.clone());
+    pentect_agent::record_process_activity(
+        "started",
+        &surface,
+        env!("CARGO_PKG_VERSION"),
+        None,
+        None,
+        None,
+    );
+    let code = catch_cli_exit(|| run(args));
+    let exit_code = code.unwrap_or(0);
+    pentect_agent::record_process_activity(
+        "finished",
+        &surface,
+        env!("CARGO_PKG_VERSION"),
+        Some(exit_code),
+        None,
+        None,
+    );
+    pentect_agent::flush_activity_log();
+    if let Some(code) = code {
         std::process::exit(code);
     }
 }
 
+fn diagnostic_surface(args: &[String]) -> String {
+    let candidate = match (
+        args.get(1).map(String::as_str),
+        args.get(2).map(String::as_str),
+    ) {
+        (Some("agent"), Some(command)) => command,
+        (Some("codex"), Some("app")) => return "codex-app".to_string(),
+        (Some("claude"), Some("app")) => return "claude-app".to_string(),
+        #[cfg(debug_assertions)]
+        (Some("__test-panic"), _) => return "test-panic".to_string(),
+        (Some("--version" | "-V"), _) => "version",
+        (Some("--help" | "-h"), _) | (None, _) => "help",
+        (Some(command), _) => command,
+    };
+    if COMMANDS.iter().any(|command| command.name == candidate)
+        || client_descriptor::find(candidate).is_some()
+    {
+        candidate.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn install_panic_logger(surface: String) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info.location().map(|location| {
+            format!(
+                "{}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            )
+        });
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        pentect_agent::record_process_activity(
+            "panic",
+            &surface,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            location.as_deref(),
+            Some(&backtrace),
+        );
+        pentect_agent::flush_activity_log();
+        previous(info);
+    }));
+}
+
 fn run(args: Vec<String>) -> Option<i32> {
+    #[cfg(debug_assertions)]
+    if args.get(1).map(String::as_str) == Some("__test-panic")
+        && std::env::var_os("PENTECT_INTERNAL_TEST_PANIC").is_some()
+    {
+        panic!("forced test panic with payload that must not be persisted");
+    }
     let inherited_env_is_trusted = pentect_agent::active_memory_store_ready();
     if is_memory_store_server(&args) || !supports_process_host(&args) {
         return dispatch(args, inherited_env_is_trusted);
@@ -308,6 +385,15 @@ fn is_memory_store_server(args: &[String]) -> bool {
 /// One-shot inspection commands would only add startup cost and disappear
 /// before a useful handoff can occur.
 fn supports_process_host(args: &[String]) -> bool {
+    if matches!(
+        (
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        (Some("log"), Some("--path"))
+    ) {
+        return false;
+    }
     matches!(
         (
             args.get(1).map(String::as_str),
@@ -485,10 +571,13 @@ fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[St
     {
         return 0;
     }
-    let opts = match AgentToolOpts::parse(tool, args) {
+    let mut opts = match AgentToolOpts::parse(tool, args) {
         Ok(o) => o,
         Err(e) => die(&e),
     };
+    if !opts.dry_run {
+        opts.command = resolve_agent_command(&opts.command).unwrap_or_else(|error| die(error));
+    }
     let pentect = opts.pentect.clone().unwrap_or_else(default_pentect_path);
     if !pentect.exists() && pentect.components().count() > 1 {
         die(format!(
@@ -504,7 +593,103 @@ fn cmd_agent_tool(tool: &'static client_descriptor::ClientDescriptor, args: &[St
         client_descriptor::Launcher::Ide(client) => ide_clients::run(client, &opts, &pentect),
     }
     .unwrap_or_else(|e| die_with_issue(&e));
+    record_child_exit(tool.name, &status);
     status.code().unwrap_or(1)
+}
+
+fn record_child_exit(surface: &str, status: &std::process::ExitStatus) {
+    #[cfg(unix)]
+    let event = {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .signal()
+            .map(|signal| format!("child-signal-{signal}"))
+            .unwrap_or_else(|| "child-exited".to_string())
+    };
+    #[cfg(not(unix))]
+    let event = "child-exited".to_string();
+    pentect_agent::record_process_activity(
+        &event,
+        surface,
+        env!("CARGO_PKG_VERSION"),
+        status.code(),
+        None,
+        None,
+    );
+}
+
+fn resolve_agent_command(program: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let pathext =
+            std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+        resolve_windows_command_from(program, &path, &pathext)
+            .ok_or_else(|| format!("could not run '{}': program not found", program.display()))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(program.to_path_buf())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn resolve_windows_command_from(program: &Path, path: &OsStr, pathext: &OsStr) -> Option<PathBuf> {
+    let names = if program.extension().is_none() {
+        let mut extensions = pathext
+            .to_string_lossy()
+            .split(';')
+            .map(str::trim)
+            .filter(|extension| !extension.is_empty())
+            // Command::new can launch PE binaries and cmd/bat shims. A
+            // PowerShell .ps1 entry may appear in PATHEXT but cannot be
+            // executed directly through CreateProcess.
+            .filter(|extension| {
+                matches!(
+                    extension.to_ascii_uppercase().as_str(),
+                    ".COM" | ".EXE" | ".BAT" | ".CMD"
+                )
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for fallback in [".COM", ".EXE", ".BAT", ".CMD"] {
+            if !extensions
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case(fallback))
+            {
+                extensions.push(fallback.to_string());
+            }
+        }
+        let mut names = extensions
+            .into_iter()
+            .map(|extension| {
+                let mut name = program.as_os_str().to_os_string();
+                name.push(extension);
+                PathBuf::from(name)
+            })
+            .collect::<Vec<_>>();
+        // npm installs a POSIX shim without an extension beside the Windows
+        // .cmd/.ps1 shims. It is a file, but Windows cannot execute it. Keep
+        // the raw name only as a final fallback after PATHEXT candidates.
+        names.push(program.to_path_buf());
+        names
+    } else {
+        vec![program.to_path_buf()]
+    };
+
+    let explicit_path = program.is_absolute() || program.components().count() > 1;
+    if explicit_path {
+        return names.into_iter().find(|candidate| candidate.is_file());
+    }
+    for directory in std::env::split_paths(path) {
+        for name in &names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn cmd_claude_app(args: &[String]) -> i32 {
@@ -1089,6 +1274,12 @@ impl AgentToolOpts {
 }
 
 fn run_codex(opts: &AgentToolOpts, pentect: &Path) -> Result<std::process::ExitStatus, String> {
+    // Releases before 0.0.36 could leave an App-only loopback provider in the
+    // shared config after an interrupted launch. Repair that exact generated
+    // shape before resolving the real upstream.
+    if let Err(error) = codex_app::recover_legacy_config() {
+        eprintln!("[pentect] warning: could not recover legacy Codex App config: {error}");
+    }
     let routing = codex_effective_routing(opts)?;
     let mut args = opts.tool_args.clone();
     if opts.dry_run {
@@ -2065,23 +2256,10 @@ const CODEX_GATEWAY_PROVIDER: &str = "pentect-openai-gateway";
 impl CodexHttpRouting {
     fn gateway_args(&self, gateway: &str) -> Vec<String> {
         let entries = if self.provider == "openai" {
-            vec![
-                format!("model_provider={}", toml_string(CODEX_GATEWAY_PROVIDER)),
-                format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}.name={}",
-                    toml_string("OpenAI through Pentect")
-                ),
-                format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}.base_url={}",
-                    toml_string(gateway)
-                ),
-                format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}.wire_api={}",
-                    toml_string("responses")
-                ),
-                format!("model_providers.{CODEX_GATEWAY_PROVIDER}.requires_openai_auth=true"),
-                format!("model_providers.{CODEX_GATEWAY_PROVIDER}.supports_websockets=false"),
-            ]
+            // Keep the built-in provider ID so Codex can resume this thread without
+            // Pentect. The gateway rejects the WebSocket upgrade with 426, which is
+            // Codex's supported signal to fall back to protected HTTP Responses.
+            vec![format!("openai_base_url={}", toml_string(gateway))]
         } else {
             let provider = codex_toml_key_segment(&self.provider);
             vec![
@@ -2645,6 +2823,106 @@ fn required_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, 
 mod tests {
     use super::*;
 
+    fn command_test_directory(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("pentect-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn windows_npm_cmd_shim_is_found_via_pathext() {
+        let directory = command_test_directory("npm-shim-resolution");
+        std::fs::create_dir_all(&directory).unwrap();
+        let shim = if cfg!(windows) {
+            directory.join("codex.cmd")
+        } else {
+            directory.join("codex.CMD")
+        };
+        std::fs::write(&shim, b"npm shim fixture").unwrap();
+
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
+                .unwrap();
+        assert_eq!(resolved.file_name().unwrap().to_string_lossy(), "codex.CMD");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_npm_cmd_shim_wins_over_posix_and_powershell_shims() {
+        let directory = command_test_directory("npm-shim-precedence");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("codex"), b"#!/bin/sh\n").unwrap();
+        let cmd = if cfg!(windows) {
+            directory.join("codex.cmd")
+        } else {
+            directory.join("codex.CMD")
+        };
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+        std::fs::write(directory.join("codex.ps1"), b"Write-Output codex\n").unwrap();
+
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
+                .unwrap();
+        assert_eq!(resolved.parent(), Some(directory.as_path()));
+        assert!(resolved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("codex.cmd"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_command_resolution_skips_powershell_only_pathext_entries() {
+        let directory = command_test_directory("npm-shim-powershell-pathext");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("codex.ps1"), b"Write-Output codex\n").unwrap();
+        let cmd = if cfg!(windows) {
+            directory.join("codex.cmd")
+        } else {
+            directory.join("codex.CMD")
+        };
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".PS1;.CMD"))
+                .unwrap();
+        assert!(resolved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("codex.cmd"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_npm_cmd_shim_executes_after_resolution() {
+        let directory = command_test_directory("npm-shim-execution");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("codex.cmd"),
+            b"@echo off\r\necho codex-cli npm-shim-test\r\n",
+        )
+        .unwrap();
+        let path = std::env::join_paths([&directory]).unwrap();
+        let resolved =
+            resolve_windows_command_from(Path::new("codex"), &path, OsStr::new(".EXE;.CMD"))
+                .unwrap();
+        let output = Command::new(resolved).arg("--version").output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "codex-cli npm-shim-test"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn public_command_snapshot_is_intentional() {
         assert_eq!(
@@ -2920,6 +3198,23 @@ mod tests {
             let args = vec!["pentect".to_string(), command.to_string()];
             assert!(!supports_process_host(&args));
         }
+        assert!(!supports_process_host(&[
+            "pentect".to_string(),
+            "log".to_string(),
+            "--path".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn diagnostic_surface_never_persists_unknown_argument_text() {
+        assert_eq!(
+            diagnostic_surface(&["pentect".to_string(), "sk-secret-command".to_string(),]),
+            "unknown"
+        );
+        assert_eq!(
+            diagnostic_surface(&["pentect".to_string(), "codex".to_string()]),
+            "codex"
+        );
     }
 
     #[test]
