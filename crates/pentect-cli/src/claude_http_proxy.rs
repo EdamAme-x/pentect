@@ -2114,7 +2114,7 @@ where
     resolve_value_strings_with(value, resolve)
 }
 
-fn is_free_form_shell_tool(name: Option<&str>) -> bool {
+pub(crate) fn is_free_form_shell_tool(name: Option<&str>) -> bool {
     name.is_some_and(|name| {
         matches!(
             name.to_ascii_lowercase().as_str(),

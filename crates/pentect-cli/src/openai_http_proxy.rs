@@ -1876,11 +1876,21 @@ where
                     });
                 for key in ["arguments", "input"] {
                     if let Some(Value::String(arguments)) = object.get_mut(key) {
-                        *arguments = if is_custom_call && key == "input" {
+                        *arguments = if is_custom_call
+                            && key == "input"
+                            && crate::claude_http_proxy::is_free_form_shell_tool(
+                                tool_name.as_deref(),
+                            ) {
                             // Custom tools carry completed free-form input rather than
-                            // JSON arguments. Resolve only shell-safe token values so a
-                            // represented value cannot inject syntax into the tool call.
+                            // JSON arguments. Only tools whose complete input is a shell
+                            // program may receive shell environment injection. In
+                            // particular, `functions.exec` carries JavaScript that can
+                            // invoke nested tools; prepending `export` to it both breaks
+                            // the program and can expose a protected value in a syntax
+                            // error.
                             crate::claude_http_proxy::resolve_shell_text_safely(arguments, resolve)?
+                        } else if is_custom_call && key == "input" {
+                            arguments.clone()
                         } else {
                             crate::claude_http_proxy::resolve_tool_input_json(
                                 arguments,
@@ -3295,6 +3305,26 @@ mod tests {
         rewrite_function_calls(&mut value, &mut resolve).unwrap();
         assert_eq!(value["item"]["input"], "python hash.py safe-secret-token");
         assert_eq!(value["visible_text"], "keep <<SECRET_0123456789abcdef>>");
+    }
+
+    #[test]
+    fn javascript_orchestrator_input_is_not_rewritten_as_shell() {
+        for name in ["exec", "functions.exec"] {
+            let input = r#"const result = await tools.exec_command({cmd:"test -n \"${PENTECT_SAMPLE_0123456789abcdef}\""}); text(result)"#;
+            let mut value = serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "custom_tool_call",
+                    "name": name,
+                    "input": input
+                }
+            });
+            let mut resolve = |_text: &str| -> Result<String, String> {
+                panic!("JavaScript orchestrator input must not enter shell resolution")
+            };
+            rewrite_function_calls(&mut value, &mut resolve).unwrap();
+            assert_eq!(value["item"]["input"], input);
+        }
     }
 
     #[test]
