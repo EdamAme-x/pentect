@@ -29,7 +29,13 @@ def _use_managed_python() -> None:
     except OSError:
         return
     if current != managed:
-        os.execv(str(managed), [str(managed), str(Path(__file__).resolve()), *sys.argv[1:]])
+        # Execute through the venv path rather than its resolved interpreter.
+        # Python discovers pyvenv.cfg from the executable path; bypassing the
+        # symlink starts the base interpreter without the venv's packages.
+        os.execv(
+            str(candidate),
+            [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
 
 
 def _byte_offset(text: str, character_offset: int) -> int:

@@ -1,7 +1,10 @@
 import importlib.util
+import os
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 SERVER_PATH = Path(__file__).parents[1] / "server.py"
@@ -18,6 +21,35 @@ class Redactor:
 
 
 class ServerTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "symlink behavior is covered on POSIX")
+    def test_managed_python_executes_through_venv_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            runtime = home / "runtime" / "python"
+            runtime.parent.mkdir()
+            runtime.touch()
+            candidate = (
+                home
+                / ".pentect"
+                / "openai-privacy-filter"
+                / "venv"
+                / "bin"
+                / "python"
+            )
+            candidate.parent.mkdir(parents=True)
+            candidate.symlink_to(runtime)
+
+            with (
+                mock.patch.object(SERVER.Path, "home", return_value=home),
+                mock.patch.object(SERVER.sys, "executable", "/usr/bin/python3"),
+                mock.patch.object(SERVER.os, "execv") as execv,
+            ):
+                SERVER._use_managed_python()
+
+            executable, arguments = execv.call_args.args
+            self.assertEqual(executable, str(candidate))
+            self.assertEqual(arguments[0], str(candidate))
+
     def test_offsets_are_utf8_bytes(self) -> None:
         result = SERVER.inspect_text(Redactor(), "AéZ")
         self.assertEqual(
