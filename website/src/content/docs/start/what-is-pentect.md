@@ -54,6 +54,10 @@ Pentect supports Codex, Claude, OpenCode, and Pi, plus supported Codex App and
 Claude Desktop routes. It also offers local masking commands, custom gateways,
 and safe plugins.
 
+Antigravity, Aider, Continue, Cline, Roo Code, Zed, Goose, Junie, and Gemini
+CLI are documented as [not implemented](/reference/compatibility/#not-implemented).
+Their proposed commands are not available and must not be treated as protected.
+
 See [Compatibility](/reference/compatibility/) for the release-tested matrix.
 
 ## When it is useful

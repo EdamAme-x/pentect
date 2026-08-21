@@ -96,6 +96,10 @@ release-tested matrix is on the [Compatibility](/reference/compatibility/) page:
 Each command protects a specific surface. Check the client page before you
 use desktop, autocomplete, or external-agent features.
 
+Other client pages are status pages only. They are listed under
+[Not implemented](/reference/compatibility/#not-implemented), and their
+proposed commands do not work in the current release.
+
 ## Use Pentect from your normal CLI command
 
 This step is optional. If you want `codex` or `claude` to use Pentect without

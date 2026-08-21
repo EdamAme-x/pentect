@@ -17,6 +17,25 @@ drift is visible before the next release.
 | ChatGPT desktop app, Codex mode | Executable launch contract and Responses protocol tests | `pentect codex app` |
 | Claude Desktop, supported Chat, attachment, and Code routes | Executable launch contract and protocol tests | `pentect claude app` |
 
+## Not implemented
+
+These clients have status pages, but no public launcher in the current
+release. The proposed commands return an unknown-command error. Starting the
+client normally does not route it through Pentect and provides no Pentect
+protection.
+
+| Client | Status page |
+| --- | --- |
+| Antigravity CLI | [Not implemented](/clients/antigravity/) |
+| Aider | [Not implemented](/clients/aider/) |
+| Continue CLI | [Not implemented](/clients/continue/) |
+| Cline CLI | [Not implemented](/clients/cline/) |
+| Roo Code | [Not implemented](/clients/roo-code/) |
+| Zed | [Not implemented](/clients/zed/) |
+| Goose CLI | [Not implemented](/clients/goose/) |
+| Junie CLI | [Not implemented](/clients/junie/) |
+| Gemini CLI | [Not implemented](/clients/gemini/) |
+
 API tests cover text, streaming, completed tool calls, structured data, file
 links, broken data, custom gateway paths, and Codex zstd-compressed requests.
 

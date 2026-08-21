@@ -18,6 +18,10 @@ description: A full list of what you can do with Pentect.
 | Add a plugin for one launch | `--plugins SOURCE` |
 | Check an app setup without launching it | `pentect codex app --check` or `pentect claude app --check` |
 
+Antigravity, Aider, Continue, Cline, Roo Code, Zed, Goose, Junie, and Gemini
+CLI are not current capabilities. See [Not implemented](/reference/compatibility/#not-implemented)
+for their status pages.
+
 Pentect changes only the process it starts. It does not create a permanent
 proxy for the whole system or replace the client UI.
 
