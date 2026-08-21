@@ -420,6 +420,19 @@ pub(crate) fn activity_share_enabled() -> Result<bool, String> {
     Ok(project.or(global).unwrap_or(true))
 }
 
+pub(crate) fn output_restore_enabled() -> Result<bool, String> {
+    let project = read_output_restore(project_config_path())?;
+    let global = read_output_restore(global_config_path()?)?;
+    Ok(output_restore_effective(project, global))
+}
+
+fn output_restore_effective(project: Option<bool>, global: Option<bool>) -> bool {
+    // Restoring assistant prose reveals protected values to terminals and local
+    // client logs. A repository may opt out, but cannot opt a user into that
+    // wider boundary without the same setting in the user config.
+    global.unwrap_or(false) && project.unwrap_or(true)
+}
+
 pub(crate) fn unknown_formats_should_block() -> Result<bool, String> {
     let project = read_unknown_format_policy(project_config_path())?;
     let global = read_unknown_format_policy(global_config_path()?)?;
@@ -587,6 +600,23 @@ fn decode_config_value(value: &toml::Value) -> Result<DecodeConfigPartial, Strin
 
 fn read_files_remember(path: PathBuf) -> Result<Option<bool>, String> {
     parse_config_file(&path)?.map_or(Ok(None), |value| files_remember_value(&value))
+}
+
+fn read_output_restore(path: PathBuf) -> Result<Option<bool>, String> {
+    parse_config_file(&path)?.map_or(Ok(None), |value| output_restore_value(&value))
+}
+
+fn output_restore_value(value: &toml::Value) -> Result<Option<bool>, String> {
+    let Some(raw) = value.get("output") else {
+        return Ok(None);
+    };
+    let Some(table) = raw.as_table() else {
+        return Err("output config must be a table".to_string());
+    };
+    table
+        .get("restore")
+        .map(|raw| config_bool(raw, "output.restore"))
+        .transpose()
 }
 
 fn reject_removed_environment_config(path: PathBuf) -> Result<(), String> {
@@ -1254,5 +1284,25 @@ unknown_min_bytes = 32
 
         let value = "[log]\nshare = true".parse::<toml::Value>().unwrap();
         assert!(activity_share_value(&value).is_err());
+    }
+
+    #[test]
+    fn output_restore_is_opt_in_and_project_cannot_enable_it() {
+        let enabled = "[output]\nrestore = true".parse::<toml::Value>().unwrap();
+        let disabled = "[output]\nrestore = false".parse::<toml::Value>().unwrap();
+        assert_eq!(output_restore_value(&enabled).unwrap(), Some(true));
+        assert_eq!(output_restore_value(&disabled).unwrap(), Some(false));
+        assert!(!output_restore_effective(None, None));
+        assert!(!output_restore_effective(Some(true), None));
+        assert!(output_restore_effective(None, Some(true)));
+        assert!(!output_restore_effective(Some(false), Some(true)));
+    }
+
+    #[test]
+    fn output_restore_rejects_non_boolean_values() {
+        let value = "[output]\nrestore = \"sometimes\""
+            .parse::<toml::Value>()
+            .unwrap();
+        assert!(output_restore_value(&value).is_err());
     }
 }

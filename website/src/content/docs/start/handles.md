@@ -11,6 +11,9 @@ A handle is a local reference to a sensitive value:
 
 The provider can see and copy this string. It cannot derive the value from it.
 Pentect restores a known handle only inside the protected local flow.
+Assistant prose keeps handles by default. The user-only
+[`output.restore`](/reference/configuration/#assistant-output-restoration)
+setting can opt into restoring known handles in the local client display.
 
 ## Anatomy
 
