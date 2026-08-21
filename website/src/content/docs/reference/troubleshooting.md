@@ -192,6 +192,17 @@ before following live events, `--json` keeps the JSONL representation, and
 version, OS, architecture, PID, source location, and a backtrace so a crash can
 be investigated after the process exits.
 
+Gateway warnings include a fixed endpoint class, HTTP method, status, retry
+hint, PID, OS, and architecture. OCR entries report the backend and a fixed
+outcome such as `scan-complete`, `scan-failed kind=decode`, or
+`scan-unavailable-blocked`. They never include URLs, image bytes, recognized
+text, or raw provider/OCR errors.
+
+Repeated diagnostics with the same safe fields are combined into one entry
+every five seconds. The entry's count and `span_ms` show how many times it
+occurred and over what interval, so a retry loop remains visible without
+writing one line per attempt.
+
 Writes are handled by a bounded background queue and flushed in batches of up
 to 64 events, 64 KiB, or 250 ms. The file rotates at 128 MiB and keeps 31
 older generations (`pentect.log.1` through `pentect.log.31`), for a maximum of

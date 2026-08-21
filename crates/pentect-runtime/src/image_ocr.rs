@@ -1,8 +1,8 @@
 #[cfg(any(feature = "ocr", test))]
 use crate::config;
-use crate::config::ImageOcrConfig;
 #[cfg(feature = "ocr")]
 use crate::config::{image_ocr_config, ImageOcrMode, ImageRedactionStyle};
+use crate::config::{ImageOcrConfig, UnscannedImagePolicy};
 #[cfg(any(feature = "ocr", test))]
 use pentect_core::model::labels;
 #[cfg(any(feature = "ocr", test))]
@@ -98,6 +98,20 @@ struct ImageSecretFinding {
     redact_pixels: bool,
 }
 
+#[derive(Debug)]
+struct ImageSecretFindings {
+    findings: Vec<ImageSecretFinding>,
+    scan_failure: Option<&'static str>,
+}
+
+impl std::ops::Deref for ImageSecretFindings {
+    type Target = [ImageSecretFinding];
+
+    fn deref(&self) -> &Self::Target {
+        &self.findings
+    }
+}
+
 #[cfg(any(feature = "ocr", test))]
 #[derive(Clone, Debug)]
 struct ImageTextSecretHit {
@@ -184,6 +198,12 @@ pub(crate) fn inspect_tool_images_for_secrets(
         started_at: std::time::Instant::now(),
     };
     collect_image_inspection(value, key, cfg, &mut inspection)?;
+    record_ocr_outcomes(
+        inspection.scanned_images,
+        inspection.unscanned_images,
+        inspection.ocr_failures,
+        cfg,
+    );
     Ok(inspection)
 }
 
@@ -203,6 +223,12 @@ pub(crate) fn redact_tool_images_for_secrets(
         notes: Vec::new(),
     };
     let updated = redact_image_value(value, key, cfg, &mut state)?;
+    record_ocr_outcomes(
+        state.scanned_images,
+        state.unscanned_images,
+        state.ocr_failures,
+        cfg,
+    );
     Ok(ImageRedaction {
         changed: updated != *value,
         updated,
@@ -297,9 +323,19 @@ fn inspect_image_bytes(
     }
     inspection.scanned_images += 1;
     match image_secret_findings(bytes, key, cfg) {
-        Ok(findings) if !findings.is_empty() => inspection.secret_images += 1,
-        Ok(_) => {}
-        Err(_) => inspection.ocr_failures += 1,
+        Ok(findings) => {
+            if let Some(kind) = findings.scan_failure {
+                inspection.ocr_failures += 1;
+                record_ocr_failure(kind);
+            }
+            if !findings.is_empty() {
+                inspection.secret_images += 1;
+            }
+        }
+        Err(_) => {
+            inspection.ocr_failures += 1;
+            record_ocr_failure("protection");
+        }
     }
 }
 
@@ -548,9 +584,16 @@ fn redact_image_bytes(
     state.scanned_images += 1;
 
     let findings = match image_secret_findings(bytes, key, cfg) {
-        Ok(findings) => findings,
+        Ok(findings) => {
+            if let Some(kind) = findings.scan_failure {
+                state.ocr_failures += 1;
+                record_ocr_failure(kind);
+            }
+            findings.findings
+        }
         Err(_) => {
             state.ocr_failures += 1;
+            record_ocr_failure("protection");
             Vec::new()
         }
     };
@@ -574,7 +617,7 @@ fn image_secret_findings(
     bytes: &[u8],
     key: &[u8; 32],
     cfg: &ImageOcrConfig,
-) -> Result<Vec<ImageSecretFinding>, String> {
+) -> Result<ImageSecretFindings, String> {
     let mut findings = Vec::new();
     for region in image_metadata_regions(bytes) {
         for hit in image_text_secret_hits(&region.text, key)? {
@@ -613,8 +656,12 @@ fn image_secret_findings(
 
     let ocr_regions = match ocr_image_regions_with_config(bytes, cfg) {
         Ok(regions) => regions,
-        Err(err) if findings.is_empty() => return Err(err),
-        Err(_) => return Ok(findings),
+        Err(err) => {
+            return Ok(ImageSecretFindings {
+                findings,
+                scan_failure: Some(ocr_failure_kind(&err)),
+            });
+        }
     };
     for region in &ocr_regions {
         for hit in image_text_secret_hits(&region.text, key)? {
@@ -649,7 +696,10 @@ fn image_secret_findings(
             redact_pixels: true,
         });
     }
-    Ok(findings)
+    Ok(ImageSecretFindings {
+        findings,
+        scan_failure: None,
+    })
 }
 
 #[cfg(feature = "ocr")]
@@ -669,11 +719,127 @@ fn image_secret_findings(
     _bytes: &[u8],
     _key: &[u8; 32],
     cfg: &ImageOcrConfig,
-) -> Result<Vec<ImageSecretFinding>, String> {
+) -> Result<ImageSecretFindings, String> {
     if matches!(cfg.mode, crate::config::ImageOcrMode::Off) {
-        Ok(Vec::new())
+        Ok(ImageSecretFindings {
+            findings: Vec::new(),
+            scan_failure: None,
+        })
     } else {
-        Err("image OCR requires a build with `--features ocr`".to_string())
+        Ok(ImageSecretFindings {
+            findings: Vec::new(),
+            scan_failure: Some("disabled"),
+        })
+    }
+}
+
+fn ocr_failure_kind(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("disabled") || error.contains("requires a build") {
+        "disabled"
+    } else if error.contains("not supported") {
+        "unsupported"
+    } else if error.contains("decode") {
+        "decode"
+    } else if error.contains("pixels; limit") || error.contains("image limit") {
+        "limit"
+    } else if error.contains("load ocr") {
+        "model-load"
+    } else if error.contains("initialize") {
+        "initialize"
+    } else if error.contains("prepare") || error.contains("preprocess") {
+        "preprocess"
+    } else if error.contains("detect ocr") || error.contains("ocr image") {
+        "recognition"
+    } else {
+        "unclassified"
+    }
+}
+
+fn record_ocr_failure(kind: &'static str) {
+    crate::activity_log::record_structured(
+        "warning",
+        "ocr",
+        "scan-failed",
+        Some(kind),
+        Some(ocr_status()),
+        Some("SCAN"),
+        None,
+        Some(matches!(kind, "initialize" | "preprocess" | "recognition")),
+        None,
+        1,
+    );
+}
+
+pub(crate) fn record_direct_ocr_outcome(result: &Result<String, String>) {
+    match result {
+        Ok(_) => crate::activity_log::record_structured(
+            "diagnostic",
+            "ocr",
+            "scan-complete",
+            Some(ocr_status()),
+            Some("image"),
+            Some("SCAN"),
+            None,
+            Some(false),
+            None,
+            1,
+        ),
+        Err(error) => record_ocr_failure(ocr_failure_kind(error)),
+    }
+}
+
+fn record_ocr_outcomes(scanned: usize, unscanned: usize, failures: usize, cfg: &ImageOcrConfig) {
+    let completed = scanned.saturating_sub(failures);
+    if completed > 0 {
+        crate::activity_log::record_structured(
+            "diagnostic",
+            "ocr",
+            "scan-complete",
+            Some(ocr_status()),
+            Some("image"),
+            Some("SCAN"),
+            None,
+            Some(false),
+            None,
+            completed as u64,
+        );
+    }
+    if unscanned > 0 {
+        let event = match cfg.unscanned_images {
+            UnscannedImagePolicy::Block => "scan-unavailable-blocked",
+            UnscannedImagePolicy::Allow => "scan-unavailable-allowed",
+        };
+        crate::activity_log::record_structured(
+            "warning",
+            "ocr",
+            event,
+            Some("source-or-limit"),
+            Some(ocr_status()),
+            Some("SCAN"),
+            None,
+            Some(false),
+            None,
+            unscanned as u64,
+        );
+    }
+    if failures > 0 {
+        let event = match cfg.unscanned_images {
+            UnscannedImagePolicy::Block => "scan-failure-blocked",
+            UnscannedImagePolicy::Allow => "scan-failure-allowed",
+        };
+        crate::activity_log::record_structured(
+            "warning",
+            "ocr",
+            event,
+            Some("policy"),
+            Some(ocr_status()),
+            Some("SCAN"),
+            None,
+            Some(false),
+            None,
+            failures as u64,
+        );
     }
 }
 
@@ -3095,6 +3261,22 @@ mod tests {
             .find(|finding| finding.labels.iter().any(|label| label == "OPENAI_API_KEY"))
             .unwrap_or_else(|| panic!("missing EXIF secret finding: {findings:?}"));
         assert!(!exif_finding.redact_pixels);
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn metadata_finding_does_not_hide_an_ocr_failure() {
+        let app1 = exif_text_payload("OPENAI_API_KEY=sk-ABCDEFGHIJKLMNOPQRSTUVWX");
+        let jpeg = solid_jpeg_with_app1(&app1);
+        let mut cfg = metadata_test_config();
+        cfg.max_pixels = 1;
+
+        let findings = image_secret_findings(&jpeg, &[7; 32], &cfg).unwrap();
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.labels.iter().any(|label| label == "OPENAI_API_KEY")));
+        assert_eq!(findings.scan_failure, Some("limit"));
     }
 
     #[cfg(feature = "ocr")]

@@ -168,12 +168,32 @@ pub fn record_read_activity(result: &MaskResult, path: &Path) {
 }
 
 pub fn record_diagnostic_activity(surface: &str, reason: &str) {
-    activity_log::record_summary(
-        "warning",
+    activity_log::record_diagnostic(surface, reason, None, None, None, None, None, None);
+}
+
+/// Persist a value-free, structured HTTP gateway diagnostic. Every text field
+/// must be a fixed classifier, never a URL, header, request body, response
+/// body, command argument, or raw error message.
+#[allow(clippy::too_many_arguments)]
+pub fn record_http_diagnostic_activity(
+    surface: &str,
+    event: &str,
+    kind: &str,
+    endpoint: &str,
+    method: &str,
+    status: Option<u16>,
+    retryable: bool,
+    version: &str,
+) {
+    activity_log::record_diagnostic(
         surface,
-        1,
-        BTreeMap::from([(reason.to_string(), 1)]),
-        None,
+        event,
+        Some(kind),
+        Some(endpoint),
+        Some(method),
+        status,
+        Some(retryable),
+        Some(version),
     );
 }
 
@@ -228,7 +248,9 @@ fn mask_input_into_memory_store_client(
 }
 
 pub fn ocr_image_bytes(bytes: &[u8]) -> Result<String, String> {
-    image_ocr::ocr_image_bytes(bytes)
+    let result = image_ocr::ocr_image_bytes(bytes);
+    image_ocr::record_direct_ocr_outcome(&result);
+    result
 }
 
 pub fn ocr_status() -> &'static str {

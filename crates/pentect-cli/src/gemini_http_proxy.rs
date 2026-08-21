@@ -32,7 +32,23 @@ type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 
 fn diagnostic(reason: &str) {
-    pentect_agent::record_diagnostic_activity("gemini", reason);
+    let (kind, retryable) = match reason {
+        "gateway-stopped" => ("runtime", false),
+        "connection-failed" => ("client-connection", true),
+        "request-invalid-json" => ("protocol", false),
+        "request-protection-skipped" => ("protection", false),
+        _ => ("unclassified", false),
+    };
+    pentect_agent::record_http_diagnostic_activity(
+        "gemini",
+        reason,
+        kind,
+        "gateway",
+        "HTTP",
+        None,
+        retryable,
+        env!("CARGO_PKG_VERSION"),
+    );
 }
 
 pub(crate) struct GeminiHttpProxyGuard {
@@ -177,7 +193,26 @@ async fn proxy_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let context = crate::gateway_diagnostics::RequestContext {
+        endpoint: classify_endpoint(
+            request
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or("/"),
+        )
+        .diagnostic_name(),
+        method: crate::gateway_diagnostics::method_name(request.method()),
+    };
     let Ok(_permit) = Arc::clone(&state.requests).try_acquire_owned() else {
+        crate::gateway_diagnostics::record(
+            "gemini",
+            "gateway-busy",
+            "capacity",
+            context,
+            Some(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+            true,
+        );
         return Ok(text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Pentect gateway is busy",
@@ -186,11 +221,18 @@ async fn proxy_request(
     match proxy_request_inner(request, &state).await {
         Ok(response) => Ok(response),
         Err(error) => {
-            diagnostic("request-failed");
-            let local = error.starts_with("unknown format blocked:")
-                || error.starts_with("image blocked:")
-                || error.starts_with("document blocked:")
-                || error.starts_with("plugin blocked:");
+            let local = crate::gateway_diagnostics::is_local_rejection(&error);
+            let response_status = if local {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            crate::gateway_diagnostics::record_request_failure(
+                "gemini",
+                context,
+                &error,
+                response_status.as_u16(),
+            );
             Ok(if local {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
@@ -258,7 +300,7 @@ async fn proxy_request_inner(
         });
         reqwest::Body::wrap_stream(stream)
     };
-    let mut upstream_request = state.client.request(method, upstream_url);
+    let mut upstream_request = state.client.request(method.clone(), upstream_url);
     let connection_headers = connection_named_headers(&request_headers);
     for (name, value) in &request_headers {
         if state.headers.forward_incoming_header(name.as_str())
@@ -276,6 +318,14 @@ async fn proxy_request_inner(
         .await
         .map_err(|error| reqwest_error_message("could not reach Gemini upstream", &error))?;
     let status = upstream.status();
+    crate::gateway_diagnostics::record_upstream_status(
+        "gemini",
+        crate::gateway_diagnostics::RequestContext {
+            endpoint: endpoint.diagnostic_name(),
+            method: crate::gateway_diagnostics::method_name(&method),
+        },
+        status,
+    );
     let response_headers = upstream.headers().clone();
     if response_headers
         .get(hyper::header::CONTENT_ENCODING)
@@ -338,6 +388,16 @@ enum GeminiEndpoint {
 }
 
 impl GeminiEndpoint {
+    fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::GenerateContent => "generate-content",
+            Self::StreamGenerateContent => "stream-generate-content",
+            Self::CountTokens => "count-tokens",
+            Self::Models => "models",
+            Self::Unknown => "unknown",
+        }
+    }
+
     fn is_protected(self) -> bool {
         matches!(
             self,

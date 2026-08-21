@@ -33,7 +33,29 @@ const MAX_CHAT_TOOL_CALLS: usize = 1024;
 static WARNED_UNKNOWN_ENDPOINT: AtomicBool = AtomicBool::new(false);
 
 fn proxy_diagnostic(reason: &str) {
-    pentect_agent::record_diagnostic_activity("openai", reason);
+    let (kind, retryable) = match reason {
+        "gateway-stopped" => ("runtime", false),
+        "connection-failed" => ("client-connection", true),
+        "request-invalid-json" | "request-content-encoding-skipped" | "unknown-endpoint" => {
+            ("protocol", false)
+        }
+        "request-protection-skipped" | "response-restore-skipped" | "sse-restore-skipped" => {
+            ("protection", false)
+        }
+        "file-attestation-unavailable" | "file-registry-unavailable" => ("storage", true),
+        "sse-event-limit" => ("limit", false),
+        _ => ("unclassified", false),
+    };
+    pentect_agent::record_http_diagnostic_activity(
+        "openai",
+        reason,
+        kind,
+        "gateway",
+        "HTTP",
+        None,
+        retryable,
+        env!("CARGO_PKG_VERSION"),
+    );
 }
 
 type ProxyBodyError = Box<dyn Error + Send + Sync>;
@@ -236,7 +258,26 @@ async fn proxy_request(
     request: Request<Incoming>,
     state: Arc<ProxyState>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let context = crate::gateway_diagnostics::RequestContext {
+        endpoint: classify_openai_endpoint(
+            request
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or("/"),
+        )
+        .diagnostic_name(),
+        method: crate::gateway_diagnostics::method_name(request.method()),
+    };
     let Ok(_permit) = Arc::clone(&state.requests).try_acquire_owned() else {
+        crate::gateway_diagnostics::record(
+            "openai",
+            "gateway-busy",
+            "capacity",
+            context,
+            Some(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+            true,
+        );
         return Ok(text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Pentect gateway is busy",
@@ -245,15 +286,18 @@ async fn proxy_request(
     match proxy_request_inner(request, &state).await {
         Ok(response) => Ok(response),
         Err(error) => {
-            proxy_diagnostic("request-failed");
-            let local_rejection = error.starts_with("image blocked:")
-                || error.starts_with("document blocked:")
-                || error.starts_with("remote ")
-                || error.starts_with("OpenAI file ")
-                || error.starts_with("file upload blocked:")
-                || error.starts_with("Files API upload ")
-                || error.starts_with("plugin blocked:")
-                || error.starts_with("unknown format blocked:");
+            let local_rejection = crate::gateway_diagnostics::is_local_rejection(&error);
+            let response_status = if local_rejection {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            crate::gateway_diagnostics::record_request_failure(
+                "openai",
+                context,
+                &error,
+                response_status.as_u16(),
+            );
             Ok(if local_rejection {
                 owned_text_response(StatusCode::UNPROCESSABLE_ENTITY, &error)
             } else {
@@ -436,7 +480,7 @@ async fn proxy_request_inner(
         reqwest::Body::wrap_stream(stream)
     };
 
-    let mut upstream_request = state.client.request(method, upstream_url);
+    let mut upstream_request = state.client.request(method.clone(), upstream_url);
     let connection_headers = connection_named_headers(&headers);
     for (name, value) in &headers {
         if state.headers.forward_incoming_header(name.as_str())
@@ -455,6 +499,14 @@ async fn proxy_request_inner(
         .await
         .map_err(|error| reqwest_error_message("could not reach OpenAI upstream", &error))?;
     let status = upstream.status();
+    crate::gateway_diagnostics::record_upstream_status(
+        "openai",
+        crate::gateway_diagnostics::RequestContext {
+            endpoint: endpoint.diagnostic_name(),
+            method: crate::gateway_diagnostics::method_name(&method),
+        },
+        status,
+    );
     let response_headers = upstream.headers().clone();
     if response_headers
         .get(hyper::header::CONTENT_ENCODING)
@@ -534,9 +586,7 @@ async fn proxy_request_inner(
                     .await
                     .is_err()
                 {
-                    eprintln!(
-                        "[pentect] file attestation unavailable; uploaded file remains untrusted"
-                    );
+                    proxy_diagnostic("file-attestation-unavailable");
                 } else if let Ok(mut files) = state.files.lock() {
                     crate::http_files::remember_scoped_file_coverage(
                         &mut files,
@@ -545,7 +595,7 @@ async fn proxy_request_inner(
                         coverage,
                     );
                 } else {
-                    eprintln!("[pentect] uploaded file registry unavailable; persistent attestation retained");
+                    proxy_diagnostic("file-registry-unavailable");
                 }
             }
         }
@@ -2250,6 +2300,22 @@ enum OpenAiEndpoint {
     Models,
     Health,
     Unknown,
+}
+
+impl OpenAiEndpoint {
+    fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::ResponsesResource => "responses-resource",
+            Self::InputTokens => "input-tokens",
+            Self::ChatCompletions => "chat-completions",
+            Self::FilesCollection => "files-collection",
+            Self::Files => "files",
+            Self::Models => "models",
+            Self::Health => "health",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 fn classify_openai_endpoint(path_and_query: &str) -> OpenAiEndpoint {

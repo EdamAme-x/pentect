@@ -8,6 +8,7 @@ mod cloud_code_http_proxy;
 mod codex_app;
 mod default_launch;
 mod doctor;
+mod gateway_diagnostics;
 mod gemini_http_proxy;
 mod handle_contract;
 mod http_files;
