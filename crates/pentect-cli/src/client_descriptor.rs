@@ -220,11 +220,10 @@ pub(crate) const GEMINI: ClientDescriptor = ClientDescriptor {
     default_upstream: Some("https://generativelanguage.googleapis.com"),
 };
 
-pub(crate) const CLIENTS: &[ClientDescriptor] = &[
-    CODEX,
-    CLAUDE,
-    OPENCODE,
-    PI,
+pub(crate) const CLIENTS: &[ClientDescriptor] = &[CODEX, CLAUDE, OPENCODE, PI];
+
+#[allow(dead_code)]
+const UNPUBLISHED_CLIENTS: &[ClientDescriptor] = &[
     ANTIGRAVITY,
     AIDER,
     GOOSE,
@@ -249,14 +248,18 @@ mod tests {
     #[test]
     fn descriptors_have_unique_names_and_path_flags() {
         let mut commands = std::collections::BTreeSet::new();
-        for (index, client) in CLIENTS.iter().enumerate() {
+        let clients = CLIENTS
+            .iter()
+            .chain(UNPUBLISHED_CLIENTS)
+            .collect::<Vec<_>>();
+        for (index, client) in clients.iter().enumerate() {
             assert!(!client.name.is_empty());
             assert!(client.path_flag.starts_with("--"));
             assert!(commands.insert(client.name));
             for alias in client.aliases {
                 assert!(commands.insert(alias), "duplicate client command {alias}");
             }
-            for other in &CLIENTS[index + 1..] {
+            for other in &clients[index + 1..] {
                 assert_ne!(client.name, other.name);
                 assert_ne!(client.path_flag, other.path_flag);
                 assert!(!other.aliases.contains(&client.name));
@@ -267,7 +270,7 @@ mod tests {
 
     #[test]
     fn launchers_match_their_protocol_and_required_metadata() {
-        for client in CLIENTS {
+        for client in CLIENTS.iter().chain(UNPUBLISHED_CLIENTS) {
             match client.launcher {
                 Launcher::CodexConfig | Launcher::OpenAi(_) | Launcher::Ide(_) => {
                     assert_eq!(client.protocol, Protocol::OpenAi, "{}", client.name);
@@ -286,7 +289,12 @@ mod tests {
     #[test]
     fn registry_resolves_names_and_aliases() {
         assert_eq!(find("codex"), Some(&CODEX));
-        assert_eq!(find("agy"), Some(&ANTIGRAVITY));
+        for client in UNPUBLISHED_CLIENTS {
+            assert_eq!(find(client.name), None, "{} is still public", client.name);
+            for alias in client.aliases {
+                assert_eq!(find(alias), None, "{alias} is still public");
+            }
+        }
         assert_eq!(find("unknown"), None);
     }
 }

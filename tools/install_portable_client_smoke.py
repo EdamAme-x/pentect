@@ -15,27 +15,18 @@ import urllib.error
 import urllib.request
 
 
-ALLOW_SCRIPTS = (
-    "@anthropic-ai/claude-code,cline,opencode-ai,@github/keytar,node-pty,"
-    "@google/genai,protobufjs"
-)
+ALLOW_SCRIPTS = "@anthropic-ai/claude-code,opencode-ai,@github/keytar,node-pty"
 
 LATEST_CLIENTS = (
     "@anthropic-ai/claude-code@latest",
     "opencode-ai@latest",
     "@earendil-works/pi-coding-agent@latest",
-    "@continuedev/cli@latest",
-    "cline@latest",
-    "@google/gemini-cli@latest",
 )
 
 RELEASE_CLIENTS = (
     "@anthropic-ai/claude-code@2.1.238",
     "opencode-ai@1.18.20",
     "@earendil-works/pi-coding-agent@0.84.2",
-    "@continuedev/cli@1.5.47",
-    "cline@3.0.56",
-    "@google/gemini-cli@0.56.0",
 )
 
 

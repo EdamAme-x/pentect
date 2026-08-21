@@ -21,12 +21,20 @@ def main() -> None:
     descriptor = (ROOT / "crates/pentect-cli/src/client_descriptor.rs").read_text(
         encoding="utf-8"
     )
-    declared = set(
-        re.findall(
-            r"pub\(crate\) const [A-Z_]+: ClientDescriptor = ClientDescriptor \{\s*name: \"([^\"]+)\"",
-            descriptor,
-        )
+    public_block = re.search(
+        r"pub\(crate\) const CLIENTS: &\[ClientDescriptor\] = &\[(.*?)\];",
+        descriptor,
+        re.DOTALL,
     )
+    assert public_block is not None
+    constants = re.findall(r"\b[A-Z][A-Z_]+\b", public_block.group(1))
+    declared = {
+        re.search(
+            rf"pub\(crate\) const {constant}: ClientDescriptor = ClientDescriptor \{{\s*name: \"([^\"]+)\"",
+            descriptor,
+        ).group(1)
+        for constant in constants
+    }
     exercised = {name for name, _ in SMOKE.PORTABLE_CLIENTS + SMOKE.NATIVE_CLIENTS}
     assert exercised == declared, (
         f"real-client smoke mismatch: missing={sorted(declared - exercised)}, "
