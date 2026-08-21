@@ -36,6 +36,19 @@ class SetupTests(unittest.TestCase):
         ):
             self.assertEqual(SETUP.build_plan("auto", {})["torch_wheel"], "cu130")
 
+    def test_windows_requires_a_newer_driver_than_linux(self) -> None:
+        with (
+            mock.patch.object(SETUP.platform, "system", return_value="Windows"),
+            mock.patch.object(SETUP.platform, "machine", return_value="x86_64"),
+        ):
+            self.assertIsNone(SETUP.cuda_wheel(527))
+            self.assertEqual(SETUP.cuda_wheel(530), "cu126")
+        with (
+            mock.patch.object(SETUP.platform, "system", return_value="Linux"),
+            mock.patch.object(SETUP.platform, "machine", return_value="x86_64"),
+        ):
+            self.assertEqual(SETUP.cuda_wheel(527), "cu126")
+
     def test_macos_uses_the_official_default_pytorch_package(self) -> None:
         with (
             mock.patch.object(SETUP, "nvidia_driver_major", return_value=None),
@@ -89,6 +102,20 @@ class SetupTests(unittest.TestCase):
                 "GITHUB_ACTIONS": "true",
                 "GITHUB_WORKFLOW": "Release",
                 "GITHUB_REPOSITORY": "someone/fork",
+            },
+            clear=True,
+        ):
+            self.assertFalse(SETUP.controlled_fixture())
+        with mock.patch.dict(
+            SETUP.os.environ, {"PENTECT_OPF_SETUP_FIXTURE": "1"}, clear=True
+        ):
+            self.assertTrue(SETUP.controlled_fixture())
+        with mock.patch.dict(
+            SETUP.os.environ,
+            {
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_WORKFLOW": "CI",
+                "GITHUB_REPOSITORY": "EdamAme-x/pentect",
             },
             clear=True,
         ):

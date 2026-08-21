@@ -80,6 +80,16 @@ class ServerTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"PENTECT_OPF_ROOT": directory}):
                 self.assertEqual(SERVER._selected_device("auto"), "cpu")
 
+    def test_fixture_setup_state_is_rejected_at_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "setup.json").write_text(
+                '{"device":"cpu","fixture":true}', encoding="utf-8"
+            )
+            with mock.patch.dict(os.environ, {"PENTECT_OPF_ROOT": str(root)}):
+                with self.assertRaisesRegex(RuntimeError, "fixture setup"):
+                    SERVER._selected_device("auto")
+
     def test_command_protocol_response_matches_request(self) -> None:
         result = SERVER.handle_request(
             Redactor(),

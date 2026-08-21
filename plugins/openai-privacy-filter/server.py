@@ -56,6 +56,11 @@ def _selected_device(argument: str) -> str:
         state = json.loads((root / "setup.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return "cpu"
+    if isinstance(state, dict) and state.get("fixture") is True:
+        raise RuntimeError(
+            "OpenAI Privacy Filter fixture setup cannot be used at runtime; "
+            "run `pentect plugins setup openai-privacy-filter` outside release CI"
+        )
     device = state.get("device") if isinstance(state, dict) else None
     return device if device in {"cpu", "cuda"} else "cpu"
 

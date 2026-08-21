@@ -13,9 +13,11 @@ and Windows otherwise, and PyTorch's official default package on macOS. See the
 [setup guide](https://pentect.dev/plugins/official/#openai-privacy-filter).
 
 ```sh
-pentect plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter
-pentect plugins setup openai-privacy-filter --profile cpu
+pentect plugins add github:@EdamAme-x/pentect/plugins/openai-privacy-filter --profile cpu
 ```
+
+To change the profile later, run
+`pentect plugins setup openai-privacy-filter --profile cuda`.
 
 The server returns byte ranges and labels. It does not return the matched text.
 Pentect turns those ranges into normal handles such as

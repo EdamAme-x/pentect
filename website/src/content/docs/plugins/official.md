@@ -99,7 +99,8 @@ OS access as the user; enable only plugins you trust.
 
 | Symptom | What to do |
 | --- | --- |
-| Python or `opf` is missing | Run `pentect plugins setup openai-privacy-filter` |
+| `opf` is missing | Run `pentect plugins setup openai-privacy-filter` |
+| Python is missing | Install a supported Python executable, then run `pentect plugins setup openai-privacy-filter` |
 | CUDA setup is unavailable | Update the NVIDIA driver or select `--profile cpu` |
 | CPU use is high | Select CUDA, or remove the plugin when it is not needed |
 | Plugin file or command changed | Inspect it, then run `pentect plugins setup` |

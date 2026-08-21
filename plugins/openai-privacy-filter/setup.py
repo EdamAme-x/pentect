@@ -16,6 +16,7 @@ from typing import Any
 
 OPF_REVISION = "f7f00ca7fb869683eb732c010299d901457f19c3"
 OPF_SOURCE = f"git+https://github.com/openai/privacy-filter.git@{OPF_REVISION}"
+# First-match selection requires descending driver thresholds.
 CUDA_INDEXES = ((580, "cu130"), (525, "cu126"))
 DEPENDENCIES = ("huggingface_hub", "numpy", "packaging", "safetensors", "tiktoken")
 

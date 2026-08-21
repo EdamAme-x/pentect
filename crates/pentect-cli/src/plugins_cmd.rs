@@ -477,6 +477,9 @@ fn add_plugin(
             setup_plugin_source(source.clone(), approved, profile, false)?;
         }
         if source.manifest_path.is_none() {
+            if profile.is_some() {
+                return Err("this plugin does not declare setup profiles".to_string());
+            }
             let active = plugins::active_from_scoped_specs(vec![(scope, spec.to_string())], true)
                 .map_err(|error| error.to_string())?;
             if active.config_paths().is_empty() {
@@ -2241,9 +2244,11 @@ fn setup_plugin_source_inner(
                     ));
                 }
             }
+            let setup_command = setup.selected_command()?;
+            println!("environment setup: {}", display_command(setup_command));
             println!(
-                "environment setup: {}",
-                display_command(setup.selected_command()?)
+                "setup executable: {}",
+                command_executable_preview(&name, &source, &setup_command[0])?.display()
             );
             if !setup.profiles.is_empty() {
                 println!("setup profiles: {}", setup.profiles.join(", "));

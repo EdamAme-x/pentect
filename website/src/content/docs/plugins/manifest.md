@@ -211,7 +211,7 @@ download = "CPU: about 3 GB; CUDA: about 6 GB"
 disk = "CPU: about 5 GB; CUDA: about 8 GB"
 ```
 
-Use `[setup.commands]` for `windows`, `macos`, and `linux` variants. Pentect
+Use `[setup.commands]` for `windows`, `macos` (macOS), and `linux` variants. Pentect
 shows this native command and the declared costs before approval, includes all
 referenced files in the command lock, and runs it without a shell. Users select
 a declared profile with `plugins add|setup --profile NAME`. The setup program
