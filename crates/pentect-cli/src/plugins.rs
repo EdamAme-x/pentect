@@ -296,6 +296,21 @@ pub(crate) fn active_from_explicit_specs(
     )
 }
 
+pub(crate) fn active_from_selected_specs(
+    specs: Vec<String>,
+    create_named: bool,
+) -> Result<ActivePlugins> {
+    let specs = specs
+        .into_iter()
+        .map(|spec| {
+            let resolved = resolve_configured_plugin_spec(&spec)?;
+            let scope = configured_scope(&resolved).unwrap_or(PluginScope::Project);
+            Ok((scope, resolved))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    active_from_scoped_specs(specs, create_named)
+}
+
 pub(crate) fn active_from_scoped_specs(
     specs: Vec<(PluginScope, String)>,
     create_named: bool,

@@ -3403,7 +3403,7 @@ fn confirm_setup() -> Result<bool, String> {
 
 fn active_for_one(spec: &str) -> Result<plugins::ActivePlugins, String> {
     let specs = plugins::parse_plugin_value(spec).map_err(|e| e.to_string())?;
-    plugins::active_from_explicit_specs(specs, true).map_err(|e| e.to_string())
+    plugins::active_from_selected_specs(specs, true).map_err(|e| e.to_string())
 }
 
 fn test_pack(path: &Path) -> Check {
