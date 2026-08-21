@@ -136,7 +136,6 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-${{ matrix.asset }}
-          save-if: false
       - name: Build release binary
         run: cargo build --release --locked -p pentect-cli
       - name: Package binary and checksum
