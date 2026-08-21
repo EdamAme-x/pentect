@@ -3356,10 +3356,16 @@ pub fn plugin_runtime_dirs(id_or_name: &str) -> Result<PluginRuntimeDirs, String
 /// global Pentect configuration. The caller supplies a stable source identity
 /// so the same approval and managed command are reused from every project.
 pub fn global_plugin_runtime_dirs(source_id: &str) -> Result<PluginRuntimeDirs, String> {
-    let id = plugin_id(source_id);
-    if id.is_empty() {
-        return Err("global plugin identity is empty".to_string());
+    if source_id.len() != 32
+        || !source_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(
+            "global plugin identity must be a 32-character lowercase hex digest".to_string(),
+        );
     }
+    let id = source_id.to_string();
     let user_root = plugin_user_data_root()?;
     if !user_root.is_absolute() {
         return Err("Pentect plugin data directory must be absolute".to_string());
@@ -3830,7 +3836,7 @@ for line in sys.stdin:
         assert_eq!(result.spans[0].label, "CONFIGURED");
 
         drop(middleware);
-        let global_id = format!("global-command-e2e-{nonce}");
+        let global_id = format!("{nonce:032x}");
         let global_dirs = global_plugin_runtime_dirs(&global_id).unwrap();
         std::fs::write(&global_dirs.config_file, "label = \"GLOBAL_CONFIGURED\"\n").unwrap();
         std::fs::write(
@@ -3889,6 +3895,18 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(left_dirs.data_dir);
         let _ = std::fs::remove_dir_all(right_dirs.data_dir);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn global_plugin_identity_rejects_normalization_collisions() {
+        for invalid in [
+            "",
+            "plugin",
+            "A0000000000000000000000000000000",
+            "--------------------------------",
+        ] {
+            assert!(global_plugin_runtime_dirs(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
